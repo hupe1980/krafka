@@ -12,7 +12,7 @@ This document describes the internal architecture of Krafka, a pure Rust Apache 
 ## Design Principles
 
 ### 1. Pure Rust
-- No C bindings (unlike rdkafka)
+- No C bindings or FFI
 - Full control over all code paths
 - No FFI overhead or complexity
 

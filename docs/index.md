@@ -89,20 +89,6 @@ async fn main() -> krafka::error::Result<()> {
 
 ---
 
-## 📊 Why Krafka?
-
-| Feature | Krafka | rdkafka | kafka-rust |
-|:--------|:------:|:-------:|:----------:|
-| Pure Rust | ✅ | ❌ | ✅ |
-| Async-native | ✅ | Partial | ❌ |
-| Zero unsafe | ✅ | ❌ | ❌ |
-| AWS MSK IAM | ✅ | ❌ | ❌ |
-| All Compression | ✅ | ✅ | Partial |
-| Consumer Groups | ✅ | ✅ | Partial |
-| Transactions | ✅ | ✅ | ❌ |
-
----
-
 ## 🏗️ Architecture
 
 Krafka is designed with performance and safety as primary goals:
