@@ -27,6 +27,12 @@ CONCEPT.md
 FINDINGS.md
 .DS_Store
 
+# Jekyll docs
+docs/_site/
+docs/.jekyll-cache/
+docs/Gemfile.lock
+docs/vendor/
+
 # Added by cargo
 
 /target

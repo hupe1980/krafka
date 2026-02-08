@@ -373,7 +373,7 @@ impl ApiVersionRange {
     /// # Example
     ///
     /// ```rust
-    /// use krafka::protocol::api::{ApiKey, ApiVersionRange};
+    /// use krafka::protocol::{ApiKey, ApiVersionRange};
     ///
     /// let broker_range = ApiVersionRange::new(ApiKey::Fetch, 0, 12);
     /// // Client supports v4-v11

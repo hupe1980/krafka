@@ -265,6 +265,7 @@ if $TEST; then
     print_section "Running Unit Tests"
     
     run_check "Unit Tests" cargo test --all-features --lib
+    run_check "Doc Tests" cargo test --doc --all-features
 fi
 
 if $INTEGRATION; then
