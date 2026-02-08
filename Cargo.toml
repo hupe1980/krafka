@@ -1,0 +1,86 @@
+[package]
+name = "krafka"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["hupe1980"]
+description = "A pure Rust, async-native Apache Kafka client"
+license = "MIT"
+repository = "https://github.com/hupe1980/krafka"
+documentation = "https://docs.rs/krafka"
+readme = "README.md"
+keywords = ["kafka", "async", "streaming", "messaging"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Zero-copy buffers
+bytes = "1"
+
+# Error handling
+thiserror = "2"
+
+# Logging and tracing
+tracing = "0.1"
+
+# Compression
+flate2 = "1"           # gzip
+snap = "1"             # snappy
+lz4_flex = "0.11"      # lz4
+zstd = "0.13"          # zstd
+
+# CRC32 for protocol
+crc32c = "0.6"
+
+# Random number generation
+rand = "0.9"
+
+# Cryptography for SASL/SCRAM
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+base64 = "0.22"
+zeroize = { version = "1.8", features = ["derive"] }
+
+# TLS/SSL support
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+
+# AWS SDK for MSK IAM authentication (optional)
+# Note: The aws-config crate adds ~2-3 MB to binary size (release build).
+# For smaller binaries, use AwsMskIamCredentials::from_env() which
+# works without the aws-msk feature (manual credential loading).
+aws-config = { version = "1", optional = true }
+aws-credential-types = { version = "1", optional = true }
+
+[features]
+default = []
+# Enable AWS MSK IAM authentication with full SDK credential chain support.
+# This adds the AWS SDK for automatic credential discovery (EC2, ECS, EKS, SSO).
+# Binary size impact: +2-3 MB (release build).
+# If binary size is critical, use manual credential loading with AwsMskIamCredentials::from_env()
+# which works without this feature.
+aws-msk = ["aws-config", "aws-credential-types"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["kafka"] }
+
+[[bench]]
+name = "producer"
+harness = false
+
+[[bench]]
+name = "consumer"
+harness = false
+
+[[bench]]
+name = "protocol"
+harness = false

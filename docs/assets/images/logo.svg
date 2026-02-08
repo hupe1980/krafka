@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <linearGradient id="rust" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#B7410E"/>
+      <stop offset="100%" style="stop-color:#8B0000"/>
+    </linearGradient>
+  </defs>
+  <!-- Kafka-inspired K -->
+  <text x="10" y="75" font-family="Arial Black, sans-serif" font-size="80" font-weight="bold" fill="url(#rust)">K</text>
+  <!-- Crab claw accent -->
+  <path d="M 75 25 Q 85 15 95 25 Q 90 30 85 28 Q 88 35 82 38" stroke="#B7410E" stroke-width="3" fill="none" stroke-linecap="round"/>
+  <path d="M 75 35 Q 85 45 95 35 Q 90 30 85 32 Q 88 25 82 22" stroke="#B7410E" stroke-width="3" fill="none" stroke-linecap="round"/>
+</svg>

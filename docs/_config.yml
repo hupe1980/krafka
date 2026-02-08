@@ -1,0 +1,85 @@
+title: Krafka
+description: A pure Rust, async-native Apache Kafka client
+url: "https://hupe1980.github.io"
+baseurl: "/krafka"
+
+# Theme
+remote_theme: just-the-docs/just-the-docs@v0.7.0
+
+# Logo
+logo: "/assets/images/logo.svg"
+
+# Aux links for top navigation
+aux_links:
+  "GitHub":
+    - "https://github.com/hupe1980/krafka"
+  "Crates.io":
+    - "https://crates.io/crates/krafka"
+  "docs.rs":
+    - "https://docs.rs/krafka"
+
+aux_links_new_tab: true
+
+# Footer content
+footer_content: "Licensed under MIT. Copyright &copy; 2026 Krafka Contributors."
+
+# Color scheme
+color_scheme: light
+
+# Enable search
+search_enabled: true
+search:
+  heading_level: 2
+  previews: 3
+  preview_words_before: 5
+  preview_words_after: 10
+  tokenizer_separator: /[\s/]+/
+  rel_url: true
+  button: false
+
+# Back to top link
+back_to_top: true
+back_to_top_text: "Back to top"
+
+# Collections for docs
+collections:
+  docs:
+    permalink: "/:collection/:path/"
+    output: true
+
+# Just the Docs defaults
+just_the_docs:
+  collections:
+    docs:
+      name: Documentation
+      nav_exclude: false
+      search_exclude: false
+
+# Heading anchor links
+heading_anchors: true
+
+# External navigation links
+nav_external_links:
+  - title: API Reference
+    url: https://docs.rs/krafka
+    hide_icon: false
+
+# Enable copy button for code blocks
+enable_copy_code_button: true
+
+# Kramdown config
+kramdown:
+  syntax_highlighter_opts:
+    block:
+      line_numbers: false
+
+# Build settings
+markdown: kramdown
+highlighter: rouge
+
+# Exclude from build
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - node_modules
+  - vendor

@@ -1,0 +1,4105 @@
+//! Kafka protocol message types.
+//!
+//! This module defines the request and response types for all Kafka APIs.
+
+use bytes::{Buf, BufMut, Bytes};
+
+use super::api::ApiKey;
+use super::primitives::{Decode, Encode, KafkaArray, KafkaBytes, KafkaString};
+use crate::error::{ErrorCode, Result};
+
+/// Metadata request.
+#[derive(Debug, Clone, Default)]
+pub struct MetadataRequest {
+    /// Topics to fetch metadata for. Null means all topics.
+    pub topics: Option<Vec<MetadataRequestTopic>>,
+    /// Whether to allow auto topic creation (v4+).
+    pub allow_auto_topic_creation: bool,
+    /// Include cluster authorized operations (v8+).
+    pub include_cluster_authorized_operations: bool,
+    /// Include topic authorized operations (v8+).
+    pub include_topic_authorized_operations: bool,
+}
+
+/// Topic in metadata request.
+#[derive(Debug, Clone)]
+pub struct MetadataRequestTopic {
+    /// Topic ID (v10+).
+    pub topic_id: Option<[u8; 16]>,
+    /// Topic name.
+    pub name: Option<String>,
+}
+
+impl MetadataRequest {
+    /// Create a request for all topics.
+    pub fn all_topics() -> Self {
+        Self {
+            // Use empty array instead of null for better compatibility with some brokers
+            topics: Some(vec![]),
+            ..Default::default()
+        }
+    }
+
+    /// Create a request for specific topics.
+    pub fn for_topics(topics: Vec<&str>) -> Self {
+        Self {
+            topics: Some(
+                topics
+                    .into_iter()
+                    .map(|name| MetadataRequestTopic {
+                        topic_id: None,
+                        name: Some(name.to_string()),
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// Get the API key.
+    pub fn api_key() -> ApiKey {
+        ApiKey::Metadata
+    }
+
+    /// Encode for version 0-3.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        match &self.topics {
+            None => KafkaArray::<KafkaString>::null().encode(buf),
+            Some(topics) => {
+                let names: Vec<KafkaString> = topics
+                    .iter()
+                    .filter_map(|t| t.name.as_ref().map(KafkaString::new))
+                    .collect();
+                KafkaArray::new(names).encode(buf);
+            }
+        }
+    }
+
+    /// Encode for version 4+.
+    pub fn encode_v4(&self, buf: &mut impl BufMut) {
+        self.encode_v0(buf);
+        buf.put_u8(if self.allow_auto_topic_creation { 1 } else { 0 });
+    }
+}
+
+/// Metadata response.
+#[derive(Debug, Clone, Default)]
+pub struct MetadataResponse {
+    /// Throttle time in milliseconds.
+    pub throttle_time_ms: i32,
+    /// Brokers in the cluster.
+    pub brokers: Vec<MetadataBroker>,
+    /// Cluster ID.
+    pub cluster_id: Option<String>,
+    /// Controller broker ID.
+    pub controller_id: i32,
+    /// Topic metadata.
+    pub topics: Vec<MetadataTopicResponse>,
+}
+
+/// Broker info in metadata response.
+#[derive(Debug, Clone)]
+pub struct MetadataBroker {
+    /// Broker ID.
+    pub node_id: i32,
+    /// Broker host.
+    pub host: String,
+    /// Broker port.
+    pub port: i32,
+    /// Broker rack.
+    pub rack: Option<String>,
+}
+
+/// Topic metadata in response.
+#[derive(Debug, Clone)]
+pub struct MetadataTopicResponse {
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// Topic name.
+    pub name: Option<String>,
+    /// Topic ID (v10+).
+    pub topic_id: Option<[u8; 16]>,
+    /// Is internal topic.
+    pub is_internal: bool,
+    /// Partition metadata.
+    pub partitions: Vec<MetadataPartitionResponse>,
+}
+
+/// Partition metadata in response.
+#[derive(Debug, Clone)]
+pub struct MetadataPartitionResponse {
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// Partition ID.
+    pub partition_index: i32,
+    /// Leader broker ID.
+    pub leader_id: i32,
+    /// Leader epoch.
+    pub leader_epoch: i32,
+    /// Replica broker IDs.
+    pub replica_nodes: Vec<i32>,
+    /// In-sync replica broker IDs.
+    pub isr_nodes: Vec<i32>,
+    /// Offline replica broker IDs (v5+).
+    pub offline_replicas: Vec<i32>,
+}
+
+impl MetadataResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let brokers_arr = KafkaArray::<MetadataBrokerV0>::decode(buf)?;
+        let topics_arr = KafkaArray::<MetadataTopicResponseV0>::decode(buf)?;
+
+        Ok(Self {
+            throttle_time_ms: 0,
+            brokers: brokers_arr
+                .0
+                .unwrap_or_default()
+                .into_iter()
+                .map(|b| b.0)
+                .collect(),
+            cluster_id: None,
+            controller_id: -1,
+            topics: topics_arr
+                .0
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| t.0)
+                .collect(),
+        })
+    }
+
+    /// Decode from version 1.
+    pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
+        let brokers_arr = KafkaArray::<MetadataBrokerV0>::decode(buf)?;
+        let controller_id = i32::decode(buf)?;
+        let topics_arr = KafkaArray::<MetadataTopicResponseV0>::decode(buf)?;
+
+        Ok(Self {
+            throttle_time_ms: 0,
+            brokers: brokers_arr
+                .0
+                .unwrap_or_default()
+                .into_iter()
+                .map(|b| b.0)
+                .collect(),
+            cluster_id: None,
+            controller_id,
+            topics: topics_arr
+                .0
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| t.0)
+                .collect(),
+        })
+    }
+
+    /// Decode from version 2-3.
+    pub fn decode_v2(buf: &mut impl Buf) -> Result<Self> {
+        let brokers_arr = KafkaArray::<MetadataBrokerV0>::decode(buf)?;
+        let cluster_id = KafkaString::decode(buf)?;
+        let controller_id = i32::decode(buf)?;
+        let topics_arr = KafkaArray::<MetadataTopicResponseV0>::decode(buf)?;
+
+        Ok(Self {
+            throttle_time_ms: 0,
+            brokers: brokers_arr
+                .0
+                .unwrap_or_default()
+                .into_iter()
+                .map(|b| b.0)
+                .collect(),
+            cluster_id: cluster_id.0,
+            controller_id,
+            topics: topics_arr
+                .0
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| t.0)
+                .collect(),
+        })
+    }
+
+    /// Find broker by ID.
+    pub fn find_broker(&self, node_id: i32) -> Option<&MetadataBroker> {
+        self.brokers.iter().find(|b| b.node_id == node_id)
+    }
+
+    /// Find topic by name.
+    pub fn find_topic(&self, name: &str) -> Option<&MetadataTopicResponse> {
+        self.topics.iter().find(|t| t.name.as_deref() == Some(name))
+    }
+}
+
+// Helper wrapper for decoding
+struct MetadataBrokerV0(MetadataBroker);
+
+impl Decode for MetadataBrokerV0 {
+    fn decode(buf: &mut impl Buf) -> Result<Self> {
+        let node_id = i32::decode(buf)?;
+        let host = KafkaString::decode(buf)?.0.unwrap_or_default();
+        let port = i32::decode(buf)?;
+
+        Ok(Self(MetadataBroker {
+            node_id,
+            host,
+            port,
+            rack: None,
+        }))
+    }
+}
+
+struct MetadataTopicResponseV0(MetadataTopicResponse);
+
+impl Decode for MetadataTopicResponseV0 {
+    fn decode(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let name = KafkaString::decode(buf)?.0;
+        let partitions_arr = KafkaArray::<MetadataPartitionResponseV0>::decode(buf)?;
+
+        Ok(Self(MetadataTopicResponse {
+            error_code,
+            name,
+            topic_id: None,
+            is_internal: false,
+            partitions: partitions_arr
+                .0
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.0)
+                .collect(),
+        }))
+    }
+}
+
+struct MetadataPartitionResponseV0(MetadataPartitionResponse);
+
+impl Decode for MetadataPartitionResponseV0 {
+    fn decode(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let partition_index = i32::decode(buf)?;
+        let leader_id = i32::decode(buf)?;
+        let replica_nodes = KafkaArray::<i32>::decode(buf)?.0.unwrap_or_default();
+        let isr_nodes = KafkaArray::<i32>::decode(buf)?.0.unwrap_or_default();
+
+        Ok(Self(MetadataPartitionResponse {
+            error_code,
+            partition_index,
+            leader_id,
+            leader_epoch: -1,
+            replica_nodes,
+            isr_nodes,
+            offline_replicas: Vec::new(),
+        }))
+    }
+}
+
+// Produce request/response
+
+/// Produce request.
+#[derive(Debug, Clone)]
+pub struct ProduceRequest {
+    /// Transactional ID (v3+).
+    pub transactional_id: Option<String>,
+    /// Required acks (-1, 0, 1).
+    pub acks: i16,
+    /// Timeout in milliseconds.
+    pub timeout_ms: i32,
+    /// Topic data.
+    pub topic_data: Vec<ProduceTopicData>,
+}
+
+/// Topic data in produce request.
+#[derive(Debug, Clone)]
+pub struct ProduceTopicData {
+    /// Topic name.
+    pub name: String,
+    /// Partition data.
+    pub partition_data: Vec<ProducePartitionData>,
+}
+
+/// Partition data in produce request.
+#[derive(Debug, Clone)]
+pub struct ProducePartitionData {
+    /// Partition index.
+    pub index: i32,
+    /// Record batch data.
+    pub records: Bytes,
+}
+
+impl ProduceRequest {
+    /// Get the API key.
+    pub fn api_key() -> ApiKey {
+        ApiKey::Produce
+    }
+
+    /// Encode for version 0-2.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        self.acks.encode(buf);
+        self.timeout_ms.encode(buf);
+
+        // Topics array
+        buf.put_i32(self.topic_data.len() as i32);
+        for topic in &self.topic_data {
+            KafkaString::new(&topic.name).encode(buf);
+
+            // Partitions array
+            buf.put_i32(topic.partition_data.len() as i32);
+            for partition in &topic.partition_data {
+                partition.index.encode(buf);
+                KafkaBytes::new(partition.records.clone()).encode(buf);
+            }
+        }
+    }
+
+    /// Encode for version 3+.
+    pub fn encode_v3(&self, buf: &mut impl BufMut) {
+        match &self.transactional_id {
+            Some(id) => KafkaString::new(id).encode(buf),
+            None => KafkaString::null().encode(buf),
+        }
+        self.encode_v0(buf);
+    }
+}
+
+/// Produce response.
+#[derive(Debug, Clone, Default)]
+pub struct ProduceResponse {
+    /// Topic responses.
+    pub responses: Vec<ProduceTopicResponse>,
+    /// Throttle time in milliseconds.
+    pub throttle_time_ms: i32,
+}
+
+/// Topic response in produce response.
+#[derive(Debug, Clone)]
+pub struct ProduceTopicResponse {
+    /// Topic name.
+    pub name: String,
+    /// Partition responses.
+    pub partition_responses: Vec<ProducePartitionResponse>,
+}
+
+/// Partition response in produce response.
+#[derive(Debug, Clone)]
+pub struct ProducePartitionResponse {
+    /// Partition index.
+    pub index: i32,
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// Base offset.
+    pub base_offset: i64,
+    /// Log append time.
+    pub log_append_time_ms: i64,
+    /// Log start offset (v5+).
+    pub log_start_offset: i64,
+}
+
+impl ProduceResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let mut responses = Vec::new();
+        let topic_count = i32::decode(buf)?;
+
+        for _ in 0..topic_count {
+            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let partition_count = i32::decode(buf)?;
+            let mut partition_responses = Vec::new();
+
+            for _ in 0..partition_count {
+                let index = i32::decode(buf)?;
+                let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+                let base_offset = i64::decode(buf)?;
+
+                partition_responses.push(ProducePartitionResponse {
+                    index,
+                    error_code,
+                    base_offset,
+                    log_append_time_ms: -1,
+                    log_start_offset: -1,
+                });
+            }
+
+            responses.push(ProduceTopicResponse {
+                name,
+                partition_responses,
+            });
+        }
+
+        Ok(Self {
+            responses,
+            throttle_time_ms: 0,
+        })
+    }
+
+    /// Decode from version 1+.
+    pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
+        let mut response = Self::decode_v0(buf)?;
+        response.throttle_time_ms = i32::decode(buf)?;
+        Ok(response)
+    }
+
+    /// Decode from version 2+.
+    pub fn decode_v2(buf: &mut impl Buf) -> Result<Self> {
+        let mut responses = Vec::new();
+        let topic_count = i32::decode(buf)?;
+
+        for _ in 0..topic_count {
+            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let partition_count = i32::decode(buf)?;
+            let mut partition_responses = Vec::new();
+
+            for _ in 0..partition_count {
+                let index = i32::decode(buf)?;
+                let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+                let base_offset = i64::decode(buf)?;
+                let log_append_time_ms = i64::decode(buf)?;
+
+                partition_responses.push(ProducePartitionResponse {
+                    index,
+                    error_code,
+                    base_offset,
+                    log_append_time_ms,
+                    log_start_offset: -1,
+                });
+            }
+
+            responses.push(ProduceTopicResponse {
+                name,
+                partition_responses,
+            });
+        }
+
+        let throttle_time_ms = i32::decode(buf)?;
+
+        Ok(Self {
+            responses,
+            throttle_time_ms,
+        })
+    }
+}
+
+// Fetch request/response
+
+/// Fetch request.
+#[derive(Debug, Clone)]
+pub struct FetchRequest {
+    /// Replica ID (-1 for consumers).
+    pub replica_id: i32,
+    /// Max wait time in milliseconds.
+    pub max_wait_ms: i32,
+    /// Min bytes to return.
+    pub min_bytes: i32,
+    /// Max bytes to return (v3+).
+    pub max_bytes: i32,
+    /// Isolation level (v4+).
+    pub isolation_level: i8,
+    /// Session ID (v7+).
+    pub session_id: i32,
+    /// Session epoch (v7+).
+    pub session_epoch: i32,
+    /// Topic data.
+    pub topics: Vec<FetchTopicRequest>,
+}
+
+/// Topic in fetch request.
+#[derive(Debug, Clone)]
+pub struct FetchTopicRequest {
+    /// Topic name.
+    pub topic: String,
+    /// Partition data.
+    pub partitions: Vec<FetchPartitionRequest>,
+}
+
+/// Partition in fetch request.
+#[derive(Debug, Clone)]
+pub struct FetchPartitionRequest {
+    /// Partition ID.
+    pub partition: i32,
+    /// Current leader epoch (v9+).
+    pub current_leader_epoch: i32,
+    /// Fetch offset.
+    pub fetch_offset: i64,
+    /// Last fetched epoch (v12+).
+    pub last_fetched_epoch: i32,
+    /// Log start offset (v5+).
+    pub log_start_offset: i64,
+    /// Partition max bytes.
+    pub partition_max_bytes: i32,
+}
+
+impl FetchRequest {
+    /// Get the API key.
+    pub fn api_key() -> ApiKey {
+        ApiKey::Fetch
+    }
+
+    /// Encode for version 0-2.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        self.replica_id.encode(buf);
+        self.max_wait_ms.encode(buf);
+        self.min_bytes.encode(buf);
+
+        // Topics array
+        buf.put_i32(self.topics.len() as i32);
+        for topic in &self.topics {
+            KafkaString::new(&topic.topic).encode(buf);
+
+            // Partitions array
+            buf.put_i32(topic.partitions.len() as i32);
+            for partition in &topic.partitions {
+                partition.partition.encode(buf);
+                partition.fetch_offset.encode(buf);
+                partition.partition_max_bytes.encode(buf);
+            }
+        }
+    }
+
+    /// Encode for version 3.
+    pub fn encode_v3(&self, buf: &mut impl BufMut) {
+        self.replica_id.encode(buf);
+        self.max_wait_ms.encode(buf);
+        self.min_bytes.encode(buf);
+        self.max_bytes.encode(buf);
+
+        // Topics array
+        buf.put_i32(self.topics.len() as i32);
+        for topic in &self.topics {
+            KafkaString::new(&topic.topic).encode(buf);
+
+            // Partitions array
+            buf.put_i32(topic.partitions.len() as i32);
+            for partition in &topic.partitions {
+                partition.partition.encode(buf);
+                partition.fetch_offset.encode(buf);
+                partition.partition_max_bytes.encode(buf);
+            }
+        }
+    }
+
+    /// Encode for version 4+.
+    pub fn encode_v4(&self, buf: &mut impl BufMut) {
+        self.replica_id.encode(buf);
+        self.max_wait_ms.encode(buf);
+        self.min_bytes.encode(buf);
+        self.max_bytes.encode(buf);
+        self.isolation_level.encode(buf);
+
+        // Topics array
+        buf.put_i32(self.topics.len() as i32);
+        for topic in &self.topics {
+            KafkaString::new(&topic.topic).encode(buf);
+
+            // Partitions array
+            buf.put_i32(topic.partitions.len() as i32);
+            for partition in &topic.partitions {
+                partition.partition.encode(buf);
+                partition.fetch_offset.encode(buf);
+                partition.partition_max_bytes.encode(buf);
+            }
+        }
+    }
+}
+
+/// Fetch response.
+#[derive(Debug, Clone, Default)]
+pub struct FetchResponse {
+    /// Throttle time.
+    pub throttle_time_ms: i32,
+    /// Error code (v7+).
+    pub error_code: ErrorCode,
+    /// Session ID (v7+).
+    pub session_id: i32,
+    /// Topic responses.
+    pub responses: Vec<FetchTopicResponse>,
+}
+
+/// Topic in fetch response.
+#[derive(Debug, Clone)]
+pub struct FetchTopicResponse {
+    /// Topic name.
+    pub topic: String,
+    /// Partition responses.
+    pub partitions: Vec<FetchPartitionResponse>,
+}
+
+/// Partition in fetch response.
+#[derive(Debug, Clone)]
+pub struct FetchPartitionResponse {
+    /// Partition ID.
+    pub partition: i32,
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// High watermark.
+    pub high_watermark: i64,
+    /// Last stable offset (v4+).
+    pub last_stable_offset: i64,
+    /// Log start offset (v5+).
+    pub log_start_offset: i64,
+    /// Aborted transactions (v4+).
+    pub aborted_transactions: Vec<AbortedTransaction>,
+    /// Record batches.
+    pub records: Option<Bytes>,
+}
+
+/// Aborted transaction info.
+#[derive(Debug, Clone)]
+pub struct AbortedTransaction {
+    /// Producer ID.
+    pub producer_id: i64,
+    /// First offset.
+    pub first_offset: i64,
+}
+
+impl FetchResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let mut responses = Vec::new();
+        let topic_count = i32::decode(buf)?;
+
+        for _ in 0..topic_count {
+            let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let partition_count = i32::decode(buf)?;
+            let mut partitions = Vec::new();
+
+            for _ in 0..partition_count {
+                let partition = i32::decode(buf)?;
+                let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+                let high_watermark = i64::decode(buf)?;
+                let records = KafkaBytes::decode(buf)?.0;
+
+                partitions.push(FetchPartitionResponse {
+                    partition,
+                    error_code,
+                    high_watermark,
+                    last_stable_offset: -1,
+                    log_start_offset: -1,
+                    aborted_transactions: Vec::new(),
+                    records,
+                });
+            }
+
+            responses.push(FetchTopicResponse { topic, partitions });
+        }
+
+        Ok(Self {
+            throttle_time_ms: 0,
+            error_code: ErrorCode::None,
+            session_id: 0,
+            responses,
+        })
+    }
+
+    /// Decode from version 1+.
+    pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let mut response = Self::decode_inner_v0(buf)?;
+        response.throttle_time_ms = throttle_time_ms;
+        Ok(response)
+    }
+
+    /// Decode from version 4+ (includes last_stable_offset and aborted_transactions).
+    pub fn decode_v4(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let mut responses = Vec::new();
+        let topic_count = i32::decode(buf)?;
+
+        for _ in 0..topic_count {
+            let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let partition_count = i32::decode(buf)?;
+            let mut partitions = Vec::new();
+
+            for _ in 0..partition_count {
+                let partition = i32::decode(buf)?;
+                let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+                let high_watermark = i64::decode(buf)?;
+                let last_stable_offset = i64::decode(buf)?;
+                let aborted_tx_count = i32::decode(buf)?;
+                let mut aborted_transactions = Vec::new();
+                for _ in 0..aborted_tx_count {
+                    aborted_transactions.push(AbortedTransaction {
+                        producer_id: i64::decode(buf)?,
+                        first_offset: i64::decode(buf)?,
+                    });
+                }
+                let records = KafkaBytes::decode(buf)?.0;
+
+                partitions.push(FetchPartitionResponse {
+                    partition,
+                    error_code,
+                    high_watermark,
+                    last_stable_offset,
+                    log_start_offset: -1,
+                    aborted_transactions,
+                    records,
+                });
+            }
+
+            responses.push(FetchTopicResponse { topic, partitions });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            error_code: ErrorCode::None,
+            session_id: 0,
+            responses,
+        })
+    }
+
+    fn decode_inner_v0(buf: &mut impl Buf) -> Result<Self> {
+        let mut responses = Vec::new();
+        let topic_count = i32::decode(buf)?;
+
+        for _ in 0..topic_count {
+            let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let partition_count = i32::decode(buf)?;
+            let mut partitions = Vec::new();
+
+            for _ in 0..partition_count {
+                let partition = i32::decode(buf)?;
+                let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+                let high_watermark = i64::decode(buf)?;
+                let records = KafkaBytes::decode(buf)?.0;
+
+                partitions.push(FetchPartitionResponse {
+                    partition,
+                    error_code,
+                    high_watermark,
+                    last_stable_offset: -1,
+                    log_start_offset: -1,
+                    aborted_transactions: Vec::new(),
+                    records,
+                });
+            }
+
+            responses.push(FetchTopicResponse { topic, partitions });
+        }
+
+        Ok(Self {
+            throttle_time_ms: 0,
+            error_code: ErrorCode::None,
+            session_id: 0,
+            responses,
+        })
+    }
+}
+
+// FindCoordinator request/response
+
+/// Find coordinator request.
+#[derive(Debug, Clone)]
+pub struct FindCoordinatorRequest {
+    /// Key (group ID or transactional ID).
+    pub key: String,
+    /// Key type (0 = group, 1 = txn).
+    pub key_type: i8,
+}
+
+impl FindCoordinatorRequest {
+    /// Create a request for a consumer group.
+    pub fn for_group(group_id: &str) -> Self {
+        Self {
+            key: group_id.to_string(),
+            key_type: 0,
+        }
+    }
+
+    /// Create a request for a transaction.
+    pub fn for_transaction(transactional_id: &str) -> Self {
+        Self {
+            key: transactional_id.to_string(),
+            key_type: 1,
+        }
+    }
+
+    /// Get the API key.
+    pub fn api_key() -> ApiKey {
+        ApiKey::FindCoordinator
+    }
+
+    /// Encode for version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        KafkaString::new(&self.key).encode(buf);
+    }
+
+    /// Encode for version 1+.
+    pub fn encode_v1(&self, buf: &mut impl BufMut) {
+        KafkaString::new(&self.key).encode(buf);
+        self.key_type.encode(buf);
+    }
+}
+
+/// Find coordinator response.
+#[derive(Debug, Clone)]
+pub struct FindCoordinatorResponse {
+    /// Throttle time.
+    pub throttle_time_ms: i32,
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// Error message.
+    pub error_message: Option<String>,
+    /// Coordinator node ID.
+    pub node_id: i32,
+    /// Coordinator host.
+    pub host: String,
+    /// Coordinator port.
+    pub port: i32,
+}
+
+impl FindCoordinatorResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let node_id = i32::decode(buf)?;
+        let host = KafkaString::decode(buf)?.0.unwrap_or_default();
+        let port = i32::decode(buf)?;
+
+        Ok(Self {
+            throttle_time_ms: 0,
+            error_code,
+            error_message: None,
+            node_id,
+            host,
+            port,
+        })
+    }
+
+    /// Decode from version 1+.
+    pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let error_message = KafkaString::decode(buf)?.0;
+        let node_id = i32::decode(buf)?;
+        let host = KafkaString::decode(buf)?.0.unwrap_or_default();
+        let port = i32::decode(buf)?;
+
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            error_message,
+            node_id,
+            host,
+            port,
+        })
+    }
+}
+
+// ============================================================================
+// JoinGroup request/response
+// ============================================================================
+
+/// JoinGroup request protocol.
+#[derive(Debug, Clone)]
+pub struct JoinGroupRequestProtocol {
+    /// Protocol name.
+    pub name: String,
+    /// Protocol metadata.
+    pub metadata: Bytes,
+}
+
+/// JoinGroup request.
+#[derive(Debug, Clone)]
+pub struct JoinGroupRequest {
+    /// Group ID.
+    pub group_id: String,
+    /// Session timeout.
+    pub session_timeout_ms: i32,
+    /// Rebalance timeout (v1+).
+    pub rebalance_timeout_ms: i32,
+    /// Member ID.
+    pub member_id: String,
+    /// Group instance ID (v5+).
+    pub group_instance_id: Option<String>,
+    /// Protocol type (e.g., "consumer").
+    pub protocol_type: String,
+    /// Supported protocols.
+    pub protocols: Vec<JoinGroupRequestProtocol>,
+}
+
+impl JoinGroupRequest {
+    /// Get the API key.
+    pub fn api_key() -> ApiKey {
+        ApiKey::JoinGroup
+    }
+
+    /// Encode for version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        KafkaString::new(&self.group_id).encode(buf);
+        self.session_timeout_ms.encode(buf);
+        KafkaString::new(&self.member_id).encode(buf);
+        KafkaString::new(&self.protocol_type).encode(buf);
+
+        buf.put_i32(self.protocols.len() as i32);
+        for protocol in &self.protocols {
+            KafkaString::new(&protocol.name).encode(buf);
+            KafkaBytes::new(protocol.metadata.clone()).encode(buf);
+        }
+    }
+
+    /// Encode for version 1+.
+    pub fn encode_v1(&self, buf: &mut impl BufMut) {
+        KafkaString::new(&self.group_id).encode(buf);
+        self.session_timeout_ms.encode(buf);
+        self.rebalance_timeout_ms.encode(buf);
+        KafkaString::new(&self.member_id).encode(buf);
+        KafkaString::new(&self.protocol_type).encode(buf);
+
+        buf.put_i32(self.protocols.len() as i32);
+        for protocol in &self.protocols {
+            KafkaString::new(&protocol.name).encode(buf);
+            KafkaBytes::new(protocol.metadata.clone()).encode(buf);
+        }
+    }
+}
+
+/// Member in JoinGroup response.
+#[derive(Debug, Clone)]
+pub struct JoinGroupResponseMember {
+    /// Member ID.
+    pub member_id: String,
+    /// Group instance ID.
+    pub group_instance_id: Option<String>,
+    /// Member metadata.
+    pub metadata: Bytes,
+}
+
+/// JoinGroup response.
+#[derive(Debug, Clone)]
+pub struct JoinGroupResponse {
+    /// Throttle time.
+    pub throttle_time_ms: i32,
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// Generation ID.
+    pub generation_id: i32,
+    /// Protocol type.
+    pub protocol_type: Option<String>,
+    /// Selected protocol name.
+    pub protocol_name: Option<String>,
+    /// Leader member ID.
+    pub leader: String,
+    /// This member's ID.
+    pub member_id: String,
+    /// Members (only for leader).
+    pub members: Vec<JoinGroupResponseMember>,
+}
+
+impl JoinGroupResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let generation_id = i32::decode(buf)?;
+        let protocol_name = KafkaString::decode(buf)?.0;
+        let leader = KafkaString::decode(buf)?.0.unwrap_or_default();
+        let member_id = KafkaString::decode(buf)?.0.unwrap_or_default();
+
+        let member_count = i32::decode(buf)?;
+        let mut members = Vec::with_capacity(member_count as usize);
+        for _ in 0..member_count {
+            let m_id = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let metadata = KafkaBytes::decode(buf)?.0.unwrap_or_default();
+            members.push(JoinGroupResponseMember {
+                member_id: m_id,
+                group_instance_id: None,
+                metadata,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms: 0,
+            error_code,
+            generation_id,
+            protocol_type: None,
+            protocol_name,
+            leader,
+            member_id,
+            members,
+        })
+    }
+
+    /// Decode from version 2+.
+    pub fn decode_v2(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let generation_id = i32::decode(buf)?;
+        let protocol_name = KafkaString::decode(buf)?.0;
+        let leader = KafkaString::decode(buf)?.0.unwrap_or_default();
+        let member_id = KafkaString::decode(buf)?.0.unwrap_or_default();
+
+        let member_count = i32::decode(buf)?;
+        let mut members = Vec::with_capacity(member_count as usize);
+        for _ in 0..member_count {
+            let m_id = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let metadata = KafkaBytes::decode(buf)?.0.unwrap_or_default();
+            members.push(JoinGroupResponseMember {
+                member_id: m_id,
+                group_instance_id: None,
+                metadata,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            generation_id,
+            protocol_type: None,
+            protocol_name,
+            leader,
+            member_id,
+            members,
+        })
+    }
+
+    /// Check if this member is the leader.
+    #[inline]
+    pub fn is_leader(&self) -> bool {
+        self.member_id == self.leader
+    }
+}
+
+// ============================================================================
+// SyncGroup request/response
+// ============================================================================
+
+/// Assignment for a member in SyncGroup.
+#[derive(Debug, Clone)]
+pub struct SyncGroupRequestAssignment {
+    /// Member ID.
+    pub member_id: String,
+    /// Assignment data.
+    pub assignment: Bytes,
+}
+
+/// SyncGroup request.
+#[derive(Debug, Clone)]
+pub struct SyncGroupRequest {
+    /// Group ID.
+    pub group_id: String,
+    /// Generation ID.
+    pub generation_id: i32,
+    /// Member ID.
+    pub member_id: String,
+    /// Group instance ID (v3+).
+    pub group_instance_id: Option<String>,
+    /// Protocol type (v5+).
+    pub protocol_type: Option<String>,
+    /// Protocol name (v5+).
+    pub protocol_name: Option<String>,
+    /// Assignments (only from leader).
+    pub assignments: Vec<SyncGroupRequestAssignment>,
+}
+
+impl SyncGroupRequest {
+    /// Get the API key.
+    pub fn api_key() -> ApiKey {
+        ApiKey::SyncGroup
+    }
+
+    /// Encode for version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        KafkaString::new(&self.group_id).encode(buf);
+        self.generation_id.encode(buf);
+        KafkaString::new(&self.member_id).encode(buf);
+
+        buf.put_i32(self.assignments.len() as i32);
+        for assignment in &self.assignments {
+            KafkaString::new(&assignment.member_id).encode(buf);
+            KafkaBytes::new(assignment.assignment.clone()).encode(buf);
+        }
+    }
+}
+
+/// SyncGroup response.
+#[derive(Debug, Clone)]
+pub struct SyncGroupResponse {
+    /// Throttle time.
+    pub throttle_time_ms: i32,
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// Protocol type (v5+).
+    pub protocol_type: Option<String>,
+    /// Protocol name (v5+).
+    pub protocol_name: Option<String>,
+    /// Assignment for this member.
+    pub assignment: Bytes,
+}
+
+impl SyncGroupResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let assignment = KafkaBytes::decode(buf)?.0.unwrap_or_default();
+
+        Ok(Self {
+            throttle_time_ms: 0,
+            error_code,
+            protocol_type: None,
+            protocol_name: None,
+            assignment,
+        })
+    }
+
+    /// Decode from version 1+.
+    pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let assignment = KafkaBytes::decode(buf)?.0.unwrap_or_default();
+
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            protocol_type: None,
+            protocol_name: None,
+            assignment,
+        })
+    }
+}
+
+// ============================================================================
+// Heartbeat request/response
+// ============================================================================
+
+/// Heartbeat request.
+#[derive(Debug, Clone)]
+pub struct HeartbeatRequest {
+    /// Group ID.
+    pub group_id: String,
+    /// Generation ID.
+    pub generation_id: i32,
+    /// Member ID.
+    pub member_id: String,
+    /// Group instance ID (v3+).
+    pub group_instance_id: Option<String>,
+}
+
+impl HeartbeatRequest {
+    /// Get the API key.
+    pub fn api_key() -> ApiKey {
+        ApiKey::Heartbeat
+    }
+
+    /// Encode for version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        KafkaString::new(&self.group_id).encode(buf);
+        self.generation_id.encode(buf);
+        KafkaString::new(&self.member_id).encode(buf);
+    }
+}
+
+/// Heartbeat response.
+#[derive(Debug, Clone)]
+pub struct HeartbeatResponse {
+    /// Throttle time.
+    pub throttle_time_ms: i32,
+    /// Error code.
+    pub error_code: ErrorCode,
+}
+
+impl HeartbeatResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        Ok(Self {
+            throttle_time_ms: 0,
+            error_code,
+        })
+    }
+
+    /// Decode from version 1+.
+    pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+        })
+    }
+}
+
+// ============================================================================
+// LeaveGroup request/response
+// ============================================================================
+
+/// Member leaving in LeaveGroup (v3+).
+#[derive(Debug, Clone)]
+pub struct LeaveGroupMember {
+    /// Member ID.
+    pub member_id: String,
+    /// Group instance ID.
+    pub group_instance_id: Option<String>,
+}
+
+/// LeaveGroup request.
+#[derive(Debug, Clone)]
+pub struct LeaveGroupRequest {
+    /// Group ID.
+    pub group_id: String,
+    /// Member ID (v0-v2).
+    pub member_id: String,
+    /// Members (v3+).
+    pub members: Vec<LeaveGroupMember>,
+}
+
+impl LeaveGroupRequest {
+    /// Get the API key.
+    pub fn api_key() -> ApiKey {
+        ApiKey::LeaveGroup
+    }
+
+    /// Encode for version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        KafkaString::new(&self.group_id).encode(buf);
+        KafkaString::new(&self.member_id).encode(buf);
+    }
+
+    /// Encode for version 3+.
+    pub fn encode_v3(&self, buf: &mut impl BufMut) {
+        KafkaString::new(&self.group_id).encode(buf);
+        buf.put_i32(self.members.len() as i32);
+        for member in &self.members {
+            KafkaString::new(&member.member_id).encode(buf);
+            match &member.group_instance_id {
+                Some(id) => KafkaString::new(id).encode(buf),
+                None => KafkaString::null().encode(buf),
+            }
+        }
+    }
+}
+
+/// LeaveGroup response.
+#[derive(Debug, Clone)]
+pub struct LeaveGroupResponse {
+    /// Throttle time.
+    pub throttle_time_ms: i32,
+    /// Error code.
+    pub error_code: ErrorCode,
+}
+
+impl LeaveGroupResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        Ok(Self {
+            throttle_time_ms: 0,
+            error_code,
+        })
+    }
+
+    /// Decode from version 1+.
+    pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+        })
+    }
+}
+
+// ============================================================================
+// OffsetCommit request/response
+// ============================================================================
+
+/// Partition in OffsetCommit request.
+#[derive(Debug, Clone)]
+pub struct OffsetCommitRequestPartition {
+    /// Partition index.
+    pub partition_index: i32,
+    /// Committed offset.
+    pub committed_offset: i64,
+    /// Committed leader epoch (v6+).
+    pub committed_leader_epoch: i32,
+    /// Commit timestamp (v1; deprecated in v2+).
+    pub commit_timestamp: i64,
+    /// Metadata.
+    pub committed_metadata: Option<String>,
+}
+
+/// Topic in OffsetCommit request.
+#[derive(Debug, Clone)]
+pub struct OffsetCommitRequestTopic {
+    /// Topic name.
+    pub name: String,
+    /// Partitions.
+    pub partitions: Vec<OffsetCommitRequestPartition>,
+}
+
+/// OffsetCommit request.
+#[derive(Debug, Clone)]
+pub struct OffsetCommitRequest {
+    /// Group ID.
+    pub group_id: String,
+    /// Generation ID (v1+).
+    pub generation_id: i32,
+    /// Member ID (v1+).
+    pub member_id: String,
+    /// Group instance ID (v7+).
+    pub group_instance_id: Option<String>,
+    /// Retention time (v2-v4; deprecated).
+    pub retention_time_ms: i64,
+    /// Topics.
+    pub topics: Vec<OffsetCommitRequestTopic>,
+}
+
+impl OffsetCommitRequest {
+    /// Get the API key.
+    pub fn api_key() -> ApiKey {
+        ApiKey::OffsetCommit
+    }
+
+    /// Encode for version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        KafkaString::new(&self.group_id).encode(buf);
+
+        buf.put_i32(self.topics.len() as i32);
+        for topic in &self.topics {
+            KafkaString::new(&topic.name).encode(buf);
+            buf.put_i32(topic.partitions.len() as i32);
+            for partition in &topic.partitions {
+                partition.partition_index.encode(buf);
+                partition.committed_offset.encode(buf);
+                match &partition.committed_metadata {
+                    Some(m) => KafkaString::new(m).encode(buf),
+                    None => KafkaString::null().encode(buf),
+                }
+            }
+        }
+    }
+
+    /// Encode for version 1.
+    pub fn encode_v1(&self, buf: &mut impl BufMut) {
+        KafkaString::new(&self.group_id).encode(buf);
+        self.generation_id.encode(buf);
+        KafkaString::new(&self.member_id).encode(buf);
+
+        buf.put_i32(self.topics.len() as i32);
+        for topic in &self.topics {
+            KafkaString::new(&topic.name).encode(buf);
+            buf.put_i32(topic.partitions.len() as i32);
+            for partition in &topic.partitions {
+                partition.partition_index.encode(buf);
+                partition.committed_offset.encode(buf);
+                partition.commit_timestamp.encode(buf);
+                match &partition.committed_metadata {
+                    Some(m) => KafkaString::new(m).encode(buf),
+                    None => KafkaString::null().encode(buf),
+                }
+            }
+        }
+    }
+
+    /// Encode for version 2+.
+    pub fn encode_v2(&self, buf: &mut impl BufMut) {
+        KafkaString::new(&self.group_id).encode(buf);
+        self.generation_id.encode(buf);
+        KafkaString::new(&self.member_id).encode(buf);
+        self.retention_time_ms.encode(buf);
+
+        buf.put_i32(self.topics.len() as i32);
+        for topic in &self.topics {
+            KafkaString::new(&topic.name).encode(buf);
+            buf.put_i32(topic.partitions.len() as i32);
+            for partition in &topic.partitions {
+                partition.partition_index.encode(buf);
+                partition.committed_offset.encode(buf);
+                match &partition.committed_metadata {
+                    Some(m) => KafkaString::new(m).encode(buf),
+                    None => KafkaString::null().encode(buf),
+                }
+            }
+        }
+    }
+}
+
+/// Partition in OffsetCommit response.
+#[derive(Debug, Clone)]
+pub struct OffsetCommitResponsePartition {
+    /// Partition index.
+    pub partition_index: i32,
+    /// Error code.
+    pub error_code: ErrorCode,
+}
+
+/// Topic in OffsetCommit response.
+#[derive(Debug, Clone)]
+pub struct OffsetCommitResponseTopic {
+    /// Topic name.
+    pub name: String,
+    /// Partitions.
+    pub partitions: Vec<OffsetCommitResponsePartition>,
+}
+
+/// OffsetCommit response.
+#[derive(Debug, Clone)]
+pub struct OffsetCommitResponse {
+    /// Throttle time.
+    pub throttle_time_ms: i32,
+    /// Topics.
+    pub topics: Vec<OffsetCommitResponseTopic>,
+}
+
+impl OffsetCommitResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let topic_count = i32::decode(buf)?;
+        let mut topics = Vec::with_capacity(topic_count as usize);
+
+        for _ in 0..topic_count {
+            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let partition_count = i32::decode(buf)?;
+            let mut partitions = Vec::with_capacity(partition_count as usize);
+
+            for _ in 0..partition_count {
+                let partition_index = i32::decode(buf)?;
+                let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+                partitions.push(OffsetCommitResponsePartition {
+                    partition_index,
+                    error_code,
+                });
+            }
+
+            topics.push(OffsetCommitResponseTopic { name, partitions });
+        }
+
+        Ok(Self {
+            throttle_time_ms: 0,
+            topics,
+        })
+    }
+
+    /// Decode from version 3+.
+    pub fn decode_v3(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let topic_count = i32::decode(buf)?;
+        let mut topics = Vec::with_capacity(topic_count as usize);
+
+        for _ in 0..topic_count {
+            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let partition_count = i32::decode(buf)?;
+            let mut partitions = Vec::with_capacity(partition_count as usize);
+
+            for _ in 0..partition_count {
+                let partition_index = i32::decode(buf)?;
+                let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+                partitions.push(OffsetCommitResponsePartition {
+                    partition_index,
+                    error_code,
+                });
+            }
+
+            topics.push(OffsetCommitResponseTopic { name, partitions });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            topics,
+        })
+    }
+
+    /// Check if all partitions succeeded.
+    pub fn all_success(&self) -> bool {
+        self.topics
+            .iter()
+            .flat_map(|t| t.partitions.iter())
+            .all(|p| p.error_code.is_ok())
+    }
+}
+
+// ============================================================================
+// OffsetFetch request/response
+// ============================================================================
+
+/// Topic in OffsetFetch request.
+#[derive(Debug, Clone)]
+pub struct OffsetFetchRequestTopic {
+    /// Topic name.
+    pub name: String,
+    /// Partition indices.
+    pub partition_indexes: Vec<i32>,
+}
+
+/// OffsetFetch request.
+#[derive(Debug, Clone)]
+pub struct OffsetFetchRequest {
+    /// Group ID.
+    pub group_id: String,
+    /// Topics (null = all topics in group).
+    pub topics: Option<Vec<OffsetFetchRequestTopic>>,
+    /// Require stable offsets (v7+).
+    pub require_stable: bool,
+}
+
+impl OffsetFetchRequest {
+    /// Get the API key.
+    pub fn api_key() -> ApiKey {
+        ApiKey::OffsetFetch
+    }
+
+    /// Encode for version 0-1.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        KafkaString::new(&self.group_id).encode(buf);
+
+        match &self.topics {
+            Some(topics) => {
+                buf.put_i32(topics.len() as i32);
+                for topic in topics {
+                    KafkaString::new(&topic.name).encode(buf);
+                    buf.put_i32(topic.partition_indexes.len() as i32);
+                    for partition in &topic.partition_indexes {
+                        partition.encode(buf);
+                    }
+                }
+            }
+            None => {
+                buf.put_i32(-1);
+            }
+        }
+    }
+}
+
+/// Partition in OffsetFetch response.
+#[derive(Debug, Clone)]
+pub struct OffsetFetchResponsePartition {
+    /// Partition index.
+    pub partition_index: i32,
+    /// Committed offset.
+    pub committed_offset: i64,
+    /// Committed leader epoch (v5+).
+    pub committed_leader_epoch: i32,
+    /// Metadata.
+    pub metadata: Option<String>,
+    /// Error code.
+    pub error_code: ErrorCode,
+}
+
+/// Topic in OffsetFetch response.
+#[derive(Debug, Clone)]
+pub struct OffsetFetchResponseTopic {
+    /// Topic name.
+    pub name: String,
+    /// Partitions.
+    pub partitions: Vec<OffsetFetchResponsePartition>,
+}
+
+/// OffsetFetch response.
+#[derive(Debug, Clone)]
+pub struct OffsetFetchResponse {
+    /// Throttle time.
+    pub throttle_time_ms: i32,
+    /// Topics.
+    pub topics: Vec<OffsetFetchResponseTopic>,
+    /// Error code (v2+).
+    pub error_code: ErrorCode,
+}
+
+impl OffsetFetchResponse {
+    /// Decode from version 0-1.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let topic_count = i32::decode(buf)?;
+        let mut topics = Vec::with_capacity(topic_count as usize);
+
+        for _ in 0..topic_count {
+            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let partition_count = i32::decode(buf)?;
+            let mut partitions = Vec::with_capacity(partition_count as usize);
+
+            for _ in 0..partition_count {
+                let partition_index = i32::decode(buf)?;
+                let committed_offset = i64::decode(buf)?;
+                let metadata = KafkaString::decode(buf)?.0;
+                let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+
+                partitions.push(OffsetFetchResponsePartition {
+                    partition_index,
+                    committed_offset,
+                    committed_leader_epoch: -1,
+                    metadata,
+                    error_code,
+                });
+            }
+
+            topics.push(OffsetFetchResponseTopic { name, partitions });
+        }
+
+        Ok(Self {
+            throttle_time_ms: 0,
+            topics,
+            error_code: ErrorCode::None,
+        })
+    }
+
+    /// Decode from version 2.
+    pub fn decode_v2(buf: &mut impl Buf) -> Result<Self> {
+        let topic_count = i32::decode(buf)?;
+        let mut topics = Vec::with_capacity(topic_count as usize);
+
+        for _ in 0..topic_count {
+            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let partition_count = i32::decode(buf)?;
+            let mut partitions = Vec::with_capacity(partition_count as usize);
+
+            for _ in 0..partition_count {
+                let partition_index = i32::decode(buf)?;
+                let committed_offset = i64::decode(buf)?;
+                let metadata = KafkaString::decode(buf)?.0;
+                let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+
+                partitions.push(OffsetFetchResponsePartition {
+                    partition_index,
+                    committed_offset,
+                    committed_leader_epoch: -1,
+                    metadata,
+                    error_code,
+                });
+            }
+
+            topics.push(OffsetFetchResponseTopic { name, partitions });
+        }
+
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+
+        Ok(Self {
+            throttle_time_ms: 0,
+            topics,
+            error_code,
+        })
+    }
+
+    /// Decode from version 3+.
+    pub fn decode_v3(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let topic_count = i32::decode(buf)?;
+        let mut topics = Vec::with_capacity(topic_count as usize);
+
+        for _ in 0..topic_count {
+            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let partition_count = i32::decode(buf)?;
+            let mut partitions = Vec::with_capacity(partition_count as usize);
+
+            for _ in 0..partition_count {
+                let partition_index = i32::decode(buf)?;
+                let committed_offset = i64::decode(buf)?;
+                let metadata = KafkaString::decode(buf)?.0;
+                let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+
+                partitions.push(OffsetFetchResponsePartition {
+                    partition_index,
+                    committed_offset,
+                    committed_leader_epoch: -1,
+                    metadata,
+                    error_code,
+                });
+            }
+
+            topics.push(OffsetFetchResponseTopic { name, partitions });
+        }
+
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+
+        Ok(Self {
+            throttle_time_ms,
+            topics,
+            error_code,
+        })
+    }
+
+    /// Get the offset for a specific topic-partition.
+    pub fn get_offset(&self, topic: &str, partition: i32) -> Option<i64> {
+        self.topics.iter().find(|t| t.name == topic).and_then(|t| {
+            t.partitions
+                .iter()
+                .find(|p| p.partition_index == partition)
+                .map(|p| p.committed_offset)
+        })
+    }
+}
+
+// ============================================================================
+// CreateTopics request/response
+// ============================================================================
+
+/// Topic configuration for CreateTopics.
+#[derive(Debug, Clone)]
+pub struct CreatableTopicConfig {
+    /// Config name.
+    pub name: String,
+    /// Config value.
+    pub value: Option<String>,
+}
+
+/// Topic to create.
+#[derive(Debug, Clone)]
+pub struct CreatableTopic {
+    /// Topic name.
+    pub name: String,
+    /// Number of partitions (-1 = default).
+    pub num_partitions: i32,
+    /// Replication factor (-1 = default).
+    pub replication_factor: i16,
+    /// Manual replica assignments.
+    pub assignments: Vec<CreatableReplicaAssignment>,
+    /// Topic configs.
+    pub configs: Vec<CreatableTopicConfig>,
+}
+
+/// Replica assignment.
+#[derive(Debug, Clone)]
+pub struct CreatableReplicaAssignment {
+    /// Partition index.
+    pub partition_index: i32,
+    /// Broker IDs.
+    pub broker_ids: Vec<i32>,
+}
+
+/// CreateTopics request.
+#[derive(Debug, Clone)]
+pub struct CreateTopicsRequest {
+    /// Topics to create.
+    pub topics: Vec<CreatableTopic>,
+    /// Timeout in milliseconds.
+    pub timeout_ms: i32,
+    /// Validate only (v1+).
+    pub validate_only: bool,
+}
+
+impl CreateTopicsRequest {
+    /// Get the API key.
+    pub fn api_key() -> ApiKey {
+        ApiKey::CreateTopics
+    }
+
+    /// Encode for version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        buf.put_i32(self.topics.len() as i32);
+        for topic in &self.topics {
+            KafkaString::new(&topic.name).encode(buf);
+            topic.num_partitions.encode(buf);
+            topic.replication_factor.encode(buf);
+
+            buf.put_i32(topic.assignments.len() as i32);
+            for assignment in &topic.assignments {
+                assignment.partition_index.encode(buf);
+                buf.put_i32(assignment.broker_ids.len() as i32);
+                for broker in &assignment.broker_ids {
+                    broker.encode(buf);
+                }
+            }
+
+            buf.put_i32(topic.configs.len() as i32);
+            for config in &topic.configs {
+                KafkaString::new(&config.name).encode(buf);
+                match &config.value {
+                    Some(v) => KafkaString::new(v).encode(buf),
+                    None => KafkaString::null().encode(buf),
+                }
+            }
+        }
+        self.timeout_ms.encode(buf);
+    }
+
+    /// Encode for version 1+.
+    pub fn encode_v1(&self, buf: &mut impl BufMut) {
+        buf.put_i32(self.topics.len() as i32);
+        for topic in &self.topics {
+            KafkaString::new(&topic.name).encode(buf);
+            topic.num_partitions.encode(buf);
+            topic.replication_factor.encode(buf);
+
+            buf.put_i32(topic.assignments.len() as i32);
+            for assignment in &topic.assignments {
+                assignment.partition_index.encode(buf);
+                buf.put_i32(assignment.broker_ids.len() as i32);
+                for broker in &assignment.broker_ids {
+                    broker.encode(buf);
+                }
+            }
+
+            buf.put_i32(topic.configs.len() as i32);
+            for config in &topic.configs {
+                KafkaString::new(&config.name).encode(buf);
+                match &config.value {
+                    Some(v) => KafkaString::new(v).encode(buf),
+                    None => KafkaString::null().encode(buf),
+                }
+            }
+        }
+        self.timeout_ms.encode(buf);
+        buf.put_u8(if self.validate_only { 1 } else { 0 });
+    }
+}
+
+/// Result for a created topic.
+#[derive(Debug, Clone)]
+pub struct CreatableTopicResult {
+    /// Topic name.
+    pub name: String,
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// Error message (v1+).
+    pub error_message: Option<String>,
+    /// Number of partitions (v5+).
+    pub num_partitions: i32,
+    /// Replication factor (v5+).
+    pub replication_factor: i16,
+}
+
+/// CreateTopics response.
+#[derive(Debug, Clone)]
+pub struct CreateTopicsResponse {
+    /// Throttle time.
+    pub throttle_time_ms: i32,
+    /// Topics.
+    pub topics: Vec<CreatableTopicResult>,
+}
+
+impl CreateTopicsResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let topic_count = i32::decode(buf)?;
+        let mut topics = Vec::with_capacity(topic_count as usize);
+
+        for _ in 0..topic_count {
+            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+
+            topics.push(CreatableTopicResult {
+                name,
+                error_code,
+                error_message: None,
+                num_partitions: -1,
+                replication_factor: -1,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms: 0,
+            topics,
+        })
+    }
+
+    /// Decode from version 1.
+    pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
+        let topic_count = i32::decode(buf)?;
+        let mut topics = Vec::with_capacity(topic_count as usize);
+
+        for _ in 0..topic_count {
+            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+            let error_message = KafkaString::decode(buf)?.0;
+
+            topics.push(CreatableTopicResult {
+                name,
+                error_code,
+                error_message,
+                num_partitions: -1,
+                replication_factor: -1,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms: 0,
+            topics,
+        })
+    }
+
+    /// Decode from version 2+.
+    pub fn decode_v2(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let topic_count = i32::decode(buf)?;
+        let mut topics = Vec::with_capacity(topic_count as usize);
+
+        for _ in 0..topic_count {
+            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+            let error_message = KafkaString::decode(buf)?.0;
+
+            topics.push(CreatableTopicResult {
+                name,
+                error_code,
+                error_message,
+                num_partitions: -1,
+                replication_factor: -1,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            topics,
+        })
+    }
+}
+
+// ============================================================================
+// DeleteTopics request/response
+// ============================================================================
+
+/// DeleteTopics request.
+#[derive(Debug, Clone)]
+pub struct DeleteTopicsRequest {
+    /// Topic names.
+    pub topic_names: Vec<String>,
+    /// Timeout in milliseconds.
+    pub timeout_ms: i32,
+}
+
+impl DeleteTopicsRequest {
+    /// Get the API key.
+    pub fn api_key() -> ApiKey {
+        ApiKey::DeleteTopics
+    }
+
+    /// Encode for version 0+.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        buf.put_i32(self.topic_names.len() as i32);
+        for name in &self.topic_names {
+            KafkaString::new(name).encode(buf);
+        }
+        self.timeout_ms.encode(buf);
+    }
+}
+
+/// Result for a deleted topic.
+#[derive(Debug, Clone)]
+pub struct DeletableTopicResult {
+    /// Topic name.
+    pub name: Option<String>,
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// Error message (v5+).
+    pub error_message: Option<String>,
+}
+
+/// DeleteTopics response.
+#[derive(Debug, Clone)]
+pub struct DeleteTopicsResponse {
+    /// Throttle time.
+    pub throttle_time_ms: i32,
+    /// Responses.
+    pub responses: Vec<DeletableTopicResult>,
+}
+
+impl DeleteTopicsResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let response_count = i32::decode(buf)?;
+        let mut responses = Vec::with_capacity(response_count as usize);
+
+        for _ in 0..response_count {
+            let name = KafkaString::decode(buf)?.0;
+            let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+
+            responses.push(DeletableTopicResult {
+                name,
+                error_code,
+                error_message: None,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms: 0,
+            responses,
+        })
+    }
+
+    /// Decode from version 1+.
+    pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let response_count = i32::decode(buf)?;
+        let mut responses = Vec::with_capacity(response_count as usize);
+
+        for _ in 0..response_count {
+            let name = KafkaString::decode(buf)?.0;
+            let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+
+            responses.push(DeletableTopicResult {
+                name,
+                error_code,
+                error_message: None,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            responses,
+        })
+    }
+}
+
+// ============================================================================
+// CreatePartitions API (Key 37)
+// ============================================================================
+
+/// CreatePartitions request.
+#[derive(Debug, Clone)]
+pub struct CreatePartitionsRequest {
+    /// Topics to create partitions for.
+    pub topics: Vec<CreatePartitionsTopic>,
+    /// Timeout in milliseconds.
+    pub timeout_ms: i32,
+    /// If true, validate the request without actually creating partitions.
+    pub validate_only: bool,
+}
+
+/// Topic in CreatePartitions request.
+#[derive(Debug, Clone)]
+pub struct CreatePartitionsTopic {
+    /// Topic name.
+    pub name: String,
+    /// New total partition count.
+    pub count: i32,
+    /// Assignment of new partitions to brokers.
+    pub assignments: Option<Vec<CreatePartitionsAssignment>>,
+}
+
+/// Partition assignment in CreatePartitions request.
+#[derive(Debug, Clone)]
+pub struct CreatePartitionsAssignment {
+    /// Broker IDs to assign the partition replicas to.
+    pub broker_ids: Vec<i32>,
+}
+
+impl CreatePartitionsRequest {
+    /// Create a simple partition increase request.
+    pub fn new(topic: impl Into<String>, count: i32, timeout: std::time::Duration) -> Self {
+        Self {
+            topics: vec![CreatePartitionsTopic {
+                name: topic.into(),
+                count,
+                assignments: None,
+            }],
+            timeout_ms: timeout.as_millis() as i32,
+            validate_only: false,
+        }
+    }
+
+    /// Encode for version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        // Array of topics
+        (self.topics.len() as i32).encode(buf);
+        for topic in &self.topics {
+            KafkaString::new(&topic.name).encode(buf);
+            topic.count.encode(buf);
+
+            // Assignments (nullable array)
+            match &topic.assignments {
+                None => (-1i32).encode(buf),
+                Some(assignments) => {
+                    (assignments.len() as i32).encode(buf);
+                    for assignment in assignments {
+                        (assignment.broker_ids.len() as i32).encode(buf);
+                        for &broker_id in &assignment.broker_ids {
+                            broker_id.encode(buf);
+                        }
+                    }
+                }
+            }
+        }
+        self.timeout_ms.encode(buf);
+        buf.put_u8(if self.validate_only { 1 } else { 0 });
+    }
+}
+
+/// CreatePartitions response.
+#[derive(Debug, Clone)]
+pub struct CreatePartitionsResponse {
+    /// Throttle time in milliseconds.
+    pub throttle_time_ms: i32,
+    /// Results per topic.
+    pub results: Vec<CreatePartitionsTopicResult>,
+}
+
+/// Result for a topic in CreatePartitions response.
+#[derive(Debug, Clone)]
+pub struct CreatePartitionsTopicResult {
+    /// Topic name.
+    pub name: String,
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// Error message.
+    pub error_message: Option<String>,
+}
+
+impl CreatePartitionsResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let result_count = i32::decode(buf)?;
+        let mut results = Vec::with_capacity(result_count as usize);
+
+        for _ in 0..result_count {
+            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+            let error_message = KafkaString::decode(buf)?.0;
+
+            results.push(CreatePartitionsTopicResult {
+                name,
+                error_code,
+                error_message,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            results,
+        })
+    }
+}
+
+// ============================================================================
+// DescribeConfigs API (Key 32)
+// ============================================================================
+
+/// Resource type for config operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigResourceType {
+    /// Unknown resource type.
+    Unknown = 0,
+    /// Topic resource.
+    Topic = 2,
+    /// Broker resource.
+    Broker = 4,
+    /// Broker logger resource.
+    BrokerLogger = 8,
+}
+
+impl ConfigResourceType {
+    /// Convert from i8.
+    #[inline]
+    pub fn from_i8(value: i8) -> Self {
+        match value {
+            2 => Self::Topic,
+            4 => Self::Broker,
+            8 => Self::BrokerLogger,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Convert to i8.
+    #[inline]
+    pub fn to_i8(self) -> i8 {
+        self as i8
+    }
+}
+
+/// DescribeConfigs request.
+#[derive(Debug, Clone)]
+pub struct DescribeConfigsRequest {
+    /// Resources to describe.
+    pub resources: Vec<DescribeConfigsResource>,
+    /// Include synonyms in response.
+    pub include_synonyms: bool,
+    /// Include documentation in response.
+    pub include_documentation: bool,
+}
+
+/// Resource in DescribeConfigs request.
+#[derive(Debug, Clone)]
+pub struct DescribeConfigsResource {
+    /// Resource type.
+    pub resource_type: ConfigResourceType,
+    /// Resource name (topic name or broker ID as string).
+    pub resource_name: String,
+    /// Config names to describe (null for all).
+    pub config_names: Option<Vec<String>>,
+}
+
+impl DescribeConfigsRequest {
+    /// Create a request to describe topic configs.
+    pub fn for_topic(topic: impl Into<String>) -> Self {
+        Self {
+            resources: vec![DescribeConfigsResource {
+                resource_type: ConfigResourceType::Topic,
+                resource_name: topic.into(),
+                config_names: None,
+            }],
+            include_synonyms: false,
+            include_documentation: false,
+        }
+    }
+
+    /// Create a request to describe broker configs.
+    pub fn for_broker(broker_id: i32) -> Self {
+        Self {
+            resources: vec![DescribeConfigsResource {
+                resource_type: ConfigResourceType::Broker,
+                resource_name: broker_id.to_string(),
+                config_names: None,
+            }],
+            include_synonyms: false,
+            include_documentation: false,
+        }
+    }
+
+    /// Encode for version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        (self.resources.len() as i32).encode(buf);
+        for resource in &self.resources {
+            resource.resource_type.to_i8().encode(buf);
+            KafkaString::new(&resource.resource_name).encode(buf);
+
+            match &resource.config_names {
+                None => (-1i32).encode(buf),
+                Some(names) => {
+                    (names.len() as i32).encode(buf);
+                    for name in names {
+                        KafkaString::new(name).encode(buf);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// DescribeConfigs response.
+#[derive(Debug, Clone)]
+pub struct DescribeConfigsResponse {
+    /// Throttle time in milliseconds.
+    pub throttle_time_ms: i32,
+    /// Results per resource.
+    pub results: Vec<DescribeConfigsResult>,
+}
+
+/// Result for a resource in DescribeConfigs response.
+#[derive(Debug, Clone)]
+pub struct DescribeConfigsResult {
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// Error message.
+    pub error_message: Option<String>,
+    /// Resource type.
+    pub resource_type: ConfigResourceType,
+    /// Resource name.
+    pub resource_name: String,
+    /// Configuration entries.
+    pub configs: Vec<DescribeConfigsEntry>,
+}
+
+/// Configuration entry in DescribeConfigs response.
+#[derive(Debug, Clone)]
+pub struct DescribeConfigsEntry {
+    /// Config name.
+    pub name: String,
+    /// Config value.
+    pub value: Option<String>,
+    /// Whether the config is read-only.
+    pub read_only: bool,
+    /// Whether the config is the default value.
+    pub is_default: bool,
+    /// Whether the config is sensitive.
+    pub is_sensitive: bool,
+}
+
+impl DescribeConfigsResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let result_count = i32::decode(buf)?;
+        let mut results = Vec::with_capacity(result_count as usize);
+
+        for _ in 0..result_count {
+            let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+            let error_message = KafkaString::decode(buf)?.0;
+            let resource_type = ConfigResourceType::from_i8(i8::decode(buf)?);
+            let resource_name = KafkaString::decode(buf)?.0.unwrap_or_default();
+
+            let config_count = i32::decode(buf)?;
+            let mut configs = Vec::with_capacity(config_count as usize);
+
+            for _ in 0..config_count {
+                let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let value = KafkaString::decode(buf)?.0;
+                let read_only = i8::decode(buf)? != 0;
+                let is_default = i8::decode(buf)? != 0;
+                let is_sensitive = i8::decode(buf)? != 0;
+
+                configs.push(DescribeConfigsEntry {
+                    name,
+                    value,
+                    read_only,
+                    is_default,
+                    is_sensitive,
+                });
+            }
+
+            results.push(DescribeConfigsResult {
+                error_code,
+                error_message,
+                resource_type,
+                resource_name,
+                configs,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            results,
+        })
+    }
+}
+
+// ============================================================================
+// AlterConfigs API (Key 33)
+// ============================================================================
+
+/// AlterConfigs request.
+#[derive(Debug, Clone)]
+pub struct AlterConfigsRequest {
+    /// Resources to alter.
+    pub resources: Vec<AlterConfigsResource>,
+    /// If true, validate without actually changing configs.
+    pub validate_only: bool,
+}
+
+/// Resource in AlterConfigs request.
+#[derive(Debug, Clone)]
+pub struct AlterConfigsResource {
+    /// Resource type.
+    pub resource_type: ConfigResourceType,
+    /// Resource name.
+    pub resource_name: String,
+    /// Configurations to set.
+    pub configs: Vec<AlterConfigsEntry>,
+}
+
+/// Configuration entry in AlterConfigs request.
+#[derive(Debug, Clone)]
+pub struct AlterConfigsEntry {
+    /// Config name.
+    pub name: String,
+    /// Config value.
+    pub value: Option<String>,
+}
+
+impl AlterConfigsRequest {
+    /// Create a request to alter topic configs.
+    pub fn for_topic(topic: impl Into<String>, configs: Vec<(String, String)>) -> Self {
+        Self {
+            resources: vec![AlterConfigsResource {
+                resource_type: ConfigResourceType::Topic,
+                resource_name: topic.into(),
+                configs: configs
+                    .into_iter()
+                    .map(|(name, value)| AlterConfigsEntry {
+                        name,
+                        value: Some(value),
+                    })
+                    .collect(),
+            }],
+            validate_only: false,
+        }
+    }
+
+    /// Encode for version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        (self.resources.len() as i32).encode(buf);
+        for resource in &self.resources {
+            resource.resource_type.to_i8().encode(buf);
+            KafkaString::new(&resource.resource_name).encode(buf);
+
+            (resource.configs.len() as i32).encode(buf);
+            for config in &resource.configs {
+                KafkaString::new(&config.name).encode(buf);
+                match &config.value {
+                    Some(v) => KafkaString::new(v).encode(buf),
+                    None => KafkaString::null().encode(buf),
+                }
+            }
+        }
+        buf.put_u8(if self.validate_only { 1 } else { 0 });
+    }
+}
+
+/// AlterConfigs response.
+#[derive(Debug, Clone)]
+pub struct AlterConfigsResponse {
+    /// Throttle time in milliseconds.
+    pub throttle_time_ms: i32,
+    /// Results per resource.
+    pub results: Vec<AlterConfigsResult>,
+}
+
+/// Result for a resource in AlterConfigs response.
+#[derive(Debug, Clone)]
+pub struct AlterConfigsResult {
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// Error message.
+    pub error_message: Option<String>,
+    /// Resource type.
+    pub resource_type: ConfigResourceType,
+    /// Resource name.
+    pub resource_name: String,
+}
+
+impl AlterConfigsResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let result_count = i32::decode(buf)?;
+        let mut results = Vec::with_capacity(result_count as usize);
+
+        for _ in 0..result_count {
+            let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+            let error_message = KafkaString::decode(buf)?.0;
+            let resource_type = ConfigResourceType::from_i8(i8::decode(buf)?);
+            let resource_name = KafkaString::decode(buf)?.0.unwrap_or_default();
+
+            results.push(AlterConfigsResult {
+                error_code,
+                error_message,
+                resource_type,
+                resource_name,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            results,
+        })
+    }
+}
+
+// ============================================================================
+// InitProducerId (API Key 22) - Idempotent Producer Support
+// ============================================================================
+
+/// Request to initialize producer ID for idempotent/transactional production.
+#[derive(Debug, Clone)]
+pub struct InitProducerIdRequest {
+    /// Transactional ID (null for non-transactional producers).
+    pub transactional_id: Option<String>,
+    /// Transaction timeout in milliseconds (-1 for non-transactional).
+    pub transaction_timeout_ms: i32,
+    /// Producer ID to use (for recovery; -1 for new producer).
+    pub producer_id: i64,
+    /// Producer epoch to use (for recovery; -1 for new producer).
+    pub producer_epoch: i16,
+}
+
+impl InitProducerIdRequest {
+    /// Create a request for a non-transactional idempotent producer.
+    #[inline]
+    pub fn idempotent() -> Self {
+        Self {
+            transactional_id: None,
+            transaction_timeout_ms: -1,
+            producer_id: -1,
+            producer_epoch: -1,
+        }
+    }
+
+    /// Create a request for a transactional producer.
+    #[inline]
+    pub fn transactional(transactional_id: &str, timeout_ms: i32) -> Self {
+        Self {
+            transactional_id: Some(transactional_id.to_string()),
+            transaction_timeout_ms: timeout_ms,
+            producer_id: -1,
+            producer_epoch: -1,
+        }
+    }
+
+    /// Encode as version 0 (non-transactional idempotent only).
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        KafkaString(self.transactional_id.clone()).encode(buf);
+        self.transaction_timeout_ms.encode(buf);
+    }
+
+    /// Encode as version 2 (with producer_id and epoch for recovery).
+    pub fn encode_v2(&self, buf: &mut impl BufMut) {
+        KafkaString(self.transactional_id.clone()).encode(buf);
+        self.transaction_timeout_ms.encode(buf);
+        self.producer_id.encode(buf);
+        self.producer_epoch.encode(buf);
+    }
+}
+
+/// Response from InitProducerId.
+#[derive(Debug, Clone)]
+pub struct InitProducerIdResponse {
+    /// Throttle time in milliseconds.
+    pub throttle_time_ms: i32,
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// Producer ID assigned by the broker.
+    pub producer_id: i64,
+    /// Producer epoch assigned by the broker.
+    pub producer_epoch: i16,
+}
+
+impl InitProducerIdResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let producer_id = i64::decode(buf)?;
+        let producer_epoch = i16::decode(buf)?;
+
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            producer_id,
+            producer_epoch,
+        })
+    }
+
+    /// Check if the response indicates success.
+    #[inline]
+    pub fn is_ok(&self) -> bool {
+        self.error_code.is_ok()
+    }
+}
+
+// ============================================================================
+// SaslHandshake (API Key 17) - SASL Mechanism Negotiation
+// ============================================================================
+
+/// Request to negotiate SASL mechanism.
+#[derive(Debug, Clone)]
+pub struct SaslHandshakeRequest {
+    /// SASL mechanism name (e.g., "PLAIN", "SCRAM-SHA-256").
+    pub mechanism: String,
+}
+
+impl SaslHandshakeRequest {
+    /// Create a new SASL handshake request.
+    #[inline]
+    pub fn new(mechanism: impl Into<String>) -> Self {
+        Self {
+            mechanism: mechanism.into(),
+        }
+    }
+
+    /// Encode as version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        KafkaString(Some(self.mechanism.clone())).encode(buf);
+    }
+
+    /// Encode as version 1.
+    pub fn encode_v1(&self, buf: &mut impl BufMut) {
+        // Same as v0
+        self.encode_v0(buf);
+    }
+}
+
+/// Response from SASL handshake.
+#[derive(Debug, Clone)]
+pub struct SaslHandshakeResponse {
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// List of mechanisms enabled on the broker.
+    pub enabled_mechanisms: Vec<String>,
+}
+
+impl SaslHandshakeResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let count = i32::decode(buf)?;
+        let mut enabled_mechanisms = Vec::with_capacity(count as usize);
+
+        for _ in 0..count {
+            if let Some(mech) = KafkaString::decode(buf)?.0 {
+                enabled_mechanisms.push(mech);
+            }
+        }
+
+        Ok(Self {
+            error_code,
+            enabled_mechanisms,
+        })
+    }
+
+    /// Check if the response indicates success.
+    #[inline]
+    pub fn is_ok(&self) -> bool {
+        self.error_code.is_ok()
+    }
+}
+
+// ============================================================================
+// SaslAuthenticate (API Key 36) - SASL Authentication
+// ============================================================================
+
+/// Request to authenticate via SASL.
+#[derive(Debug, Clone)]
+pub struct SaslAuthenticateRequest {
+    /// SASL authentication bytes.
+    pub auth_bytes: Vec<u8>,
+}
+
+impl SaslAuthenticateRequest {
+    /// Create a new SASL authenticate request.
+    #[inline]
+    pub fn new(auth_bytes: Vec<u8>) -> Self {
+        Self { auth_bytes }
+    }
+
+    /// Encode as version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        KafkaBytes(Some(bytes::Bytes::from(self.auth_bytes.clone()))).encode(buf);
+    }
+
+    /// Encode as version 1.
+    pub fn encode_v1(&self, buf: &mut impl BufMut) {
+        // Same as v0
+        self.encode_v0(buf);
+    }
+}
+
+/// Response from SASL authentication.
+#[derive(Debug, Clone)]
+pub struct SaslAuthenticateResponse {
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// Error message (if any).
+    pub error_message: Option<String>,
+    /// Authentication response bytes.
+    pub auth_bytes: Vec<u8>,
+    /// Session lifetime in milliseconds (v1+).
+    pub session_lifetime_ms: i64,
+}
+
+impl SaslAuthenticateResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let error_message = KafkaString::decode(buf)?.0;
+        let auth_bytes = KafkaBytes::decode(buf)?
+            .0
+            .map(|b| b.to_vec())
+            .unwrap_or_default();
+
+        Ok(Self {
+            error_code,
+            error_message,
+            auth_bytes,
+            session_lifetime_ms: 0,
+        })
+    }
+
+    /// Decode from version 1.
+    pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let error_message = KafkaString::decode(buf)?.0;
+        let auth_bytes = KafkaBytes::decode(buf)?
+            .0
+            .map(|b| b.to_vec())
+            .unwrap_or_default();
+        let session_lifetime_ms = i64::decode(buf)?;
+
+        Ok(Self {
+            error_code,
+            error_message,
+            auth_bytes,
+            session_lifetime_ms,
+        })
+    }
+
+    /// Check if the response indicates success.
+    #[inline]
+    pub fn is_ok(&self) -> bool {
+        self.error_code.is_ok()
+    }
+
+    /// Check if authentication is complete.
+    #[inline]
+    pub fn is_complete(&self) -> bool {
+        self.error_code.is_ok() && self.auth_bytes.is_empty()
+    }
+}
+
+// ============================================================================
+// ACL Management (API Keys 29, 30, 31)
+// ============================================================================
+
+/// ACL resource type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AclResourceType {
+    /// Unknown resource type.
+    Unknown = 0,
+    /// Any resource type (for filtering).
+    #[default]
+    Any = 1,
+    /// Topic resource.
+    Topic = 2,
+    /// Group resource (consumer groups).
+    Group = 3,
+    /// Cluster resource.
+    Cluster = 4,
+    /// Transactional ID resource.
+    TransactionalId = 5,
+    /// Delegation token resource.
+    DelegationToken = 6,
+}
+
+impl AclResourceType {
+    /// Convert from i8.
+    #[inline]
+    pub fn from_i8(value: i8) -> Self {
+        match value {
+            1 => Self::Any,
+            2 => Self::Topic,
+            3 => Self::Group,
+            4 => Self::Cluster,
+            5 => Self::TransactionalId,
+            6 => Self::DelegationToken,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Convert to i8.
+    #[inline]
+    pub fn to_i8(self) -> i8 {
+        self as i8
+    }
+}
+
+/// ACL pattern type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AclPatternType {
+    /// Unknown pattern type.
+    Unknown = 0,
+    /// Any pattern (for filtering).
+    #[default]
+    Any = 1,
+    /// Exact match pattern.
+    Literal = 2,
+    /// Prefix match pattern.
+    Prefixed = 3,
+}
+
+impl AclPatternType {
+    /// Convert from i8.
+    #[inline]
+    pub fn from_i8(value: i8) -> Self {
+        match value {
+            1 => Self::Any,
+            2 => Self::Literal,
+            3 => Self::Prefixed,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Convert to i8.
+    #[inline]
+    pub fn to_i8(self) -> i8 {
+        self as i8
+    }
+}
+
+/// ACL operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AclOperation {
+    /// Unknown operation.
+    Unknown = 0,
+    /// Any operation (for filtering).
+    #[default]
+    Any = 1,
+    /// All operations.
+    All = 2,
+    /// Read operation.
+    Read = 3,
+    /// Write operation.
+    Write = 4,
+    /// Create operation.
+    Create = 5,
+    /// Delete operation.
+    Delete = 6,
+    /// Alter operation.
+    Alter = 7,
+    /// Describe operation.
+    Describe = 8,
+    /// Cluster action.
+    ClusterAction = 9,
+    /// Describe configs.
+    DescribeConfigs = 10,
+    /// Alter configs.
+    AlterConfigs = 11,
+    /// Idempotent write.
+    IdempotentWrite = 12,
+}
+
+impl AclOperation {
+    /// Convert from i8.
+    #[inline]
+    pub fn from_i8(value: i8) -> Self {
+        match value {
+            1 => Self::Any,
+            2 => Self::All,
+            3 => Self::Read,
+            4 => Self::Write,
+            5 => Self::Create,
+            6 => Self::Delete,
+            7 => Self::Alter,
+            8 => Self::Describe,
+            9 => Self::ClusterAction,
+            10 => Self::DescribeConfigs,
+            11 => Self::AlterConfigs,
+            12 => Self::IdempotentWrite,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Convert to i8.
+    #[inline]
+    pub fn to_i8(self) -> i8 {
+        self as i8
+    }
+}
+
+/// ACL permission type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AclPermissionType {
+    /// Unknown permission.
+    Unknown = 0,
+    /// Any permission (for filtering).
+    #[default]
+    Any = 1,
+    /// Deny permission.
+    Deny = 2,
+    /// Allow permission.
+    Allow = 3,
+}
+
+impl AclPermissionType {
+    /// Convert from i8.
+    #[inline]
+    pub fn from_i8(value: i8) -> Self {
+        match value {
+            1 => Self::Any,
+            2 => Self::Deny,
+            3 => Self::Allow,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Convert to i8.
+    #[inline]
+    pub fn to_i8(self) -> i8 {
+        self as i8
+    }
+}
+
+/// ACL binding for creation/description.
+#[derive(Debug, Clone)]
+pub struct AclBinding {
+    /// Resource type.
+    pub resource_type: AclResourceType,
+    /// Resource name.
+    pub resource_name: String,
+    /// Resource pattern type.
+    pub pattern_type: AclPatternType,
+    /// Principal (e.g., "User:alice").
+    pub principal: String,
+    /// Host (e.g., "*" for any host).
+    pub host: String,
+    /// Operation.
+    pub operation: AclOperation,
+    /// Permission type.
+    pub permission_type: AclPermissionType,
+}
+
+impl AclBinding {
+    /// Create a new ACL binding.
+    pub fn new(
+        resource_type: AclResourceType,
+        resource_name: impl Into<String>,
+        principal: impl Into<String>,
+        host: impl Into<String>,
+        operation: AclOperation,
+        permission_type: AclPermissionType,
+    ) -> Self {
+        Self {
+            resource_type,
+            resource_name: resource_name.into(),
+            pattern_type: AclPatternType::Literal,
+            principal: principal.into(),
+            host: host.into(),
+            operation,
+            permission_type,
+        }
+    }
+
+    /// Set the pattern type.
+    pub fn with_pattern_type(mut self, pattern_type: AclPatternType) -> Self {
+        self.pattern_type = pattern_type;
+        self
+    }
+
+    /// Create an allow read ACL for a topic.
+    pub fn allow_read_topic(topic: impl Into<String>, principal: impl Into<String>) -> Self {
+        Self::new(
+            AclResourceType::Topic,
+            topic,
+            principal,
+            "*",
+            AclOperation::Read,
+            AclPermissionType::Allow,
+        )
+    }
+
+    /// Create an allow write ACL for a topic.
+    pub fn allow_write_topic(topic: impl Into<String>, principal: impl Into<String>) -> Self {
+        Self::new(
+            AclResourceType::Topic,
+            topic,
+            principal,
+            "*",
+            AclOperation::Write,
+            AclPermissionType::Allow,
+        )
+    }
+
+    /// Create an allow all ACL for a topic.
+    pub fn allow_all_topic(topic: impl Into<String>, principal: impl Into<String>) -> Self {
+        Self::new(
+            AclResourceType::Topic,
+            topic,
+            principal,
+            "*",
+            AclOperation::All,
+            AclPermissionType::Allow,
+        )
+    }
+}
+
+/// DescribeAcls request (API Key 29).
+#[derive(Debug, Clone)]
+pub struct DescribeAclsRequest {
+    /// Resource type filter.
+    pub resource_type: AclResourceType,
+    /// Resource name filter (null for any).
+    pub resource_name: Option<String>,
+    /// Pattern type filter.
+    pub pattern_type: AclPatternType,
+    /// Principal filter (null for any).
+    pub principal: Option<String>,
+    /// Host filter (null for any).
+    pub host: Option<String>,
+    /// Operation filter.
+    pub operation: AclOperation,
+    /// Permission type filter.
+    pub permission_type: AclPermissionType,
+}
+
+impl DescribeAclsRequest {
+    /// Create a request to describe all ACLs.
+    pub fn all() -> Self {
+        Self {
+            resource_type: AclResourceType::Any,
+            resource_name: None,
+            pattern_type: AclPatternType::Any,
+            principal: None,
+            host: None,
+            operation: AclOperation::Any,
+            permission_type: AclPermissionType::Any,
+        }
+    }
+
+    /// Create a request to describe ACLs for a topic.
+    pub fn for_topic(topic: impl Into<String>) -> Self {
+        Self {
+            resource_type: AclResourceType::Topic,
+            resource_name: Some(topic.into()),
+            pattern_type: AclPatternType::Any,
+            principal: None,
+            host: None,
+            operation: AclOperation::Any,
+            permission_type: AclPermissionType::Any,
+        }
+    }
+
+    /// Encode as version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        (self.resource_type.to_i8()).encode(buf);
+        KafkaString(self.resource_name.clone()).encode(buf);
+        KafkaString(self.principal.clone()).encode(buf);
+        KafkaString(self.host.clone()).encode(buf);
+        (self.operation.to_i8()).encode(buf);
+        (self.permission_type.to_i8()).encode(buf);
+    }
+
+    /// Encode as version 1 (with pattern type).
+    pub fn encode_v1(&self, buf: &mut impl BufMut) {
+        (self.resource_type.to_i8()).encode(buf);
+        KafkaString(self.resource_name.clone()).encode(buf);
+        (self.pattern_type.to_i8()).encode(buf);
+        KafkaString(self.principal.clone()).encode(buf);
+        KafkaString(self.host.clone()).encode(buf);
+        (self.operation.to_i8()).encode(buf);
+        (self.permission_type.to_i8()).encode(buf);
+    }
+}
+
+/// DescribeAcls response.
+#[derive(Debug, Clone)]
+pub struct DescribeAclsResponse {
+    /// Throttle time in milliseconds.
+    pub throttle_time_ms: i32,
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// Error message.
+    pub error_message: Option<String>,
+    /// List of ACL resources.
+    pub resources: Vec<DescribeAclsResource>,
+}
+
+/// ACL resource in describe response.
+#[derive(Debug, Clone)]
+pub struct DescribeAclsResource {
+    /// Resource type.
+    pub resource_type: AclResourceType,
+    /// Resource name.
+    pub resource_name: String,
+    /// Pattern type.
+    pub pattern_type: AclPatternType,
+    /// ACLs for this resource.
+    pub acls: Vec<AclDescription>,
+}
+
+/// Individual ACL description.
+#[derive(Debug, Clone)]
+pub struct AclDescription {
+    /// Principal.
+    pub principal: String,
+    /// Host.
+    pub host: String,
+    /// Operation.
+    pub operation: AclOperation,
+    /// Permission type.
+    pub permission_type: AclPermissionType,
+}
+
+impl DescribeAclsResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let error_message = KafkaString::decode(buf)?.0;
+
+        let resource_count = i32::decode(buf)?;
+        let mut resources = Vec::with_capacity(resource_count as usize);
+
+        for _ in 0..resource_count {
+            let resource_type = AclResourceType::from_i8(i8::decode(buf)?);
+            let resource_name = KafkaString::decode(buf)?.0.unwrap_or_default();
+
+            let acl_count = i32::decode(buf)?;
+            let mut acls = Vec::with_capacity(acl_count as usize);
+
+            for _ in 0..acl_count {
+                let principal = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let host = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let operation = AclOperation::from_i8(i8::decode(buf)?);
+                let permission_type = AclPermissionType::from_i8(i8::decode(buf)?);
+
+                acls.push(AclDescription {
+                    principal,
+                    host,
+                    operation,
+                    permission_type,
+                });
+            }
+
+            resources.push(DescribeAclsResource {
+                resource_type,
+                resource_name,
+                pattern_type: AclPatternType::Literal, // v0 doesn't have pattern type
+                acls,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            error_message,
+            resources,
+        })
+    }
+}
+
+/// CreateAcls request (API Key 30).
+#[derive(Debug, Clone)]
+pub struct CreateAclsRequest {
+    /// ACL bindings to create.
+    pub creations: Vec<AclBinding>,
+}
+
+impl CreateAclsRequest {
+    /// Create a new request.
+    pub fn new(creations: Vec<AclBinding>) -> Self {
+        Self { creations }
+    }
+
+    /// Encode as version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        (self.creations.len() as i32).encode(buf);
+        for acl in &self.creations {
+            (acl.resource_type.to_i8()).encode(buf);
+            KafkaString(Some(acl.resource_name.clone())).encode(buf);
+            KafkaString(Some(acl.principal.clone())).encode(buf);
+            KafkaString(Some(acl.host.clone())).encode(buf);
+            (acl.operation.to_i8()).encode(buf);
+            (acl.permission_type.to_i8()).encode(buf);
+        }
+    }
+
+    /// Encode as version 1 (with pattern type).
+    pub fn encode_v1(&self, buf: &mut impl BufMut) {
+        (self.creations.len() as i32).encode(buf);
+        for acl in &self.creations {
+            (acl.resource_type.to_i8()).encode(buf);
+            KafkaString(Some(acl.resource_name.clone())).encode(buf);
+            (acl.pattern_type.to_i8()).encode(buf);
+            KafkaString(Some(acl.principal.clone())).encode(buf);
+            KafkaString(Some(acl.host.clone())).encode(buf);
+            (acl.operation.to_i8()).encode(buf);
+            (acl.permission_type.to_i8()).encode(buf);
+        }
+    }
+}
+
+/// CreateAcls response.
+#[derive(Debug, Clone)]
+pub struct CreateAclsResponse {
+    /// Throttle time in milliseconds.
+    pub throttle_time_ms: i32,
+    /// Results for each ACL creation.
+    pub results: Vec<CreateAclsResult>,
+}
+
+/// Result of a single ACL creation.
+#[derive(Debug, Clone)]
+pub struct CreateAclsResult {
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// Error message.
+    pub error_message: Option<String>,
+}
+
+impl CreateAclsResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let result_count = i32::decode(buf)?;
+        let mut results = Vec::with_capacity(result_count as usize);
+
+        for _ in 0..result_count {
+            let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+            let error_message = KafkaString::decode(buf)?.0;
+            results.push(CreateAclsResult {
+                error_code,
+                error_message,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            results,
+        })
+    }
+
+    /// Check if all ACLs were created successfully.
+    pub fn is_ok(&self) -> bool {
+        self.results.iter().all(|r| r.error_code.is_ok())
+    }
+}
+
+/// DeleteAcls request (API Key 31).
+#[derive(Debug, Clone)]
+pub struct DeleteAclsRequest {
+    /// ACL filters for deletion.
+    pub filters: Vec<AclBindingFilter>,
+}
+
+/// Filter for deleting ACLs.
+#[derive(Debug, Clone)]
+pub struct AclBindingFilter {
+    /// Resource type filter.
+    pub resource_type: AclResourceType,
+    /// Resource name filter (null for any).
+    pub resource_name: Option<String>,
+    /// Pattern type filter.
+    pub pattern_type: AclPatternType,
+    /// Principal filter (null for any).
+    pub principal: Option<String>,
+    /// Host filter (null for any).
+    pub host: Option<String>,
+    /// Operation filter.
+    pub operation: AclOperation,
+    /// Permission type filter.
+    pub permission_type: AclPermissionType,
+}
+
+impl AclBindingFilter {
+    /// Create a filter that matches a specific ACL binding.
+    pub fn matching(binding: &AclBinding) -> Self {
+        Self {
+            resource_type: binding.resource_type,
+            resource_name: Some(binding.resource_name.clone()),
+            pattern_type: binding.pattern_type,
+            principal: Some(binding.principal.clone()),
+            host: Some(binding.host.clone()),
+            operation: binding.operation,
+            permission_type: binding.permission_type,
+        }
+    }
+
+    /// Create a filter for all ACLs on a topic.
+    pub fn for_topic(topic: impl Into<String>) -> Self {
+        Self {
+            resource_type: AclResourceType::Topic,
+            resource_name: Some(topic.into()),
+            pattern_type: AclPatternType::Any,
+            principal: None,
+            host: None,
+            operation: AclOperation::Any,
+            permission_type: AclPermissionType::Any,
+        }
+    }
+}
+
+impl DeleteAclsRequest {
+    /// Create a new request.
+    pub fn new(filters: Vec<AclBindingFilter>) -> Self {
+        Self { filters }
+    }
+
+    /// Encode as version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        (self.filters.len() as i32).encode(buf);
+        for filter in &self.filters {
+            (filter.resource_type.to_i8()).encode(buf);
+            KafkaString(filter.resource_name.clone()).encode(buf);
+            KafkaString(filter.principal.clone()).encode(buf);
+            KafkaString(filter.host.clone()).encode(buf);
+            (filter.operation.to_i8()).encode(buf);
+            (filter.permission_type.to_i8()).encode(buf);
+        }
+    }
+
+    /// Encode as version 1 (with pattern type).
+    pub fn encode_v1(&self, buf: &mut impl BufMut) {
+        (self.filters.len() as i32).encode(buf);
+        for filter in &self.filters {
+            (filter.resource_type.to_i8()).encode(buf);
+            KafkaString(filter.resource_name.clone()).encode(buf);
+            (filter.pattern_type.to_i8()).encode(buf);
+            KafkaString(filter.principal.clone()).encode(buf);
+            KafkaString(filter.host.clone()).encode(buf);
+            (filter.operation.to_i8()).encode(buf);
+            (filter.permission_type.to_i8()).encode(buf);
+        }
+    }
+}
+
+/// DeleteAcls response.
+#[derive(Debug, Clone)]
+pub struct DeleteAclsResponse {
+    /// Throttle time in milliseconds.
+    pub throttle_time_ms: i32,
+    /// Results for each filter.
+    pub filter_results: Vec<DeleteAclsFilterResult>,
+}
+
+/// Result of a single filter.
+#[derive(Debug, Clone)]
+pub struct DeleteAclsFilterResult {
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// Error message.
+    pub error_message: Option<String>,
+    /// Matching ACLs that were deleted.
+    pub matching_acls: Vec<DeleteAclsMatchingAcl>,
+}
+
+/// ACL that matched the deletion filter.
+#[derive(Debug, Clone)]
+pub struct DeleteAclsMatchingAcl {
+    /// Error code for this specific ACL.
+    pub error_code: ErrorCode,
+    /// Error message.
+    pub error_message: Option<String>,
+    /// Resource type.
+    pub resource_type: AclResourceType,
+    /// Resource name.
+    pub resource_name: String,
+    /// Pattern type.
+    pub pattern_type: AclPatternType,
+    /// Principal.
+    pub principal: String,
+    /// Host.
+    pub host: String,
+    /// Operation.
+    pub operation: AclOperation,
+    /// Permission type.
+    pub permission_type: AclPermissionType,
+}
+
+impl DeleteAclsResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let filter_count = i32::decode(buf)?;
+        let mut filter_results = Vec::with_capacity(filter_count as usize);
+
+        for _ in 0..filter_count {
+            let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+            let error_message = KafkaString::decode(buf)?.0;
+
+            let matching_count = i32::decode(buf)?;
+            let mut matching_acls = Vec::with_capacity(matching_count as usize);
+
+            for _ in 0..matching_count {
+                let acl_error_code = ErrorCode::from_i16(i16::decode(buf)?);
+                let acl_error_message = KafkaString::decode(buf)?.0;
+                let resource_type = AclResourceType::from_i8(i8::decode(buf)?);
+                let resource_name = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let principal = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let host = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let operation = AclOperation::from_i8(i8::decode(buf)?);
+                let permission_type = AclPermissionType::from_i8(i8::decode(buf)?);
+
+                matching_acls.push(DeleteAclsMatchingAcl {
+                    error_code: acl_error_code,
+                    error_message: acl_error_message,
+                    resource_type,
+                    resource_name,
+                    pattern_type: AclPatternType::Literal,
+                    principal,
+                    host,
+                    operation,
+                    permission_type,
+                });
+            }
+
+            filter_results.push(DeleteAclsFilterResult {
+                error_code,
+                error_message,
+                matching_acls,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            filter_results,
+        })
+    }
+}
+
+// ============================================================================
+// Transaction Messages (API Keys 24-28)
+// ============================================================================
+
+/// Transaction result for partition operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionResult {
+    /// Commit the transaction.
+    Commit,
+    /// Abort the transaction.
+    Abort,
+}
+
+impl TransactionResult {
+    /// Convert to boolean for wire format.
+    #[inline]
+    pub fn to_bool(self) -> bool {
+        match self {
+            TransactionResult::Commit => true,
+            TransactionResult::Abort => false,
+        }
+    }
+
+    /// Create from boolean.
+    #[inline]
+    pub fn from_bool(committed: bool) -> Self {
+        if committed {
+            TransactionResult::Commit
+        } else {
+            TransactionResult::Abort
+        }
+    }
+}
+
+/// AddPartitionsToTxn request (API Key 24).
+///
+/// Adds partitions to an ongoing transaction.
+#[derive(Debug, Clone)]
+pub struct AddPartitionsToTxnRequest {
+    /// Transactional ID.
+    pub transactional_id: String,
+    /// Producer ID.
+    pub producer_id: i64,
+    /// Producer epoch.
+    pub producer_epoch: i16,
+    /// Topics to add.
+    pub topics: Vec<AddPartitionsToTxnTopic>,
+}
+
+/// Topic in AddPartitionsToTxn request.
+#[derive(Debug, Clone)]
+pub struct AddPartitionsToTxnTopic {
+    /// Topic name.
+    pub name: String,
+    /// Partition indices.
+    pub partitions: Vec<i32>,
+}
+
+impl AddPartitionsToTxnRequest {
+    /// Create a new request.
+    pub fn new(transactional_id: impl Into<String>, producer_id: i64, producer_epoch: i16) -> Self {
+        Self {
+            transactional_id: transactional_id.into(),
+            producer_id,
+            producer_epoch,
+            topics: Vec::new(),
+        }
+    }
+
+    /// Add a topic-partition.
+    pub fn add_partition(mut self, topic: impl Into<String>, partition: i32) -> Self {
+        let topic_name = topic.into();
+        if let Some(t) = self.topics.iter_mut().find(|t| t.name == topic_name) {
+            if !t.partitions.contains(&partition) {
+                t.partitions.push(partition);
+            }
+        } else {
+            self.topics.push(AddPartitionsToTxnTopic {
+                name: topic_name,
+                partitions: vec![partition],
+            });
+        }
+        self
+    }
+
+    /// Encode as version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        KafkaString(Some(self.transactional_id.clone())).encode(buf);
+        self.producer_id.encode(buf);
+        self.producer_epoch.encode(buf);
+        (self.topics.len() as i32).encode(buf);
+        for topic in &self.topics {
+            KafkaString(Some(topic.name.clone())).encode(buf);
+            (topic.partitions.len() as i32).encode(buf);
+            for partition in &topic.partitions {
+                partition.encode(buf);
+            }
+        }
+    }
+}
+
+/// AddPartitionsToTxn response.
+#[derive(Debug, Clone)]
+pub struct AddPartitionsToTxnResponse {
+    /// Throttle time in milliseconds.
+    pub throttle_time_ms: i32,
+    /// Results by topic.
+    pub results: Vec<AddPartitionsToTxnTopicResult>,
+}
+
+/// Result for a topic in AddPartitionsToTxn.
+#[derive(Debug, Clone)]
+pub struct AddPartitionsToTxnTopicResult {
+    /// Topic name.
+    pub name: String,
+    /// Partition results.
+    pub partitions: Vec<AddPartitionsToTxnPartitionResult>,
+}
+
+/// Result for a partition in AddPartitionsToTxn.
+#[derive(Debug, Clone)]
+pub struct AddPartitionsToTxnPartitionResult {
+    /// Partition index.
+    pub partition: i32,
+    /// Error code.
+    pub error_code: ErrorCode,
+}
+
+impl AddPartitionsToTxnResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let topic_count = i32::decode(buf)?;
+        let mut results = Vec::with_capacity(topic_count as usize);
+
+        for _ in 0..topic_count {
+            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let partition_count = i32::decode(buf)?;
+            let mut partitions = Vec::with_capacity(partition_count as usize);
+
+            for _ in 0..partition_count {
+                let partition = i32::decode(buf)?;
+                let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+                partitions.push(AddPartitionsToTxnPartitionResult {
+                    partition,
+                    error_code,
+                });
+            }
+
+            results.push(AddPartitionsToTxnTopicResult { name, partitions });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            results,
+        })
+    }
+
+    /// Check if all partitions were added successfully.
+    pub fn is_ok(&self) -> bool {
+        self.results
+            .iter()
+            .all(|t| t.partitions.iter().all(|p| p.error_code.is_ok()))
+    }
+}
+
+/// AddOffsetsToTxn request (API Key 25).
+///
+/// Adds consumer group offsets to a transaction.
+#[derive(Debug, Clone)]
+pub struct AddOffsetsToTxnRequest {
+    /// Transactional ID.
+    pub transactional_id: String,
+    /// Producer ID.
+    pub producer_id: i64,
+    /// Producer epoch.
+    pub producer_epoch: i16,
+    /// Consumer group ID.
+    pub group_id: String,
+}
+
+impl AddOffsetsToTxnRequest {
+    /// Create a new request.
+    pub fn new(
+        transactional_id: impl Into<String>,
+        producer_id: i64,
+        producer_epoch: i16,
+        group_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            transactional_id: transactional_id.into(),
+            producer_id,
+            producer_epoch,
+            group_id: group_id.into(),
+        }
+    }
+
+    /// Encode as version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        KafkaString(Some(self.transactional_id.clone())).encode(buf);
+        self.producer_id.encode(buf);
+        self.producer_epoch.encode(buf);
+        KafkaString(Some(self.group_id.clone())).encode(buf);
+    }
+}
+
+/// AddOffsetsToTxn response.
+#[derive(Debug, Clone)]
+pub struct AddOffsetsToTxnResponse {
+    /// Throttle time in milliseconds.
+    pub throttle_time_ms: i32,
+    /// Error code.
+    pub error_code: ErrorCode,
+}
+
+impl AddOffsetsToTxnResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+        })
+    }
+
+    /// Check if successful.
+    #[inline]
+    pub fn is_ok(&self) -> bool {
+        self.error_code.is_ok()
+    }
+}
+
+/// EndTxn request (API Key 26).
+///
+/// Commits or aborts a transaction.
+#[derive(Debug, Clone)]
+pub struct EndTxnRequest {
+    /// Transactional ID.
+    pub transactional_id: String,
+    /// Producer ID.
+    pub producer_id: i64,
+    /// Producer epoch.
+    pub producer_epoch: i16,
+    /// Whether to commit (true) or abort (false).
+    pub committed: bool,
+}
+
+impl EndTxnRequest {
+    /// Create a commit request.
+    pub fn commit(
+        transactional_id: impl Into<String>,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Self {
+        Self {
+            transactional_id: transactional_id.into(),
+            producer_id,
+            producer_epoch,
+            committed: true,
+        }
+    }
+
+    /// Create an abort request.
+    pub fn abort(
+        transactional_id: impl Into<String>,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Self {
+        Self {
+            transactional_id: transactional_id.into(),
+            producer_id,
+            producer_epoch,
+            committed: false,
+        }
+    }
+
+    /// Encode as version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        KafkaString(Some(self.transactional_id.clone())).encode(buf);
+        self.producer_id.encode(buf);
+        self.producer_epoch.encode(buf);
+        self.committed.encode(buf);
+    }
+}
+
+/// EndTxn response.
+#[derive(Debug, Clone)]
+pub struct EndTxnResponse {
+    /// Throttle time in milliseconds.
+    pub throttle_time_ms: i32,
+    /// Error code.
+    pub error_code: ErrorCode,
+}
+
+impl EndTxnResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+        })
+    }
+
+    /// Check if successful.
+    #[inline]
+    pub fn is_ok(&self) -> bool {
+        self.error_code.is_ok()
+    }
+}
+
+/// TxnOffsetCommit request (API Key 28).
+///
+/// Commits offsets as part of a transaction.
+#[derive(Debug, Clone)]
+pub struct TxnOffsetCommitRequest {
+    /// Transactional ID.
+    pub transactional_id: String,
+    /// Consumer group ID.
+    pub group_id: String,
+    /// Producer ID.
+    pub producer_id: i64,
+    /// Producer epoch.
+    pub producer_epoch: i16,
+    /// Offsets to commit by topic.
+    pub topics: Vec<TxnOffsetCommitTopic>,
+}
+
+/// Topic in TxnOffsetCommit request.
+#[derive(Debug, Clone)]
+pub struct TxnOffsetCommitTopic {
+    /// Topic name.
+    pub name: String,
+    /// Partitions with offsets.
+    pub partitions: Vec<TxnOffsetCommitPartition>,
+}
+
+/// Partition offset in TxnOffsetCommit request.
+#[derive(Debug, Clone)]
+pub struct TxnOffsetCommitPartition {
+    /// Partition index.
+    pub partition: i32,
+    /// Offset to commit.
+    pub committed_offset: i64,
+    /// Leader epoch (optional, -1 if not used).
+    pub committed_leader_epoch: i32,
+    /// Metadata.
+    pub metadata: Option<String>,
+}
+
+impl TxnOffsetCommitRequest {
+    /// Create a new request.
+    pub fn new(
+        transactional_id: impl Into<String>,
+        group_id: impl Into<String>,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Self {
+        Self {
+            transactional_id: transactional_id.into(),
+            group_id: group_id.into(),
+            producer_id,
+            producer_epoch,
+            topics: Vec::new(),
+        }
+    }
+
+    /// Add an offset to commit.
+    pub fn add_offset(
+        mut self,
+        topic: impl Into<String>,
+        partition: i32,
+        offset: i64,
+        metadata: Option<String>,
+    ) -> Self {
+        let topic_name = topic.into();
+        let partition_data = TxnOffsetCommitPartition {
+            partition,
+            committed_offset: offset,
+            committed_leader_epoch: -1,
+            metadata,
+        };
+
+        if let Some(t) = self.topics.iter_mut().find(|t| t.name == topic_name) {
+            if let Some(p) = t.partitions.iter_mut().find(|p| p.partition == partition) {
+                *p = partition_data;
+            } else {
+                t.partitions.push(partition_data);
+            }
+        } else {
+            self.topics.push(TxnOffsetCommitTopic {
+                name: topic_name,
+                partitions: vec![partition_data],
+            });
+        }
+        self
+    }
+
+    /// Encode as version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+        KafkaString(Some(self.transactional_id.clone())).encode(buf);
+        KafkaString(Some(self.group_id.clone())).encode(buf);
+        self.producer_id.encode(buf);
+        self.producer_epoch.encode(buf);
+        (self.topics.len() as i32).encode(buf);
+        for topic in &self.topics {
+            KafkaString(Some(topic.name.clone())).encode(buf);
+            (topic.partitions.len() as i32).encode(buf);
+            for partition in &topic.partitions {
+                partition.partition.encode(buf);
+                partition.committed_offset.encode(buf);
+                KafkaString(partition.metadata.clone()).encode(buf);
+            }
+        }
+    }
+
+    /// Encode as version 2 (with leader epoch).
+    pub fn encode_v2(&self, buf: &mut impl BufMut) {
+        KafkaString(Some(self.transactional_id.clone())).encode(buf);
+        KafkaString(Some(self.group_id.clone())).encode(buf);
+        self.producer_id.encode(buf);
+        self.producer_epoch.encode(buf);
+        (self.topics.len() as i32).encode(buf);
+        for topic in &self.topics {
+            KafkaString(Some(topic.name.clone())).encode(buf);
+            (topic.partitions.len() as i32).encode(buf);
+            for partition in &topic.partitions {
+                partition.partition.encode(buf);
+                partition.committed_offset.encode(buf);
+                partition.committed_leader_epoch.encode(buf);
+                KafkaString(partition.metadata.clone()).encode(buf);
+            }
+        }
+    }
+}
+
+/// TxnOffsetCommit response.
+#[derive(Debug, Clone)]
+pub struct TxnOffsetCommitResponse {
+    /// Throttle time in milliseconds.
+    pub throttle_time_ms: i32,
+    /// Results by topic.
+    pub topics: Vec<TxnOffsetCommitTopicResult>,
+}
+
+/// Result for a topic in TxnOffsetCommit.
+#[derive(Debug, Clone)]
+pub struct TxnOffsetCommitTopicResult {
+    /// Topic name.
+    pub name: String,
+    /// Partition results.
+    pub partitions: Vec<TxnOffsetCommitPartitionResult>,
+}
+
+/// Result for a partition in TxnOffsetCommit.
+#[derive(Debug, Clone)]
+pub struct TxnOffsetCommitPartitionResult {
+    /// Partition index.
+    pub partition: i32,
+    /// Error code.
+    pub error_code: ErrorCode,
+}
+
+impl TxnOffsetCommitResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let topic_count = i32::decode(buf)?;
+        let mut topics = Vec::with_capacity(topic_count as usize);
+
+        for _ in 0..topic_count {
+            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let partition_count = i32::decode(buf)?;
+            let mut partitions = Vec::with_capacity(partition_count as usize);
+
+            for _ in 0..partition_count {
+                let partition = i32::decode(buf)?;
+                let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+                partitions.push(TxnOffsetCommitPartitionResult {
+                    partition,
+                    error_code,
+                });
+            }
+
+            topics.push(TxnOffsetCommitTopicResult { name, partitions });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            topics,
+        })
+    }
+
+    /// Check if all offsets were committed successfully.
+    pub fn is_ok(&self) -> bool {
+        self.topics
+            .iter()
+            .all(|t| t.partitions.iter().all(|p| p.error_code.is_ok()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BytesMut;
+
+    #[test]
+    fn test_metadata_request_all_topics() {
+        let request = MetadataRequest::all_topics();
+        // For Kafka compatibility, all_topics uses empty array instead of null
+        assert!(request.topics.is_some());
+        assert!(request.topics.as_ref().unwrap().is_empty());
+
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf);
+
+        // Should encode as empty array (0)
+        assert_eq!(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), 0);
+    }
+
+    #[test]
+    fn test_metadata_request_specific_topics() {
+        let request = MetadataRequest::for_topics(vec!["topic1", "topic2"]);
+        assert_eq!(request.topics.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_find_coordinator_request() {
+        let request = FindCoordinatorRequest::for_group("my-group");
+        assert_eq!(request.key, "my-group");
+        assert_eq!(request.key_type, 0);
+
+        let request = FindCoordinatorRequest::for_transaction("my-txn");
+        assert_eq!(request.key, "my-txn");
+        assert_eq!(request.key_type, 1);
+    }
+
+    #[test]
+    fn test_sasl_handshake_request() {
+        let request = SaslHandshakeRequest::new("PLAIN");
+        assert_eq!(request.mechanism, "PLAIN");
+
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_sasl_authenticate_request() {
+        let auth_bytes = vec![0, b'u', b's', b'e', b'r', 0, b'p', b'a', b's', b's'];
+        let request = SaslAuthenticateRequest::new(auth_bytes.clone());
+        assert_eq!(request.auth_bytes, auth_bytes);
+
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_init_producer_id_request() {
+        let request = InitProducerIdRequest::idempotent();
+        assert!(request.transactional_id.is_none());
+        assert_eq!(request.producer_id, -1);
+        assert_eq!(request.producer_epoch, -1);
+
+        let request = InitProducerIdRequest::transactional("my-txn", 60000);
+        assert_eq!(request.transactional_id.as_deref(), Some("my-txn"));
+        assert_eq!(request.transaction_timeout_ms, 60000);
+    }
+
+    #[test]
+    fn test_acl_resource_type() {
+        assert_eq!(AclResourceType::Topic.to_i8(), 2);
+        assert_eq!(AclResourceType::Group.to_i8(), 3);
+        assert_eq!(AclResourceType::Cluster.to_i8(), 4);
+        assert_eq!(AclResourceType::from_i8(2), AclResourceType::Topic);
+        assert_eq!(AclResourceType::from_i8(99), AclResourceType::Unknown);
+    }
+
+    #[test]
+    fn test_acl_operation() {
+        assert_eq!(AclOperation::Read.to_i8(), 3);
+        assert_eq!(AclOperation::Write.to_i8(), 4);
+        assert_eq!(AclOperation::from_i8(3), AclOperation::Read);
+        assert_eq!(AclOperation::from_i8(99), AclOperation::Unknown);
+    }
+
+    #[test]
+    fn test_acl_permission_type() {
+        assert_eq!(AclPermissionType::Allow.to_i8(), 3);
+        assert_eq!(AclPermissionType::Deny.to_i8(), 2);
+        assert_eq!(AclPermissionType::from_i8(3), AclPermissionType::Allow);
+    }
+
+    #[test]
+    fn test_acl_binding() {
+        let binding = AclBinding::allow_read_topic("my-topic", "User:alice");
+        assert_eq!(binding.resource_type, AclResourceType::Topic);
+        assert_eq!(binding.resource_name, "my-topic");
+        assert_eq!(binding.principal, "User:alice");
+        assert_eq!(binding.host, "*");
+        assert_eq!(binding.operation, AclOperation::Read);
+        assert_eq!(binding.permission_type, AclPermissionType::Allow);
+    }
+
+    #[test]
+    fn test_describe_acls_request() {
+        let request = DescribeAclsRequest::all();
+        assert_eq!(request.resource_type, AclResourceType::Any);
+        assert!(request.resource_name.is_none());
+
+        let request = DescribeAclsRequest::for_topic("my-topic");
+        assert_eq!(request.resource_type, AclResourceType::Topic);
+        assert_eq!(request.resource_name.as_deref(), Some("my-topic"));
+    }
+
+    #[test]
+    fn test_create_acls_request() {
+        let bindings = vec![
+            AclBinding::allow_read_topic("topic1", "User:alice"),
+            AclBinding::allow_write_topic("topic2", "User:bob"),
+        ];
+        let request = CreateAclsRequest::new(bindings);
+        assert_eq!(request.creations.len(), 2);
+
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_delete_acls_filter() {
+        let binding = AclBinding::allow_read_topic("my-topic", "User:alice");
+        let filter = AclBindingFilter::matching(&binding);
+
+        assert_eq!(filter.resource_name.as_deref(), Some("my-topic"));
+        assert_eq!(filter.principal.as_deref(), Some("User:alice"));
+    }
+
+    #[test]
+    fn test_transaction_result() {
+        assert!(TransactionResult::Commit.to_bool());
+        assert!(!TransactionResult::Abort.to_bool());
+        assert_eq!(
+            TransactionResult::from_bool(true),
+            TransactionResult::Commit
+        );
+        assert_eq!(
+            TransactionResult::from_bool(false),
+            TransactionResult::Abort
+        );
+    }
+
+    #[test]
+    fn test_add_partitions_to_txn_request() {
+        let request = AddPartitionsToTxnRequest::new("my-txn", 12345, 0)
+            .add_partition("topic1", 0)
+            .add_partition("topic1", 1)
+            .add_partition("topic2", 0);
+
+        assert_eq!(request.transactional_id, "my-txn");
+        assert_eq!(request.producer_id, 12345);
+        assert_eq!(request.topics.len(), 2);
+
+        let topic1 = request.topics.iter().find(|t| t.name == "topic1").unwrap();
+        assert_eq!(topic1.partitions, vec![0, 1]);
+
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_add_offsets_to_txn_request() {
+        let request = AddOffsetsToTxnRequest::new("my-txn", 12345, 0, "my-group");
+
+        assert_eq!(request.transactional_id, "my-txn");
+        assert_eq!(request.group_id, "my-group");
+
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_end_txn_request() {
+        let commit = EndTxnRequest::commit("my-txn", 12345, 0);
+        assert!(commit.committed);
+
+        let abort = EndTxnRequest::abort("my-txn", 12345, 0);
+        assert!(!abort.committed);
+
+        let mut buf = BytesMut::new();
+        commit.encode_v0(&mut buf);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_txn_offset_commit_request() {
+        let request = TxnOffsetCommitRequest::new("my-txn", "my-group", 12345, 0)
+            .add_offset("topic1", 0, 100, Some("metadata".to_string()))
+            .add_offset("topic1", 1, 200, None);
+
+        assert_eq!(request.transactional_id, "my-txn");
+        assert_eq!(request.group_id, "my-group");
+        assert_eq!(request.topics.len(), 1);
+        assert_eq!(request.topics[0].partitions.len(), 2);
+
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf);
+        assert!(!buf.is_empty());
+    }
+}

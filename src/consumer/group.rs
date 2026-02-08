@@ -1,0 +1,2132 @@
+//! Consumer group coordination.
+//!
+//! This module provides consumer group coordination primitives including:
+//! - [`ConsumerGroup`] state machine for group coordination
+//! - [`GroupCoordinator`] for managing group membership and heartbeats
+//! - [`MemberAssignment`] for tracking partition assignments
+//! - [`PartitionAssignor`] trait and implementations for partition assignment strategies
+//! - [`ConsumerRebalanceListener`] trait for rebalance callbacks
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use tokio::sync::{RwLock, mpsc};
+use tracing::{debug, error, info, warn};
+
+use crate::PartitionId;
+use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::metadata::ClusterMetadata;
+use crate::network::{BrokerConnection, ConnectionPool};
+use crate::protocol::{
+    ApiKey, FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse,
+    JoinGroupRequest, JoinGroupRequestProtocol, JoinGroupResponse, JoinGroupResponseMember,
+    LeaveGroupRequest, OffsetCommitRequest, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
+    OffsetCommitResponse, SyncGroupRequest, SyncGroupRequestAssignment, SyncGroupResponse,
+};
+
+/// Callback interface for partition rebalance events.
+///
+/// Implement this trait to receive notifications when the consumer's
+/// partition assignment changes during a rebalance.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use krafka::consumer::{ConsumerRebalanceListener, TopicPartition};
+///
+/// struct MyListener;
+///
+/// impl ConsumerRebalanceListener for MyListener {
+///     fn on_partitions_assigned(&self, partitions: &[TopicPartition]) {
+///         println!("Assigned: {:?}", partitions);
+///     }
+///
+///     fn on_partitions_revoked(&self, partitions: &[TopicPartition]) {
+///         println!("Revoked: {:?}", partitions);
+///         // Commit offsets before losing partitions
+///     }
+/// }
+/// ```
+pub trait ConsumerRebalanceListener: Send + Sync {
+    /// Called after partitions have been assigned to this consumer.
+    ///
+    /// This is triggered after a rebalance when the consumer receives
+    /// its new partition assignment.
+    fn on_partitions_assigned(&self, partitions: &[crate::consumer::TopicPartition]);
+
+    /// Called before partitions are revoked from this consumer.
+    ///
+    /// This is triggered during a rebalance before the consumer loses
+    /// its current partitions. Use this to commit offsets synchronously
+    /// if needed.
+    fn on_partitions_revoked(&self, partitions: &[crate::consumer::TopicPartition]);
+
+    /// Called when partitions are lost due to an unclean shutdown.
+    ///
+    /// This is called when the consumer unexpectedly loses its partition
+    /// assignment (e.g., session timeout). Unlike `on_partitions_revoked`,
+    /// offsets may already be committed by another consumer.
+    fn on_partitions_lost(&self, partitions: &[crate::consumer::TopicPartition]) {
+        // Default implementation delegates to revoked
+        self.on_partitions_revoked(partitions);
+    }
+}
+
+/// A no-op rebalance listener that does nothing on rebalance events.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoOpRebalanceListener;
+
+impl ConsumerRebalanceListener for NoOpRebalanceListener {
+    fn on_partitions_assigned(&self, _partitions: &[crate::consumer::TopicPartition]) {}
+    fn on_partitions_revoked(&self, _partitions: &[crate::consumer::TopicPartition]) {}
+}
+
+/// Consumer group state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroupState {
+    /// Not yet joined.
+    #[default]
+    Unjoined,
+    /// Joining the group.
+    Joining,
+    /// Awaiting sync.
+    AwaitingSync,
+    /// Stable and consuming.
+    Stable,
+    /// Preparing to rebalance.
+    PreparingRebalance,
+    /// Leaving the group.
+    Leaving,
+    /// Dead.
+    Dead,
+}
+
+/// Member assignment in a consumer group.
+#[derive(Debug, Clone, Default)]
+pub struct MemberAssignment {
+    /// Assigned partitions per topic.
+    pub partitions: HashMap<String, Vec<PartitionId>>,
+}
+
+impl MemberAssignment {
+    /// Create an empty assignment.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Add partitions for a topic.
+    pub fn add(&mut self, topic: impl Into<String>, partitions: Vec<PartitionId>) {
+        self.partitions.insert(topic.into(), partitions);
+    }
+
+    /// Get partitions for a topic.
+    pub fn get(&self, topic: &str) -> Option<&[PartitionId]> {
+        self.partitions.get(topic).map(|v| v.as_slice())
+    }
+
+    /// Get all assigned topic-partitions.
+    pub fn all_partitions(&self) -> Vec<(&str, PartitionId)> {
+        let mut result = Vec::new();
+        for (topic, partitions) in &self.partitions {
+            for &partition in partitions {
+                result.push((topic.as_str(), partition));
+            }
+        }
+        result
+    }
+
+    /// Check if empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.partitions.is_empty()
+    }
+}
+
+/// A consumer group member.
+#[derive(Debug, Clone)]
+pub struct GroupMember {
+    /// Member ID assigned by the coordinator.
+    pub member_id: String,
+    /// Client ID.
+    pub client_id: String,
+    /// Client host.
+    pub client_host: String,
+    /// Member metadata.
+    pub metadata: Vec<u8>,
+    /// Member assignment.
+    pub assignment: Vec<u8>,
+}
+
+/// Consumer group coordinator.
+#[derive(Debug)]
+pub struct ConsumerGroup {
+    /// Group ID.
+    group_id: String,
+    /// Member ID (assigned by coordinator).
+    member_id: Arc<RwLock<Option<String>>>,
+    /// Generation ID.
+    generation_id: Arc<RwLock<i32>>,
+    /// Current state.
+    state: Arc<RwLock<GroupState>>,
+    /// Current assignment.
+    assignment: Arc<RwLock<MemberAssignment>>,
+    /// Coordinator broker ID.
+    coordinator_id: Arc<RwLock<Option<i32>>>,
+    /// Session timeout.
+    session_timeout: Duration,
+    /// Heartbeat interval.
+    heartbeat_interval: Duration,
+    /// Rebalance timeout.
+    rebalance_timeout: Duration,
+}
+
+impl ConsumerGroup {
+    /// Create a new consumer group.
+    pub fn new(
+        group_id: impl Into<String>,
+        session_timeout: Duration,
+        heartbeat_interval: Duration,
+    ) -> Self {
+        Self {
+            group_id: group_id.into(),
+            member_id: Arc::new(RwLock::new(None)),
+            generation_id: Arc::new(RwLock::new(-1)),
+            state: Arc::new(RwLock::new(GroupState::Unjoined)),
+            assignment: Arc::new(RwLock::new(MemberAssignment::empty())),
+            coordinator_id: Arc::new(RwLock::new(None)),
+            session_timeout,
+            heartbeat_interval,
+            rebalance_timeout: session_timeout,
+        }
+    }
+
+    /// Get the group ID.
+    pub fn group_id(&self) -> &str {
+        &self.group_id
+    }
+
+    /// Get the session timeout.
+    pub fn session_timeout(&self) -> Duration {
+        self.session_timeout
+    }
+
+    /// Get the heartbeat interval.
+    pub fn heartbeat_interval(&self) -> Duration {
+        self.heartbeat_interval
+    }
+
+    /// Get the rebalance timeout.
+    pub fn rebalance_timeout(&self) -> Duration {
+        self.rebalance_timeout
+    }
+
+    /// Get the current state.
+    pub async fn state(&self) -> GroupState {
+        *self.state.read().await
+    }
+
+    /// Get the member ID.
+    pub async fn member_id(&self) -> Option<String> {
+        self.member_id.read().await.clone()
+    }
+
+    /// Get the generation ID.
+    pub async fn generation_id(&self) -> i32 {
+        *self.generation_id.read().await
+    }
+
+    /// Get the current assignment.
+    pub async fn assignment(&self) -> MemberAssignment {
+        self.assignment.read().await.clone()
+    }
+
+    /// Get the coordinator broker ID.
+    pub async fn coordinator_id(&self) -> Option<i32> {
+        *self.coordinator_id.read().await
+    }
+
+    /// Set the coordinator broker ID.
+    pub async fn set_coordinator(&self, broker_id: i32) {
+        *self.coordinator_id.write().await = Some(broker_id);
+    }
+
+    /// Set the state.
+    pub async fn set_state(&self, state: GroupState) {
+        *self.state.write().await = state;
+    }
+
+    /// Update member ID and generation after joining.
+    pub async fn join_complete(&self, member_id: String, generation_id: i32) {
+        *self.member_id.write().await = Some(member_id);
+        *self.generation_id.write().await = generation_id;
+    }
+
+    /// Update assignment after sync.
+    pub async fn sync_complete(&self, assignment: MemberAssignment) {
+        *self.assignment.write().await = assignment;
+        *self.state.write().await = GroupState::Stable;
+    }
+
+    /// Reset group state on error or leave.
+    pub async fn reset(&self) {
+        *self.member_id.write().await = None;
+        *self.generation_id.write().await = -1;
+        *self.state.write().await = GroupState::Unjoined;
+        *self.assignment.write().await = MemberAssignment::empty();
+    }
+
+    /// Check if a rebalance is needed.
+    pub async fn needs_rejoin(&self) -> bool {
+        matches!(
+            *self.state.read().await,
+            GroupState::Unjoined | GroupState::PreparingRebalance
+        )
+    }
+
+    /// Validate we're in a valid state to commit.
+    pub async fn validate_for_commit(&self) -> Result<()> {
+        let state = *self.state.read().await;
+        match state {
+            GroupState::Stable => Ok(()),
+            GroupState::Unjoined => Err(KrafkaError::invalid_state(
+                "Cannot commit: not part of a group",
+            )),
+            GroupState::PreparingRebalance | GroupState::AwaitingSync => Err(
+                KrafkaError::invalid_state("Cannot commit: rebalance in progress"),
+            ),
+            _ => Err(KrafkaError::invalid_state(format!(
+                "Cannot commit in state: {:?}",
+                state
+            ))),
+        }
+    }
+}
+
+/// Partition assignment strategy.
+pub trait PartitionAssignor: Send + Sync {
+    /// Strategy name.
+    fn name(&self) -> &str;
+
+    /// Assign partitions to members.
+    fn assign(
+        &self,
+        topics: &[String],
+        partitions: &HashMap<String, Vec<PartitionId>>,
+        members: &[GroupMember],
+    ) -> HashMap<String, MemberAssignment>;
+}
+
+/// Range partition assignor (default).
+#[derive(Debug, Default)]
+pub struct RangeAssignor;
+
+impl PartitionAssignor for RangeAssignor {
+    fn name(&self) -> &str {
+        "range"
+    }
+
+    fn assign(
+        &self,
+        topics: &[String],
+        partitions: &HashMap<String, Vec<PartitionId>>,
+        members: &[GroupMember],
+    ) -> HashMap<String, MemberAssignment> {
+        let mut assignments: HashMap<String, MemberAssignment> = HashMap::new();
+
+        // Initialize assignments for all members
+        for member in members {
+            assignments.insert(member.member_id.clone(), MemberAssignment::empty());
+        }
+
+        // Assign partitions for each topic
+        for topic in topics {
+            if let Some(topic_partitions) = partitions.get(topic) {
+                let mut sorted_partitions = topic_partitions.clone();
+                sorted_partitions.sort();
+
+                let num_partitions = sorted_partitions.len();
+                let num_members = members.len();
+
+                if num_members == 0 {
+                    continue;
+                }
+
+                let partitions_per_member = num_partitions / num_members;
+                let extra = num_partitions % num_members;
+
+                let mut partition_idx = 0;
+                for (member_idx, member) in members.iter().enumerate() {
+                    let count = partitions_per_member + if member_idx < extra { 1 } else { 0 };
+                    let member_partitions: Vec<PartitionId> =
+                        sorted_partitions[partition_idx..partition_idx + count].to_vec();
+                    partition_idx += count;
+
+                    if !member_partitions.is_empty()
+                        && let Some(assignment) = assignments.get_mut(&member.member_id)
+                    {
+                        assignment.add(topic.clone(), member_partitions);
+                    }
+                }
+            }
+        }
+
+        assignments
+    }
+}
+
+/// Round-robin partition assignor.
+#[derive(Debug, Default)]
+pub struct RoundRobinAssignor;
+
+impl PartitionAssignor for RoundRobinAssignor {
+    fn name(&self) -> &str {
+        "roundrobin"
+    }
+
+    fn assign(
+        &self,
+        topics: &[String],
+        partitions: &HashMap<String, Vec<PartitionId>>,
+        members: &[GroupMember],
+    ) -> HashMap<String, MemberAssignment> {
+        let mut assignments: HashMap<String, MemberAssignment> = HashMap::new();
+
+        // Initialize assignments for all members
+        for member in members {
+            assignments.insert(member.member_id.clone(), MemberAssignment::empty());
+        }
+
+        if members.is_empty() {
+            return assignments;
+        }
+
+        // Collect all topic-partitions
+        let mut all_partitions: Vec<(String, PartitionId)> = Vec::new();
+        for topic in topics {
+            if let Some(topic_partitions) = partitions.get(topic) {
+                for &partition in topic_partitions {
+                    all_partitions.push((topic.clone(), partition));
+                }
+            }
+        }
+
+        // Sort by topic then partition
+        all_partitions.sort();
+
+        // Track partitions per topic per member
+        let mut member_topic_partitions: HashMap<String, HashMap<String, Vec<PartitionId>>> =
+            HashMap::new();
+        for member in members {
+            member_topic_partitions.insert(member.member_id.clone(), HashMap::new());
+        }
+
+        // Round-robin assign
+        for (idx, (topic, partition)) in all_partitions.into_iter().enumerate() {
+            let member = &members[idx % members.len()];
+            let member_topics = member_topic_partitions.get_mut(&member.member_id).unwrap();
+            member_topics.entry(topic).or_default().push(partition);
+        }
+
+        // Build final assignments
+        for (member_id, topic_partitions) in member_topic_partitions {
+            let mut assignment = MemberAssignment::empty();
+            for (topic, partitions) in topic_partitions {
+                assignment.add(topic, partitions);
+            }
+            assignments.insert(member_id, assignment);
+        }
+
+        assignments
+    }
+}
+
+/// Cooperative sticky partition assignor.
+///
+/// This assignor implements the cooperative rebalance protocol which minimizes
+/// partition movement during rebalances. It maintains "stickiness" by trying to
+/// keep partitions with their current owners while ensuring fair distribution.
+///
+/// Key features:
+/// - Minimizes partition movement during rebalances
+/// - Maintains balanced partition distribution
+/// - Supports incremental cooperative rebalancing
+///
+/// # Example
+///
+/// ```
+/// use krafka::consumer::{CooperativeStickyAssignor, PartitionAssignor};
+///
+/// let assignor = CooperativeStickyAssignor::new();
+/// assert_eq!(assignor.name(), "cooperative-sticky");
+/// ```
+#[derive(Debug, Default)]
+pub struct CooperativeStickyAssignor {
+    /// Previous assignments for stickiness (member_id -> (topic, partitions))
+    previous_assignments: std::sync::RwLock<HashMap<String, HashMap<String, Vec<PartitionId>>>>,
+}
+
+impl CooperativeStickyAssignor {
+    /// Create a new cooperative sticky assignor.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the current assignments for future stickiness.
+    pub fn record_assignment(&self, member_id: &str, assignment: &MemberAssignment) {
+        let mut prev = self.previous_assignments.write().unwrap();
+        prev.insert(member_id.to_string(), assignment.partitions.clone());
+    }
+
+    /// Clear previous assignment for a member that left.
+    pub fn clear_member(&self, member_id: &str) {
+        let mut prev = self.previous_assignments.write().unwrap();
+        prev.remove(member_id);
+    }
+
+    /// Get partitions that should be revoked (for incremental rebalance).
+    pub fn get_partitions_to_revoke(
+        &self,
+        member_id: &str,
+        new_assignment: &MemberAssignment,
+    ) -> Vec<(String, PartitionId)> {
+        let prev = self.previous_assignments.read().unwrap();
+        let mut revoked = Vec::new();
+
+        if let Some(old_partitions) = prev.get(member_id) {
+            for (topic, old_parts) in old_partitions {
+                let new_parts = new_assignment.get(topic).unwrap_or(&[]);
+                for &old_part in old_parts {
+                    if !new_parts.contains(&old_part) {
+                        revoked.push((topic.clone(), old_part));
+                    }
+                }
+            }
+        }
+
+        revoked
+    }
+}
+
+impl PartitionAssignor for CooperativeStickyAssignor {
+    fn name(&self) -> &str {
+        "cooperative-sticky"
+    }
+
+    fn assign(
+        &self,
+        topics: &[String],
+        partitions: &HashMap<String, Vec<PartitionId>>,
+        members: &[GroupMember],
+    ) -> HashMap<String, MemberAssignment> {
+        let mut assignments: HashMap<String, MemberAssignment> = HashMap::new();
+
+        // Initialize assignments for all members
+        for member in members {
+            assignments.insert(member.member_id.clone(), MemberAssignment::empty());
+        }
+
+        if members.is_empty() {
+            return assignments;
+        }
+
+        // Collect all topic-partitions
+        let mut all_partitions: Vec<(String, PartitionId)> = Vec::new();
+        for topic in topics {
+            if let Some(topic_partitions) = partitions.get(topic) {
+                for &partition in topic_partitions {
+                    all_partitions.push((topic.clone(), partition));
+                }
+            }
+        }
+
+        // Get previous assignments for stickiness
+        let prev_assignments = self.previous_assignments.read().unwrap();
+
+        // Track which partitions are already assigned (sticky)
+        let mut sticky_assignments: HashMap<(String, PartitionId), String> = HashMap::new();
+        let mut member_partition_counts: HashMap<String, usize> = HashMap::new();
+
+        // First pass: honor previous assignments (stickiness)
+        for member in members {
+            member_partition_counts.insert(member.member_id.clone(), 0);
+
+            if let Some(prev) = prev_assignments.get(&member.member_id) {
+                for (topic, prev_parts) in prev {
+                    // Only keep partitions that are still available
+                    if let Some(available_parts) = partitions.get(topic) {
+                        for &part in prev_parts {
+                            if available_parts.contains(&part) {
+                                let key = (topic.clone(), part);
+                                if let std::collections::hash_map::Entry::Vacant(e) =
+                                    sticky_assignments.entry(key)
+                                {
+                                    e.insert(member.member_id.clone());
+                                    *member_partition_counts
+                                        .entry(member.member_id.clone())
+                                        .or_insert(0) += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Calculate target partitions per member for balance
+        let total_partitions = all_partitions.len();
+        let num_members = members.len();
+        let min_per_member = total_partitions / num_members;
+        let extra = total_partitions % num_members;
+
+        // Second pass: assign unassigned partitions while maintaining balance
+        for (topic, partition) in &all_partitions {
+            let key = (topic.clone(), *partition);
+            if sticky_assignments.contains_key(&key) {
+                continue; // Already assigned via stickiness
+            }
+
+            // Find member with fewest partitions that needs more
+            let mut best_member: Option<&str> = None;
+            let mut min_count = usize::MAX;
+
+            for (idx, member) in members.iter().enumerate() {
+                let target = min_per_member + if idx < extra { 1 } else { 0 };
+                let current = *member_partition_counts.get(&member.member_id).unwrap_or(&0);
+
+                if current < target && current < min_count {
+                    min_count = current;
+                    best_member = Some(&member.member_id);
+                }
+            }
+
+            // If everyone is at target, find anyone below max
+            if best_member.is_none() {
+                for member in members {
+                    let current = *member_partition_counts.get(&member.member_id).unwrap_or(&0);
+                    if current < min_count {
+                        min_count = current;
+                        best_member = Some(&member.member_id);
+                    }
+                }
+            }
+
+            if let Some(member_id) = best_member {
+                sticky_assignments.insert(key, member_id.to_string());
+                *member_partition_counts
+                    .entry(member_id.to_string())
+                    .or_insert(0) += 1;
+            }
+        }
+
+        // Third pass: rebalance if needed (steal from overloaded members)
+        // This ensures no member has more than ceil(total/members) partitions
+        let max_per_member = total_partitions.div_ceil(num_members);
+
+        loop {
+            let mut moved = false;
+
+            // Find overloaded and underloaded members
+            let mut overloaded: Vec<String> = Vec::new();
+            let mut underloaded: Vec<String> = Vec::new();
+
+            for member in members {
+                let count = *member_partition_counts.get(&member.member_id).unwrap_or(&0);
+                if count > max_per_member {
+                    overloaded.push(member.member_id.clone());
+                } else if count < min_per_member {
+                    underloaded.push(member.member_id.clone());
+                }
+            }
+
+            if overloaded.is_empty() || underloaded.is_empty() {
+                break;
+            }
+
+            // Move one partition from overloaded to underloaded
+            'outer: for over_member in &overloaded {
+                for under_member in &underloaded {
+                    // Find a partition to move
+                    for (_key, owner) in sticky_assignments.iter_mut() {
+                        if owner == over_member {
+                            *owner = under_member.clone();
+                            if let Some(count) = member_partition_counts.get_mut(over_member) {
+                                *count = count.saturating_sub(1);
+                            }
+                            *member_partition_counts
+                                .entry(under_member.clone())
+                                .or_insert(0) += 1;
+                            moved = true;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+
+            if !moved {
+                break;
+            }
+        }
+
+        // Build final assignments from sticky_assignments
+        for ((topic, partition), member_id) in sticky_assignments {
+            if let Some(assignment) = assignments.get_mut(&member_id) {
+                assignment
+                    .partitions
+                    .entry(topic)
+                    .or_default()
+                    .push(partition);
+            }
+        }
+
+        // Sort partitions within each topic for consistency
+        for assignment in assignments.values_mut() {
+            for parts in assignment.partitions.values_mut() {
+                parts.sort();
+            }
+        }
+
+        assignments
+    }
+}
+
+/// Controller for managing periodic heartbeat tasks.
+///
+/// The heartbeat controller sends heartbeats at a configurable interval
+/// to keep the consumer alive in its group. It tracks the last heartbeat
+/// time and can detect session timeouts.
+#[derive(Debug)]
+pub struct HeartbeatController {
+    /// Heartbeat interval.
+    interval: Duration,
+    /// Session timeout.
+    session_timeout: Duration,
+    /// Last successful heartbeat time.
+    last_heartbeat: Arc<RwLock<Option<std::time::Instant>>>,
+    /// Whether the controller is running.
+    running: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl HeartbeatController {
+    /// Create a new heartbeat controller.
+    pub fn new(interval: Duration, session_timeout: Duration) -> Self {
+        Self {
+            interval,
+            session_timeout,
+            last_heartbeat: Arc::new(RwLock::new(None)),
+            running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Get the heartbeat interval.
+    #[inline]
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// Get the session timeout.
+    #[inline]
+    pub fn session_timeout(&self) -> Duration {
+        self.session_timeout
+    }
+
+    /// Check if the controller is running.
+    #[inline]
+    pub fn is_running(&self) -> bool {
+        self.running.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Start the heartbeat controller.
+    pub fn start(&self) {
+        self.running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Stop the heartbeat controller.
+    pub fn stop(&self) {
+        self.running
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record a successful heartbeat.
+    pub async fn heartbeat_success(&self) {
+        *self.last_heartbeat.write().await = Some(std::time::Instant::now());
+    }
+
+    /// Get the time since the last heartbeat.
+    pub async fn time_since_last_heartbeat(&self) -> Option<Duration> {
+        self.last_heartbeat.read().await.map(|t| t.elapsed())
+    }
+
+    /// Check if the session may have timed out.
+    pub async fn may_have_timed_out(&self) -> bool {
+        if let Some(elapsed) = self.time_since_last_heartbeat().await {
+            elapsed > self.session_timeout
+        } else {
+            false
+        }
+    }
+
+    /// Wait for the next heartbeat interval.
+    ///
+    /// This is a convenience method for use in heartbeat loops.
+    pub async fn wait_for_next_interval(&self) {
+        tokio::time::sleep(self.interval).await;
+    }
+}
+
+/// Heartbeat response status from the coordinator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeartbeatStatus {
+    /// Heartbeat accepted, continue normally.
+    Ok,
+    /// Rebalance in progress, rejoin required.
+    RebalanceNeeded,
+    /// Unknown member, rejoin required.
+    UnknownMember,
+    /// Illegal generation, rejoin required.
+    IllegalGeneration,
+    /// Session timed out, rejoin required.
+    SessionTimeout,
+    /// Fatal error, leave group.
+    FatalError,
+}
+
+impl HeartbeatStatus {
+    /// Whether a rejoin is required based on this status.
+    #[inline]
+    pub fn requires_rejoin(&self) -> bool {
+        matches!(
+            self,
+            Self::RebalanceNeeded
+                | Self::UnknownMember
+                | Self::IllegalGeneration
+                | Self::SessionTimeout
+        )
+    }
+
+    /// Whether this is a fatal error requiring group leave.
+    #[inline]
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, Self::FatalError)
+    }
+
+    /// Convert from an ErrorCode.
+    pub fn from_error_code(code: ErrorCode) -> Self {
+        match code {
+            ErrorCode::None => Self::Ok,
+            ErrorCode::RebalanceInProgress => Self::RebalanceNeeded,
+            ErrorCode::UnknownMemberId => Self::UnknownMember,
+            ErrorCode::IllegalGeneration => Self::IllegalGeneration,
+            ErrorCode::CoordinatorNotAvailable
+            | ErrorCode::NotCoordinator
+            | ErrorCode::CoordinatorLoadInProgress => Self::SessionTimeout,
+            _ => Self::FatalError,
+        }
+    }
+}
+
+// ============================================================================
+// Group Coordinator
+// ============================================================================
+
+/// Commands for the heartbeat background task.
+#[derive(Debug)]
+pub enum HeartbeatCommand {
+    /// Stop the heartbeat task.
+    Stop,
+    /// Trigger a rejoin.
+    Rejoin,
+}
+
+/// Group coordinator that manages group membership, heartbeats, and offset commits.
+///
+/// This struct encapsulates all the logic for consumer group protocol:
+/// - Finding the group coordinator broker
+/// - Joining and syncing with the group
+/// - Sending periodic heartbeats in a background task
+/// - Committing offsets to the coordinator
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use krafka::consumer::GroupCoordinator;
+///
+/// let coordinator = GroupCoordinator::new(
+///     group_id,
+///     pool,
+///     metadata,
+///     session_timeout,
+///     heartbeat_interval,
+///     rebalance_timeout,
+/// );
+///
+/// // Find coordinator and join group
+/// coordinator.ensure_active_membership(&["topic1"]).await?;
+///
+/// // Commit offsets
+/// coordinator.commit_offsets(&offsets).await?;
+/// ```
+pub struct GroupCoordinator {
+    /// Group ID.
+    group_id: String,
+    /// Connection pool.
+    pool: Arc<ConnectionPool>,
+    /// Cluster metadata.
+    metadata: Arc<ClusterMetadata>,
+    /// Session timeout.
+    session_timeout: Duration,
+    /// Heartbeat interval.
+    heartbeat_interval: Duration,
+    /// Rebalance timeout.
+    rebalance_timeout: Duration,
+    /// Coordinator connection.
+    coordinator_conn: RwLock<Option<Arc<BrokerConnection>>>,
+    /// Coordinator node ID.
+    coordinator_id: RwLock<Option<i32>>,
+    /// Member ID assigned by coordinator.
+    member_id: RwLock<String>,
+    /// Generation ID.
+    generation_id: RwLock<i32>,
+    /// Current group state.
+    state: RwLock<GroupState>,
+    /// Current partition assignment.
+    assignment: RwLock<MemberAssignment>,
+    /// Heartbeat controller.
+    heartbeat_controller: Arc<HeartbeatController>,
+    /// Channel to control heartbeat task.
+    heartbeat_cmd_tx: RwLock<Option<mpsc::Sender<HeartbeatCommand>>>,
+    /// Subscribed topics.
+    subscribed_topics: RwLock<Vec<String>>,
+    /// Protocol type (always "consumer").
+    protocol_type: String,
+    /// Partition assignor name.
+    assignor_name: String,
+}
+
+impl GroupCoordinator {
+    /// Create a new group coordinator.
+    pub fn new(
+        group_id: impl Into<String>,
+        pool: Arc<ConnectionPool>,
+        metadata: Arc<ClusterMetadata>,
+        session_timeout: Duration,
+        heartbeat_interval: Duration,
+        rebalance_timeout: Duration,
+    ) -> Self {
+        Self {
+            group_id: group_id.into(),
+            pool,
+            metadata,
+            session_timeout,
+            heartbeat_interval,
+            rebalance_timeout,
+            coordinator_conn: RwLock::new(None),
+            coordinator_id: RwLock::new(None),
+            member_id: RwLock::new(String::new()),
+            generation_id: RwLock::new(-1),
+            state: RwLock::new(GroupState::Unjoined),
+            assignment: RwLock::new(MemberAssignment::empty()),
+            heartbeat_controller: Arc::new(HeartbeatController::new(
+                heartbeat_interval,
+                session_timeout,
+            )),
+            heartbeat_cmd_tx: RwLock::new(None),
+            subscribed_topics: RwLock::new(Vec::new()),
+            protocol_type: "consumer".to_string(),
+            assignor_name: "range".to_string(),
+        }
+    }
+
+    /// Get the group ID.
+    pub fn group_id(&self) -> &str {
+        &self.group_id
+    }
+
+    /// Get the current state.
+    pub async fn state(&self) -> GroupState {
+        *self.state.read().await
+    }
+
+    /// Get the member ID.
+    pub async fn member_id(&self) -> String {
+        self.member_id.read().await.clone()
+    }
+
+    /// Get the generation ID.
+    pub async fn generation_id(&self) -> i32 {
+        *self.generation_id.read().await
+    }
+
+    /// Get the current assignment.
+    pub async fn assignment(&self) -> MemberAssignment {
+        self.assignment.read().await.clone()
+    }
+
+    /// Set the subscribed topics.
+    pub async fn set_subscribed_topics(&self, topics: Vec<String>) {
+        *self.subscribed_topics.write().await = topics;
+    }
+
+    /// Check if the group needs to rejoin.
+    pub async fn needs_rejoin(&self) -> bool {
+        matches!(
+            *self.state.read().await,
+            GroupState::Unjoined | GroupState::PreparingRebalance
+        )
+    }
+
+    /// Find the group coordinator broker.
+    pub async fn find_coordinator(&self) -> Result<()> {
+        debug!("Finding coordinator for group '{}'", self.group_id);
+
+        // Get a connection to any broker
+        let conn = self.get_any_connection().await?;
+
+        // Send FindCoordinator request
+        let request = FindCoordinatorRequest::for_group(&self.group_id);
+        let response = conn
+            .send_request(ApiKey::FindCoordinator, 1, |buf| {
+                request.encode_v1(buf);
+            })
+            .await?;
+
+        let mut buf = response;
+        let find_response = FindCoordinatorResponse::decode_v1(&mut buf)?;
+
+        if !find_response.error_code.is_ok() {
+            return Err(KrafkaError::broker(
+                find_response.error_code,
+                format!(
+                    "Failed to find coordinator: {:?}",
+                    find_response.error_message
+                ),
+            ));
+        }
+
+        // Connect to the coordinator
+        let coordinator_addr = format!("{}:{}", find_response.host, find_response.port);
+        let coordinator_conn = self.pool.get_connection(&coordinator_addr).await?;
+
+        *self.coordinator_conn.write().await = Some(coordinator_conn);
+        *self.coordinator_id.write().await = Some(find_response.node_id);
+
+        info!(
+            "Found coordinator for group '{}': node {} at {}",
+            self.group_id, find_response.node_id, coordinator_addr
+        );
+
+        Ok(())
+    }
+
+    /// Get the coordinator connection, finding it if necessary.
+    async fn get_coordinator_connection(&self) -> Result<Arc<BrokerConnection>> {
+        {
+            let conn = self.coordinator_conn.read().await;
+            if let Some(ref c) = *conn {
+                return Ok(c.clone());
+            }
+        }
+
+        self.find_coordinator().await?;
+
+        let conn = self.coordinator_conn.read().await;
+        conn.clone()
+            .ok_or_else(|| KrafkaError::invalid_state("coordinator not found"))
+    }
+
+    /// Get any available broker connection.
+    async fn get_any_connection(&self) -> Result<Arc<BrokerConnection>> {
+        // Try cached brokers first
+        let brokers = self.metadata.brokers().await;
+        for broker in brokers {
+            if let Ok(conn) = self.pool.get_connection(&broker.address()).await {
+                return Ok(conn);
+            }
+        }
+
+        // Fall back to bootstrap servers
+        for server in self.metadata.bootstrap_servers() {
+            if let Ok(conn) = self.pool.get_connection(server).await {
+                return Ok(conn);
+            }
+        }
+
+        Err(KrafkaError::invalid_state("no available brokers"))
+    }
+
+    /// Join the consumer group.
+    pub async fn join_group(&self) -> Result<JoinGroupResponse> {
+        let conn = self.get_coordinator_connection().await?;
+
+        let member_id = self.member_id.read().await.clone();
+        let topics = self.subscribed_topics.read().await.clone();
+
+        // Build consumer protocol metadata
+        let metadata = self.encode_consumer_metadata(&topics);
+
+        let request = JoinGroupRequest {
+            group_id: self.group_id.clone(),
+            session_timeout_ms: self.session_timeout.as_millis() as i32,
+            rebalance_timeout_ms: self.rebalance_timeout.as_millis() as i32,
+            member_id: member_id.clone(),
+            group_instance_id: None,
+            protocol_type: self.protocol_type.clone(),
+            protocols: vec![JoinGroupRequestProtocol {
+                name: self.assignor_name.clone(),
+                metadata: metadata.freeze(),
+            }],
+        };
+
+        debug!(
+            "Joining group '{}' with member_id '{}'",
+            self.group_id, member_id
+        );
+
+        *self.state.write().await = GroupState::Joining;
+
+        let response = conn
+            .send_request(ApiKey::JoinGroup, 0, |buf| {
+                request.encode_v0(buf);
+            })
+            .await?;
+
+        let mut buf = response;
+        let join_response = JoinGroupResponse::decode_v0(&mut buf)?;
+
+        if !join_response.error_code.is_ok() {
+            *self.state.write().await = GroupState::Unjoined;
+            return Err(KrafkaError::broker(
+                join_response.error_code,
+                "Failed to join group",
+            ));
+        }
+
+        // Update member ID and generation
+        *self.member_id.write().await = join_response.member_id.clone();
+        *self.generation_id.write().await = join_response.generation_id;
+        *self.state.write().await = GroupState::AwaitingSync;
+
+        info!(
+            "Joined group '{}': member_id='{}', generation={}, is_leader={}",
+            self.group_id,
+            join_response.member_id,
+            join_response.generation_id,
+            join_response.is_leader()
+        );
+
+        Ok(join_response)
+    }
+
+    /// Sync with the group after joining.
+    pub async fn sync_group(&self, join_response: &JoinGroupResponse) -> Result<MemberAssignment> {
+        let conn = self.get_coordinator_connection().await?;
+
+        let member_id = self.member_id.read().await.clone();
+        let generation_id = *self.generation_id.read().await;
+        let topics = self.subscribed_topics.read().await.clone();
+
+        // If we're the leader, compute assignments
+        let assignments = if join_response.is_leader() {
+            self.compute_assignments(&topics, &join_response.members)
+                .await?
+        } else {
+            Vec::new()
+        };
+
+        let request = SyncGroupRequest {
+            group_id: self.group_id.clone(),
+            generation_id,
+            member_id: member_id.clone(),
+            group_instance_id: None,
+            protocol_type: Some(self.protocol_type.clone()),
+            protocol_name: join_response.protocol_name.clone(),
+            assignments,
+        };
+
+        debug!(
+            "Syncing group '{}': generation={}, is_leader={}",
+            self.group_id,
+            generation_id,
+            join_response.is_leader()
+        );
+
+        let response = conn
+            .send_request(ApiKey::SyncGroup, 0, |buf| {
+                request.encode_v0(buf);
+            })
+            .await?;
+
+        let mut buf = response;
+        let sync_response = SyncGroupResponse::decode_v0(&mut buf)?;
+
+        if !sync_response.error_code.is_ok() {
+            *self.state.write().await = GroupState::Unjoined;
+            return Err(KrafkaError::broker(
+                sync_response.error_code,
+                "Failed to sync group",
+            ));
+        }
+
+        // Decode the assignment
+        let assignment = self.decode_consumer_assignment(&sync_response.assignment)?;
+
+        // Update state
+        *self.assignment.write().await = assignment.clone();
+        *self.state.write().await = GroupState::Stable;
+
+        info!(
+            "Synced group '{}': received {} topic assignments",
+            self.group_id,
+            assignment.partitions.len()
+        );
+
+        for (topic, partitions) in &assignment.partitions {
+            debug!("  {} -> {:?}", topic, partitions);
+        }
+
+        Ok(assignment)
+    }
+
+    /// Ensure active group membership, joining/rejoining as needed.
+    pub async fn ensure_active_membership(&self, topics: &[String]) -> Result<MemberAssignment> {
+        // Update subscribed topics
+        self.set_subscribed_topics(topics.to_vec()).await;
+
+        let state = *self.state.read().await;
+        match state {
+            GroupState::Stable => {
+                // Already stable, return current assignment
+                Ok(self.assignment.read().await.clone())
+            }
+            GroupState::Unjoined | GroupState::PreparingRebalance => {
+                // Need to join/rejoin
+                self.perform_join_and_sync().await
+            }
+            _ => {
+                // Other states - try to rejoin
+                self.perform_join_and_sync().await
+            }
+        }
+    }
+
+    /// Perform the full join and sync sequence.
+    async fn perform_join_and_sync(&self) -> Result<MemberAssignment> {
+        // Find coordinator if needed
+        if self.coordinator_conn.read().await.is_none() {
+            self.find_coordinator().await?;
+        }
+
+        // Join group
+        let join_response = self.join_group().await?;
+
+        // Sync group
+        let assignment = self.sync_group(&join_response).await?;
+
+        // Start heartbeat task
+        self.start_heartbeat_task().await;
+
+        Ok(assignment)
+    }
+
+    /// Start the background heartbeat task.
+    async fn start_heartbeat_task(&self) {
+        // Stop existing task if any
+        self.stop_heartbeat_task().await;
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<HeartbeatCommand>(10);
+        *self.heartbeat_cmd_tx.write().await = Some(cmd_tx);
+
+        let group_id = self.group_id.clone();
+        let heartbeat_interval = self.heartbeat_interval;
+        let heartbeat_controller = self.heartbeat_controller.clone();
+
+        // Clone values we need for the task
+        let member_id = self.member_id.read().await.clone();
+        let generation_id = *self.generation_id.read().await;
+        let coordinator_conn = self.coordinator_conn.read().await.clone();
+
+        heartbeat_controller.start();
+
+        tokio::spawn(async move {
+            debug!("Starting heartbeat task for group '{}'", group_id);
+
+            let mut interval = tokio::time::interval(heartbeat_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if !heartbeat_controller.is_running() {
+                            break;
+                        }
+
+                        // Send heartbeat
+                        if let Some(ref conn) = coordinator_conn {
+                            let request = HeartbeatRequest {
+                                group_id: group_id.clone(),
+                                generation_id,
+                                member_id: member_id.clone(),
+                                group_instance_id: None,
+                            };
+
+                            match conn
+                                .send_request(ApiKey::Heartbeat, 0, |buf| {
+                                    request.encode_v0(buf);
+                                })
+                                .await
+                            {
+                                Ok(response) => {
+                                    let mut buf = response;
+                                    if let Ok(hb_response) = HeartbeatResponse::decode_v0(&mut buf) {
+                                        let status = HeartbeatStatus::from_error_code(hb_response.error_code);
+                                        match status {
+                                            HeartbeatStatus::Ok => {
+                                                heartbeat_controller.heartbeat_success().await;
+                                                debug!("Heartbeat successful for group '{}'", group_id);
+                                            }
+                                            HeartbeatStatus::RebalanceNeeded => {
+                                                warn!("Rebalance needed for group '{}', stopping heartbeat", group_id);
+                                                heartbeat_controller.stop();
+                                                break;
+                                            }
+                                            status if status.requires_rejoin() => {
+                                                warn!("Heartbeat status {:?} requires rejoin for group '{}'", status, group_id);
+                                                heartbeat_controller.stop();
+                                                break;
+                                            }
+                                            HeartbeatStatus::FatalError => {
+                                                error!("Fatal heartbeat error for group '{}'", group_id);
+                                                heartbeat_controller.stop();
+                                                break;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Heartbeat failed for group '{}': {}", group_id, e);
+                                }
+                            }
+                        }
+                    }
+                    cmd = cmd_rx.recv() => {
+                        match cmd {
+                            Some(HeartbeatCommand::Stop) | None => {
+                                debug!("Stopping heartbeat task for group '{}'", group_id);
+                                heartbeat_controller.stop();
+                                break;
+                            }
+                            Some(HeartbeatCommand::Rejoin) => {
+                                debug!("Rejoin requested for group '{}'", group_id);
+                                heartbeat_controller.stop();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            debug!("Heartbeat task ended for group '{}'", group_id);
+        });
+    }
+
+    /// Stop the background heartbeat task.
+    pub async fn stop_heartbeat_task(&self) {
+        let tx = self.heartbeat_cmd_tx.write().await.take();
+        if let Some(tx) = tx {
+            let _ = tx.send(HeartbeatCommand::Stop).await;
+        }
+        self.heartbeat_controller.stop();
+    }
+
+    /// Trigger a rejoin.
+    pub async fn trigger_rejoin(&self) {
+        *self.state.write().await = GroupState::PreparingRebalance;
+        let tx = self.heartbeat_cmd_tx.read().await.clone();
+        if let Some(tx) = tx {
+            let _ = tx.send(HeartbeatCommand::Rejoin).await;
+        }
+    }
+
+    /// Send a single heartbeat (for inline heartbeat during poll).
+    pub async fn send_heartbeat(&self) -> Result<HeartbeatStatus> {
+        let conn = self.get_coordinator_connection().await?;
+        let member_id = self.member_id.read().await.clone();
+        let generation_id = *self.generation_id.read().await;
+
+        let request = HeartbeatRequest {
+            group_id: self.group_id.clone(),
+            generation_id,
+            member_id,
+            group_instance_id: None,
+        };
+
+        let response = conn
+            .send_request(ApiKey::Heartbeat, 0, |buf| {
+                request.encode_v0(buf);
+            })
+            .await?;
+
+        let mut buf = response;
+        let hb_response = HeartbeatResponse::decode_v0(&mut buf)?;
+
+        let status = HeartbeatStatus::from_error_code(hb_response.error_code);
+        if status == HeartbeatStatus::Ok {
+            self.heartbeat_controller.heartbeat_success().await;
+        }
+
+        Ok(status)
+    }
+
+    /// Commit offsets to the coordinator.
+    pub async fn commit_offsets(
+        &self,
+        offsets: &HashMap<(String, PartitionId), (i64, Option<String>)>,
+    ) -> Result<()> {
+        if offsets.is_empty() {
+            return Ok(());
+        }
+
+        // Validate state
+        let state = *self.state.read().await;
+        if state != GroupState::Stable {
+            return Err(KrafkaError::invalid_state(format!(
+                "Cannot commit offsets: group state is {:?}",
+                state
+            )));
+        }
+
+        let conn = self.get_coordinator_connection().await?;
+        let member_id = self.member_id.read().await.clone();
+        let generation_id = *self.generation_id.read().await;
+
+        // Group offsets by topic
+        let mut topics_map: HashMap<String, Vec<OffsetCommitRequestPartition>> = HashMap::new();
+        for ((topic, partition), (offset, metadata)) in offsets {
+            topics_map
+                .entry(topic.clone())
+                .or_default()
+                .push(OffsetCommitRequestPartition {
+                    partition_index: *partition,
+                    committed_offset: *offset,
+                    committed_leader_epoch: -1,
+                    commit_timestamp: -1,
+                    committed_metadata: metadata.clone(),
+                });
+        }
+
+        let topics: Vec<OffsetCommitRequestTopic> = topics_map
+            .into_iter()
+            .map(|(name, partitions)| OffsetCommitRequestTopic { name, partitions })
+            .collect();
+
+        let request = OffsetCommitRequest {
+            group_id: self.group_id.clone(),
+            generation_id,
+            member_id,
+            group_instance_id: None,
+            retention_time_ms: -1,
+            topics,
+        };
+
+        debug!(
+            "Committing {} offsets for group '{}'",
+            offsets.len(),
+            self.group_id
+        );
+
+        let response = conn
+            .send_request(ApiKey::OffsetCommit, 2, |buf| {
+                request.encode_v2(buf);
+            })
+            .await?;
+
+        let mut buf = response;
+        let commit_response = OffsetCommitResponse::decode_v0(&mut buf)?;
+
+        // Check for errors
+        for topic in &commit_response.topics {
+            for partition in &topic.partitions {
+                if !partition.error_code.is_ok() {
+                    // Handle rebalance errors specially
+                    if partition.error_code == ErrorCode::RebalanceInProgress
+                        || partition.error_code == ErrorCode::IllegalGeneration
+                        || partition.error_code == ErrorCode::UnknownMemberId
+                    {
+                        *self.state.write().await = GroupState::PreparingRebalance;
+                        return Err(KrafkaError::broker(
+                            partition.error_code,
+                            format!(
+                                "Offset commit failed for {}-{}: rebalance needed",
+                                topic.name, partition.partition_index
+                            ),
+                        ));
+                    }
+                    return Err(KrafkaError::broker(
+                        partition.error_code,
+                        format!(
+                            "Offset commit failed for {}-{}",
+                            topic.name, partition.partition_index
+                        ),
+                    ));
+                }
+            }
+        }
+
+        info!(
+            "Committed {} offsets for group '{}'",
+            offsets.len(),
+            self.group_id
+        );
+        Ok(())
+    }
+
+    /// Leave the consumer group.
+    pub async fn leave_group(&self) -> Result<()> {
+        let state = *self.state.read().await;
+        if state == GroupState::Unjoined || state == GroupState::Dead {
+            return Ok(());
+        }
+
+        // Stop heartbeat task
+        self.stop_heartbeat_task().await;
+
+        let conn = match self.get_coordinator_connection().await {
+            Ok(c) => c,
+            Err(_) => {
+                // If we can't get a connection, just reset state
+                self.reset().await;
+                return Ok(());
+            }
+        };
+
+        let member_id = self.member_id.read().await.clone();
+
+        *self.state.write().await = GroupState::Leaving;
+
+        let request = LeaveGroupRequest {
+            group_id: self.group_id.clone(),
+            member_id: member_id.clone(),
+            members: vec![],
+        };
+
+        debug!(
+            "Leaving group '{}', member_id='{}'",
+            self.group_id, member_id
+        );
+
+        // Send leave group request (don't wait too long)
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            conn.send_request(ApiKey::LeaveGroup, 0, |buf| {
+                request.encode_v0(buf);
+            }),
+        )
+        .await;
+
+        if let Ok(Ok(_)) = result {
+            info!("Left group '{}'", self.group_id);
+        } else {
+            warn!("Failed to cleanly leave group '{}'", self.group_id);
+        }
+
+        self.reset().await;
+        Ok(())
+    }
+
+    /// Reset coordinator state.
+    async fn reset(&self) {
+        *self.member_id.write().await = String::new();
+        *self.generation_id.write().await = -1;
+        *self.state.write().await = GroupState::Unjoined;
+        *self.assignment.write().await = MemberAssignment::empty();
+        *self.coordinator_conn.write().await = None;
+        *self.coordinator_id.write().await = None;
+    }
+
+    /// Encode consumer protocol metadata.
+    fn encode_consumer_metadata(&self, topics: &[String]) -> BytesMut {
+        let mut buf = BytesMut::new();
+        // Version
+        buf.put_i16(0);
+        // Topics array
+        buf.put_i32(topics.len() as i32);
+        for topic in topics {
+            buf.put_i16(topic.len() as i16);
+            buf.put_slice(topic.as_bytes());
+        }
+        // User data (empty)
+        buf.put_i32(-1);
+        buf
+    }
+
+    /// Decode consumer assignment from SyncGroup response.
+    fn decode_consumer_assignment(&self, data: &Bytes) -> Result<MemberAssignment> {
+        if data.is_empty() {
+            return Ok(MemberAssignment::empty());
+        }
+
+        let mut buf = data.clone();
+        if buf.remaining() < 2 {
+            return Ok(MemberAssignment::empty());
+        }
+
+        // Version
+        let _version = buf.get_i16();
+
+        // Topics array
+        if buf.remaining() < 4 {
+            return Ok(MemberAssignment::empty());
+        }
+        let topic_count = buf.get_i32();
+        if topic_count < 0 {
+            return Ok(MemberAssignment::empty());
+        }
+
+        let mut assignment = MemberAssignment::empty();
+
+        for _ in 0..topic_count {
+            if buf.remaining() < 2 {
+                break;
+            }
+            let topic_len = buf.get_i16() as usize;
+            if buf.remaining() < topic_len {
+                break;
+            }
+            let topic = String::from_utf8_lossy(&buf.copy_to_bytes(topic_len)).to_string();
+
+            if buf.remaining() < 4 {
+                break;
+            }
+            let partition_count = buf.get_i32();
+            let mut partitions = Vec::with_capacity(partition_count as usize);
+
+            for _ in 0..partition_count {
+                if buf.remaining() < 4 {
+                    break;
+                }
+                partitions.push(buf.get_i32());
+            }
+
+            assignment.add(topic, partitions);
+        }
+
+        Ok(assignment)
+    }
+
+    /// Compute assignments when we are the group leader.
+    async fn compute_assignments(
+        &self,
+        topics: &[String],
+        members: &[JoinGroupResponseMember],
+    ) -> Result<Vec<SyncGroupRequestAssignment>> {
+        // Get partition info for all topics
+        let mut topic_partitions: HashMap<String, Vec<PartitionId>> = HashMap::new();
+        for topic in topics {
+            if let Some(topic_info) = self.metadata.topic(topic).await {
+                let partitions: Vec<_> =
+                    topic_info.partitions.iter().map(|p| p.partition).collect();
+                topic_partitions.insert(topic.clone(), partitions);
+            }
+        }
+
+        // Convert to GroupMember for assignor
+        let group_members: Vec<GroupMember> = members
+            .iter()
+            .map(|m| GroupMember {
+                member_id: m.member_id.clone(),
+                client_id: String::new(),
+                client_host: String::new(),
+                metadata: m.metadata.to_vec(),
+                assignment: vec![],
+            })
+            .collect();
+
+        // Use range assignor
+        let assignor = RangeAssignor;
+        let assignments = assignor.assign(topics, &topic_partitions, &group_members);
+
+        // Encode assignments
+        let mut result = Vec::with_capacity(members.len());
+        for member in members {
+            let member_assignment = assignments
+                .get(&member.member_id)
+                .cloned()
+                .unwrap_or_else(MemberAssignment::empty);
+
+            let encoded = self.encode_consumer_assignment(&member_assignment);
+
+            result.push(SyncGroupRequestAssignment {
+                member_id: member.member_id.clone(),
+                assignment: encoded.freeze(),
+            });
+        }
+
+        Ok(result)
+    }
+
+    /// Encode consumer assignment for SyncGroup request.
+    fn encode_consumer_assignment(&self, assignment: &MemberAssignment) -> BytesMut {
+        let mut buf = BytesMut::new();
+        // Version
+        buf.put_i16(0);
+        // Topics array
+        buf.put_i32(assignment.partitions.len() as i32);
+        for (topic, partitions) in &assignment.partitions {
+            buf.put_i16(topic.len() as i16);
+            buf.put_slice(topic.as_bytes());
+            buf.put_i32(partitions.len() as i32);
+            for &partition in partitions {
+                buf.put_i32(partition);
+            }
+        }
+        // User data (empty)
+        buf.put_i32(-1);
+        buf
+    }
+
+    /// Check if heartbeat is overdue (for inline heartbeat during poll).
+    pub async fn is_heartbeat_overdue(&self) -> bool {
+        if let Some(elapsed) = self.heartbeat_controller.time_since_last_heartbeat().await {
+            elapsed > self.heartbeat_interval
+        } else {
+            // No heartbeat recorded yet, should send one
+            *self.state.read().await == GroupState::Stable
+        }
+    }
+}
+
+impl std::fmt::Debug for GroupCoordinator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupCoordinator")
+            .field("group_id", &self.group_id)
+            .field("session_timeout", &self.session_timeout)
+            .field("heartbeat_interval", &self.heartbeat_interval)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_member_assignment() {
+        let mut assignment = MemberAssignment::empty();
+        assert!(assignment.is_empty());
+
+        assignment.add("topic1", vec![0, 1, 2]);
+        assignment.add("topic2", vec![0, 1]);
+
+        assert!(!assignment.is_empty());
+        assert_eq!(assignment.get("topic1"), Some(vec![0, 1, 2].as_slice()));
+        assert_eq!(assignment.all_partitions().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_consumer_group_state() {
+        let group = ConsumerGroup::new(
+            "test-group",
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+        );
+
+        assert_eq!(group.state().await, GroupState::Unjoined);
+        assert!(group.member_id().await.is_none());
+        assert_eq!(group.generation_id().await, -1);
+
+        group.join_complete("member-1".to_string(), 1).await;
+        assert_eq!(group.member_id().await, Some("member-1".to_string()));
+        assert_eq!(group.generation_id().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_consumer_group_reset() {
+        let group = ConsumerGroup::new(
+            "test-group",
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+        );
+
+        group.join_complete("member-1".to_string(), 1).await;
+        group.set_state(GroupState::Stable).await;
+
+        group.reset().await;
+        assert_eq!(group.state().await, GroupState::Unjoined);
+        assert!(group.member_id().await.is_none());
+    }
+
+    #[test]
+    fn test_range_assignor() {
+        let assignor = RangeAssignor;
+
+        let topics = vec!["topic1".to_string()];
+        let mut partitions = HashMap::new();
+        partitions.insert("topic1".to_string(), vec![0, 1, 2]);
+
+        let members = vec![
+            GroupMember {
+                member_id: "m1".to_string(),
+                client_id: "c1".to_string(),
+                client_host: "host1".to_string(),
+                metadata: vec![],
+                assignment: vec![],
+            },
+            GroupMember {
+                member_id: "m2".to_string(),
+                client_id: "c2".to_string(),
+                client_host: "host2".to_string(),
+                metadata: vec![],
+                assignment: vec![],
+            },
+        ];
+
+        let assignments = assignor.assign(&topics, &partitions, &members);
+
+        // m1 should get 2 partitions (0, 1), m2 should get 1 partition (2)
+        let m1_assignment = assignments.get("m1").unwrap();
+        let m2_assignment = assignments.get("m2").unwrap();
+
+        assert_eq!(m1_assignment.get("topic1"), Some(vec![0, 1].as_slice()));
+        assert_eq!(m2_assignment.get("topic1"), Some(vec![2].as_slice()));
+    }
+
+    #[test]
+    fn test_roundrobin_assignor() {
+        let assignor = RoundRobinAssignor;
+
+        let topics = vec!["topic1".to_string()];
+        let mut partitions = HashMap::new();
+        partitions.insert("topic1".to_string(), vec![0, 1, 2, 3]);
+
+        let members = vec![
+            GroupMember {
+                member_id: "m1".to_string(),
+                client_id: "c1".to_string(),
+                client_host: "host1".to_string(),
+                metadata: vec![],
+                assignment: vec![],
+            },
+            GroupMember {
+                member_id: "m2".to_string(),
+                client_id: "c2".to_string(),
+                client_host: "host2".to_string(),
+                metadata: vec![],
+                assignment: vec![],
+            },
+        ];
+
+        let assignments = assignor.assign(&topics, &partitions, &members);
+
+        // m1 gets 0, 2; m2 gets 1, 3
+        let m1_partitions = assignments.get("m1").unwrap().get("topic1").unwrap();
+        let m2_partitions = assignments.get("m2").unwrap().get("topic1").unwrap();
+
+        assert_eq!(m1_partitions.len(), 2);
+        assert_eq!(m2_partitions.len(), 2);
+    }
+
+    #[test]
+    fn test_noop_rebalance_listener() {
+        use crate::consumer::TopicPartition;
+
+        let listener = NoOpRebalanceListener;
+
+        // All methods should be no-ops (not panic)
+        let partitions = vec![
+            TopicPartition::new("topic1", 0),
+            TopicPartition::new("topic2", 1),
+        ];
+
+        // These should all be no-ops and not panic
+        listener.on_partitions_assigned(&partitions);
+        listener.on_partitions_revoked(&partitions);
+        listener.on_partitions_lost(&partitions);
+    }
+
+    #[test]
+    fn test_rebalance_listener_trait_bounds() {
+        // Ensure trait bounds are satisfied for async contexts
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<NoOpRebalanceListener>();
+    }
+
+    #[test]
+    fn test_custom_rebalance_listener() {
+        use crate::consumer::TopicPartition;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingListener {
+            assigned_count: AtomicUsize,
+            revoked_count: AtomicUsize,
+            lost_count: AtomicUsize,
+        }
+
+        impl ConsumerRebalanceListener for CountingListener {
+            fn on_partitions_assigned(&self, partitions: &[TopicPartition]) {
+                self.assigned_count
+                    .fetch_add(partitions.len(), Ordering::Relaxed);
+            }
+
+            fn on_partitions_revoked(&self, partitions: &[TopicPartition]) {
+                self.revoked_count
+                    .fetch_add(partitions.len(), Ordering::Relaxed);
+            }
+
+            fn on_partitions_lost(&self, partitions: &[TopicPartition]) {
+                self.lost_count
+                    .fetch_add(partitions.len(), Ordering::Relaxed);
+            }
+        }
+
+        let listener = Arc::new(CountingListener {
+            assigned_count: AtomicUsize::new(0),
+            revoked_count: AtomicUsize::new(0),
+            lost_count: AtomicUsize::new(0),
+        });
+
+        let partitions = vec![
+            TopicPartition::new("topic1", 0),
+            TopicPartition::new("topic1", 1),
+            TopicPartition::new("topic2", 0),
+        ];
+
+        listener.on_partitions_assigned(&partitions);
+        assert_eq!(listener.assigned_count.load(Ordering::Relaxed), 3);
+
+        listener.on_partitions_revoked(&partitions[..2]);
+        assert_eq!(listener.revoked_count.load(Ordering::Relaxed), 2);
+
+        listener.on_partitions_lost(&partitions[..1]);
+        assert_eq!(listener.lost_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_heartbeat_controller_creation() {
+        let controller = HeartbeatController::new(Duration::from_secs(3), Duration::from_secs(30));
+
+        assert_eq!(controller.interval(), Duration::from_secs(3));
+        assert_eq!(controller.session_timeout(), Duration::from_secs(30));
+        assert!(!controller.is_running());
+    }
+
+    #[test]
+    fn test_heartbeat_controller_start_stop() {
+        let controller = HeartbeatController::new(Duration::from_secs(3), Duration::from_secs(30));
+
+        assert!(!controller.is_running());
+        controller.start();
+        assert!(controller.is_running());
+        controller.stop();
+        assert!(!controller.is_running());
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_controller_success() {
+        let controller = HeartbeatController::new(Duration::from_secs(3), Duration::from_secs(30));
+
+        // Initially, no heartbeat recorded
+        assert!(controller.time_since_last_heartbeat().await.is_none());
+        assert!(!controller.may_have_timed_out().await);
+
+        // Record a heartbeat
+        controller.heartbeat_success().await;
+
+        // Now we should have a recent heartbeat
+        let elapsed = controller.time_since_last_heartbeat().await.unwrap();
+        assert!(elapsed < Duration::from_secs(1));
+        assert!(!controller.may_have_timed_out().await);
+    }
+
+    #[test]
+    fn test_heartbeat_status_requires_rejoin() {
+        assert!(!HeartbeatStatus::Ok.requires_rejoin());
+        assert!(HeartbeatStatus::RebalanceNeeded.requires_rejoin());
+        assert!(HeartbeatStatus::UnknownMember.requires_rejoin());
+        assert!(HeartbeatStatus::IllegalGeneration.requires_rejoin());
+        assert!(HeartbeatStatus::SessionTimeout.requires_rejoin());
+        assert!(!HeartbeatStatus::FatalError.requires_rejoin());
+    }
+
+    #[test]
+    fn test_heartbeat_status_is_fatal() {
+        assert!(!HeartbeatStatus::Ok.is_fatal());
+        assert!(!HeartbeatStatus::RebalanceNeeded.is_fatal());
+        assert!(HeartbeatStatus::FatalError.is_fatal());
+    }
+
+    #[test]
+    fn test_cooperative_sticky_assignor_basic() {
+        let assignor = CooperativeStickyAssignor::new();
+        assert_eq!(assignor.name(), "cooperative-sticky");
+
+        let topics = vec!["topic1".to_string()];
+        let mut partitions = HashMap::new();
+        partitions.insert("topic1".to_string(), vec![0, 1, 2, 3]);
+
+        let members = vec![
+            GroupMember {
+                member_id: "member-1".to_string(),
+                client_id: "client-1".to_string(),
+                client_host: "host-1".to_string(),
+                metadata: vec![],
+                assignment: vec![],
+            },
+            GroupMember {
+                member_id: "member-2".to_string(),
+                client_id: "client-2".to_string(),
+                client_host: "host-2".to_string(),
+                metadata: vec![],
+                assignment: vec![],
+            },
+        ];
+
+        let assignments = assignor.assign(&topics, &partitions, &members);
+
+        assert_eq!(assignments.len(), 2);
+        let member1_parts: Vec<_> = assignments.get("member-1").unwrap().all_partitions();
+        let member2_parts: Vec<_> = assignments.get("member-2").unwrap().all_partitions();
+
+        // Each member should have 2 partitions (4 total / 2 members)
+        assert_eq!(member1_parts.len(), 2);
+        assert_eq!(member2_parts.len(), 2);
+    }
+
+    #[test]
+    fn test_cooperative_sticky_assignor_stickiness() {
+        let assignor = CooperativeStickyAssignor::new();
+
+        let topics = vec!["topic1".to_string()];
+        let mut partitions = HashMap::new();
+        partitions.insert("topic1".to_string(), vec![0, 1, 2, 3]);
+
+        let members = vec![
+            GroupMember {
+                member_id: "member-1".to_string(),
+                client_id: "client-1".to_string(),
+                client_host: "host-1".to_string(),
+                metadata: vec![],
+                assignment: vec![],
+            },
+            GroupMember {
+                member_id: "member-2".to_string(),
+                client_id: "client-2".to_string(),
+                client_host: "host-2".to_string(),
+                metadata: vec![],
+                assignment: vec![],
+            },
+        ];
+
+        // First assignment
+        let assignments = assignor.assign(&topics, &partitions, &members);
+
+        // Record assignments for stickiness
+        for (member_id, assignment) in &assignments {
+            assignor.record_assignment(member_id, assignment);
+        }
+
+        // Assign again with same members - should maintain stickiness
+        let second_assignments = assignor.assign(&topics, &partitions, &members);
+
+        // Assignments should be identical (sticky)
+        for member_id in ["member-1", "member-2"] {
+            let first = assignments.get(member_id).unwrap();
+            let second = second_assignments.get(member_id).unwrap();
+            assert_eq!(first.partitions, second.partitions);
+        }
+    }
+
+    #[test]
+    fn test_cooperative_sticky_assignor_new_member() {
+        let assignor = CooperativeStickyAssignor::new();
+
+        let topics = vec!["topic1".to_string()];
+        let mut partitions = HashMap::new();
+        partitions.insert("topic1".to_string(), vec![0, 1, 2, 3, 4, 5]);
+
+        // Initially 2 members
+        let members_initial = vec![
+            GroupMember {
+                member_id: "member-1".to_string(),
+                client_id: "client-1".to_string(),
+                client_host: "host-1".to_string(),
+                metadata: vec![],
+                assignment: vec![],
+            },
+            GroupMember {
+                member_id: "member-2".to_string(),
+                client_id: "client-2".to_string(),
+                client_host: "host-2".to_string(),
+                metadata: vec![],
+                assignment: vec![],
+            },
+        ];
+
+        let initial_assignments = assignor.assign(&topics, &partitions, &members_initial);
+
+        // Record assignments
+        for (member_id, assignment) in &initial_assignments {
+            assignor.record_assignment(member_id, assignment);
+        }
+
+        // Add a third member
+        let members_new = vec![
+            GroupMember {
+                member_id: "member-1".to_string(),
+                client_id: "client-1".to_string(),
+                client_host: "host-1".to_string(),
+                metadata: vec![],
+                assignment: vec![],
+            },
+            GroupMember {
+                member_id: "member-2".to_string(),
+                client_id: "client-2".to_string(),
+                client_host: "host-2".to_string(),
+                metadata: vec![],
+                assignment: vec![],
+            },
+            GroupMember {
+                member_id: "member-3".to_string(),
+                client_id: "client-3".to_string(),
+                client_host: "host-3".to_string(),
+                metadata: vec![],
+                assignment: vec![],
+            },
+        ];
+
+        let new_assignments = assignor.assign(&topics, &partitions, &members_new);
+
+        // All 3 members should get 2 partitions each (6 / 3 = 2)
+        for member_id in ["member-1", "member-2", "member-3"] {
+            let parts = new_assignments.get(member_id).unwrap().all_partitions();
+            assert_eq!(
+                parts.len(),
+                2,
+                "Member {} should have 2 partitions",
+                member_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_cooperative_sticky_get_partitions_to_revoke() {
+        let assignor = CooperativeStickyAssignor::new();
+
+        // Record old assignment
+        let mut old_assignment = MemberAssignment::empty();
+        old_assignment.add("topic1", vec![0, 1, 2]);
+        assignor.record_assignment("member-1", &old_assignment);
+
+        // New assignment loses partition 2
+        let mut new_assignment = MemberAssignment::empty();
+        new_assignment.add("topic1", vec![0, 1]);
+
+        let revoked = assignor.get_partitions_to_revoke("member-1", &new_assignment);
+
+        assert_eq!(revoked.len(), 1);
+        assert_eq!(revoked[0], ("topic1".to_string(), 2));
+    }
+}

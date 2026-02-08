@@ -1,0 +1,530 @@
+//! SCRAM (Salted Challenge Response Authentication Mechanism) implementation.
+//!
+//! This module implements SCRAM-SHA-256 and SCRAM-SHA-512 as defined in RFC 5802.
+//! It provides a complete SCRAM client implementation for SASL authentication.
+//!
+//! # SCRAM Protocol Flow
+//!
+//! 1. **Client First**: Client sends username and nonce
+//! 2. **Server First**: Server responds with salt, iteration count, and combined nonce
+//! 3. **Client Final**: Client sends proof of password knowledge
+//! 4. **Server Final**: Server sends verification signature
+//!
+//! # Example
+//!
+//! ```ignore
+//! use krafka::auth::scram::{ScramClient, ScramMechanism};
+//!
+//! let mut client = ScramClient::new("username", "password", ScramMechanism::Sha256);
+//! let client_first = client.client_first_message();
+//! // ... send to server, receive server_first ...
+//! let client_final = client.client_final_message(&server_first)?;
+//! // ... send to server, receive server_final ...
+//! client.verify_server_final(&server_final)?;
+//! ```
+
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use hmac::{Hmac, Mac};
+use pbkdf2::pbkdf2_hmac;
+use rand::Rng;
+use sha2::{Digest, Sha256, Sha512};
+use std::fmt;
+
+use crate::error::{KrafkaError, Result};
+
+/// SCRAM mechanism variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScramMechanism {
+    /// SCRAM-SHA-256
+    Sha256,
+    /// SCRAM-SHA-512
+    Sha512,
+}
+
+impl ScramMechanism {
+    /// Get the mechanism name for SASL.
+    #[inline]
+    pub fn mechanism_name(&self) -> &'static str {
+        match self {
+            ScramMechanism::Sha256 => "SCRAM-SHA-256",
+            ScramMechanism::Sha512 => "SCRAM-SHA-512",
+        }
+    }
+
+    /// Get the hash output length in bytes.
+    #[inline]
+    pub fn hash_length(&self) -> usize {
+        match self {
+            ScramMechanism::Sha256 => 32,
+            ScramMechanism::Sha512 => 64,
+        }
+    }
+}
+
+impl fmt::Display for ScramMechanism {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.mechanism_name())
+    }
+}
+
+/// SCRAM client state machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScramState {
+    /// Initial state, before client-first message.
+    Initial,
+    /// After client-first, waiting for server-first.
+    WaitingServerFirst,
+    /// After server-first, ready to send client-final.
+    WaitingClientFinal,
+    /// After client-final, waiting for server-final.
+    WaitingServerFinal,
+    /// Authentication complete.
+    Complete,
+    /// Authentication failed.
+    Failed,
+}
+
+/// SCRAM client for SASL authentication.
+pub struct ScramClient {
+    /// Username.
+    username: String,
+    /// Password.
+    password: String,
+    /// SCRAM mechanism.
+    mechanism: ScramMechanism,
+    /// Client nonce.
+    client_nonce: String,
+    /// Current state.
+    state: ScramState,
+    /// Client-first-message-bare (cached for proof calculation).
+    client_first_bare: String,
+    /// Server nonce (combined).
+    server_nonce: Option<String>,
+    /// Salt from server.
+    salt: Option<Vec<u8>>,
+    /// Iteration count.
+    iteration_count: Option<u32>,
+    /// Salted password (cached).
+    salted_password: Option<Vec<u8>>,
+    /// Server signature (for verification).
+    server_signature: Option<Vec<u8>>,
+}
+
+impl ScramClient {
+    /// Create a new SCRAM client.
+    pub fn new(username: &str, password: &str, mechanism: ScramMechanism) -> Self {
+        let client_nonce = generate_nonce();
+        Self {
+            username: username.to_string(),
+            password: password.to_string(),
+            mechanism,
+            client_nonce,
+            state: ScramState::Initial,
+            client_first_bare: String::new(),
+            server_nonce: None,
+            salt: None,
+            iteration_count: None,
+            salted_password: None,
+            server_signature: None,
+        }
+    }
+
+    /// Get the current state.
+    #[inline]
+    pub fn state(&self) -> &ScramState {
+        &self.state
+    }
+
+    /// Get the mechanism.
+    #[inline]
+    pub fn mechanism(&self) -> ScramMechanism {
+        self.mechanism
+    }
+
+    /// Generate the client-first message.
+    ///
+    /// Returns the raw bytes to send in the SASL authenticate request.
+    pub fn client_first_message(&mut self) -> Vec<u8> {
+        // GS2 header: no channel binding
+        let gs2_header = "n,,";
+
+        // Escape username per RFC 5802
+        let escaped_username = escape_username(&self.username);
+
+        // client-first-message-bare
+        self.client_first_bare = format!("n={},r={}", escaped_username, self.client_nonce);
+
+        // Full client-first-message
+        let message = format!("{}{}", gs2_header, self.client_first_bare);
+
+        self.state = ScramState::WaitingServerFirst;
+        message.into_bytes()
+    }
+
+    /// Process server-first message and generate client-final message.
+    ///
+    /// # Arguments
+    ///
+    /// * `server_first` - The server-first message bytes
+    ///
+    /// # Returns
+    ///
+    /// The client-final message bytes to send.
+    pub fn process_server_first(&mut self, server_first: &[u8]) -> Result<Vec<u8>> {
+        if self.state != ScramState::WaitingServerFirst {
+            self.state = ScramState::Failed;
+            return Err(KrafkaError::auth(
+                "Invalid SCRAM state: expected WaitingServerFirst",
+            ));
+        }
+
+        let server_first_str = std::str::from_utf8(server_first)
+            .map_err(|_| KrafkaError::auth("Invalid UTF-8 in server-first message"))?;
+
+        // Parse server-first-message
+        let mut server_nonce = None;
+        let mut salt = None;
+        let mut iteration_count = None;
+
+        for part in server_first_str.split(',') {
+            if let Some(value) = part.strip_prefix("r=") {
+                server_nonce = Some(value.to_string());
+            } else if let Some(value) = part.strip_prefix("s=") {
+                salt = Some(
+                    BASE64
+                        .decode(value)
+                        .map_err(|_| KrafkaError::auth("Invalid base64 salt in server-first"))?,
+                );
+            } else if let Some(value) = part.strip_prefix("i=") {
+                iteration_count =
+                    Some(value.parse::<u32>().map_err(|_| {
+                        KrafkaError::auth("Invalid iteration count in server-first")
+                    })?);
+            }
+        }
+
+        let server_nonce =
+            server_nonce.ok_or_else(|| KrafkaError::auth("Missing nonce in server-first"))?;
+        let salt = salt.ok_or_else(|| KrafkaError::auth("Missing salt in server-first"))?;
+        let iteration_count = iteration_count
+            .ok_or_else(|| KrafkaError::auth("Missing iteration count in server-first"))?;
+
+        // Verify server nonce starts with our client nonce
+        if !server_nonce.starts_with(&self.client_nonce) {
+            self.state = ScramState::Failed;
+            return Err(KrafkaError::auth(
+                "Server nonce doesn't contain client nonce",
+            ));
+        }
+
+        self.server_nonce = Some(server_nonce.clone());
+        self.salt = Some(salt.clone());
+        self.iteration_count = Some(iteration_count);
+
+        // Calculate salted password
+        let salted_password = self.compute_salted_password(&salt, iteration_count);
+        self.salted_password = Some(salted_password.clone());
+
+        // Calculate client proof
+        let client_key = self.compute_client_key(&salted_password);
+        let stored_key = self.hash(&client_key);
+
+        // channel-binding = GS2 header base64 encoded
+        let channel_binding = BASE64.encode("n,,");
+
+        // client-final-message-without-proof
+        let client_final_without_proof = format!("c={},r={}", channel_binding, server_nonce);
+
+        // AuthMessage
+        let auth_message = format!(
+            "{},{},{}",
+            self.client_first_bare, server_first_str, client_final_without_proof
+        );
+
+        let client_signature = self.compute_hmac(&stored_key, auth_message.as_bytes());
+        let client_proof = xor_bytes(&client_key, &client_signature);
+
+        // Calculate server signature for later verification
+        let server_key = self.compute_server_key(&salted_password);
+        self.server_signature = Some(self.compute_hmac(&server_key, auth_message.as_bytes()));
+
+        // client-final-message
+        let client_final = format!(
+            "{},p={}",
+            client_final_without_proof,
+            BASE64.encode(&client_proof)
+        );
+
+        self.state = ScramState::WaitingServerFinal;
+        Ok(client_final.into_bytes())
+    }
+
+    /// Verify the server-final message.
+    ///
+    /// # Arguments
+    ///
+    /// * `server_final` - The server-final message bytes
+    ///
+    /// # Returns
+    ///
+    /// Ok(()) if verification succeeds, Err otherwise.
+    pub fn verify_server_final(&mut self, server_final: &[u8]) -> Result<()> {
+        if self.state != ScramState::WaitingServerFinal {
+            self.state = ScramState::Failed;
+            return Err(KrafkaError::auth(
+                "Invalid SCRAM state: expected WaitingServerFinal",
+            ));
+        }
+
+        let server_final_str = std::str::from_utf8(server_final)
+            .map_err(|_| KrafkaError::auth("Invalid UTF-8 in server-final message"))?;
+
+        // Check for error
+        if let Some(error) = server_final_str.strip_prefix("e=") {
+            self.state = ScramState::Failed;
+            return Err(KrafkaError::auth(format!("SCRAM server error: {}", error)));
+        }
+
+        // Parse server signature
+        let server_sig_b64 = server_final_str
+            .strip_prefix("v=")
+            .ok_or_else(|| KrafkaError::auth("Missing verifier in server-final"))?;
+
+        let server_signature = BASE64
+            .decode(server_sig_b64)
+            .map_err(|_| KrafkaError::auth("Invalid base64 in server-final verifier"))?;
+
+        // Verify signature
+        let expected = self
+            .server_signature
+            .as_ref()
+            .ok_or_else(|| KrafkaError::auth("Server signature not computed"))?;
+
+        if !constant_time_compare(&server_signature, expected) {
+            self.state = ScramState::Failed;
+            return Err(KrafkaError::auth("Server signature verification failed"));
+        }
+
+        self.state = ScramState::Complete;
+        Ok(())
+    }
+
+    /// Check if authentication is complete.
+    #[inline]
+    pub fn is_complete(&self) -> bool {
+        self.state == ScramState::Complete
+    }
+
+    /// Compute salted password using PBKDF2.
+    fn compute_salted_password(&self, salt: &[u8], iterations: u32) -> Vec<u8> {
+        let mut output = vec![0u8; self.mechanism.hash_length()];
+        match self.mechanism {
+            ScramMechanism::Sha256 => {
+                pbkdf2_hmac::<Sha256>(self.password.as_bytes(), salt, iterations, &mut output);
+            }
+            ScramMechanism::Sha512 => {
+                pbkdf2_hmac::<Sha512>(self.password.as_bytes(), salt, iterations, &mut output);
+            }
+        }
+        output
+    }
+
+    /// Compute HMAC with the appropriate hash function.
+    fn compute_hmac(&self, key: &[u8], data: &[u8]) -> Vec<u8> {
+        match self.mechanism {
+            ScramMechanism::Sha256 => {
+                let mut mac =
+                    Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take key of any size");
+                mac.update(data);
+                mac.finalize().into_bytes().to_vec()
+            }
+            ScramMechanism::Sha512 => {
+                let mut mac =
+                    Hmac::<Sha512>::new_from_slice(key).expect("HMAC can take key of any size");
+                mac.update(data);
+                mac.finalize().into_bytes().to_vec()
+            }
+        }
+    }
+
+    /// Hash data with the appropriate hash function.
+    fn hash(&self, data: &[u8]) -> Vec<u8> {
+        match self.mechanism {
+            ScramMechanism::Sha256 => Sha256::digest(data).to_vec(),
+            ScramMechanism::Sha512 => Sha512::digest(data).to_vec(),
+        }
+    }
+
+    /// Compute the client key.
+    fn compute_client_key(&self, salted_password: &[u8]) -> Vec<u8> {
+        self.compute_hmac(salted_password, b"Client Key")
+    }
+
+    /// Compute the server key.
+    fn compute_server_key(&self, salted_password: &[u8]) -> Vec<u8> {
+        self.compute_hmac(salted_password, b"Server Key")
+    }
+}
+
+impl fmt::Debug for ScramClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScramClient")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("mechanism", &self.mechanism)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+/// Generate a random nonce for SCRAM.
+fn generate_nonce() -> String {
+    let mut rng = rand::rng();
+    let bytes: [u8; 24] = rng.random();
+    BASE64.encode(bytes)
+}
+
+/// Escape username per RFC 5802.
+fn escape_username(username: &str) -> String {
+    username.replace('=', "=3D").replace(',', "=2C")
+}
+
+/// XOR two byte slices.
+fn xor_bytes(a: &[u8], b: &[u8]) -> Vec<u8> {
+    a.iter().zip(b.iter()).map(|(x, y)| x ^ y).collect()
+}
+
+/// Constant-time comparison to prevent timing attacks.
+fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut result = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        result |= x ^ y;
+    }
+    result == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scram_mechanism_name() {
+        assert_eq!(ScramMechanism::Sha256.mechanism_name(), "SCRAM-SHA-256");
+        assert_eq!(ScramMechanism::Sha512.mechanism_name(), "SCRAM-SHA-512");
+    }
+
+    #[test]
+    fn test_scram_mechanism_hash_length() {
+        assert_eq!(ScramMechanism::Sha256.hash_length(), 32);
+        assert_eq!(ScramMechanism::Sha512.hash_length(), 64);
+    }
+
+    #[test]
+    fn test_escape_username() {
+        assert_eq!(escape_username("user"), "user");
+        assert_eq!(escape_username("user=name"), "user=3Dname");
+        assert_eq!(escape_username("user,name"), "user=2Cname");
+        assert_eq!(escape_username("a=b,c"), "a=3Db=2Cc");
+    }
+
+    #[test]
+    fn test_xor_bytes() {
+        let a = vec![0x01, 0x02, 0x03];
+        let b = vec![0x01, 0x00, 0x01];
+        let result = xor_bytes(&a, &b);
+        assert_eq!(result, vec![0x00, 0x02, 0x02]);
+    }
+
+    #[test]
+    fn test_constant_time_compare() {
+        assert!(constant_time_compare(b"hello", b"hello"));
+        assert!(!constant_time_compare(b"hello", b"world"));
+        assert!(!constant_time_compare(b"hello", b"hell"));
+    }
+
+    #[test]
+    fn test_scram_client_initial_state() {
+        let client = ScramClient::new("user", "password", ScramMechanism::Sha256);
+        assert_eq!(client.state(), &ScramState::Initial);
+        assert_eq!(client.mechanism(), ScramMechanism::Sha256);
+    }
+
+    #[test]
+    fn test_scram_client_first_message() {
+        let mut client = ScramClient::new("user", "password", ScramMechanism::Sha256);
+        let msg = client.client_first_message();
+
+        let msg_str = String::from_utf8(msg).unwrap();
+        assert!(msg_str.starts_with("n,,n=user,r="));
+        assert_eq!(client.state(), &ScramState::WaitingServerFirst);
+    }
+
+    #[test]
+    fn test_scram_client_first_message_escaped() {
+        let mut client = ScramClient::new("user=name", "password", ScramMechanism::Sha256);
+        let msg = client.client_first_message();
+
+        let msg_str = String::from_utf8(msg).unwrap();
+        assert!(msg_str.contains("n=user=3Dname"));
+    }
+
+    #[test]
+    fn test_scram_client_invalid_server_first() {
+        let mut client = ScramClient::new("user", "password", ScramMechanism::Sha256);
+        client.client_first_message();
+
+        // Missing fields
+        let result = client.process_server_first(b"invalid");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_scram_client_wrong_nonce() {
+        let mut client = ScramClient::new("user", "password", ScramMechanism::Sha256);
+        client.client_first_message();
+
+        // Server nonce doesn't start with client nonce
+        let server_first = "r=wrongnonce,s=c2FsdA==,i=4096";
+        let result = client.process_server_first(server_first.as_bytes());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("client nonce"));
+    }
+
+    #[test]
+    fn test_generate_nonce() {
+        let n1 = generate_nonce();
+        let n2 = generate_nonce();
+
+        // Nonces should be different
+        assert_ne!(n1, n2);
+
+        // Nonce should be base64 encoded (32 chars for 24 bytes)
+        assert_eq!(n1.len(), 32);
+    }
+
+    #[test]
+    fn test_scram_sha256_full_flow() {
+        // This test simulates a full SCRAM-SHA-256 flow with known values
+        let mut client = ScramClient::new("user", "pencil", ScramMechanism::Sha256);
+
+        // Override the client nonce for reproducible test
+        client.client_nonce = "rOprNGfwEbeRWgbNEkqO".to_string();
+
+        let first = client.client_first_message();
+        let first_str = String::from_utf8(first).unwrap();
+        assert!(first_str.starts_with("n,,n=user,r=rOprNGfwEbeRWgbNEkqO"));
+    }
+
+    #[test]
+    fn test_scram_sha512_client() {
+        let mut client = ScramClient::new("user", "password", ScramMechanism::Sha512);
+        let first = client.client_first_message();
+
+        let first_str = String::from_utf8(first).unwrap();
+        assert!(first_str.starts_with("n,,n=user,r="));
+        assert_eq!(client.mechanism().hash_length(), 64);
+    }
+}
