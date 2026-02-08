@@ -2105,8 +2105,7 @@ mod tests {
             assert_eq!(
                 parts.len(),
                 2,
-                "Member {} should have 2 partitions",
-                member_id
+                "Member {member_id} should have 2 partitions"
             );
         }
     }

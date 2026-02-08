@@ -1050,8 +1050,7 @@ mod tests {
             assert_eq!(
                 decoded.records.len(),
                 3,
-                "Failed for compression {:?}",
-                compression
+                "Failed for compression {compression:?}"
             );
         }
     }

@@ -560,7 +560,7 @@ mod tests {
     #[test]
     fn test_credentials_debug_redacts_password() {
         let creds = PlainCredentials::new("user", "secret");
-        let debug_str = format!("{:?}", creds);
+        let debug_str = format!("{creds:?}");
         assert!(debug_str.contains("user"));
         assert!(debug_str.contains("[REDACTED]"));
         assert!(!debug_str.contains("secret"));
@@ -589,7 +589,7 @@ mod tests {
     #[test]
     fn test_aws_msk_credentials_debug_redacts() {
         let creds = AwsMskIamCredentials::new("AKID123", "supersecret", "us-east-1");
-        let debug_str = format!("{:?}", creds);
+        let debug_str = format!("{creds:?}");
         assert!(debug_str.contains("AKID123"));
         assert!(debug_str.contains("[REDACTED]"));
         assert!(!debug_str.contains("supersecret"));
