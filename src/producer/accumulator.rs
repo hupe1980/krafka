@@ -386,7 +386,7 @@ impl RecordAccumulator {
                 Ok(c) => c,
                 Err(e) => {
                     // Fail all pending records with the same error message
-                    let error_msg = format!("{}", e);
+                    let error_msg = e.to_string();
                     for pending in accumulator_batch.pending {
                         let _ = pending
                             .response_tx
@@ -425,7 +425,7 @@ impl RecordAccumulator {
                 Ok(b) => b,
                 Err(e) => {
                     // Fail all pending records
-                    let error_msg = format!("{}", e);
+                    let error_msg = e.to_string();
                     for pending in accumulator_batch.pending {
                         let _ = pending
                             .response_tx
@@ -510,7 +510,7 @@ impl RecordAccumulator {
                             }
                         }
                         Err(e) => {
-                            let error_msg = format!("{}", e);
+                            let error_msg = e.to_string();
                             for pending in accumulator_batch.pending {
                                 let _ = pending
                                     .response_tx
@@ -521,7 +521,7 @@ impl RecordAccumulator {
                 }
                 Err(e) => {
                     warn!("Failed to send batch: {:?}", e);
-                    let error_msg = format!("{}", e);
+                    let error_msg = e.to_string();
                     for pending in accumulator_batch.pending {
                         let _ = pending
                             .response_tx

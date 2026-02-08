@@ -165,7 +165,7 @@ mod tests {
             let mut buf = BytesMut::new();
             varint::encode_signed_varint(value, &mut buf);
             let decoded = varint::decode_signed_varint(&mut buf.freeze()).unwrap();
-            assert_eq!(decoded, value, "Failed for value {}", value);
+            assert_eq!(decoded, value, "Failed for value {value}");
         }
     }
 
@@ -188,7 +188,7 @@ mod tests {
             let mut buf = BytesMut::new();
             varint::encode_signed_varlong(value, &mut buf);
             let decoded = varint::decode_signed_varlong(&mut buf.freeze()).unwrap();
-            assert_eq!(decoded, value, "Failed for value {}", value);
+            assert_eq!(decoded, value, "Failed for value {value}");
         }
     }
 

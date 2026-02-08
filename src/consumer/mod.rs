@@ -717,10 +717,10 @@ impl Consumer {
         self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
 
         // Leave consumer group if we have a group coordinator
-        if let Some(ref coordinator) = self.group_coordinator {
-            if let Err(e) = coordinator.leave_group().await {
-                warn!("Error leaving consumer group: {}", e);
-            }
+        if let Some(ref coordinator) = self.group_coordinator
+            && let Err(e) = coordinator.leave_group().await
+        {
+            warn!("Error leaving consumer group: {e}");
         }
 
         self.pool.close_all().await;

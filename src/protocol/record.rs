@@ -1135,11 +1135,11 @@ mod tests {
             let encoded = batch.encode().unwrap();
             let lazy = LazyRecordBatch::decode(&mut encoded.clone()).unwrap();
 
-            assert_eq!(lazy.len(), 2, "Failed for compression {:?}", compression);
+            assert_eq!(lazy.len(), 2, "Failed for compression {compression:?}");
 
             let records: Result<Vec<_>> = lazy.records().collect();
             let records = records.unwrap();
-            assert_eq!(records.len(), 2, "Failed for compression {:?}", compression);
+            assert_eq!(records.len(), 2, "Failed for compression {compression:?}");
         }
     }
 }
