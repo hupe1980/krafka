@@ -76,11 +76,11 @@ jobs:
         timeout-minutes: 15
 
   msrv:
-    name: MSRV (1.85)
+    name: MSRV (1.87)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.87
       - uses: Swatinem/rust-cache@v2
       # Skip aws-msk feature - AWS SDK requires newer Rust
       - run: cargo check

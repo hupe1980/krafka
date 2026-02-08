@@ -2,7 +2,7 @@
 name = "krafka"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 authors = ["hupe1980"]
 description = "A pure Rust, async-native Apache Kafka client"
 license = "MIT"

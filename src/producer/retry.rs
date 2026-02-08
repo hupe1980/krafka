@@ -96,7 +96,7 @@ impl RetryPolicy {
         let jitter = if self.jitter_factor > 0.0 {
             // Simple deterministic "jitter" based on attempt number for reproducibility
             // In production, consider using rand crate
-            let jitter_sign = if attempt % 2 == 0 { 1.0 } else { -1.0 };
+            let jitter_sign = if attempt.is_multiple_of(2) { 1.0 } else { -1.0 };
             jitter_sign * jitter_range * 0.5
         } else {
             0.0

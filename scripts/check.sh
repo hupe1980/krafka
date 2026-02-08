@@ -253,7 +253,7 @@ fi
 # MSRV check (requires the toolchain to be installed)
 # Note: aws-msk feature requires newer Rust, so we check without it
 # Note: Edition 2024 features may not fully work on older toolchains
-MSRV="1.85"
+MSRV="1.87"
 if rustup run "$MSRV" cargo --version &> /dev/null; then
     run_check_optional "MSRV ($MSRV)" rustup run "$MSRV" cargo check --no-default-features
 else
