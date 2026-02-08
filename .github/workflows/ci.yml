@@ -72,6 +72,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Pre-pull Kafka image
+        run: |
+          for i in 1 2 3; do
+            docker pull confluentinc/cp-kafka:7.5.0 && break
+            echo "Retry $i failed, waiting..."
+            sleep 10
+          done
       - run: cargo test --test integration_tests -- --ignored
         timeout-minutes: 15
 
