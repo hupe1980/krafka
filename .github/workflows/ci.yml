@@ -9,8 +9,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
-  # Edition 2024 with let-chains requires Rust 1.87+
-  RUST_VERSION: "1.87"
+  # Edition 2024 with let-chains requires Rust 1.87+, AWS SDK requires 1.88+
+  RUST_VERSION: "1.88"
 
 jobs:
   check:
