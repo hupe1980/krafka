@@ -16,8 +16,8 @@ fn bench_record_batch_decoding(c: &mut Criterion) {
         // Create a batch to decode
         let mut builder = RecordBatchBuilder::new().compression(Compression::None);
         for i in 0..batch_size {
-            let key = format!("key-{}", i);
-            let value = format!("value-{}-with-some-payload-data", i);
+            let key = format!("key-{i}");
+            let value = format!("value-{i}-with-some-payload-data");
             builder = builder.add_record(
                 Some(key.as_bytes().to_vec()),
                 Some(value.as_bytes().to_vec()),
@@ -53,11 +53,8 @@ fn bench_decompression(c: &mut Criterion) {
     let records: Vec<(String, String)> = (0..100)
         .map(|i| {
             (
-                format!("key-{}", i),
-                format!(
-                    "value-{}-with-realistic-compressible-message-payload-that-repeats",
-                    i
-                ),
+                format!("key-{i}"),
+                format!("value-{i}-with-realistic-compressible-message-payload-that-repeats"),
             )
         })
         .collect();
@@ -80,7 +77,7 @@ fn bench_decompression(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(100));
         group.bench_with_input(
-            BenchmarkId::new("codec", format!("{:?}", compression)),
+            BenchmarkId::new("codec", format!("{compression:?}")),
             &encoded,
             |b, encoded| {
                 b.iter(|| {
@@ -104,8 +101,8 @@ fn bench_record_iteration(c: &mut Criterion) {
     for batch_size in [10, 100, 1000] {
         let mut builder = RecordBatchBuilder::new();
         for i in 0..batch_size {
-            let key = format!("key-{}", i);
-            let value = format!("value-{}", i);
+            let key = format!("key-{i}");
+            let value = format!("value-{i}");
             builder = builder.add_record(
                 Some(key.as_bytes().to_vec()),
                 Some(value.as_bytes().to_vec()),
@@ -146,8 +143,8 @@ fn bench_lazy_vs_eager_decoding(c: &mut Criterion) {
     for batch_size in [10, 100, 500] {
         let mut builder = RecordBatchBuilder::new().compression(Compression::Lz4);
         for i in 0..batch_size {
-            let key = format!("key-{}", i);
-            let value = format!("value-{}-with-payload-data", i);
+            let key = format!("key-{i}");
+            let value = format!("value-{i}-with-payload-data");
             builder = builder.add_record(
                 Some(key.as_bytes().to_vec()),
                 Some(value.as_bytes().to_vec()),

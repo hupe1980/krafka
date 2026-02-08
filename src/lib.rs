@@ -1,6 +1,3 @@
-// Clippy configuration
-#![allow(clippy::uninlined_format_args)]
-
 //! # Krafka
 //!
 //! A pure Rust, async-native Apache Kafka client.

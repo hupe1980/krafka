@@ -21,8 +21,8 @@ fn bench_record_batch_encoding(c: &mut Criterion) {
                 b.iter(|| {
                     let mut builder = RecordBatchBuilder::new();
                     for i in 0..size {
-                        let key = format!("key-{}", i);
-                        let value = format!("value-{}-with-some-additional-payload", i);
+                        let key = format!("key-{i}");
+                        let value = format!("value-{i}-with-some-additional-payload");
                         builder = builder.add_record(
                             Some(key.as_bytes().to_vec()),
                             Some(value.as_bytes().to_vec()),
@@ -46,11 +46,8 @@ fn bench_compression(c: &mut Criterion) {
     let records: Vec<(String, String)> = (0..100)
         .map(|i| {
             (
-                format!("key-{}", i),
-                format!(
-                    "value-{}-with-realistic-message-payload-that-is-compressible",
-                    i
-                ),
+                format!("key-{i}"),
+                format!("value-{i}-with-realistic-message-payload-that-is-compressible"),
             )
         })
         .collect();
@@ -65,7 +62,7 @@ fn bench_compression(c: &mut Criterion) {
         group.throughput(Throughput::Elements(100));
 
         group.bench_with_input(
-            BenchmarkId::new("codec", format!("{:?}", compression)),
+            BenchmarkId::new("codec", format!("{compression:?}")),
             &compression,
             |b, &compression| {
                 b.iter(|| {
@@ -145,7 +142,7 @@ fn bench_roundtrip_latency(c: &mut Criterion) {
 
     // Test with realistic message sizes
     for msg_size in [100, 1000, 10000] {
-        let key = format!("key-{}", msg_size);
+        let key = format!("key-{msg_size}");
         let value: String = (0..msg_size)
             .map(|i| (b'a' + (i % 26) as u8) as char)
             .collect();
@@ -185,9 +182,7 @@ fn bench_partitioners(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("partitioners");
 
-    let keys: Vec<Vec<u8>> = (0..1000)
-        .map(|i| format!("key-{}", i).into_bytes())
-        .collect();
+    let keys: Vec<Vec<u8>> = (0..1000).map(|i| format!("key-{i}").into_bytes()).collect();
     let partition_count = 32;
 
     // DefaultPartitioner with keys
