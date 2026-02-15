@@ -17,7 +17,7 @@ Complete reference for all Krafka configuration options.
 | `client_id` | String | `"krafka"` | Client identifier sent with requests |
 | `acks` | Acks | `Leader` | Acknowledgment level for durability |
 | `compression` | Compression | `None` | Compression codec for messages |
-| `batch_size` | usize | `16384` | Maximum bytes per batch |
+| `batch_size` | usize | `16384` | Maximum bytes per batch (must be >= 1) |
 | `linger` | Duration | `0ms` | Time to wait for batching |
 | `request_timeout` | Duration | `30s` | Timeout for broker requests |
 | `retries` | u32 | `3` | Number of retries on failure |
@@ -88,7 +88,7 @@ let producer = Producer::builder()
 | `max_poll_records` | i32 | `500` | Max records per poll (strictly enforced) |
 | `session_timeout` | Duration | `10s` | Group session timeout |
 | `heartbeat_interval` | Duration | `3s` | Heartbeat interval |
-| `max_poll_interval` | Duration | `5m` | Max time between polls |
+| `max_poll_interval` | Duration | `5m` | Max time between polls (also used as the rebalance timeout) |
 | `isolation_level` | IsolationLevel | `ReadUncommitted` | Transaction isolation |
 | `request_timeout` | Duration | `30s` | Timeout for broker requests |
 | `metadata_max_age` | Duration | `5m` | Max age before metadata refresh |

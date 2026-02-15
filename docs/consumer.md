@@ -113,6 +113,8 @@ let consumer = Consumer::builder()
 
 > **Note:** After a consumer group rebalance, Krafka automatically fetches previously committed offsets from the group coordinator (OffsetFetch). Partitions without committed offsets use the configured `auto_offset_reset` policy.
 
+> **OffsetOutOfRange Recovery:** If the broker returns `OffsetOutOfRange` during a fetch (e.g., because a partition was truncated or the consumer fell behind log retention), Krafka automatically applies the configured `auto_offset_reset` policy to recover the partition instead of stalling.
+
 ### Offset Commit
 
 Control how offsets are committed. When auto-commit is enabled (the default), Krafka automatically commits offsets during each `poll()` call when the commit interval has elapsed, and also during `close()`:
@@ -379,6 +381,8 @@ For non-blocking commits:
 ```rust
 // Commit asynchronously (spawns a background task)
 // The commit is tracked and errors are logged if it fails.
+// If offset lock contention occurs, the commit cycle is skipped
+// and a warning is logged (rather than silently dropping the commit).
 consumer.commit_async();
 ```
 

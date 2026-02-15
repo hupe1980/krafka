@@ -1546,7 +1546,12 @@ impl AdminClientBuilder {
             .bootstrap_servers
             .split(',')
             .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
             .collect();
+
+        if bootstrap_servers.is_empty() {
+            return Err(KrafkaError::config("no bootstrap servers specified"));
+        }
 
         // Create connection config with client ID and auth
         let mut conn_config_builder = ConnectionConfig::builder()

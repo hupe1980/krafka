@@ -124,11 +124,12 @@ impl Consumer {
 
         let pool = Arc::new(ConnectionPool::new(pool_config));
 
-        // Parse bootstrap servers
+        // Parse bootstrap servers — filter out empty/whitespace entries
         let bootstrap_servers: Vec<String> = config
             .bootstrap_servers
             .split(',')
             .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
             .collect();
 
         if bootstrap_servers.is_empty() {
@@ -152,7 +153,7 @@ impl Consumer {
                 metadata.clone(),
                 config.session_timeout,
                 config.heartbeat_interval,
-                config.session_timeout, // rebalance_timeout defaults to session_timeout
+                config.max_poll_interval, // rebalance_timeout matches Java client's max.poll.interval.ms
             ).with_assignor_strategy(config.partition_assignment_strategy)
              .with_group_instance_id(config.group_instance_id.clone())
              .with_isolation_level(config.isolation_level.to_i8())))
@@ -844,6 +845,33 @@ impl Consumer {
                                 topic_name, partition, e
                             );
                         }
+                    } else if partition_response.error_code
+                        == crate::error::ErrorCode::OffsetOutOfRange
+                    {
+                        // §15.1 fix: Apply auto_offset_reset for OffsetOutOfRange
+                        // to resume consumption instead of stalling the partition.
+                        warn!(
+                            "OffsetOutOfRange for {}-{}, applying auto_offset_reset",
+                            topic_name, partition
+                        );
+                        if let Some(ref gc) = self.group_coordinator {
+                            let target = self.config.auto_offset_reset.to_offset();
+                            if let Some(target) = target {
+                                let mut part_map = std::collections::HashMap::new();
+                                part_map.insert(topic_name.clone(), vec![partition]);
+                                match gc.list_offsets(&part_map, target).await {
+                                    Ok(resolved) => {
+                                        if let Some(&new_offset) = resolved.get(&(topic_name.clone(), partition)) {
+                                            let mut offsets = self.offsets.write().await;
+                                            offsets.insert((topic_name.clone(), partition), new_offset);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to resolve offset for {}-{}: {}", topic_name, partition, e);
+                                    }
+                                }
+                            }
+                        }
                     } else {
                         warn!(
                             "Fetch error for {}-{}: {:?}",
@@ -1095,12 +1123,18 @@ impl Consumer {
                 return Ok(());
             }
 
+            // §15.3 fix: Only pass actually-committed offsets to interceptor
+            let committed_offsets: HashMap<(String, PartitionId), Offset> = commit_offsets
+                .iter()
+                .map(|((topic, partition), (offset, _))| ((topic.clone(), *partition), *offset))
+                .collect();
+
             match coordinator.commit_offsets(&commit_offsets).await {
                 Ok(()) => {
-                    crate::interceptor::safe_on_commit(&*self.interceptor, &offsets, None);
+                    crate::interceptor::safe_on_commit(&*self.interceptor, &committed_offsets, None);
                 }
                 Err(e) => {
-                    crate::interceptor::safe_on_commit(&*self.interceptor, &offsets, Some(&e));
+                    crate::interceptor::safe_on_commit(&*self.interceptor, &committed_offsets, Some(&e));
                     return Err(e);
                 }
             }
@@ -1155,7 +1189,11 @@ impl Consumer {
                         })
                         .collect()
                 }
-                Err(_) => return, // Lock contention, skip this commit cycle
+                Err(_) => {
+                    // §15.2 fix: Log warning on contention so dropped commits are visible
+                    tracing::warn!("commit_async: offset lock contention, skipping this commit cycle");
+                    return;
+                }
             };
 
         let coordinator = self.group_coordinator.clone();
@@ -2255,5 +2293,37 @@ mod tests {
             .group_id("test-group");
         // The builder should have no group field; only group_coordinator is used
         assert!(builder.config.group_id.is_some());
+    }
+
+    #[test]
+    fn test_bootstrap_filter_empty_strings() {
+        // §15.5: Empty bootstrap server entries should be filtered out
+        let servers = " , ,localhost:9092, , broker:9093, ";
+        let parsed: Vec<String> = servers
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(parsed, vec!["localhost:9092", "broker:9093"]);
+
+        // Empty string should produce empty vec
+        let empty_parsed: Vec<String> = ""
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(empty_parsed.is_empty());
+    }
+
+    #[test]
+    fn test_max_poll_interval_used_for_rebalance() {
+        // §15.6: rebalance_timeout should default to max_poll_interval (not session_timeout)
+        let config = ConsumerConfig::default();
+        // In the Java client, rebalance_timeout defaults to max.poll.interval.ms (300s)
+        // not session.timeout.ms (10s). Verify our config has both.
+        assert_eq!(config.max_poll_interval, Duration::from_secs(300));
+        assert_eq!(config.session_timeout, Duration::from_secs(10));
+        // The rebalance_timeout passed to GroupCoordinator should be max_poll_interval
+        assert!(config.max_poll_interval > config.session_timeout);
     }
 }

@@ -98,11 +98,12 @@ impl Producer {
 
         let pool = Arc::new(ConnectionPool::new(pool_config));
 
-        // Parse bootstrap servers
+        // Parse bootstrap servers — filter out empty/whitespace entries
         let bootstrap_servers: Vec<String> = config
             .bootstrap_servers
             .split(',')
             .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
             .collect();
 
         if bootstrap_servers.is_empty() {
@@ -667,6 +668,9 @@ impl ProducerBuilder {
                 "max_in_flight must be >= 1",
             ));
         }
+        if self.config.batch_size == 0 {
+            return Err(KrafkaError::config("batch_size must be >= 1"));
+        }
         let interceptor: Arc<dyn crate::interceptor::ProducerInterceptor> = self
             .interceptor
             .unwrap_or_else(|| Arc::new(crate::interceptor::NoOpProducerInterceptor));
@@ -849,6 +853,19 @@ mod tests {
         match result {
             Err(e) => assert!(e.to_string().contains("max_in_flight")),
             Ok(_) => panic!("expected error for max_in_flight=0"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_producer_builder_rejects_zero_batch_size() {
+        let mut builder = Producer::builder()
+            .bootstrap_servers("localhost:9092");
+        builder.config.batch_size = 0;
+        let result = builder.build().await;
+
+        match result {
+            Err(e) => assert!(e.to_string().contains("batch_size")),
+            Ok(_) => panic!("expected error for batch_size=0"),
         }
     }
 

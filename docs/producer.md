@@ -152,6 +152,8 @@ When `linger` is set (> 0ms), the producer uses a background accumulator to batc
 
 For ultra-low latency (linger = 0), records are sent immediately without batching.
 
+> **Note:** `batch_size` must be at least 1. Setting `batch_size` to 0 will cause the builder to return a configuration error.
+
 ```rust
 // High-throughput configuration
 let producer = Producer::builder()

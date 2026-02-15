@@ -66,6 +66,8 @@ ErrorCode::FencedInstanceId          // 82: Fenced instance ID
 ErrorCode::UnstableOffsetCommit      // 88: Unstable offset commit
 ```
 
+> **Note:** `OffsetOutOfRange` errors during fetch are automatically handled by the consumer — it applies the configured `auto_offset_reset` policy to recover the affected partition without returning an error to the application.
+
 ### Checking Error Codes
 
 ```rust

@@ -960,7 +960,8 @@ async fn test_multiple_topics_subscription() {
     // Verify we got messages from both topics
     let topics: std::collections::HashSet<_> =
         all_records.iter().map(|r| r.topic.as_str()).collect();
-    assert!(topics.contains(topic1) || topics.contains(topic2));
+    assert!(topics.contains(topic1) && topics.contains(topic2),
+        "Should contain messages from both topics, got: {:?}", topics);
 }
 
 #[tokio::test]
@@ -1527,9 +1528,17 @@ async fn test_producer_timestamp_propagation() {
 
     assert!(!records.is_empty(), "Expected at least one record");
     let record = &records[0];
-    // Timestamp should match what we sent (broker may use LogAppendTime
-    // depending on config, but with CreateTime it should match)
+    // With the default CreateTime policy, the timestamp should match exactly.
+    // LogAppendTime would override it, so we accept either exact match or > 0.
     assert!(record.timestamp > 0, "Timestamp should be set");
+    if record.timestamp != timestamp {
+        // LogAppendTime override — just ensure it's a reasonable recent timestamp
+        assert!(
+            record.timestamp > 1_600_000_000_000,
+            "Timestamp should be a reasonable epoch ms, got {}",
+            record.timestamp
+        );
+    }
 }
 
 #[tokio::test]
@@ -1703,4 +1712,664 @@ async fn test_producer_metrics() {
 
     producer.close().await;
     assert!(producer.is_closed(), "Producer should be closed");
+}
+
+// ============================================================================
+// Round 15 — New integration tests for coverage gaps
+// ============================================================================
+
+/// Test that sending after producer.close() returns an error (not a panic).
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_send_after_producer_close() {
+    use krafka::producer::Producer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "send-after-close-topic";
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    let producer = Producer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .build()
+        .await
+        .expect("Failed to create producer");
+
+    producer.close().await;
+    assert!(producer.is_closed());
+
+    let result = producer.send(topic, None, b"should-fail").await;
+    assert!(result.is_err(), "Send after close should return an error");
+}
+
+/// Test consumer commit_sync and verified resume from committed offset.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_consumer_commit_and_resume_verified() {
+    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::producer::Producer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "commit-verify-topic";
+    let group_id = "commit-verify-group";
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    let producer = Producer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .build()
+        .await
+        .expect("Failed to create producer");
+
+    for i in 0..10 {
+        let _ = producer
+            .send(topic, None, format!("msg-{}", i).as_bytes())
+            .await
+            .expect("send failed");
+    }
+    producer.close().await;
+
+    // First consumer: read all and commit
+    {
+        let consumer = Consumer::builder()
+            .bootstrap_servers(&bootstrap_servers)
+            .group_id(group_id)
+            .auto_offset_reset(AutoOffsetReset::Earliest)
+            .enable_auto_commit(false)
+            .build()
+            .await
+            .expect("Failed to create consumer");
+
+        subscribe_with_retry(&consumer, &[topic], 5)
+            .await
+            .expect("Failed to subscribe");
+
+        let mut all = Vec::new();
+        for _ in 0..5 {
+            let records = consumer.poll(Duration::from_secs(2)).await.unwrap();
+            all.extend(records);
+            if all.len() >= 10 {
+                break;
+            }
+        }
+        assert_eq!(all.len(), 10, "Should read all 10 messages");
+        consumer.commit_sync().await.expect("commit failed");
+        consumer.close().await;
+    }
+
+    // Second consumer: should get NO new messages (all committed)
+    {
+        let consumer = Consumer::builder()
+            .bootstrap_servers(&bootstrap_servers)
+            .group_id(group_id)
+            .auto_offset_reset(AutoOffsetReset::Earliest)
+            .enable_auto_commit(false)
+            .build()
+            .await
+            .expect("Failed to create consumer");
+
+        subscribe_with_retry(&consumer, &[topic], 5)
+            .await
+            .expect("Failed to subscribe");
+
+        let records = consumer.poll(Duration::from_secs(3)).await.unwrap();
+        assert!(
+            records.is_empty(),
+            "Second consumer should get 0 records after commit, got {}",
+            records.len()
+        );
+        consumer.close().await;
+    }
+}
+
+/// Test consumer recv() streaming API.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_consumer_recv() {
+    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::producer::Producer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "recv-test-topic";
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    let producer = Producer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .build()
+        .await
+        .unwrap();
+
+    for i in 0..3 {
+        let _ = producer
+            .send(topic, None, format!("recv-msg-{}", i).as_bytes())
+            .await
+            .unwrap();
+    }
+    producer.close().await;
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id("recv-test-group")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .unwrap();
+
+    subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
+
+    // Use recv() to receive individual records
+    let mut received = Vec::new();
+    for _ in 0..3 {
+        match tokio::time::timeout(Duration::from_secs(10), consumer.recv()).await {
+            Ok(Ok(Some(record))) => received.push(record),
+            Ok(Ok(None)) => break,
+            Ok(Err(e)) => panic!("recv error: {}", e),
+            Err(_) => break,
+        }
+    }
+
+    assert_eq!(received.len(), 3, "Should receive 3 records via recv()");
+    consumer.close().await;
+}
+
+/// Test producer flush() forces pending messages to be sent.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_producer_flush() {
+    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::producer::Producer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "flush-test-topic";
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    let producer = Producer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .linger(Duration::from_secs(30)) // Long linger to accumulate
+        .build()
+        .await
+        .unwrap();
+
+    for i in 0..5 {
+        let _ = producer
+            .send(topic, None, format!("flush-{}", i).as_bytes())
+            .await
+            .unwrap();
+    }
+
+    // Explicit flush should ensure all messages are sent
+    producer.flush().await.expect("flush failed");
+    producer.close().await;
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id("flush-test-group")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .unwrap();
+
+    subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
+
+    let mut all = Vec::new();
+    for _ in 0..3 {
+        let recs = consumer.poll(Duration::from_secs(2)).await.unwrap();
+        all.extend(recs);
+        if all.len() >= 5 {
+            break;
+        }
+    }
+    assert_eq!(all.len(), 5, "All 5 flushed messages should be received");
+    consumer.close().await;
+}
+
+/// Test admin describe_groups returns member information.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_admin_describe_consumer_group() {
+    use krafka::admin::AdminClient;
+    use krafka::consumer::{AutoOffsetReset, Consumer};
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "describe-group-topic";
+    let group_id = "describe-group-test";
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id(group_id)
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .unwrap();
+
+    subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
+    let _ = consumer.poll(Duration::from_secs(3)).await;
+
+    let admin = AdminClient::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .build()
+        .await
+        .unwrap();
+
+    let descriptions = admin
+        .describe_groups(vec![group_id.to_string()])
+        .await
+        .expect("describe_groups failed");
+
+    assert_eq!(descriptions.len(), 1);
+    assert_eq!(descriptions[0].group_id, group_id);
+    assert!(
+        !descriptions[0].members.is_empty(),
+        "Group should have at least 1 member"
+    );
+    consumer.close().await;
+}
+
+/// Test consumer close() properly leaves the group.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_consumer_close_leaves_group() {
+    use krafka::admin::AdminClient;
+    use krafka::consumer::{AutoOffsetReset, Consumer};
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "close-leaves-group-topic";
+    let group_id = "close-leaves-group";
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id(group_id)
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .unwrap();
+
+    subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
+    let _ = consumer.poll(Duration::from_secs(3)).await;
+
+    // Explicitly close
+    consumer.close().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let admin = AdminClient::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .build()
+        .await
+        .unwrap();
+
+    let descriptions = admin
+        .describe_groups(vec![group_id.to_string()])
+        .await
+        .expect("describe_groups failed");
+
+    if !descriptions.is_empty() {
+        assert!(
+            descriptions[0].members.is_empty(),
+            "After close(), group should have no active members"
+        );
+    }
+}
+
+/// Test empty value messages roundtrip correctly.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_empty_value_message() {
+    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::producer::Producer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "empty-value-topic";
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    let producer = Producer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .build()
+        .await
+        .unwrap();
+
+    let metadata = producer.send(topic, Some(b"key"), b"").await.unwrap();
+    assert!(metadata.offset >= 0);
+    producer.close().await;
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id("empty-value-group")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .unwrap();
+
+    subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
+
+    let mut records = Vec::new();
+    for _ in 0..3 {
+        let batch = consumer.poll(Duration::from_secs(2)).await.unwrap();
+        records.extend(batch);
+        if !records.is_empty() {
+            break;
+        }
+    }
+    assert!(!records.is_empty(), "Should receive the empty-value record");
+    assert_eq!(
+        records[0].value.as_ref().map(|v| v.len()),
+        Some(0),
+        "Empty value should be preserved as zero-length"
+    );
+    consumer.close().await;
+}
+
+/// Test admin describe_broker_config returns broker configuration.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_admin_describe_broker_config() {
+    use krafka::admin::AdminClient;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let admin = AdminClient::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .build()
+        .await
+        .unwrap();
+
+    let cluster = admin.describe_cluster().await.unwrap();
+    let broker_id = cluster.brokers[0].id;
+
+    let configs = admin
+        .describe_broker_config(broker_id)
+        .await
+        .expect("describe_broker_config failed");
+
+    assert!(!configs.is_empty(), "Broker should have config entries");
+
+    assert!(
+        configs.iter().any(|c| c.name == "log.retention.hours"
+            || c.name == "log.retention.ms"
+            || c.name == "num.partitions"),
+        "Should contain standard broker configs"
+    );
+}
+
+/// Test many-partition topic with message distribution.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_many_partitions_topic() {
+    use krafka::admin::{AdminClient, NewTopic};
+    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::producer::Producer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let admin = AdminClient::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .build()
+        .await
+        .unwrap();
+
+    let topic = "many-partitions-topic";
+    admin
+        .create_topics(vec![NewTopic::new(topic, 12, 1)], Duration::from_secs(10))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let producer = Producer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .build()
+        .await
+        .unwrap();
+
+    // Send 60 messages with keys to distribute across partitions
+    for i in 0..60 {
+        let _ = producer
+            .send(topic, Some(format!("k-{}", i).as_bytes()), b"v")
+            .await
+            .unwrap();
+    }
+    producer.close().await;
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id("many-partitions-group")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .unwrap();
+
+    subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
+
+    let mut all = Vec::new();
+    for _ in 0..15 {
+        let recs = consumer.poll(Duration::from_secs(2)).await.unwrap();
+        all.extend(recs);
+        if all.len() >= 60 {
+            break;
+        }
+    }
+    assert_eq!(all.len(), 60, "All 60 messages should be received");
+
+    // Verify messages came from multiple partitions
+    let partitions: std::collections::HashSet<_> =
+        all.iter().map(|r| r.partition).collect();
+    assert!(
+        partitions.len() > 3,
+        "60 keys across 12 partitions should hit many partitions, got {}",
+        partitions.len()
+    );
+    consumer.close().await;
+}
+
+/// Test consumer pause/resume with verified assertions.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_consumer_pause_resume_verified() {
+    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::producer::Producer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "pause-verify-topic";
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    let producer = Producer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .build()
+        .await
+        .unwrap();
+
+    for i in 0..10 {
+        let _ = producer
+            .send(topic, None, format!("pv-{}", i).as_bytes())
+            .await
+            .unwrap();
+    }
+    producer.close().await;
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id("pause-verify-group")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .enable_auto_commit(false)
+        .build()
+        .await
+        .unwrap();
+
+    subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
+
+    // Poll to get assignment
+    let _ = consumer.poll(Duration::from_secs(3)).await;
+
+    // Pause
+    consumer.pause(topic, &[0]).await;
+
+    let paused = consumer.paused_partitions().await;
+    assert!(
+        paused.contains(&(topic.to_string(), 0)),
+        "Partition 0 should be paused"
+    );
+
+    // Resume
+    consumer.resume(topic, &[0]).await;
+
+    let paused = consumer.paused_partitions().await;
+    assert!(
+        !paused.contains(&(topic.to_string(), 0)),
+        "Partition 0 should no longer be paused"
+    );
+    consumer.close().await;
+}
+
+/// Test consumer seek with verified offset positioning.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_consumer_seek_verified() {
+    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::producer::Producer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "seek-verify-topic";
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    let producer = Producer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .build()
+        .await
+        .unwrap();
+
+    for i in 0..10 {
+        let _ = producer
+            .send(topic, None, format!("msg-{}", i).as_bytes())
+            .await
+            .unwrap();
+    }
+    producer.close().await;
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id("seek-verify-group")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .enable_auto_commit(false)
+        .build()
+        .await
+        .unwrap();
+
+    subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
+
+    // First poll to get assignment
+    let _ = consumer.poll(Duration::from_secs(3)).await;
+
+    // Seek to offset 5
+    consumer.seek(topic, 0, 5).await.expect("seek failed");
+
+    let mut records = Vec::new();
+    for _ in 0..3 {
+        let batch = consumer.poll(Duration::from_secs(2)).await.unwrap();
+        records.extend(batch);
+        if records.len() >= 5 {
+            break;
+        }
+    }
+
+    assert!(!records.is_empty(), "Should receive records after seek");
+    assert_eq!(
+        records[0].value_str(),
+        Some("msg-5"),
+        "First record after seek to offset 5 should be msg-5"
+    );
+    consumer.close().await;
+}
+
+/// Test topic creation with custom configs.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_admin_create_topic_with_config() {
+    use krafka::admin::{AdminClient, NewTopic};
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let admin = AdminClient::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .build()
+        .await
+        .unwrap();
+
+    let topic = "configured-topic";
+    let new_topic = NewTopic::new(topic, 3, 1)
+        .with_config("retention.ms", "3600000")
+        .with_config("cleanup.policy", "compact");
+
+    admin
+        .create_topics(vec![new_topic], Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let configs = admin.describe_topic_config(topic).await.unwrap();
+    let retention = configs.iter().find(|c| c.name == "retention.ms");
+    assert!(retention.is_some(), "Should have retention.ms config");
+    assert_eq!(
+        retention.unwrap().value.as_deref(),
+        Some("3600000"),
+        "retention.ms should be 3600000"
+    );
+}
+
+/// Test consumer metrics are available after consuming.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_consumer_metrics() {
+    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::producer::Producer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "consumer-metrics-topic";
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    let producer = Producer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .build()
+        .await
+        .unwrap();
+
+    for i in 0..5 {
+        let _ = producer
+            .send(topic, None, format!("m-{}", i).as_bytes())
+            .await
+            .unwrap();
+    }
+    producer.close().await;
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id("consumer-metrics-group")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .unwrap();
+
+    subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
+
+    let mut total = 0usize;
+    for _ in 0..3 {
+        let records = consumer.poll(Duration::from_secs(2)).await.unwrap();
+        total += records.len();
+        if total >= 5 {
+            break;
+        }
+    }
+
+    let metrics = consumer.metrics();
+    assert!(metrics.records_received.get() > 0, "Should have received records");
+    assert!(metrics.bytes_received.get() > 0, "Should have received bytes");
+    consumer.close().await;
 }

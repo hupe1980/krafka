@@ -113,10 +113,12 @@ impl ProducerIdentity {
         self.producer_epoch
             .store(producer_epoch as i32, Ordering::SeqCst);
 
-        // Clear all sequence numbers on initialization
-        if let Ok(mut sequences) = self.sequences.write() {
-            sequences.clear();
-        }
+        // Clear all sequence numbers on initialization.
+        // Recover from poisoned locks to maintain correctness.
+        self.sequences
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Reset the identity (e.g., after a fatal error).
@@ -124,9 +126,10 @@ impl ProducerIdentity {
         self.producer_id.store(-1, Ordering::SeqCst);
         self.producer_epoch.store(-1, Ordering::SeqCst);
 
-        if let Ok(mut sequences) = self.sequences.write() {
-            sequences.clear();
-        }
+        self.sequences
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Get the next sequence number for a topic-partition.
@@ -137,14 +140,11 @@ impl ProducerIdentity {
     pub fn next_sequence(&self, topic: &str, partition: PartitionId) -> i32 {
         let key = (topic.to_string(), partition);
 
-        if let Ok(mut sequences) = self.sequences.write() {
-            let state = sequences.entry(key).or_default();
-            let seq = state.next_sequence;
-            state.next_sequence = if seq == i32::MAX { 0 } else { seq + 1 };
-            seq
-        } else {
-            0
-        }
+        let mut sequences = self.sequences.write().unwrap_or_else(|e| e.into_inner());
+        let state = sequences.entry(key).or_default();
+        let seq = state.next_sequence;
+        state.next_sequence = if seq == i32::MAX { 0 } else { seq + 1 };
+        seq
     }
 
     /// Peek at the next sequence number without incrementing.
@@ -152,11 +152,8 @@ impl ProducerIdentity {
     pub fn peek_sequence(&self, topic: &str, partition: PartitionId) -> i32 {
         let key = (topic.to_string(), partition);
 
-        if let Ok(sequences) = self.sequences.read() {
-            sequences.get(&key).map(|s| s.next_sequence).unwrap_or(0)
-        } else {
-            0
-        }
+        let sequences = self.sequences.read().unwrap_or_else(|e| e.into_inner());
+        sequences.get(&key).map(|s| s.next_sequence).unwrap_or(0)
     }
 
     /// Acknowledge a sequence number for a partition.
@@ -165,8 +162,8 @@ impl ProducerIdentity {
     pub fn acknowledge(&self, topic: &str, partition: PartitionId, sequence: i32) {
         let key = (topic.to_string(), partition);
 
-        if let Ok(mut sequences) = self.sequences.write()
-            && let Some(state) = sequences.get_mut(&key)
+        let mut sequences = self.sequences.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = sequences.get_mut(&key)
             && sequence > state.last_acked_sequence
         {
             state.last_acked_sequence = sequence;
@@ -177,9 +174,8 @@ impl ProducerIdentity {
     pub fn reset_sequence(&self, topic: &str, partition: PartitionId) {
         let key = (topic.to_string(), partition);
 
-        if let Ok(mut sequences) = self.sequences.write()
-            && let Some(state) = sequences.get_mut(&key)
-        {
+        let mut sequences = self.sequences.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = sequences.get_mut(&key) {
             // Reset to the last acknowledged + 1
             state.next_sequence = state.last_acked_sequence.wrapping_add(1);
         }
@@ -190,14 +186,11 @@ impl ProducerIdentity {
     pub fn last_acked_sequence(&self, topic: &str, partition: PartitionId) -> i32 {
         let key = (topic.to_string(), partition);
 
-        if let Ok(sequences) = self.sequences.read() {
-            sequences
-                .get(&key)
-                .map(|s| s.last_acked_sequence)
-                .unwrap_or(-1)
-        } else {
-            -1
-        }
+        let sequences = self.sequences.read().unwrap_or_else(|e| e.into_inner());
+        sequences
+            .get(&key)
+            .map(|s| s.last_acked_sequence)
+            .unwrap_or(-1)
     }
 
     /// Create a snapshot of the current idempotent state.
@@ -398,5 +391,33 @@ mod tests {
         // Should wrap to 0 (matching Kafka Java client behavior)
         assert_eq!(identity.next_sequence("topic", 0), i32::MAX);
         assert_eq!(identity.peek_sequence("topic", 0), 0);
+    }
+
+    #[test]
+    fn test_lock_poison_recovery() {
+        // §15.4 fix: Verify that poisoned locks are recovered via into_inner()
+        // instead of silently returning fallback values.
+        let identity = ProducerIdentity::new();
+        identity.initialize(42, 3);
+
+        // Allocate some sequences
+        assert_eq!(identity.next_sequence("topic", 0), 0);
+        assert_eq!(identity.next_sequence("topic", 0), 1);
+
+        // Poison the lock by panicking while holding it
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = identity.sequences.write().unwrap();
+            panic!("intentional panic to poison lock");
+        }));
+
+        // Verify the lock is poisoned
+        assert!(identity.sequences.read().is_err());
+
+        // Even with poisoned lock, operations should still work (via into_inner)
+        let seq = identity.next_sequence("topic", 0);
+        assert_eq!(seq, 2, "Should recover sequence from poisoned lock");
+
+        let peek = identity.peek_sequence("topic", 0);
+        assert_eq!(peek, 3, "Peek should see incremented value after recovery");
     }
 }

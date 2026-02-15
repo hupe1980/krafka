@@ -277,7 +277,7 @@ There is zero overhead — the no-op methods are inlined away by the compiler.
   commit()
     │
     ▼
-  interceptor.on_commit(&offsets, error)  ← Observe commits here
+  interceptor.on_commit(&offsets, error)  ← Only committed offsets (filtered to assigned partitions)
 ```
 
 ## Thread Safety
