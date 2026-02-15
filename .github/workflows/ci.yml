@@ -79,8 +79,8 @@ jobs:
             echo "Retry $i failed, waiting..."
             sleep 10
           done
-      - run: cargo test --test integration_tests -- --ignored
-        timeout-minutes: 15
+      - run: cargo test --test integration_tests -- --ignored --test-threads=1
+        timeout-minutes: 45
 
   msrv:
     name: MSRV (1.88)
