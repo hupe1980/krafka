@@ -190,11 +190,13 @@ impl StickyPartitioner {
     }
 
     /// Manually switch to the next partition.
+    ///
+    /// Uses `fetch_add` for atomic read-modify-write to avoid the
+    /// race condition of separate load + store.
     pub fn next_partition(&self, partition_count: usize) {
         if partition_count > 0 {
-            let current = self.current.load(Ordering::Acquire);
-            self.current
-                .store((current + 1) % partition_count, Ordering::Release);
+            // Atomic increment; the modulo is applied at read time in partition()
+            self.current.fetch_add(1, Ordering::AcqRel);
         }
     }
 }

@@ -78,6 +78,8 @@ pub fn kafka_producer_span(
         { MESSAGING_DESTINATION } = tracing::field::Empty,
         { MESSAGING_KAFKA_PARTITION } = tracing::field::Empty,
         { MESSAGING_MESSAGE_KEY } = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        error.message = tracing::field::Empty,
     );
 
     span.record(MESSAGING_SYSTEM, "kafka");
@@ -116,6 +118,9 @@ pub fn kafka_consumer_poll_span(group_id: Option<&str>, topics: &[String]) -> Sp
         { MESSAGING_SYSTEM } = "kafka",
         { MESSAGING_OPERATION } = "receive",
         topics = %topics_str,
+        { MESSAGING_KAFKA_CONSUMER_GROUP } = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        error.message = tracing::field::Empty,
     );
 
     if let Some(gid) = group_id {
@@ -146,6 +151,8 @@ pub fn kafka_fetch_span(topic: &str, partition: PartitionId, offset: i64) -> Spa
         { MESSAGING_DESTINATION } = topic,
         { MESSAGING_KAFKA_PARTITION } = partition,
         { MESSAGING_KAFKA_OFFSET } = offset,
+        otel.status_code = tracing::field::Empty,
+        error.message = tracing::field::Empty,
     )
 }
 
@@ -176,6 +183,9 @@ pub fn kafka_commit_span(
         { MESSAGING_DESTINATION } = topic,
         { MESSAGING_KAFKA_PARTITION } = partition,
         { MESSAGING_KAFKA_OFFSET } = offset,
+        { MESSAGING_KAFKA_CONSUMER_GROUP } = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        error.message = tracing::field::Empty,
     );
 
     if let Some(gid) = group_id {
@@ -202,6 +212,9 @@ pub fn kafka_admin_span(operation: &str, resource: Option<&str>) -> Span {
         "kafka.admin",
         { MESSAGING_SYSTEM } = "kafka",
         operation = operation,
+        resource = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        error.message = tracing::field::Empty,
     );
 
     if let Some(res) = resource {

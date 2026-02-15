@@ -51,25 +51,26 @@ let version = conn.negotiate_api_version_max(ApiKey::Produce, 9).await;
 
 ### Client Supported Versions
 
-Krafka supports the following API version ranges:
+Krafka supports the following API version ranges (clamped to match actual encode/decode implementations):
 
 | API | Min | Max | Key Features |
 |-----|-----|-----|--------------|
-| Produce | 0 | 9 | v3+ transactions, v5+ headers |
-| Fetch | 0 | 12 | v4+ leader epoch |
-| Metadata | 0 | 12 | v1+ controller info |
-| OffsetCommit | 0 | 8 | v2+ retention |
-| OffsetFetch | 0 | 8 | v1+ group coordinator |
-| FindCoordinator | 0 | 4 | v1+ key type |
-| JoinGroup | 0 | 9 | v1+ rebalance timeout |
-| Heartbeat | 0 | 4 | Standard heartbeat |
-| SyncGroup | 0 | 5 | Group sync |
-| LeaveGroup | 0 | 5 | Leave group |
-| CreateTopics | 0 | 7 | Topic creation |
-| DeleteTopics | 0 | 6 | Topic deletion |
-| DescribeConfigs | 0 | 4 | Config reading |
-| AlterConfigs | 0 | 2 | Config updates |
-| InitProducerId | 0 | 4 | Idempotent/transactional |
+| Produce | 0 | 3 | v3 transactions, headers |
+| Fetch | 0 | 4 | v4 leader epoch |
+| ListOffsets | 0 | 2 | v2 isolation level |
+| Metadata | 0 | 1 | v1 controller info |
+| OffsetCommit | 0 | 2 | v2 retention |
+| OffsetFetch | 0 | 1 | v1 group coordinator |
+| FindCoordinator | 0 | 0 | Group coordinator lookup |
+| JoinGroup | 0 | 5 | v5 group instance id |
+| Heartbeat | 0 | 0 | Standard heartbeat |
+| SyncGroup | 0 | 3 | v3 group instance id |
+| LeaveGroup | 0 | 1 | v1 with response |
+| CreateTopics | 0 | 3 | Topic creation |
+| DeleteTopics | 0 | 1 | Topic deletion |
+| DescribeConfigs | 0 | 1 | Config reading |
+| AlterConfigs | 0 | 1 | Config updates |
+| InitProducerId | 0 | 1 | Idempotent/transactional |
 
 ### Version Constants
 
@@ -79,9 +80,9 @@ Client-supported versions are defined in `krafka::protocol::versions`:
 use krafka::protocol::versions;
 
 // Maximum versions the client supports
-let max_fetch = versions::FETCH_MAX;        // 12
-let max_produce = versions::PRODUCE_MAX;    // 9
-let max_metadata = versions::METADATA_MAX;  // 12
+let max_fetch = versions::FETCH_MAX;        // 4
+let max_produce = versions::PRODUCE_MAX;    // 3
+let max_metadata = versions::METADATA_MAX;  // 1
 ```
 
 ## Record Batches

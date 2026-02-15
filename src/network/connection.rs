@@ -823,6 +823,13 @@ impl BrokerConnection {
                 // Ensure data is sent immediately
                 if let Err(e) = writer.flush().await {
                     error!("Flush error: {}", e);
+                    // Propagate flush failure to the pending request so the caller
+                    // doesn't hang waiting for a response that will never arrive.
+                    let mut pending = pending.lock().await;
+                    if let Some(req) = pending.remove(&correlation_id) {
+                        let _ = req.response_tx.send(Err(KrafkaError::Network(e)));
+                    }
+                    return Ok(false);
                 }
                 Ok(false)
             }

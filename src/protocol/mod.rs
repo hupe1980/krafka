@@ -60,37 +60,43 @@ pub use record::{
 
 /// Client-supported API version ranges.
 ///
-/// This module defines the version ranges that Krafka supports for each Kafka API.
-/// These are used for version negotiation with Kafka brokers.
+/// This module defines the maximum version ranges that Krafka actually implements
+/// encode/decode for. These are used for version negotiation with Kafka brokers.
+///
+/// **Important**: These must match the highest version with a working
+/// encode+decode pair. Advertising a higher version than implemented
+/// causes protocol parse failures.
 pub mod versions {
-    /// Maximum supported Produce version.
-    pub const PRODUCE_MAX: i16 = 9;
-    /// Maximum supported Fetch version.
-    pub const FETCH_MAX: i16 = 12;
-    /// Maximum supported Metadata version.
-    pub const METADATA_MAX: i16 = 12;
+    /// Maximum supported Produce version (v0 encode/decode + v3 encode).
+    pub const PRODUCE_MAX: i16 = 3;
+    /// Maximum supported Fetch version (v4 encode/decode).
+    pub const FETCH_MAX: i16 = 4;
+    /// Maximum supported Metadata version (v0 encode/decode).
+    pub const METADATA_MAX: i16 = 1;
     /// Maximum supported OffsetCommit version.
-    pub const OFFSET_COMMIT_MAX: i16 = 8;
+    pub const OFFSET_COMMIT_MAX: i16 = 2;
     /// Maximum supported OffsetFetch version.
-    pub const OFFSET_FETCH_MAX: i16 = 8;
+    pub const OFFSET_FETCH_MAX: i16 = 1;
     /// Maximum supported FindCoordinator version.
-    pub const FIND_COORDINATOR_MAX: i16 = 4;
+    pub const FIND_COORDINATOR_MAX: i16 = 0;
     /// Maximum supported JoinGroup version.
-    pub const JOIN_GROUP_MAX: i16 = 9;
+    pub const JOIN_GROUP_MAX: i16 = 5;
     /// Maximum supported Heartbeat version.
-    pub const HEARTBEAT_MAX: i16 = 4;
+    pub const HEARTBEAT_MAX: i16 = 1;
     /// Maximum supported SyncGroup version.
-    pub const SYNC_GROUP_MAX: i16 = 5;
+    pub const SYNC_GROUP_MAX: i16 = 3;
     /// Maximum supported LeaveGroup version.
-    pub const LEAVE_GROUP_MAX: i16 = 5;
+    pub const LEAVE_GROUP_MAX: i16 = 1;
     /// Maximum supported CreateTopics version.
-    pub const CREATE_TOPICS_MAX: i16 = 7;
+    pub const CREATE_TOPICS_MAX: i16 = 2;
     /// Maximum supported DeleteTopics version.
-    pub const DELETE_TOPICS_MAX: i16 = 6;
+    pub const DELETE_TOPICS_MAX: i16 = 1;
     /// Maximum supported DescribeConfigs version.
-    pub const DESCRIBE_CONFIGS_MAX: i16 = 4;
+    pub const DESCRIBE_CONFIGS_MAX: i16 = 0;
     /// Maximum supported AlterConfigs version.
-    pub const ALTER_CONFIGS_MAX: i16 = 2;
+    pub const ALTER_CONFIGS_MAX: i16 = 0;
     /// Maximum supported InitProducerId version.
-    pub const INIT_PRODUCER_ID_MAX: i16 = 4;
+    pub const INIT_PRODUCER_ID_MAX: i16 = 0;
+    /// Maximum supported ListOffsets version (v2 encode/decode).
+    pub const LIST_OFFSETS_MAX: i16 = 2;
 }

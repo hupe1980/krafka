@@ -1640,6 +1640,24 @@ impl ListOffsetsRequest {
             }
         }
     }
+
+    /// Encode for version 2+ (includes `isolation_level`).
+    ///
+    /// Version 2 adds `isolation_level` after `replica_id`, which controls
+    /// whether transactional (uncommitted) records are visible.
+    pub fn encode_v2(&self, buf: &mut impl BufMut) {
+        buf.put_i32(self.replica_id);
+        buf.put_i8(self.isolation_level);
+        buf.put_i32(self.topics.len() as i32);
+        for topic in &self.topics {
+            KafkaString::new(&topic.name).encode(buf);
+            buf.put_i32(topic.partitions.len() as i32);
+            for partition in &topic.partitions {
+                buf.put_i32(partition.partition_index);
+                buf.put_i64(partition.timestamp);
+            }
+        }
+    }
 }
 
 /// Partition in ListOffsets response.
@@ -1673,14 +1691,43 @@ pub struct ListOffsetsResponse {
 
 impl ListOffsetsResponse {
     /// Decode version 1 response.
+    ///
+    /// Uses checked reads to avoid panics on truncated data and guards
+    /// negative counts to prevent OOM allocations.
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
+        if buf.remaining() < 4 {
+            return Err(crate::error::KrafkaError::protocol(
+                "ListOffsetsResponse: truncated (no topic count)",
+            ));
+        }
         let topic_count = buf.get_i32();
-        let mut topics = Vec::with_capacity(topic_count.min(10_000) as usize);
+        if topic_count < 0 {
+            return Err(crate::error::KrafkaError::protocol(
+                "ListOffsetsResponse: negative topic count",
+            ));
+        }
+        let mut topics = Vec::with_capacity((topic_count as usize).min(10_000));
         for _ in 0..topic_count {
             let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            if buf.remaining() < 4 {
+                return Err(crate::error::KrafkaError::protocol(
+                    "ListOffsetsResponse: truncated (no partition count)",
+                ));
+            }
             let partition_count = buf.get_i32();
-            let mut partitions = Vec::with_capacity(partition_count.min(10_000) as usize);
+            if partition_count < 0 {
+                return Err(crate::error::KrafkaError::protocol(
+                    "ListOffsetsResponse: negative partition count",
+                ));
+            }
+            let mut partitions = Vec::with_capacity((partition_count as usize).min(10_000));
+            // Each partition needs 4 + 2 + 8 + 8 = 22 bytes
             for _ in 0..partition_count {
+                if buf.remaining() < 22 {
+                    return Err(crate::error::KrafkaError::protocol(
+                        "ListOffsetsResponse: truncated partition data",
+                    ));
+                }
                 let partition_index = buf.get_i32();
                 let error_code = ErrorCode::from(buf.get_i16());
                 let timestamp = buf.get_i64();
@@ -5355,5 +5402,123 @@ mod tests {
         assert_eq!(resp.throttle_time_ms, 50);
         assert!(resp.error_code.is_ok());
         assert!(resp.assignment.is_empty());
+    }
+
+    // ── R14: ListOffsetsResponse decode safety ──
+
+    #[test]
+    fn test_list_offsets_response_decode_v1_empty() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // 0 topics
+        let mut data = buf.freeze();
+        let resp = ListOffsetsResponse::decode_v1(&mut data).unwrap();
+        assert!(resp.topics.is_empty());
+    }
+
+    #[test]
+    fn test_list_offsets_response_decode_v1_truncated_no_topic_count() {
+        let mut buf = BytesMut::new();
+        buf.put_i8(0); // only 1 byte — not enough for i32
+        let mut data = buf.freeze();
+        let result = ListOffsetsResponse::decode_v1(&mut data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_list_offsets_response_decode_v1_negative_topic_count() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(-1); // negative count
+        let mut data = buf.freeze();
+        let result = ListOffsetsResponse::decode_v1(&mut data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_list_offsets_response_decode_v1_negative_partition_count() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(1); // 1 topic
+        // topic name (short string)
+        buf.put_i16(4);
+        buf.put_slice(b"test");
+        buf.put_i32(-1); // negative partition count
+        let mut data = buf.freeze();
+        let result = ListOffsetsResponse::decode_v1(&mut data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_list_offsets_response_decode_v1_truncated_partition() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(1); // 1 topic
+        buf.put_i16(4);
+        buf.put_slice(b"test");
+        buf.put_i32(1); // 1 partition
+        buf.put_i32(0); // partition_index only (missing error_code, timestamp, offset)
+        let mut data = buf.freeze();
+        let result = ListOffsetsResponse::decode_v1(&mut data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_list_offsets_response_decode_v1_valid() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(1); // 1 topic
+        buf.put_i16(5);
+        buf.put_slice(b"topic");
+        buf.put_i32(1); // 1 partition
+        buf.put_i32(0); // partition_index
+        buf.put_i16(0); // error_code (NONE)
+        buf.put_i64(1234567890); // timestamp
+        buf.put_i64(42); // offset
+        let mut data = buf.freeze();
+        let resp = ListOffsetsResponse::decode_v1(&mut data).unwrap();
+        assert_eq!(resp.topics.len(), 1);
+        assert_eq!(resp.topics[0].name, "topic");
+        assert_eq!(resp.topics[0].partitions.len(), 1);
+        assert_eq!(resp.topics[0].partitions[0].offset, 42);
+        assert_eq!(resp.topics[0].partitions[0].timestamp, 1234567890);
+    }
+
+    // ── R14: ListOffsetsRequest encode_v2 with isolation_level ──
+
+    #[test]
+    fn test_list_offsets_request_encode_v2_includes_isolation_level() {
+        let request = ListOffsetsRequest {
+            replica_id: -1,
+            isolation_level: 1, // read_committed
+            topics: vec![ListOffsetsRequestTopic {
+                name: "test-topic".to_string(),
+                partitions: vec![ListOffsetsRequestPartition {
+                    partition_index: 0,
+                    current_leader_epoch: -1,
+                    timestamp: -1,
+                }],
+            }],
+        };
+
+        let mut buf = BytesMut::new();
+        request.encode_v2(&mut buf);
+
+        // replica_id (4 bytes) + isolation_level (1 byte) + topics
+        assert_eq!(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), -1);
+        assert_eq!(buf[4], 1); // isolation_level = read_committed
+    }
+
+    #[test]
+    fn test_list_offsets_request_encode_v1_no_isolation_level() {
+        let request = ListOffsetsRequest {
+            replica_id: -1,
+            isolation_level: 1,
+            topics: vec![],
+        };
+
+        let mut buf_v1 = BytesMut::new();
+        request.encode_v1(&mut buf_v1);
+
+        let mut buf_v2 = BytesMut::new();
+        request.encode_v2(&mut buf_v2);
+
+        // v2 should be 1 byte longer (isolation_level)
+        assert_eq!(buf_v2.len(), buf_v1.len() + 1);
     }
 }

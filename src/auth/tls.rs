@@ -139,12 +139,17 @@ pub fn create_tls_connector(config: &TlsConfig) -> Result<TlsConnector> {
 }
 
 /// Connect with TLS.
+///
+/// Uses async file I/O via `build_tls_config_async` to avoid blocking the
+/// Tokio runtime when loading certificate/key files.
 pub async fn connect_tls(
     stream: TcpStream,
     hostname: &str,
     tls_config: &TlsConfig,
 ) -> Result<TlsStream<TcpStream>> {
-    let connector = create_tls_connector(tls_config)?;
+    // Use async config builder to avoid blocking file I/O on the runtime
+    let client_config = build_tls_config_async(tls_config).await?;
+    let connector = TlsConnector::from(Arc::new(client_config));
 
     // Use SNI hostname if specified, otherwise use the connection hostname
     let sni_hostname = tls_config.sni_hostname.as_deref().unwrap_or(hostname);
@@ -162,7 +167,7 @@ pub async fn connect_tls(
     connector
         .connect(server_name, stream)
         .await
-        .map_err(|e| KrafkaError::config(format!("TLS handshake failed: {}", e)))
+        .map_err(|e| KrafkaError::auth(format!("TLS handshake failed: {}", e)))
 }
 
 /// Load certificates from a PEM file synchronously.

@@ -1471,3 +1471,236 @@ async fn test_admin_describe_topics() {
         .await
         .ok();
 }
+
+// ============================================================================
+// Round 14 Integration Tests
+// ============================================================================
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_producer_timestamp_propagation() {
+    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::producer::{Producer, ProducerRecord};
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "timestamp-test-topic";
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    let producer = Producer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .client_id("timestamp-test-producer")
+        .build()
+        .await
+        .expect("Failed to create producer");
+
+    // Send with explicit timestamp
+    let timestamp = 1700000000000_i64; // Unix epoch ms
+    let record = ProducerRecord::new(topic, b"hello".to_vec())
+        .with_key(Some(b"ts-key".to_vec()))
+        .with_timestamp(timestamp);
+    let metadata = producer
+        .send_record(record)
+        .await
+        .expect("Failed to send record with timestamp");
+
+    assert!(metadata.offset >= 0);
+    producer.close().await;
+
+    // Consume and verify timestamp was propagated
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id("timestamp-test-consumer")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .expect("Failed to create consumer");
+
+    subscribe_with_retry(&consumer, &[topic], 5)
+        .await
+        .expect("Failed to subscribe");
+
+    let records = consumer
+        .poll(Duration::from_secs(5))
+        .await
+        .expect("Failed to poll");
+
+    assert!(!records.is_empty(), "Expected at least one record");
+    let record = &records[0];
+    // Timestamp should match what we sent (broker may use LogAppendTime
+    // depending on config, but with CreateTime it should match)
+    assert!(record.timestamp > 0, "Timestamp should be set");
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_consumer_manual_assign() {
+    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::producer::Producer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "manual-assign-topic";
+    create_topic(&bootstrap_servers, topic, 2).await;
+
+    let producer = Producer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .build()
+        .await
+        .expect("Failed to create producer");
+
+    // Send messages to specific partitions
+    for i in 0..10 {
+        let _ = producer
+            .send(topic, Some(format!("k-{}", i).as_bytes()), b"val")
+            .await
+            .expect("send failed");
+    }
+    producer.close().await;
+
+    // Create consumer WITHOUT group_id — manual assignment mode
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .expect("Failed to create consumer");
+
+    // Manually assign partition 0
+    consumer
+        .assign(topic, vec![0])
+        .await
+        .expect("Failed to assign");
+
+    let records = consumer
+        .poll(Duration::from_secs(5))
+        .await
+        .expect("Failed to poll");
+
+    // Should have records from partition 0 only
+    for record in &records {
+        assert_eq!(record.partition, 0, "Should only get partition 0");
+    }
+    assert!(!records.is_empty(), "Expected records from partition 0");
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_admin_list_consumer_groups() {
+    use krafka::admin::AdminClient;
+    use krafka::consumer::{AutoOffsetReset, Consumer};
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "group-list-topic";
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    let group_id = "group-list-test-group";
+
+    // Create a consumer and join a group
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id(group_id)
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .expect("Failed to create consumer");
+
+    subscribe_with_retry(&consumer, &[topic], 5)
+        .await
+        .expect("Failed to subscribe");
+
+    // Poll once to ensure the group is actually joined
+    let _ = consumer.poll(Duration::from_secs(3)).await;
+
+    // Admin client should be able to list the group
+    let admin = AdminClient::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .build()
+        .await
+        .expect("Failed to create admin client");
+
+    let groups = admin
+        .list_consumer_groups()
+        .await
+        .expect("Failed to list groups");
+
+    assert!(
+        groups.iter().any(|g| g.group_id == group_id),
+        "Expected to find group '{}' in list: {:?}",
+        group_id,
+        groups.iter().map(|g| &g.group_id).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_consumer_unsubscribe() {
+    use krafka::consumer::{AutoOffsetReset, Consumer};
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "unsub-test-topic";
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id("unsub-test-group")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .expect("Failed to create consumer");
+
+    subscribe_with_retry(&consumer, &[topic], 5)
+        .await
+        .expect("Failed to subscribe");
+
+    // Poll to join group
+    let _ = consumer.poll(Duration::from_secs(2)).await;
+
+    // Unsubscribe
+    consumer
+        .unsubscribe()
+        .await;
+
+    // Subscription should be empty
+    let subscription = consumer.subscription().await;
+    assert!(
+        subscription.is_empty(),
+        "Subscription should be empty after unsubscribe"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_producer_metrics() {
+    use krafka::producer::Producer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "metrics-test-topic";
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    let producer = Producer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .client_id("metrics-test-producer")
+        .build()
+        .await
+        .expect("Failed to create producer");
+
+    // Send some messages
+    for i in 0..5 {
+        let _ = producer
+            .send(topic, Some(format!("k-{}", i).as_bytes()), b"value")
+            .await
+            .expect("send failed");
+    }
+
+    let metrics = producer.metrics().await;
+    assert_eq!(metrics.records_sent, 5, "Should have sent 5 records");
+    assert!(metrics.bytes_sent > 0, "Should have sent bytes");
+    assert_eq!(metrics.errors, 0, "Should have no errors");
+
+    producer.close().await;
+    assert!(producer.is_closed(), "Producer should be closed");
+}

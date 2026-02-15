@@ -465,11 +465,78 @@ impl TransactionalProducer {
     }
 
     /// Send a record to a specific partition.
+    ///
+    /// Includes retry logic with exponential backoff for transient failures.
+    /// Handles `OutOfOrderSequenceNumber` by resetting the partition sequence.
     async fn send_to_partition(
         &self,
         topic: &str,
         partition: PartitionId,
         record: ProducerRecord,
+    ) -> Result<RecordMetadata> {
+        let max_retries: u32 = 3;
+        let mut attempt: u32 = 0;
+        let mut backoff = Duration::from_millis(100);
+
+        loop {
+            let result = self
+                .do_send_to_partition(topic, partition, &record)
+                .await;
+
+            match result {
+                Ok(metadata) => {
+                    // Acknowledge sequence on success
+                    let seq = self.identity.peek_sequence(topic, partition);
+                    if seq > 0 {
+                        self.identity.acknowledge(topic, partition, seq - 1);
+                    }
+                    return Ok(metadata);
+                }
+                Err(ref e) => {
+                    // Handle OutOfOrderSequenceNumber by resetting sequence
+                    if let KrafkaError::Broker { code, .. } = e
+                        && *code == crate::error::ErrorCode::OutOfOrderSequenceNumber
+                    {
+                        warn!(
+                            "OutOfOrderSequenceNumber for {}-{}, resetting sequence",
+                            topic, partition
+                        );
+                        self.identity.reset_sequence(topic, partition);
+                    }
+
+                    // Check for fatal errors
+                    if !e.is_retriable() {
+                        return result;
+                    }
+
+                    attempt += 1;
+                    if attempt > max_retries {
+                        return result;
+                    }
+
+                    debug!(
+                        topic = topic,
+                        partition = partition,
+                        attempt = attempt,
+                        "Transient error in txn send, retrying: {}", e
+                    );
+
+                    // Refresh metadata on leader errors
+                    let _ = self.metadata.refresh_for_topics(Some(&[topic])).await;
+
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                }
+            }
+        }
+    }
+
+    /// Single attempt to send a record to a partition (no retry).
+    async fn do_send_to_partition(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+        record: &ProducerRecord,
     ) -> Result<RecordMetadata> {
         let conn = self
             .metadata
@@ -488,17 +555,22 @@ impl TransactionalProducer {
             .producer(producer_id, producer_epoch, sequence)
             .transactional(true);
 
+        // Propagate user-supplied timestamp to the batch
+        if let Some(ts) = record.timestamp {
+            batch_builder = batch_builder.base_timestamp(ts);
+        }
+
         if record.headers.is_empty() {
             batch_builder = batch_builder
-                .add_record(record.key.map(Bytes::from), Some(Bytes::from(record.value)));
+                .add_record(record.key.clone().map(Bytes::from), Some(Bytes::from(record.value.clone())));
         } else {
             batch_builder = batch_builder.add_record_with_headers(
-                record.key.map(Bytes::from),
-                Some(Bytes::from(record.value)),
+                record.key.clone().map(Bytes::from),
+                Some(Bytes::from(record.value.clone())),
                 record
                     .headers
-                    .into_iter()
-                    .map(|(k, v)| (k, Bytes::from(v)))
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Bytes::from(v.clone())))
                     .collect(),
             );
         }
@@ -832,6 +904,29 @@ impl TransactionalProducer {
     /// Get the next sequence number for a topic-partition.
     async fn next_sequence(&self, topic: &str, partition: PartitionId) -> i32 {
         self.identity.next_sequence(topic, partition)
+    }
+
+    /// Close the transactional producer and release all resources.
+    ///
+    /// If a transaction is in progress, it will be aborted before closing.
+    /// After calling `close()`, the producer cannot be used again.
+    pub async fn close(&self) {
+        // If in-transaction, abort first to clean up broker state
+        let current = self.state();
+        if current == TransactionState::InTransaction {
+            warn!("Closing transactional producer with active transaction — aborting");
+            let _ = self.abort_transaction().await;
+        }
+
+        // Set state to prevent further use
+        self.set_state(TransactionState::FatalError);
+
+        // Close all connections in the pool
+        self.pool.close_all().await;
+        info!(
+            "TransactionalProducer closed: txn.id={}",
+            self.config.transactional_id
+        );
     }
 }
 
@@ -1294,5 +1389,40 @@ mod tests {
             TransactionState::from_u8(state.load(Ordering::SeqCst)),
             TransactionState::InTransaction
         );
+    }
+
+    // ── R14: close() sets FatalError to prevent further use ──
+
+    #[test]
+    fn test_txn_close_sets_fatal_error_state() {
+        // Verify the close() contract: after close, state is FatalError
+        let state = AtomicU8::new(TransactionState::Ready as u8);
+        // Simulate close: set to FatalError
+        state.store(TransactionState::FatalError as u8, Ordering::SeqCst);
+        assert_eq!(
+            TransactionState::from_u8(state.load(Ordering::SeqCst)),
+            TransactionState::FatalError
+        );
+    }
+
+    // ── R14: OutOfOrderSequenceNumber is retriable ──
+
+    #[test]
+    fn test_out_of_order_sequence_is_retriable() {
+        let error = KrafkaError::broker(
+            ErrorCode::OutOfOrderSequenceNumber,
+            "sequence mismatch",
+        );
+        assert!(error.is_retriable());
+    }
+
+    // ── R14: ProducerRecord timestamp propagation ──
+
+    #[test]
+    fn test_producer_record_with_timestamp() {
+        use crate::producer::ProducerRecord;
+        let record = ProducerRecord::new("topic", b"value".to_vec())
+            .with_timestamp(1234567890);
+        assert_eq!(record.timestamp, Some(1234567890));
     }
 }

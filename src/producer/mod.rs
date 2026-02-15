@@ -345,6 +345,11 @@ impl Producer {
         // Build record batch
         let mut batch_builder = RecordBatchBuilder::new().compression(self.config.compression);
 
+        // Propagate user-supplied timestamp to the batch
+        if let Some(ts) = record.timestamp {
+            batch_builder = batch_builder.base_timestamp(ts);
+        }
+
         if record.headers.is_empty() {
             batch_builder = batch_builder
                 .add_record(record.key.clone().map(Bytes::from), Some(Bytes::from(record.value.clone())));

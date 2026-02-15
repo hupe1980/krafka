@@ -945,6 +945,8 @@ pub struct GroupCoordinator {
     group_instance_id: Option<String>,
     /// Persistent sticky assignor (retains previous assignments across rebalances).
     sticky_assignor: CooperativeStickyAssignor,
+    /// Transaction isolation level (0 = read_uncommitted, 1 = read_committed).
+    isolation_level: i8,
 }
 
 impl GroupCoordinator {
@@ -981,6 +983,7 @@ impl GroupCoordinator {
             assignor_name: "range".to_string(),
             group_instance_id: None,
             sticky_assignor: CooperativeStickyAssignor::new(),
+            isolation_level: 0,
         }
     }
 
@@ -997,6 +1000,12 @@ impl GroupCoordinator {
     /// Set the static group membership instance ID (KIP-345, builder pattern).
     pub fn with_group_instance_id(mut self, id: Option<String>) -> Self {
         self.group_instance_id = id;
+        self
+    }
+
+    /// Set the transaction isolation level (builder pattern).
+    pub fn with_isolation_level(mut self, level: i8) -> Self {
+        self.isolation_level = level;
         self
     }
 
@@ -1761,7 +1770,7 @@ impl GroupCoordinator {
 
             let request = ListOffsetsRequest {
                 replica_id: -1,
-                isolation_level: 0,
+                isolation_level: self.isolation_level,
                 topics,
             };
 
@@ -1773,8 +1782,8 @@ impl GroupCoordinator {
                 .await?;
 
             let response = conn
-                .send_request(ApiKey::ListOffsets, 1, |buf| {
-                    request.encode_v1(buf);
+                .send_request(ApiKey::ListOffsets, 2, |buf| {
+                    request.encode_v2(buf);
                 })
                 .await?;
 

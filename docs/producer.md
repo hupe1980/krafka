@@ -565,6 +565,7 @@ See the [Authentication Guide](authentication.md) for all supported mechanisms.
 2. **Begin**: Call `begin_transaction()` to start a new transaction
 3. **Send**: Send messages with `send()` or `send_record()`
 4. **End**: Call `commit_transaction()` or `abort_transaction()`
+5. **Close**: Call `close()` when done — aborts any active transaction and cleans up resources
 
 ```rust
 // Error handling with abort
@@ -577,7 +578,45 @@ match do_work(&producer).await {
         return Err(e);
     }
 }
+
+// When finished with the producer, always close it
+producer.close().await;
 ```
+
+### Graceful Shutdown (Transactional)
+
+Always close transactional producers properly. The `close()` method:
+- Aborts any active transaction to avoid dangling open transactions on the broker
+- Transitions the producer to `FatalError` state, preventing further use
+- Closes the underlying connection pool
+
+```rust
+// Graceful shutdown
+producer.close().await;
+// Producer is no longer usable after close()
+```
+
+### Built-in Retry Logic
+
+The transactional producer automatically retries sends on transient failures:
+- Up to **3 retry attempts** per send with exponential backoff (100ms–5s)
+- Metadata is refreshed on transient errors before retrying
+- `OutOfOrderSequenceNumber` errors trigger a sequence number reset and retry
+- Non-retriable errors (auth failures, invalid topics) fail immediately
+
+### Timestamps
+
+Both `Producer` and `TransactionalProducer` propagate the `timestamp` field from `ProducerRecord` to the Kafka record batch. If set, the timestamp is used as the `base_timestamp` of the record batch:
+
+```rust
+use krafka::producer::ProducerRecord;
+
+let mut record = ProducerRecord::new("my-topic", b"value".to_vec());
+record.timestamp = Some(1700000000000); // epoch millis
+producer.send_record(record).await?;
+```
+
+> **Note:** If `timestamp` is not set, the broker defaults apply (typically `LogAppendTime` or `CreateTime` depending on topic configuration).
 
 ### Consume-Transform-Produce (Exactly-Once)
 

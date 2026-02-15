@@ -159,6 +159,28 @@ let consumer = Consumer::builder()
     .await?;
 ```
 
+### Isolation Level
+
+Control visibility of transactional records. When consuming from topics that receive transactional writes, set `isolation_level` to `read_committed` to only see committed records:
+
+```rust
+use krafka::consumer::{Consumer, IsolationLevel};
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .isolation_level(IsolationLevel::ReadCommitted) // Only see committed txn records
+    .build()
+    .await?;
+```
+
+| Level | Description |
+|-------|-------------|
+| `ReadUncommitted` (default) | See all records, including uncommitted transactional records |
+| `ReadCommitted` | Only see committed records; uncommitted transactional records are filtered |
+
+> **Note:** `isolation_level` affects both data fetches and offset resolution (ListOffsets). Krafka uses ListOffsets v2 protocol to pass the isolation level to the broker.
+
 ## Consumer Groups
 
 ### How Consumer Groups Work

@@ -154,7 +154,8 @@ impl Consumer {
                 config.heartbeat_interval,
                 config.session_timeout, // rebalance_timeout defaults to session_timeout
             ).with_assignor_strategy(config.partition_assignment_strategy)
-             .with_group_instance_id(config.group_instance_id.clone())))
+             .with_group_instance_id(config.group_instance_id.clone())
+             .with_isolation_level(config.isolation_level.to_i8())))
         } else {
             None
         };

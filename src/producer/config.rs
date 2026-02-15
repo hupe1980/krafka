@@ -28,11 +28,21 @@ impl Acks {
     }
 
     /// Create from i16 value.
+    ///
+    /// Known values: 0 = None, 1 = Leader, -1 = All.
+    /// Unknown values default to `All` (safest default — requires full ISR ack).
     pub fn from_i16(value: i16) -> Self {
         match value {
             0 => Acks::None,
             1 => Acks::Leader,
-            _ => Acks::All,
+            -1 => Acks::All,
+            other => {
+                tracing::warn!(
+                    acks = other,
+                    "Unknown acks value, defaulting to All"
+                );
+                Acks::All
+            }
         }
     }
 }
@@ -288,5 +298,29 @@ mod tests {
             Duration::from_secs(120),
             "metadata_max_age should be set by builder"
         );
+    }
+
+    // ── R14: Acks::from_i16 known values ──
+
+    #[test]
+    fn test_acks_from_i16_known_values() {
+        assert_eq!(Acks::from_i16(0), Acks::None);
+        assert_eq!(Acks::from_i16(1), Acks::Leader);
+        assert_eq!(Acks::from_i16(-1), Acks::All);
+    }
+
+    #[test]
+    fn test_acks_from_i16_unknown_defaults_to_all() {
+        // Unknown values should default to All (safest default)
+        assert_eq!(Acks::from_i16(2), Acks::All);
+        assert_eq!(Acks::from_i16(99), Acks::All);
+        assert_eq!(Acks::from_i16(-2), Acks::All);
+    }
+
+    #[test]
+    fn test_acks_roundtrip() {
+        assert_eq!(Acks::from_i16(Acks::None.to_i16()), Acks::None);
+        assert_eq!(Acks::from_i16(Acks::Leader.to_i16()), Acks::Leader);
+        assert_eq!(Acks::from_i16(Acks::All.to_i16()), Acks::All);
     }
 }
