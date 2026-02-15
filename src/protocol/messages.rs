@@ -1160,6 +1160,23 @@ impl SyncGroupRequest {
             KafkaBytes::new(assignment.assignment.clone()).encode(buf);
         }
     }
+
+    /// Encode for version 3+ (KIP-345: includes group_instance_id).
+    pub fn encode_v3(&self, buf: &mut impl BufMut) {
+        KafkaString::new(&self.group_id).encode(buf);
+        self.generation_id.encode(buf);
+        KafkaString::new(&self.member_id).encode(buf);
+        match &self.group_instance_id {
+            Some(id) => KafkaString::new(id).encode(buf),
+            None => KafkaString::null().encode(buf),
+        }
+
+        buf.put_i32(self.assignments.len() as i32);
+        for assignment in &self.assignments {
+            KafkaString::new(&assignment.member_id).encode(buf);
+            KafkaBytes::new(assignment.assignment.clone()).encode(buf);
+        }
+    }
 }
 
 /// SyncGroup response.
@@ -5240,5 +5257,103 @@ mod tests {
         assert_eq!(resp.topics[0].partitions[0].partition, 0);
         assert_eq!(resp.topics[0].partitions[0].leader_epoch, 5);
         assert_eq!(resp.topics[0].partitions[0].end_offset, 1000);
+    }
+
+    // §R13.2: SyncGroupRequest::encode_v3 includes group_instance_id.
+    #[test]
+    fn test_sync_group_request_encode_v3_includes_group_instance_id() {
+        use bytes::BytesMut;
+
+        let request = SyncGroupRequest {
+            group_id: "my-group".to_string(),
+            generation_id: 1,
+            member_id: "member-1".to_string(),
+            group_instance_id: Some("instance-1".to_string()),
+            protocol_type: Some("consumer".to_string()),
+            protocol_name: Some("range".to_string()),
+            assignments: vec![],
+        };
+
+        let mut buf = BytesMut::new();
+        request.encode_v3(&mut buf);
+
+        // Verify the buffer contains the group_instance_id
+        let data = buf.freeze();
+        let data_str = String::from_utf8_lossy(&data);
+        assert!(
+            data_str.contains("instance-1"),
+            "v3 encoding should include group_instance_id"
+        );
+    }
+
+    // §R13.2: SyncGroupRequest::encode_v0 does NOT include group_instance_id.
+    #[test]
+    fn test_sync_group_request_encode_v0_omits_group_instance_id() {
+        use bytes::BytesMut;
+
+        let request = SyncGroupRequest {
+            group_id: "my-group".to_string(),
+            generation_id: 1,
+            member_id: "member-1".to_string(),
+            group_instance_id: Some("instance-1".to_string()),
+            protocol_type: Some("consumer".to_string()),
+            protocol_name: Some("range".to_string()),
+            assignments: vec![],
+        };
+
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf);
+
+        let data = buf.freeze();
+        let data_str = String::from_utf8_lossy(&data);
+        assert!(
+            !data_str.contains("instance-1"),
+            "v0 encoding should NOT include group_instance_id"
+        );
+    }
+
+    // §R13.8: LeaveGroupResponse decode_v0 and decode_v1 roundtrip.
+    #[test]
+    fn test_leave_group_response_decode_v0() {
+        let mut buf = BytesMut::new();
+        // error_code = 0 (NONE)
+        buf.put_i16(0);
+
+        let mut data = buf.freeze();
+        let resp = LeaveGroupResponse::decode_v0(&mut data).unwrap();
+        assert!(resp.error_code.is_ok());
+        assert_eq!(resp.throttle_time_ms, 0);
+    }
+
+    #[test]
+    fn test_leave_group_response_decode_v1_with_error() {
+        let mut buf = BytesMut::new();
+        // throttle_time_ms
+        buf.put_i32(100);
+        // error_code = 16 (NOT_COORDINATOR)
+        buf.put_i16(16);
+
+        let mut data = buf.freeze();
+        let resp = LeaveGroupResponse::decode_v1(&mut data).unwrap();
+        assert_eq!(resp.throttle_time_ms, 100);
+        assert!(!resp.error_code.is_ok());
+    }
+
+    // §R13.2: SyncGroupResponse decode_v1 roundtrip.
+    #[test]
+    fn test_sync_group_response_decode_v1() {
+        let mut buf = BytesMut::new();
+        // throttle_time_ms
+        buf.put_i32(50);
+        // error_code = 0 (NONE)
+        buf.put_i16(0);
+        // assignment (empty bytes: length = 0)
+        buf.put_i32(0);
+
+        let mut data = buf.freeze();
+        let resp = SyncGroupResponse::decode_v1(&mut data).unwrap();
+        assert_eq!(resp.throttle_time_ms, 50);
+        assert!(resp.error_code.is_ok());
+        assert!(resp.assignment.is_empty());
     }
 }

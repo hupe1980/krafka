@@ -431,6 +431,9 @@ Paused partitions are skipped during `poll()` until resumed. This is useful for:
 
 For direct partition control (without consumer groups):
 
+> **Note:** Manual assignment and group subscription are mutually exclusive.
+> Calling `assign()` on a consumer with a `group_id` configured will return an error.
+
 ```rust
 use krafka::consumer::Consumer;
 
@@ -448,8 +451,14 @@ consumer.assign("topic", vec![0, 1, 2]).await?;
 
 ### Subscribe to Multiple Topics
 
+`subscribe()` **replaces** the current subscription (it does not append):
+
 ```rust
-consumer.subscribe(&["orders", "payments", "shipments"]).await?;
+// Subscribe to initial topics
+consumer.subscribe(&["orders", "payments"]).await?;
+
+// This REPLACES the subscription — only "shipments" is subscribed now
+consumer.subscribe(&["shipments"]).await?;
 ```
 
 ### Check Subscriptions and Assignments
@@ -465,6 +474,10 @@ println!("Assigned partitions: {:?}", assignments);
 ```
 
 ### Unsubscribe
+
+Calling `unsubscribe()` performs a full cleanup: revokes partitions (notifying
+the rebalance listener), leaves the consumer group, and clears all internal
+state (offsets, paused partitions, buffered records).
 
 ```rust
 consumer.unsubscribe().await;
@@ -528,8 +541,9 @@ async fn consume_with_error_handling(consumer: &Consumer) {
 ### Streaming with `recv()`
 
 The `recv()` method returns individual records as a stream-like API.
-It returns `Result<Option<ConsumerRecord>>` — errors propagate to the caller
-rather than being silently swallowed:
+It internally buffers records fetched by `poll()` and returns them one by one,
+ensuring no data loss even when `poll()` returns multiple records.
+Errors propagate to the caller rather than being silently swallowed:
 
 ```rust
 use krafka::consumer::Consumer;

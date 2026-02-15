@@ -22,7 +22,7 @@ use crate::network::{BrokerConnection, ConnectionPool};
 use crate::protocol::{
     ApiKey, FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse,
     JoinGroupRequest, JoinGroupRequestProtocol, JoinGroupResponse, JoinGroupResponseMember,
-    LeaveGroupMember, LeaveGroupRequest, ListOffsetsRequest, ListOffsetsRequestPartition,
+    LeaveGroupMember, LeaveGroupRequest, LeaveGroupResponse, ListOffsetsRequest, ListOffsetsRequestPartition,
     ListOffsetsRequestTopic, ListOffsetsResponse, OffsetCommitRequest,
     OffsetCommitRequestPartition, OffsetCommitRequestTopic, OffsetCommitResponse,
     OffsetFetchRequest, OffsetFetchRequestTopic, OffsetFetchResponse, SyncGroupRequest,
@@ -1236,14 +1236,27 @@ impl GroupCoordinator {
             join_response.is_leader()
         );
 
-        let response = conn
-            .send_request(ApiKey::SyncGroup, 0, |buf| {
+        // Use v3 for static membership (KIP-345, §R13.2), v0 otherwise.
+        // v3 includes group_instance_id; v0 silently discards it.
+        let response = if self.group_instance_id.is_some() {
+            conn.send_request(ApiKey::SyncGroup, 3, |buf| {
+                request.encode_v3(buf);
+            })
+            .await?
+        } else {
+            conn.send_request(ApiKey::SyncGroup, 0, |buf| {
                 request.encode_v0(buf);
             })
-            .await?;
+            .await?
+        };
 
         let mut buf = response;
-        let sync_response = SyncGroupResponse::decode_v0(&mut buf)?;
+        // v1+ adds throttle_time_ms; v0 omits it
+        let sync_response = if self.group_instance_id.is_some() {
+            SyncGroupResponse::decode_v1(&mut buf)?
+        } else {
+            SyncGroupResponse::decode_v0(&mut buf)?
+        };
 
         if !sync_response.error_code.is_ok() {
             *self.state.write().await = GroupState::Unjoined;
@@ -1634,8 +1647,11 @@ impl GroupCoordinator {
             partitions.len()
         );
 
+        // §R13.9 fix: Send as API version 0 to match decode_v0.
+        // v0 and v1 share identical request wire format, but v1 response
+        // appends a trailing error_code that decode_v0 does not read.
         let response = conn
-            .send_request(ApiKey::OffsetFetch, 1, |buf| {
+            .send_request(ApiKey::OffsetFetch, 0, |buf| {
                 request.encode_v0(buf);
             })
             .await?;
@@ -1848,10 +1864,36 @@ impl GroupCoordinator {
             .await
         };
 
-        if let Ok(Ok(_)) = result {
-            info!("Left group '{}'", self.group_id);
-        } else {
-            warn!("Failed to cleanly leave group '{}'", self.group_id);
+        // §R13.8 fix: Decode the response and check for errors
+        match result {
+            Ok(Ok(response_bytes)) => {
+                let mut buf = response_bytes;
+                let decode_result = if self.group_instance_id.is_some() {
+                    LeaveGroupResponse::decode_v1(&mut buf)
+                } else {
+                    LeaveGroupResponse::decode_v0(&mut buf)
+                };
+                match decode_result {
+                    Ok(r) if r.error_code.is_ok() => {
+                        info!("Left group '{}'", self.group_id);
+                    }
+                    Ok(r) => {
+                        warn!(
+                            "LeaveGroup error for '{}': {:?}",
+                            self.group_id, r.error_code
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Failed to decode LeaveGroup response for '{}': {}", self.group_id, e);
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                warn!("Failed to send LeaveGroup request for '{}': {}", self.group_id, e);
+            }
+            Err(_) => {
+                warn!("LeaveGroup request timed out for '{}'", self.group_id);
+            }
         }
 
         self.reset().await;
