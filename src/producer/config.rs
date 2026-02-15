@@ -37,10 +37,7 @@ impl Acks {
             1 => Acks::Leader,
             -1 => Acks::All,
             other => {
-                tracing::warn!(
-                    acks = other,
-                    "Unknown acks value, defaulting to All"
-                );
+                tracing::warn!(acks = other, "Unknown acks value, defaulting to All");
                 Acks::All
             }
         }
@@ -279,9 +276,7 @@ mod tests {
 
     #[test]
     fn test_config_builder_max_in_flight() {
-        let config = ProducerConfig::builder()
-            .max_in_flight(10)
-            .build();
+        let config = ProducerConfig::builder().max_in_flight(10).build();
         assert_eq!(
             config.max_in_flight, 10,
             "max_in_flight should be set by builder"

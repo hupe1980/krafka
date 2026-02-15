@@ -359,21 +359,16 @@ impl BrokerConnection {
         let request_timeout = config.request_timeout;
 
         // Determine if we need TLS and/or SASL
-        let needs_tls = config
-            .auth
-            .as_ref()
-            .is_some_and(|a| a.requires_tls());
-        let needs_sasl = config
-            .auth
-            .as_ref()
-            .is_some_and(|a| a.requires_sasl());
+        let needs_tls = config.auth.as_ref().is_some_and(|a| a.requires_tls());
+        let needs_sasl = config.auth.as_ref().is_some_and(|a| a.requires_sasl());
 
         if needs_tls {
             // TLS path: upgrade stream then optionally do SASL
             let auth = config.auth.as_ref().unwrap();
-            let tls_config = auth.tls_config.as_ref().ok_or_else(|| {
-                KrafkaError::config("TLS required but no TLS config provided")
-            })?;
+            let tls_config = auth
+                .tls_config
+                .as_ref()
+                .ok_or_else(|| KrafkaError::config("TLS required but no TLS config provided"))?;
 
             // Extract hostname (without port) for TLS SNI
             let hostname = address.split(':').next().unwrap_or(address);
@@ -384,8 +379,14 @@ impl BrokerConnection {
             if needs_sasl {
                 // TLS + SASL: authenticate on the TLS stream, then run event loop
                 let mut tls_stream = tls_stream;
-                Self::perform_sasl_handshake(&mut tls_stream, auth, address, &config.client_id, config.max_response_size)
-                    .await?;
+                Self::perform_sasl_handshake(
+                    &mut tls_stream,
+                    auth,
+                    address,
+                    &config.client_id,
+                    config.max_response_size,
+                )
+                .await?;
 
                 // Spawn the connection task with TLS stream
                 let (reader, writer) = tokio::io::split(tls_stream);
@@ -427,7 +428,14 @@ impl BrokerConnection {
             // SASL without TLS
             let auth = config.auth.as_ref().unwrap();
             let mut stream = stream;
-            Self::perform_sasl_handshake(&mut stream, auth, address, &config.client_id, config.max_response_size).await?;
+            Self::perform_sasl_handshake(
+                &mut stream,
+                auth,
+                address,
+                &config.client_id,
+                config.max_response_size,
+            )
+            .await?;
 
             let (reader, writer) = stream.into_split();
             tokio::spawn(async move {
@@ -515,13 +523,15 @@ impl BrokerConnection {
         let handshake_request = SaslHandshakeRequest::new(&mechanism_name);
         let mut encoder = Encoder::new();
         let pos = encoder.start_message();
-        let header = RequestHeader::new(ApiKey::SaslHandshake, 1, 0)
-            .with_client_id(client_id);
+        let header = RequestHeader::new(ApiKey::SaslHandshake, 1, 0).with_client_id(client_id);
         header.encode_v1(encoder.buffer_mut());
         handshake_request.encode_v1(encoder.buffer_mut());
         encoder.finish_message(pos);
 
-        stream.write_all(&encoder.take()).await.map_err(KrafkaError::Network)?;
+        stream
+            .write_all(&encoder.take())
+            .await
+            .map_err(KrafkaError::Network)?;
         stream.flush().await.map_err(KrafkaError::Network)?;
 
         // Read handshake response
@@ -546,7 +556,8 @@ impl BrokerConnection {
         let initial_bytes = authenticator.initial_response();
         Self::send_sasl_authenticate(stream, &initial_bytes, client_id).await?;
 
-        let auth_response = Self::read_sasl_authenticate_response(stream, max_response_size).await?;
+        let auth_response =
+            Self::read_sasl_authenticate_response(stream, max_response_size).await?;
         if !auth_response.error_code.is_ok() {
             return Err(KrafkaError::auth(format!(
                 "SASL authentication failed: {:?} - {}",
@@ -593,13 +604,15 @@ impl BrokerConnection {
         let request = SaslAuthenticateRequest::new(auth_bytes.to_vec());
         let mut encoder = Encoder::new();
         let pos = encoder.start_message();
-        let header = RequestHeader::new(ApiKey::SaslAuthenticate, 0, 1)
-            .with_client_id(client_id);
+        let header = RequestHeader::new(ApiKey::SaslAuthenticate, 0, 1).with_client_id(client_id);
         header.encode(encoder.buffer_mut());
         request.encode_v0(encoder.buffer_mut());
         encoder.finish_message(pos);
 
-        stream.write_all(&encoder.take()).await.map_err(KrafkaError::Network)?;
+        stream
+            .write_all(&encoder.take())
+            .await
+            .map_err(KrafkaError::Network)?;
         stream.flush().await.map_err(KrafkaError::Network)?;
         Ok(())
     }
@@ -686,10 +699,14 @@ impl BrokerConnection {
                     .collect();
                 for id in timed_out {
                     if let Some(req) = pending_map.remove(&id) {
-                        warn!(correlation_id = id, "Request timed out after {:?}", request_timeout);
-                        let _ = req.response_tx.send(Err(KrafkaError::timeout(
-                            format!("request {} timed out after {:?}", id, request_timeout),
-                        )));
+                        warn!(
+                            correlation_id = id,
+                            "Request timed out after {:?}", request_timeout
+                        );
+                        let _ = req.response_tx.send(Err(KrafkaError::timeout(format!(
+                            "request {} timed out after {:?}",
+                            id, request_timeout
+                        ))));
                     }
                 }
             }
@@ -1288,18 +1305,14 @@ mod tests {
     /// Accepts a connection, reads SaslHandshakeRequest, SaslAuthenticateRequest,
     /// and ApiVersionsRequest, responding to each with valid responses.
     /// Returns the captured auth bytes from SaslAuthenticate for verification.
-    async fn run_mock_sasl_broker(
-        listener: tokio::net::TcpListener,
-    ) -> (String, Vec<u8>) {
+    async fn run_mock_sasl_broker(listener: tokio::net::TcpListener) -> (String, Vec<u8>) {
         use bytes::BufMut;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (mut stream, _) = listener.accept().await.unwrap();
 
         // Helper: read a length-prefixed Kafka frame
-        async fn read_frame(
-            stream: &mut tokio::net::TcpStream,
-        ) -> Vec<u8> {
+        async fn read_frame(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
             let mut len_buf = [0u8; 4];
             stream.read_exact(&mut len_buf).await.unwrap();
             let len = i32::from_be_bytes(len_buf) as usize;
@@ -1309,10 +1322,7 @@ mod tests {
         }
 
         // Helper: write a length-prefixed Kafka frame
-        async fn write_frame(
-            stream: &mut tokio::net::TcpStream,
-            data: &[u8],
-        ) {
+        async fn write_frame(stream: &mut tokio::net::TcpStream, data: &[u8]) {
             let len = data.len() as i32;
             stream.write_all(&len.to_be_bytes()).await.unwrap();
             stream.write_all(data).await.unwrap();
@@ -1331,12 +1341,10 @@ mod tests {
         } else {
             10 + client_id_len as usize
         };
-        let mech_len = i16::from_be_bytes(
-            req[mech_offset..mech_offset + 2].try_into().unwrap(),
-        ) as usize;
+        let mech_len =
+            i16::from_be_bytes(req[mech_offset..mech_offset + 2].try_into().unwrap()) as usize;
         let mechanism =
-            String::from_utf8(req[mech_offset + 2..mech_offset + 2 + mech_len].to_vec())
-                .unwrap();
+            String::from_utf8(req[mech_offset + 2..mech_offset + 2 + mech_len].to_vec()).unwrap();
 
         // Send SaslHandshakeResponse: correlation_id + error_code(0) + 1 mechanism
         let mut resp = BytesMut::new();
@@ -1358,18 +1366,16 @@ mod tests {
         } else {
             10 + client_id_len as usize
         };
-        let auth_bytes_len = i32::from_be_bytes(
-            req[auth_offset..auth_offset + 4].try_into().unwrap(),
-        ) as usize;
-        let auth_bytes =
-            req[auth_offset + 4..auth_offset + 4 + auth_bytes_len].to_vec();
+        let auth_bytes_len =
+            i32::from_be_bytes(req[auth_offset..auth_offset + 4].try_into().unwrap()) as usize;
+        let auth_bytes = req[auth_offset + 4..auth_offset + 4 + auth_bytes_len].to_vec();
 
         // Send SaslAuthenticateResponse: correlation_id + error_code(0) + null message + empty bytes
         let mut resp = BytesMut::new();
         resp.put_i32(correlation_id);
-        resp.put_i16(0);    // error_code = NONE
+        resp.put_i16(0); // error_code = NONE
         resp.put_i16(-1_i16); // error_message = null (KafkaString)
-        resp.put_i32(0);    // auth_bytes = empty (KafkaBytes, 0 length)
+        resp.put_i32(0); // auth_bytes = empty (KafkaBytes, 0 length)
         write_frame(&mut stream, &resp).await;
 
         // 3. Read ApiVersionsRequest
@@ -1399,11 +1405,18 @@ mod tests {
         // Connect with SASL/PLAIN auth
         let config = ConnectionConfig::builder()
             .client_id("test-client")
-            .auth(crate::auth::AuthConfig::sasl_plain("testuser", "testpassword"))
+            .auth(crate::auth::AuthConfig::sasl_plain(
+                "testuser",
+                "testpassword",
+            ))
             .build();
 
         let conn = BrokerConnection::connect(&addr_str, config).await;
-        assert!(conn.is_ok(), "Connection with SASL/PLAIN should succeed: {:?}", conn.err());
+        assert!(
+            conn.is_ok(),
+            "Connection with SASL/PLAIN should succeed: {:?}",
+            conn.err()
+        );
 
         let conn = conn.unwrap();
         assert!(conn.is_alive());
@@ -1456,15 +1469,16 @@ mod tests {
         });
 
         // Connect without auth
-        let config = ConnectionConfig::builder()
-            .client_id("test-client")
-            .build();
+        let config = ConnectionConfig::builder().client_id("test-client").build();
 
         let conn = BrokerConnection::connect(&addr_str, config).await;
         assert!(conn.is_ok());
 
         let api_key = mock_handle.await.unwrap();
-        assert_eq!(api_key, 18, "First request without auth should be ApiVersions (18), not SaslHandshake (17)");
+        assert_eq!(
+            api_key, 18,
+            "First request without auth should be ApiVersions (18), not SaslHandshake (17)"
+        );
 
         conn.unwrap().close().await;
     }
@@ -1494,7 +1508,7 @@ mod tests {
             let mut resp = BytesMut::new();
             resp.put_i32(correlation_id);
             resp.put_i16(33); // error_code = UNSUPPORTED_SASL_MECHANISM
-            resp.put_i32(1);  // 1 supported mechanism
+            resp.put_i32(1); // 1 supported mechanism
             let mech = b"GSSAPI";
             resp.put_i16(mech.len() as i16);
             resp.put_slice(mech);
@@ -1510,7 +1524,10 @@ mod tests {
             .build();
 
         let result = BrokerConnection::connect(&addr_str, config).await;
-        assert!(result.is_err(), "Connection should fail when SASL handshake is rejected");
+        assert!(
+            result.is_err(),
+            "Connection should fail when SASL handshake is rejected"
+        );
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("Expected error"),
@@ -1582,7 +1599,10 @@ mod tests {
             .build();
 
         let result = BrokerConnection::connect(&addr_str, config).await;
-        assert!(result.is_err(), "Connection should fail when authentication is rejected");
+        assert!(
+            result.is_err(),
+            "Connection should fail when authentication is rejected"
+        );
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("Expected error"),
@@ -1619,7 +1639,9 @@ mod tests {
         // Simulate a stream that sends a negative i32 as the length prefix
         let data: [u8; 4] = (-1i32).to_be_bytes();
         let mut cursor = std::io::Cursor::new(data);
-        let result = BrokerConnection::read_framed_response(&mut cursor, crate::protocol::MAX_MESSAGE_SIZE).await;
+        let result =
+            BrokerConnection::read_framed_response(&mut cursor, crate::protocol::MAX_MESSAGE_SIZE)
+                .await;
         assert!(result.is_err(), "negative frame length should be rejected");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
@@ -1632,7 +1654,9 @@ mod tests {
     async fn test_read_framed_response_rejects_zero_length() {
         let data: [u8; 4] = 0i32.to_be_bytes();
         let mut cursor = std::io::Cursor::new(data);
-        let result = BrokerConnection::read_framed_response(&mut cursor, crate::protocol::MAX_MESSAGE_SIZE).await;
+        let result =
+            BrokerConnection::read_framed_response(&mut cursor, crate::protocol::MAX_MESSAGE_SIZE)
+                .await;
         assert!(result.is_err(), "zero frame length should be rejected");
     }
 
@@ -1666,17 +1690,13 @@ mod tests {
     #[test]
     fn test_connection_config_builder_max_response_size_minimum() {
         // Setting a value below 1024 should be clamped to 1024
-        let config = ConnectionConfig::builder()
-            .max_response_size(100)
-            .build();
+        let config = ConnectionConfig::builder().max_response_size(100).build();
         assert_eq!(
             config.max_response_size, 1024,
             "max_response_size should be clamped to minimum of 1024 bytes"
         );
 
-        let config_zero = ConnectionConfig::builder()
-            .max_response_size(0)
-            .build();
+        let config_zero = ConnectionConfig::builder().max_response_size(0).build();
         assert_eq!(
             config_zero.max_response_size, 1024,
             "max_response_size(0) should clamp to 1024"

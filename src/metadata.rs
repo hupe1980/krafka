@@ -181,7 +181,8 @@ impl ClusterMetadata {
         // If it was refreshed within the last 100ms, skip the redundant request.
         {
             let cache = self.cache.read().await;
-            if cache.last_updated.elapsed() < Duration::from_millis(100) && !cache.brokers.is_empty()
+            if cache.last_updated.elapsed() < Duration::from_millis(100)
+                && !cache.brokers.is_empty()
             {
                 debug!("Metadata was recently refreshed, skipping redundant request");
                 return Ok(());

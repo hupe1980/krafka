@@ -678,8 +678,7 @@ mod tests {
 
     #[test]
     fn test_auth_config_sasl_oauthbearer_ssl() {
-        let config =
-            AuthConfig::sasl_oauthbearer_ssl("my-token", TlsConfig::new());
+        let config = AuthConfig::sasl_oauthbearer_ssl("my-token", TlsConfig::new());
         assert_eq!(config.security_protocol, SecurityProtocol::SaslSsl);
         assert_eq!(config.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
         assert!(config.oauthbearer_token.is_some());
@@ -690,8 +689,7 @@ mod tests {
 
     #[test]
     fn test_auth_config_sasl_oauthbearer_token() {
-        let token = OAuthBearerToken::new("jwt")
-            .with_extension("logicalCluster", "lkc-1");
+        let token = OAuthBearerToken::new("jwt").with_extension("logicalCluster", "lkc-1");
         let config = AuthConfig::sasl_oauthbearer_token(token);
         assert_eq!(config.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
         assert!(config.oauthbearer_token.is_some());
@@ -700,8 +698,7 @@ mod tests {
     #[test]
     fn test_auth_config_sasl_oauthbearer_token_ssl() {
         let token = OAuthBearerToken::new("jwt");
-        let config =
-            AuthConfig::sasl_oauthbearer_token_ssl(token, TlsConfig::new());
+        let config = AuthConfig::sasl_oauthbearer_token_ssl(token, TlsConfig::new());
         assert_eq!(config.security_protocol, SecurityProtocol::SaslSsl);
         assert_eq!(config.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
         assert!(config.oauthbearer_token.is_some());

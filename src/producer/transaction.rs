@@ -218,7 +218,12 @@ impl TransactionalProducer {
         new: TransactionState,
     ) -> std::result::Result<(), TransactionState> {
         self.state
-            .compare_exchange(expected as u8, new as u8, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(
+                expected as u8,
+                new as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
             .map(|_| ())
             .map_err(TransactionState::from_u8)
     }
@@ -229,9 +234,10 @@ impl TransactionalProducer {
     /// It fetches the producer ID and epoch from the transaction coordinator.
     pub async fn init_transactions(&self) -> Result<()> {
         // Atomic CAS: Uninitialized → Initializing (§9.3 fix: prevents concurrent calls)
-        if let Err(actual) =
-            self.try_transition(TransactionState::Uninitialized, TransactionState::Initializing)
-        {
+        if let Err(actual) = self.try_transition(
+            TransactionState::Uninitialized,
+            TransactionState::Initializing,
+        ) {
             return Err(KrafkaError::invalid_state(format!(
                 "init_transactions can only be called once (state={:?})",
                 actual
@@ -479,9 +485,7 @@ impl TransactionalProducer {
         let mut backoff = Duration::from_millis(100);
 
         loop {
-            let result = self
-                .do_send_to_partition(topic, partition, &record)
-                .await;
+            let result = self.do_send_to_partition(topic, partition, &record).await;
 
             match result {
                 Ok(metadata) => {
@@ -518,7 +522,8 @@ impl TransactionalProducer {
                         topic = topic,
                         partition = partition,
                         attempt = attempt,
-                        "Transient error in txn send, retrying: {}", e
+                        "Transient error in txn send, retrying: {}",
+                        e
                     );
 
                     // Refresh metadata on leader errors
@@ -561,8 +566,10 @@ impl TransactionalProducer {
         }
 
         if record.headers.is_empty() {
-            batch_builder = batch_builder
-                .add_record(record.key.clone().map(Bytes::from), Some(Bytes::from(record.value.clone())));
+            batch_builder = batch_builder.add_record(
+                record.key.clone().map(Bytes::from),
+                Some(Bytes::from(record.value.clone())),
+            );
         } else {
             batch_builder = batch_builder.add_record_with_headers(
                 record.key.clone().map(Bytes::from),
@@ -701,8 +708,7 @@ impl TransactionalProducer {
         }
 
         // Find the group coordinator for offset commit
-        let (group_node_id, group_host, group_port) =
-            self.find_group_coordinator(group_id).await?;
+        let (group_node_id, group_host, group_port) = self.find_group_coordinator(group_id).await?;
         let group_addr = format!("{}:{}", group_host, group_port);
 
         let group_conn = self
@@ -730,10 +736,7 @@ impl TransactionalProducer {
     }
 
     /// Find the group coordinator, returning (node_id, host, port).
-    async fn find_group_coordinator(
-        &self,
-        group_id: &str,
-    ) -> Result<(i32, String, i32)> {
+    async fn find_group_coordinator(&self, group_id: &str) -> Result<(i32, String, i32)> {
         let brokers = self.metadata.brokers().await;
         if brokers.is_empty() {
             return Err(KrafkaError::protocol("no brokers available"));
@@ -769,9 +772,10 @@ impl TransactionalProducer {
     /// Commit the current transaction.
     pub async fn commit_transaction(&self) -> Result<()> {
         // Atomic CAS: InTransaction → Committing (§6.1 fix)
-        if let Err(actual) =
-            self.try_transition(TransactionState::InTransaction, TransactionState::Committing)
-        {
+        if let Err(actual) = self.try_transition(
+            TransactionState::InTransaction,
+            TransactionState::Committing,
+        ) {
             return Err(KrafkaError::invalid_state(format!(
                 "cannot commit in state {:?}",
                 actual
@@ -1018,9 +1022,7 @@ impl TransactionalProducerBuilder {
             return Err(KrafkaError::config("transactional_id is required"));
         }
         if self.config.transaction_timeout_ms <= 0 {
-            return Err(KrafkaError::config(
-                "transaction_timeout_ms must be > 0",
-            ));
+            return Err(KrafkaError::config("transaction_timeout_ms must be > 0"));
         }
 
         let mut pool_config_builder = ConnectionConfig::builder()
@@ -1250,8 +1252,7 @@ mod tests {
 
     #[test]
     fn test_txn_builder_requires_transactional_id() {
-        let builder = TransactionalProducer::builder()
-            .bootstrap_servers("broker:9092");
+        let builder = TransactionalProducer::builder().bootstrap_servers("broker:9092");
         // Without transactional_id, it defaults to empty string
         assert!(builder.config.transactional_id.is_empty());
     }
@@ -1299,7 +1300,10 @@ mod tests {
     fn test_transaction_state_initializing_round_trip() {
         let state = TransactionState::Initializing;
         let val = state as u8;
-        assert_eq!(TransactionState::from_u8(val), TransactionState::Initializing);
+        assert_eq!(
+            TransactionState::from_u8(val),
+            TransactionState::Initializing
+        );
     }
 
     #[test]
@@ -1409,10 +1413,7 @@ mod tests {
 
     #[test]
     fn test_out_of_order_sequence_is_retriable() {
-        let error = KrafkaError::broker(
-            ErrorCode::OutOfOrderSequenceNumber,
-            "sequence mismatch",
-        );
+        let error = KrafkaError::broker(ErrorCode::OutOfOrderSequenceNumber, "sequence mismatch");
         assert!(error.is_retriable());
     }
 
@@ -1421,8 +1422,7 @@ mod tests {
     #[test]
     fn test_producer_record_with_timestamp() {
         use crate::producer::ProducerRecord;
-        let record = ProducerRecord::new("topic", b"value".to_vec())
-            .with_timestamp(1234567890);
+        let record = ProducerRecord::new("topic", b"value".to_vec()).with_timestamp(1234567890);
         assert_eq!(record.timestamp, Some(1234567890));
     }
 }

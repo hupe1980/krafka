@@ -154,10 +154,7 @@ pub(crate) fn safe_on_acknowledgement(
     if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
         interceptor.on_acknowledgement(metadata, error);
     })) {
-        tracing::error!(
-            "ProducerInterceptor.on_acknowledgement panicked: {:?}",
-            e
-        );
+        tracing::error!("ProducerInterceptor.on_acknowledgement panicked: {:?}", e);
     }
 }
 
@@ -212,13 +209,11 @@ mod tests {
         }
 
         fn send_count(&self) -> usize {
-            self.send_count
-                .load(std::sync::atomic::Ordering::Relaxed)
+            self.send_count.load(std::sync::atomic::Ordering::Relaxed)
         }
 
         fn ack_count(&self) -> usize {
-            self.ack_count
-                .load(std::sync::atomic::Ordering::Relaxed)
+            self.ack_count.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -258,8 +253,7 @@ mod tests {
         }
 
         fn commit_count(&self) -> usize {
-            self.commit_count
-                .load(std::sync::atomic::Ordering::Relaxed)
+            self.commit_count.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 

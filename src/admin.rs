@@ -49,11 +49,10 @@ use crate::protocol::{
     CreatePartitionsTopic, CreateTopicsRequest, CreateTopicsResponse, DeleteAclsRequest,
     DeleteAclsResponse, DeleteRecordsPartition, DeleteRecordsRequest, DeleteRecordsResponse,
     DeleteRecordsTopic, DeleteTopicsRequest, DeleteTopicsResponse, DescribeAclsRequest,
-    DescribeAclsResponse,
-    DescribeConfigsRequest, DescribeConfigsResponse, DescribeGroupsRequest, DescribeGroupsResponse,
-    FindCoordinatorRequest, FindCoordinatorResponse,
-    ListGroupsRequest, ListGroupsResponse, OffsetForLeaderEpochPartition,
-    OffsetForLeaderEpochRequest, OffsetForLeaderEpochResponse, OffsetForLeaderEpochTopic,
+    DescribeAclsResponse, DescribeConfigsRequest, DescribeConfigsResponse, DescribeGroupsRequest,
+    DescribeGroupsResponse, FindCoordinatorRequest, FindCoordinatorResponse, ListGroupsRequest,
+    ListGroupsResponse, OffsetForLeaderEpochPartition, OffsetForLeaderEpochRequest,
+    OffsetForLeaderEpochResponse, OffsetForLeaderEpochTopic,
 };
 
 /// Configuration for creating a topic.
@@ -1366,8 +1365,10 @@ impl AdminClient {
 
         // Group partitions by their leader broker
         let fallback_broker_id = brokers[0].id;
-        let mut leader_partitions: HashMap<i32, HashMap<String, Vec<OffsetForLeaderEpochPartition>>> =
-            HashMap::new();
+        let mut leader_partitions: HashMap<
+            i32,
+            HashMap<String, Vec<OffsetForLeaderEpochPartition>>,
+        > = HashMap::new();
 
         for (topic, partition, leader_epoch) in &partitions {
             let leader_id = self
@@ -1721,7 +1722,10 @@ mod tests {
             .sasl_plain("admin", "admin-secret");
 
         let auth = builder.config.auth.as_ref().unwrap();
-        assert_eq!(auth.security_protocol, crate::auth::SecurityProtocol::SaslPlaintext);
+        assert_eq!(
+            auth.security_protocol,
+            crate::auth::SecurityProtocol::SaslPlaintext
+        );
         assert_eq!(auth.sasl_mechanism, Some(crate::auth::SaslMechanism::Plain));
         let creds = auth.plain_credentials.as_ref().unwrap();
         assert_eq!(creds.username, "admin");
@@ -1734,7 +1738,10 @@ mod tests {
             .sasl_scram_sha256("user", "pass");
 
         let auth = builder.config.auth.as_ref().unwrap();
-        assert_eq!(auth.sasl_mechanism, Some(crate::auth::SaslMechanism::ScramSha256));
+        assert_eq!(
+            auth.sasl_mechanism,
+            Some(crate::auth::SaslMechanism::ScramSha256)
+        );
         assert!(auth.scram_credentials.is_some());
 
         let builder = AdminClient::builder()
@@ -1742,7 +1749,10 @@ mod tests {
             .sasl_scram_sha512("user", "pass");
 
         let auth = builder.config.auth.as_ref().unwrap();
-        assert_eq!(auth.sasl_mechanism, Some(crate::auth::SaslMechanism::ScramSha512));
+        assert_eq!(
+            auth.sasl_mechanism,
+            Some(crate::auth::SaslMechanism::ScramSha512)
+        );
         assert!(auth.scram_credentials.is_some());
     }
 
@@ -1758,15 +1768,17 @@ mod tests {
         let auth = builder.config.auth.as_ref().unwrap();
         assert!(auth.requires_tls());
         assert!(auth.requires_sasl());
-        assert_eq!(auth.sasl_mechanism, Some(crate::auth::SaslMechanism::AwsMskIam));
+        assert_eq!(
+            auth.sasl_mechanism,
+            Some(crate::auth::SaslMechanism::AwsMskIam)
+        );
         assert!(auth.aws_msk_iam_credentials.is_some());
         assert!(auth.tls_config.is_some());
     }
 
     #[test]
     fn test_admin_builder_no_auth_by_default() {
-        let builder = AdminClient::builder()
-            .bootstrap_servers("broker:9092");
+        let builder = AdminClient::builder().bootstrap_servers("broker:9092");
 
         assert!(builder.config.auth.is_none());
     }

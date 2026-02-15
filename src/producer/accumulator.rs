@@ -46,9 +46,7 @@ enum AccumulatorMessage {
         response_tx: oneshot::Sender<Result<()>>,
     },
     /// Shutdown the accumulator, flush remaining batches, and signal completion.
-    Shutdown {
-        response_tx: oneshot::Sender<()>,
-    },
+    Shutdown { response_tx: oneshot::Sender<()> },
 }
 
 /// Handle to the record accumulator.
@@ -428,7 +426,13 @@ impl RecordAccumulator {
             let retry_policy = self.retry_policy.clone();
             let metrics = self.metrics.clone();
             join_set.spawn(Self::send_extracted_batch(
-                topic, partition, batch.pending, metadata, config, retry_policy, metrics,
+                topic,
+                partition,
+                batch.pending,
+                metadata,
+                config,
+                retry_policy,
+                metrics,
             ));
         }
         while join_set.join_next().await.is_some() {}
@@ -461,7 +465,13 @@ impl RecordAccumulator {
             let retry_policy = self.retry_policy.clone();
             let metrics = self.metrics.clone();
             join_set.spawn(Self::send_extracted_batch(
-                topic, partition, batch.pending, metadata, config, retry_policy, metrics,
+                topic,
+                partition,
+                batch.pending,
+                metadata,
+                config,
+                retry_policy,
+                metrics,
             ));
         }
         while join_set.join_next().await.is_some() {}
@@ -492,7 +502,13 @@ impl RecordAccumulator {
             let retry_policy = self.retry_policy.clone();
             let metrics = self.metrics.clone();
             tokio::spawn(Self::send_extracted_batch(
-                topic, partition, batch.pending, metadata, config, retry_policy, metrics,
+                topic,
+                partition,
+                batch.pending,
+                metadata,
+                config,
+                retry_policy,
+                metrics,
             ));
         }
     }
@@ -561,10 +577,7 @@ impl RecordAccumulator {
         };
 
         // Retry loop (§2.4)
-        let mut retry_ctx = RetryContext::new(
-            retry_policy,
-            format!("batch({topic}-{partition})"),
-        );
+        let mut retry_ctx = RetryContext::new(retry_policy, format!("batch({topic}-{partition})"));
 
         let result: std::result::Result<(i64, i64), KrafkaError> = loop {
             // Get connection to leader
@@ -591,9 +604,12 @@ impl RecordAccumulator {
 
             // acks=0 (fire-and-forget): Kafka sends no response (R6.1 fix)
             if config.acks == 0 {
-                match conn.send_fire_and_forget(ApiKey::Produce, 0, |buf| {
-                    request.encode_v0(buf);
-                }).await {
+                match conn
+                    .send_fire_and_forget(ApiKey::Produce, 0, |buf| {
+                        request.encode_v0(buf);
+                    })
+                    .await
+                {
                     Ok(()) => {
                         retry_ctx.record_success();
                         break Ok((-1, -1));
@@ -616,60 +632,52 @@ impl RecordAccumulator {
                 .await;
 
             match response_result {
-                Ok(mut response_buf) => {
-                    match ProduceResponse::decode_v0(&mut response_buf) {
-                        Ok(produce_response) => {
-                            let pr = produce_response
-                                .responses
-                                .iter()
-                                .find(|r| r.name == topic)
-                                .and_then(|r| {
-                                    r.partition_responses
-                                        .iter()
-                                        .find(|p| p.index == partition)
-                                });
+                Ok(mut response_buf) => match ProduceResponse::decode_v0(&mut response_buf) {
+                    Ok(produce_response) => {
+                        let pr = produce_response
+                            .responses
+                            .iter()
+                            .find(|r| r.name == topic)
+                            .and_then(|r| {
+                                r.partition_responses.iter().find(|p| p.index == partition)
+                            });
 
-                            match pr {
-                                Some(pr) if pr.error_code.is_ok() => {
-                                    retry_ctx.record_success();
-                                    break Ok((pr.base_offset, pr.log_append_time_ms));
-                                }
-                                Some(pr) => {
-                                    let err = KrafkaError::broker(
-                                        pr.error_code,
-                                        format!(
-                                            "batch produce failed for {topic}-{partition}"
-                                        ),
-                                    );
-                                    if err.is_retriable() {
-                                        let _ = metadata
-                                            .refresh_for_topics(Some(&[&topic]))
-                                            .await;
-                                    }
-                                    if let Some(backoff) = retry_ctx.record_failure(&err) {
-                                        metrics.record_retry();
-                                        retry_ctx.wait(backoff).await;
-                                        continue;
-                                    }
-                                    break Err(err);
-                                }
-                                None => {
-                                    break Err(KrafkaError::protocol(
-                                        "partition not found in response",
-                                    ));
-                                }
+                        match pr {
+                            Some(pr) if pr.error_code.is_ok() => {
+                                retry_ctx.record_success();
+                                break Ok((pr.base_offset, pr.log_append_time_ms));
                             }
-                        }
-                        Err(e) => {
-                            if let Some(backoff) = retry_ctx.record_failure(&e) {
-                                metrics.record_retry();
-                                retry_ctx.wait(backoff).await;
-                                continue;
+                            Some(pr) => {
+                                let err = KrafkaError::broker(
+                                    pr.error_code,
+                                    format!("batch produce failed for {topic}-{partition}"),
+                                );
+                                if err.is_retriable() {
+                                    let _ = metadata.refresh_for_topics(Some(&[&topic])).await;
+                                }
+                                if let Some(backoff) = retry_ctx.record_failure(&err) {
+                                    metrics.record_retry();
+                                    retry_ctx.wait(backoff).await;
+                                    continue;
+                                }
+                                break Err(err);
                             }
-                            break Err(e);
+                            None => {
+                                break Err(KrafkaError::protocol(
+                                    "partition not found in response",
+                                ));
+                            }
                         }
                     }
-                }
+                    Err(e) => {
+                        if let Some(backoff) = retry_ctx.record_failure(&e) {
+                            metrics.record_retry();
+                            retry_ctx.wait(backoff).await;
+                            continue;
+                        }
+                        break Err(e);
+                    }
+                },
                 Err(e) => {
                     if e.is_retriable() {
                         debug!(
@@ -693,8 +701,7 @@ impl RecordAccumulator {
         // Complete pending records
         match result {
             Ok((base_offset, timestamp)) => {
-                let batch_bytes_total: u64 =
-                    pending.iter().map(|p| p.estimated_size as u64).sum();
+                let batch_bytes_total: u64 = pending.iter().map(|p| p.estimated_size as u64).sum();
                 metrics.record_batch(pending.len() as u64);
                 metrics.bytes_sent.add(batch_bytes_total);
                 for p in pending {
@@ -719,7 +726,11 @@ impl RecordAccumulator {
                         timestamp: 0,
                     };
                     let err = KrafkaError::protocol(&error_msg);
-                    crate::interceptor::safe_on_acknowledgement(&*config.interceptor, &meta, Some(&err));
+                    crate::interceptor::safe_on_acknowledgement(
+                        &*config.interceptor,
+                        &meta,
+                        Some(&err),
+                    );
                     let _ = p.response_tx.send(Err(err));
                 }
             }
@@ -748,7 +759,13 @@ impl RecordAccumulator {
             let retry_policy = self.retry_policy.clone();
             let metrics = self.metrics.clone();
             join_set.spawn(Self::send_extracted_batch(
-                topic, partition, batch.pending, metadata, config, retry_policy, metrics,
+                topic,
+                partition,
+                batch.pending,
+                metadata,
+                config,
+                retry_policy,
+                metrics,
             ));
         }
         while join_set.join_next().await.is_some() {}
@@ -810,8 +827,8 @@ mod tests {
         assert!(size > 64); // overhead for topic name and struct
 
         // Record with key and headers should be larger
-        let record_with_key = ProducerRecord::new("test-topic", b"value".to_vec())
-            .with_key(Some(b"key".to_vec()));
+        let record_with_key =
+            ProducerRecord::new("test-topic", b"value".to_vec()).with_key(Some(b"key".to_vec()));
         let size_with_key = RecordAccumulator::estimate_record_size(&record_with_key);
         assert!(size_with_key > size);
     }

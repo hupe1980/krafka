@@ -508,8 +508,7 @@ mod tests {
 
     #[test]
     fn test_sasl_authenticator_oauthbearer_with_extensions() {
-        let token = OAuthBearerToken::new("tok")
-            .with_extension("logicalCluster", "lkc-123");
+        let token = OAuthBearerToken::new("tok").with_extension("logicalCluster", "lkc-123");
         let auth = AuthConfig::sasl_oauthbearer_token(token);
         let mut authenticator = SaslAuthenticator::new(&auth).unwrap();
 
@@ -526,8 +525,7 @@ mod tests {
         let mut authenticator = SaslAuthenticator::new(&auth).unwrap();
         let _ = authenticator.initial_response();
 
-        let result = authenticator
-            .process_challenge(br#"{"status":"invalid_token"}"#);
+        let result = authenticator.process_challenge(br#"{"status":"invalid_token"}"#);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("invalid_token"));
     }
@@ -561,25 +559,18 @@ mod tests {
             .build();
 
         assert!(config.auth.requires_sasl());
-        assert_eq!(
-            config.auth.sasl_mechanism,
-            Some(SaslMechanism::OAuthBearer)
-        );
+        assert_eq!(config.auth.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
         assert!(config.auth.oauthbearer_token.is_some());
     }
 
     #[test]
     fn test_secure_connection_config_builder_oauthbearer_token() {
-        let token = OAuthBearerToken::new("tok")
-            .with_extension("key", "val");
+        let token = OAuthBearerToken::new("tok").with_extension("key", "val");
         let config = SecureConnectionConfig::builder()
             .sasl_oauthbearer_token(token)
             .build();
 
         assert!(config.auth.requires_sasl());
-        assert_eq!(
-            config.auth.sasl_mechanism,
-            Some(SaslMechanism::OAuthBearer)
-        );
+        assert_eq!(config.auth.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
     }
 }

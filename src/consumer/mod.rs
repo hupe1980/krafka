@@ -59,8 +59,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::error::{KrafkaError, Result};
 use crate::auth::AuthConfig;
+use crate::error::{KrafkaError, Result};
 use crate::metadata::ClusterMetadata;
 use crate::metrics::ConsumerMetrics;
 use crate::network::{ConnectionConfig, ConnectionPool};
@@ -147,16 +147,19 @@ impl Consumer {
 
         // Create group coordinator if group_id is specified
         let group_coordinator = if let Some(ref group_id) = config.group_id {
-            Some(Arc::new(GroupCoordinator::new(
-                group_id.clone(),
-                pool.clone(),
-                metadata.clone(),
-                config.session_timeout,
-                config.heartbeat_interval,
-                config.max_poll_interval, // rebalance_timeout matches Java client's max.poll.interval.ms
-            ).with_assignor_strategy(config.partition_assignment_strategy)
-             .with_group_instance_id(config.group_instance_id.clone())
-             .with_isolation_level(config.isolation_level.to_i8())))
+            Some(Arc::new(
+                GroupCoordinator::new(
+                    group_id.clone(),
+                    pool.clone(),
+                    metadata.clone(),
+                    config.session_timeout,
+                    config.heartbeat_interval,
+                    config.max_poll_interval, // rebalance_timeout matches Java client's max.poll.interval.ms
+                )
+                .with_assignor_strategy(config.partition_assignment_strategy)
+                .with_group_instance_id(config.group_instance_id.clone())
+                .with_isolation_level(config.isolation_level.to_i8()),
+            ))
         } else {
             None
         };
@@ -269,7 +272,9 @@ impl Consumer {
 
         for (topic, partitions) in assigned {
             for &partition in partitions {
-                if let Some(&offset) = committed.get(&(topic.clone(), partition)) && offset >= 0 {
+                if let Some(&offset) = committed.get(&(topic.clone(), partition))
+                    && offset >= 0
+                {
                     offsets.insert((topic.clone(), partition), offset);
                     continue;
                 }
@@ -446,7 +451,10 @@ impl Consumer {
         partition: PartitionId,
         timestamp: i64,
     ) -> Result<Offset> {
-        let conn = self.metadata.get_leader_connection(topic, partition).await?;
+        let conn = self
+            .metadata
+            .get_leader_connection(topic, partition)
+            .await?;
         let leader_epoch = self
             .metadata
             .leader_epoch(topic, partition)
@@ -826,8 +834,7 @@ impl Consumer {
 
                 if !partition_response.error_code.is_ok() {
                     // Handle leader epoch errors by validating via OffsetForLeaderEpoch
-                    if partition_response.error_code
-                        == crate::error::ErrorCode::FencedLeaderEpoch
+                    if partition_response.error_code == crate::error::ErrorCode::FencedLeaderEpoch
                         || partition_response.error_code
                             == crate::error::ErrorCode::UnknownLeaderEpoch
                     {
@@ -861,13 +868,21 @@ impl Consumer {
                                 part_map.insert(topic_name.clone(), vec![partition]);
                                 match gc.list_offsets(&part_map, target).await {
                                     Ok(resolved) => {
-                                        if let Some(&new_offset) = resolved.get(&(topic_name.clone(), partition)) {
+                                        if let Some(&new_offset) =
+                                            resolved.get(&(topic_name.clone(), partition))
+                                        {
                                             let mut offsets = self.offsets.write().await;
-                                            offsets.insert((topic_name.clone(), partition), new_offset);
+                                            offsets.insert(
+                                                (topic_name.clone(), partition),
+                                                new_offset,
+                                            );
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("Failed to resolve offset for {}-{}: {}", topic_name, partition, e);
+                                        warn!(
+                                            "Failed to resolve offset for {}-{}: {}",
+                                            topic_name, partition, e
+                                        );
                                     }
                                 }
                             }
@@ -973,13 +988,18 @@ impl Consumer {
             return Ok(());
         }
 
-        let leader_id = self.metadata.leader(topic, partition).await.ok_or_else(|| {
-            KrafkaError::invalid_state(format!("no leader for {}-{}", topic, partition))
-        })?;
+        let leader_id = self
+            .metadata
+            .leader(topic, partition)
+            .await
+            .ok_or_else(|| {
+                KrafkaError::invalid_state(format!("no leader for {}-{}", topic, partition))
+            })?;
 
-        let broker = self.metadata.broker(leader_id).await.ok_or_else(|| {
-            KrafkaError::invalid_state(format!("broker {} not found", leader_id))
-        })?;
+        let broker =
+            self.metadata.broker(leader_id).await.ok_or_else(|| {
+                KrafkaError::invalid_state(format!("broker {} not found", leader_id))
+            })?;
 
         let conn = self
             .pool
@@ -1027,10 +1047,7 @@ impl Consumer {
                             topic, partition, current_offset, partition_result.end_offset
                         );
                         let mut offsets = self.offsets.write().await;
-                        offsets.insert(
-                            (topic.to_string(), partition),
-                            partition_result.end_offset,
-                        );
+                        offsets.insert((topic.to_string(), partition), partition_result.end_offset);
                     }
                 }
             }
@@ -1131,10 +1148,18 @@ impl Consumer {
 
             match coordinator.commit_offsets(&commit_offsets).await {
                 Ok(()) => {
-                    crate::interceptor::safe_on_commit(&*self.interceptor, &committed_offsets, None);
+                    crate::interceptor::safe_on_commit(
+                        &*self.interceptor,
+                        &committed_offsets,
+                        None,
+                    );
                 }
                 Err(e) => {
-                    crate::interceptor::safe_on_commit(&*self.interceptor, &committed_offsets, Some(&e));
+                    crate::interceptor::safe_on_commit(
+                        &*self.interceptor,
+                        &committed_offsets,
+                        Some(&e),
+                    );
                     return Err(e);
                 }
             }
@@ -1170,31 +1195,33 @@ impl Consumer {
             Err(_) => HashSet::new(), // If lock contention, include all (safe fallback)
         };
 
-        let offsets_snapshot: HashMap<(String, PartitionId), (i64, Option<String>)> =
-            match self.offsets.try_read() {
-                Ok(guard) => {
-                    if guard.is_empty() {
-                        return;
-                    }
-                    guard
-                        .iter()
-                        .filter(|((topic, partition), _)| {
-                            // §R13.6 fix: Only commit offsets for assigned partitions
-                            // when using group coordination. Manual assign mode commits all.
-                            self.group_coordinator.is_none()
-                                || assigned_set.contains(&(topic.clone(), *partition))
-                        })
-                        .map(|((topic, partition), offset)| {
-                            ((topic.clone(), *partition), (*offset, None))
-                        })
-                        .collect()
-                }
-                Err(_) => {
-                    // §15.2 fix: Log warning on contention so dropped commits are visible
-                    tracing::warn!("commit_async: offset lock contention, skipping this commit cycle");
+        let offsets_snapshot: HashMap<(String, PartitionId), (i64, Option<String>)> = match self
+            .offsets
+            .try_read()
+        {
+            Ok(guard) => {
+                if guard.is_empty() {
                     return;
                 }
-            };
+                guard
+                    .iter()
+                    .filter(|((topic, partition), _)| {
+                        // §R13.6 fix: Only commit offsets for assigned partitions
+                        // when using group coordination. Manual assign mode commits all.
+                        self.group_coordinator.is_none()
+                            || assigned_set.contains(&(topic.clone(), *partition))
+                    })
+                    .map(|((topic, partition), offset)| {
+                        ((topic.clone(), *partition), (*offset, None))
+                    })
+                    .collect()
+            }
+            Err(_) => {
+                // §15.2 fix: Log warning on contention so dropped commits are visible
+                tracing::warn!("commit_async: offset lock contention, skipping this commit cycle");
+                return;
+            }
+        };
 
         let coordinator = self.group_coordinator.clone();
         let group_id = self.config.group_id.clone();
@@ -1288,10 +1315,18 @@ impl Consumer {
 
             match coordinator.commit_offsets(&commit_offsets).await {
                 Ok(()) => {
-                    crate::interceptor::safe_on_commit(&*self.interceptor, &interceptor_offsets, None);
+                    crate::interceptor::safe_on_commit(
+                        &*self.interceptor,
+                        &interceptor_offsets,
+                        None,
+                    );
                 }
                 Err(e) => {
-                    crate::interceptor::safe_on_commit(&*self.interceptor, &interceptor_offsets, Some(&e));
+                    crate::interceptor::safe_on_commit(
+                        &*self.interceptor,
+                        &interceptor_offsets,
+                        Some(&e),
+                    );
                     return Err(e);
                 }
             }
@@ -1592,10 +1627,7 @@ impl ConsumerBuilder {
     }
 
     /// Set a rebalance listener to be notified of partition assignment changes.
-    pub fn rebalance_listener(
-        mut self,
-        listener: Arc<dyn ConsumerRebalanceListener>,
-    ) -> Self {
+    pub fn rebalance_listener(mut self, listener: Arc<dyn ConsumerRebalanceListener>) -> Self {
         self.rebalance_listener = Some(listener);
         self
     }
@@ -1733,7 +1765,10 @@ mod tests {
         let auth = builder.config.auth.as_ref().unwrap();
         assert!(auth.requires_sasl());
         assert!(!auth.requires_tls());
-        assert_eq!(auth.security_protocol, crate::auth::SecurityProtocol::SaslPlaintext);
+        assert_eq!(
+            auth.security_protocol,
+            crate::auth::SecurityProtocol::SaslPlaintext
+        );
         assert_eq!(auth.sasl_mechanism, Some(crate::auth::SaslMechanism::Plain));
     }
 
@@ -1748,7 +1783,10 @@ mod tests {
         let auth = builder.config.auth.as_ref().unwrap();
         assert!(auth.requires_tls());
         assert!(auth.requires_sasl());
-        assert_eq!(auth.sasl_mechanism, Some(crate::auth::SaslMechanism::AwsMskIam));
+        assert_eq!(
+            auth.sasl_mechanism,
+            Some(crate::auth::SaslMechanism::AwsMskIam)
+        );
         assert!(auth.aws_msk_iam_credentials.is_some());
         assert!(auth.tls_config.is_some());
     }
@@ -2048,16 +2086,12 @@ mod tests {
 
         // Partition 0: last delivered = 52 → advanced to 53
         assert_eq!(
-            *delivered_offsets
-                .get(&("topic1".to_string(), 0))
-                .unwrap(),
+            *delivered_offsets.get(&("topic1".to_string(), 0)).unwrap(),
             52
         );
         // Partition 1: last delivered = 200 → advanced to 201
         assert_eq!(
-            *delivered_offsets
-                .get(&("topic1".to_string(), 1))
-                .unwrap(),
+            *delivered_offsets.get(&("topic1".to_string(), 1)).unwrap(),
             200
         );
     }
@@ -2188,7 +2222,8 @@ mod tests {
             .unwrap();
 
         rt.block_on(async {
-            let offsets: RwLock<HashMap<(String, PartitionId), Offset>> = RwLock::new(HashMap::new());
+            let offsets: RwLock<HashMap<(String, PartitionId), Offset>> =
+                RwLock::new(HashMap::new());
             let paused: RwLock<HashSet<(String, PartitionId)>> = RwLock::new(HashSet::new());
             let assignments: RwLock<HashMap<String, Vec<PartitionId>>> =
                 RwLock::new(HashMap::new());
@@ -2235,7 +2270,8 @@ mod tests {
             .unwrap();
 
         rt.block_on(async {
-            let offsets: RwLock<HashMap<(String, PartitionId), Offset>> = RwLock::new(HashMap::new());
+            let offsets: RwLock<HashMap<(String, PartitionId), Offset>> =
+                RwLock::new(HashMap::new());
             offsets.write().await.insert(("t".into(), 0), 42);
 
             let o = offsets.read().await;
@@ -2277,9 +2313,7 @@ mod tests {
             let has_group = true;
             let new_filtered: Vec<_> = offsets
                 .iter()
-                .filter(|((t, p), _)| {
-                    !has_group || assigned_set.contains(&(t.clone(), *p))
-                })
+                .filter(|((t, p), _)| !has_group || assigned_set.contains(&(t.clone(), *p)))
                 .collect();
             assert_eq!(new_filtered.len(), 0); // None pass when empty — correct
         });

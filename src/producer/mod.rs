@@ -284,10 +284,12 @@ impl Producer {
                         record.value.len() as u64
                             + record.key.as_ref().map(|k| k.len() as u64).unwrap_or(0),
                     );
-                    self.metrics
-                        .connections
-                        .set(self.pool.len().await as u64);
-                    crate::interceptor::safe_on_acknowledgement(&*self.interceptor, &metadata, None);
+                    self.metrics.connections.set(self.pool.len().await as u64);
+                    crate::interceptor::safe_on_acknowledgement(
+                        &*self.interceptor,
+                        &metadata,
+                        None,
+                    );
                     return Ok(metadata);
                 }
                 Err(ref e) => {
@@ -352,8 +354,10 @@ impl Producer {
         }
 
         if record.headers.is_empty() {
-            batch_builder = batch_builder
-                .add_record(record.key.clone().map(Bytes::from), Some(Bytes::from(record.value.clone())));
+            batch_builder = batch_builder.add_record(
+                record.key.clone().map(Bytes::from),
+                Some(Bytes::from(record.value.clone())),
+            );
         } else {
             batch_builder = batch_builder.add_record_with_headers(
                 record.key.clone().map(Bytes::from),
@@ -653,7 +657,10 @@ impl ProducerBuilder {
     ///
     /// The interceptor's `on_send` method is called before each record is sent,
     /// and `on_acknowledgement` is called after a send succeeds or fails.
-    pub fn interceptor(mut self, interceptor: Arc<dyn crate::interceptor::ProducerInterceptor>) -> Self {
+    pub fn interceptor(
+        mut self,
+        interceptor: Arc<dyn crate::interceptor::ProducerInterceptor>,
+    ) -> Self {
         self.interceptor = Some(interceptor);
         self
     }
@@ -664,9 +671,7 @@ impl ProducerBuilder {
             return Err(KrafkaError::config("bootstrap.servers is required"));
         }
         if self.config.max_in_flight == 0 {
-            return Err(KrafkaError::config(
-                "max_in_flight must be >= 1",
-            ));
+            return Err(KrafkaError::config("max_in_flight must be >= 1"));
         }
         if self.config.batch_size == 0 {
             return Err(KrafkaError::config("batch_size must be >= 1"));
@@ -711,7 +716,10 @@ mod tests {
         let auth = builder.config.auth.as_ref().unwrap();
         assert!(auth.requires_sasl());
         assert!(!auth.requires_tls());
-        assert_eq!(auth.security_protocol, crate::auth::SecurityProtocol::SaslPlaintext);
+        assert_eq!(
+            auth.security_protocol,
+            crate::auth::SecurityProtocol::SaslPlaintext
+        );
         assert_eq!(auth.sasl_mechanism, Some(crate::auth::SaslMechanism::Plain));
     }
 
@@ -725,15 +733,17 @@ mod tests {
         let auth = builder.config.auth.as_ref().unwrap();
         assert!(auth.requires_tls());
         assert!(auth.requires_sasl());
-        assert_eq!(auth.sasl_mechanism, Some(crate::auth::SaslMechanism::AwsMskIam));
+        assert_eq!(
+            auth.sasl_mechanism,
+            Some(crate::auth::SaslMechanism::AwsMskIam)
+        );
         assert!(auth.aws_msk_iam_credentials.is_some());
         assert!(auth.tls_config.is_some());
     }
 
     #[test]
     fn test_producer_builder_no_auth_by_default() {
-        let builder = Producer::builder()
-            .bootstrap_servers("broker:9092");
+        let builder = Producer::builder().bootstrap_servers("broker:9092");
 
         assert!(builder.config.auth.is_none());
     }
@@ -845,8 +855,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_producer_builder_rejects_zero_max_in_flight() {
-        let mut builder = Producer::builder()
-            .bootstrap_servers("localhost:9092");
+        let mut builder = Producer::builder().bootstrap_servers("localhost:9092");
         builder.config.max_in_flight = 0;
         let result = builder.build().await;
 
@@ -858,8 +867,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_producer_builder_rejects_zero_batch_size() {
-        let mut builder = Producer::builder()
-            .bootstrap_servers("localhost:9092");
+        let mut builder = Producer::builder().bootstrap_servers("localhost:9092");
         builder.config.batch_size = 0;
         let result = builder.build().await;
 

@@ -960,8 +960,11 @@ async fn test_multiple_topics_subscription() {
     // Verify we got messages from both topics
     let topics: std::collections::HashSet<_> =
         all_records.iter().map(|r| r.topic.as_str()).collect();
-    assert!(topics.contains(topic1) && topics.contains(topic2),
-        "Should contain messages from both topics, got: {:?}", topics);
+    assert!(
+        topics.contains(topic1) && topics.contains(topic2),
+        "Should contain messages from both topics, got: {:?}",
+        topics
+    );
 }
 
 #[tokio::test]
@@ -1668,9 +1671,7 @@ async fn test_consumer_unsubscribe() {
     let _ = consumer.poll(Duration::from_secs(2)).await;
 
     // Unsubscribe
-    consumer
-        .unsubscribe()
-        .await;
+    consumer.unsubscribe().await;
 
     // Subscription should be empty
     let subscription = consumer.subscription().await;
@@ -2156,8 +2157,7 @@ async fn test_many_partitions_topic() {
     assert_eq!(all.len(), 60, "All 60 messages should be received");
 
     // Verify messages came from multiple partitions
-    let partitions: std::collections::HashSet<_> =
-        all.iter().map(|r| r.partition).collect();
+    let partitions: std::collections::HashSet<_> = all.iter().map(|r| r.partition).collect();
     assert!(
         partitions.len() > 3,
         "60 keys across 12 partitions should hit many partitions, got {}",
@@ -2369,7 +2369,13 @@ async fn test_consumer_metrics() {
     }
 
     let metrics = consumer.metrics();
-    assert!(metrics.records_received.get() > 0, "Should have received records");
-    assert!(metrics.bytes_received.get() > 0, "Should have received bytes");
+    assert!(
+        metrics.records_received.get() > 0,
+        "Should have received records"
+    );
+    assert!(
+        metrics.bytes_received.get() > 0,
+        "Should have received bytes"
+    );
     consumer.close().await;
 }

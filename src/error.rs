@@ -652,11 +652,23 @@ mod tests {
         assert_eq!(ErrorCode::from_i16(58), ErrorCode::SaslAuthenticationFailed);
         assert_eq!(ErrorCode::from_i16(59), ErrorCode::UnknownProducerId);
         assert_eq!(ErrorCode::from_i16(60), ErrorCode::ReassignmentInProgress);
-        assert_eq!(ErrorCode::from_i16(61), ErrorCode::DelegationTokenAuthDisabled);
+        assert_eq!(
+            ErrorCode::from_i16(61),
+            ErrorCode::DelegationTokenAuthDisabled
+        );
         assert_eq!(ErrorCode::from_i16(62), ErrorCode::DelegationTokenNotFound);
-        assert_eq!(ErrorCode::from_i16(63), ErrorCode::DelegationTokenOwnerMismatch);
-        assert_eq!(ErrorCode::from_i16(64), ErrorCode::DelegationTokenRequestNotAllowed);
-        assert_eq!(ErrorCode::from_i16(65), ErrorCode::DelegationTokenAuthorizationFailed);
+        assert_eq!(
+            ErrorCode::from_i16(63),
+            ErrorCode::DelegationTokenOwnerMismatch
+        );
+        assert_eq!(
+            ErrorCode::from_i16(64),
+            ErrorCode::DelegationTokenRequestNotAllowed
+        );
+        assert_eq!(
+            ErrorCode::from_i16(65),
+            ErrorCode::DelegationTokenAuthorizationFailed
+        );
         assert_eq!(ErrorCode::from_i16(66), ErrorCode::DelegationTokenExpired);
         assert_eq!(ErrorCode::from_i16(67), ErrorCode::InvalidPrincipalType);
         assert_eq!(ErrorCode::from_i16(68), ErrorCode::NonEmptyGroup);
@@ -667,14 +679,23 @@ mod tests {
         assert_eq!(ErrorCode::from_i16(73), ErrorCode::TopicDeletionDisabled);
         assert_eq!(ErrorCode::from_i16(74), ErrorCode::FencedLeaderEpoch);
         assert_eq!(ErrorCode::from_i16(75), ErrorCode::UnknownLeaderEpoch);
-        assert_eq!(ErrorCode::from_i16(76), ErrorCode::UnsupportedCompressionType);
+        assert_eq!(
+            ErrorCode::from_i16(76),
+            ErrorCode::UnsupportedCompressionType
+        );
         assert_eq!(ErrorCode::from_i16(77), ErrorCode::StaleBrokerEpoch);
         assert_eq!(ErrorCode::from_i16(78), ErrorCode::OffsetNotAvailable);
         assert_eq!(ErrorCode::from_i16(79), ErrorCode::MemberIdRequired);
-        assert_eq!(ErrorCode::from_i16(80), ErrorCode::PreferredLeaderNotAvailable);
+        assert_eq!(
+            ErrorCode::from_i16(80),
+            ErrorCode::PreferredLeaderNotAvailable
+        );
         assert_eq!(ErrorCode::from_i16(81), ErrorCode::GroupMaxSizeReached);
         assert_eq!(ErrorCode::from_i16(82), ErrorCode::FencedInstanceId);
-        assert_eq!(ErrorCode::from_i16(83), ErrorCode::EligibleLeadersNotAvailable);
+        assert_eq!(
+            ErrorCode::from_i16(83),
+            ErrorCode::EligibleLeadersNotAvailable
+        );
         assert_eq!(ErrorCode::from_i16(84), ErrorCode::ElectionNotNeeded);
         assert_eq!(ErrorCode::from_i16(85), ErrorCode::NoReassignmentInProgress);
         assert_eq!(ErrorCode::from_i16(86), ErrorCode::GroupSubscribedToTopic);

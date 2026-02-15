@@ -336,11 +336,17 @@ mod tests {
     fn test_sticky_partitioner_auto_advance() {
         // Custom threshold of 5
         let partitioner = StickyPartitioner::with_batch_threshold(5);
-        assert_eq!(partitioner.batch_threshold, 5, "with_batch_threshold should set custom threshold");
+        assert_eq!(
+            partitioner.batch_threshold, 5,
+            "with_batch_threshold should set custom threshold"
+        );
 
         // Threshold of 0 should be clamped to 1
         let partitioner_min = StickyPartitioner::with_batch_threshold(0);
-        assert_eq!(partitioner_min.batch_threshold, 1, "with_batch_threshold(0) should clamp to 1");
+        assert_eq!(
+            partitioner_min.batch_threshold, 1,
+            "with_batch_threshold(0) should clamp to 1"
+        );
 
         let partition_count = 3;
 
@@ -361,7 +367,10 @@ mod tests {
         // Next 4 calls should stay on the new partition
         for i in 0..4 {
             let p = partitioner.partition("topic", None, partition_count);
-            assert_eq!(p, after_advance, "call {i} after advance should stay on new partition");
+            assert_eq!(
+                p, after_advance,
+                "call {i} after advance should stay on new partition"
+            );
         }
 
         // Another advance at count=10

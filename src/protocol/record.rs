@@ -586,7 +586,8 @@ impl RecordBatch {
                 if declared_len > Self::MAX_DECOMPRESSED_SIZE {
                     return Err(KrafkaError::compression(format!(
                         "snappy declared decompressed size {} exceeds maximum {} bytes (possible compression bomb)",
-                        declared_len, Self::MAX_DECOMPRESSED_SIZE
+                        declared_len,
+                        Self::MAX_DECOMPRESSED_SIZE
                     )));
                 }
                 let mut decoder = snap::raw::Decoder::new();

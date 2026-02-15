@@ -22,8 +22,8 @@ use crate::network::{BrokerConnection, ConnectionPool};
 use crate::protocol::{
     ApiKey, FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse,
     JoinGroupRequest, JoinGroupRequestProtocol, JoinGroupResponse, JoinGroupResponseMember,
-    LeaveGroupMember, LeaveGroupRequest, LeaveGroupResponse, ListOffsetsRequest, ListOffsetsRequestPartition,
-    ListOffsetsRequestTopic, ListOffsetsResponse, OffsetCommitRequest,
+    LeaveGroupMember, LeaveGroupRequest, LeaveGroupResponse, ListOffsetsRequest,
+    ListOffsetsRequestPartition, ListOffsetsRequestTopic, ListOffsetsResponse, OffsetCommitRequest,
     OffsetCommitRequestPartition, OffsetCommitRequestTopic, OffsetCommitResponse,
     OffsetFetchRequest, OffsetFetchRequestTopic, OffsetFetchResponse, SyncGroupRequest,
     SyncGroupRequestAssignment, SyncGroupResponse,
@@ -1893,12 +1893,18 @@ impl GroupCoordinator {
                         );
                     }
                     Err(e) => {
-                        warn!("Failed to decode LeaveGroup response for '{}': {}", self.group_id, e);
+                        warn!(
+                            "Failed to decode LeaveGroup response for '{}': {}",
+                            self.group_id, e
+                        );
                     }
                 }
             }
             Ok(Err(e)) => {
-                warn!("Failed to send LeaveGroup request for '{}': {}", self.group_id, e);
+                warn!(
+                    "Failed to send LeaveGroup request for '{}': {}",
+                    self.group_id, e
+                );
             }
             Err(_) => {
                 warn!("LeaveGroup request timed out for '{}'", self.group_id);
@@ -2041,10 +2047,9 @@ impl GroupCoordinator {
                 let assignor = RoundRobinAssignor;
                 assignor.assign(topics, &topic_partitions, &group_members)
             }
-            crate::consumer::config::PartitionAssignmentStrategy::CooperativeSticky => {
-                self.sticky_assignor
-                    .assign(topics, &topic_partitions, &group_members)
-            }
+            crate::consumer::config::PartitionAssignmentStrategy::CooperativeSticky => self
+                .sticky_assignor
+                .assign(topics, &topic_partitions, &group_members),
         };
 
         // Encode assignments
@@ -2689,7 +2694,10 @@ mod tests {
         // Each member should have exactly 2 partitions (6/3 = 2)
         for member_id in ["m1", "m2", "m3"] {
             let count = assignments.get(member_id).unwrap().all_partitions().len();
-            assert_eq!(count, 2, "Member {member_id} should have exactly 2 partitions");
+            assert_eq!(
+                count, 2,
+                "Member {member_id} should have exactly 2 partitions"
+            );
         }
     }
 }

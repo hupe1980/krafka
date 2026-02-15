@@ -349,7 +349,9 @@ impl ConnectionPool {
         // Fast path: check under read lock
         {
             let connections = self.connections_by_addr.read().await;
-            if let Some(conn) = connections.get(address) && conn.is_alive() {
+            if let Some(conn) = connections.get(address)
+                && conn.is_alive()
+            {
                 return Ok(conn.clone());
             }
         }
@@ -360,7 +362,9 @@ impl ConnectionPool {
         // Re-acquire write lock to store the new connection
         let mut connections = self.connections_by_addr.write().await;
         // Double-check: another task may have reconnected while we were connecting
-        if let Some(existing) = connections.get(address) && existing.is_alive() {
+        if let Some(existing) = connections.get(address)
+            && existing.is_alive()
+        {
             return Ok(existing.clone());
         }
         connections.insert(address.to_string(), conn.clone());
@@ -381,7 +385,9 @@ impl ConnectionPool {
         // Fast path: check under read lock
         {
             let connections = self.connections.read().await;
-            if let Some(conn) = connections.get(&broker_id) && conn.is_alive() {
+            if let Some(conn) = connections.get(&broker_id)
+                && conn.is_alive()
+            {
                 return Ok(conn.clone());
             }
         }
@@ -394,7 +400,9 @@ impl ConnectionPool {
         let mut connections_by_addr = self.connections_by_addr.write().await;
 
         // Double-check: another task may have reconnected while we were connecting
-        if let Some(existing) = connections.get(&broker_id) && existing.is_alive() {
+        if let Some(existing) = connections.get(&broker_id)
+            && existing.is_alive()
+        {
             return Ok(existing.clone());
         }
 

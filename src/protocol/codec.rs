@@ -71,8 +71,8 @@ impl Encoder {
     /// Finish encoding a size-prefixed message.
     /// Updates the size at the given position.
     pub fn finish_message(&mut self, size_pos: usize) {
-        let message_size = i32::try_from(self.buffer.len() - size_pos - 4)
-            .expect("message size exceeds i32::MAX");
+        let message_size =
+            i32::try_from(self.buffer.len() - size_pos - 4).expect("message size exceeds i32::MAX");
         let size_bytes = message_size.to_be_bytes();
         self.buffer[size_pos..size_pos + 4].copy_from_slice(&size_bytes);
     }

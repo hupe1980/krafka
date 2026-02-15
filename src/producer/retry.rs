@@ -346,9 +346,7 @@ mod tests {
             .with_jitter_factor(0.5); // 50% jitter
 
         // Collect multiple backoff values for the same attempt
-        let backoffs: Vec<Duration> = (0..50)
-            .map(|_| policy.calculate_backoff(2))
-            .collect();
+        let backoffs: Vec<Duration> = (0..50).map(|_| policy.calculate_backoff(2)).collect();
 
         // With 50% jitter on a 200ms base, values should range from 100ms to 300ms.
         // Check that not all values are identical (i.e., jitter is actually applied).

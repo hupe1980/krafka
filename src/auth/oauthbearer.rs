@@ -183,8 +183,7 @@ mod tests {
 
     #[test]
     fn test_oauthbearer_token_with_single_extension() {
-        let token =
-            OAuthBearerToken::new("my-token").with_extension("logicalCluster", "lkc-123");
+        let token = OAuthBearerToken::new("my-token").with_extension("logicalCluster", "lkc-123");
         let response = token.to_gs2_initial_response();
         let response_str = String::from_utf8_lossy(&response);
 
@@ -242,10 +241,7 @@ mod tests {
         // Followed by \x01
         assert_eq!(response[3], 0x01);
         // auth=Bearer prefix
-        assert_eq!(
-            &response[4..16],
-            b"auth=Bearer "
-        );
+        assert_eq!(&response[4..16], b"auth=Bearer ");
         // Ends with double \x01
         let len = response.len();
         assert_eq!(response[len - 2], 0x01);
@@ -262,8 +258,7 @@ mod tests {
 
     #[test]
     fn test_oauthbearer_token_clone() {
-        let token = OAuthBearerToken::new("tok")
-            .with_extension("k", "v");
+        let token = OAuthBearerToken::new("tok").with_extension("k", "v");
         let cloned = token.clone();
         assert_eq!(
             cloned.to_gs2_initial_response(),

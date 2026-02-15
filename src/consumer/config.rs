@@ -353,9 +353,7 @@ mod tests {
 
     #[test]
     fn test_config_builder_fetch_min_bytes() {
-        let config = ConsumerConfig::builder()
-            .fetch_min_bytes(1024)
-            .build();
+        let config = ConsumerConfig::builder().fetch_min_bytes(1024).build();
         assert_eq!(
             config.fetch_min_bytes, 1024,
             "fetch_min_bytes should be set by builder"

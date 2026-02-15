@@ -79,7 +79,10 @@ impl std::fmt::Debug for MskIamAuthenticator {
         f.debug_struct("MskIamAuthenticator")
             .field("access_key_id", &self.access_key_id)
             .field("secret_access_key", &"[REDACTED]")
-            .field("session_token", &self.session_token.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("region", &self.region)
             .field("host", &self.host)
             .finish()

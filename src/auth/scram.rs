@@ -576,7 +576,11 @@ mod tests {
         let result = client.process_server_first(server_first.as_bytes());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("below minimum"), "Expected 'below minimum' in: {}", err);
+        assert!(
+            err.contains("below minimum"),
+            "Expected 'below minimum' in: {}",
+            err
+        );
     }
 
     #[test]
@@ -589,7 +593,11 @@ mod tests {
         let result = client.process_server_first(server_first.as_bytes());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("exceeds maximum"), "Expected 'exceeds maximum' in: {}", err);
+        assert!(
+            err.contains("exceeds maximum"),
+            "Expected 'exceeds maximum' in: {}",
+            err
+        );
     }
 
     #[test]
@@ -613,7 +621,10 @@ mod tests {
     fn test_scram_debug_redacts_password() {
         let client = ScramClient::new("user", "secret_password", ScramMechanism::Sha256);
         let debug_output = format!("{:?}", client);
-        assert!(!debug_output.contains("secret_password"), "Password leaked in Debug output");
+        assert!(
+            !debug_output.contains("secret_password"),
+            "Password leaked in Debug output"
+        );
         assert!(debug_output.contains("[REDACTED]"));
     }
 

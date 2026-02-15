@@ -205,7 +205,11 @@ mod tests {
 
         let record_batch = batch.build();
         assert_eq!(record_batch.records.len(), 1);
-        assert_eq!(record_batch.records[0].headers.len(), 2, "Headers should be preserved in built batch");
+        assert_eq!(
+            record_batch.records[0].headers.len(),
+            2,
+            "Headers should be preserved in built batch"
+        );
         assert_eq!(record_batch.records[0].headers[0].key, "trace-id");
         assert_eq!(record_batch.records[0].headers[1].key, "content-type");
     }

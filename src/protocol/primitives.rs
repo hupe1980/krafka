@@ -226,10 +226,7 @@ impl Encode for KafkaString {
             None => varint::encode_unsigned_varint(0, buf),
             Some(s) => {
                 let len_plus_one = u32::try_from(s.len().saturating_add(1)).unwrap_or_else(|_| {
-                    panic!(
-                        "compact KafkaString length {} exceeds u32 limit",
-                        s.len()
-                    )
+                    panic!("compact KafkaString length {} exceeds u32 limit", s.len())
                 });
                 varint::encode_unsigned_varint(len_plus_one, buf);
                 buf.put_slice(s.as_bytes());
@@ -343,12 +340,13 @@ impl Encode for KafkaBytes {
         match &self.0 {
             None => varint::encode_unsigned_varint(0, buf),
             Some(bytes) => {
-                let len_plus_one = u32::try_from(bytes.len().saturating_add(1)).unwrap_or_else(|_| {
-                    panic!(
-                        "compact KafkaBytes length {} exceeds u32 limit",
-                        bytes.len()
-                    )
-                });
+                let len_plus_one =
+                    u32::try_from(bytes.len().saturating_add(1)).unwrap_or_else(|_| {
+                        panic!(
+                            "compact KafkaBytes length {} exceeds u32 limit",
+                            bytes.len()
+                        )
+                    });
                 varint::encode_unsigned_varint(len_plus_one, buf);
                 buf.put_slice(bytes);
             }
@@ -459,12 +457,13 @@ impl<T: Encode> Encode for KafkaArray<T> {
         match &self.0 {
             None => varint::encode_unsigned_varint(0, buf),
             Some(items) => {
-                let len_plus_one = u32::try_from(items.len().saturating_add(1)).unwrap_or_else(|_| {
-                    panic!(
-                        "compact KafkaArray length {} exceeds u32 limit",
-                        items.len()
-                    )
-                });
+                let len_plus_one =
+                    u32::try_from(items.len().saturating_add(1)).unwrap_or_else(|_| {
+                        panic!(
+                            "compact KafkaArray length {} exceeds u32 limit",
+                            items.len()
+                        )
+                    });
                 varint::encode_unsigned_varint(len_plus_one, buf);
                 for item in items {
                     item.encode_compact(buf);
@@ -519,14 +518,16 @@ pub struct TaggedField {
 
 impl Encode for TaggedFields {
     fn encode(&self, buf: &mut impl BufMut) {
-        let count = u32::try_from(self.0.len()).unwrap_or_else(|_| {
-            panic!("TaggedFields count {} exceeds u32 limit", self.0.len())
-        });
+        let count = u32::try_from(self.0.len())
+            .unwrap_or_else(|_| panic!("TaggedFields count {} exceeds u32 limit", self.0.len()));
         varint::encode_unsigned_varint(count, buf);
         for field in &self.0 {
             varint::encode_unsigned_varint(field.tag, buf);
             let data_len = u32::try_from(field.data.len()).unwrap_or_else(|_| {
-                panic!("TaggedField data length {} exceeds u32 limit", field.data.len())
+                panic!(
+                    "TaggedField data length {} exceeds u32 limit",
+                    field.data.len()
+                )
             });
             varint::encode_unsigned_varint(data_len, buf);
             buf.put_slice(&field.data);

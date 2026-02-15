@@ -119,7 +119,9 @@ impl Image for KafkaSasl {
     }
 
     fn ready_conditions(&self) -> Vec<WaitFor> {
-        vec![WaitFor::message_on_stdout("started (kafka.server.KafkaServer)")]
+        vec![WaitFor::message_on_stdout(
+            "started (kafka.server.KafkaServer)",
+        )]
     }
 
     fn env_vars(
@@ -228,10 +230,7 @@ async fn test_sasl_admin_client() {
     // Create a topic
     let topic = "sasl-admin-test";
     admin
-        .create_topics(
-            vec![NewTopic::new(topic, 1, 1)],
-            Duration::from_secs(10),
-        )
+        .create_topics(vec![NewTopic::new(topic, 1, 1)], Duration::from_secs(10))
         .await
         .expect("Failed to create topic via SASL");
 
@@ -268,10 +267,7 @@ async fn test_sasl_producer_consumer() {
         .expect("Failed to create admin client");
 
     admin
-        .create_topics(
-            vec![NewTopic::new(topic, 1, 1)],
-            Duration::from_secs(10),
-        )
+        .create_topics(vec![NewTopic::new(topic, 1, 1)], Duration::from_secs(10))
         .await
         .expect("Failed to create topic");
 
@@ -288,7 +284,11 @@ async fn test_sasl_producer_consumer() {
 
     for i in 0..5 {
         let _ = producer
-            .send(topic, Some(format!("key-{i}").as_bytes()), format!("value-{i}").as_bytes())
+            .send(
+                topic,
+                Some(format!("key-{i}").as_bytes()),
+                format!("value-{i}").as_bytes(),
+            )
             .await
             .expect("Failed to send message via SASL");
     }
@@ -319,7 +319,10 @@ async fn test_sasl_producer_consumer() {
     // Poll for messages
     let mut received = 0;
     for _ in 0..10 {
-        let records = consumer.poll(Duration::from_secs(2)).await.unwrap_or_default();
+        let records = consumer
+            .poll(Duration::from_secs(2))
+            .await
+            .unwrap_or_default();
         received += records.len();
         if received >= 5 {
             break;
