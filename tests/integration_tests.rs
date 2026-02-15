@@ -88,11 +88,19 @@ async fn poll_for_records(
     max_attempts: usize,
 ) -> Vec<krafka::consumer::ConsumerRecord> {
     let mut all = Vec::new();
-    for _ in 0..max_attempts {
+    for attempt in 0..max_attempts {
         let records = consumer
             .poll(poll_timeout)
             .await
             .expect("poll failed in poll_for_records");
+        if records.is_empty() {
+            eprintln!(
+                "[poll_for_records] attempt {}/{}: 0 records (total {})",
+                attempt + 1,
+                max_attempts,
+                all.len()
+            );
+        }
         all.extend(records);
         if all.len() >= min_records {
             break;
@@ -1469,7 +1477,7 @@ async fn test_producer_timestamp_propagation() {
         .expect("Failed to send record with timestamp");
 
     assert!(metadata.offset >= 0);
-    producer.close().await;
+    eprintln!("[ts-test] Produced record at offset {}", metadata.offset);
 
     // Consume and verify timestamp was propagated
     let consumer = Consumer::builder()
@@ -1484,7 +1492,26 @@ async fn test_producer_timestamp_propagation() {
         .await
         .expect("Failed to subscribe");
 
+    // Diagnostic: log assignment and position after subscribe
+    let assignment = consumer.assignment().await;
+    eprintln!("[ts-test] Assignment after subscribe: {:?}", assignment);
+    let pos = consumer.position(topic, 0).await;
+    eprintln!("[ts-test] Position after subscribe: {:?}", pos);
+
+    // Force seek to the beginning: ListOffsets(timestamp=-2) can transiently
+    // return the high watermark instead of the log start offset for freshly
+    // created partitions.  Seeking to offset 0 is always safe – if offset 0
+    // has been compacted away the Fetch will trigger OFFSET_OUT_OF_RANGE and
+    // our consumer auto-resets.
+    consumer
+        .seek_to_beginning(topic, 0)
+        .await
+        .expect("seek_to_beginning failed");
+
     let records = poll_for_records(&consumer, 1, Duration::from_secs(5), 8).await;
+
+    // Close producer after consuming (matches pattern of all other passing tests)
+    producer.close().await;
 
     assert!(!records.is_empty(), "Expected at least one record");
     let record = &records[0];
