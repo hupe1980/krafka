@@ -1477,41 +1477,33 @@ async fn test_producer_timestamp_propagation() {
         .expect("Failed to send record with timestamp");
 
     assert!(metadata.offset >= 0);
-    eprintln!("[ts-test] Produced record at offset {}", metadata.offset);
+    producer.close().await;
 
-    // Consume and verify timestamp was propagated
+    // Use manual partition assignment (no group coordinator) to avoid
+    // a race where ListOffsets(timestamp=-2) transiently returns the high
+    // watermark instead of the log start offset for freshly created
+    // partitions, AND the group coordinator rejoin in poll() overwrites
+    // any seek_to_beginning() the test applies.
     let consumer = Consumer::builder()
         .bootstrap_servers(&bootstrap_servers)
-        .group_id("timestamp-test-consumer")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
         .expect("Failed to create consumer");
 
-    subscribe_with_retry(&consumer, &[topic], 5)
+    consumer
+        .assign(topic, vec![0])
         .await
-        .expect("Failed to subscribe");
+        .expect("Failed to assign");
 
-    // Diagnostic: log assignment and position after subscribe
-    let assignment = consumer.assignment().await;
-    eprintln!("[ts-test] Assignment after subscribe: {:?}", assignment);
-    let pos = consumer.position(topic, 0).await;
-    eprintln!("[ts-test] Position after subscribe: {:?}", pos);
-
-    // Force seek to the beginning: ListOffsets(timestamp=-2) can transiently
-    // return the high watermark instead of the log start offset for freshly
-    // created partitions.  Seeking to offset 0 is always safe – if offset 0
-    // has been compacted away the Fetch will trigger OFFSET_OUT_OF_RANGE and
-    // our consumer auto-resets.
+    // Explicitly seek to offset 0 so we always start from the beginning,
+    // regardless of what ListOffsets returned during assign().
     consumer
         .seek_to_beginning(topic, 0)
         .await
         .expect("seek_to_beginning failed");
 
     let records = poll_for_records(&consumer, 1, Duration::from_secs(5), 8).await;
-
-    // Close producer after consuming (matches pattern of all other passing tests)
-    producer.close().await;
 
     assert!(!records.is_empty(), "Expected at least one record");
     let record = &records[0];

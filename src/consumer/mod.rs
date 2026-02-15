@@ -713,8 +713,9 @@ impl Consumer {
                                             "Poll retry: falling back to direct ListOffsets for {}-{}",
                                             topic, partition
                                         );
-                                        if let Ok(offset) =
-                                            self.resolve_list_offset(topic, *partition, timestamp).await
+                                        if let Ok(offset) = self
+                                            .resolve_list_offset(topic, *partition, timestamp)
+                                            .await
                                         {
                                             let mut offsets = self.offsets.write().await;
                                             offsets.insert((topic.clone(), *partition), offset);
