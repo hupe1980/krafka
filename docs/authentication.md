@@ -276,7 +276,7 @@ For production deployments on EC2, ECS, Lambda, or EKS, use the AWS SDK default 
 use krafka::auth::{AuthConfig, AwsMskIamCredentials};
 
 // Requires the `aws-msk` feature in Cargo.toml:
-// krafka = { version = "0.1", features = ["aws-msk"] }
+// krafka = { version = "0.2", features = ["aws-msk"] }
 
 // Loads from (in order):
 // 1. Environment variables
