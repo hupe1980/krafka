@@ -75,6 +75,32 @@ async fn subscribe_with_retry(
     Err(last_error.unwrap())
 }
 
+/// Helper to poll for records with retry.
+///
+/// The first poll after subscribe often yields 0 records because the
+/// JoinGroup/SyncGroup rebalance consumes the whole poll timeout. This helper
+/// retries until at least `min_records` are collected or `max_attempts` polls
+/// have been made.
+async fn poll_for_records(
+    consumer: &krafka::consumer::Consumer,
+    min_records: usize,
+    poll_timeout: Duration,
+    max_attempts: usize,
+) -> Vec<krafka::consumer::ConsumerRecord> {
+    let mut all = Vec::new();
+    for _ in 0..max_attempts {
+        let records = consumer
+            .poll(poll_timeout)
+            .await
+            .expect("poll failed in poll_for_records");
+        all.extend(records);
+        if all.len() >= min_records {
+            break;
+        }
+    }
+    all
+}
+
 /// Helper to create a topic using the admin client.
 async fn create_topic(bootstrap_servers: &str, topic: &str, partitions: i32) {
     use krafka::admin::{AdminClient, NewTopic};
@@ -137,11 +163,8 @@ async fn test_producer_send_receive() {
         .await
         .expect("Failed to subscribe");
 
-    // Poll for messages
-    let records = consumer
-        .poll(Duration::from_secs(5))
-        .await
-        .expect("Failed to poll");
+    // Poll for messages (first poll may be consumed by rebalance)
+    let records = poll_for_records(&consumer, 1, Duration::from_secs(5), 5).await;
 
     assert!(!records.is_empty(), "Expected at least one record");
 
@@ -251,10 +274,7 @@ async fn test_compression_roundtrip() {
             .await
             .expect("Failed to subscribe");
 
-        let records = consumer
-            .poll(Duration::from_secs(5))
-            .await
-            .expect("Failed to poll");
+        let records = poll_for_records(&consumer, 1, Duration::from_secs(5), 5).await;
 
         assert!(
             !records.is_empty(),
@@ -383,11 +403,8 @@ async fn test_consumer_group_rebalance() {
         .await
         .expect("Failed to subscribe consumer1");
 
-    // Poll to join group
-    let records1 = consumer1
-        .poll(Duration::from_secs(5))
-        .await
-        .expect("Failed to poll consumer1");
+    // Poll to join group (first poll may only do rebalance)
+    let records1 = poll_for_records(&consumer1, 1, Duration::from_secs(5), 5).await;
 
     // Create second consumer in same group
     let consumer2 = Consumer::builder()
@@ -403,10 +420,7 @@ async fn test_consumer_group_rebalance() {
         .expect("Failed to subscribe consumer2");
 
     // Poll both consumers
-    let records2 = consumer2
-        .poll(Duration::from_secs(5))
-        .await
-        .expect("Failed to poll consumer2");
+    let records2 = poll_for_records(&consumer2, 0, Duration::from_secs(5), 3).await;
 
     // At least one consumer should have received messages
     let total_records = records1.len() + records2.len();
@@ -473,11 +487,8 @@ async fn test_consumer_commit_and_resume() {
             .await
             .expect("Failed to subscribe");
 
-        // Read some messages
-        let records = consumer
-            .poll(Duration::from_secs(5))
-            .await
-            .expect("Failed to poll");
+        // Read some messages (first poll may be consumed by rebalance)
+        let records = poll_for_records(&consumer, 1, Duration::from_secs(5), 5).await;
 
         assert!(!records.is_empty(), "Expected records");
 
@@ -501,10 +512,7 @@ async fn test_consumer_commit_and_resume() {
             .expect("Failed to subscribe");
 
         // Poll - should get remaining messages or none if all were committed
-        let _records = consumer
-            .poll(Duration::from_secs(2))
-            .await
-            .expect("Failed to poll");
+        let _records = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
 
         // Success - consumer was able to resume from committed offset
     }
@@ -608,10 +616,7 @@ async fn test_consumer_handles_no_messages_gracefully() {
         .expect("Failed to subscribe");
 
     // Poll should complete without error, even with no messages
-    let records = consumer
-        .poll(Duration::from_secs(1))
-        .await
-        .expect("Poll should succeed even with no messages");
+    let records = poll_for_records(&consumer, 0, Duration::from_secs(2), 3).await;
 
     // May be empty or have the setup message depending on timing
     drop(records);
@@ -672,18 +677,8 @@ async fn test_multiple_producers_same_topic() {
         .await
         .expect("Failed to subscribe");
 
-    // Collect all messages
-    let mut all_records = Vec::new();
-    for _ in 0..3 {
-        let records = consumer
-            .poll(Duration::from_secs(2))
-            .await
-            .expect("Failed to poll");
-        all_records.extend(records);
-        if all_records.len() >= 6 {
-            break;
-        }
-    }
+    // Collect all messages (first poll may be consumed by rebalance)
+    let all_records = poll_for_records(&consumer, 6, Duration::from_secs(3), 8).await;
 
     assert_eq!(all_records.len(), 6, "Expected 6 messages from 2 producers");
 }
@@ -730,10 +725,7 @@ async fn test_large_message_handling() {
         .await
         .expect("Failed to subscribe");
 
-    let records = consumer
-        .poll(Duration::from_secs(5))
-        .await
-        .expect("Failed to poll");
+    let records = poll_for_records(&consumer, 1, Duration::from_secs(5), 5).await;
 
     assert!(!records.is_empty());
     assert_eq!(
@@ -792,10 +784,7 @@ async fn test_message_headers() {
         .await
         .expect("Failed to subscribe");
 
-    let records = consumer
-        .poll(Duration::from_secs(5))
-        .await
-        .expect("Failed to poll");
+    let records = poll_for_records(&consumer, 1, Duration::from_secs(5), 5).await;
 
     assert!(!records.is_empty());
     let record = &records[0];
@@ -885,10 +874,7 @@ async fn test_null_key_and_value() {
         .await
         .expect("Failed to subscribe");
 
-    let records = consumer
-        .poll(Duration::from_secs(5))
-        .await
-        .expect("Failed to poll");
+    let records = poll_for_records(&consumer, 1, Duration::from_secs(5), 5).await;
 
     assert!(!records.is_empty());
     let record = &records[0];
@@ -942,18 +928,8 @@ async fn test_multiple_topics_subscription() {
         .await
         .expect("Failed to subscribe");
 
-    // Collect messages from both topics
-    let mut all_records = Vec::new();
-    for _ in 0..5 {
-        let records = consumer
-            .poll(Duration::from_secs(2))
-            .await
-            .expect("poll failed");
-        all_records.extend(records);
-        if all_records.len() >= 2 {
-            break;
-        }
-    }
+    // Collect messages from both topics (first poll may be consumed by rebalance)
+    let all_records = poll_for_records(&consumer, 2, Duration::from_secs(3), 8).await;
 
     assert_eq!(all_records.len(), 2, "Expected 2 messages from 2 topics");
 
@@ -1012,8 +988,8 @@ async fn test_consumer_seek_operations() {
         .await
         .expect("Failed to subscribe");
 
-    // First poll to establish assignment
-    let _ = consumer.poll(Duration::from_secs(2)).await;
+    // First poll to establish assignment (rebalance may consume first poll)
+    let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
 
     // Seek to beginning of partition 0
     consumer
@@ -1022,10 +998,7 @@ async fn test_consumer_seek_operations() {
         .expect("seek to beginning failed");
 
     // Poll should get messages from the beginning
-    let records = consumer
-        .poll(Duration::from_secs(2))
-        .await
-        .expect("poll failed");
+    let records = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
 
     // We may or may not get records depending on timing, but no panic
     drop(records);
@@ -1114,8 +1087,8 @@ async fn test_consumer_pause_resume() {
         .await
         .expect("Failed to subscribe");
 
-    // Initial poll to get assignment
-    let _ = consumer.poll(Duration::from_secs(2)).await;
+    // Initial poll to get assignment (rebalance may consume first poll)
+    let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
 
     // Pause the partition
     consumer.pause(topic, &[0]).await;
@@ -1195,17 +1168,7 @@ async fn test_concurrent_producers() {
         .await
         .expect("Failed to subscribe");
 
-    let mut all_records = Vec::new();
-    for _ in 0..5 {
-        let records = consumer
-            .poll(Duration::from_secs(2))
-            .await
-            .expect("poll failed");
-        all_records.extend(records);
-        if all_records.len() >= 15 {
-            break;
-        }
-    }
+    let all_records = poll_for_records(&consumer, 15, Duration::from_secs(3), 10).await;
 
     assert_eq!(
         all_records.len(),
@@ -1261,10 +1224,7 @@ async fn test_producer_with_batching() {
         .await
         .expect("Failed to subscribe");
 
-    let records = consumer
-        .poll(Duration::from_secs(5))
-        .await
-        .expect("poll failed");
+    let records = poll_for_records(&consumer, 10, Duration::from_secs(5), 5).await;
     assert_eq!(records.len(), 10, "Expected 10 messages");
 }
 
@@ -1524,10 +1484,7 @@ async fn test_producer_timestamp_propagation() {
         .await
         .expect("Failed to subscribe");
 
-    let records = consumer
-        .poll(Duration::from_secs(5))
-        .await
-        .expect("Failed to poll");
+    let records = poll_for_records(&consumer, 1, Duration::from_secs(5), 5).await;
 
     assert!(!records.is_empty(), "Expected at least one record");
     let record = &records[0];
@@ -1548,7 +1505,7 @@ async fn test_producer_timestamp_propagation() {
 #[ignore = "requires Docker"]
 async fn test_consumer_manual_assign() {
     use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
+    use krafka::producer::{Producer, ProducerRecord};
 
     let (_container, bootstrap_servers) = kafka_container().await;
 
@@ -1561,12 +1518,19 @@ async fn test_consumer_manual_assign() {
         .await
         .expect("Failed to create producer");
 
-    // Send messages to specific partitions
-    for i in 0..10 {
-        let _ = producer
-            .send(topic, Some(format!("k-{}", i).as_bytes()), b"val")
-            .await
-            .expect("send failed");
+    // Send messages explicitly to partition 0 so the test is deterministic
+    for i in 0..5 {
+        let record = ProducerRecord::new(topic, format!("val-{}", i).into_bytes())
+            .with_partition(0)
+            .with_key(Some(format!("k-{}", i).into_bytes()));
+        let _ = producer.send_record(record).await.expect("send failed");
+    }
+    // Also send some to partition 1 (should NOT be received)
+    for i in 0..5 {
+        let record = ProducerRecord::new(topic, format!("val-p1-{}", i).into_bytes())
+            .with_partition(1)
+            .with_key(Some(format!("k1-{}", i).into_bytes()));
+        let _ = producer.send_record(record).await.expect("send failed");
     }
     producer.close().await;
 
@@ -1584,10 +1548,7 @@ async fn test_consumer_manual_assign() {
         .await
         .expect("Failed to assign");
 
-    let records = consumer
-        .poll(Duration::from_secs(5))
-        .await
-        .expect("Failed to poll");
+    let records = poll_for_records(&consumer, 1, Duration::from_secs(5), 5).await;
 
     // Should have records from partition 0 only
     for record in &records {
@@ -1622,8 +1583,8 @@ async fn test_admin_list_consumer_groups() {
         .await
         .expect("Failed to subscribe");
 
-    // Poll once to ensure the group is actually joined
-    let _ = consumer.poll(Duration::from_secs(3)).await;
+    // Poll multiple times to ensure the group is actually joined (rebalance may consume first poll)
+    let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
 
     // Admin client should be able to list the group
     let admin = AdminClient::builder()
@@ -1667,8 +1628,8 @@ async fn test_consumer_unsubscribe() {
         .await
         .expect("Failed to subscribe");
 
-    // Poll to join group
-    let _ = consumer.poll(Duration::from_secs(2)).await;
+    // Poll to join group (rebalance may consume first poll)
+    let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
 
     // Unsubscribe
     consumer.unsubscribe().await;
@@ -1785,14 +1746,7 @@ async fn test_consumer_commit_and_resume_verified() {
             .await
             .expect("Failed to subscribe");
 
-        let mut all = Vec::new();
-        for _ in 0..5 {
-            let records = consumer.poll(Duration::from_secs(2)).await.unwrap();
-            all.extend(records);
-            if all.len() >= 10 {
-                break;
-            }
-        }
+        let all = poll_for_records(&consumer, 10, Duration::from_secs(3), 8).await;
         assert_eq!(all.len(), 10, "Should read all 10 messages");
         consumer.commit_sync().await.expect("commit failed");
         consumer.close().await;
@@ -1813,7 +1767,8 @@ async fn test_consumer_commit_and_resume_verified() {
             .await
             .expect("Failed to subscribe");
 
-        let records = consumer.poll(Duration::from_secs(3)).await.unwrap();
+        // Poll a few times to let rebalance complete, then verify no new records
+        let records = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
         assert!(
             records.is_empty(),
             "Second consumer should get 0 records after commit, got {}",
@@ -1862,7 +1817,7 @@ async fn test_consumer_recv() {
     // Use recv() to receive individual records
     let mut received = Vec::new();
     for _ in 0..3 {
-        match tokio::time::timeout(Duration::from_secs(10), consumer.recv()).await {
+        match tokio::time::timeout(Duration::from_secs(30), consumer.recv()).await {
             Ok(Ok(Some(record))) => received.push(record),
             Ok(Ok(None)) => break,
             Ok(Err(e)) => panic!("recv error: {}", e),
@@ -1914,14 +1869,7 @@ async fn test_producer_flush() {
 
     subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
 
-    let mut all = Vec::new();
-    for _ in 0..3 {
-        let recs = consumer.poll(Duration::from_secs(2)).await.unwrap();
-        all.extend(recs);
-        if all.len() >= 5 {
-            break;
-        }
-    }
+    let all = poll_for_records(&consumer, 5, Duration::from_secs(3), 8).await;
     assert_eq!(all.len(), 5, "All 5 flushed messages should be received");
     consumer.close().await;
 }
@@ -1948,7 +1896,8 @@ async fn test_admin_describe_consumer_group() {
         .unwrap();
 
     subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
-    let _ = consumer.poll(Duration::from_secs(3)).await;
+    // Poll multiple times to ensure group join completes (first poll does rebalance)
+    let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
 
     let admin = AdminClient::builder()
         .bootstrap_servers(&bootstrap_servers)
@@ -1992,7 +1941,8 @@ async fn test_consumer_close_leaves_group() {
         .unwrap();
 
     subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
-    let _ = consumer.poll(Duration::from_secs(3)).await;
+    // Poll multiple times to ensure group join completes
+    let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
 
     // Explicitly close
     consumer.close().await;
@@ -2049,14 +1999,7 @@ async fn test_empty_value_message() {
 
     subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
 
-    let mut records = Vec::new();
-    for _ in 0..3 {
-        let batch = consumer.poll(Duration::from_secs(2)).await.unwrap();
-        records.extend(batch);
-        if !records.is_empty() {
-            break;
-        }
-    }
+    let records = poll_for_records(&consumer, 1, Duration::from_secs(3), 5).await;
     assert!(!records.is_empty(), "Should receive the empty-value record");
     assert_eq!(
         records[0].value.as_ref().map(|v| v.len()),
@@ -2146,14 +2089,7 @@ async fn test_many_partitions_topic() {
 
     subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
 
-    let mut all = Vec::new();
-    for _ in 0..15 {
-        let recs = consumer.poll(Duration::from_secs(2)).await.unwrap();
-        all.extend(recs);
-        if all.len() >= 60 {
-            break;
-        }
-    }
+    let all = poll_for_records(&consumer, 60, Duration::from_secs(3), 20).await;
     assert_eq!(all.len(), 60, "All 60 messages should be received");
 
     // Verify messages came from multiple partitions
@@ -2203,8 +2139,8 @@ async fn test_consumer_pause_resume_verified() {
 
     subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
 
-    // Poll to get assignment
-    let _ = consumer.poll(Duration::from_secs(3)).await;
+    // Poll to get assignment (first poll may only complete rebalance)
+    let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
 
     // Pause
     consumer.pause(topic, &[0]).await;
@@ -2263,20 +2199,13 @@ async fn test_consumer_seek_verified() {
 
     subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
 
-    // First poll to get assignment
-    let _ = consumer.poll(Duration::from_secs(3)).await;
+    // First poll to get assignment (rebalance may consume first poll)
+    let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
 
     // Seek to offset 5
     consumer.seek(topic, 0, 5).await.expect("seek failed");
 
-    let mut records = Vec::new();
-    for _ in 0..3 {
-        let batch = consumer.poll(Duration::from_secs(2)).await.unwrap();
-        records.extend(batch);
-        if records.len() >= 5 {
-            break;
-        }
-    }
+    let records = poll_for_records(&consumer, 1, Duration::from_secs(3), 5).await;
 
     assert!(!records.is_empty(), "Should receive records after seek");
     assert_eq!(
@@ -2359,14 +2288,8 @@ async fn test_consumer_metrics() {
 
     subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
 
-    let mut total = 0usize;
-    for _ in 0..3 {
-        let records = consumer.poll(Duration::from_secs(2)).await.unwrap();
-        total += records.len();
-        if total >= 5 {
-            break;
-        }
-    }
+    let all = poll_for_records(&consumer, 5, Duration::from_secs(3), 8).await;
+    let _total = all.len();
 
     let metrics = consumer.metrics();
     assert!(

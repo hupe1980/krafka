@@ -1694,6 +1694,8 @@ impl ListOffsetsResponse {
     ///
     /// Uses checked reads to avoid panics on truncated data and guards
     /// negative counts to prevent OOM allocations.
+    ///
+    /// The v1 response format has the topics array directly (no throttle_time_ms).
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
         if buf.remaining() < 4 {
             return Err(crate::error::KrafkaError::protocol(
@@ -1742,6 +1744,22 @@ impl ListOffsetsResponse {
             topics.push(ListOffsetsResponseTopic { name, partitions });
         }
         Ok(Self { topics })
+    }
+
+    /// Decode version 2+ response (includes `throttle_time_ms`).
+    ///
+    /// The v2+ response format starts with `throttle_time_ms` (INT32)
+    /// followed by the same topics array as v1.
+    pub fn decode_v2(buf: &mut impl Buf) -> Result<Self> {
+        if buf.remaining() < 4 {
+            return Err(crate::error::KrafkaError::protocol(
+                "ListOffsetsResponse v2: truncated (no throttle_time_ms)",
+            ));
+        }
+        let _throttle_time_ms = buf.get_i32();
+
+        // Remainder is identical to v1
+        Self::decode_v1(buf)
     }
 }
 
@@ -5477,6 +5495,45 @@ mod tests {
         assert_eq!(resp.topics[0].partitions.len(), 1);
         assert_eq!(resp.topics[0].partitions[0].offset, 42);
         assert_eq!(resp.topics[0].partitions[0].timestamp, 1234567890);
+    }
+
+    // ── ListOffsetsResponse decode_v2 (with throttle_time_ms) ──
+
+    #[test]
+    fn test_list_offsets_response_decode_v2_empty() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_i32(0); // 0 topics
+        let mut data = buf.freeze();
+        let resp = ListOffsetsResponse::decode_v2(&mut data).unwrap();
+        assert!(resp.topics.is_empty());
+    }
+
+    #[test]
+    fn test_list_offsets_response_decode_v2_valid() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(100); // throttle_time_ms
+        buf.put_i32(1); // 1 topic
+        buf.put_i16(5);
+        buf.put_slice(b"topic");
+        buf.put_i32(1); // 1 partition
+        buf.put_i32(0); // partition_index
+        buf.put_i16(0); // error_code (NONE)
+        buf.put_i64(1234567890); // timestamp
+        buf.put_i64(42); // offset
+        let mut data = buf.freeze();
+        let resp = ListOffsetsResponse::decode_v2(&mut data).unwrap();
+        assert_eq!(resp.topics.len(), 1);
+        assert_eq!(resp.topics[0].partitions[0].offset, 42);
+    }
+
+    #[test]
+    fn test_list_offsets_response_decode_v2_truncated() {
+        let mut buf = BytesMut::new();
+        buf.put_i8(0); // only 1 byte — not enough for throttle_time_ms
+        let mut data = buf.freeze();
+        let result = ListOffsetsResponse::decode_v2(&mut data);
+        assert!(result.is_err());
     }
 
     // ── R14: ListOffsetsRequest encode_v2 with isolation_level ──

@@ -334,6 +334,9 @@ impl Consumer {
             ));
         }
 
+        // Refresh metadata so we can resolve partition leaders for offset lookup
+        self.metadata.refresh_for_topics(Some(&[topic])).await?;
+
         let mut assignments = self.assignments.write().await;
         assignments.insert(topic.to_string(), partitions.clone());
 

@@ -1656,18 +1656,20 @@ impl GroupCoordinator {
             partitions.len()
         );
 
-        // §R13.9 fix: Send as API version 0 to match decode_v0.
-        // v0 and v1 share identical request wire format, but v1 response
-        // appends a trailing error_code that decode_v0 does not read.
+        // Use API version 1 for OffsetFetch: v0 returns UNKNOWN_TOPIC_OR_PARTITION
+        // on modern Kafka brokers (Confluent 7.x / Apache Kafka 3.x) because v0
+        // originally targeted ZooKeeper-based offset storage. v1+ correctly reads
+        // from the __consumer_offsets internal topic.
+        // v0 and v1 share identical request wire format; the only response
+        // difference is a trailing error_code in v1 that decode_v0 ignores.
         let response = conn
-            .send_request(ApiKey::OffsetFetch, 0, |buf| {
+            .send_request(ApiKey::OffsetFetch, 1, |buf| {
                 request.encode_v0(buf);
             })
             .await?;
 
         let mut buf = response;
         let offset_response = OffsetFetchResponse::decode_v0(&mut buf)?;
-
         let mut result = HashMap::new();
         for topic in &offset_response.topics {
             for partition in &topic.partitions {
@@ -1788,7 +1790,7 @@ impl GroupCoordinator {
                 .await?;
 
             let mut buf = response;
-            let list_response = ListOffsetsResponse::decode_v1(&mut buf)?;
+            let list_response = ListOffsetsResponse::decode_v2(&mut buf)?;
 
             for topic_resp in &list_response.topics {
                 for part_resp in &topic_resp.partitions {
