@@ -621,6 +621,58 @@ impl Consumer {
             return Ok(Vec::new());
         }
 
+        // Retry offset resolution for partitions that are missing tracked offsets.
+        // This fulfils the "will retry on next poll" contract when initial offset
+        // resolution fails (e.g., due to a transient ListOffsets error or a
+        // rejoin that left some partitions without offsets).
+        {
+            let missing: Vec<(String, PartitionId)> = {
+                let offsets = self.offsets.read().await;
+                assignments
+                    .iter()
+                    .flat_map(|(topic, partitions)| {
+                        partitions
+                            .iter()
+                            .filter(|&&p| !offsets.contains_key(&(topic.clone(), p)))
+                            .map(|&p| (topic.clone(), p))
+                    })
+                    .collect()
+            };
+
+            if !missing.is_empty() {
+                debug!(
+                    "Retrying offset resolution for {} partition(s) without tracked offsets",
+                    missing.len()
+                );
+                let mut reset_partitions: HashMap<String, Vec<PartitionId>> = HashMap::new();
+                for (topic, partition) in &missing {
+                    reset_partitions
+                        .entry(topic.clone())
+                        .or_default()
+                        .push(*partition);
+                }
+
+                // Use group coordinator path if available, otherwise direct path
+                if let Some(ref coordinator) = self.group_coordinator {
+                    if let Some(timestamp) = self.config.auto_offset_reset.to_offset() {
+                        match coordinator.list_offsets(&reset_partitions, timestamp).await {
+                            Ok(resolved) => {
+                                let mut offsets = self.offsets.write().await;
+                                for (key, offset) in resolved {
+                                    offsets.insert(key, offset);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Offset resolution retry failed: {}", e);
+                            }
+                        }
+                    }
+                } else {
+                    self.apply_auto_offset_reset(&reset_partitions).await.ok();
+                }
+            }
+        }
+
         let paused = self.paused.read().await;
 
         // Group partitions by leader broker for batch fetching

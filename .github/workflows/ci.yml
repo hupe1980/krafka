@@ -64,10 +64,6 @@ jobs:
   integration:
     name: Integration Tests
     runs-on: ubuntu-latest
-    services:
-      docker:
-        image: docker:dind
-        options: --privileged
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
