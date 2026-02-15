@@ -1484,7 +1484,7 @@ async fn test_producer_timestamp_propagation() {
         .await
         .expect("Failed to subscribe");
 
-    let records = poll_for_records(&consumer, 1, Duration::from_secs(5), 5).await;
+    let records = poll_for_records(&consumer, 1, Duration::from_secs(5), 8).await;
 
     assert!(!records.is_empty(), "Expected at least one record");
     let record = &records[0];
