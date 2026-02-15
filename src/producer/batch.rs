@@ -2,11 +2,8 @@
 
 use std::time::Instant;
 
-use tokio::sync::oneshot;
-
-use super::record::{ProducerRecord, RecordMetadata};
+use super::record::ProducerRecord;
 use crate::PartitionId;
-use crate::error::Result;
 use crate::protocol::{Compression, RecordBatch, RecordBatchBuilder};
 
 /// A batch of records to be sent together.
@@ -28,12 +25,10 @@ pub struct ProducerBatch {
     created_at: Instant,
 }
 
-/// A record in a batch with its completion channel.
+/// A record in a batch.
 #[derive(Debug)]
 struct BatchRecord {
     record: ProducerRecord,
-    #[allow(dead_code)]
-    callback: Option<oneshot::Sender<Result<RecordMetadata>>>,
 }
 
 impl ProducerBatch {
@@ -67,31 +62,7 @@ impl ProducerBatch {
         }
 
         self.size += record_size;
-        self.records.push(BatchRecord {
-            record,
-            callback: None,
-        });
-        true
-    }
-
-    /// Try to add a record with a completion callback.
-    #[inline]
-    pub fn try_add_with_callback(
-        &mut self,
-        record: ProducerRecord,
-        callback: oneshot::Sender<Result<RecordMetadata>>,
-    ) -> bool {
-        let record_size = record.estimated_size();
-
-        if !self.records.is_empty() && self.size + record_size > self.max_size {
-            return false;
-        }
-
-        self.size += record_size;
-        self.records.push(BatchRecord {
-            record,
-            callback: Some(callback),
-        });
+        self.records.push(BatchRecord { record });
         true
     }
 
@@ -132,7 +103,18 @@ impl ProducerBatch {
         for batch_record in &self.records {
             let key = batch_record.record.key.clone();
             let value = batch_record.record.value.clone();
-            builder = builder.add_record(key, Some(value));
+            let headers = &batch_record.record.headers;
+
+            if headers.is_empty() {
+                builder = builder.add_record(key, Some(value));
+            } else {
+                // Include headers so they are not silently dropped (§8.2 fix)
+                let hdrs: Vec<(String, Vec<u8>)> = headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                builder = builder.add_record_with_headers(key, Some(value), hdrs);
+            }
         }
 
         builder.build()
@@ -209,5 +191,22 @@ mod tests {
 
         let record_batch = batch.build();
         assert_eq!(record_batch.records.len(), 1);
+    }
+
+    #[test]
+    fn test_batch_build_preserves_headers() {
+        let mut batch = ProducerBatch::new("test".to_string(), 0, 4096, Compression::None);
+
+        let record = ProducerRecord::new("test", b"value".to_vec())
+            .with_key(Some(b"key".to_vec()))
+            .with_header("trace-id", b"abc123")
+            .with_header("content-type", b"application/json");
+        batch.try_add(record);
+
+        let record_batch = batch.build();
+        assert_eq!(record_batch.records.len(), 1);
+        assert_eq!(record_batch.records[0].headers.len(), 2, "Headers should be preserved in built batch");
+        assert_eq!(record_batch.records[0].headers[0].key, "trace-id");
+        assert_eq!(record_batch.records[0].headers[1].key, "content-type");
     }
 }

@@ -270,6 +270,72 @@ pub enum ErrorCode {
     SecurityDisabled = 54,
     /// Operation not attempted.
     OperationNotAttempted = 55,
+    /// Kafka storage exception.
+    KafkaStorageException = 56,
+    /// Log directory not found.
+    LogDirNotFound = 57,
+    /// SASL authentication failed.
+    SaslAuthenticationFailed = 58,
+    /// Unknown producer ID.
+    UnknownProducerId = 59,
+    /// Reassignment in progress.
+    ReassignmentInProgress = 60,
+    /// Delegation token auth disabled.
+    DelegationTokenAuthDisabled = 61,
+    /// Delegation token not found.
+    DelegationTokenNotFound = 62,
+    /// Delegation token owner mismatch.
+    DelegationTokenOwnerMismatch = 63,
+    /// Delegation token request not allowed.
+    DelegationTokenRequestNotAllowed = 64,
+    /// Delegation token authorization failed.
+    DelegationTokenAuthorizationFailed = 65,
+    /// Delegation token expired.
+    DelegationTokenExpired = 66,
+    /// Invalid principal type.
+    InvalidPrincipalType = 67,
+    /// Non-empty group.
+    NonEmptyGroup = 68,
+    /// Group ID not found.
+    GroupIdNotFound = 69,
+    /// Fetch session ID not found.
+    FetchSessionIdNotFound = 70,
+    /// Invalid fetch session epoch.
+    InvalidFetchSessionEpoch = 71,
+    /// Listener not found.
+    ListenerNotFound = 72,
+    /// Topic deletion disabled.
+    TopicDeletionDisabled = 73,
+    /// Fenced leader epoch.
+    FencedLeaderEpoch = 74,
+    /// Unknown leader epoch.
+    UnknownLeaderEpoch = 75,
+    /// Unsupported compression type.
+    UnsupportedCompressionType = 76,
+    /// Stale broker epoch.
+    StaleBrokerEpoch = 77,
+    /// Offset not available.
+    OffsetNotAvailable = 78,
+    /// Member ID required.
+    MemberIdRequired = 79,
+    /// Preferred leader not available.
+    PreferredLeaderNotAvailable = 80,
+    /// Group max size reached.
+    GroupMaxSizeReached = 81,
+    /// Fenced instance ID.
+    FencedInstanceId = 82,
+    /// Eligible leaders not available.
+    EligibleLeadersNotAvailable = 83,
+    /// Election not needed.
+    ElectionNotNeeded = 84,
+    /// No reassignment in progress.
+    NoReassignmentInProgress = 85,
+    /// Group subscribed to topic.
+    GroupSubscribedToTopic = 86,
+    /// Invalid record.
+    InvalidRecord = 87,
+    /// Unstable offset commit.
+    UnstableOffsetCommit = 88,
     /// Unknown error code.
     Unknown(i16),
 }
@@ -336,6 +402,39 @@ impl ErrorCode {
             53 => Self::TransactionalIdAuthorizationFailed,
             54 => Self::SecurityDisabled,
             55 => Self::OperationNotAttempted,
+            56 => Self::KafkaStorageException,
+            57 => Self::LogDirNotFound,
+            58 => Self::SaslAuthenticationFailed,
+            59 => Self::UnknownProducerId,
+            60 => Self::ReassignmentInProgress,
+            61 => Self::DelegationTokenAuthDisabled,
+            62 => Self::DelegationTokenNotFound,
+            63 => Self::DelegationTokenOwnerMismatch,
+            64 => Self::DelegationTokenRequestNotAllowed,
+            65 => Self::DelegationTokenAuthorizationFailed,
+            66 => Self::DelegationTokenExpired,
+            67 => Self::InvalidPrincipalType,
+            68 => Self::NonEmptyGroup,
+            69 => Self::GroupIdNotFound,
+            70 => Self::FetchSessionIdNotFound,
+            71 => Self::InvalidFetchSessionEpoch,
+            72 => Self::ListenerNotFound,
+            73 => Self::TopicDeletionDisabled,
+            74 => Self::FencedLeaderEpoch,
+            75 => Self::UnknownLeaderEpoch,
+            76 => Self::UnsupportedCompressionType,
+            77 => Self::StaleBrokerEpoch,
+            78 => Self::OffsetNotAvailable,
+            79 => Self::MemberIdRequired,
+            80 => Self::PreferredLeaderNotAvailable,
+            81 => Self::GroupMaxSizeReached,
+            82 => Self::FencedInstanceId,
+            83 => Self::EligibleLeadersNotAvailable,
+            84 => Self::ElectionNotNeeded,
+            85 => Self::NoReassignmentInProgress,
+            86 => Self::GroupSubscribedToTopic,
+            87 => Self::InvalidRecord,
+            88 => Self::UnstableOffsetCommit,
             other => Self::Unknown(other),
         }
     }
@@ -401,6 +500,39 @@ impl ErrorCode {
             Self::TransactionalIdAuthorizationFailed => 53,
             Self::SecurityDisabled => 54,
             Self::OperationNotAttempted => 55,
+            Self::KafkaStorageException => 56,
+            Self::LogDirNotFound => 57,
+            Self::SaslAuthenticationFailed => 58,
+            Self::UnknownProducerId => 59,
+            Self::ReassignmentInProgress => 60,
+            Self::DelegationTokenAuthDisabled => 61,
+            Self::DelegationTokenNotFound => 62,
+            Self::DelegationTokenOwnerMismatch => 63,
+            Self::DelegationTokenRequestNotAllowed => 64,
+            Self::DelegationTokenAuthorizationFailed => 65,
+            Self::DelegationTokenExpired => 66,
+            Self::InvalidPrincipalType => 67,
+            Self::NonEmptyGroup => 68,
+            Self::GroupIdNotFound => 69,
+            Self::FetchSessionIdNotFound => 70,
+            Self::InvalidFetchSessionEpoch => 71,
+            Self::ListenerNotFound => 72,
+            Self::TopicDeletionDisabled => 73,
+            Self::FencedLeaderEpoch => 74,
+            Self::UnknownLeaderEpoch => 75,
+            Self::UnsupportedCompressionType => 76,
+            Self::StaleBrokerEpoch => 77,
+            Self::OffsetNotAvailable => 78,
+            Self::MemberIdRequired => 79,
+            Self::PreferredLeaderNotAvailable => 80,
+            Self::GroupMaxSizeReached => 81,
+            Self::FencedInstanceId => 82,
+            Self::EligibleLeadersNotAvailable => 83,
+            Self::ElectionNotNeeded => 84,
+            Self::NoReassignmentInProgress => 85,
+            Self::GroupSubscribedToTopic => 86,
+            Self::InvalidRecord => 87,
+            Self::UnstableOffsetCommit => 88,
             Self::Unknown(code) => code,
         }
     }
@@ -410,7 +542,9 @@ impl ErrorCode {
     pub fn is_retriable(&self) -> bool {
         matches!(
             self,
-            Self::LeaderNotAvailable
+            Self::CorruptMessage
+                | Self::UnknownTopicOrPartition
+                | Self::LeaderNotAvailable
                 | Self::NotLeaderForPartition
                 | Self::RequestTimedOut
                 | Self::BrokerNotAvailable
@@ -421,6 +555,19 @@ impl ErrorCode {
                 | Self::NotCoordinator
                 | Self::NotEnoughReplicas
                 | Self::NotEnoughReplicasAfterAppend
+                | Self::OutOfOrderSequenceNumber
+                | Self::ConcurrentTransactions
+                | Self::OperationNotAttempted
+                | Self::KafkaStorageException
+                | Self::UnknownProducerId
+                | Self::FetchSessionIdNotFound
+                | Self::InvalidFetchSessionEpoch
+                | Self::FencedLeaderEpoch
+                | Self::UnknownLeaderEpoch
+                | Self::OffsetNotAvailable
+                | Self::PreferredLeaderNotAvailable
+                | Self::EligibleLeadersNotAvailable
+                | Self::UnstableOffsetCommit
         )
     }
 
@@ -472,6 +619,13 @@ mod tests {
     fn test_error_code_is_retriable() {
         assert!(ErrorCode::LeaderNotAvailable.is_retriable());
         assert!(ErrorCode::RequestTimedOut.is_retriable());
+        assert!(ErrorCode::CorruptMessage.is_retriable());
+        assert!(ErrorCode::UnknownTopicOrPartition.is_retriable());
+        assert!(ErrorCode::OutOfOrderSequenceNumber.is_retriable());
+        assert!(ErrorCode::ConcurrentTransactions.is_retriable());
+        assert!(ErrorCode::OperationNotAttempted.is_retriable());
+        assert!(ErrorCode::BrokerNotAvailable.is_retriable());
+        assert!(ErrorCode::NetworkException.is_retriable());
         assert!(!ErrorCode::None.is_retriable());
         assert!(!ErrorCode::InvalidTopic.is_retriable());
     }
@@ -487,5 +641,137 @@ mod tests {
         assert!(KrafkaError::timeout("test").is_retriable());
         assert!(KrafkaError::broker(ErrorCode::LeaderNotAvailable, "test").is_retriable());
         assert!(!KrafkaError::config("test").is_retriable());
+    }
+
+    // ── R9.10: ErrorCode 56–88 from_i16 / to_i16 round-trip ──
+
+    #[test]
+    fn test_error_code_from_i16_codes_56_to_88() {
+        assert_eq!(ErrorCode::from_i16(56), ErrorCode::KafkaStorageException);
+        assert_eq!(ErrorCode::from_i16(57), ErrorCode::LogDirNotFound);
+        assert_eq!(ErrorCode::from_i16(58), ErrorCode::SaslAuthenticationFailed);
+        assert_eq!(ErrorCode::from_i16(59), ErrorCode::UnknownProducerId);
+        assert_eq!(ErrorCode::from_i16(60), ErrorCode::ReassignmentInProgress);
+        assert_eq!(ErrorCode::from_i16(61), ErrorCode::DelegationTokenAuthDisabled);
+        assert_eq!(ErrorCode::from_i16(62), ErrorCode::DelegationTokenNotFound);
+        assert_eq!(ErrorCode::from_i16(63), ErrorCode::DelegationTokenOwnerMismatch);
+        assert_eq!(ErrorCode::from_i16(64), ErrorCode::DelegationTokenRequestNotAllowed);
+        assert_eq!(ErrorCode::from_i16(65), ErrorCode::DelegationTokenAuthorizationFailed);
+        assert_eq!(ErrorCode::from_i16(66), ErrorCode::DelegationTokenExpired);
+        assert_eq!(ErrorCode::from_i16(67), ErrorCode::InvalidPrincipalType);
+        assert_eq!(ErrorCode::from_i16(68), ErrorCode::NonEmptyGroup);
+        assert_eq!(ErrorCode::from_i16(69), ErrorCode::GroupIdNotFound);
+        assert_eq!(ErrorCode::from_i16(70), ErrorCode::FetchSessionIdNotFound);
+        assert_eq!(ErrorCode::from_i16(71), ErrorCode::InvalidFetchSessionEpoch);
+        assert_eq!(ErrorCode::from_i16(72), ErrorCode::ListenerNotFound);
+        assert_eq!(ErrorCode::from_i16(73), ErrorCode::TopicDeletionDisabled);
+        assert_eq!(ErrorCode::from_i16(74), ErrorCode::FencedLeaderEpoch);
+        assert_eq!(ErrorCode::from_i16(75), ErrorCode::UnknownLeaderEpoch);
+        assert_eq!(ErrorCode::from_i16(76), ErrorCode::UnsupportedCompressionType);
+        assert_eq!(ErrorCode::from_i16(77), ErrorCode::StaleBrokerEpoch);
+        assert_eq!(ErrorCode::from_i16(78), ErrorCode::OffsetNotAvailable);
+        assert_eq!(ErrorCode::from_i16(79), ErrorCode::MemberIdRequired);
+        assert_eq!(ErrorCode::from_i16(80), ErrorCode::PreferredLeaderNotAvailable);
+        assert_eq!(ErrorCode::from_i16(81), ErrorCode::GroupMaxSizeReached);
+        assert_eq!(ErrorCode::from_i16(82), ErrorCode::FencedInstanceId);
+        assert_eq!(ErrorCode::from_i16(83), ErrorCode::EligibleLeadersNotAvailable);
+        assert_eq!(ErrorCode::from_i16(84), ErrorCode::ElectionNotNeeded);
+        assert_eq!(ErrorCode::from_i16(85), ErrorCode::NoReassignmentInProgress);
+        assert_eq!(ErrorCode::from_i16(86), ErrorCode::GroupSubscribedToTopic);
+        assert_eq!(ErrorCode::from_i16(87), ErrorCode::InvalidRecord);
+        assert_eq!(ErrorCode::from_i16(88), ErrorCode::UnstableOffsetCommit);
+    }
+
+    #[test]
+    fn test_error_code_to_i16_codes_56_to_88() {
+        assert_eq!(ErrorCode::KafkaStorageException.to_i16(), 56);
+        assert_eq!(ErrorCode::LogDirNotFound.to_i16(), 57);
+        assert_eq!(ErrorCode::SaslAuthenticationFailed.to_i16(), 58);
+        assert_eq!(ErrorCode::UnknownProducerId.to_i16(), 59);
+        assert_eq!(ErrorCode::ReassignmentInProgress.to_i16(), 60);
+        assert_eq!(ErrorCode::DelegationTokenAuthDisabled.to_i16(), 61);
+        assert_eq!(ErrorCode::DelegationTokenNotFound.to_i16(), 62);
+        assert_eq!(ErrorCode::DelegationTokenOwnerMismatch.to_i16(), 63);
+        assert_eq!(ErrorCode::DelegationTokenRequestNotAllowed.to_i16(), 64);
+        assert_eq!(ErrorCode::DelegationTokenAuthorizationFailed.to_i16(), 65);
+        assert_eq!(ErrorCode::DelegationTokenExpired.to_i16(), 66);
+        assert_eq!(ErrorCode::InvalidPrincipalType.to_i16(), 67);
+        assert_eq!(ErrorCode::NonEmptyGroup.to_i16(), 68);
+        assert_eq!(ErrorCode::GroupIdNotFound.to_i16(), 69);
+        assert_eq!(ErrorCode::FetchSessionIdNotFound.to_i16(), 70);
+        assert_eq!(ErrorCode::InvalidFetchSessionEpoch.to_i16(), 71);
+        assert_eq!(ErrorCode::ListenerNotFound.to_i16(), 72);
+        assert_eq!(ErrorCode::TopicDeletionDisabled.to_i16(), 73);
+        assert_eq!(ErrorCode::FencedLeaderEpoch.to_i16(), 74);
+        assert_eq!(ErrorCode::UnknownLeaderEpoch.to_i16(), 75);
+        assert_eq!(ErrorCode::UnsupportedCompressionType.to_i16(), 76);
+        assert_eq!(ErrorCode::StaleBrokerEpoch.to_i16(), 77);
+        assert_eq!(ErrorCode::OffsetNotAvailable.to_i16(), 78);
+        assert_eq!(ErrorCode::MemberIdRequired.to_i16(), 79);
+        assert_eq!(ErrorCode::PreferredLeaderNotAvailable.to_i16(), 80);
+        assert_eq!(ErrorCode::GroupMaxSizeReached.to_i16(), 81);
+        assert_eq!(ErrorCode::FencedInstanceId.to_i16(), 82);
+        assert_eq!(ErrorCode::EligibleLeadersNotAvailable.to_i16(), 83);
+        assert_eq!(ErrorCode::ElectionNotNeeded.to_i16(), 84);
+        assert_eq!(ErrorCode::NoReassignmentInProgress.to_i16(), 85);
+        assert_eq!(ErrorCode::GroupSubscribedToTopic.to_i16(), 86);
+        assert_eq!(ErrorCode::InvalidRecord.to_i16(), 87);
+        assert_eq!(ErrorCode::UnstableOffsetCommit.to_i16(), 88);
+    }
+
+    // ── R9.10: new retriable codes ──
+
+    #[test]
+    fn test_r9_10_new_retriable_error_codes() {
+        // These new codes from 56–88 should be retriable
+        assert!(ErrorCode::KafkaStorageException.is_retriable());
+        assert!(ErrorCode::UnknownProducerId.is_retriable());
+        assert!(ErrorCode::FetchSessionIdNotFound.is_retriable());
+        assert!(ErrorCode::InvalidFetchSessionEpoch.is_retriable());
+        assert!(ErrorCode::FencedLeaderEpoch.is_retriable());
+        assert!(ErrorCode::UnknownLeaderEpoch.is_retriable());
+        assert!(ErrorCode::OffsetNotAvailable.is_retriable());
+        assert!(ErrorCode::PreferredLeaderNotAvailable.is_retriable());
+        assert!(ErrorCode::EligibleLeadersNotAvailable.is_retriable());
+        assert!(ErrorCode::UnstableOffsetCommit.is_retriable());
+    }
+
+    #[test]
+    fn test_r9_10_non_retriable_error_codes_56_to_88() {
+        // These new codes from 56–88 should NOT be retriable
+        assert!(!ErrorCode::LogDirNotFound.is_retriable());
+        assert!(!ErrorCode::SaslAuthenticationFailed.is_retriable());
+        assert!(!ErrorCode::ReassignmentInProgress.is_retriable());
+        assert!(!ErrorCode::DelegationTokenAuthDisabled.is_retriable());
+        assert!(!ErrorCode::DelegationTokenNotFound.is_retriable());
+        assert!(!ErrorCode::DelegationTokenOwnerMismatch.is_retriable());
+        assert!(!ErrorCode::DelegationTokenRequestNotAllowed.is_retriable());
+        assert!(!ErrorCode::DelegationTokenAuthorizationFailed.is_retriable());
+        assert!(!ErrorCode::DelegationTokenExpired.is_retriable());
+        assert!(!ErrorCode::InvalidPrincipalType.is_retriable());
+        assert!(!ErrorCode::NonEmptyGroup.is_retriable());
+        assert!(!ErrorCode::GroupIdNotFound.is_retriable());
+        assert!(!ErrorCode::ListenerNotFound.is_retriable());
+        assert!(!ErrorCode::TopicDeletionDisabled.is_retriable());
+        assert!(!ErrorCode::UnsupportedCompressionType.is_retriable());
+        assert!(!ErrorCode::StaleBrokerEpoch.is_retriable());
+        assert!(!ErrorCode::MemberIdRequired.is_retriable());
+        assert!(!ErrorCode::GroupMaxSizeReached.is_retriable());
+        assert!(!ErrorCode::FencedInstanceId.is_retriable());
+        assert!(!ErrorCode::ElectionNotNeeded.is_retriable());
+        assert!(!ErrorCode::NoReassignmentInProgress.is_retriable());
+        assert!(!ErrorCode::GroupSubscribedToTopic.is_retriable());
+        assert!(!ErrorCode::InvalidRecord.is_retriable());
+    }
+
+    // ── R9.10: round-trip through From<i16> / From<ErrorCode> traits ──
+
+    #[test]
+    fn test_error_code_round_trip_56_to_88() {
+        for code in 56i16..=88 {
+            let ec = ErrorCode::from(code);
+            let back: i16 = ec.into();
+            assert_eq!(back, code, "round-trip failed for code {}", code);
+        }
     }
 }

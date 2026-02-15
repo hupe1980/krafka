@@ -343,25 +343,26 @@ impl ConnectionPool {
 
     /// Get or create a connection to a broker by address.
     ///
-    /// Uses a single write lock to avoid TOCTOU race conditions. Dead connections
-    /// are automatically removed and replaced.
+    /// Drops the lock before performing network I/O to avoid blocking other
+    /// callers while a reconnection is in progress.
     pub async fn get_connection(&self, address: &str) -> Result<Arc<BrokerConnection>> {
-        // Use write lock immediately to avoid TOCTOU race condition
-        let mut connections = self.connections_by_addr.write().await;
-
-        // Check if we have an existing alive connection
-        if let Some(conn) = connections.get(address) {
-            if conn.is_alive() {
+        // Fast path: check under read lock
+        {
+            let connections = self.connections_by_addr.read().await;
+            if let Some(conn) = connections.get(address) && conn.is_alive() {
                 return Ok(conn.clone());
             }
-            // Connection is dead, will be replaced
-            debug!(address = %address, "Removing dead connection from pool");
         }
 
-        // Create a new connection with retry logic
+        // Slow path: reconnect WITHOUT holding any lock (§4.1 fix)
         let conn = self.reconnect_with_backoff(address).await?;
 
-        // Store it (replaces dead connection if any)
+        // Re-acquire write lock to store the new connection
+        let mut connections = self.connections_by_addr.write().await;
+        // Double-check: another task may have reconnected while we were connecting
+        if let Some(existing) = connections.get(address) && existing.is_alive() {
+            return Ok(existing.clone());
+        }
         connections.insert(address.to_string(), conn.clone());
 
         debug!("Created connection to {}", address);
@@ -370,36 +371,33 @@ impl ConnectionPool {
 
     /// Get or create a connection to a broker by ID.
     ///
-    /// Uses a single lock scope to avoid TOCTOU race conditions. Dead connections
-    /// are automatically removed and replaced.
+    /// Drops locks before performing network I/O to avoid blocking other
+    /// callers while a reconnection is in progress.
     pub async fn get_connection_by_id(
         &self,
         broker_id: BrokerId,
         address: &str,
     ) -> Result<Arc<BrokerConnection>> {
-        // Acquire both write locks to avoid TOCTOU race condition
+        // Fast path: check under read lock
+        {
+            let connections = self.connections.read().await;
+            if let Some(conn) = connections.get(&broker_id) && conn.is_alive() {
+                return Ok(conn.clone());
+            }
+        }
+
+        // Slow path: reconnect WITHOUT holding any lock (§4.1 fix)
+        let conn = self.reconnect_with_backoff(address).await?;
+
+        // Re-acquire write locks to store the new connection
         let mut connections = self.connections.write().await;
         let mut connections_by_addr = self.connections_by_addr.write().await;
 
-        // Check if we have an existing alive connection
-        if let Some(conn) = connections.get(&broker_id) {
-            if conn.is_alive() {
-                return Ok(conn.clone());
-            }
-            // Connection is dead, will be replaced
-            debug!(
-                broker_id = %broker_id,
-                address = %address,
-                "Removing dead connection from pool"
-            );
-            // Clean up the dead connection from address map too
-            connections_by_addr.remove(conn.address());
+        // Double-check: another task may have reconnected while we were connecting
+        if let Some(existing) = connections.get(&broker_id) && existing.is_alive() {
+            return Ok(existing.clone());
         }
 
-        // Create a new connection with retry logic
-        let conn = self.reconnect_with_backoff(address).await?;
-
-        // Store it by both broker ID and address
         connections.insert(broker_id, conn.clone());
         connections_by_addr.insert(address.to_string(), conn.clone());
 
@@ -469,9 +467,21 @@ impl ConnectionPool {
     }
 
     /// Close all connections.
+    ///
+    /// Closes connections from both the broker-ID map and the address map
+    /// to ensure bootstrap connections (by address only) are not leaked (R6.3 fix).
     pub async fn close_all(&self) {
         let connections = self.connections.read().await;
         for conn in connections.values() {
+            conn.close().await;
+        }
+        drop(connections);
+
+        // Also close any by-address connections that aren't in the by-ID map.
+        // This covers bootstrap connections that were created before broker IDs
+        // were known from metadata.
+        let by_addr = self.connections_by_addr.read().await;
+        for conn in by_addr.values() {
             conn.close().await;
         }
     }
@@ -568,5 +578,16 @@ mod tests {
             .connections_per_broker(0)
             .build();
         assert_eq!(config.connections_per_broker, 1);
+    }
+
+    #[tokio::test]
+    async fn test_pool_close_all_clears_both_maps() {
+        // Verify close_all operates on both connections and connections_by_addr maps
+        let pool = ConnectionPool::new(ConnectionConfig::default());
+        // Both maps start empty
+        assert!(pool.connections.read().await.is_empty());
+        assert!(pool.connections_by_addr.read().await.is_empty());
+        // close_all on empty pool should not panic
+        pool.close_all().await;
     }
 }

@@ -18,6 +18,7 @@ The Krafka producer is an async-native, high-performance message producer for Ap
 - Multiple compression codecs (gzip, snappy, lz4, zstd)
 - Flexible partitioning strategies
 - Automatic metadata refresh
+- Interceptor hooks for observability
 
 ## Basic Usage
 
@@ -42,6 +43,32 @@ async fn main() -> Result<()> {
     Ok(())
 }
 ```
+
+## Authentication
+
+Connect to secured Kafka clusters using SASL or TLS:
+
+```rust
+use krafka::producer::Producer;
+
+// SASL/SCRAM-SHA-256
+let producer = Producer::builder()
+    .bootstrap_servers("broker:9093")
+    .sasl_scram_sha256("username", "password")
+    .build()
+    .await?;
+
+// AWS MSK IAM
+use krafka::auth::AuthConfig;
+let auth = AuthConfig::aws_msk_iam("access_key", "secret_key", "us-east-1");
+let producer = Producer::builder()
+    .bootstrap_servers("broker:9094")
+    .auth(auth)
+    .build()
+    .await?;
+```
+
+See the [Authentication Guide](authentication.md) for all supported mechanisms.
 
 ## Producer Configuration
 
@@ -211,8 +238,11 @@ use krafka::producer::{
 // Round-robin: ignores keys, distributes evenly
 let partitioner = RoundRobinPartitioner::new();
 
-// Sticky: sticks to one partition until batch is full
+// Sticky: sticks to one partition, auto-advances after batch_threshold records (default 100)
 let partitioner = StickyPartitioner::new();
+
+// Sticky with custom batch threshold
+let partitioner = StickyPartitioner::with_batch_threshold(500);
 
 // Hash: uses Rust's default hasher instead of murmur2
 let partitioner = HashPartitioner::new();
@@ -250,7 +280,30 @@ impl Partitioner for RegionPartitioner {
 
 ## Error Handling
 
-Handle send failures gracefully:
+### Built-in Retry
+
+The producer automatically retries transient failures (e.g., `NotLeaderForPartition`, network timeouts) using the configured retry policy. On each retriable error, the producer refreshes metadata to discover the new partition leader before retrying with exponential backoff.
+
+Configure retries via the builder:
+
+```rust
+use krafka::producer::Producer;
+use std::time::Duration;
+
+let producer = Producer::builder()
+    .bootstrap_servers("localhost:9092")
+    .retries(5)                                      // Max retry attempts
+    .retry_backoff(Duration::from_millis(100))        // Initial backoff
+    .build()
+    .await?;
+
+// send() automatically retries on transient failures
+producer.send("topic", None, b"value").await?;
+```
+
+### Manual Retry
+
+For additional retry control beyond the built-in behavior, handle errors explicitly:
 
 ```rust
 use krafka::producer::Producer;
@@ -372,15 +425,35 @@ use std::time::Duration;
 let producer = Producer::builder()
     .bootstrap_servers("localhost:9092")
     .acks(Acks::All)                         // Wait for all ISR
-    .enable_idempotence(true)                // Exactly-once semantics
     .retries(10)                             // Retry on failure
+    .build()
+    .await?;
+```
+
+> **Note:** For idempotent/exactly-once semantics, use `TransactionalProducer` instead.
+> The `enable_idempotence()` method on the regular `Producer` is deprecated since v0.2.0.
+> `TransactionalProducer` handles PID/epoch allocation, sequence numbers, and
+> transactional batch marking automatically via `init_transactions()`.
+
+### Concurrency Control
+
+The producer enforces `max_in_flight` to limit concurrent in-flight produce requests.
+This is critical for ordering guarantees and is implemented via a semaphore:
+
+```rust
+use krafka::producer::{Producer, Acks};
+
+let producer = Producer::builder()
+    .bootstrap_servers("localhost:9092")
+    .acks(Acks::All)
+    .max_in_flight(1)    // Strict ordering (at most 1 concurrent send)
     .build()
     .await?;
 ```
 
 ## Graceful Shutdown
 
-Always close producers properly to flush pending messages:
+Always close producers properly to flush pending messages. The `close()` method guarantees that all pending batches in the accumulator are flushed to brokers before connections are torn down:
 
 ```rust
 use krafka::producer::Producer;
@@ -392,14 +465,21 @@ let producer = Producer::builder()
 
 // ... send messages ...
 
-// Flush and close
+// Flush and close — waits for all in-flight batches to complete
 producer.flush().await?;
 producer.close().await;
 ```
 
 ## Transactional Producer
 
-For exactly-once semantics across multiple partitions and topics, use the `TransactionalProducer`:
+For exactly-once semantics across multiple partitions and topics, use the `TransactionalProducer`.
+This is the **recommended** approach for idempotent and exactly-once production.
+
+The transactional producer:
+- Automatically obtains a Producer ID (PID) and epoch from the broker via `InitProducerId`
+- Sets `producer_id`, `producer_epoch`, and `base_sequence` on every record batch
+- Marks batches as transactional (attribute bit 0x10)
+- Tracks sequence numbers per topic-partition for idempotent delivery
 
 ### Basic Usage
 
@@ -451,6 +531,34 @@ let producer = TransactionalProducer::builder()
     .await?;
 ```
 
+### Authentication
+
+Connect a transactional producer to secured Kafka clusters:
+
+```rust
+use krafka::producer::TransactionalProducer;
+
+// SASL/SCRAM-SHA-256
+let producer = TransactionalProducer::builder()
+    .bootstrap_servers("broker:9093")
+    .transactional_id("my-txn-id")
+    .sasl_scram_sha256("username", "password")
+    .build()
+    .await?;
+
+// Or use AuthConfig for advanced auth (e.g., AWS MSK IAM)
+use krafka::auth::AuthConfig;
+let auth = AuthConfig::aws_msk_iam("access_key", "secret_key", "us-east-1");
+let producer = TransactionalProducer::builder()
+    .bootstrap_servers("broker:9094")
+    .transactional_id("my-txn-id")
+    .auth(auth)
+    .build()
+    .await?;
+```
+
+See the [Authentication Guide](authentication.md) for all supported mechanisms.
+
 ### Transaction Lifecycle
 
 1. **Initialize**: Call `init_transactions()` once when producer starts
@@ -499,7 +607,7 @@ producer.commit_transaction().await?;
 
 ### Transaction States
 
-The producer maintains a state machine:
+The producer maintains a state machine with atomic CAS (compare-and-swap) transitions for thread safety:
 
 | State | Description |
 |-------|-------------|
@@ -510,8 +618,48 @@ The producer maintains a state machine:
 | `Aborting` | Transaction being aborted |
 | `FatalError` | Unrecoverable error, producer must be recreated |
 
+> **Note:** State transitions are protected by atomic compare-and-swap operations, preventing race conditions when multiple tasks interact with the transactional producer concurrently.
+
+## Producer Interceptors
+
+Interceptors allow you to observe and modify records before they are sent, and
+observe the acknowledgement (or error) after a send completes.
+See the [Interceptors Guide](interceptors.md) for full details.
+
+```rust
+use krafka::interceptor::ProducerInterceptor;
+use krafka::producer::{Producer, ProducerRecord, RecordMetadata};
+use krafka::error::KrafkaError;
+use std::sync::Arc;
+
+#[derive(Debug)]
+struct AuditInterceptor;
+
+impl ProducerInterceptor for AuditInterceptor {
+    fn on_send(&self, record: &mut ProducerRecord) {
+        // Add a tracing header to every record
+        record.headers.push(("x-trace-id".to_string(), b"abc123".to_vec()));
+    }
+
+    fn on_acknowledgement(&self, metadata: &RecordMetadata, error: Option<&KrafkaError>) {
+        if let Some(err) = error {
+            eprintln!("Send failed: {}", err);
+        } else {
+            println!("Sent to {}:{}", metadata.topic, metadata.partition);
+        }
+    }
+}
+
+let producer = Producer::builder()
+    .bootstrap_servers("localhost:9092")
+    .interceptor(Arc::new(AuditInterceptor))
+    .build()
+    .await?;
+```
+
 ## Next Steps
 
+- [Interceptors Guide](interceptors.md) - Producer and consumer interceptor hooks
 - [Consumer Guide](consumer.md) - Learn about consuming messages
 - [Configuration Reference](configuration.md) - All producer options
 - [Architecture Overview](architecture.md) - How the producer works internally

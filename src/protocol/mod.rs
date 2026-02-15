@@ -49,7 +49,7 @@ mod primitives;
 mod record;
 
 pub use api::{ApiKey, ApiVersionRange, ApiVersionsRequest, ApiVersionsResponse};
-pub use codec::{Decoder, Encoder};
+pub use codec::{Decoder, Encoder, MAX_MESSAGE_SIZE};
 pub use header::{RequestHeader, ResponseHeader};
 pub use messages::*;
 pub use primitives::*;

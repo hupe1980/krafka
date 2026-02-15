@@ -6,6 +6,7 @@
 //! - SASL/PLAIN
 //! - SASL/SCRAM-SHA-256 and SASL/SCRAM-SHA-512
 //! - SASL/AWS_MSK_IAM for AWS MSK
+//! - SASL/OAUTHBEARER (RFC 7628 / KIP-255)
 //!
 //! # Security Note
 //!
@@ -13,10 +14,12 @@
 //! sensitive data from remaining in memory after use.
 
 pub mod msk_iam;
+pub mod oauthbearer;
 pub mod scram;
 pub mod tls;
 
 pub use msk_iam::MskIamAuthenticator;
+pub use oauthbearer::OAuthBearerToken;
 pub use scram::{ScramClient, ScramMechanism, ScramState};
 pub use tls::{
     MaybeSecureStream, build_tls_config, build_tls_config_async, connect_tls, create_tls_connector,
@@ -24,7 +27,7 @@ pub use tls::{
 };
 
 use std::fmt;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Security protocol for Kafka connections.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -102,14 +105,17 @@ impl PlainCredentials {
     }
 
     /// Build the SASL PLAIN authentication message.
-    pub fn to_auth_bytes(&self) -> Vec<u8> {
+    ///
+    /// The returned `Zeroizing<Vec<u8>>` is automatically zeroized on drop
+    /// to prevent the password from lingering in freed heap memory.
+    pub fn to_auth_bytes(&self) -> Zeroizing<Vec<u8>> {
         // SASL PLAIN format: \0username\0password
         let mut auth = Vec::new();
         auth.push(0);
         auth.extend_from_slice(self.username.as_bytes());
         auth.push(0);
         auth.extend_from_slice(self.password.as_bytes());
-        auth
+        Zeroizing::new(auth)
     }
 }
 
@@ -369,6 +375,8 @@ pub struct AuthConfig {
     pub scram_credentials: Option<ScramCredentials>,
     /// AWS MSK IAM credentials.
     pub aws_msk_iam_credentials: Option<AwsMskIamCredentials>,
+    /// OAUTHBEARER token.
+    pub oauthbearer_token: Option<OAuthBearerToken>,
     /// TLS configuration.
     pub tls_config: Option<TlsConfig>,
 }
@@ -469,6 +477,69 @@ impl AuthConfig {
         }
     }
 
+    /// Create a SASL/OAUTHBEARER configuration.
+    ///
+    /// Uses SASL_PLAINTEXT. For TLS, use `sasl_oauthbearer_ssl()` or
+    /// call `.sasl_oauthbearer_token()` with a pre-built `OAuthBearerToken`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use krafka::auth::AuthConfig;
+    /// let config = AuthConfig::sasl_oauthbearer("my-jwt-token");
+    /// ```
+    pub fn sasl_oauthbearer(token: impl Into<String>) -> Self {
+        Self {
+            security_protocol: SecurityProtocol::SaslPlaintext,
+            sasl_mechanism: Some(SaslMechanism::OAuthBearer),
+            oauthbearer_token: Some(OAuthBearerToken::new(token)),
+            ..Default::default()
+        }
+    }
+
+    /// Create a SASL/OAUTHBEARER over TLS configuration.
+    pub fn sasl_oauthbearer_ssl(token: impl Into<String>, tls_config: TlsConfig) -> Self {
+        Self {
+            security_protocol: SecurityProtocol::SaslSsl,
+            sasl_mechanism: Some(SaslMechanism::OAuthBearer),
+            oauthbearer_token: Some(OAuthBearerToken::new(token)),
+            tls_config: Some(tls_config),
+            ..Default::default()
+        }
+    }
+
+    /// Create a SASL/OAUTHBEARER configuration with a pre-built token.
+    ///
+    /// Use this when you need SASL extensions (e.g., for Confluent Cloud).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use krafka::auth::{AuthConfig, OAuthBearerToken};
+    /// let token = OAuthBearerToken::new("my-jwt-token")
+    ///     .with_extension("logicalCluster", "lkc-abc123");
+    /// let config = AuthConfig::sasl_oauthbearer_token(token);
+    /// ```
+    pub fn sasl_oauthbearer_token(token: OAuthBearerToken) -> Self {
+        Self {
+            security_protocol: SecurityProtocol::SaslPlaintext,
+            sasl_mechanism: Some(SaslMechanism::OAuthBearer),
+            oauthbearer_token: Some(token),
+            ..Default::default()
+        }
+    }
+
+    /// Create a SASL/OAUTHBEARER over TLS configuration with a pre-built token.
+    pub fn sasl_oauthbearer_token_ssl(token: OAuthBearerToken, tls_config: TlsConfig) -> Self {
+        Self {
+            security_protocol: SecurityProtocol::SaslSsl,
+            sasl_mechanism: Some(SaslMechanism::OAuthBearer),
+            oauthbearer_token: Some(token),
+            tls_config: Some(tls_config),
+            ..Default::default()
+        }
+    }
+
     /// Check if TLS is required.
     pub fn requires_tls(&self) -> bool {
         matches!(
@@ -512,7 +583,7 @@ mod tests {
     fn test_plain_credentials() {
         let creds = PlainCredentials::new("user", "pass");
         let auth_bytes = creds.to_auth_bytes();
-        assert_eq!(auth_bytes, b"\0user\0pass");
+        assert_eq!(&*auth_bytes, b"\0user\0pass");
     }
 
     #[test]
@@ -593,6 +664,48 @@ mod tests {
         assert!(debug_str.contains("AKID123"));
         assert!(debug_str.contains("[REDACTED]"));
         assert!(!debug_str.contains("supersecret"));
+    }
+
+    #[test]
+    fn test_auth_config_sasl_oauthbearer() {
+        let config = AuthConfig::sasl_oauthbearer("my-token");
+        assert_eq!(config.security_protocol, SecurityProtocol::SaslPlaintext);
+        assert_eq!(config.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
+        assert!(config.oauthbearer_token.is_some());
+        assert!(!config.requires_tls());
+        assert!(config.requires_sasl());
+    }
+
+    #[test]
+    fn test_auth_config_sasl_oauthbearer_ssl() {
+        let config =
+            AuthConfig::sasl_oauthbearer_ssl("my-token", TlsConfig::new());
+        assert_eq!(config.security_protocol, SecurityProtocol::SaslSsl);
+        assert_eq!(config.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
+        assert!(config.oauthbearer_token.is_some());
+        assert!(config.tls_config.is_some());
+        assert!(config.requires_tls());
+        assert!(config.requires_sasl());
+    }
+
+    #[test]
+    fn test_auth_config_sasl_oauthbearer_token() {
+        let token = OAuthBearerToken::new("jwt")
+            .with_extension("logicalCluster", "lkc-1");
+        let config = AuthConfig::sasl_oauthbearer_token(token);
+        assert_eq!(config.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
+        assert!(config.oauthbearer_token.is_some());
+    }
+
+    #[test]
+    fn test_auth_config_sasl_oauthbearer_token_ssl() {
+        let token = OAuthBearerToken::new("jwt");
+        let config =
+            AuthConfig::sasl_oauthbearer_token_ssl(token, TlsConfig::new());
+        assert_eq!(config.security_protocol, SecurityProtocol::SaslSsl);
+        assert_eq!(config.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
+        assert!(config.oauthbearer_token.is_some());
+        assert!(config.tls_config.is_some());
     }
 
     // Note: from_env() is tested manually since environment variable modification

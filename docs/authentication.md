@@ -20,6 +20,16 @@ Krafka supports multiple security protocols:
 | `SASL_PLAINTEXT` | No | Yes (SASL) |
 | `SASL_SSL` | Yes (TLS) | Yes (SASL) |
 
+### Supported SASL Mechanisms
+
+| Mechanism | Description |
+|-----------|-------------|
+| PLAIN | Simple username/password |
+| SCRAM-SHA-256 | Challenge-response with SHA-256 |
+| SCRAM-SHA-512 | Challenge-response with SHA-512 |
+| OAUTHBEARER | OAuth 2.0 bearer tokens (RFC 7628 / KIP-255) |
+| AWS_MSK_IAM | AWS IAM authentication for MSK |
+
 ## Security Protocol Selection
 
 ```rust
@@ -74,9 +84,11 @@ let config = AuthConfig::sasl_scram_sha512("username", "password");
 The SCRAM client implements RFC 5802 with:
 
 - Salted Challenge-Response mechanism
-- PBKDF2 key derivation
+- PBKDF2 key derivation with iteration count validation (4,096–1,000,000 range)
 - HMAC signature verification
-- Constant-time comparison (timing-attack resistant)
+- Constant-time comparison via the `subtle` crate (timing-attack resistant)
+- Automatic secret zeroization on drop (`password`, `salted_password`, `server_signature`)
+- Debug output redacts the password as `[REDACTED]`
 
 ```rust
 use krafka::auth::{ScramClient, ScramMechanism, ScramState};
@@ -98,6 +110,81 @@ let client_first = scram.client_first_message();
 // Verify server-final
 // scram.process_server_final(server_response)?;
 ```
+
+### SASL/OAUTHBEARER
+
+OAuth 2.0 bearer token authentication per [RFC 7628](https://datatracker.ietf.org/doc/html/rfc7628) and [KIP-255](https://cwiki.apache.org/confluence/display/KAFKA/KIP-255%3A+OAuth+Authentication+via+SASL%2FOAUTHBEARER).
+
+```rust
+use krafka::auth::{AuthConfig, OAuthBearerToken};
+
+// Basic token authentication
+let config = AuthConfig::sasl_oauthbearer("your-jwt-token-here");
+
+// With TLS (recommended for production)
+use krafka::auth::TlsConfig;
+let config = AuthConfig::sasl_oauthbearer_ssl("your-jwt-token-here", TlsConfig::new());
+```
+
+#### With SASL Extensions
+
+For providers like Confluent Cloud that require additional SASL extensions:
+
+```rust
+use krafka::auth::{AuthConfig, OAuthBearerToken};
+
+// Create token with extensions
+let token = OAuthBearerToken::new("your-jwt-token")
+    .with_extension("logicalCluster", "lkc-abc123")
+    .with_extension("identityPoolId", "pool-xyz789");
+
+let config = AuthConfig::sasl_oauthbearer_token(token);
+
+// Or with TLS
+use krafka::auth::TlsConfig;
+let config = AuthConfig::sasl_oauthbearer_token_ssl(
+    OAuthBearerToken::new("your-jwt-token")
+        .with_extension("logicalCluster", "lkc-abc123"),
+    TlsConfig::new(),
+);
+```
+
+#### Builder Convenience Methods
+
+All client builders support a shorthand `.sasl_oauthbearer(token)` method:
+
+```rust
+use krafka::producer::Producer;
+use krafka::consumer::Consumer;
+
+let producer = Producer::builder()
+    .bootstrap_servers("broker:9093")
+    .sasl_oauthbearer("your-jwt-token")
+    .build()
+    .await?;
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("broker:9093")
+    .group_id("my-group")
+    .sasl_oauthbearer("your-jwt-token")
+    .build()
+    .await?;
+```
+
+#### OAUTHBEARER Protocol Details
+
+The implementation follows RFC 7628 GS2 framing:
+
+- **Initial response**: `n,,\x01auth=Bearer <token>[\x01key=value]*\x01\x01`
+- **Server success**: Empty response (0 bytes)
+- **Server error**: JSON or text error message
+- **Security**: Token zeroized on drop via `zeroize` crate
+- **Debug safety**: Token redacted as `[REDACTED]` in Debug output
+- **Extensions**: Arbitrary key-value pairs appended to the GS2 frame
+
+> **Note**: GSSAPI/Kerberos is not supported. It requires system Kerberos libraries
+> via FFI, which is incompatible with Krafka’s `#![deny(unsafe_code)]` policy. Use
+> OAUTHBEARER or SCRAM as alternatives.
 
 ## TLS/SSL Encryption
 
@@ -283,59 +370,167 @@ The implementation uses AWS Signature v4 signing:
 | `sasl_plain_ssl(user, pass, tls)` | SASL_SSL | PLAIN |
 | `sasl_scram_sha256(user, pass)` | SASL_PLAINTEXT | SCRAM-SHA-256 |
 | `sasl_scram_sha512(user, pass)` | SASL_PLAINTEXT | SCRAM-SHA-512 |
+| `sasl_oauthbearer(token)` | SASL_PLAINTEXT | OAUTHBEARER |
+| `sasl_oauthbearer_ssl(token, tls)` | SASL_SSL | OAUTHBEARER |
+| `sasl_oauthbearer_token(OAuthBearerToken)` | SASL_PLAINTEXT | OAUTHBEARER |
+| `sasl_oauthbearer_token_ssl(OAuthBearerToken, tls)` | SASL_SSL | OAUTHBEARER |
 | `aws_msk_iam(key, secret, region)` | SASL_SSL | AWS_MSK_IAM |
 
-## Admin Client Authentication
+## Client Authentication
 
-The AdminClient supports all SASL authentication methods through dedicated builder methods:
+All Krafka clients — AdminClient, Producer, TransactionalProducer, and Consumer — support the same authentication
+methods through dedicated builder methods. Authentication is wired end-to-end: TLS upgrade
+and SASL handshake happen automatically during connection establishment.
 
-### SASL/PLAIN
+### Admin Client
 
 ```rust
 use krafka::AdminClient;
 
+// SASL/PLAIN
 let admin = AdminClient::builder()
     .client_id("admin-client")
     .bootstrap_servers("broker:9092")
     .sasl_plain("username", "password")
     .build();
-```
 
-### SASL/SCRAM-SHA-256
-
-```rust
-use krafka::AdminClient;
-
+// SASL/SCRAM-SHA-256
 let admin = AdminClient::builder()
     .bootstrap_servers("broker:9092")
     .sasl_scram_sha256("username", "password")
     .build();
-```
 
-### SASL/SCRAM-SHA-512
-
-```rust
-use krafka::AdminClient;
-
+// SASL/SCRAM-SHA-512
 let admin = AdminClient::builder()
     .bootstrap_servers("broker:9092")
     .sasl_scram_sha512("username", "password")
     .build();
 ```
 
+### Producer
+
+```rust
+use krafka::producer::Producer;
+
+// SASL/PLAIN
+let producer = Producer::builder()
+    .bootstrap_servers("broker:9092")
+    .sasl_plain("username", "password")
+    .build()
+    .await?;
+
+// SASL/SCRAM-SHA-256
+let producer = Producer::builder()
+    .bootstrap_servers("broker:9092")
+    .sasl_scram_sha256("username", "password")
+    .build()
+    .await?;
+
+// SASL/SCRAM-SHA-512
+let producer = Producer::builder()
+    .bootstrap_servers("broker:9092")
+    .sasl_scram_sha512("username", "password")
+    .build()
+    .await?;
+```
+
+### Consumer
+
+```rust
+use krafka::consumer::Consumer;
+
+// SASL/PLAIN
+let consumer = Consumer::builder()
+    .bootstrap_servers("broker:9092")
+    .group_id("my-group")
+    .sasl_plain("username", "password")
+    .build()
+    .await?;
+
+// SASL/SCRAM-SHA-256
+let consumer = Consumer::builder()
+    .bootstrap_servers("broker:9092")
+    .group_id("my-group")
+    .sasl_scram_sha256("username", "password")
+    .build()
+    .await?;
+
+// SASL/SCRAM-SHA-512
+let consumer = Consumer::builder()
+    .bootstrap_servers("broker:9092")
+    .group_id("my-group")
+    .sasl_scram_sha512("username", "password")
+    .build()
+    .await?;
+```
+
+### Transactional Producer
+
+```rust
+use krafka::producer::TransactionalProducer;
+
+// SASL/PLAIN
+let producer = TransactionalProducer::builder()
+    .bootstrap_servers("broker:9092")
+    .transactional_id("my-txn-id")
+    .sasl_plain("username", "password")
+    .build()
+    .await?;
+
+// SASL/SCRAM-SHA-256
+let producer = TransactionalProducer::builder()
+    .bootstrap_servers("broker:9092")
+    .transactional_id("my-txn-id")
+    .sasl_scram_sha256("username", "password")
+    .build()
+    .await?;
+
+// SASL/SCRAM-SHA-512
+let producer = TransactionalProducer::builder()
+    .bootstrap_servers("broker:9092")
+    .transactional_id("my-txn-id")
+    .sasl_scram_sha512("username", "password")
+    .build()
+    .await?;
+```
+
 ### Generic AuthConfig
 
-For advanced configurations or AWS MSK IAM:
+For advanced configurations or AWS MSK IAM, use `.auth()` on any builder:
 
 ```rust
 use krafka::AdminClient;
+use krafka::producer::{Producer, TransactionalProducer};
+use krafka::consumer::Consumer;
 use krafka::auth::AuthConfig;
 
 let auth = AuthConfig::aws_msk_iam("access_key", "secret_key", "us-east-1");
+
+// Works on all client types
 let admin = AdminClient::builder()
     .bootstrap_servers("broker:9092")
-    .auth(auth)
+    .auth(auth.clone())
     .build();
+
+let producer = Producer::builder()
+    .bootstrap_servers("broker:9092")
+    .auth(auth.clone())
+    .build()
+    .await?;
+
+let txn_producer = TransactionalProducer::builder()
+    .bootstrap_servers("broker:9092")
+    .transactional_id("my-txn-id")
+    .auth(auth.clone())
+    .build()
+    .await?;
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("broker:9092")
+    .group_id("my-group")
+    .auth(auth)
+    .build()
+    .await?;
 ```
 
 ## Security Best Practices
@@ -346,6 +541,9 @@ let admin = AdminClient::builder()
 4. **Store credentials securely** - Use environment variables or secrets managers
 5. **Rotate credentials regularly** - Especially for long-running applications
 6. **Verify certificates in production** - Never use `TlsConfig::insecure()` in production
+7. **Automatic secret zeroization** - All credential types (`ScramClient`, `MskIamAuthenticator`, `PlainCredentials`, `ScramCredentials`, `OAuthBearerToken`) zeroize secrets on drop to prevent memory leaks. SASL PLAIN auth bytes are wrapped in `Zeroizing<Vec<u8>>` and automatically zeroized after being sent on the wire.
+8. **Debug safety** - All credential types redact secrets in `Debug` output, so `tracing::debug!("{:?}", auth)` is safe to use
+9. **Cleartext warning** - Using `SASL_PLAINTEXT` with `PLAIN` emits a `tracing::warn!` alerting that credentials will be sent in cleartext
 
 ## Secure Connection Configuration
 
@@ -394,6 +592,8 @@ if authenticator.is_complete() {
 
 ```rust
 use krafka::auth::{AuthConfig, TlsConfig};
+use krafka::producer::Producer;
+use krafka::consumer::Consumer;
 use std::env;
 
 fn production_auth_config() -> AuthConfig {
@@ -411,6 +611,26 @@ fn production_auth_config() -> AuthConfig {
         tls_config: Some(tls_config),
         ..Default::default()
     }
+}
+
+// Use with any client
+async fn create_clients() {
+    let auth = production_auth_config();
+
+    let producer = Producer::builder()
+        .bootstrap_servers("kafka.prod.example.com:9093")
+        .auth(auth.clone())
+        .build()
+        .await
+        .unwrap();
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers("kafka.prod.example.com:9093")
+        .group_id("prod-group")
+        .auth(auth)
+        .build()
+        .await
+        .unwrap();
 }
 ```
 

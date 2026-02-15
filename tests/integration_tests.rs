@@ -801,7 +801,7 @@ async fn test_message_headers() {
     let record = &records[0];
 
     // Verify headers are present
-    assert!(record.header("trace-id").is_some() || record.headers.contains_key("trace-id"));
+    assert!(record.header("trace-id").is_some());
 }
 
 #[tokio::test]
@@ -815,6 +815,9 @@ async fn test_idempotent_producer() {
     create_topic(&bootstrap_servers, topic, 1).await;
 
     // Create idempotent producer
+    // Note: Full idempotence requires TransactionalProducer. This test
+    // verifies the producer works with the idempotence config flag set.
+    #[allow(deprecated)]
     let producer = Producer::builder()
         .bootstrap_servers(&bootstrap_servers)
         .client_id("idempotent-producer-test")

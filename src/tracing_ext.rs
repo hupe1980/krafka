@@ -70,7 +70,15 @@ pub fn kafka_producer_span(
     partition: Option<PartitionId>,
     key: Option<&[u8]>,
 ) -> Span {
-    let span = tracing::span!(Level::INFO, "kafka.produce",);
+    let span = tracing::span!(
+        Level::INFO,
+        "kafka.produce",
+        { MESSAGING_SYSTEM } = tracing::field::Empty,
+        { MESSAGING_OPERATION } = tracing::field::Empty,
+        { MESSAGING_DESTINATION } = tracing::field::Empty,
+        { MESSAGING_KAFKA_PARTITION } = tracing::field::Empty,
+        { MESSAGING_MESSAGE_KEY } = tracing::field::Empty,
+    );
 
     span.record(MESSAGING_SYSTEM, "kafka");
     span.record(MESSAGING_OPERATION, "publish");

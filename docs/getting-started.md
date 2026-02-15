@@ -21,7 +21,7 @@ tokio = { version = "1", features = ["full"] }
 
 ## Prerequisites
 
-- Rust 1.70 or later
+- Rust 1.85 or later (MSRV 1.85)
 - A running Kafka cluster (or use Docker)
 
 ### Running Kafka with Docker

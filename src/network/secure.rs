@@ -5,10 +5,11 @@
 use std::time::Duration;
 
 use crate::auth::{
-    AuthConfig, MskIamAuthenticator, PlainCredentials, SaslMechanism, ScramClient, ScramMechanism,
-    SecurityProtocol, TlsConfig,
+    AuthConfig, MskIamAuthenticator, OAuthBearerToken, PlainCredentials, SaslMechanism,
+    ScramClient, ScramMechanism, SecurityProtocol, TlsConfig,
 };
 use crate::error::{KrafkaError, Result};
+use zeroize::Zeroizing;
 
 use super::connection::ConnectionConfig;
 
@@ -113,6 +114,18 @@ impl SecureConnectionConfigBuilder {
         self
     }
 
+    /// Configure SASL/OAUTHBEARER authentication.
+    pub fn sasl_oauthbearer(mut self, token: impl Into<String>) -> Self {
+        self.auth = AuthConfig::sasl_oauthbearer(token);
+        self
+    }
+
+    /// Configure SASL/OAUTHBEARER authentication with a pre-built token.
+    pub fn sasl_oauthbearer_token(mut self, token: OAuthBearerToken) -> Self {
+        self.auth = AuthConfig::sasl_oauthbearer_token(token);
+        self
+    }
+
     /// Configure TLS with default settings.
     pub fn tls(mut self, tls_config: TlsConfig) -> Self {
         self.auth.tls_config = Some(tls_config);
@@ -140,6 +153,8 @@ pub struct SaslAuthenticator {
     scram_client: Option<ScramClient>,
     msk_iam_authenticator: Option<MskIamAuthenticator>,
     msk_iam_complete: bool,
+    oauthbearer_token: Option<OAuthBearerToken>,
+    oauthbearer_complete: bool,
 }
 
 impl SaslAuthenticator {
@@ -156,6 +171,8 @@ impl SaslAuthenticator {
                 scram_client: None,
                 msk_iam_authenticator: None,
                 msk_iam_complete: false,
+                oauthbearer_token: None,
+                oauthbearer_complete: false,
             }),
             SaslMechanism::ScramSha256 => {
                 let creds = auth.scram_credentials.as_ref()?;
@@ -169,6 +186,8 @@ impl SaslAuthenticator {
                     )),
                     msk_iam_authenticator: None,
                     msk_iam_complete: false,
+                    oauthbearer_token: None,
+                    oauthbearer_complete: false,
                 })
             }
             SaslMechanism::ScramSha512 => {
@@ -183,6 +202,8 @@ impl SaslAuthenticator {
                     )),
                     msk_iam_authenticator: None,
                     msk_iam_complete: false,
+                    oauthbearer_token: None,
+                    oauthbearer_complete: false,
                 })
             }
             SaslMechanism::AwsMskIam => {
@@ -193,9 +214,33 @@ impl SaslAuthenticator {
                     scram_client: None,
                     msk_iam_authenticator: None,
                     msk_iam_complete: false,
+                    oauthbearer_token: None,
+                    oauthbearer_complete: false,
                 })
             }
-            _ => None, // OAuth, GSSAPI not yet implemented
+            SaslMechanism::OAuthBearer => {
+                let token = auth.oauthbearer_token.as_ref().cloned().or_else(|| {
+                    tracing::error!("OAUTHBEARER mechanism requires an OAuth bearer token");
+                    None
+                })?;
+                Some(Self {
+                    mechanism: SaslMechanism::OAuthBearer,
+                    plain_credentials: None,
+                    scram_client: None,
+                    msk_iam_authenticator: None,
+                    msk_iam_complete: false,
+                    oauthbearer_token: Some(token),
+                    oauthbearer_complete: false,
+                })
+            }
+            SaslMechanism::Gssapi => {
+                tracing::error!(
+                    "SASL/GSSAPI (Kerberos) requires system Kerberos libraries and is not \
+                     available in the pure-Rust build. Use OAUTHBEARER for token-based \
+                     authentication, or SCRAM-SHA-256/512 for password-based authentication."
+                );
+                None
+            }
         }
     }
 
@@ -214,6 +259,8 @@ impl SaslAuthenticator {
             scram_client: None,
             msk_iam_authenticator: Some(authenticator),
             msk_iam_complete: false,
+            oauthbearer_token: None,
+            oauthbearer_complete: false,
         })
     }
 
@@ -241,24 +288,35 @@ impl SaslAuthenticator {
     }
 
     /// Get the initial authentication bytes.
-    pub fn initial_response(&mut self) -> Vec<u8> {
+    ///
+    /// For PLAIN mechanism, the returned bytes are wrapped in `Zeroizing`
+    /// to ensure the password is erased from memory after being sent on the wire.
+    pub fn initial_response(&mut self) -> Zeroizing<Vec<u8>> {
         match self.mechanism {
             SaslMechanism::Plain => self
                 .plain_credentials
                 .as_ref()
                 .map(|c| c.to_auth_bytes())
                 .unwrap_or_default(),
-            SaslMechanism::ScramSha256 | SaslMechanism::ScramSha512 => self
-                .scram_client
-                .as_mut()
-                .map(|c| c.client_first_message())
-                .unwrap_or_default(),
-            SaslMechanism::AwsMskIam => self
-                .msk_iam_authenticator
-                .as_ref()
-                .map(|a| a.create_auth_payload())
-                .unwrap_or_default(),
-            _ => Vec::new(),
+            SaslMechanism::ScramSha256 | SaslMechanism::ScramSha512 => Zeroizing::new(
+                self.scram_client
+                    .as_mut()
+                    .map(|c| c.client_first_message())
+                    .unwrap_or_default(),
+            ),
+            SaslMechanism::AwsMskIam => Zeroizing::new(
+                self.msk_iam_authenticator
+                    .as_ref()
+                    .map(|a| a.create_auth_payload())
+                    .unwrap_or_default(),
+            ),
+            SaslMechanism::OAuthBearer => Zeroizing::new(
+                self.oauthbearer_token
+                    .as_ref()
+                    .map(|t| t.to_gs2_initial_response())
+                    .unwrap_or_default(),
+            ),
+            SaslMechanism::Gssapi => Zeroizing::new(Vec::new()),
         }
     }
 
@@ -294,7 +352,30 @@ impl SaslAuthenticator {
                 self.msk_iam_complete = true;
                 Ok(None)
             }
-            _ => Err(KrafkaError::auth("Unsupported SASL mechanism")),
+            SaslMechanism::OAuthBearer => {
+                // Process server response after initial GS2 token message
+                let token = self
+                    .oauthbearer_token
+                    .as_ref()
+                    .ok_or_else(|| KrafkaError::auth("OAuthBearer token not configured"))?;
+
+                match token.process_server_response(challenge) {
+                    Ok(()) => {
+                        self.oauthbearer_complete = true;
+                        Ok(None) // Authentication complete
+                    }
+                    Err(e) => {
+                        // RFC 7628 §3.2.3: client must send \x01 to acknowledge the error
+                        self.oauthbearer_complete = true;
+                        // Return the failure ack byte, then propagate error on next call
+                        // Actually, we should fail immediately — the connection will know
+                        Err(e)
+                    }
+                }
+            }
+            SaslMechanism::Gssapi => Err(KrafkaError::auth(
+                "SASL/GSSAPI (Kerberos) is not available in the pure-Rust build",
+            )),
         }
     }
 
@@ -307,7 +388,8 @@ impl SaslAuthenticator {
                 .as_ref()
                 .is_some_and(|c| *c.state() == crate::auth::ScramState::Complete),
             SaslMechanism::AwsMskIam => self.msk_iam_complete,
-            _ => false,
+            SaslMechanism::OAuthBearer => self.oauthbearer_complete,
+            SaslMechanism::Gssapi => false,
         }
     }
 }
@@ -354,7 +436,7 @@ mod tests {
         assert_eq!(authenticator.mechanism_name(), "PLAIN");
 
         let initial = authenticator.initial_response();
-        assert_eq!(initial, b"\0user\0pass");
+        assert_eq!(&*initial, b"\0user\0pass");
         assert!(authenticator.is_complete());
     }
 
@@ -379,7 +461,7 @@ mod tests {
         assert_eq!(authenticator.mechanism_name(), "AWS_MSK_IAM");
 
         let initial = authenticator.initial_response();
-        let payload_str = String::from_utf8(initial).unwrap();
+        let payload_str = String::from_utf8(initial.to_vec()).unwrap();
 
         // Verify JSON payload structure
         assert!(payload_str.contains("\"version\":\"2020_10_22\""));
@@ -404,5 +486,100 @@ mod tests {
         assert!(config.auth.requires_tls());
         assert!(config.auth.requires_sasl());
         assert_eq!(config.auth.sasl_mechanism, Some(SaslMechanism::AwsMskIam));
+    }
+
+    #[test]
+    fn test_sasl_authenticator_oauthbearer() {
+        let auth = AuthConfig::sasl_oauthbearer("my-jwt-token");
+        let mut authenticator = SaslAuthenticator::new(&auth).unwrap();
+
+        assert_eq!(authenticator.mechanism_name(), "OAUTHBEARER");
+
+        let initial = authenticator.initial_response();
+        assert_eq!(&*initial, b"n,,\x01auth=Bearer my-jwt-token\x01\x01");
+
+        // Not complete until server responds
+        assert!(!authenticator.is_complete());
+
+        // Process empty challenge (server acceptance)
+        authenticator.process_challenge(&[]).unwrap();
+        assert!(authenticator.is_complete());
+    }
+
+    #[test]
+    fn test_sasl_authenticator_oauthbearer_with_extensions() {
+        let token = OAuthBearerToken::new("tok")
+            .with_extension("logicalCluster", "lkc-123");
+        let auth = AuthConfig::sasl_oauthbearer_token(token);
+        let mut authenticator = SaslAuthenticator::new(&auth).unwrap();
+
+        let initial = authenticator.initial_response();
+        let initial_str = String::from_utf8_lossy(&initial);
+        assert!(initial_str.starts_with("n,,\x01auth=Bearer tok"));
+        assert!(initial_str.contains("logicalCluster=lkc-123"));
+        assert!(initial_str.ends_with("\x01\x01"));
+    }
+
+    #[test]
+    fn test_sasl_authenticator_oauthbearer_server_error() {
+        let auth = AuthConfig::sasl_oauthbearer("bad-token");
+        let mut authenticator = SaslAuthenticator::new(&auth).unwrap();
+        let _ = authenticator.initial_response();
+
+        let result = authenticator
+            .process_challenge(br#"{"status":"invalid_token"}"#);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid_token"));
+    }
+
+    #[test]
+    fn test_sasl_authenticator_oauthbearer_missing_token() {
+        // Create an AuthConfig with OAuthBearer mechanism but no token
+        let auth = AuthConfig {
+            security_protocol: SecurityProtocol::SaslPlaintext,
+            sasl_mechanism: Some(SaslMechanism::OAuthBearer),
+            oauthbearer_token: None,
+            ..Default::default()
+        };
+        assert!(SaslAuthenticator::new(&auth).is_none());
+    }
+
+    #[test]
+    fn test_sasl_authenticator_gssapi_fails_gracefully() {
+        let auth = AuthConfig {
+            security_protocol: SecurityProtocol::SaslPlaintext,
+            sasl_mechanism: Some(SaslMechanism::Gssapi),
+            ..Default::default()
+        };
+        assert!(SaslAuthenticator::new(&auth).is_none());
+    }
+
+    #[test]
+    fn test_secure_connection_config_builder_oauthbearer() {
+        let config = SecureConnectionConfig::builder()
+            .sasl_oauthbearer("my-token")
+            .build();
+
+        assert!(config.auth.requires_sasl());
+        assert_eq!(
+            config.auth.sasl_mechanism,
+            Some(SaslMechanism::OAuthBearer)
+        );
+        assert!(config.auth.oauthbearer_token.is_some());
+    }
+
+    #[test]
+    fn test_secure_connection_config_builder_oauthbearer_token() {
+        let token = OAuthBearerToken::new("tok")
+            .with_extension("key", "val");
+        let config = SecureConnectionConfig::builder()
+            .sasl_oauthbearer_token(token)
+            .build();
+
+        assert!(config.auth.requires_sasl());
+        assert_eq!(
+            config.auth.sasl_mechanism,
+            Some(SaslMechanism::OAuthBearer)
+        );
     }
 }

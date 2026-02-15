@@ -31,23 +31,29 @@
 //!     .await?;
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::auth::AuthConfig;
 use crate::error::{KrafkaError, Result};
 use crate::metadata::{BrokerInfo, ClusterMetadata, TopicInfo};
 use crate::network::{ConnectionConfig, ConnectionPool};
+
 use crate::protocol::{
     AclBinding, AclBindingFilter, AclOperation, AclPatternType, AclPermissionType, AclResourceType,
     AlterConfigsRequest, AlterConfigsResponse, ApiKey, CreatableTopic, CreatableTopicConfig,
     CreateAclsRequest, CreateAclsResponse, CreatePartitionsRequest, CreatePartitionsResponse,
     CreatePartitionsTopic, CreateTopicsRequest, CreateTopicsResponse, DeleteAclsRequest,
-    DeleteAclsResponse, DeleteTopicsRequest, DeleteTopicsResponse, DescribeAclsRequest,
-    DescribeAclsResponse, DescribeConfigsRequest, DescribeConfigsResponse,
+    DeleteAclsResponse, DeleteRecordsPartition, DeleteRecordsRequest, DeleteRecordsResponse,
+    DeleteRecordsTopic, DeleteTopicsRequest, DeleteTopicsResponse, DescribeAclsRequest,
+    DescribeAclsResponse,
+    DescribeConfigsRequest, DescribeConfigsResponse, DescribeGroupsRequest, DescribeGroupsResponse,
+    FindCoordinatorRequest, FindCoordinatorResponse,
+    ListGroupsRequest, ListGroupsResponse, OffsetForLeaderEpochPartition,
+    OffsetForLeaderEpochRequest, OffsetForLeaderEpochResponse, OffsetForLeaderEpochTopic,
 };
 
 /// Configuration for creating a topic.
@@ -169,6 +175,73 @@ pub struct DeleteAclFilterResult {
     pub error: Option<String>,
     /// Number of ACLs deleted by this filter.
     pub deleted_count: usize,
+}
+
+/// Description of a consumer group.
+#[derive(Debug, Clone)]
+pub struct ConsumerGroupDescription {
+    /// Group ID.
+    pub group_id: String,
+    /// Group state (e.g., "Stable", "Empty", "Dead", "PreparingRebalance").
+    pub state: String,
+    /// Protocol type (e.g., "consumer").
+    pub protocol_type: String,
+    /// Protocol (e.g., assignor name like "range", "roundrobin").
+    pub protocol: String,
+    /// Group members.
+    pub members: Vec<ConsumerGroupMember>,
+    /// Error message if any.
+    pub error: Option<String>,
+}
+
+/// A member of a consumer group.
+#[derive(Debug, Clone)]
+pub struct ConsumerGroupMember {
+    /// Member ID.
+    pub member_id: String,
+    /// Group instance ID (static membership).
+    pub group_instance_id: Option<String>,
+    /// Client ID.
+    pub client_id: String,
+    /// Client host.
+    pub client_host: String,
+}
+
+/// Listing entry for a consumer group.
+#[derive(Debug, Clone)]
+pub struct ConsumerGroupListing {
+    /// Group ID.
+    pub group_id: String,
+    /// Protocol type (e.g., "consumer").
+    pub protocol_type: String,
+}
+
+/// Result of deleting records from a partition.
+#[derive(Debug, Clone)]
+pub struct DeleteRecordResult {
+    /// Topic name.
+    pub topic: String,
+    /// Partition index.
+    pub partition: i32,
+    /// The new log start offset (low watermark) after deletion.
+    pub low_watermark: i64,
+    /// Error message if any.
+    pub error: Option<String>,
+}
+
+/// Result of an OffsetForLeaderEpoch request for a partition.
+#[derive(Debug, Clone)]
+pub struct LeaderEpochResult {
+    /// Topic name.
+    pub topic: String,
+    /// Partition index.
+    pub partition: i32,
+    /// The leader epoch.
+    pub leader_epoch: i32,
+    /// The end offset for this leader epoch.
+    pub end_offset: i64,
+    /// Error message if any.
+    pub error: Option<String>,
 }
 
 /// Filter for ACL operations (describe, delete).
@@ -338,7 +411,7 @@ impl AdminClient {
                         .collect(),
                 })
                 .collect(),
-            timeout_ms: timeout.as_millis() as i32,
+            timeout_ms: crate::util::duration_to_millis_i32(timeout),
             validate_only: false,
         };
 
@@ -395,7 +468,7 @@ impl AdminClient {
         // Build request
         let request = DeleteTopicsRequest {
             topic_names: topics.clone(),
-            timeout_ms: timeout.as_millis() as i32,
+            timeout_ms: crate::util::duration_to_millis_i32(timeout),
         };
 
         // Send request
@@ -460,7 +533,7 @@ impl AdminClient {
                 count: new_total_count,
                 assignments: None,
             }],
-            timeout_ms: timeout.as_millis() as i32,
+            timeout_ms: crate::util::duration_to_millis_i32(timeout),
             validate_only: false,
         };
 
@@ -964,6 +1037,409 @@ impl AdminClient {
         Ok(DeleteAclsResult { filter_results })
     }
 
+    /// Describe consumer groups.
+    ///
+    /// Returns detailed information about each group including state, members,
+    /// and partition assignments.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let groups = admin.describe_groups(vec!["my-group".to_string()]).await?;
+    /// for group in &groups {
+    ///     println!("{}: state={}, members={}", group.group_id, group.state, group.members.len());
+    /// }
+    /// ```
+    pub async fn describe_groups(
+        &self,
+        group_ids: Vec<String>,
+    ) -> Result<Vec<ConsumerGroupDescription>> {
+        let brokers = self.metadata.brokers().await;
+        if brokers.is_empty() {
+            return Err(KrafkaError::broker(
+                crate::error::ErrorCode::UnknownServerError,
+                "no brokers available",
+            ));
+        }
+
+        // Group the group_ids by their coordinator broker
+        let mut coordinator_groups: HashMap<i32, Vec<String>> = HashMap::new();
+        let any_broker = &brokers[0];
+        let any_conn = self
+            .pool
+            .get_connection_by_id(any_broker.id, &any_broker.address())
+            .await?;
+
+        for group_id in &group_ids {
+            let coord_request = FindCoordinatorRequest::for_group(group_id);
+            let coord_response_bytes = any_conn
+                .send_request(ApiKey::FindCoordinator, 1, |buf| {
+                    coord_request.encode_v1(buf);
+                })
+                .await?;
+            let mut coord_buf = coord_response_bytes;
+            let coord_response = FindCoordinatorResponse::decode_v1(&mut coord_buf)?;
+
+            if coord_response.error_code.is_ok() {
+                coordinator_groups
+                    .entry(coord_response.node_id)
+                    .or_default()
+                    .push(group_id.clone());
+            } else {
+                // Fallback to first broker if coordinator lookup fails
+                warn!(
+                    "FindCoordinator failed for group '{}': {:?}, falling back to broker {}",
+                    group_id, coord_response.error_code, any_broker.id
+                );
+                coordinator_groups
+                    .entry(any_broker.id)
+                    .or_default()
+                    .push(group_id.clone());
+            }
+        }
+
+        let mut all_results = Vec::new();
+
+        for (broker_id, groups) in coordinator_groups {
+            // Find broker address
+            let broker = brokers
+                .iter()
+                .find(|b| b.id == broker_id)
+                .unwrap_or(any_broker);
+            let conn = self
+                .pool
+                .get_connection_by_id(broker.id, &broker.address())
+                .await?;
+
+            let request = DescribeGroupsRequest {
+                groups: groups.clone(),
+            };
+
+            let response_bytes = conn
+                .send_request(ApiKey::DescribeGroups, 0, |buf| {
+                    request.encode_v0(buf);
+                })
+                .await?;
+
+            let mut buf = response_bytes;
+            let response = DescribeGroupsResponse::decode_v0(&mut buf)?;
+
+            for g in response.groups {
+                all_results.push(ConsumerGroupDescription {
+                    group_id: g.group_id,
+                    state: g.group_state,
+                    protocol_type: g.protocol_type,
+                    protocol: g.protocol_data,
+                    members: g
+                        .members
+                        .into_iter()
+                        .map(|m| ConsumerGroupMember {
+                            member_id: m.member_id,
+                            group_instance_id: m.group_instance_id,
+                            client_id: m.client_id,
+                            client_host: m.client_host,
+                        })
+                        .collect(),
+                    error: if g.error_code.is_ok() {
+                        None
+                    } else {
+                        Some(format!("{:?}", g.error_code))
+                    },
+                });
+            }
+        }
+
+        info!("Described {} groups", all_results.len());
+        Ok(all_results)
+    }
+
+    /// List all consumer groups on the cluster.
+    ///
+    /// Returns a list of all consumer groups with their protocol types.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let groups = admin.list_consumer_groups().await?;
+    /// for group in &groups {
+    ///     println!("{} ({})", group.group_id, group.protocol_type);
+    /// }
+    /// ```
+    pub async fn list_consumer_groups(&self) -> Result<Vec<ConsumerGroupListing>> {
+        let brokers = self.metadata.brokers().await;
+        if brokers.is_empty() {
+            return Err(KrafkaError::broker(
+                crate::error::ErrorCode::UnknownServerError,
+                "no brokers available",
+            ));
+        }
+
+        // ListGroups returns groups managed by each broker, so we query all brokers
+        let mut all_groups = Vec::new();
+        let mut seen_ids = HashSet::new();
+
+        for broker in &brokers {
+            let conn = match self
+                .pool
+                .get_connection_by_id(broker.id, &broker.address())
+                .await
+            {
+                Ok(c) => c,
+                Err(_) => continue, // Skip unreachable brokers
+            };
+
+            let request = ListGroupsRequest;
+
+            let response_bytes = match conn
+                .send_request(ApiKey::ListGroups, 0, |buf| {
+                    request.encode_v0(buf);
+                })
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("ListGroups RPC failed on broker {}: {}", broker.id, e);
+                    continue;
+                }
+            };
+
+            let mut buf = response_bytes;
+            let response = match ListGroupsResponse::decode_v0(&mut buf) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("ListGroups decode failed on broker {}: {}", broker.id, e);
+                    continue;
+                }
+            };
+
+            if !response.error_code.is_ok() {
+                tracing::warn!(
+                    "ListGroups error on broker {}: {:?}",
+                    broker.id,
+                    response.error_code
+                );
+                continue;
+            }
+
+            for group in response.groups {
+                if seen_ids.insert(group.group_id.clone()) {
+                    all_groups.push(ConsumerGroupListing {
+                        group_id: group.group_id,
+                        protocol_type: group.protocol_type,
+                    });
+                }
+            }
+        }
+
+        info!("Listed {} consumer groups", all_groups.len());
+        Ok(all_groups)
+    }
+
+    /// Delete records from topic partitions before the specified offsets.
+    ///
+    /// Records with offsets less than the specified offset for each partition
+    /// will be marked for deletion. This adjusts the log start offset.
+    ///
+    /// # Arguments
+    /// * `offsets` - Map of (topic, partition) to the offset before which to delete
+    /// * `timeout` - Operation timeout
+    ///
+    /// # Example
+    /// ```ignore
+    /// use std::collections::HashMap;
+    /// let mut offsets = HashMap::new();
+    /// offsets.insert(("my-topic".to_string(), 0), 100i64);
+    /// let results = admin.delete_records(offsets, Duration::from_secs(30)).await?;
+    /// ```
+    pub async fn delete_records(
+        &self,
+        offsets: HashMap<(String, i32), i64>,
+        timeout: Duration,
+    ) -> Result<Vec<DeleteRecordResult>> {
+        let brokers = self.metadata.brokers().await;
+        if brokers.is_empty() {
+            return Err(KrafkaError::broker(
+                crate::error::ErrorCode::UnknownServerError,
+                "no brokers available",
+            ));
+        }
+
+        // Group offsets by partition leader
+        let mut leader_offsets: HashMap<i32, HashMap<String, Vec<DeleteRecordsPartition>>> =
+            HashMap::new();
+        let fallback_broker_id = brokers[0].id;
+
+        for ((topic, partition), offset) in &offsets {
+            let leader_id = self
+                .metadata
+                .leader(topic, *partition)
+                .await
+                .unwrap_or(fallback_broker_id);
+            leader_offsets
+                .entry(leader_id)
+                .or_default()
+                .entry(topic.clone())
+                .or_default()
+                .push(DeleteRecordsPartition {
+                    partition_index: *partition,
+                    offset: *offset,
+                });
+        }
+
+        let mut results = Vec::new();
+
+        for (broker_id, topics_map) in leader_offsets {
+            let broker = brokers
+                .iter()
+                .find(|b| b.id == broker_id)
+                .unwrap_or(&brokers[0]);
+            let conn = self
+                .pool
+                .get_connection_by_id(broker.id, &broker.address())
+                .await?;
+
+            let request = DeleteRecordsRequest {
+                topics: topics_map
+                    .into_iter()
+                    .map(|(name, partitions)| DeleteRecordsTopic { name, partitions })
+                    .collect(),
+                timeout_ms: crate::util::duration_to_millis_i32(timeout),
+            };
+
+            let response_bytes = conn
+                .send_request(ApiKey::DeleteRecords, 0, |buf| {
+                    request.encode_v0(buf);
+                })
+                .await?;
+
+            let mut buf = response_bytes;
+            let response = DeleteRecordsResponse::decode_v0(&mut buf)?;
+
+            for topic in response.topics {
+                for partition in topic.partitions {
+                    results.push(DeleteRecordResult {
+                        topic: topic.name.clone(),
+                        partition: partition.partition_index,
+                        low_watermark: partition.low_watermark,
+                        error: if partition.error_code.is_ok() {
+                            None
+                        } else {
+                            Some(format!("{:?}", partition.error_code))
+                        },
+                    });
+                }
+            }
+        }
+
+        info!("Deleted records from {} partition(s)", results.len());
+        Ok(results)
+    }
+
+    /// Get the end offset for each partition at the given leader epoch.
+    ///
+    /// This is used to detect log truncation after a leader change. For each
+    /// topic-partition, the broker returns the end offset for the requested
+    /// leader epoch. If the epoch is no longer valid, the broker returns
+    /// the epoch and offset where the log was truncated.
+    ///
+    /// # Arguments
+    /// * `partitions` - List of (topic, partition, leader_epoch) tuples
+    ///
+    /// # Example
+    /// ```ignore
+    /// let results = admin.offset_for_leader_epoch(
+    ///     vec![("my-topic".to_string(), 0, 5)]
+    /// ).await?;
+    /// for r in &results {
+    ///     println!("{}:{} epoch={} end_offset={}", r.topic, r.partition, r.leader_epoch, r.end_offset);
+    /// }
+    /// ```
+    pub async fn offset_for_leader_epoch(
+        &self,
+        partitions: Vec<(String, i32, i32)>,
+    ) -> Result<Vec<LeaderEpochResult>> {
+        let brokers = self.metadata.brokers().await;
+        if brokers.is_empty() {
+            return Err(KrafkaError::broker(
+                crate::error::ErrorCode::UnknownServerError,
+                "no brokers available",
+            ));
+        }
+
+        // Group partitions by their leader broker
+        let fallback_broker_id = brokers[0].id;
+        let mut leader_partitions: HashMap<i32, HashMap<String, Vec<OffsetForLeaderEpochPartition>>> =
+            HashMap::new();
+
+        for (topic, partition, leader_epoch) in &partitions {
+            let leader_id = self
+                .metadata
+                .leader(topic, *partition)
+                .await
+                .unwrap_or(fallback_broker_id);
+            leader_partitions
+                .entry(leader_id)
+                .or_default()
+                .entry(topic.clone())
+                .or_default()
+                .push(OffsetForLeaderEpochPartition {
+                    partition: *partition,
+                    current_leader_epoch: -1, // consumer perspective
+                    leader_epoch: *leader_epoch,
+                });
+        }
+
+        let mut results = Vec::new();
+
+        for (broker_id, topics_map) in leader_partitions {
+            let broker = brokers
+                .iter()
+                .find(|b| b.id == broker_id)
+                .unwrap_or(&brokers[0]);
+            let conn = self
+                .pool
+                .get_connection_by_id(broker.id, &broker.address())
+                .await?;
+
+            let request = OffsetForLeaderEpochRequest {
+                replica_id: -1, // -1 for consumer
+                topics: topics_map
+                    .into_iter()
+                    .map(|(topic, partitions)| OffsetForLeaderEpochTopic { topic, partitions })
+                    .collect(),
+            };
+
+            let response_bytes = conn
+                .send_request(ApiKey::OffsetForLeaderEpoch, 2, |buf| {
+                    request.encode_v2(buf);
+                })
+                .await?;
+
+            let mut buf = response_bytes;
+            let response = OffsetForLeaderEpochResponse::decode_v2(&mut buf)?;
+
+            for topic in response.topics {
+                for partition in topic.partitions {
+                    results.push(LeaderEpochResult {
+                        topic: topic.topic.clone(),
+                        partition: partition.partition,
+                        leader_epoch: partition.leader_epoch,
+                        end_offset: partition.end_offset,
+                        error: if partition.error_code.is_ok() {
+                            None
+                        } else {
+                            Some(format!("{:?}", partition.error_code))
+                        },
+                    });
+                }
+            }
+        }
+
+        info!(
+            "Got leader epoch offsets for {} partition(s)",
+            results.len()
+        );
+        Ok(results)
+    }
+
     /// Get access to the connection pool.
     pub fn pool(&self) -> &Arc<ConnectionPool> {
         &self.pool
@@ -1050,6 +1526,15 @@ impl AdminClientBuilder {
         self
     }
 
+    /// Configure SASL/OAUTHBEARER authentication.
+    ///
+    /// Uses a static OAuth 2.0 bearer token. For token refresh, reconnect
+    /// with a new token. For SASL extensions, use `.auth(AuthConfig::sasl_oauthbearer_token(...))`.
+    pub fn sasl_oauthbearer(mut self, token: impl Into<String>) -> Self {
+        self.config.auth = Some(AuthConfig::sasl_oauthbearer(token));
+        self
+    }
+
     /// Build the admin client.
     pub async fn build(self) -> Result<AdminClient> {
         if self.config.bootstrap_servers.is_empty() {
@@ -1063,15 +1548,16 @@ impl AdminClientBuilder {
             .map(|s| s.trim().to_string())
             .collect();
 
-        // Create connection config with client ID
-        let conn_config = ConnectionConfig::builder()
+        // Create connection config with client ID and auth
+        let mut conn_config_builder = ConnectionConfig::builder()
             .client_id(&self.config.client_id)
-            .request_timeout(self.config.request_timeout)
-            .build();
+            .request_timeout(self.config.request_timeout);
 
-        // Note: Full TLS/SASL support requires SecureConnectionPool
-        // For now, we store the auth config for future use when secure connections are needed
-        // The auth config is stored in AdminClient.config.auth
+        if let Some(ref auth) = self.config.auth {
+            conn_config_builder = conn_config_builder.auth(auth.clone());
+        }
+
+        let conn_config = conn_config_builder.build();
 
         let pool = Arc::new(ConnectionPool::new(conn_config));
         let metadata = Arc::new(ClusterMetadata::new(
@@ -1207,5 +1693,154 @@ mod tests {
         assert_eq!(filter.host, Some("localhost".to_string()));
         assert_eq!(filter.operation, AclOperation::Read);
         assert_eq!(filter.permission_type, AclPermissionType::Allow);
+    }
+
+    #[test]
+    fn test_admin_builder_with_auth() {
+        use crate::auth::AuthConfig;
+
+        let builder = AdminClient::builder()
+            .bootstrap_servers("broker:9093")
+            .auth(AuthConfig::sasl_plain("user", "pass"));
+
+        let auth = builder.config.auth.as_ref().unwrap();
+        assert!(auth.requires_sasl());
+        assert!(!auth.requires_tls());
+        assert!(auth.plain_credentials.is_some());
+    }
+
+    #[test]
+    fn test_admin_builder_sasl_plain() {
+        let builder = AdminClient::builder()
+            .bootstrap_servers("broker:9093")
+            .sasl_plain("admin", "admin-secret");
+
+        let auth = builder.config.auth.as_ref().unwrap();
+        assert_eq!(auth.security_protocol, crate::auth::SecurityProtocol::SaslPlaintext);
+        assert_eq!(auth.sasl_mechanism, Some(crate::auth::SaslMechanism::Plain));
+        let creds = auth.plain_credentials.as_ref().unwrap();
+        assert_eq!(creds.username, "admin");
+    }
+
+    #[test]
+    fn test_admin_builder_sasl_scram() {
+        let builder = AdminClient::builder()
+            .bootstrap_servers("broker:9093")
+            .sasl_scram_sha256("user", "pass");
+
+        let auth = builder.config.auth.as_ref().unwrap();
+        assert_eq!(auth.sasl_mechanism, Some(crate::auth::SaslMechanism::ScramSha256));
+        assert!(auth.scram_credentials.is_some());
+
+        let builder = AdminClient::builder()
+            .bootstrap_servers("broker:9093")
+            .sasl_scram_sha512("user", "pass");
+
+        let auth = builder.config.auth.as_ref().unwrap();
+        assert_eq!(auth.sasl_mechanism, Some(crate::auth::SaslMechanism::ScramSha512));
+        assert!(auth.scram_credentials.is_some());
+    }
+
+    #[test]
+    fn test_admin_builder_aws_msk_iam() {
+        use crate::auth::AuthConfig;
+
+        let auth = AuthConfig::aws_msk_iam("AKID", "secret", "us-east-1");
+        let builder = AdminClient::builder()
+            .bootstrap_servers("broker:9094")
+            .auth(auth);
+
+        let auth = builder.config.auth.as_ref().unwrap();
+        assert!(auth.requires_tls());
+        assert!(auth.requires_sasl());
+        assert_eq!(auth.sasl_mechanism, Some(crate::auth::SaslMechanism::AwsMskIam));
+        assert!(auth.aws_msk_iam_credentials.is_some());
+        assert!(auth.tls_config.is_some());
+    }
+
+    #[test]
+    fn test_admin_builder_no_auth_by_default() {
+        let builder = AdminClient::builder()
+            .bootstrap_servers("broker:9092");
+
+        assert!(builder.config.auth.is_none());
+    }
+
+    #[test]
+    fn test_consumer_group_description() {
+        let desc = ConsumerGroupDescription {
+            group_id: "my-group".to_string(),
+            state: "Stable".to_string(),
+            protocol_type: "consumer".to_string(),
+            protocol: "range".to_string(),
+            members: vec![
+                ConsumerGroupMember {
+                    member_id: "member-1".to_string(),
+                    group_instance_id: Some("instance-1".to_string()),
+                    client_id: "my-client".to_string(),
+                    client_host: "/127.0.0.1".to_string(),
+                },
+                ConsumerGroupMember {
+                    member_id: "member-2".to_string(),
+                    group_instance_id: None,
+                    client_id: "other-client".to_string(),
+                    client_host: "/192.168.1.1".to_string(),
+                },
+            ],
+            error: None,
+        };
+        assert_eq!(desc.group_id, "my-group");
+        assert_eq!(desc.state, "Stable");
+        assert_eq!(desc.members.len(), 2);
+        assert!(desc.members[0].group_instance_id.is_some());
+        assert!(desc.members[1].group_instance_id.is_none());
+        assert!(desc.error.is_none());
+    }
+
+    #[test]
+    fn test_consumer_group_listing() {
+        let listing = ConsumerGroupListing {
+            group_id: "my-group".to_string(),
+            protocol_type: "consumer".to_string(),
+        };
+        assert_eq!(listing.group_id, "my-group");
+        assert_eq!(listing.protocol_type, "consumer");
+    }
+
+    #[test]
+    fn test_delete_record_result() {
+        let result = DeleteRecordResult {
+            topic: "my-topic".to_string(),
+            partition: 0,
+            low_watermark: 100,
+            error: None,
+        };
+        assert_eq!(result.topic, "my-topic");
+        assert_eq!(result.partition, 0);
+        assert_eq!(result.low_watermark, 100);
+        assert!(result.error.is_none());
+
+        let result_err = DeleteRecordResult {
+            topic: "my-topic".to_string(),
+            partition: 1,
+            low_watermark: -1,
+            error: Some("NotLeaderOrFollower".to_string()),
+        };
+        assert!(result_err.error.is_some());
+    }
+
+    #[test]
+    fn test_leader_epoch_result() {
+        let result = LeaderEpochResult {
+            topic: "my-topic".to_string(),
+            partition: 0,
+            leader_epoch: 5,
+            end_offset: 1000,
+            error: None,
+        };
+        assert_eq!(result.topic, "my-topic");
+        assert_eq!(result.leader_epoch, 5);
+        assert_eq!(result.end_offset, 1000);
+        assert!(result.error.is_none());
     }
 }

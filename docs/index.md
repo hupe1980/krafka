@@ -30,6 +30,7 @@ A pure Rust, async-native Apache Kafka client designed for high performance, saf
 | 🔑 **SASL** | PLAIN, SCRAM-SHA-256/512 mechanisms |
 | 💯 **Transactions** | Exactly-once semantics |
 | ☁️ **Cloud-native** | AWS MSK support with IAM auth |
+| 🛡️ **Security hardened** | Secret zeroization, constant-time auth, decompression limits |
 
 ---
 

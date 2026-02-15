@@ -18,6 +18,9 @@ The Krafka consumer is an async-native, feature-rich Kafka consumer with:
 - Multiple partition assignment strategies
 - Manual offset control
 - Seek operations
+- Static group membership (KIP-345)
+- Interceptor hooks
+- Log compaction awareness
 
 ## Basic Usage
 
@@ -45,6 +48,34 @@ async fn main() -> Result<()> {
 }
 ```
 
+## Authentication
+
+Connect to secured Kafka clusters using SASL or TLS:
+
+```rust
+use krafka::consumer::Consumer;
+
+// SASL/SCRAM-SHA-256
+let consumer = Consumer::builder()
+    .bootstrap_servers("broker:9093")
+    .group_id("secure-group")
+    .sasl_scram_sha256("username", "password")
+    .build()
+    .await?;
+
+// AWS MSK IAM
+use krafka::auth::AuthConfig;
+let auth = AuthConfig::aws_msk_iam("access_key", "secret_key", "us-east-1");
+let consumer = Consumer::builder()
+    .bootstrap_servers("broker:9094")
+    .group_id("msk-group")
+    .auth(auth)
+    .build()
+    .await?;
+```
+
+See the [Authentication Guide](authentication.md) for all supported mechanisms.
+
 ## Consumer Configuration
 
 ### Auto Offset Reset
@@ -69,11 +100,22 @@ let consumer = Consumer::builder()
     .auto_offset_reset(AutoOffsetReset::Latest)
     .build()
     .await?;
+
+// Error if no committed offset exists
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .auto_offset_reset(AutoOffsetReset::None)
+    .build()
+    .await?;
+// poll() will return an error for partitions without committed offsets
 ```
+
+> **Note:** After a consumer group rebalance, Krafka automatically fetches previously committed offsets from the group coordinator (OffsetFetch). Partitions without committed offsets use the configured `auto_offset_reset` policy.
 
 ### Offset Commit
 
-Control how offsets are committed:
+Control how offsets are committed. When auto-commit is enabled (the default), Krafka automatically commits offsets during each `poll()` call when the commit interval has elapsed, and also during `close()`:
 
 ```rust
 use krafka::consumer::Consumer;
@@ -111,7 +153,7 @@ let consumer = Consumer::builder()
     .fetch_min_bytes(1)                          // Min bytes before returning
     .fetch_max_bytes(52428800)                   // Max bytes per fetch (50MB)
     .max_partition_fetch_bytes(1048576)          // Max bytes per partition (1MB)
-    .max_poll_records(500)                       // Max records per poll
+    .max_poll_records(500)                       // Max records per poll (strictly enforced)
     .fetch_max_wait(Duration::from_millis(500))  // Max wait time
     .build()
     .await?;
@@ -149,7 +191,37 @@ consumer2.subscribe(&["events"]).await?;
 
 ### Partition Assignment Strategies
 
-Krafka supports multiple assignment strategies:
+Krafka supports multiple assignment strategies. Configure the strategy via the builder:
+
+```rust
+use krafka::consumer::{Consumer, PartitionAssignmentStrategy};
+
+// Range assignor (default)
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .partition_assignment_strategy(PartitionAssignmentStrategy::Range)
+    .build()
+    .await?;
+
+// Round-robin for balanced distribution
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .partition_assignment_strategy(PartitionAssignmentStrategy::RoundRobin)
+    .build()
+    .await?;
+
+// Cooperative sticky for minimal partition movement during rebalances
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .partition_assignment_strategy(PartitionAssignmentStrategy::CooperativeSticky)
+    .build()
+    .await?;
+```
+
+The underlying assignor implementations are also available directly:
 
 ```rust
 use krafka::consumer::{RangeAssignor, RoundRobinAssignor, CooperativeStickyAssignor, PartitionAssignor};
@@ -195,10 +267,11 @@ let assignor = CooperativeStickyAssignor::new();
 
 ### Rebalance Listener
 
-Get notified when partition assignments change during rebalances:
+Get notified when partition assignments change during rebalances. Register a listener via the builder:
 
 ```rust
-use krafka::consumer::{ConsumerRebalanceListener, TopicPartition};
+use krafka::consumer::{Consumer, ConsumerRebalanceListener, TopicPartition};
+use std::sync::Arc;
 
 struct MyRebalanceListener;
 
@@ -222,16 +295,26 @@ impl ConsumerRebalanceListener for MyRebalanceListener {
     }
 }
 
-// Use the NoOpRebalanceListener for a no-op implementation:
+// Wire into the consumer via the builder:
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .rebalance_listener(Arc::new(MyRebalanceListener))
+    .build()
+    .await?;
+
+// Use the NoOpRebalanceListener for a no-op implementation (default):
 use krafka::consumer::NoOpRebalanceListener;
 let _listener = NoOpRebalanceListener;
 ```
 
-The listener callbacks are useful for:
+The listener is automatically invoked during `poll()` (before/after rebalance) and `close()` (partitions lost). Callbacks are useful for:
 - Committing offsets before partition loss
 - Saving processing state to external storage
 - Initializing resources when new partitions are assigned
 - Proper cleanup during consumer group rebalances
+
+> **Note:** After rebalance completes, Krafka automatically issues `OffsetFetch` to the group coordinator to retrieve committed offsets for all assigned partitions. This ensures seamless resumption from the last committed position.
 
 ## Offset Management
 
@@ -272,7 +355,8 @@ loop {
 For non-blocking commits:
 
 ```rust
-// Commit asynchronously (fire and forget)
+// Commit asynchronously (spawns a background task)
+// The commit is tracked and errors are logged if it fails.
 consumer.commit_async();
 ```
 
@@ -441,6 +525,28 @@ async fn consume_with_error_handling(consumer: &Consumer) {
 }
 ```
 
+### Streaming with `recv()`
+
+The `recv()` method returns individual records as a stream-like API.
+It returns `Result<Option<ConsumerRecord>>` — errors propagate to the caller
+rather than being silently swallowed:
+
+```rust
+use krafka::consumer::Consumer;
+use krafka::error::Result;
+
+async fn consume_stream(consumer: &Consumer) -> Result<()> {
+    while let Some(record) = consumer.recv().await? {
+        println!(
+            "topic={}, partition={}, offset={}, timestamp_type={}",
+            record.topic, record.partition, record.offset, record.timestamp_type
+        );
+        // timestamp_type: 0 = CreateTime, 1 = LogAppendTime
+    }
+    Ok(())
+}
+```
+
 ### Graceful Shutdown
 
 Always close consumers properly:
@@ -564,8 +670,104 @@ let consumer = Consumer::builder()
     .await?;
 ```
 
+## Static Group Membership (KIP-345)
+
+Static group membership allows consumers to maintain a persistent identity across restarts,
+avoiding unnecessary rebalances. When a consumer with a `group_instance_id` disconnects and
+reconnects (within the session timeout), it automatically gets the same partition assignment
+without triggering a rebalance for the entire group.
+
+### Enabling Static Membership
+
+```rust
+use krafka::consumer::Consumer;
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .group_instance_id("instance-1")  // Stable identity
+    .session_timeout(Duration::from_secs(300))  // Longer timeout for restarts
+    .build()
+    .await?;
+
+consumer.subscribe(&["my-topic"]).await?;
+```
+
+### How It Works
+
+| Behavior | Dynamic (default) | Static (with `group_instance_id`) |
+|----------|-------------------|-----------------------------------|
+| **Disconnect** | Immediate rebalance | No rebalance until session timeout |
+| **Reconnect** | New member, rebalance | Same member, no rebalance |
+| **Rolling restart** | N rebalances | Zero rebalances |
+| **Protocol version** | JoinGroup v0 | JoinGroup v5 |
+
+When `group_instance_id` is set, Krafka automatically:
+- Uses JoinGroup v5 and Heartbeat v3 protocol versions
+- Includes the instance ID in all group coordinator requests (Join, Sync, Heartbeat, OffsetCommit, Leave)
+- Uses LeaveGroup v3 with member identity on graceful shutdown
+
+### Best Practices
+
+- Assign a **unique** `group_instance_id` per consumer instance (e.g., hostname, pod name)
+- Increase `session_timeout` to cover restart duration (e.g., 5 minutes for rolling deployments)
+- Use with `CooperativeSticky` assignor for minimal partition movement
+
+```rust
+use krafka::consumer::{Consumer, PartitionAssignmentStrategy};
+use std::time::Duration;
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .group_instance_id("pod-abc-123")
+    .partition_assignment_strategy(PartitionAssignmentStrategy::CooperativeSticky)
+    .session_timeout(Duration::from_secs(300))
+    .build()
+    .await?;
+```
+
+## Consumer Interceptors
+
+Interceptors allow you to observe records after they are fetched and monitor offset commits.
+See the [Interceptors Guide](interceptors.md) for full details.
+
+```rust
+use krafka::interceptor::ConsumerInterceptor;
+use krafka::consumer::{Consumer, ConsumerRecord};
+use std::sync::Arc;
+
+#[derive(Debug)]
+struct MetricsInterceptor;
+
+impl ConsumerInterceptor for MetricsInterceptor {
+    fn on_consume(&self, records: &[ConsumerRecord]) {
+        println!("Consumed {} records", records.len());
+    }
+}
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .interceptor(Arc::new(MetricsInterceptor))
+    .build()
+    .await?;
+```
+
+## Log Compaction Awareness
+
+Krafka correctly handles log-compacted topics where records may have been deleted within a batch.
+Record offsets are calculated using each record's `offset_delta` rather than sequential indices,
+ensuring accurate offset tracking even when records within a batch have been removed by compaction.
+
+This means:
+- `consumer.position()` always returns the correct offset, even on compacted topics
+- Offset commits are accurate — no risk of re-processing or skipping records
+- No special configuration needed; compaction awareness is built-in
+
 ## Next Steps
 
+- [Interceptors Guide](interceptors.md) - Producer and consumer interceptor hooks
 - [Producer Guide](producer.md) - Learn about producing messages
 - [Configuration Reference](configuration.md) - All consumer options
 - [Architecture Overview](architecture.md) - How the consumer works internally

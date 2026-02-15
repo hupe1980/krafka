@@ -129,6 +129,8 @@ let pool = ConnectionPool::new(config);
 let conn = pool.get_connection("broker:9092").await?;
 ```
 
+> **Note:** The connection pool uses a read-lock fast path for hot-path lookups. During reconnection, all locks are dropped before performing network I/O, preventing deadlocks and enabling concurrent access to other brokers while one broker is being reconnected.
+
 ## Zero-Copy Message Handling
 
 Krafka uses `bytes::Bytes` throughout for zero-copy buffer management:

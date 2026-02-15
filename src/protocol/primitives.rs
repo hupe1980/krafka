@@ -208,7 +208,14 @@ impl Encode for KafkaString {
         match &self.0 {
             None => buf.put_i16(-1),
             Some(s) => {
-                buf.put_i16(s.len() as i16);
+                let len = i16::try_from(s.len()).unwrap_or_else(|_| {
+                    panic!(
+                        "KafkaString length {} exceeds protocol limit of {}",
+                        s.len(),
+                        i16::MAX
+                    )
+                });
+                buf.put_i16(len);
                 buf.put_slice(s.as_bytes());
             }
         }
@@ -218,7 +225,13 @@ impl Encode for KafkaString {
         match &self.0 {
             None => varint::encode_unsigned_varint(0, buf),
             Some(s) => {
-                varint::encode_unsigned_varint((s.len() + 1) as u32, buf);
+                let len_plus_one = u32::try_from(s.len().saturating_add(1)).unwrap_or_else(|_| {
+                    panic!(
+                        "compact KafkaString length {} exceeds u32 limit",
+                        s.len()
+                    )
+                });
+                varint::encode_unsigned_varint(len_plus_one, buf);
                 buf.put_slice(s.as_bytes());
             }
         }
@@ -313,7 +326,14 @@ impl Encode for KafkaBytes {
         match &self.0 {
             None => buf.put_i32(-1),
             Some(bytes) => {
-                buf.put_i32(bytes.len() as i32);
+                let len = i32::try_from(bytes.len()).unwrap_or_else(|_| {
+                    panic!(
+                        "KafkaBytes length {} exceeds protocol limit of {}",
+                        bytes.len(),
+                        i32::MAX
+                    )
+                });
+                buf.put_i32(len);
                 buf.put_slice(bytes);
             }
         }
@@ -323,7 +343,13 @@ impl Encode for KafkaBytes {
         match &self.0 {
             None => varint::encode_unsigned_varint(0, buf),
             Some(bytes) => {
-                varint::encode_unsigned_varint((bytes.len() + 1) as u32, buf);
+                let len_plus_one = u32::try_from(bytes.len().saturating_add(1)).unwrap_or_else(|_| {
+                    panic!(
+                        "compact KafkaBytes length {} exceeds u32 limit",
+                        bytes.len()
+                    )
+                });
+                varint::encode_unsigned_varint(len_plus_one, buf);
                 buf.put_slice(bytes);
             }
         }
@@ -414,7 +440,14 @@ impl<T: Encode> Encode for KafkaArray<T> {
         match &self.0 {
             None => buf.put_i32(-1),
             Some(items) => {
-                buf.put_i32(items.len() as i32);
+                let len = i32::try_from(items.len()).unwrap_or_else(|_| {
+                    panic!(
+                        "KafkaArray length {} exceeds protocol limit of {}",
+                        items.len(),
+                        i32::MAX
+                    )
+                });
+                buf.put_i32(len);
                 for item in items {
                     item.encode(buf);
                 }
@@ -426,7 +459,13 @@ impl<T: Encode> Encode for KafkaArray<T> {
         match &self.0 {
             None => varint::encode_unsigned_varint(0, buf),
             Some(items) => {
-                varint::encode_unsigned_varint((items.len() + 1) as u32, buf);
+                let len_plus_one = u32::try_from(items.len().saturating_add(1)).unwrap_or_else(|_| {
+                    panic!(
+                        "compact KafkaArray length {} exceeds u32 limit",
+                        items.len()
+                    )
+                });
+                varint::encode_unsigned_varint(len_plus_one, buf);
                 for item in items {
                     item.encode_compact(buf);
                 }
@@ -443,7 +482,7 @@ impl<T: Decode> Decode for KafkaArray<T> {
         }
 
         let len = len as usize;
-        let mut items = Vec::with_capacity(len);
+        let mut items = Vec::with_capacity(len.min(10_000));
         for _ in 0..len {
             items.push(T::decode(buf)?);
         }
@@ -457,7 +496,7 @@ impl<T: Decode> Decode for KafkaArray<T> {
         }
 
         let len = (len - 1) as usize;
-        let mut items = Vec::with_capacity(len);
+        let mut items = Vec::with_capacity(len.min(10_000));
         for _ in 0..len {
             items.push(T::decode_compact(buf)?);
         }
@@ -480,10 +519,16 @@ pub struct TaggedField {
 
 impl Encode for TaggedFields {
     fn encode(&self, buf: &mut impl BufMut) {
-        varint::encode_unsigned_varint(self.0.len() as u32, buf);
+        let count = u32::try_from(self.0.len()).unwrap_or_else(|_| {
+            panic!("TaggedFields count {} exceeds u32 limit", self.0.len())
+        });
+        varint::encode_unsigned_varint(count, buf);
         for field in &self.0 {
             varint::encode_unsigned_varint(field.tag, buf);
-            varint::encode_unsigned_varint(field.data.len() as u32, buf);
+            let data_len = u32::try_from(field.data.len()).unwrap_or_else(|_| {
+                panic!("TaggedField data length {} exceeds u32 limit", field.data.len())
+            });
+            varint::encode_unsigned_varint(data_len, buf);
             buf.put_slice(&field.data);
         }
     }
@@ -492,7 +537,7 @@ impl Encode for TaggedFields {
 impl Decode for TaggedFields {
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         let count = varint::decode_unsigned_varint(buf)?;
-        let mut fields = Vec::with_capacity(count as usize);
+        let mut fields = Vec::with_capacity((count as usize).min(10_000));
 
         for _ in 0..count {
             let tag = varint::decode_unsigned_varint(buf)?;
@@ -639,5 +684,28 @@ mod tests {
         assert_eq!(decoded.0.len(), 2);
         assert_eq!(decoded.0[0].tag, 0);
         assert_eq!(decoded.0[0].data.as_ref(), b"test");
+    }
+
+    #[test]
+    #[should_panic(expected = "KafkaString length")]
+    fn test_kafka_string_encode_rejects_oversized() {
+        // Strings > i16::MAX bytes must not silently truncate
+        let big = "x".repeat(i16::MAX as usize + 1);
+        let ks = KafkaString::from(big);
+        let mut buf = BytesMut::new();
+        ks.encode(&mut buf);
+    }
+
+    #[test]
+    fn test_kafka_string_encode_max_valid_length() {
+        // Strings exactly at i16::MAX should encode fine
+        let s = "a".repeat(i16::MAX as usize);
+        let ks = KafkaString::from(s.clone());
+        let mut buf = BytesMut::new();
+        ks.encode(&mut buf);
+        // Verify: 2-byte length prefix + string bytes
+        assert_eq!(buf.len(), 2 + s.len());
+        let decoded = KafkaString::decode(&mut buf.freeze()).unwrap();
+        assert_eq!(decoded.0.unwrap(), s);
     }
 }

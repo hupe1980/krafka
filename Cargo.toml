@@ -43,6 +43,7 @@ hmac = "0.12"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 base64 = "0.22"
 zeroize = { version = "1.8", features = ["derive"] }
+subtle = "2"
 
 # TLS/SSL support
 tokio-rustls = "0.26"

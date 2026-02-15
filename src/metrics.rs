@@ -120,10 +120,12 @@ impl Gauge {
         self.value.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Decrement the gauge by 1.
+    /// Decrement the gauge by 1 (saturates at 0 to prevent underflow).
     #[inline]
     pub fn dec(&self) {
-        self.value.fetch_sub(1, Ordering::Relaxed);
+        let _ = self.value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(1))
+        });
     }
 }
 
@@ -1001,6 +1003,28 @@ mod tests {
 
         gauge.dec();
         assert_eq!(gauge.get(), 10);
+    }
+
+    #[test]
+    fn test_gauge_dec_saturates_at_zero() {
+        let gauge = Gauge::new();
+        assert_eq!(gauge.get(), 0);
+
+        // Decrementing from 0 should not underflow
+        gauge.dec();
+        assert_eq!(gauge.get(), 0, "Gauge::dec() should saturate at 0, not underflow");
+
+        // Multiple decrements from 0 should all stay at 0
+        gauge.dec();
+        gauge.dec();
+        assert_eq!(gauge.get(), 0);
+
+        // Set to 1, dec to 0, then dec again
+        gauge.set(1);
+        gauge.dec();
+        assert_eq!(gauge.get(), 0);
+        gauge.dec();
+        assert_eq!(gauge.get(), 0, "Gauge should not wrap around u64::MAX");
     }
 
     #[test]

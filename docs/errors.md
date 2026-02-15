@@ -52,14 +52,18 @@ use krafka::error::ErrorCode;
 ErrorCode::None                      // 0: No error
 ErrorCode::UnknownServerError        // -1: Unknown error
 ErrorCode::OffsetOutOfRange          // 1: Offset out of range
-ErrorCode::NotLeaderOrFollower       // 6: Not leader for partition
+ErrorCode::NotLeaderForPartition     // 6: Not leader for partition
 ErrorCode::RequestTimedOut           // 7: Request timed out
 ErrorCode::MessageTooLarge           // 10: Message too large
 ErrorCode::UnknownTopicOrPartition   // 3: Unknown topic
 ErrorCode::LeaderNotAvailable        // 5: Leader not available
 ErrorCode::TopicAlreadyExists        // 36: Topic already exists
-ErrorCode::InvalidTopicException     // 17: Invalid topic
+ErrorCode::InvalidTopic              // 17: Invalid topic
 ErrorCode::GroupAuthorizationFailed  // 30: Group auth failed
+ErrorCode::SaslAuthenticationFailed  // 58: SASL auth failed
+ErrorCode::UnknownProducerId         // 59: Unknown producer ID
+ErrorCode::FencedInstanceId          // 82: Fenced instance ID
+ErrorCode::UnstableOffsetCommit      // 88: Unstable offset commit
 ```
 
 ### Checking Error Codes
@@ -74,7 +78,7 @@ if error_code.is_ok() {
 
 // Convert from raw i16
 let code = ErrorCode::from_i16(6);
-assert_eq!(code, ErrorCode::NotLeaderOrFollower);
+assert_eq!(code, ErrorCode::NotLeaderForPartition);
 ```
 
 ## Error Handling Patterns
@@ -141,11 +145,16 @@ fn is_retriable(error: &KrafkaError) -> bool {
         KrafkaError::Timeout { .. } => true,
         KrafkaError::Broker { code, .. } => matches!(
             code,
-            ErrorCode::NotLeaderOrFollower
+            ErrorCode::NotLeaderForPartition
             | ErrorCode::LeaderNotAvailable
             | ErrorCode::RequestTimedOut
             | ErrorCode::ReplicaNotAvailable
             | ErrorCode::NetworkException
+            | ErrorCode::CorruptMessage
+            | ErrorCode::UnknownTopicOrPartition
+            | ErrorCode::OutOfOrderSequenceNumber
+            | ErrorCode::ConcurrentTransactions
+            | ErrorCode::OperationNotAttempted
         ),
         _ => false,
     }
@@ -200,6 +209,27 @@ async fn process_topic(producer: &Producer, topic: &str) -> Result<()> {
 ```
 
 ## Consumer Error Handling
+
+### `AutoOffsetReset::None` Error
+
+When `auto_offset_reset` is set to `None` and a partition has no committed offset, `poll()` will return an error:
+
+```rust
+use krafka::consumer::{Consumer, AutoOffsetReset};
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("strict-group")
+    .auto_offset_reset(AutoOffsetReset::None)
+    .build()
+    .await?;
+
+// This will error if any assigned partition has no committed offset
+match consumer.poll(Duration::from_secs(1)).await {
+    Err(e) => eprintln!("No committed offset: {}", e),
+    Ok(records) => { /* process */ }
+}
+```
 
 ### Handling Poll Errors
 

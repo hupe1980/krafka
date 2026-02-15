@@ -29,8 +29,15 @@ use pbkdf2::pbkdf2_hmac;
 use rand::Rng;
 use sha2::{Digest, Sha256, Sha512};
 use std::fmt;
+use subtle::ConstantTimeEq;
+use zeroize::Zeroize;
 
 use crate::error::{KrafkaError, Result};
+
+/// Minimum allowed PBKDF2 iteration count to prevent downgrade attacks.
+const MIN_PBKDF2_ITERATIONS: u32 = 4096;
+/// Maximum allowed PBKDF2 iteration count to prevent DoS via excessive CPU usage.
+const MAX_PBKDF2_ITERATIONS: u32 = 1_000_000;
 
 /// SCRAM mechanism variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +95,7 @@ pub enum ScramState {
 pub struct ScramClient {
     /// Username.
     username: String,
-    /// Password.
+    /// Password (zeroized on drop).
     password: String,
     /// SCRAM mechanism.
     mechanism: ScramMechanism,
@@ -104,10 +111,23 @@ pub struct ScramClient {
     salt: Option<Vec<u8>>,
     /// Iteration count.
     iteration_count: Option<u32>,
-    /// Salted password (cached).
+    /// Salted password (zeroized on drop).
     salted_password: Option<Vec<u8>>,
     /// Server signature (for verification).
     server_signature: Option<Vec<u8>>,
+}
+
+impl Drop for ScramClient {
+    fn drop(&mut self) {
+        self.password.zeroize();
+        if let Some(ref mut salted) = self.salted_password {
+            salted.zeroize();
+        }
+        if let Some(ref mut sig) = self.server_signature {
+            sig.zeroize();
+        }
+        self.client_first_bare.zeroize();
+    }
 }
 
 impl ScramClient {
@@ -208,6 +228,22 @@ impl ScramClient {
         let salt = salt.ok_or_else(|| KrafkaError::auth("Missing salt in server-first"))?;
         let iteration_count = iteration_count
             .ok_or_else(|| KrafkaError::auth("Missing iteration count in server-first"))?;
+
+        // Validate PBKDF2 iteration count to prevent downgrade and DoS attacks (§7.3)
+        if iteration_count < MIN_PBKDF2_ITERATIONS {
+            self.state = ScramState::Failed;
+            return Err(KrafkaError::auth(format!(
+                "PBKDF2 iteration count {} is below minimum {}",
+                iteration_count, MIN_PBKDF2_ITERATIONS
+            )));
+        }
+        if iteration_count > MAX_PBKDF2_ITERATIONS {
+            self.state = ScramState::Failed;
+            return Err(KrafkaError::auth(format!(
+                "PBKDF2 iteration count {} exceeds maximum {}",
+                iteration_count, MAX_PBKDF2_ITERATIONS
+            )));
+        }
 
         // Verify server nonce starts with our client nonce
         if !server_nonce.starts_with(&self.client_nonce) {
@@ -395,15 +431,15 @@ fn xor_bytes(a: &[u8], b: &[u8]) -> Vec<u8> {
 }
 
 /// Constant-time comparison to prevent timing attacks.
+///
+/// Uses the `subtle` crate's `ConstantTimeEq` for formally verified
+/// constant-time comparison, avoiding the risk of compiler optimizations
+/// breaking a hand-rolled implementation.
 fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    let mut result = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-    result == 0
+    a.ct_eq(b).into()
 }
 
 #[cfg(test)]
@@ -526,5 +562,70 @@ mod tests {
         let first_str = String::from_utf8(first).unwrap();
         assert!(first_str.starts_with("n,,n=user,r="));
         assert_eq!(client.mechanism().hash_length(), 64);
+    }
+
+    // ── §7.2 / §7.3 / §7.4 – Security fix tests ──
+
+    #[test]
+    fn test_pbkdf2_iteration_too_low() {
+        let mut client = ScramClient::new("user", "password", ScramMechanism::Sha256);
+        client.client_first_message();
+
+        // Server sends iteration count below minimum (4096)
+        let server_first = format!("r={}extra,s=c2FsdA==,i=100", client.client_nonce);
+        let result = client.process_server_first(server_first.as_bytes());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("below minimum"), "Expected 'below minimum' in: {}", err);
+    }
+
+    #[test]
+    fn test_pbkdf2_iteration_too_high() {
+        let mut client = ScramClient::new("user", "password", ScramMechanism::Sha256);
+        client.client_first_message();
+
+        // Server sends iteration count above maximum (1_000_000)
+        let server_first = format!("r={}extra,s=c2FsdA==,i=2000000", client.client_nonce);
+        let result = client.process_server_first(server_first.as_bytes());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("exceeds maximum"), "Expected 'exceeds maximum' in: {}", err);
+    }
+
+    #[test]
+    fn test_pbkdf2_iteration_at_boundaries() {
+        // Minimum allowed (4096) should succeed
+        let mut client = ScramClient::new("user", "password", ScramMechanism::Sha256);
+        client.client_first_message();
+        let server_first = format!("r={}extra,s=c2FsdA==,i=4096", client.client_nonce);
+        let result = client.process_server_first(server_first.as_bytes());
+        assert!(result.is_ok());
+
+        // Maximum allowed (1_000_000) should succeed
+        let mut client = ScramClient::new("user", "password", ScramMechanism::Sha256);
+        client.client_first_message();
+        let server_first = format!("r={}extra,s=c2FsdA==,i=1000000", client.client_nonce);
+        let result = client.process_server_first(server_first.as_bytes());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_scram_debug_redacts_password() {
+        let client = ScramClient::new("user", "secret_password", ScramMechanism::Sha256);
+        let debug_output = format!("{:?}", client);
+        assert!(!debug_output.contains("secret_password"), "Password leaked in Debug output");
+        assert!(debug_output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_scram_zeroize_on_drop() {
+        // Create a client, do partial auth, then drop it
+        // Verifies that Drop is implemented (no panic)
+        let mut client = ScramClient::new("user", "password", ScramMechanism::Sha256);
+        client.client_first_message();
+        let server_first = format!("r={}extra,s=c2FsdA==,i=4096", client.client_nonce);
+        let _ = client.process_server_first(server_first.as_bytes());
+        // Drop should zeroize password and salted_password
+        drop(client);
     }
 }

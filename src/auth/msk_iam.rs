@@ -61,7 +61,6 @@ const ACTION: &str = "kafka-cluster:Connect";
 const USER_AGENT: &str = "krafka-rust-client";
 
 /// MSK IAM authenticator using AWS Signature v4.
-#[derive(Debug)]
 pub struct MskIamAuthenticator {
     /// AWS access key ID.
     access_key_id: String,
@@ -73,6 +72,29 @@ pub struct MskIamAuthenticator {
     region: String,
     /// Broker host (without port).
     host: String,
+}
+
+impl std::fmt::Debug for MskIamAuthenticator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MskIamAuthenticator")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"[REDACTED]")
+            .field("session_token", &self.session_token.as_ref().map(|_| "[REDACTED]"))
+            .field("region", &self.region)
+            .field("host", &self.host)
+            .finish()
+    }
+}
+
+impl Drop for MskIamAuthenticator {
+    fn drop(&mut self) {
+        // Zeroize sensitive fields on drop
+        use zeroize::Zeroize;
+        self.secret_access_key.zeroize();
+        if let Some(ref mut token) = self.session_token {
+            token.zeroize();
+        }
+    }
 }
 
 impl MskIamAuthenticator {
@@ -409,5 +431,41 @@ mod tests {
 
         let payload_str = String::from_utf8(auth.create_auth_payload()).unwrap();
         assert!(payload_str.contains("eu-west-1"));
+    }
+
+    // ── §7.1 – MskIamAuthenticator Debug redaction & zeroize ──
+
+    #[test]
+    fn test_msk_iam_debug_redacts_secrets() {
+        let creds = AwsMskIamCredentials::with_session_token(
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "FwoGZXIvYXdzEBYaDNZSNzRZzDJiLuQ8l==",
+            "us-east-1",
+        );
+        let auth = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com");
+        let debug_output = format!("{:?}", auth);
+
+        // Must NOT contain the actual secret key or session token
+        assert!(
+            !debug_output.contains("wJalrXUtnFEMI"),
+            "Secret key leaked in Debug output"
+        );
+        assert!(
+            !debug_output.contains("FwoGZXIvYXdz"),
+            "Session token leaked in Debug output"
+        );
+        // Must contain [REDACTED] markers
+        assert!(debug_output.contains("[REDACTED]"));
+        // Access key ID is OK to show (it's not secret)
+        assert!(debug_output.contains("AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    #[test]
+    fn test_msk_iam_zeroize_on_drop() {
+        // Verify Drop does not panic
+        let creds = test_credentials();
+        let auth = MskIamAuthenticator::new(&creds, "broker:9098");
+        drop(auth);
     }
 }

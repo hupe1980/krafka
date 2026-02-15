@@ -13,13 +13,15 @@ A pure Rust, async-native Apache Kafka client designed for high performance, saf
 - 🦀 **Pure Rust**: No librdkafka or C dependencies
 - ⚡ **Async-native**: Built on Tokio for true async I/O
 - 🔒 **Zero unsafe**: Safe Rust by default
-- 🚀 **High performance**: Zero-copy buffers, inline hot paths, efficient batching
+- 🚀 **High performance**: Zero-copy buffers, inline hot paths, efficient batching, concurrent batch flushing
 - 📦 **Full protocol support**: Kafka protocol with all compression codecs
 - 🔐 **TLS/SSL encryption**: Using rustls for secure connections
-- 🔑 **SASL authentication**: PLAIN, SCRAM-SHA-256/512 mechanisms
+- 🔑 **SASL authentication**: PLAIN, SCRAM-SHA-256/512, OAUTHBEARER mechanisms
 - 💯 **Transactions**: Exactly-once semantics with transactional producer
 - ☁️ **Cloud-native**: First-class AWS MSK support including IAM auth
-
+- 🛡️ **Security hardened**: Secret zeroization, constant-time auth (`subtle`), decompression bomb protection, allocation caps
+- 🔄 **Built-in retry**: Exponential backoff with metadata refresh on leader changes
+- 📊 **Metrics**: Lock-free counters/gauges/latency wired into all hot paths
 ## 🚀 Quick Start
 
 Add Krafka to your `Cargo.toml`:
@@ -152,15 +154,57 @@ async fn main() -> Result<()> {
 }
 ```
 
+### Authentication
+
+Connect to secured Kafka clusters with SASL, SCRAM, OAUTHBEARER, or AWS MSK IAM — available on all client types:
+
+```rust
+use krafka::producer::Producer;
+use krafka::consumer::Consumer;
+use krafka::AdminClient;
+
+// Producer with SASL/SCRAM-SHA-256
+let producer = Producer::builder()
+    .bootstrap_servers("broker:9093")
+    .sasl_scram_sha256("username", "password")
+    .build()
+    .await?;
+
+// Consumer with SASL/PLAIN
+let consumer = Consumer::builder()
+    .bootstrap_servers("broker:9092")
+    .group_id("secure-group")
+    .sasl_plain("username", "password")
+    .build()
+    .await?;
+
+// Producer with SASL/OAUTHBEARER
+let producer = Producer::builder()
+    .bootstrap_servers("broker:9093")
+    .sasl_oauthbearer("your-jwt-token")
+    .build()
+    .await?;
+
+// Admin with AWS MSK IAM
+use krafka::auth::AuthConfig;
+let auth = AuthConfig::aws_msk_iam("access_key", "secret_key", "us-east-1");
+let admin = AdminClient::builder()
+    .bootstrap_servers("broker:9094")
+    .auth(auth)
+    .build()
+    .await?;
+```
+
 ## 📦 Modules
 
 | Module | Description |
 |--------|-------------|
 | `producer` | High-throughput message production with batching and compression |
-| `consumer` | Consumer groups with rebalancing and offset management |
-| `admin` | Cluster administration (create/delete topics, describe cluster) |
+| `consumer` | Consumer groups with rebalancing, offset management, and static membership |
+| `admin` | Cluster administration (topics, groups, records, configuration, ACLs) |
+| `interceptor` | Producer and consumer interceptor hooks for observability |
 | `protocol` | Kafka wire protocol implementation |
-| `auth` | Authentication (SASL/PLAIN, SASL/SCRAM, AWS MSK IAM) |
+| `auth` | Authentication (SASL/PLAIN, SASL/SCRAM, SASL/OAUTHBEARER, AWS MSK IAM) |
 
 ## 🗜️ Compression
 
@@ -231,6 +275,7 @@ Full documentation is available at **[hupe1980.github.io/krafka](https://hupe198
 - [Architecture Overview](https://hupe1980.github.io/krafka/architecture)
 - [Metrics & Observability](https://hupe1980.github.io/krafka/metrics)
 - [Error Handling](https://hupe1980.github.io/krafka/errors)
+- [Interceptors](https://hupe1980.github.io/krafka/interceptors)
 - [Authentication](https://hupe1980.github.io/krafka/authentication)
 
 ## 🎮 Examples
@@ -264,14 +309,15 @@ Krafka is feature-complete and production-ready.
 **Features:**
 - ✅ Protocol layer (all message types, compression, ACL messages, transactions)
 - ✅ Network layer (async connections, pooling, TLS/SSL)
-- ✅ Producer (batching with linger timer, partitioning, compression, retry policy, idempotence)
-- ✅ Consumer (polling, offset management, seek, pause/resume, rebalance listeners, cooperative sticky assignor)
-- ✅ Admin Client (topic CRUD, partitions, configuration, ACL management)
-- ✅ Authentication (SASL/PLAIN, SASL/SCRAM-SHA-256/512, AWS MSK IAM with SDK support)
+- ✅ Producer (batching with linger timer, partitioning, compression, built-in retry with exponential backoff, metadata refresh on failure, max-in-flight enforcement via semaphore, interceptor hooks)
+- ✅ Consumer (polling, streaming `recv()` with error propagation, offset management, auto-commit timer, seek, pause/resume, configurable partition assignment strategy, rebalance listeners, cooperative sticky assignor, static group membership (KIP-345), interceptor hooks, log compaction awareness)
+- ✅ Admin Client (topic CRUD, partitions, configuration, ACL management, consumer groups, record deletion, leader epoch queries)
+- ✅ Authentication (SASL/PLAIN, SASL/SCRAM-SHA-256/512, SASL/OAUTHBEARER, AWS MSK IAM with SDK support)
 - ✅ TLS/SSL encryption (rustls, mTLS support)
-- ✅ Transactions (exactly-once semantics with transactional producer)
-- ✅ Metrics (counters, gauges, latency tracking)
-- ✅ Tracing (OpenTelemetry-compatible spans)
+- ✅ Transactions (exactly-once semantics with transactional producer — full PID/epoch/sequence tracking)
+- ✅ Metrics (counters, gauges, latency tracking — all wired into producer/consumer hot paths)
+- ✅ Tracing (OpenTelemetry-compatible spans with properly declared fields)
+- ✅ Security hardening (secret zeroization, constant-time comparison, PBKDF2 validation, decompression limits, allocation caps)
 
 ## 🤝 Contributing
 

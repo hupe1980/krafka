@@ -1,7 +1,5 @@
 //! Consumer record types.
 
-use std::collections::HashMap;
-
 use bytes::Bytes;
 
 use crate::{Offset, PartitionId, Timestamp};
@@ -24,8 +22,8 @@ pub struct ConsumerRecord {
     pub key: Option<Bytes>,
     /// Record value.
     pub value: Option<Bytes>,
-    /// Headers.
-    pub headers: HashMap<String, Bytes>,
+    /// Headers (preserves duplicate keys and null values, matching the Kafka protocol).
+    pub headers: Vec<(String, Option<Bytes>)>,
     /// Leader epoch.
     pub leader_epoch: Option<i32>,
     /// Serialized key size.
@@ -54,7 +52,7 @@ impl ConsumerRecord {
             timestamp_type: 0,
             key,
             value,
-            headers: HashMap::new(),
+            headers: Vec::new(),
             leader_epoch: None,
             serialized_key_size,
             serialized_value_size,
@@ -75,18 +73,44 @@ impl ConsumerRecord {
             .and_then(|v| std::str::from_utf8(v).ok())
     }
 
-    /// Get a header value.
+    /// Get the first header value matching the given key.
+    /// Returns `Some(Some(bytes))` if a header with a value is found,
+    /// `Some(None)` if a header with a null value is found,
+    /// or `None` if no header with that key exists.
     #[inline]
-    pub fn header(&self, key: &str) -> Option<&Bytes> {
-        self.headers.get(key)
+    pub fn header(&self, key: &str) -> Option<Option<&Bytes>> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_ref())
     }
 
-    /// Get a header value as a string.
+    /// Get the first header value as a string.
+    /// Returns `None` for missing headers and headers with null values.
     #[inline]
     pub fn header_str(&self, key: &str) -> Option<&str> {
-        self.headers
-            .get(key)
+        self.header(key)
+            .flatten()
             .and_then(|v| std::str::from_utf8(v).ok())
+    }
+
+    /// Get the first non-null header value matching the given key.
+    #[inline]
+    pub fn header_value(&self, key: &str) -> Option<&Bytes> {
+        self.headers
+            .iter()
+            .find(|(k, v)| k == key && v.is_some())
+            .and_then(|(_, v)| v.as_ref())
+    }
+
+    /// Get all header values matching the given key (including nulls).
+    #[inline]
+    pub fn headers_by_key(&self, key: &str) -> Vec<Option<&Bytes>> {
+        self.headers
+            .iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, v)| v.as_ref())
+            .collect()
     }
 }
 
@@ -262,5 +286,121 @@ mod tests {
 
         let consumer_records = ConsumerRecords::from_records(records);
         assert_eq!(consumer_records.partitions().len(), 3);
+    }
+
+    #[test]
+    fn test_consumer_record_duplicate_headers_preserved() {
+        let mut record = ConsumerRecord::new(
+            "test-topic",
+            0,
+            0,
+            None,
+            Some(Bytes::from("value")),
+        );
+
+        // Add duplicate header keys
+        record.headers.push(("trace-id".to_string(), Some(Bytes::from("abc"))));
+        record.headers.push(("trace-id".to_string(), Some(Bytes::from("def"))));
+        record.headers.push(("other".to_string(), Some(Bytes::from("xyz"))));
+
+        // Both duplicates should be preserved
+        assert_eq!(record.headers.len(), 3, "all headers including duplicates should be preserved");
+
+        // header() returns the first match
+        assert_eq!(
+            record.header("trace-id"),
+            Some(Some(&Bytes::from("abc"))),
+            "header() should return the first matching header value"
+        );
+    }
+
+    #[test]
+    fn test_consumer_record_headers_by_key() {
+        let mut record = ConsumerRecord::new(
+            "test-topic",
+            0,
+            0,
+            None,
+            Some(Bytes::from("value")),
+        );
+
+        record.headers.push(("trace-id".to_string(), Some(Bytes::from("first"))));
+        record.headers.push(("trace-id".to_string(), Some(Bytes::from("second"))));
+        record.headers.push(("trace-id".to_string(), Some(Bytes::from("third"))));
+        record.headers.push(("other-key".to_string(), Some(Bytes::from("other"))));
+
+        let trace_values = record.headers_by_key("trace-id");
+        assert_eq!(
+            trace_values.len(),
+            3,
+            "headers_by_key should return all values for a duplicate key"
+        );
+        assert_eq!(trace_values[0], Some(&Bytes::from("first")));
+        assert_eq!(trace_values[1], Some(&Bytes::from("second")));
+        assert_eq!(trace_values[2], Some(&Bytes::from("third")));
+
+        let other_values = record.headers_by_key("other-key");
+        assert_eq!(other_values.len(), 1);
+
+        let missing_values = record.headers_by_key("nonexistent");
+        assert!(missing_values.is_empty(), "headers_by_key for missing key should return empty vec");
+    }
+
+    // ── R9.7: null header values ──
+
+    #[test]
+    fn test_consumer_record_header_with_null_value() {
+        let mut record = ConsumerRecord::new("t", 0, 0, None, Some(Bytes::from("v")));
+        record.headers.push(("x-null".to_string(), None));
+        record.headers.push(("x-present".to_string(), Some(Bytes::from("data"))));
+
+        // header() returns Some(None) for a null-valued header
+        assert_eq!(record.header("x-null"), Some(None));
+        // header() returns Some(Some(&bytes)) for a present-valued header
+        assert_eq!(record.header("x-present"), Some(Some(&Bytes::from("data"))));
+        // header() returns None for a missing key
+        assert_eq!(record.header("missing"), None);
+    }
+
+    #[test]
+    fn test_consumer_record_header_value_skips_null() {
+        let mut record = ConsumerRecord::new("t", 0, 0, None, Some(Bytes::from("v")));
+        // First entry is null, second is non-null
+        record.headers.push(("key".to_string(), None));
+        record.headers.push(("key".to_string(), Some(Bytes::from("real"))));
+
+        // header_value() should skip the null and return the first non-null
+        assert_eq!(record.header_value("key"), Some(&Bytes::from("real")));
+
+        // If all values for a key are null, header_value() returns None
+        let mut record2 = ConsumerRecord::new("t", 0, 0, None, None);
+        record2.headers.push(("all-null".to_string(), None));
+        assert_eq!(record2.header_value("all-null"), None);
+    }
+
+    #[test]
+    fn test_consumer_record_header_str_returns_none_for_null() {
+        let mut record = ConsumerRecord::new("t", 0, 0, None, None);
+        record.headers.push(("h".to_string(), None));
+        record.headers.push(("h2".to_string(), Some(Bytes::from("text"))));
+
+        // null header → None
+        assert_eq!(record.header_str("h"), None);
+        // present header with valid UTF-8 → Some(str)
+        assert_eq!(record.header_str("h2"), Some("text"));
+    }
+
+    #[test]
+    fn test_consumer_record_headers_by_key_with_nulls() {
+        let mut record = ConsumerRecord::new("t", 0, 0, None, None);
+        record.headers.push(("k".to_string(), Some(Bytes::from("a"))));
+        record.headers.push(("k".to_string(), None));
+        record.headers.push(("k".to_string(), Some(Bytes::from("b"))));
+
+        let vals = record.headers_by_key("k");
+        assert_eq!(vals.len(), 3);
+        assert_eq!(vals[0], Some(&Bytes::from("a")));
+        assert_eq!(vals[1], None);
+        assert_eq!(vals[2], Some(&Bytes::from("b")));
     }
 }

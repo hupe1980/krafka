@@ -159,28 +159,42 @@ impl Partitioner for RoundRobinPartitioner {
 
 /// Sticky partitioner for improved batching.
 ///
-/// Sticks to a partition until a batch is full or a timeout occurs.
+/// Sticks to a partition until `batch_threshold` records have been sent
+/// (default: 100), then advances to the next partition. This improves
+/// batching efficiency by grouping unkeyed records together.
 #[derive(Debug)]
 pub struct StickyPartitioner {
     current: AtomicUsize,
     counter: AtomicUsize,
+    /// Number of records per sticky partition before advancing.
+    batch_threshold: usize,
 }
 
 impl StickyPartitioner {
-    /// Create a new sticky partitioner.
+    /// Create a new sticky partitioner with default batch threshold (100).
     pub fn new() -> Self {
         Self {
             current: AtomicUsize::new(0),
             counter: AtomicUsize::new(0),
+            batch_threshold: 100,
         }
     }
 
-    /// Switch to the next partition.
+    /// Create a sticky partitioner with a custom batch threshold.
+    pub fn with_batch_threshold(threshold: usize) -> Self {
+        Self {
+            current: AtomicUsize::new(0),
+            counter: AtomicUsize::new(0),
+            batch_threshold: threshold.max(1),
+        }
+    }
+
+    /// Manually switch to the next partition.
     pub fn next_partition(&self, partition_count: usize) {
         if partition_count > 0 {
-            let next = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
+            let current = self.current.load(Ordering::Acquire);
             self.current
-                .store(next % partition_count, Ordering::Release);
+                .store((current + 1) % partition_count, Ordering::Release);
         }
     }
 }
@@ -205,7 +219,13 @@ impl Partitioner for StickyPartitioner {
                 (hash as usize % partition_count) as PartitionId
             }
             _ => {
-                // Use sticky partition for non-keyed records
+                // Auto-advance after batch_threshold records
+                let count = self.counter.fetch_add(1, Ordering::Relaxed);
+                if count > 0 && count.is_multiple_of(self.batch_threshold) {
+                    let next = count / self.batch_threshold;
+                    self.current
+                        .store(next % partition_count, Ordering::Release);
+                }
                 self.current.load(Ordering::Acquire) as PartitionId
             }
         }
@@ -308,6 +328,46 @@ mod tests {
         partitioner.next_partition(3);
         let p3 = partitioner.partition("topic", None, 3);
         assert_ne!(p1, p3);
+    }
+
+    #[test]
+    fn test_sticky_partitioner_auto_advance() {
+        // Custom threshold of 5
+        let partitioner = StickyPartitioner::with_batch_threshold(5);
+        assert_eq!(partitioner.batch_threshold, 5, "with_batch_threshold should set custom threshold");
+
+        // Threshold of 0 should be clamped to 1
+        let partitioner_min = StickyPartitioner::with_batch_threshold(0);
+        assert_eq!(partitioner_min.batch_threshold, 1, "with_batch_threshold(0) should clamp to 1");
+
+        let partition_count = 3;
+
+        // First 5 calls (indices 0..4) should all return the same partition
+        let initial = partitioner.partition("topic", None, partition_count);
+        for i in 1..5 {
+            let p = partitioner.partition("topic", None, partition_count);
+            assert_eq!(p, initial, "call {i} should still be on initial partition");
+        }
+
+        // The 6th call (index 5) triggers auto-advance (count=5, 5 % 5 == 0)
+        let after_advance = partitioner.partition("topic", None, partition_count);
+        assert_ne!(
+            after_advance, initial,
+            "after batch_threshold calls, partition should auto-advance to a different partition"
+        );
+
+        // Next 4 calls should stay on the new partition
+        for i in 0..4 {
+            let p = partitioner.partition("topic", None, partition_count);
+            assert_eq!(p, after_advance, "call {i} after advance should stay on new partition");
+        }
+
+        // Another advance at count=10
+        let after_second_advance = partitioner.partition("topic", None, partition_count);
+        assert_ne!(
+            after_second_advance, after_advance,
+            "should auto-advance again after another batch_threshold calls"
+        );
     }
 
     #[test]

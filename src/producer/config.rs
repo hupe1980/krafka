@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use crate::auth::AuthConfig;
 use crate::protocol::Compression;
 
 /// Required acknowledgments for produce requests.
@@ -67,6 +68,8 @@ pub struct ProducerConfig {
     pub buffer_memory: usize,
     /// Metadata max age.
     pub metadata_max_age: Duration,
+    /// Authentication configuration (optional).
+    pub auth: Option<AuthConfig>,
 }
 
 impl Default for ProducerConfig {
@@ -86,6 +89,7 @@ impl Default for ProducerConfig {
             max_block: Duration::from_secs(60),
             buffer_memory: 32 * 1024 * 1024, // 32 MB
             metadata_max_age: Duration::from_secs(300),
+            auth: None,
         }
     }
 }
@@ -141,6 +145,66 @@ impl ProducerConfigBuilder {
         self
     }
 
+    /// Set authentication configuration.
+    ///
+    /// Enables TLS and/or SASL authentication for all connections.
+    pub fn auth(mut self, auth: AuthConfig) -> Self {
+        self.config.auth = Some(auth);
+        self
+    }
+
+    /// Set request timeout.
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.config.request_timeout = timeout;
+        self
+    }
+
+    /// Set number of retries.
+    pub fn retries(mut self, retries: u32) -> Self {
+        self.config.retries = retries;
+        self
+    }
+
+    /// Set retry backoff duration.
+    pub fn retry_backoff(mut self, backoff: Duration) -> Self {
+        self.config.retry_backoff = backoff;
+        self
+    }
+
+    /// Set max in-flight requests per connection.
+    pub fn max_in_flight(mut self, max: usize) -> Self {
+        self.config.max_in_flight = max;
+        self
+    }
+
+    /// Set whether to enable idempotent producer.
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use TransactionalProducer for idempotent/exactly-once semantics"
+    )]
+    pub fn enable_idempotence(mut self, enable: bool) -> Self {
+        self.config.enable_idempotence = enable;
+        self
+    }
+
+    /// Set max block time when send buffer is full.
+    pub fn max_block(mut self, duration: Duration) -> Self {
+        self.config.max_block = duration;
+        self
+    }
+
+    /// Set buffer memory size in bytes.
+    pub fn buffer_memory(mut self, bytes: usize) -> Self {
+        self.config.buffer_memory = bytes;
+        self
+    }
+
+    /// Set metadata max age before refresh.
+    pub fn metadata_max_age(mut self, duration: Duration) -> Self {
+        self.config.metadata_max_age = duration;
+        self
+    }
+
     /// Build the config.
     pub fn build(self) -> ProducerConfig {
         self.config
@@ -189,5 +253,40 @@ mod tests {
         assert_eq!(config.acks, Acks::All);
         assert_eq!(config.compression, Compression::Lz4);
         assert_eq!(config.batch_size, 32768);
+    }
+
+    #[test]
+    fn test_config_builder_request_timeout() {
+        let config = ProducerConfig::builder()
+            .request_timeout(Duration::from_secs(60))
+            .build();
+        assert_eq!(
+            config.request_timeout,
+            Duration::from_secs(60),
+            "request_timeout should be set by builder"
+        );
+    }
+
+    #[test]
+    fn test_config_builder_max_in_flight() {
+        let config = ProducerConfig::builder()
+            .max_in_flight(10)
+            .build();
+        assert_eq!(
+            config.max_in_flight, 10,
+            "max_in_flight should be set by builder"
+        );
+    }
+
+    #[test]
+    fn test_config_builder_metadata_max_age() {
+        let config = ProducerConfig::builder()
+            .metadata_max_age(Duration::from_secs(120))
+            .build();
+        assert_eq!(
+            config.metadata_max_age,
+            Duration::from_secs(120),
+            "metadata_max_age should be set by builder"
+        );
     }
 }

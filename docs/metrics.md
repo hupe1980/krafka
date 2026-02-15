@@ -11,13 +11,13 @@ This guide covers metrics collection and export in Krafka.
 
 ## Overview
 
-Krafka provides built-in metrics collection for:
+Krafka provides built-in metrics collection that is automatically wired into all hot paths:
 
-- **Producer metrics**: Records sent, bytes, batches, errors, retries, latency
-- **Consumer metrics**: Records received, polls, fetches, commits, lag, latency
+- **Producer metrics**: Records sent, bytes, batches, errors, retries, send latency — recorded in `send()`, `send_to_partition()`, and batch accumulator flush
+- **Consumer metrics**: Records received, polls, fetches, commits, rebalances, assigned partitions, lag, poll latency — recorded in `poll()`, `commit()`, and `close()`
 - **Connection metrics**: Connections created/closed, errors, establishment latency
 
-All metrics are lock-free using atomic operations for minimal performance impact on hot paths.
+All metrics are lock-free using atomic operations for minimal performance impact. Access metrics via `producer.metrics_handle()` or `consumer.metrics()`.
 
 ## Basic Usage
 
@@ -236,6 +236,7 @@ fn export_to_otel(snapshot: &ProducerMetricsSnapshot) {
 - Counter increments use `Ordering::Relaxed` for minimal overhead
 - Latency tracking uses compare-and-swap for min/max updates
 - Gauge updates are immediate (no aggregation)
+- Gauge `dec()` saturates at zero (will not underflow below 0), ensuring correctness for connection and partition counting
 - Prometheus export only happens on request (pull-based)
 
 ## Next Steps

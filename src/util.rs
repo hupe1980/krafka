@@ -1,6 +1,17 @@
 //! Utility functions for Krafka.\n//!\n//! This module provides low-level utilities used throughout the crate:\n//!\n//! - **Correlation ID generation**: Thread-safe ID generation for request/response matching\n//! - **CRC32C**: Checksum calculation for Kafka record validation\n//! - **Varint encoding**: Variable-length integer encoding for compact protocols
 
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::Duration;
+
+/// Convert a `Duration` to milliseconds as `i32`, capping at `i32::MAX`.
+///
+/// `Duration::as_millis()` returns `u128`, which would silently truncate
+/// when cast to `i32`. This function caps the value at `i32::MAX` (~24.8 days)
+/// to prevent silent wraparound.
+#[inline]
+pub fn duration_to_millis_i32(d: Duration) -> i32 {
+    d.as_millis().min(i32::MAX as u128) as i32
+}
 
 /// Thread-safe correlation ID generator.
 pub struct CorrelationIdGenerator {
@@ -197,5 +208,26 @@ mod tests {
         let data = b"hello world";
         let crc = crc32c(data);
         assert_eq!(crc, 0xc99465aa);
+    }
+
+    #[test]
+    fn test_duration_to_millis_i32_normal() {
+        assert_eq!(duration_to_millis_i32(Duration::from_millis(100)), 100);
+        assert_eq!(duration_to_millis_i32(Duration::from_secs(30)), 30_000);
+        assert_eq!(duration_to_millis_i32(Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn test_duration_to_millis_i32_caps_at_max() {
+        // 25 days in millis exceeds i32::MAX (~24.8 days)
+        let huge = Duration::from_secs(25 * 24 * 3600);
+        assert_eq!(duration_to_millis_i32(huge), i32::MAX);
+    }
+
+    #[test]
+    fn test_duration_to_millis_i32_exact_max() {
+        // Duration exactly at i32::MAX millis
+        let exact = Duration::from_millis(i32::MAX as u64);
+        assert_eq!(duration_to_millis_i32(exact), i32::MAX);
     }
 }

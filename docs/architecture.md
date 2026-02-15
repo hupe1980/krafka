@@ -31,6 +31,14 @@ This document describes the internal architecture of Krafka, a pure Rust Apache 
 - Avoids unnecessary copies in hot paths
 - Efficient protocol parsing
 
+### 5. Security Hardened
+- Secrets zeroized on drop (SCRAM passwords, AWS credentials)
+- Constant-time comparison via `subtle` crate (timing-attack resistant)
+- PBKDF2 iteration count validated to prevent DoS
+- Protocol allocations capped to prevent OOM from malicious brokers
+- Decompression bomb protection (128 MiB limit)
+- Debug output redacts all credentials
+
 ## Module Architecture
 
 ```
@@ -415,10 +423,12 @@ Benefits:
 
 ### Pre-allocation
 
-`Vec::with_capacity` used throughout for known-size collections:
+`Vec::with_capacity` used throughout for known-size collections, capped at 10,000 elements to protect against malicious broker responses:
 - Record batch building
 - Response decoding
 - Header collection
+
+All protocol decoding paths cap `Vec::with_capacity(len.min(10_000))` to prevent OOM from broker-supplied lengths.
 
 ## Error Handling
 
@@ -455,7 +465,10 @@ All Krafka types are designed for concurrent use:
 Internal state is protected by:
 - `RwLock<T>` for read-heavy data (metadata, offsets)
 - `AtomicBool` for flags (closed state)
-- `Arc<T>` for shared ownership
+- `AtomicU8` with `compare_exchange` for transaction state machine
+- `Arc<T>` for shared ownership (coordinator state shared with heartbeat task)
+
+Connection pool uses a read-lock fast path for hot-path lookups, dropping all locks before network I/O during reconnection.
 
 ## Benchmarks
 
@@ -498,3 +511,4 @@ Krafka includes the following production-ready features:
 - ✅ **SASL/SCRAM Authentication**: SHA-256 and SHA-512 mechanisms
 - ✅ **Metrics and Observability**: Producer, consumer, and connection metrics
 - ✅ **ACL Management**: Create, describe, and delete ACLs
+- ✅ **Security Hardening**: Secret zeroization, constant-time auth, PBKDF2 validation, decompression limits, allocation caps

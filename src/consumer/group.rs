@@ -22,8 +22,11 @@ use crate::network::{BrokerConnection, ConnectionPool};
 use crate::protocol::{
     ApiKey, FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse,
     JoinGroupRequest, JoinGroupRequestProtocol, JoinGroupResponse, JoinGroupResponseMember,
-    LeaveGroupRequest, OffsetCommitRequest, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
-    OffsetCommitResponse, SyncGroupRequest, SyncGroupRequestAssignment, SyncGroupResponse,
+    LeaveGroupMember, LeaveGroupRequest, ListOffsetsRequest, ListOffsetsRequestPartition,
+    ListOffsetsRequestTopic, ListOffsetsResponse, OffsetCommitRequest,
+    OffsetCommitRequestPartition, OffsetCommitRequestTopic, OffsetCommitResponse,
+    OffsetFetchRequest, OffsetFetchRequestTopic, OffsetFetchResponse, SyncGroupRequest,
+    SyncGroupRequestAssignment, SyncGroupResponse,
 };
 
 /// Callback interface for partition rebalance events.
@@ -425,7 +428,9 @@ impl PartitionAssignor for RoundRobinAssignor {
         // Round-robin assign
         for (idx, (topic, partition)) in all_partitions.into_iter().enumerate() {
             let member = &members[idx % members.len()];
-            let member_topics = member_topic_partitions.get_mut(&member.member_id).unwrap();
+            let member_topics = member_topic_partitions
+                .get_mut(&member.member_id)
+                .expect("member must exist in pre-populated map");
             member_topics.entry(topic).or_default().push(partition);
         }
 
@@ -475,13 +480,19 @@ impl CooperativeStickyAssignor {
 
     /// Record the current assignments for future stickiness.
     pub fn record_assignment(&self, member_id: &str, assignment: &MemberAssignment) {
-        let mut prev = self.previous_assignments.write().unwrap();
+        let mut prev = self
+            .previous_assignments
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         prev.insert(member_id.to_string(), assignment.partitions.clone());
     }
 
     /// Clear previous assignment for a member that left.
     pub fn clear_member(&self, member_id: &str) {
-        let mut prev = self.previous_assignments.write().unwrap();
+        let mut prev = self
+            .previous_assignments
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         prev.remove(member_id);
     }
 
@@ -491,7 +502,10 @@ impl CooperativeStickyAssignor {
         member_id: &str,
         new_assignment: &MemberAssignment,
     ) -> Vec<(String, PartitionId)> {
-        let prev = self.previous_assignments.read().unwrap();
+        let prev = self
+            .previous_assignments
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let mut revoked = Vec::new();
 
         if let Some(old_partitions) = prev.get(member_id) {
@@ -542,7 +556,10 @@ impl PartitionAssignor for CooperativeStickyAssignor {
         }
 
         // Get previous assignments for stickiness
-        let prev_assignments = self.previous_assignments.read().unwrap();
+        let prev_assignments = self
+            .previous_assignments
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
 
         // Track which partitions are already assigned (sticky)
         let mut sticky_assignments: HashMap<(String, PartitionId), String> = HashMap::new();
@@ -635,7 +652,11 @@ impl PartitionAssignor for CooperativeStickyAssignor {
                 let count = *member_partition_counts.get(&member.member_id).unwrap_or(&0);
                 if count > max_per_member {
                     overloaded.push(member.member_id.clone());
-                } else if count < min_per_member {
+                } else if count < max_per_member {
+                    // §10.2 fix: use max_per_member (ceil) as the underloaded threshold.
+                    // Using min_per_member (floor) left members that could accept more
+                    // partitions undetected, causing unbalanced 3-1-1 distributions
+                    // instead of balanced 2-2-1.
                     underloaded.push(member.member_id.clone());
                 }
             }
@@ -706,6 +727,8 @@ pub struct HeartbeatController {
     last_heartbeat: Arc<RwLock<Option<std::time::Instant>>>,
     /// Whether the controller is running.
     running: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether a rebalance has been detected by the heartbeat task.
+    rebalance_needed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HeartbeatController {
@@ -716,6 +739,7 @@ impl HeartbeatController {
             session_timeout,
             last_heartbeat: Arc::new(RwLock::new(None)),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rebalance_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -747,6 +771,18 @@ impl HeartbeatController {
     pub fn stop(&self) {
         self.running
             .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Signal that a rebalance is needed (called from heartbeat task).
+    pub fn signal_rebalance(&self) {
+        self.rebalance_needed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Check and clear the rebalance-needed flag.
+    pub fn take_rebalance_needed(&self) -> bool {
+        self.rebalance_needed
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// Record a successful heartbeat.
@@ -882,13 +918,13 @@ pub struct GroupCoordinator {
     /// Rebalance timeout.
     rebalance_timeout: Duration,
     /// Coordinator connection.
-    coordinator_conn: RwLock<Option<Arc<BrokerConnection>>>,
+    coordinator_conn: Arc<RwLock<Option<Arc<BrokerConnection>>>>,
     /// Coordinator node ID.
     coordinator_id: RwLock<Option<i32>>,
     /// Member ID assigned by coordinator.
-    member_id: RwLock<String>,
+    member_id: Arc<RwLock<String>>,
     /// Generation ID.
-    generation_id: RwLock<i32>,
+    generation_id: Arc<RwLock<i32>>,
     /// Current group state.
     state: RwLock<GroupState>,
     /// Current partition assignment.
@@ -901,8 +937,14 @@ pub struct GroupCoordinator {
     subscribed_topics: RwLock<Vec<String>>,
     /// Protocol type (always "consumer").
     protocol_type: String,
+    /// Partition assignment strategy.
+    assignment_strategy: crate::consumer::config::PartitionAssignmentStrategy,
     /// Partition assignor name.
     assignor_name: String,
+    /// Static group membership instance ID (KIP-345).
+    group_instance_id: Option<String>,
+    /// Persistent sticky assignor (retains previous assignments across rebalances).
+    sticky_assignor: CooperativeStickyAssignor,
 }
 
 impl GroupCoordinator {
@@ -922,10 +964,10 @@ impl GroupCoordinator {
             session_timeout,
             heartbeat_interval,
             rebalance_timeout,
-            coordinator_conn: RwLock::new(None),
+            coordinator_conn: Arc::new(RwLock::new(None)),
             coordinator_id: RwLock::new(None),
-            member_id: RwLock::new(String::new()),
-            generation_id: RwLock::new(-1),
+            member_id: Arc::new(RwLock::new(String::new())),
+            generation_id: Arc::new(RwLock::new(-1)),
             state: RwLock::new(GroupState::Unjoined),
             assignment: RwLock::new(MemberAssignment::empty()),
             heartbeat_controller: Arc::new(HeartbeatController::new(
@@ -935,8 +977,27 @@ impl GroupCoordinator {
             heartbeat_cmd_tx: RwLock::new(None),
             subscribed_topics: RwLock::new(Vec::new()),
             protocol_type: "consumer".to_string(),
+            assignment_strategy: crate::consumer::config::PartitionAssignmentStrategy::Range,
             assignor_name: "range".to_string(),
+            group_instance_id: None,
+            sticky_assignor: CooperativeStickyAssignor::new(),
         }
+    }
+
+    /// Set the partition assignment strategy (builder pattern).
+    pub fn with_assignor_strategy(
+        mut self,
+        strategy: crate::consumer::config::PartitionAssignmentStrategy,
+    ) -> Self {
+        self.assignor_name = strategy.protocol_name().to_string();
+        self.assignment_strategy = strategy;
+        self
+    }
+
+    /// Set the static group membership instance ID (KIP-345, builder pattern).
+    pub fn with_group_instance_id(mut self, id: Option<String>) -> Self {
+        self.group_instance_id = id;
+        self
     }
 
     /// Get the group ID.
@@ -971,6 +1032,11 @@ impl GroupCoordinator {
 
     /// Check if the group needs to rejoin.
     pub async fn needs_rejoin(&self) -> bool {
+        // Check heartbeat controller's rebalance flag first (immediate detection from R8.3)
+        if self.heartbeat_controller.take_rebalance_needed() {
+            *self.state.write().await = GroupState::PreparingRebalance;
+            return true;
+        }
         matches!(
             *self.state.read().await,
             GroupState::Unjoined | GroupState::PreparingRebalance
@@ -1021,11 +1087,18 @@ impl GroupCoordinator {
     }
 
     /// Get the coordinator connection, finding it if necessary.
+    /// Checks liveness of cached connections and re-discovers if dead (§9.11 fix).
     async fn get_coordinator_connection(&self) -> Result<Arc<BrokerConnection>> {
         {
             let conn = self.coordinator_conn.read().await;
             if let Some(ref c) = *conn {
-                return Ok(c.clone());
+                if c.is_alive() {
+                    return Ok(c.clone());
+                }
+                // Connection is dead, clear it and re-discover
+                drop(conn);
+                *self.coordinator_conn.write().await = None;
+                debug!("Coordinator connection is dead, re-discovering");
             }
         }
 
@@ -1064,14 +1137,14 @@ impl GroupCoordinator {
         let topics = self.subscribed_topics.read().await.clone();
 
         // Build consumer protocol metadata
-        let metadata = self.encode_consumer_metadata(&topics);
+        let metadata = self.encode_consumer_metadata(&topics)?;
 
         let request = JoinGroupRequest {
             group_id: self.group_id.clone(),
-            session_timeout_ms: self.session_timeout.as_millis() as i32,
-            rebalance_timeout_ms: self.rebalance_timeout.as_millis() as i32,
+            session_timeout_ms: crate::util::duration_to_millis_i32(self.session_timeout),
+            rebalance_timeout_ms: crate::util::duration_to_millis_i32(self.rebalance_timeout),
             member_id: member_id.clone(),
-            group_instance_id: None,
+            group_instance_id: self.group_instance_id.clone(),
             protocol_type: self.protocol_type.clone(),
             protocols: vec![JoinGroupRequestProtocol {
                 name: self.assignor_name.clone(),
@@ -1086,14 +1159,25 @@ impl GroupCoordinator {
 
         *self.state.write().await = GroupState::Joining;
 
-        let response = conn
-            .send_request(ApiKey::JoinGroup, 0, |buf| {
+        // Use v5 for static membership (KIP-345), v0 otherwise
+        let response = if self.group_instance_id.is_some() {
+            conn.send_request(ApiKey::JoinGroup, 5, |buf| {
+                request.encode_v5(buf);
+            })
+            .await?
+        } else {
+            conn.send_request(ApiKey::JoinGroup, 0, |buf| {
                 request.encode_v0(buf);
             })
-            .await?;
+            .await?
+        };
 
         let mut buf = response;
-        let join_response = JoinGroupResponse::decode_v0(&mut buf)?;
+        let join_response = if self.group_instance_id.is_some() {
+            JoinGroupResponse::decode_v5(&mut buf)?
+        } else {
+            JoinGroupResponse::decode_v0(&mut buf)?
+        };
 
         if !join_response.error_code.is_ok() {
             *self.state.write().await = GroupState::Unjoined;
@@ -1139,7 +1223,7 @@ impl GroupCoordinator {
             group_id: self.group_id.clone(),
             generation_id,
             member_id: member_id.clone(),
-            group_instance_id: None,
+            group_instance_id: self.group_instance_id.clone(),
             protocol_type: Some(self.protocol_type.clone()),
             protocol_name: join_response.protocol_name.clone(),
             assignments,
@@ -1242,10 +1326,11 @@ impl GroupCoordinator {
         let heartbeat_interval = self.heartbeat_interval;
         let heartbeat_controller = self.heartbeat_controller.clone();
 
-        // Clone values we need for the task
-        let member_id = self.member_id.read().await.clone();
-        let generation_id = *self.generation_id.read().await;
-        let coordinator_conn = self.coordinator_conn.read().await.clone();
+        // Clone Arc references so the task reads current values on each heartbeat (§2.5 fix)
+        let member_id_ref = self.member_id.clone();
+        let generation_id_ref = self.generation_id.clone();
+        let coordinator_conn_ref = self.coordinator_conn.clone();
+        let group_instance_id = self.group_instance_id.clone();
 
         heartbeat_controller.start();
 
@@ -1262,24 +1347,43 @@ impl GroupCoordinator {
                             break;
                         }
 
+                        // Read current values on each heartbeat (not stale copies)
+                        let coordinator_conn = coordinator_conn_ref.read().await.clone();
+                        let member_id = member_id_ref.read().await.clone();
+                        let generation_id = *generation_id_ref.read().await;
+
                         // Send heartbeat
                         if let Some(ref conn) = coordinator_conn {
                             let request = HeartbeatRequest {
                                 group_id: group_id.clone(),
                                 generation_id,
                                 member_id: member_id.clone(),
-                                group_instance_id: None,
+                                group_instance_id: group_instance_id.clone(),
                             };
 
-                            match conn
-                                .send_request(ApiKey::Heartbeat, 0, |buf| {
+                            // Use v3 for static membership (KIP-345), v0 otherwise
+                            let send_result = if group_instance_id.is_some() {
+                                conn.send_request(ApiKey::Heartbeat, 3, |buf| {
+                                    request.encode_v3(buf);
+                                })
+                                .await
+                            } else {
+                                conn.send_request(ApiKey::Heartbeat, 0, |buf| {
                                     request.encode_v0(buf);
                                 })
                                 .await
+                            };
+
+                            match send_result
                             {
                                 Ok(response) => {
                                     let mut buf = response;
-                                    if let Ok(hb_response) = HeartbeatResponse::decode_v0(&mut buf) {
+                                    let decode_result = if group_instance_id.is_some() {
+                                        HeartbeatResponse::decode_v1(&mut buf)
+                                    } else {
+                                        HeartbeatResponse::decode_v0(&mut buf)
+                                    };
+                                    if let Ok(hb_response) = decode_result {
                                         let status = HeartbeatStatus::from_error_code(hb_response.error_code);
                                         match status {
                                             HeartbeatStatus::Ok => {
@@ -1288,11 +1392,13 @@ impl GroupCoordinator {
                                             }
                                             HeartbeatStatus::RebalanceNeeded => {
                                                 warn!("Rebalance needed for group '{}', stopping heartbeat", group_id);
+                                                heartbeat_controller.signal_rebalance();
                                                 heartbeat_controller.stop();
                                                 break;
                                             }
                                             status if status.requires_rejoin() => {
                                                 warn!("Heartbeat status {:?} requires rejoin for group '{}'", status, group_id);
+                                                heartbeat_controller.signal_rebalance();
                                                 heartbeat_controller.stop();
                                                 break;
                                             }
@@ -1360,17 +1466,28 @@ impl GroupCoordinator {
             group_id: self.group_id.clone(),
             generation_id,
             member_id,
-            group_instance_id: None,
+            group_instance_id: self.group_instance_id.clone(),
         };
 
-        let response = conn
-            .send_request(ApiKey::Heartbeat, 0, |buf| {
+        // Use v3 for static membership (KIP-345), v0 otherwise
+        let response = if self.group_instance_id.is_some() {
+            conn.send_request(ApiKey::Heartbeat, 3, |buf| {
+                request.encode_v3(buf);
+            })
+            .await?
+        } else {
+            conn.send_request(ApiKey::Heartbeat, 0, |buf| {
                 request.encode_v0(buf);
             })
-            .await?;
+            .await?
+        };
 
         let mut buf = response;
-        let hb_response = HeartbeatResponse::decode_v0(&mut buf)?;
+        let hb_response = if self.group_instance_id.is_some() {
+            HeartbeatResponse::decode_v1(&mut buf)?
+        } else {
+            HeartbeatResponse::decode_v0(&mut buf)?
+        };
 
         let status = HeartbeatStatus::from_error_code(hb_response.error_code);
         if status == HeartbeatStatus::Ok {
@@ -1426,7 +1543,7 @@ impl GroupCoordinator {
             group_id: self.group_id.clone(),
             generation_id,
             member_id,
-            group_instance_id: None,
+            group_instance_id: self.group_instance_id.clone(),
             retention_time_ms: -1,
             topics,
         };
@@ -1483,6 +1600,193 @@ impl GroupCoordinator {
         Ok(())
     }
 
+    /// Fetch committed offsets from the coordinator.
+    ///
+    /// Returns the committed offset for each topic-partition, or `None` if
+    /// no offset has been committed for that partition.
+    pub async fn fetch_committed_offsets(
+        &self,
+        partitions: &HashMap<String, Vec<crate::PartitionId>>,
+    ) -> Result<HashMap<(String, crate::PartitionId), i64>> {
+        if partitions.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let conn = self.get_coordinator_connection().await?;
+
+        let topics: Vec<OffsetFetchRequestTopic> = partitions
+            .iter()
+            .map(|(topic, parts)| OffsetFetchRequestTopic {
+                name: topic.clone(),
+                partition_indexes: parts.clone(),
+            })
+            .collect();
+
+        let request = OffsetFetchRequest {
+            group_id: self.group_id.clone(),
+            topics: Some(topics),
+            require_stable: false,
+        };
+
+        debug!(
+            "Fetching committed offsets for group '{}' ({} topics)",
+            self.group_id,
+            partitions.len()
+        );
+
+        let response = conn
+            .send_request(ApiKey::OffsetFetch, 1, |buf| {
+                request.encode_v0(buf);
+            })
+            .await?;
+
+        let mut buf = response;
+        let offset_response = OffsetFetchResponse::decode_v0(&mut buf)?;
+
+        let mut result = HashMap::new();
+        for topic in &offset_response.topics {
+            for partition in &topic.partitions {
+                if partition.error_code.is_ok() && partition.committed_offset >= 0 {
+                    result.insert(
+                        (topic.name.clone(), partition.partition_index),
+                        partition.committed_offset,
+                    );
+                }
+            }
+        }
+
+        info!(
+            "Fetched {} committed offsets for group '{}'",
+            result.len(),
+            self.group_id
+        );
+        Ok(result)
+    }
+
+    /// List offsets (earliest/latest) for the given partitions.
+    ///
+    /// `timestamp` should be -1 for latest or -2 for earliest.
+    pub async fn list_offsets(
+        &self,
+        partitions: &HashMap<String, Vec<crate::PartitionId>>,
+        timestamp: i64,
+    ) -> Result<HashMap<(String, crate::PartitionId), i64>> {
+        if partitions.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // We need to send ListOffsets to the leader of each partition
+        let mut result = HashMap::new();
+
+        // Group by leader
+        let mut partitions_by_leader: HashMap<crate::BrokerId, Vec<(String, crate::PartitionId)>> =
+            HashMap::new();
+        let mut leaderless: Vec<(String, crate::PartitionId)> = Vec::new();
+        for (topic, parts) in partitions {
+            for &partition in parts {
+                if let Some(leader_id) = self.metadata.leader(topic, partition).await {
+                    partitions_by_leader
+                        .entry(leader_id)
+                        .or_default()
+                        .push((topic.clone(), partition));
+                } else {
+                    leaderless.push((topic.clone(), partition));
+                }
+            }
+        }
+
+        // Warn about leaderless partitions (§9.12 fix) and try after a metadata refresh
+        if !leaderless.is_empty() {
+            warn!(
+                "No leader found for {} partition(s), refreshing metadata: {:?}",
+                leaderless.len(),
+                leaderless
+            );
+            let topics: Vec<&str> = leaderless.iter().map(|(t, _)| t.as_str()).collect();
+            let _ = self.metadata.refresh_for_topics(Some(&topics)).await;
+
+            // Retry resolution after refresh
+            for (topic, partition) in leaderless {
+                if let Some(leader_id) = self.metadata.leader(&topic, partition).await {
+                    partitions_by_leader
+                        .entry(leader_id)
+                        .or_default()
+                        .push((topic, partition));
+                } else {
+                    warn!(
+                        "Still no leader for {}-{} after metadata refresh, skipping",
+                        topic, partition
+                    );
+                }
+            }
+        }
+
+        for leader_partitions in partitions_by_leader.values() {
+            // Group partitions by topic
+            let mut topics_map: HashMap<String, Vec<ListOffsetsRequestPartition>> = HashMap::new();
+            for (topic, partition) in leader_partitions {
+                topics_map
+                    .entry(topic.clone())
+                    .or_default()
+                    .push(ListOffsetsRequestPartition {
+                        partition_index: *partition,
+                        current_leader_epoch: -1,
+                        timestamp,
+                    });
+            }
+
+            let topics: Vec<ListOffsetsRequestTopic> = topics_map
+                .into_iter()
+                .map(|(name, parts)| ListOffsetsRequestTopic {
+                    name,
+                    partitions: parts,
+                })
+                .collect();
+
+            let request = ListOffsetsRequest {
+                replica_id: -1,
+                isolation_level: 0,
+                topics,
+            };
+
+            // Get connection to this leader
+            let (topic_sample, partition_sample) = &leader_partitions[0];
+            let conn = self
+                .metadata
+                .get_leader_connection(topic_sample, *partition_sample)
+                .await?;
+
+            let response = conn
+                .send_request(ApiKey::ListOffsets, 1, |buf| {
+                    request.encode_v1(buf);
+                })
+                .await?;
+
+            let mut buf = response;
+            let list_response = ListOffsetsResponse::decode_v1(&mut buf)?;
+
+            for topic_resp in &list_response.topics {
+                for part_resp in &topic_resp.partitions {
+                    if part_resp.error_code.is_ok() {
+                        result.insert(
+                            (topic_resp.name.clone(), part_resp.partition_index),
+                            part_resp.offset,
+                        );
+                    } else {
+                        // §10.6 fix: Log partition-level errors instead of silently
+                        // dropping them. Callers should handle missing partitions.
+                        warn!(
+                            "ListOffsets error for {}-{}: {:?}",
+                            topic_resp.name, part_resp.partition_index, part_resp.error_code
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Leave the consumer group.
     pub async fn leave_group(&self) -> Result<()> {
         let state = *self.state.read().await;
@@ -1509,7 +1813,14 @@ impl GroupCoordinator {
         let request = LeaveGroupRequest {
             group_id: self.group_id.clone(),
             member_id: member_id.clone(),
-            members: vec![],
+            members: if self.group_instance_id.is_some() {
+                vec![LeaveGroupMember {
+                    member_id: member_id.clone(),
+                    group_instance_id: self.group_instance_id.clone(),
+                }]
+            } else {
+                vec![]
+            },
         };
 
         debug!(
@@ -1518,13 +1829,24 @@ impl GroupCoordinator {
         );
 
         // Send leave group request (don't wait too long)
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            conn.send_request(ApiKey::LeaveGroup, 0, |buf| {
-                request.encode_v0(buf);
-            }),
-        )
-        .await;
+        // Use v3 for static membership (KIP-345), v0 otherwise
+        let result = if self.group_instance_id.is_some() {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                conn.send_request(ApiKey::LeaveGroup, 3, |buf| {
+                    request.encode_v3(buf);
+                }),
+            )
+            .await
+        } else {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                conn.send_request(ApiKey::LeaveGroup, 0, |buf| {
+                    request.encode_v0(buf);
+                }),
+            )
+            .await
+        };
 
         if let Ok(Ok(_)) = result {
             info!("Left group '{}'", self.group_id);
@@ -1547,19 +1869,26 @@ impl GroupCoordinator {
     }
 
     /// Encode consumer protocol metadata.
-    fn encode_consumer_metadata(&self, topics: &[String]) -> BytesMut {
+    fn encode_consumer_metadata(&self, topics: &[String]) -> Result<BytesMut> {
         let mut buf = BytesMut::new();
         // Version
         buf.put_i16(0);
         // Topics array
         buf.put_i32(topics.len() as i32);
         for topic in topics {
-            buf.put_i16(topic.len() as i16);
+            let topic_len = i16::try_from(topic.len()).map_err(|_| {
+                KrafkaError::protocol(format!(
+                    "topic name '{}' exceeds Kafka i16 length limit ({} bytes)",
+                    topic,
+                    topic.len()
+                ))
+            })?;
+            buf.put_i16(topic_len);
             buf.put_slice(topic.as_bytes());
         }
         // User data (empty)
         buf.put_i32(-1);
-        buf
+        Ok(buf)
     }
 
     /// Decode consumer assignment from SyncGroup response.
@@ -1591,7 +1920,11 @@ impl GroupCoordinator {
             if buf.remaining() < 2 {
                 break;
             }
-            let topic_len = buf.get_i16() as usize;
+            let topic_len_i16 = buf.get_i16();
+            if topic_len_i16 < 0 {
+                break;
+            }
+            let topic_len = topic_len_i16 as usize;
             if buf.remaining() < topic_len {
                 break;
             }
@@ -1601,7 +1934,10 @@ impl GroupCoordinator {
                 break;
             }
             let partition_count = buf.get_i32();
-            let mut partitions = Vec::with_capacity(partition_count as usize);
+            if partition_count < 0 {
+                break;
+            }
+            let mut partitions = Vec::with_capacity((partition_count as usize).min(10_000));
 
             for _ in 0..partition_count {
                 if buf.remaining() < 4 {
@@ -1644,9 +1980,21 @@ impl GroupCoordinator {
             })
             .collect();
 
-        // Use range assignor
-        let assignor = RangeAssignor;
-        let assignments = assignor.assign(topics, &topic_partitions, &group_members);
+        // Use configured assignor strategy (§2.8)
+        let assignments = match self.assignment_strategy {
+            crate::consumer::config::PartitionAssignmentStrategy::Range => {
+                let assignor = RangeAssignor;
+                assignor.assign(topics, &topic_partitions, &group_members)
+            }
+            crate::consumer::config::PartitionAssignmentStrategy::RoundRobin => {
+                let assignor = RoundRobinAssignor;
+                assignor.assign(topics, &topic_partitions, &group_members)
+            }
+            crate::consumer::config::PartitionAssignmentStrategy::CooperativeSticky => {
+                self.sticky_assignor
+                    .assign(topics, &topic_partitions, &group_members)
+            }
+        };
 
         // Encode assignments
         let mut result = Vec::with_capacity(members.len());
@@ -1656,7 +2004,7 @@ impl GroupCoordinator {
                 .cloned()
                 .unwrap_or_else(MemberAssignment::empty);
 
-            let encoded = self.encode_consumer_assignment(&member_assignment);
+            let encoded = self.encode_consumer_assignment(&member_assignment)?;
 
             result.push(SyncGroupRequestAssignment {
                 member_id: member.member_id.clone(),
@@ -1668,14 +2016,21 @@ impl GroupCoordinator {
     }
 
     /// Encode consumer assignment for SyncGroup request.
-    fn encode_consumer_assignment(&self, assignment: &MemberAssignment) -> BytesMut {
+    fn encode_consumer_assignment(&self, assignment: &MemberAssignment) -> Result<BytesMut> {
         let mut buf = BytesMut::new();
         // Version
         buf.put_i16(0);
         // Topics array
         buf.put_i32(assignment.partitions.len() as i32);
         for (topic, partitions) in &assignment.partitions {
-            buf.put_i16(topic.len() as i16);
+            let topic_len = i16::try_from(topic.len()).map_err(|_| {
+                KrafkaError::protocol(format!(
+                    "topic name '{}' exceeds Kafka i16 length limit ({} bytes)",
+                    topic,
+                    topic.len()
+                ))
+            })?;
+            buf.put_i16(topic_len);
             buf.put_slice(topic.as_bytes());
             buf.put_i32(partitions.len() as i32);
             for &partition in partitions {
@@ -1684,7 +2039,7 @@ impl GroupCoordinator {
         }
         // User data (empty)
         buf.put_i32(-1);
-        buf
+        Ok(buf)
     }
 
     /// Check if heartbeat is overdue (for inline heartbeat during poll).
@@ -2127,5 +2482,163 @@ mod tests {
 
         assert_eq!(revoked.len(), 1);
         assert_eq!(revoked[0], ("topic1".to_string(), 2));
+    }
+
+    #[test]
+    fn test_heartbeat_controller_signal_rebalance() {
+        let controller = HeartbeatController::new(Duration::from_secs(3), Duration::from_secs(30));
+
+        // Initially no rebalance needed
+        assert!(
+            !controller.take_rebalance_needed(),
+            "initially rebalance_needed should be false"
+        );
+
+        // Signal rebalance
+        controller.signal_rebalance();
+
+        // Flag should now be true
+        assert!(
+            controller.take_rebalance_needed(),
+            "after signal_rebalance(), take_rebalance_needed should return true"
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_controller_take_rebalance_needed_resets() {
+        let controller = HeartbeatController::new(Duration::from_secs(3), Duration::from_secs(30));
+
+        controller.signal_rebalance();
+
+        // First take should return true
+        assert!(
+            controller.take_rebalance_needed(),
+            "first take_rebalance_needed after signal should return true"
+        );
+
+        // Second take should return false (flag was reset)
+        assert!(
+            !controller.take_rebalance_needed(),
+            "second take_rebalance_needed should return false after reset"
+        );
+
+        // Signal again and verify it works again
+        controller.signal_rebalance();
+        assert!(
+            controller.take_rebalance_needed(),
+            "take_rebalance_needed should return true again after another signal"
+        );
+    }
+
+    /// §10.2 test: CooperativeSticky rebalancing with uneven partition count.
+    ///
+    /// With 5 partitions and 3 members, the correct distribution is 2-2-1.
+    /// Before the fix, stickiness could produce 3-1-1 because the underloaded
+    /// threshold used min_per_member (floor=1) instead of max_per_member (ceil=2).
+    #[test]
+    fn test_cooperative_sticky_uneven_partitions() {
+        let assignor = CooperativeStickyAssignor::new();
+
+        let topics = vec!["topic1".to_string()];
+        let mut partitions = HashMap::new();
+        partitions.insert("topic1".to_string(), vec![0, 1, 2, 3, 4]);
+
+        let members = vec![
+            GroupMember {
+                member_id: "m1".to_string(),
+                client_id: "c1".to_string(),
+                client_host: "h1".to_string(),
+                metadata: vec![],
+                assignment: vec![],
+            },
+            GroupMember {
+                member_id: "m2".to_string(),
+                client_id: "c2".to_string(),
+                client_host: "h2".to_string(),
+                metadata: vec![],
+                assignment: vec![],
+            },
+            GroupMember {
+                member_id: "m3".to_string(),
+                client_id: "c3".to_string(),
+                client_host: "h3".to_string(),
+                metadata: vec![],
+                assignment: vec![],
+            },
+        ];
+
+        // Pre-seed sticky assignment to create an imbalanced state:
+        // m1 has 3 partitions (0,1,2), m2 has 1 (3), m3 has 1 (4)
+        let mut m1_assignment = MemberAssignment::empty();
+        m1_assignment.add("topic1", vec![0, 1, 2]);
+        assignor.record_assignment("m1", &m1_assignment);
+
+        let mut m2_assignment = MemberAssignment::empty();
+        m2_assignment.add("topic1", vec![3]);
+        assignor.record_assignment("m2", &m2_assignment);
+
+        let mut m3_assignment = MemberAssignment::empty();
+        m3_assignment.add("topic1", vec![4]);
+        assignor.record_assignment("m3", &m3_assignment);
+
+        let assignments = assignor.assign(&topics, &partitions, &members);
+
+        // With §10.2 fix, no member should have more than ceil(5/3) = 2 partitions
+        for member_id in ["m1", "m2", "m3"] {
+            let count = assignments.get(member_id).unwrap().all_partitions().len();
+            assert!(
+                count <= 2,
+                "Member {member_id} has {count} partitions, max should be 2"
+            );
+        }
+
+        // Total partitions should still be 5
+        let total: usize = ["m1", "m2", "m3"]
+            .iter()
+            .map(|m| assignments.get(*m).unwrap().all_partitions().len())
+            .sum();
+        assert_eq!(total, 5, "Total partitions should be 5");
+    }
+
+    /// §10.2 test: CooperativeSticky with exactly even partition count.
+    #[test]
+    fn test_cooperative_sticky_even_partitions() {
+        let assignor = CooperativeStickyAssignor::new();
+
+        let topics = vec!["topic1".to_string()];
+        let mut partitions = HashMap::new();
+        partitions.insert("topic1".to_string(), vec![0, 1, 2, 3, 4, 5]);
+
+        let members = vec![
+            GroupMember {
+                member_id: "m1".to_string(),
+                client_id: "c1".to_string(),
+                client_host: "h1".to_string(),
+                metadata: vec![],
+                assignment: vec![],
+            },
+            GroupMember {
+                member_id: "m2".to_string(),
+                client_id: "c2".to_string(),
+                client_host: "h2".to_string(),
+                metadata: vec![],
+                assignment: vec![],
+            },
+            GroupMember {
+                member_id: "m3".to_string(),
+                client_id: "c3".to_string(),
+                client_host: "h3".to_string(),
+                metadata: vec![],
+                assignment: vec![],
+            },
+        ];
+
+        let assignments = assignor.assign(&topics, &partitions, &members);
+
+        // Each member should have exactly 2 partitions (6/3 = 2)
+        for member_id in ["m1", "m2", "m3"] {
+            let count = assignments.get(member_id).unwrap().all_partitions().len();
+            assert_eq!(count, 2, "Member {member_id} should have exactly 2 partitions");
+        }
     }
 }

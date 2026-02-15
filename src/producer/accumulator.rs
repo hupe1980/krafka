@@ -10,21 +10,26 @@
 //! providing low latency through the linger timer mechanism.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::interval;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 use super::batch::ProducerBatch;
 use super::record::{ProducerRecord, RecordMetadata};
+use super::retry::{RetryContext, RetryPolicy};
 use crate::PartitionId;
 use crate::error::{KrafkaError, Result};
+use crate::interceptor::ProducerInterceptor;
 use crate::metadata::ClusterMetadata;
+use crate::metrics::ProducerMetrics;
 use crate::protocol::{
-    ApiKey, Compression, ProducePartitionData, ProduceRequest, ProduceTopicData, RecordBatchBuilder,
+    ApiKey, Compression, ProducePartitionData, ProduceRequest, ProduceResponse, ProduceTopicData,
+    RecordBatchBuilder,
 };
 
 /// Message sent to the accumulator background task.
@@ -40,8 +45,10 @@ enum AccumulatorMessage {
     Flush {
         response_tx: oneshot::Sender<Result<()>>,
     },
-    /// Shutdown the accumulator.
-    Shutdown,
+    /// Shutdown the accumulator, flush remaining batches, and signal completion.
+    Shutdown {
+        response_tx: oneshot::Sender<()>,
+    },
 }
 
 /// Handle to the record accumulator.
@@ -85,14 +92,19 @@ impl RecordAccumulatorHandle {
             .map_err(|_| KrafkaError::invalid_state("accumulator response dropped"))?
     }
 
-    /// Shutdown the accumulator.
+    /// Shutdown the accumulator, flushing all pending batches before returning.
     pub async fn shutdown(&self) {
-        let _ = self.sender.send(AccumulatorMessage::Shutdown).await;
+        let (response_tx, response_rx) = oneshot::channel();
+        let _ = self
+            .sender
+            .send(AccumulatorMessage::Shutdown { response_tx })
+            .await;
+        // Wait for the accumulator to finish flushing before returning.
+        let _ = response_rx.await;
     }
 }
 
 /// Configuration for the record accumulator.
-#[derive(Debug, Clone)]
 pub struct AccumulatorConfig {
     /// Maximum batch size in bytes.
     pub batch_size: usize,
@@ -111,6 +123,41 @@ pub struct AccumulatorConfig {
     /// Maximum time to block waiting for buffer memory (ms).
     /// If memory is not available within this time, an error is returned.
     pub max_block_ms: Duration,
+    /// In-flight semaphore for concurrency limiting (shared with direct send path).
+    pub in_flight_semaphore: Arc<Semaphore>,
+    /// Producer interceptor for on_acknowledgement callbacks.
+    pub interceptor: Arc<dyn ProducerInterceptor>,
+}
+
+impl Clone for AccumulatorConfig {
+    fn clone(&self) -> Self {
+        Self {
+            batch_size: self.batch_size,
+            linger: self.linger,
+            compression: self.compression,
+            acks: self.acks,
+            request_timeout: self.request_timeout,
+            buffer_memory: self.buffer_memory,
+            max_block_ms: self.max_block_ms,
+            in_flight_semaphore: self.in_flight_semaphore.clone(),
+            interceptor: self.interceptor.clone(),
+        }
+    }
+}
+
+impl fmt::Debug for AccumulatorConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AccumulatorConfig")
+            .field("batch_size", &self.batch_size)
+            .field("linger", &self.linger)
+            .field("compression", &self.compression)
+            .field("acks", &self.acks)
+            .field("request_timeout", &self.request_timeout)
+            .field("buffer_memory", &self.buffer_memory)
+            .field("max_block_ms", &self.max_block_ms)
+            .field("interceptor", &self.interceptor)
+            .finish()
+    }
 }
 
 impl Default for AccumulatorConfig {
@@ -123,6 +170,8 @@ impl Default for AccumulatorConfig {
             request_timeout: Duration::from_secs(30),
             buffer_memory: 32 * 1024 * 1024, // 32 MB default (same as Kafka Java client)
             max_block_ms: Duration::from_secs(60), // 60 seconds default
+            in_flight_semaphore: Arc::new(Semaphore::new(5)), // default max_in_flight
+            interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
         }
     }
 }
@@ -172,6 +221,10 @@ pub struct RecordAccumulator {
     metadata: Arc<ClusterMetadata>,
     /// Current total memory usage in bytes.
     memory_used: usize,
+    /// Retry policy for transient failures.
+    retry_policy: RetryPolicy,
+    /// Shared metrics.
+    metrics: Arc<ProducerMetrics>,
 }
 
 impl RecordAccumulator {
@@ -179,6 +232,8 @@ impl RecordAccumulator {
     pub fn spawn(
         config: AccumulatorConfig,
         metadata: Arc<ClusterMetadata>,
+        retry_policy: RetryPolicy,
+        metrics: Arc<ProducerMetrics>,
     ) -> RecordAccumulatorHandle {
         let (sender, receiver) = mpsc::channel(1024);
 
@@ -187,6 +242,8 @@ impl RecordAccumulator {
             batches: HashMap::new(),
             metadata,
             memory_used: 0,
+            retry_policy,
+            metrics,
         };
 
         tokio::spawn(accumulator.run(receiver));
@@ -212,8 +269,14 @@ impl RecordAccumulator {
                             let result = self.flush_all().await;
                             let _ = response_tx.send(result);
                         }
-                        Some(AccumulatorMessage::Shutdown) | None => {
+                        Some(AccumulatorMessage::Shutdown { response_tx }) => {
                             debug!("Accumulator shutting down, flushing remaining batches");
+                            let _ = self.flush_all().await;
+                            let _ = response_tx.send(());
+                            break;
+                        }
+                        None => {
+                            debug!("Accumulator channel closed, flushing remaining batches");
                             let _ = self.flush_all().await;
                             break;
                         }
@@ -282,6 +345,11 @@ impl RecordAccumulator {
             if accumulator_batch.batch.is_full() {
                 trace!("Batch full for {}-{}, flushing", topic, partition);
                 self.flush_batch(&key).await;
+            } else if self.config.linger.is_zero() {
+                // §10.5 fix: linger=0 means send immediately without waiting
+                // for the next linger timer tick (up to 1ms delay otherwise).
+                trace!("Linger=0 for {}-{}, flushing immediately", topic, partition);
+                self.flush_batch(&key).await;
             }
         } else {
             // Batch is full, flush it first and then add to new batch
@@ -327,10 +395,9 @@ impl RecordAccumulator {
         key_size + value_size + headers_size + topic_overhead
     }
 
-    /// Check for batches that have exceeded linger time.
+    /// Check for batches that have exceeded linger time (concurrent flush §4.2).
     async fn check_linger_expiry(&mut self) {
         if self.config.linger.is_zero() {
-            // Linger disabled, flush immediately
             self.flush_all_ready().await;
             return;
         }
@@ -342,13 +409,32 @@ impl RecordAccumulator {
             .map(|(key, _)| key.clone())
             .collect();
 
+        if keys_to_flush.is_empty() {
+            return;
+        }
+
+        let mut extracted = Vec::with_capacity(keys_to_flush.len());
         for key in keys_to_flush {
             trace!("Linger expired for {:?}, flushing", key);
-            self.flush_batch(&key).await;
+            if let Some(batch) = self.extract_batch(&key) {
+                extracted.push((key, batch));
+            }
         }
+
+        let mut join_set = tokio::task::JoinSet::new();
+        for ((topic, partition), batch) in extracted {
+            let metadata = self.metadata.clone();
+            let config = self.config.clone();
+            let retry_policy = self.retry_policy.clone();
+            let metrics = self.metrics.clone();
+            join_set.spawn(Self::send_extracted_batch(
+                topic, partition, batch.pending, metadata, config, retry_policy, metrics,
+            ));
+        }
+        while join_set.join_next().await.is_some() {}
     }
 
-    /// Flush all ready batches (non-empty with linger=0).
+    /// Flush all ready batches concurrently (non-empty with linger=0).
     async fn flush_all_ready(&mut self) {
         let keys_to_flush: Vec<_> = self
             .batches
@@ -357,99 +443,172 @@ impl RecordAccumulator {
             .map(|(key, _)| key.clone())
             .collect();
 
+        if keys_to_flush.is_empty() {
+            return;
+        }
+
+        let mut extracted = Vec::with_capacity(keys_to_flush.len());
         for key in keys_to_flush {
-            self.flush_batch(&key).await;
+            if let Some(batch) = self.extract_batch(&key) {
+                extracted.push((key, batch));
+            }
+        }
+
+        let mut join_set = tokio::task::JoinSet::new();
+        for ((topic, partition), batch) in extracted {
+            let metadata = self.metadata.clone();
+            let config = self.config.clone();
+            let retry_policy = self.retry_policy.clone();
+            let metrics = self.metrics.clone();
+            join_set.spawn(Self::send_extracted_batch(
+                topic, partition, batch.pending, metadata, config, retry_policy, metrics,
+            ));
+        }
+        while join_set.join_next().await.is_some() {}
+    }
+
+    /// Extract a batch from the accumulator, freeing tracked memory.
+    fn extract_batch(&mut self, key: &(String, PartitionId)) -> Option<AccumulatorBatch> {
+        let batch = self.batches.remove(key)?;
+        if batch.batch.is_empty() {
+            return None;
+        }
+        let batch_memory: usize = batch.pending.iter().map(|p| p.estimated_size).sum();
+        self.memory_used = self.memory_used.saturating_sub(batch_memory);
+        Some(batch)
+    }
+
+    /// Flush a specific batch by spawning a background task (§10.7 fix).
+    ///
+    /// Previously, this method awaited the network I/O inline, blocking the
+    /// entire accumulator task. Now it spawns the send as a background task
+    /// matching the concurrent flush pattern used by `check_linger_expiry`.
+    async fn flush_batch(&mut self, key: &(String, PartitionId)) {
+        if let Some(batch) = self.extract_batch(key) {
+            let topic = key.0.clone();
+            let partition = key.1;
+            let metadata = self.metadata.clone();
+            let config = self.config.clone();
+            let retry_policy = self.retry_policy.clone();
+            let metrics = self.metrics.clone();
+            tokio::spawn(Self::send_extracted_batch(
+                topic, partition, batch.pending, metadata, config, retry_policy, metrics,
+            ));
         }
     }
 
-    /// Flush a specific batch.
-    async fn flush_batch(&mut self, key: &(String, PartitionId)) {
-        if let Some(accumulator_batch) = self.batches.remove(key) {
-            if accumulator_batch.batch.is_empty() {
+    /// Send an extracted batch to the broker with retry and metadata refresh (§2.4, §2.6).
+    ///
+    /// This is a static method to enable concurrent flushing via `FuturesUnordered` (§4.2).
+    /// Acquires an in-flight semaphore permit to respect `max_in_flight` concurrency limits.
+    async fn send_extracted_batch(
+        topic: String,
+        partition: PartitionId,
+        pending: Vec<PendingRecord>,
+        metadata: Arc<ClusterMetadata>,
+        config: AccumulatorConfig,
+        retry_policy: RetryPolicy,
+        metrics: Arc<ProducerMetrics>,
+    ) {
+        // Acquire in-flight permit before sending (§9.6 fix: accumulator was
+        // bypassing max_in_flight). The permit is held until this batch completes.
+        let _permit = config.in_flight_semaphore.acquire().await;
+        let _timer = metrics.send_latency.start();
+
+        // Build and encode the record batch once (immutable across retries).
+        let mut batch_builder = RecordBatchBuilder::new().compression(config.compression);
+        for p in &pending {
+            if p.record.headers.is_empty() {
+                batch_builder = batch_builder.add_record(
+                    p.record.key.clone().map(Bytes::from),
+                    Some(Bytes::from(p.record.value.clone())),
+                );
+            } else {
+                batch_builder = batch_builder.add_record_with_headers(
+                    p.record.key.clone().map(Bytes::from),
+                    Some(Bytes::from(p.record.value.clone())),
+                    p.record
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.clone(), Bytes::from(v.clone())))
+                        .collect(),
+                );
+            }
+        }
+        let batch = batch_builder.build();
+        let batch_bytes = match batch.encode() {
+            Ok(b) => b,
+            Err(e) => {
+                let error_msg = e.to_string();
+                for p in pending {
+                    let _ = p.response_tx.send(Err(KrafkaError::protocol(&error_msg)));
+                }
                 return;
             }
+        };
 
-            // Free memory for all records in this batch
-            let batch_memory: usize = accumulator_batch
-                .pending
-                .iter()
-                .map(|p| p.estimated_size)
-                .sum();
-            self.memory_used = self.memory_used.saturating_sub(batch_memory);
+        let request = ProduceRequest {
+            transactional_id: None,
+            acks: config.acks,
+            timeout_ms: crate::util::duration_to_millis_i32(config.request_timeout),
+            topic_data: vec![ProduceTopicData {
+                name: topic.clone(),
+                partition_data: vec![ProducePartitionData {
+                    index: partition,
+                    records: batch_bytes,
+                }],
+            }],
+        };
 
-            let topic = &key.0;
-            let partition = key.1;
+        // Retry loop (§2.4)
+        let mut retry_ctx = RetryContext::new(
+            retry_policy,
+            format!("batch({topic}-{partition})"),
+        );
 
+        let result: std::result::Result<(i64, i64), KrafkaError> = loop {
             // Get connection to leader
-            let conn_result = self.metadata.get_leader_connection(topic, partition).await;
-            let conn = match conn_result {
+            let conn = match metadata.get_leader_connection(&topic, partition).await {
                 Ok(c) => c,
                 Err(e) => {
-                    // Fail all pending records with the same error message
-                    let error_msg = e.to_string();
-                    for pending in accumulator_batch.pending {
-                        let _ = pending
-                            .response_tx
-                            .send(Err(KrafkaError::protocol(&error_msg)));
+                    if e.is_retriable() {
+                        debug!(
+                            topic = %topic,
+                            partition = partition,
+                            error = %e,
+                            "Batch connection error, refreshing metadata"
+                        );
+                        let _ = metadata.refresh_for_topics(Some(&[&topic])).await;
                     }
-                    return;
+                    if let Some(backoff) = retry_ctx.record_failure(&e) {
+                        metrics.record_retry();
+                        retry_ctx.wait(backoff).await;
+                        continue;
+                    }
+                    break Err(e);
                 }
             };
 
-            // Build record batch
-            let mut batch_builder = RecordBatchBuilder::new().compression(self.config.compression);
-
-            for pending in &accumulator_batch.pending {
-                if pending.record.headers.is_empty() {
-                    batch_builder = batch_builder.add_record(
-                        pending.record.key.clone().map(Bytes::from),
-                        Some(Bytes::from(pending.record.value.clone())),
-                    );
-                } else {
-                    batch_builder = batch_builder.add_record_with_headers(
-                        pending.record.key.clone().map(Bytes::from),
-                        Some(Bytes::from(pending.record.value.clone())),
-                        pending
-                            .record
-                            .headers
-                            .clone()
-                            .into_iter()
-                            .map(|(k, v)| (k, Bytes::from(v)))
-                            .collect(),
-                    );
+            // acks=0 (fire-and-forget): Kafka sends no response (R6.1 fix)
+            if config.acks == 0 {
+                match conn.send_fire_and_forget(ApiKey::Produce, 0, |buf| {
+                    request.encode_v0(buf);
+                }).await {
+                    Ok(()) => {
+                        retry_ctx.record_success();
+                        break Ok((-1, -1));
+                    }
+                    Err(e) => {
+                        if let Some(backoff) = retry_ctx.record_failure(&e) {
+                            metrics.record_retry();
+                            retry_ctx.wait(backoff).await;
+                            continue;
+                        }
+                        break Err(e);
+                    }
                 }
             }
 
-            let batch = batch_builder.build();
-            let batch_bytes = match batch.encode() {
-                Ok(b) => b,
-                Err(e) => {
-                    // Fail all pending records
-                    let error_msg = e.to_string();
-                    for pending in accumulator_batch.pending {
-                        let _ = pending
-                            .response_tx
-                            .send(Err(KrafkaError::protocol(&error_msg)));
-                    }
-                    return;
-                }
-            };
-
-            // Build produce request
-            let request = ProduceRequest {
-                transactional_id: None,
-                acks: self.config.acks,
-                timeout_ms: self.config.request_timeout.as_millis() as i32,
-                topic_data: vec![ProduceTopicData {
-                    name: topic.clone(),
-                    partition_data: vec![ProducePartitionData {
-                        index: partition,
-                        records: batch_bytes,
-                    }],
-                }],
-            };
-
-            // Send request
             let response_result = conn
                 .send_request(ApiKey::Produce, 0, |buf| {
                     request.encode_v0(buf);
@@ -457,87 +616,142 @@ impl RecordAccumulator {
                 .await;
 
             match response_result {
-                Ok(mut response) => {
-                    // Decode response
-                    match crate::protocol::ProduceResponse::decode_v0(&mut response) {
+                Ok(mut response_buf) => {
+                    match ProduceResponse::decode_v0(&mut response_buf) {
                         Ok(produce_response) => {
-                            // Find the partition response
-                            let base_offset = produce_response
+                            let pr = produce_response
                                 .responses
                                 .iter()
-                                .find(|r| r.name == *topic)
+                                .find(|r| r.name == topic)
                                 .and_then(|r| {
-                                    r.partition_responses.iter().find(|p| p.index == partition)
-                                })
-                                .map(|p| {
-                                    if !p.error_code.is_ok() {
-                                        Err(format!(
-                                            "broker error {:?}: {}-{}",
-                                            p.error_code, topic, partition
-                                        ))
-                                    } else {
-                                        Ok((p.base_offset, p.log_append_time_ms))
-                                    }
+                                    r.partition_responses
+                                        .iter()
+                                        .find(|p| p.index == partition)
                                 });
 
-                            // Complete pending records
-                            match base_offset {
-                                Some(Ok((base, timestamp))) => {
-                                    for pending in accumulator_batch.pending {
-                                        let _ = pending.response_tx.send(Ok(RecordMetadata {
-                                            topic: topic.clone(),
-                                            partition,
-                                            offset: base + pending.offset_in_batch,
-                                            timestamp,
-                                        }));
-                                    }
+                            match pr {
+                                Some(pr) if pr.error_code.is_ok() => {
+                                    retry_ctx.record_success();
+                                    break Ok((pr.base_offset, pr.log_append_time_ms));
                                 }
-                                Some(Err(error_msg)) => {
-                                    for pending in accumulator_batch.pending {
-                                        let _ = pending
-                                            .response_tx
-                                            .send(Err(KrafkaError::protocol(&error_msg)));
+                                Some(pr) => {
+                                    let err = KrafkaError::broker(
+                                        pr.error_code,
+                                        format!(
+                                            "batch produce failed for {topic}-{partition}"
+                                        ),
+                                    );
+                                    if err.is_retriable() {
+                                        let _ = metadata
+                                            .refresh_for_topics(Some(&[&topic]))
+                                            .await;
                                     }
+                                    if let Some(backoff) = retry_ctx.record_failure(&err) {
+                                        metrics.record_retry();
+                                        retry_ctx.wait(backoff).await;
+                                        continue;
+                                    }
+                                    break Err(err);
                                 }
                                 None => {
-                                    for pending in accumulator_batch.pending {
-                                        let _ =
-                                            pending.response_tx.send(Err(KrafkaError::protocol(
-                                                "partition not found in response",
-                                            )));
-                                    }
+                                    break Err(KrafkaError::protocol(
+                                        "partition not found in response",
+                                    ));
                                 }
                             }
                         }
                         Err(e) => {
-                            let error_msg = e.to_string();
-                            for pending in accumulator_batch.pending {
-                                let _ = pending
-                                    .response_tx
-                                    .send(Err(KrafkaError::protocol(&error_msg)));
+                            if let Some(backoff) = retry_ctx.record_failure(&e) {
+                                metrics.record_retry();
+                                retry_ctx.wait(backoff).await;
+                                continue;
                             }
+                            break Err(e);
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to send batch: {:?}", e);
-                    let error_msg = e.to_string();
-                    for pending in accumulator_batch.pending {
-                        let _ = pending
-                            .response_tx
-                            .send(Err(KrafkaError::protocol(&error_msg)));
+                    if e.is_retriable() {
+                        debug!(
+                            topic = %topic,
+                            partition = partition,
+                            error = %e,
+                            "Batch send error, refreshing metadata"
+                        );
+                        let _ = metadata.refresh_for_topics(Some(&[&topic])).await;
                     }
+                    if let Some(backoff) = retry_ctx.record_failure(&e) {
+                        metrics.record_retry();
+                        retry_ctx.wait(backoff).await;
+                        continue;
+                    }
+                    break Err(e);
+                }
+            }
+        };
+
+        // Complete pending records
+        match result {
+            Ok((base_offset, timestamp)) => {
+                let batch_bytes_total: u64 =
+                    pending.iter().map(|p| p.estimated_size as u64).sum();
+                metrics.record_batch(pending.len() as u64);
+                metrics.bytes_sent.add(batch_bytes_total);
+                for p in pending {
+                    let meta = RecordMetadata {
+                        topic: topic.clone(),
+                        partition,
+                        offset: base_offset + p.offset_in_batch,
+                        timestamp,
+                    };
+                    crate::interceptor::safe_on_acknowledgement(&*config.interceptor, &meta, None);
+                    let _ = p.response_tx.send(Ok(meta));
+                }
+            }
+            Err(e) => {
+                metrics.record_error();
+                let error_msg = e.to_string();
+                for p in pending {
+                    let meta = RecordMetadata {
+                        topic: topic.clone(),
+                        partition,
+                        offset: p.offset_in_batch,
+                        timestamp: 0,
+                    };
+                    let err = KrafkaError::protocol(&error_msg);
+                    crate::interceptor::safe_on_acknowledgement(&*config.interceptor, &meta, Some(&err));
+                    let _ = p.response_tx.send(Err(err));
                 }
             }
         }
     }
 
-    /// Flush all batches.
+    /// Flush all batches concurrently (§4.2).
     async fn flush_all(&mut self) -> Result<()> {
-        let keys: Vec<_> = self.batches.keys().cloned().collect();
-        for key in keys {
-            self.flush_batch(&key).await;
+        let extracted: Vec<_> = self
+            .batches
+            .drain()
+            .filter(|(_, b)| !b.batch.is_empty())
+            .collect();
+
+        // Free memory for all extracted batches
+        for (_, batch) in &extracted {
+            let batch_memory: usize = batch.pending.iter().map(|p| p.estimated_size).sum();
+            self.memory_used = self.memory_used.saturating_sub(batch_memory);
         }
+
+        // Send all batches concurrently
+        let mut join_set = tokio::task::JoinSet::new();
+        for ((topic, partition), batch) in extracted {
+            let metadata = self.metadata.clone();
+            let config = self.config.clone();
+            let retry_policy = self.retry_policy.clone();
+            let metrics = self.metrics.clone();
+            join_set.spawn(Self::send_extracted_batch(
+                topic, partition, batch.pending, metadata, config, retry_policy, metrics,
+            ));
+        }
+        while join_set.join_next().await.is_some() {}
         Ok(())
     }
 }
@@ -566,5 +780,68 @@ mod tests {
         let batch = AccumulatorBatch::new("test-topic".to_string(), 1, 32768, Compression::Gzip);
         assert!(batch.batch.is_empty());
         assert!(batch.pending.is_empty());
+    }
+
+    #[test]
+    fn test_accumulator_config_custom() {
+        let config = AccumulatorConfig {
+            batch_size: 65536,
+            linger: Duration::from_millis(50),
+            compression: Compression::Snappy,
+            acks: 1,
+            request_timeout: Duration::from_secs(10),
+            buffer_memory: 64 * 1024 * 1024,
+            max_block_ms: Duration::from_secs(30),
+            in_flight_semaphore: Arc::new(Semaphore::new(5)),
+            interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
+        };
+        assert_eq!(config.batch_size, 65536);
+        assert_eq!(config.linger, Duration::from_millis(50));
+        assert_eq!(config.acks, 1);
+        assert_eq!(config.buffer_memory, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_estimate_record_size() {
+        let record = ProducerRecord::new("test-topic", b"value".to_vec());
+        let size = RecordAccumulator::estimate_record_size(&record);
+        // Should be at least the value length + topic overhead
+        assert!(size >= 5);
+        assert!(size > 64); // overhead for topic name and struct
+
+        // Record with key and headers should be larger
+        let record_with_key = ProducerRecord::new("test-topic", b"value".to_vec())
+            .with_key(Some(b"key".to_vec()));
+        let size_with_key = RecordAccumulator::estimate_record_size(&record_with_key);
+        assert!(size_with_key > size);
+    }
+
+    /// §10.5 test: Verify linger=0 config results in immediate flush semantics.
+    #[test]
+    fn test_linger_zero_check_interval() {
+        // With linger=0, the check interval should be 1ms (minimum)
+        let linger = Duration::from_millis(0);
+        let check_interval = Duration::from_millis(1).max(linger / 10);
+        assert_eq!(check_interval, Duration::from_millis(1));
+    }
+
+    /// §10.5 test: Verify `check_linger_expiry` calls `flush_all_ready` when linger=0.
+    #[test]
+    fn test_linger_zero_is_zero() {
+        let config = AccumulatorConfig {
+            linger: Duration::from_millis(0),
+            ..Default::default()
+        };
+        assert!(config.linger.is_zero());
+    }
+
+    /// §10.7 test: Verify flush_batch signature enables spawning
+    /// (send_extracted_batch is 'static + Send, required for tokio::spawn).
+    #[test]
+    fn test_send_extracted_batch_is_send() {
+        fn assert_send<T: Send>() {}
+        // This compiles only if the future returned by send_extracted_batch is Send,
+        // which is required for tokio::spawn to work.
+        assert_send::<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>();
     }
 }

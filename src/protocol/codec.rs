@@ -71,7 +71,8 @@ impl Encoder {
     /// Finish encoding a size-prefixed message.
     /// Updates the size at the given position.
     pub fn finish_message(&mut self, size_pos: usize) {
-        let message_size = (self.buffer.len() - size_pos - 4) as i32;
+        let message_size = i32::try_from(self.buffer.len() - size_pos - 4)
+            .expect("message size exceeds i32::MAX");
         let size_bytes = message_size.to_be_bytes();
         self.buffer[size_pos..size_pos + 4].copy_from_slice(&size_bytes);
     }
@@ -124,12 +125,20 @@ impl Decoder {
         }
 
         // Read the message size (without consuming)
-        let size = i32::from_be_bytes([
+        let size_i32 = i32::from_be_bytes([
             self.buffer[0],
             self.buffer[1],
             self.buffer[2],
             self.buffer[3],
-        ]) as usize;
+        ]);
+
+        if size_i32 < 0 {
+            return Err(KrafkaError::protocol(format!(
+                "negative message size: {size_i32}"
+            )));
+        }
+
+        let size = size_i32 as usize;
 
         // Validate the size
         if size > self.max_size {
@@ -290,5 +299,24 @@ mod tests {
         decoder.extend(&msg[8..]);
         let result = decoder.decode().unwrap();
         assert_eq!(result.unwrap().as_ref(), b"0123456789");
+    }
+
+    #[test]
+    fn test_decoder_negative_size() {
+        // F-53: A negative message size should produce a clear error, not wrap to usize::MAX
+        let mut decoder = Decoder::new();
+        let mut msg = BytesMut::new();
+        msg.put_i32(-1); // negative size
+        msg.put_slice(b"junk");
+
+        decoder.extend(&msg);
+
+        let result = decoder.decode();
+        assert!(result.is_err(), "negative message size should be rejected");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("negative message size"),
+            "error should mention negative size: {err_msg}"
+        );
     }
 }

@@ -132,13 +132,15 @@ impl ProducerIdentity {
     /// Get the next sequence number for a topic-partition.
     ///
     /// This allocates a new sequence number for the next batch.
+    /// Sequence numbers wrap to 0 at `i32::MAX`, matching the Kafka Java client
+    /// behavior (`DefaultRecordBatch.incrementSequence()`).
     pub fn next_sequence(&self, topic: &str, partition: PartitionId) -> i32 {
         let key = (topic.to_string(), partition);
 
         if let Ok(mut sequences) = self.sequences.write() {
             let state = sequences.entry(key).or_default();
             let seq = state.next_sequence;
-            state.next_sequence = state.next_sequence.wrapping_add(1);
+            state.next_sequence = if seq == i32::MAX { 0 } else { seq + 1 };
             seq
         } else {
             0
@@ -393,8 +395,8 @@ mod tests {
             );
         }
 
-        // Should wrap around
+        // Should wrap to 0 (matching Kafka Java client behavior)
         assert_eq!(identity.next_sequence("topic", 0), i32::MAX);
-        assert_eq!(identity.peek_sequence("topic", 0), i32::MIN);
+        assert_eq!(identity.peek_sequence("topic", 0), 0);
     }
 }

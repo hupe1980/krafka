@@ -14,8 +14,12 @@ This guide covers administrative operations using the Krafka AdminClient.
 The AdminClient provides cluster administration capabilities:
 
 - Topic management (create, delete, describe, list)
+- Consumer group management (describe, list)
+- Record deletion (delete records before an offset)
+- Leader epoch queries (detect log truncation)
 - Cluster information
 - Partition management
+- ACL management
 
 ## Basic Usage
 
@@ -503,7 +507,119 @@ for (i, fr) in result.filter_results.iter().enumerate() {
 }
 ```
 
+## Consumer Group Management
+
+### Describing Consumer Groups
+
+Get detailed information about one or more consumer groups, including their state, members, and assignment protocol. The request is automatically routed to each group's coordinator broker via FindCoordinator:
+
+```rust
+let descriptions = admin
+    .describe_groups(vec!["my-group".to_string(), "other-group".to_string()])
+    .await?;
+
+for group in &descriptions {
+    println!("Group: {} (state: {})", group.group_id, group.state);
+    println!("  Protocol: {} / {}", group.protocol_type, group.protocol);
+    for member in &group.members {
+        println!(
+            "    Member: {} (client: {}, host: {}, instance: {:?})",
+            member.member_id, member.client_id, member.client_host,
+            member.group_instance_id
+        );
+    }
+    if let Some(error) = &group.error {
+        println!("  Error: {}", error);
+    }
+}
+```
+
+### Listing Consumer Groups
+
+List all consumer groups across the cluster:
+
+```rust
+let groups = admin.list_consumer_groups().await?;
+
+println!("Consumer groups:");
+for group in &groups {
+    println!("  {} (protocol: {})", group.group_id, group.protocol_type);
+}
+```
+
+> **Note:** `list_consumer_groups()` queries all brokers in the cluster and deduplicates results, since consumer groups are managed by their respective group coordinators.
+
+## Record Deletion
+
+### Deleting Records
+
+Delete records from topic partitions before a specified offset. Records with offsets less than the specified offset are marked for deletion (this adjusts the log start offset). Requests are automatically routed to each partition's leader broker:
+
+```rust
+use std::collections::HashMap;
+use std::time::Duration;
+
+let mut offsets = HashMap::new();
+offsets.insert(("my-topic".to_string(), 0), 100i64);  // Delete before offset 100
+offsets.insert(("my-topic".to_string(), 1), 250i64);  // Delete before offset 250
+
+let results = admin
+    .delete_records(offsets, Duration::from_secs(30))
+    .await?;
+
+for result in &results {
+    match &result.error {
+        None => println!(
+            "Deleted records from {}:{}, new low watermark: {}",
+            result.topic, result.partition, result.low_watermark
+        ),
+        Some(e) => println!(
+            "Failed to delete from {}:{}: {}",
+            result.topic, result.partition, e
+        ),
+    }
+}
+```
+
+> **Note:** Deleted records are not immediately removed from disk. The broker adjusts the log start offset, and records before that offset become inaccessible. Physical deletion happens during log segment cleanup.
+
+## Leader Epoch Queries
+
+### OffsetForLeaderEpoch
+
+Query the end offset for a given leader epoch. This is used to detect log truncation after leader changes. Requests are routed to each partition's leader broker:
+
+```rust
+// Query the end offset for leader epoch 5 on partition 0 of "my-topic"
+let results = admin
+    .offset_for_leader_epoch(vec![
+        ("my-topic".to_string(), 0, 5),
+        ("my-topic".to_string(), 1, 3),
+    ])
+    .await?;
+
+for result in &results {
+    match &result.error {
+        None => println!(
+            "{}:{} epoch={} end_offset={}",
+            result.topic, result.partition,
+            result.leader_epoch, result.end_offset
+        ),
+        Some(e) => println!(
+            "{}:{} error: {}",
+            result.topic, result.partition, e
+        ),
+    }
+}
+```
+
+This API is useful for:
+- **Log truncation detection**: After a leader change, check if the log was truncated
+- **Consumer offset validation**: Ensure a consumer's saved offset is still valid
+- **Replication diagnostics**: Verify epoch boundaries across replicas
+
 ## Next Steps
 
+- [Interceptors Guide](interceptors.md) - Producer and consumer interceptor hooks
 - [Configuration Reference](configuration.md) - All admin client options
 - [Architecture Overview](architecture.md) - How admin client works internally

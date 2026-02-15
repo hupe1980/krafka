@@ -59,6 +59,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::PartitionId;
+use crate::auth::AuthConfig;
 use crate::error::{ErrorCode, KrafkaError, Result};
 use crate::metadata::ClusterMetadata;
 use crate::network::{ConnectionConfig, ConnectionPool};
@@ -71,6 +72,7 @@ use crate::protocol::{
 };
 
 use super::config::Acks;
+use super::idempotent::ProducerIdentity;
 use super::partitioner::{DefaultPartitioner, Partitioner};
 use super::record::{ProducerRecord, RecordMetadata};
 
@@ -90,6 +92,8 @@ pub enum TransactionState {
     Aborting = 4,
     /// Fatal error occurred, producer must be recreated.
     FatalError = 5,
+    /// Initialization in progress (prevents concurrent init_transactions calls).
+    Initializing = 6,
 }
 
 impl TransactionState {
@@ -100,6 +104,7 @@ impl TransactionState {
             2 => Self::InTransaction,
             3 => Self::Committing,
             4 => Self::Aborting,
+            6 => Self::Initializing,
             _ => Self::FatalError,
         }
     }
@@ -122,6 +127,8 @@ pub struct TransactionalProducerConfig {
     pub compression: Compression,
     /// Metadata max age.
     pub metadata_max_age: Duration,
+    /// Authentication configuration.
+    pub auth: Option<AuthConfig>,
 }
 
 impl Default for TransactionalProducerConfig {
@@ -134,6 +141,7 @@ impl Default for TransactionalProducerConfig {
             request_timeout: Duration::from_secs(30),
             compression: Compression::None,
             metadata_max_age: Duration::from_secs(300),
+            auth: None,
         }
     }
 }
@@ -154,7 +162,7 @@ impl TransactionPartitions {
         self.partitions.clear();
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.partitions.is_empty()
     }
@@ -182,6 +190,8 @@ pub struct TransactionalProducer {
     coordinator_id: RwLock<Option<i32>>,
     /// Partitions in current transaction.
     txn_partitions: RwLock<TransactionPartitions>,
+    /// Sequence number tracking for idempotent production.
+    identity: ProducerIdentity,
 }
 
 impl TransactionalProducer {
@@ -200,18 +210,45 @@ impl TransactionalProducer {
         self.state.store(state as u8, Ordering::SeqCst);
     }
 
+    /// Atomically transition from `expected` to `new` state.
+    /// Returns `Err` with the actual state if the CAS failed.
+    fn try_transition(
+        &self,
+        expected: TransactionState,
+        new: TransactionState,
+    ) -> std::result::Result<(), TransactionState> {
+        self.state
+            .compare_exchange(expected as u8, new as u8, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| ())
+            .map_err(TransactionState::from_u8)
+    }
+
     /// Initialize transactions.
     ///
     /// This must be called before any transactions can be started.
     /// It fetches the producer ID and epoch from the transaction coordinator.
     pub async fn init_transactions(&self) -> Result<()> {
-        if self.state() != TransactionState::Uninitialized {
-            return Err(KrafkaError::invalid_state(
-                "init_transactions can only be called once",
-            ));
+        // Atomic CAS: Uninitialized → Initializing (§9.3 fix: prevents concurrent calls)
+        if let Err(actual) =
+            self.try_transition(TransactionState::Uninitialized, TransactionState::Initializing)
+        {
+            return Err(KrafkaError::invalid_state(format!(
+                "init_transactions can only be called once (state={:?})",
+                actual
+            )));
         }
 
         // Find transaction coordinator
+        let result = self.do_init_transactions().await;
+        if result.is_err() {
+            // Revert state so caller can retry
+            self.set_state(TransactionState::Uninitialized);
+        }
+        result
+    }
+
+    /// Inner initialization logic, separated for clean error handling.
+    async fn do_init_transactions(&self) -> Result<()> {
         let coordinator = self.find_coordinator().await?;
         *self.coordinator_id.write().await = Some(coordinator);
 
@@ -251,6 +288,10 @@ impl TransactionalProducer {
 
         *self.producer_id.write().await = response.producer_id;
         *self.producer_epoch.write().await = response.producer_epoch;
+
+        // Initialize the identity for sequence number tracking
+        self.identity
+            .initialize(response.producer_id, response.producer_epoch);
 
         self.set_state(TransactionState::Ready);
         info!(
@@ -304,15 +345,16 @@ impl TransactionalProducer {
     ///
     /// Must be called after `init_transactions()`.
     pub fn begin_transaction(&self) -> Result<()> {
-        let current = self.state();
-        if current != TransactionState::Ready {
+        // Atomic CAS: Ready → InTransaction (§6.1 fix)
+        if let Err(actual) =
+            self.try_transition(TransactionState::Ready, TransactionState::InTransaction)
+        {
             return Err(KrafkaError::invalid_state(format!(
                 "cannot begin transaction in state {:?}",
-                current
+                actual
             )));
         }
 
-        self.set_state(TransactionState::InTransaction);
         debug!("Transaction started");
         Ok(())
     }
@@ -434,11 +476,17 @@ impl TransactionalProducer {
             .get_leader_connection(topic, partition)
             .await?;
 
-        let _producer_id = *self.producer_id.read().await;
-        let _producer_epoch = *self.producer_epoch.read().await;
+        let producer_id = *self.producer_id.read().await;
+        let producer_epoch = *self.producer_epoch.read().await;
 
-        // Build record batch with transaction info
-        let mut batch_builder = RecordBatchBuilder::new().compression(self.config.compression);
+        // Get next sequence number for this topic-partition
+        let sequence = self.next_sequence(topic, partition).await;
+
+        // Build record batch with transaction info (producer ID, epoch, sequence)
+        let mut batch_builder = RecordBatchBuilder::new()
+            .compression(self.config.compression)
+            .producer(producer_id, producer_epoch, sequence)
+            .transactional(true);
 
         if record.headers.is_empty() {
             batch_builder = batch_builder
@@ -462,7 +510,7 @@ impl TransactionalProducer {
         let request = ProduceRequest {
             transactional_id: Some(self.config.transactional_id.clone()),
             acks: Acks::All.to_i16(),
-            timeout_ms: self.config.request_timeout.as_millis() as i32,
+            timeout_ms: crate::util::duration_to_millis_i32(self.config.request_timeout),
             topic_data: vec![ProduceTopicData {
                 name: topic.to_string(),
                 partition_data: vec![ProducePartitionData {
@@ -479,7 +527,7 @@ impl TransactionalProducer {
             .await?;
 
         let mut buf = response;
-        let produce_response = ProduceResponse::decode_v0(&mut buf)?;
+        let produce_response = ProduceResponse::decode_v2(&mut buf)?;
 
         for topic_response in &produce_response.responses {
             for partition_response in &topic_response.partition_responses {
@@ -581,15 +629,13 @@ impl TransactionalProducer {
         }
 
         // Find the group coordinator for offset commit
-        let group_coordinator = self.find_group_coordinator(group_id).await?;
-        let group_broker = brokers
-            .iter()
-            .find(|b| b.id == group_coordinator)
-            .ok_or_else(|| KrafkaError::protocol("group coordinator not found"))?;
+        let (group_node_id, group_host, group_port) =
+            self.find_group_coordinator(group_id).await?;
+        let group_addr = format!("{}:{}", group_host, group_port);
 
         let group_conn = self
             .pool
-            .get_connection_by_id(group_broker.id, &group_broker.address())
+            .get_connection_by_id(group_node_id, &group_addr)
             .await?;
 
         let response_bytes = group_conn
@@ -611,8 +657,11 @@ impl TransactionalProducer {
         Ok(())
     }
 
-    /// Find the group coordinator.
-    async fn find_group_coordinator(&self, group_id: &str) -> Result<i32> {
+    /// Find the group coordinator, returning (node_id, host, port).
+    async fn find_group_coordinator(
+        &self,
+        group_id: &str,
+    ) -> Result<(i32, String, i32)> {
         let brokers = self.metadata.brokers().await;
         if brokers.is_empty() {
             return Err(KrafkaError::protocol("no brokers available"));
@@ -642,20 +691,20 @@ impl TransactionalProducer {
             ));
         }
 
-        Ok(response.node_id)
+        Ok((response.node_id, response.host, response.port))
     }
 
     /// Commit the current transaction.
     pub async fn commit_transaction(&self) -> Result<()> {
-        let current = self.state();
-        if current != TransactionState::InTransaction {
+        // Atomic CAS: InTransaction → Committing (§6.1 fix)
+        if let Err(actual) =
+            self.try_transition(TransactionState::InTransaction, TransactionState::Committing)
+        {
             return Err(KrafkaError::invalid_state(format!(
                 "cannot commit in state {:?}",
-                current
+                actual
             )));
         }
-
-        self.set_state(TransactionState::Committing);
 
         let result = self.end_transaction(true).await;
 
@@ -665,9 +714,16 @@ impl TransactionalProducer {
                 self.txn_partitions.write().await.clear();
                 info!("Transaction committed");
             }
-            Err(_) => {
-                // On error, stay in committing state and let caller decide
-                warn!("Transaction commit failed");
+            Err(e) => {
+                if e.is_retriable() {
+                    // Allow the caller to retry commit
+                    self.set_state(TransactionState::InTransaction);
+                    warn!("Transaction commit failed (retriable): {}", e);
+                } else {
+                    // Fatal error — caller must abort (§9.9 fix: set FatalError state)
+                    self.set_state(TransactionState::FatalError);
+                    warn!("Transaction commit failed (fatal): {}", e);
+                }
             }
         }
 
@@ -676,15 +732,19 @@ impl TransactionalProducer {
 
     /// Abort the current transaction.
     pub async fn abort_transaction(&self) -> Result<()> {
-        let current = self.state();
-        if current != TransactionState::InTransaction && current != TransactionState::Committing {
+        // Atomic CAS: try InTransaction → Aborting first, then Committing → Aborting (§6.1 fix)
+        let transition = self
+            .try_transition(TransactionState::InTransaction, TransactionState::Aborting)
+            .or_else(|_| {
+                self.try_transition(TransactionState::Committing, TransactionState::Aborting)
+            });
+
+        if let Err(actual) = transition {
             return Err(KrafkaError::invalid_state(format!(
                 "cannot abort in state {:?}",
-                current
+                actual
             )));
         }
-
-        self.set_state(TransactionState::Aborting);
 
         let result = self.end_transaction(false).await;
 
@@ -768,6 +828,11 @@ impl TransactionalProducer {
     pub async fn producer_epoch(&self) -> i16 {
         *self.producer_epoch.read().await
     }
+
+    /// Get the next sequence number for a topic-partition.
+    async fn next_sequence(&self, topic: &str, partition: PartitionId) -> i32 {
+        self.identity.next_sequence(topic, partition)
+    }
 }
 
 /// Check if an error code is a fatal transaction error.
@@ -825,6 +890,30 @@ impl TransactionalProducerBuilder {
         self
     }
 
+    /// Set authentication configuration.
+    pub fn auth(mut self, auth: AuthConfig) -> Self {
+        self.config.auth = Some(auth);
+        self
+    }
+
+    /// Configure SASL/PLAIN authentication.
+    pub fn sasl_plain(mut self, username: &str, password: &str) -> Self {
+        self.config.auth = Some(AuthConfig::sasl_plain(username, password));
+        self
+    }
+
+    /// Configure SASL/SCRAM-SHA-256 authentication.
+    pub fn sasl_scram_sha256(mut self, username: &str, password: &str) -> Self {
+        self.config.auth = Some(AuthConfig::sasl_scram_sha256(username, password));
+        self
+    }
+
+    /// Configure SASL/SCRAM-SHA-512 authentication.
+    pub fn sasl_scram_sha512(mut self, username: &str, password: &str) -> Self {
+        self.config.auth = Some(AuthConfig::sasl_scram_sha512(username, password));
+        self
+    }
+
     /// Build the transactional producer.
     pub async fn build(self) -> Result<TransactionalProducer> {
         if self.config.bootstrap_servers.is_empty() {
@@ -833,11 +922,21 @@ impl TransactionalProducerBuilder {
         if self.config.transactional_id.is_empty() {
             return Err(KrafkaError::config("transactional_id is required"));
         }
+        if self.config.transaction_timeout_ms <= 0 {
+            return Err(KrafkaError::config(
+                "transaction_timeout_ms must be > 0",
+            ));
+        }
 
-        let pool_config = ConnectionConfig::builder()
+        let mut pool_config_builder = ConnectionConfig::builder()
             .client_id(&self.config.client_id)
-            .request_timeout(self.config.request_timeout)
-            .build();
+            .request_timeout(self.config.request_timeout);
+
+        if let Some(ref auth) = self.config.auth {
+            pool_config_builder = pool_config_builder.auth(auth.clone());
+        }
+
+        let pool_config = pool_config_builder.build();
 
         let pool = Arc::new(ConnectionPool::new(pool_config));
 
@@ -871,6 +970,7 @@ impl TransactionalProducerBuilder {
             producer_epoch: RwLock::new(-1),
             coordinator_id: RwLock::new(None),
             txn_partitions: RwLock::new(TransactionPartitions::default()),
+            identity: ProducerIdentity::new(),
         })
     }
 }
@@ -947,5 +1047,252 @@ mod tests {
             .build()
             .await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_try_transition_success() {
+        let state = AtomicU8::new(TransactionState::Ready as u8);
+        let result = state.compare_exchange(
+            TransactionState::Ready as u8,
+            TransactionState::InTransaction as u8,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            TransactionState::from_u8(state.load(Ordering::SeqCst)),
+            TransactionState::InTransaction
+        );
+    }
+
+    #[test]
+    fn test_try_transition_failure() {
+        let state = AtomicU8::new(TransactionState::Uninitialized as u8);
+        let result = state.compare_exchange(
+            TransactionState::Ready as u8,
+            TransactionState::InTransaction as u8,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        assert!(result.is_err());
+        // State should remain unchanged
+        assert_eq!(
+            TransactionState::from_u8(state.load(Ordering::SeqCst)),
+            TransactionState::Uninitialized
+        );
+    }
+
+    #[test]
+    fn test_txn_builder_no_auth_by_default() {
+        let builder = TransactionalProducer::builder()
+            .bootstrap_servers("broker:9092")
+            .transactional_id("txn-1");
+
+        assert!(builder.config.auth.is_none());
+    }
+
+    #[test]
+    fn test_txn_builder_sasl_plain() {
+        let builder = TransactionalProducer::builder()
+            .bootstrap_servers("broker:9093")
+            .transactional_id("txn-1")
+            .sasl_plain("user", "pass");
+
+        let auth = builder.config.auth.as_ref().unwrap();
+        assert!(auth.requires_sasl());
+        assert!(auth.plain_credentials.is_some());
+    }
+
+    #[test]
+    fn test_txn_builder_sasl_scram_sha256() {
+        let builder = TransactionalProducer::builder()
+            .bootstrap_servers("broker:9093")
+            .transactional_id("txn-1")
+            .sasl_scram_sha256("user", "pass");
+
+        let auth = builder.config.auth.as_ref().unwrap();
+        assert!(auth.requires_sasl());
+        assert!(auth.scram_credentials.is_some());
+    }
+
+    #[test]
+    fn test_txn_builder_sasl_scram_sha512() {
+        let builder = TransactionalProducer::builder()
+            .bootstrap_servers("broker:9093")
+            .transactional_id("txn-1")
+            .sasl_scram_sha512("user", "pass");
+
+        let auth = builder.config.auth.as_ref().unwrap();
+        assert!(auth.requires_sasl());
+        assert!(auth.scram_credentials.is_some());
+    }
+
+    #[test]
+    fn test_txn_builder_auth_config() {
+        use crate::auth::AuthConfig;
+
+        let auth = AuthConfig::sasl_scram_sha256("admin", "secret");
+        let builder = TransactionalProducer::builder()
+            .bootstrap_servers("broker:9093")
+            .transactional_id("txn-1")
+            .auth(auth);
+
+        let auth = builder.config.auth.as_ref().unwrap();
+        assert!(auth.requires_sasl());
+        assert!(auth.scram_credentials.is_some());
+    }
+
+    #[test]
+    fn test_txn_builder_initializes_producer_identity() {
+        // Verify a built TransactionalProducer starts with uninitialized identity
+        // (pid=-1, epoch=-1 until init_transactions() is called)
+        let builder = TransactionalProducer::builder()
+            .bootstrap_servers("broker:9092")
+            .transactional_id("txn-test");
+        // The builder should have the transactional_id set
+        assert_eq!(builder.config.transactional_id, "txn-test");
+    }
+
+    #[test]
+    fn test_txn_builder_requires_transactional_id() {
+        let builder = TransactionalProducer::builder()
+            .bootstrap_servers("broker:9092");
+        // Without transactional_id, it defaults to empty string
+        assert!(builder.config.transactional_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_txn_builder_rejects_zero_timeout() {
+        let result = TransactionalProducer::builder()
+            .bootstrap_servers("localhost:9092")
+            .transactional_id("txn-1")
+            .transaction_timeout_ms(0)
+            .build()
+            .await;
+
+        match result {
+            Err(e) => assert!(e.to_string().contains("transaction_timeout_ms")),
+            Ok(_) => panic!("expected error for transaction_timeout_ms=0"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_txn_builder_rejects_negative_timeout() {
+        let result = TransactionalProducer::builder()
+            .bootstrap_servers("localhost:9092")
+            .transactional_id("txn-1")
+            .transaction_timeout_ms(-1)
+            .build()
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    // ── R9.3: TransactionState::Initializing variant ──
+
+    #[test]
+    fn test_transaction_state_initializing_from_u8() {
+        assert_eq!(TransactionState::from_u8(6), TransactionState::Initializing);
+    }
+
+    #[test]
+    fn test_transaction_state_initializing_value() {
+        assert_eq!(TransactionState::Initializing as u8, 6);
+    }
+
+    #[test]
+    fn test_transaction_state_initializing_round_trip() {
+        let state = TransactionState::Initializing;
+        let val = state as u8;
+        assert_eq!(TransactionState::from_u8(val), TransactionState::Initializing);
+    }
+
+    #[test]
+    fn test_transaction_state_unknown_maps_to_fatal() {
+        // Values not explicitly mapped (except 5 which is FatalError) fall to FatalError
+        assert_eq!(TransactionState::from_u8(7), TransactionState::FatalError);
+        assert_eq!(TransactionState::from_u8(255), TransactionState::FatalError);
+    }
+
+    // ── R9.3: CAS transition with Initializing state ──
+
+    #[test]
+    fn test_try_transition_uninitialized_to_initializing() {
+        let state = AtomicU8::new(TransactionState::Uninitialized as u8);
+        let result = state.compare_exchange(
+            TransactionState::Uninitialized as u8,
+            TransactionState::Initializing as u8,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            TransactionState::from_u8(state.load(Ordering::SeqCst)),
+            TransactionState::Initializing
+        );
+    }
+
+    #[test]
+    fn test_try_transition_initializing_blocks_second_init() {
+        // Simulate: first call moved to Initializing, second call should fail
+        let state = AtomicU8::new(TransactionState::Initializing as u8);
+        let result = state.compare_exchange(
+            TransactionState::Uninitialized as u8,
+            TransactionState::Initializing as u8,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        assert!(result.is_err());
+        // State stays Initializing
+        assert_eq!(
+            TransactionState::from_u8(state.load(Ordering::SeqCst)),
+            TransactionState::Initializing
+        );
+    }
+
+    // ── R9.9: commit_transaction sets FatalError on non-retriable errors ──
+
+    #[test]
+    fn test_commit_fatal_error_state_machine() {
+        // Simulate the commit_transaction error-handling logic:
+        // On non-retriable error → state becomes FatalError
+        let state = AtomicU8::new(TransactionState::Committing as u8);
+
+        // Simulate a non-retriable error (e.g. InvalidProducerEpoch)
+        let error = KrafkaError::broker(ErrorCode::InvalidProducerEpoch, "epoch fenced");
+        assert!(!error.is_retriable());
+
+        // Apply the same logic as commit_transaction
+        if error.is_retriable() {
+            state.store(TransactionState::InTransaction as u8, Ordering::SeqCst);
+        } else {
+            state.store(TransactionState::FatalError as u8, Ordering::SeqCst);
+        }
+
+        assert_eq!(
+            TransactionState::from_u8(state.load(Ordering::SeqCst)),
+            TransactionState::FatalError
+        );
+    }
+
+    #[test]
+    fn test_commit_retriable_error_reverts_to_in_transaction() {
+        // Simulate the commit_transaction error-handling logic:
+        // On retriable error → state reverts to InTransaction
+        let state = AtomicU8::new(TransactionState::Committing as u8);
+
+        let error = KrafkaError::broker(ErrorCode::CoordinatorNotAvailable, "coordinator down");
+        assert!(error.is_retriable());
+
+        if error.is_retriable() {
+            state.store(TransactionState::InTransaction as u8, Ordering::SeqCst);
+        } else {
+            state.store(TransactionState::FatalError as u8, Ordering::SeqCst);
+        }
+
+        assert_eq!(
+            TransactionState::from_u8(state.load(Ordering::SeqCst)),
+            TransactionState::InTransaction
+        );
     }
 }

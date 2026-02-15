@@ -76,7 +76,7 @@
 //!
 //! consumer.subscribe(&["my-topic"]).await?;
 //!
-//! while let Some(msg) = consumer.recv().await {
+//! while let Some(msg) = consumer.recv().await? {
 //!     println!("{:?}", msg);
 //! }
 //! # Ok(())
@@ -91,6 +91,7 @@ pub mod admin;
 pub mod auth;
 pub mod consumer;
 pub mod error;
+pub mod interceptor;
 pub mod metadata;
 pub mod metrics;
 pub mod network;

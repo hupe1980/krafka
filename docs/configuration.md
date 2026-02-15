@@ -22,6 +22,7 @@ Complete reference for all Krafka configuration options.
 | `request_timeout` | Duration | `30s` | Timeout for broker requests |
 | `retries` | u32 | `3` | Number of retries on failure |
 | `retry_backoff` | Duration | `100ms` | Wait between retries |
+| `max_in_flight` | usize | `5` | Max concurrent in-flight requests per connection |
 | `metadata_max_age` | Duration | `5m` | Max age before metadata refresh |
 | `enable_idempotence` | bool | `false` | Enable exactly-once semantics |
 
@@ -75,6 +76,7 @@ let producer = Producer::builder()
 |--------|------|---------|-------------|
 | `bootstrap_servers` | String | Required | Comma-separated list of host:port pairs |
 | `group_id` | String | Optional | Consumer group ID |
+| `group_instance_id` | String | Optional | Static membership instance ID (KIP-345) |
 | `client_id` | String | `"krafka"` | Client identifier sent with requests |
 | `auto_offset_reset` | AutoOffsetReset | `Latest` | Where to start when no offset |
 | `enable_auto_commit` | bool | `true` | Auto-commit offsets |
@@ -83,7 +85,7 @@ let producer = Producer::builder()
 | `fetch_max_bytes` | i32 | `52428800` | Max bytes per fetch response |
 | `max_partition_fetch_bytes` | i32 | `1048576` | Max bytes per partition |
 | `fetch_max_wait` | Duration | `500ms` | Max time to wait for fetch |
-| `max_poll_records` | i32 | `500` | Max records per poll |
+| `max_poll_records` | i32 | `500` | Max records per poll (strictly enforced) |
 | `session_timeout` | Duration | `10s` | Group session timeout |
 | `heartbeat_interval` | Duration | `3s` | Heartbeat interval |
 | `max_poll_interval` | Duration | `5m` | Max time between polls |
@@ -98,7 +100,7 @@ use krafka::consumer::AutoOffsetReset;
 
 AutoOffsetReset::Earliest  // Start from the earliest offset
 AutoOffsetReset::Latest    // Start from the latest offset
-AutoOffsetReset::None      // Error if no committed offset
+AutoOffsetReset::None      // Error if no committed offset (strictly enforced)
 ```
 
 ### IsolationLevel Values
@@ -130,6 +132,7 @@ let consumer = Consumer::builder()
     .session_timeout(Duration::from_secs(30))
     .heartbeat_interval(Duration::from_secs(10))
     .isolation_level(IsolationLevel::ReadCommitted)
+    .group_instance_id("instance-1")  // Static group membership
     .build()
     .await?;
 ```
@@ -165,6 +168,7 @@ Internal connection settings (advanced):
 | `connect_timeout` | Duration | `10s` | TCP connection timeout |
 | `request_timeout` | Duration | `30s` | Request timeout |
 | `max_message_size` | usize | `10MB` | Maximum message size |
+| `max_response_size` | usize | `100MB` | Maximum response size from broker |
 
 ## Topic Configuration
 

@@ -115,6 +115,16 @@ let batch = RecordBatchBuilder::new()
 | LZ4 | Always | Very fast, good compression |
 | Zstd | Always | Best compression, fast |
 
+> **Note:** Decompression output is capped at 128 MiB to protect against compression bombs. Compressed payloads that expand beyond this limit will return a `KrafkaError::compression` error.
+
+## Protocol Safety
+
+Krafka protects against malicious or corrupted broker responses:
+
+- **Allocation caps**: All `Vec::with_capacity()` calls in protocol decoding are capped at 10,000 elements, preventing OOM from broker-supplied lengths
+- **Decompression limits**: Decompressed record data is limited to 128 MiB via streaming `.take()` limits and post-decompression size checks
+- **Record headers**: Record headers are preserved during batch building — no silent data loss
+
 ## Wire Protocol
 
 ### Request/Response Framing

@@ -1507,6 +1507,7 @@ dependencies = [
  "rustls-pemfile",
  "sha2",
  "snap",
+ "subtle",
  "testcontainers",
  "testcontainers-modules",
  "thiserror",

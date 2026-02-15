@@ -6,11 +6,11 @@
 //! - Broker discovery
 //! - Leader election tracking
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, warn};
 
 use crate::error::{KrafkaError, Result};
@@ -138,6 +138,9 @@ pub struct ClusterMetadata {
     cache: RwLock<MetadataCache>,
     /// Metadata max age before refresh.
     max_age: Duration,
+    /// Coalescing lock: prevents concurrent metadata refreshes (§6.3).
+    /// Multiple callers wait on the same in-flight refresh instead of stampeding.
+    refresh_lock: Mutex<()>,
 }
 
 impl ClusterMetadata {
@@ -152,6 +155,7 @@ impl ClusterMetadata {
             pool,
             cache: RwLock::new(MetadataCache::new()),
             max_age,
+            refresh_lock: Mutex::new(()),
         }
     }
 
@@ -166,7 +170,24 @@ impl ClusterMetadata {
     }
 
     /// Refresh metadata for specific topics.
+    ///
+    /// Uses a coalescing lock (§6.3) to prevent concurrent metadata stampedes.
+    /// If a refresh is already in-flight, callers wait for it to complete.
     pub async fn refresh_for_topics(&self, topics: Option<&[&str]>) -> Result<()> {
+        // Coalesce concurrent calls: only one refresh in-flight at a time
+        let _guard = self.refresh_lock.lock().await;
+
+        // After acquiring the lock, check if metadata was just refreshed by another caller.
+        // If it was refreshed within the last 100ms, skip the redundant request.
+        {
+            let cache = self.cache.read().await;
+            if cache.last_updated.elapsed() < Duration::from_millis(100) && !cache.brokers.is_empty()
+            {
+                debug!("Metadata was recently refreshed, skipping redundant request");
+                return Ok(());
+            }
+        }
+
         // Get a connection
         let conn = self.get_any_connection().await?;
 
@@ -237,7 +258,22 @@ impl ClusterMetadata {
             );
         }
 
-        // Update topics
+        // Update topics — clear stale entries first so deleted topics
+        // don't persist in cache (§9.4 fix). Topics present in the response
+        // with errors (e.g. UnknownTopicOrPartition for deleted topics) are
+        // explicitly removed.
+        let response_topic_names: HashSet<String> = response
+            .topics
+            .iter()
+            .filter_map(|t| t.name.clone())
+            .collect();
+
+        // Remove topics that were requested but came back with errors
+        // (they may have been deleted)
+        cache
+            .topics
+            .retain(|name, _| !response_topic_names.contains(name));
+
         for topic in response.topics {
             if !topic.error_code.is_ok() {
                 warn!(
@@ -245,6 +281,7 @@ impl ClusterMetadata {
                     topic.name.as_deref().unwrap_or("unknown"),
                     topic.error_code
                 );
+                // Don't insert — the retain above already removed the stale entry
                 continue;
             }
 
@@ -445,5 +482,26 @@ mod tests {
         assert!(!cache.is_stale(Duration::from_secs(60)));
 
         // Note: We can't easily test staleness without mocking time
+    }
+
+    #[test]
+    fn test_metadata_cache_new_is_empty() {
+        let cache = MetadataCache::new();
+        assert!(cache.brokers.is_empty());
+        assert!(cache.topics.is_empty());
+        assert!(cache.cluster_id.is_none());
+        assert_eq!(cache.controller_id, -1);
+    }
+
+    #[test]
+    fn test_broker_info_with_rack() {
+        let broker = BrokerInfo {
+            id: 1,
+            host: "broker1.kafka.local".to_string(),
+            port: 9093,
+            rack: Some("us-east-1a".to_string()),
+        };
+        assert_eq!(broker.address(), "broker1.kafka.local:9093");
+        assert_eq!(broker.rack.as_deref(), Some("us-east-1a"));
     }
 }

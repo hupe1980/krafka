@@ -91,13 +91,12 @@ impl RetryPolicy {
         // Cap at max backoff
         let capped_backoff = base_backoff.min(self.max_backoff.as_secs_f64());
 
-        // Add jitter: ±jitter_factor * backoff
+        // Add jitter: ±jitter_factor * backoff (randomized to prevent thundering herd)
         let jitter_range = capped_backoff * self.jitter_factor;
         let jitter = if self.jitter_factor > 0.0 {
-            // Simple deterministic "jitter" based on attempt number for reproducibility
-            // In production, consider using rand crate
-            let jitter_sign = if attempt.is_multiple_of(2) { 1.0 } else { -1.0 };
-            jitter_sign * jitter_range * 0.5
+            use rand::Rng;
+            let mut rng = rand::rng();
+            rng.random_range(-jitter_range..=jitter_range)
         } else {
             0.0
         };
@@ -337,5 +336,33 @@ mod tests {
 
         let policy = RetryPolicy::new().with_jitter_factor(-0.5); // Negative, should clamp
         assert_eq!(policy.jitter_factor, 0.0);
+    }
+
+    #[test]
+    fn test_calculate_backoff_jitter_produces_varying_results() {
+        let policy = RetryPolicy::new()
+            .with_initial_backoff(Duration::from_millis(100))
+            .with_backoff_multiplier(2.0)
+            .with_jitter_factor(0.5); // 50% jitter
+
+        // Collect multiple backoff values for the same attempt
+        let backoffs: Vec<Duration> = (0..50)
+            .map(|_| policy.calculate_backoff(2))
+            .collect();
+
+        // With 50% jitter on a 200ms base, values should range from 100ms to 300ms.
+        // Check that not all values are identical (i.e., jitter is actually applied).
+        let unique_count = {
+            let mut unique: Vec<u128> = backoffs.iter().map(|d| d.as_nanos()).collect();
+            unique.sort();
+            unique.dedup();
+            unique.len()
+        };
+
+        assert!(
+            unique_count > 1,
+            "with jitter_factor > 0, calculate_backoff should produce varying results, but got {} unique values",
+            unique_count
+        );
     }
 }
