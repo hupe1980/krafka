@@ -302,9 +302,15 @@ impl BrokerConnection {
     /// 3. Perform SASL authentication handshake if required
     /// 4. Fetch API versions
     pub async fn connect(address: &str, config: ConnectionConfig) -> Result<Self> {
-        let addr: std::net::SocketAddr = address
-            .parse()
-            .map_err(|e| KrafkaError::invalid_state(format!("invalid address '{address}': {e}")))?;
+        // Use tokio::net::lookup_host to support both IP:port and hostname:port
+        // (e.g. "kafka:9092" when brokers run inside containers).
+        let addr = tokio::net::lookup_host(address)
+            .await
+            .map_err(|e| KrafkaError::invalid_state(format!("invalid address '{address}': {e}")))?
+            .next()
+            .ok_or_else(|| {
+                KrafkaError::invalid_state(format!("no addresses resolved for '{address}'"))
+            })?;
 
         let socket = if addr.is_ipv6() {
             TcpSocket::new_v6()
