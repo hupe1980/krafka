@@ -304,8 +304,11 @@ impl BrokerConnection {
     pub async fn connect(address: &str, config: ConnectionConfig) -> Result<Self> {
         // Use tokio::net::lookup_host to support both IP:port and hostname:port
         // (e.g. "kafka:9092" when brokers run inside containers).
-        let mut addrs = tokio::net::lookup_host(address)
+        // Bound DNS resolution by the connect timeout so a slow resolver cannot
+        // make connect() block indefinitely.
+        let mut addrs = timeout(config.connect_timeout, tokio::net::lookup_host(address))
             .await
+            .map_err(|_| KrafkaError::timeout("DNS resolution"))?
             .map_err(KrafkaError::Network)?;
         let first_addr = addrs.next().ok_or_else(|| {
             KrafkaError::invalid_state(format!("no addresses resolved for '{address}'"))
@@ -1720,6 +1723,7 @@ mod tests {
         let hostname_addr = format!("localhost:{port}");
         let config = ConnectionConfig::builder()
             .connect_timeout(Duration::from_secs(2))
+            .request_timeout(Duration::from_secs(2))
             .build();
 
         // The connect will resolve "localhost" via lookup_host, establish TCP,
@@ -1741,7 +1745,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_dns_failure_is_retriable() {
-        let config = ConnectionConfig::default();
+        let config = ConnectionConfig::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .build();
         let result =
             BrokerConnection::connect("this-host-does-not-exist.invalid:9092", config).await;
         match result {
