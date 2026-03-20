@@ -304,13 +304,14 @@ impl BrokerConnection {
     pub async fn connect(address: &str, config: ConnectionConfig) -> Result<Self> {
         // Use tokio::net::lookup_host to support both IP:port and hostname:port
         // (e.g. "kafka:9092" when brokers run inside containers).
-        let addr = tokio::net::lookup_host(address)
+        let mut addrs = tokio::net::lookup_host(address)
             .await
-            .map_err(|e| KrafkaError::invalid_state(format!("invalid address '{address}': {e}")))?
-            .next()
-            .ok_or_else(|| {
-                KrafkaError::invalid_state(format!("no addresses resolved for '{address}'"))
-            })?;
+            .map_err(KrafkaError::Network)?;
+        let first_addr = addrs.next().ok_or_else(|| {
+            KrafkaError::invalid_state(format!("no addresses resolved for '{address}'"))
+        })?;
+        // Prefer IPv4 when available — IPv6 may be resolved first but not routable.
+        let addr = addrs.find(|a| a.is_ipv4()).unwrap_or(first_addr);
 
         let socket = if addr.is_ipv6() {
             TcpSocket::new_v6()
@@ -1707,5 +1708,50 @@ mod tests {
             config_zero.max_response_size, 1024,
             "max_response_size(0) should clamp to 1024"
         );
+    }
+
+    #[tokio::test]
+    async fn test_connect_resolves_hostname() {
+        // Bind a TCP listener so we have a real port to connect to.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Use "localhost" (a hostname, not an IP) to verify DNS resolution works.
+        let hostname_addr = format!("localhost:{port}");
+        let config = ConnectionConfig::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .build();
+
+        // The connect will resolve "localhost" via lookup_host, establish TCP,
+        // then fail on the ApiVersions handshake because our listener doesn't
+        // speak the Kafka protocol — but it must NOT fail with an address
+        // parsing error.
+        let result = BrokerConnection::connect(&hostname_addr, config).await;
+        match result {
+            Ok(_) => {} // Unlikely but acceptable — means the mock spoke enough Kafka
+            Err(err) => {
+                let err_msg = format!("{err}");
+                assert!(
+                    !err_msg.contains("invalid address"),
+                    "should not fail on address resolution, got: {err_msg}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_dns_failure_is_retriable() {
+        let config = ConnectionConfig::default();
+        let result =
+            BrokerConnection::connect("this-host-does-not-exist.invalid:9092", config).await;
+        match result {
+            Ok(_) => panic!("connect to non-existent host should fail"),
+            Err(err) => {
+                assert!(
+                    err.is_retriable(),
+                    "DNS resolution failure should be retriable (Network), got: {err}"
+                );
+            }
+        }
     }
 }
