@@ -600,14 +600,14 @@ mod tests {
 
     #[test]
     fn test_api_versions_request() {
-        let request = ApiVersionsRequest::new().with_client_software("krafka", "0.2.0");
+        let request = ApiVersionsRequest::new().with_client_software("krafka", "0.2.1");
         assert_eq!(
             request.client_software_name.as_ref().unwrap().as_str(),
             Some("krafka")
         );
         assert_eq!(
             request.client_software_version.as_ref().unwrap().as_str(),
-            Some("0.2.0")
+            Some("0.2.1")
         );
     }
 
