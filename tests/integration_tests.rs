@@ -1469,7 +1469,7 @@ async fn test_producer_timestamp_propagation() {
     // Send with explicit timestamp
     let timestamp = 1700000000000_i64; // Unix epoch ms
     let record = ProducerRecord::new(topic, b"hello".to_vec())
-        .with_key(Some(b"ts-key".to_vec()))
+        .with_key(b"ts-key".to_vec())
         .with_timestamp(timestamp);
     let metadata = producer
         .send_record(record)
@@ -1541,14 +1541,14 @@ async fn test_consumer_manual_assign() {
     for i in 0..5 {
         let record = ProducerRecord::new(topic, format!("val-{}", i).into_bytes())
             .with_partition(0)
-            .with_key(Some(format!("k-{}", i).into_bytes()));
+            .with_key(format!("k-{}", i).into_bytes());
         let _ = producer.send_record(record).await.expect("send failed");
     }
     // Also send some to partition 1 (should NOT be received)
     for i in 0..5 {
         let record = ProducerRecord::new(topic, format!("val-p1-{}", i).into_bytes())
             .with_partition(1)
-            .with_key(Some(format!("k1-{}", i).into_bytes()));
+            .with_key(format!("k1-{}", i).into_bytes());
         let _ = producer.send_record(record).await.expect("send failed");
     }
     producer.close().await;

@@ -469,8 +469,10 @@ impl TransactionalProducer {
         key: Option<&[u8]>,
         value: &[u8],
     ) -> Result<RecordMetadata> {
-        let record = ProducerRecord::new(topic, Bytes::copy_from_slice(value))
-            .with_key(key.map(Bytes::copy_from_slice));
+        let mut record = ProducerRecord::new(topic, Bytes::copy_from_slice(value));
+        if let Some(k) = key {
+            record = record.with_key(Bytes::copy_from_slice(k));
+        }
         self.send_record(record).await
     }
 

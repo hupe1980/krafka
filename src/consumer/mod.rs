@@ -108,9 +108,10 @@ pub struct Consumer {
     /// Per-broker fetch session cache (KIP-227).
     fetch_sessions: tokio::sync::Mutex<FetchSessionCache>,
     /// Per-partition backoff state for offset resolution retries.
-    /// Stores the next allowed retry time. Prevents retry storms when
-    /// offset resolution fails persistently (e.g., broker unavailable).
-    offset_retry_backoff: RwLock<HashMap<(String, PartitionId), Instant>>,
+    /// Stores the next allowed retry time and current backoff duration.
+    /// Prevents retry storms when offset resolution fails persistently
+    /// (e.g., broker unavailable).
+    offset_retry_backoff: RwLock<HashMap<(String, PartitionId), (Instant, Duration)>>,
 }
 
 impl Consumer {
@@ -611,19 +612,48 @@ impl Consumer {
 
             // Get a connection to this broker via any of its partitions
             let (sample_topic, sample_partition) = &leader_partitions[0];
-            let conn = self
+            let conn = match self
                 .metadata
                 .get_leader_connection(sample_topic, *sample_partition)
-                .await?;
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        "Failed to connect to leader for {}-{}: {}, skipping broker",
+                        sample_topic, sample_partition, e
+                    );
+                    continue;
+                }
+            };
 
-            let response = conn
+            let response = match conn
                 .send_request(ApiKey::ListOffsets, 1, |buf| {
                     request.encode_v1(buf);
                 })
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        "ListOffsets request failed for broker (leader of {}-{}): {}, skipping",
+                        sample_topic, sample_partition, e
+                    );
+                    continue;
+                }
+            };
 
             let mut buf = response;
-            let list_response = ListOffsetsResponse::decode_v1(&mut buf)?;
+            let list_response = match ListOffsetsResponse::decode_v1(&mut buf) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        "Failed to decode ListOffsets response from broker (leader of {}-{}): {}, skipping",
+                        sample_topic, sample_partition, e
+                    );
+                    continue;
+                }
+            };
 
             for topic_resp in &list_response.topics {
                 for part_resp in &topic_resp.partitions {
@@ -785,7 +815,7 @@ impl Consumer {
                                 // Only include if backoff period has elapsed
                                 backoff
                                     .get(&(topic.clone(), p))
-                                    .is_none_or(|&next_retry| now >= next_retry)
+                                    .is_none_or(|&(next_retry, _)| now >= next_retry)
                             })
                             .map(|&p| (topic.clone(), p))
                     })
@@ -868,17 +898,10 @@ impl Consumer {
                             // Start at 100ms, double each time, cap at 30s.
                             let base = Duration::from_millis(100);
                             let max = Duration::from_secs(30);
-                            let current_wait = backoff
-                                .get(&key)
-                                .map(|&next| {
-                                    // Estimate the previous interval from the stored deadline
-                                    next.saturating_duration_since(
-                                        now.checked_sub(base).unwrap_or(now),
-                                    )
-                                })
-                                .unwrap_or(Duration::ZERO);
-                            let next_wait = (current_wait * 2).max(base).min(max);
-                            backoff.insert(key, now + next_wait);
+                            let prev_wait =
+                                backoff.get(&key).map(|&(_, d)| d).unwrap_or(Duration::ZERO);
+                            let next_wait = (prev_wait * 2).max(base).min(max);
+                            backoff.insert(key, (now + next_wait, next_wait));
                         }
                     }
                 }

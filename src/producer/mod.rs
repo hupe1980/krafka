@@ -200,8 +200,10 @@ impl Producer {
         key: Option<&[u8]>,
         value: &[u8],
     ) -> Result<RecordMetadata> {
-        let record = ProducerRecord::new(topic, Bytes::copy_from_slice(value))
-            .with_key(key.map(Bytes::copy_from_slice));
+        let mut record = ProducerRecord::new(topic, Bytes::copy_from_slice(value));
+        if let Some(k) = key {
+            record = record.with_key(Bytes::copy_from_slice(k));
+        }
         self.send_record(record).await
     }
 
@@ -213,8 +215,10 @@ impl Producer {
         value: &[u8],
         headers: Vec<(String, Vec<u8>)>,
     ) -> Result<RecordMetadata> {
-        let mut record = ProducerRecord::new(topic, Bytes::copy_from_slice(value))
-            .with_key(key.map(Bytes::copy_from_slice));
+        let mut record = ProducerRecord::new(topic, Bytes::copy_from_slice(value));
+        if let Some(k) = key {
+            record = record.with_key(Bytes::copy_from_slice(k));
+        }
         record.headers = headers;
         self.send_record(record).await
     }
@@ -225,12 +229,13 @@ impl Producer {
             return Err(KrafkaError::invalid_state("producer is closed"));
         }
 
-        // Validate record fields against Kafka protocol wire-format limits
-        record.validate()?;
-
         // Invoke interceptor before send
         let mut record = record;
         crate::interceptor::safe_on_send(&*self.interceptor, &mut record);
+
+        // Validate record fields against Kafka protocol wire-format limits.
+        // Runs after the interceptor since interceptors can mutate the record.
+        record.validate()?;
 
         let topic = record.topic.clone();
 

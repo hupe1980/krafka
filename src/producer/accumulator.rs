@@ -952,7 +952,7 @@ mod tests {
 
         // Record with key and headers should be larger
         let record_with_key =
-            ProducerRecord::new("test-topic", b"value".to_vec()).with_key(Some(b"key".to_vec()));
+            ProducerRecord::new("test-topic", b"value".to_vec()).with_key(b"key".to_vec());
         let size_with_key = RecordAccumulator::estimate_record_size(&record_with_key);
         assert!(size_with_key > size);
     }

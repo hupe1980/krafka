@@ -43,8 +43,8 @@ impl ProducerRecord {
     }
 
     /// Set the key.
-    pub fn with_key(mut self, key: Option<impl Into<Bytes>>) -> Self {
-        self.key = key.map(Into::into);
+    pub fn with_key(mut self, key: impl Into<Bytes>) -> Self {
+        self.key = Some(key.into());
         self
     }
 
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn test_producer_record_with_key() {
         let record =
-            ProducerRecord::new("test-topic", b"hello".to_vec()).with_key(Some(b"my-key".to_vec()));
+            ProducerRecord::new("test-topic", b"hello".to_vec()).with_key(b"my-key".to_vec());
 
         assert_eq!(record.key, Some(Bytes::from_static(b"my-key")));
         assert_eq!(record.key_str(), Some("my-key"));
@@ -210,8 +210,8 @@ mod tests {
 
     #[test]
     fn test_producer_record_estimated_size() {
-        let record = ProducerRecord::new("test-topic", b"hello world".to_vec())
-            .with_key(Some(b"key".to_vec()));
+        let record =
+            ProducerRecord::new("test-topic", b"hello world".to_vec()).with_key(b"key".to_vec());
 
         let size = record.estimated_size();
         assert!(size > 3 + 11); // key + value at minimum
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn test_validate_valid_record() {
         let record = ProducerRecord::new("topic", b"value".to_vec())
-            .with_key(Some(b"key".to_vec()))
+            .with_key(b"key".to_vec())
             .with_header("h1", b"v1".to_vec());
         assert!(record.validate().is_ok());
     }
