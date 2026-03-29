@@ -42,7 +42,7 @@ pub enum KrafkaError {
     /// Serialization errors
     Serialization { message: String },
 
-    /// Buffer full (internal — converted to Config error after max_block timeout)
+    /// Buffer full (internal; not returned by `send`/`append()` — those return `Timeout` on max_block expiry)
     BufferFull,
 }
 ```

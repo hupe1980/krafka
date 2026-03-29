@@ -449,19 +449,23 @@ impl TransactionalProducer {
         // Uses Pending/Added states to prevent concurrent callers from
         // skipping the RPC while an in-flight add has not yet completed.
         loop {
-            let action = {
-                let mut txn_partitions = self.txn_partitions.write().await;
-                txn_partitions.begin_add(&topic, partition)
-            };
-
-            match action {
+            let mut txn_partitions = self.txn_partitions.write().await;
+            match txn_partitions.begin_add(&topic, partition) {
                 BeginAddResult::AlreadyAdded => break,
                 BeginAddResult::Wait(notify) => {
-                    // Another caller is registering this partition — wait and re-check.
-                    notify.notified().await;
+                    // Register interest in the Notify BEFORE releasing the
+                    // write lock so that confirm_add/cancel_add (which use
+                    // notify_waiters) cannot be missed.
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    drop(txn_partitions);
+                    notified.await;
+                    // Re-check state on next iteration.
                 }
                 BeginAddResult::NeedAdd(notify) => {
-                    // This caller performs the RPC without holding the lock.
+                    // Drop the lock before the RPC.
+                    drop(txn_partitions);
                     match self.add_partition_to_txn(&topic, partition).await {
                         Ok(()) => {
                             let mut txn_partitions = self.txn_partitions.write().await;

@@ -91,6 +91,14 @@ impl RecordAccumulatorHandle {
             // initial call or replenished by `AppendResponse::BufferFull`.
             let rec = pending.take().expect("pending record missing");
             let (response_tx, response_rx) = oneshot::channel();
+
+            // Pre-register interest in memory_freed BEFORE sending so that
+            // a notify_waiters() from extract_batch/flush_all between the
+            // send and the await cannot be missed.
+            let notified = self.memory_freed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             self.sender
                 .send(AccumulatorMessage::Append {
                     record: rec,
@@ -111,22 +119,17 @@ impl RecordAccumulatorHandle {
                     // record instance — zero clones on the retry path.
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() {
-                        return Err(KrafkaError::config(
-                            "Timed out waiting for buffer memory (max_block exceeded). \
-                             Consider increasing ProducerConfig::max_block / \
-                             AccumulatorConfig::max_block_ms, buffer_memory, \
-                             or reducing production rate.",
+                        return Err(KrafkaError::timeout(
+                            "producer append: max_block exceeded while waiting \
+                             for buffer memory (ProducerConfig::max_block / \
+                             AccumulatorConfig::max_block_ms)",
                         ));
                     }
-                    if tokio::time::timeout(remaining, self.memory_freed.notified())
-                        .await
-                        .is_err()
-                    {
-                        return Err(KrafkaError::config(
-                            "Timed out waiting for buffer memory (max_block exceeded). \
-                             Consider increasing ProducerConfig::max_block / \
-                             AccumulatorConfig::max_block_ms, buffer_memory, \
-                             or reducing production rate.",
+                    if tokio::time::timeout(remaining, notified).await.is_err() {
+                        return Err(KrafkaError::timeout(
+                            "producer append: max_block exceeded while waiting \
+                             for buffer memory (ProducerConfig::max_block / \
+                             AccumulatorConfig::max_block_ms)",
                         ));
                     }
                     // Replenish pending for the next iteration.
@@ -550,9 +553,9 @@ impl RecordAccumulator {
         }
         let batch_memory: usize = batch.pending.iter().map(|p| p.estimated_size).sum();
         self.memory_used = self.memory_used.saturating_sub(batch_memory);
-        // Wake one caller blocked on buffer backpressure (stores a permit so
-        // it cannot be missed even if no task is currently waiting).
-        self.memory_freed.notify_one();
+        // Wake all callers blocked on buffer backpressure so newly freed
+        // capacity can be utilized promptly by multiple pending appends.
+        self.memory_freed.notify_waiters();
         Some(batch)
     }
 
@@ -820,8 +823,8 @@ impl RecordAccumulator {
             let batch_memory: usize = batch.pending.iter().map(|p| p.estimated_size).sum();
             self.memory_used = self.memory_used.saturating_sub(batch_memory);
         }
-        // Wake callers blocked on buffer backpressure
-        self.memory_freed.notify_one();
+        // Wake all callers blocked on buffer backpressure
+        self.memory_freed.notify_waiters();
 
         // Send all batches concurrently
         let mut join_set = tokio::task::JoinSet::new();
@@ -950,7 +953,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_backpressure_timeout_returns_config_error() {
+    async fn test_backpressure_timeout_returns_timeout_error() {
         let (sender, mut receiver) = mpsc::channel::<AccumulatorMessage>(16);
         let memory_freed = Arc::new(tokio::sync::Notify::new());
         let handle = RecordAccumulatorHandle {
@@ -976,10 +979,15 @@ mod tests {
         let record = ProducerRecord::new("topic", b"value".to_vec());
         let result = handle.append(record, 0).await;
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err = result.unwrap_err();
+        let err_msg = err.to_string();
         assert!(
             err_msg.contains("max_block"),
             "expected max_block in error, got: {err_msg}"
+        );
+        assert!(
+            matches!(err, KrafkaError::Timeout { .. }),
+            "expected Timeout variant, got: {err:?}"
         );
     }
 
