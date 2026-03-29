@@ -32,6 +32,16 @@ use crate::protocol::{
     RecordBatchBuilder,
 };
 
+/// Response from the accumulator for an append attempt.
+#[derive(Debug)]
+enum AppendResponse {
+    /// Record accepted — metadata will arrive via the inner Result.
+    Done(Result<RecordMetadata>),
+    /// Buffer is full — the record is returned so the caller can retry
+    /// without cloning.
+    BufferFull(ProducerRecord),
+}
+
 /// Message sent to the accumulator background task.
 #[derive(Debug)]
 enum AccumulatorMessage {
@@ -39,7 +49,7 @@ enum AccumulatorMessage {
     Append {
         record: ProducerRecord,
         partition: PartitionId,
-        response_tx: oneshot::Sender<Result<RecordMetadata>>,
+        response_tx: oneshot::Sender<AppendResponse>,
     },
     /// Flush all batches.
     Flush {
@@ -71,17 +81,16 @@ impl RecordAccumulatorHandle {
         partition: PartitionId,
     ) -> Result<RecordMetadata> {
         let deadline = tokio::time::Instant::now() + self.max_block_ms;
-        let mut first_attempt = true;
+        // Hold the record in an Option so the first send moves it into the
+        // channel without cloning. On BufferFull the accumulator returns it,
+        // so retries are also zero-copy.
+        let mut pending = Some(record);
 
         loop {
+            // SAFETY: `pending` is always `Some` here — either set by the
+            // initial call or replenished by `AppendResponse::BufferFull`.
+            let rec = pending.take().expect("pending record missing");
             let (response_tx, response_rx) = oneshot::channel();
-            // Move the record on the first attempt; clone only on retries.
-            let rec = if first_attempt {
-                first_attempt = false;
-                record.clone()
-            } else {
-                record.clone()
-            };
             self.sender
                 .send(AccumulatorMessage::Append {
                     record: rec,
@@ -91,18 +100,22 @@ impl RecordAccumulatorHandle {
                 .await
                 .map_err(|_| KrafkaError::invalid_state("accumulator closed"))?;
 
-            let result = response_rx
+            let response = response_rx
                 .await
                 .map_err(|_| KrafkaError::invalid_state("accumulator response dropped"))?;
 
-            match result {
-                Err(KrafkaError::BufferFull) => {
-                    // Wait for memory to be freed, respecting max_block_ms deadline
+            match response {
+                AppendResponse::BufferFull(returned_record) => {
+                    // The accumulator returned the record without touching it.
+                    // Wait for memory to be freed, then retry with the same
+                    // record instance — zero clones on the retry path.
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() {
                         return Err(KrafkaError::config(
                             "Timed out waiting for buffer memory (max_block exceeded). \
-                             Consider increasing buffer_memory or max_block, or reducing production rate.",
+                             Consider increasing ProducerConfig::max_block / \
+                             AccumulatorConfig::max_block_ms, buffer_memory, \
+                             or reducing production rate.",
                         ));
                     }
                     if tokio::time::timeout(remaining, self.memory_freed.notified())
@@ -111,12 +124,15 @@ impl RecordAccumulatorHandle {
                     {
                         return Err(KrafkaError::config(
                             "Timed out waiting for buffer memory (max_block exceeded). \
-                             Consider increasing buffer_memory or max_block, or reducing production rate.",
+                             Consider increasing ProducerConfig::max_block / \
+                             AccumulatorConfig::max_block_ms, buffer_memory, \
+                             or reducing production rate.",
                         ));
                     }
-                    // Memory freed — retry the append
+                    // Replenish pending for the next iteration.
+                    pending = Some(returned_record);
                 }
-                other => return other,
+                AppendResponse::Done(result) => return result,
             }
         }
     }
@@ -221,7 +237,7 @@ impl Default for AccumulatorConfig {
 /// A pending record waiting for its batch to be sent.
 struct PendingRecord {
     record: ProducerRecord,
-    response_tx: oneshot::Sender<Result<RecordMetadata>>,
+    response_tx: oneshot::Sender<AppendResponse>,
     offset_in_batch: i64,
     /// Estimated size in bytes for memory tracking.
     estimated_size: usize,
@@ -347,7 +363,7 @@ impl RecordAccumulator {
         &mut self,
         record: ProducerRecord,
         partition: PartitionId,
-        response_tx: oneshot::Sender<Result<RecordMetadata>>,
+        response_tx: oneshot::Sender<AppendResponse>,
     ) {
         let topic = record.topic.clone();
         let key = (topic.clone(), partition);
@@ -359,8 +375,8 @@ impl RecordAccumulator {
         if self.config.buffer_memory > 0
             && self.memory_used + record_size > self.config.buffer_memory
         {
-            // Signal buffer full — the handle will block and retry
-            let _ = response_tx.send(Err(KrafkaError::BufferFull));
+            // Return the record to the caller so it can retry without cloning.
+            let _ = response_tx.send(AppendResponse::BufferFull(record));
             return;
         }
 
@@ -420,8 +436,9 @@ impl RecordAccumulator {
             } else {
                 // Record too large for batch - free the memory we reserved
                 self.memory_used = self.memory_used.saturating_sub(record_size);
-                let _ =
-                    response_tx.send(Err(KrafkaError::config("record too large for batch size")));
+                let _ = response_tx.send(AppendResponse::Done(Err(KrafkaError::config(
+                    "record too large for batch size",
+                ))));
             }
         }
     }
@@ -608,7 +625,9 @@ impl RecordAccumulator {
             Err(e) => {
                 let error_msg = e.to_string();
                 for p in pending {
-                    let _ = p.response_tx.send(Err(KrafkaError::protocol(&error_msg)));
+                    let _ = p
+                        .response_tx
+                        .send(AppendResponse::Done(Err(KrafkaError::protocol(&error_msg))));
                 }
                 return;
             }
@@ -763,7 +782,7 @@ impl RecordAccumulator {
                         timestamp,
                     };
                     crate::interceptor::safe_on_acknowledgement(&*config.interceptor, &meta, None);
-                    let _ = p.response_tx.send(Ok(meta));
+                    let _ = p.response_tx.send(AppendResponse::Done(Ok(meta)));
                 }
             }
             Err(e) => {
@@ -782,7 +801,7 @@ impl RecordAccumulator {
                         &meta,
                         Some(&err),
                     );
-                    let _ = p.response_tx.send(Err(err));
+                    let _ = p.response_tx.send(AppendResponse::Done(Err(err)));
                 }
             }
         }
@@ -943,8 +962,13 @@ mod tests {
         // Spawn a fake accumulator that always responds BufferFull
         tokio::spawn(async move {
             while let Some(msg) = receiver.recv().await {
-                if let AccumulatorMessage::Append { response_tx, .. } = msg {
-                    let _ = response_tx.send(Err(KrafkaError::BufferFull));
+                if let AccumulatorMessage::Append {
+                    record,
+                    response_tx,
+                    ..
+                } = msg
+                {
+                    let _ = response_tx.send(AppendResponse::BufferFull(record));
                 }
             }
         });
