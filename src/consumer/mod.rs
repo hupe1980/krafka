@@ -598,7 +598,7 @@ impl Consumer {
                     .or_default()
                     .push(ListOffsetsRequestPartition {
                         partition_index: *partition,
-                        // ListOffsets v2 does not serialize current_leader_epoch; use sentinel.
+                        // ListOffsets v1/v2 do not serialize current_leader_epoch; use sentinel.
                         current_leader_epoch: -1,
                         timestamp,
                     });
