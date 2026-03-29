@@ -88,9 +88,9 @@ impl ProducerRecord {
     /// Checks:
     /// - Key length fits in `i32` (Kafka bytes encoding limit of 2 GiB)
     /// - Value length fits in `i32`
-    /// - Each header key fits in `i16` (Kafka string encoding limit of 32 KiB)
+    /// - Each header key fits in `i32` (record batch v2 uses varint/i32 length prefix)
     /// - Each header value fits in `i32`
-    /// - Topic name fits in `i16`
+    /// - Topic name fits in `i16` (Kafka string encoding limit of 32 KiB)
     pub fn validate(&self) -> Result<()> {
         // Topic names are encoded as KafkaString (i16 length prefix)
         if self.topic.len() > i16::MAX as usize {

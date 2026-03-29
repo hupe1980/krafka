@@ -96,7 +96,7 @@ Krafka uses Kafka's v2 record batch format with:
 
 ### Unified Version Dispatch
 
-All message types exposed via `krafka::protocol` implement `VersionedEncode` and `VersionedDecode` traits that dispatch to the correct `encode_vN`/`decode_vN` method based on the protocol version number:
+Core request/response message types in `krafka::protocol` implement the `VersionedEncode` and `VersionedDecode` traits, which dispatch to the correct `encode_vN`/`decode_vN` method based on the protocol version number:
 
 ```rust
 use krafka::protocol::{VersionedEncode, VersionedDecode, MetadataRequest, MetadataResponse};
