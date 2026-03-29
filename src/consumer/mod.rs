@@ -576,22 +576,19 @@ impl Consumer {
         }
 
         let mut result = HashMap::new();
+        let mut last_error: Option<KrafkaError> = None;
 
         for leader_partitions in by_leader.values() {
             // Group into ListOffsetsRequest topics
             let mut topics_map: HashMap<String, Vec<ListOffsetsRequestPartition>> = HashMap::new();
             for (topic, partition) in leader_partitions {
-                let leader_epoch = self
-                    .metadata
-                    .leader_epoch(topic, *partition)
-                    .await
-                    .unwrap_or(-1);
                 topics_map
                     .entry(topic.clone())
                     .or_default()
                     .push(ListOffsetsRequestPartition {
                         partition_index: *partition,
-                        current_leader_epoch: leader_epoch,
+                        // ListOffsets v2 does not serialize current_leader_epoch; use sentinel.
+                        current_leader_epoch: -1,
                         timestamp,
                     });
             }
@@ -623,13 +620,14 @@ impl Consumer {
                         "Failed to connect to leader for {}-{}: {}, skipping broker",
                         sample_topic, sample_partition, e
                     );
+                    last_error = Some(e);
                     continue;
                 }
             };
 
             let response = match conn
-                .send_request(ApiKey::ListOffsets, 1, |buf| {
-                    request.encode_v1(buf);
+                .send_request(ApiKey::ListOffsets, 2, |buf| {
+                    request.encode_v2(buf);
                 })
                 .await
             {
@@ -639,18 +637,20 @@ impl Consumer {
                         "ListOffsets request failed for broker (leader of {}-{}): {}, skipping",
                         sample_topic, sample_partition, e
                     );
+                    last_error = Some(e);
                     continue;
                 }
             };
 
             let mut buf = response;
-            let list_response = match ListOffsetsResponse::decode_v1(&mut buf) {
+            let list_response = match ListOffsetsResponse::decode_v2(&mut buf) {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(
                         "Failed to decode ListOffsets response from broker (leader of {}-{}): {}, skipping",
                         sample_topic, sample_partition, e
                     );
+                    last_error = Some(e);
                     continue;
                 }
             };
@@ -670,6 +670,12 @@ impl Consumer {
                     }
                 }
             }
+        }
+
+        if result.is_empty()
+            && let Some(e) = last_error
+        {
+            return Err(e);
         }
 
         Ok(result)
@@ -905,7 +911,8 @@ impl Consumer {
                             let prev_wait =
                                 backoff.get(&key).map(|&(_, d)| d).unwrap_or(Duration::ZERO);
                             let next_wait = (prev_wait * 2).max(base).min(max);
-                            backoff.insert(key, (now + next_wait, next_wait));
+                            let backoff_now = Instant::now();
+                            backoff.insert(key, (backoff_now + next_wait, next_wait));
                         }
                     }
                 }
