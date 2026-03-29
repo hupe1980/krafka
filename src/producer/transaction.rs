@@ -374,9 +374,7 @@ impl TransactionalProducer {
         );
 
         let response_bytes = conn
-            .send_request(ApiKey::InitProducerId, 0, |buf| {
-                request.encode_v0(buf);
-            })
+            .send_request(ApiKey::InitProducerId, 0, |buf| request.encode_v0(buf))
             .await?;
 
         let mut buf = response_bytes;
@@ -420,10 +418,21 @@ impl TransactionalProducer {
 
         let request = FindCoordinatorRequest::for_transaction(&self.config.transactional_id);
 
+        // Transaction coordinator lookup requires v1 (key_type field).
+        // Verify the broker supports it.
+        let fc_version = conn
+            .negotiate_api_version_max(ApiKey::FindCoordinator, 1)
+            .await
+            .unwrap_or(0);
+        if fc_version < 1 {
+            return Err(KrafkaError::protocol(
+                "broker does not support FindCoordinator v1; \
+                 transactional coordinator lookup requires key_type (v1+)",
+            ));
+        }
+
         let response_bytes = conn
-            .send_request(ApiKey::FindCoordinator, 1, |buf| {
-                request.encode_v1(buf);
-            })
+            .send_request(ApiKey::FindCoordinator, 1, |buf| request.encode_v1(buf))
             .await?;
 
         let mut buf = response_bytes;
@@ -582,9 +591,7 @@ impl TransactionalProducer {
         .add_partition(topic, partition);
 
         let response_bytes = conn
-            .send_request(ApiKey::AddPartitionsToTxn, 0, |buf| {
-                request.encode_v0(buf);
-            })
+            .send_request(ApiKey::AddPartitionsToTxn, 0, |buf| request.encode_v0(buf))
             .await?;
 
         let mut buf = response_bytes;
@@ -736,9 +743,7 @@ impl TransactionalProducer {
         };
 
         let response = conn
-            .send_request(ApiKey::Produce, 3, |buf| {
-                request.encode_v3(buf);
-            })
+            .send_request(ApiKey::Produce, 3, |buf| request.encode_v3(buf))
             .await?;
 
         let mut buf = response;
@@ -816,9 +821,7 @@ impl TransactionalProducer {
         );
 
         let response_bytes = conn
-            .send_request(ApiKey::AddOffsetsToTxn, 0, |buf| {
-                add_request.encode_v0(buf);
-            })
+            .send_request(ApiKey::AddOffsetsToTxn, 0, |buf| add_request.encode_v0(buf))
             .await?;
 
         let mut buf = response_bytes;
@@ -854,7 +857,7 @@ impl TransactionalProducer {
 
         let response_bytes = group_conn
             .send_request(ApiKey::TxnOffsetCommit, 0, |buf| {
-                commit_request.encode_v0(buf);
+                commit_request.encode_v0(buf)
             })
             .await?;
 
@@ -886,14 +889,29 @@ impl TransactionalProducer {
 
         let request = FindCoordinatorRequest::for_group(group_id);
 
+        // Negotiate FindCoordinator version — prefer v1, fall back to v0.
+        // Group coordinator lookup works with both v0 and v1.
+        let fc_version = conn
+            .negotiate_api_version_max(ApiKey::FindCoordinator, 1)
+            .await
+            .unwrap_or(0);
+
         let response_bytes = conn
-            .send_request(ApiKey::FindCoordinator, 1, |buf| {
-                request.encode_v1(buf);
+            .send_request(ApiKey::FindCoordinator, fc_version, |buf| {
+                if fc_version >= 1 {
+                    request.encode_v1(buf)
+                } else {
+                    request.encode_v0(buf)
+                }
             })
             .await?;
 
         let mut buf = response_bytes;
-        let response = FindCoordinatorResponse::decode_v1(&mut buf)?;
+        let response = if fc_version >= 1 {
+            FindCoordinatorResponse::decode_v1(&mut buf)?
+        } else {
+            FindCoordinatorResponse::decode_v0(&mut buf)?
+        };
 
         if !response.error_code.is_ok() {
             return Err(KrafkaError::broker(
@@ -1004,9 +1022,7 @@ impl TransactionalProducer {
         };
 
         let response_bytes = conn
-            .send_request(ApiKey::EndTxn, 0, |buf| {
-                request.encode_v0(buf);
-            })
+            .send_request(ApiKey::EndTxn, 0, |buf| request.encode_v0(buf))
             .await?;
 
         let mut buf = response_bytes;

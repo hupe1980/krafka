@@ -6,7 +6,7 @@
 use bytes::{Buf, BufMut};
 
 use super::api::ApiKey;
-use super::primitives::{Decode, Encode, KafkaString, TaggedFields};
+use super::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::error::Result;
 
 /// Request header for Kafka protocol.
@@ -46,35 +46,38 @@ impl RequestHeader {
 
     /// Encode the header for header version 0.
     #[inline]
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
         self.api_key.encode(buf);
         self.api_version.encode(buf);
         self.correlation_id.encode(buf);
+        Ok(())
     }
 
     /// Encode the header for header version 1.
     #[inline]
-    pub fn encode_v1(&self, buf: &mut impl BufMut) {
+    pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
         self.api_key.encode(buf);
         self.api_version.encode(buf);
         self.correlation_id.encode(buf);
         match &self.client_id {
-            Some(client_id) => client_id.encode(buf),
-            None => KafkaString::null().encode(buf),
+            Some(client_id) => client_id.try_encode(buf)?,
+            None => KafkaString::null().try_encode(buf)?,
         }
+        Ok(())
     }
 
     /// Encode the header for header version 2 (flexible).
     #[inline]
-    pub fn encode_v2(&self, buf: &mut impl BufMut) {
+    pub fn encode_v2(&self, buf: &mut impl BufMut) -> Result<()> {
         self.api_key.encode(buf);
         self.api_version.encode(buf);
         self.correlation_id.encode(buf);
         match &self.client_id {
-            Some(client_id) => client_id.encode_compact(buf),
-            None => KafkaString::null().encode_compact(buf),
+            Some(client_id) => client_id.try_encode_compact(buf)?,
+            None => KafkaString::null().try_encode_compact(buf)?,
         }
-        TaggedFields::default().encode(buf);
+        TaggedFields::default().try_encode(buf)?;
+        Ok(())
     }
 
     /// Determine the header version to use based on the API key and version.
@@ -98,13 +101,14 @@ impl RequestHeader {
     }
 
     /// Encode the header using the appropriate version.
-    pub fn encode(&self, buf: &mut impl BufMut) {
+    pub fn encode(&self, buf: &mut impl BufMut) -> Result<()> {
         let header_version = Self::header_version(self.api_key, self.api_version);
         match header_version {
-            0 => self.encode_v0(buf),
-            1 => self.encode_v1(buf),
-            _ => self.encode_v2(buf),
+            0 => self.encode_v0(buf)?,
+            1 => self.encode_v1(buf)?,
+            _ => self.encode_v2(buf)?,
         }
+        Ok(())
     }
 }
 
@@ -180,7 +184,7 @@ mod tests {
     fn test_request_header_v0() {
         let header = RequestHeader::new(ApiKey::ApiVersions, 0, 1);
         let mut buf = BytesMut::new();
-        header.encode_v0(&mut buf);
+        header.encode_v0(&mut buf).unwrap();
 
         let mut buf = buf.freeze();
         assert_eq!(i16::decode(&mut buf).unwrap(), 18); // ApiVersions = 18
@@ -192,7 +196,7 @@ mod tests {
     fn test_request_header_v1() {
         let header = RequestHeader::new(ApiKey::Metadata, 0, 42).with_client_id("test-client");
         let mut buf = BytesMut::new();
-        header.encode_v1(&mut buf);
+        header.encode_v1(&mut buf).unwrap();
 
         let mut buf = buf.freeze();
         assert_eq!(i16::decode(&mut buf).unwrap(), 3); // Metadata = 3
@@ -215,7 +219,7 @@ mod tests {
     fn test_response_header_v1() {
         let mut buf = BytesMut::new();
         42i32.encode(&mut buf);
-        TaggedFields::default().encode(&mut buf);
+        TaggedFields::default().try_encode(&mut buf).unwrap();
 
         let header = ResponseHeader::decode_v1(&mut buf.freeze()).unwrap();
         assert_eq!(header.correlation_id, 42);

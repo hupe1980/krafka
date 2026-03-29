@@ -726,9 +726,7 @@ impl RecordAccumulator {
             // acks=0 (fire-and-forget): Kafka sends no response (R6.1 fix)
             if config.acks == 0 {
                 match conn
-                    .send_fire_and_forget(ApiKey::Produce, 0, |buf| {
-                        request.encode_v0(buf);
-                    })
+                    .send_fire_and_forget(ApiKey::Produce, 0, |buf| request.encode_v0(buf))
                     .await
                 {
                     Ok(()) => {
@@ -747,9 +745,7 @@ impl RecordAccumulator {
             }
 
             let response_result = conn
-                .send_request(ApiKey::Produce, 0, |buf| {
-                    request.encode_v0(buf);
-                })
+                .send_request(ApiKey::Produce, 0, |buf| request.encode_v0(buf))
                 .await;
 
             match response_result {

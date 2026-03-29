@@ -416,9 +416,7 @@ impl AdminClient {
 
         // Send request
         let response_bytes = conn
-            .send_request(ApiKey::CreateTopics, 0, |buf| {
-                request.encode_v0(buf);
-            })
+            .send_request(ApiKey::CreateTopics, 0, |buf| request.encode_v0(buf))
             .await?;
 
         // Decode response
@@ -472,9 +470,7 @@ impl AdminClient {
 
         // Send request
         let response_bytes = conn
-            .send_request(ApiKey::DeleteTopics, 0, |buf| {
-                request.encode_v0(buf);
-            })
+            .send_request(ApiKey::DeleteTopics, 0, |buf| request.encode_v0(buf))
             .await?;
 
         // Decode response
@@ -538,9 +534,7 @@ impl AdminClient {
 
         // Send request
         let response_bytes = conn
-            .send_request(ApiKey::CreatePartitions, 0, |buf| {
-                request.encode_v0(buf);
-            })
+            .send_request(ApiKey::CreatePartitions, 0, |buf| request.encode_v0(buf))
             .await?;
 
         // Decode response
@@ -595,9 +589,7 @@ impl AdminClient {
         let request = DescribeConfigsRequest::for_topic(topic);
 
         let response_bytes = conn
-            .send_request(ApiKey::DescribeConfigs, 0, |buf| {
-                request.encode_v0(buf);
-            })
+            .send_request(ApiKey::DescribeConfigs, 0, |buf| request.encode_v0(buf))
             .await?;
 
         let mut buf = response_bytes;
@@ -645,9 +637,7 @@ impl AdminClient {
         let request = DescribeConfigsRequest::for_broker(broker_id);
 
         let response_bytes = conn
-            .send_request(ApiKey::DescribeConfigs, 0, |buf| {
-                request.encode_v0(buf);
-            })
+            .send_request(ApiKey::DescribeConfigs, 0, |buf| request.encode_v0(buf))
             .await?;
 
         let mut buf = response_bytes;
@@ -702,9 +692,7 @@ impl AdminClient {
         let request = AlterConfigsRequest::for_topic(topic, configs.into_iter().collect());
 
         let response_bytes = conn
-            .send_request(ApiKey::AlterConfigs, 0, |buf| {
-                request.encode_v0(buf);
-            })
+            .send_request(ApiKey::AlterConfigs, 0, |buf| request.encode_v0(buf))
             .await?;
 
         let mut buf = response_bytes;
@@ -874,9 +862,7 @@ impl AdminClient {
         };
 
         let response_bytes = conn
-            .send_request(ApiKey::DescribeAcls, 0, |buf| {
-                request.encode_v0(buf);
-            })
+            .send_request(ApiKey::DescribeAcls, 0, |buf| request.encode_v0(buf))
             .await?;
 
         let mut buf = response_bytes;
@@ -942,9 +928,7 @@ impl AdminClient {
         };
 
         let response_bytes = conn
-            .send_request(ApiKey::CreateAcls, 0, |buf| {
-                request.encode_v0(buf);
-            })
+            .send_request(ApiKey::CreateAcls, 0, |buf| request.encode_v0(buf))
             .await?;
 
         let mut buf = response_bytes;
@@ -1008,9 +992,7 @@ impl AdminClient {
         };
 
         let response_bytes = conn
-            .send_request(ApiKey::DeleteAcls, 0, |buf| {
-                request.encode_v0(buf);
-            })
+            .send_request(ApiKey::DeleteAcls, 0, |buf| request.encode_v0(buf))
             .await?;
 
         let mut buf = response_bytes;
@@ -1072,7 +1054,7 @@ impl AdminClient {
             let coord_request = FindCoordinatorRequest::for_group(group_id);
             let coord_response_bytes = any_conn
                 .send_request(ApiKey::FindCoordinator, 1, |buf| {
-                    coord_request.encode_v1(buf);
+                    coord_request.encode_v1(buf)
                 })
                 .await?;
             let mut coord_buf = coord_response_bytes;
@@ -1114,9 +1096,7 @@ impl AdminClient {
             };
 
             let response_bytes = conn
-                .send_request(ApiKey::DescribeGroups, 0, |buf| {
-                    request.encode_v0(buf);
-                })
+                .send_request(ApiKey::DescribeGroups, 0, |buf| request.encode_v0(buf))
                 .await?;
 
             let mut buf = response_bytes;
@@ -1188,9 +1168,7 @@ impl AdminClient {
             let request = ListGroupsRequest;
 
             let response_bytes = match conn
-                .send_request(ApiKey::ListGroups, 0, |buf| {
-                    request.encode_v0(buf);
-                })
+                .send_request(ApiKey::ListGroups, 0, |buf| request.encode_v0(buf))
                 .await
             {
                 Ok(r) => r,
@@ -1304,9 +1282,7 @@ impl AdminClient {
             };
 
             let response_bytes = conn
-                .send_request(ApiKey::DeleteRecords, 0, |buf| {
-                    request.encode_v0(buf);
-                })
+                .send_request(ApiKey::DeleteRecords, 0, |buf| request.encode_v0(buf))
                 .await?;
 
             let mut buf = response_bytes;
@@ -1410,7 +1386,7 @@ impl AdminClient {
 
             let response_bytes = conn
                 .send_request(ApiKey::OffsetForLeaderEpoch, 2, |buf| {
-                    request.encode_v2(buf);
+                    request.encode_v2(buf)
                 })
                 .await?;
 

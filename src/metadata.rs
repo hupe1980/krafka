@@ -199,9 +199,7 @@ impl ClusterMetadata {
         };
 
         let response = conn
-            .send_request(ApiKey::Metadata, 0, |buf| {
-                request.encode_v0(buf);
-            })
+            .send_request(ApiKey::Metadata, 0, |buf| request.encode_v0(buf))
             .await?;
 
         // Decode response

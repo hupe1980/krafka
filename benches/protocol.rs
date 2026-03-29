@@ -189,7 +189,7 @@ fn bench_request_header(c: &mut Criterion) {
     group.bench_function("encode_v0", |b| {
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(32);
-            header.encode_v0(&mut buf);
+            header.encode_v0(&mut buf).unwrap();
             black_box(buf)
         });
     });
@@ -198,7 +198,7 @@ fn bench_request_header(c: &mut Criterion) {
     group.bench_function("encode_v1", |b| {
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(64);
-            header.encode_v1(&mut buf);
+            header.encode_v1(&mut buf).unwrap();
             black_box(buf)
         });
     });
@@ -207,7 +207,7 @@ fn bench_request_header(c: &mut Criterion) {
     group.bench_function("encode_v2", |b| {
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(64);
-            header.encode_v2(&mut buf);
+            header.encode_v2(&mut buf).unwrap();
             black_box(buf)
         });
     });

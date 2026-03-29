@@ -396,10 +396,8 @@ impl Producer {
 
         // acks=0 (fire-and-forget): Kafka sends no response, so don't wait for one (R6.1 fix)
         if self.config.acks == Acks::None {
-            conn.send_fire_and_forget(ApiKey::Produce, 0, |buf| {
-                request.encode_v0(buf);
-            })
-            .await?;
+            conn.send_fire_and_forget(ApiKey::Produce, 0, |buf| request.encode_v0(buf))
+                .await?;
 
             return Ok(RecordMetadata {
                 topic: topic.to_string(),
@@ -411,9 +409,7 @@ impl Producer {
 
         // Send request and wait for response (acks=1 or acks=-1/all)
         let response = conn
-            .send_request(ApiKey::Produce, 0, |buf| {
-                request.encode_v0(buf);
-            })
+            .send_request(ApiKey::Produce, 0, |buf| request.encode_v0(buf))
             .await?;
 
         // Decode response

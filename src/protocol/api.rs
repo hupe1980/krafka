@@ -4,7 +4,7 @@
 
 use bytes::{Buf, BufMut};
 
-use super::primitives::{Decode, Encode, KafkaArray, KafkaString, TaggedFields};
+use super::primitives::{Decode, Encode, KafkaArray, KafkaString, TaggedFields, TryEncode};
 use crate::error::Result;
 
 /// Kafka API keys.
@@ -465,24 +465,26 @@ impl ApiVersionsRequest {
     }
 
     /// Encode for version 0-2.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
         // Empty request body for v0-2
         let _ = buf;
+        Ok(())
     }
 
     /// Encode for version 3+ (flexible).
-    pub fn encode_v3(&self, buf: &mut impl BufMut) {
+    pub fn encode_v3(&self, buf: &mut impl BufMut) -> Result<()> {
         if let Some(ref name) = self.client_software_name {
-            name.encode_compact(buf);
+            name.try_encode_compact(buf)?;
         } else {
-            KafkaString::null().encode_compact(buf);
+            KafkaString::null().try_encode_compact(buf)?;
         }
         if let Some(ref version) = self.client_software_version {
-            version.encode_compact(buf);
+            version.try_encode_compact(buf)?;
         } else {
-            KafkaString::null().encode_compact(buf);
+            KafkaString::null().try_encode_compact(buf)?;
         }
-        TaggedFields::default().encode(buf);
+        TaggedFields::default().try_encode(buf)?;
+        Ok(())
     }
 }
 

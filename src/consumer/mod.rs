@@ -636,17 +636,27 @@ impl Consumer {
                 }
             };
 
+            // Negotiate ListOffsets version — prefer v2, fall back to v1.
+            let list_version = conn
+                .negotiate_api_version_max(ApiKey::ListOffsets, 2)
+                .await
+                .unwrap_or(1);
+
             let response = match conn
-                .send_request(ApiKey::ListOffsets, 2, |buf| {
-                    request.encode_v2(buf);
+                .send_request(ApiKey::ListOffsets, list_version, |buf| {
+                    if list_version >= 2 {
+                        request.encode_v2(buf)
+                    } else {
+                        request.encode_v1(buf)
+                    }
                 })
                 .await
             {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(
-                        "ListOffsets request failed for broker (leader of {}-{}): {}, skipping",
-                        sample_topic, sample_partition, e
+                        "ListOffsets v{} request failed for broker (leader of {}-{}): {}, skipping",
+                        list_version, sample_topic, sample_partition, e
                     );
                     last_error = Some(e);
                     continue;
@@ -654,12 +664,16 @@ impl Consumer {
             };
 
             let mut buf = response;
-            let list_response = match ListOffsetsResponse::decode_v2(&mut buf) {
+            let list_response = match if list_version >= 2 {
+                ListOffsetsResponse::decode_v2(&mut buf)
+            } else {
+                ListOffsetsResponse::decode_v1(&mut buf)
+            } {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(
-                        "Failed to decode ListOffsets response from broker (leader of {}-{}): {}, skipping",
-                        sample_topic, sample_partition, e
+                        "Failed to decode ListOffsets v{} response from broker (leader of {}-{}): {}, skipping",
+                        list_version, sample_topic, sample_partition, e
                     );
                     last_error = Some(e);
                     continue;
@@ -1181,9 +1195,9 @@ impl Consumer {
         let response = match conn
             .send_request(ApiKey::Fetch, fetch_version, |buf| {
                 if fetch_version >= 7 {
-                    request.encode_v7(buf);
+                    request.encode_v7(buf)
                 } else {
-                    request.encode_v4(buf);
+                    request.encode_v4(buf)
                 }
             })
             .await
@@ -1464,7 +1478,7 @@ impl Consumer {
 
         let response_bytes = conn
             .send_request(ApiKey::OffsetForLeaderEpoch, 2, |buf| {
-                request.encode_v2(buf);
+                request.encode_v2(buf)
             })
             .await?;
 
