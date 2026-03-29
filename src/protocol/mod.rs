@@ -21,7 +21,7 @@
 //! | Metadata | 0 | 1 | v1+ includes controller info |
 //! | OffsetCommit | 0 | 2 | v2+ for retention |
 //! | OffsetFetch | 0 | 1 | v1+ for group coordinator |
-//! | FindCoordinator | 0 | 0 | Group coordinator lookup |
+//! | FindCoordinator | 0 | 1 | Group/txn coordinator lookup |
 //! | JoinGroup | 0 | 5 | v5+ group instance id |
 //! | Heartbeat | 0 | 1 | v0 is baseline |
 //! | SyncGroup | 0 | 3 | v3+ group instance id |

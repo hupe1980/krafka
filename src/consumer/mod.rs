@@ -663,10 +663,18 @@ impl Consumer {
                             part_resp.offset,
                         );
                     } else {
+                        let err = KrafkaError::broker(
+                            part_resp.error_code,
+                            format!(
+                                "ListOffsets error for {}-{}",
+                                topic_resp.name, part_resp.partition_index
+                            ),
+                        );
                         warn!(
                             "ListOffsets error for {}-{}: {:?}",
                             topic_resp.name, part_resp.partition_index, part_resp.error_code
                         );
+                        last_error = Some(err);
                     }
                 }
             }

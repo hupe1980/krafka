@@ -289,7 +289,7 @@ Before sending, each `ProducerRecord` is validated against Kafka wire-format lim
 - **Topic name**: max 32,767 bytes (i16 limit)
 - **Key**: max 2,147,483,647 bytes (i32 limit)
 - **Value**: max 2,147,483,647 bytes (i32 limit)
-- **Header keys**: max 32,767 bytes (i16 limit)
+- **Header keys**: max 2,147,483,647 bytes (i32 limit)
 - **Header values**: max 2,147,483,647 bytes (i32 limit)
 
 Oversized data returns a descriptive `KrafkaError::config` error instead of panicking.

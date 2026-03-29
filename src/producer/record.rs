@@ -121,15 +121,15 @@ impl ProducerRecord {
             )));
         }
 
-        // Header keys are encoded as KafkaString (i16 length prefix)
-        // Header values are encoded as KafkaBytes (i32 length prefix)
+        // Header keys and values are encoded with varint i32 length prefixes
+        // in the record batch v2 format.
         for (i, (key, value)) in self.headers.iter().enumerate() {
-            if key.len() > i16::MAX as usize {
+            if key.len() > i32::MAX as usize {
                 return Err(KrafkaError::config(format!(
                     "header[{}] key length {} exceeds protocol limit of {}",
                     i,
                     key.len(),
-                    i16::MAX
+                    i32::MAX
                 )));
             }
             if value.len() > i32::MAX as usize {
@@ -246,11 +246,12 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_oversized_header_key() {
+    fn test_validate_accepts_header_key_within_i32_limit() {
+        // Header keys use varint i32 length prefix in record batch v2,
+        // so i16::MAX + 1 must be accepted (previously rejected).
         let record = ProducerRecord::new("topic", b"v".to_vec())
             .with_header("x".repeat(i16::MAX as usize + 1), b"v".to_vec());
-        let err = record.validate().unwrap_err().to_string();
-        assert!(err.contains("header[0] key length"), "unexpected: {err}");
+        assert!(record.validate().is_ok());
     }
 
     #[test]
