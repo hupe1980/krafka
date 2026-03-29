@@ -217,10 +217,12 @@ impl Consumer {
             let assignment = coordinator.ensure_active_membership(&topic_strings).await?;
 
             // Update our assignments based on the group assignment
-            let mut assignments = self.assignments.write().await;
-            assignments.clear();
-            for (topic, partitions) in &assignment.partitions {
-                assignments.insert(topic.clone(), partitions.clone());
+            {
+                let mut assignments = self.assignments.write().await;
+                assignments.clear();
+                for (topic, partitions) in &assignment.partitions {
+                    assignments.insert(topic.clone(), partitions.clone());
+                }
             }
 
             // Fetch committed offsets for our assigned partitions

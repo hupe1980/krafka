@@ -212,6 +212,54 @@ impl TransactionPartitions {
     }
 }
 
+/// RAII guard that cancels a pending partition add if dropped without confirmation.
+///
+/// When the task performing the `AddPartitionsToTxn` RPC is cancelled (e.g.,
+/// via `select!` or `timeout`), this guard ensures the partition is rolled back
+/// from `Pending` to absent so that future callers aren't stuck waiting forever.
+struct PendingAddGuard {
+    txn_partitions: Arc<RwLock<TransactionPartitions>>,
+    topic: String,
+    partition: PartitionId,
+    notify: Arc<Notify>,
+    /// Set to `true` when `confirm_add` or an explicit `cancel_add` is called,
+    /// preventing the drop impl from double-cancelling.
+    defused: bool,
+}
+
+impl PendingAddGuard {
+    /// Confirm the add succeeded. Consumes the guard without cancelling.
+    async fn confirm(mut self, topic: &str, partition: PartitionId) {
+        self.defused = true;
+        let mut txn_partitions = self.txn_partitions.write().await;
+        txn_partitions.confirm_add(topic, partition, &self.notify);
+    }
+
+    /// Explicitly cancel the add (RPC failed). Consumes the guard.
+    async fn cancel(mut self, topic: &str, partition: PartitionId) {
+        self.defused = true;
+        let mut txn_partitions = self.txn_partitions.write().await;
+        txn_partitions.cancel_add(topic, partition, &self.notify);
+    }
+}
+
+impl Drop for PendingAddGuard {
+    fn drop(&mut self) {
+        if !self.defused {
+            // Best-effort cancel: we can't await the lock in drop, so use
+            // try_write. If contended, spawn a task to do it.
+            let topic = self.topic.clone();
+            let partition = self.partition;
+            let notify = self.notify.clone();
+            let txn_partitions = self.txn_partitions.clone();
+            tokio::spawn(async move {
+                let mut tp = txn_partitions.write().await;
+                tp.cancel_add(&topic, partition, &notify);
+            });
+        }
+    }
+}
+
 /// A transactional Kafka producer.
 ///
 /// Provides exactly-once semantics through transactions.
@@ -233,7 +281,7 @@ pub struct TransactionalProducer {
     /// Transaction coordinator broker ID.
     coordinator_id: RwLock<Option<i32>>,
     /// Partitions in current transaction.
-    txn_partitions: RwLock<TransactionPartitions>,
+    txn_partitions: Arc<RwLock<TransactionPartitions>>,
     /// Sequence number tracking for idempotent production.
     identity: ProducerIdentity,
 }
@@ -464,16 +512,23 @@ impl TransactionalProducer {
                     // Re-check state on next iteration.
                 }
                 BeginAddResult::NeedAdd(notify) => {
-                    // Drop the lock before the RPC.
+                    // Drop the lock before the RPC. The guard ensures that
+                    // if this task is cancelled, the Pending state is rolled
+                    // back so waiters don't hang forever.
                     drop(txn_partitions);
+                    let guard = PendingAddGuard {
+                        txn_partitions: self.txn_partitions.clone(),
+                        topic: topic.clone(),
+                        partition,
+                        notify,
+                        defused: false,
+                    };
                     match self.add_partition_to_txn(&topic, partition).await {
                         Ok(()) => {
-                            let mut txn_partitions = self.txn_partitions.write().await;
-                            txn_partitions.confirm_add(&topic, partition, &notify);
+                            guard.confirm(&topic, partition).await;
                         }
                         Err(e) => {
-                            let mut txn_partitions = self.txn_partitions.write().await;
-                            txn_partitions.cancel_add(&topic, partition, &notify);
+                            guard.cancel(&topic, partition).await;
                             return Err(e);
                         }
                     }
@@ -1138,7 +1193,7 @@ impl TransactionalProducerBuilder {
             producer_id: RwLock::new(-1),
             producer_epoch: RwLock::new(-1),
             coordinator_id: RwLock::new(None),
-            txn_partitions: RwLock::new(TransactionPartitions::default()),
+            txn_partitions: Arc::new(RwLock::new(TransactionPartitions::default())),
             identity: ProducerIdentity::new(),
         })
     }
