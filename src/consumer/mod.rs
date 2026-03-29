@@ -955,10 +955,10 @@ impl Consumer {
         // Negotiate fetch API version — prefer v7 (sessions), fall back to v4.
         // We only implement encode/decode for v4 and v7, so we must not send v5/v6
         // (which add log_start_offset to the request partition) with our v4 encoder.
-        let fetch_version = match conn.negotiate_api_version(ApiKey::Fetch, 7, 7).await {
-            Some(v) => v, // Broker supports v7
-            None => 4,    // Fall back to v4
-        };
+        let fetch_version = conn
+            .negotiate_api_version(ApiKey::Fetch, 7, 7)
+            .await
+            .unwrap_or(4);
 
         // For v7+, apply fetch session state to produce incremental requests
         let request = if fetch_version >= 7 {
