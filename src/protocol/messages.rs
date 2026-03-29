@@ -4938,6 +4938,7 @@ impl VersionedEncode for FindCoordinatorRequest {
     fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
         match version {
             0 => self.encode_v0(buf),
+            1 => self.encode_v1(buf),
             _ => return unsupported_encode!("FindCoordinatorRequest", version),
         }
         Ok(())
@@ -4948,6 +4949,7 @@ impl VersionedDecode for FindCoordinatorResponse {
     fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
         match version {
             0 => Self::decode_v0(buf),
+            1 => Self::decode_v1(buf),
             _ => unsupported_decode!("FindCoordinatorResponse", version),
         }
     }

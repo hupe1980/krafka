@@ -61,7 +61,7 @@ Krafka supports the following API version ranges (clamped to match actual encode
 | Metadata | 0 | 1 | v1 controller info |
 | OffsetCommit | 0 | 2 | v2 retention |
 | OffsetFetch | 0 | 1 | v1 group coordinator |
-| FindCoordinator | 0 | 0 | Group coordinator lookup |
+| FindCoordinator | 0 | 1 | Group/txn coordinator lookup |
 | JoinGroup | 0 | 5 | v5 group instance id |
 | Heartbeat | 0 | 0 | Standard heartbeat |
 | SyncGroup | 0 | 3 | v3 group instance id |
@@ -144,7 +144,7 @@ Krafka protects against malicious or corrupted broker responses:
 - **Allocation caps**: All `Vec::with_capacity()` calls in protocol decoding are capped at 10,000 elements, preventing OOM from broker-supplied lengths
 - **Decompression limits**: Decompressed record data is limited to 128 MiB via streaming `.take()` limits and post-decompression size checks
 - **Record headers**: Record headers are preserved during batch building — no silent data loss
-- **Encode validation**: The `TryEncode` trait provides fallible encoding for protocol primitives (`KafkaString`, `KafkaBytes`, `KafkaArray`, `TaggedFields`), returning errors instead of panicking on oversized data. `ProducerRecord::validate()` checks wire-format limits at the API boundary before encoding
+- **Encode validation**: The `TryEncode` trait provides fallible encoding for protocol primitives (`KafkaString`, `KafkaBytes`, `KafkaArray<T>` where `T: TryEncode`, `TaggedFields`), returning errors instead of panicking on oversized data. `ProducerRecord::validate()` checks wire-format limits at the API boundary before encoding
 
 ## Wire Protocol
 

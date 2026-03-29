@@ -78,7 +78,7 @@ pub mod versions {
     /// Maximum supported OffsetFetch version.
     pub const OFFSET_FETCH_MAX: i16 = 1;
     /// Maximum supported FindCoordinator version.
-    pub const FIND_COORDINATOR_MAX: i16 = 0;
+    pub const FIND_COORDINATOR_MAX: i16 = 1;
     /// Maximum supported JoinGroup version.
     pub const JOIN_GROUP_MAX: i16 = 5;
     /// Maximum supported Heartbeat version.
