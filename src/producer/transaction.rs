@@ -246,16 +246,21 @@ impl PendingAddGuard {
 impl Drop for PendingAddGuard {
     fn drop(&mut self) {
         if !self.defused {
-            // Best-effort cancel: we can't await the lock in drop, so use
-            // try_write. If contended, spawn a task to do it.
+            // Best-effort cancel: we can't await the lock in drop, so first
+            // try a non-blocking write. If the lock is contended and a Tokio
+            // runtime is available, spawn a task to perform the cancel.
             let topic = self.topic.clone();
             let partition = self.partition;
             let notify = self.notify.clone();
-            let txn_partitions = self.txn_partitions.clone();
-            tokio::spawn(async move {
-                let mut tp = txn_partitions.write().await;
+            if let Ok(mut tp) = self.txn_partitions.try_write() {
                 tp.cancel_add(&topic, partition, &notify);
-            });
+            } else if tokio::runtime::Handle::try_current().is_ok() {
+                let txn_partitions = self.txn_partitions.clone();
+                tokio::spawn(async move {
+                    let mut tp = txn_partitions.write().await;
+                    tp.cancel_add(&topic, partition, &notify);
+                });
+            }
         }
     }
 }

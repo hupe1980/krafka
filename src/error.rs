@@ -70,10 +70,6 @@ pub enum KrafkaError {
         /// Error message describing the serialization failure.
         message: String,
     },
-
-    /// Buffer memory full (backpressure).
-    #[error("buffer memory full")]
-    BufferFull,
 }
 
 impl KrafkaError {

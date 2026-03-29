@@ -980,19 +980,6 @@ mod tests {
 
     // ── Backpressure tests ──────────────────────────────────────
 
-    #[test]
-    fn test_buffer_full_error_variant() {
-        let err = KrafkaError::BufferFull;
-        assert_eq!(err.to_string(), "buffer memory full");
-    }
-
-    #[test]
-    fn test_notify_shared_via_arc() {
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let notify2 = notify.clone();
-        assert!(Arc::ptr_eq(&notify, &notify2));
-    }
-
     #[tokio::test]
     async fn test_backpressure_timeout_returns_timeout_error() {
         let (sender, mut receiver) = mpsc::channel::<AccumulatorMessage>(16);
