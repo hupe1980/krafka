@@ -329,6 +329,20 @@ fn partition(key: &[u8], partition_count: usize) -> i32 {
       │ <───────────────────────── │                            │
 ```
 
+### Fetch Sessions (KIP-227)
+
+When the broker supports Fetch API v7+, Krafka uses incremental fetch sessions to reduce request
+sizes. A per-broker `FetchSessionState` tracks the partitions registered with the broker's session.
+On each `poll()`, the consumer computes a diff against the previous state:
+
+- **New/changed partitions** go in the `topics` field (only offset and `max_bytes` changes)
+- **Removed partitions** go in the `forgotten_topics` field
+- The `session_id` and incrementing `session_epoch` (a per-session epoch, not the partition
+  leader epoch) maintain session continuity
+
+If the broker returns `FetchSessionIdNotFound` or `InvalidFetchSessionEpoch`, the session is reset
+and the next poll sends a full fetch. All sessions are cleared on consumer group rebalance.
+
 ### Consumer Group Protocol
 
 ```
@@ -506,6 +520,7 @@ cargo bench
 Krafka includes the following production-ready features:
 
 - ✅ **Transactional Producer**: Exactly-once semantics with `TransactionalProducer`
+- ✅ **Incremental Fetch Sessions**: KIP-227 — bandwidth-efficient incremental fetches with per-broker session tracking
 - ✅ **TLS/SSL encryption**: Secure connections with rustls and mTLS support
 - ✅ **AWS MSK IAM authentication**: Native support with optional SDK integration
 - ✅ **SASL/SCRAM Authentication**: SHA-256 and SHA-512 mechanisms
