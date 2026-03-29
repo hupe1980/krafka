@@ -55,7 +55,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::PartitionId;
@@ -146,16 +146,60 @@ impl Default for TransactionalProducerConfig {
     }
 }
 
+/// State of a partition within the current transaction.
+#[derive(Debug, Clone)]
+enum PartitionAddState {
+    /// AddPartitionsToTxn RPC is in-flight; concurrent callers should wait.
+    Pending(Arc<Notify>),
+    /// Successfully registered with the transaction coordinator.
+    Added,
+}
+
+/// Result of attempting to begin adding a partition to the transaction.
+enum BeginAddResult {
+    /// Partition already registered — nothing to do.
+    AlreadyAdded,
+    /// Another caller is registering this partition — wait on the Notify.
+    Wait(Arc<Notify>),
+    /// This caller must perform the RPC. Notify to signal waiters afterwards.
+    NeedAdd(Arc<Notify>),
+}
+
 /// Partitions added to the current transaction.
 #[derive(Debug, Default)]
 struct TransactionPartitions {
-    /// Topic-partitions added to the transaction.
-    partitions: std::collections::HashSet<(String, PartitionId)>,
+    /// Topic-partitions and their registration state.
+    partitions: std::collections::HashMap<(String, PartitionId), PartitionAddState>,
 }
 
 impl TransactionPartitions {
-    fn add(&mut self, topic: &str, partition: PartitionId) -> bool {
-        self.partitions.insert((topic.to_string(), partition))
+    /// Begin adding a partition. Returns the action the caller must take.
+    fn begin_add(&mut self, topic: &str, partition: PartitionId) -> BeginAddResult {
+        let key = (topic.to_string(), partition);
+        match self.partitions.get(&key) {
+            Some(PartitionAddState::Added) => BeginAddResult::AlreadyAdded,
+            Some(PartitionAddState::Pending(notify)) => BeginAddResult::Wait(notify.clone()),
+            None => {
+                let notify = Arc::new(Notify::new());
+                self.partitions
+                    .insert(key, PartitionAddState::Pending(notify.clone()));
+                BeginAddResult::NeedAdd(notify)
+            }
+        }
+    }
+
+    /// Confirm a partition was successfully registered.
+    fn confirm_add(&mut self, topic: &str, partition: PartitionId, notify: &Notify) {
+        let key = (topic.to_string(), partition);
+        self.partitions.insert(key, PartitionAddState::Added);
+        notify.notify_waiters();
+    }
+
+    /// Cancel a pending add (RPC failed). Removes the entry and wakes waiters.
+    fn cancel_add(&mut self, topic: &str, partition: PartitionId, notify: &Notify) {
+        let key = (topic.to_string(), partition);
+        self.partitions.remove(&key);
+        notify.notify_waiters();
     }
 
     fn clear(&mut self) {
@@ -165,6 +209,59 @@ impl TransactionPartitions {
     #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.partitions.is_empty()
+    }
+}
+
+/// RAII guard that cancels a pending partition add if dropped without confirmation.
+///
+/// When the task performing the `AddPartitionsToTxn` RPC is cancelled (e.g.,
+/// via `select!` or `timeout`), this guard ensures the partition is rolled back
+/// from `Pending` to absent so that future callers aren't stuck waiting forever.
+struct PendingAddGuard {
+    txn_partitions: Arc<RwLock<TransactionPartitions>>,
+    topic: String,
+    partition: PartitionId,
+    notify: Arc<Notify>,
+    /// Set to `true` when `confirm_add` or an explicit `cancel_add` is called,
+    /// preventing the drop impl from double-cancelling.
+    defused: bool,
+}
+
+impl PendingAddGuard {
+    /// Confirm the add succeeded. Consumes the guard without cancelling.
+    async fn confirm(mut self, topic: &str, partition: PartitionId) {
+        self.defused = true;
+        let mut txn_partitions = self.txn_partitions.write().await;
+        txn_partitions.confirm_add(topic, partition, &self.notify);
+    }
+
+    /// Explicitly cancel the add (RPC failed). Consumes the guard.
+    async fn cancel(mut self, topic: &str, partition: PartitionId) {
+        self.defused = true;
+        let mut txn_partitions = self.txn_partitions.write().await;
+        txn_partitions.cancel_add(topic, partition, &self.notify);
+    }
+}
+
+impl Drop for PendingAddGuard {
+    fn drop(&mut self) {
+        if !self.defused {
+            // Best-effort cancel: we can't await the lock in drop, so first
+            // try a non-blocking write. If the lock is contended and a Tokio
+            // runtime is available, spawn a task to perform the cancel.
+            let topic = self.topic.clone();
+            let partition = self.partition;
+            let notify = self.notify.clone();
+            if let Ok(mut tp) = self.txn_partitions.try_write() {
+                tp.cancel_add(&topic, partition, &notify);
+            } else if tokio::runtime::Handle::try_current().is_ok() {
+                let txn_partitions = self.txn_partitions.clone();
+                tokio::spawn(async move {
+                    let mut tp = txn_partitions.write().await;
+                    tp.cancel_add(&topic, partition, &notify);
+                });
+            }
+        }
     }
 }
 
@@ -189,7 +286,7 @@ pub struct TransactionalProducer {
     /// Transaction coordinator broker ID.
     coordinator_id: RwLock<Option<i32>>,
     /// Partitions in current transaction.
-    txn_partitions: RwLock<TransactionPartitions>,
+    txn_partitions: Arc<RwLock<TransactionPartitions>>,
     /// Sequence number tracking for idempotent production.
     identity: ProducerIdentity,
 }
@@ -233,7 +330,7 @@ impl TransactionalProducer {
     /// This must be called before any transactions can be started.
     /// It fetches the producer ID and epoch from the transaction coordinator.
     pub async fn init_transactions(&self) -> Result<()> {
-        // Atomic CAS: Uninitialized → Initializing (§9.3 fix: prevents concurrent calls)
+        // Atomic CAS: Uninitialized → Initializing
         if let Err(actual) = self.try_transition(
             TransactionState::Uninitialized,
             TransactionState::Initializing,
@@ -351,7 +448,7 @@ impl TransactionalProducer {
     ///
     /// Must be called after `init_transactions()`.
     pub fn begin_transaction(&self) -> Result<()> {
-        // Atomic CAS: Ready → InTransaction (§6.1 fix)
+        // Atomic CAS: Ready → InTransaction
         if let Err(actual) =
             self.try_transition(TransactionState::Ready, TransactionState::InTransaction)
         {
@@ -401,12 +498,47 @@ impl TransactionalProducer {
             }
         };
 
-        // Add partition to transaction if not already added
-        {
+        // Add partition to transaction if not already registered.
+        // Uses Pending/Added states to prevent concurrent callers from
+        // skipping the RPC while an in-flight add has not yet completed.
+        loop {
             let mut txn_partitions = self.txn_partitions.write().await;
-            if txn_partitions.add(&topic, partition) {
-                // New partition, need to add to transaction
-                self.add_partition_to_txn(&topic, partition).await?;
+            match txn_partitions.begin_add(&topic, partition) {
+                BeginAddResult::AlreadyAdded => break,
+                BeginAddResult::Wait(notify) => {
+                    // Register interest in the Notify BEFORE releasing the
+                    // write lock so that confirm_add/cancel_add (which use
+                    // notify_waiters) cannot be missed.
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    drop(txn_partitions);
+                    notified.await;
+                    // Re-check state on next iteration.
+                }
+                BeginAddResult::NeedAdd(notify) => {
+                    // Drop the lock before the RPC. The guard ensures that
+                    // if this task is cancelled, the Pending state is rolled
+                    // back so waiters don't hang forever.
+                    drop(txn_partitions);
+                    let guard = PendingAddGuard {
+                        txn_partitions: self.txn_partitions.clone(),
+                        topic: topic.clone(),
+                        partition,
+                        notify,
+                        defused: false,
+                    };
+                    match self.add_partition_to_txn(&topic, partition).await {
+                        Ok(()) => {
+                            guard.confirm(&topic, partition).await;
+                        }
+                        Err(e) => {
+                            guard.cancel(&topic, partition).await;
+                            return Err(e);
+                        }
+                    }
+                    break;
+                }
             }
         }
 
@@ -771,7 +903,7 @@ impl TransactionalProducer {
 
     /// Commit the current transaction.
     pub async fn commit_transaction(&self) -> Result<()> {
-        // Atomic CAS: InTransaction → Committing (§6.1 fix)
+        // Atomic CAS: InTransaction → Committing
         if let Err(actual) = self.try_transition(
             TransactionState::InTransaction,
             TransactionState::Committing,
@@ -796,7 +928,7 @@ impl TransactionalProducer {
                     self.set_state(TransactionState::InTransaction);
                     warn!("Transaction commit failed (retriable): {}", e);
                 } else {
-                    // Fatal error — caller must abort (§9.9 fix: set FatalError state)
+                    // Fatal error — caller must abort
                     self.set_state(TransactionState::FatalError);
                     warn!("Transaction commit failed (fatal): {}", e);
                 }
@@ -808,7 +940,7 @@ impl TransactionalProducer {
 
     /// Abort the current transaction.
     pub async fn abort_transaction(&self) -> Result<()> {
-        // Atomic CAS: try InTransaction → Aborting first, then Committing → Aborting (§6.1 fix)
+        // Atomic CAS: try InTransaction → Aborting first, then Committing → Aborting
         let transition = self
             .try_transition(TransactionState::InTransaction, TransactionState::Aborting)
             .or_else(|_| {
@@ -1066,7 +1198,7 @@ impl TransactionalProducerBuilder {
             producer_id: RwLock::new(-1),
             producer_epoch: RwLock::new(-1),
             coordinator_id: RwLock::new(None),
-            txn_partitions: RwLock::new(TransactionPartitions::default()),
+            txn_partitions: Arc::new(RwLock::new(TransactionPartitions::default())),
             identity: ProducerIdentity::new(),
         })
     }
@@ -1105,14 +1237,32 @@ mod tests {
         let mut partitions = TransactionPartitions::default();
         assert!(partitions.is_empty());
 
-        assert!(partitions.add("topic1", 0));
+        // First add returns NeedAdd
+        let result = partitions.begin_add("topic1", 0);
+        let notify = match result {
+            BeginAddResult::NeedAdd(n) => n,
+            _ => panic!("expected NeedAdd"),
+        };
         assert!(!partitions.is_empty());
 
-        // Adding same partition returns false
-        assert!(!partitions.add("topic1", 0));
+        // Same partition while Pending returns Wait
+        assert!(matches!(
+            partitions.begin_add("topic1", 0),
+            BeginAddResult::Wait(_)
+        ));
 
-        // Different partition returns true
-        assert!(partitions.add("topic1", 1));
+        // Confirm, then same partition returns AlreadyAdded
+        partitions.confirm_add("topic1", 0, &notify);
+        assert!(matches!(
+            partitions.begin_add("topic1", 0),
+            BeginAddResult::AlreadyAdded
+        ));
+
+        // Different partition returns NeedAdd
+        assert!(matches!(
+            partitions.begin_add("topic1", 1),
+            BeginAddResult::NeedAdd(_)
+        ));
 
         partitions.clear();
         assert!(partitions.is_empty());
@@ -1424,5 +1574,46 @@ mod tests {
         use crate::producer::ProducerRecord;
         let record = ProducerRecord::new("topic", b"value".to_vec()).with_timestamp(1234567890);
         assert_eq!(record.timestamp, Some(1234567890));
+    }
+
+    #[test]
+    fn test_transaction_partitions_state_machine() {
+        let mut tp = TransactionPartitions::default();
+
+        // First add returns NeedAdd
+        let result = tp.begin_add("topic", 0);
+        let notify = match result {
+            BeginAddResult::NeedAdd(n) => n,
+            _ => panic!("expected NeedAdd"),
+        };
+
+        // Concurrent add returns Wait
+        let result2 = tp.begin_add("topic", 0);
+        assert!(matches!(result2, BeginAddResult::Wait(_)));
+
+        // Confirm moves to Added
+        tp.confirm_add("topic", 0, &notify);
+        assert!(matches!(
+            tp.begin_add("topic", 0),
+            BeginAddResult::AlreadyAdded
+        ));
+
+        // Different partition returns NeedAdd
+        let result3 = tp.begin_add("topic", 1);
+        let notify2 = match result3 {
+            BeginAddResult::NeedAdd(n) => n,
+            _ => panic!("expected NeedAdd"),
+        };
+
+        // Cancel removes — next call returns NeedAdd again
+        tp.cancel_add("topic", 1, &notify2);
+        assert!(matches!(
+            tp.begin_add("topic", 1),
+            BeginAddResult::NeedAdd(_)
+        ));
+
+        // Clear empties everything
+        tp.clear();
+        assert!(tp.is_empty());
     }
 }

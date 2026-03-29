@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn test_lock_poison_recovery() {
-        // §15.4 fix: Verify that poisoned locks are recovered via into_inner()
+        // Verify that poisoned locks are recovered via into_inner()
         // instead of silently returning fallback values.
         let identity = ProducerIdentity::new();
         identity.initialize(42, 3);

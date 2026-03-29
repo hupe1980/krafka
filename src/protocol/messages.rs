@@ -5324,7 +5324,7 @@ mod tests {
         assert_eq!(resp.topics[0].partitions[0].end_offset, 1000);
     }
 
-    // §R13.2: SyncGroupRequest::encode_v3 includes group_instance_id.
+    // SyncGroupRequest::encode_v3 includes group_instance_id.
     #[test]
     fn test_sync_group_request_encode_v3_includes_group_instance_id() {
         use bytes::BytesMut;
@@ -5351,7 +5351,7 @@ mod tests {
         );
     }
 
-    // §R13.2: SyncGroupRequest::encode_v0 does NOT include group_instance_id.
+    // SyncGroupRequest::encode_v0 does NOT include group_instance_id.
     #[test]
     fn test_sync_group_request_encode_v0_omits_group_instance_id() {
         use bytes::BytesMut;
@@ -5377,7 +5377,7 @@ mod tests {
         );
     }
 
-    // §R13.8: LeaveGroupResponse decode_v0 and decode_v1 roundtrip.
+    // LeaveGroupResponse decode_v0 and decode_v1 roundtrip.
     #[test]
     fn test_leave_group_response_decode_v0() {
         let mut buf = BytesMut::new();
@@ -5404,7 +5404,7 @@ mod tests {
         assert!(!resp.error_code.is_ok());
     }
 
-    // §R13.2: SyncGroupResponse decode_v1 roundtrip.
+    // SyncGroupResponse decode_v1 roundtrip.
     #[test]
     fn test_sync_group_response_decode_v1() {
         let mut buf = BytesMut::new();

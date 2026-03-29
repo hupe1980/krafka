@@ -653,7 +653,7 @@ impl PartitionAssignor for CooperativeStickyAssignor {
                 if count > max_per_member {
                     overloaded.push(member.member_id.clone());
                 } else if count < max_per_member {
-                    // §10.2 fix: use max_per_member (ceil) as the underloaded threshold.
+                    // use max_per_member (ceil) as the underloaded threshold.
                     // Using min_per_member (floor) left members that could accept more
                     // partitions undetected, causing unbalanced 3-1-1 distributions
                     // instead of balanced 2-2-1.
@@ -1096,7 +1096,7 @@ impl GroupCoordinator {
     }
 
     /// Get the coordinator connection, finding it if necessary.
-    /// Checks liveness of cached connections and re-discovers if dead (§9.11 fix).
+    /// Checks liveness of cached connections and re-discovers if dead.
     async fn get_coordinator_connection(&self) -> Result<Arc<BrokerConnection>> {
         {
             let conn = self.coordinator_conn.read().await;
@@ -1245,7 +1245,7 @@ impl GroupCoordinator {
             join_response.is_leader()
         );
 
-        // Use v3 for static membership (KIP-345, §R13.2), v0 otherwise.
+        // Use v3 for static membership (KIP-345), v0 otherwise.
         // v3 includes group_instance_id; v0 silently discards it.
         let response = if self.group_instance_id.is_some() {
             conn.send_request(ApiKey::SyncGroup, 3, |buf| {
@@ -1348,7 +1348,7 @@ impl GroupCoordinator {
         let heartbeat_interval = self.heartbeat_interval;
         let heartbeat_controller = self.heartbeat_controller.clone();
 
-        // Clone Arc references so the task reads current values on each heartbeat (§2.5 fix)
+        // Clone Arc references so the task reads current values on each heartbeat
         let member_id_ref = self.member_id.clone();
         let generation_id_ref = self.generation_id.clone();
         let coordinator_conn_ref = self.coordinator_conn.clone();
@@ -1722,7 +1722,7 @@ impl GroupCoordinator {
             }
         }
 
-        // Warn about leaderless partitions (§9.12 fix) and try after a metadata refresh
+        // Warn about leaderless partitions and try after a metadata refresh
         if !leaderless.is_empty() {
             warn!(
                 "No leader found for {} partition(s), refreshing metadata: {:?}",
@@ -1800,7 +1800,7 @@ impl GroupCoordinator {
                             part_resp.offset,
                         );
                     } else {
-                        // §10.6 fix: Log partition-level errors instead of silently
+                        // Log partition-level errors instead of silently
                         // dropping them. Callers should handle missing partitions.
                         warn!(
                             "ListOffsets error for {}-{}: {:?}",
@@ -1875,7 +1875,7 @@ impl GroupCoordinator {
             .await
         };
 
-        // §R13.8 fix: Decode the response and check for errors
+        // Decode the response and check for errors
         match result {
             Ok(Ok(response_bytes)) => {
                 let mut buf = response_bytes;
@@ -2039,7 +2039,7 @@ impl GroupCoordinator {
             })
             .collect();
 
-        // Use configured assignor strategy (§2.8)
+        // Use configured assignor strategy
         let assignments = match self.assignment_strategy {
             crate::consumer::config::PartitionAssignmentStrategy::Range => {
                 let assignor = RangeAssignor;
@@ -2588,7 +2588,7 @@ mod tests {
         );
     }
 
-    /// §10.2 test: CooperativeSticky rebalancing with uneven partition count.
+    /// CooperativeSticky rebalancing with uneven partition count.
     ///
     /// With 5 partitions and 3 members, the correct distribution is 2-2-1.
     /// Before the fix, stickiness could produce 3-1-1 because the underloaded
@@ -2641,7 +2641,7 @@ mod tests {
 
         let assignments = assignor.assign(&topics, &partitions, &members);
 
-        // With §10.2 fix, no member should have more than ceil(5/3) = 2 partitions
+        // With fix, no member should have more than ceil(5/3) = 2 partitions
         for member_id in ["m1", "m2", "m3"] {
             let count = assignments.get(member_id).unwrap().all_partitions().len();
             assert!(
@@ -2658,7 +2658,7 @@ mod tests {
         assert_eq!(total, 5, "Total partitions should be 5");
     }
 
-    /// §10.2 test: CooperativeSticky with exactly even partition count.
+    /// CooperativeSticky with exactly even partition count.
     #[test]
     fn test_cooperative_sticky_even_partitions() {
         let assignor = CooperativeStickyAssignor::new();

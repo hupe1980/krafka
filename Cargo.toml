@@ -14,7 +14,7 @@ categories = ["network-programming", "asynchronous"]
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.26", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 
 # Zero-copy buffers
 bytes = "1"
@@ -29,7 +29,7 @@ tracing = "0.1"
 flate2 = "1"           # gzip
 snap = "1"             # snappy
 lz4_flex = "0.11"      # lz4
-zstd = "0.13"          # zstd
+zstd = "0.13"          # zstd (requires C toolchain via zstd-sys)
 
 # CRC32 for protocol
 crc32c = "0.6"

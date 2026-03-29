@@ -254,8 +254,8 @@ impl Producer {
 
     /// Send a record to a specific partition.
     ///
-    /// Retries transient failures with exponential backoff (§2.4).
-    /// Triggers metadata refresh on leader-change errors (§2.6).
+    /// Retries transient failures with exponential backoff.
+    /// Triggers metadata refresh on leader-change errors.
     /// Limits concurrent in-flight requests via semaphore (max_in_flight).
     async fn send_to_partition(
         &self,
@@ -295,7 +295,7 @@ impl Producer {
                 Err(ref e) => {
                     self.metrics.record_error();
 
-                    // Refresh metadata on leader-not-available / not-leader errors (§2.6)
+                    // Refresh metadata on leader-not-available / not-leader errors
                     if e.is_retriable() {
                         debug!(
                             topic = topic,

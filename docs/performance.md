@@ -166,7 +166,7 @@ let consumer = ConsumerBuilder::new()
 
 ## Memory Backpressure
 
-Configure memory limits to prevent OOM during high throughput:
+Configure memory limits to prevent OOM during high throughput. When batching is enabled (`linger > 0`) and the buffer is full, `send()` blocks the caller for up to `max_block` waiting for in-flight batches to drain, matching the Kafka Java client's `max.block.ms` semantics:
 
 ```rust
 use krafka::producer::AccumulatorConfig;

@@ -229,7 +229,7 @@ impl ScramClient {
         let iteration_count = iteration_count
             .ok_or_else(|| KrafkaError::auth("Missing iteration count in server-first"))?;
 
-        // Validate PBKDF2 iteration count to prevent downgrade and DoS attacks (§7.3)
+        // Validate PBKDF2 iteration count to prevent downgrade and DoS attacks
         if iteration_count < MIN_PBKDF2_ITERATIONS {
             self.state = ScramState::Failed;
             return Err(KrafkaError::auth(format!(
@@ -564,7 +564,7 @@ mod tests {
         assert_eq!(client.mechanism().hash_length(), 64);
     }
 
-    // ── §7.2 / §7.3 / §7.4 – Security fix tests ──
+    // ── Security fix tests ──
 
     #[test]
     fn test_pbkdf2_iteration_too_low() {

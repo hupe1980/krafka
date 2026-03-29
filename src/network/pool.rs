@@ -356,7 +356,7 @@ impl ConnectionPool {
             }
         }
 
-        // Slow path: reconnect WITHOUT holding any lock (§4.1 fix)
+        // Slow path: reconnect WITHOUT holding any lock
         let conn = self.reconnect_with_backoff(address).await?;
 
         // Re-acquire write lock to store the new connection
@@ -392,7 +392,7 @@ impl ConnectionPool {
             }
         }
 
-        // Slow path: reconnect WITHOUT holding any lock (§4.1 fix)
+        // Slow path: reconnect WITHOUT holding any lock
         let conn = self.reconnect_with_backoff(address).await?;
 
         // Re-acquire write locks to store the new connection

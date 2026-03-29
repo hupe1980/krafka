@@ -15,29 +15,32 @@ Krafka uses a single error enum for all error conditions:
 
 ```rust
 pub enum KrafkaError {
+    /// Network-related errors (connection, I/O)
+    Network(io::Error),
+
     /// Protocol encoding/decoding errors
     Protocol { message: String },
-    
-    /// Kafka broker errors (with error code)
-    Broker { code: ErrorCode, message: String },
-    
+
     /// Authentication failures
     Auth { message: String },
-    
+
     /// Operation timeouts
     Timeout { operation: String },
-    
-    /// Compression/decompression errors
-    Compression { codec: String, source: Box<dyn Error> },
-    
+
+    /// Kafka broker errors (with error code)
+    Broker { code: ErrorCode, message: String },
+
     /// Configuration errors
     Config { message: String },
-    
+
+    /// Compression/decompression errors
+    Compression { message: String },
+
     /// Invalid state errors
     InvalidState { message: String },
-    
+
     /// Serialization errors
-    Serialization { message: String, source: Option<Box<dyn Error>> },
+    Serialization { message: String },
 }
 ```
 

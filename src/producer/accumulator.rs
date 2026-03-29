@@ -12,10 +12,11 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use tokio::time::interval;
 use tracing::{debug, trace};
 
@@ -32,6 +33,16 @@ use crate::protocol::{
     RecordBatchBuilder,
 };
 
+/// Response from the accumulator for an append attempt.
+#[derive(Debug)]
+enum AppendResponse {
+    /// Record accepted — metadata will arrive via the inner Result.
+    Done(Result<RecordMetadata>),
+    /// Buffer is full — the record is returned so the caller can retry
+    /// without cloning.
+    BufferFull(ProducerRecord),
+}
+
 /// Message sent to the accumulator background task.
 #[derive(Debug)]
 enum AccumulatorMessage {
@@ -39,7 +50,7 @@ enum AccumulatorMessage {
     Append {
         record: ProducerRecord,
         partition: PartitionId,
-        response_tx: oneshot::Sender<Result<RecordMetadata>>,
+        response_tx: oneshot::Sender<AppendResponse>,
     },
     /// Flush all batches.
     Flush {
@@ -53,28 +64,91 @@ enum AccumulatorMessage {
 #[derive(Clone)]
 pub struct RecordAccumulatorHandle {
     sender: mpsc::Sender<AccumulatorMessage>,
+    /// Notified when buffer memory is freed (backpressure).
+    memory_freed: Arc<Notify>,
+    /// Maximum time to block waiting for buffer memory.
+    max_block_ms: Duration,
 }
 
 impl RecordAccumulatorHandle {
     /// Append a record to the accumulator.
+    ///
+    /// If the accumulator buffer is full, blocks for up to `max_block_ms`
+    /// waiting for memory to be freed before returning an error, matching
+    /// the Kafka Java client's `max.block.ms` backpressure behavior.
     pub async fn append(
         &self,
         record: ProducerRecord,
         partition: PartitionId,
     ) -> Result<RecordMetadata> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender
-            .send(AccumulatorMessage::Append {
-                record,
-                partition,
-                response_tx,
-            })
+        let deadline = tokio::time::Instant::now() + self.max_block_ms;
+        // Hold the record in an Option so the first send moves it into the
+        // channel without cloning. On BufferFull the accumulator returns it,
+        // so retries are also zero-copy.
+        let mut pending = Some(record);
+
+        loop {
+            // SAFETY: `pending` is always `Some` here — either set by the
+            // initial call or replenished by `AppendResponse::BufferFull`.
+            let rec = pending.take().expect("pending record missing");
+            let (response_tx, response_rx) = oneshot::channel();
+
+            // Pre-register interest in memory_freed BEFORE sending so that
+            // a notify_waiters() from extract_batch/flush_all between the
+            // send and the await cannot be missed.
+            let notified = self.memory_freed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            // Respect max_block_ms for the channel send too, in case the
+            // accumulator channel is backed up.
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::timeout(
+                remaining,
+                self.sender.send(AccumulatorMessage::Append {
+                    record: rec,
+                    partition,
+                    response_tx,
+                }),
+            )
             .await
+            .map_err(|_| {
+                KrafkaError::timeout(
+                    "producer append: max_block exceeded while sending to accumulator",
+                )
+            })?
             .map_err(|_| KrafkaError::invalid_state("accumulator closed"))?;
 
-        response_rx
-            .await
-            .map_err(|_| KrafkaError::invalid_state("accumulator response dropped"))?
+            let response = response_rx
+                .await
+                .map_err(|_| KrafkaError::invalid_state("accumulator response dropped"))?;
+
+            match response {
+                AppendResponse::BufferFull(returned_record) => {
+                    // The accumulator returned the record without touching it.
+                    // Wait for memory to be freed, then retry with the same
+                    // record instance — zero clones on the retry path.
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(KrafkaError::timeout(
+                            "producer append: max_block exceeded while waiting \
+                             for buffer memory (ProducerConfig::max_block / \
+                             AccumulatorConfig::max_block_ms)",
+                        ));
+                    }
+                    if tokio::time::timeout(remaining, notified).await.is_err() {
+                        return Err(KrafkaError::timeout(
+                            "producer append: max_block exceeded while waiting \
+                             for buffer memory (ProducerConfig::max_block / \
+                             AccumulatorConfig::max_block_ms)",
+                        ));
+                    }
+                    // Replenish pending for the next iteration.
+                    pending = Some(returned_record);
+                }
+                AppendResponse::Done(result) => return result,
+            }
+        }
     }
 
     /// Flush all pending batches.
@@ -177,10 +251,29 @@ impl Default for AccumulatorConfig {
 /// A pending record waiting for its batch to be sent.
 struct PendingRecord {
     record: ProducerRecord,
-    response_tx: oneshot::Sender<Result<RecordMetadata>>,
+    response_tx: oneshot::Sender<AppendResponse>,
     offset_in_batch: i64,
     /// Estimated size in bytes for memory tracking.
     estimated_size: usize,
+}
+
+/// RAII guard that releases in-flight memory and notifies waiters on drop.
+///
+/// Created by `extract_batch` and passed to `send_extracted_batch`.
+/// When the send task completes (or panics), the guard automatically
+/// decrements `in_flight_memory` and wakes blocked `append()` callers.
+struct InFlightGuard {
+    bytes: usize,
+    in_flight_memory: Arc<AtomicUsize>,
+    memory_freed: Arc<Notify>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight_memory
+            .fetch_sub(self.bytes, Ordering::Relaxed);
+        self.memory_freed.notify_waiters();
+    }
 }
 
 /// A batch with its pending records.
@@ -217,12 +310,16 @@ pub struct RecordAccumulator {
     batches: HashMap<(String, PartitionId), AccumulatorBatch>,
     /// Cluster metadata for sending.
     metadata: Arc<ClusterMetadata>,
-    /// Current total memory usage in bytes.
+    /// Current total memory usage in bytes (buffered, not yet extracted).
     memory_used: usize,
+    /// Memory held by in-flight send tasks (extracted but not yet completed).
+    in_flight_memory: Arc<AtomicUsize>,
     /// Retry policy for transient failures.
     retry_policy: RetryPolicy,
     /// Shared metrics.
     metrics: Arc<ProducerMetrics>,
+    /// Notified when buffer memory is freed (backpressure).
+    memory_freed: Arc<Notify>,
 }
 
 impl RecordAccumulator {
@@ -234,19 +331,28 @@ impl RecordAccumulator {
         metrics: Arc<ProducerMetrics>,
     ) -> RecordAccumulatorHandle {
         let (sender, receiver) = mpsc::channel(1024);
+        let memory_freed = Arc::new(Notify::new());
+        let in_flight_memory = Arc::new(AtomicUsize::new(0));
+        let max_block_ms = config.max_block_ms;
 
         let accumulator = Self {
             config,
             batches: HashMap::new(),
             metadata,
             memory_used: 0,
+            in_flight_memory,
             retry_policy,
             metrics,
+            memory_freed: memory_freed.clone(),
         };
 
         tokio::spawn(accumulator.run(receiver));
 
-        RecordAccumulatorHandle { sender }
+        RecordAccumulatorHandle {
+            sender,
+            memory_freed,
+            max_block_ms,
+        }
     }
 
     /// Run the accumulator background task.
@@ -294,7 +400,7 @@ impl RecordAccumulator {
         &mut self,
         record: ProducerRecord,
         partition: PartitionId,
-        response_tx: oneshot::Sender<Result<RecordMetadata>>,
+        response_tx: oneshot::Sender<AppendResponse>,
     ) {
         let topic = record.topic.clone();
         let key = (topic.clone(), partition);
@@ -302,17 +408,12 @@ impl RecordAccumulator {
         // Estimate record size for memory tracking
         let record_size = Self::estimate_record_size(&record);
 
-        // Check memory limit before appending (0 = unlimited)
-        if self.config.buffer_memory > 0
-            && self.memory_used + record_size > self.config.buffer_memory
-        {
-            // Memory limit exceeded - return error
-            // In a more sophisticated implementation, we could block and wait for memory
-            let _ = response_tx.send(Err(KrafkaError::config(format!(
-                "Buffer memory limit exceeded: {} + {} > {} bytes. \
-                 Consider increasing buffer_memory or reducing production rate.",
-                self.memory_used, record_size, self.config.buffer_memory
-            ))));
+        // Check memory limit before appending (0 = unlimited).
+        // Include in-flight memory so extracted-but-unsent batches are counted.
+        let total_memory = self.memory_used + self.in_flight_memory.load(Ordering::Relaxed);
+        if self.config.buffer_memory > 0 && total_memory + record_size > self.config.buffer_memory {
+            // Return the record to the caller so it can retry without cloning.
+            let _ = response_tx.send(AppendResponse::BufferFull(record));
             return;
         }
 
@@ -344,7 +445,7 @@ impl RecordAccumulator {
                 trace!("Batch full for {}-{}, flushing", topic, partition);
                 self.flush_batch(&key).await;
             } else if self.config.linger.is_zero() {
-                // §10.5 fix: linger=0 means send immediately without waiting
+                // linger=0 means send immediately without waiting
                 // for the next linger timer tick (up to 1ms delay otherwise).
                 trace!("Linger=0 for {}-{}, flushing immediately", topic, partition);
                 self.flush_batch(&key).await;
@@ -372,8 +473,11 @@ impl RecordAccumulator {
             } else {
                 // Record too large for batch - free the memory we reserved
                 self.memory_used = self.memory_used.saturating_sub(record_size);
-                let _ =
-                    response_tx.send(Err(KrafkaError::config("record too large for batch size")));
+                // Wake any tasks waiting for buffer memory so they can make progress.
+                self.memory_freed.notify_waiters();
+                let _ = response_tx.send(AppendResponse::Done(Err(KrafkaError::config(
+                    "record too large for batch size",
+                ))));
             }
         }
     }
@@ -393,7 +497,7 @@ impl RecordAccumulator {
         key_size + value_size + headers_size + topic_overhead
     }
 
-    /// Check for batches that have exceeded linger time (concurrent flush §4.2).
+    /// Check for batches that have exceeded linger time (concurrent flush).
     async fn check_linger_expiry(&mut self) {
         if self.config.linger.is_zero() {
             self.flush_all_ready().await;
@@ -414,13 +518,13 @@ impl RecordAccumulator {
         let mut extracted = Vec::with_capacity(keys_to_flush.len());
         for key in keys_to_flush {
             trace!("Linger expired for {:?}, flushing", key);
-            if let Some(batch) = self.extract_batch(&key) {
-                extracted.push((key, batch));
+            if let Some(item) = self.extract_batch(&key) {
+                extracted.push((key, item));
             }
         }
 
         let mut join_set = tokio::task::JoinSet::new();
-        for ((topic, partition), batch) in extracted {
+        for ((topic, partition), (batch, guard)) in extracted {
             let metadata = self.metadata.clone();
             let config = self.config.clone();
             let retry_policy = self.retry_policy.clone();
@@ -429,6 +533,7 @@ impl RecordAccumulator {
                 topic,
                 partition,
                 batch.pending,
+                guard,
                 metadata,
                 config,
                 retry_policy,
@@ -453,13 +558,13 @@ impl RecordAccumulator {
 
         let mut extracted = Vec::with_capacity(keys_to_flush.len());
         for key in keys_to_flush {
-            if let Some(batch) = self.extract_batch(&key) {
-                extracted.push((key, batch));
+            if let Some(item) = self.extract_batch(&key) {
+                extracted.push((key, item));
             }
         }
 
         let mut join_set = tokio::task::JoinSet::new();
-        for ((topic, partition), batch) in extracted {
+        for ((topic, partition), (batch, guard)) in extracted {
             let metadata = self.metadata.clone();
             let config = self.config.clone();
             let retry_policy = self.retry_policy.clone();
@@ -468,6 +573,7 @@ impl RecordAccumulator {
                 topic,
                 partition,
                 batch.pending,
+                guard,
                 metadata,
                 config,
                 retry_policy,
@@ -477,24 +583,36 @@ impl RecordAccumulator {
         while join_set.join_next().await.is_some() {}
     }
 
-    /// Extract a batch from the accumulator, freeing tracked memory.
-    fn extract_batch(&mut self, key: &(String, PartitionId)) -> Option<AccumulatorBatch> {
+    /// Extract a batch from the accumulator, transferring its memory to
+    /// the in-flight tracker. The actual free + notify happens when the
+    /// send task completes (see `send_extracted_batch`).
+    fn extract_batch(
+        &mut self,
+        key: &(String, PartitionId),
+    ) -> Option<(AccumulatorBatch, InFlightGuard)> {
         let batch = self.batches.remove(key)?;
         if batch.batch.is_empty() {
             return None;
         }
         let batch_memory: usize = batch.pending.iter().map(|p| p.estimated_size).sum();
         self.memory_used = self.memory_used.saturating_sub(batch_memory);
-        Some(batch)
+        self.in_flight_memory
+            .fetch_add(batch_memory, Ordering::Relaxed);
+        let guard = InFlightGuard {
+            bytes: batch_memory,
+            in_flight_memory: self.in_flight_memory.clone(),
+            memory_freed: self.memory_freed.clone(),
+        };
+        Some((batch, guard))
     }
 
-    /// Flush a specific batch by spawning a background task (§10.7 fix).
+    /// Flush a specific batch by spawning a background task.
     ///
     /// Previously, this method awaited the network I/O inline, blocking the
     /// entire accumulator task. Now it spawns the send as a background task
     /// matching the concurrent flush pattern used by `check_linger_expiry`.
     async fn flush_batch(&mut self, key: &(String, PartitionId)) {
-        if let Some(batch) = self.extract_batch(key) {
+        if let Some((batch, guard)) = self.extract_batch(key) {
             let topic = key.0.clone();
             let partition = key.1;
             let metadata = self.metadata.clone();
@@ -505,6 +623,7 @@ impl RecordAccumulator {
                 topic,
                 partition,
                 batch.pending,
+                guard,
                 metadata,
                 config,
                 retry_policy,
@@ -513,20 +632,22 @@ impl RecordAccumulator {
         }
     }
 
-    /// Send an extracted batch to the broker with retry and metadata refresh (§2.4, §2.6).
+    /// Send an extracted batch to the broker with retry and metadata refresh.
     ///
-    /// This is a static method to enable concurrent flushing via `FuturesUnordered` (§4.2).
+    /// This is a static method to enable concurrent flushing via `FuturesUnordered`.
     /// Acquires an in-flight semaphore permit to respect `max_in_flight` concurrency limits.
+    #[allow(clippy::too_many_arguments)]
     async fn send_extracted_batch(
         topic: String,
         partition: PartitionId,
         pending: Vec<PendingRecord>,
+        _in_flight_guard: InFlightGuard,
         metadata: Arc<ClusterMetadata>,
         config: AccumulatorConfig,
         retry_policy: RetryPolicy,
         metrics: Arc<ProducerMetrics>,
     ) {
-        // Acquire in-flight permit before sending (§9.6 fix: accumulator was
+        // Acquire in-flight permit before sending (accumulator was
         // bypassing max_in_flight). The permit is held until this batch completes.
         let _permit = config.in_flight_semaphore.acquire().await;
         let _timer = metrics.send_latency.start();
@@ -557,7 +678,9 @@ impl RecordAccumulator {
             Err(e) => {
                 let error_msg = e.to_string();
                 for p in pending {
-                    let _ = p.response_tx.send(Err(KrafkaError::protocol(&error_msg)));
+                    let _ = p
+                        .response_tx
+                        .send(AppendResponse::Done(Err(KrafkaError::protocol(&error_msg))));
                 }
                 return;
             }
@@ -576,7 +699,7 @@ impl RecordAccumulator {
             }],
         };
 
-        // Retry loop (§2.4)
+        // Retry loop
         let mut retry_ctx = RetryContext::new(retry_policy, format!("batch({topic}-{partition})"));
 
         let result: std::result::Result<(i64, i64), KrafkaError> = loop {
@@ -712,7 +835,7 @@ impl RecordAccumulator {
                         timestamp,
                     };
                     crate::interceptor::safe_on_acknowledgement(&*config.interceptor, &meta, None);
-                    let _ = p.response_tx.send(Ok(meta));
+                    let _ = p.response_tx.send(AppendResponse::Done(Ok(meta)));
                 }
             }
             Err(e) => {
@@ -731,29 +854,31 @@ impl RecordAccumulator {
                         &meta,
                         Some(&err),
                     );
-                    let _ = p.response_tx.send(Err(err));
+                    let _ = p.response_tx.send(AppendResponse::Done(Err(err)));
                 }
             }
         }
     }
 
-    /// Flush all batches concurrently (§4.2).
+    /// Flush all batches concurrently.
     async fn flush_all(&mut self) -> Result<()> {
-        let extracted: Vec<_> = self
+        let keys: Vec<_> = self
             .batches
-            .drain()
-            .filter(|(_, b)| !b.batch.is_empty())
+            .keys()
+            .filter(|k| self.batches.get(*k).is_some_and(|b| !b.batch.is_empty()))
+            .cloned()
             .collect();
 
-        // Free memory for all extracted batches
-        for (_, batch) in &extracted {
-            let batch_memory: usize = batch.pending.iter().map(|p| p.estimated_size).sum();
-            self.memory_used = self.memory_used.saturating_sub(batch_memory);
+        let mut extracted = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(item) = self.extract_batch(&key) {
+                extracted.push((key, item));
+            }
         }
 
         // Send all batches concurrently
         let mut join_set = tokio::task::JoinSet::new();
-        for ((topic, partition), batch) in extracted {
+        for ((topic, partition), (batch, guard)) in extracted {
             let metadata = self.metadata.clone();
             let config = self.config.clone();
             let retry_policy = self.retry_policy.clone();
@@ -762,6 +887,7 @@ impl RecordAccumulator {
                 topic,
                 partition,
                 batch.pending,
+                guard,
                 metadata,
                 config,
                 retry_policy,
@@ -833,7 +959,7 @@ mod tests {
         assert!(size_with_key > size);
     }
 
-    /// §10.5 test: Verify linger=0 config results in immediate flush semantics.
+    /// Verify linger=0 config results in immediate flush semantics.
     #[test]
     fn test_linger_zero_check_interval() {
         // With linger=0, the check interval should be 1ms (minimum)
@@ -842,7 +968,7 @@ mod tests {
         assert_eq!(check_interval, Duration::from_millis(1));
     }
 
-    /// §10.5 test: Verify `check_linger_expiry` calls `flush_all_ready` when linger=0.
+    /// Verify `check_linger_expiry` calls `flush_all_ready` when linger=0.
     #[test]
     fn test_linger_zero_is_zero() {
         let config = AccumulatorConfig {
@@ -852,7 +978,7 @@ mod tests {
         assert!(config.linger.is_zero());
     }
 
-    /// §10.7 test: Verify flush_batch signature enables spawning
+    /// Verify flush_batch signature enables spawning
     /// (send_extracted_batch is 'static + Send, required for tokio::spawn).
     #[test]
     fn test_send_extracted_batch_is_send() {
@@ -860,5 +986,58 @@ mod tests {
         // This compiles only if the future returned by send_extracted_batch is Send,
         // which is required for tokio::spawn to work.
         assert_send::<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>();
+    }
+
+    // ── Backpressure tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_backpressure_timeout_returns_timeout_error() {
+        let (sender, mut receiver) = mpsc::channel::<AccumulatorMessage>(16);
+        let memory_freed = Arc::new(tokio::sync::Notify::new());
+        let handle = RecordAccumulatorHandle {
+            sender,
+            memory_freed,
+            max_block_ms: Duration::from_millis(50),
+        };
+
+        // Spawn a fake accumulator that always responds BufferFull
+        tokio::spawn(async move {
+            while let Some(msg) = receiver.recv().await {
+                if let AccumulatorMessage::Append {
+                    record,
+                    response_tx,
+                    ..
+                } = msg
+                {
+                    let _ = response_tx.send(AppendResponse::BufferFull(record));
+                }
+            }
+        });
+
+        let record = ProducerRecord::new("topic", b"value".to_vec());
+        let result = handle.append(record, 0).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("max_block"),
+            "expected max_block in error, got: {err_msg}"
+        );
+        assert!(
+            matches!(err, KrafkaError::Timeout { .. }),
+            "expected Timeout variant, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backpressure_unblocks_on_notify() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let n = notify.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            n.notify_waiters();
+        });
+        let result = tokio::time::timeout(Duration::from_secs(2), notify.notified()).await;
+        assert!(result.is_ok(), "notify should have fired");
     }
 }

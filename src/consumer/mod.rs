@@ -97,9 +97,9 @@ pub struct Consumer {
     rebalance_listener: Arc<dyn ConsumerRebalanceListener>,
     /// Consumer interceptor.
     interceptor: Arc<dyn crate::interceptor::ConsumerInterceptor>,
-    /// Last auto-commit time (for auto-commit timer §2.7).
+    /// Last auto-commit time (for auto-commit timer).
     last_auto_commit: RwLock<Instant>,
-    /// Buffer for records returned by `recv()` (§R13.1).
+    /// Buffer for records returned by `recv()`.
     /// `poll()` may return multiple records; `recv()` buffers the rest here.
     recv_buffer: RwLock<std::collections::VecDeque<ConsumerRecord>>,
 }
@@ -197,12 +197,15 @@ impl Consumer {
     /// Subscribe to topics.
     ///
     /// Replaces the current subscription with the given topics (matching
-    /// the Kafka Java client's replace semantics). §R13.11 fix.
+    /// the Kafka Java client's replace semantics).
     pub async fn subscribe(&self, topics: &[&str]) -> Result<()> {
-        let mut subscriptions = self.subscriptions.write().await;
-        subscriptions.clear();
-        for topic in topics {
-            subscriptions.insert((*topic).to_string());
+        // Scope the write lock so it is dropped before network I/O
+        {
+            let mut subscriptions = self.subscriptions.write().await;
+            subscriptions.clear();
+            for topic in topics {
+                subscriptions.insert((*topic).to_string());
+            }
         }
 
         // Refresh metadata for subscribed topics
@@ -214,13 +217,15 @@ impl Consumer {
             let assignment = coordinator.ensure_active_membership(&topic_strings).await?;
 
             // Update our assignments based on the group assignment
-            let mut assignments = self.assignments.write().await;
-            assignments.clear();
-            for (topic, partitions) in &assignment.partitions {
-                assignments.insert(topic.clone(), partitions.clone());
+            {
+                let mut assignments = self.assignments.write().await;
+                assignments.clear();
+                for (topic, partitions) in &assignment.partitions {
+                    assignments.insert(topic.clone(), partitions.clone());
+                }
             }
 
-            // Fetch committed offsets for our assigned partitions (§2.3 fix)
+            // Fetch committed offsets for our assigned partitions
             self.fetch_and_apply_committed_offsets(&assignment.partitions)
                 .await?;
 
@@ -238,7 +243,7 @@ impl Consumer {
             let assigned_snapshot = assignments.clone();
             drop(assignments);
 
-            // §10.4 fix: Apply auto_offset_reset for non-group consumers.
+            // Apply auto_offset_reset for non-group consumers.
             // Without this, all partitions default to offset 0 regardless of
             // the configured auto_offset_reset policy.
             self.apply_auto_offset_reset(&assigned_snapshot).await?;
@@ -368,7 +373,7 @@ impl Consumer {
     /// Assign specific partitions manually.
     ///
     /// Manual assignment and group subscription are mutually exclusive.
-    /// This method returns an error if a group coordinator is active (§R13.5 fix).
+    /// This method returns an error if a group coordinator is active.
     pub async fn assign(&self, topic: &str, partitions: Vec<PartitionId>) -> Result<()> {
         if self.group_coordinator.is_some() {
             return Err(KrafkaError::invalid_state(
@@ -387,7 +392,7 @@ impl Consumer {
         drop(subscriptions);
         drop(assignments);
 
-        // §10.4 fix: Apply auto_offset_reset for manually assigned partitions
+        // Apply auto_offset_reset for manually assigned partitions
         let mut assigned = HashMap::new();
         assigned.insert(topic.to_string(), partitions.clone());
         self.apply_auto_offset_reset(&assigned).await?;
@@ -400,7 +405,7 @@ impl Consumer {
     ///
     /// This resolves initial offsets based on the configured `auto_offset_reset`
     /// policy (Earliest, Latest, or None). Used by both group and non-group
-    /// consumers during partition assignment (§10.4 fix).
+    /// consumers during partition assignment.
     async fn apply_auto_offset_reset(
         &self,
         assigned: &HashMap<String, Vec<PartitionId>>,
@@ -581,7 +586,7 @@ impl Consumer {
         let _poll_timer = self.metrics.poll_latency.start();
         self.metrics.polls.inc();
 
-        // Auto-commit timer (§2.7): commit if interval has elapsed
+        // Auto-commit timer: commit if interval has elapsed
         if self.config.enable_auto_commit && self.group_coordinator.is_some() {
             let should_commit = {
                 let last = self.last_auto_commit.read().await;
@@ -635,7 +640,7 @@ impl Consumer {
                     self.rebalance_listener.on_partitions_assigned(&assigned);
                     self.metrics.assigned_partitions.set(assigned.len() as u64);
 
-                    // Fetch committed offsets for new assignment (§2.3 fix)
+                    // Fetch committed offsets for new assignment
                     self.fetch_and_apply_committed_offsets(&assignment.partitions)
                         .await?;
                 }
@@ -796,9 +801,9 @@ impl Consumer {
             }
         }
 
-        // Enforce max_poll_records (§2.9 fix)
+        // Enforce max_poll_records
         // Negative values are treated as unlimited (no truncation)
-        // §10.1 fix: Only advance offsets for records actually delivered.
+        // Only advance offsets for records actually delivered.
         // When truncating, recompute offset updates from delivered records only.
         if self.config.max_poll_records > 0 {
             let max = self.config.max_poll_records as usize;
@@ -822,7 +827,7 @@ impl Consumer {
             }
         }
 
-        // Commit the offset updates (deferred from batch_fetch_from_broker per §10.1)
+        // Commit the offset updates (deferred from batch_fetch_from_broker until after max_poll_records handling)
         if !all_offset_updates.is_empty() {
             let mut offsets = self.offsets.write().await;
             for (key, new_offset) in all_offset_updates {
@@ -890,8 +895,8 @@ impl Consumer {
         for (topic, partitions) in &topics_map {
             let mut fetch_partitions = Vec::with_capacity(partitions.len());
             for &partition in partitions {
-                // §R13.3 fix: Skip partitions with no tracked offset rather than
-                // defaulting to 0, which defeats the §12.5 auto_offset_reset fix.
+                // Skip partitions with no tracked offset rather than
+                // defaulting to 0, which defeats the auto_offset_reset fix.
                 let offset = {
                     let offsets = self.offsets.read().await;
                     match offsets.get(&(topic.clone(), partition)).copied() {
@@ -980,7 +985,7 @@ impl Consumer {
                     } else if partition_response.error_code
                         == crate::error::ErrorCode::OffsetOutOfRange
                     {
-                        // §15.1 fix: Apply auto_offset_reset for OffsetOutOfRange
+                        // Apply auto_offset_reset for OffsetOutOfRange
                         // to resume consumption instead of stalling the partition.
                         warn!(
                             "OffsetOutOfRange for {}-{}, applying auto_offset_reset",
@@ -1074,7 +1079,7 @@ impl Consumer {
 
         // NOTE: Offsets are NOT advanced here. They are advanced in poll()
         // after max_poll_records truncation to avoid silently losing records
-        // whose offsets were already committed (§10.1 fix).
+        // whose offsets were already committed.
         // We return offset_updates alongside records so the caller can apply them.
         Ok((records, offset_updates))
     }
@@ -1095,7 +1100,7 @@ impl Consumer {
             OffsetForLeaderEpochResponse, OffsetForLeaderEpochTopic,
         };
 
-        // Refresh metadata first to get updated leader info (§R13.10 fix: log failure)
+        // Refresh metadata first to get updated leader info
         if let Err(e) = self.metadata.refresh_for_topics(Some(&[topic])).await {
             warn!(
                 "Metadata refresh failed for {}: {}, using cached metadata",
@@ -1185,12 +1190,12 @@ impl Consumer {
     ///
     /// This is a convenience method that returns one record at a time.
     /// Internally buffers records from `poll()` and returns them one by one,
-    /// ensuring no records are lost (§R13.1 fix).
+    /// ensuring no records are lost.
     ///
     /// Returns `Ok(None)` if the consumer is closed, or `Err` on failure.
     pub async fn recv(&self) -> Result<Option<ConsumerRecord>> {
         loop {
-            // Return buffered records first (§R13.1)
+            // Return buffered records first
             {
                 let mut buffer = self.recv_buffer.write().await;
                 if let Some(record) = buffer.pop_front() {
@@ -1239,7 +1244,7 @@ impl Consumer {
         self.metrics.commits.inc();
 
         // Build the set of currently assigned partitions, so we don't commit
-        // stale offsets for revoked partitions (§9.8 fix).
+        // stale offsets for revoked partitions.
         let assignments = self.assignments.read().await;
         let assigned_set: HashSet<(String, PartitionId)> = assignments
             .iter()
@@ -1250,7 +1255,7 @@ impl Consumer {
         if let Some(ref coordinator) = self.group_coordinator {
             // Convert offsets to the format expected by coordinator,
             // filtering to only currently assigned partitions.
-            // §R13.6 fix: Use explicit group check instead of assigned_set.is_empty()
+            // Use explicit group check instead of assigned_set.is_empty()
             // to avoid committing stale offsets when assignments are temporarily empty.
             let commit_offsets: HashMap<(String, PartitionId), (i64, Option<String>)> = offsets
                 .iter()
@@ -1265,7 +1270,7 @@ impl Consumer {
                 return Ok(());
             }
 
-            // §15.3 fix: Only pass actually-committed offsets to interceptor
+            // Only pass actually-committed offsets to interceptor
             let committed_offsets: HashMap<(String, PartitionId), Offset> = commit_offsets
                 .iter()
                 .map(|((topic, partition), (offset, _))| ((topic.clone(), *partition), *offset))
@@ -1311,7 +1316,7 @@ impl Consumer {
     /// to handle commit errors.
     pub fn commit_async(&self) {
         // Snapshot offsets without blocking (try_read avoids async in non-async fn)
-        // Also filter to only assigned partitions (§9.8 fix)
+        // Also filter to only assigned partitions
         let assigned_set: HashSet<(String, PartitionId)> = match self.assignments.try_read() {
             Ok(guard) => guard
                 .iter()
@@ -1331,7 +1336,7 @@ impl Consumer {
                 guard
                     .iter()
                     .filter(|((topic, partition), _)| {
-                        // §R13.6 fix: Only commit offsets for assigned partitions
+                        // Only commit offsets for assigned partitions
                         // when using group coordination. Manual assign mode commits all.
                         self.group_coordinator.is_none()
                             || assigned_set.contains(&(topic.clone(), *partition))
@@ -1342,7 +1347,7 @@ impl Consumer {
                     .collect()
             }
             Err(_) => {
-                // §15.2 fix: Log warning on contention so dropped commits are visible
+                // Log warning on contention so dropped commits are visible
                 tracing::warn!("commit_async: offset lock contention, skipping this commit cycle");
                 return;
             }
@@ -1506,7 +1511,7 @@ impl Consumer {
 
     /// Unsubscribe from all topics.
     ///
-    /// §R13.4 fix: properly notifies the rebalance listener, leaves the
+    /// properly notifies the rebalance listener, leaves the
     /// consumer group, clears offsets, paused set, and drains recv buffer.
     pub async fn unsubscribe(&self) {
         // Notify listener of revoked partitions before clearing
@@ -2106,7 +2111,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// §10.1 test: Verify max_poll_records truncation recomputes offset updates
+    /// Verify max_poll_records truncation recomputes offset updates
     /// to prevent data loss for undelivered records.
     #[test]
     fn test_max_poll_records_offset_recomputation() {
@@ -2159,7 +2164,7 @@ mod tests {
         assert_ne!(*offset, original_offset_updates[0].1);
     }
 
-    /// §10.1 test: Verify max_poll_records with multiple partitions recomputes
+    /// Verify max_poll_records with multiple partitions recomputes
     /// offsets correctly per partition.
     #[test]
     fn test_max_poll_records_multi_partition_offset() {
@@ -2252,7 +2257,7 @@ mod tests {
         assert!(builder.interceptor.is_some());
     }
 
-    // §R13.1: recv() buffers remaining records so none are lost.
+    // recv() buffers remaining records so none are lost.
     #[tokio::test]
     async fn test_recv_buffer_returns_all_records() {
         use std::collections::VecDeque;
@@ -2294,7 +2299,7 @@ mod tests {
         assert!(buffer.is_empty());
     }
 
-    // §R13.5: assign() is rejected when group coordinator is active.
+    // assign() is rejected when group coordinator is active.
     #[test]
     fn test_assign_with_group_id_configured() {
         let builder = Consumer::builder()
@@ -2306,7 +2311,7 @@ mod tests {
         assert!(builder.config.group_id.is_some());
     }
 
-    // §R13.11: subscribe() replaces rather than appending.
+    // subscribe() replaces rather than appending.
     #[test]
     fn test_subscribe_replaces_subscriptions() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2320,7 +2325,7 @@ mod tests {
             // First subscribe
             {
                 let mut s = subs.write().await;
-                s.clear(); // §R13.11: clear before insert
+                s.clear(); // clear before insert
                 s.insert("topic1".to_string());
             }
             assert_eq!(subs.read().await.len(), 1);
@@ -2329,7 +2334,7 @@ mod tests {
             // Second subscribe replaces, not appends
             {
                 let mut s = subs.write().await;
-                s.clear(); // §R13.11: clear before insert
+                s.clear(); // clear before insert
                 s.insert("topic2".to_string());
             }
             assert_eq!(subs.read().await.len(), 1);
@@ -2338,7 +2343,7 @@ mod tests {
         });
     }
 
-    // §R13.4: unsubscribe() clears offsets, paused, and recv_buffer.
+    // unsubscribe() clears offsets, paused, and recv_buffer.
     #[test]
     fn test_unsubscribe_clears_all_state() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2386,7 +2391,7 @@ mod tests {
         });
     }
 
-    // §R13.3: Fetch skips partitions with no tracked offset.
+    // Fetch skips partitions with no tracked offset.
     #[test]
     fn test_fetch_skips_untracked_partitions() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2407,7 +2412,7 @@ mod tests {
         });
     }
 
-    // §R13.6: Commit filtering uses group_coordinator check, not assigned_set emptiness.
+    // Commit filtering uses group_coordinator check, not assigned_set emptiness.
     #[test]
     fn test_commit_filter_does_not_leak_stale_offsets() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2434,7 +2439,7 @@ mod tests {
                 .collect();
             assert_eq!(old_filtered.len(), 2); // Both pass — wrong
 
-            // NEW behavior (§R13.6): group consumers never commit unassigned
+            // NEW behavior: group consumers never commit unassigned
             let has_group = true;
             let new_filtered: Vec<_> = offsets
                 .iter()
@@ -2444,7 +2449,7 @@ mod tests {
         });
     }
 
-    // §R13.7: group field removed — only group_coordinator accessor exists.
+    // group field removed — only group_coordinator accessor exists.
     #[test]
     fn test_no_legacy_group_field() {
         let builder = Consumer::builder()
@@ -2456,7 +2461,7 @@ mod tests {
 
     #[test]
     fn test_bootstrap_filter_empty_strings() {
-        // §15.5: Empty bootstrap server entries should be filtered out
+        // Empty bootstrap server entries should be filtered out
         let servers = " , ,localhost:9092, , broker:9093, ";
         let parsed: Vec<String> = servers
             .split(',')
@@ -2476,7 +2481,7 @@ mod tests {
 
     #[test]
     fn test_max_poll_interval_used_for_rebalance() {
-        // §15.6: rebalance_timeout should default to max_poll_interval (not session_timeout)
+        // rebalance_timeout should default to max_poll_interval (not session_timeout)
         let config = ConsumerConfig::default();
         // In the Java client, rebalance_timeout defaults to max.poll.interval.ms (300s)
         // not session.timeout.ms (10s). Verify our config has both.
