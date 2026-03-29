@@ -954,11 +954,7 @@ impl Consumer {
 
         // Negotiate fetch API version — prefer v7 (sessions) with v4 fallback
         let fetch_version = conn
-            .negotiate_api_version(
-                ApiKey::Fetch,
-                crate::protocol::versions::FETCH_MAX,
-                4,
-            )
+            .negotiate_api_version(ApiKey::Fetch, crate::protocol::versions::FETCH_MAX, 4)
             .await
             .unwrap_or(4);
 
@@ -967,6 +963,21 @@ impl Consumer {
             let mut sessions = self.fetch_sessions.lock().await;
             let session = sessions.get_or_create(broker_id);
             let session_req = session.build_request(&fetch_topics);
+            if session_req.is_full_fetch {
+                debug!(
+                    "Fetch broker {}: full fetch (session_id={}, epoch={})",
+                    broker_id, session_req.session_id, session_req.session_epoch
+                );
+            } else {
+                debug!(
+                    "Fetch broker {}: incremental (session_id={}, epoch={}, changed={}, forgotten={})",
+                    broker_id,
+                    session_req.session_id,
+                    session_req.session_epoch,
+                    session_req.topics.len(),
+                    session_req.forgotten_topics.len()
+                );
+            }
             FetchRequest {
                 session_id: session_req.session_id,
                 session_epoch: session_req.session_epoch,
@@ -1000,8 +1011,7 @@ impl Consumer {
         // Handle top-level session errors (v7+)
         if fetch_version >= 7 {
             if fetch_response.error_code == crate::error::ErrorCode::FetchSessionIdNotFound
-                || fetch_response.error_code
-                    == crate::error::ErrorCode::InvalidFetchSessionEpoch
+                || fetch_response.error_code == crate::error::ErrorCode::InvalidFetchSessionEpoch
             {
                 // Reset session and let the next poll do a full fetch
                 warn!(

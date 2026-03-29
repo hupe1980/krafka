@@ -21,9 +21,6 @@ use crate::{BrokerId, PartitionId};
 /// Epoch value indicating the initial (full) fetch.
 pub const INITIAL_EPOCH: i32 = 0;
 
-/// Epoch value used when sessions are not supported.
-pub const SESSIONLESS_EPOCH: i32 = -1;
-
 /// Snapshot of partition fetch parameters, used to detect changes between
 /// consecutive fetches so that incremental requests only carry deltas.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,7 +33,8 @@ struct PartitionState {
 /// Per-broker fetch session state.
 #[derive(Debug)]
 pub struct FetchSessionState {
-    /// Broker ID this session belongs to.
+    /// Broker ID this session belongs to (used in Debug output).
+    #[allow(dead_code)]
     broker_id: BrokerId,
     /// Session ID returned by the broker (0 = no session).
     session_id: i32,
@@ -73,27 +71,27 @@ impl FetchSessionState {
         }
     }
 
-    /// Returns the broker ID.
-    pub fn broker_id(&self) -> BrokerId {
-        self.broker_id
-    }
-
-    /// Returns the current session ID.
-    pub fn session_id(&self) -> i32 {
-        self.session_id
-    }
-
-    /// Returns the current epoch.
-    pub fn epoch(&self) -> i32 {
-        self.epoch
-    }
-
     /// Returns true if the session is established (session_id != 0).
     pub fn has_session(&self) -> bool {
         self.session_id != 0
     }
 
-    /// Returns the number of partitions tracked in this session.
+    #[cfg(test)]
+    pub fn broker_id(&self) -> BrokerId {
+        self.broker_id
+    }
+
+    #[cfg(test)]
+    pub fn session_id(&self) -> i32 {
+        self.session_id
+    }
+
+    #[cfg(test)]
+    pub fn epoch(&self) -> i32 {
+        self.epoch
+    }
+
+    #[cfg(test)]
     pub fn partition_count(&self) -> usize {
         self.partitions.len()
     }
@@ -105,10 +103,7 @@ impl FetchSessionState {
     /// - `session_id` / `session_epoch` to set on the wire
     /// - `topics` with only new/changed partitions (or all if full fetch)
     /// - `forgotten_topics` with removed partitions
-    pub fn build_request(
-        &self,
-        desired: &[FetchTopicRequest],
-    ) -> FetchSessionRequest {
+    pub fn build_request(&self, desired: &[FetchTopicRequest]) -> FetchSessionRequest {
         // Build a flat set of the desired partitions for fast lookup.
         let mut desired_map: HashMap<(String, PartitionId), &FetchPartitionRequest> =
             HashMap::new();
@@ -275,6 +270,7 @@ impl FetchSessionCache {
     }
 
     /// Remove sessions for brokers not in the given set.
+    #[cfg(test)]
     pub fn retain_brokers(&mut self, broker_ids: &[BrokerId]) {
         self.sessions.retain(|id, _| broker_ids.contains(id));
     }
@@ -284,10 +280,7 @@ impl FetchSessionCache {
 mod tests {
     use super::*;
 
-    fn make_topic_request(
-        topic: &str,
-        partitions: &[(i32, i64, i32)],
-    ) -> FetchTopicRequest {
+    fn make_topic_request(topic: &str, partitions: &[(i32, i64, i32)]) -> FetchTopicRequest {
         FetchTopicRequest {
             topic: topic.to_string(),
             partitions: partitions
@@ -312,14 +305,16 @@ mod tests {
             topic: topic.to_string(),
             partitions: partitions
                 .iter()
-                .map(|&(partition, offset, max_bytes, epoch)| FetchPartitionRequest {
-                    partition,
-                    current_leader_epoch: epoch,
-                    fetch_offset: offset,
-                    last_fetched_epoch: -1,
-                    log_start_offset: -1,
-                    partition_max_bytes: max_bytes,
-                })
+                .map(
+                    |&(partition, offset, max_bytes, epoch)| FetchPartitionRequest {
+                        partition,
+                        current_leader_epoch: epoch,
+                        fetch_offset: offset,
+                        last_fetched_epoch: -1,
+                        log_start_offset: -1,
+                        partition_max_bytes: max_bytes,
+                    },
+                )
                 .collect(),
         }
     }
