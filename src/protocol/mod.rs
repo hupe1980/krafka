@@ -77,7 +77,7 @@ pub mod versions {
     pub const OFFSET_COMMIT_MAX: i16 = 2;
     /// Maximum supported OffsetFetch version.
     pub const OFFSET_FETCH_MAX: i16 = 1;
-    /// Maximum supported FindCoordinator version.
+    /// Maximum supported FindCoordinator version (v1 adds key_type for txn coordinators).
     pub const FIND_COORDINATOR_MAX: i16 = 1;
     /// Maximum supported JoinGroup version.
     pub const JOIN_GROUP_MAX: i16 = 5;
