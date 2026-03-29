@@ -808,16 +808,20 @@ impl Consumer {
                 assignments
                     .iter()
                     .flat_map(|(topic, partitions)| {
-                        partitions
-                            .iter()
-                            .filter(|&&p| !offsets.contains_key(&(topic.clone(), p)))
-                            .filter(|&&p| {
-                                // Only include if backoff period has elapsed
-                                backoff
-                                    .get(&(topic.clone(), p))
-                                    .is_none_or(|&(next_retry, _)| now >= next_retry)
-                            })
-                            .map(|&p| (topic.clone(), p))
+                        partitions.iter().filter_map(|&p| {
+                            let key = (topic.clone(), p);
+
+                            if offsets.contains_key(&key) {
+                                return None;
+                            }
+
+                            // Only include if backoff period has elapsed
+                            match backoff.get(&key) {
+                                None => Some(key),
+                                Some(&(next_retry, _)) if now >= next_retry => Some(key),
+                                _ => None,
+                            }
+                        })
                     })
                     .collect()
             };

@@ -1179,19 +1179,22 @@ impl Drop for BrokerConnection {
 
 /// Extract the hostname from an address string for TLS SNI.
 ///
-/// Handles both IPv4/hostname (`host:port`) and IPv6 bracket notation
-/// (`[::1]:port`). Returns the bare hostname without port or brackets.
+/// Handles bracketed IPv6 (`[::1]:port`), bare IPv6 (`2001:db8::1`),
+/// and IPv4/hostname with optional port (`host:port`). Returns the bare
+/// hostname without port or brackets.
 fn extract_sni_hostname(address: &str) -> &str {
-    if address.starts_with('[') {
-        // IPv6 with brackets: extract between '[' and ']'
-        address
-            .strip_prefix('[')
-            .and_then(|s| s.split(']').next())
-            .unwrap_or(address)
-    } else {
-        // IPv4 or hostname: take everything before the first ':'
-        address.split(':').next().unwrap_or(address)
+    // Bracketed IPv6: [::1]:port or [::1]
+    if let Some(rest) = address.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(address);
     }
+
+    // Bare IPv6 without port: 2001:db8::1
+    if address.parse::<std::net::Ipv6Addr>().is_ok() {
+        return address;
+    }
+
+    // IPv4 or hostname: strip trailing :port (rsplit_once handles no-port case)
+    address.rsplit_once(':').map_or(address, |(host, _)| host)
 }
 
 #[cfg(test)]
@@ -1800,6 +1803,22 @@ mod tests {
     #[test]
     fn test_extract_sni_hostname_ipv6_full() {
         assert_eq!(extract_sni_hostname("[2001:db8::1]:9092"), "2001:db8::1");
+    }
+
+    #[test]
+    fn test_extract_sni_hostname_ipv6_unbracketed() {
+        // `2001:db8::1:9092` is a valid 8-group IPv6 address, so the function
+        // correctly returns it as-is. Use bracket notation `[2001:db8::1]:9092`
+        // to unambiguously separate host from port.
+        assert_eq!(extract_sni_hostname("2001:db8::1:9092"), "2001:db8::1:9092");
+        // When the string is NOT a valid IPv6 address, the last :segment
+        // is stripped as a port.
+        assert_eq!(extract_sni_hostname("2001:db8::zz:9092"), "2001:db8::zz");
+    }
+
+    #[test]
+    fn test_extract_sni_hostname_ipv6_no_port() {
+        assert_eq!(extract_sni_hostname("2001:db8::1"), "2001:db8::1");
     }
 
     #[test]

@@ -4863,10 +4863,10 @@ macro_rules! unsupported_decode {
 impl VersionedEncode for MetadataRequest {
     fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
         match version {
-            // Supported metadata request versions are 0 through 3. Higher
-            // versions are rejected here until corresponding response
-            // decoding support and version negotiation caps are updated.
-            0..=3 => self.encode_v0(buf),
+            // Capped to METADATA_MAX (currently 1). Raise this range when
+            // higher-version encode/decode support and version constants
+            // are updated together.
+            0..=1 => self.encode_v0(buf),
             _ => return unsupported_encode!("MetadataRequest", version),
         }
         Ok(())
@@ -4878,9 +4878,6 @@ impl VersionedDecode for MetadataResponse {
         match version {
             0 => Self::decode_v0(buf),
             1 => Self::decode_v1(buf),
-            // decode_v2 handles v2-v3 fields; higher versions add fields
-            // that this decoder does not consume.
-            2..=3 => Self::decode_v2(buf),
             _ => unsupported_decode!("MetadataResponse", version),
         }
     }
