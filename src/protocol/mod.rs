@@ -26,7 +26,7 @@
 //! | Heartbeat | 0 | 1 | v0 is baseline |
 //! | SyncGroup | 0 | 3 | v3+ group instance id |
 //! | LeaveGroup | 0 | 1 | v0 is baseline |
-//! | CreateTopics | 0 | 3 | v0 is baseline |
+//! | CreateTopics | 0 | 2 | v0 is baseline |
 //! | DeleteTopics | 0 | 1 | v0 is baseline |
 //!
 //! ## Example

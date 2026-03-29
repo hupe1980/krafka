@@ -940,18 +940,6 @@ impl Consumer {
             });
         }
 
-        let request = FetchRequest {
-            replica_id: -1, // Consumer
-            max_wait_ms: crate::util::duration_to_millis_i32(timeout),
-            min_bytes: self.config.fetch_min_bytes,
-            max_bytes: self.config.fetch_max_bytes,
-            isolation_level: self.config.isolation_level.to_i8(),
-            session_id: 0,
-            session_epoch: -1,
-            topics: fetch_topics.clone(),
-            forgotten_topics: Vec::new(),
-        };
-
         // Negotiate fetch API version — prefer v7 (sessions), fall back to v4.
         // We only implement encode/decode for v4 and v7, so we must not send v5/v6
         // (which add log_start_offset to the request partition) with our v4 encoder.
@@ -960,8 +948,9 @@ impl Consumer {
             .await
             .unwrap_or(4);
 
-        // For v7+, apply fetch session state to produce incremental requests
-        let request = if fetch_version >= 7 {
+        // Build the fetch request. For v7, compute an incremental session diff
+        // from fetch_topics without cloning the full topic list into the base request.
+        let (session_id, session_epoch, request_topics, forgotten_topics) = if fetch_version >= 7 {
             let mut sessions = self.fetch_sessions.lock().await;
             let session = sessions.get_or_create(broker_id);
             let session_req = session.build_request(&fetch_topics);
@@ -980,15 +969,28 @@ impl Consumer {
                     session_req.forgotten_topics.len()
                 );
             }
-            FetchRequest {
-                session_id: session_req.session_id,
-                session_epoch: session_req.session_epoch,
-                topics: session_req.topics,
-                forgotten_topics: session_req.forgotten_topics,
-                ..request
-            }
+            (
+                session_req.session_id,
+                session_req.session_epoch,
+                session_req.topics,
+                session_req.forgotten_topics,
+            )
         } else {
-            request
+            // v4: move fetch_topics into the request; update_from_response
+            // is only called for v7+ so fetch_topics is not needed later.
+            (0, -1, std::mem::take(&mut fetch_topics), Vec::new())
+        };
+
+        let request = FetchRequest {
+            replica_id: -1, // Consumer
+            max_wait_ms: crate::util::duration_to_millis_i32(timeout),
+            min_bytes: self.config.fetch_min_bytes,
+            max_bytes: self.config.fetch_max_bytes,
+            isolation_level: self.config.isolation_level.to_i8(),
+            session_id,
+            session_epoch,
+            topics: request_topics,
+            forgotten_topics,
         };
 
         // Send request with negotiated version

@@ -127,10 +127,17 @@ impl FetchSessionState {
         // Incremental fetch: compute diff.
         let next_epoch = self.next_epoch();
 
+        // Build a borrowed-key view of the previous partitions to avoid
+        // allocating Strings for lookups on every (topic, partition).
+        let mut prev_map: HashMap<(&str, PartitionId), &PartitionState> = HashMap::new();
+        for ((topic, partition), state) in &self.partitions {
+            prev_map.insert((topic.as_str(), *partition), state);
+        }
+
         // 1. Find new or changed partitions.
         let mut changed: HashMap<&str, Vec<FetchPartitionRequest>> = HashMap::new();
         for (&(topic, partition), req) in &desired_map {
-            let is_new_or_changed = match self.partitions.get(&(topic.to_string(), partition)) {
+            let is_new_or_changed = match prev_map.get(&(topic, partition)) {
                 None => true, // New partition.
                 Some(prev) => {
                     prev.fetch_offset != req.fetch_offset

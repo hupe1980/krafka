@@ -678,7 +678,7 @@ Krafka implements [KIP-227](https://cwiki.apache.org/confluence/display/KAFKA/KI
   (full fetch)              (incremental)
   ┌──────────────┐          ┌──────────────┐
   │ session_id: 0│          │ session_id: 42│
-  │ epoch: 0     │          │ epoch: 2      │
+  │ epoch: 0     │          │ epoch: 1      │
   │ topics:      │          │ topics:       │
   │   p0, p1, p2 │    →     │   p1 (changed)│
   │   p3, p4     │          │ forgotten:    │

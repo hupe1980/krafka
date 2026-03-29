@@ -588,7 +588,7 @@ impl FetchRequest {
         }
     }
 
-    /// Encode for version 4-6.
+    /// Encode for version 4.
     pub fn encode_v4(&self, buf: &mut impl BufMut) {
         self.replica_id.encode(buf);
         self.max_wait_ms.encode(buf);
@@ -746,7 +746,7 @@ impl FetchResponse {
         Ok(response)
     }
 
-    /// Decode from version 4-6 (includes last_stable_offset and aborted_transactions).
+    /// Decode from version 4 (includes last_stable_offset and aborted_transactions).
     pub fn decode_v4(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let mut responses = Vec::new();
