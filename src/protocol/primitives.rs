@@ -221,11 +221,13 @@ impl From<Option<String>> for KafkaString {
 
 impl Encode for KafkaString {
     fn encode(&self, buf: &mut impl BufMut) {
-        self.try_encode(buf).expect("KafkaString exceeds protocol size limit; validate before encoding")
+        self.try_encode(buf)
+            .expect("KafkaString exceeds protocol size limit; validate before encoding")
     }
 
     fn encode_compact(&self, buf: &mut impl BufMut) {
-        self.try_encode_compact(buf).expect("compact KafkaString exceeds protocol size limit; validate before encoding")
+        self.try_encode_compact(buf)
+            .expect("compact KafkaString exceeds protocol size limit; validate before encoding")
     }
 }
 
@@ -351,11 +353,13 @@ impl From<&[u8]> for KafkaBytes {
 
 impl Encode for KafkaBytes {
     fn encode(&self, buf: &mut impl BufMut) {
-        self.try_encode(buf).expect("KafkaBytes exceeds protocol size limit; validate before encoding")
+        self.try_encode(buf)
+            .expect("KafkaBytes exceeds protocol size limit; validate before encoding")
     }
 
     fn encode_compact(&self, buf: &mut impl BufMut) {
-        self.try_encode_compact(buf).expect("compact KafkaBytes exceeds protocol size limit; validate before encoding")
+        self.try_encode_compact(buf)
+            .expect("compact KafkaBytes exceeds protocol size limit; validate before encoding")
     }
 }
 
@@ -382,13 +386,12 @@ impl TryEncode for KafkaBytes {
         match &self.0 {
             None => varint::encode_unsigned_varint(0, buf),
             Some(bytes) => {
-                let len_plus_one =
-                    u32::try_from(bytes.len().saturating_add(1)).map_err(|_| {
-                        KrafkaError::protocol(format!(
-                            "compact KafkaBytes length {} exceeds u32 limit",
-                            bytes.len()
-                        ))
-                    })?;
+                let len_plus_one = u32::try_from(bytes.len().saturating_add(1)).map_err(|_| {
+                    KrafkaError::protocol(format!(
+                        "compact KafkaBytes length {} exceeds u32 limit",
+                        bytes.len()
+                    ))
+                })?;
                 varint::encode_unsigned_varint(len_plus_one, buf);
                 buf.put_slice(bytes);
             }
@@ -481,9 +484,8 @@ impl<T: Encode> Encode for KafkaArray<T> {
         match &self.0 {
             None => buf.put_i32(-1),
             Some(items) => {
-                let len = i32::try_from(items.len()).expect(
-                    "KafkaArray exceeds protocol size limit; validate before encoding",
-                );
+                let len = i32::try_from(items.len())
+                    .expect("KafkaArray exceeds protocol size limit; validate before encoding");
                 buf.put_i32(len);
                 for item in items {
                     item.encode(buf);
@@ -533,13 +535,12 @@ impl<T: Encode + TryEncode> TryEncode for KafkaArray<T> {
         match &self.0 {
             None => varint::encode_unsigned_varint(0, buf),
             Some(items) => {
-                let len_plus_one =
-                    u32::try_from(items.len().saturating_add(1)).map_err(|_| {
-                        KrafkaError::protocol(format!(
-                            "compact KafkaArray length {} exceeds u32 limit",
-                            items.len()
-                        ))
-                    })?;
+                let len_plus_one = u32::try_from(items.len().saturating_add(1)).map_err(|_| {
+                    KrafkaError::protocol(format!(
+                        "compact KafkaArray length {} exceeds u32 limit",
+                        items.len()
+                    ))
+                })?;
                 varint::encode_unsigned_varint(len_plus_one, buf);
                 for item in items {
                     item.try_encode_compact(buf)?;
@@ -595,7 +596,8 @@ pub struct TaggedField {
 
 impl Encode for TaggedFields {
     fn encode(&self, buf: &mut impl BufMut) {
-        self.try_encode(buf).expect("TaggedFields exceeds protocol size limit; validate before encoding")
+        self.try_encode(buf)
+            .expect("TaggedFields exceeds protocol size limit; validate before encoding")
     }
 }
 
@@ -806,7 +808,10 @@ mod tests {
         let result = ks.try_encode(&mut buf);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("KafkaString length"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("KafkaString length"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

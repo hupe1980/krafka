@@ -1786,7 +1786,10 @@ mod tests {
 
     #[test]
     fn test_extract_sni_hostname_hostname() {
-        assert_eq!(extract_sni_hostname("broker.example.com:9092"), "broker.example.com");
+        assert_eq!(
+            extract_sni_hostname("broker.example.com:9092"),
+            "broker.example.com"
+        );
     }
 
     #[test]
@@ -1796,14 +1799,14 @@ mod tests {
 
     #[test]
     fn test_extract_sni_hostname_ipv6_full() {
-        assert_eq!(
-            extract_sni_hostname("[2001:db8::1]:9092"),
-            "2001:db8::1"
-        );
+        assert_eq!(extract_sni_hostname("[2001:db8::1]:9092"), "2001:db8::1");
     }
 
     #[test]
     fn test_extract_sni_hostname_no_port() {
-        assert_eq!(extract_sni_hostname("broker.example.com"), "broker.example.com");
+        assert_eq!(
+            extract_sni_hostname("broker.example.com"),
+            "broker.example.com"
+        );
     }
 }

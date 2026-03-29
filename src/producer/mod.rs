@@ -358,10 +358,8 @@ impl Producer {
         }
 
         if record.headers.is_empty() {
-            batch_builder = batch_builder.add_record(
-                record.key.clone(),
-                Some(record.value.clone()),
-            );
+            batch_builder =
+                batch_builder.add_record(record.key.clone(), Some(record.value.clone()));
         } else {
             batch_builder = batch_builder.add_record_with_headers(
                 record.key.clone(),

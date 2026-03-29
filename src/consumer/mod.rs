@@ -524,10 +524,7 @@ impl Consumer {
             .get(&(topic.to_string(), partition))
             .copied()
             .ok_or_else(|| {
-                KrafkaError::protocol(format!(
-                    "no offset returned for {}-{}",
-                    topic, partition
-                ))
+                KrafkaError::protocol(format!("no offset returned for {}-{}", topic, partition))
             })
     }
 
@@ -548,7 +545,10 @@ impl Consumer {
         for (topic, parts) in partitions {
             for &p in parts {
                 if let Some(leader) = self.metadata.leader(topic, p).await {
-                    by_leader.entry(leader).or_default().push((topic.clone(), p));
+                    by_leader
+                        .entry(leader)
+                        .or_default()
+                        .push((topic.clone(), p));
                 } else {
                     leaderless.push((topic.clone(), p));
                 }
@@ -877,8 +877,7 @@ impl Consumer {
                                     )
                                 })
                                 .unwrap_or(Duration::ZERO);
-                            let next_wait =
-                                (current_wait * 2).max(base).min(max);
+                            let next_wait = (current_wait * 2).max(base).min(max);
                             backoff.insert(key, now + next_wait);
                         }
                     }
@@ -1241,9 +1240,7 @@ impl Consumer {
                                             // Coordinator didn't return this partition;
                                             // fall back to direct ListOffsets.
                                             if let Ok(offset) = self
-                                                .resolve_list_offset(
-                                                    topic_name, partition, target,
-                                                )
+                                                .resolve_list_offset(topic_name, partition, target)
                                                 .await
                                             {
                                                 let mut offsets = self.offsets.write().await;
@@ -1270,10 +1267,7 @@ impl Consumer {
                                 {
                                     Ok(offset) => {
                                         let mut offsets = self.offsets.write().await;
-                                        offsets.insert(
-                                            (topic_name.clone(), partition),
-                                            offset,
-                                        );
+                                        offsets.insert((topic_name.clone(), partition), offset);
                                     }
                                     Err(e) => {
                                         warn!(
