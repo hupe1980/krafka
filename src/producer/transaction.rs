@@ -55,7 +55,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::PartitionId;
@@ -146,20 +146,60 @@ impl Default for TransactionalProducerConfig {
     }
 }
 
+/// State of a partition within the current transaction.
+#[derive(Debug, Clone)]
+enum PartitionAddState {
+    /// AddPartitionsToTxn RPC is in-flight; concurrent callers should wait.
+    Pending(Arc<Notify>),
+    /// Successfully registered with the transaction coordinator.
+    Added,
+}
+
+/// Result of attempting to begin adding a partition to the transaction.
+enum BeginAddResult {
+    /// Partition already registered — nothing to do.
+    AlreadyAdded,
+    /// Another caller is registering this partition — wait on the Notify.
+    Wait(Arc<Notify>),
+    /// This caller must perform the RPC. Notify to signal waiters afterwards.
+    NeedAdd(Arc<Notify>),
+}
+
 /// Partitions added to the current transaction.
 #[derive(Debug, Default)]
 struct TransactionPartitions {
-    /// Topic-partitions added to the transaction.
-    partitions: std::collections::HashSet<(String, PartitionId)>,
+    /// Topic-partitions and their registration state.
+    partitions: std::collections::HashMap<(String, PartitionId), PartitionAddState>,
 }
 
 impl TransactionPartitions {
-    fn add(&mut self, topic: &str, partition: PartitionId) -> bool {
-        self.partitions.insert((topic.to_string(), partition))
+    /// Begin adding a partition. Returns the action the caller must take.
+    fn begin_add(&mut self, topic: &str, partition: PartitionId) -> BeginAddResult {
+        let key = (topic.to_string(), partition);
+        match self.partitions.get(&key) {
+            Some(PartitionAddState::Added) => BeginAddResult::AlreadyAdded,
+            Some(PartitionAddState::Pending(notify)) => BeginAddResult::Wait(notify.clone()),
+            None => {
+                let notify = Arc::new(Notify::new());
+                self.partitions
+                    .insert(key, PartitionAddState::Pending(notify.clone()));
+                BeginAddResult::NeedAdd(notify)
+            }
+        }
     }
 
-    fn remove(&mut self, topic: &str, partition: PartitionId) {
-        self.partitions.remove(&(topic.to_string(), partition));
+    /// Confirm a partition was successfully registered.
+    fn confirm_add(&mut self, topic: &str, partition: PartitionId, notify: &Notify) {
+        let key = (topic.to_string(), partition);
+        self.partitions.insert(key, PartitionAddState::Added);
+        notify.notify_waiters();
+    }
+
+    /// Cancel a pending add (RPC failed). Removes the entry and wakes waiters.
+    fn cancel_add(&mut self, topic: &str, partition: PartitionId, notify: &Notify) {
+        let key = (topic.to_string(), partition);
+        self.partitions.remove(&key);
+        notify.notify_waiters();
     }
 
     fn clear(&mut self) {
@@ -405,19 +445,36 @@ impl TransactionalProducer {
             }
         };
 
-        // Add partition to transaction if not already added
-        let is_new = {
-            let mut txn_partitions = self.txn_partitions.write().await;
-            txn_partitions.add(&topic, partition)
-        };
-
-        if is_new {
-            // New partition — send AddPartitionsToTxn RPC without holding the lock.
-            // On failure, roll back so a retry can re-add the partition.
-            if let Err(e) = self.add_partition_to_txn(&topic, partition).await {
+        // Add partition to transaction if not already registered.
+        // Uses Pending/Added states to prevent concurrent callers from
+        // skipping the RPC while an in-flight add has not yet completed.
+        loop {
+            let action = {
                 let mut txn_partitions = self.txn_partitions.write().await;
-                txn_partitions.remove(&topic, partition);
-                return Err(e);
+                txn_partitions.begin_add(&topic, partition)
+            };
+
+            match action {
+                BeginAddResult::AlreadyAdded => break,
+                BeginAddResult::Wait(notify) => {
+                    // Another caller is registering this partition — wait and re-check.
+                    notify.notified().await;
+                }
+                BeginAddResult::NeedAdd(notify) => {
+                    // This caller performs the RPC without holding the lock.
+                    match self.add_partition_to_txn(&topic, partition).await {
+                        Ok(()) => {
+                            let mut txn_partitions = self.txn_partitions.write().await;
+                            txn_partitions.confirm_add(&topic, partition, &notify);
+                        }
+                        Err(e) => {
+                            let mut txn_partitions = self.txn_partitions.write().await;
+                            txn_partitions.cancel_add(&topic, partition, &notify);
+                            return Err(e);
+                        }
+                    }
+                    break;
+                }
             }
         }
 
@@ -1116,14 +1173,32 @@ mod tests {
         let mut partitions = TransactionPartitions::default();
         assert!(partitions.is_empty());
 
-        assert!(partitions.add("topic1", 0));
+        // First add returns NeedAdd
+        let result = partitions.begin_add("topic1", 0);
+        let notify = match result {
+            BeginAddResult::NeedAdd(n) => n,
+            _ => panic!("expected NeedAdd"),
+        };
         assert!(!partitions.is_empty());
 
-        // Adding same partition returns false
-        assert!(!partitions.add("topic1", 0));
+        // Same partition while Pending returns Wait
+        assert!(matches!(
+            partitions.begin_add("topic1", 0),
+            BeginAddResult::Wait(_)
+        ));
 
-        // Different partition returns true
-        assert!(partitions.add("topic1", 1));
+        // Confirm, then same partition returns AlreadyAdded
+        partitions.confirm_add("topic1", 0, &notify);
+        assert!(matches!(
+            partitions.begin_add("topic1", 0),
+            BeginAddResult::AlreadyAdded
+        ));
+
+        // Different partition returns NeedAdd
+        assert!(matches!(
+            partitions.begin_add("topic1", 1),
+            BeginAddResult::NeedAdd(_)
+        ));
 
         partitions.clear();
         assert!(partitions.is_empty());
@@ -1438,14 +1513,43 @@ mod tests {
     }
 
     #[test]
-    fn test_transaction_partitions_remove() {
+    fn test_transaction_partitions_state_machine() {
         let mut tp = TransactionPartitions::default();
-        tp.add("topic", 0);
-        tp.add("topic", 1);
-        assert!(!tp.is_empty());
-        tp.remove("topic", 0);
-        assert!(!tp.is_empty());
-        tp.remove("topic", 1);
+
+        // First add returns NeedAdd
+        let result = tp.begin_add("topic", 0);
+        let notify = match result {
+            BeginAddResult::NeedAdd(n) => n,
+            _ => panic!("expected NeedAdd"),
+        };
+
+        // Concurrent add returns Wait
+        let result2 = tp.begin_add("topic", 0);
+        assert!(matches!(result2, BeginAddResult::Wait(_)));
+
+        // Confirm moves to Added
+        tp.confirm_add("topic", 0, &notify);
+        assert!(matches!(
+            tp.begin_add("topic", 0),
+            BeginAddResult::AlreadyAdded
+        ));
+
+        // Different partition returns NeedAdd
+        let result3 = tp.begin_add("topic", 1);
+        let notify2 = match result3 {
+            BeginAddResult::NeedAdd(n) => n,
+            _ => panic!("expected NeedAdd"),
+        };
+
+        // Cancel removes — next call returns NeedAdd again
+        tp.cancel_add("topic", 1, &notify2);
+        assert!(matches!(
+            tp.begin_add("topic", 1),
+            BeginAddResult::NeedAdd(_)
+        ));
+
+        // Clear empties everything
+        tp.clear();
         assert!(tp.is_empty());
     }
 }

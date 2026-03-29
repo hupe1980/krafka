@@ -193,7 +193,7 @@ let producer = Producer::builder()
 | `buffer_memory` | 32 MB | Maximum total memory for buffering records |
 | `max_block` | 60s | Maximum time to block when buffer is full |
 
-When the buffer memory limit is reached, `send()` will block the caller for up to `max_block` waiting for in-flight batches to complete and free memory. If memory is still unavailable after the timeout, an error is returned. This provides backpressure matching the Kafka Java client's `max.block.ms` behavior, preventing both OOM conditions and unnecessary record loss under bursty load.
+When batching/accumulation is enabled (i.e., `linger > 0`) and the buffer memory limit is reached, `send()` will block the caller for up to `max_block` waiting for in-flight batches to complete and free memory. If memory is still unavailable after the timeout, an error is returned. This provides backpressure matching the Kafka Java client's `max.block.ms` behavior, preventing both OOM conditions and unnecessary record loss under bursty load. In direct-send mode (`linger = 0`), records bypass the accumulator, so `buffer_memory`/`max_block` do not apply.
 
 ## Flushing
 

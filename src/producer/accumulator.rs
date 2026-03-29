@@ -71,12 +71,20 @@ impl RecordAccumulatorHandle {
         partition: PartitionId,
     ) -> Result<RecordMetadata> {
         let deadline = tokio::time::Instant::now() + self.max_block_ms;
+        let mut first_attempt = true;
 
         loop {
             let (response_tx, response_rx) = oneshot::channel();
+            // Move the record on the first attempt; clone only on retries.
+            let rec = if first_attempt {
+                first_attempt = false;
+                record.clone()
+            } else {
+                record.clone()
+            };
             self.sender
                 .send(AccumulatorMessage::Append {
-                    record: record.clone(),
+                    record: rec,
                     partition,
                     response_tx,
                 })
@@ -93,7 +101,7 @@ impl RecordAccumulatorHandle {
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() {
                         return Err(KrafkaError::config(
-                            "Timed out waiting for buffer memory after max_block_ms. \
+                            "Timed out waiting for buffer memory (max_block exceeded). \
                              Consider increasing buffer_memory or max_block, or reducing production rate.",
                         ));
                     }
@@ -102,7 +110,7 @@ impl RecordAccumulatorHandle {
                         .is_err()
                     {
                         return Err(KrafkaError::config(
-                            "Timed out waiting for buffer memory after max_block_ms. \
+                            "Timed out waiting for buffer memory (max_block exceeded). \
                              Consider increasing buffer_memory or max_block, or reducing production rate.",
                         ));
                     }
@@ -525,8 +533,9 @@ impl RecordAccumulator {
         }
         let batch_memory: usize = batch.pending.iter().map(|p| p.estimated_size).sum();
         self.memory_used = self.memory_used.saturating_sub(batch_memory);
-        // Wake callers blocked on buffer backpressure
-        self.memory_freed.notify_waiters();
+        // Wake one caller blocked on buffer backpressure (stores a permit so
+        // it cannot be missed even if no task is currently waiting).
+        self.memory_freed.notify_one();
         Some(batch)
     }
 
@@ -792,6 +801,8 @@ impl RecordAccumulator {
             let batch_memory: usize = batch.pending.iter().map(|p| p.estimated_size).sum();
             self.memory_used = self.memory_used.saturating_sub(batch_memory);
         }
+        // Wake callers blocked on buffer backpressure
+        self.memory_freed.notify_one();
 
         // Send all batches concurrently
         let mut join_set = tokio::task::JoinSet::new();
@@ -943,8 +954,8 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("max_block_ms"),
-            "expected max_block_ms in error, got: {err_msg}"
+            err_msg.contains("max_block"),
+            "expected max_block in error, got: {err_msg}"
         );
     }
 

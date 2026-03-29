@@ -825,7 +825,7 @@ impl Consumer {
             }
         }
 
-        // Commit the offset updates (deferred from batch_fetch_from_broker per)
+        // Commit the offset updates (deferred from batch_fetch_from_broker until after max_poll_records handling)
         if !all_offset_updates.is_empty() {
             let mut offsets = self.offsets.write().await;
             for (key, new_offset) in all_offset_updates {
@@ -2255,7 +2255,7 @@ mod tests {
         assert!(builder.interceptor.is_some());
     }
 
-    //: recv() buffers remaining records so none are lost.
+    // recv() buffers remaining records so none are lost.
     #[tokio::test]
     async fn test_recv_buffer_returns_all_records() {
         use std::collections::VecDeque;
@@ -2297,7 +2297,7 @@ mod tests {
         assert!(buffer.is_empty());
     }
 
-    //: assign() is rejected when group coordinator is active.
+    // assign() is rejected when group coordinator is active.
     #[test]
     fn test_assign_with_group_id_configured() {
         let builder = Consumer::builder()
@@ -2309,7 +2309,7 @@ mod tests {
         assert!(builder.config.group_id.is_some());
     }
 
-    //: subscribe() replaces rather than appending.
+    // subscribe() replaces rather than appending.
     #[test]
     fn test_subscribe_replaces_subscriptions() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2323,7 +2323,7 @@ mod tests {
             // First subscribe
             {
                 let mut s = subs.write().await;
-                s.clear(); //: clear before insert
+                s.clear(); // clear before insert
                 s.insert("topic1".to_string());
             }
             assert_eq!(subs.read().await.len(), 1);
@@ -2332,7 +2332,7 @@ mod tests {
             // Second subscribe replaces, not appends
             {
                 let mut s = subs.write().await;
-                s.clear(); //: clear before insert
+                s.clear(); // clear before insert
                 s.insert("topic2".to_string());
             }
             assert_eq!(subs.read().await.len(), 1);
@@ -2341,7 +2341,7 @@ mod tests {
         });
     }
 
-    //: unsubscribe() clears offsets, paused, and recv_buffer.
+    // unsubscribe() clears offsets, paused, and recv_buffer.
     #[test]
     fn test_unsubscribe_clears_all_state() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2389,7 +2389,7 @@ mod tests {
         });
     }
 
-    //: Fetch skips partitions with no tracked offset.
+    // Fetch skips partitions with no tracked offset.
     #[test]
     fn test_fetch_skips_untracked_partitions() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2410,7 +2410,7 @@ mod tests {
         });
     }
 
-    //: Commit filtering uses group_coordinator check, not assigned_set emptiness.
+    // Commit filtering uses group_coordinator check, not assigned_set emptiness.
     #[test]
     fn test_commit_filter_does_not_leak_stale_offsets() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2447,7 +2447,7 @@ mod tests {
         });
     }
 
-    //: group field removed — only group_coordinator accessor exists.
+    // group field removed — only group_coordinator accessor exists.
     #[test]
     fn test_no_legacy_group_field() {
         let builder = Consumer::builder()
@@ -2459,7 +2459,7 @@ mod tests {
 
     #[test]
     fn test_bootstrap_filter_empty_strings() {
-        //: Empty bootstrap server entries should be filtered out
+        // Empty bootstrap server entries should be filtered out
         let servers = " , ,localhost:9092, , broker:9093, ";
         let parsed: Vec<String> = servers
             .split(',')
@@ -2479,7 +2479,7 @@ mod tests {
 
     #[test]
     fn test_max_poll_interval_used_for_rebalance() {
-        //: rebalance_timeout should default to max_poll_interval (not session_timeout)
+        // rebalance_timeout should default to max_poll_interval (not session_timeout)
         let config = ConsumerConfig::default();
         // In the Java client, rebalance_timeout defaults to max.poll.interval.ms (300s)
         // not session.timeout.ms (10s). Verify our config has both.

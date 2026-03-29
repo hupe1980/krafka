@@ -1245,7 +1245,7 @@ impl GroupCoordinator {
             join_response.is_leader()
         );
 
-        // Use v3 for static membership (KIP-345,), v0 otherwise.
+        // Use v3 for static membership (KIP-345), v0 otherwise.
         // v3 includes group_instance_id; v0 silently discards it.
         let response = if self.group_instance_id.is_some() {
             conn.send_request(ApiKey::SyncGroup, 3, |buf| {
