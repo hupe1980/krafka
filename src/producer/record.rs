@@ -94,7 +94,7 @@ impl ProducerRecord {
     pub fn validate(&self) -> Result<()> {
         // Topic names are encoded as KafkaString (i16 length prefix)
         if self.topic.len() > i16::MAX as usize {
-            return Err(KrafkaError::config(format!(
+            return Err(KrafkaError::protocol(format!(
                 "topic name length {} exceeds protocol limit of {}",
                 self.topic.len(),
                 i16::MAX
@@ -105,7 +105,7 @@ impl ProducerRecord {
         if let Some(ref key) = self.key
             && key.len() > i32::MAX as usize
         {
-            return Err(KrafkaError::config(format!(
+            return Err(KrafkaError::protocol(format!(
                 "record key length {} exceeds protocol limit of {}",
                 key.len(),
                 i32::MAX
@@ -114,7 +114,7 @@ impl ProducerRecord {
 
         // Value is encoded as KafkaBytes (i32 length prefix)
         if self.value.len() > i32::MAX as usize {
-            return Err(KrafkaError::config(format!(
+            return Err(KrafkaError::protocol(format!(
                 "record value length {} exceeds protocol limit of {}",
                 self.value.len(),
                 i32::MAX
@@ -125,7 +125,7 @@ impl ProducerRecord {
         // in the record batch v2 format.
         for (i, (key, value)) in self.headers.iter().enumerate() {
             if key.len() > i32::MAX as usize {
-                return Err(KrafkaError::config(format!(
+                return Err(KrafkaError::protocol(format!(
                     "header[{}] key length {} exceeds protocol limit of {}",
                     i,
                     key.len(),
@@ -133,7 +133,7 @@ impl ProducerRecord {
                 )));
             }
             if value.len() > i32::MAX as usize {
-                return Err(KrafkaError::config(format!(
+                return Err(KrafkaError::protocol(format!(
                     "header[{}] value length {} exceeds protocol limit of {}",
                     i,
                     value.len(),

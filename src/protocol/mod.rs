@@ -23,9 +23,9 @@
 //! | OffsetFetch | 0 | 1 | v1+ for group coordinator |
 //! | FindCoordinator | 0 | 1 | Group/txn coordinator lookup |
 //! | JoinGroup | 0 | 5 | v5+ group instance id |
-//! | Heartbeat | 0 | 1 | v0 is baseline |
+//! | Heartbeat | 0 | 3 | v3+ group instance id (KIP-345) |
 //! | SyncGroup | 0 | 3 | v3+ group instance id |
-//! | LeaveGroup | 0 | 1 | v0 is baseline |
+//! | LeaveGroup | 0 | 3 | v3+ batch leave (KIP-345) |
 //! | CreateTopics | 0 | 2 | v0 is baseline |
 //! | DeleteTopics | 0 | 1 | v0 is baseline |
 //!
@@ -58,6 +58,15 @@ pub use record::{
     RecordHeader,
 };
 
+use crate::error::{KrafkaError, Result};
+
+/// Convert a collection length to i32, returning an error if it overflows.
+#[inline]
+pub(crate) fn array_len_i32(len: usize) -> Result<i32> {
+    i32::try_from(len)
+        .map_err(|_| KrafkaError::protocol(format!("array length {len} exceeds i32::MAX")))
+}
+
 /// Client-supported API version ranges.
 ///
 /// This module defines the maximum version ranges that Krafka actually implements
@@ -81,12 +90,12 @@ pub mod versions {
     pub const FIND_COORDINATOR_MAX: i16 = 1;
     /// Maximum supported JoinGroup version.
     pub const JOIN_GROUP_MAX: i16 = 5;
-    /// Maximum supported Heartbeat version.
-    pub const HEARTBEAT_MAX: i16 = 1;
+    /// Maximum supported Heartbeat version (v3 adds group_instance_id for KIP-345).
+    pub const HEARTBEAT_MAX: i16 = 3;
     /// Maximum supported SyncGroup version.
     pub const SYNC_GROUP_MAX: i16 = 3;
-    /// Maximum supported LeaveGroup version.
-    pub const LEAVE_GROUP_MAX: i16 = 1;
+    /// Maximum supported LeaveGroup version (v3 adds batch leave for KIP-345).
+    pub const LEAVE_GROUP_MAX: i16 = 3;
     /// Maximum supported CreateTopics version.
     pub const CREATE_TOPICS_MAX: i16 = 2;
     /// Maximum supported DeleteTopics version.

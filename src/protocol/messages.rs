@@ -7,6 +7,7 @@
 use bytes::{Buf, BufMut, Bytes};
 
 use super::api::ApiKey;
+use super::array_len_i32;
 use super::primitives::{Decode, Encode, KafkaArray, KafkaBytes, KafkaString, TryEncode};
 use crate::error::{ErrorCode, KrafkaError, Result};
 
@@ -363,12 +364,12 @@ impl ProduceRequest {
         self.timeout_ms.encode(buf);
 
         // Topics array
-        buf.put_i32(self.topic_data.len() as i32);
+        buf.put_i32(array_len_i32(self.topic_data.len())?);
         for topic in &self.topic_data {
             KafkaString::new(&topic.name).try_encode(buf)?;
 
             // Partitions array
-            buf.put_i32(topic.partition_data.len() as i32);
+            buf.put_i32(array_len_i32(topic.partition_data.len())?);
             for partition in &topic.partition_data {
                 partition.index.encode(buf);
                 KafkaBytes::new(partition.records.clone()).try_encode(buf)?;
@@ -578,12 +579,12 @@ impl FetchRequest {
         self.min_bytes.encode(buf);
 
         // Topics array
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
             KafkaString::new(&topic.topic).try_encode(buf)?;
 
             // Partitions array
-            buf.put_i32(topic.partitions.len() as i32);
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition.encode(buf);
                 partition.fetch_offset.encode(buf);
@@ -601,12 +602,12 @@ impl FetchRequest {
         self.max_bytes.encode(buf);
 
         // Topics array
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
             KafkaString::new(&topic.topic).try_encode(buf)?;
 
             // Partitions array
-            buf.put_i32(topic.partitions.len() as i32);
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition.encode(buf);
                 partition.fetch_offset.encode(buf);
@@ -625,12 +626,12 @@ impl FetchRequest {
         self.isolation_level.encode(buf);
 
         // Topics array
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
             KafkaString::new(&topic.topic).try_encode(buf)?;
 
             // Partitions array
-            buf.put_i32(topic.partitions.len() as i32);
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition.encode(buf);
                 partition.fetch_offset.encode(buf);
@@ -651,12 +652,12 @@ impl FetchRequest {
         self.session_epoch.encode(buf);
 
         // Topics array
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
             KafkaString::new(&topic.topic).try_encode(buf)?;
 
             // Partitions array
-            buf.put_i32(topic.partitions.len() as i32);
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition.encode(buf);
                 partition.fetch_offset.encode(buf);
@@ -667,10 +668,10 @@ impl FetchRequest {
         }
 
         // Forgotten topics array (v7+)
-        buf.put_i32(self.forgotten_topics.len() as i32);
+        buf.put_i32(array_len_i32(self.forgotten_topics.len())?);
         for forgotten in &self.forgotten_topics {
             KafkaString::new(&forgotten.topic).try_encode(buf)?;
-            buf.put_i32(forgotten.partitions.len() as i32);
+            buf.put_i32(array_len_i32(forgotten.partitions.len())?);
             for &partition in &forgotten.partitions {
                 partition.encode(buf);
             }
@@ -1060,7 +1061,7 @@ impl JoinGroupRequest {
         KafkaString::new(&self.member_id).try_encode(buf)?;
         KafkaString::new(&self.protocol_type).try_encode(buf)?;
 
-        buf.put_i32(self.protocols.len() as i32);
+        buf.put_i32(array_len_i32(self.protocols.len())?);
         for protocol in &self.protocols {
             KafkaString::new(&protocol.name).try_encode(buf)?;
             KafkaBytes::new(protocol.metadata.clone()).try_encode(buf)?;
@@ -1076,7 +1077,7 @@ impl JoinGroupRequest {
         KafkaString::new(&self.member_id).try_encode(buf)?;
         KafkaString::new(&self.protocol_type).try_encode(buf)?;
 
-        buf.put_i32(self.protocols.len() as i32);
+        buf.put_i32(array_len_i32(self.protocols.len())?);
         for protocol in &self.protocols {
             KafkaString::new(&protocol.name).try_encode(buf)?;
             KafkaBytes::new(protocol.metadata.clone()).try_encode(buf)?;
@@ -1096,7 +1097,7 @@ impl JoinGroupRequest {
         }
         KafkaString::new(&self.protocol_type).try_encode(buf)?;
 
-        buf.put_i32(self.protocols.len() as i32);
+        buf.put_i32(array_len_i32(self.protocols.len())?);
         for protocol in &self.protocols {
             KafkaString::new(&protocol.name).try_encode(buf)?;
             KafkaBytes::new(protocol.metadata.clone()).try_encode(buf)?;
@@ -1288,7 +1289,7 @@ impl SyncGroupRequest {
         self.generation_id.encode(buf);
         KafkaString::new(&self.member_id).try_encode(buf)?;
 
-        buf.put_i32(self.assignments.len() as i32);
+        buf.put_i32(array_len_i32(self.assignments.len())?);
         for assignment in &self.assignments {
             KafkaString::new(&assignment.member_id).try_encode(buf)?;
             KafkaBytes::new(assignment.assignment.clone()).try_encode(buf)?;
@@ -1306,7 +1307,7 @@ impl SyncGroupRequest {
             None => KafkaString::null().try_encode(buf)?,
         }
 
-        buf.put_i32(self.assignments.len() as i32);
+        buf.put_i32(array_len_i32(self.assignments.len())?);
         for assignment in &self.assignments {
             KafkaString::new(&assignment.member_id).try_encode(buf)?;
             KafkaBytes::new(assignment.assignment.clone()).try_encode(buf)?;
@@ -1475,7 +1476,7 @@ impl LeaveGroupRequest {
     /// Encode for version 3+.
     pub fn encode_v3(&self, buf: &mut impl BufMut) -> Result<()> {
         KafkaString::new(&self.group_id).try_encode(buf)?;
-        buf.put_i32(self.members.len() as i32);
+        buf.put_i32(array_len_i32(self.members.len())?);
         for member in &self.members {
             KafkaString::new(&member.member_id).try_encode(buf)?;
             match &member.group_instance_id {
@@ -1572,10 +1573,10 @@ impl OffsetCommitRequest {
     pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
         KafkaString::new(&self.group_id).try_encode(buf)?;
 
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
             KafkaString::new(&topic.name).try_encode(buf)?;
-            buf.put_i32(topic.partitions.len() as i32);
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition_index.encode(buf);
                 partition.committed_offset.encode(buf);
@@ -1594,10 +1595,10 @@ impl OffsetCommitRequest {
         self.generation_id.encode(buf);
         KafkaString::new(&self.member_id).try_encode(buf)?;
 
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
             KafkaString::new(&topic.name).try_encode(buf)?;
-            buf.put_i32(topic.partitions.len() as i32);
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition_index.encode(buf);
                 partition.committed_offset.encode(buf);
@@ -1618,10 +1619,10 @@ impl OffsetCommitRequest {
         KafkaString::new(&self.member_id).try_encode(buf)?;
         self.retention_time_ms.encode(buf);
 
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
             KafkaString::new(&topic.name).try_encode(buf)?;
-            buf.put_i32(topic.partitions.len() as i32);
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition_index.encode(buf);
                 partition.committed_offset.encode(buf);
@@ -1773,10 +1774,10 @@ impl ListOffsetsRequest {
     /// Encode for version 1 (single offset response per partition).
     pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
         buf.put_i32(self.replica_id);
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
             KafkaString::new(&topic.name).try_encode(buf)?;
-            buf.put_i32(topic.partitions.len() as i32);
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 buf.put_i32(partition.partition_index);
                 buf.put_i64(partition.timestamp);
@@ -1792,10 +1793,10 @@ impl ListOffsetsRequest {
     pub fn encode_v2(&self, buf: &mut impl BufMut) -> Result<()> {
         buf.put_i32(self.replica_id);
         buf.put_i8(self.isolation_level);
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
             KafkaString::new(&topic.name).try_encode(buf)?;
-            buf.put_i32(topic.partitions.len() as i32);
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 buf.put_i32(partition.partition_index);
                 buf.put_i64(partition.timestamp);
@@ -1944,10 +1945,10 @@ impl OffsetFetchRequest {
 
         match &self.topics {
             Some(topics) => {
-                buf.put_i32(topics.len() as i32);
+                buf.put_i32(array_len_i32(topics.len())?);
                 for topic in topics {
                     KafkaString::new(&topic.name).try_encode(buf)?;
-                    buf.put_i32(topic.partition_indexes.len() as i32);
+                    buf.put_i32(array_len_i32(topic.partition_indexes.len())?);
                     for partition in &topic.partition_indexes {
                         partition.encode(buf);
                     }
@@ -2174,22 +2175,22 @@ impl CreateTopicsRequest {
 
     /// Encode for version 0.
     pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
             KafkaString::new(&topic.name).try_encode(buf)?;
             topic.num_partitions.encode(buf);
             topic.replication_factor.encode(buf);
 
-            buf.put_i32(topic.assignments.len() as i32);
+            buf.put_i32(array_len_i32(topic.assignments.len())?);
             for assignment in &topic.assignments {
                 assignment.partition_index.encode(buf);
-                buf.put_i32(assignment.broker_ids.len() as i32);
+                buf.put_i32(array_len_i32(assignment.broker_ids.len())?);
                 for broker in &assignment.broker_ids {
                     broker.encode(buf);
                 }
             }
 
-            buf.put_i32(topic.configs.len() as i32);
+            buf.put_i32(array_len_i32(topic.configs.len())?);
             for config in &topic.configs {
                 KafkaString::new(&config.name).try_encode(buf)?;
                 match &config.value {
@@ -2204,22 +2205,22 @@ impl CreateTopicsRequest {
 
     /// Encode for version 1+.
     pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
             KafkaString::new(&topic.name).try_encode(buf)?;
             topic.num_partitions.encode(buf);
             topic.replication_factor.encode(buf);
 
-            buf.put_i32(topic.assignments.len() as i32);
+            buf.put_i32(array_len_i32(topic.assignments.len())?);
             for assignment in &topic.assignments {
                 assignment.partition_index.encode(buf);
-                buf.put_i32(assignment.broker_ids.len() as i32);
+                buf.put_i32(array_len_i32(assignment.broker_ids.len())?);
                 for broker in &assignment.broker_ids {
                     broker.encode(buf);
                 }
             }
 
-            buf.put_i32(topic.configs.len() as i32);
+            buf.put_i32(array_len_i32(topic.configs.len())?);
             for config in &topic.configs {
                 KafkaString::new(&config.name).try_encode(buf)?;
                 match &config.value {
@@ -2356,7 +2357,7 @@ impl DeleteTopicsRequest {
 
     /// Encode for version 0+.
     pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
-        buf.put_i32(self.topic_names.len() as i32);
+        buf.put_i32(array_len_i32(self.topic_names.len())?);
         for name in &self.topic_names {
             KafkaString::new(name).try_encode(buf)?;
         }
@@ -2482,7 +2483,7 @@ impl CreatePartitionsRequest {
     /// Encode for version 0.
     pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
         // Array of topics
-        (self.topics.len() as i32).encode(buf);
+        array_len_i32(self.topics.len())?.encode(buf);
         for topic in &self.topics {
             KafkaString::new(&topic.name).try_encode(buf)?;
             topic.count.encode(buf);
@@ -2491,9 +2492,9 @@ impl CreatePartitionsRequest {
             match &topic.assignments {
                 None => (-1i32).encode(buf),
                 Some(assignments) => {
-                    (assignments.len() as i32).encode(buf);
+                    array_len_i32(assignments.len())?.encode(buf);
                     for assignment in assignments {
-                        (assignment.broker_ids.len() as i32).encode(buf);
+                        array_len_i32(assignment.broker_ids.len())?.encode(buf);
                         for &broker_id in &assignment.broker_ids {
                             broker_id.encode(buf);
                         }
@@ -2640,7 +2641,7 @@ impl DescribeConfigsRequest {
 
     /// Encode for version 0.
     pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
-        (self.resources.len() as i32).encode(buf);
+        array_len_i32(self.resources.len())?.encode(buf);
         for resource in &self.resources {
             resource.resource_type.to_i8().encode(buf);
             KafkaString::new(&resource.resource_name).try_encode(buf)?;
@@ -2648,7 +2649,7 @@ impl DescribeConfigsRequest {
             match &resource.config_names {
                 None => (-1i32).encode(buf),
                 Some(names) => {
-                    (names.len() as i32).encode(buf);
+                    array_len_i32(names.len())?.encode(buf);
                     for name in names {
                         KafkaString::new(name).try_encode(buf)?;
                     }
@@ -2800,12 +2801,12 @@ impl AlterConfigsRequest {
 
     /// Encode for version 0.
     pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
-        (self.resources.len() as i32).encode(buf);
+        array_len_i32(self.resources.len())?.encode(buf);
         for resource in &self.resources {
             resource.resource_type.to_i8().encode(buf);
             KafkaString::new(&resource.resource_name).try_encode(buf)?;
 
-            (resource.configs.len() as i32).encode(buf);
+            array_len_i32(resource.configs.len())?.encode(buf);
             for config in &resource.configs {
                 KafkaString::new(&config.name).try_encode(buf)?;
                 match &config.value {
@@ -3552,7 +3553,7 @@ impl CreateAclsRequest {
 
     /// Encode as version 0.
     pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
-        (self.creations.len() as i32).encode(buf);
+        array_len_i32(self.creations.len())?.encode(buf);
         for acl in &self.creations {
             (acl.resource_type.to_i8()).encode(buf);
             KafkaString(Some(acl.resource_name.clone())).try_encode(buf)?;
@@ -3566,7 +3567,7 @@ impl CreateAclsRequest {
 
     /// Encode as version 1 (with pattern type).
     pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
-        (self.creations.len() as i32).encode(buf);
+        array_len_i32(self.creations.len())?.encode(buf);
         for acl in &self.creations {
             (acl.resource_type.to_i8()).encode(buf);
             KafkaString(Some(acl.resource_name.clone())).try_encode(buf)?;
@@ -3688,7 +3689,7 @@ impl DeleteAclsRequest {
 
     /// Encode as version 0.
     pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
-        (self.filters.len() as i32).encode(buf);
+        array_len_i32(self.filters.len())?.encode(buf);
         for filter in &self.filters {
             (filter.resource_type.to_i8()).encode(buf);
             KafkaString(filter.resource_name.clone()).try_encode(buf)?;
@@ -3702,7 +3703,7 @@ impl DeleteAclsRequest {
 
     /// Encode as version 1 (with pattern type).
     pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
-        (self.filters.len() as i32).encode(buf);
+        array_len_i32(self.filters.len())?.encode(buf);
         for filter in &self.filters {
             (filter.resource_type.to_i8()).encode(buf);
             KafkaString(filter.resource_name.clone()).try_encode(buf)?;
@@ -3900,10 +3901,10 @@ impl AddPartitionsToTxnRequest {
         KafkaString(Some(self.transactional_id.clone())).try_encode(buf)?;
         self.producer_id.encode(buf);
         self.producer_epoch.encode(buf);
-        (self.topics.len() as i32).encode(buf);
+        array_len_i32(self.topics.len())?.encode(buf);
         for topic in &self.topics {
             KafkaString(Some(topic.name.clone())).try_encode(buf)?;
-            (topic.partitions.len() as i32).encode(buf);
+            array_len_i32(topic.partitions.len())?.encode(buf);
             for partition in &topic.partitions {
                 partition.encode(buf);
             }
@@ -4219,10 +4220,10 @@ impl TxnOffsetCommitRequest {
         KafkaString(Some(self.group_id.clone())).try_encode(buf)?;
         self.producer_id.encode(buf);
         self.producer_epoch.encode(buf);
-        (self.topics.len() as i32).encode(buf);
+        array_len_i32(self.topics.len())?.encode(buf);
         for topic in &self.topics {
             KafkaString(Some(topic.name.clone())).try_encode(buf)?;
-            (topic.partitions.len() as i32).encode(buf);
+            array_len_i32(topic.partitions.len())?.encode(buf);
             for partition in &topic.partitions {
                 partition.partition.encode(buf);
                 partition.committed_offset.encode(buf);
@@ -4238,10 +4239,10 @@ impl TxnOffsetCommitRequest {
         KafkaString(Some(self.group_id.clone())).try_encode(buf)?;
         self.producer_id.encode(buf);
         self.producer_epoch.encode(buf);
-        (self.topics.len() as i32).encode(buf);
+        array_len_i32(self.topics.len())?.encode(buf);
         for topic in &self.topics {
             KafkaString(Some(topic.name.clone())).try_encode(buf)?;
-            (topic.partitions.len() as i32).encode(buf);
+            array_len_i32(topic.partitions.len())?.encode(buf);
             for partition in &topic.partitions {
                 partition.partition.encode(buf);
                 partition.committed_offset.encode(buf);
@@ -4337,7 +4338,7 @@ impl DescribeGroupsRequest {
 
     /// Encode for version 0+.
     pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
-        buf.put_i32(self.groups.len() as i32);
+        buf.put_i32(array_len_i32(self.groups.len())?);
         for group in &self.groups {
             KafkaString::new(group).try_encode(buf)?;
         }
@@ -4616,10 +4617,10 @@ impl DeleteRecordsRequest {
 
     /// Encode for version 0+.
     pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
             KafkaString::new(&topic.name).try_encode(buf)?;
-            buf.put_i32(topic.partitions.len() as i32);
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition_index.encode(buf);
                 partition.offset.encode(buf);
@@ -4734,10 +4735,10 @@ impl OffsetForLeaderEpochRequest {
     /// Encode for version 2+ (includes current_leader_epoch for fencing).
     pub fn encode_v2(&self, buf: &mut impl BufMut) -> Result<()> {
         // v2 adds replica_id before topics
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
             KafkaString::new(&topic.topic).try_encode(buf)?;
-            buf.put_i32(topic.partitions.len() as i32);
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition.encode(buf);
                 partition.current_leader_epoch.encode(buf);
@@ -4750,10 +4751,10 @@ impl OffsetForLeaderEpochRequest {
     /// Encode for version 3+ (adds replica_id field).
     pub fn encode_v3(&self, buf: &mut impl BufMut) -> Result<()> {
         self.replica_id.encode(buf);
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
             KafkaString::new(&topic.topic).try_encode(buf)?;
-            buf.put_i32(topic.partitions.len() as i32);
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition.encode(buf);
                 partition.current_leader_epoch.encode(buf);
@@ -5057,7 +5058,8 @@ impl VersionedDecode for SyncGroupResponse {
 impl VersionedEncode for HeartbeatRequest {
     fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
         match version {
-            0..=1 => self.encode_v0(buf)?,
+            0..=2 => self.encode_v0(buf)?,
+            3 => self.encode_v3(buf)?,
             _ => return unsupported_encode!("HeartbeatRequest", version),
         }
         Ok(())
@@ -5068,7 +5070,7 @@ impl VersionedDecode for HeartbeatResponse {
     fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
         match version {
             0 => Self::decode_v0(buf),
-            1 => Self::decode_v1(buf),
+            1..=3 => Self::decode_v1(buf),
             _ => unsupported_decode!("HeartbeatResponse", version),
         }
     }
@@ -5077,7 +5079,8 @@ impl VersionedDecode for HeartbeatResponse {
 impl VersionedEncode for LeaveGroupRequest {
     fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
         match version {
-            0..=1 => self.encode_v0(buf)?,
+            0..=2 => self.encode_v0(buf)?,
+            3 => self.encode_v3(buf)?,
             _ => return unsupported_encode!("LeaveGroupRequest", version),
         }
         Ok(())
@@ -5088,7 +5091,7 @@ impl VersionedDecode for LeaveGroupResponse {
     fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
         match version {
             0 => Self::decode_v0(buf),
-            1 => Self::decode_v1(buf),
+            1..=3 => Self::decode_v1(buf),
             _ => unsupported_decode!("LeaveGroupResponse", version),
         }
     }

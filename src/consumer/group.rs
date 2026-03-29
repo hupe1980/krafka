@@ -1909,7 +1909,7 @@ impl GroupCoordinator {
         // Version
         buf.put_i16(0);
         // Topics array
-        buf.put_i32(topics.len() as i32);
+        buf.put_i32(crate::protocol::array_len_i32(topics.len())?);
         for topic in topics {
             let topic_len = i16::try_from(topic.len()).map_err(|_| {
                 KrafkaError::protocol(format!(
@@ -2055,7 +2055,7 @@ impl GroupCoordinator {
         // Version
         buf.put_i16(0);
         // Topics array
-        buf.put_i32(assignment.partitions.len() as i32);
+        buf.put_i32(crate::protocol::array_len_i32(assignment.partitions.len())?);
         for (topic, partitions) in &assignment.partitions {
             let topic_len = i16::try_from(topic.len()).map_err(|_| {
                 KrafkaError::protocol(format!(
@@ -2066,7 +2066,7 @@ impl GroupCoordinator {
             })?;
             buf.put_i16(topic_len);
             buf.put_slice(topic.as_bytes());
-            buf.put_i32(partitions.len() as i32);
+            buf.put_i32(crate::protocol::array_len_i32(partitions.len())?);
             for &partition in partitions {
                 buf.put_i32(partition);
             }
