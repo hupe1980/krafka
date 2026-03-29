@@ -100,14 +100,24 @@ impl RecordAccumulatorHandle {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            self.sender
-                .send(AccumulatorMessage::Append {
+            // Respect max_block_ms for the channel send too, in case the
+            // accumulator channel is backed up.
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::timeout(
+                remaining,
+                self.sender.send(AccumulatorMessage::Append {
                     record: rec,
                     partition,
                     response_tx,
-                })
-                .await
-                .map_err(|_| KrafkaError::invalid_state("accumulator closed"))?;
+                }),
+            )
+            .await
+            .map_err(|_| {
+                KrafkaError::timeout(
+                    "producer append: max_block exceeded while sending to accumulator",
+                )
+            })?
+            .map_err(|_| KrafkaError::invalid_state("accumulator closed"))?;
 
             let response = response_rx
                 .await
