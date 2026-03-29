@@ -4863,10 +4863,10 @@ macro_rules! unsupported_decode {
 impl VersionedEncode for MetadataRequest {
     fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
         match version {
+            // Supported metadata request versions are 0 through 3. Higher
+            // versions are rejected here until corresponding response
+            // decoding support and version negotiation caps are updated.
             0..=3 => self.encode_v0(buf),
-            // encode_v4 is wire-compatible through the METADATA_MAX (v1 currently)
-            // but we include it for forward-compat if the cap is raised.
-            4.. => self.encode_v4(buf),
             _ => return unsupported_encode!("MetadataRequest", version),
         }
         Ok(())
@@ -6499,13 +6499,13 @@ mod tests {
     }
 
     #[test]
-    fn test_versioned_encode_metadata_request_v4() {
+    fn test_versioned_encode_metadata_request_rejects_v4() {
         let request = MetadataRequest::all_topics();
         let mut buf = BytesMut::new();
-        request.encode_versioned(4, &mut buf).unwrap();
-        let mut expected = BytesMut::new();
-        request.encode_v4(&mut expected);
-        assert_eq!(buf, expected);
+        let result = request.encode_versioned(4, &mut buf);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unsupported"), "got: {msg}");
     }
 
     #[test]

@@ -96,7 +96,7 @@ Krafka uses Kafka's v2 record batch format with:
 
 ### Unified Version Dispatch
 
-All request/response types implement `VersionedEncode` and `VersionedDecode` traits that dispatch to the correct `encode_vN`/`decode_vN` method based on the protocol version number:
+All message types in `protocol::messages` implement `VersionedEncode` and `VersionedDecode` traits that dispatch to the correct `encode_vN`/`decode_vN` method based on the protocol version number:
 
 ```rust
 use krafka::protocol::messages::{VersionedEncode, VersionedDecode, MetadataRequest, MetadataResponse};
@@ -105,10 +105,10 @@ let request = MetadataRequest::all_topics();
 let mut buf = bytes::BytesMut::new();
 
 // Encode for a specific protocol version — dispatches to the right encoder
-request.encode_versioned(4, &mut buf)?;
+request.encode_versioned(1, &mut buf)?;
 
 // Decode response for a specific version
-let response = MetadataResponse::decode_versioned(2, &mut response_buf)?;
+let response = MetadataResponse::decode_versioned(1, &mut response_buf)?;
 ```
 
 Unsupported version numbers (including negative values) return a descriptive `KrafkaError::protocol` error.

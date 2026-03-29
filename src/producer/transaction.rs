@@ -486,6 +486,9 @@ impl TransactionalProducer {
             )));
         }
 
+        // Validate record fields against Kafka protocol wire-format limits.
+        record.validate()?;
+
         let topic = record.topic.clone();
 
         // Determine partition

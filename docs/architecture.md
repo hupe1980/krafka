@@ -212,7 +212,7 @@ The reconnection logic checks `is_retriable()` on errors to avoid retrying non-t
 5. Response is received and framed
 6. Response is decoded via `VersionedDecode::decode_versioned(version, buf)` — dispatches to the correct `decode_vN` method
 
-All 30+ request/response type pairs implement the `VersionedEncode`/`VersionedDecode` traits, providing unified version dispatch with unsupported-version error handling.
+The core protocol request/response type pairs in `protocol::messages` implement the `VersionedEncode`/`VersionedDecode` traits, providing unified version dispatch with unsupported-version error handling.
 
 ```rust
 // Internal flow
