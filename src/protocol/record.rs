@@ -560,7 +560,7 @@ impl RecordBatch {
         })
     }
 
-    /// Maximum decompressed size (128 MiB) to protect against compression bombs (§5.2).
+    /// Maximum decompressed size (128 MiB) to protect against compression bombs.
     const MAX_DECOMPRESSED_SIZE: usize = 128 * 1024 * 1024;
 
     fn decompress_records(compression: Compression, data: &[u8]) -> Result<Bytes> {

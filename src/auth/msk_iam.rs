@@ -436,7 +436,7 @@ mod tests {
         assert!(payload_str.contains("eu-west-1"));
     }
 
-    // ── §7.1 – MskIamAuthenticator Debug redaction & zeroize ──
+    // ── MskIamAuthenticator Debug redaction & zeroize ──
 
     #[test]
     fn test_msk_iam_debug_redacts_secrets() {

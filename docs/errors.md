@@ -38,6 +38,9 @@ pub enum KrafkaError {
     
     /// Serialization errors
     Serialization { message: String, source: Option<Box<dyn Error>> },
+    
+    /// Buffer full (internal — converted to Config error after max_block_ms timeout)
+    BufferFull,
 }
 ```
 

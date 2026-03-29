@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use tokio::time::interval;
 use tracing::{debug, trace};
 
@@ -53,28 +53,64 @@ enum AccumulatorMessage {
 #[derive(Clone)]
 pub struct RecordAccumulatorHandle {
     sender: mpsc::Sender<AccumulatorMessage>,
+    /// Notified when buffer memory is freed (backpressure).
+    memory_freed: Arc<Notify>,
+    /// Maximum time to block waiting for buffer memory.
+    max_block_ms: Duration,
 }
 
 impl RecordAccumulatorHandle {
     /// Append a record to the accumulator.
+    ///
+    /// If the accumulator buffer is full, blocks for up to `max_block_ms`
+    /// waiting for memory to be freed before returning an error, matching
+    /// the Kafka Java client's `max.block.ms` backpressure behavior.
     pub async fn append(
         &self,
         record: ProducerRecord,
         partition: PartitionId,
     ) -> Result<RecordMetadata> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender
-            .send(AccumulatorMessage::Append {
-                record,
-                partition,
-                response_tx,
-            })
-            .await
-            .map_err(|_| KrafkaError::invalid_state("accumulator closed"))?;
+        let deadline = tokio::time::Instant::now() + self.max_block_ms;
 
-        response_rx
-            .await
-            .map_err(|_| KrafkaError::invalid_state("accumulator response dropped"))?
+        loop {
+            let (response_tx, response_rx) = oneshot::channel();
+            self.sender
+                .send(AccumulatorMessage::Append {
+                    record: record.clone(),
+                    partition,
+                    response_tx,
+                })
+                .await
+                .map_err(|_| KrafkaError::invalid_state("accumulator closed"))?;
+
+            let result = response_rx
+                .await
+                .map_err(|_| KrafkaError::invalid_state("accumulator response dropped"))?;
+
+            match result {
+                Err(KrafkaError::BufferFull) => {
+                    // Wait for memory to be freed, respecting max_block_ms deadline
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(KrafkaError::config(
+                            "Timed out waiting for buffer memory after max_block_ms. \
+                             Consider increasing buffer_memory or max_block, or reducing production rate.",
+                        ));
+                    }
+                    if tokio::time::timeout(remaining, self.memory_freed.notified())
+                        .await
+                        .is_err()
+                    {
+                        return Err(KrafkaError::config(
+                            "Timed out waiting for buffer memory after max_block_ms. \
+                             Consider increasing buffer_memory or max_block, or reducing production rate.",
+                        ));
+                    }
+                    // Memory freed — retry the append
+                }
+                other => return other,
+            }
+        }
     }
 
     /// Flush all pending batches.
@@ -223,6 +259,8 @@ pub struct RecordAccumulator {
     retry_policy: RetryPolicy,
     /// Shared metrics.
     metrics: Arc<ProducerMetrics>,
+    /// Notified when buffer memory is freed (backpressure).
+    memory_freed: Arc<Notify>,
 }
 
 impl RecordAccumulator {
@@ -234,6 +272,8 @@ impl RecordAccumulator {
         metrics: Arc<ProducerMetrics>,
     ) -> RecordAccumulatorHandle {
         let (sender, receiver) = mpsc::channel(1024);
+        let memory_freed = Arc::new(Notify::new());
+        let max_block_ms = config.max_block_ms;
 
         let accumulator = Self {
             config,
@@ -242,11 +282,16 @@ impl RecordAccumulator {
             memory_used: 0,
             retry_policy,
             metrics,
+            memory_freed: memory_freed.clone(),
         };
 
         tokio::spawn(accumulator.run(receiver));
 
-        RecordAccumulatorHandle { sender }
+        RecordAccumulatorHandle {
+            sender,
+            memory_freed,
+            max_block_ms,
+        }
     }
 
     /// Run the accumulator background task.
@@ -306,13 +351,8 @@ impl RecordAccumulator {
         if self.config.buffer_memory > 0
             && self.memory_used + record_size > self.config.buffer_memory
         {
-            // Memory limit exceeded - return error
-            // In a more sophisticated implementation, we could block and wait for memory
-            let _ = response_tx.send(Err(KrafkaError::config(format!(
-                "Buffer memory limit exceeded: {} + {} > {} bytes. \
-                 Consider increasing buffer_memory or reducing production rate.",
-                self.memory_used, record_size, self.config.buffer_memory
-            ))));
+            // Signal buffer full — the handle will block and retry
+            let _ = response_tx.send(Err(KrafkaError::BufferFull));
             return;
         }
 
@@ -344,7 +384,7 @@ impl RecordAccumulator {
                 trace!("Batch full for {}-{}, flushing", topic, partition);
                 self.flush_batch(&key).await;
             } else if self.config.linger.is_zero() {
-                // §10.5 fix: linger=0 means send immediately without waiting
+                // linger=0 means send immediately without waiting
                 // for the next linger timer tick (up to 1ms delay otherwise).
                 trace!("Linger=0 for {}-{}, flushing immediately", topic, partition);
                 self.flush_batch(&key).await;
@@ -393,7 +433,7 @@ impl RecordAccumulator {
         key_size + value_size + headers_size + topic_overhead
     }
 
-    /// Check for batches that have exceeded linger time (concurrent flush §4.2).
+    /// Check for batches that have exceeded linger time (concurrent flush).
     async fn check_linger_expiry(&mut self) {
         if self.config.linger.is_zero() {
             self.flush_all_ready().await;
@@ -485,10 +525,12 @@ impl RecordAccumulator {
         }
         let batch_memory: usize = batch.pending.iter().map(|p| p.estimated_size).sum();
         self.memory_used = self.memory_used.saturating_sub(batch_memory);
+        // Wake callers blocked on buffer backpressure
+        self.memory_freed.notify_waiters();
         Some(batch)
     }
 
-    /// Flush a specific batch by spawning a background task (§10.7 fix).
+    /// Flush a specific batch by spawning a background task.
     ///
     /// Previously, this method awaited the network I/O inline, blocking the
     /// entire accumulator task. Now it spawns the send as a background task
@@ -513,9 +555,9 @@ impl RecordAccumulator {
         }
     }
 
-    /// Send an extracted batch to the broker with retry and metadata refresh (§2.4, §2.6).
+    /// Send an extracted batch to the broker with retry and metadata refresh.
     ///
-    /// This is a static method to enable concurrent flushing via `FuturesUnordered` (§4.2).
+    /// This is a static method to enable concurrent flushing via `FuturesUnordered`.
     /// Acquires an in-flight semaphore permit to respect `max_in_flight` concurrency limits.
     async fn send_extracted_batch(
         topic: String,
@@ -526,7 +568,7 @@ impl RecordAccumulator {
         retry_policy: RetryPolicy,
         metrics: Arc<ProducerMetrics>,
     ) {
-        // Acquire in-flight permit before sending (§9.6 fix: accumulator was
+        // Acquire in-flight permit before sending (accumulator was
         // bypassing max_in_flight). The permit is held until this batch completes.
         let _permit = config.in_flight_semaphore.acquire().await;
         let _timer = metrics.send_latency.start();
@@ -576,7 +618,7 @@ impl RecordAccumulator {
             }],
         };
 
-        // Retry loop (§2.4)
+        // Retry loop
         let mut retry_ctx = RetryContext::new(retry_policy, format!("batch({topic}-{partition})"));
 
         let result: std::result::Result<(i64, i64), KrafkaError> = loop {
@@ -737,7 +779,7 @@ impl RecordAccumulator {
         }
     }
 
-    /// Flush all batches concurrently (§4.2).
+    /// Flush all batches concurrently.
     async fn flush_all(&mut self) -> Result<()> {
         let extracted: Vec<_> = self
             .batches
@@ -833,7 +875,7 @@ mod tests {
         assert!(size_with_key > size);
     }
 
-    /// §10.5 test: Verify linger=0 config results in immediate flush semantics.
+    /// Verify linger=0 config results in immediate flush semantics.
     #[test]
     fn test_linger_zero_check_interval() {
         // With linger=0, the check interval should be 1ms (minimum)
@@ -842,7 +884,7 @@ mod tests {
         assert_eq!(check_interval, Duration::from_millis(1));
     }
 
-    /// §10.5 test: Verify `check_linger_expiry` calls `flush_all_ready` when linger=0.
+    /// Verify `check_linger_expiry` calls `flush_all_ready` when linger=0.
     #[test]
     fn test_linger_zero_is_zero() {
         let config = AccumulatorConfig {
@@ -852,7 +894,7 @@ mod tests {
         assert!(config.linger.is_zero());
     }
 
-    /// §10.7 test: Verify flush_batch signature enables spawning
+    /// Verify flush_batch signature enables spawning
     /// (send_extracted_batch is 'static + Send, required for tokio::spawn).
     #[test]
     fn test_send_extracted_batch_is_send() {
@@ -860,5 +902,64 @@ mod tests {
         // This compiles only if the future returned by send_extracted_batch is Send,
         // which is required for tokio::spawn to work.
         assert_send::<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>();
+    }
+
+    // ── Backpressure tests ──────────────────────────────────────
+
+    #[test]
+    fn test_buffer_full_error_variant() {
+        let err = KrafkaError::BufferFull;
+        assert_eq!(err.to_string(), "buffer memory full");
+    }
+
+    #[test]
+    fn test_notify_shared_via_arc() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let notify2 = notify.clone();
+        assert!(Arc::ptr_eq(&notify, &notify2));
+    }
+
+    #[tokio::test]
+    async fn test_backpressure_timeout_returns_config_error() {
+        let (sender, mut receiver) = mpsc::channel::<AccumulatorMessage>(16);
+        let memory_freed = Arc::new(tokio::sync::Notify::new());
+        let handle = RecordAccumulatorHandle {
+            sender,
+            memory_freed,
+            max_block_ms: Duration::from_millis(50),
+        };
+
+        // Spawn a fake accumulator that always responds BufferFull
+        tokio::spawn(async move {
+            while let Some(msg) = receiver.recv().await {
+                match msg {
+                    AccumulatorMessage::Append { response_tx, .. } => {
+                        let _ = response_tx.send(Err(KrafkaError::BufferFull));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let record = ProducerRecord::new("topic", b"value".to_vec());
+        let result = handle.append(record, 0).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("max_block_ms"),
+            "expected max_block_ms in error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backpressure_unblocks_on_notify() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let n = notify.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            n.notify_waiters();
+        });
+        let result = tokio::time::timeout(Duration::from_secs(2), notify.notified()).await;
+        assert!(result.is_ok(), "notify should have fired");
     }
 }

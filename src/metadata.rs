@@ -138,7 +138,7 @@ pub struct ClusterMetadata {
     cache: RwLock<MetadataCache>,
     /// Metadata max age before refresh.
     max_age: Duration,
-    /// Coalescing lock: prevents concurrent metadata refreshes (§6.3).
+    /// Coalescing lock: prevents concurrent metadata refreshes.
     /// Multiple callers wait on the same in-flight refresh instead of stampeding.
     refresh_lock: Mutex<()>,
 }
@@ -171,7 +171,7 @@ impl ClusterMetadata {
 
     /// Refresh metadata for specific topics.
     ///
-    /// Uses a coalescing lock (§6.3) to prevent concurrent metadata stampedes.
+    /// Uses a coalescing lock to prevent concurrent metadata stampedes.
     /// If a refresh is already in-flight, callers wait for it to complete.
     pub async fn refresh_for_topics(&self, topics: Option<&[&str]>) -> Result<()> {
         // Coalesce concurrent calls: only one refresh in-flight at a time
@@ -260,7 +260,7 @@ impl ClusterMetadata {
         }
 
         // Update topics — clear stale entries first so deleted topics
-        // don't persist in cache (§9.4 fix). Topics present in the response
+        // don't persist in cache. Topics present in the response
         // with errors (e.g. UnknownTopicOrPartition for deleted topics) are
         // explicitly removed.
         let response_topic_names: HashSet<String> = response

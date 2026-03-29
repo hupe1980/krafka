@@ -158,6 +158,10 @@ impl TransactionPartitions {
         self.partitions.insert((topic.to_string(), partition))
     }
 
+    fn remove(&mut self, topic: &str, partition: PartitionId) {
+        self.partitions.remove(&(topic.to_string(), partition));
+    }
+
     fn clear(&mut self) {
         self.partitions.clear();
     }
@@ -233,7 +237,7 @@ impl TransactionalProducer {
     /// This must be called before any transactions can be started.
     /// It fetches the producer ID and epoch from the transaction coordinator.
     pub async fn init_transactions(&self) -> Result<()> {
-        // Atomic CAS: Uninitialized → Initializing (§9.3 fix: prevents concurrent calls)
+        // Atomic CAS: Uninitialized → Initializing
         if let Err(actual) = self.try_transition(
             TransactionState::Uninitialized,
             TransactionState::Initializing,
@@ -351,7 +355,7 @@ impl TransactionalProducer {
     ///
     /// Must be called after `init_transactions()`.
     pub fn begin_transaction(&self) -> Result<()> {
-        // Atomic CAS: Ready → InTransaction (§6.1 fix)
+        // Atomic CAS: Ready → InTransaction
         if let Err(actual) =
             self.try_transition(TransactionState::Ready, TransactionState::InTransaction)
         {
@@ -402,11 +406,18 @@ impl TransactionalProducer {
         };
 
         // Add partition to transaction if not already added
-        {
+        let is_new = {
             let mut txn_partitions = self.txn_partitions.write().await;
-            if txn_partitions.add(&topic, partition) {
-                // New partition, need to add to transaction
-                self.add_partition_to_txn(&topic, partition).await?;
+            txn_partitions.add(&topic, partition)
+        };
+
+        if is_new {
+            // New partition — send AddPartitionsToTxn RPC without holding the lock.
+            // On failure, roll back so a retry can re-add the partition.
+            if let Err(e) = self.add_partition_to_txn(&topic, partition).await {
+                let mut txn_partitions = self.txn_partitions.write().await;
+                txn_partitions.remove(&topic, partition);
+                return Err(e);
             }
         }
 
@@ -771,7 +782,7 @@ impl TransactionalProducer {
 
     /// Commit the current transaction.
     pub async fn commit_transaction(&self) -> Result<()> {
-        // Atomic CAS: InTransaction → Committing (§6.1 fix)
+        // Atomic CAS: InTransaction → Committing
         if let Err(actual) = self.try_transition(
             TransactionState::InTransaction,
             TransactionState::Committing,
@@ -796,7 +807,7 @@ impl TransactionalProducer {
                     self.set_state(TransactionState::InTransaction);
                     warn!("Transaction commit failed (retriable): {}", e);
                 } else {
-                    // Fatal error — caller must abort (§9.9 fix: set FatalError state)
+                    // Fatal error — caller must abort
                     self.set_state(TransactionState::FatalError);
                     warn!("Transaction commit failed (fatal): {}", e);
                 }
@@ -808,7 +819,7 @@ impl TransactionalProducer {
 
     /// Abort the current transaction.
     pub async fn abort_transaction(&self) -> Result<()> {
-        // Atomic CAS: try InTransaction → Aborting first, then Committing → Aborting (§6.1 fix)
+        // Atomic CAS: try InTransaction → Aborting first, then Committing → Aborting
         let transition = self
             .try_transition(TransactionState::InTransaction, TransactionState::Aborting)
             .or_else(|_| {
@@ -1424,5 +1435,17 @@ mod tests {
         use crate::producer::ProducerRecord;
         let record = ProducerRecord::new("topic", b"value".to_vec()).with_timestamp(1234567890);
         assert_eq!(record.timestamp, Some(1234567890));
+    }
+
+    #[test]
+    fn test_transaction_partitions_remove() {
+        let mut tp = TransactionPartitions::default();
+        tp.add("topic", 0);
+        tp.add("topic", 1);
+        assert!(!tp.is_empty());
+        tp.remove("topic", 0);
+        assert!(!tp.is_empty());
+        tp.remove("topic", 1);
+        assert!(tp.is_empty());
     }
 }

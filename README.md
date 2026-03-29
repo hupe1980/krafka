@@ -309,7 +309,7 @@ Krafka is feature-complete and production-ready.
 **Features:**
 - ✅ Protocol layer (all message types, compression, ACL messages, transactions)
 - ✅ Network layer (async connections, pooling, TLS/SSL)
-- ✅ Producer (batching with linger timer, partitioning, compression, built-in retry with exponential backoff, metadata refresh on failure, max-in-flight enforcement via semaphore, interceptor hooks)
+- ✅ Producer (batching with linger timer, partitioning, compression, built-in retry with exponential backoff, metadata refresh on failure, max-in-flight enforcement via semaphore, buffer backpressure with `max_block_ms`, interceptor hooks)
 - ✅ Consumer (polling, streaming `recv()` with error propagation, offset management, auto-commit timer, seek, pause/resume, configurable partition assignment strategy, rebalance listeners, cooperative sticky assignor, static group membership (KIP-345), interceptor hooks, log compaction awareness)
 - ✅ Admin Client (topic CRUD, partitions, configuration, ACL management, consumer groups, record deletion, leader epoch queries)
 - ✅ Authentication (SASL/PLAIN, SASL/SCRAM-SHA-256/512, SASL/OAUTHBEARER, AWS MSK IAM with SDK support)

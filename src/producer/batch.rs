@@ -108,7 +108,7 @@ impl ProducerBatch {
             if headers.is_empty() {
                 builder = builder.add_record(key, Some(value));
             } else {
-                // Include headers so they are not silently dropped (§8.2 fix)
+                // Include headers so they are not silently dropped
                 let hdrs: Vec<(String, Vec<u8>)> = headers
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
