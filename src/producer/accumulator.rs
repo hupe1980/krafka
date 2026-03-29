@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -246,6 +247,25 @@ struct PendingRecord {
     estimated_size: usize,
 }
 
+/// RAII guard that releases in-flight memory and notifies waiters on drop.
+///
+/// Created by `extract_batch` and passed to `send_extracted_batch`.
+/// When the send task completes (or panics), the guard automatically
+/// decrements `in_flight_memory` and wakes blocked `append()` callers.
+struct InFlightGuard {
+    bytes: usize,
+    in_flight_memory: Arc<AtomicUsize>,
+    memory_freed: Arc<Notify>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight_memory
+            .fetch_sub(self.bytes, Ordering::Relaxed);
+        self.memory_freed.notify_waiters();
+    }
+}
+
 /// A batch with its pending records.
 struct AccumulatorBatch {
     batch: ProducerBatch,
@@ -280,8 +300,10 @@ pub struct RecordAccumulator {
     batches: HashMap<(String, PartitionId), AccumulatorBatch>,
     /// Cluster metadata for sending.
     metadata: Arc<ClusterMetadata>,
-    /// Current total memory usage in bytes.
+    /// Current total memory usage in bytes (buffered, not yet extracted).
     memory_used: usize,
+    /// Memory held by in-flight send tasks (extracted but not yet completed).
+    in_flight_memory: Arc<AtomicUsize>,
     /// Retry policy for transient failures.
     retry_policy: RetryPolicy,
     /// Shared metrics.
@@ -300,6 +322,7 @@ impl RecordAccumulator {
     ) -> RecordAccumulatorHandle {
         let (sender, receiver) = mpsc::channel(1024);
         let memory_freed = Arc::new(Notify::new());
+        let in_flight_memory = Arc::new(AtomicUsize::new(0));
         let max_block_ms = config.max_block_ms;
 
         let accumulator = Self {
@@ -307,6 +330,7 @@ impl RecordAccumulator {
             batches: HashMap::new(),
             metadata,
             memory_used: 0,
+            in_flight_memory,
             retry_policy,
             metrics,
             memory_freed: memory_freed.clone(),
@@ -374,10 +398,10 @@ impl RecordAccumulator {
         // Estimate record size for memory tracking
         let record_size = Self::estimate_record_size(&record);
 
-        // Check memory limit before appending (0 = unlimited)
-        if self.config.buffer_memory > 0
-            && self.memory_used + record_size > self.config.buffer_memory
-        {
+        // Check memory limit before appending (0 = unlimited).
+        // Include in-flight memory so extracted-but-unsent batches are counted.
+        let total_memory = self.memory_used + self.in_flight_memory.load(Ordering::Relaxed);
+        if self.config.buffer_memory > 0 && total_memory + record_size > self.config.buffer_memory {
             // Return the record to the caller so it can retry without cloning.
             let _ = response_tx.send(AppendResponse::BufferFull(record));
             return;
@@ -439,6 +463,8 @@ impl RecordAccumulator {
             } else {
                 // Record too large for batch - free the memory we reserved
                 self.memory_used = self.memory_used.saturating_sub(record_size);
+                // Wake any tasks waiting for buffer memory so they can make progress.
+                self.memory_freed.notify_waiters();
                 let _ = response_tx.send(AppendResponse::Done(Err(KrafkaError::config(
                     "record too large for batch size",
                 ))));
@@ -482,13 +508,13 @@ impl RecordAccumulator {
         let mut extracted = Vec::with_capacity(keys_to_flush.len());
         for key in keys_to_flush {
             trace!("Linger expired for {:?}, flushing", key);
-            if let Some(batch) = self.extract_batch(&key) {
-                extracted.push((key, batch));
+            if let Some(item) = self.extract_batch(&key) {
+                extracted.push((key, item));
             }
         }
 
         let mut join_set = tokio::task::JoinSet::new();
-        for ((topic, partition), batch) in extracted {
+        for ((topic, partition), (batch, guard)) in extracted {
             let metadata = self.metadata.clone();
             let config = self.config.clone();
             let retry_policy = self.retry_policy.clone();
@@ -497,6 +523,7 @@ impl RecordAccumulator {
                 topic,
                 partition,
                 batch.pending,
+                guard,
                 metadata,
                 config,
                 retry_policy,
@@ -521,13 +548,13 @@ impl RecordAccumulator {
 
         let mut extracted = Vec::with_capacity(keys_to_flush.len());
         for key in keys_to_flush {
-            if let Some(batch) = self.extract_batch(&key) {
-                extracted.push((key, batch));
+            if let Some(item) = self.extract_batch(&key) {
+                extracted.push((key, item));
             }
         }
 
         let mut join_set = tokio::task::JoinSet::new();
-        for ((topic, partition), batch) in extracted {
+        for ((topic, partition), (batch, guard)) in extracted {
             let metadata = self.metadata.clone();
             let config = self.config.clone();
             let retry_policy = self.retry_policy.clone();
@@ -536,6 +563,7 @@ impl RecordAccumulator {
                 topic,
                 partition,
                 batch.pending,
+                guard,
                 metadata,
                 config,
                 retry_policy,
@@ -545,18 +573,27 @@ impl RecordAccumulator {
         while join_set.join_next().await.is_some() {}
     }
 
-    /// Extract a batch from the accumulator, freeing tracked memory.
-    fn extract_batch(&mut self, key: &(String, PartitionId)) -> Option<AccumulatorBatch> {
+    /// Extract a batch from the accumulator, transferring its memory to
+    /// the in-flight tracker. The actual free + notify happens when the
+    /// send task completes (see `send_extracted_batch`).
+    fn extract_batch(
+        &mut self,
+        key: &(String, PartitionId),
+    ) -> Option<(AccumulatorBatch, InFlightGuard)> {
         let batch = self.batches.remove(key)?;
         if batch.batch.is_empty() {
             return None;
         }
         let batch_memory: usize = batch.pending.iter().map(|p| p.estimated_size).sum();
         self.memory_used = self.memory_used.saturating_sub(batch_memory);
-        // Wake all callers blocked on buffer backpressure so newly freed
-        // capacity can be utilized promptly by multiple pending appends.
-        self.memory_freed.notify_waiters();
-        Some(batch)
+        self.in_flight_memory
+            .fetch_add(batch_memory, Ordering::Relaxed);
+        let guard = InFlightGuard {
+            bytes: batch_memory,
+            in_flight_memory: self.in_flight_memory.clone(),
+            memory_freed: self.memory_freed.clone(),
+        };
+        Some((batch, guard))
     }
 
     /// Flush a specific batch by spawning a background task.
@@ -565,7 +602,7 @@ impl RecordAccumulator {
     /// entire accumulator task. Now it spawns the send as a background task
     /// matching the concurrent flush pattern used by `check_linger_expiry`.
     async fn flush_batch(&mut self, key: &(String, PartitionId)) {
-        if let Some(batch) = self.extract_batch(key) {
+        if let Some((batch, guard)) = self.extract_batch(key) {
             let topic = key.0.clone();
             let partition = key.1;
             let metadata = self.metadata.clone();
@@ -576,6 +613,7 @@ impl RecordAccumulator {
                 topic,
                 partition,
                 batch.pending,
+                guard,
                 metadata,
                 config,
                 retry_policy,
@@ -588,10 +626,12 @@ impl RecordAccumulator {
     ///
     /// This is a static method to enable concurrent flushing via `FuturesUnordered`.
     /// Acquires an in-flight semaphore permit to respect `max_in_flight` concurrency limits.
+    #[allow(clippy::too_many_arguments)]
     async fn send_extracted_batch(
         topic: String,
         partition: PartitionId,
         pending: Vec<PendingRecord>,
+        _in_flight_guard: InFlightGuard,
         metadata: Arc<ClusterMetadata>,
         config: AccumulatorConfig,
         retry_policy: RetryPolicy,
@@ -812,23 +852,23 @@ impl RecordAccumulator {
 
     /// Flush all batches concurrently.
     async fn flush_all(&mut self) -> Result<()> {
-        let extracted: Vec<_> = self
+        let keys: Vec<_> = self
             .batches
-            .drain()
-            .filter(|(_, b)| !b.batch.is_empty())
+            .keys()
+            .filter(|k| self.batches.get(*k).is_some_and(|b| !b.batch.is_empty()))
+            .cloned()
             .collect();
 
-        // Free memory for all extracted batches
-        for (_, batch) in &extracted {
-            let batch_memory: usize = batch.pending.iter().map(|p| p.estimated_size).sum();
-            self.memory_used = self.memory_used.saturating_sub(batch_memory);
+        let mut extracted = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(item) = self.extract_batch(&key) {
+                extracted.push((key, item));
+            }
         }
-        // Wake all callers blocked on buffer backpressure
-        self.memory_freed.notify_waiters();
 
         // Send all batches concurrently
         let mut join_set = tokio::task::JoinSet::new();
-        for ((topic, partition), batch) in extracted {
+        for ((topic, partition), (batch, guard)) in extracted {
             let metadata = self.metadata.clone();
             let config = self.config.clone();
             let retry_policy = self.retry_policy.clone();
@@ -837,6 +877,7 @@ impl RecordAccumulator {
                 topic,
                 partition,
                 batch.pending,
+                guard,
                 metadata,
                 config,
                 retry_policy,
