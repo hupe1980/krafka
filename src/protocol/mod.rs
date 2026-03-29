@@ -17,7 +17,7 @@
 //! | API | Min | Max | Notes |
 //! |-----|-----|-----|-------|
 //! | Produce | 0 | 3 | v3+ for transactions |
-//! | Fetch | 0 | 7 | v4+ isolation level, v7 fetch sessions |
+//! | Fetch | 0 | 7 | v0-4 and v7 only (v5/v6 unsupported); v4 isolation level, v7 fetch sessions |
 //! | Metadata | 0 | 1 | v1+ includes controller info |
 //! | OffsetCommit | 0 | 2 | v2+ for retention |
 //! | OffsetFetch | 0 | 1 | v1+ for group coordinator |

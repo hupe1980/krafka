@@ -41,8 +41,9 @@ pub struct FetchSessionState {
     /// Current epoch.
     epoch: i32,
     /// Partitions currently registered in the session, keyed by
-    /// (topic, partition).
-    partitions: HashMap<(String, PartitionId), PartitionState>,
+    /// topic → partition → state. Nested map avoids cloning topic strings
+    /// per partition on every update.
+    partitions: HashMap<String, HashMap<PartitionId, PartitionState>>,
 }
 
 /// The result of computing a fetch request from session state.
@@ -93,7 +94,7 @@ impl FetchSessionState {
 
     #[cfg(test)]
     pub fn partition_count(&self) -> usize {
-        self.partitions.len()
+        self.partitions.values().map(|m| m.len()).sum()
     }
 
     /// Build the fetch request parameters by computing the diff between the
@@ -129,17 +130,11 @@ impl FetchSessionState {
         // it is bumped by update_from_response() after a successful response.
         let epoch = self.epoch;
 
-        // Build a borrowed-key view of the previous partitions to avoid
-        // allocating Strings for lookups on every (topic, partition).
-        let mut prev_map: HashMap<(&str, PartitionId), &PartitionState> = HashMap::new();
-        for ((topic, partition), state) in &self.partitions {
-            prev_map.insert((topic.as_str(), *partition), state);
-        }
-
         // 1. Find new or changed partitions.
         let mut changed: HashMap<&str, Vec<FetchPartitionRequest>> = HashMap::new();
         for (&(topic, partition), req) in &desired_map {
-            let is_new_or_changed = match prev_map.get(&(topic, partition)) {
+            let is_new_or_changed = match self.partitions.get(topic).and_then(|m| m.get(&partition))
+            {
                 None => true, // New partition.
                 Some(prev) => {
                     prev.fetch_offset != req.fetch_offset
@@ -153,12 +148,14 @@ impl FetchSessionState {
 
         // 2. Find removed partitions.
         let mut forgotten_map: HashMap<&str, Vec<i32>> = HashMap::new();
-        for (topic, partition) in self.partitions.keys() {
-            if !desired_map.contains_key(&(topic.as_str(), *partition)) {
-                forgotten_map
-                    .entry(topic.as_str())
-                    .or_default()
-                    .push(*partition);
+        for (topic, partitions) in &self.partitions {
+            for &partition in partitions.keys() {
+                if !desired_map.contains_key(&(topic.as_str(), partition)) {
+                    forgotten_map
+                        .entry(topic.as_str())
+                        .or_default()
+                        .push(partition);
+                }
             }
         }
 
@@ -214,9 +211,10 @@ impl FetchSessionState {
         // This ensures our state matches what the broker tracked.
         self.partitions.clear();
         for topic in desired {
+            let topic_map = self.partitions.entry(topic.topic.clone()).or_default();
             for part in &topic.partitions {
-                self.partitions.insert(
-                    (topic.topic.clone(), part.partition),
+                topic_map.insert(
+                    part.partition,
                     PartitionState {
                         fetch_offset: part.fetch_offset,
                         partition_max_bytes: part.partition_max_bytes,

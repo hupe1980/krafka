@@ -80,7 +80,7 @@ Client-supported versions are defined in `krafka::protocol::versions`:
 use krafka::protocol::versions;
 
 // Maximum versions the client supports
-let max_fetch = versions::FETCH_MAX;        // 7
+let max_fetch = versions::FETCH_MAX;        // 7 (only v0-4 and v7; use try-v7-else-v4 pattern)
 let max_produce = versions::PRODUCE_MAX;    // 3
 let max_metadata = versions::METADATA_MAX;  // 1
 ```

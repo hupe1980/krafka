@@ -993,8 +993,11 @@ impl Consumer {
             forgotten_topics,
         };
 
-        // Send request with negotiated version
-        let response = conn
+        // Send request with negotiated version.
+        // For v7 sessions, reset session on any send/decode failure so the
+        // next poll re-establishes with a full fetch instead of hitting
+        // InvalidFetchSessionEpoch.
+        let response = match conn
             .send_request(ApiKey::Fetch, fetch_version, |buf| {
                 if fetch_version >= 7 {
                     request.encode_v7(buf);
@@ -1002,14 +1005,33 @@ impl Consumer {
                     request.encode_v4(buf);
                 }
             })
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                if fetch_version >= 7 {
+                    let mut sessions = self.fetch_sessions.lock().await;
+                    sessions.reset_broker(broker_id);
+                }
+                return Err(e);
+            }
+        };
 
         // Decode response with matching version
         let mut buf = response;
-        let fetch_response = if fetch_version >= 7 {
-            FetchResponse::decode_v7(&mut buf)?
+        let fetch_response = match if fetch_version >= 7 {
+            FetchResponse::decode_v7(&mut buf)
         } else {
-            FetchResponse::decode_v4(&mut buf)?
+            FetchResponse::decode_v4(&mut buf)
+        } {
+            Ok(r) => r,
+            Err(e) => {
+                if fetch_version >= 7 {
+                    let mut sessions = self.fetch_sessions.lock().await;
+                    sessions.reset_broker(broker_id);
+                }
+                return Err(e);
+            }
         };
 
         // Handle top-level session errors (v7+)
