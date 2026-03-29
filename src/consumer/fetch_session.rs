@@ -105,11 +105,11 @@ impl FetchSessionState {
     /// - `forgotten_topics` with removed partitions
     pub fn build_request(&self, desired: &[FetchTopicRequest]) -> FetchSessionRequest {
         // Build a flat set of the desired partitions for fast lookup.
-        let mut desired_map: HashMap<(String, PartitionId), &FetchPartitionRequest> =
-            HashMap::new();
+        // Keys borrow topic strings from `desired` to avoid per-poll cloning.
+        let mut desired_map: HashMap<(&str, PartitionId), &FetchPartitionRequest> = HashMap::new();
         for topic in desired {
             for part in &topic.partitions {
-                desired_map.insert((topic.topic.clone(), part.partition), part);
+                desired_map.insert((topic.topic.as_str(), part.partition), part);
             }
         }
 
@@ -128,9 +128,9 @@ impl FetchSessionState {
         let next_epoch = self.next_epoch();
 
         // 1. Find new or changed partitions.
-        let mut changed: HashMap<String, Vec<FetchPartitionRequest>> = HashMap::new();
-        for ((topic, partition), req) in &desired_map {
-            let is_new_or_changed = match self.partitions.get(&(topic.clone(), *partition)) {
+        let mut changed: HashMap<&str, Vec<FetchPartitionRequest>> = HashMap::new();
+        for (&(topic, partition), req) in &desired_map {
+            let is_new_or_changed = match self.partitions.get(&(topic.to_string(), partition)) {
                 None => true, // New partition.
                 Some(prev) => {
                     prev.fetch_offset != req.fetch_offset
@@ -139,19 +139,16 @@ impl FetchSessionState {
                 }
             };
             if is_new_or_changed {
-                changed
-                    .entry(topic.clone())
-                    .or_default()
-                    .push((*req).clone());
+                changed.entry(topic).or_default().push((*req).clone());
             }
         }
 
         // 2. Find removed partitions.
-        let mut forgotten_map: HashMap<String, Vec<i32>> = HashMap::new();
+        let mut forgotten_map: HashMap<&str, Vec<i32>> = HashMap::new();
         for (topic, partition) in self.partitions.keys() {
-            if !desired_map.contains_key(&(topic.clone(), *partition)) {
+            if !desired_map.contains_key(&(topic.as_str(), *partition)) {
                 forgotten_map
-                    .entry(topic.clone())
+                    .entry(topic.as_str())
                     .or_default()
                     .push(*partition);
             }
@@ -159,12 +156,18 @@ impl FetchSessionState {
 
         let topics: Vec<FetchTopicRequest> = changed
             .into_iter()
-            .map(|(topic, partitions)| FetchTopicRequest { topic, partitions })
+            .map(|(topic, partitions)| FetchTopicRequest {
+                topic: topic.to_string(),
+                partitions,
+            })
             .collect();
 
         let forgotten_topics: Vec<FetchForgottenTopic> = forgotten_map
             .into_iter()
-            .map(|(topic, partitions)| FetchForgottenTopic { topic, partitions })
+            .map(|(topic, partitions)| FetchForgottenTopic {
+                topic: topic.to_string(),
+                partitions,
+            })
             .collect();
 
         FetchSessionRequest {

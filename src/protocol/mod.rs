@@ -16,18 +16,18 @@
 //!
 //! | API | Min | Max | Notes |
 //! |-----|-----|-----|-------|
-//! | Produce | 0 | 9 | v3+ for transactions, v5+ for headers |
-//! | Fetch | 0 | 12 | v4+ for leader epoch |
-//! | Metadata | 0 | 12 | v1+ includes controller info |
-//! | OffsetCommit | 0 | 8 | v2+ for retention |
-//! | OffsetFetch | 0 | 8 | v1+ for group coordinator |
-//! | FindCoordinator | 0 | 4 | v1+ for key type |
-//! | JoinGroup | 0 | 9 | v1+ for rebalance timeout |
-//! | Heartbeat | 0 | 4 | v0 is baseline |
-//! | SyncGroup | 0 | 5 | v0 is baseline |
-//! | LeaveGroup | 0 | 5 | v0 is baseline |
-//! | CreateTopics | 0 | 7 | v0 is baseline |
-//! | DeleteTopics | 0 | 6 | v0 is baseline |
+//! | Produce | 0 | 3 | v3+ for transactions |
+//! | Fetch | 0 | 7 | v4+ isolation level, v7 fetch sessions |
+//! | Metadata | 0 | 1 | v1+ includes controller info |
+//! | OffsetCommit | 0 | 2 | v2+ for retention |
+//! | OffsetFetch | 0 | 1 | v1+ for group coordinator |
+//! | FindCoordinator | 0 | 0 | Group coordinator lookup |
+//! | JoinGroup | 0 | 5 | v5+ group instance id |
+//! | Heartbeat | 0 | 1 | v0 is baseline |
+//! | SyncGroup | 0 | 3 | v3+ group instance id |
+//! | LeaveGroup | 0 | 1 | v0 is baseline |
+//! | CreateTopics | 0 | 3 | v0 is baseline |
+//! | DeleteTopics | 0 | 1 | v0 is baseline |
 //!
 //! ## Example
 //!
@@ -35,7 +35,7 @@
 //! use krafka::protocol::ApiKey;
 //!
 //! // Negotiate the best version for Fetch
-//! let version = conn.negotiate_api_version(ApiKey::Fetch, 12, 4).await;
+//! let version = conn.negotiate_api_version(ApiKey::Fetch, 7, 4).await;
 //! if let Some(v) = version {
 //!     println!("Using Fetch v{}", v);
 //! }

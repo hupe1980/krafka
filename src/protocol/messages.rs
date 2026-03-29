@@ -5677,4 +5677,152 @@ mod tests {
         // v2 should be 1 byte longer (isolation_level)
         assert_eq!(buf_v2.len(), buf_v1.len() + 1);
     }
+
+    #[test]
+    fn test_fetch_request_encode_v7_includes_session_fields() {
+        let request = FetchRequest {
+            replica_id: -1,
+            max_wait_ms: 500,
+            min_bytes: 1,
+            max_bytes: 1048576,
+            isolation_level: 0,
+            session_id: 42,
+            session_epoch: 3,
+            topics: vec![FetchTopicRequest {
+                topic: "test-topic".to_string(),
+                partitions: vec![FetchPartitionRequest {
+                    partition: 0,
+                    current_leader_epoch: -1,
+                    fetch_offset: 100,
+                    last_fetched_epoch: -1,
+                    log_start_offset: -1,
+                    partition_max_bytes: 1048576,
+                }],
+            }],
+            forgotten_topics: vec![FetchForgottenTopic {
+                topic: "old-topic".to_string(),
+                partitions: vec![1, 2],
+            }],
+        };
+
+        let mut buf_v4 = BytesMut::new();
+        request.encode_v4(&mut buf_v4);
+
+        let mut buf_v7 = BytesMut::new();
+        request.encode_v7(&mut buf_v7);
+
+        // v7 adds session_id(4) + session_epoch(4) + log_start_offset per partition(8)
+        // + forgotten_topics array (4 + topic string + partitions)
+        assert!(buf_v7.len() > buf_v4.len());
+
+        // Verify session_id and session_epoch at expected offsets:
+        // replica_id(4) + max_wait_ms(4) + min_bytes(4) + max_bytes(4) + isolation_level(1) = 17
+        let session_id_bytes = &buf_v7[17..21];
+        assert_eq!(i32::from_be_bytes(session_id_bytes.try_into().unwrap()), 42);
+        let session_epoch_bytes = &buf_v7[21..25];
+        assert_eq!(
+            i32::from_be_bytes(session_epoch_bytes.try_into().unwrap()),
+            3
+        );
+    }
+
+    #[test]
+    fn test_fetch_request_encode_v7_empty_forgotten_topics() {
+        let request = FetchRequest {
+            replica_id: -1,
+            max_wait_ms: 500,
+            min_bytes: 1,
+            max_bytes: 1048576,
+            isolation_level: 0,
+            session_id: 0,
+            session_epoch: 0,
+            topics: vec![],
+            forgotten_topics: vec![],
+        };
+
+        let mut buf = BytesMut::new();
+        request.encode_v7(&mut buf);
+
+        // Should still encode: header fields + empty topics array(4) + empty forgotten array(4)
+        // replica_id(4) + max_wait_ms(4) + min_bytes(4) + max_bytes(4) + isolation_level(1)
+        // + session_id(4) + session_epoch(4) + topics_count(4) + forgotten_count(4) = 33
+        assert_eq!(buf.len(), 33);
+    }
+
+    #[test]
+    fn test_fetch_response_decode_v7_round_trip() {
+        // Build a v7 response manually: throttle(4) + error_code(2) + session_id(4) + topics
+        let mut raw = BytesMut::new();
+        raw.put_i32(100); // throttle_time_ms
+        raw.put_i16(0); // error_code (None)
+        raw.put_i32(42); // session_id
+        raw.put_i32(1); // 1 topic
+        // topic name
+        raw.put_i16(5);
+        raw.put_slice(b"topic");
+        raw.put_i32(1); // 1 partition
+        raw.put_i32(0); // partition id
+        raw.put_i16(0); // error_code
+        raw.put_i64(1000); // high_watermark
+        raw.put_i64(999); // last_stable_offset
+        raw.put_i64(0); // log_start_offset
+        raw.put_i32(0); // 0 aborted transactions
+        raw.put_i32(-1); // records (null/-1 length)
+
+        let mut buf = raw.freeze();
+        let resp = FetchResponse::decode_v7(&mut buf).unwrap();
+
+        assert_eq!(resp.throttle_time_ms, 100);
+        assert_eq!(resp.error_code, ErrorCode::None);
+        assert_eq!(resp.session_id, 42);
+        assert_eq!(resp.responses.len(), 1);
+        assert_eq!(resp.responses[0].topic, "topic");
+        assert_eq!(resp.responses[0].partitions.len(), 1);
+        assert_eq!(resp.responses[0].partitions[0].partition, 0);
+        assert_eq!(resp.responses[0].partitions[0].high_watermark, 1000);
+        assert_eq!(resp.responses[0].partitions[0].last_stable_offset, 999);
+        assert_eq!(resp.responses[0].partitions[0].log_start_offset, 0);
+    }
+
+    #[test]
+    fn test_fetch_response_decode_v7_session_error() {
+        let mut raw = BytesMut::new();
+        raw.put_i32(0); // throttle_time_ms
+        raw.put_i16(70); // FetchSessionIdNotFound
+        raw.put_i32(0); // session_id
+        raw.put_i32(0); // 0 topics
+
+        let mut buf = raw.freeze();
+        let resp = FetchResponse::decode_v7(&mut buf).unwrap();
+
+        assert_eq!(resp.error_code, ErrorCode::FetchSessionIdNotFound);
+        assert_eq!(resp.session_id, 0);
+        assert!(resp.responses.is_empty());
+    }
+
+    #[test]
+    fn test_fetch_response_decode_v7_vs_v4_extra_fields() {
+        // v4 response: no error_code, no session_id
+        let mut raw_v4 = BytesMut::new();
+        raw_v4.put_i32(50); // throttle_time_ms
+        raw_v4.put_i32(0); // 0 topics
+
+        let mut buf_v4 = raw_v4.freeze();
+        let resp_v4 = FetchResponse::decode_v4(&mut buf_v4).unwrap();
+        assert_eq!(resp_v4.throttle_time_ms, 50);
+        assert_eq!(resp_v4.error_code, ErrorCode::None); // default
+        assert_eq!(resp_v4.session_id, 0); // default
+
+        // v7 response: has error_code + session_id
+        let mut raw_v7 = BytesMut::new();
+        raw_v7.put_i32(50); // throttle_time_ms
+        raw_v7.put_i16(0); // error_code
+        raw_v7.put_i32(99); // session_id
+        raw_v7.put_i32(0); // 0 topics
+
+        let mut buf_v7 = raw_v7.freeze();
+        let resp_v7 = FetchResponse::decode_v7(&mut buf_v7).unwrap();
+        assert_eq!(resp_v7.throttle_time_ms, 50);
+        assert_eq!(resp_v7.session_id, 99);
+    }
 }
