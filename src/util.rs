@@ -1,4 +1,4 @@
-//! Utility functions for Krafka.\n//!\n//! This module provides low-level utilities used throughout the crate:\n//!\n//! - **Correlation ID generation**: Thread-safe ID generation for request/response matching\n//! - **CRC32C**: Checksum calculation for Kafka record validation\n//! - **Varint encoding**: Variable-length integer encoding for compact protocols
+//! Utility functions for Krafka.\n//!\n//! This module provides low-level utilities used throughout the crate:\n//!\n//! - **Correlation ID generation**: Thread-safe ID generation for request/response matching\n//! - **CRC32C**: Checksum calculation for Kafka record validation\n//! - **Varint encoding**: Variable-length integer encoding for compact protocols\n//! - **SNI hostname extraction**: Parse hostnames from address strings for TLS SNI
 
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
@@ -229,5 +229,71 @@ mod tests {
         // Duration exactly at i32::MAX millis
         let exact = Duration::from_millis(i32::MAX as u64);
         assert_eq!(duration_to_millis_i32(exact), i32::MAX);
+    }
+}
+
+/// Extract the hostname from an address string for TLS SNI.
+///
+/// Handles bracketed IPv6 (`[::1]:port`), bare IPv6 (`2001:db8::1`),
+/// and IPv4/hostname with optional port (`host:port`). Returns the bare
+/// hostname without port or brackets.
+pub fn extract_sni_hostname(address: &str) -> &str {
+    // Bracketed IPv6: [::1]:port or [::1]
+    if let Some(rest) = address.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(address);
+    }
+
+    // Bare IPv6 without port: 2001:db8::1
+    if address.parse::<std::net::Ipv6Addr>().is_ok() {
+        return address;
+    }
+
+    // IPv4 or hostname: strip trailing :port (rsplit_once handles no-port case)
+    address.rsplit_once(':').map_or(address, |(host, _)| host)
+}
+
+#[cfg(test)]
+mod sni_tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_sni_bracketed_ipv6_with_port() {
+        assert_eq!(extract_sni_hostname("[::1]:9092"), "::1");
+    }
+
+    #[test]
+    fn test_extract_sni_bracketed_ipv6_no_port() {
+        assert_eq!(extract_sni_hostname("[::1]"), "::1");
+    }
+
+    #[test]
+    fn test_extract_sni_bare_ipv6() {
+        assert_eq!(extract_sni_hostname("2001:db8::1"), "2001:db8::1");
+    }
+
+    #[test]
+    fn test_extract_sni_bare_ipv6_loopback() {
+        assert_eq!(extract_sni_hostname("::1"), "::1");
+    }
+
+    #[test]
+    fn test_extract_sni_ipv4_with_port() {
+        assert_eq!(extract_sni_hostname("192.168.1.1:9092"), "192.168.1.1");
+    }
+
+    #[test]
+    fn test_extract_sni_hostname_with_port() {
+        assert_eq!(
+            extract_sni_hostname("broker.example.com:9092"),
+            "broker.example.com"
+        );
+    }
+
+    #[test]
+    fn test_extract_sni_hostname_no_port() {
+        assert_eq!(
+            extract_sni_hostname("broker.example.com"),
+            "broker.example.com"
+        );
     }
 }

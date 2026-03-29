@@ -421,13 +421,13 @@ impl TransactionalProducer {
         let request = FindCoordinatorRequest::for_transaction(&self.config.transactional_id);
 
         let response_bytes = conn
-            .send_request(ApiKey::FindCoordinator, 0, |buf| {
-                request.encode_v0(buf);
+            .send_request(ApiKey::FindCoordinator, 1, |buf| {
+                request.encode_v1(buf);
             })
             .await?;
 
         let mut buf = response_bytes;
-        let response = FindCoordinatorResponse::decode_v0(&mut buf)?;
+        let response = FindCoordinatorResponse::decode_v1(&mut buf)?;
 
         if !response.error_code.is_ok() {
             return Err(KrafkaError::broker(
@@ -887,13 +887,13 @@ impl TransactionalProducer {
         let request = FindCoordinatorRequest::for_group(group_id);
 
         let response_bytes = conn
-            .send_request(ApiKey::FindCoordinator, 0, |buf| {
-                request.encode_v0(buf);
+            .send_request(ApiKey::FindCoordinator, 1, |buf| {
+                request.encode_v1(buf);
             })
             .await?;
 
         let mut buf = response_bytes;
-        let response = FindCoordinatorResponse::decode_v0(&mut buf)?;
+        let response = FindCoordinatorResponse::decode_v1(&mut buf)?;
 
         if !response.error_code.is_ok() {
             return Err(KrafkaError::broker(

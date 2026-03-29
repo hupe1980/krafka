@@ -448,7 +448,18 @@ impl Consumer {
                     batch.entry(topic.clone()).or_default().push(*partition);
                 }
 
-                let resolved = self.resolve_list_offsets(&batch, timestamp).await?;
+                let resolved = match self.resolve_list_offsets(&batch, timestamp).await {
+                    Ok(resolved) => resolved,
+                    Err(e) => {
+                        warn!(
+                            "Failed to resolve offsets via ListOffsets for {:?}: {}. \
+                             Will retry on next poll",
+                            batch.keys().collect::<Vec<_>>(),
+                            e
+                        );
+                        HashMap::new()
+                    }
+                };
                 let mut offsets = self.offsets.write().await;
                 for ((topic, partition), offset) in &resolved {
                     offsets.insert((topic.clone(), *partition), *offset);

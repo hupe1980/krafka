@@ -154,21 +154,8 @@ pub async fn connect_tls(
     // Use SNI hostname if specified, otherwise use the connection hostname
     let sni_hostname = tls_config.sni_hostname.as_deref().unwrap_or(hostname);
 
-    // Parse the hostname, stripping port if present.
-    // Handles bracketed IPv6 ([::1]:9092), bare IPv6 (::1), and host:port.
-    let host = if let Some(rest) = sni_hostname.strip_prefix('[') {
-        // Bracketed IPv6: [::1]:port or [::1]
-        rest.split(']').next().unwrap_or(sni_hostname).to_string()
-    } else if sni_hostname.parse::<std::net::Ipv6Addr>().is_ok() {
-        // Bare IPv6 without port
-        sni_hostname.to_string()
-    } else {
-        // IPv4 or hostname: strip trailing :port
-        sni_hostname
-            .rsplit_once(':')
-            .map_or(sni_hostname, |(h, _)| h)
-            .to_string()
-    };
+    // Extract the bare hostname (no port, no brackets) using the shared helper
+    let host = crate::util::extract_sni_hostname(sni_hostname).to_string();
 
     let server_name = ServerName::try_from(host)
         .map_err(|e| KrafkaError::config(format!("Invalid server name: {}", e)))?;
