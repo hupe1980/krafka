@@ -932,11 +932,8 @@ mod tests {
         // Spawn a fake accumulator that always responds BufferFull
         tokio::spawn(async move {
             while let Some(msg) = receiver.recv().await {
-                match msg {
-                    AccumulatorMessage::Append { response_tx, .. } => {
-                        let _ = response_tx.send(Err(KrafkaError::BufferFull));
-                    }
-                    _ => {}
+                if let AccumulatorMessage::Append { response_tx, .. } = msg {
+                    let _ = response_tx.send(Err(KrafkaError::BufferFull));
                 }
             }
         });
