@@ -28,6 +28,7 @@ use crate::protocol::{
     SaslHandshakeRequest, SaslHandshakeResponse,
 };
 use crate::util::CorrelationIdGenerator;
+use crate::util::extract_sni_hostname;
 
 use super::secure::SaslAuthenticator;
 
@@ -1176,9 +1177,6 @@ impl Drop for BrokerConnection {
         }
     }
 }
-
-// Local import from shared utility for use in this module and tests
-use crate::util::extract_sni_hostname;
 
 #[cfg(test)]
 mod tests {

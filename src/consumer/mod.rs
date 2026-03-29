@@ -569,7 +569,10 @@ impl Consumer {
 
         // Retry leaderless partitions after a metadata refresh
         if !leaderless.is_empty() {
-            let topics: Vec<&str> = leaderless.iter().map(|(t, _)| t.as_str()).collect();
+            // Deduplicate topics to avoid redundant refresh work when multiple
+            // partitions of the same topic are leaderless.
+            let topic_set: HashSet<&str> = leaderless.iter().map(|(t, _)| t.as_str()).collect();
+            let topics: Vec<&str> = topic_set.into_iter().collect();
             let _ = self.metadata.refresh_for_topics(Some(&topics)).await;
             for (topic, partition) in leaderless {
                 if let Some(leader) = self.metadata.leader(&topic, partition).await {
@@ -589,7 +592,7 @@ impl Consumer {
         let mut result = HashMap::new();
         let mut last_error: Option<KrafkaError> = None;
 
-        for leader_partitions in by_leader.values() {
+        for (&leader_id, leader_partitions) in &by_leader {
             // Group into ListOffsetsRequest topics
             let mut topics_map: HashMap<String, Vec<ListOffsetsRequestPartition>> = HashMap::new();
             for (topic, partition) in leader_partitions {
@@ -618,29 +621,46 @@ impl Consumer {
                 topics,
             };
 
-            // Get a connection to this broker via any of its partitions
-            let (sample_topic, sample_partition) = &leader_partitions[0];
+            // Get a connection to this broker by leader ID
+            let broker_info = match self.metadata.broker(leader_id).await {
+                Some(b) => b,
+                None => {
+                    warn!("Broker {} not found in metadata, skipping", leader_id);
+                    last_error = Some(KrafkaError::invalid_state(format!(
+                        "broker {} not found in metadata",
+                        leader_id
+                    )));
+                    continue;
+                }
+            };
             let conn = match self
-                .metadata
-                .get_leader_connection(sample_topic, *sample_partition)
+                .pool
+                .get_connection_by_id(leader_id, &broker_info.address())
                 .await
             {
                 Ok(c) => c,
                 Err(e) => {
-                    warn!(
-                        "Failed to connect to leader for {}-{}: {}, skipping broker",
-                        sample_topic, sample_partition, e
-                    );
+                    warn!("Failed to connect to broker {}: {}, skipping", leader_id, e);
                     last_error = Some(e);
                     continue;
                 }
             };
 
-            // Negotiate ListOffsets version — prefer v2, fall back to v1.
+            // Negotiate ListOffsets version — require v1+, prefer v2.
             let list_version = conn
                 .negotiate_api_version_max(ApiKey::ListOffsets, 2)
                 .await
                 .unwrap_or(1);
+
+            if list_version < 1 {
+                let err = KrafkaError::protocol(format!(
+                    "broker {} only supports ListOffsets v{}, but v1+ is required",
+                    leader_id, list_version
+                ));
+                warn!("{}", err);
+                last_error = Some(err);
+                continue;
+            }
 
             let response = match conn
                 .send_request(ApiKey::ListOffsets, list_version, |buf| {
@@ -655,8 +675,8 @@ impl Consumer {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(
-                        "ListOffsets v{} request failed for broker (leader of {}-{}): {}, skipping",
-                        list_version, sample_topic, sample_partition, e
+                        "ListOffsets v{} request failed for broker {}: {}, skipping",
+                        list_version, leader_id, e
                     );
                     last_error = Some(e);
                     continue;
@@ -672,8 +692,8 @@ impl Consumer {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(
-                        "Failed to decode ListOffsets v{} response from broker (leader of {}-{}): {}, skipping",
-                        list_version, sample_topic, sample_partition, e
+                        "Failed to decode ListOffsets v{} response from broker {}: {}, skipping",
+                        list_version, leader_id, e
                     );
                     last_error = Some(e);
                     continue;

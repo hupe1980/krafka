@@ -240,7 +240,12 @@ mod tests {
 pub fn extract_sni_hostname(address: &str) -> &str {
     // Bracketed IPv6: [::1]:port or [::1]
     if let Some(rest) = address.strip_prefix('[') {
-        return rest.split(']').next().unwrap_or(address);
+        return if let Some(pos) = rest.find(']') {
+            &rest[..pos]
+        } else {
+            // Malformed bracketed address (missing closing ']'); fall back to original.
+            address
+        };
     }
 
     // Bare IPv6 without port: 2001:db8::1

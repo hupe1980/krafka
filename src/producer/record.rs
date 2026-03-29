@@ -48,6 +48,12 @@ impl ProducerRecord {
         self
     }
 
+    /// Clear the key (set it to `None`).
+    pub fn without_key(mut self) -> Self {
+        self.key = None;
+        self
+    }
+
     /// Set the timestamp.
     pub fn with_timestamp(mut self, timestamp: Timestamp) -> Self {
         self.timestamp = Some(timestamp);
