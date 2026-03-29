@@ -94,6 +94,25 @@ Krafka uses Kafka's v2 record batch format with:
 - Variable-length encoding for efficiency
 - Optional compression (gzip, snappy, lz4, zstd)
 
+### Unified Version Dispatch
+
+All request/response types implement `VersionedEncode` and `VersionedDecode` traits that dispatch to the correct `encode_vN`/`decode_vN` method based on the protocol version number:
+
+```rust
+use krafka::protocol::messages::{VersionedEncode, VersionedDecode, MetadataRequest, MetadataResponse};
+
+let request = MetadataRequest::all_topics();
+let mut buf = bytes::BytesMut::new();
+
+// Encode for a specific protocol version — dispatches to the right encoder
+request.encode_versioned(4, &mut buf)?;
+
+// Decode response for a specific version
+let response = MetadataResponse::decode_versioned(2, &mut response_buf)?;
+```
+
+Unsupported version numbers (including negative values) return a descriptive `KrafkaError::protocol` error.
+
 ### Creating Records
 
 ```rust
@@ -125,6 +144,7 @@ Krafka protects against malicious or corrupted broker responses:
 - **Allocation caps**: All `Vec::with_capacity()` calls in protocol decoding are capped at 10,000 elements, preventing OOM from broker-supplied lengths
 - **Decompression limits**: Decompressed record data is limited to 128 MiB via streaming `.take()` limits and post-decompression size checks
 - **Record headers**: Record headers are preserved during batch building — no silent data loss
+- **Encode validation**: The `TryEncode` trait provides fallible encoding for protocol primitives (`KafkaString`, `KafkaBytes`, `KafkaArray`, `TaggedFields`), returning errors instead of panicking on oversized data. `ProducerRecord::validate()` checks wire-format limits at the API boundary before encoding
 
 ## Wire Protocol
 

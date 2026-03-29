@@ -657,13 +657,13 @@ impl RecordAccumulator {
         for p in &pending {
             if p.record.headers.is_empty() {
                 batch_builder = batch_builder.add_record(
-                    p.record.key.clone().map(Bytes::from),
-                    Some(Bytes::from(p.record.value.clone())),
+                    p.record.key.clone(),
+                    Some(p.record.value.clone()),
                 );
             } else {
                 batch_builder = batch_builder.add_record_with_headers(
-                    p.record.key.clone().map(Bytes::from),
-                    Some(Bytes::from(p.record.value.clone())),
+                    p.record.key.clone(),
+                    Some(p.record.value.clone()),
                     p.record
                         .headers
                         .iter()

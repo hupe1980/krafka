@@ -1,5 +1,8 @@
 //! Producer record types.
 
+use bytes::Bytes;
+
+use crate::error::{KrafkaError, Result};
 use crate::{PartitionId, Timestamp};
 
 /// A record to be sent to Kafka.
@@ -10,10 +13,10 @@ pub struct ProducerRecord {
     pub topic: String,
     /// Target partition (optional, will be computed if not set).
     pub partition: Option<PartitionId>,
-    /// Record key (optional).
-    pub key: Option<Vec<u8>>,
-    /// Record value.
-    pub value: Vec<u8>,
+    /// Record key (optional, zero-copy via `Bytes`).
+    pub key: Option<Bytes>,
+    /// Record value (zero-copy via `Bytes`).
+    pub value: Bytes,
     /// Record timestamp (optional, will use current time if not set).
     pub timestamp: Option<Timestamp>,
     /// Record headers.
@@ -22,7 +25,7 @@ pub struct ProducerRecord {
 
 impl ProducerRecord {
     /// Create a new producer record.
-    pub fn new(topic: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
+    pub fn new(topic: impl Into<String>, value: impl Into<Bytes>) -> Self {
         Self {
             topic: topic.into(),
             partition: None,
@@ -40,8 +43,8 @@ impl ProducerRecord {
     }
 
     /// Set the key.
-    pub fn with_key(mut self, key: Option<Vec<u8>>) -> Self {
-        self.key = key;
+    pub fn with_key(mut self, key: Option<impl Into<Bytes>>) -> Self {
+        self.key = key.map(Into::into);
         self
     }
 
@@ -79,6 +82,68 @@ impl ProducerRecord {
         // Overhead for record metadata
         key_size + value_size + headers_size + 50
     }
+
+    /// Validate that this record's fields do not exceed Kafka wire-format limits.
+    ///
+    /// Checks:
+    /// - Key length fits in `i32` (Kafka bytes encoding limit of 2 GiB)
+    /// - Value length fits in `i32`
+    /// - Each header key fits in `i16` (Kafka string encoding limit of 32 KiB)
+    /// - Each header value fits in `i32`
+    /// - Topic name fits in `i16`
+    pub fn validate(&self) -> Result<()> {
+        // Topic names are encoded as KafkaString (i16 length prefix)
+        if self.topic.len() > i16::MAX as usize {
+            return Err(KrafkaError::config(format!(
+                "topic name length {} exceeds protocol limit of {}",
+                self.topic.len(),
+                i16::MAX
+            )));
+        }
+
+        // Key is encoded as KafkaBytes (i32 length prefix)
+        if let Some(ref key) = self.key
+            && key.len() > i32::MAX as usize
+        {
+            return Err(KrafkaError::config(format!(
+                "record key length {} exceeds protocol limit of {}",
+                key.len(),
+                i32::MAX
+            )));
+        }
+
+        // Value is encoded as KafkaBytes (i32 length prefix)
+        if self.value.len() > i32::MAX as usize {
+            return Err(KrafkaError::config(format!(
+                "record value length {} exceeds protocol limit of {}",
+                self.value.len(),
+                i32::MAX
+            )));
+        }
+
+        // Header keys are encoded as KafkaString (i16 length prefix)
+        // Header values are encoded as KafkaBytes (i32 length prefix)
+        for (i, (key, value)) in self.headers.iter().enumerate() {
+            if key.len() > i16::MAX as usize {
+                return Err(KrafkaError::config(format!(
+                    "header[{}] key length {} exceeds protocol limit of {}",
+                    i,
+                    key.len(),
+                    i16::MAX
+                )));
+            }
+            if value.len() > i32::MAX as usize {
+                return Err(KrafkaError::config(format!(
+                    "header[{}] value length {} exceeds protocol limit of {}",
+                    i,
+                    value.len(),
+                    i32::MAX
+                )));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Metadata returned after successfully sending a record.
@@ -111,7 +176,7 @@ mod tests {
     fn test_producer_record_new() {
         let record = ProducerRecord::new("test-topic", b"hello".to_vec());
         assert_eq!(record.topic, "test-topic");
-        assert_eq!(record.value, b"hello");
+        assert_eq!(record.value.as_ref(), b"hello");
         assert!(record.key.is_none());
         assert!(record.partition.is_none());
     }
@@ -121,7 +186,7 @@ mod tests {
         let record =
             ProducerRecord::new("test-topic", b"hello".to_vec()).with_key(Some(b"my-key".to_vec()));
 
-        assert_eq!(record.key, Some(b"my-key".to_vec()));
+        assert_eq!(record.key, Some(Bytes::from_static(b"my-key")));
         assert_eq!(record.key_str(), Some("my-key"));
     }
 
@@ -163,5 +228,35 @@ mod tests {
 
         assert!(metadata.is_success());
         assert_eq!(metadata.offset, 42);
+    }
+
+    #[test]
+    fn test_validate_valid_record() {
+        let record = ProducerRecord::new("topic", b"value".to_vec())
+            .with_key(Some(b"key".to_vec()))
+            .with_header("h1", b"v1".to_vec());
+        assert!(record.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_oversized_topic() {
+        let record = ProducerRecord::new("x".repeat(i16::MAX as usize + 1), b"v".to_vec());
+        let err = record.validate().unwrap_err().to_string();
+        assert!(err.contains("topic name length"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_oversized_header_key() {
+        let record = ProducerRecord::new("topic", b"v".to_vec())
+            .with_header("x".repeat(i16::MAX as usize + 1), b"v".to_vec());
+        let err = record.validate().unwrap_err().to_string();
+        assert!(err.contains("header[0] key length"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn test_validate_accepts_max_valid_sizes() {
+        // Topic at max i16 length
+        let record = ProducerRecord::new("a".repeat(i16::MAX as usize), b"v".to_vec());
+        assert!(record.validate().is_ok());
     }
 }

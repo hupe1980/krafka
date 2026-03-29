@@ -1,12 +1,32 @@
 //! Kafka protocol message types.
 //!
 //! This module defines the request and response types for all Kafka APIs.
+//! Each request/response type implements [`VersionedEncode`] and/or
+//! [`VersionedDecode`] for version-dispatched encoding and decoding.
 
 use bytes::{Buf, BufMut, Bytes};
 
 use super::api::ApiKey;
 use super::primitives::{Decode, Encode, KafkaArray, KafkaBytes, KafkaString};
-use crate::error::{ErrorCode, Result};
+use crate::error::{ErrorCode, KrafkaError, Result};
+
+/// Trait for encoding a request/response at a specific protocol version.
+///
+/// Implementors dispatch to the appropriate `encode_vN` method based on
+/// the version number, returning an error for unsupported versions.
+pub trait VersionedEncode {
+    /// Encode this message for the given protocol version.
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()>;
+}
+
+/// Trait for decoding a response/request from a specific protocol version.
+///
+/// Implementors dispatch to the appropriate `decode_vN` method based on
+/// the version number, returning an error for unsupported versions.
+pub trait VersionedDecode: Sized {
+    /// Decode this message from the given protocol version.
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self>;
+}
 
 /// Metadata request.
 #[derive(Debug, Clone, Default)]
@@ -4818,6 +4838,646 @@ impl OffsetForLeaderEpochResponse {
     }
 }
 
+// ---------------------------------------------------------------------------
+// VersionedEncode / VersionedDecode implementations
+// ---------------------------------------------------------------------------
+
+macro_rules! unsupported_encode {
+    ($type:expr, $version:expr) => {
+        Err(KrafkaError::protocol(format!(
+            "unsupported {} encode version {}",
+            $type, $version
+        )))
+    };
+}
+
+macro_rules! unsupported_decode {
+    ($type:expr, $version:expr) => {
+        Err(KrafkaError::protocol(format!(
+            "unsupported {} decode version {}",
+            $type, $version
+        )))
+    };
+}
+
+impl VersionedEncode for MetadataRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0..=3 => self.encode_v0(buf),
+            4.. => self.encode_v4(buf),
+            _ => return unsupported_encode!("MetadataRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for MetadataResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1 => Self::decode_v1(buf),
+            2.. => Self::decode_v2(buf),
+            _ => unsupported_decode!("MetadataResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for ProduceRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0..=2 => self.encode_v0(buf),
+            3.. => self.encode_v3(buf),
+            _ => return unsupported_encode!("ProduceRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for ProduceResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1 => Self::decode_v1(buf),
+            2.. => Self::decode_v2(buf),
+            _ => unsupported_decode!("ProduceResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for FetchRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0..=2 => self.encode_v0(buf),
+            3 => self.encode_v3(buf),
+            4..=6 => self.encode_v4(buf),
+            7.. => self.encode_v7(buf),
+            _ => return unsupported_encode!("FetchRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for FetchResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1..=3 => Self::decode_v1(buf),
+            4..=6 => Self::decode_v4(buf),
+            7.. => Self::decode_v7(buf),
+            _ => unsupported_decode!("FetchResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for FindCoordinatorRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf),
+            1.. => self.encode_v1(buf),
+            _ => return unsupported_encode!("FindCoordinatorRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for FindCoordinatorResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1.. => Self::decode_v1(buf),
+            _ => unsupported_decode!("FindCoordinatorResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for JoinGroupRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf),
+            1..=4 => self.encode_v1(buf),
+            5.. => self.encode_v5(buf),
+            _ => return unsupported_encode!("JoinGroupRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for JoinGroupResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0..=1 => Self::decode_v0(buf),
+            2..=4 => Self::decode_v2(buf),
+            5.. => Self::decode_v5(buf),
+            _ => unsupported_decode!("JoinGroupResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for SyncGroupRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0..=2 => self.encode_v0(buf),
+            3.. => self.encode_v3(buf),
+            _ => return unsupported_encode!("SyncGroupRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for SyncGroupResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1.. => Self::decode_v1(buf),
+            _ => unsupported_decode!("SyncGroupResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for HeartbeatRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0..=2 => self.encode_v0(buf),
+            3.. => self.encode_v3(buf),
+            _ => return unsupported_encode!("HeartbeatRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for HeartbeatResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1.. => Self::decode_v1(buf),
+            _ => unsupported_decode!("HeartbeatResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for LeaveGroupRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0..=2 => self.encode_v0(buf),
+            3.. => self.encode_v3(buf),
+            _ => return unsupported_encode!("LeaveGroupRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for LeaveGroupResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1.. => Self::decode_v1(buf),
+            _ => unsupported_decode!("LeaveGroupResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for OffsetCommitRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf),
+            1 => self.encode_v1(buf),
+            2.. => self.encode_v2(buf),
+            _ => return unsupported_encode!("OffsetCommitRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for OffsetCommitResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0..=2 => Self::decode_v0(buf),
+            3.. => Self::decode_v3(buf),
+            _ => unsupported_decode!("OffsetCommitResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for ListOffsetsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            1 => self.encode_v1(buf),
+            2.. => self.encode_v2(buf),
+            _ => return unsupported_encode!("ListOffsetsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for ListOffsetsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            1 => Self::decode_v1(buf),
+            2.. => Self::decode_v2(buf),
+            _ => unsupported_decode!("ListOffsetsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for OffsetFetchRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0.. => self.encode_v0(buf),
+            _ => return unsupported_encode!("OffsetFetchRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for OffsetFetchResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0..=1 => Self::decode_v0(buf),
+            2 => Self::decode_v2(buf),
+            3.. => Self::decode_v3(buf),
+            _ => unsupported_decode!("OffsetFetchResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for CreateTopicsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf),
+            1.. => self.encode_v1(buf),
+            _ => return unsupported_encode!("CreateTopicsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for CreateTopicsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1 => Self::decode_v1(buf),
+            2.. => Self::decode_v2(buf),
+            _ => unsupported_decode!("CreateTopicsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for DeleteTopicsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0.. => self.encode_v0(buf),
+            _ => return unsupported_encode!("DeleteTopicsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for DeleteTopicsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1.. => Self::decode_v1(buf),
+            _ => unsupported_decode!("DeleteTopicsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for CreatePartitionsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0.. => self.encode_v0(buf),
+            _ => return unsupported_encode!("CreatePartitionsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for CreatePartitionsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0.. => Self::decode_v0(buf),
+            _ => unsupported_decode!("CreatePartitionsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for DescribeConfigsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0.. => self.encode_v0(buf),
+            _ => return unsupported_encode!("DescribeConfigsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for DescribeConfigsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0.. => Self::decode_v0(buf),
+            _ => unsupported_decode!("DescribeConfigsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for AlterConfigsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0.. => self.encode_v0(buf),
+            _ => return unsupported_encode!("AlterConfigsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for AlterConfigsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0.. => Self::decode_v0(buf),
+            _ => unsupported_decode!("AlterConfigsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for InitProducerIdRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0..=1 => self.encode_v0(buf),
+            2.. => self.encode_v2(buf),
+            _ => return unsupported_encode!("InitProducerIdRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for InitProducerIdResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0.. => Self::decode_v0(buf),
+            _ => unsupported_decode!("InitProducerIdResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for SaslHandshakeRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf),
+            1.. => self.encode_v1(buf),
+            _ => return unsupported_encode!("SaslHandshakeRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for SaslHandshakeResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0.. => Self::decode_v0(buf),
+            _ => unsupported_decode!("SaslHandshakeResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for SaslAuthenticateRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf),
+            1.. => self.encode_v1(buf),
+            _ => return unsupported_encode!("SaslAuthenticateRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for SaslAuthenticateResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1.. => Self::decode_v1(buf),
+            _ => unsupported_decode!("SaslAuthenticateResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for DescribeAclsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf),
+            1.. => self.encode_v1(buf),
+            _ => return unsupported_encode!("DescribeAclsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for DescribeAclsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0.. => Self::decode_v0(buf),
+            _ => unsupported_decode!("DescribeAclsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for CreateAclsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf),
+            1.. => self.encode_v1(buf),
+            _ => return unsupported_encode!("CreateAclsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for CreateAclsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0.. => Self::decode_v0(buf),
+            _ => unsupported_decode!("CreateAclsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for DeleteAclsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf),
+            1.. => self.encode_v1(buf),
+            _ => return unsupported_encode!("DeleteAclsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for DeleteAclsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0.. => Self::decode_v0(buf),
+            _ => unsupported_decode!("DeleteAclsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for AddPartitionsToTxnRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0.. => self.encode_v0(buf),
+            _ => return unsupported_encode!("AddPartitionsToTxnRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for AddPartitionsToTxnResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0.. => Self::decode_v0(buf),
+            _ => unsupported_decode!("AddPartitionsToTxnResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for AddOffsetsToTxnRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0.. => self.encode_v0(buf),
+            _ => return unsupported_encode!("AddOffsetsToTxnRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for AddOffsetsToTxnResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0.. => Self::decode_v0(buf),
+            _ => unsupported_decode!("AddOffsetsToTxnResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for EndTxnRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0.. => self.encode_v0(buf),
+            _ => return unsupported_encode!("EndTxnRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for EndTxnResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0.. => Self::decode_v0(buf),
+            _ => unsupported_decode!("EndTxnResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for TxnOffsetCommitRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0..=1 => self.encode_v0(buf),
+            2.. => self.encode_v2(buf),
+            _ => return unsupported_encode!("TxnOffsetCommitRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for TxnOffsetCommitResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0.. => Self::decode_v0(buf),
+            _ => unsupported_decode!("TxnOffsetCommitResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for DescribeGroupsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0.. => self.encode_v0(buf),
+            _ => return unsupported_encode!("DescribeGroupsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for DescribeGroupsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1.. => Self::decode_v1(buf),
+            _ => unsupported_decode!("DescribeGroupsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for ListGroupsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0.. => self.encode_v0(buf),
+            _ => return unsupported_encode!("ListGroupsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for ListGroupsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1.. => Self::decode_v1(buf),
+            _ => unsupported_decode!("ListGroupsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for DeleteRecordsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0.. => self.encode_v0(buf),
+            _ => return unsupported_encode!("DeleteRecordsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for DeleteRecordsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0.. => Self::decode_v0(buf),
+            _ => unsupported_decode!("DeleteRecordsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for OffsetForLeaderEpochRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            2 => self.encode_v2(buf),
+            3.. => self.encode_v3(buf),
+            _ => return unsupported_encode!("OffsetForLeaderEpochRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for OffsetForLeaderEpochResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1 => Self::decode_v1(buf),
+            2.. => Self::decode_v2(buf),
+            _ => unsupported_decode!("OffsetForLeaderEpochResponse", version),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5824,5 +6484,81 @@ mod tests {
         let resp_v7 = FetchResponse::decode_v7(&mut buf_v7).unwrap();
         assert_eq!(resp_v7.throttle_time_ms, 50);
         assert_eq!(resp_v7.session_id, 99);
+    }
+
+    // ── VersionedEncode / VersionedDecode tests ─────────────────────
+
+    #[test]
+    fn test_versioned_encode_metadata_request_v0() {
+        let request = MetadataRequest::all_topics();
+        let mut buf = BytesMut::new();
+        request.encode_versioned(0, &mut buf).unwrap();
+        // Should produce the same bytes as encode_v0
+        let mut expected = BytesMut::new();
+        request.encode_v0(&mut expected);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn test_versioned_encode_metadata_request_v4() {
+        let request = MetadataRequest::all_topics();
+        let mut buf = BytesMut::new();
+        request.encode_versioned(4, &mut buf).unwrap();
+        let mut expected = BytesMut::new();
+        request.encode_v4(&mut expected);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn test_versioned_encode_rejects_negative_version() {
+        let request = MetadataRequest::all_topics();
+        let mut buf = BytesMut::new();
+        let result = request.encode_versioned(-1, &mut buf);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unsupported"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_versioned_decode_rejects_negative_version() {
+        let mut buf = bytes::Bytes::new();
+        let result = MetadataResponse::decode_versioned(-1, &mut buf);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unsupported"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_versioned_encode_decode_roundtrip_sasl_handshake() {
+        let request = SaslHandshakeRequest::new("SCRAM-SHA-256");
+        let mut buf = BytesMut::new();
+        request.encode_versioned(0, &mut buf).unwrap();
+        assert!(!buf.is_empty());
+        // High version still works (dispatches to latest encoder)
+        let mut buf2 = BytesMut::new();
+        request.encode_versioned(1, &mut buf2).unwrap();
+        assert!(!buf2.is_empty());
+    }
+
+    #[test]
+    fn test_versioned_encode_fetch_request_dispatches_correctly() {
+        let request = FetchRequest {
+            replica_id: -1,
+            max_wait_ms: 500,
+            min_bytes: 1,
+            max_bytes: 1048576,
+            isolation_level: 0,
+            session_id: 0,
+            session_epoch: -1,
+            topics: vec![],
+            forgotten_topics: vec![],
+        };
+        // v0 and v7 should use different encoders and produce different output
+        let mut buf_v0 = BytesMut::new();
+        request.encode_versioned(0, &mut buf_v0).unwrap();
+        let mut buf_v7 = BytesMut::new();
+        request.encode_versioned(7, &mut buf_v7).unwrap();
+        // v7 encodes extra fields (session_id, session_epoch) so should be longer
+        assert!(buf_v7.len() > buf_v0.len());
     }
 }

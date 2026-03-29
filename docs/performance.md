@@ -135,6 +135,7 @@ let conn = pool.get_connection("broker:9092").await?;
 
 Krafka uses `bytes::Bytes` throughout for zero-copy buffer management:
 
+- **Producer record pipeline**: `ProducerRecord` key and value use `Bytes`, so batching clones the reference count (O(1)) instead of copying data
 - Record batches share underlying memory
 - Slicing operations don't copy data
 - Custom compression codecs can provide their own buffers
@@ -163,6 +164,12 @@ let consumer = ConsumerBuilder::new()
     .fetch_max_wait(Duration::from_millis(100))  // Max wait time
     .build();
 ```
+
+### Batched Offset Resolution
+
+When multiple partitions need offset resolution (e.g., after rebalance or on first poll), Krafka groups partitions by leader broker and sends one batched `ListOffsets` RPC per broker. This reduces 50 partitions from 50 round-trips down to 2-3, significantly improving consumer startup and rebalance time.
+
+Failed offset resolutions use per-partition exponential backoff (100ms base, 30s cap) to prevent retry storms under sustained broker unavailability.
 
 ### Incremental Fetch Sessions (KIP-227)
 

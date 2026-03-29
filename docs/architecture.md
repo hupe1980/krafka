@@ -206,11 +206,13 @@ The reconnection logic checks `is_retriable()` on errors to avoid retrying non-t
 ### Request/Response Flow
 
 1. Caller creates request struct
-2. Request is encoded to bytes
+2. Request is encoded via `VersionedEncode::encode_versioned(version, buf)` — dispatches to the correct `encode_vN` method
 3. Correlation ID is assigned
 4. Request is sent over TCP
 5. Response is received and framed
-6. Response is decoded and returned
+6. Response is decoded via `VersionedDecode::decode_versioned(version, buf)` — dispatches to the correct `decode_vN` method
+
+All 30+ request/response type pairs implement the `VersionedEncode`/`VersionedDecode` traits, providing unified version dispatch with unsupported-version error handling.
 
 ```rust
 // Internal flow

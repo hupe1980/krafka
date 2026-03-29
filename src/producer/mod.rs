@@ -200,7 +200,8 @@ impl Producer {
         key: Option<&[u8]>,
         value: &[u8],
     ) -> Result<RecordMetadata> {
-        let record = ProducerRecord::new(topic, value.to_vec()).with_key(key.map(|k| k.to_vec()));
+        let record = ProducerRecord::new(topic, Bytes::copy_from_slice(value))
+            .with_key(key.map(Bytes::copy_from_slice));
         self.send_record(record).await
     }
 
@@ -212,8 +213,8 @@ impl Producer {
         value: &[u8],
         headers: Vec<(String, Vec<u8>)>,
     ) -> Result<RecordMetadata> {
-        let mut record =
-            ProducerRecord::new(topic, value.to_vec()).with_key(key.map(|k| k.to_vec()));
+        let mut record = ProducerRecord::new(topic, Bytes::copy_from_slice(value))
+            .with_key(key.map(Bytes::copy_from_slice));
         record.headers = headers;
         self.send_record(record).await
     }
@@ -223,6 +224,9 @@ impl Producer {
         if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(KrafkaError::invalid_state("producer is closed"));
         }
+
+        // Validate record fields against Kafka protocol wire-format limits
+        record.validate()?;
 
         // Invoke interceptor before send
         let mut record = record;
@@ -355,13 +359,13 @@ impl Producer {
 
         if record.headers.is_empty() {
             batch_builder = batch_builder.add_record(
-                record.key.clone().map(Bytes::from),
-                Some(Bytes::from(record.value.clone())),
+                record.key.clone(),
+                Some(record.value.clone()),
             );
         } else {
             batch_builder = batch_builder.add_record_with_headers(
-                record.key.clone().map(Bytes::from),
-                Some(Bytes::from(record.value.clone())),
+                record.key.clone(),
+                Some(record.value.clone()),
                 record
                     .headers
                     .iter()

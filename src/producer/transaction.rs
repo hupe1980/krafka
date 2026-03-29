@@ -469,7 +469,8 @@ impl TransactionalProducer {
         key: Option<&[u8]>,
         value: &[u8],
     ) -> Result<RecordMetadata> {
-        let record = ProducerRecord::new(topic, value.to_vec()).with_key(key.map(|k| k.to_vec()));
+        let record = ProducerRecord::new(topic, Bytes::copy_from_slice(value))
+            .with_key(key.map(Bytes::copy_from_slice));
         self.send_record(record).await
     }
 
@@ -699,13 +700,13 @@ impl TransactionalProducer {
 
         if record.headers.is_empty() {
             batch_builder = batch_builder.add_record(
-                record.key.clone().map(Bytes::from),
-                Some(Bytes::from(record.value.clone())),
+                record.key.clone(),
+                Some(record.value.clone()),
             );
         } else {
             batch_builder = batch_builder.add_record_with_headers(
-                record.key.clone().map(Bytes::from),
-                Some(Bytes::from(record.value.clone())),
+                record.key.clone(),
+                Some(record.value.clone()),
                 record
                     .headers
                     .iter()

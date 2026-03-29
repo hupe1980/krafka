@@ -282,6 +282,18 @@ impl Partitioner for RegionPartitioner {
 
 ## Error Handling
 
+### Record Validation
+
+Before sending, each `ProducerRecord` is validated against Kafka wire-format limits:
+
+- **Topic name**: max 32,767 bytes (i16 limit)
+- **Key**: max 2,147,483,647 bytes (i32 limit)
+- **Value**: max 2,147,483,647 bytes (i32 limit)
+- **Header keys**: max 32,767 bytes (i16 limit)
+- **Header values**: max 2,147,483,647 bytes (i32 limit)
+
+Oversized data returns a descriptive `KrafkaError::config` error instead of panicking.
+
 ### Built-in Retry
 
 The producer automatically retries transient failures (e.g., `NotLeaderForPartition`, network timeouts) using the configured retry policy. On each retriable error, the producer refreshes metadata to discover the new partition leader before retrying with exponential backoff.

@@ -380,8 +380,9 @@ impl BrokerConnection {
                 .as_ref()
                 .ok_or_else(|| KrafkaError::config("TLS required but no TLS config provided"))?;
 
-            // Extract hostname (without port) for TLS SNI
-            let hostname = address.split(':').next().unwrap_or(address);
+            // Extract hostname (without port) for TLS SNI.
+            // Handle IPv6 bracket notation like [::1]:9092.
+            let hostname = extract_sni_hostname(address);
             let tls_stream = connect_tls(stream, hostname, tls_config).await?;
 
             info!("TLS handshake completed for {address}");
@@ -1176,6 +1177,23 @@ impl Drop for BrokerConnection {
     }
 }
 
+/// Extract the hostname from an address string for TLS SNI.
+///
+/// Handles both IPv4/hostname (`host:port`) and IPv6 bracket notation
+/// (`[::1]:port`). Returns the bare hostname without port or brackets.
+fn extract_sni_hostname(address: &str) -> &str {
+    if address.starts_with('[') {
+        // IPv6 with brackets: extract between '[' and ']'
+        address
+            .strip_prefix('[')
+            .and_then(|s| s.split(']').next())
+            .unwrap_or(address)
+    } else {
+        // IPv4 or hostname: take everything before the first ':'
+        address.split(':').next().unwrap_or(address)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1759,5 +1777,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_extract_sni_hostname_ipv4() {
+        assert_eq!(extract_sni_hostname("192.168.1.1:9092"), "192.168.1.1");
+    }
+
+    #[test]
+    fn test_extract_sni_hostname_hostname() {
+        assert_eq!(extract_sni_hostname("broker.example.com:9092"), "broker.example.com");
+    }
+
+    #[test]
+    fn test_extract_sni_hostname_ipv6_brackets() {
+        assert_eq!(extract_sni_hostname("[::1]:9092"), "::1");
+    }
+
+    #[test]
+    fn test_extract_sni_hostname_ipv6_full() {
+        assert_eq!(
+            extract_sni_hostname("[2001:db8::1]:9092"),
+            "2001:db8::1"
+        );
+    }
+
+    #[test]
+    fn test_extract_sni_hostname_no_port() {
+        assert_eq!(extract_sni_hostname("broker.example.com"), "broker.example.com");
     }
 }

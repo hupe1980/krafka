@@ -24,6 +24,22 @@ pub trait Encode {
     }
 }
 
+/// Fallible encoding trait for values that may exceed Kafka protocol size limits.
+///
+/// Types that implement this trait can fail during encoding if their data exceeds
+/// the protocol's wire-format limits (e.g., strings longer than `i16::MAX` bytes).
+/// Use `try_encode` at API boundaries to validate data before committing to
+/// the infallible `Encode` trait.
+pub trait TryEncode {
+    /// Attempt to encode this value, returning an error if it exceeds protocol limits.
+    fn try_encode(&self, buf: &mut impl BufMut) -> Result<()>;
+
+    /// Attempt to encode this value using the compact format.
+    fn try_encode_compact(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.try_encode(buf)
+    }
+}
+
 /// Trait for decoding values from the Kafka wire format.
 pub trait Decode: Sized {
     /// Decode a value from the buffer.
@@ -205,33 +221,48 @@ impl From<Option<String>> for KafkaString {
 
 impl Encode for KafkaString {
     fn encode(&self, buf: &mut impl BufMut) {
+        self.try_encode(buf).expect("KafkaString exceeds protocol size limit; validate before encoding")
+    }
+
+    fn encode_compact(&self, buf: &mut impl BufMut) {
+        self.try_encode_compact(buf).expect("compact KafkaString exceeds protocol size limit; validate before encoding")
+    }
+}
+
+impl TryEncode for KafkaString {
+    fn try_encode(&self, buf: &mut impl BufMut) -> Result<()> {
         match &self.0 {
             None => buf.put_i16(-1),
             Some(s) => {
-                let len = i16::try_from(s.len()).unwrap_or_else(|_| {
-                    panic!(
+                let len = i16::try_from(s.len()).map_err(|_| {
+                    KrafkaError::protocol(format!(
                         "KafkaString length {} exceeds protocol limit of {}",
                         s.len(),
                         i16::MAX
-                    )
-                });
+                    ))
+                })?;
                 buf.put_i16(len);
                 buf.put_slice(s.as_bytes());
             }
         }
+        Ok(())
     }
 
-    fn encode_compact(&self, buf: &mut impl BufMut) {
+    fn try_encode_compact(&self, buf: &mut impl BufMut) -> Result<()> {
         match &self.0 {
             None => varint::encode_unsigned_varint(0, buf),
             Some(s) => {
-                let len_plus_one = u32::try_from(s.len().saturating_add(1)).unwrap_or_else(|_| {
-                    panic!("compact KafkaString length {} exceeds u32 limit", s.len())
-                });
+                let len_plus_one = u32::try_from(s.len().saturating_add(1)).map_err(|_| {
+                    KrafkaError::protocol(format!(
+                        "compact KafkaString length {} exceeds u32 limit",
+                        s.len()
+                    ))
+                })?;
                 varint::encode_unsigned_varint(len_plus_one, buf);
                 buf.put_slice(s.as_bytes());
             }
         }
+        Ok(())
     }
 }
 
@@ -320,37 +351,49 @@ impl From<&[u8]> for KafkaBytes {
 
 impl Encode for KafkaBytes {
     fn encode(&self, buf: &mut impl BufMut) {
+        self.try_encode(buf).expect("KafkaBytes exceeds protocol size limit; validate before encoding")
+    }
+
+    fn encode_compact(&self, buf: &mut impl BufMut) {
+        self.try_encode_compact(buf).expect("compact KafkaBytes exceeds protocol size limit; validate before encoding")
+    }
+}
+
+impl TryEncode for KafkaBytes {
+    fn try_encode(&self, buf: &mut impl BufMut) -> Result<()> {
         match &self.0 {
             None => buf.put_i32(-1),
             Some(bytes) => {
-                let len = i32::try_from(bytes.len()).unwrap_or_else(|_| {
-                    panic!(
+                let len = i32::try_from(bytes.len()).map_err(|_| {
+                    KrafkaError::protocol(format!(
                         "KafkaBytes length {} exceeds protocol limit of {}",
                         bytes.len(),
                         i32::MAX
-                    )
-                });
+                    ))
+                })?;
                 buf.put_i32(len);
                 buf.put_slice(bytes);
             }
         }
+        Ok(())
     }
 
-    fn encode_compact(&self, buf: &mut impl BufMut) {
+    fn try_encode_compact(&self, buf: &mut impl BufMut) -> Result<()> {
         match &self.0 {
             None => varint::encode_unsigned_varint(0, buf),
             Some(bytes) => {
                 let len_plus_one =
-                    u32::try_from(bytes.len().saturating_add(1)).unwrap_or_else(|_| {
-                        panic!(
+                    u32::try_from(bytes.len().saturating_add(1)).map_err(|_| {
+                        KrafkaError::protocol(format!(
                             "compact KafkaBytes length {} exceeds u32 limit",
                             bytes.len()
-                        )
-                    });
+                        ))
+                    })?;
                 varint::encode_unsigned_varint(len_plus_one, buf);
                 buf.put_slice(bytes);
             }
         }
+        Ok(())
     }
 }
 
@@ -438,13 +481,9 @@ impl<T: Encode> Encode for KafkaArray<T> {
         match &self.0 {
             None => buf.put_i32(-1),
             Some(items) => {
-                let len = i32::try_from(items.len()).unwrap_or_else(|_| {
-                    panic!(
-                        "KafkaArray length {} exceeds protocol limit of {}",
-                        items.len(),
-                        i32::MAX
-                    )
-                });
+                let len = i32::try_from(items.len()).expect(
+                    "KafkaArray exceeds protocol size limit; validate before encoding",
+                );
                 buf.put_i32(len);
                 for item in items {
                     item.encode(buf);
@@ -457,19 +496,57 @@ impl<T: Encode> Encode for KafkaArray<T> {
         match &self.0 {
             None => varint::encode_unsigned_varint(0, buf),
             Some(items) => {
-                let len_plus_one =
-                    u32::try_from(items.len().saturating_add(1)).unwrap_or_else(|_| {
-                        panic!(
-                            "compact KafkaArray length {} exceeds u32 limit",
-                            items.len()
-                        )
-                    });
+                let len_plus_one = u32::try_from(items.len().saturating_add(1)).expect(
+                    "compact KafkaArray exceeds protocol size limit; validate before encoding",
+                );
                 varint::encode_unsigned_varint(len_plus_one, buf);
                 for item in items {
                     item.encode_compact(buf);
                 }
             }
         }
+    }
+}
+
+impl<T: Encode + TryEncode> TryEncode for KafkaArray<T> {
+    fn try_encode(&self, buf: &mut impl BufMut) -> Result<()> {
+        match &self.0 {
+            None => buf.put_i32(-1),
+            Some(items) => {
+                let len = i32::try_from(items.len()).map_err(|_| {
+                    KrafkaError::protocol(format!(
+                        "KafkaArray length {} exceeds protocol limit of {}",
+                        items.len(),
+                        i32::MAX
+                    ))
+                })?;
+                buf.put_i32(len);
+                for item in items {
+                    item.try_encode(buf)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn try_encode_compact(&self, buf: &mut impl BufMut) -> Result<()> {
+        match &self.0 {
+            None => varint::encode_unsigned_varint(0, buf),
+            Some(items) => {
+                let len_plus_one =
+                    u32::try_from(items.len().saturating_add(1)).map_err(|_| {
+                        KrafkaError::protocol(format!(
+                            "compact KafkaArray length {} exceeds u32 limit",
+                            items.len()
+                        ))
+                    })?;
+                varint::encode_unsigned_varint(len_plus_one, buf);
+                for item in items {
+                    item.try_encode_compact(buf)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -518,20 +595,31 @@ pub struct TaggedField {
 
 impl Encode for TaggedFields {
     fn encode(&self, buf: &mut impl BufMut) {
-        let count = u32::try_from(self.0.len())
-            .unwrap_or_else(|_| panic!("TaggedFields count {} exceeds u32 limit", self.0.len()));
+        self.try_encode(buf).expect("TaggedFields exceeds protocol size limit; validate before encoding")
+    }
+}
+
+impl TryEncode for TaggedFields {
+    fn try_encode(&self, buf: &mut impl BufMut) -> Result<()> {
+        let count = u32::try_from(self.0.len()).map_err(|_| {
+            KrafkaError::protocol(format!(
+                "TaggedFields count {} exceeds u32 limit",
+                self.0.len()
+            ))
+        })?;
         varint::encode_unsigned_varint(count, buf);
         for field in &self.0 {
             varint::encode_unsigned_varint(field.tag, buf);
-            let data_len = u32::try_from(field.data.len()).unwrap_or_else(|_| {
-                panic!(
+            let data_len = u32::try_from(field.data.len()).map_err(|_| {
+                KrafkaError::protocol(format!(
                     "TaggedField data length {} exceeds u32 limit",
                     field.data.len()
-                )
-            });
+                ))
+            })?;
             varint::encode_unsigned_varint(data_len, buf);
             buf.put_slice(&field.data);
         }
+        Ok(())
     }
 }
 
@@ -708,5 +796,51 @@ mod tests {
         assert_eq!(buf.len(), 2 + s.len());
         let decoded = KafkaString::decode(&mut buf.freeze()).unwrap();
         assert_eq!(decoded.0.unwrap(), s);
+    }
+
+    #[test]
+    fn test_kafka_string_try_encode_oversized_returns_error() {
+        let big = "x".repeat(i16::MAX as usize + 1);
+        let ks = KafkaString::from(big);
+        let mut buf = BytesMut::new();
+        let result = ks.try_encode(&mut buf);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("KafkaString length"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_kafka_string_try_encode_valid() {
+        let ks = KafkaString::new("hello");
+        let mut buf = BytesMut::new();
+        assert!(ks.try_encode(&mut buf).is_ok());
+        assert_eq!(buf.len(), 2 + 5); // i16 len + "hello"
+    }
+
+    #[test]
+    fn test_kafka_bytes_try_encode_valid() {
+        let kb = KafkaBytes::new(vec![1, 2, 3]);
+        let mut buf = BytesMut::new();
+        assert!(kb.try_encode(&mut buf).is_ok());
+        assert_eq!(buf.len(), 4 + 3); // i32 len + 3 bytes
+    }
+
+    #[test]
+    fn test_kafka_bytes_try_encode_null() {
+        let kb = KafkaBytes::null();
+        let mut buf = BytesMut::new();
+        assert!(kb.try_encode(&mut buf).is_ok());
+        assert_eq!(buf.len(), 4); // i32 -1
+    }
+
+    #[test]
+    fn test_tagged_fields_try_encode_valid() {
+        let fields = TaggedFields(vec![TaggedField {
+            tag: 0,
+            data: Bytes::from_static(b"test"),
+        }]);
+        let mut buf = BytesMut::new();
+        assert!(fields.try_encode(&mut buf).is_ok());
+        assert!(!buf.is_empty());
     }
 }
