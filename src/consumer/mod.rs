@@ -36,6 +36,7 @@
 //! ```
 
 mod config;
+mod fetch_session;
 mod group;
 mod offset;
 mod record;
@@ -71,6 +72,8 @@ use crate::protocol::{
 };
 use crate::{Offset, PartitionId};
 
+use fetch_session::FetchSessionCache;
+
 /// A Kafka consumer.
 pub struct Consumer {
     /// Consumer configuration.
@@ -102,6 +105,8 @@ pub struct Consumer {
     /// Buffer for records returned by `recv()`.
     /// `poll()` may return multiple records; `recv()` buffers the rest here.
     recv_buffer: RwLock<std::collections::VecDeque<ConsumerRecord>>,
+    /// Per-broker fetch session cache (KIP-227).
+    fetch_sessions: tokio::sync::Mutex<FetchSessionCache>,
 }
 
 impl Consumer {
@@ -191,6 +196,7 @@ impl Consumer {
             interceptor: Arc::new(crate::interceptor::NoOpConsumerInterceptor),
             last_auto_commit: RwLock::new(Instant::now()),
             recv_buffer: RwLock::new(std::collections::VecDeque::new()),
+            fetch_sessions: tokio::sync::Mutex::new(FetchSessionCache::new()),
         })
     }
 
@@ -619,6 +625,9 @@ impl Consumer {
                             .collect();
                         self.rebalance_listener.on_partitions_revoked(&revoked);
                         self.metrics.rebalances.inc();
+
+                        // Reset all fetch sessions — partition ownership is changing
+                        self.fetch_sessions.lock().await.reset_all();
                     }
 
                     let assignment = coordinator.ensure_active_membership(&topics).await?;
@@ -939,19 +948,76 @@ impl Consumer {
             isolation_level: self.config.isolation_level.to_i8(),
             session_id: 0,
             session_epoch: -1,
-            topics: fetch_topics,
+            topics: fetch_topics.clone(),
+            forgotten_topics: Vec::new(),
         };
 
-        // Send request
+        // Negotiate fetch API version — prefer v7 (sessions) with v4 fallback
+        let fetch_version = conn
+            .negotiate_api_version(
+                ApiKey::Fetch,
+                crate::protocol::versions::FETCH_MAX,
+                4,
+            )
+            .await
+            .unwrap_or(4);
+
+        // For v7+, apply fetch session state to produce incremental requests
+        let request = if fetch_version >= 7 {
+            let mut sessions = self.fetch_sessions.lock().await;
+            let session = sessions.get_or_create(broker_id);
+            let session_req = session.build_request(&fetch_topics);
+            FetchRequest {
+                session_id: session_req.session_id,
+                session_epoch: session_req.session_epoch,
+                topics: session_req.topics,
+                forgotten_topics: session_req.forgotten_topics,
+                ..request
+            }
+        } else {
+            request
+        };
+
+        // Send request with negotiated version
         let response = conn
-            .send_request(ApiKey::Fetch, 4, |buf| {
-                request.encode_v4(buf);
+            .send_request(ApiKey::Fetch, fetch_version, |buf| {
+                if fetch_version >= 7 {
+                    request.encode_v7(buf);
+                } else {
+                    request.encode_v4(buf);
+                }
             })
             .await?;
 
-        // Decode response
+        // Decode response with matching version
         let mut buf = response;
-        let fetch_response = FetchResponse::decode_v4(&mut buf)?;
+        let fetch_response = if fetch_version >= 7 {
+            FetchResponse::decode_v7(&mut buf)?
+        } else {
+            FetchResponse::decode_v4(&mut buf)?
+        };
+
+        // Handle top-level session errors (v7+)
+        if fetch_version >= 7 {
+            if fetch_response.error_code == crate::error::ErrorCode::FetchSessionIdNotFound
+                || fetch_response.error_code
+                    == crate::error::ErrorCode::InvalidFetchSessionEpoch
+            {
+                // Reset session and let the next poll do a full fetch
+                warn!(
+                    "Fetch session error for broker {}: {:?}, resetting session",
+                    broker_id, fetch_response.error_code
+                );
+                let mut sessions = self.fetch_sessions.lock().await;
+                sessions.reset_broker(broker_id);
+                return Ok((Vec::new(), Vec::new()));
+            }
+
+            // Update session state from response
+            let mut sessions = self.fetch_sessions.lock().await;
+            let session = sessions.get_or_create(broker_id);
+            session.update_from_response(fetch_response.session_id, &fetch_topics);
+        }
 
         // Process records
         let mut records = Vec::new();

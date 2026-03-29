@@ -15,7 +15,8 @@ A pure Rust, async-native Apache Kafka client designed for high performance, saf
 - 🔒 **Zero unsafe**: Safe Rust by default
 - 🚀 **High performance**: Zero-copy buffers, inline hot paths, efficient batching, concurrent batch flushing
 - 📦 **Full protocol support**: Kafka protocol with all compression codecs
-- 🔐 **TLS/SSL encryption**: Using rustls for secure connections
+- � **Incremental fetch sessions**: KIP-227 fetch sessions for bandwidth-efficient multi-partition consumers
+- �🔐 **TLS/SSL encryption**: Using rustls for secure connections
 - 🔑 **SASL authentication**: PLAIN, SCRAM-SHA-256/512, OAUTHBEARER mechanisms
 - 💯 **Transactions**: Exactly-once semantics with transactional producer
 - ☁️ **Cloud-native**: First-class AWS MSK support including IAM auth

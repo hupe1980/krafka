@@ -500,6 +500,17 @@ pub struct FetchRequest {
     pub session_epoch: i32,
     /// Topic data.
     pub topics: Vec<FetchTopicRequest>,
+    /// Forgotten topics/partitions to remove from the session (v7+).
+    pub forgotten_topics: Vec<FetchForgottenTopic>,
+}
+
+/// Topic-partitions to forget from a fetch session (v7+).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FetchForgottenTopic {
+    /// Topic name.
+    pub topic: String,
+    /// Partition IDs to forget.
+    pub partitions: Vec<i32>,
 }
 
 /// Topic in fetch request.
@@ -577,7 +588,7 @@ impl FetchRequest {
         }
     }
 
-    /// Encode for version 4+.
+    /// Encode for version 4-6.
     pub fn encode_v4(&self, buf: &mut impl BufMut) {
         self.replica_id.encode(buf);
         self.max_wait_ms.encode(buf);
@@ -596,6 +607,43 @@ impl FetchRequest {
                 partition.partition.encode(buf);
                 partition.fetch_offset.encode(buf);
                 partition.partition_max_bytes.encode(buf);
+            }
+        }
+    }
+
+    /// Encode for version 7-10 (fetch sessions: session_id, session_epoch, forgotten_topics).
+    pub fn encode_v7(&self, buf: &mut impl BufMut) {
+        self.replica_id.encode(buf);
+        self.max_wait_ms.encode(buf);
+        self.min_bytes.encode(buf);
+        self.max_bytes.encode(buf);
+        self.isolation_level.encode(buf);
+        self.session_id.encode(buf);
+        self.session_epoch.encode(buf);
+
+        // Topics array
+        buf.put_i32(self.topics.len() as i32);
+        for topic in &self.topics {
+            KafkaString::new(&topic.topic).encode(buf);
+
+            // Partitions array
+            buf.put_i32(topic.partitions.len() as i32);
+            for partition in &topic.partitions {
+                partition.partition.encode(buf);
+                partition.fetch_offset.encode(buf);
+                // log_start_offset introduced in v5
+                partition.log_start_offset.encode(buf);
+                partition.partition_max_bytes.encode(buf);
+            }
+        }
+
+        // Forgotten topics array (v7+)
+        buf.put_i32(self.forgotten_topics.len() as i32);
+        for forgotten in &self.forgotten_topics {
+            KafkaString::new(&forgotten.topic).encode(buf);
+            buf.put_i32(forgotten.partitions.len() as i32);
+            for &partition in &forgotten.partitions {
+                partition.encode(buf);
             }
         }
     }
@@ -698,7 +746,7 @@ impl FetchResponse {
         Ok(response)
     }
 
-    /// Decode from version 4+ (includes last_stable_offset and aborted_transactions).
+    /// Decode from version 4-6 (includes last_stable_offset and aborted_transactions).
     pub fn decode_v4(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let mut responses = Vec::new();
@@ -742,6 +790,57 @@ impl FetchResponse {
             throttle_time_ms,
             error_code: ErrorCode::None,
             session_id: 0,
+            responses,
+        })
+    }
+
+    /// Decode from version 7-10 (includes error_code, session_id, log_start_offset).
+    pub fn decode_v7(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let session_id = i32::decode(buf)?;
+        let mut responses = Vec::new();
+        let topic_count = i32::decode(buf)?;
+
+        for _ in 0..topic_count {
+            let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let partition_count = i32::decode(buf)?;
+            let mut partitions = Vec::new();
+
+            for _ in 0..partition_count {
+                let partition = i32::decode(buf)?;
+                let partition_error_code = ErrorCode::from_i16(i16::decode(buf)?);
+                let high_watermark = i64::decode(buf)?;
+                let last_stable_offset = i64::decode(buf)?;
+                let log_start_offset = i64::decode(buf)?;
+                let aborted_tx_count = i32::decode(buf)?;
+                let mut aborted_transactions = Vec::new();
+                for _ in 0..aborted_tx_count {
+                    aborted_transactions.push(AbortedTransaction {
+                        producer_id: i64::decode(buf)?,
+                        first_offset: i64::decode(buf)?,
+                    });
+                }
+                let records = KafkaBytes::decode(buf)?.0;
+
+                partitions.push(FetchPartitionResponse {
+                    partition,
+                    error_code: partition_error_code,
+                    high_watermark,
+                    last_stable_offset,
+                    log_start_offset,
+                    aborted_transactions,
+                    records,
+                });
+            }
+
+            responses.push(FetchTopicResponse { topic, partitions });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            session_id,
             responses,
         })
     }

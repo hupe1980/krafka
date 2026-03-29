@@ -18,6 +18,7 @@ The Krafka consumer is an async-native, feature-rich Kafka consumer with:
 - Multiple partition assignment strategies
 - Manual offset control
 - Seek operations
+- Incremental fetch sessions (KIP-227)
 - Static group membership (KIP-345)
 - Interceptor hooks
 - Log compaction awareness
@@ -658,6 +659,46 @@ one request per broker (O(k) round trips, where k = number of unique leaders).
 
 This optimization significantly improves throughput when consuming from topics with many partitions 
 spread across multiple brokers.
+
+### Incremental Fetch Sessions (KIP-227)
+
+Krafka implements [KIP-227](https://cwiki.apache.org/confluence/display/KAFKA/KIP-227%3A+Introduce+Incremental+FetchRequests+to+Increase+Partition+Scalability) fetch sessions to minimize fetch request sizes. Instead of sending the full partition list on every `poll()`, the broker tracks per-session state and the client sends only partition changes.
+
+**How it works:**
+
+1. On the first fetch to a broker, Krafka sends a full fetch request (epoch 0) with all partitions
+2. The broker establishes a session and returns a `session_id`
+3. On subsequent fetches, Krafka computes a diff against the previous session state:
+   - **Changed partitions**: Only partitions with new offsets, different `max_bytes`, or leader epoch changes
+   - **Forgotten topics**: Partitions removed since the last fetch (e.g., after rebalance)
+4. The broker applies the diff to its session state and returns data for all tracked partitions
+
+```
+  First poll()              Subsequent poll()
+  (full fetch)              (incremental)
+  ┌──────────────┐          ┌──────────────┐
+  │ session_id: 0│          │ session_id: 42│
+  │ epoch: 0     │          │ epoch: 2      │
+  │ topics:      │          │ topics:       │
+  │   p0, p1, p2 │    →     │   p1 (changed)│
+  │   p3, p4     │          │ forgotten:    │
+  └──────────────┘          │   p4 (removed)│
+                            └──────────────┘
+```
+
+**Benefits:**
+
+- **Reduced bandwidth**: With 100 partitions, incremental fetches can be 10-100x smaller
+- **Lower broker CPU**: Broker parses smaller requests
+- **Automatic fallback**: Falls back to Fetch v4 (full requests) for brokers that don't support v7+
+
+**Error recovery:**
+
+- `FetchSessionIdNotFound` or `InvalidFetchSessionEpoch` errors automatically reset the session
+- The next fetch sends a full request to re-establish the session
+- All sessions are reset on consumer group rebalance
+
+Fetch sessions are enabled automatically when the broker supports Fetch API v7+. No configuration is needed.
 
 ## Performance Tips
 

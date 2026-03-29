@@ -56,7 +56,7 @@ Krafka supports the following API version ranges (clamped to match actual encode
 | API | Min | Max | Key Features |
 |-----|-----|-----|--------------|
 | Produce | 0 | 3 | v3 transactions, headers |
-| Fetch | 0 | 4 | v4 leader epoch |
+| Fetch | 0 | 7 | v4 leader epoch, v7 fetch sessions (KIP-227) |
 | ListOffsets | 0 | 2 | v2 isolation level |
 | Metadata | 0 | 1 | v1 controller info |
 | OffsetCommit | 0 | 2 | v2 retention |
@@ -80,7 +80,7 @@ Client-supported versions are defined in `krafka::protocol::versions`:
 use krafka::protocol::versions;
 
 // Maximum versions the client supports
-let max_fetch = versions::FETCH_MAX;        // 4
+let max_fetch = versions::FETCH_MAX;        // 7
 let max_produce = versions::PRODUCE_MAX;    // 3
 let max_metadata = versions::METADATA_MAX;  // 1
 ```
