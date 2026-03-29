@@ -35,10 +35,10 @@
 //! use krafka::protocol::ApiKey;
 //!
 //! // Negotiate the best version for Fetch
-//! let version = conn.negotiate_api_version(ApiKey::Fetch, 7, 4).await;
-//! if let Some(v) = version {
-//!     println!("Using Fetch v{}", v);
-//! }
+//! // Try v7 first (fetch sessions), fall back to v4.
+//! let version = conn.negotiate_api_version(ApiKey::Fetch, 7, 7).await
+//!     .unwrap_or(4);
+//! println!("Using Fetch v{}", version);
 //! ```
 
 mod api;

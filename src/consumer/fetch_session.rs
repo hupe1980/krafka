@@ -5,7 +5,8 @@
 //! broker tracks session state and the client only sends partition changes.
 //!
 //! A per-broker `FetchSessionState` tracks:
-//! - `session_id` / `session_epoch` returned by the broker
+//! - `session_id` (returned by the broker) and `session_epoch` (maintained by
+//!   the client)
 //! - The set of partitions (with their fetch offsets and parameters) that
 //!   are currently registered in the session
 //!
@@ -27,7 +28,6 @@ pub const INITIAL_EPOCH: i32 = 0;
 struct PartitionState {
     fetch_offset: i64,
     partition_max_bytes: i32,
-    current_leader_epoch: i32,
 }
 
 /// Per-broker fetch session state.
@@ -125,7 +125,9 @@ impl FetchSessionState {
         }
 
         // Incremental fetch: compute diff.
-        let next_epoch = self.next_epoch();
+        // self.epoch already represents the next epoch to send;
+        // it is bumped by update_from_response() after a successful response.
+        let epoch = self.epoch;
 
         // Build a borrowed-key view of the previous partitions to avoid
         // allocating Strings for lookups on every (topic, partition).
@@ -142,7 +144,6 @@ impl FetchSessionState {
                 Some(prev) => {
                     prev.fetch_offset != req.fetch_offset
                         || prev.partition_max_bytes != req.partition_max_bytes
-                        || prev.current_leader_epoch != req.current_leader_epoch
                 }
             };
             if is_new_or_changed {
@@ -179,7 +180,7 @@ impl FetchSessionState {
 
         FetchSessionRequest {
             session_id: self.session_id,
-            session_epoch: next_epoch,
+            session_epoch: epoch,
             topics,
             forgotten_topics,
             is_full_fetch: false,
@@ -219,7 +220,6 @@ impl FetchSessionState {
                     PartitionState {
                         fetch_offset: part.fetch_offset,
                         partition_max_bytes: part.partition_max_bytes,
-                        current_leader_epoch: part.current_leader_epoch,
                     },
                 );
             }
@@ -376,7 +376,7 @@ mod tests {
         let req = state.build_request(&desired);
         assert!(!req.is_full_fetch);
         assert_eq!(req.session_id, 42);
-        assert_eq!(req.session_epoch, 2); // bumped from 1
+        assert_eq!(req.session_epoch, 1); // epoch maintained by client
         assert!(req.topics.is_empty()); // no changes
         assert!(req.forgotten_topics.is_empty()); // no removals
     }
@@ -472,8 +472,12 @@ mod tests {
 
         let desired = vec![make_topic_request("topic-a", &[(0, 100, 1048576)])];
         let req = state.build_request(&desired);
-        // next_epoch should wrap to 1.
-        assert_eq!(req.session_epoch, 1);
+        // build_request uses self.epoch directly.
+        assert_eq!(req.session_epoch, i32::MAX);
+
+        // update_from_response bumps via next_epoch, which wraps to 1.
+        state.update_from_response(42, &desired);
+        assert_eq!(state.epoch(), 1);
     }
 
     #[test]
@@ -512,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn test_leader_epoch_change_detected() {
+    fn test_leader_epoch_change_not_tracked() {
         let mut state = FetchSessionState::new(1);
         let desired = vec![make_topic_request_with_epoch(
             "topic-a",
@@ -521,6 +525,8 @@ mod tests {
         state.update_from_response(42, &desired);
 
         // Same offset, same max_bytes, but leader epoch changed.
+        // Since Fetch v7 does not serialize current_leader_epoch,
+        // the diff should NOT detect this as a change.
         let desired2 = vec![make_topic_request_with_epoch(
             "topic-a",
             &[(0, 100, 1048576, 6)],
@@ -528,8 +534,8 @@ mod tests {
         let req = state.build_request(&desired2);
 
         assert!(!req.is_full_fetch);
-        assert_eq!(req.topics.len(), 1);
-        assert_eq!(req.topics[0].partitions[0].current_leader_epoch, 6);
+        assert!(req.topics.is_empty()); // no changes detected
+        assert!(req.forgotten_topics.is_empty());
     }
 
     #[test]

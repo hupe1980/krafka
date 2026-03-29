@@ -611,7 +611,7 @@ impl FetchRequest {
         }
     }
 
-    /// Encode for version 7-10 (fetch sessions: session_id, session_epoch, forgotten_topics).
+    /// Encode for version 7 (fetch sessions: session_id, session_epoch, forgotten_topics).
     pub fn encode_v7(&self, buf: &mut impl BufMut) {
         self.replica_id.encode(buf);
         self.max_wait_ms.encode(buf);
@@ -794,7 +794,7 @@ impl FetchResponse {
         })
     }
 
-    /// Decode from version 7-10 (includes error_code, session_id, log_start_offset).
+    /// Decode from version 7 (includes error_code, session_id, log_start_offset).
     pub fn decode_v7(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);

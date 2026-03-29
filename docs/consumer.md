@@ -669,7 +669,7 @@ Krafka implements [KIP-227](https://cwiki.apache.org/confluence/display/KAFKA/KI
 1. On the first fetch to a broker, Krafka sends a full fetch request (epoch 0) with all partitions
 2. The broker establishes a session and returns a `session_id`
 3. On subsequent fetches, Krafka computes a diff against the previous session state:
-   - **Changed partitions**: Only partitions with new offsets, different `max_bytes`, or leader epoch changes
+   - **Changed partitions**: Only partitions with new offsets or different `max_bytes`
    - **Forgotten topics**: Partitions removed since the last fetch (e.g., after rebalance)
 4. The broker applies the diff to its session state and returns data for all tracked partitions
 

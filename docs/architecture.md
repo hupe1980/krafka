@@ -335,9 +335,10 @@ When the broker supports Fetch API v7+, Krafka uses incremental fetch sessions t
 sizes. A per-broker `FetchSessionState` tracks the partitions registered with the broker's session.
 On each `poll()`, the consumer computes a diff against the previous state:
 
-- **New/changed partitions** go in the `topics` field (only offset, max_bytes, or epoch differences)
+- **New/changed partitions** go in the `topics` field (only offset and `max_bytes` changes)
 - **Removed partitions** go in the `forgotten_topics` field
-- The `session_id` and incrementing `session_epoch` maintain session continuity
+- The `session_id` and incrementing `session_epoch` (a per-session epoch, not the partition
+  leader epoch) maintain session continuity
 
 If the broker returns `FetchSessionIdNotFound` or `InvalidFetchSessionEpoch`, the session is reset
 and the next poll sends a full fetch. All sessions are cleared on consumer group rebalance.
