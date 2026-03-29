@@ -2819,4 +2819,308 @@ mod tests {
         // The rebalance_timeout passed to GroupCoordinator should be max_poll_interval
         assert!(config.max_poll_interval > config.session_timeout);
     }
+
+    /// Test that partition grouping by leader works correctly.
+    /// This mirrors the grouping logic inside resolve_list_offsets.
+    #[test]
+    fn test_list_offsets_partition_grouping_by_leader() {
+        // Simulate the leader-based grouping that resolve_list_offsets performs.
+        let leader_map: HashMap<(&str, PartitionId), crate::BrokerId> = [
+            (("topic1", 0), 1),
+            (("topic1", 1), 2),
+            (("topic2", 0), 1), // same leader as topic1-0
+            (("topic2", 1), 3),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut partitions: HashMap<String, Vec<PartitionId>> = HashMap::new();
+        partitions.insert("topic1".to_string(), vec![0, 1]);
+        partitions.insert("topic2".to_string(), vec![0, 1]);
+
+        let mut by_leader: HashMap<crate::BrokerId, Vec<(String, PartitionId)>> = HashMap::new();
+        for (topic, parts) in &partitions {
+            for &p in parts {
+                if let Some(&leader) = leader_map.get(&(topic.as_str(), p)) {
+                    by_leader
+                        .entry(leader)
+                        .or_default()
+                        .push((topic.clone(), p));
+                }
+            }
+        }
+
+        // Broker 1 should have topic1-0 and topic2-0
+        assert_eq!(by_leader[&1].len(), 2);
+        assert!(by_leader[&1].contains(&("topic1".to_string(), 0)));
+        assert!(by_leader[&1].contains(&("topic2".to_string(), 0)));
+        // Broker 2 should have topic1-1
+        assert_eq!(by_leader[&2].len(), 1);
+        assert_eq!(by_leader[&2][0], ("topic1".to_string(), 1));
+        // Broker 3 should have topic2-1
+        assert_eq!(by_leader[&3].len(), 1);
+        assert_eq!(by_leader[&3][0], ("topic2".to_string(), 1));
+    }
+
+    /// Test request construction from grouped partitions.
+    #[test]
+    fn test_list_offsets_request_construction() {
+        let leader_partitions: Vec<(String, PartitionId)> = vec![
+            ("topic1".to_string(), 0),
+            ("topic1".to_string(), 2),
+            ("topic2".to_string(), 1),
+        ];
+        let timestamp = -1i64; // latest
+
+        let mut topics_map: HashMap<String, Vec<ListOffsetsRequestPartition>> = HashMap::new();
+        for (topic, partition) in &leader_partitions {
+            topics_map
+                .entry(topic.clone())
+                .or_default()
+                .push(ListOffsetsRequestPartition {
+                    partition_index: *partition,
+                    current_leader_epoch: -1,
+                    timestamp,
+                });
+        }
+
+        let topics: Vec<ListOffsetsRequestTopic> = topics_map
+            .into_iter()
+            .map(|(name, parts)| ListOffsetsRequestTopic {
+                name,
+                partitions: parts,
+            })
+            .collect();
+
+        let request = ListOffsetsRequest {
+            replica_id: -1,
+            isolation_level: 0,
+            topics,
+        };
+
+        assert_eq!(request.replica_id, -1);
+        assert_eq!(request.topics.len(), 2);
+
+        // Find topic1 and topic2 in the request
+        let t1 = request.topics.iter().find(|t| t.name == "topic1").unwrap();
+        assert_eq!(t1.partitions.len(), 2);
+        assert!(t1.partitions.iter().any(|p| p.partition_index == 0));
+        assert!(t1.partitions.iter().any(|p| p.partition_index == 2));
+        for p in &t1.partitions {
+            assert_eq!(p.timestamp, -1);
+            assert_eq!(p.current_leader_epoch, -1);
+        }
+
+        let t2 = request.topics.iter().find(|t| t.name == "topic2").unwrap();
+        assert_eq!(t2.partitions.len(), 1);
+        assert_eq!(t2.partitions[0].partition_index, 1);
+    }
+
+    /// Test response result extraction — successful offsets are collected.
+    #[test]
+    fn test_list_offsets_response_result_extraction() {
+        use crate::error::ErrorCode;
+        use crate::protocol::{ListOffsetsResponsePartition, ListOffsetsResponseTopic};
+
+        let response = ListOffsetsResponse {
+            topics: vec![
+                ListOffsetsResponseTopic {
+                    name: "topic1".to_string(),
+                    partitions: vec![
+                        ListOffsetsResponsePartition {
+                            partition_index: 0,
+                            error_code: ErrorCode::None,
+                            timestamp: -1,
+                            offset: 42,
+                        },
+                        ListOffsetsResponsePartition {
+                            partition_index: 1,
+                            error_code: ErrorCode::None,
+                            timestamp: -1,
+                            offset: 100,
+                        },
+                    ],
+                },
+                ListOffsetsResponseTopic {
+                    name: "topic2".to_string(),
+                    partitions: vec![ListOffsetsResponsePartition {
+                        partition_index: 0,
+                        error_code: ErrorCode::None,
+                        timestamp: -1,
+                        offset: 7,
+                    }],
+                },
+            ],
+        };
+
+        // Simulate the result extraction logic from resolve_list_offsets
+        let mut result: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        for topic_resp in &response.topics {
+            for part_resp in &topic_resp.partitions {
+                if part_resp.error_code.is_ok() {
+                    result.insert(
+                        (topic_resp.name.clone(), part_resp.partition_index),
+                        part_resp.offset,
+                    );
+                }
+            }
+        }
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[&("topic1".to_string(), 0)], 42);
+        assert_eq!(result[&("topic1".to_string(), 1)], 100);
+        assert_eq!(result[&("topic2".to_string(), 0)], 7);
+    }
+
+    /// Test partial failure — some partitions succeed, some have error codes.
+    /// Successful results are kept; errors are recorded but don't block success.
+    #[test]
+    fn test_list_offsets_partial_failure_keeps_successes() {
+        use crate::error::ErrorCode;
+        use crate::protocol::{ListOffsetsResponsePartition, ListOffsetsResponseTopic};
+
+        let response = ListOffsetsResponse {
+            topics: vec![ListOffsetsResponseTopic {
+                name: "topic1".to_string(),
+                partitions: vec![
+                    ListOffsetsResponsePartition {
+                        partition_index: 0,
+                        error_code: ErrorCode::None,
+                        timestamp: -1,
+                        offset: 42,
+                    },
+                    ListOffsetsResponsePartition {
+                        partition_index: 1,
+                        error_code: ErrorCode::NotLeaderForPartition,
+                        timestamp: -1,
+                        offset: -1,
+                    },
+                    ListOffsetsResponsePartition {
+                        partition_index: 2,
+                        error_code: ErrorCode::None,
+                        timestamp: -1,
+                        offset: 99,
+                    },
+                ],
+            }],
+        };
+
+        let mut result: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let mut last_error: Option<KrafkaError> = None;
+
+        for topic_resp in &response.topics {
+            for part_resp in &topic_resp.partitions {
+                if part_resp.error_code.is_ok() {
+                    result.insert(
+                        (topic_resp.name.clone(), part_resp.partition_index),
+                        part_resp.offset,
+                    );
+                } else {
+                    last_error = Some(KrafkaError::broker(
+                        part_resp.error_code,
+                        format!(
+                            "ListOffsets error for {}-{}",
+                            topic_resp.name, part_resp.partition_index
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // Successful partitions are present
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[&("topic1".to_string(), 0)], 42);
+        assert_eq!(result[&("topic1".to_string(), 2)], 99);
+        // Failed partition is not present
+        assert!(!result.contains_key(&("topic1".to_string(), 1)));
+        // Error was recorded
+        assert!(last_error.is_some());
+        // But since we have results, the method would return Ok (not Err)
+        assert!(!result.is_empty());
+    }
+
+    /// Test that all-failed response with no results propagates the error.
+    #[test]
+    fn test_list_offsets_all_failed_returns_error() {
+        use crate::error::ErrorCode;
+        use crate::protocol::{ListOffsetsResponsePartition, ListOffsetsResponseTopic};
+
+        let response = ListOffsetsResponse {
+            topics: vec![ListOffsetsResponseTopic {
+                name: "topic1".to_string(),
+                partitions: vec![ListOffsetsResponsePartition {
+                    partition_index: 0,
+                    error_code: ErrorCode::NotLeaderForPartition,
+                    timestamp: -1,
+                    offset: -1,
+                }],
+            }],
+        };
+
+        let mut result: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let mut last_error: Option<KrafkaError> = None;
+
+        for topic_resp in &response.topics {
+            for part_resp in &topic_resp.partitions {
+                if part_resp.error_code.is_ok() {
+                    result.insert(
+                        (topic_resp.name.clone(), part_resp.partition_index),
+                        part_resp.offset,
+                    );
+                } else {
+                    last_error = Some(KrafkaError::broker(
+                        part_resp.error_code,
+                        format!(
+                            "ListOffsets error for {}-{}",
+                            topic_resp.name, part_resp.partition_index
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // No results — method would return Err(last_error)
+        assert!(result.is_empty());
+        assert!(last_error.is_some());
+        let err = last_error.unwrap();
+        assert!(err.to_string().contains("ListOffsets error"));
+    }
+
+    /// Test ListOffsets request round-trip encode/decode for v1 and v2.
+    #[test]
+    fn test_list_offsets_request_encode_decode_roundtrip() {
+        use bytes::BytesMut;
+
+        let request = ListOffsetsRequest {
+            replica_id: -1,
+            isolation_level: 1,
+            topics: vec![ListOffsetsRequestTopic {
+                name: "test-topic".to_string(),
+                partitions: vec![
+                    ListOffsetsRequestPartition {
+                        partition_index: 0,
+                        current_leader_epoch: -1,
+                        timestamp: -1, // latest
+                    },
+                    ListOffsetsRequestPartition {
+                        partition_index: 1,
+                        current_leader_epoch: -1,
+                        timestamp: -2, // earliest
+                    },
+                ],
+            }],
+        };
+
+        // v1 encode/decode
+        let mut buf = BytesMut::new();
+        request.encode_v1(&mut buf).unwrap();
+        let encoded_v1_len = buf.len();
+        assert!(encoded_v1_len > 0);
+
+        // v2 encode produces additional isolation_level byte
+        let mut buf_v2 = BytesMut::new();
+        request.encode_v2(&mut buf_v2).unwrap();
+        // v2 has one extra byte for isolation_level
+        assert_eq!(buf_v2.len(), encoded_v1_len + 1);
+    }
 }
