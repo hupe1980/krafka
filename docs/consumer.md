@@ -287,8 +287,9 @@ rebalances when consumers join or leave the group.
 - **Owned-partition metadata (v1)**: Encodes each member's current assignment in
   JoinGroup metadata so the leader can compute minimal revocations.
 - **Proper revocation semantics**: `on_partitions_revoked` is called only for the
-  diff (partitions being moved), while `on_partitions_lost` is called for partitions
-  that vanish unexpectedly (e.g., topic deletion).
+  diff (partitions being moved) during normal rebalances (including topic deletion),
+  while `on_partitions_lost` is reserved for unclean loss scenarios (e.g., session
+  timeout or fencing) where ownership may already have been transferred.
 
 ```rust
 use krafka::consumer::{ConsumerBuilder, PartitionAssignmentStrategy};

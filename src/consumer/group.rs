@@ -489,6 +489,7 @@ impl CooperativeStickyAssignor {
                 let mut prev = poison.into_inner();
                 prev.clear();
                 prev.insert(member_id.to_string(), assignment.partitions.clone());
+                self.previous_assignments.clear_poison();
             }
         }
     }
@@ -502,6 +503,7 @@ impl CooperativeStickyAssignor {
             Err(poison) => {
                 warn!("sticky assignor lock poisoned on clear_member, clearing all");
                 poison.into_inner().clear();
+                self.previous_assignments.clear_poison();
             }
         }
     }
@@ -516,6 +518,7 @@ impl CooperativeStickyAssignor {
             Ok(guard) => guard,
             Err(_poison) => {
                 warn!("sticky assignor lock poisoned on read, treating as empty");
+                self.previous_assignments.clear_poison();
                 return Vec::new();
             }
         };
@@ -569,13 +572,15 @@ impl PartitionAssignor for CooperativeStickyAssignor {
         }
 
         // Get previous assignments for stickiness.
-        // On poison, fall back to an empty map (non-sticky) to match the log message.
+        // On poison, fall back to an empty map (non-sticky) and clear the poison
+        // so subsequent calls resume normal sticky behavior.
         let default_prev = HashMap::new();
         let prev_guard = self.previous_assignments.read();
         let prev_assignments = match &prev_guard {
             Ok(guard) => guard,
             Err(_) => {
                 warn!("sticky assignor lock poisoned during assign, treating as empty");
+                self.previous_assignments.clear_poison();
                 &default_prev
             }
         };
@@ -1175,6 +1180,7 @@ impl GroupCoordinator {
                 Err(poison) => {
                     warn!("sticky assignor lock poisoned in join_group, treating as empty");
                     drop(poison.into_inner());
+                    self.sticky_assignor.previous_assignments.clear_poison();
                     HashMap::new()
                 }
             }
@@ -2075,8 +2081,10 @@ impl GroupCoordinator {
         let mut topics = Vec::new();
         if buf.remaining() >= 4 {
             let topic_count = buf.get_i32();
-            // Cap by remaining buffer to prevent allocation DoS from malformed data
-            let safe_count = (topic_count.max(0) as usize).min(buf.remaining() / 2);
+            // Cap by hard limit and remaining buffer to prevent allocation DoS
+            let safe_count = (topic_count.max(0) as usize)
+                .min(10_000)
+                .min(buf.remaining() / 2);
             for _ in 0..safe_count {
                 if buf.remaining() < 2 {
                     break;
@@ -2101,8 +2109,10 @@ impl GroupCoordinator {
         let mut owned = HashMap::new();
         if version >= 1 && buf.remaining() >= 4 {
             let topic_count = buf.get_i32();
-            // Cap topic count by remaining buffer to prevent allocation DoS
-            let safe_topic_count = (topic_count.max(0) as usize).min(buf.remaining() / 6);
+            // Cap topic count by hard limit and remaining buffer to prevent allocation DoS
+            let safe_topic_count = (topic_count.max(0) as usize)
+                .min(10_000)
+                .min(buf.remaining() / 6);
             for _ in 0..safe_topic_count {
                 if buf.remaining() < 2 {
                     break;

@@ -818,6 +818,9 @@ impl Consumer {
                                 .iter()
                                 .map(|(t, p)| TopicPartition::new(t, *p))
                                 .collect();
+                            // Send an inline heartbeat before invoking user callback
+                            // to avoid session timeout if the callback is slow.
+                            let _ = coordinator.send_heartbeat().await;
                             self.rebalance_listener.on_partitions_revoked(&revoked);
                             self.metrics.rebalances.inc();
 
@@ -993,23 +996,26 @@ impl Consumer {
                                 }
                             }
 
-                            // Determine partitions that were removed without revocation
-                            // (e.g., topic deletion)
-                            let mut lost: Vec<TopicPartition> = Vec::new();
+                            // Determine partitions removed in this rebalance
+                            // (e.g., reassigned to another member, topic deleted).
+                            // This is a clean cooperative revocation, not an unclean
+                            // loss, so use on_partitions_revoked (not on_partitions_lost).
+                            let mut revoked_parts: Vec<TopicPartition> = Vec::new();
                             for (topic, partitions) in &old_assignments {
                                 let new_parts = new_assignment.partitions.get(topic);
                                 for &p in partitions {
                                     let gone = new_parts.is_none_or(|np| !np.contains(&p));
                                     if gone {
-                                        lost.push(TopicPartition::new(topic, p));
+                                        revoked_parts.push(TopicPartition::new(topic, p));
                                     }
                                 }
                             }
-                            if !lost.is_empty() {
-                                self.rebalance_listener.on_partitions_lost(&lost);
-                                // Remove offsets for lost partitions
+                            if !revoked_parts.is_empty() {
+                                self.rebalance_listener
+                                    .on_partitions_revoked(&revoked_parts);
+                                // Remove offsets for revoked partitions
                                 let mut offsets = self.offsets.write().await;
-                                for tp in &lost {
+                                for tp in &revoked_parts {
                                     offsets.remove(&(tp.topic.clone(), tp.partition));
                                 }
                             }
