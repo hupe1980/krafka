@@ -266,4 +266,12 @@ mod tests {
         let record = ProducerRecord::new("a".repeat(i16::MAX as usize), b"v".to_vec());
         assert!(record.validate().is_ok());
     }
+
+    #[test]
+    fn test_without_key_clears_key() {
+        let record = ProducerRecord::new("topic", b"value".to_vec())
+            .with_key("my-key")
+            .without_key();
+        assert!(record.key.is_none());
+    }
 }

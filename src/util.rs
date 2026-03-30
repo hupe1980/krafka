@@ -301,4 +301,18 @@ mod sni_tests {
             "broker.example.com"
         );
     }
+    #[test]
+    fn test_extract_sni_bracketed_ipv6_full() {
+        assert_eq!(extract_sni_hostname("[2001:db8::1]:9092"), "2001:db8::1");
+    }
+
+    #[test]
+    fn test_extract_sni_ipv6_ambiguous_port() {
+        // `2001:db8::1:9092` is a valid 8-group IPv6 address, so the function
+        // correctly returns it as-is. Use bracket notation to separate host from port.
+        assert_eq!(extract_sni_hostname("2001:db8::1:9092"), "2001:db8::1:9092");
+        // When the string is NOT a valid IPv6 address, the last :segment
+        // is stripped as a port.
+        assert_eq!(extract_sni_hostname("2001:db8::zz:9092"), "2001:db8::zz");
+    }
 }

@@ -6637,10 +6637,10 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_oversized_bytes_returns_error_not_panic() {
-        // Record data exceeding i32::MAX bytes must produce an Err.
-        // We can't allocate that much memory, so test with a smaller type
-        // (KafkaString uses i16 length prefix, so > 32767 bytes triggers error).
+    fn test_encode_oversized_topic_name_returns_error_not_panic() {
+        // KafkaString uses an i16 length prefix, so > 32767 bytes triggers error.
+        // We can't allocate i32::MAX bytes, so we validate the fallible path
+        // via the smaller KafkaString limit instead.
         let oversized_topic = "x".repeat(i16::MAX as usize + 1);
         let request = ProduceRequest {
             transactional_id: None,
