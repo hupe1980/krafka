@@ -7,7 +7,7 @@
 //! - [`PartitionAssignor`] trait and implementations for partition assignment strategies
 //! - [`ConsumerRebalanceListener`] trait for rebalance callbacks
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -487,6 +487,13 @@ impl CooperativeStickyAssignor {
     /// Clear previous assignment for a member that left.
     pub fn clear_member(&self, member_id: &str) {
         self.previous_assignments.write().remove(member_id);
+    }
+
+    /// Retain only the given member IDs, removing stale entries.
+    pub fn retain_members(&self, member_ids: &HashSet<&str>) {
+        self.previous_assignments
+            .write()
+            .retain(|k, _| member_ids.contains(k.as_str()));
     }
 
     /// Get partitions that should be revoked (for incremental rebalance).
@@ -2217,7 +2224,11 @@ impl GroupCoordinator {
 
         // For cooperative protocol, decode member metadata to extract owned partitions
         // and feed them into the sticky assignor before computing new assignments.
+        // Prune stale members first to prevent unbounded growth of previous_assignments.
         if self.is_cooperative() {
+            let current_member_ids: HashSet<&str> =
+                members.iter().map(|m| m.member_id.as_str()).collect();
+            self.sticky_assignor.retain_members(&current_member_ids);
             for m in members {
                 let (_member_topics, owned) = Self::decode_consumer_metadata(&m.metadata);
                 let assignment = MemberAssignment { partitions: owned };

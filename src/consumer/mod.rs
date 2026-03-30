@@ -266,6 +266,56 @@ impl Consumer {
         Ok(())
     }
 
+    /// Apply per-partition cleanup for revoked partitions.
+    ///
+    /// Removes revoked entries from assignments, offsets, backoff, paused, and recv_buffer.
+    /// Also resets fetch sessions. Called by all cooperative revocation paths.
+    async fn apply_partition_revocations(&self, revoked: &[(String, PartitionId)]) {
+        // Remove from assignments
+        {
+            let mut assignments = self.assignments.write().await;
+            for (topic, partition) in revoked {
+                if let Some(parts) = assignments.get_mut(topic) {
+                    parts.retain(|&p| p != *partition);
+                    if parts.is_empty() {
+                        assignments.remove(topic);
+                    }
+                }
+            }
+        }
+        // Remove offsets for revoked partitions
+        {
+            let mut offsets = self.offsets.write().await;
+            for (topic, partition) in revoked {
+                offsets.remove(&(topic.clone(), *partition));
+            }
+        }
+        // Reset fetch sessions after partition revocation
+        self.fetch_sessions.lock().await.reset_all();
+        // Remove offset retry backoff entries
+        {
+            let mut backoff = self.offset_retry_backoff.write().await;
+            for (topic, partition) in revoked {
+                backoff.remove(&(topic.clone(), *partition));
+            }
+        }
+        // Discard buffered records from revoked partitions
+        {
+            let revoked_set: HashSet<(&str, PartitionId)> =
+                revoked.iter().map(|(t, p)| (t.as_str(), *p)).collect();
+            let mut buf = self.recv_buffer.write().await;
+            buf.retain(|r| !revoked_set.contains(&(r.topic.as_str(), r.partition)));
+        }
+        // Clear paused state for revoked partitions
+        {
+            let mut paused = self.paused.write().await;
+            for (topic, partition) in revoked {
+                paused.remove(&(topic.clone(), *partition));
+            }
+            self.metrics.paused_partitions.set(paused.len() as u64);
+        }
+    }
+
     /// Fetch committed offsets and apply auto_offset_reset for partitions without committed offsets.
     ///
     /// Called after group assignment to initialize partition offsets:
@@ -833,50 +883,7 @@ impl Consumer {
                             self.rebalance_listener.on_partitions_revoked(&revoked);
                             self.metrics.rebalances.inc();
 
-                            // Remove revoked partitions from local state
-                            {
-                                let mut assignments = self.assignments.write().await;
-                                for (topic, partition) in &to_revoke {
-                                    if let Some(parts) = assignments.get_mut(topic) {
-                                        parts.retain(|&p| p != *partition);
-                                        if parts.is_empty() {
-                                            assignments.remove(topic);
-                                        }
-                                    }
-                                }
-                            }
-                            // Remove offsets for revoked partitions
-                            {
-                                let mut offsets = self.offsets.write().await;
-                                for (topic, partition) in &to_revoke {
-                                    offsets.remove(&(topic.clone(), *partition));
-                                }
-                            }
-                            // Reset all fetch sessions after partition revocation
-                            self.fetch_sessions.lock().await.reset_all();
-                            {
-                                let mut backoff = self.offset_retry_backoff.write().await;
-                                for (topic, partition) in &to_revoke {
-                                    backoff.remove(&(topic.clone(), *partition));
-                                }
-                            }
-                            // Discard buffered records from revoked partitions
-                            {
-                                let revoked_set: HashSet<(&str, PartitionId)> =
-                                    to_revoke.iter().map(|(t, p)| (t.as_str(), *p)).collect();
-                                let mut buf = self.recv_buffer.write().await;
-                                buf.retain(|r| {
-                                    !revoked_set.contains(&(r.topic.as_str(), r.partition))
-                                });
-                            }
-                            // Clear paused state for revoked partitions
-                            {
-                                let mut paused = self.paused.write().await;
-                                for (topic, partition) in &to_revoke {
-                                    paused.remove(&(topic.clone(), *partition));
-                                }
-                                self.metrics.paused_partitions.set(paused.len() as u64);
-                            }
+                            self.apply_partition_revocations(&to_revoke).await;
 
                             // Update owned partitions in sticky assignor before second rejoin.
                             // Must reflect the POST-REVOCATION state (what we actually own now),
@@ -924,49 +931,7 @@ impl Consumer {
                                 }
                                 self.rebalance_listener
                                     .on_partitions_revoked(&extra_revoked);
-                                {
-                                    let mut assignments = self.assignments.write().await;
-                                    for (topic, partition) in &extra_revoke {
-                                        if let Some(parts) = assignments.get_mut(topic) {
-                                            parts.retain(|&p| p != *partition);
-                                            if parts.is_empty() {
-                                                assignments.remove(topic);
-                                            }
-                                        }
-                                    }
-                                }
-                                {
-                                    let mut offsets = self.offsets.write().await;
-                                    for (topic, partition) in &extra_revoke {
-                                        offsets.remove(&(topic.clone(), *partition));
-                                    }
-                                }
-                                {
-                                    let mut backoff = self.offset_retry_backoff.write().await;
-                                    for (topic, partition) in &extra_revoke {
-                                        backoff.remove(&(topic.clone(), *partition));
-                                    }
-                                }
-                                self.fetch_sessions.lock().await.reset_all();
-                                // Discard buffered records from revoked partitions
-                                {
-                                    let revoked_set: HashSet<(&str, PartitionId)> = extra_revoke
-                                        .iter()
-                                        .map(|(t, p)| (t.as_str(), *p))
-                                        .collect();
-                                    let mut buf = self.recv_buffer.write().await;
-                                    buf.retain(|r| {
-                                        !revoked_set.contains(&(r.topic.as_str(), r.partition))
-                                    });
-                                }
-                                // Clear paused state for revoked partitions
-                                {
-                                    let mut paused = self.paused.write().await;
-                                    for (topic, partition) in &extra_revoke {
-                                        paused.remove(&(topic.clone(), *partition));
-                                    }
-                                    self.metrics.paused_partitions.set(paused.len() as u64);
-                                }
+                                self.apply_partition_revocations(&extra_revoke).await;
 
                                 // Update owned state for next round
                                 let mid = coordinator.member_id().await;
@@ -1080,36 +1045,11 @@ impl Consumer {
                             if !revoked_parts.is_empty() {
                                 self.rebalance_listener
                                     .on_partitions_revoked(&revoked_parts);
-                                // Remove offsets for revoked partitions
-                                let mut offsets = self.offsets.write().await;
-                                for tp in &revoked_parts {
-                                    offsets.remove(&(tp.topic.clone(), tp.partition));
-                                }
-                                drop(offsets);
-                                // Clean offset retry backoff for revoked partitions
-                                {
-                                    let mut backoff = self.offset_retry_backoff.write().await;
-                                    for tp in &revoked_parts {
-                                        backoff.remove(&(tp.topic.clone(), tp.partition));
-                                    }
-                                }
-                                // Reset fetch sessions after partition changes
-                                self.fetch_sessions.lock().await.reset_all();
-                                // Discard buffered records from revoked partitions
-                                let revoked_set: HashSet<(&str, PartitionId)> = revoked_parts
+                                let revoked_tuples: Vec<(String, PartitionId)> = revoked_parts
                                     .iter()
-                                    .map(|tp| (tp.topic.as_str(), tp.partition))
+                                    .map(|tp| (tp.topic.clone(), tp.partition))
                                     .collect();
-                                let mut buf = self.recv_buffer.write().await;
-                                buf.retain(|r| {
-                                    !revoked_set.contains(&(r.topic.as_str(), r.partition))
-                                });
-                                // Clear paused state for revoked partitions
-                                let mut paused = self.paused.write().await;
-                                for tp in &revoked_parts {
-                                    paused.remove(&(tp.topic.clone(), tp.partition));
-                                }
-                                self.metrics.paused_partitions.set(paused.len() as u64);
+                                self.apply_partition_revocations(&revoked_tuples).await;
                             }
 
                             // Update to new assignment
