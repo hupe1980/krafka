@@ -910,10 +910,18 @@ impl Consumer {
                                     warn!(
                                         "Cooperative rebalance exceeded {} rounds with pending revocations; \
                                          this may indicate cascading membership changes. \
-                                         Applying current assignment.",
+                                         Deferring assignment to next poll cycle.",
                                         max_cooperative_rounds
                                     );
-                                    break;
+                                    // Start heartbeat to avoid session timeout, then
+                                    // trigger a rejoin so the next poll re-enters rebalance
+                                    // with a clean round. Do NOT apply final_assignment
+                                    // since it still required another rejoin.
+                                    coordinator.start_heartbeat_task().await;
+                                    coordinator.trigger_rejoin().await;
+                                    // Note: rebalances metric was already incremented
+                                    // at Phase 1 entry; do not double-count here.
+                                    return Ok(vec![]);
                                 }
 
                                 coordinator.trigger_rejoin().await;
@@ -1017,8 +1025,8 @@ impl Consumer {
                             if !newly_assigned.is_empty() {
                                 self.rebalance_listener
                                     .on_partitions_assigned(&newly_assigned);
-                                self.metrics.rebalances.inc();
                             }
+                            self.metrics.rebalances.inc();
                             self.metrics.assigned_partitions.set(
                                 new_assignment
                                     .partitions

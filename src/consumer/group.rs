@@ -1417,7 +1417,7 @@ impl GroupCoordinator {
     }
 
     /// Start the background heartbeat task.
-    async fn start_heartbeat_task(&self) {
+    pub(crate) async fn start_heartbeat_task(&self) {
         // Stop existing task if any
         self.stop_heartbeat_task().await;
 
@@ -2233,11 +2233,9 @@ impl GroupCoordinator {
         if self.is_cooperative() {
             for m in members {
                 let (_member_topics, owned) = Self::decode_consumer_metadata(&m.metadata);
-                if !owned.is_empty() {
-                    let assignment = MemberAssignment { partitions: owned };
-                    self.sticky_assignor
-                        .record_assignment(&m.member_id, &assignment);
-                }
+                let assignment = MemberAssignment { partitions: owned };
+                self.sticky_assignor
+                    .record_assignment(&m.member_id, &assignment);
             }
         }
 
