@@ -241,7 +241,7 @@ mod tests {
 /// hostname without port or brackets.
 ///
 /// Returns an error if the address is empty, contains mismatched brackets,
-/// or has empty brackets.
+/// has empty brackets, or has an invalid bracketed format.
 pub fn extract_sni_hostname(address: &str) -> Result<&str> {
     if address.is_empty() {
         return Err(KrafkaError::config("empty address"));
@@ -253,17 +253,24 @@ pub fn extract_sni_hostname(address: &str) -> Result<&str> {
     match (has_open, has_close) {
         // Bracketed: [host]:port or [host]
         (true, true) => {
-            let start = address.find('[').unwrap() + 1;
-            let end = address.find(']').unwrap();
-            if start > end {
+            // '[' must be at position 0
+            if !address.starts_with('[') {
                 return Err(KrafkaError::config(format!(
-                    "malformed address (']' before '['): {address}"
+                    "malformed address ('[' not at start): {address}"
                 )));
             }
-            let hostname = &address[start..end];
+            let end = address.find(']').unwrap();
+            let hostname = &address[1..end];
             if hostname.is_empty() {
                 return Err(KrafkaError::config(format!(
                     "empty hostname in brackets: {address}"
+                )));
+            }
+            // After ']' must be empty or ':port'
+            let after = &address[end + 1..];
+            if !after.is_empty() && !after.starts_with(':') {
+                return Err(KrafkaError::config(format!(
+                    "unexpected characters after closing ']': {address}"
                 )));
             }
             Ok(hostname)
@@ -368,6 +375,10 @@ mod sni_tests {
         assert!(extract_sni_hostname("::1]:9092").is_err());
         assert!(extract_sni_hostname("host]").is_err());
         assert!(extract_sni_hostname("host]:9092").is_err());
+        // '[' not at start
+        assert!(extract_sni_hostname("foo[::1]:9092").is_err());
+        // Trailing garbage after ']'
+        assert!(extract_sni_hostname("[::1]extra").is_err());
     }
 
     #[test]

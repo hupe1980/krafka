@@ -107,6 +107,9 @@ let mut buf = bytes::BytesMut::new();
 // Encode for a specific protocol version — dispatches to the right encoder
 request.encode_versioned(1, &mut buf)?;
 
+// In real usage, `response_buf` would be filled with bytes read from the network.
+let mut response_buf = buf.freeze();
+
 // Decode response for a specific version
 let response = MetadataResponse::decode_versioned(1, &mut response_buf)?;
 ```

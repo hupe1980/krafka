@@ -26,10 +26,6 @@ pub struct ConsumerRecord {
     pub headers: Vec<(String, Option<Bytes>)>,
     /// Leader epoch.
     pub leader_epoch: Option<i32>,
-    /// Serialized key size.
-    pub serialized_key_size: i32,
-    /// Serialized value size.
-    pub serialized_value_size: i32,
 }
 
 impl ConsumerRecord {
@@ -41,9 +37,6 @@ impl ConsumerRecord {
         key: Option<Bytes>,
         value: Option<Bytes>,
     ) -> Self {
-        let serialized_key_size = key.as_ref().map(|k| k.len() as i32).unwrap_or(-1);
-        let serialized_value_size = value.as_ref().map(|v| v.len() as i32).unwrap_or(-1);
-
         Self {
             topic: topic.into(),
             partition,
@@ -54,9 +47,19 @@ impl ConsumerRecord {
             value,
             headers: Vec::new(),
             leader_epoch: None,
-            serialized_key_size,
-            serialized_value_size,
         }
+    }
+
+    /// Serialized key size in bytes, or `None` if the key is absent.
+    #[inline]
+    pub fn serialized_key_size(&self) -> Option<usize> {
+        self.key.as_ref().map(|k| k.len())
+    }
+
+    /// Serialized value size in bytes, or `None` if the value is absent.
+    #[inline]
+    pub fn serialized_value_size(&self) -> Option<usize> {
+        self.value.as_ref().map(|v| v.len())
     }
 
     /// Get the key as a string if present.
@@ -256,6 +259,15 @@ mod tests {
         assert_eq!(record.offset, 42);
         assert_eq!(record.key_str(), Some("key"));
         assert_eq!(record.value_str(), Some("value"));
+        assert_eq!(record.serialized_key_size(), Some(3));
+        assert_eq!(record.serialized_value_size(), Some(5));
+    }
+
+    #[test]
+    fn test_consumer_record_serialized_sizes_absent() {
+        let record = ConsumerRecord::new("topic", 0, 0, None, None);
+        assert_eq!(record.serialized_key_size(), None);
+        assert_eq!(record.serialized_value_size(), None);
     }
 
     #[test]

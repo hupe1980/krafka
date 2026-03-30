@@ -423,7 +423,12 @@ impl TransactionalProducer {
         let fc_version = conn
             .negotiate_api_version_max(ApiKey::FindCoordinator, 1)
             .await
-            .unwrap_or(0);
+            .ok_or_else(|| {
+                KrafkaError::protocol(
+                    "broker does not support FindCoordinator; \
+                     transactional coordinator lookup requires v1+",
+                )
+            })?;
         if fc_version < 1 {
             return Err(KrafkaError::protocol(
                 "broker does not support FindCoordinator v1; \
@@ -894,7 +899,7 @@ impl TransactionalProducer {
         let fc_version = conn
             .negotiate_api_version_max(ApiKey::FindCoordinator, 1)
             .await
-            .unwrap_or(0);
+            .ok_or_else(|| KrafkaError::protocol("broker does not support FindCoordinator"))?;
 
         let response_bytes = conn
             .send_request(ApiKey::FindCoordinator, fc_version, |buf| {

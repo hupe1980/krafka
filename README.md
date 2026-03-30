@@ -29,11 +29,11 @@ Add Krafka to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-krafka = "0.2"
+krafka = "0.3"
 tokio = { version = "1", features = ["full"] }
 
 # For AWS MSK IAM authentication with full SDK support:
-# krafka = { version = "0.2", features = ["aws-msk"] }
+# krafka = { version = "0.3", features = ["aws-msk"] }
 ```
 
 ### Producer

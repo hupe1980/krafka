@@ -573,7 +573,12 @@ impl Consumer {
             // partitions of the same topic are leaderless.
             let topic_set: HashSet<&str> = leaderless.iter().map(|(t, _)| t.as_str()).collect();
             let topics: Vec<&str> = topic_set.into_iter().collect();
-            let _ = self.metadata.refresh_for_topics(Some(&topics)).await;
+            if let Err(err) = self.metadata.refresh_for_topics(Some(&topics)).await {
+                warn!(
+                    "Failed to refresh metadata for leaderless topics {:?}: {}",
+                    topics, err
+                );
+            }
             for (topic, partition) in leaderless {
                 if let Some(leader) = self.metadata.leader(&topic, partition).await {
                     by_leader
@@ -647,10 +652,18 @@ impl Consumer {
             };
 
             // Negotiate ListOffsets version — require v1+, prefer v2.
-            let list_version = conn
-                .negotiate_api_version_max(ApiKey::ListOffsets, 2)
-                .await
-                .unwrap_or(1);
+            let list_version = match conn.negotiate_api_version_max(ApiKey::ListOffsets, 2).await {
+                Some(v) => v,
+                None => {
+                    let err = KrafkaError::protocol(format!(
+                        "broker {} does not support ListOffsets",
+                        leader_id
+                    ));
+                    warn!("{}", err);
+                    last_error = Some(err);
+                    continue;
+                }
+            };
 
             if list_version < 1 {
                 let err = KrafkaError::protocol(format!(
@@ -1161,7 +1174,13 @@ impl Consumer {
         let fetch_version = conn
             .negotiate_api_version(ApiKey::Fetch, 7, 7)
             .await
-            .unwrap_or(4);
+            .unwrap_or_else(|| {
+                debug!(
+                    "Broker {} does not support Fetch v7, falling back to v4",
+                    broker_id
+                );
+                4
+            });
 
         // Build the fetch request. For v7, compute an incremental session diff
         // from fetch_topics without cloning the full topic list into the base request.
@@ -1386,10 +1405,6 @@ impl Consumer {
                                     // where records may have been deleted (log compaction awareness).
                                     let record_offset =
                                         batch.base_offset + record.offset_delta as i64;
-                                    let key_size =
-                                        record.key.as_ref().map(|k| k.len() as i32).unwrap_or(-1);
-                                    let value_size =
-                                        record.value.as_ref().map(|v| v.len() as i32).unwrap_or(-1);
                                     records.push(ConsumerRecord {
                                         topic: topic_name.clone(),
                                         partition,
@@ -1404,8 +1419,6 @@ impl Consumer {
                                             .map(|h| (h.key, h.value))
                                             .collect(),
                                         leader_epoch: None,
-                                        serialized_key_size: key_size,
-                                        serialized_value_size: value_size,
                                     });
                                     last_offset_for_partition = Some(record_offset);
                                 }
@@ -2477,8 +2490,6 @@ mod tests {
                 value: Some(bytes::Bytes::from(format!("val-{i}"))),
                 headers: vec![],
                 leader_epoch: None,
-                serialized_key_size: -1,
-                serialized_value_size: 5,
             })
             .collect();
 
@@ -2530,8 +2541,6 @@ mod tests {
                 value: Some(bytes::Bytes::from("val")),
                 headers: vec![],
                 leader_epoch: None,
-                serialized_key_size: -1,
-                serialized_value_size: 3,
             });
         }
         // 3 records from partition 1
@@ -2546,8 +2555,6 @@ mod tests {
                 value: Some(bytes::Bytes::from("val")),
                 headers: vec![],
                 leader_epoch: None,
-                serialized_key_size: -1,
-                serialized_value_size: 3,
             });
         }
 
@@ -2623,8 +2630,6 @@ mod tests {
             value: Some(bytes::Bytes::from("r1")),
             headers: vec![],
             leader_epoch: None,
-            serialized_key_size: -1,
-            serialized_value_size: 2,
         });
         buffer.push_back(ConsumerRecord {
             topic: "t".into(),
@@ -2636,8 +2641,6 @@ mod tests {
             value: Some(bytes::Bytes::from("r2")),
             headers: vec![],
             leader_epoch: None,
-            serialized_key_size: -1,
-            serialized_value_size: 2,
         });
 
         assert_eq!(buffer.len(), 2);
@@ -2723,8 +2726,6 @@ mod tests {
                 value: None,
                 headers: vec![],
                 leader_epoch: None,
-                serialized_key_size: -1,
-                serialized_value_size: -1,
             });
 
             // Simulate unsubscribe clearing
