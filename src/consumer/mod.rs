@@ -3107,9 +3107,9 @@ mod tests {
         assert!(err.to_string().contains("ListOffsets error"));
     }
 
-    /// Test ListOffsets request round-trip encode/decode for v1 and v2.
+    /// Test ListOffsets request encoding for v1 and v2 produces expected sizes.
     #[test]
-    fn test_list_offsets_request_encode_decode_roundtrip() {
+    fn test_list_offsets_request_encode_v1_v2() {
         use bytes::BytesMut;
 
         let request = ListOffsetsRequest {
@@ -3132,7 +3132,7 @@ mod tests {
             }],
         };
 
-        // v1 encode/decode
+        // v1 encode
         let mut buf = BytesMut::new();
         request.encode_v1(&mut buf).unwrap();
         let encoded_v1_len = buf.len();
