@@ -1856,12 +1856,21 @@ impl GroupCoordinator {
             Ok(Ok(response_bytes)) => {
                 let mut buf = response_bytes;
                 let decode_result = if self.group_instance_id.is_some() {
-                    LeaveGroupResponse::decode_v1(&mut buf)
+                    LeaveGroupResponse::decode_v3(&mut buf)
                 } else {
                     LeaveGroupResponse::decode_v0(&mut buf)
                 };
                 match decode_result {
                     Ok(r) if r.error_code.is_ok() => {
+                        // Check per-member errors (v3 batch leave)
+                        for member in &r.members {
+                            if !member.error_code.is_ok() {
+                                warn!(
+                                    "LeaveGroup per-member error for '{}' (member '{}'): {:?}",
+                                    self.group_id, member.member_id, member.error_code
+                                );
+                            }
+                        }
                         info!("Left group '{}'", self.group_id);
                     }
                     Ok(r) => {

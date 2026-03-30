@@ -266,12 +266,25 @@ pub fn extract_sni_hostname(address: &str) -> Result<&str> {
                     "empty hostname in brackets: {address}"
                 )));
             }
-            // After ']' must be empty or ':port'
+            // After ']' must be empty or a well-formed ':port' with no extra brackets
             let after = &address[end + 1..];
-            if !after.is_empty() && !after.starts_with(':') {
+            if after.contains('[') || after.contains(']') {
                 return Err(KrafkaError::config(format!(
-                    "unexpected characters after closing ']': {address}"
+                    "unexpected bracket characters after closing ']': {address}"
                 )));
+            }
+            if !after.is_empty() {
+                if !after.starts_with(':') {
+                    return Err(KrafkaError::config(format!(
+                        "unexpected characters after closing ']': {address}"
+                    )));
+                }
+                let port_str = &after[1..];
+                if port_str.is_empty() || !port_str.chars().all(|c| c.is_ascii_digit()) {
+                    return Err(KrafkaError::config(format!(
+                        "invalid port after closing ']': {address}"
+                    )));
+                }
             }
             Ok(hostname)
         }
@@ -379,6 +392,12 @@ mod sni_tests {
         assert!(extract_sni_hostname("foo[::1]:9092").is_err());
         // Trailing garbage after ']'
         assert!(extract_sni_hostname("[::1]extra").is_err());
+        // Extra closing bracket in port section
+        assert!(extract_sni_hostname("[::1]:9092]").is_err());
+        // Invalid port (non-numeric)
+        assert!(extract_sni_hostname("[::1]:abc").is_err());
+        // Empty port after colon
+        assert!(extract_sni_hostname("[::1]:").is_err());
     }
 
     #[test]

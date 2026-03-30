@@ -1488,6 +1488,17 @@ impl LeaveGroupRequest {
     }
 }
 
+/// Member result in LeaveGroup response (v3+).
+#[derive(Debug, Clone)]
+pub struct LeaveGroupResponseMember {
+    /// Member ID.
+    pub member_id: String,
+    /// Group instance ID.
+    pub group_instance_id: Option<String>,
+    /// Per-member error code.
+    pub error_code: ErrorCode,
+}
+
 /// LeaveGroup response.
 #[derive(Debug, Clone)]
 pub struct LeaveGroupResponse {
@@ -1495,6 +1506,8 @@ pub struct LeaveGroupResponse {
     pub throttle_time_ms: i32,
     /// Error code.
     pub error_code: ErrorCode,
+    /// Per-member results (v3+ only, empty for earlier versions).
+    pub members: Vec<LeaveGroupResponseMember>,
 }
 
 impl LeaveGroupResponse {
@@ -1504,16 +1517,41 @@ impl LeaveGroupResponse {
         Ok(Self {
             throttle_time_ms: 0,
             error_code,
+            members: vec![],
         })
     }
 
-    /// Decode from version 1+.
+    /// Decode from version 1-2.
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         Ok(Self {
             throttle_time_ms,
             error_code,
+            members: vec![],
+        })
+    }
+
+    /// Decode from version 3+ (KIP-345 batch leave with per-member results).
+    pub fn decode_v3(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let member_count = i32::decode(buf)?;
+        let mut members = Vec::new();
+        for _ in 0..member_count {
+            let member_id = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let group_instance_id = KafkaString::decode(buf)?.0;
+            let member_error_code = ErrorCode::from_i16(i16::decode(buf)?);
+            members.push(LeaveGroupResponseMember {
+                member_id,
+                group_instance_id,
+                error_code: member_error_code,
+            });
+        }
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            members,
         })
     }
 }
@@ -5091,7 +5129,8 @@ impl VersionedDecode for LeaveGroupResponse {
     fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
         match version {
             0 => Self::decode_v0(buf),
-            1..=3 => Self::decode_v1(buf),
+            1..=2 => Self::decode_v1(buf),
+            3 => Self::decode_v3(buf),
             _ => unsupported_decode!("LeaveGroupResponse", version),
         }
     }
@@ -6203,6 +6242,7 @@ mod tests {
         let resp = LeaveGroupResponse::decode_v0(&mut data).unwrap();
         assert!(resp.error_code.is_ok());
         assert_eq!(resp.throttle_time_ms, 0);
+        assert!(resp.members.is_empty());
     }
 
     #[test]
@@ -6217,6 +6257,48 @@ mod tests {
         let resp = LeaveGroupResponse::decode_v1(&mut data).unwrap();
         assert_eq!(resp.throttle_time_ms, 100);
         assert!(!resp.error_code.is_ok());
+        assert!(resp.members.is_empty());
+    }
+
+    #[test]
+    fn test_leave_group_response_decode_v3_with_members() {
+        let mut buf = BytesMut::new();
+        // throttle_time_ms
+        buf.put_i32(50);
+        // top-level error_code = 0 (NONE)
+        buf.put_i16(0);
+        // members array length = 2
+        buf.put_i32(2);
+
+        // member 1: member_id = "m-1", group_instance_id = "i-1", error_code = 0
+        let m1 = b"m-1";
+        buf.put_i16(m1.len() as i16);
+        buf.put_slice(m1);
+        let i1 = b"i-1";
+        buf.put_i16(i1.len() as i16);
+        buf.put_slice(i1);
+        buf.put_i16(0);
+
+        // member 2: member_id = "m-2", group_instance_id = null, error_code = 79 (FENCED_INSTANCE_ID)
+        let m2 = b"m-2";
+        buf.put_i16(m2.len() as i16);
+        buf.put_slice(m2);
+        buf.put_i16(-1); // null group_instance_id
+        buf.put_i16(79);
+
+        let mut data = buf.freeze();
+        let resp = LeaveGroupResponse::decode_v3(&mut data).unwrap();
+        assert_eq!(resp.throttle_time_ms, 50);
+        assert!(resp.error_code.is_ok());
+        assert_eq!(resp.members.len(), 2);
+
+        assert_eq!(resp.members[0].member_id, "m-1");
+        assert_eq!(resp.members[0].group_instance_id, Some("i-1".to_string()));
+        assert!(resp.members[0].error_code.is_ok());
+
+        assert_eq!(resp.members[1].member_id, "m-2");
+        assert_eq!(resp.members[1].group_instance_id, None);
+        assert!(!resp.members[1].error_code.is_ok());
     }
 
     // SyncGroupResponse decode_v1 roundtrip.
