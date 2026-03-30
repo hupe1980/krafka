@@ -869,6 +869,14 @@ impl Consumer {
                                     !revoked_set.contains(&(r.topic.as_str(), r.partition))
                                 });
                             }
+                            // Clear paused state for revoked partitions
+                            {
+                                let mut paused = self.paused.write().await;
+                                for (topic, partition) in &to_revoke {
+                                    paused.remove(&(topic.clone(), *partition));
+                                }
+                                self.metrics.paused_partitions.set(paused.len() as u64);
+                            }
 
                             // Update owned partitions in sticky assignor before second rejoin.
                             // Must reflect the POST-REVOCATION state (what we actually own now),
@@ -950,6 +958,14 @@ impl Consumer {
                                     buf.retain(|r| {
                                         !revoked_set.contains(&(r.topic.as_str(), r.partition))
                                     });
+                                }
+                                // Clear paused state for revoked partitions
+                                {
+                                    let mut paused = self.paused.write().await;
+                                    for (topic, partition) in &extra_revoke {
+                                        paused.remove(&(topic.clone(), *partition));
+                                    }
+                                    self.metrics.paused_partitions.set(paused.len() as u64);
                                 }
 
                                 // Update owned state for next round
@@ -1088,6 +1104,12 @@ impl Consumer {
                                 buf.retain(|r| {
                                     !revoked_set.contains(&(r.topic.as_str(), r.partition))
                                 });
+                                // Clear paused state for revoked partitions
+                                let mut paused = self.paused.write().await;
+                                for tp in &revoked_parts {
+                                    paused.remove(&(tp.topic.clone(), tp.partition));
+                                }
+                                self.metrics.paused_partitions.set(paused.len() as u64);
                             }
 
                             // Update to new assignment
@@ -1144,10 +1166,18 @@ impl Consumer {
 
                             // Reset all fetch sessions — partition ownership is changing
                             self.fetch_sessions.lock().await.reset_all();
+                            // Clear all offsets — all partitions revoked
+                            self.offsets.write().await.clear();
                             // Clear offset retry backoff — fresh start after rebalance
                             self.offset_retry_backoff.write().await.clear();
                             // Discard all buffered records — all partitions revoked
                             self.recv_buffer.write().await.clear();
+                            // Clear any paused partitions — fresh assignment after revoke
+                            {
+                                let mut paused = self.paused.write().await;
+                                paused.clear();
+                                self.metrics.paused_partitions.set(paused.len() as u64);
+                            }
                         }
 
                         let assignment = coordinator.ensure_active_membership(&topics).await?;
