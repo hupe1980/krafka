@@ -853,11 +853,11 @@ impl Consumer {
                             }
                             // Discard buffered records from revoked partitions
                             {
+                                let revoked_set: HashSet<(&str, PartitionId)> =
+                                    to_revoke.iter().map(|(t, p)| (t.as_str(), *p)).collect();
                                 let mut buf = self.recv_buffer.write().await;
                                 buf.retain(|r| {
-                                    !to_revoke
-                                        .iter()
-                                        .any(|(t, p)| t == &r.topic && *p == r.partition)
+                                    !revoked_set.contains(&(r.topic.as_str(), r.partition))
                                 });
                             }
 
@@ -926,11 +926,13 @@ impl Consumer {
                                 self.fetch_sessions.lock().await.reset_all();
                                 // Discard buffered records from revoked partitions
                                 {
+                                    let revoked_set: HashSet<(&str, PartitionId)> = extra_revoke
+                                        .iter()
+                                        .map(|(t, p)| (t.as_str(), *p))
+                                        .collect();
                                     let mut buf = self.recv_buffer.write().await;
                                     buf.retain(|r| {
-                                        !extra_revoke
-                                            .iter()
-                                            .any(|(t, p)| t == &r.topic && *p == r.partition)
+                                        !revoked_set.contains(&(r.topic.as_str(), r.partition))
                                     });
                                 }
 
@@ -949,12 +951,14 @@ impl Consumer {
                                          Deferring assignment to next poll cycle.",
                                         max_cooperative_rounds
                                     );
-                                    // Start heartbeat to avoid session timeout, then
-                                    // trigger a rejoin so the next poll re-enters rebalance
-                                    // with a clean round. Do NOT apply final_assignment
-                                    // since it still required another rejoin.
+                                    // Start heartbeat to avoid session timeout while we
+                                    // defer the additional cooperative rebalance round
+                                    // to the next poll cycle. Do NOT apply final_assignment
+                                    // since it still required another rejoin. Set state
+                                    // directly instead of trigger_rejoin() to avoid
+                                    // killing the heartbeat task via Rejoin command.
                                     coordinator.start_heartbeat_task().await;
-                                    coordinator.trigger_rejoin().await;
+                                    coordinator.set_preparing_rebalance().await;
                                     // Note: rebalances metric was already incremented
                                     // at Phase 1 entry; do not double-count here.
                                     return Ok(vec![]);
@@ -1062,11 +1066,13 @@ impl Consumer {
                                 // Reset fetch sessions after partition changes
                                 self.fetch_sessions.lock().await.reset_all();
                                 // Discard buffered records from revoked partitions
+                                let revoked_set: HashSet<(&str, PartitionId)> = revoked_parts
+                                    .iter()
+                                    .map(|tp| (tp.topic.as_str(), tp.partition))
+                                    .collect();
                                 let mut buf = self.recv_buffer.write().await;
                                 buf.retain(|r| {
-                                    !revoked_parts.iter().any(|tp| {
-                                        tp.topic == r.topic && tp.partition == r.partition
-                                    })
+                                    !revoked_set.contains(&(r.topic.as_str(), r.partition))
                                 });
                             }
 

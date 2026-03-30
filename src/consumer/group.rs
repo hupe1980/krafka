@@ -1525,6 +1525,13 @@ impl GroupCoordinator {
         }
     }
 
+    /// Mark state as PreparingRebalance without stopping the heartbeat task.
+    /// Used when we want the next poll to re-enter rebalance but need the
+    /// background heartbeat to keep running (e.g., round-limit deferral).
+    pub async fn set_preparing_rebalance(&self) {
+        *self.state.write().await = GroupState::PreparingRebalance;
+    }
+
     /// Send a single heartbeat (for inline heartbeat during poll).
     pub async fn send_heartbeat(&self) -> Result<HeartbeatStatus> {
         let conn = self.get_coordinator_connection().await?;
