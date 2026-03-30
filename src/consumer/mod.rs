@@ -820,7 +820,16 @@ impl Consumer {
                                 .collect();
                             // Send an inline heartbeat before invoking user callback
                             // to avoid session timeout if the callback is slow.
-                            let _ = coordinator.send_heartbeat().await;
+                            match coordinator.send_heartbeat().await {
+                                Ok(status) if status.requires_rejoin() => {
+                                    coordinator.trigger_rejoin().await;
+                                    return Ok(vec![]);
+                                }
+                                Err(e) => {
+                                    warn!("Pre-revocation heartbeat failed: {}", e);
+                                }
+                                _ => {}
+                            }
                             self.rebalance_listener.on_partitions_revoked(&revoked);
                             self.metrics.rebalances.inc();
 
@@ -870,9 +879,7 @@ impl Consumer {
                                 let owned = MemberAssignment {
                                     partitions: current.clone(),
                                 };
-                                coordinator
-                                    .sticky_assignor
-                                    .record_assignment(&member_id, &owned);
+                                coordinator.record_owned_partitions(&member_id, &owned);
                             }
 
                             // Phase 2: rejoin to finalize after revocations.
@@ -897,7 +904,16 @@ impl Consumer {
                                     .collect();
                                 // Send an inline heartbeat before user callback
                                 // (heartbeat task is not running during Phase 2)
-                                let _ = coordinator.send_heartbeat().await;
+                                match coordinator.send_heartbeat().await {
+                                    Ok(status) if status.requires_rejoin() => {
+                                        coordinator.trigger_rejoin().await;
+                                        return Ok(vec![]);
+                                    }
+                                    Err(e) => {
+                                        warn!("Pre-revocation heartbeat failed: {}", e);
+                                    }
+                                    _ => {}
+                                }
                                 self.rebalance_listener
                                     .on_partitions_revoked(&extra_revoked);
                                 {
@@ -942,7 +958,7 @@ impl Consumer {
                                 let owned = MemberAssignment {
                                     partitions: current.clone(),
                                 };
-                                coordinator.sticky_assignor.record_assignment(&mid, &owned);
+                                coordinator.record_owned_partitions(&mid, &owned);
 
                                 if round == max_cooperative_rounds - 1 {
                                     warn!(
@@ -1016,9 +1032,7 @@ impl Consumer {
                             // Record final assignment so the next rebalance's
                             // join_group metadata reports correct owned partitions.
                             let member_id = coordinator.member_id().await;
-                            coordinator
-                                .sticky_assignor
-                                .record_assignment(&member_id, &final_assignment);
+                            coordinator.record_owned_partitions(&member_id, &final_assignment);
                         } else {
                             // No revocations — assignment is final in one round
                             let old_assignments = self.assignments.read().await.clone();
@@ -1113,9 +1127,7 @@ impl Consumer {
                             // Record final assignment so the next rebalance's
                             // join_group metadata reports correct owned partitions.
                             let member_id = coordinator.member_id().await;
-                            coordinator
-                                .sticky_assignor
-                                .record_assignment(&member_id, &new_assignment);
+                            coordinator.record_owned_partitions(&member_id, &new_assignment);
                         }
                     } else {
                         // Eager rebalance: revoke all, then reassign all

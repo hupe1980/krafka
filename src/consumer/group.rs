@@ -932,7 +932,7 @@ pub struct GroupCoordinator {
     /// Static group membership instance ID (KIP-345).
     group_instance_id: Option<String>,
     /// Persistent sticky assignor (retains previous assignments across rebalances).
-    pub(crate) sticky_assignor: CooperativeStickyAssignor,
+    sticky_assignor: CooperativeStickyAssignor,
     /// Transaction isolation level (0 = read_uncommitted, 1 = read_committed).
     isolation_level: i8,
 }
@@ -1377,8 +1377,9 @@ impl GroupCoordinator {
                 "Cooperative rebalance: revoking {} partition(s) before second rejoin",
                 to_revoke.len()
             );
-            // Don't start heartbeat yet — we need another rejoin after revocation
-            // The assignment from this round is kept in sticky_assignor for the next round
+            // Don't start heartbeat yet — we need another rejoin after revocation.
+            // The caller (e.g. the poll loop) will update the owned-partitions baseline
+            // in sticky_assignor after applying these revocations and finalizing the assignment.
             Ok((new_assignment, to_revoke))
         }
     }
@@ -1530,6 +1531,14 @@ impl GroupCoordinator {
     /// background heartbeat to keep running (e.g., round-limit deferral).
     pub async fn set_preparing_rebalance(&self) {
         *self.state.write().await = GroupState::PreparingRebalance;
+    }
+
+    /// Record owned partitions in the sticky assignor for the next rebalance.
+    /// The poll loop calls this after applying revocations or finalizing assignment
+    /// so that the next join_group metadata reports the correct owned state.
+    pub fn record_owned_partitions(&self, member_id: &str, assignment: &MemberAssignment) {
+        self.sticky_assignor
+            .record_assignment(member_id, assignment);
     }
 
     /// Send a single heartbeat (for inline heartbeat during poll).
