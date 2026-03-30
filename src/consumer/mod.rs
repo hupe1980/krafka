@@ -840,7 +840,7 @@ impl Consumer {
                                     offsets.remove(&(topic.clone(), *partition));
                                 }
                             }
-                            // Reset fetch sessions for revoked partitions
+                            // Reset all fetch sessions after partition revocation
                             self.fetch_sessions.lock().await.reset_all();
                             self.offset_retry_backoff.write().await.clear();
 
@@ -873,15 +873,7 @@ impl Consumer {
                                     break;
                                 }
 
-                                if round == max_cooperative_rounds - 1 {
-                                    warn!(
-                                        "Cooperative rebalance still has revocations after {} rounds, proceeding",
-                                        max_cooperative_rounds
-                                    );
-                                    break;
-                                }
-
-                                // Process additional revocations
+                                // Process additional revocations (including final round)
                                 let extra_revoked: Vec<TopicPartition> = extra_revoke
                                     .iter()
                                     .map(|(t, p)| TopicPartition::new(t, *p))
@@ -913,6 +905,16 @@ impl Consumer {
                                     partitions: current.clone(),
                                 };
                                 coordinator.sticky_assignor.record_assignment(&mid, &owned);
+
+                                if round == max_cooperative_rounds - 1 {
+                                    warn!(
+                                        "Cooperative rebalance exceeded {} rounds with pending revocations; \
+                                         this may indicate cascading membership changes. \
+                                         Applying current assignment.",
+                                        max_cooperative_rounds
+                                    );
+                                    break;
+                                }
 
                                 coordinator.trigger_rejoin().await;
                             }
@@ -962,6 +964,13 @@ impl Consumer {
                                 }
                                 self.fetch_and_apply_committed_offsets(&new_parts).await?;
                             }
+
+                            // Record final assignment so the next rebalance's
+                            // join_group metadata reports correct owned partitions.
+                            let member_id = coordinator.member_id().await;
+                            coordinator
+                                .sticky_assignor
+                                .record_assignment(&member_id, &final_assignment);
                         } else {
                             // No revocations — assignment is final in one round
                             let old_assignments = self.assignments.read().await.clone();
@@ -1030,6 +1039,13 @@ impl Consumer {
                                 }
                                 self.fetch_and_apply_committed_offsets(&new_parts).await?;
                             }
+
+                            // Record final assignment so the next rebalance's
+                            // join_group metadata reports correct owned partitions.
+                            let member_id = coordinator.member_id().await;
+                            coordinator
+                                .sticky_assignor
+                                .record_assignment(&member_id, &new_assignment);
                         }
                     } else {
                         // Eager rebalance: revoke all, then reassign all

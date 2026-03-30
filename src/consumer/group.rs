@@ -514,9 +514,9 @@ impl CooperativeStickyAssignor {
     ) -> Vec<(String, PartitionId)> {
         let prev = match self.previous_assignments.read() {
             Ok(guard) => guard,
-            Err(poison) => {
+            Err(_poison) => {
                 warn!("sticky assignor lock poisoned on read, treating as empty");
-                poison.into_inner()
+                return Vec::new();
             }
         };
         let mut revoked = Vec::new();
@@ -568,12 +568,15 @@ impl PartitionAssignor for CooperativeStickyAssignor {
             }
         }
 
-        // Get previous assignments for stickiness
-        let prev_assignments = match self.previous_assignments.read() {
+        // Get previous assignments for stickiness.
+        // On poison, fall back to an empty map (non-sticky) to match the log message.
+        let default_prev = HashMap::new();
+        let prev_guard = self.previous_assignments.read();
+        let prev_assignments = match &prev_guard {
             Ok(guard) => guard,
-            Err(poison) => {
+            Err(_) => {
                 warn!("sticky assignor lock poisoned during assign, treating as empty");
-                poison.into_inner()
+                &default_prev
             }
         };
 
@@ -1167,14 +1170,14 @@ impl GroupCoordinator {
 
         // Get owned partitions for cooperative metadata
         let owned_partitions = if self.is_cooperative() {
-            let prev = match self.sticky_assignor.previous_assignments.read() {
-                Ok(guard) => guard,
+            match self.sticky_assignor.previous_assignments.read() {
+                Ok(guard) => guard.get(&member_id).cloned().unwrap_or_default(),
                 Err(poison) => {
                     warn!("sticky assignor lock poisoned in join_group, treating as empty");
-                    poison.into_inner()
+                    drop(poison.into_inner());
+                    HashMap::new()
                 }
-            };
-            prev.get(&member_id).cloned().unwrap_or_default()
+            }
         } else {
             HashMap::new()
         };
@@ -1304,11 +1307,9 @@ impl GroupCoordinator {
         // Decode the assignment
         let assignment = self.decode_consumer_assignment(&sync_response.assignment)?;
 
-        // Record assignment for cooperative sticky (stickiness across rebalances)
-        if self.is_cooperative() {
-            self.sticky_assignor
-                .record_assignment(&member_id, &assignment);
-        }
+        // Note: for cooperative mode, record_assignment() is NOT called here.
+        // The poll loop defers it until after get_partitions_to_revoke() has
+        // compared old vs new, so the previous-assignment baseline stays intact.
 
         // Update state
         *self.assignment.write().await = assignment.clone();
@@ -2120,7 +2121,7 @@ impl GroupCoordinator {
                     .min(10_000)
                     .min(buf.remaining() / 4);
                 let mut parts = Vec::with_capacity(safe_part_count);
-                for _ in 0..part_count.max(0) {
+                for _ in 0..safe_part_count {
                     if buf.remaining() < 4 {
                         break;
                     }
@@ -2157,6 +2158,12 @@ impl GroupCoordinator {
         }
         // Cap iteration by remaining buffer to prevent allocation DoS
         let safe_topic_count = (topic_count as usize).min(buf.remaining() / 6);
+        if safe_topic_count < topic_count as usize {
+            warn!(
+                "assignment topic count {} exceeds buffer capacity, decoding {} topics",
+                topic_count, safe_topic_count
+            );
+        }
 
         let mut assignment = MemberAssignment::empty();
 
@@ -2181,13 +2188,18 @@ impl GroupCoordinator {
             if partition_count < 0 {
                 break;
             }
-            let mut partitions = Vec::with_capacity(
-                (partition_count as usize)
-                    .min(10_000)
-                    .min(buf.remaining() / 4),
-            );
+            let safe_partition_count = (partition_count as usize)
+                .min(10_000)
+                .min(buf.remaining() / 4);
+            if safe_partition_count < partition_count as usize {
+                warn!(
+                    "assignment partition count {} for '{}' exceeds buffer/cap, decoding {}",
+                    partition_count, topic, safe_partition_count
+                );
+            }
+            let mut partitions = Vec::with_capacity(safe_partition_count);
 
-            for _ in 0..partition_count {
+            for _ in 0..safe_partition_count {
                 if buf.remaining() < 4 {
                     break;
                 }
@@ -3245,5 +3257,59 @@ mod tests {
         sorted.sort();
         assert!(sorted.contains(&("t1".to_string(), 1)));
         assert!(sorted.contains(&("t2".to_string(), 0)));
+    }
+
+    #[test]
+    fn test_decode_consumer_metadata_overcounted_partitions() {
+        // Build v1 metadata where owned partitions claim 1_000_000 entries
+        // but only 3 fit in the buffer. The safe loop bound must cap iteration.
+        let mut buf = BytesMut::new();
+        buf.put_i16(1); // version 1
+        buf.put_i32(1); // 1 subscribed topic
+        let topic = b"sub";
+        buf.put_i16(topic.len() as i16);
+        buf.put_slice(topic);
+        buf.put_i32(-1); // no user data
+
+        // Owned partitions section
+        buf.put_i32(1); // 1 owned topic
+        let owned_topic = b"test";
+        buf.put_i16(owned_topic.len() as i16);
+        buf.put_slice(owned_topic);
+        buf.put_i32(1_000_000); // claim 1M partitions
+        buf.put_i32(0); // only 3 actual partition values
+        buf.put_i32(1);
+        buf.put_i32(2);
+
+        let (topics, owned) = GroupCoordinator::decode_consumer_metadata(&buf);
+        assert_eq!(topics, vec!["sub".to_string()]);
+        // Should decode only the 3 partitions that fit, not spin 1M times
+        let parts = owned.get("test").unwrap();
+        assert_eq!(parts, &[0, 1, 2]);
+    }
+
+    #[test]
+    fn test_cooperative_sticky_record_after_no_revocation_rebalance() {
+        // Simulates the no-revocation path: after sync, the caller records
+        // the final assignment. Verify that the next get_partitions_to_revoke
+        // uses it correctly.
+        let assignor = CooperativeStickyAssignor::new();
+
+        // Simulate first rebalance result (no prior state)
+        let mut first = MemberAssignment::empty();
+        first.add("t1", vec![0, 1, 2]);
+        // Caller records final assignment (as the poll loop now does)
+        assignor.record_assignment("m1", &first);
+
+        // Verify owned state was persisted
+        let prev = assignor.previous_assignments.read().unwrap();
+        assert_eq!(prev.get("m1").unwrap().get("t1").unwrap(), &vec![0, 1, 2]);
+        drop(prev);
+
+        // Second rebalance: some partitions moved away
+        let mut second = MemberAssignment::empty();
+        second.add("t1", vec![0, 1]); // partition 2 moved
+        let revoked = assignor.get_partitions_to_revoke("m1", &second);
+        assert_eq!(revoked, vec![("t1".to_string(), 2)]);
     }
 }

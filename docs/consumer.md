@@ -291,12 +291,12 @@ rebalances when consumers join or leave the group.
   that vanish unexpectedly (e.g., topic deletion).
 
 ```rust
-use krafka::consumer::ConsumerBuilder;
+use krafka::consumer::{ConsumerBuilder, PartitionAssignmentStrategy};
 
 let consumer = ConsumerBuilder::default()
     .bootstrap_servers("localhost:9092")
     .group_id("my-group")
-    .partition_assignment_strategy("cooperative-sticky")
+    .partition_assignment_strategy(PartitionAssignmentStrategy::CooperativeSticky)
     .build()
     .await?;
 
