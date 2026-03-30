@@ -14,11 +14,24 @@ use crate::error::{KrafkaError, Result};
 use crate::util::varint;
 
 /// Trait for encoding values to the Kafka wire format.
+///
+/// # Compact vs non-compact encodings
+///
+/// The default implementation of [`Encode::encode_compact`] simply delegates to
+/// [`Encode::encode`], and is therefore only correct when the compact and non-compact
+/// encodings are identical for a type (e.g., primitive integers).
+///
+/// If a type has a distinct compact encoding (such as strings, bytes, or arrays
+/// that use varint-encoded length prefixes), implementors **must** override
+/// `encode_compact`.
 pub trait Encode {
     /// Encode this value to the buffer.
     fn encode(&self, buf: &mut impl BufMut);
 
     /// Encode this value using the compact format.
+    ///
+    /// The default delegates to [`Encode::encode`] and is only valid when the
+    /// compact and non-compact encodings are identical for the implementing type.
     fn encode_compact(&self, buf: &mut impl BufMut) {
         self.encode(buf);
     }
@@ -30,22 +43,48 @@ pub trait Encode {
 /// the protocol's wire-format limits (e.g., strings longer than `i16::MAX` bytes).
 /// Use `try_encode` at API boundaries to validate data before committing to
 /// the infallible `Encode` trait.
+///
+/// # Compact vs non-compact encodings
+///
+/// The default implementation of [`TryEncode::try_encode_compact`] simply delegates
+/// to [`TryEncode::try_encode`], and is therefore only correct when the compact and
+/// non-compact encodings are identical for a type (e.g., primitive integers).
+///
+/// If a type has a distinct compact encoding (such as strings, bytes, or arrays
+/// that use varint-encoded length prefixes), implementors **must** override
+/// `try_encode_compact`.
 pub trait TryEncode {
     /// Attempt to encode this value, returning an error if it exceeds protocol limits.
     fn try_encode(&self, buf: &mut impl BufMut) -> Result<()>;
 
     /// Attempt to encode this value using the compact format.
+    ///
+    /// The default delegates to [`TryEncode::try_encode`] and is only valid when the
+    /// compact and non-compact encodings are identical for the implementing type.
     fn try_encode_compact(&self, buf: &mut impl BufMut) -> Result<()> {
         self.try_encode(buf)
     }
 }
 
 /// Trait for decoding values from the Kafka wire format.
+///
+/// # Compact vs non-compact decodings
+///
+/// The default implementation of [`Decode::decode_compact`] simply delegates to
+/// [`Decode::decode`], and is therefore only correct when the compact and non-compact
+/// decodings are identical for a type (e.g., primitive integers).
+///
+/// If a type has a distinct compact decoding (such as strings, bytes, or arrays
+/// that use varint-encoded length prefixes), implementors **must** override
+/// `decode_compact`.
 pub trait Decode: Sized {
     /// Decode a value from the buffer.
     fn decode(buf: &mut impl Buf) -> Result<Self>;
 
     /// Decode a value using the compact format.
+    ///
+    /// The default delegates to [`Decode::decode`] and is only valid when the
+    /// compact and non-compact decodings are identical for the implementing type.
     fn decode_compact(buf: &mut impl Buf) -> Result<Self> {
         Self::decode(buf)
     }
