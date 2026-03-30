@@ -845,7 +845,21 @@ impl Consumer {
                             }
                             // Reset all fetch sessions after partition revocation
                             self.fetch_sessions.lock().await.reset_all();
-                            self.offset_retry_backoff.write().await.clear();
+                            {
+                                let mut backoff = self.offset_retry_backoff.write().await;
+                                for (topic, partition) in &to_revoke {
+                                    backoff.remove(&(topic.clone(), *partition));
+                                }
+                            }
+                            // Discard buffered records from revoked partitions
+                            {
+                                let mut buf = self.recv_buffer.write().await;
+                                buf.retain(|r| {
+                                    !to_revoke
+                                        .iter()
+                                        .any(|(t, p)| t == &r.topic && *p == r.partition)
+                                });
+                            }
 
                             // Update owned partitions in sticky assignor before second rejoin.
                             // Must reflect the POST-REVOCATION state (what we actually own now),
@@ -910,6 +924,15 @@ impl Consumer {
                                     }
                                 }
                                 self.fetch_sessions.lock().await.reset_all();
+                                // Discard buffered records from revoked partitions
+                                {
+                                    let mut buf = self.recv_buffer.write().await;
+                                    buf.retain(|r| {
+                                        !extra_revoke
+                                            .iter()
+                                            .any(|(t, p)| t == &r.topic && *p == r.partition)
+                                    });
+                                }
 
                                 // Update owned state for next round
                                 let mid = coordinator.member_id().await;
@@ -1038,6 +1061,13 @@ impl Consumer {
                                 }
                                 // Reset fetch sessions after partition changes
                                 self.fetch_sessions.lock().await.reset_all();
+                                // Discard buffered records from revoked partitions
+                                let mut buf = self.recv_buffer.write().await;
+                                buf.retain(|r| {
+                                    !revoked_parts.iter().any(|tp| {
+                                        tp.topic == r.topic && tp.partition == r.partition
+                                    })
+                                });
                             }
 
                             // Update to new assignment
@@ -1098,6 +1128,8 @@ impl Consumer {
                             self.fetch_sessions.lock().await.reset_all();
                             // Clear offset retry backoff — fresh start after rebalance
                             self.offset_retry_backoff.write().await.clear();
+                            // Discard all buffered records — all partitions revoked
+                            self.recv_buffer.write().await.clear();
                         }
 
                         let assignment = coordinator.ensure_active_membership(&topics).await?;
