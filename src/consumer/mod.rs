@@ -804,44 +804,275 @@ impl Consumer {
             if coordinator.needs_rejoin().await {
                 let topics: Vec<String> = self.subscriptions.read().await.iter().cloned().collect();
                 if !topics.is_empty() {
-                    // Notify listener of revoked partitions before rebalance
-                    let old_assignments = self.assignments.read().await.clone();
-                    if !old_assignments.is_empty() {
-                        let revoked: Vec<TopicPartition> = old_assignments
+                    coordinator.set_subscribed_topics(topics.clone()).await;
+
+                    if coordinator.is_cooperative() {
+                        // Cooperative incremental rebalance (KIP-429)
+                        // Phase 1: join+sync to get new target assignment
+                        let (new_assignment, to_revoke) =
+                            coordinator.perform_cooperative_join_and_sync().await?;
+
+                        if !to_revoke.is_empty() {
+                            // Revoke only the diff — keep consuming unaffected partitions
+                            let revoked: Vec<TopicPartition> = to_revoke
+                                .iter()
+                                .map(|(t, p)| TopicPartition::new(t, *p))
+                                .collect();
+                            self.rebalance_listener.on_partitions_revoked(&revoked);
+                            self.metrics.rebalances.inc();
+
+                            // Remove revoked partitions from local state
+                            {
+                                let mut assignments = self.assignments.write().await;
+                                for (topic, partition) in &to_revoke {
+                                    if let Some(parts) = assignments.get_mut(topic) {
+                                        parts.retain(|&p| p != *partition);
+                                        if parts.is_empty() {
+                                            assignments.remove(topic);
+                                        }
+                                    }
+                                }
+                            }
+                            // Remove offsets for revoked partitions
+                            {
+                                let mut offsets = self.offsets.write().await;
+                                for (topic, partition) in &to_revoke {
+                                    offsets.remove(&(topic.clone(), *partition));
+                                }
+                            }
+                            // Reset fetch sessions for revoked partitions
+                            self.fetch_sessions.lock().await.reset_all();
+                            self.offset_retry_backoff.write().await.clear();
+
+                            // Update owned partitions in sticky assignor before second rejoin.
+                            // Must reflect the POST-REVOCATION state (what we actually own now),
+                            // not the full Phase 1 result from sync_group().
+                            let member_id = coordinator.member_id().await;
+                            {
+                                let current = self.assignments.read().await;
+                                let owned = MemberAssignment {
+                                    partitions: current.clone(),
+                                };
+                                coordinator
+                                    .sticky_assignor
+                                    .record_assignment(&member_id, &owned);
+                            }
+
+                            // Phase 2: rejoin to finalize after revocations.
+                            // In rare cases (concurrent topic changes, racing rebalances),
+                            // additional revocations may be needed. Loop with a bound.
+                            coordinator.trigger_rejoin().await;
+                            let mut final_assignment = MemberAssignment::empty();
+                            let max_cooperative_rounds = 3;
+                            for round in 0..max_cooperative_rounds {
+                                let (assignment, extra_revoke) =
+                                    coordinator.perform_cooperative_join_and_sync().await?;
+                                final_assignment = assignment;
+
+                                if extra_revoke.is_empty() {
+                                    break;
+                                }
+
+                                if round == max_cooperative_rounds - 1 {
+                                    warn!(
+                                        "Cooperative rebalance still has revocations after {} rounds, proceeding",
+                                        max_cooperative_rounds
+                                    );
+                                    break;
+                                }
+
+                                // Process additional revocations
+                                let extra_revoked: Vec<TopicPartition> = extra_revoke
+                                    .iter()
+                                    .map(|(t, p)| TopicPartition::new(t, *p))
+                                    .collect();
+                                self.rebalance_listener
+                                    .on_partitions_revoked(&extra_revoked);
+                                {
+                                    let mut assignments = self.assignments.write().await;
+                                    for (topic, partition) in &extra_revoke {
+                                        if let Some(parts) = assignments.get_mut(topic) {
+                                            parts.retain(|&p| p != *partition);
+                                            if parts.is_empty() {
+                                                assignments.remove(topic);
+                                            }
+                                        }
+                                    }
+                                }
+                                {
+                                    let mut offsets = self.offsets.write().await;
+                                    for (topic, partition) in &extra_revoke {
+                                        offsets.remove(&(topic.clone(), *partition));
+                                    }
+                                }
+
+                                // Update owned state for next round
+                                let mid = coordinator.member_id().await;
+                                let current = self.assignments.read().await;
+                                let owned = MemberAssignment {
+                                    partitions: current.clone(),
+                                };
+                                coordinator.sticky_assignor.record_assignment(&mid, &owned);
+
+                                coordinator.trigger_rejoin().await;
+                            }
+
+                            // Determine newly assigned partitions (new - old)
+                            let old_assignments = self.assignments.read().await.clone();
+                            let mut newly_assigned = Vec::new();
+                            for (topic, partitions) in &final_assignment.partitions {
+                                let old_parts = old_assignments.get(topic);
+                                for &p in partitions {
+                                    let is_new = old_parts.is_none_or(|old| !old.contains(&p));
+                                    if is_new {
+                                        newly_assigned.push(TopicPartition::new(topic, p));
+                                    }
+                                }
+                            }
+
+                            // Update to final assignment
+                            let mut assignments = self.assignments.write().await;
+                            assignments.clear();
+                            for (topic, partitions) in &final_assignment.partitions {
+                                assignments.insert(topic.clone(), partitions.clone());
+                            }
+                            drop(assignments);
+
+                            if !newly_assigned.is_empty() {
+                                self.rebalance_listener
+                                    .on_partitions_assigned(&newly_assigned);
+                            }
+                            self.metrics.assigned_partitions.set(
+                                final_assignment
+                                    .partitions
+                                    .values()
+                                    .map(|v| v.len())
+                                    .sum::<usize>() as u64,
+                            );
+
+                            // Fetch committed offsets for newly assigned partitions only
+                            if !newly_assigned.is_empty() {
+                                let mut new_parts: HashMap<String, Vec<PartitionId>> =
+                                    HashMap::new();
+                                for tp in &newly_assigned {
+                                    new_parts
+                                        .entry(tp.topic.clone())
+                                        .or_default()
+                                        .push(tp.partition);
+                                }
+                                self.fetch_and_apply_committed_offsets(&new_parts).await?;
+                            }
+                        } else {
+                            // No revocations — assignment is final in one round
+                            let old_assignments = self.assignments.read().await.clone();
+                            let mut newly_assigned = Vec::new();
+                            for (topic, partitions) in &new_assignment.partitions {
+                                let old_parts = old_assignments.get(topic);
+                                for &p in partitions {
+                                    let is_new = old_parts.is_none_or(|old| !old.contains(&p));
+                                    if is_new {
+                                        newly_assigned.push(TopicPartition::new(topic, p));
+                                    }
+                                }
+                            }
+
+                            // Determine partitions that were removed without revocation
+                            // (e.g., topic deletion)
+                            let mut lost: Vec<TopicPartition> = Vec::new();
+                            for (topic, partitions) in &old_assignments {
+                                let new_parts = new_assignment.partitions.get(topic);
+                                for &p in partitions {
+                                    let gone = new_parts.is_none_or(|np| !np.contains(&p));
+                                    if gone {
+                                        lost.push(TopicPartition::new(topic, p));
+                                    }
+                                }
+                            }
+                            if !lost.is_empty() {
+                                self.rebalance_listener.on_partitions_lost(&lost);
+                                // Remove offsets for lost partitions
+                                let mut offsets = self.offsets.write().await;
+                                for tp in &lost {
+                                    offsets.remove(&(tp.topic.clone(), tp.partition));
+                                }
+                            }
+
+                            // Update to new assignment
+                            let mut assignments = self.assignments.write().await;
+                            assignments.clear();
+                            for (topic, partitions) in &new_assignment.partitions {
+                                assignments.insert(topic.clone(), partitions.clone());
+                            }
+                            drop(assignments);
+
+                            if !newly_assigned.is_empty() {
+                                self.rebalance_listener
+                                    .on_partitions_assigned(&newly_assigned);
+                                self.metrics.rebalances.inc();
+                            }
+                            self.metrics.assigned_partitions.set(
+                                new_assignment
+                                    .partitions
+                                    .values()
+                                    .map(|v| v.len())
+                                    .sum::<usize>() as u64,
+                            );
+
+                            // Fetch committed offsets for newly assigned partitions only
+                            if !newly_assigned.is_empty() {
+                                let mut new_parts: HashMap<String, Vec<PartitionId>> =
+                                    HashMap::new();
+                                for tp in &newly_assigned {
+                                    new_parts
+                                        .entry(tp.topic.clone())
+                                        .or_default()
+                                        .push(tp.partition);
+                                }
+                                self.fetch_and_apply_committed_offsets(&new_parts).await?;
+                            }
+                        }
+                    } else {
+                        // Eager rebalance: revoke all, then reassign all
+                        let old_assignments = self.assignments.read().await.clone();
+                        if !old_assignments.is_empty() {
+                            let revoked: Vec<TopicPartition> = old_assignments
+                                .iter()
+                                .flat_map(|(t, ps)| {
+                                    ps.iter().map(move |&p| TopicPartition::new(t, p))
+                                })
+                                .collect();
+                            self.rebalance_listener.on_partitions_revoked(&revoked);
+                            self.metrics.rebalances.inc();
+
+                            // Reset all fetch sessions — partition ownership is changing
+                            self.fetch_sessions.lock().await.reset_all();
+                            // Clear offset retry backoff — fresh start after rebalance
+                            self.offset_retry_backoff.write().await.clear();
+                        }
+
+                        let assignment = coordinator.ensure_active_membership(&topics).await?;
+
+                        // Update our assignments
+                        let mut assignments = self.assignments.write().await;
+                        assignments.clear();
+                        for (topic, partitions) in &assignment.partitions {
+                            assignments.insert(topic.clone(), partitions.clone());
+                        }
+                        drop(assignments);
+
+                        // Notify listener of newly assigned partitions
+                        let assigned: Vec<TopicPartition> = assignment
+                            .partitions
                             .iter()
                             .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
                             .collect();
-                        self.rebalance_listener.on_partitions_revoked(&revoked);
-                        self.metrics.rebalances.inc();
+                        self.rebalance_listener.on_partitions_assigned(&assigned);
+                        self.metrics.assigned_partitions.set(assigned.len() as u64);
 
-                        // Reset all fetch sessions — partition ownership is changing
-                        self.fetch_sessions.lock().await.reset_all();
-                        // Clear offset retry backoff — fresh start after rebalance
-                        self.offset_retry_backoff.write().await.clear();
+                        // Fetch committed offsets for new assignment
+                        self.fetch_and_apply_committed_offsets(&assignment.partitions)
+                            .await?;
                     }
-
-                    let assignment = coordinator.ensure_active_membership(&topics).await?;
-
-                    // Update our assignments
-                    let mut assignments = self.assignments.write().await;
-                    assignments.clear();
-                    for (topic, partitions) in &assignment.partitions {
-                        assignments.insert(topic.clone(), partitions.clone());
-                    }
-                    drop(assignments);
-
-                    // Notify listener of newly assigned partitions
-                    let assigned: Vec<TopicPartition> = assignment
-                        .partitions
-                        .iter()
-                        .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
-                        .collect();
-                    self.rebalance_listener.on_partitions_assigned(&assigned);
-                    self.metrics.assigned_partitions.set(assigned.len() as u64);
-
-                    // Fetch committed offsets for new assignment
-                    self.fetch_and_apply_committed_offsets(&assignment.partitions)
-                        .await?;
                 }
             }
 
