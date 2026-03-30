@@ -37,6 +37,9 @@ crc32c = "0.6"
 # Random number generation
 rand = "0.9"
 
+# Synchronization (non-poisoning RwLock)
+parking_lot = "0.12"
+
 # Cryptography for SASL/SCRAM
 sha2 = "0.10"
 hmac = "0.12"

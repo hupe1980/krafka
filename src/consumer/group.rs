@@ -469,7 +469,7 @@ impl PartitionAssignor for RoundRobinAssignor {
 #[derive(Debug, Default)]
 pub struct CooperativeStickyAssignor {
     /// Previous assignments for stickiness (member_id -> (topic, partitions))
-    previous_assignments: std::sync::RwLock<HashMap<String, HashMap<String, Vec<PartitionId>>>>,
+    previous_assignments: parking_lot::RwLock<HashMap<String, HashMap<String, Vec<PartitionId>>>>,
 }
 
 impl CooperativeStickyAssignor {
@@ -480,32 +480,13 @@ impl CooperativeStickyAssignor {
 
     /// Record the current assignments for future stickiness.
     pub fn record_assignment(&self, member_id: &str, assignment: &MemberAssignment) {
-        match self.previous_assignments.write() {
-            Ok(mut prev) => {
-                prev.insert(member_id.to_string(), assignment.partitions.clone());
-            }
-            Err(poison) => {
-                warn!("sticky assignor lock poisoned, clearing stale state");
-                let mut prev = poison.into_inner();
-                prev.clear();
-                prev.insert(member_id.to_string(), assignment.partitions.clone());
-                self.previous_assignments.clear_poison();
-            }
-        }
+        let mut prev = self.previous_assignments.write();
+        prev.insert(member_id.to_string(), assignment.partitions.clone());
     }
 
     /// Clear previous assignment for a member that left.
     pub fn clear_member(&self, member_id: &str) {
-        match self.previous_assignments.write() {
-            Ok(mut prev) => {
-                prev.remove(member_id);
-            }
-            Err(poison) => {
-                warn!("sticky assignor lock poisoned on clear_member, clearing all");
-                poison.into_inner().clear();
-                self.previous_assignments.clear_poison();
-            }
-        }
+        self.previous_assignments.write().remove(member_id);
     }
 
     /// Get partitions that should be revoked (for incremental rebalance).
@@ -514,14 +495,7 @@ impl CooperativeStickyAssignor {
         member_id: &str,
         new_assignment: &MemberAssignment,
     ) -> Vec<(String, PartitionId)> {
-        let prev = match self.previous_assignments.read() {
-            Ok(guard) => guard,
-            Err(_poison) => {
-                warn!("sticky assignor lock poisoned on read, treating as empty");
-                self.previous_assignments.clear_poison();
-                return Vec::new();
-            }
-        };
+        let prev = self.previous_assignments.read();
         let mut revoked = Vec::new();
 
         if let Some(old_partitions) = prev.get(member_id) {
@@ -572,18 +546,8 @@ impl PartitionAssignor for CooperativeStickyAssignor {
         }
 
         // Get previous assignments for stickiness.
-        // On poison, fall back to an empty map (non-sticky) and clear the poison
-        // so subsequent calls resume normal sticky behavior.
-        let default_prev = HashMap::new();
         let prev_guard = self.previous_assignments.read();
-        let prev_assignments = match &prev_guard {
-            Ok(guard) => guard,
-            Err(_) => {
-                warn!("sticky assignor lock poisoned during assign, treating as empty");
-                self.previous_assignments.clear_poison();
-                &default_prev
-            }
-        };
+        let prev_assignments = &*prev_guard;
 
         // Track which partitions are already assigned (sticky)
         let mut sticky_assignments: HashMap<(String, PartitionId), String> = HashMap::new();
@@ -1175,15 +1139,12 @@ impl GroupCoordinator {
 
         // Get owned partitions for cooperative metadata
         let owned_partitions = if self.is_cooperative() {
-            match self.sticky_assignor.previous_assignments.read() {
-                Ok(guard) => guard.get(&member_id).cloned().unwrap_or_default(),
-                Err(poison) => {
-                    warn!("sticky assignor lock poisoned in join_group, treating as empty");
-                    drop(poison.into_inner());
-                    self.sticky_assignor.previous_assignments.clear_poison();
-                    HashMap::new()
-                }
-            }
+            self.sticky_assignor
+                .previous_assignments
+                .read()
+                .get(&member_id)
+                .cloned()
+                .unwrap_or_default()
         } else {
             HashMap::new()
         };
@@ -3310,7 +3271,7 @@ mod tests {
         assignor.record_assignment("m1", &first);
 
         // Verify owned state was persisted
-        let prev = assignor.previous_assignments.read().unwrap();
+        let prev = assignor.previous_assignments.read();
         assert_eq!(prev.get("m1").unwrap().get("t1").unwrap(), &vec![0, 1, 2]);
         drop(prev);
 

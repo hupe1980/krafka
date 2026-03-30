@@ -881,6 +881,9 @@ impl Consumer {
                                     .iter()
                                     .map(|(t, p)| TopicPartition::new(t, *p))
                                     .collect();
+                                // Send an inline heartbeat before user callback
+                                // (heartbeat task is not running during Phase 2)
+                                let _ = coordinator.send_heartbeat().await;
                                 self.rebalance_listener
                                     .on_partitions_revoked(&extra_revoked);
                                 {
@@ -900,6 +903,13 @@ impl Consumer {
                                         offsets.remove(&(topic.clone(), *partition));
                                     }
                                 }
+                                {
+                                    let mut backoff = self.offset_retry_backoff.write().await;
+                                    for (topic, partition) in &extra_revoke {
+                                        backoff.remove(&(topic.clone(), *partition));
+                                    }
+                                }
+                                self.fetch_sessions.lock().await.reset_all();
 
                                 // Update owned state for next round
                                 let mid = coordinator.member_id().await;
@@ -1018,6 +1028,16 @@ impl Consumer {
                                 for tp in &revoked_parts {
                                     offsets.remove(&(tp.topic.clone(), tp.partition));
                                 }
+                                drop(offsets);
+                                // Clean offset retry backoff for revoked partitions
+                                {
+                                    let mut backoff = self.offset_retry_backoff.write().await;
+                                    for tp in &revoked_parts {
+                                        backoff.remove(&(tp.topic.clone(), tp.partition));
+                                    }
+                                }
+                                // Reset fetch sessions after partition changes
+                                self.fetch_sessions.lock().await.reset_all();
                             }
 
                             // Update to new assignment
