@@ -885,6 +885,15 @@ impl Consumer {
 
                             self.apply_partition_revocations(&to_revoke).await;
 
+                            // Update metric to reflect post-revocation state.
+                            // This ensures the metric stays accurate if Phase 2
+                            // returns early (heartbeat requires rejoin, round-limit).
+                            {
+                                let current = self.assignments.read().await;
+                                let count: usize = current.values().map(|ps| ps.len()).sum();
+                                self.metrics.assigned_partitions.set(count as u64);
+                            }
+
                             // Update owned partitions in sticky assignor before second rejoin.
                             // Must reflect the POST-REVOCATION state (what we actually own now),
                             // not the full Phase 1 result from sync_group().
@@ -939,6 +948,10 @@ impl Consumer {
                                 let owned = MemberAssignment {
                                     partitions: current.clone(),
                                 };
+                                // Keep assigned_partitions metric in sync after revocations
+                                let count: usize = current.values().map(|ps| ps.len()).sum();
+                                self.metrics.assigned_partitions.set(count as u64);
+                                drop(current);
                                 coordinator.record_owned_partitions(&mid, &owned);
 
                                 if round == max_cooperative_rounds - 1 {
@@ -958,6 +971,8 @@ impl Consumer {
                                     coordinator.set_preparing_rebalance().await;
                                     // Note: rebalances metric was already incremented
                                     // at Phase 1 entry; do not double-count here.
+                                    // assigned_partitions metric was already updated
+                                    // after apply_partition_revocations above.
                                     return Ok(vec![]);
                                 }
 

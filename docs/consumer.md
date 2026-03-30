@@ -279,8 +279,9 @@ protocol (KIP-429), minimizing partition movement and avoiding stop-the-world
 rebalances when consumers join or leave the group.
 
 **Key features:**
-- **Incremental two-phase rebalance**: Only revoked partitions are paused during
-  a rebalance — all other partitions continue being consumed without interruption.
+- **Incremental two-phase rebalance**: Only the partitions being moved are revoked
+  and cleaned up — unaffected partitions retain their state and do not go through
+  a full revoke/reassign cycle.
 - **Stickiness**: Partitions stay with their current owner when possible, reducing
   unnecessary movement.
 - **Balanced distribution**: Ensures fair partition allocation across consumers.
