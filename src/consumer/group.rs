@@ -1062,9 +1062,7 @@ impl GroupCoordinator {
         // Send FindCoordinator request
         let request = FindCoordinatorRequest::for_group(&self.group_id);
         let response = conn
-            .send_request(ApiKey::FindCoordinator, 1, |buf| {
-                request.encode_v1(buf);
-            })
+            .send_request(ApiKey::FindCoordinator, 1, |buf| request.encode_v1(buf))
             .await?;
 
         let mut buf = response;
@@ -1170,15 +1168,11 @@ impl GroupCoordinator {
 
         // Use v5 for static membership (KIP-345), v0 otherwise
         let response = if self.group_instance_id.is_some() {
-            conn.send_request(ApiKey::JoinGroup, 5, |buf| {
-                request.encode_v5(buf);
-            })
-            .await?
+            conn.send_request(ApiKey::JoinGroup, 5, |buf| request.encode_v5(buf))
+                .await?
         } else {
-            conn.send_request(ApiKey::JoinGroup, 0, |buf| {
-                request.encode_v0(buf);
-            })
-            .await?
+            conn.send_request(ApiKey::JoinGroup, 0, |buf| request.encode_v0(buf))
+                .await?
         };
 
         let mut buf = response;
@@ -1248,15 +1242,11 @@ impl GroupCoordinator {
         // Use v3 for static membership (KIP-345), v0 otherwise.
         // v3 includes group_instance_id; v0 silently discards it.
         let response = if self.group_instance_id.is_some() {
-            conn.send_request(ApiKey::SyncGroup, 3, |buf| {
-                request.encode_v3(buf);
-            })
-            .await?
+            conn.send_request(ApiKey::SyncGroup, 3, |buf| request.encode_v3(buf))
+                .await?
         } else {
-            conn.send_request(ApiKey::SyncGroup, 0, |buf| {
-                request.encode_v0(buf);
-            })
-            .await?
+            conn.send_request(ApiKey::SyncGroup, 0, |buf| request.encode_v0(buf))
+                .await?
         };
 
         let mut buf = response;
@@ -1386,12 +1376,12 @@ impl GroupCoordinator {
                             // Use v3 for static membership (KIP-345), v0 otherwise
                             let send_result = if group_instance_id.is_some() {
                                 conn.send_request(ApiKey::Heartbeat, 3, |buf| {
-                                    request.encode_v3(buf);
+                                    request.encode_v3(buf)
                                 })
                                 .await
                             } else {
                                 conn.send_request(ApiKey::Heartbeat, 0, |buf| {
-                                    request.encode_v0(buf);
+                                    request.encode_v0(buf)
                                 })
                                 .await
                             };
@@ -1493,15 +1483,11 @@ impl GroupCoordinator {
 
         // Use v3 for static membership (KIP-345), v0 otherwise
         let response = if self.group_instance_id.is_some() {
-            conn.send_request(ApiKey::Heartbeat, 3, |buf| {
-                request.encode_v3(buf);
-            })
-            .await?
+            conn.send_request(ApiKey::Heartbeat, 3, |buf| request.encode_v3(buf))
+                .await?
         } else {
-            conn.send_request(ApiKey::Heartbeat, 0, |buf| {
-                request.encode_v0(buf);
-            })
-            .await?
+            conn.send_request(ApiKey::Heartbeat, 0, |buf| request.encode_v0(buf))
+                .await?
         };
 
         let mut buf = response;
@@ -1577,9 +1563,7 @@ impl GroupCoordinator {
         );
 
         let response = conn
-            .send_request(ApiKey::OffsetCommit, 2, |buf| {
-                request.encode_v2(buf);
-            })
+            .send_request(ApiKey::OffsetCommit, 2, |buf| request.encode_v2(buf))
             .await?;
 
         let mut buf = response;
@@ -1663,9 +1647,7 @@ impl GroupCoordinator {
         // v0 and v1 share identical request wire format; the only response
         // difference is a trailing error_code in v1 that decode_v0 ignores.
         let response = conn
-            .send_request(ApiKey::OffsetFetch, 1, |buf| {
-                request.encode_v0(buf);
-            })
+            .send_request(ApiKey::OffsetFetch, 1, |buf| request.encode_v0(buf))
             .await?;
 
         let mut buf = response;
@@ -1784,9 +1766,7 @@ impl GroupCoordinator {
                 .await?;
 
             let response = conn
-                .send_request(ApiKey::ListOffsets, 2, |buf| {
-                    request.encode_v2(buf);
-                })
+                .send_request(ApiKey::ListOffsets, 2, |buf| request.encode_v2(buf))
                 .await?;
 
             let mut buf = response;
@@ -1860,17 +1840,13 @@ impl GroupCoordinator {
         let result = if self.group_instance_id.is_some() {
             tokio::time::timeout(
                 Duration::from_secs(5),
-                conn.send_request(ApiKey::LeaveGroup, 3, |buf| {
-                    request.encode_v3(buf);
-                }),
+                conn.send_request(ApiKey::LeaveGroup, 3, |buf| request.encode_v3(buf)),
             )
             .await
         } else {
             tokio::time::timeout(
                 Duration::from_secs(5),
-                conn.send_request(ApiKey::LeaveGroup, 0, |buf| {
-                    request.encode_v0(buf);
-                }),
+                conn.send_request(ApiKey::LeaveGroup, 0, |buf| request.encode_v0(buf)),
             )
             .await
         };
@@ -1880,12 +1856,21 @@ impl GroupCoordinator {
             Ok(Ok(response_bytes)) => {
                 let mut buf = response_bytes;
                 let decode_result = if self.group_instance_id.is_some() {
-                    LeaveGroupResponse::decode_v1(&mut buf)
+                    LeaveGroupResponse::decode_v3(&mut buf)
                 } else {
                     LeaveGroupResponse::decode_v0(&mut buf)
                 };
                 match decode_result {
                     Ok(r) if r.error_code.is_ok() => {
+                        // Check per-member errors (v3 batch leave)
+                        for member in &r.members {
+                            if !member.error_code.is_ok() {
+                                warn!(
+                                    "LeaveGroup per-member error for '{}' (member '{}'): {:?}",
+                                    self.group_id, member.member_id, member.error_code
+                                );
+                            }
+                        }
                         info!("Left group '{}'", self.group_id);
                     }
                     Ok(r) => {
@@ -1933,7 +1918,7 @@ impl GroupCoordinator {
         // Version
         buf.put_i16(0);
         // Topics array
-        buf.put_i32(topics.len() as i32);
+        buf.put_i32(crate::protocol::array_len_i32(topics.len())?);
         for topic in topics {
             let topic_len = i16::try_from(topic.len()).map_err(|_| {
                 KrafkaError::protocol(format!(
@@ -2079,7 +2064,7 @@ impl GroupCoordinator {
         // Version
         buf.put_i16(0);
         // Topics array
-        buf.put_i32(assignment.partitions.len() as i32);
+        buf.put_i32(crate::protocol::array_len_i32(assignment.partitions.len())?);
         for (topic, partitions) in &assignment.partitions {
             let topic_len = i16::try_from(topic.len()).map_err(|_| {
                 KrafkaError::protocol(format!(
@@ -2090,7 +2075,7 @@ impl GroupCoordinator {
             })?;
             buf.put_i16(topic_len);
             buf.put_slice(topic.as_bytes());
-            buf.put_i32(partitions.len() as i32);
+            buf.put_i32(crate::protocol::array_len_i32(partitions.len())?);
             for &partition in partitions {
                 buf.put_i32(partition);
             }

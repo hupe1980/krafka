@@ -656,14 +656,12 @@ impl RecordAccumulator {
         let mut batch_builder = RecordBatchBuilder::new().compression(config.compression);
         for p in &pending {
             if p.record.headers.is_empty() {
-                batch_builder = batch_builder.add_record(
-                    p.record.key.clone().map(Bytes::from),
-                    Some(Bytes::from(p.record.value.clone())),
-                );
+                batch_builder =
+                    batch_builder.add_record(p.record.key.clone(), Some(p.record.value.clone()));
             } else {
                 batch_builder = batch_builder.add_record_with_headers(
-                    p.record.key.clone().map(Bytes::from),
-                    Some(Bytes::from(p.record.value.clone())),
+                    p.record.key.clone(),
+                    Some(p.record.value.clone()),
                     p.record
                         .headers
                         .iter()
@@ -728,9 +726,7 @@ impl RecordAccumulator {
             // acks=0 (fire-and-forget): Kafka sends no response (R6.1 fix)
             if config.acks == 0 {
                 match conn
-                    .send_fire_and_forget(ApiKey::Produce, 0, |buf| {
-                        request.encode_v0(buf);
-                    })
+                    .send_fire_and_forget(ApiKey::Produce, 0, |buf| request.encode_v0(buf))
                     .await
                 {
                     Ok(()) => {
@@ -749,9 +745,7 @@ impl RecordAccumulator {
             }
 
             let response_result = conn
-                .send_request(ApiKey::Produce, 0, |buf| {
-                    request.encode_v0(buf);
-                })
+                .send_request(ApiKey::Produce, 0, |buf| request.encode_v0(buf))
                 .await;
 
             match response_result {
@@ -954,7 +948,7 @@ mod tests {
 
         // Record with key and headers should be larger
         let record_with_key =
-            ProducerRecord::new("test-topic", b"value".to_vec()).with_key(Some(b"key".to_vec()));
+            ProducerRecord::new("test-topic", b"value".to_vec()).with_key(b"key".to_vec());
         let size_with_key = RecordAccumulator::estimate_record_size(&record_with_key);
         assert!(size_with_key > size);
     }

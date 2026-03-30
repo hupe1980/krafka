@@ -1,12 +1,35 @@
 //! Kafka protocol message types.
 //!
 //! This module defines the request and response types for all Kafka APIs.
+//! Each request/response type implements [`VersionedEncode`] and/or
+//! [`VersionedDecode`] for version-dispatched encoding and decoding.
 
 use bytes::{Buf, BufMut, Bytes};
 
 use super::api::ApiKey;
-use super::primitives::{Decode, Encode, KafkaArray, KafkaBytes, KafkaString};
-use crate::error::{ErrorCode, Result};
+use super::array_len_i32;
+use super::primitives::{Decode, Encode, KafkaArray, KafkaBytes, KafkaString, TryEncode};
+use crate::error::{ErrorCode, KrafkaError, Result};
+
+/// Trait for encoding a request/response at a specific protocol version.
+///
+/// Implementors dispatch to the appropriate `encode_vN` method based on
+/// the version number, returning an error for unsupported versions.
+/// All encoding is fallible — oversized inputs return an error instead of
+/// panicking.
+pub trait VersionedEncode {
+    /// Encode this message for the given protocol version.
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()>;
+}
+
+/// Trait for decoding a response/request from a specific protocol version.
+///
+/// Implementors dispatch to the appropriate `decode_vN` method based on
+/// the version number, returning an error for unsupported versions.
+pub trait VersionedDecode: Sized {
+    /// Decode this message from the given protocol version.
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self>;
+}
 
 /// Metadata request.
 #[derive(Debug, Clone, Default)]
@@ -62,23 +85,25 @@ impl MetadataRequest {
     }
 
     /// Encode for version 0-3.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
         match &self.topics {
-            None => KafkaArray::<KafkaString>::null().encode(buf),
+            None => KafkaArray::<KafkaString>::null().try_encode(buf)?,
             Some(topics) => {
                 let names: Vec<KafkaString> = topics
                     .iter()
                     .filter_map(|t| t.name.as_ref().map(KafkaString::new))
                     .collect();
-                KafkaArray::new(names).encode(buf);
+                KafkaArray::new(names).try_encode(buf)?;
             }
         }
+        Ok(())
     }
 
     /// Encode for version 4+.
-    pub fn encode_v4(&self, buf: &mut impl BufMut) {
-        self.encode_v0(buf);
+    pub fn encode_v4(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.encode_v0(buf)?;
         buf.put_u8(if self.allow_auto_topic_creation { 1 } else { 0 });
+        Ok(())
     }
 }
 
@@ -334,31 +359,33 @@ impl ProduceRequest {
     }
 
     /// Encode for version 0-2.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
         self.acks.encode(buf);
         self.timeout_ms.encode(buf);
 
         // Topics array
-        buf.put_i32(self.topic_data.len() as i32);
+        buf.put_i32(array_len_i32(self.topic_data.len())?);
         for topic in &self.topic_data {
-            KafkaString::new(&topic.name).encode(buf);
+            KafkaString::new(&topic.name).try_encode(buf)?;
 
             // Partitions array
-            buf.put_i32(topic.partition_data.len() as i32);
+            buf.put_i32(array_len_i32(topic.partition_data.len())?);
             for partition in &topic.partition_data {
                 partition.index.encode(buf);
-                KafkaBytes::new(partition.records.clone()).encode(buf);
+                KafkaBytes::new(partition.records.clone()).try_encode(buf)?;
             }
         }
+        Ok(())
     }
 
     /// Encode for version 3+.
-    pub fn encode_v3(&self, buf: &mut impl BufMut) {
+    pub fn encode_v3(&self, buf: &mut impl BufMut) -> Result<()> {
         match &self.transactional_id {
-            Some(id) => KafkaString::new(id).encode(buf),
-            None => KafkaString::null().encode(buf),
+            Some(id) => KafkaString::new(id).try_encode(buf)?,
+            None => KafkaString::null().try_encode(buf)?,
         }
-        self.encode_v0(buf);
+        self.encode_v0(buf)?;
+        Ok(())
     }
 }
 
@@ -546,50 +573,52 @@ impl FetchRequest {
     }
 
     /// Encode for version 0-2.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
         self.replica_id.encode(buf);
         self.max_wait_ms.encode(buf);
         self.min_bytes.encode(buf);
 
         // Topics array
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
-            KafkaString::new(&topic.topic).encode(buf);
+            KafkaString::new(&topic.topic).try_encode(buf)?;
 
             // Partitions array
-            buf.put_i32(topic.partitions.len() as i32);
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition.encode(buf);
                 partition.fetch_offset.encode(buf);
                 partition.partition_max_bytes.encode(buf);
             }
         }
+        Ok(())
     }
 
     /// Encode for version 3.
-    pub fn encode_v3(&self, buf: &mut impl BufMut) {
+    pub fn encode_v3(&self, buf: &mut impl BufMut) -> Result<()> {
         self.replica_id.encode(buf);
         self.max_wait_ms.encode(buf);
         self.min_bytes.encode(buf);
         self.max_bytes.encode(buf);
 
         // Topics array
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
-            KafkaString::new(&topic.topic).encode(buf);
+            KafkaString::new(&topic.topic).try_encode(buf)?;
 
             // Partitions array
-            buf.put_i32(topic.partitions.len() as i32);
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition.encode(buf);
                 partition.fetch_offset.encode(buf);
                 partition.partition_max_bytes.encode(buf);
             }
         }
+        Ok(())
     }
 
     /// Encode for version 4.
-    pub fn encode_v4(&self, buf: &mut impl BufMut) {
+    pub fn encode_v4(&self, buf: &mut impl BufMut) -> Result<()> {
         self.replica_id.encode(buf);
         self.max_wait_ms.encode(buf);
         self.min_bytes.encode(buf);
@@ -597,22 +626,23 @@ impl FetchRequest {
         self.isolation_level.encode(buf);
 
         // Topics array
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
-            KafkaString::new(&topic.topic).encode(buf);
+            KafkaString::new(&topic.topic).try_encode(buf)?;
 
             // Partitions array
-            buf.put_i32(topic.partitions.len() as i32);
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition.encode(buf);
                 partition.fetch_offset.encode(buf);
                 partition.partition_max_bytes.encode(buf);
             }
         }
+        Ok(())
     }
 
     /// Encode for version 7 (fetch sessions: session_id, session_epoch, forgotten_topics).
-    pub fn encode_v7(&self, buf: &mut impl BufMut) {
+    pub fn encode_v7(&self, buf: &mut impl BufMut) -> Result<()> {
         self.replica_id.encode(buf);
         self.max_wait_ms.encode(buf);
         self.min_bytes.encode(buf);
@@ -622,12 +652,12 @@ impl FetchRequest {
         self.session_epoch.encode(buf);
 
         // Topics array
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
-            KafkaString::new(&topic.topic).encode(buf);
+            KafkaString::new(&topic.topic).try_encode(buf)?;
 
             // Partitions array
-            buf.put_i32(topic.partitions.len() as i32);
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition.encode(buf);
                 partition.fetch_offset.encode(buf);
@@ -638,14 +668,15 @@ impl FetchRequest {
         }
 
         // Forgotten topics array (v7+)
-        buf.put_i32(self.forgotten_topics.len() as i32);
+        buf.put_i32(array_len_i32(self.forgotten_topics.len())?);
         for forgotten in &self.forgotten_topics {
-            KafkaString::new(&forgotten.topic).encode(buf);
-            buf.put_i32(forgotten.partitions.len() as i32);
+            KafkaString::new(&forgotten.topic).try_encode(buf)?;
+            buf.put_i32(array_len_i32(forgotten.partitions.len())?);
             for &partition in &forgotten.partitions {
                 partition.encode(buf);
             }
         }
+        Ok(())
     }
 }
 
@@ -917,14 +948,16 @@ impl FindCoordinatorRequest {
     }
 
     /// Encode for version 0.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        KafkaString::new(&self.key).encode(buf);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.key).try_encode(buf)?;
+        Ok(())
     }
 
     /// Encode for version 1+.
-    pub fn encode_v1(&self, buf: &mut impl BufMut) {
-        KafkaString::new(&self.key).encode(buf);
+    pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.key).try_encode(buf)?;
         self.key_type.encode(buf);
+        Ok(())
     }
 }
 
@@ -1022,51 +1055,54 @@ impl JoinGroupRequest {
     }
 
     /// Encode for version 0.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        KafkaString::new(&self.group_id).encode(buf);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.group_id).try_encode(buf)?;
         self.session_timeout_ms.encode(buf);
-        KafkaString::new(&self.member_id).encode(buf);
-        KafkaString::new(&self.protocol_type).encode(buf);
+        KafkaString::new(&self.member_id).try_encode(buf)?;
+        KafkaString::new(&self.protocol_type).try_encode(buf)?;
 
-        buf.put_i32(self.protocols.len() as i32);
+        buf.put_i32(array_len_i32(self.protocols.len())?);
         for protocol in &self.protocols {
-            KafkaString::new(&protocol.name).encode(buf);
-            KafkaBytes::new(protocol.metadata.clone()).encode(buf);
+            KafkaString::new(&protocol.name).try_encode(buf)?;
+            KafkaBytes::new(protocol.metadata.clone()).try_encode(buf)?;
         }
+        Ok(())
     }
 
     /// Encode for version 1+.
-    pub fn encode_v1(&self, buf: &mut impl BufMut) {
-        KafkaString::new(&self.group_id).encode(buf);
+    pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.group_id).try_encode(buf)?;
         self.session_timeout_ms.encode(buf);
         self.rebalance_timeout_ms.encode(buf);
-        KafkaString::new(&self.member_id).encode(buf);
-        KafkaString::new(&self.protocol_type).encode(buf);
+        KafkaString::new(&self.member_id).try_encode(buf)?;
+        KafkaString::new(&self.protocol_type).try_encode(buf)?;
 
-        buf.put_i32(self.protocols.len() as i32);
+        buf.put_i32(array_len_i32(self.protocols.len())?);
         for protocol in &self.protocols {
-            KafkaString::new(&protocol.name).encode(buf);
-            KafkaBytes::new(protocol.metadata.clone()).encode(buf);
+            KafkaString::new(&protocol.name).try_encode(buf)?;
+            KafkaBytes::new(protocol.metadata.clone()).try_encode(buf)?;
         }
+        Ok(())
     }
 
     /// Encode for version 5+ (adds group_instance_id for KIP-345 static membership).
-    pub fn encode_v5(&self, buf: &mut impl BufMut) {
-        KafkaString::new(&self.group_id).encode(buf);
+    pub fn encode_v5(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.group_id).try_encode(buf)?;
         self.session_timeout_ms.encode(buf);
         self.rebalance_timeout_ms.encode(buf);
-        KafkaString::new(&self.member_id).encode(buf);
+        KafkaString::new(&self.member_id).try_encode(buf)?;
         match &self.group_instance_id {
-            Some(id) => KafkaString::new(id).encode(buf),
-            None => KafkaString::null().encode(buf),
+            Some(id) => KafkaString::new(id).try_encode(buf)?,
+            None => KafkaString::null().try_encode(buf)?,
         }
-        KafkaString::new(&self.protocol_type).encode(buf);
+        KafkaString::new(&self.protocol_type).try_encode(buf)?;
 
-        buf.put_i32(self.protocols.len() as i32);
+        buf.put_i32(array_len_i32(self.protocols.len())?);
         for protocol in &self.protocols {
-            KafkaString::new(&protocol.name).encode(buf);
-            KafkaBytes::new(protocol.metadata.clone()).encode(buf);
+            KafkaString::new(&protocol.name).try_encode(buf)?;
+            KafkaBytes::new(protocol.metadata.clone()).try_encode(buf)?;
         }
+        Ok(())
     }
 }
 
@@ -1248,33 +1284,35 @@ impl SyncGroupRequest {
     }
 
     /// Encode for version 0.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        KafkaString::new(&self.group_id).encode(buf);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.group_id).try_encode(buf)?;
         self.generation_id.encode(buf);
-        KafkaString::new(&self.member_id).encode(buf);
+        KafkaString::new(&self.member_id).try_encode(buf)?;
 
-        buf.put_i32(self.assignments.len() as i32);
+        buf.put_i32(array_len_i32(self.assignments.len())?);
         for assignment in &self.assignments {
-            KafkaString::new(&assignment.member_id).encode(buf);
-            KafkaBytes::new(assignment.assignment.clone()).encode(buf);
+            KafkaString::new(&assignment.member_id).try_encode(buf)?;
+            KafkaBytes::new(assignment.assignment.clone()).try_encode(buf)?;
         }
+        Ok(())
     }
 
     /// Encode for version 3+ (KIP-345: includes group_instance_id).
-    pub fn encode_v3(&self, buf: &mut impl BufMut) {
-        KafkaString::new(&self.group_id).encode(buf);
+    pub fn encode_v3(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.group_id).try_encode(buf)?;
         self.generation_id.encode(buf);
-        KafkaString::new(&self.member_id).encode(buf);
+        KafkaString::new(&self.member_id).try_encode(buf)?;
         match &self.group_instance_id {
-            Some(id) => KafkaString::new(id).encode(buf),
-            None => KafkaString::null().encode(buf),
+            Some(id) => KafkaString::new(id).try_encode(buf)?,
+            None => KafkaString::null().try_encode(buf)?,
         }
 
-        buf.put_i32(self.assignments.len() as i32);
+        buf.put_i32(array_len_i32(self.assignments.len())?);
         for assignment in &self.assignments {
-            KafkaString::new(&assignment.member_id).encode(buf);
-            KafkaBytes::new(assignment.assignment.clone()).encode(buf);
+            KafkaString::new(&assignment.member_id).try_encode(buf)?;
+            KafkaBytes::new(assignment.assignment.clone()).try_encode(buf)?;
         }
+        Ok(())
     }
 }
 
@@ -1348,21 +1386,23 @@ impl HeartbeatRequest {
     }
 
     /// Encode for version 0.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        KafkaString::new(&self.group_id).encode(buf);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.group_id).try_encode(buf)?;
         self.generation_id.encode(buf);
-        KafkaString::new(&self.member_id).encode(buf);
+        KafkaString::new(&self.member_id).try_encode(buf)?;
+        Ok(())
     }
 
     /// Encode for version 3+ (adds group_instance_id for KIP-345 static membership).
-    pub fn encode_v3(&self, buf: &mut impl BufMut) {
-        KafkaString::new(&self.group_id).encode(buf);
+    pub fn encode_v3(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.group_id).try_encode(buf)?;
         self.generation_id.encode(buf);
-        KafkaString::new(&self.member_id).encode(buf);
+        KafkaString::new(&self.member_id).try_encode(buf)?;
         match &self.group_instance_id {
-            Some(id) => KafkaString::new(id).encode(buf),
-            None => KafkaString::null().encode(buf),
+            Some(id) => KafkaString::new(id).try_encode(buf)?,
+            None => KafkaString::null().try_encode(buf)?,
         }
+        Ok(())
     }
 }
 
@@ -1427,23 +1467,36 @@ impl LeaveGroupRequest {
     }
 
     /// Encode for version 0.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        KafkaString::new(&self.group_id).encode(buf);
-        KafkaString::new(&self.member_id).encode(buf);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.group_id).try_encode(buf)?;
+        KafkaString::new(&self.member_id).try_encode(buf)?;
+        Ok(())
     }
 
     /// Encode for version 3+.
-    pub fn encode_v3(&self, buf: &mut impl BufMut) {
-        KafkaString::new(&self.group_id).encode(buf);
-        buf.put_i32(self.members.len() as i32);
+    pub fn encode_v3(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.group_id).try_encode(buf)?;
+        buf.put_i32(array_len_i32(self.members.len())?);
         for member in &self.members {
-            KafkaString::new(&member.member_id).encode(buf);
+            KafkaString::new(&member.member_id).try_encode(buf)?;
             match &member.group_instance_id {
-                Some(id) => KafkaString::new(id).encode(buf),
-                None => KafkaString::null().encode(buf),
+                Some(id) => KafkaString::new(id).try_encode(buf)?,
+                None => KafkaString::null().try_encode(buf)?,
             }
         }
+        Ok(())
     }
+}
+
+/// Member result in LeaveGroup response (v3+).
+#[derive(Debug, Clone)]
+pub struct LeaveGroupResponseMember {
+    /// Member ID.
+    pub member_id: String,
+    /// Group instance ID.
+    pub group_instance_id: Option<String>,
+    /// Per-member error code.
+    pub error_code: ErrorCode,
 }
 
 /// LeaveGroup response.
@@ -1453,6 +1506,8 @@ pub struct LeaveGroupResponse {
     pub throttle_time_ms: i32,
     /// Error code.
     pub error_code: ErrorCode,
+    /// Per-member results (v3+ only, empty for earlier versions).
+    pub members: Vec<LeaveGroupResponseMember>,
 }
 
 impl LeaveGroupResponse {
@@ -1462,16 +1517,41 @@ impl LeaveGroupResponse {
         Ok(Self {
             throttle_time_ms: 0,
             error_code,
+            members: vec![],
         })
     }
 
-    /// Decode from version 1+.
+    /// Decode from version 1-2.
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         Ok(Self {
             throttle_time_ms,
             error_code,
+            members: vec![],
+        })
+    }
+
+    /// Decode from version 3+ (KIP-345 batch leave with per-member results).
+    pub fn decode_v3(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let member_count = i32::decode(buf)?;
+        let mut members = Vec::new();
+        for _ in 0..member_count {
+            let member_id = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let group_instance_id = KafkaString::decode(buf)?.0;
+            let member_error_code = ErrorCode::from_i16(i16::decode(buf)?);
+            members.push(LeaveGroupResponseMember {
+                member_id,
+                group_instance_id,
+                error_code: member_error_code,
+            });
+        }
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            members,
         })
     }
 }
@@ -1528,66 +1608,69 @@ impl OffsetCommitRequest {
     }
 
     /// Encode for version 0.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        KafkaString::new(&self.group_id).encode(buf);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.group_id).try_encode(buf)?;
 
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
-            KafkaString::new(&topic.name).encode(buf);
-            buf.put_i32(topic.partitions.len() as i32);
+            KafkaString::new(&topic.name).try_encode(buf)?;
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition_index.encode(buf);
                 partition.committed_offset.encode(buf);
                 match &partition.committed_metadata {
-                    Some(m) => KafkaString::new(m).encode(buf),
-                    None => KafkaString::null().encode(buf),
+                    Some(m) => KafkaString::new(m).try_encode(buf)?,
+                    None => KafkaString::null().try_encode(buf)?,
                 }
             }
         }
+        Ok(())
     }
 
     /// Encode for version 1.
-    pub fn encode_v1(&self, buf: &mut impl BufMut) {
-        KafkaString::new(&self.group_id).encode(buf);
+    pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.group_id).try_encode(buf)?;
         self.generation_id.encode(buf);
-        KafkaString::new(&self.member_id).encode(buf);
+        KafkaString::new(&self.member_id).try_encode(buf)?;
 
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
-            KafkaString::new(&topic.name).encode(buf);
-            buf.put_i32(topic.partitions.len() as i32);
+            KafkaString::new(&topic.name).try_encode(buf)?;
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition_index.encode(buf);
                 partition.committed_offset.encode(buf);
                 partition.commit_timestamp.encode(buf);
                 match &partition.committed_metadata {
-                    Some(m) => KafkaString::new(m).encode(buf),
-                    None => KafkaString::null().encode(buf),
+                    Some(m) => KafkaString::new(m).try_encode(buf)?,
+                    None => KafkaString::null().try_encode(buf)?,
                 }
             }
         }
+        Ok(())
     }
 
     /// Encode for version 2+.
-    pub fn encode_v2(&self, buf: &mut impl BufMut) {
-        KafkaString::new(&self.group_id).encode(buf);
+    pub fn encode_v2(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.group_id).try_encode(buf)?;
         self.generation_id.encode(buf);
-        KafkaString::new(&self.member_id).encode(buf);
+        KafkaString::new(&self.member_id).try_encode(buf)?;
         self.retention_time_ms.encode(buf);
 
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
-            KafkaString::new(&topic.name).encode(buf);
-            buf.put_i32(topic.partitions.len() as i32);
+            KafkaString::new(&topic.name).try_encode(buf)?;
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition_index.encode(buf);
                 partition.committed_offset.encode(buf);
                 match &partition.committed_metadata {
-                    Some(m) => KafkaString::new(m).encode(buf),
-                    None => KafkaString::null().encode(buf),
+                    Some(m) => KafkaString::new(m).try_encode(buf)?,
+                    None => KafkaString::null().try_encode(buf)?,
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -1727,35 +1810,37 @@ impl ListOffsetsRequest {
     }
 
     /// Encode for version 1 (single offset response per partition).
-    pub fn encode_v1(&self, buf: &mut impl BufMut) {
+    pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
         buf.put_i32(self.replica_id);
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
-            KafkaString::new(&topic.name).encode(buf);
-            buf.put_i32(topic.partitions.len() as i32);
+            KafkaString::new(&topic.name).try_encode(buf)?;
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 buf.put_i32(partition.partition_index);
                 buf.put_i64(partition.timestamp);
             }
         }
+        Ok(())
     }
 
     /// Encode for version 2+ (includes `isolation_level`).
     ///
     /// Version 2 adds `isolation_level` after `replica_id`, which controls
     /// whether transactional (uncommitted) records are visible.
-    pub fn encode_v2(&self, buf: &mut impl BufMut) {
+    pub fn encode_v2(&self, buf: &mut impl BufMut) -> Result<()> {
         buf.put_i32(self.replica_id);
         buf.put_i8(self.isolation_level);
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
-            KafkaString::new(&topic.name).encode(buf);
-            buf.put_i32(topic.partitions.len() as i32);
+            KafkaString::new(&topic.name).try_encode(buf)?;
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 buf.put_i32(partition.partition_index);
                 buf.put_i64(partition.timestamp);
             }
         }
+        Ok(())
     }
 }
 
@@ -1893,15 +1978,15 @@ impl OffsetFetchRequest {
     }
 
     /// Encode for version 0-1.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        KafkaString::new(&self.group_id).encode(buf);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.group_id).try_encode(buf)?;
 
         match &self.topics {
             Some(topics) => {
-                buf.put_i32(topics.len() as i32);
+                buf.put_i32(array_len_i32(topics.len())?);
                 for topic in topics {
-                    KafkaString::new(&topic.name).encode(buf);
-                    buf.put_i32(topic.partition_indexes.len() as i32);
+                    KafkaString::new(&topic.name).try_encode(buf)?;
+                    buf.put_i32(array_len_i32(topic.partition_indexes.len())?);
                     for partition in &topic.partition_indexes {
                         partition.encode(buf);
                     }
@@ -1911,6 +1996,7 @@ impl OffsetFetchRequest {
                 buf.put_i32(-1);
             }
         }
+        Ok(())
     }
 }
 
@@ -2126,62 +2212,64 @@ impl CreateTopicsRequest {
     }
 
     /// Encode for version 0.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        buf.put_i32(self.topics.len() as i32);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
-            KafkaString::new(&topic.name).encode(buf);
+            KafkaString::new(&topic.name).try_encode(buf)?;
             topic.num_partitions.encode(buf);
             topic.replication_factor.encode(buf);
 
-            buf.put_i32(topic.assignments.len() as i32);
+            buf.put_i32(array_len_i32(topic.assignments.len())?);
             for assignment in &topic.assignments {
                 assignment.partition_index.encode(buf);
-                buf.put_i32(assignment.broker_ids.len() as i32);
+                buf.put_i32(array_len_i32(assignment.broker_ids.len())?);
                 for broker in &assignment.broker_ids {
                     broker.encode(buf);
                 }
             }
 
-            buf.put_i32(topic.configs.len() as i32);
+            buf.put_i32(array_len_i32(topic.configs.len())?);
             for config in &topic.configs {
-                KafkaString::new(&config.name).encode(buf);
+                KafkaString::new(&config.name).try_encode(buf)?;
                 match &config.value {
-                    Some(v) => KafkaString::new(v).encode(buf),
-                    None => KafkaString::null().encode(buf),
+                    Some(v) => KafkaString::new(v).try_encode(buf)?,
+                    None => KafkaString::null().try_encode(buf)?,
                 }
             }
         }
         self.timeout_ms.encode(buf);
+        Ok(())
     }
 
     /// Encode for version 1+.
-    pub fn encode_v1(&self, buf: &mut impl BufMut) {
-        buf.put_i32(self.topics.len() as i32);
+    pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
-            KafkaString::new(&topic.name).encode(buf);
+            KafkaString::new(&topic.name).try_encode(buf)?;
             topic.num_partitions.encode(buf);
             topic.replication_factor.encode(buf);
 
-            buf.put_i32(topic.assignments.len() as i32);
+            buf.put_i32(array_len_i32(topic.assignments.len())?);
             for assignment in &topic.assignments {
                 assignment.partition_index.encode(buf);
-                buf.put_i32(assignment.broker_ids.len() as i32);
+                buf.put_i32(array_len_i32(assignment.broker_ids.len())?);
                 for broker in &assignment.broker_ids {
                     broker.encode(buf);
                 }
             }
 
-            buf.put_i32(topic.configs.len() as i32);
+            buf.put_i32(array_len_i32(topic.configs.len())?);
             for config in &topic.configs {
-                KafkaString::new(&config.name).encode(buf);
+                KafkaString::new(&config.name).try_encode(buf)?;
                 match &config.value {
-                    Some(v) => KafkaString::new(v).encode(buf),
-                    None => KafkaString::null().encode(buf),
+                    Some(v) => KafkaString::new(v).try_encode(buf)?,
+                    None => KafkaString::null().try_encode(buf)?,
                 }
             }
         }
         self.timeout_ms.encode(buf);
         buf.put_u8(if self.validate_only { 1 } else { 0 });
+        Ok(())
     }
 }
 
@@ -2306,12 +2394,13 @@ impl DeleteTopicsRequest {
     }
 
     /// Encode for version 0+.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        buf.put_i32(self.topic_names.len() as i32);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        buf.put_i32(array_len_i32(self.topic_names.len())?);
         for name in &self.topic_names {
-            KafkaString::new(name).encode(buf);
+            KafkaString::new(name).try_encode(buf)?;
         }
         self.timeout_ms.encode(buf);
+        Ok(())
     }
 }
 
@@ -2430,20 +2519,20 @@ impl CreatePartitionsRequest {
     }
 
     /// Encode for version 0.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
         // Array of topics
-        (self.topics.len() as i32).encode(buf);
+        array_len_i32(self.topics.len())?.encode(buf);
         for topic in &self.topics {
-            KafkaString::new(&topic.name).encode(buf);
+            KafkaString::new(&topic.name).try_encode(buf)?;
             topic.count.encode(buf);
 
             // Assignments (nullable array)
             match &topic.assignments {
                 None => (-1i32).encode(buf),
                 Some(assignments) => {
-                    (assignments.len() as i32).encode(buf);
+                    array_len_i32(assignments.len())?.encode(buf);
                     for assignment in assignments {
-                        (assignment.broker_ids.len() as i32).encode(buf);
+                        array_len_i32(assignment.broker_ids.len())?.encode(buf);
                         for &broker_id in &assignment.broker_ids {
                             broker_id.encode(buf);
                         }
@@ -2453,6 +2542,7 @@ impl CreatePartitionsRequest {
         }
         self.timeout_ms.encode(buf);
         buf.put_u8(if self.validate_only { 1 } else { 0 });
+        Ok(())
     }
 }
 
@@ -2588,22 +2678,23 @@ impl DescribeConfigsRequest {
     }
 
     /// Encode for version 0.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        (self.resources.len() as i32).encode(buf);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        array_len_i32(self.resources.len())?.encode(buf);
         for resource in &self.resources {
             resource.resource_type.to_i8().encode(buf);
-            KafkaString::new(&resource.resource_name).encode(buf);
+            KafkaString::new(&resource.resource_name).try_encode(buf)?;
 
             match &resource.config_names {
                 None => (-1i32).encode(buf),
                 Some(names) => {
-                    (names.len() as i32).encode(buf);
+                    array_len_i32(names.len())?.encode(buf);
                     for name in names {
-                        KafkaString::new(name).encode(buf);
+                        KafkaString::new(name).try_encode(buf)?;
                     }
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -2747,22 +2838,23 @@ impl AlterConfigsRequest {
     }
 
     /// Encode for version 0.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        (self.resources.len() as i32).encode(buf);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        array_len_i32(self.resources.len())?.encode(buf);
         for resource in &self.resources {
             resource.resource_type.to_i8().encode(buf);
-            KafkaString::new(&resource.resource_name).encode(buf);
+            KafkaString::new(&resource.resource_name).try_encode(buf)?;
 
-            (resource.configs.len() as i32).encode(buf);
+            array_len_i32(resource.configs.len())?.encode(buf);
             for config in &resource.configs {
-                KafkaString::new(&config.name).encode(buf);
+                KafkaString::new(&config.name).try_encode(buf)?;
                 match &config.value {
-                    Some(v) => KafkaString::new(v).encode(buf),
-                    None => KafkaString::null().encode(buf),
+                    Some(v) => KafkaString::new(v).try_encode(buf)?,
+                    None => KafkaString::null().try_encode(buf)?,
                 }
             }
         }
         buf.put_u8(if self.validate_only { 1 } else { 0 });
+        Ok(())
     }
 }
 
@@ -2857,17 +2949,19 @@ impl InitProducerIdRequest {
     }
 
     /// Encode as version 0 (non-transactional idempotent only).
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        KafkaString(self.transactional_id.clone()).encode(buf);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString(self.transactional_id.clone()).try_encode(buf)?;
         self.transaction_timeout_ms.encode(buf);
+        Ok(())
     }
 
     /// Encode as version 2 (with producer_id and epoch for recovery).
-    pub fn encode_v2(&self, buf: &mut impl BufMut) {
-        KafkaString(self.transactional_id.clone()).encode(buf);
+    pub fn encode_v2(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString(self.transactional_id.clone()).try_encode(buf)?;
         self.transaction_timeout_ms.encode(buf);
         self.producer_id.encode(buf);
         self.producer_epoch.encode(buf);
+        Ok(())
     }
 }
 
@@ -2928,14 +3022,16 @@ impl SaslHandshakeRequest {
     }
 
     /// Encode as version 0.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        KafkaString(Some(self.mechanism.clone())).encode(buf);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString(Some(self.mechanism.clone())).try_encode(buf)?;
+        Ok(())
     }
 
     /// Encode as version 1.
-    pub fn encode_v1(&self, buf: &mut impl BufMut) {
+    pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
         // Same as v0
-        self.encode_v0(buf);
+        self.encode_v0(buf)?;
+        Ok(())
     }
 }
 
@@ -2993,14 +3089,16 @@ impl SaslAuthenticateRequest {
     }
 
     /// Encode as version 0.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        KafkaBytes(Some(bytes::Bytes::from(self.auth_bytes.clone()))).encode(buf);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaBytes(Some(bytes::Bytes::from(self.auth_bytes.clone()))).try_encode(buf)?;
+        Ok(())
     }
 
     /// Encode as version 1.
-    pub fn encode_v1(&self, buf: &mut impl BufMut) {
+    pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
         // Same as v0
-        self.encode_v0(buf);
+        self.encode_v0(buf)?;
+        Ok(())
     }
 }
 
@@ -3368,24 +3466,26 @@ impl DescribeAclsRequest {
     }
 
     /// Encode as version 0.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
         (self.resource_type.to_i8()).encode(buf);
-        KafkaString(self.resource_name.clone()).encode(buf);
-        KafkaString(self.principal.clone()).encode(buf);
-        KafkaString(self.host.clone()).encode(buf);
+        KafkaString(self.resource_name.clone()).try_encode(buf)?;
+        KafkaString(self.principal.clone()).try_encode(buf)?;
+        KafkaString(self.host.clone()).try_encode(buf)?;
         (self.operation.to_i8()).encode(buf);
         (self.permission_type.to_i8()).encode(buf);
+        Ok(())
     }
 
     /// Encode as version 1 (with pattern type).
-    pub fn encode_v1(&self, buf: &mut impl BufMut) {
+    pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
         (self.resource_type.to_i8()).encode(buf);
-        KafkaString(self.resource_name.clone()).encode(buf);
+        KafkaString(self.resource_name.clone()).try_encode(buf)?;
         (self.pattern_type.to_i8()).encode(buf);
-        KafkaString(self.principal.clone()).encode(buf);
-        KafkaString(self.host.clone()).encode(buf);
+        KafkaString(self.principal.clone()).try_encode(buf)?;
+        KafkaString(self.host.clone()).try_encode(buf)?;
         (self.operation.to_i8()).encode(buf);
         (self.permission_type.to_i8()).encode(buf);
+        Ok(())
     }
 }
 
@@ -3490,30 +3590,32 @@ impl CreateAclsRequest {
     }
 
     /// Encode as version 0.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        (self.creations.len() as i32).encode(buf);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        array_len_i32(self.creations.len())?.encode(buf);
         for acl in &self.creations {
             (acl.resource_type.to_i8()).encode(buf);
-            KafkaString(Some(acl.resource_name.clone())).encode(buf);
-            KafkaString(Some(acl.principal.clone())).encode(buf);
-            KafkaString(Some(acl.host.clone())).encode(buf);
+            KafkaString(Some(acl.resource_name.clone())).try_encode(buf)?;
+            KafkaString(Some(acl.principal.clone())).try_encode(buf)?;
+            KafkaString(Some(acl.host.clone())).try_encode(buf)?;
             (acl.operation.to_i8()).encode(buf);
             (acl.permission_type.to_i8()).encode(buf);
         }
+        Ok(())
     }
 
     /// Encode as version 1 (with pattern type).
-    pub fn encode_v1(&self, buf: &mut impl BufMut) {
-        (self.creations.len() as i32).encode(buf);
+    pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
+        array_len_i32(self.creations.len())?.encode(buf);
         for acl in &self.creations {
             (acl.resource_type.to_i8()).encode(buf);
-            KafkaString(Some(acl.resource_name.clone())).encode(buf);
+            KafkaString(Some(acl.resource_name.clone())).try_encode(buf)?;
             (acl.pattern_type.to_i8()).encode(buf);
-            KafkaString(Some(acl.principal.clone())).encode(buf);
-            KafkaString(Some(acl.host.clone())).encode(buf);
+            KafkaString(Some(acl.principal.clone())).try_encode(buf)?;
+            KafkaString(Some(acl.host.clone())).try_encode(buf)?;
             (acl.operation.to_i8()).encode(buf);
             (acl.permission_type.to_i8()).encode(buf);
         }
+        Ok(())
     }
 }
 
@@ -3624,30 +3726,32 @@ impl DeleteAclsRequest {
     }
 
     /// Encode as version 0.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        (self.filters.len() as i32).encode(buf);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        array_len_i32(self.filters.len())?.encode(buf);
         for filter in &self.filters {
             (filter.resource_type.to_i8()).encode(buf);
-            KafkaString(filter.resource_name.clone()).encode(buf);
-            KafkaString(filter.principal.clone()).encode(buf);
-            KafkaString(filter.host.clone()).encode(buf);
+            KafkaString(filter.resource_name.clone()).try_encode(buf)?;
+            KafkaString(filter.principal.clone()).try_encode(buf)?;
+            KafkaString(filter.host.clone()).try_encode(buf)?;
             (filter.operation.to_i8()).encode(buf);
             (filter.permission_type.to_i8()).encode(buf);
         }
+        Ok(())
     }
 
     /// Encode as version 1 (with pattern type).
-    pub fn encode_v1(&self, buf: &mut impl BufMut) {
-        (self.filters.len() as i32).encode(buf);
+    pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
+        array_len_i32(self.filters.len())?.encode(buf);
         for filter in &self.filters {
             (filter.resource_type.to_i8()).encode(buf);
-            KafkaString(filter.resource_name.clone()).encode(buf);
+            KafkaString(filter.resource_name.clone()).try_encode(buf)?;
             (filter.pattern_type.to_i8()).encode(buf);
-            KafkaString(filter.principal.clone()).encode(buf);
-            KafkaString(filter.host.clone()).encode(buf);
+            KafkaString(filter.principal.clone()).try_encode(buf)?;
+            KafkaString(filter.host.clone()).try_encode(buf)?;
             (filter.operation.to_i8()).encode(buf);
             (filter.permission_type.to_i8()).encode(buf);
         }
+        Ok(())
     }
 }
 
@@ -3831,18 +3935,19 @@ impl AddPartitionsToTxnRequest {
     }
 
     /// Encode as version 0.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        KafkaString(Some(self.transactional_id.clone())).encode(buf);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString(Some(self.transactional_id.clone())).try_encode(buf)?;
         self.producer_id.encode(buf);
         self.producer_epoch.encode(buf);
-        (self.topics.len() as i32).encode(buf);
+        array_len_i32(self.topics.len())?.encode(buf);
         for topic in &self.topics {
-            KafkaString(Some(topic.name.clone())).encode(buf);
-            (topic.partitions.len() as i32).encode(buf);
+            KafkaString(Some(topic.name.clone())).try_encode(buf)?;
+            array_len_i32(topic.partitions.len())?.encode(buf);
             for partition in &topic.partitions {
                 partition.encode(buf);
             }
         }
+        Ok(())
     }
 }
 
@@ -3943,11 +4048,12 @@ impl AddOffsetsToTxnRequest {
     }
 
     /// Encode as version 0.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        KafkaString(Some(self.transactional_id.clone())).encode(buf);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString(Some(self.transactional_id.clone())).try_encode(buf)?;
         self.producer_id.encode(buf);
         self.producer_epoch.encode(buf);
-        KafkaString(Some(self.group_id.clone())).encode(buf);
+        KafkaString(Some(self.group_id.clone())).try_encode(buf)?;
+        Ok(())
     }
 }
 
@@ -4023,11 +4129,12 @@ impl EndTxnRequest {
     }
 
     /// Encode as version 0.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        KafkaString(Some(self.transactional_id.clone())).encode(buf);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString(Some(self.transactional_id.clone())).try_encode(buf)?;
         self.producer_id.encode(buf);
         self.producer_epoch.encode(buf);
         self.committed.encode(buf);
+        Ok(())
     }
 }
 
@@ -4146,40 +4253,42 @@ impl TxnOffsetCommitRequest {
     }
 
     /// Encode as version 0.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        KafkaString(Some(self.transactional_id.clone())).encode(buf);
-        KafkaString(Some(self.group_id.clone())).encode(buf);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString(Some(self.transactional_id.clone())).try_encode(buf)?;
+        KafkaString(Some(self.group_id.clone())).try_encode(buf)?;
         self.producer_id.encode(buf);
         self.producer_epoch.encode(buf);
-        (self.topics.len() as i32).encode(buf);
+        array_len_i32(self.topics.len())?.encode(buf);
         for topic in &self.topics {
-            KafkaString(Some(topic.name.clone())).encode(buf);
-            (topic.partitions.len() as i32).encode(buf);
+            KafkaString(Some(topic.name.clone())).try_encode(buf)?;
+            array_len_i32(topic.partitions.len())?.encode(buf);
             for partition in &topic.partitions {
                 partition.partition.encode(buf);
                 partition.committed_offset.encode(buf);
-                KafkaString(partition.metadata.clone()).encode(buf);
+                KafkaString(partition.metadata.clone()).try_encode(buf)?;
             }
         }
+        Ok(())
     }
 
     /// Encode as version 2 (with leader epoch).
-    pub fn encode_v2(&self, buf: &mut impl BufMut) {
-        KafkaString(Some(self.transactional_id.clone())).encode(buf);
-        KafkaString(Some(self.group_id.clone())).encode(buf);
+    pub fn encode_v2(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString(Some(self.transactional_id.clone())).try_encode(buf)?;
+        KafkaString(Some(self.group_id.clone())).try_encode(buf)?;
         self.producer_id.encode(buf);
         self.producer_epoch.encode(buf);
-        (self.topics.len() as i32).encode(buf);
+        array_len_i32(self.topics.len())?.encode(buf);
         for topic in &self.topics {
-            KafkaString(Some(topic.name.clone())).encode(buf);
-            (topic.partitions.len() as i32).encode(buf);
+            KafkaString(Some(topic.name.clone())).try_encode(buf)?;
+            array_len_i32(topic.partitions.len())?.encode(buf);
             for partition in &topic.partitions {
                 partition.partition.encode(buf);
                 partition.committed_offset.encode(buf);
                 partition.committed_leader_epoch.encode(buf);
-                KafkaString(partition.metadata.clone()).encode(buf);
+                KafkaString(partition.metadata.clone()).try_encode(buf)?;
             }
         }
+        Ok(())
     }
 }
 
@@ -4266,11 +4375,12 @@ impl DescribeGroupsRequest {
     }
 
     /// Encode for version 0+.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        buf.put_i32(self.groups.len() as i32);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        buf.put_i32(array_len_i32(self.groups.len())?);
         for group in &self.groups {
-            KafkaString::new(group).encode(buf);
+            KafkaString::new(group).try_encode(buf)?;
         }
+        Ok(())
     }
 }
 
@@ -4431,9 +4541,10 @@ impl ListGroupsRequest {
     }
 
     /// Encode for version 0+.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
         // No request body for v0
         let _ = buf;
+        Ok(())
     }
 }
 
@@ -4543,17 +4654,18 @@ impl DeleteRecordsRequest {
     }
 
     /// Encode for version 0+.
-    pub fn encode_v0(&self, buf: &mut impl BufMut) {
-        buf.put_i32(self.topics.len() as i32);
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
-            KafkaString::new(&topic.name).encode(buf);
-            buf.put_i32(topic.partitions.len() as i32);
+            KafkaString::new(&topic.name).try_encode(buf)?;
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition_index.encode(buf);
                 partition.offset.encode(buf);
             }
         }
         self.timeout_ms.encode(buf);
+        Ok(())
     }
 }
 
@@ -4659,33 +4771,35 @@ impl OffsetForLeaderEpochRequest {
     }
 
     /// Encode for version 2+ (includes current_leader_epoch for fencing).
-    pub fn encode_v2(&self, buf: &mut impl BufMut) {
+    pub fn encode_v2(&self, buf: &mut impl BufMut) -> Result<()> {
         // v2 adds replica_id before topics
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
-            KafkaString::new(&topic.topic).encode(buf);
-            buf.put_i32(topic.partitions.len() as i32);
+            KafkaString::new(&topic.topic).try_encode(buf)?;
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition.encode(buf);
                 partition.current_leader_epoch.encode(buf);
                 partition.leader_epoch.encode(buf);
             }
         }
+        Ok(())
     }
 
     /// Encode for version 3+ (adds replica_id field).
-    pub fn encode_v3(&self, buf: &mut impl BufMut) {
+    pub fn encode_v3(&self, buf: &mut impl BufMut) -> Result<()> {
         self.replica_id.encode(buf);
-        buf.put_i32(self.topics.len() as i32);
+        buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
-            KafkaString::new(&topic.topic).encode(buf);
-            buf.put_i32(topic.partitions.len() as i32);
+            KafkaString::new(&topic.topic).try_encode(buf)?;
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition.encode(buf);
                 partition.current_leader_epoch.encode(buf);
                 partition.leader_epoch.encode(buf);
             }
         }
+        Ok(())
     }
 }
 
@@ -4818,6 +4932,647 @@ impl OffsetForLeaderEpochResponse {
     }
 }
 
+// ---------------------------------------------------------------------------
+// VersionedEncode / VersionedDecode implementations
+// ---------------------------------------------------------------------------
+
+macro_rules! unsupported_encode {
+    ($type:expr, $version:expr) => {
+        Err(KrafkaError::protocol(format!(
+            "unsupported {} encode version {}",
+            $type, $version
+        )))
+    };
+}
+
+macro_rules! unsupported_decode {
+    ($type:expr, $version:expr) => {
+        Err(KrafkaError::protocol(format!(
+            "unsupported {} decode version {}",
+            $type, $version
+        )))
+    };
+}
+
+impl VersionedEncode for MetadataRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            // Capped to METADATA_MAX (currently 1). Raise this range when
+            // higher-version encode/decode support and version constants
+            // are updated together.
+            0..=1 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("MetadataRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for MetadataResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1 => Self::decode_v1(buf),
+            _ => unsupported_decode!("MetadataResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for ProduceRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0..=2 => self.encode_v0(buf)?,
+            3 => self.encode_v3(buf)?,
+            _ => return unsupported_encode!("ProduceRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for ProduceResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1 => Self::decode_v1(buf),
+            2..=3 => Self::decode_v2(buf),
+            _ => unsupported_decode!("ProduceResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for FetchRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0..=2 => self.encode_v0(buf)?,
+            3 => self.encode_v3(buf)?,
+            4 => self.encode_v4(buf)?,
+            // v5-v6 add fields (log_start_offset) that encode_v4 doesn't produce
+            5 | 6 => return unsupported_encode!("FetchRequest", version),
+            7 => self.encode_v7(buf)?,
+            _ => return unsupported_encode!("FetchRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for FetchResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1..=3 => Self::decode_v1(buf),
+            4 => Self::decode_v4(buf),
+            // v5-v6 add fields (log_start_offset) that decode_v4 doesn't consume
+            5 | 6 => unsupported_decode!("FetchResponse", version),
+            7 => Self::decode_v7(buf),
+            _ => unsupported_decode!("FetchResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for FindCoordinatorRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            1 => self.encode_v1(buf)?,
+            _ => return unsupported_encode!("FindCoordinatorRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for FindCoordinatorResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1 => Self::decode_v1(buf),
+            _ => unsupported_decode!("FindCoordinatorResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for JoinGroupRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            1..=4 => self.encode_v1(buf)?,
+            5 => self.encode_v5(buf)?,
+            _ => return unsupported_encode!("JoinGroupRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for JoinGroupResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0..=1 => Self::decode_v0(buf),
+            2..=4 => Self::decode_v2(buf),
+            5 => Self::decode_v5(buf),
+            _ => unsupported_decode!("JoinGroupResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for SyncGroupRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0..=2 => self.encode_v0(buf)?,
+            3 => self.encode_v3(buf)?,
+            _ => return unsupported_encode!("SyncGroupRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for SyncGroupResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1..=3 => Self::decode_v1(buf),
+            _ => unsupported_decode!("SyncGroupResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for HeartbeatRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0..=2 => self.encode_v0(buf)?,
+            3 => self.encode_v3(buf)?,
+            _ => return unsupported_encode!("HeartbeatRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for HeartbeatResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1..=3 => Self::decode_v1(buf),
+            _ => unsupported_decode!("HeartbeatResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for LeaveGroupRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0..=2 => self.encode_v0(buf)?,
+            3 => self.encode_v3(buf)?,
+            _ => return unsupported_encode!("LeaveGroupRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for LeaveGroupResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1..=2 => Self::decode_v1(buf),
+            3 => Self::decode_v3(buf),
+            _ => unsupported_decode!("LeaveGroupResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for OffsetCommitRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            1 => self.encode_v1(buf)?,
+            2 => self.encode_v2(buf)?,
+            _ => return unsupported_encode!("OffsetCommitRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for OffsetCommitResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0..=2 => Self::decode_v0(buf),
+            _ => unsupported_decode!("OffsetCommitResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for ListOffsetsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            1 => self.encode_v1(buf)?,
+            2 => self.encode_v2(buf)?,
+            _ => return unsupported_encode!("ListOffsetsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for ListOffsetsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            1 => Self::decode_v1(buf),
+            2 => Self::decode_v2(buf),
+            _ => unsupported_decode!("ListOffsetsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for OffsetFetchRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0..=1 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("OffsetFetchRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for OffsetFetchResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0..=1 => Self::decode_v0(buf),
+            _ => unsupported_decode!("OffsetFetchResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for CreateTopicsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            1..=2 => self.encode_v1(buf)?,
+            _ => return unsupported_encode!("CreateTopicsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for CreateTopicsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1 => Self::decode_v1(buf),
+            2 => Self::decode_v2(buf),
+            _ => unsupported_decode!("CreateTopicsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for DeleteTopicsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0..=1 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("DeleteTopicsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for DeleteTopicsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1 => Self::decode_v1(buf),
+            _ => unsupported_decode!("DeleteTopicsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for CreatePartitionsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("CreatePartitionsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for CreatePartitionsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            _ => unsupported_decode!("CreatePartitionsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for DescribeConfigsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("DescribeConfigsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for DescribeConfigsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            _ => unsupported_decode!("DescribeConfigsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for AlterConfigsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("AlterConfigsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for AlterConfigsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            _ => unsupported_decode!("AlterConfigsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for InitProducerIdRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("InitProducerIdRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for InitProducerIdResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            _ => unsupported_decode!("InitProducerIdResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for SaslHandshakeRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            1 => self.encode_v1(buf)?,
+            _ => return unsupported_encode!("SaslHandshakeRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for SaslHandshakeResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0..=1 => Self::decode_v0(buf),
+            _ => unsupported_decode!("SaslHandshakeResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for SaslAuthenticateRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            1 => self.encode_v1(buf)?,
+            _ => return unsupported_encode!("SaslAuthenticateRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for SaslAuthenticateResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1 => Self::decode_v1(buf),
+            _ => unsupported_decode!("SaslAuthenticateResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for DescribeAclsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            1 => self.encode_v1(buf)?,
+            _ => return unsupported_encode!("DescribeAclsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for DescribeAclsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0..=1 => Self::decode_v0(buf),
+            _ => unsupported_decode!("DescribeAclsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for CreateAclsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            1 => self.encode_v1(buf)?,
+            _ => return unsupported_encode!("CreateAclsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for CreateAclsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0..=1 => Self::decode_v0(buf),
+            _ => unsupported_decode!("CreateAclsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for DeleteAclsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            1 => self.encode_v1(buf)?,
+            _ => return unsupported_encode!("DeleteAclsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for DeleteAclsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0..=1 => Self::decode_v0(buf),
+            _ => unsupported_decode!("DeleteAclsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for AddPartitionsToTxnRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("AddPartitionsToTxnRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for AddPartitionsToTxnResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            _ => unsupported_decode!("AddPartitionsToTxnResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for AddOffsetsToTxnRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("AddOffsetsToTxnRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for AddOffsetsToTxnResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            _ => unsupported_decode!("AddOffsetsToTxnResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for EndTxnRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("EndTxnRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for EndTxnResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            _ => unsupported_decode!("EndTxnResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for TxnOffsetCommitRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("TxnOffsetCommitRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for TxnOffsetCommitResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            _ => unsupported_decode!("TxnOffsetCommitResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for DescribeGroupsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0..=1 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("DescribeGroupsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for DescribeGroupsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1 => Self::decode_v1(buf),
+            _ => unsupported_decode!("DescribeGroupsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for ListGroupsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0..=1 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("ListGroupsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for ListGroupsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1 => Self::decode_v1(buf),
+            _ => unsupported_decode!("ListGroupsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for DeleteRecordsRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("DeleteRecordsRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for DeleteRecordsResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            _ => unsupported_decode!("DeleteRecordsResponse", version),
+        }
+    }
+}
+
+impl VersionedEncode for OffsetForLeaderEpochRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            2 => self.encode_v2(buf)?,
+            3 => self.encode_v3(buf)?,
+            _ => return unsupported_encode!("OffsetForLeaderEpochRequest", version),
+        }
+        Ok(())
+    }
+}
+
+impl VersionedDecode for OffsetForLeaderEpochResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            1 => Self::decode_v1(buf),
+            2..=3 => Self::decode_v2(buf),
+            _ => unsupported_decode!("OffsetForLeaderEpochResponse", version),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4831,7 +5586,7 @@ mod tests {
         assert!(request.topics.as_ref().unwrap().is_empty());
 
         let mut buf = BytesMut::new();
-        request.encode_v0(&mut buf);
+        request.encode_v0(&mut buf).unwrap();
 
         // Should encode as empty array (0)
         assert_eq!(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), 0);
@@ -4860,7 +5615,7 @@ mod tests {
         assert_eq!(request.mechanism, "PLAIN");
 
         let mut buf = BytesMut::new();
-        request.encode_v0(&mut buf);
+        request.encode_v0(&mut buf).unwrap();
         assert!(!buf.is_empty());
     }
 
@@ -4871,7 +5626,7 @@ mod tests {
         assert_eq!(request.auth_bytes, auth_bytes);
 
         let mut buf = BytesMut::new();
-        request.encode_v0(&mut buf);
+        request.encode_v0(&mut buf).unwrap();
         assert!(!buf.is_empty());
     }
 
@@ -4943,7 +5698,7 @@ mod tests {
         assert_eq!(request.creations.len(), 2);
 
         let mut buf = BytesMut::new();
-        request.encode_v0(&mut buf);
+        request.encode_v0(&mut buf).unwrap();
         assert!(!buf.is_empty());
     }
 
@@ -4985,7 +5740,7 @@ mod tests {
         assert_eq!(topic1.partitions, vec![0, 1]);
 
         let mut buf = BytesMut::new();
-        request.encode_v0(&mut buf);
+        request.encode_v0(&mut buf).unwrap();
         assert!(!buf.is_empty());
     }
 
@@ -4997,7 +5752,7 @@ mod tests {
         assert_eq!(request.group_id, "my-group");
 
         let mut buf = BytesMut::new();
-        request.encode_v0(&mut buf);
+        request.encode_v0(&mut buf).unwrap();
         assert!(!buf.is_empty());
     }
 
@@ -5010,7 +5765,7 @@ mod tests {
         assert!(!abort.committed);
 
         let mut buf = BytesMut::new();
-        commit.encode_v0(&mut buf);
+        commit.encode_v0(&mut buf).unwrap();
         assert!(!buf.is_empty());
     }
 
@@ -5026,7 +5781,7 @@ mod tests {
         assert_eq!(request.topics[0].partitions.len(), 2);
 
         let mut buf = BytesMut::new();
-        request.encode_v0(&mut buf);
+        request.encode_v0(&mut buf).unwrap();
         assert!(!buf.is_empty());
     }
 
@@ -5039,7 +5794,7 @@ mod tests {
         assert_eq!(DescribeGroupsRequest::api_key(), ApiKey::DescribeGroups);
 
         let mut buf = BytesMut::new();
-        request.encode_v0(&mut buf);
+        request.encode_v0(&mut buf).unwrap();
         assert!(!buf.is_empty());
     }
 
@@ -5086,7 +5841,7 @@ mod tests {
         let request = ListGroupsRequest;
         assert_eq!(ListGroupsRequest::api_key(), ApiKey::ListGroups);
         let mut buf = BytesMut::new();
-        request.encode_v0(&mut buf);
+        request.encode_v0(&mut buf).unwrap();
         // ListGroups v0 has an empty body
         assert!(buf.is_empty());
     }
@@ -5143,7 +5898,7 @@ mod tests {
         assert_eq!(DeleteRecordsRequest::api_key(), ApiKey::DeleteRecords);
 
         let mut buf = BytesMut::new();
-        request.encode_v0(&mut buf);
+        request.encode_v0(&mut buf).unwrap();
         assert!(!buf.is_empty());
     }
 
@@ -5196,11 +5951,11 @@ mod tests {
         );
 
         let mut buf = BytesMut::new();
-        request.encode_v2(&mut buf);
+        request.encode_v2(&mut buf).unwrap();
         assert!(!buf.is_empty());
 
         let mut buf3 = BytesMut::new();
-        request.encode_v3(&mut buf3);
+        request.encode_v3(&mut buf3).unwrap();
         // v3 includes replica_id prefix, so it should be longer
         assert!(buf3.len() > buf.len());
     }
@@ -5275,10 +6030,10 @@ mod tests {
         };
 
         let mut buf_v0 = BytesMut::new();
-        request.encode_v0(&mut buf_v0);
+        request.encode_v0(&mut buf_v0).unwrap();
 
         let mut buf_v5 = BytesMut::new();
-        request.encode_v5(&mut buf_v5);
+        request.encode_v5(&mut buf_v5).unwrap();
 
         // v5 should include group_instance_id, so it should be larger
         assert!(buf_v5.len() > buf_v0.len());
@@ -5294,10 +6049,10 @@ mod tests {
         };
 
         let mut buf_v0 = BytesMut::new();
-        request.encode_v0(&mut buf_v0);
+        request.encode_v0(&mut buf_v0).unwrap();
 
         let mut buf_v3 = BytesMut::new();
-        request.encode_v3(&mut buf_v3);
+        request.encode_v3(&mut buf_v3).unwrap();
 
         // v3 should include group_instance_id, so it should be larger
         assert!(buf_v3.len() > buf_v0.len());
@@ -5313,10 +6068,10 @@ mod tests {
         };
 
         let mut buf_v0 = BytesMut::new();
-        request.encode_v0(&mut buf_v0);
+        request.encode_v0(&mut buf_v0).unwrap();
 
         let mut buf_v3 = BytesMut::new();
-        request.encode_v3(&mut buf_v3);
+        request.encode_v3(&mut buf_v3).unwrap();
 
         // v3 with null instance_id should be slightly larger (null marker)
         assert!(buf_v3.len() >= buf_v0.len());
@@ -5439,7 +6194,7 @@ mod tests {
         };
 
         let mut buf = BytesMut::new();
-        request.encode_v3(&mut buf);
+        request.encode_v3(&mut buf).unwrap();
 
         // Verify the buffer contains the group_instance_id
         let data = buf.freeze();
@@ -5466,7 +6221,7 @@ mod tests {
         };
 
         let mut buf = BytesMut::new();
-        request.encode_v0(&mut buf);
+        request.encode_v0(&mut buf).unwrap();
 
         let data = buf.freeze();
         let data_str = String::from_utf8_lossy(&data);
@@ -5487,6 +6242,7 @@ mod tests {
         let resp = LeaveGroupResponse::decode_v0(&mut data).unwrap();
         assert!(resp.error_code.is_ok());
         assert_eq!(resp.throttle_time_ms, 0);
+        assert!(resp.members.is_empty());
     }
 
     #[test]
@@ -5501,6 +6257,48 @@ mod tests {
         let resp = LeaveGroupResponse::decode_v1(&mut data).unwrap();
         assert_eq!(resp.throttle_time_ms, 100);
         assert!(!resp.error_code.is_ok());
+        assert!(resp.members.is_empty());
+    }
+
+    #[test]
+    fn test_leave_group_response_decode_v3_with_members() {
+        let mut buf = BytesMut::new();
+        // throttle_time_ms
+        buf.put_i32(50);
+        // top-level error_code = 0 (NONE)
+        buf.put_i16(0);
+        // members array length = 2
+        buf.put_i32(2);
+
+        // member 1: member_id = "m-1", group_instance_id = "i-1", error_code = 0
+        let m1 = b"m-1";
+        buf.put_i16(m1.len() as i16);
+        buf.put_slice(m1);
+        let i1 = b"i-1";
+        buf.put_i16(i1.len() as i16);
+        buf.put_slice(i1);
+        buf.put_i16(0);
+
+        // member 2: member_id = "m-2", group_instance_id = null, error_code = 79 (FENCED_INSTANCE_ID)
+        let m2 = b"m-2";
+        buf.put_i16(m2.len() as i16);
+        buf.put_slice(m2);
+        buf.put_i16(-1); // null group_instance_id
+        buf.put_i16(79);
+
+        let mut data = buf.freeze();
+        let resp = LeaveGroupResponse::decode_v3(&mut data).unwrap();
+        assert_eq!(resp.throttle_time_ms, 50);
+        assert!(resp.error_code.is_ok());
+        assert_eq!(resp.members.len(), 2);
+
+        assert_eq!(resp.members[0].member_id, "m-1");
+        assert_eq!(resp.members[0].group_instance_id, Some("i-1".to_string()));
+        assert!(resp.members[0].error_code.is_ok());
+
+        assert_eq!(resp.members[1].member_id, "m-2");
+        assert_eq!(resp.members[1].group_instance_id, None);
+        assert!(!resp.members[1].error_code.is_ok());
     }
 
     // SyncGroupResponse decode_v1 roundtrip.
@@ -5653,7 +6451,7 @@ mod tests {
         };
 
         let mut buf = BytesMut::new();
-        request.encode_v2(&mut buf);
+        request.encode_v2(&mut buf).unwrap();
 
         // replica_id (4 bytes) + isolation_level (1 byte) + topics
         assert_eq!(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), -1);
@@ -5669,10 +6467,10 @@ mod tests {
         };
 
         let mut buf_v1 = BytesMut::new();
-        request.encode_v1(&mut buf_v1);
+        request.encode_v1(&mut buf_v1).unwrap();
 
         let mut buf_v2 = BytesMut::new();
-        request.encode_v2(&mut buf_v2);
+        request.encode_v2(&mut buf_v2).unwrap();
 
         // v2 should be 1 byte longer (isolation_level)
         assert_eq!(buf_v2.len(), buf_v1.len() + 1);
@@ -5706,10 +6504,10 @@ mod tests {
         };
 
         let mut buf_v4 = BytesMut::new();
-        request.encode_v4(&mut buf_v4);
+        request.encode_v4(&mut buf_v4).unwrap();
 
         let mut buf_v7 = BytesMut::new();
-        request.encode_v7(&mut buf_v7);
+        request.encode_v7(&mut buf_v7).unwrap();
 
         // v7 adds session_id(4) + session_epoch(4) + log_start_offset per partition(8)
         // + forgotten_topics array (4 + topic string + partitions)
@@ -5741,7 +6539,7 @@ mod tests {
         };
 
         let mut buf = BytesMut::new();
-        request.encode_v7(&mut buf);
+        request.encode_v7(&mut buf).unwrap();
 
         // Should still encode: header fields + empty topics array(4) + empty forgotten array(4)
         // replica_id(4) + max_wait_ms(4) + min_bytes(4) + max_bytes(4) + isolation_level(1)
@@ -5824,5 +6622,135 @@ mod tests {
         let resp_v7 = FetchResponse::decode_v7(&mut buf_v7).unwrap();
         assert_eq!(resp_v7.throttle_time_ms, 50);
         assert_eq!(resp_v7.session_id, 99);
+    }
+
+    // ── VersionedEncode / VersionedDecode tests ─────────────────────
+
+    #[test]
+    fn test_versioned_encode_metadata_request_v0() {
+        let request = MetadataRequest::all_topics();
+        let mut buf = BytesMut::new();
+        request.encode_versioned(0, &mut buf).unwrap();
+        // Should produce the same bytes as encode_v0
+        let mut expected = BytesMut::new();
+        request.encode_v0(&mut expected).unwrap();
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn test_versioned_encode_metadata_request_rejects_v4() {
+        let request = MetadataRequest::all_topics();
+        let mut buf = BytesMut::new();
+        let result = request.encode_versioned(4, &mut buf);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unsupported"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_versioned_encode_rejects_negative_version() {
+        let request = MetadataRequest::all_topics();
+        let mut buf = BytesMut::new();
+        let result = request.encode_versioned(-1, &mut buf);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unsupported"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_versioned_decode_rejects_negative_version() {
+        let mut buf = bytes::Bytes::new();
+        let result = MetadataResponse::decode_versioned(-1, &mut buf);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unsupported"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_versioned_encode_decode_roundtrip_sasl_handshake() {
+        let request = SaslHandshakeRequest::new("SCRAM-SHA-256");
+        let mut buf = BytesMut::new();
+        request.encode_versioned(0, &mut buf).unwrap();
+        assert!(!buf.is_empty());
+        // High version still works (dispatches to latest encoder)
+        let mut buf2 = BytesMut::new();
+        request.encode_versioned(1, &mut buf2).unwrap();
+        assert!(!buf2.is_empty());
+    }
+
+    #[test]
+    fn test_versioned_encode_fetch_request_dispatches_correctly() {
+        let request = FetchRequest {
+            replica_id: -1,
+            max_wait_ms: 500,
+            min_bytes: 1,
+            max_bytes: 1048576,
+            isolation_level: 0,
+            session_id: 0,
+            session_epoch: -1,
+            topics: vec![],
+            forgotten_topics: vec![],
+        };
+        // v0 and v7 should use different encoders and produce different output
+        let mut buf_v0 = BytesMut::new();
+        request.encode_versioned(0, &mut buf_v0).unwrap();
+        let mut buf_v7 = BytesMut::new();
+        request.encode_versioned(7, &mut buf_v7).unwrap();
+        // v7 encodes extra fields (session_id, session_epoch) so should be longer
+        assert!(buf_v7.len() > buf_v0.len());
+    }
+
+    #[test]
+    fn test_encode_oversized_string_returns_error_not_panic() {
+        // A string exceeding i16::MAX bytes must produce an Err, not a panic.
+        let oversized = "x".repeat(i16::MAX as usize + 1);
+        let request = FindCoordinatorRequest {
+            key: oversized,
+            key_type: 0,
+        };
+        let mut buf = BytesMut::new();
+        let result = request.encode_v0(&mut buf);
+        assert!(result.is_err(), "expected Err for oversized string");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("exceeds"),
+            "error should mention size limit: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_encode_oversized_topic_name_returns_error_not_panic() {
+        // KafkaString uses an i16 length prefix, so > 32767 bytes triggers error.
+        // We can't allocate i32::MAX bytes, so we validate the fallible path
+        // via the smaller KafkaString limit instead.
+        let oversized_topic = "x".repeat(i16::MAX as usize + 1);
+        let request = ProduceRequest {
+            transactional_id: None,
+            acks: -1,
+            timeout_ms: 30000,
+            topic_data: vec![ProduceTopicData {
+                name: oversized_topic,
+                partition_data: vec![],
+            }],
+        };
+        let mut buf = BytesMut::new();
+        let result = request.encode_v0(&mut buf);
+        assert!(result.is_err(), "expected Err for oversized topic name");
+    }
+
+    #[test]
+    fn test_encode_versioned_oversized_returns_error() {
+        // End-to-end: VersionedEncode must propagate encoding errors.
+        let oversized = "x".repeat(i16::MAX as usize + 1);
+        let request = FindCoordinatorRequest {
+            key: oversized,
+            key_type: 0,
+        };
+        let mut buf = BytesMut::new();
+        let result = request.encode_versioned(0, &mut buf);
+        assert!(
+            result.is_err(),
+            "VersionedEncode must propagate encoding errors"
+        );
     }
 }

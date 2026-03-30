@@ -114,7 +114,9 @@ let consumer = Consumer::builder()
 
 > **Note:** After a consumer group rebalance, Krafka automatically fetches previously committed offsets from the group coordinator (OffsetFetch). Partitions without committed offsets use the configured `auto_offset_reset` policy.
 
-> **OffsetOutOfRange Recovery:** If the broker returns `OffsetOutOfRange` during a fetch (e.g., because a partition was truncated or the consumer fell behind log retention), Krafka automatically applies the configured `auto_offset_reset` policy to recover the partition instead of stalling.
+> **OffsetOutOfRange Recovery:** If the broker returns `OffsetOutOfRange` during a fetch (e.g., because a partition was truncated or the consumer fell behind log retention), Krafka automatically applies the configured `auto_offset_reset` policy to recover the partition instead of stalling. This works for both group-based and standalone (manually assigned) consumers.
+
+> **Offset Resolution:** When multiple partitions need offset resolution (e.g., after a rebalance or on first poll), Krafka batches `ListOffsets` requests by leader broker — resolving 50 partitions in 2-3 RPCs instead of 50. Failed offset resolutions use per-partition exponential backoff (100ms base, 30s cap) to prevent retry storms under sustained broker unavailability.
 
 ### Offset Commit
 
@@ -461,12 +463,15 @@ For direct partition control (without consumer groups):
 > **Note:** Manual assignment and group subscription are mutually exclusive.
 > Calling `assign()` on a consumer with a `group_id` configured will return an error.
 
+> **Standalone Recovery:** Standalone consumers have the same `OffsetOutOfRange` recovery as group consumers — the configured `auto_offset_reset` policy is applied automatically to recover stalled partitions.
+
 ```rust
 use krafka::consumer::Consumer;
 
 let consumer = Consumer::builder()
     .bootstrap_servers("localhost:9092")
     // Note: no group_id for manual assignment
+    .auto_offset_reset(krafka::consumer::AutoOffsetReset::Earliest)
     .build()
     .await?;
 

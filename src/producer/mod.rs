@@ -200,7 +200,10 @@ impl Producer {
         key: Option<&[u8]>,
         value: &[u8],
     ) -> Result<RecordMetadata> {
-        let record = ProducerRecord::new(topic, value.to_vec()).with_key(key.map(|k| k.to_vec()));
+        let mut record = ProducerRecord::new(topic, Bytes::copy_from_slice(value));
+        if let Some(k) = key {
+            record = record.with_key(Bytes::copy_from_slice(k));
+        }
         self.send_record(record).await
     }
 
@@ -212,8 +215,10 @@ impl Producer {
         value: &[u8],
         headers: Vec<(String, Vec<u8>)>,
     ) -> Result<RecordMetadata> {
-        let mut record =
-            ProducerRecord::new(topic, value.to_vec()).with_key(key.map(|k| k.to_vec()));
+        let mut record = ProducerRecord::new(topic, Bytes::copy_from_slice(value));
+        if let Some(k) = key {
+            record = record.with_key(Bytes::copy_from_slice(k));
+        }
         record.headers = headers;
         self.send_record(record).await
     }
@@ -227,6 +232,10 @@ impl Producer {
         // Invoke interceptor before send
         let mut record = record;
         crate::interceptor::safe_on_send(&*self.interceptor, &mut record);
+
+        // Validate record fields against Kafka protocol wire-format limits.
+        // Runs after the interceptor since interceptors can mutate the record.
+        record.validate()?;
 
         let topic = record.topic.clone();
 
@@ -354,14 +363,12 @@ impl Producer {
         }
 
         if record.headers.is_empty() {
-            batch_builder = batch_builder.add_record(
-                record.key.clone().map(Bytes::from),
-                Some(Bytes::from(record.value.clone())),
-            );
+            batch_builder =
+                batch_builder.add_record(record.key.clone(), Some(record.value.clone()));
         } else {
             batch_builder = batch_builder.add_record_with_headers(
-                record.key.clone().map(Bytes::from),
-                Some(Bytes::from(record.value.clone())),
+                record.key.clone(),
+                Some(record.value.clone()),
                 record
                     .headers
                     .iter()
@@ -389,10 +396,8 @@ impl Producer {
 
         // acks=0 (fire-and-forget): Kafka sends no response, so don't wait for one (R6.1 fix)
         if self.config.acks == Acks::None {
-            conn.send_fire_and_forget(ApiKey::Produce, 0, |buf| {
-                request.encode_v0(buf);
-            })
-            .await?;
+            conn.send_fire_and_forget(ApiKey::Produce, 0, |buf| request.encode_v0(buf))
+                .await?;
 
             return Ok(RecordMetadata {
                 topic: topic.to_string(),
@@ -404,9 +409,7 @@ impl Producer {
 
         // Send request and wait for response (acks=1 or acks=-1/all)
         let response = conn
-            .send_request(ApiKey::Produce, 0, |buf| {
-                request.encode_v0(buf);
-            })
+            .send_request(ApiKey::Produce, 0, |buf| request.encode_v0(buf))
             .await?;
 
         // Decode response

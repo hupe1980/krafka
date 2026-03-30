@@ -185,9 +185,7 @@ mod tests {
     fn test_batch_build() {
         let mut batch = ProducerBatch::new("test".to_string(), 0, 1024, Compression::None);
 
-        batch.try_add(
-            ProducerRecord::new("test", b"value".to_vec()).with_key(Some(b"key".to_vec())),
-        );
+        batch.try_add(ProducerRecord::new("test", b"value".to_vec()).with_key(b"key".to_vec()));
 
         let record_batch = batch.build();
         assert_eq!(record_batch.records.len(), 1);
@@ -198,7 +196,7 @@ mod tests {
         let mut batch = ProducerBatch::new("test".to_string(), 0, 4096, Compression::None);
 
         let record = ProducerRecord::new("test", b"value".to_vec())
-            .with_key(Some(b"key".to_vec()))
+            .with_key(b"key".to_vec())
             .with_header("trace-id", b"abc123")
             .with_header("content-type", b"application/json");
         batch.try_add(record);

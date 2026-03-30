@@ -154,12 +154,8 @@ pub async fn connect_tls(
     // Use SNI hostname if specified, otherwise use the connection hostname
     let sni_hostname = tls_config.sni_hostname.as_deref().unwrap_or(hostname);
 
-    // Parse the hostname, stripping port if present
-    let host = sni_hostname
-        .split(':')
-        .next()
-        .unwrap_or(sni_hostname)
-        .to_string();
+    // Extract the bare hostname (no port, no brackets) using the shared helper
+    let host = crate::util::extract_sni_hostname(sni_hostname)?.to_string();
 
     let server_name = ServerName::try_from(host)
         .map_err(|e| KrafkaError::config(format!("Invalid server name: {}", e)))?;

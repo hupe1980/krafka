@@ -28,6 +28,7 @@ use crate::protocol::{
     SaslHandshakeRequest, SaslHandshakeResponse,
 };
 use crate::util::CorrelationIdGenerator;
+use crate::util::extract_sni_hostname;
 
 use super::secure::SaslAuthenticator;
 
@@ -380,8 +381,9 @@ impl BrokerConnection {
                 .as_ref()
                 .ok_or_else(|| KrafkaError::config("TLS required but no TLS config provided"))?;
 
-            // Extract hostname (without port) for TLS SNI
-            let hostname = address.split(':').next().unwrap_or(address);
+            // Extract hostname (without port) for TLS SNI.
+            // Handle IPv6 bracket notation like [::1]:9092.
+            let hostname = extract_sni_hostname(address)?;
             let tls_stream = connect_tls(stream, hostname, tls_config).await?;
 
             info!("TLS handshake completed for {address}");
@@ -534,8 +536,8 @@ impl BrokerConnection {
         let mut encoder = Encoder::new();
         let pos = encoder.start_message();
         let header = RequestHeader::new(ApiKey::SaslHandshake, 1, 0).with_client_id(client_id);
-        header.encode_v1(encoder.buffer_mut());
-        handshake_request.encode_v1(encoder.buffer_mut());
+        header.encode_v1(encoder.buffer_mut())?;
+        handshake_request.encode_v1(encoder.buffer_mut())?;
         encoder.finish_message(pos);
 
         stream
@@ -615,8 +617,8 @@ impl BrokerConnection {
         let mut encoder = Encoder::new();
         let pos = encoder.start_message();
         let header = RequestHeader::new(ApiKey::SaslAuthenticate, 0, 1).with_client_id(client_id);
-        header.encode(encoder.buffer_mut());
-        request.encode_v0(encoder.buffer_mut());
+        header.encode(encoder.buffer_mut())?;
+        request.encode_v0(encoder.buffer_mut())?;
         encoder.finish_message(pos);
 
         stream
@@ -924,8 +926,8 @@ impl BrokerConnection {
         let pos = encoder.start_message();
         let header = RequestHeader::new(ApiKey::ApiVersions, 0, correlation_id)
             .with_client_id(&self.config.client_id);
-        header.encode_v1(encoder.buffer_mut());
-        request.encode_v0(encoder.buffer_mut());
+        header.encode_v1(encoder.buffer_mut())?;
+        request.encode_v0(encoder.buffer_mut())?;
         encoder.finish_message(pos);
 
         // Send request (use high priority for API versions)
@@ -990,7 +992,7 @@ impl BrokerConnection {
         &self,
         api_key: ApiKey,
         api_version: i16,
-        request_body: impl FnOnce(&mut BytesMut),
+        request_body: impl FnOnce(&mut BytesMut) -> Result<()>,
     ) -> Result<Bytes> {
         let priority = RequestPriority::for_api_key(api_key);
         self.send_request_with_priority(api_key, api_version, priority, request_body)
@@ -1005,7 +1007,7 @@ impl BrokerConnection {
         api_key: ApiKey,
         api_version: i16,
         priority: RequestPriority,
-        request_body: impl FnOnce(&mut BytesMut),
+        request_body: impl FnOnce(&mut BytesMut) -> Result<()>,
     ) -> Result<Bytes> {
         let correlation_id = self.correlation_id_gen.next();
         let mut encoder = Encoder::new();
@@ -1014,8 +1016,8 @@ impl BrokerConnection {
         let pos = encoder.start_message();
         let header = RequestHeader::new(api_key, api_version, correlation_id)
             .with_client_id(&self.config.client_id);
-        header.encode(encoder.buffer_mut());
-        request_body(encoder.buffer_mut());
+        header.encode(encoder.buffer_mut())?;
+        request_body(encoder.buffer_mut())?;
         encoder.finish_message(pos);
 
         // Send request to appropriate channel
@@ -1064,7 +1066,7 @@ impl BrokerConnection {
         &self,
         api_key: ApiKey,
         api_version: i16,
-        request_body: impl FnOnce(&mut BytesMut),
+        request_body: impl FnOnce(&mut BytesMut) -> Result<()>,
     ) -> Result<()> {
         let correlation_id = self.correlation_id_gen.next();
         let mut encoder = Encoder::new();
@@ -1073,8 +1075,8 @@ impl BrokerConnection {
         let pos = encoder.start_message();
         let header = RequestHeader::new(api_key, api_version, correlation_id)
             .with_client_id(&self.config.client_id);
-        header.encode(encoder.buffer_mut());
-        request_body(encoder.buffer_mut());
+        header.encode(encoder.buffer_mut())?;
+        request_body(encoder.buffer_mut())?;
         encoder.finish_message(pos);
 
         // Send as fire-and-forget — no pending entry is created

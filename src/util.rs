@@ -1,7 +1,9 @@
-//! Utility functions for Krafka.\n//!\n//! This module provides low-level utilities used throughout the crate:\n//!\n//! - **Correlation ID generation**: Thread-safe ID generation for request/response matching\n//! - **CRC32C**: Checksum calculation for Kafka record validation\n//! - **Varint encoding**: Variable-length integer encoding for compact protocols
+//! Utility functions for Krafka.\n//!\n//! This module provides low-level utilities used throughout the crate:\n//!\n//! - **Correlation ID generation**: Thread-safe ID generation for request/response matching\n//! - **CRC32C**: Checksum calculation for Kafka record validation\n//! - **Varint encoding**: Variable-length integer encoding for compact protocols\n//! - **SNI hostname extraction**: Parse hostnames from address strings for TLS SNI
 
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
+
+use crate::error::{KrafkaError, Result};
 
 /// Convert a `Duration` to milliseconds as `i32`, capping at `i32::MAX`.
 ///
@@ -229,5 +231,179 @@ mod tests {
         // Duration exactly at i32::MAX millis
         let exact = Duration::from_millis(i32::MAX as u64);
         assert_eq!(duration_to_millis_i32(exact), i32::MAX);
+    }
+}
+
+/// Extract the hostname from an address string for TLS SNI.
+///
+/// Handles bracketed IPv6 (`[::1]:port`), bare IPv6 (`2001:db8::1`),
+/// and IPv4/hostname with optional port (`host:port`). Returns the bare
+/// hostname without port or brackets.
+///
+/// Returns an error if the address is empty, contains mismatched brackets,
+/// has empty brackets, or has an invalid bracketed format.
+pub fn extract_sni_hostname(address: &str) -> Result<&str> {
+    if address.is_empty() {
+        return Err(KrafkaError::config("empty address"));
+    }
+
+    let has_open = address.contains('[');
+    let has_close = address.contains(']');
+
+    match (has_open, has_close) {
+        // Bracketed: [host]:port or [host]
+        (true, true) => {
+            // '[' must be at position 0
+            if !address.starts_with('[') {
+                return Err(KrafkaError::config(format!(
+                    "malformed address ('[' not at start): {address}"
+                )));
+            }
+            let end = address.find(']').unwrap();
+            let hostname = &address[1..end];
+            if hostname.is_empty() {
+                return Err(KrafkaError::config(format!(
+                    "empty hostname in brackets: {address}"
+                )));
+            }
+            // After ']' must be empty or a well-formed ':port' with no extra brackets
+            let after = &address[end + 1..];
+            if after.contains('[') || after.contains(']') {
+                return Err(KrafkaError::config(format!(
+                    "unexpected bracket characters after closing ']': {address}"
+                )));
+            }
+            if !after.is_empty() {
+                if !after.starts_with(':') {
+                    return Err(KrafkaError::config(format!(
+                        "unexpected characters after closing ']': {address}"
+                    )));
+                }
+                let port_str = &after[1..];
+                if port_str.is_empty() || !port_str.chars().all(|c| c.is_ascii_digit()) {
+                    return Err(KrafkaError::config(format!(
+                        "invalid port after closing ']': {address}"
+                    )));
+                }
+            }
+            Ok(hostname)
+        }
+        // Mismatched brackets
+        (true, false) => Err(KrafkaError::config(format!(
+            "malformed address (missing closing ']'): {address}"
+        ))),
+        (false, true) => Err(KrafkaError::config(format!(
+            "malformed address (unexpected ']' without '['): {address}"
+        ))),
+        // No brackets: bare IPv6, IPv4, or hostname
+        (false, false) => {
+            if address.parse::<std::net::Ipv6Addr>().is_ok() {
+                Ok(address)
+            } else {
+                Ok(address.rsplit_once(':').map_or(address, |(host, _)| host))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod sni_tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_sni_bracketed_ipv6_with_port() {
+        assert_eq!(extract_sni_hostname("[::1]:9092").unwrap(), "::1");
+    }
+
+    #[test]
+    fn test_extract_sni_bracketed_ipv6_no_port() {
+        assert_eq!(extract_sni_hostname("[::1]").unwrap(), "::1");
+    }
+
+    #[test]
+    fn test_extract_sni_bare_ipv6() {
+        assert_eq!(extract_sni_hostname("2001:db8::1").unwrap(), "2001:db8::1");
+    }
+
+    #[test]
+    fn test_extract_sni_bare_ipv6_loopback() {
+        assert_eq!(extract_sni_hostname("::1").unwrap(), "::1");
+    }
+
+    #[test]
+    fn test_extract_sni_ipv4_with_port() {
+        assert_eq!(
+            extract_sni_hostname("192.168.1.1:9092").unwrap(),
+            "192.168.1.1"
+        );
+    }
+
+    #[test]
+    fn test_extract_sni_hostname_with_port() {
+        assert_eq!(
+            extract_sni_hostname("broker.example.com:9092").unwrap(),
+            "broker.example.com"
+        );
+    }
+
+    #[test]
+    fn test_extract_sni_hostname_no_port() {
+        assert_eq!(
+            extract_sni_hostname("broker.example.com").unwrap(),
+            "broker.example.com"
+        );
+    }
+
+    #[test]
+    fn test_extract_sni_bracketed_ipv6_full() {
+        assert_eq!(
+            extract_sni_hostname("[2001:db8::1]:9092").unwrap(),
+            "2001:db8::1"
+        );
+    }
+
+    #[test]
+    fn test_extract_sni_ipv6_ambiguous_port() {
+        // `2001:db8::1:9092` is a valid 8-group IPv6 address, so the function
+        // correctly returns it as-is. Use bracket notation to separate host from port.
+        assert_eq!(
+            extract_sni_hostname("2001:db8::1:9092").unwrap(),
+            "2001:db8::1:9092"
+        );
+        // When the string is NOT a valid IPv6 address, the last :segment
+        // is stripped as a port.
+        assert_eq!(
+            extract_sni_hostname("2001:db8::zz:9092").unwrap(),
+            "2001:db8::zz"
+        );
+    }
+
+    #[test]
+    fn test_extract_sni_malformed_bracket_returns_error() {
+        // Missing closing ']'
+        assert!(extract_sni_hostname("[::1").is_err());
+        assert!(extract_sni_hostname("[host").is_err());
+        assert!(extract_sni_hostname("[host:9092").is_err());
+        // Stray closing ']' without opening '['
+        assert!(extract_sni_hostname("::1]:9092").is_err());
+        assert!(extract_sni_hostname("host]").is_err());
+        assert!(extract_sni_hostname("host]:9092").is_err());
+        // '[' not at start
+        assert!(extract_sni_hostname("foo[::1]:9092").is_err());
+        // Trailing garbage after ']'
+        assert!(extract_sni_hostname("[::1]extra").is_err());
+        // Extra closing bracket in port section
+        assert!(extract_sni_hostname("[::1]:9092]").is_err());
+        // Invalid port (non-numeric)
+        assert!(extract_sni_hostname("[::1]:abc").is_err());
+        // Empty port after colon
+        assert!(extract_sni_hostname("[::1]:").is_err());
+    }
+
+    #[test]
+    fn test_extract_sni_empty_input_returns_error() {
+        assert!(extract_sni_hostname("").is_err());
+        assert!(extract_sni_hostname("[]").is_err());
+        assert!(extract_sni_hostname("[]:9092").is_err());
     }
 }
