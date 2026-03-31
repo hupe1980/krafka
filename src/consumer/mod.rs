@@ -1117,7 +1117,6 @@ impl Consumer {
                                 })
                                 .collect();
                             self.rebalance_listener.on_partitions_revoked(&revoked);
-                            self.metrics.rebalances.inc();
 
                             // Reset all fetch sessions — partition ownership is changing
                             self.fetch_sessions.lock().await.reset_all();
@@ -1134,6 +1133,8 @@ impl Consumer {
                                 self.metrics.paused_partitions.set(paused.len() as u64);
                             }
                         }
+
+                        self.metrics.rebalances.inc();
 
                         let assignment = coordinator.ensure_active_membership(&topics).await?;
 

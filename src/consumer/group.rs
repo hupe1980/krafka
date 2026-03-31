@@ -2012,9 +2012,12 @@ impl GroupCoordinator {
             buf.put_i16(0);
         }
 
-        // Topics array
-        buf.put_i32(crate::protocol::array_len_i32(topics.len())?);
-        for topic in topics {
+        // Topics array — sorted for deterministic encoding so the broker
+        // does not detect spurious metadata changes between generations.
+        let mut sorted_topics: Vec<&String> = topics.iter().collect();
+        sorted_topics.sort();
+        buf.put_i32(crate::protocol::array_len_i32(sorted_topics.len())?);
+        for topic in &sorted_topics {
             let topic_len = i16::try_from(topic.len()).map_err(|_| {
                 KrafkaError::protocol(format!(
                     "topic name '{}' exceeds Kafka i16 length limit ({} bytes)",
@@ -2029,9 +2032,12 @@ impl GroupCoordinator {
         buf.put_i32(-1);
 
         if self.is_cooperative() {
-            // Owned partitions (version 1+)
-            buf.put_i32(crate::protocol::array_len_i32(owned_partitions.len())?);
-            for (topic, partitions) in owned_partitions {
+            // Owned partitions (version 1+) — sorted for deterministic encoding.
+            let mut sorted_owned: Vec<(&String, &Vec<PartitionId>)> =
+                owned_partitions.iter().collect();
+            sorted_owned.sort_by_key(|(topic, _)| topic.as_str());
+            buf.put_i32(crate::protocol::array_len_i32(sorted_owned.len())?);
+            for (topic, partitions) in &sorted_owned {
                 let topic_len = i16::try_from(topic.len()).map_err(|_| {
                     KrafkaError::protocol(format!(
                         "topic name '{}' exceeds Kafka i16 length limit",
@@ -2040,8 +2046,10 @@ impl GroupCoordinator {
                 })?;
                 buf.put_i16(topic_len);
                 buf.put_slice(topic.as_bytes());
-                buf.put_i32(crate::protocol::array_len_i32(partitions.len())?);
-                for &p in partitions {
+                let mut sorted_parts = partitions.to_vec();
+                sorted_parts.sort();
+                buf.put_i32(crate::protocol::array_len_i32(sorted_parts.len())?);
+                for &p in &sorted_parts {
                     buf.put_i32(p);
                 }
             }
@@ -2065,10 +2073,17 @@ impl GroupCoordinator {
         let mut topics = Vec::new();
         if buf.remaining() >= 4 {
             let topic_count = buf.get_i32();
-            // Cap by hard limit and remaining buffer to prevent allocation DoS
-            let safe_count = (topic_count.max(0) as usize)
-                .min(10_000)
-                .min(buf.remaining() / 2);
+            let count = topic_count.max(0) as usize;
+            if count > 10_000 {
+                // Declared count exceeds hard cap — buffer position would be
+                // misaligned after partial decode, so return early.
+                warn!(
+                    "decode_consumer_metadata: topic count {} exceeds cap, returning partial",
+                    count
+                );
+                return (topics, HashMap::new());
+            }
+            let safe_count = count.min(buf.remaining() / 2);
             for _ in 0..safe_count {
                 if buf.remaining() < 2 {
                     break;
@@ -2093,10 +2108,17 @@ impl GroupCoordinator {
         let mut owned = HashMap::new();
         if version >= 1 && buf.remaining() >= 4 {
             let topic_count = buf.get_i32();
-            // Cap topic count by hard limit and remaining buffer to prevent allocation DoS
-            let safe_topic_count = (topic_count.max(0) as usize)
-                .min(10_000)
-                .min(buf.remaining() / 6);
+            let count = topic_count.max(0) as usize;
+            if count > 10_000 {
+                // Declared count exceeds hard cap — buffer position would be
+                // misaligned after partial decode, so return early.
+                warn!(
+                    "decode_consumer_metadata: owned topic count {} exceeds cap, returning partial",
+                    count
+                );
+                return (topics, owned);
+            }
+            let safe_topic_count = count.min(buf.remaining() / 6);
             for _ in 0..safe_topic_count {
                 if buf.remaining() < 2 {
                     break;
@@ -2110,10 +2132,15 @@ impl GroupCoordinator {
                     break;
                 }
                 let part_count = buf.get_i32();
-                // Cap allocation by both a hard limit and remaining buffer bytes
-                let safe_part_count = (part_count.max(0) as usize)
-                    .min(10_000)
-                    .min(buf.remaining() / 4);
+                let pcount = part_count.max(0) as usize;
+                if pcount > 10_000 {
+                    warn!(
+                        "decode_consumer_metadata: partition count {} for '{}' exceeds cap, returning partial",
+                        pcount, topic
+                    );
+                    return (topics, owned);
+                }
+                let safe_part_count = pcount.min(buf.remaining() / 4);
                 let mut parts = Vec::with_capacity(safe_part_count);
                 for _ in 0..safe_part_count {
                     if buf.remaining() < 4 {
@@ -3257,8 +3284,9 @@ mod tests {
 
     #[test]
     fn test_decode_consumer_metadata_overcounted_partitions() {
-        // Build v1 metadata where owned partitions claim 1_000_000 entries
-        // but only 3 fit in the buffer. The safe loop bound must cap iteration.
+        // Build v1 metadata where owned partitions claim 5000 entries
+        // but only 3 fit in the buffer. The safe loop bound must cap iteration
+        // based on remaining bytes (5000 is within the hard cap of 10,000).
         let mut buf = BytesMut::new();
         buf.put_i16(1); // version 1
         buf.put_i32(1); // 1 subscribed topic
@@ -3272,7 +3300,7 @@ mod tests {
         let owned_topic = b"test";
         buf.put_i16(owned_topic.len() as i16);
         buf.put_slice(owned_topic);
-        buf.put_i32(1_000_000); // claim 1M partitions
+        buf.put_i32(5_000); // claim 5000 partitions
         buf.put_i32(0); // only 3 actual partition values
         buf.put_i32(1);
         buf.put_i32(2);
