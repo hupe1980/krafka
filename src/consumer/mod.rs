@@ -298,14 +298,24 @@ impl Consumer {
     /// `forgotten_topics` diffs from the updated assignment, preserving KIP-227
     /// incremental fetch benefits. Called by all cooperative revocation paths.
     async fn apply_partition_revocations(&self, revoked: &[(String, PartitionId)]) {
+        // Build per-topic set of revoked partition IDs for O(T * P) removal
+        // instead of O(R * P) when many partitions of the same topic are revoked.
+        let revoked_by_topic: HashMap<&str, HashSet<PartitionId>> = {
+            let mut m: HashMap<&str, HashSet<PartitionId>> = HashMap::new();
+            for (topic, partition) in revoked {
+                m.entry(topic.as_str()).or_default().insert(*partition);
+            }
+            m
+        };
+
         // Remove from assignments
         {
             let mut assignments = self.assignments.write().await;
-            for (topic, partition) in revoked {
-                if let Some(parts) = assignments.get_mut(topic) {
-                    parts.retain(|&p| p != *partition);
+            for (topic, revoked_parts) in &revoked_by_topic {
+                if let Some(parts) = assignments.get_mut(*topic) {
+                    parts.retain(|p| !revoked_parts.contains(p));
                     if parts.is_empty() {
-                        assignments.remove(topic);
+                        assignments.remove(*topic);
                     }
                 }
             }
@@ -339,6 +349,17 @@ impl Consumer {
             }
             self.metrics.paused_partitions.set(paused.len() as u64);
         }
+    }
+
+    /// Group topic-partitions into a map keyed by topic name.
+    fn group_partitions_by_topic(
+        partitions: &[TopicPartition],
+    ) -> HashMap<String, Vec<PartitionId>> {
+        let mut map: HashMap<String, Vec<PartitionId>> = HashMap::new();
+        for tp in partitions {
+            map.entry(tp.topic.clone()).or_default().push(tp.partition);
+        }
+        map
     }
 
     /// Fetch committed offsets and apply auto_offset_reset for partitions without committed offsets.
@@ -1051,14 +1072,7 @@ impl Consumer {
 
                             // Fetch committed offsets for newly assigned partitions only
                             if !newly_assigned.is_empty() {
-                                let mut new_parts: HashMap<String, Vec<PartitionId>> =
-                                    HashMap::new();
-                                for tp in &newly_assigned {
-                                    new_parts
-                                        .entry(tp.topic.clone())
-                                        .or_default()
-                                        .push(tp.partition);
-                                }
+                                let new_parts = Self::group_partitions_by_topic(&newly_assigned);
                                 self.fetch_and_apply_committed_offsets(&new_parts).await?;
                             }
 
@@ -1127,14 +1141,7 @@ impl Consumer {
 
                             // Fetch committed offsets for newly assigned partitions only
                             if !newly_assigned.is_empty() {
-                                let mut new_parts: HashMap<String, Vec<PartitionId>> =
-                                    HashMap::new();
-                                for tp in &newly_assigned {
-                                    new_parts
-                                        .entry(tp.topic.clone())
-                                        .or_default()
-                                        .push(tp.partition);
-                                }
+                                let new_parts = Self::group_partitions_by_topic(&newly_assigned);
                                 self.fetch_and_apply_committed_offsets(&new_parts).await?;
                             }
 

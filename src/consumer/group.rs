@@ -490,7 +490,7 @@ impl CooperativeStickyAssignor {
     }
 
     /// Retain only the given member IDs, removing stale entries.
-    pub fn retain_members(&self, member_ids: &HashSet<&str>) {
+    pub(crate) fn retain_members(&self, member_ids: &HashSet<&str>) {
         self.previous_assignments
             .write()
             .retain(|k, _| member_ids.contains(k.as_str()));
@@ -2105,10 +2105,8 @@ impl GroupCoordinator {
             let topic_count = buf.get_i32();
             let count = topic_count.max(0) as usize;
             if count > 10_000 {
-                // Declared count exceeds hard cap — buffer position would be
-                // misaligned after partial decode, so return early.
                 warn!(
-                    "decode_consumer_metadata: topic count {} exceeds cap, returning partial",
+                    "decode_consumer_metadata: topic count {} exceeds cap, returning early",
                     count
                 );
                 return (topics, HashMap::new());
@@ -2116,11 +2114,11 @@ impl GroupCoordinator {
             let safe_count = count.min(buf.remaining() / 2);
             for _ in 0..safe_count {
                 if buf.remaining() < 2 {
-                    break;
+                    return (topics, HashMap::new());
                 }
                 let len = buf.get_i16();
                 if len < 0 || buf.remaining() < len as usize {
-                    break;
+                    return (topics, HashMap::new());
                 }
                 topics.push(String::from_utf8_lossy(&buf.copy_to_bytes(len as usize)).to_string());
             }
@@ -2129,7 +2127,10 @@ impl GroupCoordinator {
         // Skip user_data
         if buf.remaining() >= 4 {
             let user_data_len = buf.get_i32();
-            if user_data_len > 0 && buf.remaining() >= user_data_len as usize {
+            if user_data_len > 0 {
+                if buf.remaining() < user_data_len as usize {
+                    return (topics, HashMap::new());
+                }
                 buf.advance(user_data_len as usize);
             }
         }
@@ -2140,10 +2141,8 @@ impl GroupCoordinator {
             let topic_count = buf.get_i32();
             let count = topic_count.max(0) as usize;
             if count > 10_000 {
-                // Declared count exceeds hard cap — buffer position would be
-                // misaligned after partial decode, so return early.
                 warn!(
-                    "decode_consumer_metadata: owned topic count {} exceeds cap, returning partial",
+                    "decode_consumer_metadata: owned topic count {} exceeds cap, returning early",
                     count
                 );
                 return (topics, owned);
@@ -2151,21 +2150,21 @@ impl GroupCoordinator {
             let safe_topic_count = count.min(buf.remaining() / 6);
             for _ in 0..safe_topic_count {
                 if buf.remaining() < 2 {
-                    break;
+                    return (topics, owned);
                 }
                 let len = buf.get_i16();
                 if len < 0 || buf.remaining() < len as usize {
-                    break;
+                    return (topics, owned);
                 }
                 let topic = String::from_utf8_lossy(&buf.copy_to_bytes(len as usize)).to_string();
                 if buf.remaining() < 4 {
-                    break;
+                    return (topics, owned);
                 }
                 let part_count = buf.get_i32();
                 let pcount = part_count.max(0) as usize;
                 if pcount > 10_000 {
                     warn!(
-                        "decode_consumer_metadata: partition count {} for '{}' exceeds cap, returning partial",
+                        "decode_consumer_metadata: partition count {} for '{}' exceeds cap, returning early",
                         pcount, topic
                     );
                     return (topics, owned);
@@ -2174,7 +2173,7 @@ impl GroupCoordinator {
                 let mut parts = Vec::with_capacity(safe_part_count);
                 for _ in 0..safe_part_count {
                     if buf.remaining() < 4 {
-                        break;
+                        return (topics, owned);
                     }
                     parts.push(buf.get_i32());
                 }
