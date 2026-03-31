@@ -2057,7 +2057,7 @@ impl GroupCoordinator {
         if data.len() < 2 {
             return (Vec::new(), HashMap::new());
         }
-        let mut buf = Bytes::copy_from_slice(data);
+        let mut buf = data;
 
         let version = buf.get_i16();
 

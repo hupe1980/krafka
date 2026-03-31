@@ -269,7 +269,9 @@ impl Consumer {
     /// Apply per-partition cleanup for revoked partitions.
     ///
     /// Removes revoked entries from assignments, offsets, backoff, paused, and recv_buffer.
-    /// Also resets fetch sessions. Called by all cooperative revocation paths.
+    /// Fetch sessions are NOT reset here — `build_request()` automatically computes
+    /// `forgotten_topics` diffs from the updated assignment, preserving KIP-227
+    /// incremental fetch benefits. Called by all cooperative revocation paths.
     async fn apply_partition_revocations(&self, revoked: &[(String, PartitionId)]) {
         // Remove from assignments
         {
@@ -290,8 +292,6 @@ impl Consumer {
                 offsets.remove(&(topic.clone(), *partition));
             }
         }
-        // Reset fetch sessions after partition revocation
-        self.fetch_sessions.lock().await.reset_all();
         // Remove offset retry backoff entries
         {
             let mut backoff = self.offset_retry_backoff.write().await;
