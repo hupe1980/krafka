@@ -226,7 +226,7 @@ impl Consumer {
         // If we have a group coordinator, join the group
         if let Some(ref coordinator) = self.group_coordinator {
             let topic_strings: Vec<String> = topics.iter().map(|s| s.to_string()).collect();
-            let assignment = coordinator.ensure_active_membership(&topic_strings).await?;
+            let (assignment, joined) = coordinator.ensure_active_membership(&topic_strings).await?;
 
             // Update our assignments based on the group assignment
             {
@@ -237,9 +237,34 @@ impl Consumer {
                 }
             }
 
-            // Fetch committed offsets for our assigned partitions
-            self.fetch_and_apply_committed_offsets(&assignment.partitions)
-                .await?;
+            if joined {
+                // An actual JoinGroup/SyncGroup occurred (first join or topic change).
+
+                // Record owned partitions so the sticky assignor has the correct
+                // baseline for the next JoinGroup (KIP-429 two-phase semantics).
+                if coordinator.is_cooperative() {
+                    let member_id = coordinator.member_id().await;
+                    coordinator.record_owned_partitions(&member_id, &assignment);
+                }
+
+                // Notify listener of assignment (matches Java client behavior:
+                // ConsumerRebalanceListener.onPartitionsAssigned is invoked on every
+                // successful rebalance, including the very first one).
+                let assigned: Vec<TopicPartition> = assignment
+                    .partitions
+                    .iter()
+                    .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
+                    .collect();
+                self.rebalance_listener.on_partitions_assigned(&assigned);
+                self.metrics.rebalances.inc();
+
+                // Update assigned_partitions metric
+                self.metrics.assigned_partitions.set(assigned.len() as u64);
+
+                // Fetch committed offsets for our assigned partitions
+                self.fetch_and_apply_committed_offsets(&assignment.partitions)
+                    .await?;
+            }
 
             debug!("Subscribed to topics via group coordinator: {:?}", topics);
         } else {
@@ -342,7 +367,19 @@ impl Consumer {
 
         for (topic, partitions) in assigned {
             for &partition in partitions {
-                let committed_val = committed.get(&(topic.clone(), partition));
+                let key = (topic.clone(), partition);
+
+                // Respect user-set offsets (e.g., from seek() in on_partitions_assigned).
+                // If the caller already positioned this partition, do not overwrite.
+                if offsets.contains_key(&key) {
+                    debug!(
+                        "Keeping existing offset for {}-{} (user-set or prior)",
+                        topic, partition
+                    );
+                    continue;
+                }
+
+                let committed_val = committed.get(&key);
                 if let Some(&offset) = committed_val
                     && offset >= 0
                 {
@@ -350,7 +387,7 @@ impl Consumer {
                         "Using committed offset {} for {}-{}",
                         offset, topic, partition
                     );
-                    offsets.insert((topic.clone(), partition), offset);
+                    offsets.insert(key, offset);
                     continue;
                 }
                 // No committed offset or negative (unknown)
@@ -358,7 +395,7 @@ impl Consumer {
                     "No committed offset for {}-{} (committed={:?}), will auto-reset",
                     topic, partition, committed_val
                 );
-                need_reset.push((topic.clone(), partition));
+                need_reset.push(key);
             }
         }
 
@@ -1136,7 +1173,7 @@ impl Consumer {
 
                         self.metrics.rebalances.inc();
 
-                        let assignment = coordinator.ensure_active_membership(&topics).await?;
+                        let (assignment, _) = coordinator.ensure_active_membership(&topics).await?;
 
                         // Update our assignments
                         let mut assignments = self.assignments.write().await;

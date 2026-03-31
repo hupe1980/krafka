@@ -1304,22 +1304,52 @@ impl GroupCoordinator {
 
     /// Ensure active group membership, joining/rejoining as needed.
     ///
+    /// Returns `(assignment, joined)` where `joined` is `true` when an actual
+    /// JoinGroup/SyncGroup round-trip occurred (first join or topic change).
+    /// When the group is already Stable with unchanged topics, returns the
+    /// cached assignment with `joined = false`.
+    ///
     /// For eager (non-cooperative) protocols, performs a single join+sync.
     /// For cooperative protocols, the caller should use
     /// `perform_cooperative_join_and_sync` instead for the two-phase flow.
-    pub async fn ensure_active_membership(&self, topics: &[String]) -> Result<MemberAssignment> {
+    pub async fn ensure_active_membership(
+        &self,
+        topics: &[String],
+    ) -> Result<(MemberAssignment, bool)> {
+        // Detect topic changes: if the subscription changed while Stable,
+        // force a rejoin so the broker learns the new subscription.
+        {
+            let state = *self.state.read().await;
+            if state == GroupState::Stable {
+                let old_topics = self.subscribed_topics.read().await;
+                let mut old_sorted = old_topics.clone();
+                drop(old_topics);
+                old_sorted.sort();
+                let mut new_sorted = topics.to_vec();
+                new_sorted.sort();
+                if old_sorted != new_sorted {
+                    // Topics changed — must rejoin to update broker subscription.
+                    // Use set_preparing_rebalance (not trigger_rejoin) so the
+                    // heartbeat task keeps running while perform_join_and_sync
+                    // does the actual rejoin below.
+                    self.set_preparing_rebalance().await;
+                }
+            }
+        }
+
         // Update subscribed topics
         self.set_subscribed_topics(topics.to_vec()).await;
 
         let state = *self.state.read().await;
         match state {
             GroupState::Stable => {
-                // Already stable, return current assignment
-                Ok(self.assignment.read().await.clone())
+                // Already stable with same topics, return current assignment
+                Ok((self.assignment.read().await.clone(), false))
             }
             _ => {
                 // Need to join/rejoin
-                self.perform_join_and_sync().await
+                let assignment = self.perform_join_and_sync().await?;
+                Ok((assignment, true))
             }
         }
     }
