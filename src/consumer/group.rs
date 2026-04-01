@@ -1038,6 +1038,11 @@ impl GroupCoordinator {
         self.assignment.read().await.clone()
     }
 
+    /// Get the current subscribed topics.
+    pub async fn subscribed_topics(&self) -> Vec<String> {
+        self.subscribed_topics.read().await.clone()
+    }
+
     /// Set the subscribed topics.
     pub async fn set_subscribed_topics(&self, topics: Vec<String>) {
         *self.subscribed_topics.write().await = topics;

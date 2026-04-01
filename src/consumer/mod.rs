@@ -226,44 +226,64 @@ impl Consumer {
         // If we have a group coordinator, join the group
         if let Some(ref coordinator) = self.group_coordinator {
             let topic_strings: Vec<String> = topics.iter().map(|s| s.to_string()).collect();
-            let (assignment, joined) = coordinator.ensure_active_membership(&topic_strings).await?;
 
-            // Update our assignments based on the group assignment
-            {
-                let mut assignments = self.assignments.write().await;
-                assignments.clear();
-                for (topic, partitions) in &assignment.partitions {
-                    assignments.insert(topic.clone(), partitions.clone());
+            if coordinator.is_cooperative() {
+                // Cooperative (KIP-429): defer the join/sync to poll(), which
+                // implements the full two-phase rebalance protocol (revocations,
+                // on_partitions_revoked callback, second rejoin). subscribe()
+                // only updates the subscription metadata; poll() will detect
+                // needs_rejoin() and drive the cooperative flow.
+
+                // Detect topic changes while Stable — mark for rejoin.
+                {
+                    let state = coordinator.state().await;
+                    if state == GroupState::Stable {
+                        let mut old_sorted = coordinator.subscribed_topics().await;
+                        old_sorted.sort();
+                        let mut new_sorted = topic_strings.clone();
+                        new_sorted.sort();
+                        if old_sorted != new_sorted {
+                            coordinator.set_preparing_rebalance().await;
+                        }
+                    }
                 }
-            }
 
-            if joined {
-                // An actual JoinGroup/SyncGroup occurred (first join or topic change).
+                coordinator.set_subscribed_topics(topic_strings).await;
+            } else {
+                // Eager: join immediately in subscribe() — single-phase is correct.
+                let (assignment, joined) =
+                    coordinator.ensure_active_membership(&topic_strings).await?;
 
-                // Record owned partitions so the sticky assignor has the correct
-                // baseline for the next JoinGroup (KIP-429 two-phase semantics).
-                if coordinator.is_cooperative() {
-                    let member_id = coordinator.member_id().await;
-                    coordinator.record_owned_partitions(&member_id, &assignment);
+                // Update our assignments based on the group assignment
+                {
+                    let mut assignments = self.assignments.write().await;
+                    assignments.clear();
+                    for (topic, partitions) in &assignment.partitions {
+                        assignments.insert(topic.clone(), partitions.clone());
+                    }
                 }
 
-                // Notify listener of assignment (matches Java client behavior:
-                // ConsumerRebalanceListener.onPartitionsAssigned is invoked on every
-                // successful rebalance, including the very first one).
-                let assigned: Vec<TopicPartition> = assignment
-                    .partitions
-                    .iter()
-                    .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
-                    .collect();
-                self.rebalance_listener.on_partitions_assigned(&assigned);
-                self.metrics.rebalances.inc();
+                if joined {
+                    // An actual JoinGroup/SyncGroup occurred (first join or topic change).
 
-                // Update assigned_partitions metric
-                self.metrics.assigned_partitions.set(assigned.len() as u64);
+                    // Notify listener of assignment (matches Java client behavior:
+                    // ConsumerRebalanceListener.onPartitionsAssigned is invoked on every
+                    // successful rebalance, including the very first one).
+                    let assigned: Vec<TopicPartition> = assignment
+                        .partitions
+                        .iter()
+                        .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
+                        .collect();
+                    self.rebalance_listener.on_partitions_assigned(&assigned);
+                    self.metrics.rebalances.inc();
 
-                // Fetch committed offsets for our assigned partitions
-                self.fetch_and_apply_committed_offsets(&assignment.partitions)
-                    .await?;
+                    // Update assigned_partitions metric
+                    self.metrics.assigned_partitions.set(assigned.len() as u64);
+
+                    // Fetch committed offsets for our assigned partitions
+                    self.fetch_and_apply_committed_offsets(&assignment.partitions)
+                        .await?;
+                }
             }
 
             debug!("Subscribed to topics via group coordinator: {:?}", topics);
@@ -1188,6 +1208,14 @@ impl Consumer {
                                 paused.clear();
                                 self.metrics.paused_partitions.set(paused.len() as u64);
                             }
+
+                            // Clear assignments immediately after revocation so that
+                            // if ensure_active_membership fails below, the next poll
+                            // won't re-fire on_partitions_revoked for already-revoked
+                            // partitions. Matches the Java client's behavior of
+                            // clearing subscription state after the eager revoke phase.
+                            self.assignments.write().await.clear();
+                            self.metrics.assigned_partitions.set(0);
                         }
 
                         self.metrics.rebalances.inc();
