@@ -314,7 +314,8 @@ let consumer = ConsumerBuilder::default()
 4. Revoked partitions are released and `on_partitions_revoked` fires.
 5. Phase 2: Members rejoin with updated owned-partition metadata.
 6. Final assignments are distributed and `on_partitions_assigned` fires
-   for newly acquired partitions only.
+   with the full post-rebalance assignment (committed offsets are only
+   fetched for newly acquired partitions).
 
 ### Rebalance Listener
 

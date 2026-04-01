@@ -1058,19 +1058,25 @@ impl Consumer {
                             }
                             drop(assignments);
 
-                            if !newly_assigned.is_empty() {
-                                self.rebalance_listener
-                                    .on_partitions_assigned(&newly_assigned);
-                            }
-                            self.metrics.assigned_partitions.set(
-                                final_assignment
-                                    .partitions
-                                    .values()
-                                    .map(|v| v.len())
-                                    .sum::<usize>() as u64,
-                            );
+                            // Notify listener with the full post-rebalance assignment
+                            // (matching Java ConsumerRebalanceListener.onPartitionsAssigned
+                            // contract), not just the diff. Always fire, even when the
+                            // assignment is empty (e.g., more consumers than partitions).
+                            let full_assigned: Vec<TopicPartition> = final_assignment
+                                .partitions
+                                .iter()
+                                .flat_map(|(t, ps)| {
+                                    ps.iter().map(move |&p| TopicPartition::new(t, p))
+                                })
+                                .collect();
+                            self.rebalance_listener
+                                .on_partitions_assigned(&full_assigned);
+                            self.metrics
+                                .assigned_partitions
+                                .set(full_assigned.len() as u64);
 
                             // Fetch committed offsets for newly assigned partitions only
+                            // (retained partitions already have tracked offsets).
                             if !newly_assigned.is_empty() {
                                 let new_parts = Self::group_partitions_by_topic(&newly_assigned);
                                 self.fetch_and_apply_committed_offsets(&new_parts).await?;
@@ -1126,20 +1132,26 @@ impl Consumer {
                             }
                             drop(assignments);
 
-                            if !newly_assigned.is_empty() {
-                                self.rebalance_listener
-                                    .on_partitions_assigned(&newly_assigned);
-                            }
+                            // Notify listener with the full post-rebalance assignment
+                            // (matching Java ConsumerRebalanceListener.onPartitionsAssigned
+                            // contract), not just the diff. Always fire, even when the
+                            // assignment is empty (e.g., more consumers than partitions).
+                            let full_assigned: Vec<TopicPartition> = new_assignment
+                                .partitions
+                                .iter()
+                                .flat_map(|(t, ps)| {
+                                    ps.iter().map(move |&p| TopicPartition::new(t, p))
+                                })
+                                .collect();
+                            self.rebalance_listener
+                                .on_partitions_assigned(&full_assigned);
                             self.metrics.rebalances.inc();
-                            self.metrics.assigned_partitions.set(
-                                new_assignment
-                                    .partitions
-                                    .values()
-                                    .map(|v| v.len())
-                                    .sum::<usize>() as u64,
-                            );
+                            self.metrics
+                                .assigned_partitions
+                                .set(full_assigned.len() as u64);
 
                             // Fetch committed offsets for newly assigned partitions only
+                            // (retained partitions already have tracked offsets).
                             if !newly_assigned.is_empty() {
                                 let new_parts = Self::group_partitions_by_topic(&newly_assigned);
                                 self.fetch_and_apply_committed_offsets(&new_parts).await?;

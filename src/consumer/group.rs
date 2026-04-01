@@ -55,8 +55,11 @@ use crate::protocol::{
 pub trait ConsumerRebalanceListener: Send + Sync {
     /// Called after partitions have been assigned to this consumer.
     ///
-    /// This is triggered after a rebalance when the consumer receives
-    /// its new partition assignment.
+    /// The `partitions` parameter contains the **full set** of partitions now
+    /// owned by this consumer after the rebalance — not just newly added ones.
+    /// It may include partitions that were already assigned before the rebalance.
+    /// This matches the Java `ConsumerRebalanceListener.onPartitionsAssigned`
+    /// contract.
     fn on_partitions_assigned(&self, partitions: &[crate::consumer::TopicPartition]);
 
     /// Called before partitions are revoked from this consumer.
