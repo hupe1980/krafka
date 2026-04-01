@@ -727,6 +727,11 @@ pub struct HeartbeatController {
     running: Arc<std::sync::atomic::AtomicBool>,
     /// Whether a rebalance has been detected by the heartbeat task.
     rebalance_needed: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the member session has been invalidated by a heartbeat error
+    /// (UNKNOWN_MEMBER_ID, ILLEGAL_GENERATION, SESSION_TIMEOUT).
+    /// When set, needs_rejoin() will clear member_id and generation_id
+    /// in addition to triggering a rebalance.
+    member_invalidated: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HeartbeatController {
@@ -738,6 +743,7 @@ impl HeartbeatController {
             last_heartbeat: Arc::new(RwLock::new(None)),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rebalance_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            member_invalidated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -780,6 +786,22 @@ impl HeartbeatController {
     /// Check and clear the rebalance-needed flag.
     pub fn take_rebalance_needed(&self) -> bool {
         self.rebalance_needed
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Signal that the member session has been invalidated
+    /// (UNKNOWN_MEMBER_ID, ILLEGAL_GENERATION, or session timeout).
+    /// Also sets the rebalance_needed flag.
+    pub fn signal_member_invalidated(&self) {
+        self.member_invalidated
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.rebalance_needed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Check and clear the member-invalidated flag.
+    pub fn take_member_invalidated(&self) -> bool {
+        self.member_invalidated
             .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
@@ -1052,6 +1074,14 @@ impl GroupCoordinator {
     pub async fn needs_rejoin(&self) -> bool {
         // Check heartbeat controller's rebalance flag first (immediate detection from R8.3)
         if self.heartbeat_controller.take_rebalance_needed() {
+            // If the heartbeat detected a session-invalidating error
+            // (UNKNOWN_MEMBER_ID, ILLEGAL_GENERATION, session timeout),
+            // clear the member identity so the next join_group() sends
+            // a fresh empty member_id. This must happen here (not in
+            // the heartbeat task) because we need access to sticky_assignor.
+            if self.heartbeat_controller.take_member_invalidated() {
+                self.reset_member_identity().await;
+            }
             *self.state.write().await = GroupState::PreparingRebalance;
             return true;
         }
@@ -1204,6 +1234,15 @@ impl GroupCoordinator {
         };
 
         if !join_response.error_code.is_ok() {
+            // Reset member identity on session-invalidating errors so the
+            // next rejoin attempt sends an empty member_id (fresh registration)
+            // instead of the dead one. Matches the Java client's behavior in
+            // AbstractCoordinator.resetStateOnResponseError().
+            if join_response.error_code == ErrorCode::UnknownMemberId
+                || join_response.error_code == ErrorCode::IllegalGeneration
+            {
+                self.reset_member_identity().await;
+            }
             *self.state.write().await = GroupState::Unjoined;
             return Err(KrafkaError::broker(
                 join_response.error_code,
@@ -1211,7 +1250,17 @@ impl GroupCoordinator {
             ));
         }
 
-        // Update member ID and generation
+        // Update member ID and generation.
+        // If the broker assigned a different member_id (e.g., first join
+        // with empty id, or broker-side reassignment), clear the old
+        // entry from sticky_assignor to prevent unbounded accumulation
+        // of orphaned previous_assignments keyed by stale member IDs.
+        {
+            let old_member_id = self.member_id.read().await.clone();
+            if !old_member_id.is_empty() && old_member_id != join_response.member_id {
+                self.sticky_assignor.clear_member(&old_member_id);
+            }
+        }
         *self.member_id.write().await = join_response.member_id.clone();
         *self.generation_id.write().await = join_response.generation_id;
         *self.state.write().await = GroupState::AwaitingSync;
@@ -1279,6 +1328,18 @@ impl GroupCoordinator {
         };
 
         if !sync_response.error_code.is_ok() {
+            // Reset member identity on session-invalidating errors.
+            // After a failed sync with UNKNOWN_MEMBER_ID or ILLEGAL_GENERATION,
+            // the broker no longer recognizes our member_id + generation_id pair.
+            // Clearing them ensures the next rejoin sends a fresh empty
+            // member_id for re-registration.
+            // REBALANCE_IN_PROGRESS means the session is still valid but the
+            // group is rebalancing — keep member_id so we can rejoin faster.
+            if sync_response.error_code == ErrorCode::UnknownMemberId
+                || sync_response.error_code == ErrorCode::IllegalGeneration
+            {
+                self.reset_member_identity().await;
+            }
             *self.state.write().await = GroupState::Unjoined;
             return Err(KrafkaError::broker(
                 sync_response.error_code,
@@ -1434,11 +1495,13 @@ impl GroupCoordinator {
         // Stop existing task if any
         self.stop_heartbeat_task().await;
 
-        // Clear any stale rebalance signal from the previous heartbeat task.
-        // Between sending the Stop command and the old task terminating, it
-        // may have received REBALANCE_IN_PROGRESS and called signal_rebalance().
-        // That signal is now stale — we just completed a successful join/sync.
+        // Clear any stale rebalance/invalidation signals from the previous
+        // heartbeat task. Between sending the Stop command and the old task
+        // terminating, it may have received REBALANCE_IN_PROGRESS or a
+        // session-invalidating error. Those signals are now stale — we just
+        // completed a successful join/sync.
         self.heartbeat_controller.take_rebalance_needed();
+        self.heartbeat_controller.take_member_invalidated();
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<HeartbeatCommand>(10);
         *self.heartbeat_cmd_tx.write().await = Some(cmd_tx);
@@ -1519,7 +1582,17 @@ impl GroupCoordinator {
                                             }
                                             status if status.requires_rejoin() => {
                                                 warn!("Heartbeat status {:?} requires rejoin for group '{}'", status, group_id);
-                                                heartbeat_controller.signal_rebalance();
+                                                // For session-invalidating errors (UnknownMember,
+                                                // IllegalGeneration, SessionTimeout), signal that
+                                                // member identity must be cleared. The actual
+                                                // cleanup (sticky_assignor + member_id + generation_id)
+                                                // happens in needs_rejoin() which has full access
+                                                // to the coordinator.
+                                                if status != HeartbeatStatus::RebalanceNeeded {
+                                                    heartbeat_controller.signal_member_invalidated();
+                                                } else {
+                                                    heartbeat_controller.signal_rebalance();
+                                                }
                                                 heartbeat_controller.stop();
                                                 break;
                                             }
@@ -2028,12 +2101,27 @@ impl GroupCoordinator {
 
     /// Reset coordinator state.
     async fn reset(&self) {
-        *self.member_id.write().await = String::new();
-        *self.generation_id.write().await = -1;
+        self.reset_member_identity().await;
         *self.state.write().await = GroupState::Unjoined;
         *self.assignment.write().await = MemberAssignment::empty();
         *self.coordinator_conn.write().await = None;
         *self.coordinator_id.write().await = None;
+    }
+
+    /// Clear member identity (member_id, generation_id) and any associated
+    /// sticky assignor state.
+    ///
+    /// Called on session-invalidating errors (UNKNOWN_MEMBER_ID,
+    /// ILLEGAL_GENERATION, session timeout) so the next join_group() sends
+    /// a fresh empty member_id for re-registration.  Also called by reset()
+    /// during leave_group/close to prevent orphaned previous_assignments.
+    async fn reset_member_identity(&self) {
+        let old = self.member_id.read().await.clone();
+        if !old.is_empty() {
+            self.sticky_assignor.clear_member(&old);
+        }
+        *self.member_id.write().await = String::new();
+        *self.generation_id.write().await = -1;
     }
 
     /// Encode consumer protocol metadata.

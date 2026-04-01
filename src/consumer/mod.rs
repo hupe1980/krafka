@@ -273,21 +273,7 @@ impl Consumer {
                             .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
                             .collect();
                         self.rebalance_listener.on_partitions_revoked(&revoked);
-
-                        // Reset all fetch sessions — partition ownership is changing
-                        self.fetch_sessions.lock().await.reset_all();
-                        // Clear all offsets — all partitions revoked in eager mode
-                        self.offsets.write().await.clear();
-                        // Clear offset retry backoff — fresh start after rebalance
-                        self.offset_retry_backoff.write().await.clear();
-                        // Discard all buffered records — all partitions revoked
-                        self.recv_buffer.write().await.clear();
-                        // Clear any paused partitions — fresh assignment after revoke
-                        {
-                            let mut paused = self.paused.write().await;
-                            paused.clear();
-                            self.metrics.paused_partitions.set(0);
-                        }
+                        self.clear_partition_state().await;
                     }
 
                     self.metrics.rebalances.inc();
@@ -405,6 +391,78 @@ impl Consumer {
             }
             self.metrics.paused_partitions.set(paused.len() as u64);
         }
+    }
+
+    /// Finalize a cooperative rebalance: compute newly-assigned diff, update
+    /// assignments, fire `on_partitions_assigned`, fetch committed offsets for
+    /// new partitions, and record owned partitions in the sticky assignor.
+    async fn finalize_cooperative_assignment(
+        &self,
+        coordinator: &GroupCoordinator,
+        assignment: &MemberAssignment,
+        old_assignments: &HashMap<String, Vec<PartitionId>>,
+    ) -> Result<()> {
+        // Determine newly assigned partitions (new - old)
+        let mut newly_assigned = Vec::new();
+        for (topic, partitions) in &assignment.partitions {
+            let old_parts = old_assignments.get(topic);
+            for &p in partitions {
+                let is_new = old_parts.is_none_or(|old| !old.contains(&p));
+                if is_new {
+                    newly_assigned.push(TopicPartition::new(topic, p));
+                }
+            }
+        }
+
+        // Update to final assignment
+        {
+            let mut assignments = self.assignments.write().await;
+            assignments.clear();
+            for (topic, partitions) in &assignment.partitions {
+                assignments.insert(topic.clone(), partitions.clone());
+            }
+        }
+
+        // Notify listener with the full post-rebalance assignment
+        // (matching Java ConsumerRebalanceListener.onPartitionsAssigned
+        // contract), not just the diff. Always fire, even when the
+        // assignment is empty (e.g., more consumers than partitions).
+        let full_assigned: Vec<TopicPartition> = assignment
+            .partitions
+            .iter()
+            .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
+            .collect();
+        self.rebalance_listener
+            .on_partitions_assigned(&full_assigned);
+        self.metrics
+            .assigned_partitions
+            .set(full_assigned.len() as u64);
+
+        // Fetch committed offsets for newly assigned partitions only
+        // (retained partitions already have tracked offsets).
+        if !newly_assigned.is_empty() {
+            let new_parts = Self::group_partitions_by_topic(&newly_assigned);
+            self.fetch_and_apply_committed_offsets(&new_parts).await?;
+        }
+
+        // Record final assignment so the next rebalance's
+        // join_group metadata reports correct owned partitions.
+        let member_id = coordinator.member_id().await;
+        coordinator.record_owned_partitions(&member_id, assignment);
+
+        Ok(())
+    }
+
+    /// Clear all per-partition state after an eager revocation or unsubscribe/close.
+    ///
+    /// Resets fetch sessions, offsets, retry backoff, buffered records, and paused set.
+    async fn clear_partition_state(&self) {
+        self.fetch_sessions.lock().await.reset_all();
+        self.offsets.write().await.clear();
+        self.offset_retry_backoff.write().await.clear();
+        self.recv_buffer.write().await.clear();
+        self.paused.write().await.clear();
+        self.metrics.paused_partitions.set(0);
     }
 
     /// Group topic-partitions into a map keyed by topic name.
@@ -1093,68 +1151,18 @@ impl Consumer {
                                 coordinator.trigger_rejoin().await;
                             }
 
-                            // Determine newly assigned partitions (new - old)
+                            // Finalize cooperative assignment: update assignments,
+                            // fire on_partitions_assigned, fetch offsets, record owned.
                             let old_assignments = self.assignments.read().await.clone();
-                            let mut newly_assigned = Vec::new();
-                            for (topic, partitions) in &final_assignment.partitions {
-                                let old_parts = old_assignments.get(topic);
-                                for &p in partitions {
-                                    let is_new = old_parts.is_none_or(|old| !old.contains(&p));
-                                    if is_new {
-                                        newly_assigned.push(TopicPartition::new(topic, p));
-                                    }
-                                }
-                            }
-
-                            // Update to final assignment
-                            let mut assignments = self.assignments.write().await;
-                            assignments.clear();
-                            for (topic, partitions) in &final_assignment.partitions {
-                                assignments.insert(topic.clone(), partitions.clone());
-                            }
-                            drop(assignments);
-
-                            // Notify listener with the full post-rebalance assignment
-                            // (matching Java ConsumerRebalanceListener.onPartitionsAssigned
-                            // contract), not just the diff. Always fire, even when the
-                            // assignment is empty (e.g., more consumers than partitions).
-                            let full_assigned: Vec<TopicPartition> = final_assignment
-                                .partitions
-                                .iter()
-                                .flat_map(|(t, ps)| {
-                                    ps.iter().map(move |&p| TopicPartition::new(t, p))
-                                })
-                                .collect();
-                            self.rebalance_listener
-                                .on_partitions_assigned(&full_assigned);
-                            self.metrics
-                                .assigned_partitions
-                                .set(full_assigned.len() as u64);
-
-                            // Fetch committed offsets for newly assigned partitions only
-                            // (retained partitions already have tracked offsets).
-                            if !newly_assigned.is_empty() {
-                                let new_parts = Self::group_partitions_by_topic(&newly_assigned);
-                                self.fetch_and_apply_committed_offsets(&new_parts).await?;
-                            }
-
-                            // Record final assignment so the next rebalance's
-                            // join_group metadata reports correct owned partitions.
-                            let member_id = coordinator.member_id().await;
-                            coordinator.record_owned_partitions(&member_id, &final_assignment);
+                            self.finalize_cooperative_assignment(
+                                coordinator,
+                                &final_assignment,
+                                &old_assignments,
+                            )
+                            .await?;
                         } else {
                             // No revocations — assignment is final in one round
                             let old_assignments = self.assignments.read().await.clone();
-                            let mut newly_assigned = Vec::new();
-                            for (topic, partitions) in &new_assignment.partitions {
-                                let old_parts = old_assignments.get(topic);
-                                for &p in partitions {
-                                    let is_new = old_parts.is_none_or(|old| !old.contains(&p));
-                                    if is_new {
-                                        newly_assigned.push(TopicPartition::new(topic, p));
-                                    }
-                                }
-                            }
 
                             // Determine partitions removed in this rebalance
                             // (e.g., reassigned to another member, topic deleted).
@@ -1180,43 +1188,16 @@ impl Consumer {
                                 self.apply_partition_revocations(&revoked_tuples).await;
                             }
 
-                            // Update to new assignment
-                            let mut assignments = self.assignments.write().await;
-                            assignments.clear();
-                            for (topic, partitions) in &new_assignment.partitions {
-                                assignments.insert(topic.clone(), partitions.clone());
-                            }
-                            drop(assignments);
-
-                            // Notify listener with the full post-rebalance assignment
-                            // (matching Java ConsumerRebalanceListener.onPartitionsAssigned
-                            // contract), not just the diff. Always fire, even when the
-                            // assignment is empty (e.g., more consumers than partitions).
-                            let full_assigned: Vec<TopicPartition> = new_assignment
-                                .partitions
-                                .iter()
-                                .flat_map(|(t, ps)| {
-                                    ps.iter().map(move |&p| TopicPartition::new(t, p))
-                                })
-                                .collect();
-                            self.rebalance_listener
-                                .on_partitions_assigned(&full_assigned);
                             self.metrics.rebalances.inc();
-                            self.metrics
-                                .assigned_partitions
-                                .set(full_assigned.len() as u64);
 
-                            // Fetch committed offsets for newly assigned partitions only
-                            // (retained partitions already have tracked offsets).
-                            if !newly_assigned.is_empty() {
-                                let new_parts = Self::group_partitions_by_topic(&newly_assigned);
-                                self.fetch_and_apply_committed_offsets(&new_parts).await?;
-                            }
-
-                            // Record final assignment so the next rebalance's
-                            // join_group metadata reports correct owned partitions.
-                            let member_id = coordinator.member_id().await;
-                            coordinator.record_owned_partitions(&member_id, &new_assignment);
+                            // Finalize cooperative assignment: update assignments,
+                            // fire on_partitions_assigned, fetch offsets, record owned.
+                            self.finalize_cooperative_assignment(
+                                coordinator,
+                                &new_assignment,
+                                &old_assignments,
+                            )
+                            .await?;
                         }
                     } else {
                         // Eager rebalance: revoke all, then reassign all
@@ -1229,21 +1210,7 @@ impl Consumer {
                                 })
                                 .collect();
                             self.rebalance_listener.on_partitions_revoked(&revoked);
-
-                            // Reset all fetch sessions — partition ownership is changing
-                            self.fetch_sessions.lock().await.reset_all();
-                            // Clear all offsets — all partitions revoked
-                            self.offsets.write().await.clear();
-                            // Clear offset retry backoff — fresh start after rebalance
-                            self.offset_retry_backoff.write().await.clear();
-                            // Discard all buffered records — all partitions revoked
-                            self.recv_buffer.write().await.clear();
-                            // Clear any paused partitions — fresh assignment after revoke
-                            {
-                                let mut paused = self.paused.write().await;
-                                paused.clear();
-                                self.metrics.paused_partitions.set(paused.len() as u64);
-                            }
+                            self.clear_partition_state().await;
 
                             // Clear assignments immediately after revocation so that
                             // if ensure_active_membership fails below, the next poll
@@ -2332,15 +2299,8 @@ impl Consumer {
 
         self.subscriptions.write().await.clear();
         self.assignments.write().await.clear();
-        self.offsets.write().await.clear();
-        self.paused.write().await.clear();
-        self.recv_buffer.write().await.clear();
-        self.offset_retry_backoff.write().await.clear();
-        self.fetch_sessions.lock().await.reset_all();
-
-        // Reset metrics to reflect empty state
+        self.clear_partition_state().await;
         self.metrics.assigned_partitions.set(0);
-        self.metrics.paused_partitions.set(0);
 
         debug!("Unsubscribed from all topics");
     }
@@ -2407,13 +2367,8 @@ impl Consumer {
         // from partitions already signaled as lost via on_partitions_lost above.
         self.subscriptions.write().await.clear();
         self.assignments.write().await.clear();
-        self.offsets.write().await.clear();
-        self.paused.write().await.clear();
-        self.recv_buffer.write().await.clear();
-        self.offset_retry_backoff.write().await.clear();
-        self.fetch_sessions.lock().await.reset_all();
+        self.clear_partition_state().await;
         self.metrics.assigned_partitions.set(0);
-        self.metrics.paused_partitions.set(0);
 
         // Notify interceptor of shutdown
         crate::interceptor::safe_consumer_close(&*self.interceptor);
