@@ -1434,6 +1434,12 @@ impl GroupCoordinator {
         // Stop existing task if any
         self.stop_heartbeat_task().await;
 
+        // Clear any stale rebalance signal from the previous heartbeat task.
+        // Between sending the Stop command and the old task terminating, it
+        // may have received REBALANCE_IN_PROGRESS and called signal_rebalance().
+        // That signal is now stale — we just completed a successful join/sync.
+        self.heartbeat_controller.take_rebalance_needed();
+
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<HeartbeatCommand>(10);
         *self.heartbeat_cmd_tx.write().await = Some(cmd_tx);
 

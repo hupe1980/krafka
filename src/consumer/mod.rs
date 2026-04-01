@@ -251,8 +251,47 @@ impl Consumer {
                 coordinator.set_subscribed_topics(topic_strings).await;
             } else {
                 // Eager: join immediately in subscribe() — single-phase is correct.
+
+                // Snapshot old assignment before the join. If a JoinGroup/SyncGroup
+                // occurs, we must revoke the old partitions (eager = revoke all)
+                // to clean up per-partition state and notify the listener.
+                let old_assignments = self.assignments.read().await.clone();
+
                 let (assignment, joined) =
                     coordinator.ensure_active_membership(&topic_strings).await?;
+
+                if joined {
+                    // An actual JoinGroup/SyncGroup occurred (first join or topic change).
+
+                    // Eager revocation: notify listener and clean up stale per-partition
+                    // state from the previous assignment before applying the new one.
+                    // Without this, re-subscribing with different topics would leak
+                    // old offsets, buffered records, paused state, and fetch sessions.
+                    if !old_assignments.is_empty() {
+                        let revoked: Vec<TopicPartition> = old_assignments
+                            .iter()
+                            .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
+                            .collect();
+                        self.rebalance_listener.on_partitions_revoked(&revoked);
+
+                        // Reset all fetch sessions — partition ownership is changing
+                        self.fetch_sessions.lock().await.reset_all();
+                        // Clear all offsets — all partitions revoked in eager mode
+                        self.offsets.write().await.clear();
+                        // Clear offset retry backoff — fresh start after rebalance
+                        self.offset_retry_backoff.write().await.clear();
+                        // Discard all buffered records — all partitions revoked
+                        self.recv_buffer.write().await.clear();
+                        // Clear any paused partitions — fresh assignment after revoke
+                        {
+                            let mut paused = self.paused.write().await;
+                            paused.clear();
+                            self.metrics.paused_partitions.set(0);
+                        }
+                    }
+
+                    self.metrics.rebalances.inc();
+                }
 
                 // Update our assignments based on the group assignment
                 {
@@ -264,8 +303,6 @@ impl Consumer {
                 }
 
                 if joined {
-                    // An actual JoinGroup/SyncGroup occurred (first join or topic change).
-
                     // Notify listener of assignment (matches Java client behavior:
                     // ConsumerRebalanceListener.onPartitionsAssigned is invoked on every
                     // successful rebalance, including the very first one).
@@ -275,7 +312,6 @@ impl Consumer {
                         .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
                         .collect();
                     self.rebalance_listener.on_partitions_assigned(&assigned);
-                    self.metrics.rebalances.inc();
 
                     // Update assigned_partitions metric
                     self.metrics.assigned_partitions.set(assigned.len() as u64);
@@ -2300,6 +2336,11 @@ impl Consumer {
         self.paused.write().await.clear();
         self.recv_buffer.write().await.clear();
         self.offset_retry_backoff.write().await.clear();
+        self.fetch_sessions.lock().await.reset_all();
+
+        // Reset metrics to reflect empty state
+        self.metrics.assigned_partitions.set(0);
+        self.metrics.paused_partitions.set(0);
 
         debug!("Unsubscribed from all topics");
     }
@@ -2361,6 +2402,18 @@ impl Consumer {
         {
             warn!("Error leaving consumer group: {e}");
         }
+
+        // Clear per-partition state so post-close recv() cannot return records
+        // from partitions already signaled as lost via on_partitions_lost above.
+        self.subscriptions.write().await.clear();
+        self.assignments.write().await.clear();
+        self.offsets.write().await.clear();
+        self.paused.write().await.clear();
+        self.recv_buffer.write().await.clear();
+        self.offset_retry_backoff.write().await.clear();
+        self.fetch_sessions.lock().await.reset_all();
+        self.metrics.assigned_partitions.set(0);
+        self.metrics.paused_partitions.set(0);
 
         // Notify interceptor of shutdown
         crate::interceptor::safe_consumer_close(&*self.interceptor);
