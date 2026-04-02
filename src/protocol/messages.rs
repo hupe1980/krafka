@@ -7094,6 +7094,44 @@ mod tests {
         assert!(msg.contains("unsupported"), "got: {msg}");
     }
 
+    /// v0: brokers (no rack) + topics (no is_internal), no controller_id/cluster_id/throttle.
+    #[test]
+    fn test_metadata_response_decode_v0() {
+        let mut buf = BytesMut::new();
+        // 1 broker
+        buf.put_i32(1);
+        buf.put_i32(1); // node_id
+        let host = b"broker1";
+        buf.put_i16(host.len() as i16);
+        buf.put_slice(host);
+        buf.put_i32(9092); // port
+        // 1 topic
+        buf.put_i32(1);
+        buf.put_i16(0); // error_code
+        let topic = b"test";
+        buf.put_i16(topic.len() as i16);
+        buf.put_slice(topic);
+        // 1 partition
+        buf.put_i32(1);
+        buf.put_i16(0); // error_code
+        buf.put_i32(0); // partition_index
+        buf.put_i32(1); // leader_id
+        buf.put_i32(1); // replicas count
+        buf.put_i32(1); // replica
+        buf.put_i32(1); // isr count
+        buf.put_i32(1); // isr
+
+        let resp = MetadataResponse::decode_versioned(0, &mut buf.freeze()).unwrap();
+        assert_eq!(resp.brokers.len(), 1);
+        assert_eq!(resp.brokers[0].rack, None); // no rack in v0
+        assert_eq!(resp.controller_id, -1); // no controller in v0
+        assert_eq!(resp.cluster_id, None);
+        assert_eq!(resp.throttle_time_ms, 0);
+        assert!(!resp.topics[0].is_internal); // defaults to false in v0
+        assert_eq!(resp.topics[0].partitions[0].leader_epoch, -1);
+        assert!(resp.topics[0].partitions[0].offline_replicas.is_empty());
+    }
+
     /// Build a v1 Metadata response on the wire:
     /// brokers (with rack) + controller_id + topics (with is_internal).
     #[test]
@@ -7233,6 +7271,38 @@ mod tests {
         let resp = MetadataResponse::decode_versioned(5, &mut buf.freeze()).unwrap();
         assert_eq!(resp.topics[0].partitions[0].offline_replicas, vec![2]);
         assert_eq!(resp.topics[0].partitions[0].leader_epoch, -1); // not in v5
+    }
+
+    /// v6 has the same wire format as v5 — verify dispatch routes through decode_v5.
+    #[test]
+    fn test_metadata_response_decode_v6() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_i32(0); // 0 brokers
+        buf.put_i16(-1); // cluster_id null
+        buf.put_i32(-1); // controller_id
+        // 1 topic
+        buf.put_i32(1);
+        buf.put_i16(0); // error_code
+        let topic = b"t2";
+        buf.put_i16(topic.len() as i16);
+        buf.put_slice(topic);
+        buf.put_u8(1); // is_internal = true
+        // 1 partition
+        buf.put_i32(1);
+        buf.put_i16(0); // error_code
+        buf.put_i32(0); // partition_index
+        buf.put_i32(1); // leader_id
+        buf.put_i32(1); // replicas count
+        buf.put_i32(1);
+        buf.put_i32(1); // isr count
+        buf.put_i32(1);
+        buf.put_i32(0); // offline_replicas count
+
+        let resp = MetadataResponse::decode_versioned(6, &mut buf.freeze()).unwrap();
+        assert_eq!(resp.topics[0].name.as_deref(), Some("t2"));
+        assert!(resp.topics[0].is_internal);
+        assert_eq!(resp.topics[0].partitions[0].leader_epoch, -1); // not in v6
     }
 
     /// v7 adds partition leader_epoch.

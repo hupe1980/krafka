@@ -176,9 +176,9 @@ impl ClusterMetadata {
     /// Uses a coalescing lock to prevent concurrent metadata stampedes.
     /// If a refresh is already in-flight, callers wait for it to complete.
     ///
-    /// The Metadata API version is negotiated with the broker:
-    /// - Preferred: v7+ (cluster_id, broker rack, leader epoch, offline replicas)
-    /// - Fallback: v0 (basic broker + topic metadata)
+    /// The Metadata API version is negotiated with the broker (v0-v8, no gaps).
+    /// Higher versions unlock richer fields: cluster_id, broker rack,
+    /// leader epoch, and offline replicas.
     pub async fn refresh_for_topics(&self, topics: Option<&[&str]>) -> Result<()> {
         // Coalesce concurrent calls: only one refresh in-flight at a time
         let _guard = self.refresh_lock.lock().await;
@@ -203,10 +203,12 @@ impl ClusterMetadata {
         let metadata_version = conn
             .negotiate_api_version_max(ApiKey::Metadata, crate::protocol::versions::METADATA_MAX)
             .await
-            .unwrap_or_else(|| {
-                debug!("Broker does not advertise Metadata support, falling back to v0");
-                0
-            });
+            .ok_or_else(|| {
+                KrafkaError::protocol(format!(
+                    "failed to negotiate Metadata API version with broker (client max: {})",
+                    crate::protocol::versions::METADATA_MAX,
+                ))
+            })?;
 
         // Build and send metadata request
         let request = match topics {
