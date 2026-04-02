@@ -868,6 +868,16 @@ impl HeartbeatStatus {
         matches!(self, Self::FatalError)
     }
 
+    /// Whether this status indicates the member session has been invalidated
+    /// (as opposed to a simple rebalance-in-progress).
+    #[inline]
+    pub fn is_session_invalidating(&self) -> bool {
+        matches!(
+            self,
+            Self::UnknownMember | Self::IllegalGeneration | Self::SessionTimeout
+        )
+    }
+
     /// Convert from an ErrorCode.
     pub fn from_error_code(code: ErrorCode) -> Self {
         match code {
@@ -919,7 +929,8 @@ pub enum HeartbeatCommand {
 /// );
 ///
 /// // Find coordinator and join group
-/// coordinator.ensure_active_membership(&["topic1"]).await?;
+/// let topics = vec!["topic1".to_string()];
+/// let (assignment, joined) = coordinator.ensure_active_membership(&topics).await?;
 ///
 /// // Commit offsets
 /// coordinator.commit_offsets(&offsets).await?;
@@ -1700,6 +1711,23 @@ impl GroupCoordinator {
         }
 
         Ok(status)
+    }
+
+    /// Handle inline heartbeat status by clearing member identity for
+    /// session-invalidating errors before triggering a rejoin.
+    ///
+    /// Returns `true` if a rejoin was triggered and the caller should
+    /// abort the current rebalance phase (return early from poll).
+    pub async fn handle_inline_heartbeat_status(&self, status: HeartbeatStatus) -> bool {
+        if status.requires_rejoin() {
+            if status.is_session_invalidating() {
+                self.reset_member_identity().await;
+            }
+            self.trigger_rejoin().await;
+            true
+        } else {
+            false
+        }
     }
 
     /// Commit offsets to the coordinator.
@@ -2758,6 +2786,16 @@ mod tests {
         assert!(!HeartbeatStatus::Ok.is_fatal());
         assert!(!HeartbeatStatus::RebalanceNeeded.is_fatal());
         assert!(HeartbeatStatus::FatalError.is_fatal());
+    }
+
+    #[test]
+    fn test_heartbeat_status_is_session_invalidating() {
+        assert!(!HeartbeatStatus::Ok.is_session_invalidating());
+        assert!(!HeartbeatStatus::RebalanceNeeded.is_session_invalidating());
+        assert!(HeartbeatStatus::UnknownMember.is_session_invalidating());
+        assert!(HeartbeatStatus::IllegalGeneration.is_session_invalidating());
+        assert!(HeartbeatStatus::SessionTimeout.is_session_invalidating());
+        assert!(!HeartbeatStatus::FatalError.is_session_invalidating());
     }
 
     #[test]

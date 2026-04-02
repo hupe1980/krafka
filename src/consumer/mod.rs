@@ -322,6 +322,10 @@ impl Consumer {
             let assigned_snapshot = assignments.clone();
             drop(assignments);
 
+            // Update metric for standalone partition count
+            let count: usize = assigned_snapshot.values().map(|p| p.len()).sum();
+            self.metrics.assigned_partitions.set(count as u64);
+
             // Apply auto_offset_reset for non-group consumers.
             // Without this, all partitions default to offset 0 regardless of
             // the configured auto_offset_reset policy.
@@ -463,6 +467,264 @@ impl Consumer {
         self.recv_buffer.write().await.clear();
         self.paused.write().await.clear();
         self.metrics.paused_partitions.set(0);
+    }
+
+    /// Send an inline heartbeat, invoke the revocation callback, apply
+    /// partition revocations, and update the metric + sticky-assignor state.
+    ///
+    /// Returns `true` if an inline heartbeat signalled session invalidation
+    /// and poll() should return early.
+    async fn apply_revocation_round(
+        &self,
+        coordinator: &Arc<GroupCoordinator>,
+        revoked_tuples: &[(String, PartitionId)],
+        revoked_tps: &[TopicPartition],
+    ) -> Result<bool> {
+        // Send an inline heartbeat before invoking the user callback
+        // to avoid session timeout if the callback is slow.
+        match coordinator.send_heartbeat().await {
+            Ok(status) if coordinator.handle_inline_heartbeat_status(status).await => {
+                return Ok(true);
+            }
+            Err(e) => {
+                warn!("Pre-revocation heartbeat failed: {}", e);
+            }
+            _ => {}
+        }
+        self.rebalance_listener.on_partitions_revoked(revoked_tps);
+        self.apply_partition_revocations(revoked_tuples).await;
+
+        // Update metric and owned-partition state in a single lock
+        // acquisition. The metric is set eagerly so it stays accurate
+        // even if a subsequent Phase 2 round returns early.
+        let member_id = coordinator.member_id().await;
+        let current = self.assignments.read().await;
+        let count: usize = current.values().map(|ps| ps.len()).sum();
+        self.metrics.assigned_partitions.set(count as u64);
+        let owned = MemberAssignment {
+            partitions: current.clone(),
+        };
+        drop(current);
+        coordinator.record_owned_partitions(&member_id, &owned);
+
+        Ok(false)
+    }
+
+    /// Handle group rebalance and inline heartbeat during poll.
+    ///
+    /// Returns `true` if poll() should return an empty result immediately
+    /// (e.g., cooperative rebalance requires another poll cycle).
+    async fn handle_group_rebalance(&self) -> Result<bool> {
+        let Some(ref coordinator) = self.group_coordinator else {
+            return Ok(false);
+        };
+
+        if coordinator.needs_rejoin().await {
+            let topics: Vec<String> = self.subscriptions.read().await.iter().cloned().collect();
+            if !topics.is_empty() {
+                coordinator.set_subscribed_topics(topics.clone()).await;
+
+                if coordinator.is_cooperative() {
+                    if self.handle_cooperative_rebalance(coordinator).await? {
+                        return Ok(true);
+                    }
+                } else {
+                    self.handle_eager_rebalance(coordinator, &topics).await?;
+                }
+            }
+        }
+
+        // Check if inline heartbeat is needed
+        if coordinator.is_heartbeat_overdue().await {
+            match coordinator.send_heartbeat().await {
+                Ok(status) if coordinator.handle_inline_heartbeat_status(status).await => {
+                    debug!("Heartbeat indicated rejoin needed");
+                }
+                Err(e) => {
+                    warn!("Inline heartbeat failed: {}", e);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Handle cooperative incremental rebalance (KIP-429).
+    ///
+    /// Returns `true` if poll() should return an empty result immediately,
+    /// which happens when an inline heartbeat signals rejoin or when the
+    /// cooperative round limit is exceeded.
+    async fn handle_cooperative_rebalance(
+        &self,
+        coordinator: &Arc<GroupCoordinator>,
+    ) -> Result<bool> {
+        // Phase 1: join+sync to get new target assignment
+        let (new_assignment, to_revoke) = coordinator.perform_cooperative_join_and_sync().await?;
+
+        if !to_revoke.is_empty() {
+            // Revoke only the diff — keep consuming unaffected partitions
+            let revoked: Vec<TopicPartition> = to_revoke
+                .iter()
+                .map(|(t, p)| TopicPartition::new(t, *p))
+                .collect();
+            if self
+                .apply_revocation_round(coordinator, &to_revoke, &revoked)
+                .await?
+            {
+                return Ok(true);
+            }
+            self.metrics.rebalances.inc();
+
+            // Phase 2: rejoin to finalize after revocations.
+            // In rare cases (concurrent topic changes, racing rebalances),
+            // additional revocations may be needed. Loop with a bound.
+            coordinator.trigger_rejoin().await;
+            let mut final_assignment = MemberAssignment::empty();
+            let max_cooperative_rounds = 3;
+            for round in 0..max_cooperative_rounds {
+                let (assignment, extra_revoke) =
+                    coordinator.perform_cooperative_join_and_sync().await?;
+                final_assignment = assignment;
+
+                if extra_revoke.is_empty() {
+                    break;
+                }
+
+                // Process additional revocations (including final round)
+                let extra_revoked: Vec<TopicPartition> = extra_revoke
+                    .iter()
+                    .map(|(t, p)| TopicPartition::new(t, *p))
+                    .collect();
+                if self
+                    .apply_revocation_round(coordinator, &extra_revoke, &extra_revoked)
+                    .await?
+                {
+                    return Ok(true);
+                }
+
+                if round == max_cooperative_rounds - 1 {
+                    warn!(
+                        "Cooperative rebalance exceeded {} rounds with pending revocations; \
+                         this may indicate cascading membership changes. \
+                         Deferring assignment to next poll cycle.",
+                        max_cooperative_rounds
+                    );
+                    // Start heartbeat to avoid session timeout while we
+                    // defer the additional cooperative rebalance round
+                    // to the next poll cycle. Do NOT apply final_assignment
+                    // since it still required another rejoin. Set state
+                    // directly instead of trigger_rejoin() to avoid
+                    // killing the heartbeat task via Rejoin command.
+                    coordinator.start_heartbeat_task().await;
+                    coordinator.set_preparing_rebalance().await;
+                    // Note: rebalances metric was already incremented
+                    // at Phase 1 entry; do not double-count here.
+                    // assigned_partitions metric was already updated
+                    // after apply_partition_revocations above.
+                    return Ok(true);
+                }
+
+                coordinator.trigger_rejoin().await;
+            }
+
+            // Finalize cooperative assignment: update assignments,
+            // fire on_partitions_assigned, fetch offsets, record owned.
+            let old_assignments = self.assignments.read().await.clone();
+            self.finalize_cooperative_assignment(coordinator, &final_assignment, &old_assignments)
+                .await?;
+        } else {
+            // No revocations — assignment is final in one round
+            let old_assignments = self.assignments.read().await.clone();
+
+            // Determine partitions removed in this rebalance
+            // (e.g., reassigned to another member, topic deleted).
+            // This is a clean cooperative revocation, not an unclean
+            // loss, so use on_partitions_revoked (not on_partitions_lost).
+            let mut revoked_parts: Vec<TopicPartition> = Vec::new();
+            for (topic, partitions) in &old_assignments {
+                let new_parts = new_assignment.partitions.get(topic);
+                for &p in partitions {
+                    let gone = new_parts.is_none_or(|np| !np.contains(&p));
+                    if gone {
+                        revoked_parts.push(TopicPartition::new(topic, p));
+                    }
+                }
+            }
+            if !revoked_parts.is_empty() {
+                self.rebalance_listener
+                    .on_partitions_revoked(&revoked_parts);
+                let revoked_tuples: Vec<(String, PartitionId)> = revoked_parts
+                    .iter()
+                    .map(|tp| (tp.topic.clone(), tp.partition))
+                    .collect();
+                self.apply_partition_revocations(&revoked_tuples).await;
+            }
+
+            self.metrics.rebalances.inc();
+
+            // Finalize cooperative assignment: update assignments,
+            // fire on_partitions_assigned, fetch offsets, record owned.
+            self.finalize_cooperative_assignment(coordinator, &new_assignment, &old_assignments)
+                .await?;
+        }
+
+        Ok(false)
+    }
+
+    /// Handle eager rebalance: revoke all partitions, then reassign from scratch.
+    async fn handle_eager_rebalance(
+        &self,
+        coordinator: &Arc<GroupCoordinator>,
+        topics: &[String],
+    ) -> Result<()> {
+        let old_assignments = self.assignments.read().await.clone();
+        if !old_assignments.is_empty() {
+            let revoked: Vec<TopicPartition> = old_assignments
+                .iter()
+                .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
+                .collect();
+            self.rebalance_listener.on_partitions_revoked(&revoked);
+            self.clear_partition_state().await;
+
+            // Clear assignments immediately after revocation so that
+            // if ensure_active_membership fails below, the next poll
+            // won't re-fire on_partitions_revoked for already-revoked
+            // partitions. Matches the Java client's behavior of
+            // clearing subscription state after the eager revoke phase.
+            self.assignments.write().await.clear();
+            self.metrics.assigned_partitions.set(0);
+        }
+
+        self.metrics.rebalances.inc();
+
+        // `joined` is always true here: handle_group_rebalance gates on
+        // needs_rejoin(), so ensure_active_membership always performs a
+        // full JoinGroup/SyncGroup.
+        let (assignment, _joined) = coordinator.ensure_active_membership(topics).await?;
+
+        // Update our assignments
+        let mut assignments = self.assignments.write().await;
+        assignments.clear();
+        for (topic, partitions) in &assignment.partitions {
+            assignments.insert(topic.clone(), partitions.clone());
+        }
+        drop(assignments);
+
+        // Notify listener of newly assigned partitions
+        let assigned: Vec<TopicPartition> = assignment
+            .partitions
+            .iter()
+            .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
+            .collect();
+        self.rebalance_listener.on_partitions_assigned(&assigned);
+        self.metrics.assigned_partitions.set(assigned.len() as u64);
+
+        // Fetch committed offsets for new assignment
+        self.fetch_and_apply_committed_offsets(&assignment.partitions)
+            .await?;
+
+        Ok(())
     }
 
     /// Group topic-partitions into a map keyed by topic name.
@@ -1021,248 +1283,8 @@ impl Consumer {
         }
 
         // Handle group rebalance if needed
-        if let Some(ref coordinator) = self.group_coordinator {
-            // Check if we need to rejoin the group
-            if coordinator.needs_rejoin().await {
-                let topics: Vec<String> = self.subscriptions.read().await.iter().cloned().collect();
-                if !topics.is_empty() {
-                    coordinator.set_subscribed_topics(topics.clone()).await;
-
-                    if coordinator.is_cooperative() {
-                        // Cooperative incremental rebalance (KIP-429)
-                        // Phase 1: join+sync to get new target assignment
-                        let (new_assignment, to_revoke) =
-                            coordinator.perform_cooperative_join_and_sync().await?;
-
-                        if !to_revoke.is_empty() {
-                            // Revoke only the diff — keep consuming unaffected partitions
-                            let revoked: Vec<TopicPartition> = to_revoke
-                                .iter()
-                                .map(|(t, p)| TopicPartition::new(t, *p))
-                                .collect();
-                            // Send an inline heartbeat before invoking user callback
-                            // to avoid session timeout if the callback is slow.
-                            match coordinator.send_heartbeat().await {
-                                Ok(status) if status.requires_rejoin() => {
-                                    coordinator.trigger_rejoin().await;
-                                    return Ok(vec![]);
-                                }
-                                Err(e) => {
-                                    warn!("Pre-revocation heartbeat failed: {}", e);
-                                }
-                                _ => {}
-                            }
-                            self.rebalance_listener.on_partitions_revoked(&revoked);
-                            self.metrics.rebalances.inc();
-
-                            self.apply_partition_revocations(&to_revoke).await;
-
-                            // Update metric to reflect post-revocation state.
-                            // This ensures the metric stays accurate if Phase 2
-                            // returns early (heartbeat requires rejoin, round-limit).
-                            {
-                                let current = self.assignments.read().await;
-                                let count: usize = current.values().map(|ps| ps.len()).sum();
-                                self.metrics.assigned_partitions.set(count as u64);
-                            }
-
-                            // Update owned partitions in sticky assignor before second rejoin.
-                            // Must reflect the POST-REVOCATION state (what we actually own now),
-                            // not the full Phase 1 result from sync_group().
-                            let member_id = coordinator.member_id().await;
-                            {
-                                let current = self.assignments.read().await;
-                                let owned = MemberAssignment {
-                                    partitions: current.clone(),
-                                };
-                                coordinator.record_owned_partitions(&member_id, &owned);
-                            }
-
-                            // Phase 2: rejoin to finalize after revocations.
-                            // In rare cases (concurrent topic changes, racing rebalances),
-                            // additional revocations may be needed. Loop with a bound.
-                            coordinator.trigger_rejoin().await;
-                            let mut final_assignment = MemberAssignment::empty();
-                            let max_cooperative_rounds = 3;
-                            for round in 0..max_cooperative_rounds {
-                                let (assignment, extra_revoke) =
-                                    coordinator.perform_cooperative_join_and_sync().await?;
-                                final_assignment = assignment;
-
-                                if extra_revoke.is_empty() {
-                                    break;
-                                }
-
-                                // Process additional revocations (including final round)
-                                let extra_revoked: Vec<TopicPartition> = extra_revoke
-                                    .iter()
-                                    .map(|(t, p)| TopicPartition::new(t, *p))
-                                    .collect();
-                                // Send an inline heartbeat before user callback
-                                // (heartbeat task is not running during Phase 2)
-                                match coordinator.send_heartbeat().await {
-                                    Ok(status) if status.requires_rejoin() => {
-                                        coordinator.trigger_rejoin().await;
-                                        return Ok(vec![]);
-                                    }
-                                    Err(e) => {
-                                        warn!("Pre-revocation heartbeat failed: {}", e);
-                                    }
-                                    _ => {}
-                                }
-                                self.rebalance_listener
-                                    .on_partitions_revoked(&extra_revoked);
-                                self.apply_partition_revocations(&extra_revoke).await;
-
-                                // Update owned state for next round
-                                let mid = coordinator.member_id().await;
-                                let current = self.assignments.read().await;
-                                let owned = MemberAssignment {
-                                    partitions: current.clone(),
-                                };
-                                // Keep assigned_partitions metric in sync after revocations
-                                let count: usize = current.values().map(|ps| ps.len()).sum();
-                                self.metrics.assigned_partitions.set(count as u64);
-                                drop(current);
-                                coordinator.record_owned_partitions(&mid, &owned);
-
-                                if round == max_cooperative_rounds - 1 {
-                                    warn!(
-                                        "Cooperative rebalance exceeded {} rounds with pending revocations; \
-                                         this may indicate cascading membership changes. \
-                                         Deferring assignment to next poll cycle.",
-                                        max_cooperative_rounds
-                                    );
-                                    // Start heartbeat to avoid session timeout while we
-                                    // defer the additional cooperative rebalance round
-                                    // to the next poll cycle. Do NOT apply final_assignment
-                                    // since it still required another rejoin. Set state
-                                    // directly instead of trigger_rejoin() to avoid
-                                    // killing the heartbeat task via Rejoin command.
-                                    coordinator.start_heartbeat_task().await;
-                                    coordinator.set_preparing_rebalance().await;
-                                    // Note: rebalances metric was already incremented
-                                    // at Phase 1 entry; do not double-count here.
-                                    // assigned_partitions metric was already updated
-                                    // after apply_partition_revocations above.
-                                    return Ok(vec![]);
-                                }
-
-                                coordinator.trigger_rejoin().await;
-                            }
-
-                            // Finalize cooperative assignment: update assignments,
-                            // fire on_partitions_assigned, fetch offsets, record owned.
-                            let old_assignments = self.assignments.read().await.clone();
-                            self.finalize_cooperative_assignment(
-                                coordinator,
-                                &final_assignment,
-                                &old_assignments,
-                            )
-                            .await?;
-                        } else {
-                            // No revocations — assignment is final in one round
-                            let old_assignments = self.assignments.read().await.clone();
-
-                            // Determine partitions removed in this rebalance
-                            // (e.g., reassigned to another member, topic deleted).
-                            // This is a clean cooperative revocation, not an unclean
-                            // loss, so use on_partitions_revoked (not on_partitions_lost).
-                            let mut revoked_parts: Vec<TopicPartition> = Vec::new();
-                            for (topic, partitions) in &old_assignments {
-                                let new_parts = new_assignment.partitions.get(topic);
-                                for &p in partitions {
-                                    let gone = new_parts.is_none_or(|np| !np.contains(&p));
-                                    if gone {
-                                        revoked_parts.push(TopicPartition::new(topic, p));
-                                    }
-                                }
-                            }
-                            if !revoked_parts.is_empty() {
-                                self.rebalance_listener
-                                    .on_partitions_revoked(&revoked_parts);
-                                let revoked_tuples: Vec<(String, PartitionId)> = revoked_parts
-                                    .iter()
-                                    .map(|tp| (tp.topic.clone(), tp.partition))
-                                    .collect();
-                                self.apply_partition_revocations(&revoked_tuples).await;
-                            }
-
-                            self.metrics.rebalances.inc();
-
-                            // Finalize cooperative assignment: update assignments,
-                            // fire on_partitions_assigned, fetch offsets, record owned.
-                            self.finalize_cooperative_assignment(
-                                coordinator,
-                                &new_assignment,
-                                &old_assignments,
-                            )
-                            .await?;
-                        }
-                    } else {
-                        // Eager rebalance: revoke all, then reassign all
-                        let old_assignments = self.assignments.read().await.clone();
-                        if !old_assignments.is_empty() {
-                            let revoked: Vec<TopicPartition> = old_assignments
-                                .iter()
-                                .flat_map(|(t, ps)| {
-                                    ps.iter().map(move |&p| TopicPartition::new(t, p))
-                                })
-                                .collect();
-                            self.rebalance_listener.on_partitions_revoked(&revoked);
-                            self.clear_partition_state().await;
-
-                            // Clear assignments immediately after revocation so that
-                            // if ensure_active_membership fails below, the next poll
-                            // won't re-fire on_partitions_revoked for already-revoked
-                            // partitions. Matches the Java client's behavior of
-                            // clearing subscription state after the eager revoke phase.
-                            self.assignments.write().await.clear();
-                            self.metrics.assigned_partitions.set(0);
-                        }
-
-                        self.metrics.rebalances.inc();
-
-                        let (assignment, _) = coordinator.ensure_active_membership(&topics).await?;
-
-                        // Update our assignments
-                        let mut assignments = self.assignments.write().await;
-                        assignments.clear();
-                        for (topic, partitions) in &assignment.partitions {
-                            assignments.insert(topic.clone(), partitions.clone());
-                        }
-                        drop(assignments);
-
-                        // Notify listener of newly assigned partitions
-                        let assigned: Vec<TopicPartition> = assignment
-                            .partitions
-                            .iter()
-                            .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
-                            .collect();
-                        self.rebalance_listener.on_partitions_assigned(&assigned);
-                        self.metrics.assigned_partitions.set(assigned.len() as u64);
-
-                        // Fetch committed offsets for new assignment
-                        self.fetch_and_apply_committed_offsets(&assignment.partitions)
-                            .await?;
-                    }
-                }
-            }
-
-            // Check if inline heartbeat is needed
-            if coordinator.is_heartbeat_overdue().await {
-                match coordinator.send_heartbeat().await {
-                    Ok(status) if status.requires_rejoin() => {
-                        // Need to rejoin - will be handled on next poll
-                        coordinator.trigger_rejoin().await;
-                        debug!("Heartbeat indicated rejoin needed");
-                    }
-                    Err(e) => {
-                        warn!("Inline heartbeat failed: {}", e);
-                    }
-                    _ => {}
-                }
-            }
+        if self.handle_group_rebalance().await? {
+            return Ok(vec![]);
         }
 
         let assignments = self.assignments.read().await;
