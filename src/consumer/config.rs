@@ -75,6 +75,7 @@ impl PartitionAssignmentStrategy {
 
 /// Consumer configuration.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ConsumerConfig {
     /// Bootstrap servers (comma-separated).
     pub bootstrap_servers: String,

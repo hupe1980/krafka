@@ -510,6 +510,7 @@ impl ProduceResponse {
 
 /// Fetch request.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FetchRequest {
     /// Replica ID (-1 for consumers).
     pub replica_id: i32,
@@ -535,6 +536,7 @@ pub struct FetchRequest {
 
 /// Topic-partitions to forget from a fetch session (v7+).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FetchForgottenTopic {
     /// Topic name.
     pub topic: String,
@@ -544,6 +546,7 @@ pub struct FetchForgottenTopic {
 
 /// Topic in fetch request.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FetchTopicRequest {
     /// Topic name.
     pub topic: String,
@@ -553,6 +556,7 @@ pub struct FetchTopicRequest {
 
 /// Partition in fetch request.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FetchPartitionRequest {
     /// Partition ID.
     pub partition: i32,
@@ -645,44 +649,17 @@ impl FetchRequest {
 
     /// Encode for version 7 (fetch sessions: session_id, session_epoch, forgotten_topics).
     pub fn encode_v7(&self, buf: &mut impl BufMut) -> Result<()> {
-        self.replica_id.encode(buf);
-        self.max_wait_ms.encode(buf);
-        self.min_bytes.encode(buf);
-        self.max_bytes.encode(buf);
-        self.isolation_level.encode(buf);
-        self.session_id.encode(buf);
-        self.session_epoch.encode(buf);
-
-        // Topics array
-        buf.put_i32(array_len_i32(self.topics.len())?);
-        for topic in &self.topics {
-            KafkaString::new(&topic.topic).try_encode(buf)?;
-
-            // Partitions array
-            buf.put_i32(array_len_i32(topic.partitions.len())?);
-            for partition in &topic.partitions {
-                partition.partition.encode(buf);
-                partition.fetch_offset.encode(buf);
-                // log_start_offset introduced in v5
-                partition.log_start_offset.encode(buf);
-                partition.partition_max_bytes.encode(buf);
-            }
-        }
-
-        // Forgotten topics array (v7+)
-        buf.put_i32(array_len_i32(self.forgotten_topics.len())?);
-        for forgotten in &self.forgotten_topics {
-            KafkaString::new(&forgotten.topic).try_encode(buf)?;
-            buf.put_i32(array_len_i32(forgotten.partitions.len())?);
-            for &partition in &forgotten.partitions {
-                partition.encode(buf);
-            }
-        }
-        Ok(())
+        self.encode_inner_v7(buf, false)
     }
 
     /// Encode for version 9 (v7 + `current_leader_epoch` per partition, KIP-320).
     pub fn encode_v9(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.encode_inner_v7(buf, true)
+    }
+
+    /// Shared encoder for v7–v10. When `include_leader_epoch` is true, emits
+    /// `current_leader_epoch` between partition id and fetch_offset (v9+, KIP-320).
+    fn encode_inner_v7(&self, buf: &mut impl BufMut, include_leader_epoch: bool) -> Result<()> {
         self.replica_id.encode(buf);
         self.max_wait_ms.encode(buf);
         self.min_bytes.encode(buf);
@@ -700,9 +677,12 @@ impl FetchRequest {
             buf.put_i32(array_len_i32(topic.partitions.len())?);
             for partition in &topic.partitions {
                 partition.partition.encode(buf);
-                // current_leader_epoch introduced in v9 (KIP-320)
-                partition.current_leader_epoch.encode(buf);
+                if include_leader_epoch {
+                    // current_leader_epoch introduced in v9 (KIP-320)
+                    partition.current_leader_epoch.encode(buf);
+                }
                 partition.fetch_offset.encode(buf);
+                // log_start_offset introduced in v5
                 partition.log_start_offset.encode(buf);
                 partition.partition_max_bytes.encode(buf);
             }
@@ -730,6 +710,7 @@ impl FetchRequest {
 
 /// Fetch response.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct FetchResponse {
     /// Throttle time.
     pub throttle_time_ms: i32,
@@ -743,6 +724,7 @@ pub struct FetchResponse {
 
 /// Topic in fetch response.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FetchTopicResponse {
     /// Topic name.
     pub topic: String,
@@ -752,6 +734,7 @@ pub struct FetchTopicResponse {
 
 /// Partition in fetch response.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FetchPartitionResponse {
     /// Partition ID.
     pub partition: i32,
@@ -880,58 +863,18 @@ impl FetchResponse {
 
     /// Decode from version 7 (includes error_code, session_id, log_start_offset).
     pub fn decode_v7(buf: &mut impl Buf) -> Result<Self> {
-        let throttle_time_ms = i32::decode(buf)?;
-        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
-        let session_id = i32::decode(buf)?;
-        let mut responses = Vec::new();
-        let topic_count = i32::decode(buf)?;
-
-        for _ in 0..topic_count {
-            let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let partition_count = i32::decode(buf)?;
-            let mut partitions = Vec::new();
-
-            for _ in 0..partition_count {
-                let partition = i32::decode(buf)?;
-                let partition_error_code = ErrorCode::from_i16(i16::decode(buf)?);
-                let high_watermark = i64::decode(buf)?;
-                let last_stable_offset = i64::decode(buf)?;
-                let log_start_offset = i64::decode(buf)?;
-                let aborted_tx_count = i32::decode(buf)?;
-                let mut aborted_transactions = Vec::new();
-                for _ in 0..aborted_tx_count {
-                    aborted_transactions.push(AbortedTransaction {
-                        producer_id: i64::decode(buf)?,
-                        first_offset: i64::decode(buf)?,
-                    });
-                }
-                let records = KafkaBytes::decode(buf)?.0;
-
-                partitions.push(FetchPartitionResponse {
-                    partition,
-                    error_code: partition_error_code,
-                    high_watermark,
-                    last_stable_offset,
-                    log_start_offset,
-                    aborted_transactions,
-                    preferred_read_replica: -1,
-                    records,
-                });
-            }
-
-            responses.push(FetchTopicResponse { topic, partitions });
-        }
-
-        Ok(Self {
-            throttle_time_ms,
-            error_code,
-            session_id,
-            responses,
-        })
+        Self::decode_inner_v7(buf, false)
     }
 
     /// Decode from version 11 (v7 + preferred_read_replica per partition, KIP-392).
     pub fn decode_v11(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode_inner_v7(buf, true)
+    }
+
+    /// Shared decoder for v7–v11. When `has_preferred_read_replica` is true,
+    /// reads `preferred_read_replica` between aborted_transactions and records
+    /// (v11+, KIP-392); otherwise defaults to `-1`.
+    fn decode_inner_v7(buf: &mut impl Buf, has_preferred_read_replica: bool) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let session_id = i32::decode(buf)?;
@@ -957,7 +900,11 @@ impl FetchResponse {
                         first_offset: i64::decode(buf)?,
                     });
                 }
-                let preferred_read_replica = i32::decode(buf)?;
+                let preferred_read_replica = if has_preferred_read_replica {
+                    i32::decode(buf)?
+                } else {
+                    -1
+                };
                 let records = KafkaBytes::decode(buf)?.0;
 
                 partitions.push(FetchPartitionResponse {

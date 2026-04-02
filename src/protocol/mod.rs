@@ -17,7 +17,7 @@
 //! | API | Min | Max | Notes |
 //! |-----|-----|-----|-------|
 //! | Produce | 0 | 3 | v3+ for transactions |
-//! | Fetch | 0 | 7 | v0-4 and v7 only (v5/v6 unsupported); v4 isolation level, v7 fetch sessions |
+//! | Fetch | 0 | 11 | v0-4, v7-v11 (v5/v6 unsupported); v4 isolation level, v7 fetch sessions, v9 leader epoch fencing, v11 follower fetch (KIP-392) |
 //! | Metadata | 0 | 1 | v1+ includes controller info |
 //! | OffsetCommit | 0 | 2 | v2+ for retention |
 //! | OffsetFetch | 0 | 1 | v1+ for group coordinator |
@@ -35,8 +35,8 @@
 //! use krafka::protocol::ApiKey;
 //!
 //! // Negotiate the best version for Fetch
-//! // Try v7 first (fetch sessions), fall back to v4.
-//! let version = conn.negotiate_api_version(ApiKey::Fetch, 7, 7).await
+//! // Try v11 first (follower fetch, KIP-392), fall back through v10/v7 to v4.
+//! let version = conn.negotiate_api_version(ApiKey::Fetch, 11, 7).await
 //!     .unwrap_or(4);
 //! println!("Using Fetch v{}", version);
 //! ```

@@ -148,6 +148,76 @@ fn compute_aggregate_lag(
     (total_lag, max_lag)
 }
 
+/// Result of routing assigned partitions to brokers for fetching.
+struct FetchRoutingPlan {
+    /// Partitions grouped by target broker ID.
+    partitions_by_broker: HashMap<crate::BrokerId, Vec<(String, PartitionId)>>,
+    /// Preferred replica entries that have expired and should be removed.
+    expired_preferred: Vec<(String, PartitionId)>,
+}
+
+/// Build a per-broker fetch plan from assignments, paused set, preferred
+/// replicas, and leader information.
+///
+/// For each assigned (non-paused) partition, the function checks whether
+/// a preferred replica exists and is not expired.  If so, the partition
+/// is routed to that replica; otherwise it falls back to the leader.
+/// Partitions without a known leader are skipped.
+///
+/// This is a pure function extracted from `Consumer::poll()` so that the
+/// routing logic can be unit-tested without a live broker.
+fn build_fetch_routing_plan(
+    assignments: &HashMap<String, Vec<PartitionId>>,
+    paused: &HashSet<(String, PartitionId)>,
+    preferred_replicas: &HashMap<(String, PartitionId), (crate::BrokerId, Instant)>,
+    leaders: &HashMap<(String, PartitionId), crate::BrokerId>,
+    now: Instant,
+) -> FetchRoutingPlan {
+    let mut partitions_by_broker: HashMap<crate::BrokerId, Vec<(String, PartitionId)>> =
+        HashMap::new();
+    let mut expired_preferred: Vec<(String, PartitionId)> = Vec::new();
+
+    for (topic, partitions) in assignments {
+        for &partition in partitions {
+            let key = (topic.clone(), partition);
+
+            if paused.contains(&key) {
+                continue;
+            }
+
+            // Check for a valid (non-expired) preferred replica
+            let target_broker = if let Some(&(replica_id, expiry)) = preferred_replicas.get(&key) {
+                if now < expiry {
+                    Some(replica_id)
+                } else {
+                    expired_preferred.push(key.clone());
+                    None
+                }
+            } else {
+                None
+            };
+
+            let broker_id = match target_broker {
+                Some(id) => id,
+                None => {
+                    if let Some(&leader_id) = leaders.get(&key) {
+                        leader_id
+                    } else {
+                        continue; // no leader known — skip
+                    }
+                }
+            };
+
+            partitions_by_broker.entry(broker_id).or_default().push(key);
+        }
+    }
+
+    FetchRoutingPlan {
+        partitions_by_broker,
+        expired_preferred,
+    }
+}
+
 impl Consumer {
     /// Create a new consumer builder.
     pub fn builder() -> ConsumerBuilder {
@@ -1517,56 +1587,41 @@ impl Consumer {
 
         let paused = self.paused.read().await;
 
-        // Group partitions by target broker for batch fetching.
-        // When a preferred read replica is known and not expired (KIP-392),
-        // route the partition to that replica; otherwise use the leader.
-        let mut partitions_by_broker: HashMap<crate::BrokerId, Vec<(String, PartitionId)>> =
-            HashMap::new();
+        // Resolve leaders for all assigned (non-paused) partitions so the
+        // pure routing helper doesn't need async metadata access.
+        let mut leaders: HashMap<(String, PartitionId), crate::BrokerId> = HashMap::new();
+        for (topic, partitions) in assignments.iter() {
+            for &partition in partitions {
+                if paused.contains(&(topic.clone(), partition)) {
+                    continue;
+                }
+                if let Some(leader_id) = self.metadata.leader(topic, partition).await {
+                    leaders.insert((topic.clone(), partition), leader_id);
+                } else {
+                    warn!(
+                        "No leader found for {}-{}, skipping in batch fetch",
+                        topic, partition
+                    );
+                }
+            }
+        }
 
         let now = Instant::now();
         let preferred = self.preferred_replicas.read().await;
 
-        for (topic, partitions) in assignments.iter() {
-            for &partition in partitions {
-                // Skip paused partitions
-                if paused.contains(&(topic.clone(), partition)) {
-                    continue;
-                }
+        let plan = build_fetch_routing_plan(&assignments, &paused, &preferred, &leaders, now);
 
-                let key = (topic.clone(), partition);
+        // Release read lock before potentially acquiring write lock
+        drop(preferred);
 
-                // Check for a valid (non-expired) preferred replica
-                let target_broker = if let Some(&(replica_id, expiry)) = preferred.get(&key) {
-                    if now < expiry {
-                        Some(replica_id)
-                    } else {
-                        None // expired — fall through to leader
-                    }
-                } else {
-                    None
-                };
-
-                let broker_id = match target_broker {
-                    Some(id) => id,
-                    None => {
-                        if let Some(leader_id) = self.metadata.leader(topic, partition).await {
-                            leader_id
-                        } else {
-                            warn!(
-                                "No leader found for {}-{}, skipping in batch fetch",
-                                topic, partition
-                            );
-                            continue;
-                        }
-                    }
-                };
-
-                partitions_by_broker.entry(broker_id).or_default().push(key);
+        // Remove expired preferred replica entries so they don't accumulate
+        if !plan.expired_preferred.is_empty() {
+            let mut pref = self.preferred_replicas.write().await;
+            for key in &plan.expired_preferred {
+                pref.remove(key);
             }
         }
 
-        // Release locks before network I/O
-        drop(preferred);
         drop(paused);
         drop(assignments);
 
@@ -1575,7 +1630,7 @@ impl Consumer {
         let mut all_hw_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
 
         // Fetch from each broker (one request per broker, containing all its partitions)
-        for (broker_id, topic_partitions) in partitions_by_broker {
+        for (broker_id, topic_partitions) in plan.partitions_by_broker {
             match self
                 .batch_fetch_from_broker(broker_id, &topic_partitions, timeout)
                 .await
@@ -4313,5 +4368,158 @@ mod tests {
 
         let (total_lag, _) = compute_aggregate_lag(&offsets, &high_watermarks);
         assert_eq!(total_lag, 0);
+    }
+
+    // --- Fetch routing plan tests (KIP-392) ---
+
+    #[test]
+    fn test_routing_plan_uses_leader_when_no_preferred() {
+        let mut assignments = HashMap::new();
+        assignments.insert("t".to_string(), vec![0, 1]);
+
+        let leaders = HashMap::from([(("t".into(), 0), 1), (("t".into(), 1), 2)]);
+
+        let plan = build_fetch_routing_plan(
+            &assignments,
+            &HashSet::new(),
+            &HashMap::new(),
+            &leaders,
+            Instant::now(),
+        );
+
+        assert!(plan.expired_preferred.is_empty());
+        assert_eq!(plan.partitions_by_broker[&1], vec![("t".into(), 0)]);
+        assert_eq!(plan.partitions_by_broker[&2], vec![("t".into(), 1)]);
+    }
+
+    #[test]
+    fn test_routing_plan_routes_to_preferred_replica() {
+        let mut assignments = HashMap::new();
+        assignments.insert("t".to_string(), vec![0]);
+
+        let leaders = HashMap::from([(("t".into(), 0), 1)]);
+        let preferred = HashMap::from([(
+            ("t".into(), 0),
+            (3_i32, Instant::now() + Duration::from_secs(60)),
+        )]);
+
+        let plan = build_fetch_routing_plan(
+            &assignments,
+            &HashSet::new(),
+            &preferred,
+            &leaders,
+            Instant::now(),
+        );
+
+        assert!(plan.expired_preferred.is_empty());
+        // Should route to preferred replica (broker 3), not leader (broker 1)
+        assert_eq!(plan.partitions_by_broker.len(), 1);
+        assert_eq!(plan.partitions_by_broker[&3], vec![("t".into(), 0)]);
+    }
+
+    #[test]
+    fn test_routing_plan_falls_back_on_expired_preferred() {
+        let mut assignments = HashMap::new();
+        assignments.insert("t".to_string(), vec![0]);
+
+        let leaders = HashMap::from([(("t".into(), 0), 1)]);
+        // Preferred replica that expired 10 seconds ago
+        let preferred = HashMap::from([(
+            ("t".into(), 0),
+            (3_i32, Instant::now() - Duration::from_secs(10)),
+        )]);
+
+        let plan = build_fetch_routing_plan(
+            &assignments,
+            &HashSet::new(),
+            &preferred,
+            &leaders,
+            Instant::now(),
+        );
+
+        // Should fall back to leader (broker 1)
+        assert_eq!(plan.partitions_by_broker[&1], vec![("t".into(), 0)]);
+        // Should report the expired entry for cleanup
+        assert_eq!(plan.expired_preferred, vec![("t".into(), 0)]);
+    }
+
+    #[test]
+    fn test_routing_plan_skips_paused_partitions() {
+        let mut assignments = HashMap::new();
+        assignments.insert("t".to_string(), vec![0, 1]);
+
+        let leaders = HashMap::from([(("t".into(), 0), 1), (("t".into(), 1), 1)]);
+        let paused = HashSet::from([("t".into(), 0)]);
+
+        let plan = build_fetch_routing_plan(
+            &assignments,
+            &paused,
+            &HashMap::new(),
+            &leaders,
+            Instant::now(),
+        );
+
+        // Only partition 1 should be in the plan
+        let all: Vec<_> = plan.partitions_by_broker.values().flatten().collect();
+        assert_eq!(all.len(), 1);
+        assert_eq!(*all[0], ("t".into(), 1));
+    }
+
+    #[test]
+    fn test_routing_plan_skips_partitions_without_leader() {
+        let mut assignments = HashMap::new();
+        assignments.insert("t".to_string(), vec![0, 1]);
+
+        // Only partition 0 has a leader
+        let leaders = HashMap::from([(("t".into(), 0), 1)]);
+
+        let plan = build_fetch_routing_plan(
+            &assignments,
+            &HashSet::new(),
+            &HashMap::new(),
+            &leaders,
+            Instant::now(),
+        );
+
+        let all: Vec<_> = plan.partitions_by_broker.values().flatten().collect();
+        assert_eq!(all.len(), 1);
+        assert_eq!(*all[0], ("t".into(), 0));
+    }
+
+    #[test]
+    fn test_routing_plan_mixed_preferred_and_leader() {
+        let mut assignments = HashMap::new();
+        assignments.insert("t".to_string(), vec![0, 1, 2]);
+
+        let leaders = HashMap::from([
+            (("t".into(), 0), 1),
+            (("t".into(), 1), 1),
+            (("t".into(), 2), 2),
+        ]);
+        let future = Instant::now() + Duration::from_secs(300);
+        let preferred = HashMap::from([
+            // p0 has a valid preferred replica
+            (("t".into(), 0), (3_i32, future)),
+            // p1 has an expired preferred replica
+            (
+                ("t".into(), 1),
+                (3_i32, Instant::now() - Duration::from_secs(1)),
+            ),
+            // p2 has no preferred replica
+        ]);
+
+        let plan = build_fetch_routing_plan(
+            &assignments,
+            &HashSet::new(),
+            &preferred,
+            &leaders,
+            Instant::now(),
+        );
+
+        // p0 → broker 3 (preferred), p1 → broker 1 (leader, expired), p2 → broker 2 (leader)
+        assert!(plan.partitions_by_broker[&3].contains(&("t".into(), 0)));
+        assert!(plan.partitions_by_broker[&1].contains(&("t".into(), 1)));
+        assert!(plan.partitions_by_broker[&2].contains(&("t".into(), 2)));
+        assert_eq!(plan.expired_preferred, vec![("t".into(), 1)]);
     }
 }
