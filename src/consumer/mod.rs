@@ -1592,11 +1592,12 @@ impl Consumer {
         let mut leaders: HashMap<(String, PartitionId), crate::BrokerId> = HashMap::new();
         for (topic, partitions) in assignments.iter() {
             for &partition in partitions {
-                if paused.contains(&(topic.clone(), partition)) {
+                let key = (topic.clone(), partition);
+                if paused.contains(&key) {
                     continue;
                 }
                 if let Some(leader_id) = self.metadata.leader(topic, partition).await {
-                    leaders.insert((topic.clone(), partition), leader_id);
+                    leaders.insert(key, leader_id);
                 } else {
                     warn!(
                         "No leader found for {}-{}, skipping in batch fetch",
@@ -1945,36 +1946,31 @@ impl Consumer {
             let topic_name = &topic_response.topic;
             for partition_response in topic_response.partitions {
                 let partition = partition_response.partition;
+                let key = (topic_name.clone(), partition);
 
                 // Capture high watermark regardless of error/empty response.
                 // The broker always returns a valid high_watermark even when
                 // there are no records to deliver.
                 if partition_response.high_watermark >= 0 {
-                    hw_updates.push((
-                        (topic_name.clone(), partition),
-                        partition_response.high_watermark,
-                    ));
+                    hw_updates.push((key.clone(), partition_response.high_watermark));
                 }
 
                 // Cache log_start_offset (earliest available offset) when
                 // present. Returned in Fetch v5+; allows `cached_beginning_offset`
                 // to serve beginning offsets from cache without a network round-trip.
                 if partition_response.log_start_offset >= 0 {
-                    lso_updates.push((
-                        (topic_name.clone(), partition),
-                        partition_response.log_start_offset,
-                    ));
+                    lso_updates.push((key.clone(), partition_response.log_start_offset));
                 }
 
                 // Track preferred read replica (KIP-392, v11+ only).
                 // For v7-v10, preferred_read_replica is our fabricated default
                 // (-1) and must not clear valid mappings from earlier v11 responses.
                 if fetch_version >= 11 {
-                    let key = (topic_name.clone(), partition);
                     if partition_response.preferred_read_replica >= 0 {
-                        pref_updates.push((key, Some(partition_response.preferred_read_replica)));
+                        pref_updates
+                            .push((key.clone(), Some(partition_response.preferred_read_replica)));
                     } else {
-                        pref_updates.push((key, None));
+                        pref_updates.push((key.clone(), None));
                     }
                 }
 
@@ -1989,7 +1985,7 @@ impl Consumer {
                             "Error from non-leader replica {} for {}-{}: {:?}, clearing preferred replica",
                             broker_id, topic_name, partition, partition_response.error_code
                         );
-                        pref_updates.push(((topic_name.clone(), partition), None));
+                        pref_updates.push((key.clone(), None));
                     }
                     // Handle leader epoch errors by validating via OffsetForLeaderEpoch
                     if partition_response.error_code == crate::error::ErrorCode::FencedLeaderEpoch
@@ -2066,7 +2062,7 @@ impl Consumer {
 
                     // Track offset update for this partition
                     if let Some(last_offset) = last_offset_for_partition {
-                        offset_updates.push(((topic_name.clone(), partition), last_offset + 1));
+                        offset_updates.push((key, last_offset + 1));
                     }
                 }
             }

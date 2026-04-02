@@ -511,8 +511,7 @@ impl ProduceResponse {
 /// Fetch request.
 ///
 /// This struct is `#[non_exhaustive]`; use [`Default::default()`] and then
-/// set the fields you need, or construct it via struct-literal syntax within
-/// this crate.
+/// set the fields you need.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct FetchRequest {

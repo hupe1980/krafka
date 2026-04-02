@@ -94,6 +94,24 @@ Krafka uses Kafka's v2 record batch format with:
 - Variable-length encoding for efficiency
 - Optional compression (gzip, snappy, lz4, zstd)
 
+### Header Versioning
+
+Every Kafka request/response is prefixed with a header whose format depends on
+whether the API version uses flexible encoding:
+
+| Header state | Request header | Response header |
+|-------------|----------------|-----------------|
+| Non-flexible | v1 — standard `KafkaString` for client_id | v0 — correlation_id only |
+| Flexible | v2 — compact string for client_id + tagged fields | v1 — correlation_id + tagged fields |
+
+The transition version varies per API (e.g., Fetch becomes flexible at v12,
+Produce at v9). `ApiKey::flexible_version()` returns the threshold for each API,
+and the header is selected automatically by `RequestHeader::encode()` /
+`ResponseHeader::decode()`.
+
+**Note:** `ApiVersions` response always uses header v0 regardless of the API
+version (needed for protocol bootstrapping).
+
 ### Unified Version Dispatch
 
 Core request/response message types in `krafka::protocol` implement the `VersionedEncode` and `VersionedDecode` traits, which dispatch to the correct `encode_vN`/`decode_vN` method based on the protocol version number:

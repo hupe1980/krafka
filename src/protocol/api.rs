@@ -309,6 +309,87 @@ impl ApiKey {
             Self::Unknown(key) => key,
         }
     }
+
+    /// Return the minimum API version at which this API key uses flexible
+    /// encoding (compact strings + tagged fields in headers and payloads).
+    ///
+    /// Values sourced from the Apache Kafka protocol JSON schemas.
+    /// Returns `i16::MAX` when the API never uses flexible encoding.
+    pub fn flexible_version(self) -> i16 {
+        match self {
+            Self::Produce => 9,
+            Self::Fetch => 12,
+            Self::ListOffsets => 6,
+            Self::Metadata => 9,
+            Self::LeaderAndIsr => 4,
+            Self::StopReplica => 2,
+            Self::UpdateMetadata => 6,
+            Self::ControlledShutdown => 3,
+            Self::OffsetCommit => 8,
+            Self::OffsetFetch => 6,
+            Self::FindCoordinator => 3,
+            Self::JoinGroup => 6,
+            Self::Heartbeat => 4,
+            Self::LeaveGroup => 4,
+            Self::SyncGroup => 4,
+            Self::DescribeGroups => 5,
+            Self::ListGroups => 3,
+            Self::SaslHandshake => i16::MAX,
+            Self::ApiVersions => 3,
+            Self::CreateTopics => 5,
+            Self::DeleteTopics => 4,
+            Self::DeleteRecords => 2,
+            Self::InitProducerId => 2,
+            Self::OffsetForLeaderEpoch => 4,
+            Self::AddPartitionsToTxn => 4,
+            Self::AddOffsetsToTxn => 3,
+            Self::EndTxn => 3,
+            Self::WriteTxnMarkers => 1,
+            Self::TxnOffsetCommit => 3,
+            Self::DescribeAcls => 2,
+            Self::CreateAcls => 2,
+            Self::DeleteAcls => 2,
+            Self::DescribeConfigs => 4,
+            Self::AlterConfigs => 2,
+            Self::AlterReplicaLogDirs => 2,
+            Self::DescribeLogDirs => 2,
+            Self::SaslAuthenticate => 2,
+            Self::CreatePartitions => 2,
+            Self::CreateDelegationToken => 2,
+            Self::RenewDelegationToken => 2,
+            Self::ExpireDelegationToken => 2,
+            Self::DescribeDelegationToken => 2,
+            Self::DeleteGroups => 2,
+            Self::ElectLeaders => 2,
+            Self::IncrementalAlterConfigs => 1,
+            Self::AlterPartitionReassignments => 0,
+            Self::ListPartitionReassignments => 0,
+            Self::OffsetDelete => i16::MAX,
+            Self::DescribeClientQuotas => 1,
+            Self::AlterClientQuotas => 1,
+            Self::DescribeUserScramCredentials => 0,
+            Self::AlterUserScramCredentials => 0,
+            Self::Vote => 0,
+            Self::BeginQuorumEpoch => 0,
+            Self::EndQuorumEpoch => 0,
+            Self::DescribeQuorum => 0,
+            Self::AlterPartition => 0,
+            Self::UpdateFeatures => 0,
+            Self::Envelope => 0,
+            Self::FetchSnapshot => 0,
+            Self::DescribeCluster => 0,
+            Self::DescribeProducers => 0,
+            Self::BrokerRegistration => 0,
+            Self::BrokerHeartbeat => 0,
+            Self::UnregisterBroker => 0,
+            Self::DescribeTransactions => 0,
+            Self::ListTransactions => 0,
+            Self::AllocateProducerIds => 0,
+            Self::ConsumerGroupHeartbeat => 0,
+            // Unknown APIs: assume never flexible (safest default).
+            Self::Unknown(_) => i16::MAX,
+        }
+    }
 }
 
 impl From<i16> for ApiKey {
