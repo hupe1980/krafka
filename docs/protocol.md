@@ -55,7 +55,7 @@ Krafka supports the following API version ranges (clamped to match actual encode
 | API | Min | Max | Key Features |
 |-----|-----|-----|--------------|
 | Produce | 0 | 3 | v3 transactions, headers |
-| Fetch | 0 | 4, 7-11 | v4 isolation level, v7 fetch sessions (KIP-227), v9 leader epoch fencing (KIP-320), v11 follower fetch (KIP-392); v5/v6 not supported |
+| Fetch | 0 | 4, 7-11 | v4 isolation level, v7 fetch sessions (KIP-227), v9 leader epoch fencing (KIP-320), v11 closest-replica fetching (KIP-392); v5/v6 not supported |
 | ListOffsets | 0 | 2 | v2 isolation level |
 | Metadata | 0 | 1 | v1 controller info |
 | OffsetCommit | 0 | 2 | v2 retention |

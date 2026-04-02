@@ -595,7 +595,8 @@ impl Consumer {
     /// Clear all per-partition state after an eager revocation or unsubscribe/close.
     ///
     /// Resets fetch sessions, offsets, retry backoff, buffered records, paused set,
-    /// high watermark and log start offset caches, and lag metrics.
+    /// high watermark and log start offset caches, preferred replica mappings, and
+    /// lag metrics.
     async fn clear_partition_state(&self) {
         self.fetch_sessions.lock().await.reset_all();
         self.offsets.write().await.clear();
@@ -1981,17 +1982,25 @@ impl Consumer {
                 }
 
                 if !partition_response.error_code.is_ok() {
-                    // When fetching from a non-leader preferred replica and
-                    // the broker returns an error, clear the preferred replica
-                    // so the next poll falls back to the partition leader.
-                    if let Some(leader_id) = self.metadata.leader(topic_name, partition).await
-                        && broker_id != leader_id
-                    {
-                        debug!(
-                            "Error from non-leader replica {} for {}-{}: {:?}, clearing preferred replica",
-                            broker_id, topic_name, partition, partition_response.error_code
-                        );
-                        pref_updates.push((key.clone(), None));
+                    // When fetching from a preferred replica and the broker
+                    // returns an error, clear the preferred replica so the
+                    // next poll falls back to the partition leader.  We also
+                    // clear when leader metadata is unavailable (None) to
+                    // avoid getting stuck routing to a failing replica until
+                    // expiry.
+                    if fetch_version >= 11 {
+                        let is_leader = self
+                            .metadata
+                            .leader(topic_name, partition)
+                            .await
+                            .is_some_and(|leader_id| leader_id == broker_id);
+                        if !is_leader {
+                            debug!(
+                                "Error from non-leader broker {} for {}-{}: {:?}, clearing preferred replica",
+                                broker_id, topic_name, partition, partition_response.error_code
+                            );
+                            pref_updates.push((key.clone(), None));
+                        }
                     }
                     // Handle leader epoch errors by validating via OffsetForLeaderEpoch
                     if partition_response.error_code == crate::error::ErrorCode::FencedLeaderEpoch
