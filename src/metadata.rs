@@ -177,8 +177,8 @@ impl ClusterMetadata {
     /// If a refresh is already in-flight, callers wait for it to complete.
     ///
     /// The Metadata API version is negotiated with the broker (v0-v8, no gaps).
-    /// Higher versions unlock richer fields: cluster_id, broker rack,
-    /// leader epoch, and offline replicas.
+    /// Versions are cumulative: rack since v1, cluster_id since v2,
+    /// offline replicas since v5, and leader_epoch since v7.
     pub async fn refresh_for_topics(&self, topics: Option<&[&str]>) -> Result<()> {
         // Coalesce concurrent calls: only one refresh in-flight at a time
         let _guard = self.refresh_lock.lock().await;
@@ -199,7 +199,7 @@ impl ClusterMetadata {
         let conn = self.get_any_connection().await?;
 
         // Negotiate the highest mutually supported version (v0-v8, no gaps).
-        // v7+ gives us leader_epoch, broker rack, and offline replicas.
+        // Cumulative: rack since v1, cluster_id v2, offline replicas v5, leader_epoch v7.
         let metadata_version = conn
             .negotiate_api_version_max(ApiKey::Metadata, crate::protocol::versions::METADATA_MAX)
             .await

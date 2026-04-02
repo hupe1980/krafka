@@ -239,54 +239,21 @@ impl MetadataResponse {
     ///
     /// v3 adds throttle_time_ms. v4 only changes the request (allow_auto_topic_creation).
     pub fn decode_v3(buf: &mut impl Buf) -> Result<Self> {
-        let throttle_time_ms = i32::decode(buf)?;
-        let brokers = decode_array::<MetadataBrokerV1, _>(buf)?;
-        let cluster_id = KafkaString::decode(buf)?.0;
-        let controller_id = i32::decode(buf)?;
-        let topics = decode_array::<MetadataTopicResponseV1, _>(buf)?;
-        Ok(Self {
-            throttle_time_ms,
-            brokers,
-            cluster_id,
-            controller_id,
-            topics,
-        })
+        Self::decode_v3_plus::<MetadataTopicResponseV1>(buf)
     }
 
     /// Decode from version 5-6.
     ///
     /// v5 adds partition offline_replicas. v6 has no wire changes.
     pub fn decode_v5(buf: &mut impl Buf) -> Result<Self> {
-        let throttle_time_ms = i32::decode(buf)?;
-        let brokers = decode_array::<MetadataBrokerV1, _>(buf)?;
-        let cluster_id = KafkaString::decode(buf)?.0;
-        let controller_id = i32::decode(buf)?;
-        let topics = decode_array::<MetadataTopicResponseV5, _>(buf)?;
-        Ok(Self {
-            throttle_time_ms,
-            brokers,
-            cluster_id,
-            controller_id,
-            topics,
-        })
+        Self::decode_v3_plus::<MetadataTopicResponseV5>(buf)
     }
 
     /// Decode from version 7.
     ///
     /// v7 adds partition leader_epoch.
     pub fn decode_v7(buf: &mut impl Buf) -> Result<Self> {
-        let throttle_time_ms = i32::decode(buf)?;
-        let brokers = decode_array::<MetadataBrokerV1, _>(buf)?;
-        let cluster_id = KafkaString::decode(buf)?.0;
-        let controller_id = i32::decode(buf)?;
-        let topics = decode_array::<MetadataTopicResponseV7, _>(buf)?;
-        Ok(Self {
-            throttle_time_ms,
-            brokers,
-            cluster_id,
-            controller_id,
-            topics,
-        })
+        Self::decode_v3_plus::<MetadataTopicResponseV7>(buf)
     }
 
     /// Decode from version 8.
@@ -294,13 +261,22 @@ impl MetadataResponse {
     /// v8 adds topic_authorized_operations and cluster_authorized_operations.
     /// These fields are read but not stored (we pass `false` in the request).
     pub fn decode_v8(buf: &mut impl Buf) -> Result<Self> {
+        let resp = Self::decode_v3_plus::<MetadataTopicResponseV8>(buf)?;
+        // cluster_authorized_operations — read and discard
+        let _cluster_authorized_operations = i32::decode(buf)?;
+        Ok(resp)
+    }
+
+    /// Shared decoder for Metadata v3-v8 wire format.
+    ///
+    /// Layout: throttle_time_ms, brokers (v1 format), cluster_id,
+    /// controller_id, topics (parametrized by `T`).
+    fn decode_v3_plus<T: Decode + Into<MetadataTopicResponse>>(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let brokers = decode_array::<MetadataBrokerV1, _>(buf)?;
         let cluster_id = KafkaString::decode(buf)?.0;
         let controller_id = i32::decode(buf)?;
-        let topics = decode_array::<MetadataTopicResponseV8, _>(buf)?;
-        // cluster_authorized_operations — read and discard
-        let _cluster_authorized_operations = i32::decode(buf)?;
+        let topics = decode_array::<T, _>(buf)?;
         Ok(Self {
             throttle_time_ms,
             brokers,
@@ -442,7 +418,7 @@ impl From<MetadataPartitionResponseV5> for MetadataPartitionResponse {
     }
 }
 
-/// v7+ partition decoder: adds leader_epoch + offline_replicas.
+/// v7+ partition decoder: adds leader_epoch (offline_replicas since v5).
 struct MetadataPartitionResponseV7(MetadataPartitionResponse);
 
 impl Decode for MetadataPartitionResponseV7 {
