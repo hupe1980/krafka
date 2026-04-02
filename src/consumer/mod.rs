@@ -112,6 +112,34 @@ pub struct Consumer {
     /// Prevents retry storms when offset resolution fails persistently
     /// (e.g., broker unavailable).
     offset_retry_backoff: RwLock<HashMap<(String, PartitionId), (Instant, Duration)>>,
+    /// Per-partition high watermark from the latest fetch response.
+    /// Used to compute consumer lag without additional network calls.
+    high_watermarks: RwLock<HashMap<(String, PartitionId), Offset>>,
+    /// Per-partition log start offset from the latest fetch response.
+    /// Caches the earliest available offset so `cached_beginning_offset()` can
+    /// return immediately without a network round-trip.
+    log_start_offsets: RwLock<HashMap<(String, PartitionId), Offset>>,
+}
+
+/// Compute aggregate lag from offset and high-watermark caches.
+///
+/// Returns `(total_lag, max_lag)` where `total_lag` is the sum across all
+/// partitions (using `saturating_add`) and `max_lag` is the per-partition
+/// maximum. Only partitions present in both maps contribute.
+fn compute_aggregate_lag(
+    offsets: &HashMap<(String, PartitionId), Offset>,
+    high_watermarks: &HashMap<(String, PartitionId), Offset>,
+) -> (u64, u64) {
+    let mut total_lag: u64 = 0;
+    let mut max_lag: u64 = 0;
+    for (key, &watermark) in high_watermarks {
+        if let Some(&position) = offsets.get(key) {
+            let partition_lag = (watermark - position).max(0) as u64;
+            total_lag = total_lag.saturating_add(partition_lag);
+            max_lag = max_lag.max(partition_lag);
+        }
+    }
+    (total_lag, max_lag)
 }
 
 impl Consumer {
@@ -203,6 +231,8 @@ impl Consumer {
             recv_buffer: RwLock::new(std::collections::VecDeque::new()),
             fetch_sessions: tokio::sync::Mutex::new(FetchSessionCache::new()),
             offset_retry_backoff: RwLock::new(HashMap::new()),
+            high_watermarks: RwLock::new(HashMap::new()),
+            log_start_offsets: RwLock::new(HashMap::new()),
         })
     }
 
@@ -354,6 +384,11 @@ impl Consumer {
             m
         };
 
+        // Precompute owned keys once to avoid repeated String clones in each
+        // removal loop below.
+        let revoked_keys: Vec<(String, PartitionId)> =
+            revoked.iter().map(|(t, p)| (t.clone(), *p)).collect();
+
         // Remove from assignments
         {
             let mut assignments = self.assignments.write().await;
@@ -369,32 +404,49 @@ impl Consumer {
         // Remove offsets for revoked partitions
         {
             let mut offsets = self.offsets.write().await;
-            for (topic, partition) in revoked {
-                offsets.remove(&(topic.clone(), *partition));
+            for key in &revoked_keys {
+                offsets.remove(key);
             }
         }
         // Remove offset retry backoff entries
         {
             let mut backoff = self.offset_retry_backoff.write().await;
-            for (topic, partition) in revoked {
-                backoff.remove(&(topic.clone(), *partition));
+            for key in &revoked_keys {
+                backoff.remove(key);
             }
         }
         // Discard buffered records from revoked partitions
         {
             let revoked_set: HashSet<(&str, PartitionId)> =
-                revoked.iter().map(|(t, p)| (t.as_str(), *p)).collect();
+                revoked_keys.iter().map(|(t, p)| (t.as_str(), *p)).collect();
             let mut buf = self.recv_buffer.write().await;
             buf.retain(|r| !revoked_set.contains(&(r.topic.as_str(), r.partition)));
         }
         // Clear paused state for revoked partitions
         {
             let mut paused = self.paused.write().await;
-            for (topic, partition) in revoked {
-                paused.remove(&(topic.clone(), *partition));
+            for key in &revoked_keys {
+                paused.remove(key);
             }
             self.metrics.paused_partitions.set(paused.len() as u64);
         }
+        // Clear cached high watermarks for revoked partitions
+        {
+            let mut hw = self.high_watermarks.write().await;
+            for key in &revoked_keys {
+                hw.remove(key);
+            }
+        }
+        // Clear cached log start offsets for revoked partitions
+        {
+            let mut lso = self.log_start_offsets.write().await;
+            for key in &revoked_keys {
+                lso.remove(key);
+            }
+        }
+        // Recompute lag metrics from remaining caches so revoked
+        // partitions no longer contribute to exported values.
+        self.recompute_lag_metrics().await;
     }
 
     /// Finalize a cooperative rebalance: compute newly-assigned diff, update
@@ -459,14 +511,39 @@ impl Consumer {
 
     /// Clear all per-partition state after an eager revocation or unsubscribe/close.
     ///
-    /// Resets fetch sessions, offsets, retry backoff, buffered records, and paused set.
+    /// Resets fetch sessions, offsets, retry backoff, buffered records, paused set,
+    /// high watermark and log start offset caches, and lag metrics.
     async fn clear_partition_state(&self) {
         self.fetch_sessions.lock().await.reset_all();
         self.offsets.write().await.clear();
         self.offset_retry_backoff.write().await.clear();
         self.recv_buffer.write().await.clear();
         self.paused.write().await.clear();
+        self.high_watermarks.write().await.clear();
+        self.log_start_offsets.write().await.clear();
         self.metrics.paused_partitions.set(0);
+        self.metrics.lag.set(0);
+        self.metrics.lag_max.set(0);
+    }
+
+    /// Recompute lag and lag_max gauges from cached offsets and high watermarks.
+    ///
+    /// Call after any mutation of `self.offsets` or `self.high_watermarks` so
+    /// the exported metrics always reflect the current consumer position.
+    /// Acquires read locks in documented order: offsets → high_watermarks.
+    ///
+    /// This performs an O(partitions) full scan via [`compute_aggregate_lag`].
+    /// An incremental (delta-based) approach was considered but rejected:
+    /// the typical partition count per consumer (tens to low thousands) makes
+    /// the scan complete in microseconds, while incremental bookkeeping would
+    /// add complexity and drift risk for negligible gain. Callers on the hot
+    /// path (e.g. `poll()`) already guard calls behind a change-detection flag.
+    async fn recompute_lag_metrics(&self) {
+        let offsets = self.offsets.read().await;
+        let hw = self.high_watermarks.read().await;
+        let (total_lag, max_lag) = compute_aggregate_lag(&offsets, &hw);
+        self.metrics.lag.set(total_lag);
+        self.metrics.lag_max.set(max_lag);
     }
 
     /// Send an inline heartbeat, invoke the revocation callback, apply
@@ -824,9 +901,8 @@ impl Consumer {
                 // dropped some partitions (partition-level errors), resolve
                 // them individually via the direct ListOffsets v1 path.
                 for (topic, partition) in &need_reset {
-                    if !resolved.contains_key(&(topic.clone(), *partition))
-                        && !offsets.contains_key(&(topic.clone(), *partition))
-                    {
+                    let key = (topic.clone(), *partition);
+                    if !resolved.contains_key(&key) && !offsets.contains_key(&key) {
                         debug!(
                             "Falling back to direct ListOffsets for {}-{} \
                              (coordinator path returned no result)",
@@ -837,7 +913,7 @@ impl Consumer {
                         match self.resolve_list_offset(topic, *partition, timestamp).await {
                             Ok(offset) => {
                                 offsets = self.offsets.write().await;
-                                offsets.insert((topic.clone(), *partition), offset);
+                                offsets.insert(key, offset);
                             }
                             Err(e) => {
                                 warn!(
@@ -863,6 +939,11 @@ impl Consumer {
             }
         }
 
+        // Drop the write lock before recomputing lag metrics to avoid
+        // deadlocking with the read lock that recompute_lag_metrics acquires.
+        drop(offsets);
+
+        self.recompute_lag_metrics().await;
         Ok(())
     }
 
@@ -948,6 +1029,7 @@ impl Consumer {
                 for ((topic, partition), offset) in &resolved {
                     offsets.insert((topic.clone(), *partition), *offset);
                 }
+                drop(offsets);
 
                 // Log any partitions that weren't resolved (broker skipped or errored)
                 for (topic, partition) in &need_reset {
@@ -972,13 +1054,17 @@ impl Consumer {
             }
         }
 
+        self.recompute_lag_metrics().await;
         Ok(())
     }
 
     /// Seek to a specific offset.
     pub async fn seek(&self, topic: &str, partition: PartitionId, offset: Offset) -> Result<()> {
-        let mut offsets = self.offsets.write().await;
-        offsets.insert((topic.to_string(), partition), offset);
+        {
+            let mut offsets = self.offsets.write().await;
+            offsets.insert((topic.to_string(), partition), offset);
+        }
+        self.recompute_lag_metrics().await;
         debug!("Seek to offset {} for {}-{}", offset, topic, partition);
         Ok(())
     }
@@ -1384,6 +1470,9 @@ impl Consumer {
                     self.apply_auto_offset_reset(&reset_partitions).await.ok();
                 }
 
+                // Recompute lag after resolving offsets for missing partitions
+                self.recompute_lag_metrics().await;
+
                 // Apply exponential backoff for partitions that are still
                 // unresolved after the retry attempt. Clear backoff for
                 // partitions that were successfully resolved.
@@ -1446,6 +1535,7 @@ impl Consumer {
 
         let mut all_records = Vec::new();
         let mut all_offset_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
+        let mut all_hw_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
 
         // Fetch from each broker (one request per broker, containing all its partitions)
         for (broker_id, topic_partitions) in partitions_by_leader {
@@ -1453,9 +1543,10 @@ impl Consumer {
                 .batch_fetch_from_broker(broker_id, &topic_partitions, timeout)
                 .await
             {
-                Ok((records, offset_updates)) => {
+                Ok((records, offset_updates, hw_updates)) => {
                     all_records.extend(records);
                     all_offset_updates.extend(offset_updates);
+                    all_hw_updates.extend(hw_updates);
                 }
                 Err(e) => {
                     self.metrics.record_error();
@@ -1491,11 +1582,26 @@ impl Consumer {
         }
 
         // Commit the offset updates (deferred from batch_fetch_from_broker until after max_poll_records handling)
-        if !all_offset_updates.is_empty() {
+        let offsets_changed = !all_offset_updates.is_empty();
+        if offsets_changed {
             let mut offsets = self.offsets.write().await;
             for (key, new_offset) in all_offset_updates {
                 offsets.insert(key, new_offset);
             }
+        }
+
+        // Update high watermarks
+        let hw_changed = !all_hw_updates.is_empty();
+        if hw_changed {
+            let mut hw = self.high_watermarks.write().await;
+            for (key, watermark) in all_hw_updates {
+                hw.insert(key, watermark);
+            }
+        }
+
+        // Recompute lag metrics whenever offsets or watermarks changed
+        if offsets_changed || hw_changed {
+            self.recompute_lag_metrics().await;
         }
 
         // Record metrics
@@ -1526,9 +1632,13 @@ impl Consumer {
         broker_id: crate::BrokerId,
         topic_partitions: &[(String, PartitionId)],
         timeout: Duration,
-    ) -> Result<(Vec<ConsumerRecord>, Vec<((String, PartitionId), Offset)>)> {
+    ) -> Result<(
+        Vec<ConsumerRecord>,
+        Vec<((String, PartitionId), Offset)>,
+        Vec<((String, PartitionId), Offset)>,
+    )> {
         if topic_partitions.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
         }
 
         self.metrics.record_fetch();
@@ -1706,7 +1816,7 @@ impl Consumer {
                 );
                 let mut sessions = self.fetch_sessions.lock().await;
                 sessions.reset_broker(broker_id);
-                return Ok((Vec::new(), Vec::new()));
+                return Ok((Vec::new(), Vec::new(), Vec::new()));
             }
 
             // Update session state from response
@@ -1718,11 +1828,33 @@ impl Consumer {
         // Process records
         let mut records = Vec::new();
         let mut offset_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
+        let mut hw_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
+        let mut lso_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
 
         for topic_response in fetch_response.responses {
             let topic_name = &topic_response.topic;
             for partition_response in topic_response.partitions {
                 let partition = partition_response.partition;
+
+                // Capture high watermark regardless of error/empty response.
+                // The broker always returns a valid high_watermark even when
+                // there are no records to deliver.
+                if partition_response.high_watermark >= 0 {
+                    hw_updates.push((
+                        (topic_name.clone(), partition),
+                        partition_response.high_watermark,
+                    ));
+                }
+
+                // Cache log_start_offset (earliest available offset) when
+                // present. Returned in Fetch v5+; allows `cached_beginning_offset`
+                // to serve beginning offsets from cache without a network round-trip.
+                if partition_response.log_start_offset >= 0 {
+                    lso_updates.push((
+                        (topic_name.clone(), partition),
+                        partition_response.log_start_offset,
+                    ));
+                }
 
                 if !partition_response.error_code.is_ok() {
                     // Handle leader epoch errors by validating via OffsetForLeaderEpoch
@@ -1747,69 +1879,11 @@ impl Consumer {
                     } else if partition_response.error_code
                         == crate::error::ErrorCode::OffsetOutOfRange
                     {
-                        // Apply auto_offset_reset for OffsetOutOfRange
-                        // to resume consumption instead of stalling the partition.
-                        // Works for both group and standalone consumers.
                         warn!(
                             "OffsetOutOfRange for {}-{}, applying auto_offset_reset",
                             topic_name, partition
                         );
-                        if let Some(target) = self.config.auto_offset_reset.to_offset() {
-                            if let Some(ref gc) = self.group_coordinator {
-                                let mut part_map = std::collections::HashMap::new();
-                                part_map.insert(topic_name.clone(), vec![partition]);
-                                match gc.list_offsets(&part_map, target).await {
-                                    Ok(resolved) => {
-                                        if let Some(&new_offset) =
-                                            resolved.get(&(topic_name.clone(), partition))
-                                        {
-                                            let mut offsets = self.offsets.write().await;
-                                            offsets.insert(
-                                                (topic_name.clone(), partition),
-                                                new_offset,
-                                            );
-                                        } else {
-                                            // Coordinator didn't return this partition;
-                                            // fall back to direct ListOffsets.
-                                            if let Ok(offset) = self
-                                                .resolve_list_offset(topic_name, partition, target)
-                                                .await
-                                            {
-                                                let mut offsets = self.offsets.write().await;
-                                                offsets.insert(
-                                                    (topic_name.clone(), partition),
-                                                    offset,
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to resolve offset for {}-{}: {}",
-                                            topic_name, partition, e
-                                        );
-                                    }
-                                }
-                            } else {
-                                // Standalone consumer (no group coordinator):
-                                // resolve directly via ListOffsets to the leader.
-                                match self
-                                    .resolve_list_offset(topic_name, partition, target)
-                                    .await
-                                {
-                                    Ok(offset) => {
-                                        let mut offsets = self.offsets.write().await;
-                                        offsets.insert((topic_name.clone(), partition), offset);
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to resolve offset for {}-{}: {}",
-                                            topic_name, partition, e
-                                        );
-                                    }
-                                }
-                            }
-                        }
+                        self.handle_offset_out_of_range(topic_name, partition).await;
                     } else {
                         warn!(
                             "Fetch error for {}-{}: {:?}",
@@ -1867,8 +1941,60 @@ impl Consumer {
         // NOTE: Offsets are NOT advanced here. They are advanced in poll()
         // after max_poll_records truncation to avoid silently losing records
         // whose offsets were already committed.
-        // We return offset_updates alongside records so the caller can apply them.
-        Ok((records, offset_updates))
+        // We return offset_updates and high watermarks alongside records so
+        // the caller can apply them and compute lag.
+
+        // Apply log_start_offset updates directly (not affected by
+        // max_poll_records truncation — they reflect broker state).
+        if !lso_updates.is_empty() {
+            let mut lso = self.log_start_offsets.write().await;
+            for (key, offset) in lso_updates {
+                lso.insert(key, offset);
+            }
+        }
+
+        Ok((records, offset_updates, hw_updates))
+    }
+
+    /// Handle an `OffsetOutOfRange` error for a single partition by resolving
+    /// a new offset via the configured `auto_offset_reset` policy.
+    async fn handle_offset_out_of_range(&self, topic: &str, partition: PartitionId) {
+        let Some(target) = self.config.auto_offset_reset.to_offset() else {
+            return;
+        };
+
+        let key = (topic.to_string(), partition);
+
+        let resolved = if let Some(ref gc) = self.group_coordinator {
+            let mut part_map = HashMap::new();
+            part_map.insert(key.0.clone(), vec![partition]);
+            match gc.list_offsets(&part_map, target).await {
+                Ok(offsets) => offsets.get(&key).copied(),
+                Err(e) => {
+                    warn!(
+                        "Coordinator list_offsets failed for {}-{}: {}, falling back to direct",
+                        topic, partition, e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Use coordinator result, or fall back to direct ListOffsets
+        let offset = match resolved {
+            Some(o) => Some(o),
+            None => self
+                .resolve_list_offset(topic, partition, target)
+                .await
+                .ok(),
+        };
+
+        if let Some(new_offset) = offset {
+            self.offsets.write().await.insert(key, new_offset);
+            self.recompute_lag_metrics().await;
+        }
     }
 
     /// Validate the consumer's offset for a partition using OffsetForLeaderEpoch.
@@ -1944,6 +2070,9 @@ impl Consumer {
         let mut buf = response_bytes;
         let response = OffsetForLeaderEpochResponse::decode_v2(&mut buf)?;
 
+        let key = (topic.to_string(), partition);
+        let mut offset_changed = false;
+
         for topic_result in response.topics {
             for partition_result in topic_result.partitions {
                 if partition_result.partition != partition {
@@ -1952,10 +2081,7 @@ impl Consumer {
                 if partition_result.error_code.is_ok() && partition_result.end_offset >= 0 {
                     let current_offset = {
                         let offsets = self.offsets.read().await;
-                        offsets
-                            .get(&(topic.to_string(), partition))
-                            .copied()
-                            .unwrap_or(0)
+                        offsets.get(&key).copied().unwrap_or(0)
                     };
 
                     if current_offset > partition_result.end_offset {
@@ -1964,12 +2090,16 @@ impl Consumer {
                             topic, partition, current_offset, partition_result.end_offset
                         );
                         let mut offsets = self.offsets.write().await;
-                        offsets.insert((topic.to_string(), partition), partition_result.end_offset);
+                        offsets.insert(key.clone(), partition_result.end_offset);
+                        offset_changed = true;
                     }
                 }
             }
         }
 
+        if offset_changed {
+            self.recompute_lag_metrics().await;
+        }
         Ok(())
     }
 
@@ -2264,17 +2394,21 @@ impl Consumer {
             }
 
             // Update internal offset store
-            let mut internal_offsets = self.offsets.write().await;
-            for (tp, offset_meta) in filtered_offsets {
-                internal_offsets.insert((tp.topic, tp.partition), offset_meta.offset);
-            }
+            let count = {
+                let mut internal_offsets = self.offsets.write().await;
+                for (tp, offset_meta) in filtered_offsets {
+                    internal_offsets.insert((tp.topic, tp.partition), offset_meta.offset);
+                }
+                internal_offsets.len()
+            };
 
             info!(
                 "Committed {} partition offsets with metadata (local only)",
-                internal_offsets.len()
+                count
             );
         }
 
+        self.recompute_lag_metrics().await;
         Ok(())
     }
 
@@ -2294,6 +2428,69 @@ impl Consumer {
     pub async fn subscription(&self) -> HashSet<String> {
         let subscriptions = self.subscriptions.read().await;
         subscriptions.clone()
+    }
+
+    /// Get the current lag for a specific partition.
+    ///
+    /// Returns the difference between the high watermark (latest offset on the
+    /// broker) and the consumer's current position. Returns `None` if the high
+    /// watermark or position is not yet known (e.g., no fetch has completed for
+    /// this partition).
+    ///
+    /// This uses cached high watermarks from the most recent fetch response —
+    /// no additional network calls are made.
+    pub async fn current_lag(&self, topic: &str, partition: PartitionId) -> Option<u64> {
+        let key = (topic.to_string(), partition);
+        // Acquire offsets before high_watermarks to match the documented
+        // lock ordering: assignments → offsets → high_watermarks.
+        let offsets = self.offsets.read().await;
+        let position = offsets.get(&key).copied()?;
+        let hw = self.high_watermarks.read().await;
+        let watermark = hw.get(&key).copied()?;
+        Some((watermark - position).max(0) as u64)
+    }
+
+    /// Get per-partition lag for all assigned partitions.
+    ///
+    /// Returns a map of `(topic, partition) → lag` for every partition where
+    /// both the high watermark and current position are known. Partitions that
+    /// haven't been fetched yet are omitted.
+    pub async fn lag(&self) -> HashMap<(String, PartitionId), u64> {
+        // Acquire offsets before high_watermarks to match the documented
+        // lock ordering: assignments → offsets → high_watermarks.
+        let offsets = self.offsets.read().await;
+        let hw = self.high_watermarks.read().await;
+        let mut result = HashMap::with_capacity(hw.len());
+        for (key, &watermark) in hw.iter() {
+            if let Some(&position) = offsets.get(key) {
+                result.insert(key.clone(), (watermark - position).max(0) as u64);
+            }
+        }
+        result
+    }
+
+    /// Get the cached beginning (log start) offset for a partition.
+    ///
+    /// Returns the earliest available offset on the broker, cached from
+    /// fetch responses. Returns `None` if no fetch has completed for this
+    /// partition yet. No network calls are made.
+    pub async fn cached_beginning_offset(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+    ) -> Option<Offset> {
+        let key = (topic.to_string(), partition);
+        self.log_start_offsets.read().await.get(&key).copied()
+    }
+
+    /// Get the cached end (high watermark) offset for a partition.
+    ///
+    /// Returns the latest offset on the broker, cached from fetch responses.
+    /// Returns `None` if no fetch has completed for this partition yet.
+    /// No network calls are made.
+    pub async fn cached_end_offset(&self, topic: &str, partition: PartitionId) -> Option<Offset> {
+        let key = (topic.to_string(), partition);
+        self.high_watermarks.read().await.get(&key).copied()
     }
 
     /// Unsubscribe from all topics.
@@ -3902,5 +4099,105 @@ mod tests {
         };
         tracker.on_partitions_assigned(&[]);
         assert!(tracker.assigned_called.load(Ordering::SeqCst));
+    }
+
+    /// Test the lag computation logic via the extracted `compute_aggregate_lag`
+    /// helper — the same function used by `recompute_lag_metrics()` in
+    /// production.
+    #[test]
+    fn test_lag_computation_logic() {
+        let mut offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let mut high_watermarks: HashMap<(String, PartitionId), Offset> = HashMap::new();
+
+        // No data → lag is 0
+        let (total_lag, max_lag) = compute_aggregate_lag(&offsets, &high_watermarks);
+        assert_eq!(total_lag, 0);
+        assert_eq!(max_lag, 0);
+
+        // Populate two partitions
+        offsets.insert(("t".into(), 0), 50);
+        offsets.insert(("t".into(), 1), 100);
+        high_watermarks.insert(("t".into(), 0), 80);
+        high_watermarks.insert(("t".into(), 1), 120);
+
+        let (total_lag, max_lag) = compute_aggregate_lag(&offsets, &high_watermarks);
+
+        assert_eq!(total_lag, 50); // (80-50) + (120-100)
+        assert_eq!(max_lag, 30); // max(30, 20)
+    }
+
+    #[test]
+    fn test_lag_negative_clamped_to_zero() {
+        // Position ahead of high watermark (can happen briefly after a reset)
+        let mut offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let mut high_watermarks: HashMap<(String, PartitionId), Offset> = HashMap::new();
+
+        offsets.insert(("t".into(), 0), 100);
+        high_watermarks.insert(("t".into(), 0), 80);
+
+        let (total_lag, _) = compute_aggregate_lag(&offsets, &high_watermarks);
+        assert_eq!(total_lag, 0);
+    }
+
+    #[test]
+    fn test_lag_partial_watermarks() {
+        // High watermark known for only one of two partitions
+        let mut offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let mut high_watermarks: HashMap<(String, PartitionId), Offset> = HashMap::new();
+
+        offsets.insert(("t".into(), 0), 50);
+        offsets.insert(("t".into(), 1), 100);
+        high_watermarks.insert(("t".into(), 0), 80);
+        // Partition 1 has no high watermark
+
+        let (total_lag, _) = compute_aggregate_lag(&offsets, &high_watermarks);
+        assert_eq!(total_lag, 30); // Only partition 0 contributes
+    }
+
+    #[test]
+    fn test_lag_after_revocation() {
+        // Simulate clearing revoked partitions and recomputing lag metrics
+        let mut offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let mut high_watermarks: HashMap<(String, PartitionId), Offset> = HashMap::new();
+
+        offsets.insert(("t".into(), 0), 50);
+        offsets.insert(("t".into(), 1), 100);
+        high_watermarks.insert(("t".into(), 0), 100); // lag = 50
+        high_watermarks.insert(("t".into(), 1), 200); // lag = 100
+
+        // Revoke partition 0
+        let revoked = vec![TopicPartition::new("t", 0)];
+        for tp in &revoked {
+            let key = (tp.topic.clone(), tp.partition);
+            offsets.remove(&key);
+            high_watermarks.remove(&key);
+        }
+
+        assert!(!high_watermarks.contains_key(&("t".into(), 0)));
+        assert!(high_watermarks.contains_key(&("t".into(), 1)));
+
+        // Recompute lag from remaining caches (same logic as apply_partition_revocations)
+        let (total_lag, max_lag) = compute_aggregate_lag(&offsets, &high_watermarks);
+
+        // Only partition 1 remains: lag = 200 - 100 = 100
+        assert_eq!(total_lag, 100);
+        assert_eq!(max_lag, 100);
+    }
+
+    #[test]
+    fn test_lag_clear_resets_to_zero() {
+        // After clear_partition_state, all caches are empty → lag must be 0
+        let mut offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let mut high_watermarks: HashMap<(String, PartitionId), Offset> = HashMap::new();
+
+        offsets.insert(("t".into(), 0), 50);
+        high_watermarks.insert(("t".into(), 0), 100);
+
+        // Simulate clear_partition_state
+        offsets.clear();
+        high_watermarks.clear();
+
+        let (total_lag, _) = compute_aggregate_lag(&offsets, &high_watermarks);
+        assert_eq!(total_lag, 0);
     }
 }

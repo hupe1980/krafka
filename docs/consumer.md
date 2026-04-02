@@ -22,6 +22,7 @@ The Krafka consumer is an async-native, feature-rich Kafka consumer with:
 - Static group membership (KIP-345)
 - Interceptor hooks
 - Log compaction awareness
+- Per-partition offset lag tracking
 
 ## Basic Usage
 
@@ -875,6 +876,42 @@ This means:
 - `consumer.position()` always returns the correct offset, even on compacted topics
 - Offset commits are accurate — no risk of re-processing or skipping records
 - No special configuration needed; compaction awareness is built-in
+
+## Offset Lag Tracking
+
+Krafka tracks consumer lag automatically by caching the high watermark returned in every fetch response. When the broker supports Fetch v5+, the log start offset is also cached. No additional network calls are needed.
+
+Lag values are returned as `u64` (always non-negative, clamped at zero when the position is ahead of the watermark) to match the internal metrics representation.
+
+```rust
+// Per-partition lag (returns None if no fetch has completed for this partition)
+if let Some(lag) = consumer.current_lag("my-topic", 0).await {
+    println!("Partition 0 lag: {} records", lag);
+}
+
+// All partition lags at once
+let lags = consumer.lag().await;
+for ((topic, partition), lag) in &lags {
+    println!("{}-{}: {} records behind", topic, partition, lag);
+}
+
+// Cached beginning/end offsets (no network call)
+if let Some(start) = consumer.cached_beginning_offset("my-topic", 0).await {
+    println!("Earliest available offset: {}", start);
+}
+if let Some(end) = consumer.cached_end_offset("my-topic", 0).await {
+    println!("High watermark: {}", end);
+}
+```
+
+Lag is also exposed via metrics (recomputed after every offset or high-watermark mutation — seek, commit, poll, offset reset, revocation):
+
+| Metric | Description |
+|--------|-------------|
+| `lag` | Total lag across all assigned partitions |
+| `lag_max` | Maximum per-partition lag |
+
+High watermarks and log start offsets are automatically cleared when partitions are revoked or the consumer unsubscribes. Lag metrics are recomputed accordingly.
 
 ## Next Steps
 

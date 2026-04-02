@@ -168,7 +168,8 @@ async fn main() {
 | `commits_total` | Counter | Total offset commits |
 | `errors_total` | Counter | Total errors |
 | `rebalances_total` | Counter | Total rebalance operations |
-| `lag` | Gauge | Current consumer lag |
+| `lag` | Gauge | Total consumer lag across all assigned partitions |
+| `lag_max` | Gauge | Maximum per-partition consumer lag |
 | `assigned_partitions` | Gauge | Currently assigned partitions |
 | `paused_partitions` | Gauge | Currently paused partitions |
 | `poll_latency_seconds` | Summary | Poll latency statistics |

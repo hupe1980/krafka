@@ -433,8 +433,15 @@ impl MetricsExport for ConsumerMetrics {
             &mut output,
             prefix,
             "lag",
-            "Current consumer lag",
+            "Total consumer lag across all assigned partitions",
             self.lag.get(),
+        );
+        write_prometheus_gauge(
+            &mut output,
+            prefix,
+            "lag_max",
+            "Maximum per-partition consumer lag",
+            self.lag_max.get(),
         );
         write_prometheus_gauge(
             &mut output,
@@ -680,10 +687,18 @@ impl KrafkaMetrics {
         self.consumer.rebalances.reset();
         self.consumer.poll_latency.reset();
         self.consumer.fetch_latency.reset();
+        self.consumer.lag.set(0);
+        self.consumer.lag_max.set(0);
+        self.consumer.assigned_partitions.set(0);
+        self.consumer.paused_partitions.set(0);
+
+        self.producer.connections.set(0);
+        self.producer.buffered_records.set(0);
 
         self.connection.connections_created.reset();
         self.connection.connections_closed.reset();
         self.connection.connection_errors.reset();
+        self.connection.active_connections.set(0);
         self.connection.connect_latency.reset();
     }
 }
@@ -758,6 +773,7 @@ impl ProducerMetrics {
 
 /// Snapshot of producer metrics.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ProducerMetricsSnapshot {
     /// Number of records sent successfully.
     pub records_sent: u64,
@@ -800,8 +816,10 @@ pub struct ConsumerMetrics {
     pub poll_latency: LatencyTracker,
     /// Fetch latency.
     pub fetch_latency: LatencyTracker,
-    /// Current lag (records behind).
+    /// Total consumer lag across all assigned partitions (records behind).
     pub lag: Gauge,
+    /// Maximum per-partition lag across all assigned partitions.
+    pub lag_max: Gauge,
     /// Current number of assigned partitions.
     pub assigned_partitions: Gauge,
     /// Current number of paused partitions.
@@ -868,6 +886,7 @@ impl ConsumerMetrics {
             poll_latency: self.poll_latency.snapshot(),
             fetch_latency: self.fetch_latency.snapshot(),
             lag: self.lag.get(),
+            lag_max: self.lag_max.get(),
             assigned_partitions: self.assigned_partitions.get(),
             paused_partitions: self.paused_partitions.get(),
         }
@@ -876,6 +895,7 @@ impl ConsumerMetrics {
 
 /// Snapshot of consumer metrics.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ConsumerMetricsSnapshot {
     /// Number of records received.
     pub records_received: u64,
@@ -897,8 +917,10 @@ pub struct ConsumerMetricsSnapshot {
     pub poll_latency: LatencySnapshot,
     /// Fetch latency statistics.
     pub fetch_latency: LatencySnapshot,
-    /// Current lag.
+    /// Total consumer lag across all assigned partitions.
     pub lag: u64,
+    /// Maximum per-partition lag.
+    pub lag_max: u64,
     /// Assigned partitions.
     pub assigned_partitions: u64,
     /// Paused partitions.
@@ -960,6 +982,7 @@ impl ConnectionMetrics {
 
 /// Snapshot of connection metrics.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ConnectionMetricsSnapshot {
     /// Total connections created.
     pub connections_created: u64,
@@ -1221,5 +1244,43 @@ mod tests {
         assert!(output.contains("test_send_latency_seconds_sum"));
         assert!(output.contains("test_send_latency_seconds_min"));
         assert!(output.contains("test_send_latency_seconds_max"));
+    }
+
+    #[test]
+    fn test_consumer_lag_metrics() {
+        let metrics = ConsumerMetrics::new();
+
+        // Initially zero
+        assert_eq!(metrics.lag.get(), 0);
+        assert_eq!(metrics.lag_max.get(), 0);
+
+        // Set lag values
+        metrics.lag.set(42);
+        metrics.lag_max.set(15);
+
+        assert_eq!(metrics.lag.get(), 42);
+        assert_eq!(metrics.lag_max.get(), 15);
+
+        // Snapshot captures lag values
+        let snap = metrics.snapshot();
+        assert_eq!(snap.lag, 42);
+        assert_eq!(snap.lag_max, 15);
+    }
+
+    #[test]
+    fn test_consumer_lag_prometheus_export() {
+        let metrics = ConsumerMetrics::new();
+        metrics.lag.set(100);
+        metrics.lag_max.set(30);
+
+        let output = metrics.to_prometheus_text("c");
+
+        assert!(output.contains("# HELP c_lag Total consumer lag across all assigned partitions"));
+        assert!(output.contains("# TYPE c_lag gauge"));
+        assert!(output.contains("c_lag 100"));
+
+        assert!(output.contains("# HELP c_lag_max Maximum per-partition consumer lag"));
+        assert!(output.contains("# TYPE c_lag_max gauge"));
+        assert!(output.contains("c_lag_max 30"));
     }
 }
