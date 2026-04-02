@@ -274,23 +274,48 @@ assert_eq!(cooperative.name(), "cooperative-sticky");
 
 #### Cooperative Sticky Assignor
 
-The `CooperativeStickyAssignor` provides incremental cooperative rebalancing, minimizing
-partition movement when consumers join or leave:
+The `CooperativeStickyAssignor` implements the incremental cooperative rebalancing
+protocol (KIP-429), minimizing partition movement and avoiding stop-the-world
+rebalances when consumers join or leave the group.
+
+**Key features:**
+- **Incremental two-phase rebalance**: Only the partitions being moved are revoked
+  and cleaned up — unaffected partitions retain their state and do not go through
+  a full revoke/reassign cycle.
+- **Stickiness**: Partitions stay with their current owner when possible, reducing
+  unnecessary movement.
+- **Balanced distribution**: Ensures fair partition allocation across consumers.
+- **Owned-partition metadata (v1)**: Encodes each member's current assignment in
+  JoinGroup metadata so the leader can compute minimal revocations.
+- **Proper revocation semantics**: `on_partitions_revoked` is called only for the
+  diff (partitions being moved) during normal rebalances (including topic deletion),
+  while `on_partitions_lost` is used when ownership may already have been transferred
+  (e.g., session timeout, fencing, or graceful shutdown via `close()`).
 
 ```rust
-use krafka::consumer::{CooperativeStickyAssignor, PartitionAssignor};
+use krafka::consumer::{ConsumerBuilder, PartitionAssignmentStrategy};
 
-let assignor = CooperativeStickyAssignor::new();
+let consumer = ConsumerBuilder::default()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .partition_assignment_strategy(PartitionAssignmentStrategy::CooperativeSticky)
+    .build()
+    .await?;
 
-// Key features:
-// - Maintains stickiness: partitions stay with their current owner when possible
-// - Balanced distribution: ensures fair partition allocation across consumers
-// - Incremental rebalance: only moves partitions that need to move
-
-// Track which partitions were revoked during rebalance
-// (for implementing incremental cooperative protocol)
-// let revoked = assignor.get_partitions_to_revoke("member-id", &new_assignment);
+// During a rebalance, only affected partitions are revoked/released from this consumer.
+// Unaffected partitions keep their assignment and continue being consumed.
 ```
+
+**How it works:**
+
+1. A rebalance is triggered (new member joins, member leaves, etc.).
+2. Phase 1: All members join and receive new target assignments.
+3. Each member computes which partitions to revoke (old − new).
+4. Revoked partitions are released and `on_partitions_revoked` fires.
+5. Phase 2: Members rejoin with updated owned-partition metadata.
+6. Final assignments are distributed and `on_partitions_assigned` fires
+   with the full post-rebalance assignment (committed offsets are only
+   fetched for newly acquired partitions).
 
 ### Rebalance Listener
 

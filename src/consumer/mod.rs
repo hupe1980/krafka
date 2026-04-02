@@ -226,20 +226,87 @@ impl Consumer {
         // If we have a group coordinator, join the group
         if let Some(ref coordinator) = self.group_coordinator {
             let topic_strings: Vec<String> = topics.iter().map(|s| s.to_string()).collect();
-            let assignment = coordinator.ensure_active_membership(&topic_strings).await?;
 
-            // Update our assignments based on the group assignment
-            {
-                let mut assignments = self.assignments.write().await;
-                assignments.clear();
-                for (topic, partitions) in &assignment.partitions {
-                    assignments.insert(topic.clone(), partitions.clone());
+            if coordinator.is_cooperative() {
+                // Cooperative (KIP-429): defer the join/sync to poll(), which
+                // implements the full two-phase rebalance protocol (revocations,
+                // on_partitions_revoked callback, second rejoin). subscribe()
+                // only updates the subscription metadata; poll() will detect
+                // needs_rejoin() and drive the cooperative flow.
+
+                // Detect topic changes while Stable — mark for rejoin.
+                {
+                    let state = coordinator.state().await;
+                    if state == GroupState::Stable {
+                        let mut old_sorted = coordinator.subscribed_topics().await;
+                        old_sorted.sort();
+                        let mut new_sorted = topic_strings.clone();
+                        new_sorted.sort();
+                        if old_sorted != new_sorted {
+                            coordinator.set_preparing_rebalance().await;
+                        }
+                    }
+                }
+
+                coordinator.set_subscribed_topics(topic_strings).await;
+            } else {
+                // Eager: join immediately in subscribe() — single-phase is correct.
+
+                // Snapshot old assignment before the join. If a JoinGroup/SyncGroup
+                // occurs, we must revoke the old partitions (eager = revoke all)
+                // to clean up per-partition state and notify the listener.
+                let old_assignments = self.assignments.read().await.clone();
+
+                let (assignment, joined) =
+                    coordinator.ensure_active_membership(&topic_strings).await?;
+
+                if joined {
+                    // An actual JoinGroup/SyncGroup occurred (first join or topic change).
+
+                    // Eager revocation: notify listener and clean up stale per-partition
+                    // state from the previous assignment before applying the new one.
+                    // Without this, re-subscribing with different topics would leak
+                    // old offsets, buffered records, paused state, and fetch sessions.
+                    if !old_assignments.is_empty() {
+                        let revoked: Vec<TopicPartition> = old_assignments
+                            .iter()
+                            .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
+                            .collect();
+                        self.rebalance_listener.on_partitions_revoked(&revoked);
+                        self.clear_partition_state().await;
+                    }
+
+                    self.metrics.rebalances.inc();
+                }
+
+                // Update our assignments based on the group assignment
+                {
+                    let mut assignments = self.assignments.write().await;
+                    assignments.clear();
+                    for (topic, partitions) in &assignment.partitions {
+                        assignments.insert(topic.clone(), partitions.clone());
+                    }
+                }
+
+                if joined {
+                    // Notify listener of assignment (matches Java client behavior:
+                    // ConsumerRebalanceListener.onPartitionsAssigned is invoked on every
+                    // successful rebalance, including the very first one).
+                    let assigned: Vec<TopicPartition> = assignment
+                        .partitions
+                        .iter()
+                        .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
+                        .collect();
+                    self.rebalance_listener.on_partitions_assigned(&assigned);
+
+                    // Update assigned_partitions metric
+                    self.metrics.assigned_partitions.set(assigned.len() as u64);
+
+                    // Fetch committed offsets for our assigned partitions
+                    self.fetch_and_apply_committed_offsets(&assignment.partitions)
+                        .await?;
                 }
             }
-
-            // Fetch committed offsets for our assigned partitions
-            self.fetch_and_apply_committed_offsets(&assignment.partitions)
-                .await?;
 
             debug!("Subscribed to topics via group coordinator: {:?}", topics);
         } else {
@@ -255,6 +322,10 @@ impl Consumer {
             let assigned_snapshot = assignments.clone();
             drop(assignments);
 
+            // Update metric for standalone partition count
+            let count: usize = assigned_snapshot.values().map(|p| p.len()).sum();
+            self.metrics.assigned_partitions.set(count as u64);
+
             // Apply auto_offset_reset for non-group consumers.
             // Without this, all partitions default to offset 0 regardless of
             // the configured auto_offset_reset policy.
@@ -264,6 +335,407 @@ impl Consumer {
         }
 
         Ok(())
+    }
+
+    /// Apply per-partition cleanup for revoked partitions.
+    ///
+    /// Removes revoked entries from assignments, offsets, backoff, paused, and recv_buffer.
+    /// Fetch sessions are NOT reset here — `build_request()` automatically computes
+    /// `forgotten_topics` diffs from the updated assignment, preserving KIP-227
+    /// incremental fetch benefits. Called by all cooperative revocation paths.
+    async fn apply_partition_revocations(&self, revoked: &[(String, PartitionId)]) {
+        // Build per-topic set of revoked partition IDs for O(T * P) removal
+        // instead of O(R * P) when many partitions of the same topic are revoked.
+        let revoked_by_topic: HashMap<&str, HashSet<PartitionId>> = {
+            let mut m: HashMap<&str, HashSet<PartitionId>> = HashMap::new();
+            for (topic, partition) in revoked {
+                m.entry(topic.as_str()).or_default().insert(*partition);
+            }
+            m
+        };
+
+        // Remove from assignments
+        {
+            let mut assignments = self.assignments.write().await;
+            for (topic, revoked_parts) in &revoked_by_topic {
+                if let Some(parts) = assignments.get_mut(*topic) {
+                    parts.retain(|p| !revoked_parts.contains(p));
+                    if parts.is_empty() {
+                        assignments.remove(*topic);
+                    }
+                }
+            }
+        }
+        // Remove offsets for revoked partitions
+        {
+            let mut offsets = self.offsets.write().await;
+            for (topic, partition) in revoked {
+                offsets.remove(&(topic.clone(), *partition));
+            }
+        }
+        // Remove offset retry backoff entries
+        {
+            let mut backoff = self.offset_retry_backoff.write().await;
+            for (topic, partition) in revoked {
+                backoff.remove(&(topic.clone(), *partition));
+            }
+        }
+        // Discard buffered records from revoked partitions
+        {
+            let revoked_set: HashSet<(&str, PartitionId)> =
+                revoked.iter().map(|(t, p)| (t.as_str(), *p)).collect();
+            let mut buf = self.recv_buffer.write().await;
+            buf.retain(|r| !revoked_set.contains(&(r.topic.as_str(), r.partition)));
+        }
+        // Clear paused state for revoked partitions
+        {
+            let mut paused = self.paused.write().await;
+            for (topic, partition) in revoked {
+                paused.remove(&(topic.clone(), *partition));
+            }
+            self.metrics.paused_partitions.set(paused.len() as u64);
+        }
+    }
+
+    /// Finalize a cooperative rebalance: compute newly-assigned diff, update
+    /// assignments, fire `on_partitions_assigned`, fetch committed offsets for
+    /// new partitions, and record owned partitions in the sticky assignor.
+    async fn finalize_cooperative_assignment(
+        &self,
+        coordinator: &GroupCoordinator,
+        assignment: &MemberAssignment,
+        old_assignments: &HashMap<String, Vec<PartitionId>>,
+    ) -> Result<()> {
+        // Determine newly assigned partitions (new - old)
+        let mut newly_assigned = Vec::new();
+        for (topic, partitions) in &assignment.partitions {
+            let old_parts = old_assignments.get(topic);
+            for &p in partitions {
+                let is_new = old_parts.is_none_or(|old| !old.contains(&p));
+                if is_new {
+                    newly_assigned.push(TopicPartition::new(topic, p));
+                }
+            }
+        }
+
+        // Update to final assignment
+        {
+            let mut assignments = self.assignments.write().await;
+            assignments.clear();
+            for (topic, partitions) in &assignment.partitions {
+                assignments.insert(topic.clone(), partitions.clone());
+            }
+        }
+
+        // Notify listener with the full post-rebalance assignment
+        // (matching Java ConsumerRebalanceListener.onPartitionsAssigned
+        // contract), not just the diff. Always fire, even when the
+        // assignment is empty (e.g., more consumers than partitions).
+        let full_assigned: Vec<TopicPartition> = assignment
+            .partitions
+            .iter()
+            .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
+            .collect();
+        self.rebalance_listener
+            .on_partitions_assigned(&full_assigned);
+        self.metrics
+            .assigned_partitions
+            .set(full_assigned.len() as u64);
+
+        // Fetch committed offsets for newly assigned partitions only
+        // (retained partitions already have tracked offsets).
+        if !newly_assigned.is_empty() {
+            let new_parts = Self::group_partitions_by_topic(&newly_assigned);
+            self.fetch_and_apply_committed_offsets(&new_parts).await?;
+        }
+
+        // Record final assignment so the next rebalance's
+        // join_group metadata reports correct owned partitions.
+        let member_id = coordinator.member_id().await;
+        coordinator.record_owned_partitions(&member_id, assignment);
+
+        Ok(())
+    }
+
+    /// Clear all per-partition state after an eager revocation or unsubscribe/close.
+    ///
+    /// Resets fetch sessions, offsets, retry backoff, buffered records, and paused set.
+    async fn clear_partition_state(&self) {
+        self.fetch_sessions.lock().await.reset_all();
+        self.offsets.write().await.clear();
+        self.offset_retry_backoff.write().await.clear();
+        self.recv_buffer.write().await.clear();
+        self.paused.write().await.clear();
+        self.metrics.paused_partitions.set(0);
+    }
+
+    /// Send an inline heartbeat, invoke the revocation callback, apply
+    /// partition revocations, and update the metric + sticky-assignor state.
+    ///
+    /// Returns `true` if an inline heartbeat signalled session invalidation
+    /// and poll() should return early.
+    async fn apply_revocation_round(
+        &self,
+        coordinator: &Arc<GroupCoordinator>,
+        revoked_tuples: &[(String, PartitionId)],
+        revoked_tps: &[TopicPartition],
+    ) -> Result<bool> {
+        // Send an inline heartbeat before invoking the user callback
+        // to avoid session timeout if the callback is slow.
+        match coordinator.send_heartbeat().await {
+            Ok(status) if coordinator.handle_inline_heartbeat_status(status).await => {
+                return Ok(true);
+            }
+            Err(e) => {
+                warn!("Pre-revocation heartbeat failed: {}", e);
+            }
+            _ => {}
+        }
+        self.rebalance_listener.on_partitions_revoked(revoked_tps);
+        self.apply_partition_revocations(revoked_tuples).await;
+
+        // Update metric and owned-partition state in a single lock
+        // acquisition. The metric is set eagerly so it stays accurate
+        // even if a subsequent Phase 2 round returns early.
+        let member_id = coordinator.member_id().await;
+        let current = self.assignments.read().await;
+        let count: usize = current.values().map(|ps| ps.len()).sum();
+        self.metrics.assigned_partitions.set(count as u64);
+        let owned = MemberAssignment {
+            partitions: current.clone(),
+        };
+        drop(current);
+        coordinator.record_owned_partitions(&member_id, &owned);
+
+        Ok(false)
+    }
+
+    /// Handle group rebalance and inline heartbeat during poll.
+    ///
+    /// Returns `true` if poll() should return an empty result immediately
+    /// (e.g., cooperative rebalance requires another poll cycle).
+    async fn handle_group_rebalance(&self) -> Result<bool> {
+        let Some(ref coordinator) = self.group_coordinator else {
+            return Ok(false);
+        };
+
+        if coordinator.needs_rejoin().await {
+            let topics: Vec<String> = self.subscriptions.read().await.iter().cloned().collect();
+            if !topics.is_empty() {
+                coordinator.set_subscribed_topics(topics.clone()).await;
+
+                if coordinator.is_cooperative() {
+                    if self.handle_cooperative_rebalance(coordinator).await? {
+                        return Ok(true);
+                    }
+                } else {
+                    self.handle_eager_rebalance(coordinator, &topics).await?;
+                }
+            }
+        }
+
+        // Check if inline heartbeat is needed
+        if coordinator.is_heartbeat_overdue().await {
+            match coordinator.send_heartbeat().await {
+                Ok(status) if coordinator.handle_inline_heartbeat_status(status).await => {
+                    debug!("Heartbeat indicated rejoin needed");
+                }
+                Err(e) => {
+                    warn!("Inline heartbeat failed: {}", e);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Handle cooperative incremental rebalance (KIP-429).
+    ///
+    /// Returns `true` if poll() should return an empty result immediately,
+    /// which happens when an inline heartbeat signals rejoin or when the
+    /// cooperative round limit is exceeded.
+    async fn handle_cooperative_rebalance(
+        &self,
+        coordinator: &Arc<GroupCoordinator>,
+    ) -> Result<bool> {
+        // Phase 1: join+sync to get new target assignment
+        let (new_assignment, to_revoke) = coordinator.perform_cooperative_join_and_sync().await?;
+
+        if !to_revoke.is_empty() {
+            // Revoke only the diff — keep consuming unaffected partitions
+            let revoked: Vec<TopicPartition> = to_revoke
+                .iter()
+                .map(|(t, p)| TopicPartition::new(t, *p))
+                .collect();
+            if self
+                .apply_revocation_round(coordinator, &to_revoke, &revoked)
+                .await?
+            {
+                return Ok(true);
+            }
+            self.metrics.rebalances.inc();
+
+            // Phase 2: rejoin to finalize after revocations.
+            // In rare cases (concurrent topic changes, racing rebalances),
+            // additional revocations may be needed. Loop with a bound.
+            coordinator.trigger_rejoin().await;
+            let mut final_assignment = MemberAssignment::empty();
+            let max_cooperative_rounds = 3;
+            for round in 0..max_cooperative_rounds {
+                let (assignment, extra_revoke) =
+                    coordinator.perform_cooperative_join_and_sync().await?;
+                final_assignment = assignment;
+
+                if extra_revoke.is_empty() {
+                    break;
+                }
+
+                // Process additional revocations (including final round)
+                let extra_revoked: Vec<TopicPartition> = extra_revoke
+                    .iter()
+                    .map(|(t, p)| TopicPartition::new(t, *p))
+                    .collect();
+                if self
+                    .apply_revocation_round(coordinator, &extra_revoke, &extra_revoked)
+                    .await?
+                {
+                    return Ok(true);
+                }
+
+                if round == max_cooperative_rounds - 1 {
+                    warn!(
+                        "Cooperative rebalance exceeded {} rounds with pending revocations; \
+                         this may indicate cascading membership changes. \
+                         Deferring assignment to next poll cycle.",
+                        max_cooperative_rounds
+                    );
+                    // Start heartbeat to avoid session timeout while we
+                    // defer the additional cooperative rebalance round
+                    // to the next poll cycle. Do NOT apply final_assignment
+                    // since it still required another rejoin. Set state
+                    // directly instead of trigger_rejoin() to avoid
+                    // killing the heartbeat task via Rejoin command.
+                    coordinator.start_heartbeat_task().await;
+                    coordinator.set_preparing_rebalance().await;
+                    // Note: rebalances metric was already incremented
+                    // at Phase 1 entry; do not double-count here.
+                    // assigned_partitions metric was already updated
+                    // after apply_partition_revocations above.
+                    return Ok(true);
+                }
+
+                coordinator.trigger_rejoin().await;
+            }
+
+            // Finalize cooperative assignment: update assignments,
+            // fire on_partitions_assigned, fetch offsets, record owned.
+            let old_assignments = self.assignments.read().await.clone();
+            self.finalize_cooperative_assignment(coordinator, &final_assignment, &old_assignments)
+                .await?;
+        } else {
+            // No revocations — assignment is final in one round
+            let old_assignments = self.assignments.read().await.clone();
+
+            // Determine partitions removed in this rebalance
+            // (e.g., reassigned to another member, topic deleted).
+            // This is a clean cooperative revocation, not an unclean
+            // loss, so use on_partitions_revoked (not on_partitions_lost).
+            let mut revoked_parts: Vec<TopicPartition> = Vec::new();
+            for (topic, partitions) in &old_assignments {
+                let new_parts = new_assignment.partitions.get(topic);
+                for &p in partitions {
+                    let gone = new_parts.is_none_or(|np| !np.contains(&p));
+                    if gone {
+                        revoked_parts.push(TopicPartition::new(topic, p));
+                    }
+                }
+            }
+            if !revoked_parts.is_empty() {
+                self.rebalance_listener
+                    .on_partitions_revoked(&revoked_parts);
+                let revoked_tuples: Vec<(String, PartitionId)> = revoked_parts
+                    .iter()
+                    .map(|tp| (tp.topic.clone(), tp.partition))
+                    .collect();
+                self.apply_partition_revocations(&revoked_tuples).await;
+            }
+
+            self.metrics.rebalances.inc();
+
+            // Finalize cooperative assignment: update assignments,
+            // fire on_partitions_assigned, fetch offsets, record owned.
+            self.finalize_cooperative_assignment(coordinator, &new_assignment, &old_assignments)
+                .await?;
+        }
+
+        Ok(false)
+    }
+
+    /// Handle eager rebalance: revoke all partitions, then reassign from scratch.
+    async fn handle_eager_rebalance(
+        &self,
+        coordinator: &Arc<GroupCoordinator>,
+        topics: &[String],
+    ) -> Result<()> {
+        let old_assignments = self.assignments.read().await.clone();
+        if !old_assignments.is_empty() {
+            let revoked: Vec<TopicPartition> = old_assignments
+                .iter()
+                .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
+                .collect();
+            self.rebalance_listener.on_partitions_revoked(&revoked);
+            self.clear_partition_state().await;
+
+            // Clear assignments immediately after revocation so that
+            // if ensure_active_membership fails below, the next poll
+            // won't re-fire on_partitions_revoked for already-revoked
+            // partitions. Matches the Java client's behavior of
+            // clearing subscription state after the eager revoke phase.
+            self.assignments.write().await.clear();
+            self.metrics.assigned_partitions.set(0);
+        }
+
+        self.metrics.rebalances.inc();
+
+        // `joined` is always true here: handle_group_rebalance gates on
+        // needs_rejoin(), so ensure_active_membership always performs a
+        // full JoinGroup/SyncGroup.
+        let (assignment, _joined) = coordinator.ensure_active_membership(topics).await?;
+
+        // Update our assignments
+        let mut assignments = self.assignments.write().await;
+        assignments.clear();
+        for (topic, partitions) in &assignment.partitions {
+            assignments.insert(topic.clone(), partitions.clone());
+        }
+        drop(assignments);
+
+        // Notify listener of newly assigned partitions
+        let assigned: Vec<TopicPartition> = assignment
+            .partitions
+            .iter()
+            .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
+            .collect();
+        self.rebalance_listener.on_partitions_assigned(&assigned);
+        self.metrics.assigned_partitions.set(assigned.len() as u64);
+
+        // Fetch committed offsets for new assignment
+        self.fetch_and_apply_committed_offsets(&assignment.partitions)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Group topic-partitions into a map keyed by topic name.
+    fn group_partitions_by_topic(
+        partitions: &[TopicPartition],
+    ) -> HashMap<String, Vec<PartitionId>> {
+        let mut map: HashMap<String, Vec<PartitionId>> = HashMap::new();
+        for tp in partitions {
+            map.entry(tp.topic.clone()).or_default().push(tp.partition);
+        }
+        map
     }
 
     /// Fetch committed offsets and apply auto_offset_reset for partitions without committed offsets.
@@ -292,7 +764,19 @@ impl Consumer {
 
         for (topic, partitions) in assigned {
             for &partition in partitions {
-                let committed_val = committed.get(&(topic.clone(), partition));
+                let key = (topic.clone(), partition);
+
+                // Respect user-set offsets (e.g., from seek() in on_partitions_assigned).
+                // If the caller already positioned this partition, do not overwrite.
+                if offsets.contains_key(&key) {
+                    debug!(
+                        "Keeping existing offset for {}-{} (user-set or prior)",
+                        topic, partition
+                    );
+                    continue;
+                }
+
+                let committed_val = committed.get(&key);
                 if let Some(&offset) = committed_val
                     && offset >= 0
                 {
@@ -300,7 +784,7 @@ impl Consumer {
                         "Using committed offset {} for {}-{}",
                         offset, topic, partition
                     );
-                    offsets.insert((topic.clone(), partition), offset);
+                    offsets.insert(key, offset);
                     continue;
                 }
                 // No committed offset or negative (unknown)
@@ -308,7 +792,7 @@ impl Consumer {
                     "No committed offset for {}-{} (committed={:?}), will auto-reset",
                     topic, partition, committed_val
                 );
-                need_reset.push((topic.clone(), partition));
+                need_reset.push(key);
             }
         }
 
@@ -799,66 +1283,8 @@ impl Consumer {
         }
 
         // Handle group rebalance if needed
-        if let Some(ref coordinator) = self.group_coordinator {
-            // Check if we need to rejoin the group
-            if coordinator.needs_rejoin().await {
-                let topics: Vec<String> = self.subscriptions.read().await.iter().cloned().collect();
-                if !topics.is_empty() {
-                    // Notify listener of revoked partitions before rebalance
-                    let old_assignments = self.assignments.read().await.clone();
-                    if !old_assignments.is_empty() {
-                        let revoked: Vec<TopicPartition> = old_assignments
-                            .iter()
-                            .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
-                            .collect();
-                        self.rebalance_listener.on_partitions_revoked(&revoked);
-                        self.metrics.rebalances.inc();
-
-                        // Reset all fetch sessions — partition ownership is changing
-                        self.fetch_sessions.lock().await.reset_all();
-                        // Clear offset retry backoff — fresh start after rebalance
-                        self.offset_retry_backoff.write().await.clear();
-                    }
-
-                    let assignment = coordinator.ensure_active_membership(&topics).await?;
-
-                    // Update our assignments
-                    let mut assignments = self.assignments.write().await;
-                    assignments.clear();
-                    for (topic, partitions) in &assignment.partitions {
-                        assignments.insert(topic.clone(), partitions.clone());
-                    }
-                    drop(assignments);
-
-                    // Notify listener of newly assigned partitions
-                    let assigned: Vec<TopicPartition> = assignment
-                        .partitions
-                        .iter()
-                        .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
-                        .collect();
-                    self.rebalance_listener.on_partitions_assigned(&assigned);
-                    self.metrics.assigned_partitions.set(assigned.len() as u64);
-
-                    // Fetch committed offsets for new assignment
-                    self.fetch_and_apply_committed_offsets(&assignment.partitions)
-                        .await?;
-                }
-            }
-
-            // Check if inline heartbeat is needed
-            if coordinator.is_heartbeat_overdue().await {
-                match coordinator.send_heartbeat().await {
-                    Ok(status) if status.requires_rejoin() => {
-                        // Need to rejoin - will be handled on next poll
-                        coordinator.trigger_rejoin().await;
-                        debug!("Heartbeat indicated rejoin needed");
-                    }
-                    Err(e) => {
-                        warn!("Inline heartbeat failed: {}", e);
-                    }
-                    _ => {}
-                }
-            }
+        if self.handle_group_rebalance().await? {
+            return Ok(vec![]);
         }
 
         let assignments = self.assignments.read().await;
@@ -1895,10 +2321,8 @@ impl Consumer {
 
         self.subscriptions.write().await.clear();
         self.assignments.write().await.clear();
-        self.offsets.write().await.clear();
-        self.paused.write().await.clear();
-        self.recv_buffer.write().await.clear();
-        self.offset_retry_backoff.write().await.clear();
+        self.clear_partition_state().await;
+        self.metrics.assigned_partitions.set(0);
 
         debug!("Unsubscribed from all topics");
     }
@@ -1960,6 +2384,13 @@ impl Consumer {
         {
             warn!("Error leaving consumer group: {e}");
         }
+
+        // Clear per-partition state so post-close recv() cannot return records
+        // from partitions already signaled as lost via on_partitions_lost above.
+        self.subscriptions.write().await.clear();
+        self.assignments.write().await.clear();
+        self.clear_partition_state().await;
+        self.metrics.assigned_partitions.set(0);
 
         // Notify interceptor of shutdown
         crate::interceptor::safe_consumer_close(&*self.interceptor);
@@ -3143,5 +3574,333 @@ mod tests {
         request.encode_v2(&mut buf_v2).unwrap();
         // v2 has one extra byte for isolation_level
         assert_eq!(buf_v2.len(), encoded_v1_len + 1);
+    }
+
+    // ── Cooperative rebalance algorithm tests ───────────────────────────
+
+    /// Compute newly-assigned diff (new - old) as used in
+    /// finalize_cooperative_assignment.
+    fn cooperative_newly_assigned(
+        new: &HashMap<String, Vec<PartitionId>>,
+        old: &HashMap<String, Vec<PartitionId>>,
+    ) -> Vec<TopicPartition> {
+        let mut result = Vec::new();
+        for (topic, partitions) in new {
+            let old_parts = old.get(topic);
+            for &p in partitions {
+                let is_new = old_parts.is_none_or(|o| !o.contains(&p));
+                if is_new {
+                    result.push(TopicPartition::new(topic, p));
+                }
+            }
+        }
+        result
+    }
+
+    /// Compute cooperative revocations (old - new) as used in the
+    /// no-revocations poll path.
+    fn cooperative_revocations(
+        old: &HashMap<String, Vec<PartitionId>>,
+        new: &HashMap<String, Vec<PartitionId>>,
+    ) -> Vec<TopicPartition> {
+        let mut result = Vec::new();
+        for (topic, partitions) in old {
+            let new_parts = new.get(topic);
+            for &p in partitions {
+                let gone = new_parts.is_none_or(|np| !np.contains(&p));
+                if gone {
+                    result.push(TopicPartition::new(topic, p));
+                }
+            }
+        }
+        result
+    }
+
+    /// Simulate the apply_partition_revocations HashMap algorithm.
+    fn apply_revocations_to_assignments(
+        assignments: &mut HashMap<String, Vec<PartitionId>>,
+        revoked: &[(String, PartitionId)],
+    ) {
+        let mut revoked_by_topic: HashMap<&str, HashSet<PartitionId>> = HashMap::new();
+        for (topic, partition) in revoked {
+            revoked_by_topic
+                .entry(topic.as_str())
+                .or_default()
+                .insert(*partition);
+        }
+        for (topic, revoked_parts) in &revoked_by_topic {
+            if let Some(parts) = assignments.get_mut(*topic) {
+                parts.retain(|p| !revoked_parts.contains(p));
+                if parts.is_empty() {
+                    assignments.remove(*topic);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cooperative_newly_assigned_fresh_join() {
+        let old: HashMap<String, Vec<PartitionId>> = HashMap::new();
+        let new: HashMap<String, Vec<PartitionId>> = [
+            ("topic1".to_string(), vec![0, 1, 2]),
+            ("topic2".to_string(), vec![0]),
+        ]
+        .into_iter()
+        .collect();
+
+        let result = cooperative_newly_assigned(&new, &old);
+        assert_eq!(result.len(), 4);
+        assert!(result.contains(&TopicPartition::new("topic1", 0)));
+        assert!(result.contains(&TopicPartition::new("topic1", 1)));
+        assert!(result.contains(&TopicPartition::new("topic1", 2)));
+        assert!(result.contains(&TopicPartition::new("topic2", 0)));
+    }
+
+    #[test]
+    fn test_cooperative_newly_assigned_partial_overlap() {
+        let old: HashMap<String, Vec<PartitionId>> = [
+            ("topic1".to_string(), vec![0, 1]),
+            ("topic2".to_string(), vec![0]),
+        ]
+        .into_iter()
+        .collect();
+        let new: HashMap<String, Vec<PartitionId>> = [
+            ("topic1".to_string(), vec![1, 2]),
+            ("topic3".to_string(), vec![0]),
+        ]
+        .into_iter()
+        .collect();
+
+        let result = cooperative_newly_assigned(&new, &old);
+        // topic1-1 retained, topic1-2 new, topic3-0 new
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&TopicPartition::new("topic1", 2)));
+        assert!(result.contains(&TopicPartition::new("topic3", 0)));
+        assert!(!result.contains(&TopicPartition::new("topic1", 1))); // retained
+    }
+
+    #[test]
+    fn test_cooperative_newly_assigned_identical() {
+        let assignment: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0, 1])].into_iter().collect();
+
+        let result = cooperative_newly_assigned(&assignment, &assignment);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_cooperative_revocations_partial() {
+        let old: HashMap<String, Vec<PartitionId>> = [
+            ("topic1".to_string(), vec![0, 1, 2]),
+            ("topic2".to_string(), vec![0]),
+        ]
+        .into_iter()
+        .collect();
+        let new: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![1])].into_iter().collect();
+
+        let result = cooperative_revocations(&old, &new);
+        // topic1-0, topic1-2, topic2-0 revoked; topic1-1 retained
+        assert_eq!(result.len(), 3);
+        assert!(result.contains(&TopicPartition::new("topic1", 0)));
+        assert!(result.contains(&TopicPartition::new("topic1", 2)));
+        assert!(result.contains(&TopicPartition::new("topic2", 0)));
+    }
+
+    #[test]
+    fn test_cooperative_revocations_full() {
+        let old: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0, 1])].into_iter().collect();
+        let new: HashMap<String, Vec<PartitionId>> = HashMap::new();
+
+        let result = cooperative_revocations(&old, &new);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_cooperative_revocations_none() {
+        let old: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0])].into_iter().collect();
+        let new: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0, 1])].into_iter().collect();
+
+        let result = cooperative_revocations(&old, &new);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_apply_revocations_removes_partitions() {
+        let mut assignments: HashMap<String, Vec<PartitionId>> = [
+            ("topic1".to_string(), vec![0, 1, 2]),
+            ("topic2".to_string(), vec![0, 1]),
+        ]
+        .into_iter()
+        .collect();
+
+        let revoked = vec![
+            ("topic1".to_string(), 0),
+            ("topic1".to_string(), 2),
+            ("topic2".to_string(), 1),
+        ];
+
+        apply_revocations_to_assignments(&mut assignments, &revoked);
+
+        assert_eq!(assignments["topic1"], vec![1]);
+        assert_eq!(assignments["topic2"], vec![0]);
+    }
+
+    #[test]
+    fn test_apply_revocations_removes_empty_topics() {
+        let mut assignments: HashMap<String, Vec<PartitionId>> = [
+            ("topic1".to_string(), vec![0]),
+            ("topic2".to_string(), vec![0, 1]),
+        ]
+        .into_iter()
+        .collect();
+
+        let revoked = vec![("topic1".to_string(), 0)];
+        apply_revocations_to_assignments(&mut assignments, &revoked);
+
+        // topic1 should be removed entirely since it became empty
+        assert!(!assignments.contains_key("topic1"));
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments["topic2"], vec![0, 1]);
+    }
+
+    #[test]
+    fn test_apply_revocations_nonexistent_partition() {
+        let mut assignments: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0, 1])].into_iter().collect();
+
+        let revoked = vec![
+            ("topic1".to_string(), 5), // doesn't exist
+            ("topic3".to_string(), 0), // topic doesn't exist
+        ];
+        apply_revocations_to_assignments(&mut assignments, &revoked);
+
+        // Assignments unchanged
+        assert_eq!(assignments["topic1"], vec![0, 1]);
+    }
+
+    /// Full cooperative two-phase scenario: verify newly-assigned and revoked
+    /// diffs are consistent across the protocol flow.
+    #[test]
+    fn test_cooperative_two_phase_rebalance_consistency() {
+        // Phase 1: existing assignment pre-rebalance
+        let phase0: HashMap<String, Vec<PartitionId>> = [
+            ("topic1".to_string(), vec![0, 1, 2]),
+            ("topic2".to_string(), vec![0]),
+        ]
+        .into_iter()
+        .collect();
+
+        // Phase 1 result: broker says revoke topic1-2 and topic2-0
+        let phase1_target: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0, 1])].into_iter().collect();
+
+        let to_revoke = cooperative_revocations(&phase0, &phase1_target);
+        assert_eq!(to_revoke.len(), 2);
+        assert!(to_revoke.contains(&TopicPartition::new("topic1", 2)));
+        assert!(to_revoke.contains(&TopicPartition::new("topic2", 0)));
+
+        // Apply revocations
+        let mut current = phase0.clone();
+        let revoked_tuples: Vec<(String, PartitionId)> = to_revoke
+            .iter()
+            .map(|tp| (tp.topic.clone(), tp.partition))
+            .collect();
+        apply_revocations_to_assignments(&mut current, &revoked_tuples);
+        assert_eq!(current["topic1"], vec![0, 1]);
+        assert!(!current.contains_key("topic2"));
+
+        // Phase 2: rejoin gives final assignment with a new partition
+        let phase2_final: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0, 1, 3])]
+                .into_iter()
+                .collect();
+
+        let newly_assigned = cooperative_newly_assigned(&phase2_final, &current);
+        assert_eq!(newly_assigned.len(), 1);
+        assert!(newly_assigned.contains(&TopicPartition::new("topic1", 3)));
+
+        // No further revocations needed
+        let extra_revoke = cooperative_revocations(&current, &phase2_final);
+        assert!(extra_revoke.is_empty());
+    }
+
+    /// Verify that cooperative rebalance callbacks follow Java client ordering:
+    /// on_partitions_revoked fires before on_partitions_assigned.
+    #[test]
+    fn test_cooperative_callback_ordering() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct OrderTracker {
+            revoke_seq: AtomicU64,
+            assign_seq: AtomicU64,
+            counter: AtomicU64,
+        }
+        impl ConsumerRebalanceListener for OrderTracker {
+            fn on_partitions_assigned(&self, _: &[TopicPartition]) {
+                self.assign_seq.store(
+                    self.counter.fetch_add(1, Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+            }
+            fn on_partitions_revoked(&self, _: &[TopicPartition]) {
+                self.revoke_seq.store(
+                    self.counter.fetch_add(1, Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+            }
+        }
+
+        let tracker = Arc::new(OrderTracker {
+            revoke_seq: AtomicU64::new(u64::MAX),
+            assign_seq: AtomicU64::new(u64::MAX),
+            counter: AtomicU64::new(0),
+        });
+
+        // Simulate cooperative rebalance callback sequence:
+        // 1. Revoke phase
+        let revoked = vec![TopicPartition::new("topic1", 2)];
+        tracker.on_partitions_revoked(&revoked);
+        // 2. Assign phase
+        let assigned = vec![
+            TopicPartition::new("topic1", 0),
+            TopicPartition::new("topic1", 1),
+            TopicPartition::new("topic1", 3),
+        ];
+        tracker.on_partitions_assigned(&assigned);
+
+        let revoke_order = tracker.revoke_seq.load(Ordering::SeqCst);
+        let assign_order = tracker.assign_seq.load(Ordering::SeqCst);
+        assert!(
+            revoke_order < assign_order,
+            "on_partitions_revoked (seq={revoke_order}) must fire before on_partitions_assigned (seq={assign_order})"
+        );
+    }
+
+    /// Verify that on_partitions_assigned is called even with empty assignment
+    /// (more consumers than partitions).
+    #[test]
+    fn test_cooperative_on_assigned_fires_on_empty() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct EmptyTracker {
+            assigned_called: AtomicBool,
+        }
+        impl ConsumerRebalanceListener for EmptyTracker {
+            fn on_partitions_assigned(&self, parts: &[TopicPartition]) {
+                assert!(parts.is_empty());
+                self.assigned_called.store(true, Ordering::SeqCst);
+            }
+            fn on_partitions_revoked(&self, _: &[TopicPartition]) {}
+        }
+
+        let tracker = EmptyTracker {
+            assigned_called: AtomicBool::new(false),
+        };
+        tracker.on_partitions_assigned(&[]);
+        assert!(tracker.assigned_called.load(Ordering::SeqCst));
     }
 }
