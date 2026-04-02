@@ -37,8 +37,8 @@ This enables dynamic version negotiation for optimal compatibility and feature u
 use krafka::protocol::ApiKey;
 
 // After connection, negotiate the best Fetch version
-// Client supports v4-v12, broker might support v0-v13
-let version = conn.negotiate_api_version(ApiKey::Fetch, 12, 4).await;
+// Client supports v7-v11, broker might support v0-v13
+let version = conn.negotiate_api_version(ApiKey::Fetch, 11, 7).await;
 
 match version {
     Some(v) => println!("Using Fetch v{}", v),
@@ -46,7 +46,7 @@ match version {
 }
 
 // Convenience method with min=0
-let version = conn.negotiate_api_version_max(ApiKey::Produce, 9).await;
+let version = conn.negotiate_api_version_max(ApiKey::Produce, 3).await;
 ```
 
 ### Client Supported Versions
@@ -56,7 +56,7 @@ Krafka supports the following API version ranges (clamped to match actual encode
 | API | Min | Max | Key Features |
 |-----|-----|-----|--------------|
 | Produce | 0 | 3 | v3 transactions, headers |
-| Fetch | 0 | 4, 7 | v4 isolation level, v7 fetch sessions (KIP-227); v5/v6 not supported |
+| Fetch | 0 | 4, 7-11 | v4 isolation level, v7 fetch sessions (KIP-227), v9 leader epoch fencing (KIP-320), v11 follower fetch (KIP-392); v5/v6 not supported |
 | ListOffsets | 0 | 2 | v2 isolation level |
 | Metadata | 0 | 1 | v1 controller info |
 | OffsetCommit | 0 | 2 | v2 retention |
@@ -80,7 +80,7 @@ Client-supported versions are defined in `krafka::protocol::versions`:
 use krafka::protocol::versions;
 
 // Maximum versions the client supports
-let max_fetch = versions::FETCH_MAX;        // 7 (only v0-4 and v7; use try-v7-else-v4 pattern)
+let max_fetch = versions::FETCH_MAX;        // 11 (v0-4 and v7-v11; v5/v6 unsupported)
 let max_produce = versions::PRODUCE_MAX;    // 3
 let max_metadata = versions::METADATA_MAX;  // 1
 ```

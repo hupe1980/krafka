@@ -1811,9 +1811,11 @@ impl Consumer {
         // v5/v6 are unsupported (different request wire format).
         // Prefer the highest version we implement:
         //   v11 — rack_id for closest-replica routing (KIP-392)
-        //   v10 — current_leader_epoch for leader fencing (KIP-320)
-        // When client_rack is not set, cap at v10 so we still get epoch
-        // fencing without sending an unnecessary rack_id.
+        //   v9/v10 — current_leader_epoch for leader fencing (KIP-320;
+        //            v10 shares the same request wire format as v9)
+        // When client_rack is not set, cap at v10 (highest version without
+        // rack_id) so we still get epoch fencing without sending an
+        // unnecessary rack_id.
         let preferred_version = if self.config.client_rack.is_some() {
             11
         } else {

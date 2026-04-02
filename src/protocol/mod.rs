@@ -35,7 +35,7 @@
 //! use krafka::protocol::ApiKey;
 //!
 //! // Negotiate the best version for Fetch
-//! // Try v11 first (follower fetch, KIP-392), fall back through v10/v7 to v4.
+//! // Negotiate within v7..=v11; fall back to v4 if the broker doesn't support v7+.
 //! let version = conn.negotiate_api_version(ApiKey::Fetch, 11, 7).await
 //!     .unwrap_or(4);
 //! println!("Using Fetch v{}", version);

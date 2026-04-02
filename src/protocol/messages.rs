@@ -509,6 +509,10 @@ impl ProduceResponse {
 // Fetch request/response
 
 /// Fetch request.
+///
+/// This struct is `#[non_exhaustive]`; use [`Default::default()`] and then
+/// set the fields you need, or construct it via struct-literal syntax within
+/// this crate.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct FetchRequest {
@@ -534,6 +538,23 @@ pub struct FetchRequest {
     pub rack_id: String,
 }
 
+impl Default for FetchRequest {
+    fn default() -> Self {
+        Self {
+            replica_id: -1,
+            max_wait_ms: 0,
+            min_bytes: 0,
+            max_bytes: 0,
+            isolation_level: 0,
+            session_id: 0,
+            session_epoch: -1,
+            topics: Vec::new(),
+            forgotten_topics: Vec::new(),
+            rack_id: String::new(),
+        }
+    }
+}
+
 /// Topic-partitions to forget from a fetch session (v7+).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -545,7 +566,7 @@ pub struct FetchForgottenTopic {
 }
 
 /// Topic in fetch request.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct FetchTopicRequest {
     /// Topic name.
@@ -570,6 +591,19 @@ pub struct FetchPartitionRequest {
     pub log_start_offset: i64,
     /// Partition max bytes.
     pub partition_max_bytes: i32,
+}
+
+impl Default for FetchPartitionRequest {
+    fn default() -> Self {
+        Self {
+            partition: 0,
+            current_leader_epoch: -1,
+            fetch_offset: 0,
+            last_fetched_epoch: -1,
+            log_start_offset: -1,
+            partition_max_bytes: 0,
+        }
+    }
 }
 
 impl FetchRequest {
@@ -723,7 +757,7 @@ pub struct FetchResponse {
 }
 
 /// Topic in fetch response.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct FetchTopicResponse {
     /// Topic name.
@@ -753,6 +787,21 @@ pub struct FetchPartitionResponse {
     pub preferred_read_replica: i32,
     /// Record batches.
     pub records: Option<Bytes>,
+}
+
+impl Default for FetchPartitionResponse {
+    fn default() -> Self {
+        Self {
+            partition: 0,
+            error_code: ErrorCode::None,
+            high_watermark: -1,
+            last_stable_offset: -1,
+            log_start_offset: -1,
+            aborted_transactions: Vec::new(),
+            preferred_read_replica: -1,
+            records: None,
+        }
+    }
 }
 
 /// Aborted transaction info.

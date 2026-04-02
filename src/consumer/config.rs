@@ -74,6 +74,9 @@ impl PartitionAssignmentStrategy {
 }
 
 /// Consumer configuration.
+///
+/// This struct is `#[non_exhaustive]`; use [`ConsumerConfig::builder()`] or
+/// [`Default::default()`] to construct instances.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ConsumerConfig {
