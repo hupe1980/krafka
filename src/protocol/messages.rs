@@ -38,10 +38,6 @@ pub struct MetadataRequest {
     pub topics: Option<Vec<MetadataRequestTopic>>,
     /// Whether to allow auto topic creation (v4+).
     pub allow_auto_topic_creation: bool,
-    /// Include cluster authorized operations (v8+).
-    pub include_cluster_authorized_operations: bool,
-    /// Include topic authorized operations (v8+).
-    pub include_topic_authorized_operations: bool,
 }
 
 /// Topic in metadata request.
@@ -55,10 +51,11 @@ pub struct MetadataRequestTopic {
 
 impl MetadataRequest {
     /// Create a request for all topics.
+    ///
+    /// `topics: None`. `encode_v0` converts this to an empty array (v0 is
+    /// non-nullable); `encode_v1`+ emits a null array.
     pub fn all_topics() -> Self {
         Self {
-            // Null array = "all topics" for Kafka Metadata v1+.
-            // v0 also handles null (-1 length) as "all topics" in practice.
             topics: None,
             ..Default::default()
         }
@@ -85,44 +82,47 @@ impl MetadataRequest {
         ApiKey::Metadata
     }
 
-    /// Encode for version 0-3.
+    /// Extract topic names as `KafkaString`s for wire encoding.
+    fn topic_names(topics: &[MetadataRequestTopic]) -> Vec<KafkaString> {
+        topics
+            .iter()
+            .filter_map(|t| t.name.as_ref().map(KafkaString::new))
+            .collect()
+    }
+
+    /// Encode for version 0 (topics is non-nullable; `None` → empty array = "all topics").
     pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
         match &self.topics {
+            None => KafkaArray::<KafkaString>::new(vec![]).try_encode(buf)?,
+            Some(topics) => KafkaArray::new(Self::topic_names(topics)).try_encode(buf)?,
+        }
+        Ok(())
+    }
+
+    /// Encode for version 1-3 (topics is nullable; `None` → null array = "all topics").
+    pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
+        match &self.topics {
             None => KafkaArray::<KafkaString>::null().try_encode(buf)?,
-            Some(topics) => {
-                let names: Vec<KafkaString> = topics
-                    .iter()
-                    .filter_map(|t| t.name.as_ref().map(KafkaString::new))
-                    .collect();
-                KafkaArray::new(names).try_encode(buf)?;
-            }
+            Some(topics) => KafkaArray::new(Self::topic_names(topics)).try_encode(buf)?,
         }
         Ok(())
     }
 
     /// Encode for version 4-7.
     pub fn encode_v4(&self, buf: &mut impl BufMut) -> Result<()> {
-        self.encode_v0(buf)?;
+        self.encode_v1(buf)?;
         buf.put_u8(if self.allow_auto_topic_creation { 1 } else { 0 });
         Ok(())
     }
 
     /// Encode for version 8.
     ///
-    /// Adds include_cluster_authorized_operations and
-    /// include_topic_authorized_operations.
+    /// Authorized-operations flags are always encoded as `false` because
+    /// `MetadataResponse` does not yet surface the results.
     pub fn encode_v8(&self, buf: &mut impl BufMut) -> Result<()> {
         self.encode_v4(buf)?;
-        buf.put_u8(if self.include_cluster_authorized_operations {
-            1
-        } else {
-            0
-        });
-        buf.put_u8(if self.include_topic_authorized_operations {
-            1
-        } else {
-            0
-        });
+        buf.put_u8(0); // include_cluster_authorized_operations — not yet surfaced
+        buf.put_u8(0); // include_topic_authorized_operations — not yet surfaced
         Ok(())
     }
 }
@@ -260,7 +260,9 @@ impl MetadataResponse {
     /// Decode from version 8.
     ///
     /// v8 adds topic_authorized_operations and cluster_authorized_operations.
-    /// These fields are read but not stored (we pass `false` in the request).
+    /// Both are read and discarded — the encoder always sends `false` for the
+    /// include flags, so brokers return the "not requested" sentinel (`i32::MIN`).
+    /// When authorized-operations support is added, plumb these into the response.
     pub fn decode_v8(buf: &mut impl Buf) -> Result<Self> {
         let resp = Self::decode_v3_plus::<MetadataTopicResponseV8>(buf)?;
         // cluster_authorized_operations — read and discard
@@ -5319,7 +5321,8 @@ macro_rules! unsupported_decode {
 impl VersionedEncode for MetadataRequest {
     fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
         match version {
-            0..=3 => self.encode_v0(buf)?,
+            0 => self.encode_v0(buf)?,
+            1..=3 => self.encode_v1(buf)?,
             4..=7 => self.encode_v4(buf)?,
             8 => self.encode_v8(buf)?,
             _ => return unsupported_encode!("MetadataRequest", version),
@@ -5957,11 +5960,25 @@ mod tests {
         let request = MetadataRequest::all_topics();
         // Null array = "all topics" for Metadata v1+.
         assert!(request.topics.is_none());
+    }
 
+    /// v0: topics is non-nullable — `None` encodes as empty array (length 0).
+    #[test]
+    fn test_metadata_request_all_topics_encode_v0() {
+        let request = MetadataRequest::all_topics();
         let mut buf = BytesMut::new();
         request.encode_v0(&mut buf).unwrap();
+        // v0: empty array (length 0) means "all topics"
+        assert_eq!(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), 0);
+    }
 
-        // Should encode as null array (-1)
+    /// v1+: topics is nullable — `None` encodes as null array (length -1).
+    #[test]
+    fn test_metadata_request_all_topics_encode_v1() {
+        let request = MetadataRequest::all_topics();
+        let mut buf = BytesMut::new();
+        request.encode_v1(&mut buf).unwrap();
+        // v1+: null array (-1 length) means "all topics"
         assert_eq!(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), -1);
     }
 
@@ -7013,6 +7030,36 @@ mod tests {
     }
 
     #[test]
+    fn test_versioned_encode_metadata_request_v1() {
+        let request = MetadataRequest::all_topics();
+        let mut buf = BytesMut::new();
+        request.encode_versioned(1, &mut buf).unwrap();
+        let mut expected = BytesMut::new();
+        request.encode_v1(&mut expected).unwrap();
+        assert_eq!(buf, expected);
+    }
+
+    /// v0 and v1 encode differently for all_topics(): empty array vs null array.
+    #[test]
+    fn test_versioned_encode_metadata_v0_vs_v1_all_topics() {
+        let request = MetadataRequest::all_topics();
+        let mut buf_v0 = BytesMut::new();
+        request.encode_versioned(0, &mut buf_v0).unwrap();
+        let mut buf_v1 = BytesMut::new();
+        request.encode_versioned(1, &mut buf_v1).unwrap();
+        // v0: 0x00000000 (empty array), v1: 0xFFFFFFFF (null array)
+        assert_ne!(buf_v0, buf_v1);
+        assert_eq!(
+            i32::from_be_bytes([buf_v0[0], buf_v0[1], buf_v0[2], buf_v0[3]]),
+            0
+        );
+        assert_eq!(
+            i32::from_be_bytes([buf_v1[0], buf_v1[1], buf_v1[2], buf_v1[3]]),
+            -1
+        );
+    }
+
+    #[test]
     fn test_versioned_encode_metadata_request_v4() {
         let request = MetadataRequest::all_topics();
         let mut buf = BytesMut::new();
@@ -7356,16 +7403,16 @@ mod tests {
         assert_eq!(resp.topics[0].name.as_deref(), Some("orders"));
     }
 
-    /// Encode v4 adds allow_auto_topic_creation byte.
+    /// Encode v4 adds allow_auto_topic_creation byte on top of v1.
     #[test]
     fn test_metadata_request_encode_v4_adds_auto_create() {
         let request = MetadataRequest::all_topics();
-        let mut buf_v0 = BytesMut::new();
-        request.encode_v0(&mut buf_v0).unwrap();
+        let mut buf_v1 = BytesMut::new();
+        request.encode_v1(&mut buf_v1).unwrap();
         let mut buf_v4 = BytesMut::new();
         request.encode_v4(&mut buf_v4).unwrap();
-        // v4 = v0 + 1 byte (allow_auto_topic_creation)
-        assert_eq!(buf_v4.len(), buf_v0.len() + 1);
+        // v4 = v1 + 1 byte (allow_auto_topic_creation)
+        assert_eq!(buf_v4.len(), buf_v1.len() + 1);
     }
 
     /// Encode v8 adds two more boolean bytes.
