@@ -62,14 +62,14 @@ Krafka supports the following API version ranges (clamped to match actual encode
 | OffsetFetch | 0 | 1 | v1 group coordinator |
 | FindCoordinator | 0 | 1 | Group/txn coordinator lookup |
 | JoinGroup | 0 | 5 | v5 group instance id |
-| Heartbeat | 0 | 0 | Standard heartbeat |
+| Heartbeat | 0 | 3 | v3 group instance id (KIP-345) |
 | SyncGroup | 0 | 3 | v3 group instance id |
-| LeaveGroup | 0 | 1 | v1 with response |
-| CreateTopics | 0 | 3 | Topic creation |
+| LeaveGroup | 0 | 3 | v3 batch leave (KIP-345) |
+| CreateTopics | 0 | 2 | Topic creation |
 | DeleteTopics | 0 | 1 | Topic deletion |
-| DescribeConfigs | 0 | 1 | Config reading |
-| AlterConfigs | 0 | 1 | Config updates |
-| InitProducerId | 0 | 1 | Idempotent/transactional |
+| DescribeConfigs | 0 | 0 | Config reading |
+| AlterConfigs | 0 | 0 | Config updates |
+| InitProducerId | 0 | 0 | Idempotent/transactional |
 
 ### Version Constants
 

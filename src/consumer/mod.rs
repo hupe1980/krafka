@@ -154,6 +154,9 @@ struct FetchRoutingPlan {
     partitions_by_broker: HashMap<crate::BrokerId, Vec<(String, PartitionId)>>,
     /// Preferred replica entries that have expired and should be removed.
     expired_preferred: Vec<(String, PartitionId)>,
+    /// Partitions that have neither a known leader nor a valid preferred
+    /// replica and will not be fetched this round.
+    skipped: Vec<(String, PartitionId)>,
 }
 
 /// Build a per-broker fetch plan from pre-filtered partition keys,
@@ -177,6 +180,7 @@ fn build_fetch_routing_plan(
     let mut partitions_by_broker: HashMap<crate::BrokerId, Vec<(String, PartitionId)>> =
         HashMap::new();
     let mut expired_preferred: Vec<(String, PartitionId)> = Vec::new();
+    let mut skipped: Vec<(String, PartitionId)> = Vec::new();
 
     for key in non_paused_keys {
         // Check for a valid (non-expired) preferred replica
@@ -197,7 +201,8 @@ fn build_fetch_routing_plan(
                 if let Some(&leader_id) = leaders.get(&key) {
                     leader_id
                 } else {
-                    continue; // no leader known — skip
+                    skipped.push(key);
+                    continue;
                 }
             }
         };
@@ -208,6 +213,7 @@ fn build_fetch_routing_plan(
     FetchRoutingPlan {
         partitions_by_broker,
         expired_preferred,
+        skipped,
     }
 }
 
@@ -1593,11 +1599,6 @@ impl Consumer {
                 }
                 if let Some(leader_id) = self.metadata.leader(topic, partition).await {
                     leaders.insert(key.clone(), leader_id);
-                } else {
-                    warn!(
-                        "No leader found for {}-{}, will skip unless a preferred replica is available",
-                        topic, partition
-                    );
                 }
                 non_paused_keys.push(key);
             }
@@ -1610,6 +1611,15 @@ impl Consumer {
 
         // Release read lock before potentially acquiring write lock
         drop(preferred);
+
+        // Warn only for partitions that are truly skipped (no leader AND no
+        // valid preferred replica). This avoids log spam during transient
+        // metadata gaps when a preferred replica is still available.
+        for (topic, partition) in &plan.skipped {
+            warn!(
+                "No leader or preferred replica for {topic}-{partition}, skipping in batch fetch"
+            );
+        }
 
         // Remove expired preferred replica entries so they don't accumulate
         if !plan.expired_preferred.is_empty() {
@@ -4430,6 +4440,20 @@ mod tests {
         let all: Vec<_> = plan.partitions_by_broker.values().flatten().collect();
         assert_eq!(all.len(), 1);
         assert_eq!(*all[0], ("t".into(), 0));
+        assert_eq!(plan.skipped, vec![("t".into(), 1)]);
+    }
+
+    #[test]
+    fn test_routing_plan_all_partitions_skipped() {
+        // No leaders and no preferred replicas → every partition is skipped,
+        // plan is empty.
+        let keys = vec![("t".into(), 0), ("t".into(), 1)];
+
+        let plan = build_fetch_routing_plan(keys, &HashMap::new(), &HashMap::new(), Instant::now());
+
+        assert!(plan.partitions_by_broker.is_empty());
+        assert!(plan.expired_preferred.is_empty());
+        assert_eq!(plan.skipped.len(), 2);
     }
 
     #[test]
