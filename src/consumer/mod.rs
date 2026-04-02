@@ -121,6 +121,27 @@ pub struct Consumer {
     log_start_offsets: RwLock<HashMap<(String, PartitionId), Offset>>,
 }
 
+/// Compute aggregate lag from offset and high-watermark caches.
+///
+/// Returns `(total_lag, max_lag)` where `total_lag` is the sum across all
+/// partitions (using `saturating_add`) and `max_lag` is the per-partition
+/// maximum. Only partitions present in both maps contribute.
+fn compute_aggregate_lag(
+    offsets: &HashMap<(String, PartitionId), Offset>,
+    high_watermarks: &HashMap<(String, PartitionId), Offset>,
+) -> (u64, u64) {
+    let mut total_lag: u64 = 0;
+    let mut max_lag: u64 = 0;
+    for (key, &watermark) in high_watermarks {
+        if let Some(&position) = offsets.get(key) {
+            let partition_lag = (watermark - position).max(0) as u64;
+            total_lag = total_lag.saturating_add(partition_lag);
+            max_lag = max_lag.max(partition_lag);
+        }
+    }
+    (total_lag, max_lag)
+}
+
 impl Consumer {
     /// Create a new consumer builder.
     pub fn builder() -> ConsumerBuilder {
@@ -505,18 +526,17 @@ impl Consumer {
     /// Call after any mutation of `self.offsets` or `self.high_watermarks` so
     /// the exported metrics always reflect the current consumer position.
     /// Acquires read locks in documented order: offsets → high_watermarks.
+    ///
+    /// This performs an O(partitions) full scan via [`compute_aggregate_lag`].
+    /// An incremental (delta-based) approach was considered but rejected:
+    /// the typical partition count per consumer (tens to low thousands) makes
+    /// the scan complete in microseconds, while incremental bookkeeping would
+    /// add complexity and drift risk for negligible gain. Callers on the hot
+    /// path (e.g. `poll()`) already guard calls behind a change-detection flag.
     async fn recompute_lag_metrics(&self) {
         let offsets = self.offsets.read().await;
         let hw = self.high_watermarks.read().await;
-        let mut total_lag: u64 = 0;
-        let mut max_lag: u64 = 0;
-        for (key, &watermark) in hw.iter() {
-            if let Some(&position) = offsets.get(key) {
-                let partition_lag = (watermark - position).max(0) as u64;
-                total_lag = total_lag.saturating_add(partition_lag);
-                max_lag = max_lag.max(partition_lag);
-            }
-        }
+        let (total_lag, max_lag) = compute_aggregate_lag(&offsets, &hw);
         self.metrics.lag.set(total_lag);
         self.metrics.lag_max.set(max_lag);
     }
@@ -915,6 +935,10 @@ impl Consumer {
             }
         }
 
+        // Drop the write lock before recomputing lag metrics to avoid
+        // deadlocking with the read lock that recompute_lag_metrics acquires.
+        drop(offsets);
+
         self.recompute_lag_metrics().await;
         Ok(())
     }
@@ -1001,6 +1025,7 @@ impl Consumer {
                 for ((topic, partition), offset) in &resolved {
                     offsets.insert((topic.clone(), *partition), *offset);
                 }
+                drop(offsets);
 
                 // Log any partitions that weren't resolved (broker skipped or errored)
                 for (topic, partition) in &need_reset {
@@ -2407,7 +2432,7 @@ impl Consumer {
     ///
     /// This uses cached high watermarks from the most recent fetch response —
     /// no additional network calls are made.
-    pub async fn current_lag(&self, topic: &str, partition: PartitionId) -> Option<i64> {
+    pub async fn current_lag(&self, topic: &str, partition: PartitionId) -> Option<u64> {
         let key = (topic.to_string(), partition);
         // Acquire offsets before high_watermarks to match the documented
         // lock ordering: assignments → offsets → high_watermarks.
@@ -2415,7 +2440,7 @@ impl Consumer {
         let position = offsets.get(&key).copied()?;
         let hw = self.high_watermarks.read().await;
         let watermark = hw.get(&key).copied()?;
-        Some((watermark - position).max(0))
+        Some((watermark - position).max(0) as u64)
     }
 
     /// Get per-partition lag for all assigned partitions.
@@ -2423,7 +2448,7 @@ impl Consumer {
     /// Returns a map of `(topic, partition) → lag` for every partition where
     /// both the high watermark and current position are known. Partitions that
     /// haven't been fetched yet are omitted.
-    pub async fn lag(&self) -> HashMap<(String, PartitionId), i64> {
+    pub async fn lag(&self) -> HashMap<(String, PartitionId), u64> {
         // Acquire offsets before high_watermarks to match the documented
         // lock ordering: assignments → offsets → high_watermarks.
         let offsets = self.offsets.read().await;
@@ -2431,7 +2456,7 @@ impl Consumer {
         let mut result = HashMap::with_capacity(hw.len());
         for (key, &watermark) in hw.iter() {
             if let Some(&position) = offsets.get(key) {
-                result.insert(key.clone(), (watermark - position).max(0));
+                result.insert(key.clone(), (watermark - position).max(0) as u64);
             }
         }
         result
@@ -4069,22 +4094,18 @@ mod tests {
         assert!(tracker.assigned_called.load(Ordering::SeqCst));
     }
 
-    /// Test the lag computation logic that runs inside poll().
-    ///
-    /// Since `Consumer` requires a live broker, we replicate the computation
-    /// performed in poll() against in-memory HashMaps using the same u64
-    /// arithmetic with saturating_add.
+    /// Test the lag computation logic via the extracted `compute_aggregate_lag`
+    /// helper — the same function used by `recompute_lag_metrics()` in
+    /// production.
     #[test]
     fn test_lag_computation_logic() {
         let mut offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
         let mut high_watermarks: HashMap<(String, PartitionId), Offset> = HashMap::new();
 
         // No data → lag is 0
-        let total_lag: u64 = high_watermarks
-            .iter()
-            .filter_map(|(k, &hw)| offsets.get(k).map(|&pos| (hw - pos).max(0) as u64))
-            .fold(0u64, |acc, v| acc.saturating_add(v));
+        let (total_lag, max_lag) = compute_aggregate_lag(&offsets, &high_watermarks);
         assert_eq!(total_lag, 0);
+        assert_eq!(max_lag, 0);
 
         // Populate two partitions
         offsets.insert(("t".into(), 0), 50);
@@ -4092,15 +4113,7 @@ mod tests {
         high_watermarks.insert(("t".into(), 0), 80);
         high_watermarks.insert(("t".into(), 1), 120);
 
-        let mut total_lag: u64 = 0;
-        let mut max_lag: u64 = 0;
-        for (k, &hw) in &high_watermarks {
-            if let Some(&pos) = offsets.get(k) {
-                let partition_lag = (hw - pos).max(0) as u64;
-                total_lag = total_lag.saturating_add(partition_lag);
-                max_lag = max_lag.max(partition_lag);
-            }
-        }
+        let (total_lag, max_lag) = compute_aggregate_lag(&offsets, &high_watermarks);
 
         assert_eq!(total_lag, 50); // (80-50) + (120-100)
         assert_eq!(max_lag, 30); // max(30, 20)
@@ -4115,11 +4128,8 @@ mod tests {
         offsets.insert(("t".into(), 0), 100);
         high_watermarks.insert(("t".into(), 0), 80);
 
-        let lag: u64 = high_watermarks
-            .iter()
-            .filter_map(|(k, &hw)| offsets.get(k).map(|&pos| (hw - pos).max(0) as u64))
-            .fold(0u64, |acc, v| acc.saturating_add(v));
-        assert_eq!(lag, 0);
+        let (total_lag, _) = compute_aggregate_lag(&offsets, &high_watermarks);
+        assert_eq!(total_lag, 0);
     }
 
     #[test]
@@ -4133,10 +4143,7 @@ mod tests {
         high_watermarks.insert(("t".into(), 0), 80);
         // Partition 1 has no high watermark
 
-        let total_lag: u64 = high_watermarks
-            .iter()
-            .filter_map(|(k, &hw)| offsets.get(k).map(|&pos| (hw - pos).max(0) as u64))
-            .fold(0u64, |acc, v| acc.saturating_add(v));
+        let (total_lag, _) = compute_aggregate_lag(&offsets, &high_watermarks);
         assert_eq!(total_lag, 30); // Only partition 0 contributes
     }
 
@@ -4163,15 +4170,7 @@ mod tests {
         assert!(high_watermarks.contains_key(&("t".into(), 1)));
 
         // Recompute lag from remaining caches (same logic as apply_partition_revocations)
-        let mut total_lag: u64 = 0;
-        let mut max_lag: u64 = 0;
-        for (key, &watermark) in &high_watermarks {
-            if let Some(&position) = offsets.get(key) {
-                let partition_lag = (watermark - position).max(0) as u64;
-                total_lag = total_lag.saturating_add(partition_lag);
-                max_lag = max_lag.max(partition_lag);
-            }
-        }
+        let (total_lag, max_lag) = compute_aggregate_lag(&offsets, &high_watermarks);
 
         // Only partition 1 remains: lag = 200 - 100 = 100
         assert_eq!(total_lag, 100);
@@ -4191,10 +4190,7 @@ mod tests {
         offsets.clear();
         high_watermarks.clear();
 
-        let total_lag: u64 = high_watermarks
-            .iter()
-            .filter_map(|(k, &hw)| offsets.get(k).map(|&pos| (hw - pos).max(0) as u64))
-            .fold(0u64, |acc, v| acc.saturating_add(v));
+        let (total_lag, _) = compute_aggregate_lag(&offsets, &high_watermarks);
         assert_eq!(total_lag, 0);
     }
 }
