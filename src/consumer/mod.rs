@@ -116,7 +116,7 @@ pub struct Consumer {
     /// Used to compute consumer lag without additional network calls.
     high_watermarks: RwLock<HashMap<(String, PartitionId), Offset>>,
     /// Per-partition log start offset from the latest fetch response.
-    /// Caches the earliest available offset so `beginning_offsets()` can
+    /// Caches the earliest available offset so `cached_beginning_offset()` can
     /// return immediately without a network round-trip.
     log_start_offsets: RwLock<HashMap<(String, PartitionId), Offset>>,
 }
@@ -418,6 +418,23 @@ impl Consumer {
                 lso.remove(&(topic.clone(), *partition));
             }
         }
+        // Recompute lag metrics from remaining caches so revoked
+        // partitions no longer contribute to exported values.
+        {
+            let offsets = self.offsets.read().await;
+            let hw = self.high_watermarks.read().await;
+            let mut total_lag: u64 = 0;
+            let mut max_lag: u64 = 0;
+            for (key, &watermark) in hw.iter() {
+                if let Some(&position) = offsets.get(key) {
+                    let partition_lag = (watermark - position).max(0) as u64;
+                    total_lag = total_lag.saturating_add(partition_lag);
+                    max_lag = max_lag.max(partition_lag);
+                }
+            }
+            self.metrics.lag.set(total_lag);
+            self.metrics.lag_max.set(max_lag);
+        }
     }
 
     /// Finalize a cooperative rebalance: compute newly-assigned diff, update
@@ -482,7 +499,8 @@ impl Consumer {
 
     /// Clear all per-partition state after an eager revocation or unsubscribe/close.
     ///
-    /// Resets fetch sessions, offsets, retry backoff, buffered records, and paused set.
+    /// Resets fetch sessions, offsets, retry backoff, buffered records, paused set,
+    /// high watermark and log start offset caches, and lag metrics.
     async fn clear_partition_state(&self) {
         self.fetch_sessions.lock().await.reset_all();
         self.offsets.write().await.clear();
@@ -492,6 +510,8 @@ impl Consumer {
         self.high_watermarks.write().await.clear();
         self.log_start_offsets.write().await.clear();
         self.metrics.paused_partitions.set(0);
+        self.metrics.lag.set(0);
+        self.metrics.lag_max.set(0);
     }
 
     /// Send an inline heartbeat, invoke the revocation callback, apply
@@ -1535,8 +1555,9 @@ impl Consumer {
             }
             // Write lock released — compute lag with only read locks so
             // concurrent current_lag()/cached_end_offset() callers aren't blocked.
-            let hw = self.high_watermarks.read().await;
+            // Acquire offsets before high_watermarks to match lock ordering.
             let offsets = self.offsets.read().await;
+            let hw = self.high_watermarks.read().await;
             let mut total_lag: u64 = 0;
             let mut max_lag: u64 = 0;
             for (key, &watermark) in hw.iter() {
@@ -1793,8 +1814,8 @@ impl Consumer {
                 }
 
                 // Cache log_start_offset (earliest available offset) when
-                // present. Returned in Fetch v5+; allows `beginning_offsets()`
-                // to return cached values without a network round-trip.
+                // present. Returned in Fetch v5+; allows `cached_beginning_offset`
+                // to serve beginning offsets from cache without a network round-trip.
                 if partition_response.log_start_offset >= 0 {
                     lso_updates.push((
                         (topic_name.clone(), partition),
@@ -2378,10 +2399,12 @@ impl Consumer {
     /// no additional network calls are made.
     pub async fn current_lag(&self, topic: &str, partition: PartitionId) -> Option<i64> {
         let key = (topic.to_string(), partition);
-        let hw = self.high_watermarks.read().await;
-        let watermark = hw.get(&key).copied()?;
+        // Acquire offsets before high_watermarks to match the documented
+        // lock ordering: assignments → offsets → high_watermarks.
         let offsets = self.offsets.read().await;
         let position = offsets.get(&key).copied()?;
+        let hw = self.high_watermarks.read().await;
+        let watermark = hw.get(&key).copied()?;
         Some((watermark - position).max(0))
     }
 
@@ -2391,8 +2414,10 @@ impl Consumer {
     /// both the high watermark and current position are known. Partitions that
     /// haven't been fetched yet are omitted.
     pub async fn lag(&self) -> HashMap<(String, PartitionId), i64> {
-        let hw = self.high_watermarks.read().await;
+        // Acquire offsets before high_watermarks to match the documented
+        // lock ordering: assignments → offsets → high_watermarks.
         let offsets = self.offsets.read().await;
+        let hw = self.high_watermarks.read().await;
         let mut result = HashMap::with_capacity(hw.len());
         for (key, &watermark) in hw.iter() {
             if let Some(&position) = offsets.get(key) {
@@ -4107,18 +4132,59 @@ mod tests {
 
     #[test]
     fn test_lag_after_revocation() {
-        // Simulate clearing revoked partitions from high_watermarks
+        // Simulate clearing revoked partitions and recomputing lag metrics
+        let mut offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
         let mut high_watermarks: HashMap<(String, PartitionId), Offset> = HashMap::new();
-        high_watermarks.insert(("t".into(), 0), 100);
-        high_watermarks.insert(("t".into(), 1), 200);
+
+        offsets.insert(("t".into(), 0), 50);
+        offsets.insert(("t".into(), 1), 100);
+        high_watermarks.insert(("t".into(), 0), 100); // lag = 50
+        high_watermarks.insert(("t".into(), 1), 200); // lag = 100
 
         // Revoke partition 0
         let revoked = vec![TopicPartition::new("t", 0)];
         for tp in &revoked {
-            high_watermarks.remove(&(tp.topic.clone(), tp.partition));
+            let key = (tp.topic.clone(), tp.partition);
+            offsets.remove(&key);
+            high_watermarks.remove(&key);
         }
 
         assert!(!high_watermarks.contains_key(&("t".into(), 0)));
         assert!(high_watermarks.contains_key(&("t".into(), 1)));
+
+        // Recompute lag from remaining caches (same logic as apply_partition_revocations)
+        let mut total_lag: u64 = 0;
+        let mut max_lag: u64 = 0;
+        for (key, &watermark) in &high_watermarks {
+            if let Some(&position) = offsets.get(key) {
+                let partition_lag = (watermark - position).max(0) as u64;
+                total_lag = total_lag.saturating_add(partition_lag);
+                max_lag = max_lag.max(partition_lag);
+            }
+        }
+
+        // Only partition 1 remains: lag = 200 - 100 = 100
+        assert_eq!(total_lag, 100);
+        assert_eq!(max_lag, 100);
+    }
+
+    #[test]
+    fn test_lag_clear_resets_to_zero() {
+        // After clear_partition_state, all caches are empty → lag must be 0
+        let mut offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let mut high_watermarks: HashMap<(String, PartitionId), Offset> = HashMap::new();
+
+        offsets.insert(("t".into(), 0), 50);
+        high_watermarks.insert(("t".into(), 0), 100);
+
+        // Simulate clear_partition_state
+        offsets.clear();
+        high_watermarks.clear();
+
+        let total_lag: u64 = high_watermarks
+            .iter()
+            .filter_map(|(k, &hw)| offsets.get(k).map(|&pos| (hw - pos).max(0) as u64))
+            .fold(0u64, |acc, v| acc.saturating_add(v));
+        assert_eq!(total_lag, 0);
     }
 }

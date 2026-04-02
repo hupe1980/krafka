@@ -433,7 +433,7 @@ impl MetricsExport for ConsumerMetrics {
             &mut output,
             prefix,
             "lag",
-            "Total consumer lag across all partitions",
+            "Total consumer lag across all assigned partitions",
             self.lag.get(),
         );
         write_prometheus_gauge(
@@ -773,7 +773,6 @@ impl ProducerMetrics {
 
 /// Snapshot of producer metrics.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct ProducerMetricsSnapshot {
     /// Number of records sent successfully.
     pub records_sent: u64,
@@ -982,7 +981,6 @@ impl ConnectionMetrics {
 
 /// Snapshot of connection metrics.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct ConnectionMetricsSnapshot {
     /// Total connections created.
     pub connections_created: u64,
@@ -1275,7 +1273,7 @@ mod tests {
 
         let output = metrics.to_prometheus_text("c");
 
-        assert!(output.contains("# HELP c_lag Total consumer lag across all partitions"));
+        assert!(output.contains("# HELP c_lag Total consumer lag across all assigned partitions"));
         assert!(output.contains("# TYPE c_lag gauge"));
         assert!(output.contains("c_lag 100"));
 
