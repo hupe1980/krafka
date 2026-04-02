@@ -1593,17 +1593,15 @@ impl GroupCoordinator {
                                             }
                                             status if status.requires_rejoin() => {
                                                 warn!("Heartbeat status {:?} requires rejoin for group '{}'", status, group_id);
-                                                // For session-invalidating errors (UnknownMember,
-                                                // IllegalGeneration, SessionTimeout), signal that
-                                                // member identity must be cleared. The actual
-                                                // cleanup (sticky_assignor + member_id + generation_id)
-                                                // happens in needs_rejoin() which has full access
-                                                // to the coordinator.
-                                                if status != HeartbeatStatus::RebalanceNeeded {
-                                                    heartbeat_controller.signal_member_invalidated();
-                                                } else {
-                                                    heartbeat_controller.signal_rebalance();
-                                                }
+                                                // This arm only fires for session-invalidating
+                                                // errors (UnknownMember, IllegalGeneration,
+                                                // SessionTimeout) — RebalanceNeeded is handled
+                                                // above. Signal that member identity must be
+                                                // cleared. The actual cleanup (sticky_assignor +
+                                                // member_id + generation_id) happens in
+                                                // needs_rejoin() which has full access to the
+                                                // coordinator.
+                                                heartbeat_controller.signal_member_invalidated();
                                                 heartbeat_controller.stop();
                                                 break;
                                             }

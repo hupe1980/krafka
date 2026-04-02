@@ -289,8 +289,8 @@ rebalances when consumers join or leave the group.
   JoinGroup metadata so the leader can compute minimal revocations.
 - **Proper revocation semantics**: `on_partitions_revoked` is called only for the
   diff (partitions being moved) during normal rebalances (including topic deletion),
-  while `on_partitions_lost` is reserved for unclean loss scenarios (e.g., session
-  timeout or fencing) where ownership may already have been transferred.
+  while `on_partitions_lost` is used when ownership may already have been transferred
+  (e.g., session timeout, fencing, or graceful shutdown via `close()`).
 
 ```rust
 use krafka::consumer::{ConsumerBuilder, PartitionAssignmentStrategy};
@@ -302,8 +302,8 @@ let consumer = ConsumerBuilder::default()
     .build()
     .await?;
 
-// During rebalance, only affected partitions are paused.
-// Unaffected partitions continue being consumed.
+// During a rebalance, only affected partitions are revoked/released from this consumer.
+// Unaffected partitions keep their assignment and continue being consumed.
 ```
 
 **How it works:**
