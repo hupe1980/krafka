@@ -689,10 +689,16 @@ impl KrafkaMetrics {
         self.consumer.fetch_latency.reset();
         self.consumer.lag.set(0);
         self.consumer.lag_max.set(0);
+        self.consumer.assigned_partitions.set(0);
+        self.consumer.paused_partitions.set(0);
+
+        self.producer.connections.set(0);
+        self.producer.buffered_records.set(0);
 
         self.connection.connections_created.reset();
         self.connection.connections_closed.reset();
         self.connection.connection_errors.reset();
+        self.connection.active_connections.set(0);
         self.connection.connect_latency.reset();
     }
 }
@@ -767,6 +773,7 @@ impl ProducerMetrics {
 
 /// Snapshot of producer metrics.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ProducerMetricsSnapshot {
     /// Number of records sent successfully.
     pub records_sent: u64,
@@ -809,7 +816,7 @@ pub struct ConsumerMetrics {
     pub poll_latency: LatencyTracker,
     /// Fetch latency.
     pub fetch_latency: LatencyTracker,
-    /// Current lag (records behind).
+    /// Total consumer lag across all assigned partitions (records behind).
     pub lag: Gauge,
     /// Maximum per-partition lag across all assigned partitions.
     pub lag_max: Gauge,
@@ -888,6 +895,7 @@ impl ConsumerMetrics {
 
 /// Snapshot of consumer metrics.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ConsumerMetricsSnapshot {
     /// Number of records received.
     pub records_received: u64,
@@ -909,7 +917,7 @@ pub struct ConsumerMetricsSnapshot {
     pub poll_latency: LatencySnapshot,
     /// Fetch latency statistics.
     pub fetch_latency: LatencySnapshot,
-    /// Current lag.
+    /// Total consumer lag across all assigned partitions.
     pub lag: u64,
     /// Maximum per-partition lag.
     pub lag_max: u64,
@@ -974,6 +982,7 @@ impl ConnectionMetrics {
 
 /// Snapshot of connection metrics.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ConnectionMetricsSnapshot {
     /// Total connections created.
     pub connections_created: u64,

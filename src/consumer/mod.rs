@@ -1527,14 +1527,15 @@ impl Consumer {
 
         // Update high watermarks and compute aggregate lag
         if !all_hw_updates.is_empty() {
-            let mut hw = self.high_watermarks.write().await;
-            for (key, watermark) in all_hw_updates {
-                hw.insert(key, watermark);
+            {
+                let mut hw = self.high_watermarks.write().await;
+                for (key, watermark) in all_hw_updates {
+                    hw.insert(key, watermark);
+                }
             }
-
-            // Compute total and max lag across all assigned partitions:
-            // lag = sum(high_watermark - current_position) for each partition
-            // lag_max = max(high_watermark - current_position) across all partitions
+            // Write lock released — compute lag with only read locks so
+            // concurrent current_lag()/cached_end_offset() callers aren't blocked.
+            let hw = self.high_watermarks.read().await;
             let offsets = self.offsets.read().await;
             let mut total_lag: u64 = 0;
             let mut max_lag: u64 = 0;
@@ -1908,11 +1909,13 @@ impl Consumer {
             return;
         };
 
+        let key = (topic.to_string(), partition);
+
         let resolved = if let Some(ref gc) = self.group_coordinator {
             let mut part_map = HashMap::new();
-            part_map.insert(topic.to_string(), vec![partition]);
+            part_map.insert(key.0.clone(), vec![partition]);
             match gc.list_offsets(&part_map, target).await {
-                Ok(offsets) => offsets.get(&(topic.to_string(), partition)).copied(),
+                Ok(offsets) => offsets.get(&key).copied(),
                 Err(e) => {
                     warn!(
                         "Coordinator list_offsets failed for {}-{}: {}, falling back to direct",
@@ -1935,10 +1938,7 @@ impl Consumer {
         };
 
         if let Some(new_offset) = offset {
-            self.offsets
-                .write()
-                .await
-                .insert((topic.to_string(), partition), new_offset);
+            self.offsets.write().await.insert(key, new_offset);
         }
     }
 
@@ -4036,18 +4036,19 @@ mod tests {
 
     /// Test the lag computation logic that runs inside poll().
     ///
-    /// Since `Consumer` requires a live broker, we replicate the exact
-    /// computation performed in poll() against in-memory HashMaps.
+    /// Since `Consumer` requires a live broker, we replicate the computation
+    /// performed in poll() against in-memory HashMaps using the same u64
+    /// arithmetic with saturating_add.
     #[test]
     fn test_lag_computation_logic() {
         let mut offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
         let mut high_watermarks: HashMap<(String, PartitionId), Offset> = HashMap::new();
 
         // No data → lag is 0
-        let total_lag: i64 = high_watermarks
+        let total_lag: u64 = high_watermarks
             .iter()
-            .filter_map(|(k, &hw)| offsets.get(k).map(|&pos| (hw - pos).max(0)))
-            .sum();
+            .filter_map(|(k, &hw)| offsets.get(k).map(|&pos| (hw - pos).max(0) as u64))
+            .fold(0u64, |acc, v| acc.saturating_add(v));
         assert_eq!(total_lag, 0);
 
         // Populate two partitions
@@ -4056,15 +4057,15 @@ mod tests {
         high_watermarks.insert(("t".into(), 0), 80);
         high_watermarks.insert(("t".into(), 1), 120);
 
-        let total_lag: i64 = high_watermarks
-            .iter()
-            .filter_map(|(k, &hw)| offsets.get(k).map(|&pos| (hw - pos).max(0)))
-            .sum();
-        let max_lag: i64 = high_watermarks
-            .iter()
-            .filter_map(|(k, &hw)| offsets.get(k).map(|&pos| (hw - pos).max(0)))
-            .max()
-            .unwrap_or(0);
+        let mut total_lag: u64 = 0;
+        let mut max_lag: u64 = 0;
+        for (k, &hw) in &high_watermarks {
+            if let Some(&pos) = offsets.get(k) {
+                let partition_lag = (hw - pos).max(0) as u64;
+                total_lag = total_lag.saturating_add(partition_lag);
+                max_lag = max_lag.max(partition_lag);
+            }
+        }
 
         assert_eq!(total_lag, 50); // (80-50) + (120-100)
         assert_eq!(max_lag, 30); // max(30, 20)
@@ -4079,10 +4080,10 @@ mod tests {
         offsets.insert(("t".into(), 0), 100);
         high_watermarks.insert(("t".into(), 0), 80);
 
-        let lag: i64 = high_watermarks
+        let lag: u64 = high_watermarks
             .iter()
-            .filter_map(|(k, &hw)| offsets.get(k).map(|&pos| (hw - pos).max(0)))
-            .sum();
+            .filter_map(|(k, &hw)| offsets.get(k).map(|&pos| (hw - pos).max(0) as u64))
+            .fold(0u64, |acc, v| acc.saturating_add(v));
         assert_eq!(lag, 0);
     }
 
@@ -4097,10 +4098,10 @@ mod tests {
         high_watermarks.insert(("t".into(), 0), 80);
         // Partition 1 has no high watermark
 
-        let total_lag: i64 = high_watermarks
+        let total_lag: u64 = high_watermarks
             .iter()
-            .filter_map(|(k, &hw)| offsets.get(k).map(|&pos| (hw - pos).max(0)))
-            .sum();
+            .filter_map(|(k, &hw)| offsets.get(k).map(|&pos| (hw - pos).max(0) as u64))
+            .fold(0u64, |acc, v| acc.saturating_add(v));
         assert_eq!(total_lag, 30); // Only partition 0 contributes
     }
 

@@ -879,7 +879,7 @@ This means:
 
 ## Offset Lag Tracking
 
-Krafka tracks consumer lag automatically by caching the high watermark and log start offset returned in every fetch response. No additional network calls are needed.
+Krafka tracks consumer lag automatically by caching the high watermark returned in every fetch response. When the broker supports Fetch v5+, the log start offset is also cached. No additional network calls are needed.
 
 ```rust
 // Per-partition lag (returns None if no fetch has completed for this partition)
