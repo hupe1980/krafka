@@ -1813,8 +1813,8 @@ impl Consumer {
             });
         }
 
-        // Negotiate fetch API version — prefer v11 (KIP-392 follower fetch),
-        // fall back through v7 (sessions) to v4.
+        // Negotiate fetch API version — prefer v11 (KIP-392 closest-replica
+        // fetching), fall back through v7 (sessions) to v4.
         // We implement encode/decode for v4, v7-v10, and v11.
         // v5/v6 are unsupported (different request wire format).
         // Prefer the highest version we implement:
@@ -1987,20 +1987,22 @@ impl Consumer {
                     // next poll falls back to the partition leader.  We also
                     // clear when leader metadata is unavailable (None) to
                     // avoid getting stuck routing to a failing replica until
-                    // expiry.
-                    if fetch_version >= 11 {
-                        let is_leader = self
-                            .metadata
-                            .leader(topic_name, partition)
-                            .await
-                            .is_some_and(|leader_id| leader_id == broker_id);
-                        if !is_leader {
-                            debug!(
-                                "Error from non-leader broker {} for {}-{}: {:?}, clearing preferred replica",
-                                broker_id, topic_name, partition, partition_response.error_code
-                            );
-                            pref_updates.push((key.clone(), None));
-                        }
+                    // expiry.  This is not gated on fetch_version >= 11
+                    // because a stale preferred mapping from an earlier v11
+                    // response can still route fetches to this broker even
+                    // when the negotiated version is lower (e.g. rolling
+                    // upgrade).
+                    let is_leader = self
+                        .metadata
+                        .leader(topic_name, partition)
+                        .await
+                        .is_some_and(|leader_id| leader_id == broker_id);
+                    if !is_leader {
+                        debug!(
+                            "Error from non-leader broker {} for {}-{}: {:?}, clearing preferred replica",
+                            broker_id, topic_name, partition, partition_response.error_code
+                        );
+                        pref_updates.push((key.clone(), None));
                     }
                     // Handle leader epoch errors by validating via OffsetForLeaderEpoch
                     if partition_response.error_code == crate::error::ErrorCode::FencedLeaderEpoch
