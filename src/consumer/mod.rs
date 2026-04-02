@@ -68,7 +68,7 @@ use crate::network::{ConnectionConfig, ConnectionPool};
 use crate::protocol::{
     ApiKey, FetchPartitionRequest, FetchRequest, FetchResponse, FetchTopicRequest,
     ListOffsetsRequest, ListOffsetsRequestPartition, ListOffsetsRequestTopic, ListOffsetsResponse,
-    RecordBatch,
+    RecordBatch, VersionedDecode, VersionedEncode,
 };
 use crate::{Offset, PartitionId};
 
@@ -119,6 +119,12 @@ pub struct Consumer {
     /// Caches the earliest available offset so `cached_beginning_offset()` can
     /// return immediately without a network round-trip.
     log_start_offsets: RwLock<HashMap<(String, PartitionId), Offset>>,
+    /// Preferred read replica per partition with expiry (KIP-392).
+    ///
+    /// When a broker returns a preferred_read_replica in a fetch response,
+    /// subsequent fetches for that partition are routed to the indicated
+    /// replica until the entry expires (after `metadata_max_age`).
+    preferred_replicas: RwLock<HashMap<(String, PartitionId), (crate::BrokerId, Instant)>>,
 }
 
 /// Compute aggregate lag from offset and high-watermark caches.
@@ -140,6 +146,75 @@ fn compute_aggregate_lag(
         }
     }
     (total_lag, max_lag)
+}
+
+/// Result of routing assigned partitions to brokers for fetching.
+struct FetchRoutingPlan {
+    /// Partitions grouped by target broker ID.
+    partitions_by_broker: HashMap<crate::BrokerId, Vec<(String, PartitionId)>>,
+    /// Preferred replica entries that have expired and should be removed.
+    expired_preferred: Vec<(String, PartitionId)>,
+    /// Partitions that have neither a known leader nor a valid preferred
+    /// replica and will not be fetched this round.
+    skipped: Vec<(String, PartitionId)>,
+}
+
+/// Build a per-broker fetch plan from pre-filtered partition keys,
+/// preferred replicas, and leader information.
+///
+/// `non_paused_keys` should contain only assigned, non-paused partitions
+/// (the caller is responsible for filtering). For each key the function
+/// checks whether a preferred replica exists and is not expired. If so,
+/// the partition is routed to that replica, regardless of whether a leader
+/// is known. If there is no valid preferred replica, the function falls
+/// back to the leader if one is known; otherwise the partition is skipped.
+///
+/// This is a pure function extracted from `Consumer::poll()` so that the
+/// routing logic can be unit-tested without a live broker.
+fn build_fetch_routing_plan(
+    non_paused_keys: Vec<(String, PartitionId)>,
+    preferred_replicas: &HashMap<(String, PartitionId), (crate::BrokerId, Instant)>,
+    leaders: &HashMap<(String, PartitionId), crate::BrokerId>,
+    now: Instant,
+) -> FetchRoutingPlan {
+    let mut partitions_by_broker: HashMap<crate::BrokerId, Vec<(String, PartitionId)>> =
+        HashMap::new();
+    let mut expired_preferred: Vec<(String, PartitionId)> = Vec::new();
+    let mut skipped: Vec<(String, PartitionId)> = Vec::new();
+
+    for key in non_paused_keys {
+        // Check for a valid (non-expired) preferred replica
+        let target_broker = if let Some(&(replica_id, expiry)) = preferred_replicas.get(&key) {
+            if now < expiry {
+                Some(replica_id)
+            } else {
+                expired_preferred.push(key.clone());
+                None
+            }
+        } else {
+            None
+        };
+
+        let broker_id = match target_broker {
+            Some(id) => id,
+            None => {
+                if let Some(&leader_id) = leaders.get(&key) {
+                    leader_id
+                } else {
+                    skipped.push(key);
+                    continue;
+                }
+            }
+        };
+
+        partitions_by_broker.entry(broker_id).or_default().push(key);
+    }
+
+    FetchRoutingPlan {
+        partitions_by_broker,
+        expired_preferred,
+        skipped,
+    }
 }
 
 impl Consumer {
@@ -233,6 +308,7 @@ impl Consumer {
             offset_retry_backoff: RwLock::new(HashMap::new()),
             high_watermarks: RwLock::new(HashMap::new()),
             log_start_offsets: RwLock::new(HashMap::new()),
+            preferred_replicas: RwLock::new(HashMap::new()),
         })
     }
 
@@ -444,6 +520,13 @@ impl Consumer {
                 lso.remove(key);
             }
         }
+        // Clear preferred replica mappings for revoked partitions
+        {
+            let mut pref = self.preferred_replicas.write().await;
+            for key in &revoked_keys {
+                pref.remove(key);
+            }
+        }
         // Recompute lag metrics from remaining caches so revoked
         // partitions no longer contribute to exported values.
         self.recompute_lag_metrics().await;
@@ -512,7 +595,8 @@ impl Consumer {
     /// Clear all per-partition state after an eager revocation or unsubscribe/close.
     ///
     /// Resets fetch sessions, offsets, retry backoff, buffered records, paused set,
-    /// high watermark and log start offset caches, and lag metrics.
+    /// high watermark and log start offset caches, preferred replica mappings, and
+    /// lag metrics.
     async fn clear_partition_state(&self) {
         self.fetch_sessions.lock().await.reset_all();
         self.offsets.write().await.clear();
@@ -521,6 +605,7 @@ impl Consumer {
         self.paused.write().await.clear();
         self.high_watermarks.write().await.clear();
         self.log_start_offsets.write().await.clear();
+        self.preferred_replicas.write().await.clear();
         self.metrics.paused_partitions.set(0);
         self.metrics.lag.set(0);
         self.metrics.lag_max.set(0);
@@ -1502,34 +1587,49 @@ impl Consumer {
 
         let paused = self.paused.read().await;
 
-        // Group partitions by leader broker for batch fetching
-        // This reduces O(n) round trips to O(k) where k = number of unique leaders
-        let mut partitions_by_leader: HashMap<crate::BrokerId, Vec<(String, PartitionId)>> =
-            HashMap::new();
-
+        // Collect non-paused partition keys (one topic clone per partition)
+        // and resolve leaders so the pure routing helper doesn't need async
+        // metadata access.
+        let mut non_paused_keys: Vec<(String, PartitionId)> = Vec::new();
+        let mut leaders: HashMap<(String, PartitionId), crate::BrokerId> = HashMap::new();
         for (topic, partitions) in assignments.iter() {
             for &partition in partitions {
-                // Skip paused partitions
-                if paused.contains(&(topic.clone(), partition)) {
+                let key = (topic.clone(), partition);
+                if paused.contains(&key) {
                     continue;
                 }
-
-                // Get leader for this partition
                 if let Some(leader_id) = self.metadata.leader(topic, partition).await {
-                    partitions_by_leader
-                        .entry(leader_id)
-                        .or_default()
-                        .push((topic.clone(), partition));
-                } else {
-                    warn!(
-                        "No leader found for {}-{}, skipping in batch fetch",
-                        topic, partition
-                    );
+                    leaders.insert(key.clone(), leader_id);
                 }
+                non_paused_keys.push(key);
             }
         }
 
-        // Release locks before network I/O
+        let now = Instant::now();
+        let preferred = self.preferred_replicas.read().await;
+
+        let plan = build_fetch_routing_plan(non_paused_keys, &preferred, &leaders, now);
+
+        // Release read lock before potentially acquiring write lock
+        drop(preferred);
+
+        // Warn only for partitions that are truly skipped (no leader AND no
+        // valid preferred replica). This avoids log spam during transient
+        // metadata gaps when a preferred replica is still available.
+        for (topic, partition) in &plan.skipped {
+            warn!(
+                "No leader or preferred replica for {topic}-{partition}, skipping in batch fetch"
+            );
+        }
+
+        // Remove expired preferred replica entries so they don't accumulate
+        if !plan.expired_preferred.is_empty() {
+            let mut pref = self.preferred_replicas.write().await;
+            for key in &plan.expired_preferred {
+                pref.remove(key);
+            }
+        }
+
         drop(paused);
         drop(assignments);
 
@@ -1538,7 +1638,7 @@ impl Consumer {
         let mut all_hw_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
 
         // Fetch from each broker (one request per broker, containing all its partitions)
-        for (broker_id, topic_partitions) in partitions_by_leader {
+        for (broker_id, topic_partitions) in plan.partitions_by_broker {
             match self
                 .batch_fetch_from_broker(broker_id, &topic_partitions, timeout)
                 .await
@@ -1551,6 +1651,15 @@ impl Consumer {
                 Err(e) => {
                     self.metrics.record_error();
                     warn!("Batch fetch from broker {} failed: {}", broker_id, e);
+                    // Clear preferred replica mappings for all partitions that
+                    // were being fetched from this broker.  If the broker was
+                    // actually the leader the entries won't exist (no-op), but
+                    // if it was a preferred replica this avoids routing to a
+                    // dead broker for up to metadata_max_age.
+                    let mut pref = self.preferred_replicas.write().await;
+                    for tp in &topic_partitions {
+                        pref.remove(tp);
+                    }
                 }
             }
         }
@@ -1704,15 +1813,28 @@ impl Consumer {
             });
         }
 
-        // Negotiate fetch API version — prefer v7 (sessions), fall back to v4.
-        // We only implement encode/decode for v4 and v7, so we must not send v5/v6
-        // (which add log_start_offset to the request partition) with our v4 encoder.
+        // Negotiate fetch API version — prefer v11 (KIP-392 closest-replica
+        // fetching), fall back through v7 (sessions) to v4.
+        // We implement encode/decode for v4, v7-v10, and v11.
+        // v5/v6 are unsupported (different request wire format).
+        // Prefer the highest version we implement:
+        //   v11 — rack_id for closest-replica routing (KIP-392)
+        //   v9/v10 — current_leader_epoch for leader fencing (KIP-320;
+        //            v10 shares the same request wire format as v9)
+        // When client_rack is not set, cap at v10 (highest version without
+        // rack_id) so we still get epoch fencing without sending an
+        // unnecessary rack_id.
+        let preferred_version = if self.config.client_rack.is_some() {
+            11
+        } else {
+            10
+        };
         let fetch_version = conn
-            .negotiate_api_version(ApiKey::Fetch, 7, 7)
+            .negotiate_api_version(ApiKey::Fetch, preferred_version, 7)
             .await
             .unwrap_or_else(|| {
                 debug!(
-                    "Broker {} does not support Fetch v7, falling back to v4",
+                    "Broker {} does not support Fetch v7+, falling back to v4",
                     broker_id
                 );
                 4
@@ -1761,19 +1883,16 @@ impl Consumer {
             session_epoch,
             topics: request_topics,
             forgotten_topics,
+            rack_id: self.config.client_rack.clone().unwrap_or_default(),
         };
 
         // Send request with negotiated version.
-        // For v7 sessions, reset session on any send/decode failure so the
+        // For v7+ sessions, reset session on any send/decode failure so the
         // next poll re-establishes with a full fetch instead of hitting
         // InvalidFetchSessionEpoch.
         let response = match conn
             .send_request(ApiKey::Fetch, fetch_version, |buf| {
-                if fetch_version >= 7 {
-                    request.encode_v7(buf)
-                } else {
-                    request.encode_v4(buf)
-                }
+                request.encode_versioned(fetch_version, buf)
             })
             .await
         {
@@ -1789,11 +1908,7 @@ impl Consumer {
 
         // Decode response with matching version
         let mut buf = response;
-        let fetch_response = match if fetch_version >= 7 {
-            FetchResponse::decode_v7(&mut buf)
-        } else {
-            FetchResponse::decode_v4(&mut buf)
-        } {
+        let fetch_response = match FetchResponse::decode_versioned(fetch_version, &mut buf) {
             Ok(r) => r,
             Err(e) => {
                 if fetch_version >= 7 {
@@ -1830,33 +1945,65 @@ impl Consumer {
         let mut offset_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
         let mut hw_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
         let mut lso_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
+        // Preferred replica updates (KIP-392): Some(id) to set, None to clear.
+        // Collected during the loop, applied in a single write lock afterwards.
+        let mut pref_updates: Vec<((String, PartitionId), Option<crate::BrokerId>)> = Vec::new();
 
         for topic_response in fetch_response.responses {
             let topic_name = &topic_response.topic;
             for partition_response in topic_response.partitions {
                 let partition = partition_response.partition;
+                let key = (topic_name.clone(), partition);
 
                 // Capture high watermark regardless of error/empty response.
                 // The broker always returns a valid high_watermark even when
                 // there are no records to deliver.
                 if partition_response.high_watermark >= 0 {
-                    hw_updates.push((
-                        (topic_name.clone(), partition),
-                        partition_response.high_watermark,
-                    ));
+                    hw_updates.push((key.clone(), partition_response.high_watermark));
                 }
 
                 // Cache log_start_offset (earliest available offset) when
                 // present. Returned in Fetch v5+; allows `cached_beginning_offset`
                 // to serve beginning offsets from cache without a network round-trip.
                 if partition_response.log_start_offset >= 0 {
-                    lso_updates.push((
-                        (topic_name.clone(), partition),
-                        partition_response.log_start_offset,
-                    ));
+                    lso_updates.push((key.clone(), partition_response.log_start_offset));
+                }
+
+                // Track preferred read replica (KIP-392, v11+ only).
+                // For v7-v10, preferred_read_replica is our fabricated default
+                // (-1) and must not clear valid mappings from earlier v11 responses.
+                if fetch_version >= 11 {
+                    if partition_response.preferred_read_replica >= 0 {
+                        pref_updates
+                            .push((key.clone(), Some(partition_response.preferred_read_replica)));
+                    } else {
+                        pref_updates.push((key.clone(), None));
+                    }
                 }
 
                 if !partition_response.error_code.is_ok() {
+                    // When fetching from a preferred replica and the broker
+                    // returns an error, clear the preferred replica so the
+                    // next poll falls back to the partition leader.  We also
+                    // clear when leader metadata is unavailable (None) to
+                    // avoid getting stuck routing to a failing replica until
+                    // expiry.  This is not gated on fetch_version >= 11
+                    // because a stale preferred mapping from an earlier v11
+                    // response can still route fetches to this broker even
+                    // when the negotiated version is lower (e.g. rolling
+                    // upgrade).
+                    let is_leader = self
+                        .metadata
+                        .leader(topic_name, partition)
+                        .await
+                        .is_some_and(|leader_id| leader_id == broker_id);
+                    if !is_leader {
+                        debug!(
+                            "Error from non-leader broker {} for {}-{}: {:?}, clearing preferred replica",
+                            broker_id, topic_name, partition, partition_response.error_code
+                        );
+                        pref_updates.push((key.clone(), None));
+                    }
                     // Handle leader epoch errors by validating via OffsetForLeaderEpoch
                     if partition_response.error_code == crate::error::ErrorCode::FencedLeaderEpoch
                         || partition_response.error_code
@@ -1932,7 +2079,7 @@ impl Consumer {
 
                     // Track offset update for this partition
                     if let Some(last_offset) = last_offset_for_partition {
-                        offset_updates.push(((topic_name.clone(), partition), last_offset + 1));
+                        offset_updates.push((key, last_offset + 1));
                     }
                 }
             }
@@ -1950,6 +2097,22 @@ impl Consumer {
             let mut lso = self.log_start_offsets.write().await;
             for (key, offset) in lso_updates {
                 lso.insert(key, offset);
+            }
+        }
+
+        // Apply preferred replica updates in a single write lock (KIP-392).
+        // Last-write-wins: if a partition appears multiple times (e.g. set by
+        // the response then cleared by error handling), the final entry takes
+        // effect.
+        if !pref_updates.is_empty() {
+            let expiry = Instant::now() + self.config.metadata_max_age;
+            let mut pref = self.preferred_replicas.write().await;
+            for (key, value) in pref_updates {
+                if let Some(replica_id) = value {
+                    pref.insert(key, (replica_id, expiry));
+                } else {
+                    pref.remove(&key);
+                }
             }
         }
 
@@ -2743,6 +2906,27 @@ impl ConsumerBuilder {
     /// Set metadata max age before forcing a refresh.
     pub fn metadata_max_age(mut self, age: Duration) -> Self {
         self.config.metadata_max_age = age;
+        self
+    }
+
+    /// Set the client rack ID for closest-replica fetching (KIP-392).
+    ///
+    /// When configured, the consumer includes its rack in fetch requests.
+    /// The broker may return a preferred read replica in the same rack,
+    /// reducing cross-rack network traffic.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let consumer = Consumer::builder()
+    ///     .bootstrap_servers("localhost:9092")
+    ///     .group_id("my-group")
+    ///     .client_rack("us-east-1a")
+    ///     .build()
+    ///     .await?;
+    /// ```
+    pub fn client_rack(mut self, rack: impl Into<String>) -> Self {
+        self.config.client_rack = Some(rack.into());
         self
     }
 
@@ -4199,5 +4383,117 @@ mod tests {
 
         let (total_lag, _) = compute_aggregate_lag(&offsets, &high_watermarks);
         assert_eq!(total_lag, 0);
+    }
+
+    // --- Fetch routing plan tests (KIP-392) ---
+
+    #[test]
+    fn test_routing_plan_uses_leader_when_no_preferred() {
+        let keys = vec![("t".into(), 0), ("t".into(), 1)];
+
+        let leaders = HashMap::from([(("t".into(), 0), 1), (("t".into(), 1), 2)]);
+
+        let plan = build_fetch_routing_plan(keys, &HashMap::new(), &leaders, Instant::now());
+
+        assert!(plan.expired_preferred.is_empty());
+        assert_eq!(plan.partitions_by_broker[&1], vec![("t".into(), 0)]);
+        assert_eq!(plan.partitions_by_broker[&2], vec![("t".into(), 1)]);
+    }
+
+    #[test]
+    fn test_routing_plan_routes_to_preferred_replica() {
+        let keys = vec![("t".into(), 0)];
+
+        let leaders = HashMap::from([(("t".into(), 0), 1)]);
+        let preferred = HashMap::from([(
+            ("t".into(), 0),
+            (3_i32, Instant::now() + Duration::from_secs(60)),
+        )]);
+
+        let plan = build_fetch_routing_plan(keys, &preferred, &leaders, Instant::now());
+
+        assert!(plan.expired_preferred.is_empty());
+        // Should route to preferred replica (broker 3), not leader (broker 1)
+        assert_eq!(plan.partitions_by_broker.len(), 1);
+        assert_eq!(plan.partitions_by_broker[&3], vec![("t".into(), 0)]);
+    }
+
+    #[test]
+    fn test_routing_plan_falls_back_on_expired_preferred() {
+        let keys = vec![("t".into(), 0)];
+
+        let leaders = HashMap::from([(("t".into(), 0), 1)]);
+        // Preferred replica that expired 10 seconds ago
+        let preferred = HashMap::from([(
+            ("t".into(), 0),
+            (3_i32, Instant::now() - Duration::from_secs(10)),
+        )]);
+
+        let plan = build_fetch_routing_plan(keys, &preferred, &leaders, Instant::now());
+
+        // Should fall back to leader (broker 1)
+        assert_eq!(plan.partitions_by_broker[&1], vec![("t".into(), 0)]);
+        // Should report the expired entry for cleanup
+        assert_eq!(plan.expired_preferred, vec![("t".into(), 0)]);
+    }
+
+    #[test]
+    fn test_routing_plan_skips_partitions_without_leader() {
+        // Only partition 0 has a leader; partition 1 has neither leader nor
+        // preferred replica and should be skipped.
+        let keys = vec![("t".into(), 0), ("t".into(), 1)];
+
+        // Only partition 0 has a leader
+        let leaders = HashMap::from([(("t".into(), 0), 1)]);
+
+        let plan = build_fetch_routing_plan(keys, &HashMap::new(), &leaders, Instant::now());
+
+        let all: Vec<_> = plan.partitions_by_broker.values().flatten().collect();
+        assert_eq!(all.len(), 1);
+        assert_eq!(*all[0], ("t".into(), 0));
+        assert_eq!(plan.skipped, vec![("t".into(), 1)]);
+    }
+
+    #[test]
+    fn test_routing_plan_all_partitions_skipped() {
+        // No leaders and no preferred replicas → every partition is skipped,
+        // plan is empty.
+        let keys = vec![("t".into(), 0), ("t".into(), 1)];
+
+        let plan = build_fetch_routing_plan(keys, &HashMap::new(), &HashMap::new(), Instant::now());
+
+        assert!(plan.partitions_by_broker.is_empty());
+        assert!(plan.expired_preferred.is_empty());
+        assert_eq!(plan.skipped.len(), 2);
+    }
+
+    #[test]
+    fn test_routing_plan_mixed_preferred_and_leader() {
+        let keys = vec![("t".into(), 0), ("t".into(), 1), ("t".into(), 2)];
+
+        let leaders = HashMap::from([
+            (("t".into(), 0), 1),
+            (("t".into(), 1), 1),
+            (("t".into(), 2), 2),
+        ]);
+        let future = Instant::now() + Duration::from_secs(300);
+        let preferred = HashMap::from([
+            // p0 has a valid preferred replica
+            (("t".into(), 0), (3_i32, future)),
+            // p1 has an expired preferred replica
+            (
+                ("t".into(), 1),
+                (3_i32, Instant::now() - Duration::from_secs(1)),
+            ),
+            // p2 has no preferred replica
+        ]);
+
+        let plan = build_fetch_routing_plan(keys, &preferred, &leaders, Instant::now());
+
+        // p0 → broker 3 (preferred), p1 → broker 1 (leader, expired), p2 → broker 2 (leader)
+        assert!(plan.partitions_by_broker[&3].contains(&("t".into(), 0)));
+        assert!(plan.partitions_by_broker[&1].contains(&("t".into(), 1)));
+        assert!(plan.partitions_by_broker[&2].contains(&("t".into(), 2)));
+        assert_eq!(plan.expired_preferred, vec![("t".into(), 1)]);
     }
 }

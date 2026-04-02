@@ -36,17 +36,16 @@ This enables dynamic version negotiation for optimal compatibility and feature u
 ```rust
 use krafka::protocol::ApiKey;
 
-// After connection, negotiate the best Fetch version
-// Client supports v4-v12, broker might support v0-v13
-let version = conn.negotiate_api_version(ApiKey::Fetch, 12, 4).await;
-
-match version {
-    Some(v) => println!("Using Fetch v{}", v),
-    None => println!("No compatible version found!"),
-}
+// Prefer Fetch v7..=v11; fall back to v4 if the broker doesn't support v7+.
+let fetch_version = match conn.negotiate_api_version(ApiKey::Fetch, 11, 7).await {
+    Some(v) => v,
+    None => conn.negotiate_api_version(ApiKey::Fetch, 4, 4).await
+        .expect("broker does not support any usable Fetch version"),
+};
+println!("Using Fetch v{}", fetch_version);
 
 // Convenience method with min=0
-let version = conn.negotiate_api_version_max(ApiKey::Produce, 9).await;
+let version = conn.negotiate_api_version_max(ApiKey::Produce, 3).await;
 ```
 
 ### Client Supported Versions
@@ -56,21 +55,21 @@ Krafka supports the following API version ranges (clamped to match actual encode
 | API | Min | Max | Key Features |
 |-----|-----|-----|--------------|
 | Produce | 0 | 3 | v3 transactions, headers |
-| Fetch | 0 | 4, 7 | v4 isolation level, v7 fetch sessions (KIP-227); v5/v6 not supported |
+| Fetch | 0 | 11 | v0-4, v7-v11 (v5/v6 unsupported); v4 isolation level, v7 fetch sessions (KIP-227), v9 leader epoch fencing (KIP-320), v11 closest-replica fetching (KIP-392) |
 | ListOffsets | 0 | 2 | v2 isolation level |
 | Metadata | 0 | 1 | v1 controller info |
 | OffsetCommit | 0 | 2 | v2 retention |
 | OffsetFetch | 0 | 1 | v1 group coordinator |
 | FindCoordinator | 0 | 1 | Group/txn coordinator lookup |
 | JoinGroup | 0 | 5 | v5 group instance id |
-| Heartbeat | 0 | 0 | Standard heartbeat |
+| Heartbeat | 0 | 3 | v3 group instance id (KIP-345) |
 | SyncGroup | 0 | 3 | v3 group instance id |
-| LeaveGroup | 0 | 1 | v1 with response |
-| CreateTopics | 0 | 3 | Topic creation |
+| LeaveGroup | 0 | 3 | v3 batch leave (KIP-345) |
+| CreateTopics | 0 | 2 | Topic creation |
 | DeleteTopics | 0 | 1 | Topic deletion |
-| DescribeConfigs | 0 | 1 | Config reading |
-| AlterConfigs | 0 | 1 | Config updates |
-| InitProducerId | 0 | 1 | Idempotent/transactional |
+| DescribeConfigs | 0 | 0 | Config reading |
+| AlterConfigs | 0 | 0 | Config updates |
+| InitProducerId | 0 | 0 | Idempotent/transactional |
 
 ### Version Constants
 
@@ -80,7 +79,7 @@ Client-supported versions are defined in `krafka::protocol::versions`:
 use krafka::protocol::versions;
 
 // Maximum versions the client supports
-let max_fetch = versions::FETCH_MAX;        // 7 (only v0-4 and v7; use try-v7-else-v4 pattern)
+let max_fetch = versions::FETCH_MAX;        // 11 (v0-4 and v7-v11; v5/v6 unsupported)
 let max_produce = versions::PRODUCE_MAX;    // 3
 let max_metadata = versions::METADATA_MAX;  // 1
 ```
@@ -93,6 +92,24 @@ Krafka uses Kafka's v2 record batch format with:
 - CRC32C checksums (validated on decode)
 - Variable-length encoding for efficiency
 - Optional compression (gzip, snappy, lz4, zstd)
+
+### Header Versioning
+
+Every Kafka request/response is prefixed with a header whose format depends on
+whether the API version uses flexible encoding:
+
+| Header state | Request header | Response header |
+|-------------|----------------|-----------------|
+| Non-flexible | v1 — standard `KafkaString` for client_id | v0 — correlation_id only |
+| Flexible | v2 — compact string for client_id + tagged fields | v1 — correlation_id + tagged fields |
+
+The transition version varies per API (e.g., Fetch becomes flexible at v12,
+Produce at v9). `ApiKey::flexible_version()` returns the threshold for each API,
+and the header is selected automatically by `RequestHeader::encode()` /
+`ResponseHeader::decode()`.
+
+**Note:** `ApiVersions` response always uses header v0 regardless of the API
+version (needed for protocol bootstrapping).
 
 ### Unified Version Dispatch
 

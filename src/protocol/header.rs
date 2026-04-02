@@ -80,23 +80,17 @@ impl RequestHeader {
         Ok(())
     }
 
-    /// Determine the header version to use based on the API key and version.
+    /// Determine the request header version based on the API key and version.
+    ///
+    /// Each Kafka API transitions to flexible encoding (compact strings +
+    /// tagged fields) at a version defined by `ApiKey::flexible_version()`.
+    /// Below that threshold → header v1 (standard strings);
+    /// at or above → header v2 (flexible).
     pub fn header_version(api_key: ApiKey, api_version: i16) -> i16 {
-        // Most APIs use header v2 for flexible versions
-        // This is a simplified version - in practice, each API has specific rules
-        match api_key {
-            ApiKey::ApiVersions => {
-                // ApiVersions uses header v0 for v0-2, v2 for v3+
-                if api_version >= 3 { 2 } else { 1 }
-            }
-            // For most other APIs, use header v2 for newer versions
-            _ => {
-                if api_version >= 9 {
-                    2
-                } else {
-                    1
-                }
-            }
+        if api_version >= api_key.flexible_version() {
+            2
+        } else {
+            1
         }
     }
 
@@ -146,21 +140,21 @@ impl ResponseHeader {
         Ok(Self { correlation_id })
     }
 
-    /// Determine the header version to use based on the API key and version.
+    /// Determine the response header version based on the API key and version.
+    ///
+    /// Below `ApiKey::flexible_version()` → header v0 (correlation_id only);
+    /// at or above → header v1 (correlation_id + tagged fields).
+    ///
+    /// **Exception:** ApiVersions always uses response header v0 regardless
+    /// of the API version (needed for protocol bootstrapping).
     pub fn header_version(api_key: ApiKey, api_version: i16) -> i16 {
-        match api_key {
-            ApiKey::ApiVersions => {
-                // ApiVersions always uses response header v0
-                0
-            }
-            // For most other APIs, use header v1 for flexible versions
-            _ => {
-                if api_version >= 9 {
-                    1
-                } else {
-                    0
-                }
-            }
+        if api_key == ApiKey::ApiVersions {
+            return 0;
+        }
+        if api_version >= api_key.flexible_version() {
+            1
+        } else {
+            0
         }
     }
 
@@ -236,5 +230,96 @@ mod tests {
         // ApiVersions always uses response header v0
         assert_eq!(ResponseHeader::header_version(ApiKey::ApiVersions, 0), 0);
         assert_eq!(ResponseHeader::header_version(ApiKey::ApiVersions, 3), 0);
+    }
+
+    #[test]
+    fn test_header_version_fetch() {
+        // Fetch becomes flexible at v12. Versions 0-11 must use non-flexible headers.
+        for v in 0..12 {
+            assert_eq!(
+                RequestHeader::header_version(ApiKey::Fetch, v),
+                1,
+                "Fetch v{v} request header should be v1 (non-flexible)"
+            );
+            assert_eq!(
+                ResponseHeader::header_version(ApiKey::Fetch, v),
+                0,
+                "Fetch v{v} response header should be v0 (non-flexible)"
+            );
+        }
+        // v12+ uses flexible headers
+        assert_eq!(RequestHeader::header_version(ApiKey::Fetch, 12), 2);
+        assert_eq!(ResponseHeader::header_version(ApiKey::Fetch, 12), 1);
+    }
+
+    /// Verify header versions at the flexible boundary for every API we use.
+    #[test]
+    fn test_header_version_flexible_boundaries() {
+        // APIs krafka sends requests for; the flexible boundary is derived
+        // from `ApiKey::flexible_version()` to avoid duplicating that mapping.
+        let apis: &[ApiKey] = &[
+            ApiKey::Produce,
+            ApiKey::Fetch,
+            ApiKey::ListOffsets,
+            ApiKey::Metadata,
+            ApiKey::OffsetCommit,
+            ApiKey::OffsetFetch,
+            ApiKey::FindCoordinator,
+            ApiKey::JoinGroup,
+            ApiKey::Heartbeat,
+            ApiKey::LeaveGroup,
+            ApiKey::SyncGroup,
+            ApiKey::DescribeGroups,
+            ApiKey::ListGroups,
+            ApiKey::CreateTopics,
+            ApiKey::DeleteTopics,
+            ApiKey::DeleteRecords,
+            ApiKey::InitProducerId,
+            ApiKey::OffsetForLeaderEpoch,
+            ApiKey::AddPartitionsToTxn,
+            ApiKey::AddOffsetsToTxn,
+            ApiKey::EndTxn,
+            ApiKey::TxnOffsetCommit,
+            ApiKey::DescribeAcls,
+            ApiKey::CreateAcls,
+            ApiKey::DeleteAcls,
+            ApiKey::DescribeConfigs,
+            ApiKey::AlterConfigs,
+            ApiKey::CreatePartitions,
+            ApiKey::ApiVersions,
+        ];
+
+        for &api in apis {
+            let flex = api.flexible_version();
+
+            // One version below the boundary: non-flexible headers.
+            if flex > 0 {
+                let before = flex - 1;
+                assert_eq!(
+                    RequestHeader::header_version(api, before),
+                    1,
+                    "{api:?} v{before} request header should be v1"
+                );
+                assert_eq!(
+                    ResponseHeader::header_version(api, before),
+                    0,
+                    "{api:?} v{before} response header should be v0"
+                );
+            }
+
+            // At the boundary: flexible headers.
+            assert_eq!(
+                RequestHeader::header_version(api, flex),
+                2,
+                "{api:?} v{flex} request header should be v2"
+            );
+            // ApiVersions response is special-cased to always return v0.
+            let expected_resp = if api == ApiKey::ApiVersions { 0 } else { 1 };
+            assert_eq!(
+                ResponseHeader::header_version(api, flex),
+                expected_resp,
+                "{api:?} v{flex} response header mismatch"
+            );
+        }
     }
 }

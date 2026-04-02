@@ -19,6 +19,7 @@ The Krafka consumer is an async-native, feature-rich Kafka consumer with:
 - Manual offset control
 - Seek operations
 - Incremental fetch sessions (KIP-227)
+- Closest-replica fetching (KIP-392)
 - Static group membership (KIP-345)
 - Interceptor hooks
 - Log compaction awareness
@@ -730,6 +731,43 @@ Krafka implements [KIP-227](https://cwiki.apache.org/confluence/display/KAFKA/KI
 - All sessions are reset on consumer group rebalance
 
 Fetch sessions are enabled automatically when the broker supports Fetch API v7+. No configuration is needed.
+
+### Closest-Replica Fetching (KIP-392)
+
+Krafka implements [KIP-392](https://cwiki.apache.org/confluence/display/KAFKA/KIP-392%3A+Allow+consumers+to+fetch+from+closest+replica) to allow consumers to fetch from the closest replica rather than always from the partition leader. This is especially useful in multi-datacenter or multi-availability-zone deployments where cross-rack traffic is expensive.
+
+**Configuration:**
+
+Set `client_rack` to the rack or availability zone of the consumer:
+
+```rust
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .client_rack("us-east-1a")
+    .build()
+    .await?;
+```
+
+**How it works:**
+
+1. The consumer includes its `rack_id` in Fetch requests (Fetch API v11+)
+2. The broker compares the consumer's rack with each partition's replica placement
+3. If a replica exists in the same rack, the broker returns it as `preferred_read_replica`
+4. On subsequent polls, Krafka routes that partition's fetch to the preferred replica
+5. The mapping expires after `metadata_max_age` (default 5 minutes), causing a fresh lookup
+
+**Error fallback:**
+
+- If a non-leader replica returns an error, the preferred replica mapping is cleared
+- The next poll falls back to the partition leader
+- On rebalance or unsubscribe, all preferred replica mappings are cleared
+
+**Requirements:**
+
+- Broker must support Fetch API v11 (Kafka 2.4+)
+- Brokers must be configured with `broker.rack`
+- When `client_rack` is not set, Krafka negotiates up to Fetch v10 (sessions + leader epoch fencing) but does not send a rack ID
 
 ## Performance Tips
 

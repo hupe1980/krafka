@@ -17,7 +17,7 @@
 //! | API | Min | Max | Notes |
 //! |-----|-----|-----|-------|
 //! | Produce | 0 | 3 | v3+ for transactions |
-//! | Fetch | 0 | 7 | v0-4 and v7 only (v5/v6 unsupported); v4 isolation level, v7 fetch sessions |
+//! | Fetch | 0 | 11 | v0-4, v7-v11 (v5/v6 unsupported); v4 isolation level, v7 fetch sessions, v9 leader epoch fencing, v11 closest-replica fetching (KIP-392) |
 //! | Metadata | 0 | 1 | v1+ includes controller info |
 //! | OffsetCommit | 0 | 2 | v2+ for retention |
 //! | OffsetFetch | 0 | 1 | v1+ for group coordinator |
@@ -35,10 +35,13 @@
 //! use krafka::protocol::ApiKey;
 //!
 //! // Negotiate the best version for Fetch
-//! // Try v7 first (fetch sessions), fall back to v4.
-//! let version = conn.negotiate_api_version(ApiKey::Fetch, 7, 7).await
-//!     .unwrap_or(4);
-//! println!("Using Fetch v{}", version);
+//! // Prefer Fetch v7..=v11; fall back to v4 if the broker doesn't support v7+.
+//! let fetch_version = match conn.negotiate_api_version(ApiKey::Fetch, 11, 7).await {
+//!     Some(v) => v,
+//!     None => conn.negotiate_api_version(ApiKey::Fetch, 4, 4).await
+//!         .expect("broker does not support any usable Fetch version"),
+//! };
+//! println!("Using Fetch v{}", fetch_version);
 //! ```
 
 mod api;
@@ -78,8 +81,8 @@ pub(crate) fn array_len_i32(len: usize) -> Result<i32> {
 pub mod versions {
     /// Maximum supported Produce version (v0 encode/decode + v3 encode).
     pub const PRODUCE_MAX: i16 = 3;
-    /// Maximum supported Fetch version (v7 encode/decode — fetch sessions, KIP-227).
-    pub const FETCH_MAX: i16 = 7;
+    /// Maximum supported Fetch version (v11 encode/decode — closest-replica fetching, KIP-392).
+    pub const FETCH_MAX: i16 = 11;
     /// Maximum supported Metadata version (v0 encode/decode).
     pub const METADATA_MAX: i16 = 1;
     /// Maximum supported OffsetCommit version.
