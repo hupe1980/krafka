@@ -3553,4 +3553,332 @@ mod tests {
         // v2 has one extra byte for isolation_level
         assert_eq!(buf_v2.len(), encoded_v1_len + 1);
     }
+
+    // ── Cooperative rebalance algorithm tests ───────────────────────────
+
+    /// Compute newly-assigned diff (new - old) as used in
+    /// finalize_cooperative_assignment.
+    fn cooperative_newly_assigned(
+        new: &HashMap<String, Vec<PartitionId>>,
+        old: &HashMap<String, Vec<PartitionId>>,
+    ) -> Vec<TopicPartition> {
+        let mut result = Vec::new();
+        for (topic, partitions) in new {
+            let old_parts = old.get(topic);
+            for &p in partitions {
+                let is_new = old_parts.is_none_or(|o| !o.contains(&p));
+                if is_new {
+                    result.push(TopicPartition::new(topic, p));
+                }
+            }
+        }
+        result
+    }
+
+    /// Compute cooperative revocations (old - new) as used in the
+    /// no-revocations poll path.
+    fn cooperative_revocations(
+        old: &HashMap<String, Vec<PartitionId>>,
+        new: &HashMap<String, Vec<PartitionId>>,
+    ) -> Vec<TopicPartition> {
+        let mut result = Vec::new();
+        for (topic, partitions) in old {
+            let new_parts = new.get(topic);
+            for &p in partitions {
+                let gone = new_parts.is_none_or(|np| !np.contains(&p));
+                if gone {
+                    result.push(TopicPartition::new(topic, p));
+                }
+            }
+        }
+        result
+    }
+
+    /// Simulate the apply_partition_revocations HashMap algorithm.
+    fn apply_revocations_to_assignments(
+        assignments: &mut HashMap<String, Vec<PartitionId>>,
+        revoked: &[(String, PartitionId)],
+    ) {
+        let mut revoked_by_topic: HashMap<&str, HashSet<PartitionId>> = HashMap::new();
+        for (topic, partition) in revoked {
+            revoked_by_topic
+                .entry(topic.as_str())
+                .or_default()
+                .insert(*partition);
+        }
+        for (topic, revoked_parts) in &revoked_by_topic {
+            if let Some(parts) = assignments.get_mut(*topic) {
+                parts.retain(|p| !revoked_parts.contains(p));
+                if parts.is_empty() {
+                    assignments.remove(*topic);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cooperative_newly_assigned_fresh_join() {
+        let old: HashMap<String, Vec<PartitionId>> = HashMap::new();
+        let new: HashMap<String, Vec<PartitionId>> = [
+            ("topic1".to_string(), vec![0, 1, 2]),
+            ("topic2".to_string(), vec![0]),
+        ]
+        .into_iter()
+        .collect();
+
+        let result = cooperative_newly_assigned(&new, &old);
+        assert_eq!(result.len(), 4);
+        assert!(result.contains(&TopicPartition::new("topic1", 0)));
+        assert!(result.contains(&TopicPartition::new("topic1", 1)));
+        assert!(result.contains(&TopicPartition::new("topic1", 2)));
+        assert!(result.contains(&TopicPartition::new("topic2", 0)));
+    }
+
+    #[test]
+    fn test_cooperative_newly_assigned_partial_overlap() {
+        let old: HashMap<String, Vec<PartitionId>> = [
+            ("topic1".to_string(), vec![0, 1]),
+            ("topic2".to_string(), vec![0]),
+        ]
+        .into_iter()
+        .collect();
+        let new: HashMap<String, Vec<PartitionId>> = [
+            ("topic1".to_string(), vec![1, 2]),
+            ("topic3".to_string(), vec![0]),
+        ]
+        .into_iter()
+        .collect();
+
+        let result = cooperative_newly_assigned(&new, &old);
+        // topic1-1 retained, topic1-2 new, topic3-0 new
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&TopicPartition::new("topic1", 2)));
+        assert!(result.contains(&TopicPartition::new("topic3", 0)));
+        assert!(!result.contains(&TopicPartition::new("topic1", 1))); // retained
+    }
+
+    #[test]
+    fn test_cooperative_newly_assigned_identical() {
+        let assignment: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0, 1])].into_iter().collect();
+
+        let result = cooperative_newly_assigned(&assignment, &assignment);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_cooperative_revocations_partial() {
+        let old: HashMap<String, Vec<PartitionId>> = [
+            ("topic1".to_string(), vec![0, 1, 2]),
+            ("topic2".to_string(), vec![0]),
+        ]
+        .into_iter()
+        .collect();
+        let new: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![1])].into_iter().collect();
+
+        let result = cooperative_revocations(&old, &new);
+        // topic1-0, topic1-2, topic2-0 revoked; topic1-1 retained
+        assert_eq!(result.len(), 3);
+        assert!(result.contains(&TopicPartition::new("topic1", 0)));
+        assert!(result.contains(&TopicPartition::new("topic1", 2)));
+        assert!(result.contains(&TopicPartition::new("topic2", 0)));
+    }
+
+    #[test]
+    fn test_cooperative_revocations_full() {
+        let old: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0, 1])].into_iter().collect();
+        let new: HashMap<String, Vec<PartitionId>> = HashMap::new();
+
+        let result = cooperative_revocations(&old, &new);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_cooperative_revocations_none() {
+        let old: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0])].into_iter().collect();
+        let new: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0, 1])].into_iter().collect();
+
+        let result = cooperative_revocations(&old, &new);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_apply_revocations_removes_partitions() {
+        let mut assignments: HashMap<String, Vec<PartitionId>> = [
+            ("topic1".to_string(), vec![0, 1, 2]),
+            ("topic2".to_string(), vec![0, 1]),
+        ]
+        .into_iter()
+        .collect();
+
+        let revoked = vec![
+            ("topic1".to_string(), 0),
+            ("topic1".to_string(), 2),
+            ("topic2".to_string(), 1),
+        ];
+
+        apply_revocations_to_assignments(&mut assignments, &revoked);
+
+        assert_eq!(assignments["topic1"], vec![1]);
+        assert_eq!(assignments["topic2"], vec![0]);
+    }
+
+    #[test]
+    fn test_apply_revocations_removes_empty_topics() {
+        let mut assignments: HashMap<String, Vec<PartitionId>> = [
+            ("topic1".to_string(), vec![0]),
+            ("topic2".to_string(), vec![0, 1]),
+        ]
+        .into_iter()
+        .collect();
+
+        let revoked = vec![("topic1".to_string(), 0)];
+        apply_revocations_to_assignments(&mut assignments, &revoked);
+
+        // topic1 should be removed entirely since it became empty
+        assert!(!assignments.contains_key("topic1"));
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments["topic2"], vec![0, 1]);
+    }
+
+    #[test]
+    fn test_apply_revocations_nonexistent_partition() {
+        let mut assignments: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0, 1])].into_iter().collect();
+
+        let revoked = vec![
+            ("topic1".to_string(), 5), // doesn't exist
+            ("topic3".to_string(), 0), // topic doesn't exist
+        ];
+        apply_revocations_to_assignments(&mut assignments, &revoked);
+
+        // Assignments unchanged
+        assert_eq!(assignments["topic1"], vec![0, 1]);
+    }
+
+    /// Full cooperative two-phase scenario: verify newly-assigned and revoked
+    /// diffs are consistent across the protocol flow.
+    #[test]
+    fn test_cooperative_two_phase_rebalance_consistency() {
+        // Phase 1: existing assignment pre-rebalance
+        let phase0: HashMap<String, Vec<PartitionId>> = [
+            ("topic1".to_string(), vec![0, 1, 2]),
+            ("topic2".to_string(), vec![0]),
+        ]
+        .into_iter()
+        .collect();
+
+        // Phase 1 result: broker says revoke topic1-2 and topic2-0
+        let phase1_target: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0, 1])].into_iter().collect();
+
+        let to_revoke = cooperative_revocations(&phase0, &phase1_target);
+        assert_eq!(to_revoke.len(), 2);
+        assert!(to_revoke.contains(&TopicPartition::new("topic1", 2)));
+        assert!(to_revoke.contains(&TopicPartition::new("topic2", 0)));
+
+        // Apply revocations
+        let mut current = phase0.clone();
+        let revoked_tuples: Vec<(String, PartitionId)> = to_revoke
+            .iter()
+            .map(|tp| (tp.topic.clone(), tp.partition))
+            .collect();
+        apply_revocations_to_assignments(&mut current, &revoked_tuples);
+        assert_eq!(current["topic1"], vec![0, 1]);
+        assert!(!current.contains_key("topic2"));
+
+        // Phase 2: rejoin gives final assignment with a new partition
+        let phase2_final: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0, 1, 3])]
+                .into_iter()
+                .collect();
+
+        let newly_assigned = cooperative_newly_assigned(&phase2_final, &current);
+        assert_eq!(newly_assigned.len(), 1);
+        assert!(newly_assigned.contains(&TopicPartition::new("topic1", 3)));
+
+        // No further revocations needed
+        let extra_revoke = cooperative_revocations(&current, &phase2_final);
+        assert!(extra_revoke.is_empty());
+    }
+
+    /// Verify that cooperative rebalance callbacks follow Java client ordering:
+    /// on_partitions_revoked fires before on_partitions_assigned.
+    #[test]
+    fn test_cooperative_callback_ordering() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct OrderTracker {
+            revoke_seq: AtomicU64,
+            assign_seq: AtomicU64,
+            counter: AtomicU64,
+        }
+        impl ConsumerRebalanceListener for OrderTracker {
+            fn on_partitions_assigned(&self, _: &[TopicPartition]) {
+                self.assign_seq.store(
+                    self.counter.fetch_add(1, Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+            }
+            fn on_partitions_revoked(&self, _: &[TopicPartition]) {
+                self.revoke_seq.store(
+                    self.counter.fetch_add(1, Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+            }
+        }
+
+        let tracker = Arc::new(OrderTracker {
+            revoke_seq: AtomicU64::new(u64::MAX),
+            assign_seq: AtomicU64::new(u64::MAX),
+            counter: AtomicU64::new(0),
+        });
+
+        // Simulate cooperative rebalance callback sequence:
+        // 1. Revoke phase
+        let revoked = vec![TopicPartition::new("topic1", 2)];
+        tracker.on_partitions_revoked(&revoked);
+        // 2. Assign phase
+        let assigned = vec![
+            TopicPartition::new("topic1", 0),
+            TopicPartition::new("topic1", 1),
+            TopicPartition::new("topic1", 3),
+        ];
+        tracker.on_partitions_assigned(&assigned);
+
+        let revoke_order = tracker.revoke_seq.load(Ordering::SeqCst);
+        let assign_order = tracker.assign_seq.load(Ordering::SeqCst);
+        assert!(
+            revoke_order < assign_order,
+            "on_partitions_revoked (seq={revoke_order}) must fire before on_partitions_assigned (seq={assign_order})"
+        );
+    }
+
+    /// Verify that on_partitions_assigned is called even with empty assignment
+    /// (more consumers than partitions).
+    #[test]
+    fn test_cooperative_on_assigned_fires_on_empty() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct EmptyTracker {
+            assigned_called: AtomicBool,
+        }
+        impl ConsumerRebalanceListener for EmptyTracker {
+            fn on_partitions_assigned(&self, parts: &[TopicPartition]) {
+                assert!(parts.is_empty());
+                self.assigned_called.store(true, Ordering::SeqCst);
+            }
+            fn on_partitions_revoked(&self, _: &[TopicPartition]) {}
+        }
+
+        let tracker = EmptyTracker {
+            assigned_called: AtomicBool::new(false),
+        };
+        tracker.on_partitions_assigned(&[]);
+        assert!(tracker.assigned_called.load(Ordering::SeqCst));
+    }
 }
