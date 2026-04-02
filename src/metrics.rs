@@ -773,6 +773,7 @@ impl ProducerMetrics {
 
 /// Snapshot of producer metrics.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ProducerMetricsSnapshot {
     /// Number of records sent successfully.
     pub records_sent: u64,
@@ -981,6 +982,7 @@ impl ConnectionMetrics {
 
 /// Snapshot of connection metrics.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ConnectionMetricsSnapshot {
     /// Total connections created.
     pub connections_created: u64,

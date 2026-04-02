@@ -420,21 +420,7 @@ impl Consumer {
         }
         // Recompute lag metrics from remaining caches so revoked
         // partitions no longer contribute to exported values.
-        {
-            let offsets = self.offsets.read().await;
-            let hw = self.high_watermarks.read().await;
-            let mut total_lag: u64 = 0;
-            let mut max_lag: u64 = 0;
-            for (key, &watermark) in hw.iter() {
-                if let Some(&position) = offsets.get(key) {
-                    let partition_lag = (watermark - position).max(0) as u64;
-                    total_lag = total_lag.saturating_add(partition_lag);
-                    max_lag = max_lag.max(partition_lag);
-                }
-            }
-            self.metrics.lag.set(total_lag);
-            self.metrics.lag_max.set(max_lag);
-        }
+        self.recompute_lag_metrics().await;
     }
 
     /// Finalize a cooperative rebalance: compute newly-assigned diff, update
@@ -512,6 +498,27 @@ impl Consumer {
         self.metrics.paused_partitions.set(0);
         self.metrics.lag.set(0);
         self.metrics.lag_max.set(0);
+    }
+
+    /// Recompute lag and lag_max gauges from cached offsets and high watermarks.
+    ///
+    /// Call after any mutation of `self.offsets` or `self.high_watermarks` so
+    /// the exported metrics always reflect the current consumer position.
+    /// Acquires read locks in documented order: offsets → high_watermarks.
+    async fn recompute_lag_metrics(&self) {
+        let offsets = self.offsets.read().await;
+        let hw = self.high_watermarks.read().await;
+        let mut total_lag: u64 = 0;
+        let mut max_lag: u64 = 0;
+        for (key, &watermark) in hw.iter() {
+            if let Some(&position) = offsets.get(key) {
+                let partition_lag = (watermark - position).max(0) as u64;
+                total_lag = total_lag.saturating_add(partition_lag);
+                max_lag = max_lag.max(partition_lag);
+            }
+        }
+        self.metrics.lag.set(total_lag);
+        self.metrics.lag_max.set(max_lag);
     }
 
     /// Send an inline heartbeat, invoke the revocation callback, apply
@@ -908,6 +915,7 @@ impl Consumer {
             }
         }
 
+        self.recompute_lag_metrics().await;
         Ok(())
     }
 
@@ -1017,13 +1025,17 @@ impl Consumer {
             }
         }
 
+        self.recompute_lag_metrics().await;
         Ok(())
     }
 
     /// Seek to a specific offset.
     pub async fn seek(&self, topic: &str, partition: PartitionId, offset: Offset) -> Result<()> {
-        let mut offsets = self.offsets.write().await;
-        offsets.insert((topic.to_string(), partition), offset);
+        {
+            let mut offsets = self.offsets.write().await;
+            offsets.insert((topic.to_string(), partition), offset);
+        }
+        self.recompute_lag_metrics().await;
         debug!("Seek to offset {} for {}-{}", offset, topic, partition);
         Ok(())
     }
@@ -1429,6 +1441,9 @@ impl Consumer {
                     self.apply_auto_offset_reset(&reset_partitions).await.ok();
                 }
 
+                // Recompute lag after resolving offsets for missing partitions
+                self.recompute_lag_metrics().await;
+
                 // Apply exponential backoff for partitions that are still
                 // unresolved after the retry attempt. Clear backoff for
                 // partitions that were successfully resolved.
@@ -1538,37 +1553,26 @@ impl Consumer {
         }
 
         // Commit the offset updates (deferred from batch_fetch_from_broker until after max_poll_records handling)
-        if !all_offset_updates.is_empty() {
+        let offsets_changed = !all_offset_updates.is_empty();
+        if offsets_changed {
             let mut offsets = self.offsets.write().await;
             for (key, new_offset) in all_offset_updates {
                 offsets.insert(key, new_offset);
             }
         }
 
-        // Update high watermarks and compute aggregate lag
-        if !all_hw_updates.is_empty() {
-            {
-                let mut hw = self.high_watermarks.write().await;
-                for (key, watermark) in all_hw_updates {
-                    hw.insert(key, watermark);
-                }
+        // Update high watermarks
+        let hw_changed = !all_hw_updates.is_empty();
+        if hw_changed {
+            let mut hw = self.high_watermarks.write().await;
+            for (key, watermark) in all_hw_updates {
+                hw.insert(key, watermark);
             }
-            // Write lock released — compute lag with only read locks so
-            // concurrent current_lag()/cached_end_offset() callers aren't blocked.
-            // Acquire offsets before high_watermarks to match lock ordering.
-            let offsets = self.offsets.read().await;
-            let hw = self.high_watermarks.read().await;
-            let mut total_lag: u64 = 0;
-            let mut max_lag: u64 = 0;
-            for (key, &watermark) in hw.iter() {
-                if let Some(&position) = offsets.get(key) {
-                    let partition_lag = (watermark - position).max(0) as u64;
-                    total_lag = total_lag.saturating_add(partition_lag);
-                    max_lag = max_lag.max(partition_lag);
-                }
-            }
-            self.metrics.lag.set(total_lag);
-            self.metrics.lag_max.set(max_lag);
+        }
+
+        // Recompute lag metrics whenever offsets or watermarks changed
+        if offsets_changed || hw_changed {
+            self.recompute_lag_metrics().await;
         }
 
         // Record metrics
@@ -1960,6 +1964,7 @@ impl Consumer {
 
         if let Some(new_offset) = offset {
             self.offsets.write().await.insert(key, new_offset);
+            self.recompute_lag_metrics().await;
         }
     }
 
@@ -2036,6 +2041,9 @@ impl Consumer {
         let mut buf = response_bytes;
         let response = OffsetForLeaderEpochResponse::decode_v2(&mut buf)?;
 
+        let key = (topic.to_string(), partition);
+        let mut offset_changed = false;
+
         for topic_result in response.topics {
             for partition_result in topic_result.partitions {
                 if partition_result.partition != partition {
@@ -2044,10 +2052,7 @@ impl Consumer {
                 if partition_result.error_code.is_ok() && partition_result.end_offset >= 0 {
                     let current_offset = {
                         let offsets = self.offsets.read().await;
-                        offsets
-                            .get(&(topic.to_string(), partition))
-                            .copied()
-                            .unwrap_or(0)
+                        offsets.get(&key).copied().unwrap_or(0)
                     };
 
                     if current_offset > partition_result.end_offset {
@@ -2056,12 +2061,16 @@ impl Consumer {
                             topic, partition, current_offset, partition_result.end_offset
                         );
                         let mut offsets = self.offsets.write().await;
-                        offsets.insert((topic.to_string(), partition), partition_result.end_offset);
+                        offsets.insert(key.clone(), partition_result.end_offset);
+                        offset_changed = true;
                     }
                 }
             }
         }
 
+        if offset_changed {
+            self.recompute_lag_metrics().await;
+        }
         Ok(())
     }
 
@@ -2367,6 +2376,7 @@ impl Consumer {
             );
         }
 
+        self.recompute_lag_metrics().await;
         Ok(())
     }
 
