@@ -57,8 +57,9 @@ impl MetadataRequest {
     /// Create a request for all topics.
     pub fn all_topics() -> Self {
         Self {
-            // Use empty array instead of null for better compatibility with some brokers
-            topics: Some(vec![]),
+            // Null array = "all topics" for Kafka Metadata v1+.
+            // v0 also handles null (-1 length) as "all topics" in practice.
+            topics: None,
             ..Default::default()
         }
     }
@@ -5954,15 +5955,14 @@ mod tests {
     #[test]
     fn test_metadata_request_all_topics() {
         let request = MetadataRequest::all_topics();
-        // For Kafka compatibility, all_topics uses empty array instead of null
-        assert!(request.topics.is_some());
-        assert!(request.topics.as_ref().unwrap().is_empty());
+        // Null array = "all topics" for Metadata v1+.
+        assert!(request.topics.is_none());
 
         let mut buf = BytesMut::new();
         request.encode_v0(&mut buf).unwrap();
 
-        // Should encode as empty array (0)
-        assert_eq!(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), 0);
+        // Should encode as null array (-1)
+        assert_eq!(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), -1);
     }
 
     #[test]
