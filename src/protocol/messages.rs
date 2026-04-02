@@ -781,8 +781,11 @@ pub struct FetchPartitionResponse {
     pub log_start_offset: i64,
     /// Aborted transactions (v4+).
     pub aborted_transactions: Vec<AbortedTransaction>,
-    /// Preferred read replica for closest-replica routing (v11+, KIP-392).
-    /// A value of -1 means no preference (use the leader).
+    /// Preferred read replica ID for closest-replica routing (v11+, KIP-392).
+    ///
+    /// When >= 0, the consumer should preferentially fetch from this replica
+    /// (reduces cross-rack traffic). When -1, no preference; use the leader.
+    /// v7-v10 responses always set this to -1.
     pub preferred_read_replica: i32,
     /// Record batches.
     pub records: Option<Bytes>,

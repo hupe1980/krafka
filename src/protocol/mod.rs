@@ -35,10 +35,13 @@
 //! use krafka::protocol::ApiKey;
 //!
 //! // Negotiate the best version for Fetch
-//! // Negotiate within v7..=v11; fall back to v4 if the broker doesn't support v7+.
-//! let version = conn.negotiate_api_version(ApiKey::Fetch, 11, 7).await
-//!     .unwrap_or(4);
-//! println!("Using Fetch v{}", version);
+//! // Prefer Fetch v7..=v11; fall back to v4 if the broker doesn't support v7+.
+//! let fetch_version = match conn.negotiate_api_version(ApiKey::Fetch, 11, 7).await {
+//!     Some(v) => v,
+//!     None => conn.negotiate_api_version(ApiKey::Fetch, 4, 4).await
+//!         .expect("broker does not support any usable Fetch version"),
+//! };
+//! println!("Using Fetch v{}", fetch_version);
 //! ```
 
 mod api;
