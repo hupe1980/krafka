@@ -384,6 +384,11 @@ impl Consumer {
             m
         };
 
+        // Precompute owned keys once to avoid repeated String clones in each
+        // removal loop below.
+        let revoked_keys: Vec<(String, PartitionId)> =
+            revoked.iter().map(|(t, p)| (t.clone(), *p)).collect();
+
         // Remove from assignments
         {
             let mut assignments = self.assignments.write().await;
@@ -399,44 +404,44 @@ impl Consumer {
         // Remove offsets for revoked partitions
         {
             let mut offsets = self.offsets.write().await;
-            for (topic, partition) in revoked {
-                offsets.remove(&(topic.clone(), *partition));
+            for key in &revoked_keys {
+                offsets.remove(key);
             }
         }
         // Remove offset retry backoff entries
         {
             let mut backoff = self.offset_retry_backoff.write().await;
-            for (topic, partition) in revoked {
-                backoff.remove(&(topic.clone(), *partition));
+            for key in &revoked_keys {
+                backoff.remove(key);
             }
         }
         // Discard buffered records from revoked partitions
         {
             let revoked_set: HashSet<(&str, PartitionId)> =
-                revoked.iter().map(|(t, p)| (t.as_str(), *p)).collect();
+                revoked_keys.iter().map(|(t, p)| (t.as_str(), *p)).collect();
             let mut buf = self.recv_buffer.write().await;
             buf.retain(|r| !revoked_set.contains(&(r.topic.as_str(), r.partition)));
         }
         // Clear paused state for revoked partitions
         {
             let mut paused = self.paused.write().await;
-            for (topic, partition) in revoked {
-                paused.remove(&(topic.clone(), *partition));
+            for key in &revoked_keys {
+                paused.remove(key);
             }
             self.metrics.paused_partitions.set(paused.len() as u64);
         }
         // Clear cached high watermarks for revoked partitions
         {
             let mut hw = self.high_watermarks.write().await;
-            for (topic, partition) in revoked {
-                hw.remove(&(topic.clone(), *partition));
+            for key in &revoked_keys {
+                hw.remove(key);
             }
         }
         // Clear cached log start offsets for revoked partitions
         {
             let mut lso = self.log_start_offsets.write().await;
-            for (topic, partition) in revoked {
-                lso.remove(&(topic.clone(), *partition));
+            for key in &revoked_keys {
+                lso.remove(key);
             }
         }
         // Recompute lag metrics from remaining caches so revoked
@@ -896,9 +901,8 @@ impl Consumer {
                 // dropped some partitions (partition-level errors), resolve
                 // them individually via the direct ListOffsets v1 path.
                 for (topic, partition) in &need_reset {
-                    if !resolved.contains_key(&(topic.clone(), *partition))
-                        && !offsets.contains_key(&(topic.clone(), *partition))
-                    {
+                    let key = (topic.clone(), *partition);
+                    if !resolved.contains_key(&key) && !offsets.contains_key(&key) {
                         debug!(
                             "Falling back to direct ListOffsets for {}-{} \
                              (coordinator path returned no result)",
@@ -909,7 +913,7 @@ impl Consumer {
                         match self.resolve_list_offset(topic, *partition, timestamp).await {
                             Ok(offset) => {
                                 offsets = self.offsets.write().await;
-                                offsets.insert((topic.clone(), *partition), offset);
+                                offsets.insert(key, offset);
                             }
                             Err(e) => {
                                 warn!(
@@ -2390,14 +2394,17 @@ impl Consumer {
             }
 
             // Update internal offset store
-            let mut internal_offsets = self.offsets.write().await;
-            for (tp, offset_meta) in filtered_offsets {
-                internal_offsets.insert((tp.topic, tp.partition), offset_meta.offset);
-            }
+            let count = {
+                let mut internal_offsets = self.offsets.write().await;
+                for (tp, offset_meta) in filtered_offsets {
+                    internal_offsets.insert((tp.topic, tp.partition), offset_meta.offset);
+                }
+                internal_offsets.len()
+            };
 
             info!(
                 "Committed {} partition offsets with metadata (local only)",
-                internal_offsets.len()
+                count
             );
         }
 
