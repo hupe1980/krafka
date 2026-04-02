@@ -36,14 +36,10 @@ This enables dynamic version negotiation for optimal compatibility and feature u
 ```rust
 use krafka::protocol::ApiKey;
 
-// After connection, negotiate the best Fetch version
-// Client supports v7-v11, broker might support v0-v13
-let version = conn.negotiate_api_version(ApiKey::Fetch, 11, 7).await;
-
-match version {
-    Some(v) => println!("Using Fetch v{}", v),
-    None => println!("No compatible version found!"),
-}
+// Negotiate within v7..=v11; fall back to v4 if the broker doesn't support v7+.
+let version = conn.negotiate_api_version(ApiKey::Fetch, 11, 7).await
+    .unwrap_or(4);
+println!("Using Fetch v{}", version);
 
 // Convenience method with min=0
 let version = conn.negotiate_api_version_max(ApiKey::Produce, 3).await;

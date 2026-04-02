@@ -255,44 +255,42 @@ mod tests {
     /// Verify header versions at the flexible boundary for every API we use.
     #[test]
     fn test_header_version_flexible_boundaries() {
-        // (api_key, flexible_version) for all APIs krafka sends requests for.
-        let apis: &[(ApiKey, i16)] = &[
-            (ApiKey::Produce, 9),
-            (ApiKey::Fetch, 12),
-            (ApiKey::ListOffsets, 6),
-            (ApiKey::Metadata, 9),
-            (ApiKey::OffsetCommit, 8),
-            (ApiKey::OffsetFetch, 6),
-            (ApiKey::FindCoordinator, 3),
-            (ApiKey::JoinGroup, 6),
-            (ApiKey::Heartbeat, 4),
-            (ApiKey::LeaveGroup, 4),
-            (ApiKey::SyncGroup, 4),
-            (ApiKey::DescribeGroups, 5),
-            (ApiKey::ListGroups, 3),
-            (ApiKey::CreateTopics, 5),
-            (ApiKey::DeleteTopics, 4),
-            (ApiKey::DeleteRecords, 2),
-            (ApiKey::InitProducerId, 2),
-            (ApiKey::OffsetForLeaderEpoch, 4),
-            (ApiKey::AddPartitionsToTxn, 4),
-            (ApiKey::AddOffsetsToTxn, 3),
-            (ApiKey::EndTxn, 3),
-            (ApiKey::TxnOffsetCommit, 3),
-            (ApiKey::DescribeAcls, 2),
-            (ApiKey::CreateAcls, 2),
-            (ApiKey::DeleteAcls, 2),
-            (ApiKey::DescribeConfigs, 4),
-            (ApiKey::AlterConfigs, 2),
-            (ApiKey::CreatePartitions, 2),
+        // APIs krafka sends requests for; the flexible boundary is derived
+        // from `ApiKey::flexible_version()` to avoid duplicating that mapping.
+        let apis: &[ApiKey] = &[
+            ApiKey::Produce,
+            ApiKey::Fetch,
+            ApiKey::ListOffsets,
+            ApiKey::Metadata,
+            ApiKey::OffsetCommit,
+            ApiKey::OffsetFetch,
+            ApiKey::FindCoordinator,
+            ApiKey::JoinGroup,
+            ApiKey::Heartbeat,
+            ApiKey::LeaveGroup,
+            ApiKey::SyncGroup,
+            ApiKey::DescribeGroups,
+            ApiKey::ListGroups,
+            ApiKey::CreateTopics,
+            ApiKey::DeleteTopics,
+            ApiKey::DeleteRecords,
+            ApiKey::InitProducerId,
+            ApiKey::OffsetForLeaderEpoch,
+            ApiKey::AddPartitionsToTxn,
+            ApiKey::AddOffsetsToTxn,
+            ApiKey::EndTxn,
+            ApiKey::TxnOffsetCommit,
+            ApiKey::DescribeAcls,
+            ApiKey::CreateAcls,
+            ApiKey::DeleteAcls,
+            ApiKey::DescribeConfigs,
+            ApiKey::AlterConfigs,
+            ApiKey::CreatePartitions,
+            ApiKey::ApiVersions,
         ];
 
-        for &(api, flex) in apis {
-            assert_eq!(
-                api.flexible_version(),
-                flex,
-                "{api:?} flexible_version mismatch"
-            );
+        for &api in apis {
+            let flex = api.flexible_version();
 
             // One version below the boundary: non-flexible headers.
             if flex > 0 {

@@ -160,9 +160,10 @@ struct FetchRoutingPlan {
 /// replicas, and leader information.
 ///
 /// For each assigned (non-paused) partition, the function checks whether
-/// a preferred replica exists and is not expired.  If so, the partition
-/// is routed to that replica; otherwise it falls back to the leader.
-/// Partitions without a known leader are skipped.
+/// a preferred replica exists and is not expired. If so, the partition
+/// is routed to that replica, regardless of whether a leader is known.
+/// If there is no valid preferred replica, the function falls back to the
+/// leader if one is known; otherwise the partition is skipped.
 ///
 /// This is a pure function extracted from `Consumer::poll()` so that the
 /// routing logic can be unit-tested without a live broker.
