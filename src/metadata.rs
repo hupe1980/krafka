@@ -15,7 +15,9 @@ use tracing::{debug, warn};
 
 use crate::error::{KrafkaError, Result};
 use crate::network::{BrokerConnection, ConnectionPool};
-use crate::protocol::{ApiKey, MetadataRequest, MetadataResponse};
+use crate::protocol::{
+    ApiKey, MetadataRequest, MetadataResponse, VersionedDecode, VersionedEncode,
+};
 use crate::{BrokerId, PartitionId};
 
 /// Information about a broker.
@@ -173,6 +175,10 @@ impl ClusterMetadata {
     ///
     /// Uses a coalescing lock to prevent concurrent metadata stampedes.
     /// If a refresh is already in-flight, callers wait for it to complete.
+    ///
+    /// The Metadata API version is negotiated with the broker:
+    /// - Preferred: v7+ (cluster_id, broker rack, leader epoch, offline replicas)
+    /// - Fallback: v0 (basic broker + topic metadata)
     pub async fn refresh_for_topics(&self, topics: Option<&[&str]>) -> Result<()> {
         // Coalesce concurrent calls: only one refresh in-flight at a time
         let _guard = self.refresh_lock.lock().await;
@@ -192,6 +198,16 @@ impl ClusterMetadata {
         // Get a connection
         let conn = self.get_any_connection().await?;
 
+        // Negotiate the highest mutually supported version (v0-v8, no gaps).
+        // v7+ gives us leader_epoch, broker rack, and offline replicas.
+        let metadata_version = conn
+            .negotiate_api_version_max(ApiKey::Metadata, crate::protocol::versions::METADATA_MAX)
+            .await
+            .unwrap_or_else(|| {
+                debug!("Broker does not advertise Metadata support, falling back to v0");
+                0
+            });
+
         // Build and send metadata request
         let request = match topics {
             Some(t) => MetadataRequest::for_topics(t.to_vec()),
@@ -199,12 +215,14 @@ impl ClusterMetadata {
         };
 
         let response = conn
-            .send_request(ApiKey::Metadata, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::Metadata, metadata_version, |buf| {
+                request.encode_versioned(metadata_version, buf)
+            })
             .await?;
 
         // Decode response
         let mut buf = response;
-        let metadata = MetadataResponse::decode_v0(&mut buf)?;
+        let metadata = MetadataResponse::decode_versioned(metadata_version, &mut buf)?;
 
         // Update cache
         self.update_cache(metadata).await;
