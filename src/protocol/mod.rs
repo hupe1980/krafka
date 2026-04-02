@@ -78,8 +78,8 @@ pub(crate) fn array_len_i32(len: usize) -> Result<i32> {
 pub mod versions {
     /// Maximum supported Produce version (v0 encode/decode + v3 encode).
     pub const PRODUCE_MAX: i16 = 3;
-    /// Maximum supported Fetch version (v7 encode/decode — fetch sessions, KIP-227).
-    pub const FETCH_MAX: i16 = 7;
+    /// Maximum supported Fetch version (v11 encode/decode — KIP-392 follower fetch).
+    pub const FETCH_MAX: i16 = 11;
     /// Maximum supported Metadata version (v0 encode/decode).
     pub const METADATA_MAX: i16 = 1;
     /// Maximum supported OffsetCommit version.

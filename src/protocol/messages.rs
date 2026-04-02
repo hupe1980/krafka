@@ -529,6 +529,8 @@ pub struct FetchRequest {
     pub topics: Vec<FetchTopicRequest>,
     /// Forgotten topics/partitions to remove from the session (v7+).
     pub forgotten_topics: Vec<FetchForgottenTopic>,
+    /// Consumer rack ID for closest-replica routing (v11+, KIP-392).
+    pub rack_id: String,
 }
 
 /// Topic-partitions to forget from a fetch session (v7+).
@@ -678,6 +680,52 @@ impl FetchRequest {
         }
         Ok(())
     }
+
+    /// Encode for version 9 (v7 + `current_leader_epoch` per partition, KIP-320).
+    pub fn encode_v9(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.replica_id.encode(buf);
+        self.max_wait_ms.encode(buf);
+        self.min_bytes.encode(buf);
+        self.max_bytes.encode(buf);
+        self.isolation_level.encode(buf);
+        self.session_id.encode(buf);
+        self.session_epoch.encode(buf);
+
+        // Topics array
+        buf.put_i32(array_len_i32(self.topics.len())?);
+        for topic in &self.topics {
+            KafkaString::new(&topic.topic).try_encode(buf)?;
+
+            // Partitions array
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
+            for partition in &topic.partitions {
+                partition.partition.encode(buf);
+                // current_leader_epoch introduced in v9 (KIP-320)
+                partition.current_leader_epoch.encode(buf);
+                partition.fetch_offset.encode(buf);
+                partition.log_start_offset.encode(buf);
+                partition.partition_max_bytes.encode(buf);
+            }
+        }
+
+        // Forgotten topics array (v7+)
+        buf.put_i32(array_len_i32(self.forgotten_topics.len())?);
+        for forgotten in &self.forgotten_topics {
+            KafkaString::new(&forgotten.topic).try_encode(buf)?;
+            buf.put_i32(array_len_i32(forgotten.partitions.len())?);
+            for &partition in &forgotten.partitions {
+                partition.encode(buf);
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode for version 11 (v9 + rack_id for closest-replica routing, KIP-392).
+    pub fn encode_v11(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.encode_v9(buf)?;
+        KafkaString::new(&self.rack_id).try_encode(buf)?;
+        Ok(())
+    }
 }
 
 /// Fetch response.
@@ -717,6 +765,9 @@ pub struct FetchPartitionResponse {
     pub log_start_offset: i64,
     /// Aborted transactions (v4+).
     pub aborted_transactions: Vec<AbortedTransaction>,
+    /// Preferred read replica for closest-replica routing (v11+, KIP-392).
+    /// A value of -1 means no preference (use the leader).
+    pub preferred_read_replica: i32,
     /// Record batches.
     pub records: Option<Bytes>,
 }
@@ -754,6 +805,7 @@ impl FetchResponse {
                     last_stable_offset: -1,
                     log_start_offset: -1,
                     aborted_transactions: Vec::new(),
+                    preferred_read_replica: -1,
                     records,
                 });
             }
@@ -810,6 +862,7 @@ impl FetchResponse {
                     last_stable_offset,
                     log_start_offset: -1,
                     aborted_transactions,
+                    preferred_read_replica: -1,
                     records,
                 });
             }
@@ -861,6 +914,60 @@ impl FetchResponse {
                     last_stable_offset,
                     log_start_offset,
                     aborted_transactions,
+                    preferred_read_replica: -1,
+                    records,
+                });
+            }
+
+            responses.push(FetchTopicResponse { topic, partitions });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            session_id,
+            responses,
+        })
+    }
+
+    /// Decode from version 11 (v7 + preferred_read_replica per partition, KIP-392).
+    pub fn decode_v11(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let session_id = i32::decode(buf)?;
+        let mut responses = Vec::new();
+        let topic_count = i32::decode(buf)?;
+
+        for _ in 0..topic_count {
+            let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let partition_count = i32::decode(buf)?;
+            let mut partitions = Vec::new();
+
+            for _ in 0..partition_count {
+                let partition = i32::decode(buf)?;
+                let partition_error_code = ErrorCode::from_i16(i16::decode(buf)?);
+                let high_watermark = i64::decode(buf)?;
+                let last_stable_offset = i64::decode(buf)?;
+                let log_start_offset = i64::decode(buf)?;
+                let aborted_tx_count = i32::decode(buf)?;
+                let mut aborted_transactions = Vec::new();
+                for _ in 0..aborted_tx_count {
+                    aborted_transactions.push(AbortedTransaction {
+                        producer_id: i64::decode(buf)?,
+                        first_offset: i64::decode(buf)?,
+                    });
+                }
+                let preferred_read_replica = i32::decode(buf)?;
+                let records = KafkaBytes::decode(buf)?.0;
+
+                partitions.push(FetchPartitionResponse {
+                    partition,
+                    error_code: partition_error_code,
+                    high_watermark,
+                    last_stable_offset,
+                    log_start_offset,
+                    aborted_transactions,
+                    preferred_read_replica,
                     records,
                 });
             }
@@ -898,6 +1005,7 @@ impl FetchResponse {
                     last_stable_offset: -1,
                     log_start_offset: -1,
                     aborted_transactions: Vec::new(),
+                    preferred_read_replica: -1,
                     records,
                 });
             }
@@ -5007,7 +5115,12 @@ impl VersionedEncode for FetchRequest {
             4 => self.encode_v4(buf)?,
             // v5-v6 add fields (log_start_offset) that encode_v4 doesn't produce
             5 | 6 => return unsupported_encode!("FetchRequest", version),
-            7 => self.encode_v7(buf)?,
+            // v7-v8 share the same wire format (fetch sessions, KIP-227)
+            7 | 8 => self.encode_v7(buf)?,
+            // v9 adds current_leader_epoch per partition (KIP-320)
+            9 | 10 => self.encode_v9(buf)?,
+            // v11 adds rack_id for closest-replica routing (KIP-392)
+            11 => self.encode_v11(buf)?,
             _ => return unsupported_encode!("FetchRequest", version),
         }
         Ok(())
@@ -5022,7 +5135,10 @@ impl VersionedDecode for FetchResponse {
             4 => Self::decode_v4(buf),
             // v5-v6 add fields (log_start_offset) that decode_v4 doesn't consume
             5 | 6 => unsupported_decode!("FetchResponse", version),
-            7 => Self::decode_v7(buf),
+            // v7-v10 share the same wire format
+            7..=10 => Self::decode_v7(buf),
+            // v11 adds preferred_read_replica per partition (KIP-392)
+            11 => Self::decode_v11(buf),
             _ => unsupported_decode!("FetchResponse", version),
         }
     }
@@ -6501,6 +6617,7 @@ mod tests {
                 topic: "old-topic".to_string(),
                 partitions: vec![1, 2],
             }],
+            rack_id: String::new(),
         };
 
         let mut buf_v4 = BytesMut::new();
@@ -6536,6 +6653,7 @@ mod tests {
             session_epoch: 0,
             topics: vec![],
             forgotten_topics: vec![],
+            rack_id: String::new(),
         };
 
         let mut buf = BytesMut::new();
@@ -6690,6 +6808,7 @@ mod tests {
             session_epoch: -1,
             topics: vec![],
             forgotten_topics: vec![],
+            rack_id: String::new(),
         };
         // v0 and v7 should use different encoders and produce different output
         let mut buf_v0 = BytesMut::new();
@@ -6698,6 +6817,242 @@ mod tests {
         request.encode_versioned(7, &mut buf_v7).unwrap();
         // v7 encodes extra fields (session_id, session_epoch) so should be longer
         assert!(buf_v7.len() > buf_v0.len());
+    }
+
+    #[test]
+    fn test_fetch_request_encode_v11_appends_rack_id() {
+        let request = FetchRequest {
+            replica_id: -1,
+            max_wait_ms: 500,
+            min_bytes: 1,
+            max_bytes: 1048576,
+            isolation_level: 0,
+            session_id: 0,
+            session_epoch: 0,
+            topics: vec![FetchTopicRequest {
+                topic: "t".to_string(),
+                partitions: vec![FetchPartitionRequest {
+                    partition: 0,
+                    current_leader_epoch: 5,
+                    fetch_offset: 100,
+                    last_fetched_epoch: -1,
+                    log_start_offset: 0,
+                    partition_max_bytes: 1048576,
+                }],
+            }],
+            forgotten_topics: vec![],
+            rack_id: "us-east-1a".to_string(),
+        };
+
+        let mut buf_v9 = BytesMut::new();
+        request.encode_v9(&mut buf_v9).unwrap();
+
+        let mut buf_v11 = BytesMut::new();
+        request.encode_v11(&mut buf_v11).unwrap();
+
+        // v11 is v9 + rack_id string (2 bytes length + 10 bytes "us-east-1a")
+        assert_eq!(buf_v11.len(), buf_v9.len() + 2 + 10);
+
+        // The v11 buffer should start with the same bytes as v9
+        assert_eq!(&buf_v11[..buf_v9.len()], &buf_v9[..]);
+    }
+
+    #[test]
+    fn test_fetch_request_encode_v11_empty_rack_id() {
+        let request = FetchRequest {
+            replica_id: -1,
+            max_wait_ms: 500,
+            min_bytes: 1,
+            max_bytes: 1048576,
+            isolation_level: 0,
+            session_id: 0,
+            session_epoch: 0,
+            topics: vec![],
+            forgotten_topics: vec![],
+            rack_id: String::new(),
+        };
+
+        let mut buf_v9 = BytesMut::new();
+        request.encode_v9(&mut buf_v9).unwrap();
+
+        let mut buf_v11 = BytesMut::new();
+        request.encode_v11(&mut buf_v11).unwrap();
+
+        // Empty rack_id: 2-byte length prefix (0) only
+        assert_eq!(buf_v11.len(), buf_v9.len() + 2);
+    }
+
+    #[test]
+    fn test_fetch_response_decode_v11_preferred_read_replica() {
+        // Build a v11 response: same as v7 but with preferred_read_replica per partition
+        let mut raw = BytesMut::new();
+        raw.put_i32(100); // throttle_time_ms
+        raw.put_i16(0); // error_code (None)
+        raw.put_i32(42); // session_id
+        raw.put_i32(1); // 1 topic
+        // topic name
+        raw.put_i16(5);
+        raw.put_slice(b"topic");
+        raw.put_i32(1); // 1 partition
+        raw.put_i32(0); // partition id
+        raw.put_i16(0); // error_code
+        raw.put_i64(1000); // high_watermark
+        raw.put_i64(999); // last_stable_offset
+        raw.put_i64(0); // log_start_offset
+        raw.put_i32(0); // 0 aborted transactions
+        raw.put_i32(3); // preferred_read_replica = broker 3
+        raw.put_i32(-1); // records (null/-1 length)
+
+        let mut buf = raw.freeze();
+        let resp = FetchResponse::decode_v11(&mut buf).unwrap();
+
+        assert_eq!(resp.throttle_time_ms, 100);
+        assert_eq!(resp.session_id, 42);
+        assert_eq!(resp.responses.len(), 1);
+        let part = &resp.responses[0].partitions[0];
+        assert_eq!(part.partition, 0);
+        assert_eq!(part.high_watermark, 1000);
+        assert_eq!(part.preferred_read_replica, 3);
+    }
+
+    #[test]
+    fn test_fetch_response_decode_v11_no_preferred_replica() {
+        let mut raw = BytesMut::new();
+        raw.put_i32(0); // throttle_time_ms
+        raw.put_i16(0); // error_code
+        raw.put_i32(0); // session_id
+        raw.put_i32(1); // 1 topic
+        raw.put_i16(1);
+        raw.put_slice(b"t");
+        raw.put_i32(1); // 1 partition
+        raw.put_i32(0); // partition id
+        raw.put_i16(0); // error_code
+        raw.put_i64(500); // high_watermark
+        raw.put_i64(499); // last_stable_offset
+        raw.put_i64(0); // log_start_offset
+        raw.put_i32(0); // 0 aborted transactions
+        raw.put_i32(-1); // preferred_read_replica = -1 (no preference)
+        raw.put_i32(-1); // records (null)
+
+        let mut buf = raw.freeze();
+        let resp = FetchResponse::decode_v11(&mut buf).unwrap();
+
+        assert_eq!(resp.responses[0].partitions[0].preferred_read_replica, -1);
+    }
+
+    #[test]
+    fn test_versioned_encode_fetch_v11_dispatches_to_encode_v11() {
+        let request = FetchRequest {
+            replica_id: -1,
+            max_wait_ms: 500,
+            min_bytes: 1,
+            max_bytes: 1048576,
+            isolation_level: 0,
+            session_id: 0,
+            session_epoch: 0,
+            topics: vec![],
+            forgotten_topics: vec![],
+            rack_id: "rack-a".to_string(),
+        };
+
+        let mut buf_direct = BytesMut::new();
+        request.encode_v11(&mut buf_direct).unwrap();
+
+        let mut buf_versioned = BytesMut::new();
+        request.encode_versioned(11, &mut buf_versioned).unwrap();
+
+        assert_eq!(buf_direct, buf_versioned);
+    }
+
+    #[test]
+    fn test_versioned_decode_fetch_v11_dispatches_to_decode_v11() {
+        let mut raw = BytesMut::new();
+        raw.put_i32(0); // throttle_time_ms
+        raw.put_i16(0); // error_code
+        raw.put_i32(0); // session_id
+        raw.put_i32(0); // 0 topics
+
+        let data = raw.freeze();
+        let resp = FetchResponse::decode_versioned(11, &mut data.clone()).unwrap();
+        assert_eq!(resp.throttle_time_ms, 0);
+        assert!(resp.responses.is_empty());
+    }
+
+    #[test]
+    fn test_versioned_encode_fetch_v8_dispatches_to_v7() {
+        let request = FetchRequest {
+            replica_id: -1,
+            max_wait_ms: 500,
+            min_bytes: 1,
+            max_bytes: 1048576,
+            isolation_level: 0,
+            session_id: 0,
+            session_epoch: 0,
+            topics: vec![FetchTopicRequest {
+                topic: "t".to_string(),
+                partitions: vec![FetchPartitionRequest {
+                    partition: 0,
+                    current_leader_epoch: -1,
+                    fetch_offset: 100,
+                    last_fetched_epoch: -1,
+                    log_start_offset: 0,
+                    partition_max_bytes: 1048576,
+                }],
+            }],
+            forgotten_topics: vec![],
+            rack_id: String::new(),
+        };
+
+        let mut buf_v7 = BytesMut::new();
+        request.encode_versioned(7, &mut buf_v7).unwrap();
+
+        let mut buf_v8 = BytesMut::new();
+        request.encode_versioned(8, &mut buf_v8).unwrap();
+        assert_eq!(buf_v8, buf_v7, "v8 should produce same bytes as v7");
+    }
+
+    #[test]
+    fn test_versioned_encode_fetch_v9_v10_dispatches_to_v9() {
+        let request = FetchRequest {
+            replica_id: -1,
+            max_wait_ms: 500,
+            min_bytes: 1,
+            max_bytes: 1048576,
+            isolation_level: 0,
+            session_id: 0,
+            session_epoch: 0,
+            topics: vec![FetchTopicRequest {
+                topic: "t".to_string(),
+                partitions: vec![FetchPartitionRequest {
+                    partition: 0,
+                    current_leader_epoch: 5,
+                    fetch_offset: 100,
+                    last_fetched_epoch: -1,
+                    log_start_offset: 0,
+                    partition_max_bytes: 1048576,
+                }],
+            }],
+            forgotten_topics: vec![],
+            rack_id: String::new(),
+        };
+
+        let mut buf_v9 = BytesMut::new();
+        request.encode_v9(&mut buf_v9).unwrap();
+
+        for version in 9..=10 {
+            let mut buf = BytesMut::new();
+            request.encode_versioned(version, &mut buf).unwrap();
+            assert_eq!(buf, buf_v9, "v{version} should produce same bytes as v9");
+        }
+
+        // v9+ includes current_leader_epoch (4 bytes per partition) that v7 omits
+        let mut buf_v7 = BytesMut::new();
+        request.encode_v7(&mut buf_v7).unwrap();
+        assert_eq!(
+            buf_v9.len(),
+            buf_v7.len() + 4,
+            "v9 should be 4 bytes longer than v7 (current_leader_epoch per partition)"
+        );
     }
 
     #[test]

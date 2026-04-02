@@ -116,6 +116,12 @@ pub struct ConsumerConfig {
     /// trigger a rebalance when a static member leaves and rejoins within the
     /// session timeout, as long as it uses the same instance ID.
     pub group_instance_id: Option<String>,
+    /// Client rack ID for closest-replica fetching (KIP-392).
+    ///
+    /// When set, the broker may direct fetches to a replica in the same rack,
+    /// reducing cross-rack traffic. The value should match the `broker.rack`
+    /// configuration on the brokers.
+    pub client_rack: Option<String>,
     /// Authentication configuration (optional).
     pub auth: Option<AuthConfig>,
 }
@@ -141,6 +147,7 @@ impl Default for ConsumerConfig {
             metadata_max_age: Duration::from_secs(300),
             partition_assignment_strategy: PartitionAssignmentStrategy::Range,
             group_instance_id: None,
+            client_rack: None,
             auth: None,
         }
     }
@@ -281,6 +288,12 @@ impl ConsumerConfigBuilder {
         self
     }
 
+    /// Set the client rack ID for closest-replica fetching (KIP-392).
+    pub fn client_rack(mut self, rack: impl Into<String>) -> Self {
+        self.config.client_rack = Some(rack.into());
+        self
+    }
+
     /// Build the config.
     pub fn build(self) -> ConsumerConfig {
         self.config
@@ -403,6 +416,25 @@ mod tests {
             config.group_instance_id,
             Some("instance-1".to_string()),
             "group_instance_id should be set by builder"
+        );
+    }
+
+    #[test]
+    fn test_config_default_client_rack_is_none() {
+        let config = ConsumerConfig::default();
+        assert!(
+            config.client_rack.is_none(),
+            "client_rack should be None by default"
+        );
+    }
+
+    #[test]
+    fn test_config_builder_client_rack() {
+        let config = ConsumerConfig::builder().client_rack("us-east-1a").build();
+        assert_eq!(
+            config.client_rack,
+            Some("us-east-1a".to_string()),
+            "client_rack should be set by builder"
         );
     }
 }
