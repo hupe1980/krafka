@@ -83,10 +83,19 @@ impl MetadataRequest {
     }
 
     /// Extract topic names as `KafkaString`s for wire encoding.
-    fn topic_names(topics: &[MetadataRequestTopic]) -> Vec<KafkaString> {
+    ///
+    /// Returns an error if any entry has `name: None` — topic IDs are only
+    /// supported from v10+, and we cap at v8.
+    fn topic_names(topics: &[MetadataRequestTopic]) -> Result<Vec<KafkaString>> {
         topics
             .iter()
-            .filter_map(|t| t.name.as_ref().map(KafkaString::new))
+            .map(|t| {
+                t.name.as_ref().map(KafkaString::new).ok_or_else(|| {
+                    crate::error::KrafkaError::protocol(
+                        "MetadataRequestTopic.name is required for v0-v8",
+                    )
+                })
+            })
             .collect()
     }
 
@@ -94,7 +103,7 @@ impl MetadataRequest {
     pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
         match &self.topics {
             None => KafkaArray::<KafkaString>::new(vec![]).try_encode(buf)?,
-            Some(topics) => KafkaArray::new(Self::topic_names(topics)).try_encode(buf)?,
+            Some(topics) => KafkaArray::new(Self::topic_names(topics)?).try_encode(buf)?,
         }
         Ok(())
     }
@@ -103,7 +112,7 @@ impl MetadataRequest {
     pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
         match &self.topics {
             None => KafkaArray::<KafkaString>::null().try_encode(buf)?,
-            Some(topics) => KafkaArray::new(Self::topic_names(topics)).try_encode(buf)?,
+            Some(topics) => KafkaArray::new(Self::topic_names(topics)?).try_encode(buf)?,
         }
         Ok(())
     }
