@@ -18,7 +18,7 @@
 //! |-----|-----|-----|-------|
 //! | Produce | 0 | 3 | v3+ for transactions |
 //! | Fetch | 0 | 11 | v0-4, v7-v11 (v5/v6 unsupported); v4 isolation level, v7 fetch sessions, v9 leader epoch fencing, v11 closest-replica fetching (KIP-392) |
-//! | Metadata | 0 | 8 | v1 controller + rack, v2 cluster_id, v3 throttle, v5 offline replicas, v7 leader epoch, v8 wire-compatible (authorized ops decoded but not yet exposed) |
+//! | Metadata | 0 | 8 | v1 controller + rack, v2 cluster_id, v3 throttle, v5 offline replicas, v7 leader epoch, v8 adds cluster/topic authorized-operations (decoded and discarded) |
 //! | OffsetCommit | 0 | 2 | v2+ for retention |
 //! | OffsetFetch | 0 | 1 | v1+ for group coordinator |
 //! | FindCoordinator | 0 | 1 | Group/txn coordinator lookup |
