@@ -23,8 +23,14 @@ atomic pointer store at the end.
 ## Error Filtering
 
 - Topics with error codes are **not** inserted into the cache (deleted/unauthorized topics filtered out).
+- On partial refresh, error topics are **removed** from the cache (may have been deleted).
 - Partitions with error codes are **excluded** from their topic's partition list.
 - `leader_epoch` of `-1` means unknown — treat accordingly.
+
+## Full vs. Partial Refresh
+
+- **Full refresh** (`refresh_for_topics(None)`): response is authoritative — topics are rebuilt from scratch. Deleted topics are automatically purged because we start from an empty map.
+- **Partial refresh** (`refresh_for_topics(Some(&[...]))`): response is delta-merged into the existing cache. Topics not in the request are preserved.
 
 ## Staleness
 

@@ -224,8 +224,11 @@ impl ClusterMetadata {
         let mut buf = response;
         let metadata = MetadataResponse::decode_versioned(metadata_version, &mut buf)?;
 
-        // Update cache
-        self.update_cache(metadata);
+        // Update cache. A full refresh (topics=None) is authoritative — the
+        // response contains every topic currently in the cluster, so we rebuild
+        // from scratch. A partial refresh delta-merges into the existing cache.
+        let full_refresh = topics.is_none();
+        self.update_cache(metadata, full_refresh);
 
         Ok(())
     }
@@ -255,7 +258,12 @@ impl ClusterMetadata {
     /// Update the metadata cache from a response.
     ///
     /// Builds a new snapshot and swaps it in atomically via `ArcSwap`.
-    fn update_cache(&self, response: MetadataResponse) {
+    ///
+    /// When `full_refresh` is true the response is authoritative (all topics in
+    /// the cluster), so the topic map is rebuilt from scratch. When false
+    /// (partial/topic-specific refresh), the response is delta-merged into the
+    /// existing cache so that topics not in the request are preserved.
+    fn update_cache(&self, response: MetadataResponse, full_refresh: bool) {
         let old = self.cache.load();
 
         let mut brokers = HashMap::new();
@@ -271,9 +279,13 @@ impl ClusterMetadata {
             );
         }
 
-        // Start from old topics, then apply the response delta in a single pass.
-        // Error topics are removed (may have been deleted); successful ones are upserted.
-        let mut topics = old.topics.clone();
+        // Full refresh: response is authoritative — start empty.
+        // Partial refresh: delta-merge into existing topics.
+        let mut topics = if full_refresh {
+            HashMap::new()
+        } else {
+            old.topics.clone()
+        };
 
         for topic in response.topics {
             let Some(topic_name) = topic.name else {
