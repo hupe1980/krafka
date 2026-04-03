@@ -1779,7 +1779,7 @@ impl AdminClientBuilder {
     /// Build the admin client.
     pub async fn build(self) -> Result<AdminClient> {
         if self.config.bootstrap_servers.is_empty() {
-            return Err(KrafkaError::config("bootstrap_servers is required"));
+            return Err(KrafkaError::config("bootstrap.servers is required"));
         }
 
         let bootstrap_servers =

@@ -1180,7 +1180,7 @@ impl TransactionalProducerBuilder {
     /// Build the transactional producer.
     pub async fn build(self) -> Result<TransactionalProducer> {
         if self.config.bootstrap_servers.is_empty() {
-            return Err(KrafkaError::config("bootstrap_servers is required"));
+            return Err(KrafkaError::config("bootstrap.servers is required"));
         }
         if self.config.transactional_id.is_empty() {
             return Err(KrafkaError::config("transactional_id is required"));

@@ -2282,6 +2282,7 @@ impl Consumer {
             match self.poll(Duration::from_secs(1)).await {
                 Ok(records) if !records.is_empty() => {
                     let mut iter = records.into_iter();
+                    // SAFETY: `!records.is_empty()` guard above guarantees at least one element
                     let first = iter.next().unwrap();
                     // Buffer any remaining records for subsequent recv() calls
                     if iter.len() > 0 {

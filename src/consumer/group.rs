@@ -298,14 +298,13 @@ impl ConsumerGroup {
         match state {
             GroupState::Stable => Ok(()),
             GroupState::Unjoined => Err(KrafkaError::invalid_state(
-                "Cannot commit: not part of a group",
+                "cannot commit: not part of a group",
             )),
             GroupState::PreparingRebalance | GroupState::AwaitingSync => Err(
-                KrafkaError::invalid_state("Cannot commit: rebalance in progress"),
+                KrafkaError::invalid_state("cannot commit: rebalance in progress"),
             ),
             _ => Err(KrafkaError::invalid_state(format!(
-                "Cannot commit in state: {:?}",
-                state
+                "cannot commit in state: {state:?}",
             ))),
         }
     }
@@ -1743,7 +1742,7 @@ impl GroupCoordinator {
         let state = *self.state.read().await;
         if state != GroupState::Stable {
             return Err(KrafkaError::invalid_state(format!(
-                "Cannot commit offsets: group state is {:?}",
+                "cannot commit offsets: group state is {:?}",
                 state
             )));
         }
