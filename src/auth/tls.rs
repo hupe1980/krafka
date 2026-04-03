@@ -139,12 +139,12 @@ pub async fn connect_tls(
     let host = crate::util::extract_sni_hostname(sni_hostname)?.to_string();
 
     let server_name = ServerName::try_from(host)
-        .map_err(|e| KrafkaError::config(format!("Invalid server name: {}", e)))?;
+        .map_err(|e| KrafkaError::config(format!("Invalid server name: {e}")))?;
 
     connector
         .connect(server_name, stream)
         .await
-        .map_err(|e| KrafkaError::auth(format!("TLS handshake failed: {}", e)))
+        .map_err(|e| KrafkaError::auth(format!("TLS handshake failed: {e}")))
 }
 
 /// Load certificates from a PEM file synchronously.
@@ -153,11 +153,11 @@ pub async fn connect_tls(
 /// use [`load_certs_async`] instead.
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     let file = File::open(Path::new(path))
-        .map_err(|e| KrafkaError::config(format!("Failed to open cert file {}: {}", path, e)))?;
+        .map_err(|e| KrafkaError::config(format!("Failed to open cert file {path}: {e}")))?;
     let mut reader = BufReader::new(file);
 
     certs(&mut reader)
-        .map(|c| c.map_err(|e| KrafkaError::config(format!("Failed to parse cert: {}", e))))
+        .map(|c| c.map_err(|e| KrafkaError::config(format!("Failed to parse cert: {e}"))))
         .collect()
 }
 
@@ -168,7 +168,7 @@ pub async fn load_certs_async(path: &str) -> Result<Vec<CertificateDer<'static>>
     let path = path.to_string();
     tokio::task::spawn_blocking(move || load_certs(&path))
         .await
-        .map_err(|e| KrafkaError::config(format!("Failed to spawn blocking task: {}", e)))?
+        .map_err(|e| KrafkaError::config(format!("Failed to spawn blocking task: {e}")))?
 }
 
 /// Load a private key from a PEM file synchronously.
@@ -177,11 +177,11 @@ pub async fn load_certs_async(path: &str) -> Result<Vec<CertificateDer<'static>>
 /// use [`load_private_key_async`] instead.
 fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
     let file = File::open(Path::new(path))
-        .map_err(|e| KrafkaError::config(format!("Failed to open key file {}: {}", path, e)))?;
+        .map_err(|e| KrafkaError::config(format!("Failed to open key file {path}: {e}")))?;
     let mut reader = BufReader::new(file);
 
     private_key(&mut reader)
-        .map_err(|e| KrafkaError::config(format!("Failed to read private key: {}", e)))?
+        .map_err(|e| KrafkaError::config(format!("Failed to read private key: {e}")))?
         .ok_or_else(|| KrafkaError::config("No private key found in file"))
 }
 
@@ -192,7 +192,7 @@ pub async fn load_private_key_async(path: &str) -> Result<PrivateKeyDer<'static>
     let path = path.to_string();
     tokio::task::spawn_blocking(move || load_private_key(&path))
         .await
-        .map_err(|e| KrafkaError::config(format!("Failed to spawn blocking task: {}", e)))?
+        .map_err(|e| KrafkaError::config(format!("Failed to spawn blocking task: {e}")))?
 }
 
 /// Build a rustls ClientConfig asynchronously.

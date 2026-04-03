@@ -233,9 +233,10 @@ impl Producer {
         let partition = match record.partition {
             Some(p) => p,
             None => {
-                let partition_count = self.metadata.partition_count(&topic).ok_or_else(|| {
-                    KrafkaError::invalid_state(format!("unknown topic: {}", topic))
-                })?;
+                let partition_count = self
+                    .metadata
+                    .partition_count(&topic)
+                    .ok_or_else(|| KrafkaError::invalid_state(format!("unknown topic: {topic}")))?;
                 self.partitioner
                     .partition(&topic, record.key.as_deref(), partition_count)
             }
@@ -412,7 +413,7 @@ impl Producer {
                     if !partition_response.error_code.is_ok() {
                         return Err(KrafkaError::broker(
                             partition_response.error_code,
-                            format!("produce failed for {}-{}", topic, partition),
+                            format!("produce failed for {topic}-{partition}"),
                         ));
                     }
 

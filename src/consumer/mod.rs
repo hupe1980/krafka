@@ -272,8 +272,8 @@ impl Consumer {
         info!(
             "Consumer initialized with {} brokers{}",
             metadata.brokers().len(),
-            if group_coordinator.is_some() {
-                format!(", group_id='{}'", config.group_id.as_ref().unwrap())
+            if let Some(ref gid) = config.group_id {
+                format!(", group_id='{gid}'")
             } else {
                 String::new()
             }
@@ -1003,10 +1003,8 @@ impl Consumer {
             }
             None => {
                 // AutoOffsetReset::None — fail if no committed offset
-                let missing: Vec<String> = need_reset
-                    .iter()
-                    .map(|(t, p)| format!("{}-{}", t, p))
-                    .collect();
+                let missing: Vec<String> =
+                    need_reset.iter().map(|(t, p)| format!("{t}-{p}")).collect();
                 return Err(KrafkaError::invalid_state(format!(
                     "no committed offset for partitions and auto.offset.reset=none: {}",
                     missing.join(", ")
@@ -1118,10 +1116,8 @@ impl Consumer {
             }
             None => {
                 // AutoOffsetReset::None — fail if no offset
-                let missing: Vec<String> = need_reset
-                    .iter()
-                    .map(|(t, p)| format!("{}-{}", t, p))
-                    .collect();
+                let missing: Vec<String> =
+                    need_reset.iter().map(|(t, p)| format!("{t}-{p}")).collect();
                 return Err(KrafkaError::invalid_state(format!(
                     "no offset for partitions and auto.offset.reset=none: {}",
                     missing.join(", ")
@@ -1181,7 +1177,7 @@ impl Consumer {
             .get(&(topic.to_string(), partition))
             .copied()
             .ok_or_else(|| {
-                KrafkaError::protocol(format!("no offset returned for {}-{}", topic, partition))
+                KrafkaError::protocol(format!("no offset returned for {topic}-{partition}"))
             })
     }
 
@@ -1301,10 +1297,9 @@ impl Consumer {
                 Some(v) => v,
                 None => {
                     let err = KrafkaError::protocol(format!(
-                        "broker {} does not support ListOffsets",
-                        leader_id
+                        "no mutually supported ListOffsets API version for broker {leader_id}"
                     ));
-                    warn!("{}", err);
+                    warn!("{err}");
                     last_error = Some(err);
                     continue;
                 }
@@ -1541,8 +1536,8 @@ impl Consumer {
                             }
                         }
                     }
-                } else {
-                    self.apply_auto_offset_reset(&reset_partitions).await.ok();
+                } else if let Err(e) = self.apply_auto_offset_reset(&reset_partitions).await {
+                    warn!("Auto-offset-reset failed for missing partitions: {e}");
                 }
 
                 // Recompute lag after resolving offsets for missing partitions
@@ -1820,8 +1815,7 @@ impl Consumer {
             .await
             .unwrap_or_else(|| {
                 debug!(
-                    "Broker {} does not support Fetch v7+, falling back to v4",
-                    broker_id
+                    "No mutually supported Fetch v7+ for broker {broker_id}, falling back to v4"
                 );
                 4
             });
@@ -2033,7 +2027,7 @@ impl Consumer {
                     // from large fetch responses. When max_poll_records is set,
                     // stop decoding once we have enough records. The remaining
                     // data will be re-fetched on the next poll using the
-                    // committed offset.
+                    // next fetch offset tracked locally for this partition.
                     let record_limit = if self.config.max_poll_records > 0 {
                         self.config.max_poll_records as usize
                     } else {
@@ -2153,6 +2147,10 @@ impl Consumer {
             None => self
                 .resolve_list_offset(topic, partition, target)
                 .await
+                .map_err(|e| {
+                    warn!("Direct list_offset failed for {topic}-{partition}: {e}");
+                    e
+                })
                 .ok(),
         };
 
@@ -2193,7 +2191,7 @@ impl Consumer {
         }
 
         let leader_id = self.metadata.leader(topic, partition).ok_or_else(|| {
-            KrafkaError::invalid_state(format!("no leader for {}-{}", topic, partition))
+            KrafkaError::invalid_state(format!("no leader for {topic}-{partition}"))
         })?;
 
         let broker = self

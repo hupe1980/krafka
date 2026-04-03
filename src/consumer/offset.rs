@@ -110,6 +110,7 @@ impl OffsetStore {
 }
 
 /// Offset reset strategy result.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetOffset {
     /// Use the earliest available offset.

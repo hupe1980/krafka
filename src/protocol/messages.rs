@@ -2961,6 +2961,7 @@ impl CreatePartitionsResponse {
 // ============================================================================
 
 /// Resource type for config operations.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigResourceType {
     /// Unknown resource type.
@@ -3533,6 +3534,7 @@ impl SaslAuthenticateResponse {
 // ============================================================================
 
 /// ACL resource type.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AclResourceType {
     /// Unknown resource type.
@@ -3575,6 +3577,7 @@ impl AclResourceType {
 }
 
 /// ACL pattern type.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AclPatternType {
     /// Unknown pattern type.
@@ -3608,6 +3611,7 @@ impl AclPatternType {
 }
 
 /// ACL operation.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AclOperation {
     /// Unknown operation.
@@ -3668,6 +3672,7 @@ impl AclOperation {
 }
 
 /// ACL permission type.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AclPermissionType {
     /// Unknown permission.
@@ -4218,6 +4223,7 @@ impl DeleteAclsResponse {
 // ============================================================================
 
 /// Transaction result for partition operations.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionResult {
     /// Commit the transaction.

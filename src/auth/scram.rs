@@ -318,7 +318,7 @@ impl ScramClient {
         // Check for error
         if let Some(error) = server_final_str.strip_prefix("e=") {
             self.state = ScramState::Failed;
-            return Err(KrafkaError::auth(format!("SCRAM server error: {}", error)));
+            return Err(KrafkaError::auth(format!("SCRAM server error: {error}")));
         }
 
         // Parse server signature

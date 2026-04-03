@@ -71,41 +71,43 @@ impl RequestPriority {
 }
 
 /// Configuration for broker connections.
+///
+/// Use [`ConnectionConfig::builder()`] or [`Default::default()`] to construct.
 #[derive(Debug, Clone)]
 pub struct ConnectionConfig {
     /// Connection timeout.
-    pub connect_timeout: Duration,
+    pub(crate) connect_timeout: Duration,
     /// Request timeout.
-    pub request_timeout: Duration,
+    pub(crate) request_timeout: Duration,
     /// Socket send buffer size.
-    pub send_buffer_size: Option<usize>,
+    pub(crate) send_buffer_size: Option<usize>,
     /// Socket receive buffer size.
-    pub recv_buffer_size: Option<usize>,
+    pub(crate) recv_buffer_size: Option<usize>,
     /// TCP nodelay.
-    pub nodelay: bool,
+    pub(crate) nodelay: bool,
     /// Client ID.
-    pub client_id: String,
+    pub(crate) client_id: String,
     /// Number of connections per broker for high-throughput scenarios.
     ///
     /// Default is 1. For extreme high-throughput (>100k msg/s per broker),
     /// consider 2-4 connections to parallelize I/O operations.
-    pub connections_per_broker: usize,
+    pub(crate) connections_per_broker: usize,
     /// High-priority channel capacity for heartbeats and metadata requests.
     ///
     /// This should be small since high-priority requests should be rare.
-    pub high_priority_channel_capacity: usize,
+    pub(crate) high_priority_channel_capacity: usize,
     /// Normal-priority channel capacity for produce and fetch requests.
-    pub normal_priority_channel_capacity: usize,
+    pub(crate) normal_priority_channel_capacity: usize,
     /// Maximum response size in bytes.
     ///
     /// Responses larger than this are rejected to prevent excessive memory allocation.
     /// Default: 100 MB (matching `MAX_MESSAGE_SIZE`).
-    pub max_response_size: usize,
+    pub(crate) max_response_size: usize,
     /// Authentication configuration (optional).
     ///
     /// When set, the connection will perform TLS upgrade and/or SASL
     /// authentication handshake during establishment.
-    pub auth: Option<AuthConfig>,
+    pub(crate) auth: Option<AuthConfig>,
 }
 
 impl Default for ConnectionConfig {
@@ -130,6 +132,61 @@ impl ConnectionConfig {
     /// Create a new connection config builder.
     pub fn builder() -> ConnectionConfigBuilder {
         ConnectionConfigBuilder::default()
+    }
+
+    /// Returns the connection timeout.
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    /// Returns the request timeout.
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    /// Returns the socket send buffer size, if set.
+    pub fn send_buffer_size(&self) -> Option<usize> {
+        self.send_buffer_size
+    }
+
+    /// Returns the socket receive buffer size, if set.
+    pub fn recv_buffer_size(&self) -> Option<usize> {
+        self.recv_buffer_size
+    }
+
+    /// Returns whether TCP nodelay is enabled.
+    pub fn nodelay(&self) -> bool {
+        self.nodelay
+    }
+
+    /// Returns the client ID.
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// Returns the number of connections per broker.
+    pub fn connections_per_broker(&self) -> usize {
+        self.connections_per_broker
+    }
+
+    /// Returns the high-priority channel capacity.
+    pub fn high_priority_channel_capacity(&self) -> usize {
+        self.high_priority_channel_capacity
+    }
+
+    /// Returns the normal-priority channel capacity.
+    pub fn normal_priority_channel_capacity(&self) -> usize {
+        self.normal_priority_channel_capacity
+    }
+
+    /// Returns the maximum response size in bytes.
+    pub fn max_response_size(&self) -> usize {
+        self.max_response_size
+    }
+
+    /// Returns the authentication configuration, if set.
+    pub fn auth(&self) -> Option<&AuthConfig> {
+        self.auth.as_ref()
     }
 }
 

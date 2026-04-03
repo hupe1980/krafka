@@ -33,7 +33,7 @@ fn main() {
     println!("3. SASL/PLAIN Authentication");
     let config = AuthConfig::sasl_plain("username", "password");
     println!("   Security: SASL_PLAINTEXT");
-    println!("   Mechanism: {:?}", config.sasl_mechanism);
+    println!("   Mechanism: {:?}", config.sasl_mechanism());
     println!("   Requires SASL: {}", config.requires_sasl());
     println!("   Use case: Simple username/password auth (use with TLS!)\n");
 
@@ -42,7 +42,7 @@ fn main() {
     let tls_config = TlsConfig::new();
     let config = AuthConfig::sasl_plain_ssl("username", "password", tls_config);
     println!("   Security: SASL_SSL");
-    println!("   Mechanism: {:?}", config.sasl_mechanism);
+    println!("   Mechanism: {:?}", config.sasl_mechanism());
     println!("   Requires TLS: {}", config.requires_tls());
     println!("   Use case: Production with simple auth\n");
 
@@ -50,14 +50,14 @@ fn main() {
     println!("5. SASL/SCRAM-SHA-256 Authentication");
     let config = AuthConfig::sasl_scram_sha256("username", "password");
     println!("   Security: SASL_PLAINTEXT");
-    println!("   Mechanism: {:?}", config.sasl_mechanism);
+    println!("   Mechanism: {:?}", config.sasl_mechanism());
     println!("   Use case: Secure challenge-response auth (stronger than PLAIN)\n");
 
     // Example 6: SASL/SCRAM-SHA-512
     println!("6. SASL/SCRAM-SHA-512 Authentication");
     let config = AuthConfig::sasl_scram_sha512("username", "password");
     println!("   Security: SASL_PLAINTEXT");
-    println!("   Mechanism: {:?}", config.sasl_mechanism);
+    println!("   Mechanism: {:?}", config.sasl_mechanism());
     println!("   Use case: Maximum security SCRAM authentication\n");
 
     // Example 7: AWS MSK IAM Authentication
@@ -72,7 +72,7 @@ fn main() {
             println!("   Loaded from environment!");
             println!(
                 "   Security: SASL_SSL, Mechanism: {:?}",
-                config.sasl_mechanism
+                config.sasl_mechanism()
             );
         }
         Err(e) => {
@@ -88,7 +88,7 @@ fn main() {
         "us-east-1",
     );
     println!("   Security: SASL_SSL");
-    println!("   Mechanism: {:?}", config.sasl_mechanism);
+    println!("   Mechanism: {:?}", config.sasl_mechanism());
     println!("   Requires TLS: {}", config.requires_tls());
     println!("   Use case: AWS Managed Streaming for Kafka (MSK)");
     println!("   Note: For production, use from_env() or from_default_chain()\n");
@@ -120,22 +120,21 @@ fn main() {
 
     println!("Default (verify server certs with Mozilla roots):");
     let tls = TlsConfig::new();
-    println!("   verify_server_cert: {}", tls.verify_server_cert);
-    println!("   ca_cert_path: {:?}", tls.ca_cert_path);
+    println!("   verify_server_cert: {}", tls.verify_server_cert());
+    println!("   ca_cert_path: {:?}", tls.ca_cert_path());
 
     println!("\nInsecure (skip verification - NOT for production):");
     #[allow(deprecated)]
     let tls = TlsConfig::insecure();
-    println!("   verify_server_cert: {}", tls.verify_server_cert);
+    println!("   verify_server_cert: {}", tls.verify_server_cert());
 
     println!("\nWith custom CA:");
     let tls = TlsConfig::new().with_ca_cert("/etc/kafka/ca.pem");
-    println!("   ca_cert_path: {:?}", tls.ca_cert_path);
+    println!("   ca_cert_path: {:?}", tls.ca_cert_path());
 
     println!("\nWith SNI hostname:");
-    let mut tls = TlsConfig::new();
-    tls.sni_hostname = Some("kafka.example.com".to_string());
-    println!("   sni_hostname: {:?}", tls.sni_hostname);
+    let tls = TlsConfig::new().with_sni_hostname("kafka.example.com");
+    println!("   sni_hostname: {:?}", tls.sni_hostname());
 
     println!("\n=== Security Recommendations ===");
     println!("1. Always use TLS (SSL or SASL_SSL) in production");
@@ -160,7 +159,7 @@ fn main() {
         .sasl_scram_sha256("user", "pass")
         .tls(TlsConfig::new())
         .build();
-    println!("Client ID: {}", config.connection.client_id);
+    println!("Client ID: {}", config.connection.client_id());
     println!("Requires TLS: {}", config.auth.requires_tls());
     println!("Requires SASL: {}", config.auth.requires_sasl());
 

@@ -56,6 +56,7 @@ use crate::protocol::{
 };
 
 /// Configuration for creating a topic.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct NewTopic {
     /// Topic name.
@@ -87,6 +88,7 @@ impl NewTopic {
 }
 
 /// Result of topic creation.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct CreateTopicResult {
     /// Topic name.
@@ -96,6 +98,7 @@ pub struct CreateTopicResult {
 }
 
 /// Result of topic deletion.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DeleteTopicResult {
     /// Topic name.
@@ -105,6 +108,7 @@ pub struct DeleteTopicResult {
 }
 
 /// Result of partition creation.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct CreatePartitionsResult {
     /// Topic name.
@@ -114,6 +118,7 @@ pub struct CreatePartitionsResult {
 }
 
 /// A configuration entry.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ConfigEntry {
     /// Configuration name.
@@ -129,6 +134,7 @@ pub struct ConfigEntry {
 }
 
 /// Result of config alteration.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct AlterConfigResult {
     /// Resource name.
@@ -138,6 +144,7 @@ pub struct AlterConfigResult {
 }
 
 /// Result of describing ACLs.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DescribeAclsResult {
     /// Error message if any.
@@ -147,6 +154,7 @@ pub struct DescribeAclsResult {
 }
 
 /// Result of creating ACLs.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct CreateAclsResult {
     /// Results for each ACL creation.
@@ -154,6 +162,7 @@ pub struct CreateAclsResult {
 }
 
 /// Result of a single ACL creation.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct CreateAclResult {
     /// Error message if any.
@@ -161,6 +170,7 @@ pub struct CreateAclResult {
 }
 
 /// Result of deleting ACLs.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DeleteAclsResult {
     /// Results for each filter.
@@ -168,6 +178,7 @@ pub struct DeleteAclsResult {
 }
 
 /// Result for a single ACL filter deletion.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DeleteAclFilterResult {
     /// Error message if any.
@@ -177,6 +188,7 @@ pub struct DeleteAclFilterResult {
 }
 
 /// Description of a consumer group.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ConsumerGroupDescription {
     /// Group ID.
@@ -194,6 +206,7 @@ pub struct ConsumerGroupDescription {
 }
 
 /// A member of a consumer group.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ConsumerGroupMember {
     /// Member ID.
@@ -207,6 +220,7 @@ pub struct ConsumerGroupMember {
 }
 
 /// Listing entry for a consumer group.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ConsumerGroupListing {
     /// Group ID.
@@ -216,6 +230,7 @@ pub struct ConsumerGroupListing {
 }
 
 /// Result of deleting records from a partition.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DeleteRecordResult {
     /// Topic name.
@@ -229,6 +244,7 @@ pub struct DeleteRecordResult {
 }
 
 /// Result of an OffsetForLeaderEpoch request for a partition.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct LeaderEpochResult {
     /// Topic name.
@@ -246,6 +262,7 @@ pub struct LeaderEpochResult {
 /// Filter for ACL operations (describe, delete).
 ///
 /// This struct encapsulates all the filter parameters for ACL queries.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct AclFilter {
     /// Resource type to filter by.
@@ -331,16 +348,18 @@ impl AclFilter {
 }
 
 /// Admin client configuration.
+///
+/// Use [`AdminConfig::builder()`] or [`Default::default()`] to construct.
 #[derive(Debug, Clone)]
 pub struct AdminConfig {
     /// Bootstrap servers.
-    pub bootstrap_servers: String,
+    pub(crate) bootstrap_servers: String,
     /// Client ID.
-    pub client_id: String,
+    pub(crate) client_id: String,
     /// Request timeout.
-    pub request_timeout: Duration,
+    pub(crate) request_timeout: Duration,
     /// Authentication configuration (optional).
-    pub auth: Option<AuthConfig>,
+    pub(crate) auth: Option<AuthConfig>,
 }
 
 impl Default for AdminConfig {
@@ -351,6 +370,71 @@ impl Default for AdminConfig {
             request_timeout: Duration::from_secs(30),
             auth: None,
         }
+    }
+}
+
+impl AdminConfig {
+    /// Create a new config builder.
+    pub fn builder() -> AdminConfigBuilder {
+        AdminConfigBuilder::default()
+    }
+
+    /// Returns the bootstrap servers.
+    pub fn bootstrap_servers(&self) -> &str {
+        &self.bootstrap_servers
+    }
+
+    /// Returns the client ID.
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// Returns the request timeout.
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    /// Returns the authentication configuration, if set.
+    pub fn auth(&self) -> Option<&AuthConfig> {
+        self.auth.as_ref()
+    }
+}
+
+/// Builder for AdminConfig.
+#[must_use = "builders do nothing until .build() is called"]
+#[derive(Debug, Default)]
+pub struct AdminConfigBuilder {
+    config: AdminConfig,
+}
+
+impl AdminConfigBuilder {
+    /// Set bootstrap servers.
+    pub fn bootstrap_servers(mut self, servers: impl Into<String>) -> Self {
+        self.config.bootstrap_servers = servers.into();
+        self
+    }
+
+    /// Set client ID.
+    pub fn client_id(mut self, id: impl Into<String>) -> Self {
+        self.config.client_id = id.into();
+        self
+    }
+
+    /// Set request timeout.
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.config.request_timeout = timeout;
+        self
+    }
+
+    /// Set authentication configuration.
+    pub fn auth(mut self, auth: AuthConfig) -> Self {
+        self.config.auth = Some(auth);
+        self
+    }
+
+    /// Build the AdminConfig.
+    pub fn build(self) -> AdminConfig {
+        self.config
     }
 }
 
@@ -418,7 +502,9 @@ impl AdminClient {
         let version = conn
             .negotiate_api_version_max(ApiKey::CreateTopics, versions::CREATE_TOPICS_MAX)
             .await
-            .ok_or_else(|| KrafkaError::protocol("broker does not support CreateTopics API"))?;
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported CreateTopics API version")
+            })?;
 
         let response_bytes = conn
             .send_request(ApiKey::CreateTopics, version, |buf| match version {
@@ -492,7 +578,9 @@ impl AdminClient {
         let version = conn
             .negotiate_api_version_max(ApiKey::DeleteTopics, versions::DELETE_TOPICS_MAX)
             .await
-            .ok_or_else(|| KrafkaError::protocol("broker does not support DeleteTopics API"))?;
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported DeleteTopics API version")
+            })?;
 
         let response_bytes = conn
             .send_request(ApiKey::DeleteTopics, version, |buf| request.encode_v0(buf))
@@ -569,7 +657,9 @@ impl AdminClient {
         let version = conn
             .negotiate_api_version_max(ApiKey::CreatePartitions, versions::CREATE_PARTITIONS_MAX)
             .await
-            .ok_or_else(|| KrafkaError::protocol("broker does not support CreatePartitions API"))?;
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported CreatePartitions API version")
+            })?;
 
         let response_bytes = conn
             .send_request(ApiKey::CreatePartitions, version, |buf| {
@@ -631,7 +721,9 @@ impl AdminClient {
         let version = conn
             .negotiate_api_version_max(ApiKey::DescribeConfigs, versions::DESCRIBE_CONFIGS_MAX)
             .await
-            .ok_or_else(|| KrafkaError::protocol("broker does not support DescribeConfigs API"))?;
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported DescribeConfigs API version")
+            })?;
 
         let response_bytes = conn
             .send_request(ApiKey::DescribeConfigs, version, |buf| {
@@ -686,7 +778,9 @@ impl AdminClient {
         let version = conn
             .negotiate_api_version_max(ApiKey::DescribeConfigs, versions::DESCRIBE_CONFIGS_MAX)
             .await
-            .ok_or_else(|| KrafkaError::protocol("broker does not support DescribeConfigs API"))?;
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported DescribeConfigs API version")
+            })?;
 
         let response_bytes = conn
             .send_request(ApiKey::DescribeConfigs, version, |buf| {
@@ -748,7 +842,9 @@ impl AdminClient {
         let version = conn
             .negotiate_api_version_max(ApiKey::AlterConfigs, versions::ALTER_CONFIGS_MAX)
             .await
-            .ok_or_else(|| KrafkaError::protocol("broker does not support AlterConfigs API"))?;
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported AlterConfigs API version")
+            })?;
 
         let response_bytes = conn
             .send_request(ApiKey::AlterConfigs, version, |buf| request.encode_v0(buf))
@@ -917,7 +1013,9 @@ impl AdminClient {
         let version = conn
             .negotiate_api_version_max(ApiKey::DescribeAcls, versions::DESCRIBE_ACLS_MAX)
             .await
-            .ok_or_else(|| KrafkaError::protocol("broker does not support DescribeAcls API"))?;
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported DescribeAcls API version")
+            })?;
 
         let response_bytes = conn
             .send_request(ApiKey::DescribeAcls, version, |buf| request.encode_v0(buf))
@@ -988,7 +1086,7 @@ impl AdminClient {
         let version = conn
             .negotiate_api_version_max(ApiKey::CreateAcls, versions::CREATE_ACLS_MAX)
             .await
-            .ok_or_else(|| KrafkaError::protocol("broker does not support CreateAcls API"))?;
+            .ok_or_else(|| KrafkaError::protocol("no mutually supported CreateAcls API version"))?;
 
         let response_bytes = conn
             .send_request(ApiKey::CreateAcls, version, |buf| request.encode_v0(buf))
@@ -1057,7 +1155,7 @@ impl AdminClient {
         let version = conn
             .negotiate_api_version_max(ApiKey::DeleteAcls, versions::DELETE_ACLS_MAX)
             .await
-            .ok_or_else(|| KrafkaError::protocol("broker does not support DeleteAcls API"))?;
+            .ok_or_else(|| KrafkaError::protocol("no mutually supported DeleteAcls API version"))?;
 
         let response_bytes = conn
             .send_request(ApiKey::DeleteAcls, version, |buf| request.encode_v0(buf))
@@ -1124,7 +1222,7 @@ impl AdminClient {
                 .negotiate_api_version_max(ApiKey::FindCoordinator, versions::FIND_COORDINATOR_MAX)
                 .await
                 .ok_or_else(|| {
-                    KrafkaError::protocol("broker does not support FindCoordinator API")
+                    KrafkaError::protocol("no mutually supported FindCoordinator API version")
                 })?;
 
             let coord_response_bytes = any_conn
@@ -1190,7 +1288,7 @@ impl AdminClient {
                 .negotiate_api_version_max(ApiKey::DescribeGroups, versions::DESCRIBE_GROUPS_MAX)
                 .await
                 .ok_or_else(|| {
-                    KrafkaError::protocol("broker does not support DescribeGroups API")
+                    KrafkaError::protocol("no mutually supported DescribeGroups API version")
                 })?;
 
             let response_bytes = conn
@@ -1282,7 +1380,7 @@ impl AdminClient {
                 Some(v) => v,
                 None => {
                     warn!(
-                        "Broker {} does not support ListGroups API, skipping",
+                        "No mutually supported ListGroups API version for broker {}, skipping",
                         broker.id
                     );
                     continue;
@@ -1422,7 +1520,7 @@ impl AdminClient {
                 .negotiate_api_version_max(ApiKey::DeleteRecords, versions::DELETE_RECORDS_MAX)
                 .await
                 .ok_or_else(|| {
-                    KrafkaError::protocol("broker does not support DeleteRecords API")
+                    KrafkaError::protocol("no mutually supported DeleteRecords API version")
                 })?;
 
             let response_bytes = conn
@@ -1534,7 +1632,7 @@ impl AdminClient {
                 )
                 .await
                 .ok_or_else(|| {
-                    KrafkaError::protocol("broker does not support OffsetForLeaderEpoch API")
+                    KrafkaError::protocol("no mutually supported OffsetForLeaderEpoch API version")
                 })?;
 
             let response_bytes = conn

@@ -425,13 +425,13 @@ impl TransactionalProducer {
             .await
             .ok_or_else(|| {
                 KrafkaError::protocol(
-                    "broker does not support FindCoordinator; \
+                    "no mutually supported FindCoordinator API version; \
                      transactional coordinator lookup requires v1+",
                 )
             })?;
         if fc_version < 1 {
             return Err(KrafkaError::protocol(
-                "broker does not support FindCoordinator v1; \
+                "no mutually supported FindCoordinator v1+; \
                  transactional coordinator lookup requires key_type (v1+)",
             ));
         }
@@ -509,9 +509,10 @@ impl TransactionalProducer {
         let partition = match record.partition {
             Some(p) => p,
             None => {
-                let partition_count = self.metadata.partition_count(&topic).ok_or_else(|| {
-                    KrafkaError::invalid_state(format!("unknown topic: {}", topic))
-                })?;
+                let partition_count = self
+                    .metadata
+                    .partition_count(&topic)
+                    .ok_or_else(|| KrafkaError::invalid_state(format!("unknown topic: {topic}")))?;
                 self.partitioner
                     .partition(&topic, record.key.as_deref(), partition_count)
             }
@@ -763,7 +764,7 @@ impl TransactionalProducer {
                         }
                         return Err(KrafkaError::broker(
                             partition_response.error_code,
-                            format!("produce failed for {}-{}", topic, partition),
+                            format!("produce failed for {topic}-{partition}"),
                         ));
                     }
 
@@ -852,7 +853,7 @@ impl TransactionalProducer {
 
         // Find the group coordinator for offset commit
         let (group_node_id, group_host, group_port) = self.find_group_coordinator(group_id).await?;
-        let group_addr = format!("{}:{}", group_host, group_port);
+        let group_addr = format!("{group_host}:{group_port}");
 
         let group_conn = self
             .pool
@@ -898,7 +899,9 @@ impl TransactionalProducer {
         let fc_version = conn
             .negotiate_api_version_max(ApiKey::FindCoordinator, 1)
             .await
-            .ok_or_else(|| KrafkaError::protocol("broker does not support FindCoordinator"))?;
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported FindCoordinator API version")
+            })?;
 
         let response_bytes = conn
             .send_request(ApiKey::FindCoordinator, fc_version, |buf| {

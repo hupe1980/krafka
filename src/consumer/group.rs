@@ -90,6 +90,7 @@ impl ConsumerRebalanceListener for NoOpRebalanceListener {
 }
 
 /// Consumer group state.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GroupState {
     /// Not yet joined.
@@ -833,6 +834,7 @@ impl HeartbeatController {
 }
 
 /// Heartbeat response status from the coordinator.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeartbeatStatus {
     /// Heartbeat accepted, continue normally.

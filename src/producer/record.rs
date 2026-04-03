@@ -6,6 +6,7 @@ use crate::error::{KrafkaError, Result};
 use crate::{PartitionId, Timestamp};
 
 /// A record to be sent to Kafka.
+#[non_exhaustive]
 #[must_use]
 #[derive(Debug, Clone)]
 pub struct ProducerRecord {
@@ -98,6 +99,11 @@ impl ProducerRecord {
     /// - Each header value fits in `i32`
     /// - Topic name fits in `i16` (Kafka string encoding limit of 32 KiB)
     pub fn validate(&self) -> Result<()> {
+        // Topic names cannot be empty
+        if self.topic.is_empty() {
+            return Err(KrafkaError::protocol("topic name cannot be empty"));
+        }
+
         // Topic names are encoded as KafkaString (i16 length prefix)
         if self.topic.len() > i16::MAX as usize {
             return Err(KrafkaError::protocol(format!(
@@ -153,8 +159,9 @@ impl ProducerRecord {
 }
 
 /// Metadata returned after successfully sending a record.
+#[non_exhaustive]
 #[must_use = "contains the result of a send operation"]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordMetadata {
     /// Topic the record was sent to.
     pub topic: String,
@@ -273,5 +280,29 @@ mod tests {
             .with_key("my-key")
             .without_key();
         assert!(record.key.is_none());
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_topic() {
+        let record = ProducerRecord::new("", b"value".to_vec());
+        let err = record.validate().unwrap_err().to_string();
+        assert!(err.contains("empty"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn test_record_metadata_equality() {
+        let a = RecordMetadata {
+            topic: "t".to_string(),
+            partition: 0,
+            offset: 1,
+            timestamp: 100,
+        };
+        let b = RecordMetadata {
+            topic: "t".to_string(),
+            partition: 0,
+            offset: 1,
+            timestamp: 100,
+        };
+        assert_eq!(a, b);
     }
 }

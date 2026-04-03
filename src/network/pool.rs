@@ -19,16 +19,18 @@ use crate::BrokerId;
 use crate::error::{KrafkaError, Result};
 
 /// Configuration for connection retry with exponential backoff.
+///
+/// Use [`ConnectionRetryConfig::builder()`] or [`Default::default()`] to construct.
 #[derive(Debug, Clone)]
 pub struct ConnectionRetryConfig {
     /// Maximum number of retries (0 = no retries).
-    pub max_retries: u32,
+    pub(crate) max_retries: u32,
     /// Initial backoff duration.
-    pub initial_backoff: Duration,
+    pub(crate) initial_backoff: Duration,
     /// Maximum backoff duration (caps exponential growth).
-    pub max_backoff: Duration,
+    pub(crate) max_backoff: Duration,
     /// Backoff multiplier for exponential growth.
-    pub backoff_multiplier: f64,
+    pub(crate) backoff_multiplier: f64,
 }
 
 impl Default for ConnectionRetryConfig {
@@ -43,6 +45,31 @@ impl Default for ConnectionRetryConfig {
 }
 
 impl ConnectionRetryConfig {
+    /// Create a new config builder.
+    pub fn builder() -> ConnectionRetryConfigBuilder {
+        ConnectionRetryConfigBuilder::default()
+    }
+
+    /// Returns the maximum number of retries.
+    pub fn max_retries(&self) -> u32 {
+        self.max_retries
+    }
+
+    /// Returns the initial backoff duration.
+    pub fn initial_backoff(&self) -> Duration {
+        self.initial_backoff
+    }
+
+    /// Returns the maximum backoff duration.
+    pub fn max_backoff(&self) -> Duration {
+        self.max_backoff
+    }
+
+    /// Returns the backoff multiplier.
+    pub fn backoff_multiplier(&self) -> f64 {
+        self.backoff_multiplier
+    }
+
     /// Calculate the backoff duration for a given attempt number (1-indexed).
     #[inline]
     fn calculate_backoff(&self, attempt: u32) -> Duration {
@@ -58,6 +85,44 @@ impl ConnectionRetryConfig {
         let capped_backoff = base_backoff.min(self.max_backoff.as_secs_f64());
 
         Duration::from_secs_f64(capped_backoff)
+    }
+}
+
+/// Builder for ConnectionRetryConfig.
+#[must_use = "builders do nothing until .build() is called"]
+#[derive(Debug, Default)]
+pub struct ConnectionRetryConfigBuilder {
+    config: ConnectionRetryConfig,
+}
+
+impl ConnectionRetryConfigBuilder {
+    /// Set maximum number of retries.
+    pub fn max_retries(mut self, retries: u32) -> Self {
+        self.config.max_retries = retries;
+        self
+    }
+
+    /// Set initial backoff duration.
+    pub fn initial_backoff(mut self, duration: Duration) -> Self {
+        self.config.initial_backoff = duration;
+        self
+    }
+
+    /// Set maximum backoff duration.
+    pub fn max_backoff(mut self, duration: Duration) -> Self {
+        self.config.max_backoff = duration;
+        self
+    }
+
+    /// Set backoff multiplier.
+    pub fn backoff_multiplier(mut self, multiplier: f64) -> Self {
+        self.config.backoff_multiplier = multiplier;
+        self
+    }
+
+    /// Build the ConnectionRetryConfig.
+    pub fn build(self) -> ConnectionRetryConfig {
+        self.config
     }
 }
 
@@ -122,7 +187,7 @@ impl BrokerConnectionBundle {
         let mut connections = Vec::with_capacity(num_connections);
         for handle in handles {
             let conn = handle.await.map_err(|e| {
-                KrafkaError::invalid_state(format!("Connection task failed: {}", e))
+                KrafkaError::invalid_state(format!("Connection task failed: {e}"))
             })??;
             connections.push(Arc::new(conn));
         }

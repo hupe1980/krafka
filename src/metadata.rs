@@ -22,6 +22,7 @@ use crate::protocol::{
 use crate::{BrokerId, PartitionId};
 
 /// Information about a broker.
+#[non_exhaustive]
 #[must_use]
 #[derive(Debug, Clone)]
 pub struct BrokerInfo {
@@ -43,6 +44,7 @@ impl BrokerInfo {
 }
 
 /// Information about a topic partition.
+#[non_exhaustive]
 #[must_use]
 #[derive(Debug, Clone)]
 pub struct PartitionInfo {
@@ -63,6 +65,7 @@ pub struct PartitionInfo {
 }
 
 /// Information about a topic.
+#[non_exhaustive]
 #[must_use]
 #[derive(Debug, Clone)]
 pub struct TopicInfo {
@@ -429,7 +432,7 @@ impl ClusterMetadata {
             .get(topic)
             .and_then(|t| t.leader(partition))
             .ok_or_else(|| {
-                KrafkaError::invalid_state(format!("no leader for {}-{}", topic, partition))
+                KrafkaError::invalid_state(format!("no leader for {topic}-{partition}"))
             })?;
 
         let broker = cache

@@ -321,7 +321,7 @@ impl Decode for KafkaString {
 
         let bytes = buf.copy_to_bytes(len);
         let s = String::from_utf8(bytes.to_vec())
-            .map_err(|e| KrafkaError::protocol(format!("invalid UTF-8 string: {}", e)))?;
+            .map_err(|e| KrafkaError::protocol(format!("invalid UTF-8 string: {e}")))?;
         Ok(Self(Some(s)))
     }
 
@@ -338,7 +338,7 @@ impl Decode for KafkaString {
 
         let bytes = buf.copy_to_bytes(len);
         let s = String::from_utf8(bytes.to_vec())
-            .map_err(|e| KrafkaError::protocol(format!("invalid UTF-8 string: {}", e)))?;
+            .map_err(|e| KrafkaError::protocol(format!("invalid UTF-8 string: {e}")))?;
         Ok(Self(Some(s)))
     }
 }

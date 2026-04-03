@@ -169,7 +169,7 @@ let batch = RecordBatchBuilder::new()
 
 Krafka protects against malicious or corrupted broker responses:
 
-- **Decode array bounds**: Every array-length field decoded from the wire passes through `check_decode_array_len()`, which rejects negative counts and counts exceeding `MAX_DECODE_ARRAY_LEN` (100,000). This applies to all 63+ decode sites in protocol messages, `KafkaArray` decode paths, and record batch/header counts. The check runs *before* any `Vec::with_capacity()` allocation, preventing both OOM and runaway decode loops.
+- **Decode array bounds**: Every array-length field decoded from the wire is validated against `MAX_DECODE_ARRAY_LEN` (100,000), typically via `check_decode_array_len()` and in some specialized decode paths (e.g., `KafkaArray::decode`, record batch counts) via equivalent local checks. These checks reject negative counts and oversized counts across all 63+ protocol-message decode sites, `KafkaArray` decode paths, and record batch/header counts. The validation runs *before* any `Vec::with_capacity()` allocation, preventing both OOM and runaway decode loops.
 - **Decompression limits**: Decompressed record data is limited to 128 MiB via streaming `.take()` limits and post-decompression size checks
 - **Record headers**: Record headers are preserved during batch building — no silent data loss
 - **Encode validation**: The `TryEncode` trait provides fallible encoding for protocol primitives (`KafkaString`, `KafkaBytes`, `KafkaArray<T>` where `T: TryEncode`, `TaggedFields`), returning errors instead of panicking on oversized data. `ProducerRecord::validate()` checks wire-format limits at the API boundary before encoding

@@ -6,6 +6,7 @@ use crate::auth::AuthConfig;
 use crate::protocol::Compression;
 
 /// Required acknowledgments for produce requests.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Acks {
     /// Don't wait for any acknowledgment.
@@ -45,38 +46,40 @@ impl Acks {
 }
 
 /// Producer configuration.
+///
+/// Use [`ProducerConfig::builder()`] or [`Default::default()`] to construct.
 #[derive(Debug, Clone)]
 pub struct ProducerConfig {
     /// Bootstrap servers (comma-separated).
-    pub bootstrap_servers: String,
+    pub(crate) bootstrap_servers: String,
     /// Client ID.
-    pub client_id: String,
+    pub(crate) client_id: String,
     /// Required acknowledgments.
-    pub acks: Acks,
+    pub(crate) acks: Acks,
     /// Compression type.
-    pub compression: Compression,
+    pub(crate) compression: Compression,
     /// Batch size in bytes.
-    pub batch_size: usize,
+    pub(crate) batch_size: usize,
     /// Time to wait before sending a batch.
-    pub linger: Duration,
+    pub(crate) linger: Duration,
     /// Request timeout.
-    pub request_timeout: Duration,
+    pub(crate) request_timeout: Duration,
     /// Number of retries.
-    pub retries: u32,
+    pub(crate) retries: u32,
     /// Time between retries.
-    pub retry_backoff: Duration,
+    pub(crate) retry_backoff: Duration,
     /// Max in-flight requests per connection.
-    pub max_in_flight: usize,
+    pub(crate) max_in_flight: usize,
     /// Enable idempotent producer.
-    pub enable_idempotence: bool,
+    pub(crate) enable_idempotence: bool,
     /// Max block time when buffer is full.
-    pub max_block: Duration,
+    pub(crate) max_block: Duration,
     /// Buffer memory size.
-    pub buffer_memory: usize,
+    pub(crate) buffer_memory: usize,
     /// Metadata max age.
-    pub metadata_max_age: Duration,
+    pub(crate) metadata_max_age: Duration,
     /// Authentication configuration (optional).
-    pub auth: Option<AuthConfig>,
+    pub(crate) auth: Option<AuthConfig>,
 }
 
 impl Default for ProducerConfig {
@@ -105,6 +108,81 @@ impl ProducerConfig {
     /// Create a new config builder.
     pub fn builder() -> ProducerConfigBuilder {
         ProducerConfigBuilder::default()
+    }
+
+    /// Returns the bootstrap servers.
+    pub fn bootstrap_servers(&self) -> &str {
+        &self.bootstrap_servers
+    }
+
+    /// Returns the client ID.
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// Returns the required acknowledgments.
+    pub fn acks(&self) -> Acks {
+        self.acks
+    }
+
+    /// Returns the compression type.
+    pub fn compression(&self) -> Compression {
+        self.compression
+    }
+
+    /// Returns the batch size in bytes.
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    /// Returns the linger time.
+    pub fn linger(&self) -> Duration {
+        self.linger
+    }
+
+    /// Returns the request timeout.
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    /// Returns the number of retries.
+    pub fn retries(&self) -> u32 {
+        self.retries
+    }
+
+    /// Returns the retry backoff duration.
+    pub fn retry_backoff(&self) -> Duration {
+        self.retry_backoff
+    }
+
+    /// Returns the max in-flight requests per connection.
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight
+    }
+
+    /// Returns whether idempotent producer is enabled.
+    pub fn enable_idempotence(&self) -> bool {
+        self.enable_idempotence
+    }
+
+    /// Returns the max block time when buffer is full.
+    pub fn max_block(&self) -> Duration {
+        self.max_block
+    }
+
+    /// Returns the buffer memory size.
+    pub fn buffer_memory(&self) -> usize {
+        self.buffer_memory
+    }
+
+    /// Returns the metadata max age.
+    pub fn metadata_max_age(&self) -> Duration {
+        self.metadata_max_age
+    }
+
+    /// Returns the authentication configuration, if set.
+    pub fn auth(&self) -> Option<&AuthConfig> {
+        self.auth.as_ref()
     }
 }
 

@@ -9,6 +9,7 @@ use crate::error::{KrafkaError, Result};
 use crate::util::{crc32c, varint};
 
 /// Compression codec.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum Compression {
@@ -41,6 +42,7 @@ impl Compression {
 }
 
 /// Timestamp type.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum TimestampType {
@@ -103,7 +105,7 @@ impl RecordHeader {
             return Err(KrafkaError::protocol("invalid header key length"));
         }
         let key = String::from_utf8(buf.copy_to_bytes(key_len as usize).to_vec())
-            .map_err(|e| KrafkaError::protocol(format!("invalid header key: {}", e)))?;
+            .map_err(|e| KrafkaError::protocol(format!("invalid header key: {e}")))?;
 
         let value_len = varint::decode_signed_varint(buf)?;
         let value = if value_len < 0 {

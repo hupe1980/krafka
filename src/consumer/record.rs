@@ -5,6 +5,7 @@ use bytes::Bytes;
 use crate::{Offset, PartitionId, Timestamp};
 
 /// A record consumed from Kafka.
+#[non_exhaustive]
 #[must_use = "contains data consumed from Kafka"]
 #[derive(Debug, Clone)]
 pub struct ConsumerRecord {

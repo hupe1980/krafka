@@ -7,6 +7,7 @@ use std::io;
 use thiserror::Error;
 
 /// The main error type for Krafka operations.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum KrafkaError {
     /// Network-related errors (connection, I/O).
@@ -152,6 +153,7 @@ impl KrafkaError {
 /// Kafka protocol error codes.
 ///
 /// These are the standard error codes defined in the Kafka protocol.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(i16)]
 pub enum ErrorCode {

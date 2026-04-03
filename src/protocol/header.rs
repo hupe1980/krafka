@@ -15,6 +15,7 @@ use crate::error::Result;
 /// - v0: api_key, api_version, correlation_id
 /// - v1: api_key, api_version, correlation_id, client_id
 /// - v2: api_key, api_version, correlation_id, client_id, tagged_fields (flexible)
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct RequestHeader {
     /// The API key for the request.
@@ -111,6 +112,7 @@ impl RequestHeader {
 /// The header format varies based on the header version:
 /// - v0: correlation_id
 /// - v1: correlation_id, tagged_fields (flexible)
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ResponseHeader {
     /// The correlation ID matching the request.
