@@ -121,7 +121,7 @@ impl Producer {
 
         info!(
             "Producer initialized with {} brokers",
-            metadata.brokers().await.len()
+            metadata.brokers().len()
         );
 
         let partitioner: Arc<dyn Partitioner> = Arc::new(DefaultPartitioner::new());
@@ -243,10 +243,9 @@ impl Producer {
         let partition = match record.partition {
             Some(p) => p,
             None => {
-                let partition_count =
-                    self.metadata.partition_count(&topic).await.ok_or_else(|| {
-                        KrafkaError::invalid_state(format!("unknown topic: {}", topic))
-                    })?;
+                let partition_count = self.metadata.partition_count(&topic).ok_or_else(|| {
+                    KrafkaError::invalid_state(format!("unknown topic: {}", topic))
+                })?;
                 self.partitioner
                     .partition(&topic, record.key.as_deref(), partition_count)
             }

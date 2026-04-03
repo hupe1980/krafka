@@ -281,7 +281,7 @@ impl Consumer {
 
         info!(
             "Consumer initialized with {} brokers{}",
-            metadata.brokers().await.len(),
+            metadata.brokers().len(),
             if group_coordinator.is_some() {
                 format!(", group_id='{}'", config.group_id.as_ref().unwrap())
             } else {
@@ -419,7 +419,7 @@ impl Consumer {
             // Assign all partitions (simple assignment without group coordination)
             let mut assignments = self.assignments.write().await;
             for topic in topics {
-                if let Some(topic_info) = self.metadata.topic(topic).await {
+                if let Some(topic_info) = self.metadata.topic(topic) {
                     let partitions: Vec<_> =
                         topic_info.partitions.iter().map(|p| p.partition).collect();
                     assignments.insert((*topic).to_string(), partitions);
@@ -1211,7 +1211,7 @@ impl Consumer {
         let mut leaderless: Vec<(String, PartitionId)> = Vec::new();
         for (topic, parts) in partitions {
             for &p in parts {
-                if let Some(leader) = self.metadata.leader(topic, p).await {
+                if let Some(leader) = self.metadata.leader(topic, p) {
                     by_leader
                         .entry(leader)
                         .or_default()
@@ -1235,7 +1235,7 @@ impl Consumer {
                 );
             }
             for (topic, partition) in leaderless {
-                if let Some(leader) = self.metadata.leader(&topic, partition).await {
+                if let Some(leader) = self.metadata.leader(&topic, partition) {
                     by_leader
                         .entry(leader)
                         .or_default()
@@ -1282,7 +1282,7 @@ impl Consumer {
             };
 
             // Get a connection to this broker by leader ID
-            let broker_info = match self.metadata.broker(leader_id).await {
+            let broker_info = match self.metadata.broker(leader_id) {
                 Some(b) => b,
                 None => {
                     warn!("Broker {} not found in metadata, skipping", leader_id);
@@ -1598,7 +1598,7 @@ impl Consumer {
                 if paused.contains(&key) {
                     continue;
                 }
-                if let Some(leader_id) = self.metadata.leader(topic, partition).await {
+                if let Some(leader_id) = self.metadata.leader(topic, partition) {
                     leaders.insert(key.clone(), leader_id);
                 }
                 non_paused_keys.push(key);
@@ -1754,10 +1754,10 @@ impl Consumer {
         let _fetch_timer = self.metrics.fetch_latency.start();
 
         // Get connection to this broker
-        let broker =
-            self.metadata.broker(broker_id).await.ok_or_else(|| {
-                KrafkaError::invalid_state(format!("broker {} not found", broker_id))
-            })?;
+        let broker = self
+            .metadata
+            .broker(broker_id)
+            .ok_or_else(|| KrafkaError::invalid_state(format!("broker {} not found", broker_id)))?;
         let conn = self
             .pool
             .get_connection_by_id(broker_id, &broker.address())
@@ -1793,11 +1793,7 @@ impl Consumer {
                     }
                 };
                 // Get leader epoch from metadata for fencing stale reads
-                let leader_epoch = self
-                    .metadata
-                    .leader_epoch(topic, partition)
-                    .await
-                    .unwrap_or(-1);
+                let leader_epoch = self.metadata.leader_epoch(topic, partition).unwrap_or(-1);
                 fetch_partitions.push(FetchPartitionRequest {
                     partition,
                     current_leader_epoch: leader_epoch,
@@ -1995,7 +1991,6 @@ impl Consumer {
                     let is_leader = self
                         .metadata
                         .leader(topic_name, partition)
-                        .await
                         .is_some_and(|leader_id| leader_id == broker_id);
                     if !is_leader {
                         debug!(
@@ -2184,28 +2179,20 @@ impl Consumer {
             );
         }
 
-        let leader_epoch = self
-            .metadata
-            .leader_epoch(topic, partition)
-            .await
-            .unwrap_or(-1);
+        let leader_epoch = self.metadata.leader_epoch(topic, partition).unwrap_or(-1);
 
         if leader_epoch < 0 {
             return Ok(());
         }
 
-        let leader_id = self
-            .metadata
-            .leader(topic, partition)
-            .await
-            .ok_or_else(|| {
-                KrafkaError::invalid_state(format!("no leader for {}-{}", topic, partition))
-            })?;
+        let leader_id = self.metadata.leader(topic, partition).ok_or_else(|| {
+            KrafkaError::invalid_state(format!("no leader for {}-{}", topic, partition))
+        })?;
 
-        let broker =
-            self.metadata.broker(leader_id).await.ok_or_else(|| {
-                KrafkaError::invalid_state(format!("broker {} not found", leader_id))
-            })?;
+        let broker = self
+            .metadata
+            .broker(leader_id)
+            .ok_or_else(|| KrafkaError::invalid_state(format!("broker {} not found", leader_id)))?;
 
         let conn = self
             .pool

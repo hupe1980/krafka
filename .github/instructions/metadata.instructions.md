@@ -14,9 +14,11 @@ description: "Use when editing metadata: cache refresh coalescing, lock ordering
 ## Lock Ordering
 
 1. `refresh_lock` (Mutex) — held only during the refresh RPC
-2. `cache` (RwLock) — write-locked briefly to swap in new data
+2. `cache` (ArcSwap) — lock-free reads via `load()`, atomic writes via `store()`
 
-Never hold both locks simultaneously. Always release `cache` before attempting a refresh RPC.
+`ArcSwap` eliminates lock-ordering concerns: readers never block writers and
+vice-versa. `refresh_lock` serializes RPC calls; the cache swap is a single
+atomic pointer store at the end.
 
 ## Error Filtering
 

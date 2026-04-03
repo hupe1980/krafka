@@ -60,6 +60,7 @@ webpki-roots = "0.26"
 # works without the aws-msk feature (manual credential loading).
 aws-config = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
+arc-swap = "1.9.0"
 
 [features]
 default = []

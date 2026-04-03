@@ -1169,7 +1169,7 @@ impl GroupCoordinator {
     /// Get any available broker connection.
     async fn get_any_connection(&self) -> Result<Arc<BrokerConnection>> {
         // Try cached brokers first
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         for broker in brokers {
             if let Ok(conn) = self.pool.get_connection(&broker.address()).await {
                 return Ok(conn);
@@ -1916,7 +1916,7 @@ impl GroupCoordinator {
         let mut leaderless: Vec<(String, crate::PartitionId)> = Vec::new();
         for (topic, parts) in partitions {
             for &partition in parts {
-                if let Some(leader_id) = self.metadata.leader(topic, partition).await {
+                if let Some(leader_id) = self.metadata.leader(topic, partition) {
                     partitions_by_leader
                         .entry(leader_id)
                         .or_default()
@@ -1939,7 +1939,7 @@ impl GroupCoordinator {
 
             // Retry resolution after refresh
             for (topic, partition) in leaderless {
-                if let Some(leader_id) = self.metadata.leader(&topic, partition).await {
+                if let Some(leader_id) = self.metadata.leader(&topic, partition) {
                     partitions_by_leader
                         .entry(leader_id)
                         .or_default()
@@ -2399,7 +2399,7 @@ impl GroupCoordinator {
         // Get partition info for all topics
         let mut topic_partitions: HashMap<String, Vec<PartitionId>> = HashMap::new();
         for topic in topics {
-            if let Some(topic_info) = self.metadata.topic(topic).await {
+            if let Some(topic_info) = self.metadata.topic(topic) {
                 let partitions: Vec<_> =
                     topic_info.partitions.iter().map(|p| p.partition).collect();
                 topic_partitions.insert(topic.clone(), partitions);

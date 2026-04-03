@@ -356,7 +356,7 @@ impl TransactionalProducer {
         *self.coordinator_id.write().await = Some(coordinator);
 
         // Get connection to coordinator
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         let broker = brokers
             .iter()
             .find(|b| b.id == coordinator)
@@ -405,7 +405,7 @@ impl TransactionalProducer {
 
     /// Find the transaction coordinator.
     async fn find_coordinator(&self) -> Result<i32> {
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::protocol("no brokers available"));
         }
@@ -509,10 +509,9 @@ impl TransactionalProducer {
         let partition = match record.partition {
             Some(p) => p,
             None => {
-                let partition_count =
-                    self.metadata.partition_count(&topic).await.ok_or_else(|| {
-                        KrafkaError::invalid_state(format!("unknown topic: {}", topic))
-                    })?;
+                let partition_count = self.metadata.partition_count(&topic).ok_or_else(|| {
+                    KrafkaError::invalid_state(format!("unknown topic: {}", topic))
+                })?;
                 self.partitioner
                     .partition(&topic, record.key.as_deref(), partition_count)
             }
@@ -574,7 +573,7 @@ impl TransactionalProducer {
             .await
             .ok_or_else(|| KrafkaError::invalid_state("no coordinator"))?;
 
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         let broker = brokers
             .iter()
             .find(|b| b.id == coordinator_id)
@@ -803,7 +802,7 @@ impl TransactionalProducer {
             .await
             .ok_or_else(|| KrafkaError::invalid_state("no coordinator"))?;
 
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         let broker = brokers
             .iter()
             .find(|b| b.id == coordinator_id)
@@ -881,7 +880,7 @@ impl TransactionalProducer {
 
     /// Find the group coordinator, returning (node_id, host, port).
     async fn find_group_coordinator(&self, group_id: &str) -> Result<(i32, String, i32)> {
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::protocol("no brokers available"));
         }
@@ -1006,7 +1005,7 @@ impl TransactionalProducer {
             .await
             .ok_or_else(|| KrafkaError::invalid_state("no coordinator"))?;
 
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         let broker = brokers
             .iter()
             .find(|b| b.id == coordinator_id)
