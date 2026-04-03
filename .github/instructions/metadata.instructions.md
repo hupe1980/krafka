@@ -8,7 +8,7 @@ description: "Use when editing metadata: cache refresh coalescing, lock ordering
 ## Cache Refresh Coalescing
 
 - A `Mutex` (`refresh_lock`) serializes concurrent refresh requests.
-- After acquiring the lock, check if cache was updated within 100 ms by another task — if so, skip the redundant request.
+- After acquiring the lock, check if cache was updated within 100 ms by another task — if so, skip **only** when all requested topics are already present in the cache. A partial refresh for a missing topic must never be skipped.
 - Never remove this check; it prevents thundering-herd on stale cache.
 
 ## Lock Ordering
@@ -29,8 +29,8 @@ atomic pointer store at the end.
 
 ## Full vs. Partial Refresh
 
-- **Full refresh** (`refresh_for_topics(None)`): response is authoritative — topics are rebuilt from scratch. Deleted topics are automatically purged because we start from an empty map.
-- **Partial refresh** (`refresh_for_topics(Some(&[...]))`): response is delta-merged into the existing cache. Topics not in the request are preserved.
+- **Full refresh** (`refresh_for_topics(None)`): response is authoritative — brokers and topics are rebuilt from scratch. Deleted topics and decommissioned brokers are automatically purged.
+- **Partial refresh** (`refresh_for_topics(Some(&[...]))`): response is delta-merged into the existing cache. Topics and brokers not in the request are preserved so that preserved topics cannot reference missing brokers.
 
 ## Staleness
 

@@ -187,11 +187,19 @@ impl ClusterMetadata {
         let _guard = self.refresh_lock.lock().await;
 
         // After acquiring the lock, check if metadata was just refreshed by another caller.
-        // If it was refreshed within the last 100ms, skip the redundant request.
+        // If it was refreshed within the last 100ms, skip the redundant request — but only
+        // when all requested topics are already present in the cache. A partial refresh for
+        // a missing topic must not be skipped.
         let cache = self.cache.load();
         if cache.last_updated.elapsed() < Duration::from_millis(100) && !cache.brokers.is_empty() {
-            debug!("Metadata was recently refreshed, skipping redundant request");
-            return Ok(());
+            let all_present = match topics {
+                None => true,
+                Some(names) => names.iter().all(|name| cache.topics.contains_key(*name)),
+            };
+            if all_present {
+                debug!("Metadata was recently refreshed, skipping redundant request");
+                return Ok(());
+            }
         }
 
         // Get a connection
@@ -261,13 +269,21 @@ impl ClusterMetadata {
     /// Builds a new snapshot and swaps it in atomically via `ArcSwap`.
     ///
     /// When `full_refresh` is true the response is authoritative (all topics in
-    /// the cluster), so the topic map is rebuilt from scratch. When false
-    /// (partial/topic-specific refresh), the response is delta-merged into the
-    /// existing cache so that topics not in the request are preserved.
+    /// the cluster), so the broker and topic maps are rebuilt from scratch.
+    /// When false (partial/topic-specific refresh), the response is delta-merged
+    /// into the existing cache so that topics not in the request are preserved
+    /// and broker entries referenced by preserved topics remain available.
     fn update_cache(&self, response: MetadataResponse, full_refresh: bool) {
         let old = self.cache.load();
 
-        let mut brokers = HashMap::new();
+        // Full refresh: response is authoritative — start empty.
+        // Partial refresh: merge into the existing broker map so preserved
+        // topics cannot end up referencing brokers missing from the cache.
+        let mut brokers = if full_refresh {
+            HashMap::new()
+        } else {
+            old.brokers.clone()
+        };
         for broker in response.brokers {
             brokers.insert(
                 broker.node_id,
