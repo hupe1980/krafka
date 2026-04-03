@@ -677,7 +677,10 @@ impl TransactionalProducer {
                     );
 
                     // Refresh metadata on leader errors
-                    let _ = self.metadata.refresh_for_topics(Some(&[topic])).await;
+                    if let Err(refresh_err) = self.metadata.refresh_for_topics(Some(&[topic])).await
+                    {
+                        debug!(error = %refresh_err, "Metadata refresh failed during txn retry");
+                    }
 
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(5));
@@ -1078,7 +1081,9 @@ impl TransactionalProducer {
         let current = self.state();
         if current == TransactionState::InTransaction {
             warn!("Closing transactional producer with active transaction — aborting");
-            let _ = self.abort_transaction().await;
+            if let Err(abort_err) = self.abort_transaction().await {
+                warn!(error = %abort_err, "Failed to abort transaction during close");
+            }
         }
 
         // Set state to prevent further use
@@ -1638,5 +1643,11 @@ mod tests {
         // Clear empties everything
         tp.clear();
         assert!(tp.is_empty());
+    }
+
+    #[test]
+    fn test_transactional_producer_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<TransactionalProducer>();
     }
 }

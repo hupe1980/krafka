@@ -2091,4 +2091,10 @@ mod tests {
         assert_eq!(result.end_offset, 1000);
         assert!(result.error.is_none());
     }
+
+    #[test]
+    fn test_admin_client_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AdminClient>();
+    }
 }

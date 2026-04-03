@@ -302,7 +302,11 @@ impl Producer {
                             error = %e,
                             "Transient error, refreshing metadata"
                         );
-                        let _ = self.metadata.refresh_for_topics(Some(&[topic])).await;
+                        if let Err(refresh_err) =
+                            self.metadata.refresh_for_topics(Some(&[topic])).await
+                        {
+                            debug!(error = %refresh_err, "Metadata refresh failed during retry");
+                        }
                     }
 
                     if let Some(backoff) = retry_ctx.record_failure(e) {
@@ -885,5 +889,11 @@ mod tests {
             .interceptor(Arc::new(TestInterceptor));
 
         assert!(builder.interceptor.is_some());
+    }
+
+    #[test]
+    fn test_producer_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Producer>();
     }
 }

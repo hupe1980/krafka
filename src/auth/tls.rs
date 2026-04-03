@@ -13,18 +13,22 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rustls::client::WantsClientCert;
+#[cfg(feature = "danger-insecure-tls")]
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+#[cfg(feature = "danger-insecure-tls")]
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::{
-    ClientConfig, ConfigBuilder, DigitallySignedStruct, Error as RustlsError, RootCertStore,
-    SignatureScheme,
-};
+#[cfg(feature = "danger-insecure-tls")]
+use rustls::pki_types::UnixTime;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::{ClientConfig, ConfigBuilder, RootCertStore};
+#[cfg(feature = "danger-insecure-tls")]
+use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use rustls_pemfile::{certs, private_key};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
+#[cfg(feature = "danger-insecure-tls")]
 use tracing::warn;
 
 use crate::auth::TlsConfig;
@@ -100,11 +104,22 @@ impl AsyncWrite for MaybeSecureStream {
 /// Returns an error if certificate/key files cannot be read or parsed.
 pub fn build_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
     if !config.verify_server_cert {
-        warn!(
-            "TLS certificate verification is disabled (verify_server_cert=false). \
-             This is insecure and should only be used for local development."
-        );
-        return build_insecure_tls_config(config);
+        #[cfg(feature = "danger-insecure-tls")]
+        {
+            warn!(
+                "TLS certificate verification is disabled (verify_server_cert=false). \
+                 This is insecure and should only be used for local development."
+            );
+            return build_insecure_tls_config(config);
+        }
+        #[cfg(not(feature = "danger-insecure-tls"))]
+        {
+            return Err(KrafkaError::config(
+                "Insecure TLS mode (verify_server_cert=false) requires the \
+                 'danger-insecure-tls' crate feature. If you need self-signed certificates, \
+                 provide the CA certificate via TlsConfig::with_ca_cert() instead.",
+            ));
+        }
     }
 
     let root_store = load_root_store(config)?;
@@ -208,11 +223,22 @@ pub async fn load_private_key_async(path: &str) -> Result<PrivateKeyDer<'static>
 /// Returns an error if certificate or key files cannot be read or parsed.
 pub async fn build_tls_config_async(config: &TlsConfig) -> Result<ClientConfig> {
     if !config.verify_server_cert {
-        warn!(
-            "TLS certificate verification is disabled (verify_server_cert=false). \
-             This is insecure and should only be used for local development."
-        );
-        return build_insecure_tls_config_async(config).await;
+        #[cfg(feature = "danger-insecure-tls")]
+        {
+            warn!(
+                "TLS certificate verification is disabled (verify_server_cert=false). \
+                 This is insecure and should only be used for local development."
+            );
+            return build_insecure_tls_config_async(config).await;
+        }
+        #[cfg(not(feature = "danger-insecure-tls"))]
+        {
+            return Err(KrafkaError::config(
+                "Insecure TLS mode (verify_server_cert=false) requires the \
+                 'danger-insecure-tls' crate feature. If you need self-signed certificates, \
+                 provide the CA certificate via TlsConfig::with_ca_cert() instead.",
+            ));
+        }
     }
 
     let root_store = load_root_store_async(config).await?;
@@ -299,6 +325,7 @@ async fn load_client_auth_async(
 
 /// Resolve the crypto provider: prefer the globally-installed default,
 /// fall back to the ring provider.
+#[cfg(feature = "danger-insecure-tls")]
 fn resolve_crypto_provider() -> Arc<CryptoProvider> {
     CryptoProvider::get_default()
         .cloned()
@@ -306,6 +333,7 @@ fn resolve_crypto_provider() -> Arc<CryptoProvider> {
 }
 
 /// Create the insecure builder that skips certificate verification.
+#[cfg(feature = "danger-insecure-tls")]
 fn insecure_builder(
     provider: Arc<CryptoProvider>,
 ) -> Result<ConfigBuilder<ClientConfig, WantsClientCert>> {
@@ -324,6 +352,7 @@ fn insecure_builder(
 ///
 /// Uses synchronous file I/O for client certificates. For async contexts,
 /// use [`build_insecure_tls_config_async`] instead.
+#[cfg(feature = "danger-insecure-tls")]
 fn build_insecure_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
     let builder = insecure_builder(resolve_crypto_provider())?;
     let client_auth = load_client_auth(config)?;
@@ -332,6 +361,7 @@ fn build_insecure_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
 
 /// Async variant of [`build_insecure_tls_config`] that uses non-blocking file I/O
 /// for client certificate loading.
+#[cfg(feature = "danger-insecure-tls")]
 async fn build_insecure_tls_config_async(config: &TlsConfig) -> Result<ClientConfig> {
     let builder = insecure_builder(resolve_crypto_provider())?;
     let client_auth = load_client_auth_async(config).await?;
@@ -343,17 +373,20 @@ async fn build_insecure_tls_config_async(config: &TlsConfig) -> Result<ClientCon
 /// Carries a reference to the [`CryptoProvider`] used when building the
 /// [`ClientConfig`] so that [`supported_verify_schemes`] always returns schemes
 /// consistent with that provider (instead of relying on the global default).
+#[cfg(feature = "danger-insecure-tls")]
 #[derive(Debug)]
 struct NoServerCertVerifier {
     provider: Arc<CryptoProvider>,
 }
 
+#[cfg(feature = "danger-insecure-tls")]
 impl NoServerCertVerifier {
     fn new(provider: Arc<CryptoProvider>) -> Self {
         Self { provider }
     }
 }
 
+#[cfg(feature = "danger-insecure-tls")]
 impl ServerCertVerifier for NoServerCertVerifier {
     fn verify_server_cert(
         &self,
@@ -417,6 +450,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "danger-insecure-tls")]
     fn test_build_tls_config_insecure_succeeds() {
         setup_crypto_provider();
         let config = TlsConfig::insecure();

@@ -481,17 +481,16 @@ impl ConnectionPool {
     /// Register a connection for a broker ID.
     pub async fn register(&self, broker_id: BrokerId, conn: Arc<BrokerConnection>) {
         let mut connections = self.connections.write().await;
-        connections.insert(broker_id, conn.clone());
-
         let mut connections_by_addr = self.connections_by_addr.write().await;
+        connections.insert(broker_id, conn.clone());
         connections_by_addr.insert(conn.address().to_string(), conn);
     }
 
     /// Remove a connection by broker ID.
     pub async fn remove(&self, broker_id: BrokerId) {
         let mut connections = self.connections.write().await;
+        let mut connections_by_addr = self.connections_by_addr.write().await;
         if let Some(conn) = connections.remove(&broker_id) {
-            let mut connections_by_addr = self.connections_by_addr.write().await;
             connections_by_addr.remove(conn.address());
         }
     }

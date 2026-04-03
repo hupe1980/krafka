@@ -306,7 +306,9 @@ impl fmt::Debug for AwsMskIamCredentials {
 
 /// TLS configuration.
 ///
-/// Use [`TlsConfig::new()`], [`TlsConfig::insecure()`], or [`Default::default()`] to construct.
+/// Use [`TlsConfig::new()`] or [`Default::default()`] to construct.
+/// For insecure mode, enable the `danger-insecure-tls` feature and use
+/// `TlsConfig::insecure()`.
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
     /// Path to CA certificate file.
@@ -348,6 +350,9 @@ impl TlsConfig {
     /// development or testing with self-signed certificates. For production
     /// use with self-signed certs, prefer [`with_ca_cert()`](Self::with_ca_cert)
     /// to supply the CA certificate explicitly.
+    ///
+    /// Requires the `danger-insecure-tls` crate feature.
+    #[cfg(feature = "danger-insecure-tls")]
     pub fn insecure() -> Self {
         Self {
             verify_server_cert: false,

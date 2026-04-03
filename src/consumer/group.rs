@@ -1937,7 +1937,9 @@ impl GroupCoordinator {
                 leaderless
             );
             let topics: Vec<&str> = leaderless.iter().map(|(t, _)| t.as_str()).collect();
-            let _ = self.metadata.refresh_for_topics(Some(&topics)).await;
+            if let Err(refresh_err) = self.metadata.refresh_for_topics(Some(&topics)).await {
+                debug!(error = %refresh_err, "Metadata refresh failed for leaderless partitions");
+            }
 
             // Retry resolution after refresh
             for (topic, partition) in leaderless {

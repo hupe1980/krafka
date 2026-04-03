@@ -124,9 +124,12 @@ fn main() {
     println!("   ca_cert_path: {:?}", tls.ca_cert_path());
 
     println!("\nInsecure (skip verification - NOT for production):");
-    #[allow(deprecated)]
-    let tls = TlsConfig::insecure();
-    println!("   verify_server_cert: {}", tls.verify_server_cert());
+    println!("   Requires 'danger-insecure-tls' crate feature");
+    #[cfg(feature = "danger-insecure-tls")]
+    {
+        let tls = TlsConfig::insecure();
+        println!("   verify_server_cert: {}", tls.verify_server_cert());
+    }
 
     println!("\nWith custom CA:");
     let tls = TlsConfig::new().with_ca_cert("/etc/kafka/ca.pem");

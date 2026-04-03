@@ -712,7 +712,10 @@ impl RecordAccumulator {
                             error = %e,
                             "Batch connection error, refreshing metadata"
                         );
-                        let _ = metadata.refresh_for_topics(Some(&[&topic])).await;
+                        if let Err(refresh_err) = metadata.refresh_for_topics(Some(&[&topic])).await
+                        {
+                            debug!(error = %refresh_err, "Metadata refresh failed during batch retry");
+                        }
                     }
                     if let Some(backoff) = retry_ctx.record_failure(&e) {
                         metrics.record_retry();
@@ -769,8 +772,11 @@ impl RecordAccumulator {
                                     pr.error_code,
                                     format!("batch produce failed for {topic}-{partition}"),
                                 );
-                                if err.is_retriable() {
-                                    let _ = metadata.refresh_for_topics(Some(&[&topic])).await;
+                                if err.is_retriable()
+                                    && let Err(refresh_err) =
+                                        metadata.refresh_for_topics(Some(&[&topic])).await
+                                {
+                                    debug!(error = %refresh_err, "Metadata refresh failed during batch retry");
                                 }
                                 if let Some(backoff) = retry_ctx.record_failure(&err) {
                                     metrics.record_retry();
@@ -803,7 +809,10 @@ impl RecordAccumulator {
                             error = %e,
                             "Batch send error, refreshing metadata"
                         );
-                        let _ = metadata.refresh_for_topics(Some(&[&topic])).await;
+                        if let Err(refresh_err) = metadata.refresh_for_topics(Some(&[&topic])).await
+                        {
+                            debug!(error = %refresh_err, "Metadata refresh failed during batch retry");
+                        }
                     }
                     if let Some(backoff) = retry_ctx.record_failure(&e) {
                         metrics.record_retry();

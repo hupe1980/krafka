@@ -4468,4 +4468,10 @@ mod tests {
         assert!(plan.partitions_by_broker[&2].contains(&("t".into(), 2)));
         assert_eq!(plan.expired_preferred, vec![("t".into(), 1)]);
     }
+
+    #[test]
+    fn test_consumer_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Consumer>();
+    }
 }

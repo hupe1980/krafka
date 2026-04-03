@@ -85,16 +85,22 @@ impl RecordHeader {
 
     /// Encode the header.
     #[inline]
-    pub fn encode(&self, buf: &mut impl BufMut) {
-        varint::encode_signed_varint(self.key.len() as i32, buf);
+    pub fn encode(&self, buf: &mut impl BufMut) -> Result<()> {
+        let key_len = i32::try_from(self.key.len())
+            .map_err(|_| KrafkaError::protocol("record header key too large for i32 length"))?;
+        varint::encode_signed_varint(key_len, buf);
         buf.put_slice(self.key.as_bytes());
         match &self.value {
             Some(v) => {
-                varint::encode_signed_varint(v.len() as i32, buf);
+                let val_len = i32::try_from(v.len()).map_err(|_| {
+                    KrafkaError::protocol("record header value too large for i32 length")
+                })?;
+                varint::encode_signed_varint(val_len, buf);
                 buf.put_slice(v);
             }
             None => varint::encode_signed_varint(-1, buf),
         }
+        Ok(())
     }
 
     /// Decode a header.
@@ -172,18 +178,21 @@ impl Record {
 
     /// Encode the record to a buffer.
     #[inline]
-    pub fn encode(&self, buf: &mut impl BufMut) {
+    pub fn encode(&self, buf: &mut impl BufMut) -> Result<()> {
         // First encode to a temporary buffer to get the size
         let mut record_buf = BytesMut::new();
-        self.encode_body(&mut record_buf);
+        self.encode_body(&mut record_buf)?;
 
         // Write length + body
-        varint::encode_signed_varint(record_buf.len() as i32, buf);
+        let record_len = i32::try_from(record_buf.len())
+            .map_err(|_| KrafkaError::protocol("record too large for i32 length prefix"))?;
+        varint::encode_signed_varint(record_len, buf);
         buf.put_slice(&record_buf);
+        Ok(())
     }
 
     #[inline]
-    fn encode_body(&self, buf: &mut impl BufMut) {
+    fn encode_body(&self, buf: &mut impl BufMut) -> Result<()> {
         buf.put_i8(self.attributes);
         varint::encode_signed_varlong(self.timestamp_delta, buf);
         varint::encode_signed_varint(self.offset_delta, buf);
@@ -191,7 +200,9 @@ impl Record {
         // Key
         match &self.key {
             Some(k) => {
-                varint::encode_signed_varint(k.len() as i32, buf);
+                let key_len = i32::try_from(k.len())
+                    .map_err(|_| KrafkaError::protocol("record key too large for i32 length"))?;
+                varint::encode_signed_varint(key_len, buf);
                 buf.put_slice(k);
             }
             None => varint::encode_signed_varint(-1, buf),
@@ -200,17 +211,22 @@ impl Record {
         // Value
         match &self.value {
             Some(v) => {
-                varint::encode_signed_varint(v.len() as i32, buf);
+                let val_len = i32::try_from(v.len())
+                    .map_err(|_| KrafkaError::protocol("record value too large for i32 length"))?;
+                varint::encode_signed_varint(val_len, buf);
                 buf.put_slice(v);
             }
             None => varint::encode_signed_varint(-1, buf),
         }
 
         // Headers
-        varint::encode_signed_varint(self.headers.len() as i32, buf);
+        let headers_len = i32::try_from(self.headers.len())
+            .map_err(|_| KrafkaError::protocol("record headers count exceeds i32 limit"))?;
+        varint::encode_signed_varint(headers_len, buf);
         for header in &self.headers {
-            header.encode(buf);
+            header.encode(buf)?;
         }
+        Ok(())
     }
 
     /// Decode a record from a buffer.
@@ -387,7 +403,7 @@ impl RecordBatch {
         // First, encode the records
         let mut records_buf = BytesMut::new();
         for record in &self.records {
-            record.encode(&mut records_buf);
+            record.encode(&mut records_buf)?;
         }
 
         // Compress if needed
@@ -398,11 +414,15 @@ impl RecordBatch {
         // 4 (last_offset_delta) + 8 (base_timestamp) + 8 (max_timestamp) +
         // 8 (producer_id) + 2 (producer_epoch) + 4 (base_sequence) +
         // 4 (records_count) + records
-        let batch_length = 4 + 1 + 4 + 2 + 4 + 8 + 8 + 8 + 2 + 4 + 4 + compressed_records.len();
+        let batch_length =
+            i32::try_from(4 + 1 + 4 + 2 + 4 + 8 + 8 + 8 + 2 + 4 + 4 + compressed_records.len())
+                .map_err(|_| {
+                    KrafkaError::protocol("record batch too large for i32 length prefix")
+                })?;
 
         // Write header
         buf.put_i64(self.base_offset);
-        buf.put_i32(batch_length as i32);
+        buf.put_i32(batch_length);
         buf.put_i32(self.partition_leader_epoch);
         buf.put_i8(self.magic);
 
@@ -419,7 +439,11 @@ impl RecordBatch {
         buf.put_i64(self.producer_id);
         buf.put_i16(self.producer_epoch);
         buf.put_i32(self.base_sequence);
-        buf.put_i32(self.records.len() as i32);
+        buf.put_i32(
+            i32::try_from(self.records.len()).map_err(|_| {
+                KrafkaError::protocol("record batch record count exceeds i32 limit")
+            })?,
+        );
         buf.put_slice(&compressed_records);
 
         // Calculate and write CRC
@@ -1016,7 +1040,7 @@ mod tests {
             .with_header("header1", Bytes::from("value1"));
 
         let mut buf = BytesMut::new();
-        record.encode(&mut buf);
+        record.encode(&mut buf).unwrap();
 
         let decoded = Record::decode(&mut buf.freeze()).unwrap();
         assert_eq!(decoded.key, Some(Bytes::from("key")));
@@ -1032,7 +1056,7 @@ mod tests {
         let record = Record::new(None, Some(Bytes::from("value")));
 
         let mut buf = BytesMut::new();
-        record.encode(&mut buf);
+        record.encode(&mut buf).unwrap();
 
         let decoded = Record::decode(&mut buf.freeze()).unwrap();
         assert!(decoded.key.is_none());
