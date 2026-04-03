@@ -12,13 +12,18 @@ use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::{ClientConfig, RootCertStore};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::CryptoProvider;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
+};
 use rustls_pemfile::{certs, private_key};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
+use tracing::warn;
 
 use crate::auth::TlsConfig;
 use crate::error::{KrafkaError, Result};
@@ -83,18 +88,21 @@ impl AsyncWrite for MaybeSecureStream {
 
 /// Build a rustls ClientConfig from TlsConfig.
 ///
+/// When `verify_server_cert` is `false`, certificate verification is skipped
+/// entirely. This is useful for local development with self-signed certificates
+/// but **must not** be used in production — it exposes the connection to
+/// man-in-the-middle attacks.
+///
 /// # Errors
 ///
-/// Returns an error if `verify_server_cert` is `false`, as insecure mode
-/// is not supported. TLS without verification defeats the purpose of TLS.
+/// Returns an error if certificate/key files cannot be read or parsed.
 pub fn build_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
-    // Reject insecure mode - verification cannot be disabled
     if !config.verify_server_cert {
-        return Err(KrafkaError::config(
-            "Insecure TLS mode (verify_server_cert=false) is not supported. \
-             TLS without certificate verification is unsafe and defeats the purpose of TLS. \
-             If you need to use a self-signed certificate, provide it via ca_cert_path instead.",
-        ));
+        warn!(
+            "TLS certificate verification is disabled (verify_server_cert=false). \
+             This is insecure and should only be used for local development."
+        );
+        return build_insecure_tls_config(config);
     }
 
     let mut root_store = RootCertStore::empty();
@@ -219,20 +227,19 @@ pub async fn load_private_key_async(path: &str) -> Result<PrivateKeyDer<'static>
 /// Uses `spawn_blocking` for file I/O operations to avoid blocking the async runtime.
 /// This is the recommended method for async applications.
 ///
+/// When `verify_server_cert` is `false`, certificate verification is skipped.
+/// See [`build_tls_config`] for security implications.
+///
 /// # Errors
 ///
-/// Returns an error if:
-/// - `verify_server_cert` is `false` (insecure mode not supported)
-/// - Certificate or key files cannot be read
-/// - Certificate or key parsing fails
+/// Returns an error if certificate or key files cannot be read or parsed.
 pub async fn build_tls_config_async(config: &TlsConfig) -> Result<ClientConfig> {
-    // Reject insecure mode - verification cannot be disabled
     if !config.verify_server_cert {
-        return Err(KrafkaError::config(
-            "Insecure TLS mode (verify_server_cert=false) is not supported. \
-             TLS without certificate verification is unsafe and defeats the purpose of TLS. \
-             If you need to use a self-signed certificate, provide it via ca_cert_path instead.",
-        ));
+        warn!(
+            "TLS certificate verification is disabled (verify_server_cert=false). \
+             This is insecure and should only be used for local development."
+        );
+        return build_insecure_tls_config(config);
     }
 
     let mut root_store = RootCertStore::empty();
@@ -270,6 +277,79 @@ pub async fn build_tls_config_async(config: &TlsConfig) -> Result<ClientConfig> 
     Ok(client_config)
 }
 
+/// Build a rustls ClientConfig that skips all certificate verification.
+///
+/// **Warning:** This disables TLS security and must only be used for local
+/// development or testing. A `warn!` log is emitted by callers.
+fn build_insecure_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
+    let provider = CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+
+    let builder = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| KrafkaError::config(format!("Failed to set protocol versions: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoServerCertVerifier));
+
+    let client_config = if let (Some(cert_path), Some(key_path)) =
+        (&config.client_cert_path, &config.client_key_path)
+    {
+        let client_certs = load_certs(cert_path)?;
+        let client_key = load_private_key(key_path)?;
+        builder
+            .with_client_auth_cert(client_certs, client_key)
+            .map_err(|e| KrafkaError::config(format!("Failed to set client auth: {e}")))?
+    } else {
+        builder.with_no_client_auth()
+    };
+
+    Ok(client_config)
+}
+
+/// A certificate verifier that accepts any server certificate without validation.
+///
+/// This is intentionally minimal and only used when `verify_server_cert = false`.
+#[derive(Debug)]
+struct NoServerCertVerifier;
+
+impl ServerCertVerifier for NoServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        CryptoProvider::get_default()
+            .map(|p| p.signature_verification_algorithms.supported_schemes())
+            .unwrap_or_default()
+    }
+}
+
 /// Create a TLS connector asynchronously.
 ///
 /// Uses async file I/O for loading certificates and keys.
@@ -296,15 +376,14 @@ mod tests {
     }
 
     #[test]
-    fn test_build_tls_config_insecure_rejected() {
+    fn test_build_tls_config_insecure_succeeds() {
         setup_crypto_provider();
-        // Insecure mode should now return an error
-        #[allow(deprecated)]
         let config = TlsConfig::insecure();
         let result = build_tls_config(&config);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("not supported"));
+        assert!(
+            result.is_ok(),
+            "insecure TLS config should succeed: {result:?}"
+        );
     }
 
     #[test]

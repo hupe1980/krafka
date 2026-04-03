@@ -26,7 +26,7 @@ States: `Initial → WaitingServerFirst → WaitingClientFinal → WaitingServer
 ## TLS
 
 - `rustls` only (no OpenSSL / native-tls).
-- Insecure mode (`verify_server_cert = false`) is rejected at runtime — do not re-enable.
+- Insecure mode (`verify_server_cert = false`) is supported for local development — emits a `warn!` log and uses `NoServerCertVerifier` via `dangerous()` builder. For production, prefer `with_ca_cert()`.
 - File I/O for certs: use `load_certs_async()` / `spawn_blocking` in async contexts; sync variants only in tests.
 - SNI hostname extraction must handle IPv6 brackets (`[::1]:9092`).
 

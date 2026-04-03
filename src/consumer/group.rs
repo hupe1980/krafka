@@ -23,10 +23,10 @@ use crate::protocol::{
     ApiKey, FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse,
     JoinGroupRequest, JoinGroupRequestProtocol, JoinGroupResponse, JoinGroupResponseMember,
     LeaveGroupMember, LeaveGroupRequest, LeaveGroupResponse, ListOffsetsRequest,
-    ListOffsetsRequestPartition, ListOffsetsRequestTopic, ListOffsetsResponse, OffsetCommitRequest,
-    OffsetCommitRequestPartition, OffsetCommitRequestTopic, OffsetCommitResponse,
-    OffsetFetchRequest, OffsetFetchRequestTopic, OffsetFetchResponse, SyncGroupRequest,
-    SyncGroupRequestAssignment, SyncGroupResponse,
+    ListOffsetsRequestPartition, ListOffsetsRequestTopic, ListOffsetsResponse,
+    MAX_DECODE_ARRAY_LEN, OffsetCommitRequest, OffsetCommitRequestPartition,
+    OffsetCommitRequestTopic, OffsetCommitResponse, OffsetFetchRequest, OffsetFetchRequestTopic,
+    OffsetFetchResponse, SyncGroupRequest, SyncGroupRequestAssignment, SyncGroupResponse,
 };
 
 /// Callback interface for partition rebalance events.
@@ -2367,7 +2367,7 @@ impl GroupCoordinator {
                 break;
             }
             let safe_partition_count = (partition_count as usize)
-                .min(10_000)
+                .min(MAX_DECODE_ARRAY_LEN)
                 .min(buf.remaining() / 4);
             if safe_partition_count < partition_count as usize {
                 warn!(

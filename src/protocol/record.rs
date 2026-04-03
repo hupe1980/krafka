@@ -252,7 +252,19 @@ impl Record {
 
         // Headers
         let header_count = varint::decode_signed_varint(buf)?;
-        let mut headers = Vec::with_capacity((header_count.max(0) as usize).min(10_000));
+        if header_count < 0 {
+            return Err(KrafkaError::protocol(format!(
+                "negative header count {header_count} in record"
+            )));
+        }
+        let header_count = header_count as usize;
+        if header_count > super::MAX_DECODE_ARRAY_LEN {
+            return Err(KrafkaError::protocol(format!(
+                "header count {header_count} exceeds safety limit {}",
+                super::MAX_DECODE_ARRAY_LEN
+            )));
+        }
+        let mut headers = Vec::with_capacity(header_count);
         for _ in 0..header_count {
             headers.push(RecordHeader::decode(buf)?);
         }
@@ -539,9 +551,17 @@ impl RecordBatch {
         let decompressed = Self::decompress_records(attributes.compression, &compressed_records)?;
         let mut records_buf = decompressed.as_ref();
 
-        // Decode records
-        let mut records = Vec::with_capacity((records_count as usize).min(10_000));
-        for _ in 0..records_count {
+        // Decode records — records_count already validated as non-negative above;
+        // apply upper-bound check before looping.
+        let records_len = records_count as usize;
+        if records_len > super::MAX_DECODE_ARRAY_LEN {
+            return Err(KrafkaError::protocol(format!(
+                "records count {records_len} exceeds safety limit {}",
+                super::MAX_DECODE_ARRAY_LEN
+            )));
+        }
+        let mut records = Vec::with_capacity(records_len);
+        for _ in 0..records_len {
             records.push(Record::decode(&mut records_buf)?);
         }
 
@@ -849,6 +869,13 @@ impl LazyRecordBatch {
                 "invalid negative records count: {records_count}"
             )));
         }
+        if records_count as usize > super::MAX_DECODE_ARRAY_LEN {
+            return Err(KrafkaError::protocol(format!(
+                "records count {} exceeds safety limit {}",
+                records_count,
+                super::MAX_DECODE_ARRAY_LEN
+            )));
+        }
 
         // Remaining bytes are the (possibly compressed) records
         let records_len = batch_length - 49;
@@ -924,7 +951,7 @@ impl LazyRecordBatch {
     ///
     /// This is equivalent to `records().collect()` but with proper error handling.
     pub fn decode_all(&self) -> Result<Vec<Record>> {
-        let mut records = Vec::with_capacity((self.records_count as usize).min(10_000));
+        let mut records = Vec::with_capacity(self.records_count as usize);
         for result in self.records() {
             records.push(result?);
         }

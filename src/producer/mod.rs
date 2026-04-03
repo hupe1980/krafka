@@ -98,17 +98,7 @@ impl Producer {
 
         let pool = Arc::new(ConnectionPool::new(pool_config));
 
-        // Parse bootstrap servers — filter out empty/whitespace entries
-        let bootstrap_servers: Vec<String> = config
-            .bootstrap_servers
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        if bootstrap_servers.is_empty() {
-            return Err(KrafkaError::config("no bootstrap servers specified"));
-        }
+        let bootstrap_servers = crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
 
         let metadata = Arc::new(ClusterMetadata::new(
             bootstrap_servers,

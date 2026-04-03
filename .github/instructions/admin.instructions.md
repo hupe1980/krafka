@@ -12,8 +12,11 @@ Callers must check individual results — a successful RPC does not mean every r
 
 ## API Versions
 
-Admin requests currently use **v0** of each API (lowest common denominator).
-When bumping a version, update the corresponding encode/decode path in `src/protocol/` **and** verify the new fields here.
+Admin requests use **automatic version negotiation** via `negotiate_api_version_max` on each broker connection.
+The negotiated version is clamped to the client's maximum supported version for each API.
+Multi-version encode/decode dispatch is implemented for: CreateTopics (v0–v2), DeleteTopics (v0–v1), FindCoordinator (v0–v1), DescribeGroups (v0–v1), ListGroups (v0–v1), OffsetForLeaderEpoch (v0–v2).
+Single-version APIs (v0 only): CreatePartitions, DescribeConfigs, AlterConfigs, DescribeAcls, CreateAcls, DeleteAcls, DeleteRecords.
+When adding a new version, update the version constant in `src/protocol/mod.rs::versions`, add the `encode_vN`/`decode_vN` methods in `src/protocol/messages.rs`, and add version dispatch in the admin method.
 
 ## Destructive Operations
 

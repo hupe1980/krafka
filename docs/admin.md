@@ -21,6 +21,14 @@ The AdminClient provides cluster administration capabilities:
 - Partition management
 - ACL management
 
+### API Version Negotiation
+
+The AdminClient automatically negotiates the best API version for each RPC
+using the broker's `ApiVersions` response. This ensures forward compatibility
+with newer Kafka releases while gracefully falling back to older protocol
+versions on legacy brokers. If a broker does not support a required API, the
+client returns a clear protocol error.
+
 ## Basic Usage
 
 ```rust

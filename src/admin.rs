@@ -52,7 +52,7 @@ use crate::protocol::{
     DescribeAclsResponse, DescribeConfigsRequest, DescribeConfigsResponse, DescribeGroupsRequest,
     DescribeGroupsResponse, FindCoordinatorRequest, FindCoordinatorResponse, ListGroupsRequest,
     ListGroupsResponse, OffsetForLeaderEpochPartition, OffsetForLeaderEpochRequest,
-    OffsetForLeaderEpochResponse, OffsetForLeaderEpochTopic,
+    OffsetForLeaderEpochResponse, OffsetForLeaderEpochTopic, versions,
 };
 
 /// Configuration for creating a topic.
@@ -414,14 +414,34 @@ impl AdminClient {
             validate_only: false,
         };
 
-        // Send request
+        // Send request — negotiate API version with broker
+        let version = conn
+            .negotiate_api_version_max(ApiKey::CreateTopics, versions::CREATE_TOPICS_MAX)
+            .await
+            .ok_or_else(|| KrafkaError::protocol("broker does not support CreateTopics API"))?;
+
         let response_bytes = conn
-            .send_request(ApiKey::CreateTopics, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::CreateTopics, version, |buf| match version {
+                0 => request.encode_v0(buf),
+                1 | 2 => request.encode_v1(buf),
+                _ => Err(KrafkaError::protocol(format!(
+                    "unsupported CreateTopics version {version}"
+                ))),
+            })
             .await?;
 
         // Decode response
         let mut buf = response_bytes;
-        let response = CreateTopicsResponse::decode_v0(&mut buf)?;
+        let response = match version {
+            0 => CreateTopicsResponse::decode_v0(&mut buf)?,
+            1 => CreateTopicsResponse::decode_v1(&mut buf)?,
+            2 => CreateTopicsResponse::decode_v2(&mut buf)?,
+            _ => {
+                return Err(KrafkaError::protocol(format!(
+                    "unsupported CreateTopics version {version}"
+                )));
+            }
+        };
 
         // Convert to results
         let results = response
@@ -468,14 +488,27 @@ impl AdminClient {
             timeout_ms: crate::util::duration_to_millis_i32(timeout),
         };
 
-        // Send request
+        // Send request — negotiate API version with broker
+        let version = conn
+            .negotiate_api_version_max(ApiKey::DeleteTopics, versions::DELETE_TOPICS_MAX)
+            .await
+            .ok_or_else(|| KrafkaError::protocol("broker does not support DeleteTopics API"))?;
+
         let response_bytes = conn
-            .send_request(ApiKey::DeleteTopics, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::DeleteTopics, version, |buf| request.encode_v0(buf))
             .await?;
 
         // Decode response
         let mut buf = response_bytes;
-        let response = DeleteTopicsResponse::decode_v0(&mut buf)?;
+        let response = match version {
+            0 => DeleteTopicsResponse::decode_v0(&mut buf)?,
+            1 => DeleteTopicsResponse::decode_v1(&mut buf)?,
+            _ => {
+                return Err(KrafkaError::protocol(format!(
+                    "unsupported DeleteTopics version {version}"
+                )));
+            }
+        };
 
         // Convert to results
         let results = response
@@ -532,9 +565,16 @@ impl AdminClient {
             validate_only: false,
         };
 
-        // Send request
+        // Send request — negotiate API version with broker
+        let version = conn
+            .negotiate_api_version_max(ApiKey::CreatePartitions, versions::CREATE_PARTITIONS_MAX)
+            .await
+            .ok_or_else(|| KrafkaError::protocol("broker does not support CreatePartitions API"))?;
+
         let response_bytes = conn
-            .send_request(ApiKey::CreatePartitions, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::CreatePartitions, version, |buf| {
+                request.encode_v0(buf)
+            })
             .await?;
 
         // Decode response
@@ -588,8 +628,15 @@ impl AdminClient {
 
         let request = DescribeConfigsRequest::for_topic(topic);
 
+        let version = conn
+            .negotiate_api_version_max(ApiKey::DescribeConfigs, versions::DESCRIBE_CONFIGS_MAX)
+            .await
+            .ok_or_else(|| KrafkaError::protocol("broker does not support DescribeConfigs API"))?;
+
         let response_bytes = conn
-            .send_request(ApiKey::DescribeConfigs, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::DescribeConfigs, version, |buf| {
+                request.encode_v0(buf)
+            })
             .await?;
 
         let mut buf = response_bytes;
@@ -636,8 +683,15 @@ impl AdminClient {
 
         let request = DescribeConfigsRequest::for_broker(broker_id);
 
+        let version = conn
+            .negotiate_api_version_max(ApiKey::DescribeConfigs, versions::DESCRIBE_CONFIGS_MAX)
+            .await
+            .ok_or_else(|| KrafkaError::protocol("broker does not support DescribeConfigs API"))?;
+
         let response_bytes = conn
-            .send_request(ApiKey::DescribeConfigs, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::DescribeConfigs, version, |buf| {
+                request.encode_v0(buf)
+            })
             .await?;
 
         let mut buf = response_bytes;
@@ -691,8 +745,13 @@ impl AdminClient {
 
         let request = AlterConfigsRequest::for_topic(topic, configs.into_iter().collect());
 
+        let version = conn
+            .negotiate_api_version_max(ApiKey::AlterConfigs, versions::ALTER_CONFIGS_MAX)
+            .await
+            .ok_or_else(|| KrafkaError::protocol("broker does not support AlterConfigs API"))?;
+
         let response_bytes = conn
-            .send_request(ApiKey::AlterConfigs, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::AlterConfigs, version, |buf| request.encode_v0(buf))
             .await?;
 
         let mut buf = response_bytes;
@@ -855,8 +914,13 @@ impl AdminClient {
             permission_type: filter.permission_type,
         };
 
+        let version = conn
+            .negotiate_api_version_max(ApiKey::DescribeAcls, versions::DESCRIBE_ACLS_MAX)
+            .await
+            .ok_or_else(|| KrafkaError::protocol("broker does not support DescribeAcls API"))?;
+
         let response_bytes = conn
-            .send_request(ApiKey::DescribeAcls, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::DescribeAcls, version, |buf| request.encode_v0(buf))
             .await?;
 
         let mut buf = response_bytes;
@@ -921,8 +985,13 @@ impl AdminClient {
             creations: acls.clone(),
         };
 
+        let version = conn
+            .negotiate_api_version_max(ApiKey::CreateAcls, versions::CREATE_ACLS_MAX)
+            .await
+            .ok_or_else(|| KrafkaError::protocol("broker does not support CreateAcls API"))?;
+
         let response_bytes = conn
-            .send_request(ApiKey::CreateAcls, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::CreateAcls, version, |buf| request.encode_v0(buf))
             .await?;
 
         let mut buf = response_bytes;
@@ -985,8 +1054,13 @@ impl AdminClient {
             filters: filters.clone(),
         };
 
+        let version = conn
+            .negotiate_api_version_max(ApiKey::DeleteAcls, versions::DELETE_ACLS_MAX)
+            .await
+            .ok_or_else(|| KrafkaError::protocol("broker does not support DeleteAcls API"))?;
+
         let response_bytes = conn
-            .send_request(ApiKey::DeleteAcls, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::DeleteAcls, version, |buf| request.encode_v0(buf))
             .await?;
 
         let mut buf = response_bytes;
@@ -1046,13 +1120,36 @@ impl AdminClient {
 
         for group_id in &group_ids {
             let coord_request = FindCoordinatorRequest::for_group(group_id);
+            let coord_version = any_conn
+                .negotiate_api_version_max(ApiKey::FindCoordinator, versions::FIND_COORDINATOR_MAX)
+                .await
+                .ok_or_else(|| {
+                    KrafkaError::protocol("broker does not support FindCoordinator API")
+                })?;
+
             let coord_response_bytes = any_conn
-                .send_request(ApiKey::FindCoordinator, 1, |buf| {
-                    coord_request.encode_v1(buf)
-                })
+                .send_request(
+                    ApiKey::FindCoordinator,
+                    coord_version,
+                    |buf| match coord_version {
+                        0 => coord_request.encode_v0(buf),
+                        1 => coord_request.encode_v1(buf),
+                        _ => Err(KrafkaError::protocol(format!(
+                            "unsupported FindCoordinator version {coord_version}"
+                        ))),
+                    },
+                )
                 .await?;
             let mut coord_buf = coord_response_bytes;
-            let coord_response = FindCoordinatorResponse::decode_v1(&mut coord_buf)?;
+            let coord_response = match coord_version {
+                0 => FindCoordinatorResponse::decode_v0(&mut coord_buf)?,
+                1 => FindCoordinatorResponse::decode_v1(&mut coord_buf)?,
+                _ => {
+                    return Err(KrafkaError::protocol(format!(
+                        "unsupported FindCoordinator version {coord_version}"
+                    )));
+                }
+            };
 
             if coord_response.error_code.is_ok() {
                 coordinator_groups
@@ -1089,12 +1186,29 @@ impl AdminClient {
                 groups: groups.clone(),
             };
 
+            let version = conn
+                .negotiate_api_version_max(ApiKey::DescribeGroups, versions::DESCRIBE_GROUPS_MAX)
+                .await
+                .ok_or_else(|| {
+                    KrafkaError::protocol("broker does not support DescribeGroups API")
+                })?;
+
             let response_bytes = conn
-                .send_request(ApiKey::DescribeGroups, 0, |buf| request.encode_v0(buf))
+                .send_request(ApiKey::DescribeGroups, version, |buf| {
+                    request.encode_v0(buf)
+                })
                 .await?;
 
             let mut buf = response_bytes;
-            let response = DescribeGroupsResponse::decode_v0(&mut buf)?;
+            let response = match version {
+                0 => DescribeGroupsResponse::decode_v0(&mut buf)?,
+                1 => DescribeGroupsResponse::decode_v1(&mut buf)?,
+                _ => {
+                    return Err(KrafkaError::protocol(format!(
+                        "unsupported DescribeGroups version {version}"
+                    )));
+                }
+            };
 
             for g in response.groups {
                 all_results.push(ConsumerGroupDescription {
@@ -1161,8 +1275,22 @@ impl AdminClient {
 
             let request = ListGroupsRequest;
 
+            let version = match conn
+                .negotiate_api_version_max(ApiKey::ListGroups, versions::LIST_GROUPS_MAX)
+                .await
+            {
+                Some(v) => v,
+                None => {
+                    warn!(
+                        "Broker {} does not support ListGroups API, skipping",
+                        broker.id
+                    );
+                    continue;
+                }
+            };
+
             let response_bytes = match conn
-                .send_request(ApiKey::ListGroups, 0, |buf| request.encode_v0(buf))
+                .send_request(ApiKey::ListGroups, version, |buf| request.encode_v0(buf))
                 .await
             {
                 Ok(r) => r,
@@ -1173,10 +1301,26 @@ impl AdminClient {
             };
 
             let mut buf = response_bytes;
-            let response = match ListGroupsResponse::decode_v0(&mut buf) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("ListGroups decode failed on broker {}: {}", broker.id, e);
+            let response = match version {
+                0 => match ListGroupsResponse::decode_v0(&mut buf) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("ListGroups decode failed on broker {}: {}", broker.id, e);
+                        continue;
+                    }
+                },
+                1 => match ListGroupsResponse::decode_v1(&mut buf) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("ListGroups decode failed on broker {}: {}", broker.id, e);
+                        continue;
+                    }
+                },
+                _ => {
+                    warn!(
+                        "Unsupported ListGroups version {version}, skipping broker {}",
+                        broker.id
+                    );
                     continue;
                 }
             };
@@ -1274,8 +1418,15 @@ impl AdminClient {
                 timeout_ms: crate::util::duration_to_millis_i32(timeout),
             };
 
+            let version = conn
+                .negotiate_api_version_max(ApiKey::DeleteRecords, versions::DELETE_RECORDS_MAX)
+                .await
+                .ok_or_else(|| {
+                    KrafkaError::protocol("broker does not support DeleteRecords API")
+                })?;
+
             let response_bytes = conn
-                .send_request(ApiKey::DeleteRecords, 0, |buf| request.encode_v0(buf))
+                .send_request(ApiKey::DeleteRecords, version, |buf| request.encode_v0(buf))
                 .await?;
 
             let mut buf = response_bytes;
@@ -1376,14 +1527,37 @@ impl AdminClient {
                     .collect(),
             };
 
+            let version = conn
+                .negotiate_api_version_max(
+                    ApiKey::OffsetForLeaderEpoch,
+                    versions::OFFSET_FOR_LEADER_EPOCH_MAX,
+                )
+                .await
+                .ok_or_else(|| {
+                    KrafkaError::protocol("broker does not support OffsetForLeaderEpoch API")
+                })?;
+
             let response_bytes = conn
-                .send_request(ApiKey::OffsetForLeaderEpoch, 2, |buf| {
-                    request.encode_v2(buf)
+                .send_request(ApiKey::OffsetForLeaderEpoch, version, |buf| match version {
+                    0..=1 => request.encode_v0(buf),
+                    2 => request.encode_v2(buf),
+                    _ => Err(KrafkaError::protocol(format!(
+                        "unsupported OffsetForLeaderEpoch encode version {version}"
+                    ))),
                 })
                 .await?;
 
             let mut buf = response_bytes;
-            let response = OffsetForLeaderEpochResponse::decode_v2(&mut buf)?;
+            let response = match version {
+                0 => OffsetForLeaderEpochResponse::decode_v0(&mut buf)?,
+                1 => OffsetForLeaderEpochResponse::decode_v1(&mut buf)?,
+                2 => OffsetForLeaderEpochResponse::decode_v2(&mut buf)?,
+                _ => {
+                    return Err(KrafkaError::protocol(format!(
+                        "unsupported OffsetForLeaderEpoch version {version}"
+                    )));
+                }
+            };
 
             for topic in response.topics {
                 for partition in topic.partitions {
@@ -1510,17 +1684,8 @@ impl AdminClientBuilder {
             return Err(KrafkaError::config("bootstrap_servers is required"));
         }
 
-        let bootstrap_servers: Vec<String> = self
-            .config
-            .bootstrap_servers
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        if bootstrap_servers.is_empty() {
-            return Err(KrafkaError::config("no bootstrap servers specified"));
-        }
+        let bootstrap_servers =
+            crate::util::parse_bootstrap_servers(&self.config.bootstrap_servers)?;
 
         // Create connection config with client ID and auth
         let mut conn_config_builder = ConnectionConfig::builder()

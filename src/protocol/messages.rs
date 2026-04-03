@@ -8,6 +8,7 @@ use bytes::{Buf, BufMut, Bytes};
 
 use super::api::ApiKey;
 use super::array_len_i32;
+use super::check_decode_array_len;
 use super::primitives::{Decode, Encode, KafkaArray, KafkaBytes, KafkaString, TryEncode};
 use crate::error::{ErrorCode, KrafkaError, Result};
 
@@ -693,11 +694,11 @@ impl ProduceResponse {
     /// Decode from version 0.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let mut responses = Vec::new();
-        let topic_count = i32::decode(buf)?;
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
 
         for _ in 0..topic_count {
             let name = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let partition_count = i32::decode(buf)?;
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partition_responses = Vec::new();
 
             for _ in 0..partition_count {
@@ -736,11 +737,11 @@ impl ProduceResponse {
     /// Decode from version 2+.
     pub fn decode_v2(buf: &mut impl Buf) -> Result<Self> {
         let mut responses = Vec::new();
-        let topic_count = i32::decode(buf)?;
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
 
         for _ in 0..topic_count {
             let name = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let partition_count = i32::decode(buf)?;
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partition_responses = Vec::new();
 
             for _ in 0..partition_count {
@@ -1086,11 +1087,11 @@ impl FetchResponse {
     /// Decode from version 0.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let mut responses = Vec::new();
-        let topic_count = i32::decode(buf)?;
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
 
         for _ in 0..topic_count {
             let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let partition_count = i32::decode(buf)?;
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partitions = Vec::new();
 
             for _ in 0..partition_count {
@@ -1134,11 +1135,11 @@ impl FetchResponse {
     pub fn decode_v4(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let mut responses = Vec::new();
-        let topic_count = i32::decode(buf)?;
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
 
         for _ in 0..topic_count {
             let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let partition_count = i32::decode(buf)?;
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partitions = Vec::new();
 
             for _ in 0..partition_count {
@@ -1146,7 +1147,7 @@ impl FetchResponse {
                 let error_code = ErrorCode::from_i16(i16::decode(buf)?);
                 let high_watermark = i64::decode(buf)?;
                 let last_stable_offset = i64::decode(buf)?;
-                let aborted_tx_count = i32::decode(buf)?;
+                let aborted_tx_count = check_decode_array_len(i32::decode(buf)?)?;
                 let mut aborted_transactions = Vec::new();
                 for _ in 0..aborted_tx_count {
                     aborted_transactions.push(AbortedTransaction {
@@ -1197,11 +1198,11 @@ impl FetchResponse {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let session_id = i32::decode(buf)?;
         let mut responses = Vec::new();
-        let topic_count = i32::decode(buf)?;
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
 
         for _ in 0..topic_count {
             let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let partition_count = i32::decode(buf)?;
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partitions = Vec::new();
 
             for _ in 0..partition_count {
@@ -1210,7 +1211,7 @@ impl FetchResponse {
                 let high_watermark = i64::decode(buf)?;
                 let last_stable_offset = i64::decode(buf)?;
                 let log_start_offset = i64::decode(buf)?;
-                let aborted_tx_count = i32::decode(buf)?;
+                let aborted_tx_count = check_decode_array_len(i32::decode(buf)?)?;
                 let mut aborted_transactions = Vec::new();
                 for _ in 0..aborted_tx_count {
                     aborted_transactions.push(AbortedTransaction {
@@ -1250,11 +1251,11 @@ impl FetchResponse {
 
     fn decode_inner_v0(buf: &mut impl Buf) -> Result<Self> {
         let mut responses = Vec::new();
-        let topic_count = i32::decode(buf)?;
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
 
         for _ in 0..topic_count {
             let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let partition_count = i32::decode(buf)?;
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partitions = Vec::new();
 
             for _ in 0..partition_count {
@@ -1520,8 +1521,8 @@ impl JoinGroupResponse {
         let leader = KafkaString::decode(buf)?.0.unwrap_or_default();
         let member_id = KafkaString::decode(buf)?.0.unwrap_or_default();
 
-        let member_count = i32::decode(buf)?;
-        let mut members = Vec::with_capacity((member_count as usize).min(10_000));
+        let member_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut members = Vec::with_capacity(member_count);
         for _ in 0..member_count {
             let m_id = KafkaString::decode(buf)?.0.unwrap_or_default();
             let metadata = KafkaBytes::decode(buf)?.0.unwrap_or_default();
@@ -1553,8 +1554,8 @@ impl JoinGroupResponse {
         let leader = KafkaString::decode(buf)?.0.unwrap_or_default();
         let member_id = KafkaString::decode(buf)?.0.unwrap_or_default();
 
-        let member_count = i32::decode(buf)?;
-        let mut members = Vec::with_capacity((member_count as usize).min(10_000));
+        let member_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut members = Vec::with_capacity(member_count);
         for _ in 0..member_count {
             let m_id = KafkaString::decode(buf)?.0.unwrap_or_default();
             let metadata = KafkaBytes::decode(buf)?.0.unwrap_or_default();
@@ -1586,8 +1587,8 @@ impl JoinGroupResponse {
         let leader = KafkaString::decode(buf)?.0.unwrap_or_default();
         let member_id = KafkaString::decode(buf)?.0.unwrap_or_default();
 
-        let member_count = i32::decode(buf)?;
-        let mut members = Vec::with_capacity((member_count as usize).min(10_000));
+        let member_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut members = Vec::with_capacity(member_count);
         for _ in 0..member_count {
             let m_id = KafkaString::decode(buf)?.0.unwrap_or_default();
             let group_instance_id = KafkaString::decode(buf)?.0;
@@ -1909,7 +1910,7 @@ impl LeaveGroupResponse {
     pub fn decode_v3(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
-        let member_count = i32::decode(buf)?;
+        let member_count = check_decode_array_len(i32::decode(buf)?)?;
         let mut members = Vec::new();
         for _ in 0..member_count {
             let member_id = KafkaString::decode(buf)?.0.unwrap_or_default();
@@ -2077,13 +2078,13 @@ pub struct OffsetCommitResponse {
 impl OffsetCommitResponse {
     /// Decode from version 0.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
-        let topic_count = i32::decode(buf)?;
-        let mut topics = Vec::with_capacity((topic_count as usize).min(10_000));
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
             let name = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let partition_count = i32::decode(buf)?;
-            let mut partitions = Vec::with_capacity((partition_count as usize).min(10_000));
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut partitions = Vec::with_capacity(partition_count);
 
             for _ in 0..partition_count {
                 let partition_index = i32::decode(buf)?;
@@ -2106,13 +2107,13 @@ impl OffsetCommitResponse {
     /// Decode from version 3+.
     pub fn decode_v3(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
-        let topic_count = i32::decode(buf)?;
-        let mut topics = Vec::with_capacity((topic_count as usize).min(10_000));
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
             let name = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let partition_count = i32::decode(buf)?;
-            let mut partitions = Vec::with_capacity((partition_count as usize).min(10_000));
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut partitions = Vec::with_capacity(partition_count);
 
             for _ in 0..partition_count {
                 let partition_index = i32::decode(buf)?;
@@ -2259,13 +2260,8 @@ impl ListOffsetsResponse {
                 "ListOffsetsResponse: truncated (no topic count)",
             ));
         }
-        let topic_count = buf.get_i32();
-        if topic_count < 0 {
-            return Err(crate::error::KrafkaError::protocol(
-                "ListOffsetsResponse: negative topic count",
-            ));
-        }
-        let mut topics = Vec::with_capacity((topic_count as usize).min(10_000));
+        let topic_count = check_decode_array_len(buf.get_i32())?;
+        let mut topics = Vec::with_capacity(topic_count);
         for _ in 0..topic_count {
             let name = KafkaString::decode(buf)?.0.unwrap_or_default();
             if buf.remaining() < 4 {
@@ -2273,13 +2269,8 @@ impl ListOffsetsResponse {
                     "ListOffsetsResponse: truncated (no partition count)",
                 ));
             }
-            let partition_count = buf.get_i32();
-            if partition_count < 0 {
-                return Err(crate::error::KrafkaError::protocol(
-                    "ListOffsetsResponse: negative partition count",
-                ));
-            }
-            let mut partitions = Vec::with_capacity((partition_count as usize).min(10_000));
+            let partition_count = check_decode_array_len(buf.get_i32())?;
+            let mut partitions = Vec::with_capacity(partition_count);
             // Each partition needs 4 + 2 + 8 + 8 = 22 bytes
             for _ in 0..partition_count {
                 if buf.remaining() < 22 {
@@ -2411,13 +2402,13 @@ pub struct OffsetFetchResponse {
 impl OffsetFetchResponse {
     /// Decode from version 0-1.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
-        let topic_count = i32::decode(buf)?;
-        let mut topics = Vec::with_capacity((topic_count as usize).min(10_000));
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
             let name = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let partition_count = i32::decode(buf)?;
-            let mut partitions = Vec::with_capacity((partition_count as usize).min(10_000));
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut partitions = Vec::with_capacity(partition_count);
 
             for _ in 0..partition_count {
                 let partition_index = i32::decode(buf)?;
@@ -2446,13 +2437,13 @@ impl OffsetFetchResponse {
 
     /// Decode from version 2.
     pub fn decode_v2(buf: &mut impl Buf) -> Result<Self> {
-        let topic_count = i32::decode(buf)?;
-        let mut topics = Vec::with_capacity((topic_count as usize).min(10_000));
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
             let name = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let partition_count = i32::decode(buf)?;
-            let mut partitions = Vec::with_capacity((partition_count as usize).min(10_000));
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut partitions = Vec::with_capacity(partition_count);
 
             for _ in 0..partition_count {
                 let partition_index = i32::decode(buf)?;
@@ -2484,13 +2475,13 @@ impl OffsetFetchResponse {
     /// Decode from version 3+.
     pub fn decode_v3(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
-        let topic_count = i32::decode(buf)?;
-        let mut topics = Vec::with_capacity((topic_count as usize).min(10_000));
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
             let name = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let partition_count = i32::decode(buf)?;
-            let mut partitions = Vec::with_capacity((partition_count as usize).min(10_000));
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut partitions = Vec::with_capacity(partition_count);
 
             for _ in 0..partition_count {
                 let partition_index = i32::decode(buf)?;
@@ -2673,8 +2664,8 @@ pub struct CreateTopicsResponse {
 impl CreateTopicsResponse {
     /// Decode from version 0.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
-        let topic_count = i32::decode(buf)?;
-        let mut topics = Vec::with_capacity((topic_count as usize).min(10_000));
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
             let name = KafkaString::decode(buf)?.0.unwrap_or_default();
@@ -2697,8 +2688,8 @@ impl CreateTopicsResponse {
 
     /// Decode from version 1.
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
-        let topic_count = i32::decode(buf)?;
-        let mut topics = Vec::with_capacity((topic_count as usize).min(10_000));
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
             let name = KafkaString::decode(buf)?.0.unwrap_or_default();
@@ -2723,8 +2714,8 @@ impl CreateTopicsResponse {
     /// Decode from version 2+.
     pub fn decode_v2(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
-        let topic_count = i32::decode(buf)?;
-        let mut topics = Vec::with_capacity((topic_count as usize).min(10_000));
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
             let name = KafkaString::decode(buf)?.0.unwrap_or_default();
@@ -2800,8 +2791,8 @@ pub struct DeleteTopicsResponse {
 impl DeleteTopicsResponse {
     /// Decode from version 0.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
-        let response_count = i32::decode(buf)?;
-        let mut responses = Vec::with_capacity((response_count as usize).min(10_000));
+        let response_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut responses = Vec::with_capacity(response_count);
 
         for _ in 0..response_count {
             let name = KafkaString::decode(buf)?.0;
@@ -2823,8 +2814,8 @@ impl DeleteTopicsResponse {
     /// Decode from version 1+.
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
-        let response_count = i32::decode(buf)?;
-        let mut responses = Vec::with_capacity((response_count as usize).min(10_000));
+        let response_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut responses = Vec::with_capacity(response_count);
 
         for _ in 0..response_count {
             let name = KafkaString::decode(buf)?.0;
@@ -2943,8 +2934,8 @@ impl CreatePartitionsResponse {
     /// Decode from version 0.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
-        let result_count = i32::decode(buf)?;
-        let mut results = Vec::with_capacity((result_count as usize).min(10_000));
+        let result_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut results = Vec::with_capacity(result_count);
 
         for _ in 0..result_count {
             let name = KafkaString::decode(buf)?.0.unwrap_or_default();
@@ -3114,8 +3105,8 @@ impl DescribeConfigsResponse {
     /// Decode from version 0.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
-        let result_count = i32::decode(buf)?;
-        let mut results = Vec::with_capacity((result_count as usize).min(10_000));
+        let result_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut results = Vec::with_capacity(result_count);
 
         for _ in 0..result_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -3123,8 +3114,8 @@ impl DescribeConfigsResponse {
             let resource_type = ConfigResourceType::from_i8(i8::decode(buf)?);
             let resource_name = KafkaString::decode(buf)?.0.unwrap_or_default();
 
-            let config_count = i32::decode(buf)?;
-            let mut configs = Vec::with_capacity((config_count as usize).min(10_000));
+            let config_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut configs = Vec::with_capacity(config_count);
 
             for _ in 0..config_count {
                 let name = KafkaString::decode(buf)?.0.unwrap_or_default();
@@ -3257,8 +3248,8 @@ impl AlterConfigsResponse {
     /// Decode from version 0.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
-        let result_count = i32::decode(buf)?;
-        let mut results = Vec::with_capacity((result_count as usize).min(10_000));
+        let result_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut results = Vec::with_capacity(result_count);
 
         for _ in 0..result_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -3421,8 +3412,8 @@ impl SaslHandshakeResponse {
     /// Decode from version 0.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
-        let count = i32::decode(buf)?;
-        let mut enabled_mechanisms = Vec::with_capacity((count as usize).min(10_000));
+        let count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut enabled_mechanisms = Vec::with_capacity(count);
 
         for _ in 0..count {
             if let Some(mech) = KafkaString::decode(buf)?.0 {
@@ -3908,15 +3899,15 @@ impl DescribeAclsResponse {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let error_message = KafkaString::decode(buf)?.0;
 
-        let resource_count = i32::decode(buf)?;
-        let mut resources = Vec::with_capacity((resource_count as usize).min(10_000));
+        let resource_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut resources = Vec::with_capacity(resource_count);
 
         for _ in 0..resource_count {
             let resource_type = AclResourceType::from_i8(i8::decode(buf)?);
             let resource_name = KafkaString::decode(buf)?.0.unwrap_or_default();
 
-            let acl_count = i32::decode(buf)?;
-            let mut acls = Vec::with_capacity((acl_count as usize).min(10_000));
+            let acl_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut acls = Vec::with_capacity(acl_count);
 
             for _ in 0..acl_count {
                 let principal = KafkaString::decode(buf)?.0.unwrap_or_default();
@@ -4014,8 +4005,8 @@ impl CreateAclsResponse {
     /// Decode from version 0.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
-        let result_count = i32::decode(buf)?;
-        let mut results = Vec::with_capacity((result_count as usize).min(10_000));
+        let result_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut results = Vec::with_capacity(result_count);
 
         for _ in 0..result_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -4175,15 +4166,15 @@ impl DeleteAclsResponse {
     /// Decode from version 0.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
-        let filter_count = i32::decode(buf)?;
-        let mut filter_results = Vec::with_capacity((filter_count as usize).min(10_000));
+        let filter_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut filter_results = Vec::with_capacity(filter_count);
 
         for _ in 0..filter_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
             let error_message = KafkaString::decode(buf)?.0;
 
-            let matching_count = i32::decode(buf)?;
-            let mut matching_acls = Vec::with_capacity((matching_count as usize).min(10_000));
+            let matching_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut matching_acls = Vec::with_capacity(matching_count);
 
             for _ in 0..matching_count {
                 let acl_error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -4355,13 +4346,13 @@ impl AddPartitionsToTxnResponse {
     /// Decode from version 0.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
-        let topic_count = i32::decode(buf)?;
-        let mut results = Vec::with_capacity((topic_count as usize).min(10_000));
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut results = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
             let name = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let partition_count = i32::decode(buf)?;
-            let mut partitions = Vec::with_capacity((partition_count as usize).min(10_000));
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut partitions = Vec::with_capacity(partition_count);
 
             for _ in 0..partition_count {
                 let partition = i32::decode(buf)?;
@@ -4696,13 +4687,13 @@ impl TxnOffsetCommitResponse {
     /// Decode from version 0.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
-        let topic_count = i32::decode(buf)?;
-        let mut topics = Vec::with_capacity((topic_count as usize).min(10_000));
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
             let name = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let partition_count = i32::decode(buf)?;
-            let mut partitions = Vec::with_capacity((partition_count as usize).min(10_000));
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut partitions = Vec::with_capacity(partition_count);
 
             for _ in 0..partition_count {
                 let partition = i32::decode(buf)?;
@@ -4803,8 +4794,8 @@ pub struct DescribeGroupsResponse {
 impl DescribeGroupsResponse {
     /// Decode from version 0.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
-        let group_count = i32::decode(buf)?;
-        let mut groups = Vec::with_capacity((group_count as usize).min(10_000));
+        let group_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut groups = Vec::with_capacity(group_count);
 
         for _ in 0..group_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -4813,8 +4804,8 @@ impl DescribeGroupsResponse {
             let protocol_type = KafkaString::decode(buf)?.0.unwrap_or_default();
             let protocol_data = KafkaString::decode(buf)?.0.unwrap_or_default();
 
-            let member_count = i32::decode(buf)?;
-            let mut members = Vec::with_capacity((member_count as usize).min(10_000));
+            let member_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut members = Vec::with_capacity(member_count);
 
             for _ in 0..member_count {
                 let member_id = KafkaString::decode(buf)?.0.unwrap_or_default();
@@ -4852,8 +4843,8 @@ impl DescribeGroupsResponse {
     /// Decode from version 1+.
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
-        let group_count = i32::decode(buf)?;
-        let mut groups = Vec::with_capacity((group_count as usize).min(10_000));
+        let group_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut groups = Vec::with_capacity(group_count);
 
         for _ in 0..group_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -4862,8 +4853,8 @@ impl DescribeGroupsResponse {
             let protocol_type = KafkaString::decode(buf)?.0.unwrap_or_default();
             let protocol_data = KafkaString::decode(buf)?.0.unwrap_or_default();
 
-            let member_count = i32::decode(buf)?;
-            let mut members = Vec::with_capacity((member_count as usize).min(10_000));
+            let member_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut members = Vec::with_capacity(member_count);
 
             for _ in 0..member_count {
                 let member_id = KafkaString::decode(buf)?.0.unwrap_or_default();
@@ -4945,8 +4936,8 @@ impl ListGroupsResponse {
     /// Decode from version 0.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
-        let group_count = i32::decode(buf)?;
-        let mut groups = Vec::with_capacity((group_count as usize).min(100_000));
+        let group_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut groups = Vec::with_capacity(group_count);
 
         for _ in 0..group_count {
             let group_id = KafkaString::decode(buf)?.0.unwrap_or_default();
@@ -4968,8 +4959,8 @@ impl ListGroupsResponse {
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
-        let group_count = i32::decode(buf)?;
-        let mut groups = Vec::with_capacity((group_count as usize).min(100_000));
+        let group_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut groups = Vec::with_capacity(group_count);
 
         for _ in 0..group_count {
             let group_id = KafkaString::decode(buf)?.0.unwrap_or_default();
@@ -5075,13 +5066,13 @@ impl DeleteRecordsResponse {
     /// Decode from version 0+.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
-        let topic_count = i32::decode(buf)?;
-        let mut topics = Vec::with_capacity((topic_count as usize).min(10_000));
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
             let name = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let partition_count = i32::decode(buf)?;
-            let mut partitions = Vec::with_capacity((partition_count as usize).min(100_000));
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut partitions = Vec::with_capacity(partition_count);
 
             for _ in 0..partition_count {
                 let partition_index = i32::decode(buf)?;
@@ -5143,9 +5134,22 @@ impl OffsetForLeaderEpochRequest {
         ApiKey::OffsetForLeaderEpoch
     }
 
-    /// Encode for version 2+ (includes current_leader_epoch for fencing).
+    /// Encode for version 0–1 (no current_leader_epoch field).
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        buf.put_i32(array_len_i32(self.topics.len())?);
+        for topic in &self.topics {
+            KafkaString::new(&topic.topic).try_encode(buf)?;
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
+            for partition in &topic.partitions {
+                partition.partition.encode(buf);
+                partition.leader_epoch.encode(buf);
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode for version 2 (adds current_leader_epoch per partition for fencing).
     pub fn encode_v2(&self, buf: &mut impl BufMut) -> Result<()> {
-        // v2 adds replica_id before topics
         buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
             KafkaString::new(&topic.topic).try_encode(buf)?;
@@ -5210,13 +5214,13 @@ pub struct OffsetForLeaderEpochResponse {
 impl OffsetForLeaderEpochResponse {
     /// Decode from version 0+.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
-        let topic_count = i32::decode(buf)?;
-        let mut topics = Vec::with_capacity((topic_count as usize).min(10_000));
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
             let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let partition_count = i32::decode(buf)?;
-            let mut partitions = Vec::with_capacity((partition_count as usize).min(100_000));
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut partitions = Vec::with_capacity(partition_count);
 
             for _ in 0..partition_count {
                 let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -5241,13 +5245,13 @@ impl OffsetForLeaderEpochResponse {
 
     /// Decode from version 1+ (adds leader_epoch to response).
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
-        let topic_count = i32::decode(buf)?;
-        let mut topics = Vec::with_capacity((topic_count as usize).min(10_000));
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
             let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let partition_count = i32::decode(buf)?;
-            let mut partitions = Vec::with_capacity((partition_count as usize).min(100_000));
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut partitions = Vec::with_capacity(partition_count);
 
             for _ in 0..partition_count {
                 let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -5274,13 +5278,13 @@ impl OffsetForLeaderEpochResponse {
     /// Decode from version 2+ (adds throttle_time_ms header).
     pub fn decode_v2(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
-        let topic_count = i32::decode(buf)?;
-        let mut topics = Vec::with_capacity((topic_count as usize).min(10_000));
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
             let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let partition_count = i32::decode(buf)?;
-            let mut partitions = Vec::with_capacity((partition_count as usize).min(100_000));
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut partitions = Vec::with_capacity(partition_count);
 
             for _ in 0..partition_count {
                 let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -5940,6 +5944,7 @@ impl VersionedDecode for DeleteRecordsResponse {
 impl VersionedEncode for OffsetForLeaderEpochRequest {
     fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
         match version {
+            0..=1 => self.encode_v0(buf)?,
             2 => self.encode_v2(buf)?,
             3 => self.encode_v3(buf)?,
             _ => return unsupported_encode!("OffsetForLeaderEpochRequest", version),

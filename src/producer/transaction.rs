@@ -1193,12 +1193,8 @@ impl TransactionalProducerBuilder {
 
         let pool = Arc::new(ConnectionPool::new(pool_config));
 
-        let bootstrap_servers: Vec<String> = self
-            .config
-            .bootstrap_servers
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .collect();
+        let bootstrap_servers =
+            crate::util::parse_bootstrap_servers(&self.config.bootstrap_servers)?;
 
         let metadata = Arc::new(ClusterMetadata::new(
             bootstrap_servers,

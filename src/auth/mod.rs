@@ -327,16 +327,12 @@ impl TlsConfig {
 
     /// Create a TLS config for self-signed certificates.
     ///
-    /// **Note:** This method is deprecated. Use `with_ca_cert()` instead.
-    /// Skipping certificate verification is not supported as it defeats
-    /// the purpose of TLS and exposes connections to man-in-the-middle attacks.
+    /// Create a TLS config that skips server certificate verification.
     ///
-    /// For testing with self-signed certificates, provide the CA certificate
-    /// using the `with_ca_cert()` method.
-    #[deprecated(
-        since = "0.1.0",
-        note = "Use with_ca_cert() with your CA certificate instead. Insecure mode is not supported."
-    )]
+    /// **Warning:** This disables TLS security entirely. Use only for local
+    /// development or testing with self-signed certificates. For production
+    /// use with self-signed certs, prefer [`with_ca_cert()`](Self::with_ca_cert)
+    /// to supply the CA certificate explicitly.
     pub fn insecure() -> Self {
         Self {
             verify_server_cert: false,

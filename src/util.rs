@@ -234,6 +234,24 @@ mod tests {
     }
 }
 
+/// Parse a comma-separated bootstrap servers string into individual addresses.
+///
+/// Trims whitespace, filters empty entries, and returns an error if no
+/// valid servers remain.
+pub fn parse_bootstrap_servers(servers: &str) -> Result<Vec<String>> {
+    let addrs: Vec<String> = servers
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if addrs.is_empty() {
+        return Err(KrafkaError::config("no bootstrap servers specified"));
+    }
+
+    Ok(addrs)
+}
+
 /// Extract the hostname from an address string for TLS SNI.
 ///
 /// Handles bracketed IPv6 (`[::1]:port`), bare IPv6 (`2001:db8::1`),
@@ -303,6 +321,39 @@ pub fn extract_sni_hostname(address: &str) -> Result<&str> {
                 Ok(address.rsplit_once(':').map_or(address, |(host, _)| host))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_bootstrap_servers_basic() {
+        let result = parse_bootstrap_servers("localhost:9092,broker:9093").unwrap();
+        assert_eq!(result, vec!["localhost:9092", "broker:9093"]);
+    }
+
+    #[test]
+    fn test_parse_bootstrap_servers_trims_whitespace() {
+        let result = parse_bootstrap_servers(" localhost:9092 , broker:9093 ").unwrap();
+        assert_eq!(result, vec!["localhost:9092", "broker:9093"]);
+    }
+
+    #[test]
+    fn test_parse_bootstrap_servers_filters_empty() {
+        let result = parse_bootstrap_servers(" , ,localhost:9092, , broker:9093, ").unwrap();
+        assert_eq!(result, vec!["localhost:9092", "broker:9093"]);
+    }
+
+    #[test]
+    fn test_parse_bootstrap_servers_empty_string() {
+        assert!(parse_bootstrap_servers("").is_err());
+    }
+
+    #[test]
+    fn test_parse_bootstrap_servers_only_whitespace() {
+        assert!(parse_bootstrap_servers(" , , ").is_err());
     }
 }
 

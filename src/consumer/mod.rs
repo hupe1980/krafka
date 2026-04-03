@@ -237,17 +237,7 @@ impl Consumer {
 
         let pool = Arc::new(ConnectionPool::new(pool_config));
 
-        // Parse bootstrap servers — filter out empty/whitespace entries
-        let bootstrap_servers: Vec<String> = config
-            .bootstrap_servers
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        if bootstrap_servers.is_empty() {
-            return Err(KrafkaError::config("no bootstrap servers specified"));
-        }
+        let bootstrap_servers = crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
 
         let metadata = Arc::new(ClusterMetadata::new(
             bootstrap_servers,
@@ -1685,7 +1675,7 @@ impl Consumer {
                 }
                 all_offset_updates = delivered_offsets
                     .into_iter()
-                    .map(|(key, offset)| (key, offset + 1))
+                    .map(|(key, offset)| (key, offset.saturating_add(1)))
                     .collect();
             }
         }
@@ -2039,19 +2029,36 @@ impl Consumer {
                     let mut batch_buf = record_bytes;
                     let mut last_offset_for_partition: Option<Offset> = None;
 
-                    while batch_buf.len() >= 12 {
+                    // Cap record accumulation to avoid unbounded memory growth
+                    // from large fetch responses. When max_poll_records is set,
+                    // stop decoding once we have enough records. The remaining
+                    // data will be re-fetched on the next poll using the
+                    // committed offset.
+                    let record_limit = if self.config.max_poll_records > 0 {
+                        self.config.max_poll_records as usize
+                    } else {
+                        usize::MAX
+                    };
+
+                    while batch_buf.len() >= 12 && records.len() < record_limit {
                         match RecordBatch::decode(&mut batch_buf) {
                             Ok(batch) => {
                                 for record in batch.records.into_iter() {
+                                    if records.len() >= record_limit {
+                                        break;
+                                    }
                                     // Use offset_delta for correct offset in compacted topics
                                     // where records may have been deleted (log compaction awareness).
-                                    let record_offset =
-                                        batch.base_offset + record.offset_delta as i64;
+                                    let record_offset = batch
+                                        .base_offset
+                                        .saturating_add(record.offset_delta as i64);
                                     records.push(ConsumerRecord {
                                         topic: topic_name.clone(),
                                         partition,
                                         offset: record_offset,
-                                        timestamp: batch.base_timestamp + record.timestamp_delta,
+                                        timestamp: batch
+                                            .base_timestamp
+                                            .saturating_add(record.timestamp_delta),
                                         timestamp_type: batch.attributes.timestamp_type as i8,
                                         key: record.key,
                                         value: record.value,
@@ -2074,7 +2081,7 @@ impl Consumer {
 
                     // Track offset update for this partition
                     if let Some(last_offset) = last_offset_for_partition {
-                        offset_updates.push((key, last_offset + 1));
+                        offset_updates.push((key, last_offset.saturating_add(1)));
                     }
                 }
             }
@@ -3606,26 +3613,6 @@ mod tests {
             .group_id("test-group");
         // The builder should have no group field; only group_coordinator is used
         assert!(builder.config.group_id.is_some());
-    }
-
-    #[test]
-    fn test_bootstrap_filter_empty_strings() {
-        // Empty bootstrap server entries should be filtered out
-        let servers = " , ,localhost:9092, , broker:9093, ";
-        let parsed: Vec<String> = servers
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        assert_eq!(parsed, vec!["localhost:9092", "broker:9093"]);
-
-        // Empty string should produce empty vec
-        let empty_parsed: Vec<String> = ""
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        assert!(empty_parsed.is_empty());
     }
 
     #[test]
