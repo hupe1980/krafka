@@ -20,6 +20,7 @@ pub enum Acks {
 
 impl Acks {
     /// Convert to the protocol i16 value.
+    #[inline]
     pub fn to_i16(self) -> i16 {
         match self {
             Acks::None => 0,
@@ -32,6 +33,7 @@ impl Acks {
     ///
     /// Known values: 0 = None, 1 = Leader, -1 = All.
     /// Unknown values default to `All` (safest default — requires full ISR ack).
+    #[inline]
     pub fn from_i16(value: i16) -> Self {
         match value {
             0 => Acks::None,
@@ -111,76 +113,91 @@ impl ProducerConfig {
     }
 
     /// Returns the bootstrap servers.
+    #[inline]
     pub fn bootstrap_servers(&self) -> &str {
         &self.bootstrap_servers
     }
 
     /// Returns the client ID.
+    #[inline]
     pub fn client_id(&self) -> &str {
         &self.client_id
     }
 
     /// Returns the required acknowledgments.
+    #[inline]
     pub fn acks(&self) -> Acks {
         self.acks
     }
 
     /// Returns the compression type.
+    #[inline]
     pub fn compression(&self) -> Compression {
         self.compression
     }
 
     /// Returns the batch size in bytes.
+    #[inline]
     pub fn batch_size(&self) -> usize {
         self.batch_size
     }
 
     /// Returns the linger time.
+    #[inline]
     pub fn linger(&self) -> Duration {
         self.linger
     }
 
     /// Returns the request timeout.
+    #[inline]
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
     }
 
     /// Returns the number of retries.
+    #[inline]
     pub fn retries(&self) -> u32 {
         self.retries
     }
 
     /// Returns the retry backoff duration.
+    #[inline]
     pub fn retry_backoff(&self) -> Duration {
         self.retry_backoff
     }
 
     /// Returns the max in-flight requests per connection.
+    #[inline]
     pub fn max_in_flight(&self) -> usize {
         self.max_in_flight
     }
 
     /// Returns whether idempotent producer is enabled.
+    #[inline]
     pub fn enable_idempotence(&self) -> bool {
         self.enable_idempotence
     }
 
     /// Returns the max block time when buffer is full.
+    #[inline]
     pub fn max_block(&self) -> Duration {
         self.max_block
     }
 
     /// Returns the buffer memory size.
+    #[inline]
     pub fn buffer_memory(&self) -> usize {
         self.buffer_memory
     }
 
     /// Returns the metadata max age.
+    #[inline]
     pub fn metadata_max_age(&self) -> Duration {
         self.metadata_max_age
     }
 
     /// Returns the authentication configuration, if set.
+    #[inline]
     pub fn auth(&self) -> Option<&AuthConfig> {
         self.auth.as_ref()
     }

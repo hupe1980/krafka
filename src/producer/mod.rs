@@ -477,6 +477,7 @@ impl Producer {
     }
 
     /// Get the shared metrics handle (for external monitoring).
+    #[inline]
     pub fn metrics_handle(&self) -> Arc<ProducerMetricsInner> {
         self.metrics.clone()
     }

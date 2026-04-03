@@ -380,21 +380,25 @@ impl AdminConfig {
     }
 
     /// Returns the bootstrap servers.
+    #[inline]
     pub fn bootstrap_servers(&self) -> &str {
         &self.bootstrap_servers
     }
 
     /// Returns the client ID.
+    #[inline]
     pub fn client_id(&self) -> &str {
         &self.client_id
     }
 
     /// Returns the request timeout.
+    #[inline]
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
     }
 
     /// Returns the authentication configuration, if set.
+    #[inline]
     pub fn auth(&self) -> Option<&AuthConfig> {
         self.auth.as_ref()
     }
@@ -918,11 +922,13 @@ impl AdminClient {
     }
 
     /// Get the client ID.
+    #[inline]
     pub fn client_id(&self) -> &str {
         &self.config.client_id
     }
 
     /// Get the request timeout.
+    #[inline]
     pub fn request_timeout(&self) -> Duration {
         self.config.request_timeout
     }

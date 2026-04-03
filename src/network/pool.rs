@@ -479,6 +479,11 @@ impl ConnectionPool {
     }
 
     /// Register a connection for a broker ID.
+    ///
+    /// Both maps are updated atomically under write locks to prevent
+    /// inconsistent state if another task reads between updates.
+    /// Lock ordering: `connections` → `connections_by_addr` (consistent
+    /// across all pool methods; no deadlock risk).
     pub async fn register(&self, broker_id: BrokerId, conn: Arc<BrokerConnection>) {
         let mut connections = self.connections.write().await;
         let mut connections_by_addr = self.connections_by_addr.write().await;
@@ -487,6 +492,9 @@ impl ConnectionPool {
     }
 
     /// Remove a connection by broker ID.
+    ///
+    /// Lock ordering matches [`register`](Self::register): `connections` →
+    /// `connections_by_addr`.
     pub async fn remove(&self, broker_id: BrokerId) {
         let mut connections = self.connections.write().await;
         let mut connections_by_addr = self.connections_by_addr.write().await;

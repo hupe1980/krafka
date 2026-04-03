@@ -160,7 +160,7 @@ let consumer = Consumer::builder()
     .fetch_min_bytes(1)                          // Min bytes before returning
     .fetch_max_bytes(52428800)                   // Max bytes per fetch (50MB)
     .max_partition_fetch_bytes(1048576)          // Max bytes per partition (1MB)
-    .max_poll_records(500)                       // Max records per poll (strictly enforced)
+    .max_poll_records(500)                       // Max records per poll
     .fetch_max_wait(Duration::from_millis(500))  // Max wait time
     .build()
     .await?;

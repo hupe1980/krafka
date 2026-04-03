@@ -1925,6 +1925,10 @@ impl Consumer {
         let mut offset_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
         let mut hw_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
         let mut lso_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
+        // Snapshot current fetch offsets so we can skip already-delivered
+        // records when Kafka returns a whole batch that starts before the
+        // requested fetch offset (e.g. after max_poll_records truncation).
+        let current_offsets = self.offsets.read().await.clone();
         // Preferred replica updates (KIP-392): Some(id) to set, None to clear.
         // Collected during the loop, applied in a single write lock afterwards.
         let mut pref_updates: Vec<((String, PartitionId), Option<crate::BrokerId>)> = Vec::new();
@@ -2023,29 +2027,45 @@ impl Consumer {
                     let mut batch_buf = record_bytes;
                     let mut last_offset_for_partition: Option<Offset> = None;
 
+                    // Fetch offset for this partition — used to skip records
+                    // already delivered in a prior poll when Kafka returns a
+                    // batch that starts before the requested offset.
+                    let partition_fetch_offset = current_offsets.get(&key).copied().unwrap_or(0);
+
                     // Cap record accumulation to avoid unbounded memory growth
                     // from large fetch responses. When max_poll_records is set,
-                    // stop decoding once we have enough records. The remaining
-                    // data will be re-fetched on the next poll using the
-                    // next fetch offset tracked locally for this partition.
+                    // stop decoding NEW batches once we have enough records.
+                    // Within a single batch, all records are consumed to avoid
+                    // setting the fetch offset to the middle of a batch, which
+                    // would cause duplicate delivery on re-fetch.
                     let record_limit = if self.config.max_poll_records > 0 {
                         self.config.max_poll_records as usize
                     } else {
                         usize::MAX
                     };
 
-                    while batch_buf.len() >= 12 && records.len() < record_limit {
+                    while batch_buf.len() >= 12 {
+                        // Stop decoding new batches once we have enough records.
+                        if records.len() >= record_limit {
+                            break;
+                        }
+
                         match RecordBatch::decode(&mut batch_buf) {
                             Ok(batch) => {
                                 for record in batch.records.into_iter() {
-                                    if records.len() >= record_limit {
-                                        break;
-                                    }
                                     // Use offset_delta for correct offset in compacted topics
                                     // where records may have been deleted (log compaction awareness).
                                     let record_offset = batch
                                         .base_offset
                                         .saturating_add(record.offset_delta as i64);
+
+                                    // Skip records below the fetch offset — these were
+                                    // already delivered in a prior poll but are included
+                                    // because Kafka returns whole batches.
+                                    if record_offset < partition_fetch_offset {
+                                        continue;
+                                    }
+
                                     records.push(ConsumerRecord {
                                         topic: topic_name.clone(),
                                         partition,
@@ -2759,11 +2779,13 @@ impl Consumer {
     }
 
     /// Get the group coordinator, if one is configured.
+    #[inline]
     pub fn group_coordinator(&self) -> Option<&Arc<GroupCoordinator>> {
         self.group_coordinator.as_ref()
     }
 
     /// Get a snapshot of consumer metrics.
+    #[inline]
     pub fn metrics(&self) -> &Arc<ConsumerMetrics> {
         &self.metrics
     }

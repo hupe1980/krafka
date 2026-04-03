@@ -1053,6 +1053,7 @@ impl TransactionalProducer {
     }
 
     /// Get the transactional ID.
+    #[inline]
     pub fn transactional_id(&self) -> &str {
         &self.config.transactional_id
     }

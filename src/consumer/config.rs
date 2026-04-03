@@ -22,6 +22,7 @@ impl AutoOffsetReset {
     ///
     /// Returns `None` for `AutoOffsetReset::None` since that variant should
     /// produce an error rather than a valid offset.
+    #[inline]
     pub fn to_offset(&self) -> Option<i64> {
         match self {
             AutoOffsetReset::Earliest => Some(-2),
@@ -44,6 +45,7 @@ pub enum IsolationLevel {
 
 impl IsolationLevel {
     /// Convert to the protocol i8 value.
+    #[inline]
     pub fn to_i8(self) -> i8 {
         match self {
             IsolationLevel::ReadUncommitted => 0,
@@ -67,6 +69,7 @@ pub enum PartitionAssignmentStrategy {
 
 impl PartitionAssignmentStrategy {
     /// Get the Kafka protocol name for this strategy.
+    #[inline]
     pub fn protocol_name(&self) -> &'static str {
         match self {
             Self::Range => "range",
@@ -165,101 +168,121 @@ impl ConsumerConfig {
     }
 
     /// Returns the bootstrap servers.
+    #[inline]
     pub fn bootstrap_servers(&self) -> &str {
         &self.bootstrap_servers
     }
 
     /// Returns the consumer group ID, if set.
+    #[inline]
     pub fn group_id(&self) -> Option<&str> {
         self.group_id.as_deref()
     }
 
     /// Returns the client ID.
+    #[inline]
     pub fn client_id(&self) -> &str {
         &self.client_id
     }
 
     /// Returns the auto offset reset behavior.
+    #[inline]
     pub fn auto_offset_reset(&self) -> AutoOffsetReset {
         self.auto_offset_reset
     }
 
     /// Returns whether auto commit is enabled.
+    #[inline]
     pub fn enable_auto_commit(&self) -> bool {
         self.enable_auto_commit
     }
 
     /// Returns the auto commit interval.
+    #[inline]
     pub fn auto_commit_interval(&self) -> Duration {
         self.auto_commit_interval
     }
 
     /// Returns the minimum bytes to fetch.
+    #[inline]
     pub fn fetch_min_bytes(&self) -> i32 {
         self.fetch_min_bytes
     }
 
     /// Returns the maximum bytes to fetch.
+    #[inline]
     pub fn fetch_max_bytes(&self) -> i32 {
         self.fetch_max_bytes
     }
 
     /// Returns the maximum bytes per partition.
+    #[inline]
     pub fn max_partition_fetch_bytes(&self) -> i32 {
         self.max_partition_fetch_bytes
     }
 
     /// Returns the maximum poll records.
+    #[inline]
     pub fn max_poll_records(&self) -> i32 {
         self.max_poll_records
     }
 
     /// Returns the maximum poll interval.
+    #[inline]
     pub fn max_poll_interval(&self) -> Duration {
         self.max_poll_interval
     }
 
     /// Returns the request timeout.
+    #[inline]
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
     }
 
     /// Returns the session timeout.
+    #[inline]
     pub fn session_timeout(&self) -> Duration {
         self.session_timeout
     }
 
     /// Returns the heartbeat interval.
+    #[inline]
     pub fn heartbeat_interval(&self) -> Duration {
         self.heartbeat_interval
     }
 
     /// Returns the isolation level.
+    #[inline]
     pub fn isolation_level(&self) -> IsolationLevel {
         self.isolation_level
     }
 
     /// Returns the metadata max age.
+    #[inline]
     pub fn metadata_max_age(&self) -> Duration {
         self.metadata_max_age
     }
 
     /// Returns the partition assignment strategy.
+    #[inline]
     pub fn partition_assignment_strategy(&self) -> PartitionAssignmentStrategy {
         self.partition_assignment_strategy
     }
 
     /// Returns the static group membership instance ID, if set.
+    #[inline]
     pub fn group_instance_id(&self) -> Option<&str> {
         self.group_instance_id.as_deref()
     }
 
     /// Returns the client rack ID, if set.
+    #[inline]
     pub fn client_rack(&self) -> Option<&str> {
         self.client_rack.as_deref()
     }
 
     /// Returns the authentication configuration, if set.
+    #[inline]
     pub fn auth(&self) -> Option<&AuthConfig> {
         self.auth.as_ref()
     }
