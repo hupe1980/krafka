@@ -188,12 +188,12 @@ impl ClusterMetadata {
 
         // After acquiring the lock, check if metadata was just refreshed by another caller.
         // If it was refreshed within the last 100ms, skip the redundant request — but only
-        // when all requested topics are already present in the cache. A partial refresh for
-        // a missing topic must not be skipped.
+        // for partial refreshes where all requested topics are already present. Full refreshes
+        // are never skipped: a recent partial refresh does not guarantee a full-cluster snapshot.
         let cache = self.cache.load();
         if cache.last_updated.elapsed() < Duration::from_millis(100) && !cache.brokers.is_empty() {
             let all_present = match topics {
-                None => true,
+                None => false,
                 Some(names) => names.iter().all(|name| cache.topics.contains_key(*name)),
             };
             if all_present {

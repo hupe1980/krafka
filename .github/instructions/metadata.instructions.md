@@ -8,7 +8,7 @@ description: "Use when editing metadata: cache refresh coalescing, lock ordering
 ## Cache Refresh Coalescing
 
 - A `Mutex` (`refresh_lock`) serializes concurrent refresh requests.
-- After acquiring the lock, check if cache was updated within 100 ms by another task — if so, skip **only** when all requested topics are already present in the cache. A partial refresh for a missing topic must never be skipped.
+- After acquiring the lock, check if cache was updated within 100 ms by another task — if so, skip **only** partial refreshes where all requested topics are already present. Full refreshes (`topics: None`) are never skipped because a recent partial refresh does not guarantee a full-cluster snapshot.
 - Never remove this check; it prevents thundering-herd on stale cache.
 
 ## Lock Ordering
