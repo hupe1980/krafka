@@ -10,7 +10,7 @@ use crate::error::Result;
 /// Kafka API keys.
 ///
 /// Each API key corresponds to a specific request/response pair in the Kafka protocol.
-#[non_exhaustive]
+/// Forward compatibility is provided by the `Unknown(i16)` variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i16)]
 pub enum ApiKey {

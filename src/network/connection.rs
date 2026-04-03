@@ -595,7 +595,7 @@ impl BrokerConnection {
         let header = RequestHeader::new(ApiKey::SaslHandshake, 1, 0).with_client_id(client_id);
         header.encode_v1(encoder.buffer_mut())?;
         handshake_request.encode_v1(encoder.buffer_mut())?;
-        encoder.finish_message(pos);
+        encoder.finish_message(pos)?;
 
         stream
             .write_all(&encoder.take())
@@ -676,7 +676,7 @@ impl BrokerConnection {
         let header = RequestHeader::new(ApiKey::SaslAuthenticate, 0, 1).with_client_id(client_id);
         header.encode(encoder.buffer_mut())?;
         request.encode_v0(encoder.buffer_mut())?;
-        encoder.finish_message(pos);
+        encoder.finish_message(pos)?;
 
         stream
             .write_all(&encoder.take())
@@ -985,7 +985,7 @@ impl BrokerConnection {
             .with_client_id(&self.config.client_id);
         header.encode_v1(encoder.buffer_mut())?;
         request.encode_v0(encoder.buffer_mut())?;
-        encoder.finish_message(pos);
+        encoder.finish_message(pos)?;
 
         // Send request (use high priority for API versions)
         let (response_tx, response_rx) = oneshot::channel();
@@ -1075,7 +1075,7 @@ impl BrokerConnection {
             .with_client_id(&self.config.client_id);
         header.encode(encoder.buffer_mut())?;
         request_body(encoder.buffer_mut())?;
-        encoder.finish_message(pos);
+        encoder.finish_message(pos)?;
 
         // Send request to appropriate channel
         let (response_tx, response_rx) = oneshot::channel();
@@ -1134,7 +1134,7 @@ impl BrokerConnection {
             .with_client_id(&self.config.client_id);
         header.encode(encoder.buffer_mut())?;
         request_body(encoder.buffer_mut())?;
-        encoder.finish_message(pos);
+        encoder.finish_message(pos)?;
 
         // Send as fire-and-forget — no pending entry is created
         let channel = self.channel_for_priority(RequestPriority::Normal);

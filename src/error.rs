@@ -153,7 +153,7 @@ impl KrafkaError {
 /// Kafka protocol error codes.
 ///
 /// These are the standard error codes defined in the Kafka protocol.
-#[non_exhaustive]
+/// Forward compatibility is provided by the `Unknown(i16)` variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(i16)]
 pub enum ErrorCode {
