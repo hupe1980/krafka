@@ -8,21 +8,29 @@ description: "Use when editing metadata: cache refresh coalescing, lock ordering
 ## Cache Refresh Coalescing
 
 - A `Mutex` (`refresh_lock`) serializes concurrent refresh requests.
-- After acquiring the lock, check if cache was updated within 100 ms by another task — if so, skip the redundant request.
+- After acquiring the lock, check if cache was updated within 100 ms by another task — if so, skip **only** partial refreshes where all requested topics are already present. Full refreshes (`topics: None`) are never skipped because a recent partial refresh does not guarantee a full-cluster snapshot.
 - Never remove this check; it prevents thundering-herd on stale cache.
 
 ## Lock Ordering
 
 1. `refresh_lock` (Mutex) — held only during the refresh RPC
-2. `cache` (RwLock) — write-locked briefly to swap in new data
+2. `cache` (ArcSwap) — lock-free reads via `load()`, atomic writes via `store()`
 
-Never hold both locks simultaneously. Always release `cache` before attempting a refresh RPC.
+`ArcSwap` eliminates lock-ordering concerns: readers never block writers and
+vice-versa. `refresh_lock` serializes RPC calls; the cache swap is a single
+atomic pointer store at the end.
 
 ## Error Filtering
 
 - Topics with error codes are **not** inserted into the cache (deleted/unauthorized topics filtered out).
+- On partial refresh, error topics are **removed** from the cache (may have been deleted).
 - Partitions with error codes are **excluded** from their topic's partition list.
 - `leader_epoch` of `-1` means unknown — treat accordingly.
+
+## Full vs. Partial Refresh
+
+- **Full refresh** (`refresh_for_topics(None)`): response is authoritative — brokers and topics are rebuilt from scratch. Deleted topics and decommissioned brokers are automatically purged.
+- **Partial refresh** (`refresh_for_topics(Some(&[...]))`): response is delta-merged into the existing cache. Topics and brokers not in the request are preserved so that preserved topics cannot reference missing brokers.
 
 ## Staleness
 

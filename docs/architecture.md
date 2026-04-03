@@ -260,6 +260,7 @@ where
 - Automatic refresh when cache is stale (configurable TTL)
 - Forced refresh on NotLeaderForPartition errors
 - Topic-specific refresh when subscribing
+- API version negotiation: negotiates the highest mutually supported Metadata version (v0-v8, no gaps); versions are cumulative (rack since v1, cluster_id since v2, offline replicas since v5), and v7 specifically adds leader_epoch
 
 ## Producer Architecture
 

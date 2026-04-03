@@ -38,10 +38,6 @@ pub struct MetadataRequest {
     pub topics: Option<Vec<MetadataRequestTopic>>,
     /// Whether to allow auto topic creation (v4+).
     pub allow_auto_topic_creation: bool,
-    /// Include cluster authorized operations (v8+).
-    pub include_cluster_authorized_operations: bool,
-    /// Include topic authorized operations (v8+).
-    pub include_topic_authorized_operations: bool,
 }
 
 /// Topic in metadata request.
@@ -55,10 +51,12 @@ pub struct MetadataRequestTopic {
 
 impl MetadataRequest {
     /// Create a request for all topics.
+    ///
+    /// `topics: None`. `encode_v0` converts this to an empty array (v0 is
+    /// non-nullable); `encode_v1`+ emits a null array.
     pub fn all_topics() -> Self {
         Self {
-            // Use empty array instead of null for better compatibility with some brokers
-            topics: Some(vec![]),
+            topics: None,
             ..Default::default()
         }
     }
@@ -84,25 +82,56 @@ impl MetadataRequest {
         ApiKey::Metadata
     }
 
-    /// Encode for version 0-3.
+    /// Extract topic names as `KafkaString`s for wire encoding.
+    ///
+    /// Returns an error if any entry has `name: None` — topic IDs are only
+    /// supported from v10+, and we cap at v8.
+    fn topic_names(topics: &[MetadataRequestTopic]) -> Result<Vec<KafkaString>> {
+        topics
+            .iter()
+            .map(|t| {
+                t.name.as_ref().map(KafkaString::new).ok_or_else(|| {
+                    crate::error::KrafkaError::protocol(
+                        "MetadataRequestTopic.name is required for v0-v8",
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Encode for version 0 (topics is non-nullable; `None` → empty array = "all topics").
     pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
         match &self.topics {
-            None => KafkaArray::<KafkaString>::null().try_encode(buf)?,
-            Some(topics) => {
-                let names: Vec<KafkaString> = topics
-                    .iter()
-                    .filter_map(|t| t.name.as_ref().map(KafkaString::new))
-                    .collect();
-                KafkaArray::new(names).try_encode(buf)?;
-            }
+            None => KafkaArray::<KafkaString>::new(vec![]).try_encode(buf)?,
+            Some(topics) => KafkaArray::new(Self::topic_names(topics)?).try_encode(buf)?,
         }
         Ok(())
     }
 
-    /// Encode for version 4+.
+    /// Encode for version 1-3 (topics is nullable; `None` → null array = "all topics").
+    pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
+        match &self.topics {
+            None => KafkaArray::<KafkaString>::null().try_encode(buf)?,
+            Some(topics) => KafkaArray::new(Self::topic_names(topics)?).try_encode(buf)?,
+        }
+        Ok(())
+    }
+
+    /// Encode for version 4-7.
     pub fn encode_v4(&self, buf: &mut impl BufMut) -> Result<()> {
-        self.encode_v0(buf)?;
+        self.encode_v1(buf)?;
         buf.put_u8(if self.allow_auto_topic_creation { 1 } else { 0 });
+        Ok(())
+    }
+
+    /// Encode for version 8.
+    ///
+    /// Authorized-operations flags are always encoded as `false` because
+    /// `MetadataResponse` does not yet surface the results.
+    pub fn encode_v8(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.encode_v4(buf)?;
+        buf.put_u8(0); // include_cluster_authorized_operations — not yet surfaced
+        buf.put_u8(0); // include_topic_authorized_operations — not yet surfaced
         Ok(())
     }
 }
@@ -172,76 +201,100 @@ pub struct MetadataPartitionResponse {
 impl MetadataResponse {
     /// Decode from version 0.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
-        let brokers_arr = KafkaArray::<MetadataBrokerV0>::decode(buf)?;
-        let topics_arr = KafkaArray::<MetadataTopicResponseV0>::decode(buf)?;
-
+        let brokers = decode_array::<MetadataBrokerV0, _>(buf)?;
+        let topics = decode_array::<MetadataTopicResponseV0, _>(buf)?;
         Ok(Self {
             throttle_time_ms: 0,
-            brokers: brokers_arr
-                .0
-                .unwrap_or_default()
-                .into_iter()
-                .map(|b| b.0)
-                .collect(),
+            brokers,
             cluster_id: None,
             controller_id: -1,
-            topics: topics_arr
-                .0
-                .unwrap_or_default()
-                .into_iter()
-                .map(|t| t.0)
-                .collect(),
+            topics,
         })
     }
 
     /// Decode from version 1.
+    ///
+    /// v1 adds broker rack, controller_id, and topic is_internal.
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
-        let brokers_arr = KafkaArray::<MetadataBrokerV0>::decode(buf)?;
+        let brokers = decode_array::<MetadataBrokerV1, _>(buf)?;
         let controller_id = i32::decode(buf)?;
-        let topics_arr = KafkaArray::<MetadataTopicResponseV0>::decode(buf)?;
-
+        let topics = decode_array::<MetadataTopicResponseV1, _>(buf)?;
         Ok(Self {
             throttle_time_ms: 0,
-            brokers: brokers_arr
-                .0
-                .unwrap_or_default()
-                .into_iter()
-                .map(|b| b.0)
-                .collect(),
+            brokers,
             cluster_id: None,
             controller_id,
-            topics: topics_arr
-                .0
-                .unwrap_or_default()
-                .into_iter()
-                .map(|t| t.0)
-                .collect(),
+            topics,
         })
     }
 
-    /// Decode from version 2-3.
+    /// Decode from version 2.
+    ///
+    /// v2 adds cluster_id.
     pub fn decode_v2(buf: &mut impl Buf) -> Result<Self> {
-        let brokers_arr = KafkaArray::<MetadataBrokerV0>::decode(buf)?;
-        let cluster_id = KafkaString::decode(buf)?;
+        let brokers = decode_array::<MetadataBrokerV1, _>(buf)?;
+        let cluster_id = KafkaString::decode(buf)?.0;
         let controller_id = i32::decode(buf)?;
-        let topics_arr = KafkaArray::<MetadataTopicResponseV0>::decode(buf)?;
-
+        let topics = decode_array::<MetadataTopicResponseV1, _>(buf)?;
         Ok(Self {
             throttle_time_ms: 0,
-            brokers: brokers_arr
-                .0
-                .unwrap_or_default()
-                .into_iter()
-                .map(|b| b.0)
-                .collect(),
-            cluster_id: cluster_id.0,
+            brokers,
+            cluster_id,
             controller_id,
-            topics: topics_arr
-                .0
-                .unwrap_or_default()
-                .into_iter()
-                .map(|t| t.0)
-                .collect(),
+            topics,
+        })
+    }
+
+    /// Decode from version 3-4.
+    ///
+    /// v3 adds throttle_time_ms. v4 only changes the request (allow_auto_topic_creation).
+    pub fn decode_v3(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode_v3_plus::<MetadataTopicResponseV1>(buf)
+    }
+
+    /// Decode from version 5-6.
+    ///
+    /// v5 adds partition offline_replicas. v6 has no wire changes.
+    pub fn decode_v5(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode_v3_plus::<MetadataTopicResponseV5>(buf)
+    }
+
+    /// Decode from version 7.
+    ///
+    /// v7 adds partition leader_epoch.
+    pub fn decode_v7(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode_v3_plus::<MetadataTopicResponseV7>(buf)
+    }
+
+    /// Decode from version 8.
+    ///
+    /// v8 adds topic_authorized_operations and cluster_authorized_operations.
+    /// Both are read and discarded — the encoder always sends `false` for the
+    /// include flags, so brokers return the "not requested" sentinel (`i32::MIN`).
+    /// When authorized-operations support is added, plumb these into the response.
+    pub fn decode_v8(buf: &mut impl Buf) -> Result<Self> {
+        let resp = Self::decode_v3_plus::<MetadataTopicResponseV8>(buf)?;
+        // cluster_authorized_operations — read and discard
+        let _cluster_authorized_operations = i32::decode(buf)?;
+        Ok(resp)
+    }
+
+    /// Shared decoder for Metadata v3-v8 wire format.
+    ///
+    /// Layout: throttle_time_ms, brokers (v1 format), cluster_id,
+    /// controller_id, topics (parametrized by `T`).
+    fn decode_v3_plus<T: Decode + Into<MetadataTopicResponse>>(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let brokers = decode_array::<MetadataBrokerV1, _>(buf)?;
+        let cluster_id = KafkaString::decode(buf)?.0;
+        let controller_id = i32::decode(buf)?;
+        let topics = decode_array::<T, _>(buf)?;
+        Ok(Self {
+            throttle_time_ms,
+            brokers,
+            cluster_id,
+            controller_id,
+            topics,
         })
     }
 
@@ -256,7 +309,24 @@ impl MetadataResponse {
     }
 }
 
-// Helper wrapper for decoding
+/// Decode a `KafkaArray` of newtype wrappers and unwrap each element's inner value.
+fn decode_array<W: Decode + Into<T>, T>(buf: &mut impl Buf) -> Result<Vec<T>> {
+    Ok(KafkaArray::<W>::decode(buf)?
+        .0
+        .unwrap_or_default()
+        .into_iter()
+        .map(Into::into)
+        .collect())
+}
+
+// ── Metadata decode helper newtypes ─────────────────────────────────
+//
+// Each newtype decodes a specific wire format version and converts into the
+// public response type via `From`. Only the fields that differ between
+// versions need a separate newtype; higher versions reuse lower partition
+// decoders when the partition layout hasn't changed.
+
+/// v0 broker decoder: node_id, host, port (no rack).
 struct MetadataBrokerV0(MetadataBroker);
 
 impl Decode for MetadataBrokerV0 {
@@ -264,7 +334,6 @@ impl Decode for MetadataBrokerV0 {
         let node_id = i32::decode(buf)?;
         let host = KafkaString::decode(buf)?.0.unwrap_or_default();
         let port = i32::decode(buf)?;
-
         Ok(Self(MetadataBroker {
             node_id,
             host,
@@ -274,29 +343,37 @@ impl Decode for MetadataBrokerV0 {
     }
 }
 
-struct MetadataTopicResponseV0(MetadataTopicResponse);
+impl From<MetadataBrokerV0> for MetadataBroker {
+    fn from(w: MetadataBrokerV0) -> Self {
+        w.0
+    }
+}
 
-impl Decode for MetadataTopicResponseV0 {
+/// v1+ broker decoder: adds rack (nullable string).
+struct MetadataBrokerV1(MetadataBroker);
+
+impl Decode for MetadataBrokerV1 {
     fn decode(buf: &mut impl Buf) -> Result<Self> {
-        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
-        let name = KafkaString::decode(buf)?.0;
-        let partitions_arr = KafkaArray::<MetadataPartitionResponseV0>::decode(buf)?;
-
-        Ok(Self(MetadataTopicResponse {
-            error_code,
-            name,
-            topic_id: None,
-            is_internal: false,
-            partitions: partitions_arr
-                .0
-                .unwrap_or_default()
-                .into_iter()
-                .map(|p| p.0)
-                .collect(),
+        let node_id = i32::decode(buf)?;
+        let host = KafkaString::decode(buf)?.0.unwrap_or_default();
+        let port = i32::decode(buf)?;
+        let rack = KafkaString::decode(buf)?.0;
+        Ok(Self(MetadataBroker {
+            node_id,
+            host,
+            port,
+            rack,
         }))
     }
 }
 
+impl From<MetadataBrokerV1> for MetadataBroker {
+    fn from(w: MetadataBrokerV1) -> Self {
+        w.0
+    }
+}
+
+/// v0 partition decoder: no offline_replicas, no leader_epoch.
 struct MetadataPartitionResponseV0(MetadataPartitionResponse);
 
 impl Decode for MetadataPartitionResponseV0 {
@@ -306,7 +383,6 @@ impl Decode for MetadataPartitionResponseV0 {
         let leader_id = i32::decode(buf)?;
         let replica_nodes = KafkaArray::<i32>::decode(buf)?.0.unwrap_or_default();
         let isr_nodes = KafkaArray::<i32>::decode(buf)?.0.unwrap_or_default();
-
         Ok(Self(MetadataPartitionResponse {
             error_code,
             partition_index,
@@ -316,6 +392,197 @@ impl Decode for MetadataPartitionResponseV0 {
             isr_nodes,
             offline_replicas: Vec::new(),
         }))
+    }
+}
+
+impl From<MetadataPartitionResponseV0> for MetadataPartitionResponse {
+    fn from(w: MetadataPartitionResponseV0) -> Self {
+        w.0
+    }
+}
+
+/// v5+ partition decoder: adds offline_replicas.
+struct MetadataPartitionResponseV5(MetadataPartitionResponse);
+
+impl Decode for MetadataPartitionResponseV5 {
+    fn decode(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let partition_index = i32::decode(buf)?;
+        let leader_id = i32::decode(buf)?;
+        let replica_nodes = KafkaArray::<i32>::decode(buf)?.0.unwrap_or_default();
+        let isr_nodes = KafkaArray::<i32>::decode(buf)?.0.unwrap_or_default();
+        let offline_replicas = KafkaArray::<i32>::decode(buf)?.0.unwrap_or_default();
+        Ok(Self(MetadataPartitionResponse {
+            error_code,
+            partition_index,
+            leader_id,
+            leader_epoch: -1,
+            replica_nodes,
+            isr_nodes,
+            offline_replicas,
+        }))
+    }
+}
+
+impl From<MetadataPartitionResponseV5> for MetadataPartitionResponse {
+    fn from(w: MetadataPartitionResponseV5) -> Self {
+        w.0
+    }
+}
+
+/// v7+ partition decoder: adds leader_epoch (offline_replicas since v5).
+struct MetadataPartitionResponseV7(MetadataPartitionResponse);
+
+impl Decode for MetadataPartitionResponseV7 {
+    fn decode(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let partition_index = i32::decode(buf)?;
+        let leader_id = i32::decode(buf)?;
+        let leader_epoch = i32::decode(buf)?;
+        let replica_nodes = KafkaArray::<i32>::decode(buf)?.0.unwrap_or_default();
+        let isr_nodes = KafkaArray::<i32>::decode(buf)?.0.unwrap_or_default();
+        let offline_replicas = KafkaArray::<i32>::decode(buf)?.0.unwrap_or_default();
+        Ok(Self(MetadataPartitionResponse {
+            error_code,
+            partition_index,
+            leader_id,
+            leader_epoch,
+            replica_nodes,
+            isr_nodes,
+            offline_replicas,
+        }))
+    }
+}
+
+impl From<MetadataPartitionResponseV7> for MetadataPartitionResponse {
+    fn from(w: MetadataPartitionResponseV7) -> Self {
+        w.0
+    }
+}
+
+/// v0 topic decoder: no is_internal, v0 partitions.
+struct MetadataTopicResponseV0(MetadataTopicResponse);
+
+impl Decode for MetadataTopicResponseV0 {
+    fn decode(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let name = KafkaString::decode(buf)?.0;
+        let partitions = decode_array::<MetadataPartitionResponseV0, _>(buf)?;
+        Ok(Self(MetadataTopicResponse {
+            error_code,
+            name,
+            topic_id: None,
+            is_internal: false,
+            partitions,
+        }))
+    }
+}
+
+impl From<MetadataTopicResponseV0> for MetadataTopicResponse {
+    fn from(w: MetadataTopicResponseV0) -> Self {
+        w.0
+    }
+}
+
+/// v1-v4 topic decoder: adds is_internal, v0 partitions.
+struct MetadataTopicResponseV1(MetadataTopicResponse);
+
+impl Decode for MetadataTopicResponseV1 {
+    fn decode(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let name = KafkaString::decode(buf)?.0;
+        let is_internal = bool::decode(buf)?;
+        let partitions = decode_array::<MetadataPartitionResponseV0, _>(buf)?;
+        Ok(Self(MetadataTopicResponse {
+            error_code,
+            name,
+            topic_id: None,
+            is_internal,
+            partitions,
+        }))
+    }
+}
+
+impl From<MetadataTopicResponseV1> for MetadataTopicResponse {
+    fn from(w: MetadataTopicResponseV1) -> Self {
+        w.0
+    }
+}
+
+/// v5-v6 topic decoder: is_internal + v5 partitions (offline_replicas).
+struct MetadataTopicResponseV5(MetadataTopicResponse);
+
+impl Decode for MetadataTopicResponseV5 {
+    fn decode(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let name = KafkaString::decode(buf)?.0;
+        let is_internal = bool::decode(buf)?;
+        let partitions = decode_array::<MetadataPartitionResponseV5, _>(buf)?;
+        Ok(Self(MetadataTopicResponse {
+            error_code,
+            name,
+            topic_id: None,
+            is_internal,
+            partitions,
+        }))
+    }
+}
+
+impl From<MetadataTopicResponseV5> for MetadataTopicResponse {
+    fn from(w: MetadataTopicResponseV5) -> Self {
+        w.0
+    }
+}
+
+/// v7 topic decoder: is_internal + v7 partitions (leader_epoch + offline_replicas).
+struct MetadataTopicResponseV7(MetadataTopicResponse);
+
+impl Decode for MetadataTopicResponseV7 {
+    fn decode(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let name = KafkaString::decode(buf)?.0;
+        let is_internal = bool::decode(buf)?;
+        let partitions = decode_array::<MetadataPartitionResponseV7, _>(buf)?;
+        Ok(Self(MetadataTopicResponse {
+            error_code,
+            name,
+            topic_id: None,
+            is_internal,
+            partitions,
+        }))
+    }
+}
+
+impl From<MetadataTopicResponseV7> for MetadataTopicResponse {
+    fn from(w: MetadataTopicResponseV7) -> Self {
+        w.0
+    }
+}
+
+/// v8 topic decoder: v7 partitions + topic_authorized_operations (discarded).
+struct MetadataTopicResponseV8(MetadataTopicResponse);
+
+impl Decode for MetadataTopicResponseV8 {
+    fn decode(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let name = KafkaString::decode(buf)?.0;
+        let is_internal = bool::decode(buf)?;
+        let partitions = decode_array::<MetadataPartitionResponseV7, _>(buf)?;
+        // topic_authorized_operations — read and discard
+        let _topic_authorized_operations = i32::decode(buf)?;
+        Ok(Self(MetadataTopicResponse {
+            error_code,
+            name,
+            topic_id: None,
+            is_internal,
+            partitions,
+        }))
+    }
+}
+
+impl From<MetadataTopicResponseV8> for MetadataTopicResponse {
+    fn from(w: MetadataTopicResponseV8) -> Self {
+        w.0
     }
 }
 
@@ -5063,10 +5330,10 @@ macro_rules! unsupported_decode {
 impl VersionedEncode for MetadataRequest {
     fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
         match version {
-            // Capped to METADATA_MAX (currently 1). Raise this range when
-            // higher-version encode/decode support and version constants
-            // are updated together.
-            0..=1 => self.encode_v0(buf)?,
+            0 => self.encode_v0(buf)?,
+            1..=3 => self.encode_v1(buf)?,
+            4..=7 => self.encode_v4(buf)?,
+            8 => self.encode_v8(buf)?,
             _ => return unsupported_encode!("MetadataRequest", version),
         }
         Ok(())
@@ -5078,6 +5345,11 @@ impl VersionedDecode for MetadataResponse {
         match version {
             0 => Self::decode_v0(buf),
             1 => Self::decode_v1(buf),
+            2 => Self::decode_v2(buf),
+            3..=4 => Self::decode_v3(buf),
+            5..=6 => Self::decode_v5(buf),
+            7 => Self::decode_v7(buf),
+            8 => Self::decode_v8(buf),
             _ => unsupported_decode!("MetadataResponse", version),
         }
     }
@@ -5695,15 +5967,28 @@ mod tests {
     #[test]
     fn test_metadata_request_all_topics() {
         let request = MetadataRequest::all_topics();
-        // For Kafka compatibility, all_topics uses empty array instead of null
-        assert!(request.topics.is_some());
-        assert!(request.topics.as_ref().unwrap().is_empty());
+        // Null array = "all topics" for Metadata v1+.
+        assert!(request.topics.is_none());
+    }
 
+    /// v0: topics is non-nullable — `None` encodes as empty array (length 0).
+    #[test]
+    fn test_metadata_request_all_topics_encode_v0() {
+        let request = MetadataRequest::all_topics();
         let mut buf = BytesMut::new();
         request.encode_v0(&mut buf).unwrap();
-
-        // Should encode as empty array (0)
+        // v0: empty array (length 0) means "all topics"
         assert_eq!(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), 0);
+    }
+
+    /// v1+: topics is nullable — `None` encodes as null array (length -1).
+    #[test]
+    fn test_metadata_request_all_topics_encode_v1() {
+        let request = MetadataRequest::all_topics();
+        let mut buf = BytesMut::new();
+        request.encode_v1(&mut buf).unwrap();
+        // v1+: null array (-1 length) means "all topics"
+        assert_eq!(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), -1);
     }
 
     #[test]
@@ -6754,10 +7039,60 @@ mod tests {
     }
 
     #[test]
-    fn test_versioned_encode_metadata_request_rejects_v4() {
+    fn test_versioned_encode_metadata_request_v1() {
         let request = MetadataRequest::all_topics();
         let mut buf = BytesMut::new();
-        let result = request.encode_versioned(4, &mut buf);
+        request.encode_versioned(1, &mut buf).unwrap();
+        let mut expected = BytesMut::new();
+        request.encode_v1(&mut expected).unwrap();
+        assert_eq!(buf, expected);
+    }
+
+    /// v0 and v1 encode differently for all_topics(): empty array vs null array.
+    #[test]
+    fn test_versioned_encode_metadata_v0_vs_v1_all_topics() {
+        let request = MetadataRequest::all_topics();
+        let mut buf_v0 = BytesMut::new();
+        request.encode_versioned(0, &mut buf_v0).unwrap();
+        let mut buf_v1 = BytesMut::new();
+        request.encode_versioned(1, &mut buf_v1).unwrap();
+        // v0: 0x00000000 (empty array), v1: 0xFFFFFFFF (null array)
+        assert_ne!(buf_v0, buf_v1);
+        assert_eq!(
+            i32::from_be_bytes([buf_v0[0], buf_v0[1], buf_v0[2], buf_v0[3]]),
+            0
+        );
+        assert_eq!(
+            i32::from_be_bytes([buf_v1[0], buf_v1[1], buf_v1[2], buf_v1[3]]),
+            -1
+        );
+    }
+
+    #[test]
+    fn test_versioned_encode_metadata_request_v4() {
+        let request = MetadataRequest::all_topics();
+        let mut buf = BytesMut::new();
+        request.encode_versioned(4, &mut buf).unwrap();
+        let mut expected = BytesMut::new();
+        request.encode_v4(&mut expected).unwrap();
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn test_versioned_encode_metadata_request_v8() {
+        let request = MetadataRequest::all_topics();
+        let mut buf = BytesMut::new();
+        request.encode_versioned(8, &mut buf).unwrap();
+        let mut expected = BytesMut::new();
+        request.encode_v8(&mut expected).unwrap();
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn test_versioned_encode_metadata_request_rejects_v9() {
+        let request = MetadataRequest::all_topics();
+        let mut buf = BytesMut::new();
+        let result = request.encode_versioned(9, &mut buf);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("unsupported"), "got: {msg}");
@@ -6780,6 +7115,325 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("unsupported"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_versioned_decode_metadata_rejects_v9() {
+        let mut buf = bytes::Bytes::new();
+        let result = MetadataResponse::decode_versioned(9, &mut buf);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unsupported"), "got: {msg}");
+    }
+
+    /// v0: brokers (no rack) + topics (no is_internal), no controller_id/cluster_id/throttle.
+    #[test]
+    fn test_metadata_response_decode_v0() {
+        let mut buf = BytesMut::new();
+        // 1 broker
+        buf.put_i32(1);
+        buf.put_i32(1); // node_id
+        let host = b"broker1";
+        buf.put_i16(host.len() as i16);
+        buf.put_slice(host);
+        buf.put_i32(9092); // port
+        // 1 topic
+        buf.put_i32(1);
+        buf.put_i16(0); // error_code
+        let topic = b"test";
+        buf.put_i16(topic.len() as i16);
+        buf.put_slice(topic);
+        // 1 partition
+        buf.put_i32(1);
+        buf.put_i16(0); // error_code
+        buf.put_i32(0); // partition_index
+        buf.put_i32(1); // leader_id
+        buf.put_i32(1); // replicas count
+        buf.put_i32(1); // replica
+        buf.put_i32(1); // isr count
+        buf.put_i32(1); // isr
+
+        let resp = MetadataResponse::decode_versioned(0, &mut buf.freeze()).unwrap();
+        assert_eq!(resp.brokers.len(), 1);
+        assert_eq!(resp.brokers[0].rack, None); // no rack in v0
+        assert_eq!(resp.controller_id, -1); // no controller in v0
+        assert_eq!(resp.cluster_id, None);
+        assert_eq!(resp.throttle_time_ms, 0);
+        assert!(!resp.topics[0].is_internal); // defaults to false in v0
+        assert_eq!(resp.topics[0].partitions[0].leader_epoch, -1);
+        assert!(resp.topics[0].partitions[0].offline_replicas.is_empty());
+    }
+
+    /// Build a v1 Metadata response on the wire:
+    /// brokers (with rack) + controller_id + topics (with is_internal).
+    #[test]
+    fn test_metadata_response_decode_v1() {
+        let mut buf = BytesMut::new();
+        // 1 broker
+        buf.put_i32(1);
+        buf.put_i32(1); // node_id
+        let host = b"broker1";
+        buf.put_i16(host.len() as i16);
+        buf.put_slice(host);
+        buf.put_i32(9092); // port
+        let rack = b"us-east-1a";
+        buf.put_i16(rack.len() as i16);
+        buf.put_slice(rack); // rack
+        // controller_id
+        buf.put_i32(1);
+        // 1 topic
+        buf.put_i32(1);
+        buf.put_i16(0); // error_code
+        let topic = b"test";
+        buf.put_i16(topic.len() as i16);
+        buf.put_slice(topic);
+        buf.put_u8(0); // is_internal = false
+        // 1 partition
+        buf.put_i32(1);
+        buf.put_i16(0); // error_code
+        buf.put_i32(0); // partition_index
+        buf.put_i32(1); // leader_id
+        buf.put_i32(1); // replicas count
+        buf.put_i32(1); // replica
+        buf.put_i32(1); // isr count
+        buf.put_i32(1); // isr
+
+        let resp = MetadataResponse::decode_versioned(1, &mut buf.freeze()).unwrap();
+        assert_eq!(resp.brokers.len(), 1);
+        assert_eq!(resp.brokers[0].rack.as_deref(), Some("us-east-1a"));
+        assert_eq!(resp.controller_id, 1);
+        assert_eq!(resp.cluster_id, None);
+        assert_eq!(resp.throttle_time_ms, 0);
+        assert_eq!(resp.topics[0].partitions[0].leader_epoch, -1);
+    }
+
+    /// v2 adds cluster_id.
+    #[test]
+    fn test_metadata_response_decode_v2() {
+        let mut buf = BytesMut::new();
+        // 1 broker
+        buf.put_i32(1);
+        buf.put_i32(1);
+        let host = b"broker1";
+        buf.put_i16(host.len() as i16);
+        buf.put_slice(host);
+        buf.put_i32(9092);
+        let rack = b"rack-a";
+        buf.put_i16(rack.len() as i16);
+        buf.put_slice(rack);
+        // cluster_id
+        let cid = b"abc-cluster";
+        buf.put_i16(cid.len() as i16);
+        buf.put_slice(cid);
+        // controller_id
+        buf.put_i32(1);
+        // 0 topics
+        buf.put_i32(0);
+
+        let resp = MetadataResponse::decode_versioned(2, &mut buf.freeze()).unwrap();
+        assert_eq!(resp.cluster_id.as_deref(), Some("abc-cluster"));
+        assert_eq!(resp.brokers[0].rack.as_deref(), Some("rack-a"));
+    }
+
+    /// v3 adds throttle_time_ms.
+    #[test]
+    fn test_metadata_response_decode_v3() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(50); // throttle_time_ms
+        // 0 brokers
+        buf.put_i32(0);
+        // cluster_id = null
+        buf.put_i16(-1);
+        // controller_id
+        buf.put_i32(-1);
+        // 0 topics
+        buf.put_i32(0);
+
+        let resp = MetadataResponse::decode_versioned(3, &mut buf.freeze()).unwrap();
+        assert_eq!(resp.throttle_time_ms, 50);
+        assert_eq!(resp.cluster_id, None);
+    }
+
+    /// v4 response is same wire format as v3.
+    #[test]
+    fn test_metadata_response_decode_v4() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_i32(0); // 0 brokers
+        let cid = b"kraft-cluster-1";
+        buf.put_i16(cid.len() as i16);
+        buf.put_slice(cid);
+        buf.put_i32(2); // controller_id
+        buf.put_i32(0); // 0 topics
+
+        let resp = MetadataResponse::decode_versioned(4, &mut buf.freeze()).unwrap();
+        assert_eq!(resp.cluster_id.as_deref(), Some("kraft-cluster-1"));
+        assert_eq!(resp.controller_id, 2);
+    }
+
+    /// v5 adds partition offline_replicas.
+    #[test]
+    fn test_metadata_response_decode_v5() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_i32(0); // 0 brokers
+        buf.put_i16(-1); // cluster_id null
+        buf.put_i32(-1); // controller_id
+        // 1 topic
+        buf.put_i32(1);
+        buf.put_i16(0); // error_code
+        let topic = b"t1";
+        buf.put_i16(topic.len() as i16);
+        buf.put_slice(topic);
+        buf.put_u8(0); // is_internal
+        // 1 partition
+        buf.put_i32(1);
+        buf.put_i16(0); // error_code
+        buf.put_i32(0); // partition_index
+        buf.put_i32(1); // leader_id
+        buf.put_i32(2); // replicas count
+        buf.put_i32(1);
+        buf.put_i32(2);
+        buf.put_i32(2); // isr count
+        buf.put_i32(1);
+        buf.put_i32(2);
+        buf.put_i32(1); // offline_replicas count
+        buf.put_i32(2); // offline replica
+
+        let resp = MetadataResponse::decode_versioned(5, &mut buf.freeze()).unwrap();
+        assert_eq!(resp.topics[0].partitions[0].offline_replicas, vec![2]);
+        assert_eq!(resp.topics[0].partitions[0].leader_epoch, -1); // not in v5
+    }
+
+    /// v6 has the same wire format as v5 — verify dispatch routes through decode_v5.
+    #[test]
+    fn test_metadata_response_decode_v6() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_i32(0); // 0 brokers
+        buf.put_i16(-1); // cluster_id null
+        buf.put_i32(-1); // controller_id
+        // 1 topic
+        buf.put_i32(1);
+        buf.put_i16(0); // error_code
+        let topic = b"t2";
+        buf.put_i16(topic.len() as i16);
+        buf.put_slice(topic);
+        buf.put_u8(1); // is_internal = true
+        // 1 partition
+        buf.put_i32(1);
+        buf.put_i16(0); // error_code
+        buf.put_i32(0); // partition_index
+        buf.put_i32(1); // leader_id
+        buf.put_i32(1); // replicas count
+        buf.put_i32(1);
+        buf.put_i32(1); // isr count
+        buf.put_i32(1);
+        buf.put_i32(0); // offline_replicas count
+
+        let resp = MetadataResponse::decode_versioned(6, &mut buf.freeze()).unwrap();
+        assert_eq!(resp.topics[0].name.as_deref(), Some("t2"));
+        assert!(resp.topics[0].is_internal);
+        assert_eq!(resp.topics[0].partitions[0].leader_epoch, -1); // not in v6
+    }
+
+    /// v7 adds partition leader_epoch.
+    #[test]
+    fn test_metadata_response_decode_v7() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        // 1 broker with rack
+        buf.put_i32(1);
+        buf.put_i32(1);
+        let host = b"broker1";
+        buf.put_i16(host.len() as i16);
+        buf.put_slice(host);
+        buf.put_i32(9092);
+        let rack = b"az-1";
+        buf.put_i16(rack.len() as i16);
+        buf.put_slice(rack);
+        // cluster_id
+        let cid = b"kraft-id";
+        buf.put_i16(cid.len() as i16);
+        buf.put_slice(cid);
+        buf.put_i32(1); // controller_id
+        // 1 topic
+        buf.put_i32(1);
+        buf.put_i16(0); // error_code
+        let topic = b"events";
+        buf.put_i16(topic.len() as i16);
+        buf.put_slice(topic);
+        buf.put_u8(0); // is_internal
+        // 1 partition
+        buf.put_i32(1);
+        buf.put_i16(0); // error_code
+        buf.put_i32(0); // partition_index
+        buf.put_i32(1); // leader_id
+        buf.put_i32(42); // leader_epoch (new in v7)
+        buf.put_i32(1); // replicas count
+        buf.put_i32(1);
+        buf.put_i32(1); // isr count
+        buf.put_i32(1);
+        buf.put_i32(0); // offline_replicas count
+
+        let resp = MetadataResponse::decode_versioned(7, &mut buf.freeze()).unwrap();
+        assert_eq!(resp.cluster_id.as_deref(), Some("kraft-id"));
+        assert_eq!(resp.brokers[0].rack.as_deref(), Some("az-1"));
+        assert_eq!(resp.topics[0].partitions[0].leader_epoch, 42);
+        assert!(resp.topics[0].partitions[0].offline_replicas.is_empty());
+    }
+
+    /// v8 adds topic_authorized_operations and cluster_authorized_operations.
+    #[test]
+    fn test_metadata_response_decode_v8() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(10); // throttle_time_ms
+        buf.put_i32(0); // 0 brokers
+        let cid = b"kraft-8";
+        buf.put_i16(cid.len() as i16);
+        buf.put_slice(cid);
+        buf.put_i32(0); // controller_id
+        // 1 topic
+        buf.put_i32(1);
+        buf.put_i16(0); // error_code
+        let topic = b"orders";
+        buf.put_i16(topic.len() as i16);
+        buf.put_slice(topic);
+        buf.put_u8(0); // is_internal
+        // 0 partitions
+        buf.put_i32(0);
+        buf.put_i32(-2147483648_i32); // topic_authorized_operations (not requested)
+        // cluster_authorized_operations
+        buf.put_i32(-2147483648_i32);
+
+        let resp = MetadataResponse::decode_versioned(8, &mut buf.freeze()).unwrap();
+        assert_eq!(resp.throttle_time_ms, 10);
+        assert_eq!(resp.cluster_id.as_deref(), Some("kraft-8"));
+        assert_eq!(resp.topics[0].name.as_deref(), Some("orders"));
+    }
+
+    /// Encode v4 adds allow_auto_topic_creation byte on top of v1.
+    #[test]
+    fn test_metadata_request_encode_v4_adds_auto_create() {
+        let request = MetadataRequest::all_topics();
+        let mut buf_v1 = BytesMut::new();
+        request.encode_v1(&mut buf_v1).unwrap();
+        let mut buf_v4 = BytesMut::new();
+        request.encode_v4(&mut buf_v4).unwrap();
+        // v4 = v1 + 1 byte (allow_auto_topic_creation)
+        assert_eq!(buf_v4.len(), buf_v1.len() + 1);
+    }
+
+    /// Encode v8 adds two more boolean bytes.
+    #[test]
+    fn test_metadata_request_encode_v8_adds_authorized_ops() {
+        let request = MetadataRequest::all_topics();
+        let mut buf_v4 = BytesMut::new();
+        request.encode_v4(&mut buf_v4).unwrap();
+        let mut buf_v8 = BytesMut::new();
+        request.encode_v8(&mut buf_v8).unwrap();
+        // v8 = v4 + 2 bytes (include_cluster/topic_authorized_operations)
+        assert_eq!(buf_v8.len(), buf_v4.len() + 2);
     }
 
     #[test]

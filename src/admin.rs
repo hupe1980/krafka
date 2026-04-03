@@ -377,7 +377,7 @@ impl AdminClient {
         timeout: Duration,
     ) -> Result<Vec<CreateTopicResult>> {
         // Get any broker connection (controller for leadership, but any broker forwards)
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
                 crate::error::ErrorCode::UnknownServerError,
@@ -448,7 +448,7 @@ impl AdminClient {
         timeout: Duration,
     ) -> Result<Vec<DeleteTopicResult>> {
         // Get any broker connection
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
                 crate::error::ErrorCode::UnknownServerError,
@@ -507,7 +507,7 @@ impl AdminClient {
         let topic_name = topic.into();
 
         // Get any broker connection
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
                 crate::error::ErrorCode::UnknownServerError,
@@ -572,7 +572,7 @@ impl AdminClient {
 
     /// Describe configuration for a topic.
     pub async fn describe_topic_config(&self, topic: &str) -> Result<Vec<ConfigEntry>> {
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
                 crate::error::ErrorCode::UnknownServerError,
@@ -620,7 +620,7 @@ impl AdminClient {
 
     /// Describe configuration for a broker.
     pub async fn describe_broker_config(&self, broker_id: i32) -> Result<Vec<ConfigEntry>> {
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
                 crate::error::ErrorCode::UnknownServerError,
@@ -675,7 +675,7 @@ impl AdminClient {
         topic: &str,
         configs: HashMap<String, String>,
     ) -> Result<AlterConfigResult> {
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
                 crate::error::ErrorCode::UnknownServerError,
@@ -727,19 +727,13 @@ impl AdminClient {
     /// List all topics.
     pub async fn list_topics(&self) -> Result<Vec<String>> {
         self.metadata.refresh().await?;
-        Ok(self
-            .metadata
-            .topics()
-            .await
-            .into_iter()
-            .map(|t| t.name)
-            .collect())
+        Ok(self.metadata.topics().into_iter().map(|t| t.name).collect())
     }
 
     /// Describe topics.
     pub async fn describe_topics(&self, topics: &[String]) -> Result<Vec<TopicInfo>> {
         self.metadata.refresh().await?;
-        let all_topics = self.metadata.topics().await;
+        let all_topics = self.metadata.topics();
 
         let mut result = Vec::new();
         for topic_name in topics {
@@ -753,8 +747,8 @@ impl AdminClient {
     /// Describe the cluster.
     pub async fn describe_cluster(&self) -> Result<ClusterDescription> {
         self.metadata.refresh().await?;
-        let brokers = self.metadata.brokers().await;
-        let controller = self.metadata.controller().await;
+        let brokers = self.metadata.brokers();
+        let controller = self.metadata.controller();
 
         Ok(ClusterDescription {
             controller_id: controller.map(|c| c.id),
@@ -765,7 +759,7 @@ impl AdminClient {
     /// Get partition count for a topic.
     pub async fn partition_count(&self, topic: &str) -> Result<Option<usize>> {
         self.metadata.refresh().await?;
-        Ok(self.metadata.partition_count(topic).await)
+        Ok(self.metadata.partition_count(topic))
     }
 
     /// Get the client ID.
@@ -837,7 +831,7 @@ impl AdminClient {
     /// let result = admin.describe_acls_with_filter(filter).await?;
     /// ```
     pub async fn describe_acls_with_filter(&self, filter: AclFilter) -> Result<DescribeAclsResult> {
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
                 crate::error::ErrorCode::UnknownServerError,
@@ -909,7 +903,7 @@ impl AdminClient {
     /// admin.create_acls(vec![acl]).await?;
     /// ```
     pub async fn create_acls(&self, acls: Vec<AclBinding>) -> Result<CreateAclsResult> {
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
                 crate::error::ErrorCode::UnknownServerError,
@@ -973,7 +967,7 @@ impl AdminClient {
     /// admin.delete_acls(vec![filter]).await?;
     /// ```
     pub async fn delete_acls(&self, filters: Vec<AclBindingFilter>) -> Result<DeleteAclsResult> {
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
                 crate::error::ErrorCode::UnknownServerError,
@@ -1034,7 +1028,7 @@ impl AdminClient {
         &self,
         group_ids: Vec<String>,
     ) -> Result<Vec<ConsumerGroupDescription>> {
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
                 crate::error::ErrorCode::UnknownServerError,
@@ -1143,7 +1137,7 @@ impl AdminClient {
     /// }
     /// ```
     pub async fn list_consumer_groups(&self) -> Result<Vec<ConsumerGroupListing>> {
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
                 crate::error::ErrorCode::UnknownServerError,
@@ -1231,7 +1225,7 @@ impl AdminClient {
         offsets: HashMap<(String, i32), i64>,
         timeout: Duration,
     ) -> Result<Vec<DeleteRecordResult>> {
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
                 crate::error::ErrorCode::UnknownServerError,
@@ -1248,7 +1242,6 @@ impl AdminClient {
             let leader_id = self
                 .metadata
                 .leader(topic, *partition)
-                .await
                 .unwrap_or(fallback_broker_id);
             leader_offsets
                 .entry(leader_id)
@@ -1331,7 +1324,7 @@ impl AdminClient {
         &self,
         partitions: Vec<(String, i32, i32)>,
     ) -> Result<Vec<LeaderEpochResult>> {
-        let brokers = self.metadata.brokers().await;
+        let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
                 crate::error::ErrorCode::UnknownServerError,
@@ -1350,7 +1343,6 @@ impl AdminClient {
             let leader_id = self
                 .metadata
                 .leader(topic, *partition)
-                .await
                 .unwrap_or(fallback_broker_id);
             leader_partitions
                 .entry(leader_id)

@@ -6,16 +6,19 @@
 //! - Broker discovery
 //! - Leader election tracking
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex, RwLock};
+use arc_swap::ArcSwap;
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use crate::error::{KrafkaError, Result};
 use crate::network::{BrokerConnection, ConnectionPool};
-use crate::protocol::{ApiKey, MetadataRequest, MetadataResponse};
+use crate::protocol::{
+    ApiKey, MetadataRequest, MetadataResponse, VersionedDecode, VersionedEncode,
+};
 use crate::{BrokerId, PartitionId};
 
 /// Information about a broker.
@@ -106,8 +109,9 @@ struct MetadataCache {
     controller_id: BrokerId,
     /// Brokers by ID.
     brokers: HashMap<BrokerId, BrokerInfo>,
-    /// Topics by name.
-    topics: HashMap<String, TopicInfo>,
+    /// Topics by name. Wrapped in `Arc` so that partial-refresh clones of
+    /// the map are O(n) ref-count bumps instead of O(n) deep copies.
+    topics: HashMap<String, Arc<TopicInfo>>,
     /// When the metadata was last updated.
     last_updated: Instant,
 }
@@ -134,8 +138,8 @@ pub struct ClusterMetadata {
     bootstrap_servers: Vec<String>,
     /// Connection pool.
     pool: Arc<ConnectionPool>,
-    /// Cached metadata.
-    cache: RwLock<MetadataCache>,
+    /// Cached metadata (lock-free reads via `ArcSwap`).
+    cache: ArcSwap<MetadataCache>,
     /// Metadata max age before refresh.
     max_age: Duration,
     /// Coalescing lock: prevents concurrent metadata refreshes.
@@ -153,7 +157,7 @@ impl ClusterMetadata {
         Self {
             bootstrap_servers,
             pool,
-            cache: RwLock::new(MetadataCache::new()),
+            cache: ArcSwap::from_pointee(MetadataCache::new()),
             max_age,
             refresh_lock: Mutex::new(()),
         }
@@ -173,17 +177,26 @@ impl ClusterMetadata {
     ///
     /// Uses a coalescing lock to prevent concurrent metadata stampedes.
     /// If a refresh is already in-flight, callers wait for it to complete.
+    ///
+    /// The Metadata API version is negotiated with the broker (v0-v8, no gaps).
+    /// Versions are cumulative: rack since v1, cluster_id since v2,
+    /// offline replicas since v5, and leader_epoch since v7.
+    /// Falls back to v0 if the broker doesn't advertise Metadata support.
     pub async fn refresh_for_topics(&self, topics: Option<&[&str]>) -> Result<()> {
         // Coalesce concurrent calls: only one refresh in-flight at a time
         let _guard = self.refresh_lock.lock().await;
 
         // After acquiring the lock, check if metadata was just refreshed by another caller.
-        // If it was refreshed within the last 100ms, skip the redundant request.
-        {
-            let cache = self.cache.read().await;
-            if cache.last_updated.elapsed() < Duration::from_millis(100)
-                && !cache.brokers.is_empty()
-            {
+        // If it was refreshed within the last 100ms, skip the redundant request — but only
+        // for partial refreshes where all requested topics are already present. Full refreshes
+        // are never skipped: a recent partial refresh does not guarantee a full-cluster snapshot.
+        let cache = self.cache.load();
+        if cache.last_updated.elapsed() < Duration::from_millis(100) && !cache.brokers.is_empty() {
+            let all_present = match topics {
+                None => false,
+                Some(names) => names.iter().all(|name| cache.topics.contains_key(*name)),
+            };
+            if all_present {
                 debug!("Metadata was recently refreshed, skipping redundant request");
                 return Ok(());
             }
@@ -192,6 +205,18 @@ impl ClusterMetadata {
         // Get a connection
         let conn = self.get_any_connection().await?;
 
+        // Negotiate the highest mutually supported version (v0-v8, no gaps).
+        // Cumulative: rack since v1, cluster_id v2, offline replicas v5, leader_epoch v7.
+        // Falls back to v0 if the broker doesn't advertise Metadata support
+        // (mirrors the Fetch negotiation pattern in consumer).
+        let metadata_version = conn
+            .negotiate_api_version_max(ApiKey::Metadata, crate::protocol::versions::METADATA_MAX)
+            .await
+            .unwrap_or_else(|| {
+                debug!("Metadata API version negotiation unavailable; falling back to v0");
+                0
+            });
+
         // Build and send metadata request
         let request = match topics {
             Some(t) => MetadataRequest::for_topics(t.to_vec()),
@@ -199,15 +224,20 @@ impl ClusterMetadata {
         };
 
         let response = conn
-            .send_request(ApiKey::Metadata, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::Metadata, metadata_version, |buf| {
+                request.encode_versioned(metadata_version, buf)
+            })
             .await?;
 
         // Decode response
         let mut buf = response;
-        let metadata = MetadataResponse::decode_v0(&mut buf)?;
+        let metadata = MetadataResponse::decode_versioned(metadata_version, &mut buf)?;
 
-        // Update cache
-        self.update_cache(metadata).await;
+        // Update cache. A full refresh (topics=None) is authoritative — the
+        // response contains every topic currently in the cluster, so we rebuild
+        // from scratch. A partial refresh delta-merges into the existing cache.
+        let full_refresh = topics.is_none();
+        self.update_cache(metadata, full_refresh);
 
         Ok(())
     }
@@ -215,12 +245,10 @@ impl ClusterMetadata {
     /// Get a connection to any available broker.
     async fn get_any_connection(&self) -> Result<Arc<BrokerConnection>> {
         // Try to use a cached broker first
-        {
-            let cache = self.cache.read().await;
-            for broker in cache.brokers.values() {
-                if let Ok(conn) = self.pool.get_connection(&broker.address()).await {
-                    return Ok(conn);
-                }
+        let cache = self.cache.load();
+        for broker in cache.brokers.values() {
+            if let Ok(conn) = self.pool.get_connection(&broker.address()).await {
+                return Ok(conn);
             }
         }
 
@@ -237,16 +265,27 @@ impl ClusterMetadata {
     }
 
     /// Update the metadata cache from a response.
-    async fn update_cache(&self, response: MetadataResponse) {
-        let mut cache = self.cache.write().await;
+    ///
+    /// Builds a new snapshot and swaps it in atomically via `ArcSwap`.
+    ///
+    /// When `full_refresh` is true the response is authoritative (all topics in
+    /// the cluster), so the broker and topic maps are rebuilt from scratch.
+    /// When false (partial/topic-specific refresh), the response is delta-merged
+    /// into the existing cache so that topics not in the request are preserved
+    /// and broker entries referenced by preserved topics remain available.
+    fn update_cache(&self, response: MetadataResponse, full_refresh: bool) {
+        let old = self.cache.load();
 
-        cache.cluster_id = response.cluster_id;
-        cache.controller_id = response.controller_id;
-
-        // Update brokers
-        cache.brokers.clear();
+        // Full refresh: response is authoritative — start empty.
+        // Partial refresh: merge into the existing broker map so preserved
+        // topics cannot end up referencing brokers missing from the cache.
+        let mut brokers = if full_refresh {
+            HashMap::new()
+        } else {
+            old.brokers.clone()
+        };
         for broker in response.brokers {
-            cache.brokers.insert(
+            brokers.insert(
                 broker.node_id,
                 BrokerInfo {
                     id: broker.node_id,
@@ -257,37 +296,24 @@ impl ClusterMetadata {
             );
         }
 
-        // Update topics — clear stale entries first so deleted topics
-        // don't persist in cache. Topics present in the response
-        // with errors (e.g. UnknownTopicOrPartition for deleted topics) are
-        // explicitly removed.
-        let response_topic_names: HashSet<String> = response
-            .topics
-            .iter()
-            .filter_map(|t| t.name.clone())
-            .collect();
-
-        // Remove topics that were requested but came back with errors
-        // (they may have been deleted)
-        cache
-            .topics
-            .retain(|name, _| !response_topic_names.contains(name));
+        // Full refresh: response is authoritative — start empty.
+        // Partial refresh: delta-merge into existing topics.
+        let mut topics = if full_refresh {
+            HashMap::new()
+        } else {
+            old.topics.clone()
+        };
 
         for topic in response.topics {
+            let Some(topic_name) = topic.name else {
+                continue;
+            };
+
             if !topic.error_code.is_ok() {
-                warn!(
-                    "Topic {} has error: {:?}",
-                    topic.name.as_deref().unwrap_or("unknown"),
-                    topic.error_code
-                );
-                // Don't insert — the retain above already removed the stale entry
+                warn!("Topic {} has error: {:?}", topic_name, topic.error_code);
+                topics.remove(&topic_name);
                 continue;
             }
-
-            let topic_name = match &topic.name {
-                Some(name) => name.clone(),
-                None => continue,
-            };
 
             let partitions: Vec<PartitionInfo> = topic
                 .partitions
@@ -304,61 +330,78 @@ impl ClusterMetadata {
                 })
                 .collect();
 
-            cache.topics.insert(
+            topics.insert(
                 topic_name.clone(),
-                TopicInfo {
+                Arc::new(TopicInfo {
                     name: topic_name,
                     is_internal: topic.is_internal,
                     partitions,
-                },
+                }),
             );
         }
 
-        cache.last_updated = Instant::now();
+        let new_cache = MetadataCache {
+            cluster_id: response.cluster_id,
+            controller_id: response.controller_id,
+            brokers,
+            topics,
+            last_updated: Instant::now(),
+        };
+
         debug!(
             "Updated metadata: {} brokers, {} topics",
-            cache.brokers.len(),
-            cache.topics.len()
+            new_cache.brokers.len(),
+            new_cache.topics.len()
         );
+
+        self.cache.store(Arc::new(new_cache));
     }
 
     /// Get broker info by ID.
-    pub async fn broker(&self, broker_id: BrokerId) -> Option<BrokerInfo> {
-        let cache = self.cache.read().await;
-        cache.brokers.get(&broker_id).cloned()
+    pub fn broker(&self, broker_id: BrokerId) -> Option<BrokerInfo> {
+        self.cache.load().brokers.get(&broker_id).cloned()
     }
 
     /// Get all brokers.
-    pub async fn brokers(&self) -> Vec<BrokerInfo> {
-        let cache = self.cache.read().await;
-        cache.brokers.values().cloned().collect()
+    pub fn brokers(&self) -> Vec<BrokerInfo> {
+        self.cache.load().brokers.values().cloned().collect()
     }
 
     /// Get topic info by name.
-    pub async fn topic(&self, name: &str) -> Option<TopicInfo> {
-        let cache = self.cache.read().await;
-        cache.topics.get(name).cloned()
+    pub fn topic(&self, name: &str) -> Option<TopicInfo> {
+        self.cache
+            .load()
+            .topics
+            .get(name)
+            .map(|t| t.as_ref().clone())
     }
 
     /// Get all topics.
-    pub async fn topics(&self) -> Vec<TopicInfo> {
-        let cache = self.cache.read().await;
-        cache.topics.values().cloned().collect()
+    pub fn topics(&self) -> Vec<TopicInfo> {
+        self.cache
+            .load()
+            .topics
+            .values()
+            .map(|t| t.as_ref().clone())
+            .collect()
     }
 
     /// Get the leader for a topic partition.
-    pub async fn leader(&self, topic: &str, partition: PartitionId) -> Option<BrokerId> {
-        let cache = self.cache.read().await;
-        cache.topics.get(topic).and_then(|t| t.leader(partition))
+    pub fn leader(&self, topic: &str, partition: PartitionId) -> Option<BrokerId> {
+        self.cache
+            .load()
+            .topics
+            .get(topic)
+            .and_then(|t| t.leader(partition))
     }
 
     /// Get the leader epoch for a topic partition.
     ///
     /// The leader epoch is used for fencing stale reads after leadership changes.
     /// Returns None if the topic/partition is not found in metadata.
-    pub async fn leader_epoch(&self, topic: &str, partition: PartitionId) -> Option<i32> {
-        let cache = self.cache.read().await;
-        cache
+    pub fn leader_epoch(&self, topic: &str, partition: PartitionId) -> Option<i32> {
+        self.cache
+            .load()
             .topics
             .get(topic)
             .and_then(|t| t.leader_epoch(partition))
@@ -370,60 +413,58 @@ impl ClusterMetadata {
         topic: &str,
         partition: PartitionId,
     ) -> Result<Arc<BrokerConnection>> {
-        // Check if we need to refresh metadata
-        {
-            let cache = self.cache.read().await;
-            if cache.is_stale(self.max_age) || !cache.topics.contains_key(topic) {
-                drop(cache);
-                self.refresh_for_topics(Some(&[topic])).await?;
-            }
-        }
-
-        let (broker_id, broker_addr) = {
-            let cache = self.cache.read().await;
-
-            let leader_id = cache
-                .topics
-                .get(topic)
-                .and_then(|t| t.leader(partition))
-                .ok_or_else(|| {
-                    KrafkaError::invalid_state(format!("no leader for {}-{}", topic, partition))
-                })?;
-
-            let broker = cache.brokers.get(&leader_id).ok_or_else(|| {
-                KrafkaError::invalid_state(format!("broker {} not found", leader_id))
-            })?;
-
-            (leader_id, broker.address())
+        // Refresh if stale or topic is unknown, then re-load the updated snapshot.
+        // Otherwise reuse the snapshot we already have.
+        let cache = self.cache.load();
+        let cache = if cache.is_stale(self.max_age) || !cache.topics.contains_key(topic) {
+            drop(cache);
+            self.refresh_for_topics(Some(&[topic])).await?;
+            self.cache.load()
+        } else {
+            cache
         };
 
+        let leader_id = cache
+            .topics
+            .get(topic)
+            .and_then(|t| t.leader(partition))
+            .ok_or_else(|| {
+                KrafkaError::invalid_state(format!("no leader for {}-{}", topic, partition))
+            })?;
+
+        let broker = cache
+            .brokers
+            .get(&leader_id)
+            .ok_or_else(|| KrafkaError::invalid_state(format!("broker {} not found", leader_id)))?;
+
         self.pool
-            .get_connection_by_id(broker_id, &broker_addr)
+            .get_connection_by_id(leader_id, &broker.address())
             .await
     }
 
     /// Get the controller broker.
-    pub async fn controller(&self) -> Option<BrokerInfo> {
-        let cache = self.cache.read().await;
+    pub fn controller(&self) -> Option<BrokerInfo> {
+        let cache = self.cache.load();
         cache.brokers.get(&cache.controller_id).cloned()
     }
 
     /// Get the cluster ID.
-    pub async fn cluster_id(&self) -> Option<String> {
-        let cache = self.cache.read().await;
-        cache.cluster_id.clone()
+    pub fn cluster_id(&self) -> Option<String> {
+        self.cache.load().cluster_id.clone()
     }
 
     /// Check if metadata needs refresh.
-    pub async fn needs_refresh(&self) -> bool {
-        let cache = self.cache.read().await;
-        cache.is_stale(self.max_age)
+    pub fn needs_refresh(&self) -> bool {
+        self.cache.load().is_stale(self.max_age)
     }
 
     /// Get partition count for a topic.
-    pub async fn partition_count(&self, topic: &str) -> Option<usize> {
-        let cache = self.cache.read().await;
-        cache.topics.get(topic).map(|t| t.partition_count())
+    pub fn partition_count(&self, topic: &str) -> Option<usize> {
+        self.cache
+            .load()
+            .topics
+            .get(topic)
+            .map(|t| t.partition_count())
     }
 }
 
