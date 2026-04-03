@@ -109,8 +109,9 @@ struct MetadataCache {
     controller_id: BrokerId,
     /// Brokers by ID.
     brokers: HashMap<BrokerId, BrokerInfo>,
-    /// Topics by name.
-    topics: HashMap<String, TopicInfo>,
+    /// Topics by name. Wrapped in `Arc` so that partial-refresh clones of
+    /// the map are O(n) ref-count bumps instead of O(n) deep copies.
+    topics: HashMap<String, Arc<TopicInfo>>,
     /// When the metadata was last updated.
     last_updated: Instant,
 }
@@ -315,11 +316,11 @@ impl ClusterMetadata {
 
             topics.insert(
                 topic_name.clone(),
-                TopicInfo {
+                Arc::new(TopicInfo {
                     name: topic_name,
                     is_internal: topic.is_internal,
                     partitions,
-                },
+                }),
             );
         }
 
@@ -352,12 +353,21 @@ impl ClusterMetadata {
 
     /// Get topic info by name.
     pub fn topic(&self, name: &str) -> Option<TopicInfo> {
-        self.cache.load().topics.get(name).cloned()
+        self.cache
+            .load()
+            .topics
+            .get(name)
+            .map(|t| t.as_ref().clone())
     }
 
     /// Get all topics.
     pub fn topics(&self) -> Vec<TopicInfo> {
-        self.cache.load().topics.values().cloned().collect()
+        self.cache
+            .load()
+            .topics
+            .values()
+            .map(|t| t.as_ref().clone())
+            .collect()
     }
 
     /// Get the leader for a topic partition.
