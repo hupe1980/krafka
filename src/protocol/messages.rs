@@ -8,8 +8,8 @@ use bytes::{Buf, BufMut, Bytes};
 
 use super::api::ApiKey;
 use super::array_len_i32;
-use super::check_decode_array_len;
 use super::primitives::{Decode, Encode, KafkaArray, KafkaBytes, KafkaString, TryEncode};
+use super::{check_decode_array_len, check_decode_nullable_array_len};
 use crate::error::{ErrorCode, KrafkaError, Result};
 
 /// Trait for encoding a request/response at a specific protocol version.
@@ -1147,7 +1147,7 @@ impl FetchResponse {
                 let error_code = ErrorCode::from_i16(i16::decode(buf)?);
                 let high_watermark = i64::decode(buf)?;
                 let last_stable_offset = i64::decode(buf)?;
-                let aborted_tx_count = check_decode_array_len(i32::decode(buf)?)?;
+                let aborted_tx_count = check_decode_nullable_array_len(i32::decode(buf)?)?;
                 let mut aborted_transactions = Vec::new();
                 for _ in 0..aborted_tx_count {
                     aborted_transactions.push(AbortedTransaction {
@@ -1211,7 +1211,7 @@ impl FetchResponse {
                 let high_watermark = i64::decode(buf)?;
                 let last_stable_offset = i64::decode(buf)?;
                 let log_start_offset = i64::decode(buf)?;
-                let aborted_tx_count = check_decode_array_len(i32::decode(buf)?)?;
+                let aborted_tx_count = check_decode_nullable_array_len(i32::decode(buf)?)?;
                 let mut aborted_transactions = Vec::new();
                 for _ in 0..aborted_tx_count {
                     aborted_transactions.push(AbortedTransaction {

@@ -101,6 +101,19 @@ pub(crate) fn check_decode_array_len(len: i32) -> Result<usize> {
     Ok(len)
 }
 
+/// Like [`check_decode_array_len`], but treats `-1` as a null array (returns 0).
+///
+/// In the Kafka wire protocol, some array fields are "nullable": a length of
+/// `-1` signals an absent/null array. Use this variant for those fields
+/// (e.g. `aborted_transactions` in FetchResponse).
+#[inline]
+pub(crate) fn check_decode_nullable_array_len(len: i32) -> Result<usize> {
+    if len == -1 {
+        return Ok(0);
+    }
+    check_decode_array_len(len)
+}
+
 /// Client-supported API version ranges.
 ///
 /// This module defines the maximum version ranges that Krafka actually implements
@@ -181,5 +194,22 @@ mod tests {
     fn check_decode_array_len_rejects_oversized() {
         assert!(check_decode_array_len(100_001).is_err());
         assert!(check_decode_array_len(i32::MAX).is_err());
+    }
+
+    #[test]
+    fn check_decode_nullable_array_len_null() {
+        assert_eq!(check_decode_nullable_array_len(-1).unwrap(), 0);
+    }
+
+    #[test]
+    fn check_decode_nullable_array_len_valid() {
+        assert_eq!(check_decode_nullable_array_len(0).unwrap(), 0);
+        assert_eq!(check_decode_nullable_array_len(5).unwrap(), 5);
+    }
+
+    #[test]
+    fn check_decode_nullable_array_len_rejects_other_negative() {
+        assert!(check_decode_nullable_array_len(-2).is_err());
+        assert!(check_decode_nullable_array_len(i32::MIN).is_err());
     }
 }

@@ -12,11 +12,13 @@ use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
+use rustls::client::WantsClientCert;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{
-    ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
+    ClientConfig, ConfigBuilder, DigitallySignedStruct, Error as RustlsError, RootCertStore,
+    SignatureScheme,
 };
 use rustls_pemfile::{certs, private_key};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -105,39 +107,10 @@ pub fn build_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
         return build_insecure_tls_config(config);
     }
 
-    let mut root_store = RootCertStore::empty();
-
-    // Load CA certificates
-    if let Some(ca_path) = &config.ca_cert_path {
-        let ca_certs = load_certs(ca_path)?;
-        for cert in ca_certs {
-            root_store
-                .add(cert)
-                .map_err(|e| KrafkaError::config(format!("Failed to add CA cert: {}", e)))?;
-        }
-    } else {
-        // Use webpki-roots for default trust anchors
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    }
-
+    let root_store = load_root_store(config)?;
     let builder = ClientConfig::builder().with_root_certificates(root_store);
-
-    let client_config = if let (Some(cert_path), Some(key_path)) =
-        (&config.client_cert_path, &config.client_key_path)
-    {
-        // mTLS: client certificate authentication
-        let client_certs = load_certs(cert_path)?;
-        let client_key = load_private_key(key_path)?;
-
-        builder
-            .with_client_auth_cert(client_certs, client_key)
-            .map_err(|e| KrafkaError::config(format!("Failed to set client auth: {}", e)))?
-    } else {
-        // No client certificate
-        builder.with_no_client_auth()
-    };
-
-    Ok(client_config)
+    let client_auth = load_client_auth(config)?;
+    finish_with_client_auth(builder, client_auth)
 }
 
 /// Create a TLS connector from TlsConfig.
@@ -239,79 +212,147 @@ pub async fn build_tls_config_async(config: &TlsConfig) -> Result<ClientConfig> 
             "TLS certificate verification is disabled (verify_server_cert=false). \
              This is insecure and should only be used for local development."
         );
-        return build_insecure_tls_config(config);
+        return build_insecure_tls_config_async(config).await;
     }
 
-    let mut root_store = RootCertStore::empty();
-
-    // Load CA certificates asynchronously
-    if let Some(ca_path) = &config.ca_cert_path {
-        let ca_certs = load_certs_async(ca_path).await?;
-        for cert in ca_certs {
-            root_store
-                .add(cert)
-                .map_err(|e| KrafkaError::config(format!("Failed to add CA cert: {}", e)))?;
-        }
-    } else {
-        // Use webpki-roots for default trust anchors
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    }
-
+    let root_store = load_root_store_async(config).await?;
     let builder = ClientConfig::builder().with_root_certificates(root_store);
-
-    let client_config = if let (Some(cert_path), Some(key_path)) =
-        (&config.client_cert_path, &config.client_key_path)
-    {
-        // mTLS: client certificate authentication
-        let client_certs = load_certs_async(cert_path).await?;
-        let client_key = load_private_key_async(key_path).await?;
-
-        builder
-            .with_client_auth_cert(client_certs, client_key)
-            .map_err(|e| KrafkaError::config(format!("Failed to set client auth: {}", e)))?
-    } else {
-        // No client certificate
-        builder.with_no_client_auth()
-    };
-
-    Ok(client_config)
+    let client_auth = load_client_auth_async(config).await?;
+    finish_with_client_auth(builder, client_auth)
 }
 
-/// Build a rustls ClientConfig that skips all certificate verification.
-///
-/// **Warning:** This disables TLS security and must only be used for local
-/// development or testing. A `warn!` log is emitted by callers.
-fn build_insecure_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
-    let provider = CryptoProvider::get_default()
-        .cloned()
-        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+// ---------------------------------------------------------------------------
+// Shared helpers — centralise logic that would otherwise be duplicated across
+// the sync/async × secure/insecure builder matrix.
+// ---------------------------------------------------------------------------
 
-    let builder = ClientConfig::builder_with_provider(provider)
+/// Attach optional client‐certificate authentication to a builder that is
+/// waiting for a client‐auth decision, producing the final [`ClientConfig`].
+fn finish_with_client_auth(
+    builder: ConfigBuilder<ClientConfig, WantsClientCert>,
+    client_auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+) -> Result<ClientConfig> {
+    if let Some((certs, key)) = client_auth {
+        builder
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| KrafkaError::config(format!("Failed to set client auth: {e}")))
+    } else {
+        Ok(builder.with_no_client_auth())
+    }
+}
+
+/// Load root certificate store synchronously.
+fn load_root_store(config: &TlsConfig) -> Result<RootCertStore> {
+    let mut root_store = RootCertStore::empty();
+    if let Some(ca_path) = &config.ca_cert_path {
+        for cert in load_certs(ca_path)? {
+            root_store
+                .add(cert)
+                .map_err(|e| KrafkaError::config(format!("Failed to add CA cert: {e}")))?;
+        }
+    } else {
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    Ok(root_store)
+}
+
+/// Load root certificate store asynchronously.
+async fn load_root_store_async(config: &TlsConfig) -> Result<RootCertStore> {
+    let mut root_store = RootCertStore::empty();
+    if let Some(ca_path) = &config.ca_cert_path {
+        for cert in load_certs_async(ca_path).await? {
+            root_store
+                .add(cert)
+                .map_err(|e| KrafkaError::config(format!("Failed to add CA cert: {e}")))?;
+        }
+    } else {
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    Ok(root_store)
+}
+
+/// Load client certificate + private key synchronously, if configured.
+fn load_client_auth(
+    config: &TlsConfig,
+) -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
+    if let (Some(cert_path), Some(key_path)) = (&config.client_cert_path, &config.client_key_path) {
+        let certs = load_certs(cert_path)?;
+        let key = load_private_key(key_path)?;
+        Ok(Some((certs, key)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Load client certificate + private key asynchronously, if configured.
+async fn load_client_auth_async(
+    config: &TlsConfig,
+) -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
+    if let (Some(cert_path), Some(key_path)) = (&config.client_cert_path, &config.client_key_path) {
+        let certs = load_certs_async(cert_path).await?;
+        let key = load_private_key_async(key_path).await?;
+        Ok(Some((certs, key)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Resolve the crypto provider: prefer the globally-installed default,
+/// fall back to the ring provider.
+fn resolve_crypto_provider() -> Arc<CryptoProvider> {
+    CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()))
+}
+
+/// Create the insecure builder that skips certificate verification.
+fn insecure_builder(
+    provider: Arc<CryptoProvider>,
+) -> Result<ConfigBuilder<ClientConfig, WantsClientCert>> {
+    let verifier = Arc::new(NoServerCertVerifier::new(Arc::clone(&provider)));
+    Ok(ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| KrafkaError::config(format!("Failed to set protocol versions: {e}")))?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoServerCertVerifier));
+        .with_custom_certificate_verifier(verifier))
+}
 
-    let client_config = if let (Some(cert_path), Some(key_path)) =
-        (&config.client_cert_path, &config.client_key_path)
-    {
-        let client_certs = load_certs(cert_path)?;
-        let client_key = load_private_key(key_path)?;
-        builder
-            .with_client_auth_cert(client_certs, client_key)
-            .map_err(|e| KrafkaError::config(format!("Failed to set client auth: {e}")))?
-    } else {
-        builder.with_no_client_auth()
-    };
+/// Build a rustls [`ClientConfig`] that skips all certificate verification.
+///
+/// **Warning:** This disables TLS security and must only be used for local
+/// development or testing. A `warn!` log is emitted by callers.
+///
+/// Uses synchronous file I/O for client certificates. For async contexts,
+/// use [`build_insecure_tls_config_async`] instead.
+fn build_insecure_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
+    let builder = insecure_builder(resolve_crypto_provider())?;
+    let client_auth = load_client_auth(config)?;
+    finish_with_client_auth(builder, client_auth)
+}
 
-    Ok(client_config)
+/// Async variant of [`build_insecure_tls_config`] that uses non-blocking file I/O
+/// for client certificate loading.
+async fn build_insecure_tls_config_async(config: &TlsConfig) -> Result<ClientConfig> {
+    let builder = insecure_builder(resolve_crypto_provider())?;
+    let client_auth = load_client_auth_async(config).await?;
+    finish_with_client_auth(builder, client_auth)
 }
 
 /// A certificate verifier that accepts any server certificate without validation.
 ///
-/// This is intentionally minimal and only used when `verify_server_cert = false`.
+/// Carries a reference to the [`CryptoProvider`] used when building the
+/// [`ClientConfig`] so that [`supported_verify_schemes`] always returns schemes
+/// consistent with that provider (instead of relying on the global default).
 #[derive(Debug)]
-struct NoServerCertVerifier;
+struct NoServerCertVerifier {
+    provider: Arc<CryptoProvider>,
+}
+
+impl NoServerCertVerifier {
+    fn new(provider: Arc<CryptoProvider>) -> Self {
+        Self { provider }
+    }
+}
 
 impl ServerCertVerifier for NoServerCertVerifier {
     fn verify_server_cert(
@@ -344,9 +385,9 @@ impl ServerCertVerifier for NoServerCertVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        CryptoProvider::get_default()
-            .map(|p| p.signature_verification_algorithms.supported_schemes())
-            .unwrap_or_default()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
