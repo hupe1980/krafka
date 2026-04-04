@@ -111,6 +111,11 @@ impl ConnectionRetryConfig {
 
         // Defensive: Duration::from_secs_f64 panics on NaN/Inf
         if !final_backoff.is_finite() {
+            warn!(
+                attempt,
+                final_backoff,
+                "Backoff calculation produced non-finite value, falling back to max_backoff"
+            );
             return self.max_backoff;
         }
 
@@ -156,7 +161,11 @@ impl ConnectionRetryConfigBuilder {
 
     /// Set jitter factor (0.0–1.0) to randomize backoff and prevent thundering herd.
     pub fn jitter_factor(mut self, factor: f64) -> Self {
-        self.config.jitter_factor = factor.clamp(0.0, 1.0);
+        self.config.jitter_factor = if factor.is_finite() {
+            factor.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         self
     }
 

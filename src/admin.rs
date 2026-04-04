@@ -554,7 +554,10 @@ impl AdminClient {
                 error: if t.error_code.is_ok() {
                     None
                 } else {
-                    Some(format!("{:?}", t.error_code))
+                    Some(
+                        t.error_message
+                            .unwrap_or_else(|| format!("{:?}", t.error_code)),
+                    )
                 },
             })
             .collect();
@@ -624,7 +627,10 @@ impl AdminClient {
                 error: if r.error_code.is_ok() {
                     None
                 } else {
-                    Some(format!("{:?}", r.error_code))
+                    Some(
+                        r.error_message
+                            .unwrap_or_else(|| format!("{:?}", r.error_code)),
+                    )
                 },
             })
             .collect();

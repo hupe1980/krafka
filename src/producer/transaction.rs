@@ -268,12 +268,18 @@ impl Drop for PendingAddGuard {
             let notify = self.notify.clone();
             if let Ok(mut tp) = self.txn_partitions.try_write() {
                 tp.cancel_add(&topic, partition, &notify);
-            } else if tokio::runtime::Handle::try_current().is_ok() {
+            } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let txn_partitions = self.txn_partitions.clone();
-                tokio::spawn(async move {
+                handle.spawn(async move {
                     let mut tp = txn_partitions.write().await;
                     tp.cancel_add(&topic, partition, &notify);
                 });
+            } else {
+                warn!(
+                    topic = %topic,
+                    partition,
+                    "PendingAddGuard dropped without cleanup: lock contended and no runtime available"
+                );
             }
         }
     }
