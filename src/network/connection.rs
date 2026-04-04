@@ -135,56 +135,67 @@ impl ConnectionConfig {
     }
 
     /// Returns the connection timeout.
+    #[inline]
     pub fn connect_timeout(&self) -> Duration {
         self.connect_timeout
     }
 
     /// Returns the request timeout.
+    #[inline]
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
     }
 
     /// Returns the socket send buffer size, if set.
+    #[inline]
     pub fn send_buffer_size(&self) -> Option<usize> {
         self.send_buffer_size
     }
 
     /// Returns the socket receive buffer size, if set.
+    #[inline]
     pub fn recv_buffer_size(&self) -> Option<usize> {
         self.recv_buffer_size
     }
 
     /// Returns whether TCP nodelay is enabled.
+    #[inline]
     pub fn nodelay(&self) -> bool {
         self.nodelay
     }
 
     /// Returns the client ID.
+    #[inline]
     pub fn client_id(&self) -> &str {
         &self.client_id
     }
 
     /// Returns the number of connections per broker.
+    #[inline]
     pub fn connections_per_broker(&self) -> usize {
         self.connections_per_broker
     }
 
     /// Returns the high-priority channel capacity.
+    #[inline]
     pub fn high_priority_channel_capacity(&self) -> usize {
         self.high_priority_channel_capacity
     }
 
     /// Returns the normal-priority channel capacity.
+    #[inline]
     pub fn normal_priority_channel_capacity(&self) -> usize {
         self.normal_priority_channel_capacity
     }
 
     /// Returns the maximum response size in bytes.
+    #[inline]
     pub fn max_response_size(&self) -> usize {
         self.max_response_size
     }
 
     /// Returns the authentication configuration, if set.
+    #[inline]
     pub fn auth(&self) -> Option<&AuthConfig> {
         self.auth.as_ref()
     }

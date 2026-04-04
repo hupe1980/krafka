@@ -54,21 +54,25 @@ impl ConnectionRetryConfig {
     }
 
     /// Returns the maximum number of retries.
+    #[inline]
     pub fn max_retries(&self) -> u32 {
         self.max_retries
     }
 
     /// Returns the initial backoff duration.
+    #[inline]
     pub fn initial_backoff(&self) -> Duration {
         self.initial_backoff
     }
 
     /// Returns the maximum backoff duration.
+    #[inline]
     pub fn max_backoff(&self) -> Duration {
         self.max_backoff
     }
 
     /// Returns the backoff multiplier.
+    #[inline]
     pub fn backoff_multiplier(&self) -> f64 {
         self.backoff_multiplier
     }

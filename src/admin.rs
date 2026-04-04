@@ -1143,7 +1143,14 @@ impl AdminClient {
             .await?;
 
         let mut buf = response_bytes;
-        let response = CreateAclsResponse::decode_v0(&mut buf)?;
+        let response = match version {
+            0..=1 => CreateAclsResponse::decode_v0(&mut buf)?,
+            _ => {
+                return Err(KrafkaError::protocol(format!(
+                    "unsupported CreateAcls decode version {version}"
+                )));
+            }
+        };
 
         let results = response
             .results

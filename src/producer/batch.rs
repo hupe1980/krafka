@@ -70,7 +70,7 @@ impl ProducerBatch {
     ///
     /// The caller provides the pre-computed `record_size` to ensure
     /// the same value is used for both the fit check and subsequent
-    /// [`track`] call.
+    /// [`Self::track`] call.
     #[inline]
     pub fn would_fit(&self, record_size: usize) -> bool {
         self.is_empty() || self.size + record_size <= self.max_size
@@ -78,7 +78,7 @@ impl ProducerBatch {
 
     /// Track a record's size without storing its data.
     ///
-    /// Use with [`would_fit`] when the caller manages record storage
+    /// Use with [`Self::would_fit`] when the caller manages record storage
     /// separately (e.g., in `PendingRecord`). Increments `len()`, `size()`,
     /// and `is_full()` as if the record were added.
     #[inline]
