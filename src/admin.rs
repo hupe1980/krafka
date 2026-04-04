@@ -460,12 +460,22 @@ impl AdminClient {
         AdminClientBuilder::default()
     }
 
+    /// Return an error if the admin client has been closed.
+    #[inline]
+    fn check_not_closed(&self) -> Result<()> {
+        if self.is_closed() {
+            return Err(KrafkaError::invalid_state("AdminClient is closed"));
+        }
+        Ok(())
+    }
+
     /// Create topics.
     pub async fn create_topics(
         &self,
         topics: Vec<NewTopic>,
         timeout: Duration,
     ) -> Result<Vec<CreateTopicResult>> {
+        self.check_not_closed()?;
         // Get any broker connection (controller for leadership, but any broker forwards)
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
@@ -559,6 +569,7 @@ impl AdminClient {
         topics: Vec<String>,
         timeout: Duration,
     ) -> Result<Vec<DeleteTopicResult>> {
+        self.check_not_closed()?;
         // Get any broker connection
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
@@ -631,6 +642,7 @@ impl AdminClient {
         new_total_count: i32,
         timeout: Duration,
     ) -> Result<CreatePartitionsResult> {
+        self.check_not_closed()?;
         let topic_name = topic.into();
 
         // Get any broker connection
@@ -708,6 +720,7 @@ impl AdminClient {
 
     /// Describe configuration for a topic.
     pub async fn describe_topic_config(&self, topic: &str) -> Result<Vec<ConfigEntry>> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -765,6 +778,7 @@ impl AdminClient {
 
     /// Describe configuration for a broker.
     pub async fn describe_broker_config(&self, broker_id: i32) -> Result<Vec<ConfigEntry>> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -829,6 +843,7 @@ impl AdminClient {
         topic: &str,
         configs: HashMap<String, String>,
     ) -> Result<AlterConfigResult> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -887,12 +902,14 @@ impl AdminClient {
 
     /// List all topics.
     pub async fn list_topics(&self) -> Result<Vec<String>> {
+        self.check_not_closed()?;
         self.metadata.refresh().await?;
         Ok(self.metadata.topics().into_iter().map(|t| t.name).collect())
     }
 
     /// Describe topics.
     pub async fn describe_topics(&self, topics: &[String]) -> Result<Vec<TopicInfo>> {
+        self.check_not_closed()?;
         self.metadata.refresh().await?;
         let all_topics = self.metadata.topics();
 
@@ -907,6 +924,7 @@ impl AdminClient {
 
     /// Describe the cluster.
     pub async fn describe_cluster(&self) -> Result<ClusterDescription> {
+        self.check_not_closed()?;
         self.metadata.refresh().await?;
         let brokers = self.metadata.brokers();
         let controller = self.metadata.controller();
@@ -919,6 +937,7 @@ impl AdminClient {
 
     /// Get partition count for a topic.
     pub async fn partition_count(&self, topic: &str) -> Result<Option<usize>> {
+        self.check_not_closed()?;
         self.metadata.refresh().await?;
         Ok(self.metadata.partition_count(topic))
     }
@@ -970,6 +989,7 @@ impl AdminClient {
         operation: AclOperation,
         permission_type: AclPermissionType,
     ) -> Result<DescribeAclsResult> {
+        self.check_not_closed()?;
         self.describe_acls_with_filter(AclFilter {
             resource_type,
             resource_name: resource_name.map(|s| s.to_string()),
@@ -994,6 +1014,7 @@ impl AdminClient {
     /// let result = admin.describe_acls_with_filter(filter).await?;
     /// ```
     pub async fn describe_acls_with_filter(&self, filter: AclFilter) -> Result<DescribeAclsResult> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -1087,6 +1108,7 @@ impl AdminClient {
     /// admin.create_acls(vec![acl]).await?;
     /// ```
     pub async fn create_acls(&self, acls: Vec<AclBinding>) -> Result<CreateAclsResult> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -1162,6 +1184,7 @@ impl AdminClient {
     /// admin.delete_acls(vec![filter]).await?;
     /// ```
     pub async fn delete_acls(&self, filters: Vec<AclBindingFilter>) -> Result<DeleteAclsResult> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -1242,6 +1265,7 @@ impl AdminClient {
         &self,
         group_ids: Vec<String>,
     ) -> Result<Vec<ConsumerGroupDescription>> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -1391,6 +1415,7 @@ impl AdminClient {
     /// }
     /// ```
     pub async fn list_consumer_groups(&self) -> Result<Vec<ConsumerGroupListing>> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -1509,6 +1534,7 @@ impl AdminClient {
         offsets: HashMap<(String, i32), i64>,
         timeout: Duration,
     ) -> Result<Vec<DeleteRecordResult>> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -1615,6 +1641,7 @@ impl AdminClient {
         &self,
         partitions: Vec<(String, i32, i32)>,
     ) -> Result<Vec<LeaderEpochResult>> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(

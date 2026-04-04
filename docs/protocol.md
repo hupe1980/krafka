@@ -70,13 +70,13 @@ Krafka supports the following API version ranges (clamped to match actual encode
 | CreatePartitions | 0 | 0 | Partition management |
 | DescribeConfigs | 0 | 0 | Config reading |
 | AlterConfigs | 0 | 0 | Config updates |
-| DescribeAcls | 0 | 0 | ACL queries |
-| CreateAcls | 0 | 0 | ACL creation |
-| DeleteAcls | 0 | 0 | ACL deletion |
+| DescribeAcls | 0 | 1 | ACL queries |
+| CreateAcls | 0 | 1 | ACL creation |
+| DeleteAcls | 0 | 1 | ACL deletion |
 | DescribeGroups | 0 | 1 | Consumer group inspection |
 | ListGroups | 0 | 1 | Consumer group listing |
 | DeleteRecords | 0 | 0 | Log truncation |
-| OffsetForLeaderEpoch | 0 | 2 | Leader epoch validation |
+| OffsetForLeaderEpoch | 0 | 3 | Leader epoch validation |
 | InitProducerId | 0 | 0 | Idempotent/transactional |
 
 ### Version Constants

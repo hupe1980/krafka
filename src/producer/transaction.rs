@@ -168,37 +168,50 @@ enum BeginAddResult {
 /// Partitions added to the current transaction.
 #[derive(Debug, Default)]
 struct TransactionPartitions {
-    /// Topic-partitions and their registration state.
-    partitions: std::collections::HashMap<(String, PartitionId), PartitionAddState>,
+    /// Topic-partitions and their registration state (topic → partition → state).
+    partitions: std::collections::HashMap<
+        String,
+        std::collections::HashMap<PartitionId, PartitionAddState>,
+    >,
 }
 
 impl TransactionPartitions {
     /// Begin adding a partition. Returns the action the caller must take.
     fn begin_add(&mut self, topic: &str, partition: PartitionId) -> BeginAddResult {
-        let key = (topic.to_string(), partition);
-        match self.partitions.get(&key) {
-            Some(PartitionAddState::Added) => BeginAddResult::AlreadyAdded,
-            Some(PartitionAddState::Pending(notify)) => BeginAddResult::Wait(notify.clone()),
-            None => {
-                let notify = Arc::new(Notify::new());
-                self.partitions
-                    .insert(key, PartitionAddState::Pending(notify.clone()));
-                BeginAddResult::NeedAdd(notify)
+        if let Some(topic_map) = self.partitions.get(topic) {
+            match topic_map.get(&partition) {
+                Some(PartitionAddState::Added) => return BeginAddResult::AlreadyAdded,
+                Some(PartitionAddState::Pending(notify)) => {
+                    return BeginAddResult::Wait(notify.clone());
+                }
+                None => {}
             }
         }
+        let notify = Arc::new(Notify::new());
+        self.partitions
+            .entry(topic.to_string())
+            .or_default()
+            .insert(partition, PartitionAddState::Pending(notify.clone()));
+        BeginAddResult::NeedAdd(notify)
     }
 
     /// Confirm a partition was successfully registered.
     fn confirm_add(&mut self, topic: &str, partition: PartitionId, notify: &Notify) {
-        let key = (topic.to_string(), partition);
-        self.partitions.insert(key, PartitionAddState::Added);
+        self.partitions
+            .entry(topic.to_string())
+            .or_default()
+            .insert(partition, PartitionAddState::Added);
         notify.notify_waiters();
     }
 
     /// Cancel a pending add (RPC failed). Removes the entry and wakes waiters.
     fn cancel_add(&mut self, topic: &str, partition: PartitionId, notify: &Notify) {
-        let key = (topic.to_string(), partition);
-        self.partitions.remove(&key);
+        if let Some(topic_map) = self.partitions.get_mut(topic) {
+            topic_map.remove(&partition);
+            if topic_map.is_empty() {
+                self.partitions.remove(topic);
+            }
+        }
         notify.notify_waiters();
     }
 

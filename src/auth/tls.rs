@@ -311,12 +311,16 @@ fn load_client_auth(
 }
 
 /// Load client certificate + private key asynchronously, if configured.
+///
+/// Certificate and key files are loaded concurrently via `tokio::try_join!`.
 async fn load_client_auth_async(
     config: &TlsConfig,
 ) -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
     if let (Some(cert_path), Some(key_path)) = (&config.client_cert_path, &config.client_key_path) {
-        let certs = load_certs_async(cert_path).await?;
-        let key = load_private_key_async(key_path).await?;
+        let (certs, key) = tokio::try_join!(
+            load_certs_async(cert_path),
+            load_private_key_async(key_path)
+        )?;
         Ok(Some((certs, key)))
     } else {
         Ok(None)

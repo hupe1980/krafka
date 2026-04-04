@@ -291,7 +291,7 @@ impl Producer {
                     );
                     return Ok(metadata);
                 }
-                Err(ref e) => {
+                Err(e) => {
                     self.metrics.record_error();
 
                     // Refresh metadata on leader-not-available / not-leader errors
@@ -309,13 +309,12 @@ impl Producer {
                         }
                     }
 
-                    if let Some(backoff) = retry_ctx.record_failure(e) {
+                    if let Some(backoff) = retry_ctx.record_failure(&e) {
                         self.metrics.retries.inc();
                         retry_ctx.wait(backoff).await;
                         continue;
                     }
                     // Final failure — notify interceptor
-                    let err = result.unwrap_err();
                     let dummy_metadata = RecordMetadata {
                         topic: topic.to_string(),
                         partition,
@@ -325,9 +324,9 @@ impl Producer {
                     crate::interceptor::safe_on_acknowledgement(
                         &*self.interceptor,
                         &dummy_metadata,
-                        Some(&err),
+                        Some(&e),
                     );
-                    return Err(err);
+                    return Err(e);
                 }
             }
         }

@@ -310,8 +310,13 @@ impl TryEncode for KafkaString {
 impl Decode for KafkaString {
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         let len = i16::decode(buf)?;
-        if len < 0 {
+        if len == -1 {
             return Ok(Self(None));
+        }
+        if len < 0 {
+            return Err(KrafkaError::protocol(format!(
+                "invalid negative string length {len} (only -1 is valid for null)"
+            )));
         }
 
         let len = len as usize;
@@ -442,8 +447,13 @@ impl TryEncode for KafkaBytes {
 impl Decode for KafkaBytes {
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         let len = i32::decode(buf)?;
-        if len < 0 {
+        if len == -1 {
             return Ok(Self(None));
+        }
+        if len < 0 {
+            return Err(KrafkaError::protocol(format!(
+                "invalid negative bytes length {len} (only -1 is valid for null)"
+            )));
         }
 
         let len = len as usize;
@@ -593,8 +603,13 @@ impl<T: Encode + TryEncode> TryEncode for KafkaArray<T> {
 impl<T: Decode> Decode for KafkaArray<T> {
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         let len = i32::decode(buf)?;
-        if len < 0 {
+        if len == -1 {
             return Ok(Self(None));
+        }
+        if len < 0 {
+            return Err(crate::error::KrafkaError::protocol(format!(
+                "invalid negative array length {len} (only -1 is valid for null)"
+            )));
         }
 
         let len = len as usize;

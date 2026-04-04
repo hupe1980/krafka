@@ -36,8 +36,8 @@ fuzz_target!(|data: &[u8]| {
         let _ = DeleteTopicsResponse::decode_versioned(v, &mut buf.clone());
     }
 
-    // Fuzz OffsetForLeaderEpochResponse decode (v0–v2)
-    for v in 0..=2 {
+    // Fuzz OffsetForLeaderEpochResponse decode (v0–v3)
+    for v in 0..=3 {
         let _ = OffsetForLeaderEpochResponse::decode_versioned(v, &mut buf.clone());
     }
 });
