@@ -14,8 +14,8 @@ Callers must check individual results — a successful RPC does not mean every r
 
 Admin requests use **automatic version negotiation** via `negotiate_api_version_max` on each broker connection.
 The negotiated version is clamped to the client's maximum supported version for each API.
-Multi-version encode/decode dispatch is implemented for: CreateTopics (v0–v2), DeleteTopics (v0–v1), FindCoordinator (v0–v1), DescribeGroups (v0–v1), ListGroups (v0–v1), OffsetForLeaderEpoch (v0–v2).
-Single-version APIs (v0 only): CreatePartitions, DescribeConfigs, AlterConfigs, DescribeAcls, CreateAcls, DeleteAcls, DeleteRecords.
+Multi-version encode/decode dispatch is implemented for: CreateTopics (v0–v2), DeleteTopics (v0–v1), FindCoordinator (v0–v1), DescribeGroups (v0–v1), ListGroups (v0–v1), OffsetForLeaderEpoch (v0–v3), DescribeAcls (v0–v1), CreateAcls (v0–v1), DeleteAcls (v0–v1).
+Single-version APIs (v0 only): CreatePartitions, DescribeConfigs, AlterConfigs, DeleteRecords.
 When adding a new version, update the version constant in `src/protocol/mod.rs::versions`, add the `encode_vN`/`decode_vN` methods in `src/protocol/messages.rs`, and add version dispatch in the admin method.
 
 ## Destructive Operations

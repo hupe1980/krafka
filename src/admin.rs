@@ -1026,11 +1026,25 @@ impl AdminClient {
             })?;
 
         let response_bytes = conn
-            .send_request(ApiKey::DescribeAcls, version, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::DescribeAcls, version, |buf| match version {
+                0 => request.encode_v0(buf),
+                1 => request.encode_v1(buf),
+                _ => Err(KrafkaError::protocol(format!(
+                    "unsupported DescribeAcls encode version {version}"
+                ))),
+            })
             .await?;
 
         let mut buf = response_bytes;
-        let response = DescribeAclsResponse::decode_v0(&mut buf)?;
+        let response = match version {
+            0 => DescribeAclsResponse::decode_v0(&mut buf)?,
+            1 => DescribeAclsResponse::decode_v1(&mut buf)?,
+            _ => {
+                return Err(KrafkaError::protocol(format!(
+                    "unsupported DescribeAcls decode version {version}"
+                )));
+            }
+        };
 
         let bindings = response
             .resources
@@ -1097,7 +1111,13 @@ impl AdminClient {
             .ok_or_else(|| KrafkaError::protocol("no mutually supported CreateAcls API version"))?;
 
         let response_bytes = conn
-            .send_request(ApiKey::CreateAcls, version, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::CreateAcls, version, |buf| match version {
+                0 => request.encode_v0(buf),
+                1 => request.encode_v1(buf),
+                _ => Err(KrafkaError::protocol(format!(
+                    "unsupported CreateAcls encode version {version}"
+                ))),
+            })
             .await?;
 
         let mut buf = response_bytes;
@@ -1166,11 +1186,25 @@ impl AdminClient {
             .ok_or_else(|| KrafkaError::protocol("no mutually supported DeleteAcls API version"))?;
 
         let response_bytes = conn
-            .send_request(ApiKey::DeleteAcls, version, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::DeleteAcls, version, |buf| match version {
+                0 => request.encode_v0(buf),
+                1 => request.encode_v1(buf),
+                _ => Err(KrafkaError::protocol(format!(
+                    "unsupported DeleteAcls encode version {version}"
+                ))),
+            })
             .await?;
 
         let mut buf = response_bytes;
-        let response = DeleteAclsResponse::decode_v0(&mut buf)?;
+        let response = match version {
+            0 => DeleteAclsResponse::decode_v0(&mut buf)?,
+            1 => DeleteAclsResponse::decode_v1(&mut buf)?,
+            _ => {
+                return Err(KrafkaError::protocol(format!(
+                    "unsupported DeleteAcls decode version {version}"
+                )));
+            }
+        };
 
         let filter_results = response
             .filter_results
@@ -1647,6 +1681,7 @@ impl AdminClient {
                 .send_request(ApiKey::OffsetForLeaderEpoch, version, |buf| match version {
                     0..=1 => request.encode_v0(buf),
                     2 => request.encode_v2(buf),
+                    3 => request.encode_v3(buf),
                     _ => Err(KrafkaError::protocol(format!(
                         "unsupported OffsetForLeaderEpoch encode version {version}"
                     ))),
@@ -1657,7 +1692,7 @@ impl AdminClient {
             let response = match version {
                 0 => OffsetForLeaderEpochResponse::decode_v0(&mut buf)?,
                 1 => OffsetForLeaderEpochResponse::decode_v1(&mut buf)?,
-                2 => OffsetForLeaderEpochResponse::decode_v2(&mut buf)?,
+                2..=3 => OffsetForLeaderEpochResponse::decode_v2(&mut buf)?,
                 _ => {
                     return Err(KrafkaError::protocol(format!(
                         "unsupported OffsetForLeaderEpoch version {version}"

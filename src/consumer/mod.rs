@@ -68,7 +68,7 @@ use crate::network::{ConnectionConfig, ConnectionPool};
 use crate::protocol::{
     ApiKey, FetchPartitionRequest, FetchRequest, FetchResponse, FetchTopicRequest,
     ListOffsetsRequest, ListOffsetsRequestPartition, ListOffsetsRequestTopic, ListOffsetsResponse,
-    RecordBatch, VersionedDecode, VersionedEncode,
+    RecordBatch, VersionedDecode, VersionedEncode, versions,
 };
 use crate::{Offset, PartitionId};
 
@@ -1293,7 +1293,10 @@ impl Consumer {
             };
 
             // Negotiate ListOffsets version — require v1+, prefer v2.
-            let list_version = match conn.negotiate_api_version_max(ApiKey::ListOffsets, 2).await {
+            let list_version = match conn
+                .negotiate_api_version_max(ApiKey::ListOffsets, versions::LIST_OFFSETS_MAX)
+                .await
+            {
                 Some(v) => v,
                 None => {
                     let err = KrafkaError::protocol(format!(
@@ -1925,10 +1928,7 @@ impl Consumer {
         let mut offset_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
         let mut hw_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
         let mut lso_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
-        // Snapshot current fetch offsets so we can skip already-delivered
-        // records when Kafka returns a whole batch that starts before the
-        // requested fetch offset (e.g. after max_poll_records truncation).
-        let current_offsets = self.offsets.read().await.clone();
+
         // Preferred replica updates (KIP-392): Some(id) to set, None to clear.
         // Collected during the loop, applied in a single write lock afterwards.
         let mut pref_updates: Vec<((String, PartitionId), Option<crate::BrokerId>)> = Vec::new();
@@ -2030,7 +2030,10 @@ impl Consumer {
                     // Fetch offset for this partition — used to skip records
                     // already delivered in a prior poll when Kafka returns a
                     // batch that starts before the requested offset.
-                    let partition_fetch_offset = current_offsets.get(&key).copied().unwrap_or(0);
+                    // Read lock is acquired and dropped inline to avoid cloning
+                    // the entire offsets map on every fetch pass.
+                    let partition_fetch_offset =
+                        self.offsets.read().await.get(&key).copied().unwrap_or(0);
 
                     // Cap record accumulation to avoid unbounded memory growth
                     // from large fetch responses. When max_poll_records is set,
@@ -2236,14 +2239,38 @@ impl Consumer {
             }],
         };
 
+        let version = conn
+            .negotiate_api_version_max(
+                ApiKey::OffsetForLeaderEpoch,
+                versions::OFFSET_FOR_LEADER_EPOCH_MAX,
+            )
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported OffsetForLeaderEpoch API version")
+            })?;
+
         let response_bytes = conn
-            .send_request(ApiKey::OffsetForLeaderEpoch, 2, |buf| {
-                request.encode_v2(buf)
+            .send_request(ApiKey::OffsetForLeaderEpoch, version, |buf| match version {
+                0..=1 => request.encode_v0(buf),
+                2 => request.encode_v2(buf),
+                3 => request.encode_v3(buf),
+                _ => Err(KrafkaError::protocol(format!(
+                    "unsupported OffsetForLeaderEpoch encode version {version}"
+                ))),
             })
             .await?;
 
         let mut buf = response_bytes;
-        let response = OffsetForLeaderEpochResponse::decode_v2(&mut buf)?;
+        let response = match version {
+            0 => OffsetForLeaderEpochResponse::decode_v0(&mut buf)?,
+            1 => OffsetForLeaderEpochResponse::decode_v1(&mut buf)?,
+            2..=3 => OffsetForLeaderEpochResponse::decode_v2(&mut buf)?,
+            _ => {
+                return Err(KrafkaError::protocol(format!(
+                    "unsupported OffsetForLeaderEpoch decode version {version}"
+                )));
+            }
+        };
 
         let key = (topic.to_string(), partition);
         let mut offset_changed = false;

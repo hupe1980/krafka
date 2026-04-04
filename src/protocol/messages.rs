@@ -3833,6 +3833,53 @@ impl DescribeAclsResponse {
             resources,
         })
     }
+
+    /// Decode from version 1 (adds pattern_type per resource).
+    pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let error_message = KafkaString::decode(buf)?.0;
+
+        let resource_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut resources = Vec::with_capacity(resource_count);
+
+        for _ in 0..resource_count {
+            let resource_type = AclResourceType::from_i8(i8::decode(buf)?);
+            let resource_name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let pattern_type = AclPatternType::from_i8(i8::decode(buf)?);
+
+            let acl_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut acls = Vec::with_capacity(acl_count);
+
+            for _ in 0..acl_count {
+                let principal = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let host = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let operation = AclOperation::from_i8(i8::decode(buf)?);
+                let permission_type = AclPermissionType::from_i8(i8::decode(buf)?);
+
+                acls.push(AclDescription {
+                    principal,
+                    host,
+                    operation,
+                    permission_type,
+                });
+            }
+
+            resources.push(DescribeAclsResource {
+                resource_type,
+                resource_name,
+                pattern_type,
+                acls,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            error_message,
+            resources,
+        })
+    }
 }
 
 /// CreateAcls request (API Key 30).
@@ -4087,6 +4134,56 @@ impl DeleteAclsResponse {
                     resource_type,
                     resource_name,
                     pattern_type: AclPatternType::Literal,
+                    principal,
+                    host,
+                    operation,
+                    permission_type,
+                });
+            }
+
+            filter_results.push(DeleteAclsFilterResult {
+                error_code,
+                error_message,
+                matching_acls,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            filter_results,
+        })
+    }
+
+    /// Decode from version 1 (adds pattern_type per matching ACL).
+    pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let filter_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut filter_results = Vec::with_capacity(filter_count);
+
+        for _ in 0..filter_count {
+            let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+            let error_message = KafkaString::decode(buf)?.0;
+
+            let matching_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut matching_acls = Vec::with_capacity(matching_count);
+
+            for _ in 0..matching_count {
+                let acl_error_code = ErrorCode::from_i16(i16::decode(buf)?);
+                let acl_error_message = KafkaString::decode(buf)?.0;
+                let resource_type = AclResourceType::from_i8(i8::decode(buf)?);
+                let resource_name = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let pattern_type = AclPatternType::from_i8(i8::decode(buf)?);
+                let principal = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let host = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let operation = AclOperation::from_i8(i8::decode(buf)?);
+                let permission_type = AclPermissionType::from_i8(i8::decode(buf)?);
+
+                matching_acls.push(DeleteAclsMatchingAcl {
+                    error_code: acl_error_code,
+                    error_message: acl_error_message,
+                    resource_type,
+                    resource_name,
+                    pattern_type,
                     principal,
                     host,
                     operation,
@@ -5614,7 +5711,8 @@ impl VersionedEncode for DescribeAclsRequest {
 impl VersionedDecode for DescribeAclsResponse {
     fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
         match version {
-            0..=1 => Self::decode_v0(buf),
+            0 => Self::decode_v0(buf),
+            1 => Self::decode_v1(buf),
             _ => unsupported_decode!("DescribeAclsResponse", version),
         }
     }
@@ -5654,7 +5752,8 @@ impl VersionedEncode for DeleteAclsRequest {
 impl VersionedDecode for DeleteAclsResponse {
     fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
         match version {
-            0..=1 => Self::decode_v0(buf),
+            0 => Self::decode_v0(buf),
+            1 => Self::decode_v1(buf),
             _ => unsupported_decode!("DeleteAclsResponse", version),
         }
     }

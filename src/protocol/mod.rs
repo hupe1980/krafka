@@ -153,20 +153,20 @@ pub mod versions {
     pub const DESCRIBE_CONFIGS_MAX: i16 = 0;
     /// Maximum supported AlterConfigs version.
     pub const ALTER_CONFIGS_MAX: i16 = 0;
-    /// Maximum supported DescribeAcls version.
-    pub const DESCRIBE_ACLS_MAX: i16 = 0;
-    /// Maximum supported CreateAcls version.
-    pub const CREATE_ACLS_MAX: i16 = 0;
-    /// Maximum supported DeleteAcls version.
-    pub const DELETE_ACLS_MAX: i16 = 0;
+    /// Maximum supported DescribeAcls version (v1 adds pattern_type for prefixed ACLs).
+    pub const DESCRIBE_ACLS_MAX: i16 = 1;
+    /// Maximum supported CreateAcls version (v1 adds pattern_type for prefixed ACLs).
+    pub const CREATE_ACLS_MAX: i16 = 1;
+    /// Maximum supported DeleteAcls version (v1 adds pattern_type for prefixed ACLs).
+    pub const DELETE_ACLS_MAX: i16 = 1;
     /// Maximum supported DescribeGroups version.
     pub const DESCRIBE_GROUPS_MAX: i16 = 1;
     /// Maximum supported ListGroups version.
     pub const LIST_GROUPS_MAX: i16 = 1;
     /// Maximum supported DeleteRecords version.
     pub const DELETE_RECORDS_MAX: i16 = 0;
-    /// Maximum supported OffsetForLeaderEpoch version.
-    pub const OFFSET_FOR_LEADER_EPOCH_MAX: i16 = 2;
+    /// Maximum supported OffsetForLeaderEpoch version (v3 adds replica_id for consumer/follower fencing).
+    pub const OFFSET_FOR_LEADER_EPOCH_MAX: i16 = 3;
     /// Maximum supported InitProducerId version.
     pub const INIT_PRODUCER_ID_MAX: i16 = 0;
     /// Maximum supported ListOffsets version (v2 encode/decode).
