@@ -467,7 +467,7 @@ let producer = Producer::builder()
 
 ## Graceful Shutdown
 
-Always close producers properly to flush pending messages. The `close()` method guarantees that all pending batches in the accumulator are flushed to brokers before connections are torn down:
+Always close producers properly to flush pending messages. The `close()` method guarantees that all pending batches in the accumulator are flushed to brokers before connections are torn down. Calling `close()` more than once is a no-op:
 
 ```rust
 use krafka::producer::Producer;
@@ -603,6 +603,7 @@ Always close transactional producers properly. The `close()` method:
 - Aborts any active transaction to avoid dangling open transactions on the broker
 - Transitions the producer to `FatalError` state, preventing further use
 - Closes the underlying connection pool
+- Is idempotent — calling it more than once is a no-op
 
 ```rust
 // Graceful shutdown

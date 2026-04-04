@@ -1764,8 +1764,12 @@ impl AdminClient {
     }
 
     /// Close the admin client.
+    ///
+    /// Calling `close()` more than once is a no-op.
     pub async fn close(&self) {
-        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        if self.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         self.pool.close_all().await;
         info!("AdminClient closed");
     }

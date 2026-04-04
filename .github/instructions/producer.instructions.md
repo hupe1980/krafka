@@ -34,10 +34,10 @@ Always check **both** components against `buffer_memory` limit.
 
 ```
 close()
-  1. closed.store(true)      ← rejects new sends
-  2. accumulator.shutdown()   ← flushes all pending batches, blocks until done
-  3. interceptor close hook
-  4. pool.close_all()         ← tears down broker connections
+  0. closed.swap(true)       ← idempotent guard; second call returns early
+  1. accumulator.shutdown()   ← flushes all pending batches, blocks until done
+  2. interceptor close hook
+  3. pool.close_all()         ← tears down broker connections
 ```
 
 Adding state to `Producer` → verify it is drained or cleaned up in steps 1–4.

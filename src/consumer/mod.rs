@@ -2750,8 +2750,13 @@ impl Consumer {
     }
 
     /// Close the consumer.
+    ///
+    /// Commits offsets (if auto-commit is enabled), leaves the consumer group,
+    /// and tears down connections. Calling `close()` more than once is a no-op.
     pub async fn close(&self) {
-        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        if self.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
 
         // Auto-commit on close (if enabled)
         if self.config.enable_auto_commit

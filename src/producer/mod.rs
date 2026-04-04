@@ -443,8 +443,13 @@ impl Producer {
     }
 
     /// Close the producer.
+    ///
+    /// Flushes pending records, notifies interceptors, and tears down connections.
+    /// Calling `close()` more than once is a no-op.
     pub async fn close(&self) {
-        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        if self.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
 
         // Shutdown accumulator first to flush pending records
         if let Some(ref accumulator) = self.accumulator {

@@ -51,7 +51,7 @@
 //! ```
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -303,6 +303,8 @@ pub struct TransactionalProducer {
     txn_partitions: Arc<RwLock<TransactionPartitions>>,
     /// Sequence number tracking for idempotent production.
     identity: ProducerIdentity,
+    /// Explicit closed flag, separate from transaction state.
+    closed: AtomicBool,
 }
 
 impl TransactionalProducer {
@@ -1117,7 +1119,13 @@ impl TransactionalProducer {
     ///
     /// If a transaction is in progress, it will be aborted before closing.
     /// After calling `close()`, the producer cannot be used again.
+    /// Calling `close()` more than once is a no-op.
     pub async fn close(&self) {
+        // Atomic swap — only the first caller proceeds.
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
         // If in-transaction, abort first to clean up broker state
         let current = self.state();
         if current == TransactionState::InTransaction {
@@ -1138,12 +1146,14 @@ impl TransactionalProducer {
         );
     }
 
-    /// Check if the transactional producer has been closed.
+    /// Check if the transactional producer has been explicitly closed.
     ///
-    /// A closed producer is in `FatalError` state and cannot be used again.
+    /// Returns `true` only when [`Self::close`] has been called. A producer in
+    /// [`TransactionState::FatalError`] due to a broker error is *not*
+    /// considered closed — use [`Self::state`] to check for fatal errors.
     #[inline]
     pub fn is_closed(&self) -> bool {
-        self.state() == TransactionState::FatalError
+        self.closed.load(Ordering::SeqCst)
     }
 }
 
@@ -1277,6 +1287,7 @@ impl TransactionalProducerBuilder {
             coordinator_id: RwLock::new(None),
             txn_partitions: Arc::new(RwLock::new(TransactionPartitions::default())),
             identity: ProducerIdentity::new(),
+            closed: AtomicBool::new(false),
         })
     }
 }
@@ -1633,6 +1644,27 @@ mod tests {
         assert_eq!(
             TransactionState::from_u8(state.load(Ordering::SeqCst)),
             TransactionState::FatalError
+        );
+    }
+
+    #[test]
+    fn test_is_closed_distinguishes_close_from_fatal_error() {
+        // FatalError from a broker error does NOT mean closed
+        let closed = AtomicBool::new(false);
+        let state = AtomicU8::new(TransactionState::Ready as u8);
+
+        // Simulate fatal broker error
+        state.store(TransactionState::FatalError as u8, Ordering::SeqCst);
+        assert!(
+            !closed.load(Ordering::SeqCst),
+            "should not be closed after fatal error"
+        );
+
+        // Simulate explicit close
+        closed.store(true, Ordering::SeqCst);
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "should be closed after close()"
         );
     }
 
