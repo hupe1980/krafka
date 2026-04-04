@@ -637,7 +637,8 @@ impl TransactionalProducer {
     /// Send a record to a specific partition.
     ///
     /// Includes retry logic with exponential backoff for transient failures.
-    /// Handles `OutOfOrderSequenceNumber` by resetting the partition sequence.
+    /// On `OutOfOrderSequenceNumber`, resets the partition sequence and rebuilds
+    /// the batch with a fresh sequence before retrying.
     async fn send_to_partition(
         &self,
         topic: &str,
@@ -652,48 +653,17 @@ impl TransactionalProducer {
 
         // Allocate the sequence number once — retries must resend the same
         // sequence to maintain idempotent semantics.
-        let sequence = self.next_sequence(topic, partition).await;
+        let mut sequence = self.next_sequence(topic, partition).await;
 
         // Build the record batch and request once before entering the retry loop.
-        let mut batch_builder = RecordBatchBuilder::new()
-            .compression(self.config.compression)
-            .producer(producer_id, producer_epoch, sequence)
-            .transactional(true);
-
-        if let Some(ts) = record.timestamp {
-            batch_builder = batch_builder.base_timestamp(ts);
-        }
-
-        if record.headers.is_empty() {
-            batch_builder =
-                batch_builder.add_record(record.key.clone(), Some(record.value.clone()));
-        } else {
-            batch_builder = batch_builder.add_record_with_headers(
-                record.key.clone(),
-                Some(record.value.clone()),
-                record
-                    .headers
-                    .iter()
-                    .map(|(k, v)| (k.clone(), Bytes::from(v.clone())))
-                    .collect(),
-            );
-        }
-
-        let batch = batch_builder.build();
-        let batch_bytes = batch.encode()?;
-
-        let request = ProduceRequest {
-            transactional_id: Some(self.config.transactional_id.clone()),
-            acks: Acks::All.to_i16(),
-            timeout_ms: crate::util::duration_to_millis_i32(self.config.request_timeout),
-            topic_data: vec![ProduceTopicData {
-                name: topic.to_string(),
-                partition_data: vec![ProducePartitionData {
-                    index: partition,
-                    records: batch_bytes,
-                }],
-            }],
-        };
+        let mut request = self.build_produce_request(
+            topic,
+            partition,
+            &record,
+            producer_id,
+            producer_epoch,
+            sequence,
+        )?;
 
         loop {
             // Re-acquire connection on each attempt (leader may have moved).
@@ -741,6 +711,43 @@ impl TransactionalProducer {
             match send_result {
                 Ok(metadata) => return Ok(metadata),
                 Err(e) => {
+                    // OutOfOrderSequenceNumber means the broker's expected
+                    // sequence diverged from ours. Reset local state and
+                    // rebuild the batch with a fresh sequence before retrying.
+                    if let KrafkaError::Broker { code, .. } = &e
+                        && *code == ErrorCode::OutOfOrderSequenceNumber
+                    {
+                        if retry_policy.max_retries_reached(attempt) {
+                            return Err(e);
+                        }
+                        attempt += 1;
+
+                        warn!(
+                            topic = topic,
+                            partition = partition,
+                            "OutOfOrderSequenceNumber, resetting sequence and rebuilding batch"
+                        );
+                        self.identity.reset_sequence(topic, partition);
+                        sequence = self.next_sequence(topic, partition).await;
+                        request = self.build_produce_request(
+                            topic,
+                            partition,
+                            &record,
+                            producer_id,
+                            producer_epoch,
+                            sequence,
+                        )?;
+
+                        if let Err(refresh_err) =
+                            self.metadata.refresh_for_topics(Some(&[topic])).await
+                        {
+                            debug!(error = %refresh_err, "Metadata refresh failed during txn retry");
+                        }
+
+                        tokio::time::sleep(retry_policy.calculate_backoff(attempt)).await;
+                        continue;
+                    }
+
                     if !retry_policy.should_retry(&e, attempt) {
                         return Err(e);
                     }
@@ -764,6 +771,57 @@ impl TransactionalProducer {
                 }
             }
         }
+    }
+
+    /// Build a produce request for a single record to a partition.
+    fn build_produce_request(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+        record: &ProducerRecord,
+        producer_id: i64,
+        producer_epoch: i16,
+        sequence: i32,
+    ) -> Result<ProduceRequest> {
+        let mut batch_builder = RecordBatchBuilder::new()
+            .compression(self.config.compression)
+            .producer(producer_id, producer_epoch, sequence)
+            .transactional(true);
+
+        if let Some(ts) = record.timestamp {
+            batch_builder = batch_builder.base_timestamp(ts);
+        }
+
+        if record.headers.is_empty() {
+            batch_builder =
+                batch_builder.add_record(record.key.clone(), Some(record.value.clone()));
+        } else {
+            batch_builder = batch_builder.add_record_with_headers(
+                record.key.clone(),
+                Some(record.value.clone()),
+                record
+                    .headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Bytes::from(v.clone())))
+                    .collect(),
+            );
+        }
+
+        let batch = batch_builder.build();
+        let batch_bytes = batch.encode()?;
+
+        Ok(ProduceRequest {
+            transactional_id: Some(self.config.transactional_id.clone()),
+            acks: Acks::All.to_i16(),
+            timeout_ms: crate::util::duration_to_millis_i32(self.config.request_timeout),
+            topic_data: vec![ProduceTopicData {
+                name: topic.to_string(),
+                partition_data: vec![ProducePartitionData {
+                    index: partition,
+                    records: batch_bytes,
+                }],
+            }],
+        })
     }
 
     /// Send consumer offsets within the current transaction.

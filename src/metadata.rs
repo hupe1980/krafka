@@ -29,11 +29,11 @@ pub struct BrokerInfo {
     /// Broker ID.
     pub id: BrokerId,
     /// Broker host.
-    pub host: String,
+    host: String,
     /// Broker port.
-    pub port: i32,
+    port: i32,
     /// Broker rack (optional).
-    pub rack: Option<String>,
+    rack: Option<String>,
     /// Cached `host:port` address string.
     address: String,
 }
@@ -49,6 +49,24 @@ impl BrokerInfo {
             rack,
             address,
         }
+    }
+
+    /// Get the broker host.
+    #[inline]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Get the broker port.
+    #[inline]
+    pub fn port(&self) -> i32 {
+        self.port
+    }
+
+    /// Get the broker rack, if any.
+    #[inline]
+    pub fn rack(&self) -> Option<&str> {
+        self.rack.as_deref()
     }
 
     /// Get the broker address as `host:port`.
@@ -566,6 +584,6 @@ mod tests {
             Some("us-east-1a".to_string()),
         );
         assert_eq!(broker.address(), "broker1.kafka.local:9093");
-        assert_eq!(broker.rack.as_deref(), Some("us-east-1a"));
+        assert_eq!(broker.rack(), Some("us-east-1a"));
     }
 }

@@ -80,14 +80,22 @@ impl ProducerRecord {
     }
 
     /// Get the estimated size in bytes.
+    ///
+    /// Accounts for key, value, headers (including per-header wire overhead),
+    /// topic name, and struct metadata overhead. This is the single source of
+    /// truth used by both batch size-gating and memory backpressure.
     #[inline]
     pub fn estimated_size(&self) -> usize {
         let key_size = self.key.as_ref().map(|k| k.len()).unwrap_or(0);
         let value_size = self.value.len();
-        let headers_size: usize = self.headers.iter().map(|(k, v)| k.len() + v.len()).sum();
+        let headers_size: usize = self
+            .headers
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 8) // 8 bytes wire overhead per header
+            .sum();
+        let topic_overhead = self.topic.len() + 64; // struct metadata overhead
 
-        // Overhead for record metadata
-        key_size + value_size + headers_size + 50
+        key_size + value_size + headers_size + topic_overhead
     }
 
     /// Validate that this record's fields do not exceed Kafka wire-format limits.

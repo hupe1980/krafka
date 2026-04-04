@@ -276,7 +276,7 @@ println!("  Brokers:");
 for broker in cluster.brokers {
     println!(
         "    - {} at {}:{} (rack: {:?})",
-        broker.id, broker.host, broker.port, broker.rack
+        broker.id, broker.host(), broker.port(), broker.rack()
     );
 }
 ```

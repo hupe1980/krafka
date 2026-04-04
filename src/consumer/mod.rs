@@ -2037,24 +2037,13 @@ impl Consumer {
                     let partition_fetch_offset =
                         self.offsets.read().await.get(&key).copied().unwrap_or(0);
 
-                    // Cap record accumulation to avoid unbounded memory growth
-                    // from large fetch responses. When max_poll_records is set,
-                    // stop decoding NEW batches once we have enough records.
-                    // Within a single batch, all records are consumed to avoid
-                    // setting the fetch offset to the middle of a batch, which
-                    // would cause duplicate delivery on re-fetch.
-                    let record_limit = if self.config.max_poll_records > 0 {
-                        self.config.max_poll_records as usize
-                    } else {
-                        usize::MAX
-                    };
-
+                    // Decode all fetched batches for this partition. `poll()`
+                    // applies `max_poll_records` after aggregation and
+                    // recomputes offsets for the returned subset, so stopping
+                    // here without buffering the remaining bytes would force a
+                    // re-fetch/re-decode of the dropped batches on subsequent
+                    // polls.
                     while batch_buf.len() >= 12 {
-                        // Stop decoding new batches once we have enough records.
-                        if records.len() >= record_limit {
-                            break;
-                        }
-
                         match RecordBatch::decode(&mut batch_buf) {
                             Ok(batch) => {
                                 for record in batch.records.into_iter() {
