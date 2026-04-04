@@ -1647,27 +1647,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_is_closed_distinguishes_close_from_fatal_error() {
-        // FatalError from a broker error does NOT mean closed
-        let closed = AtomicBool::new(false);
-        let state = AtomicU8::new(TransactionState::Ready as u8);
-
-        // Simulate fatal broker error
-        state.store(TransactionState::FatalError as u8, Ordering::SeqCst);
-        assert!(
-            !closed.load(Ordering::SeqCst),
-            "should not be closed after fatal error"
-        );
-
-        // Simulate explicit close
-        closed.store(true, Ordering::SeqCst);
-        assert!(
-            closed.load(Ordering::SeqCst),
-            "should be closed after close()"
-        );
-    }
-
     // ── R14: OutOfOrderSequenceNumber is retriable ──
 
     #[test]

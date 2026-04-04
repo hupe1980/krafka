@@ -66,10 +66,13 @@ impl OffsetStore {
     /// Set the committed offset for a topic-partition.
     #[inline]
     pub fn commit(&mut self, topic: &str, partition: PartitionId, offset: OffsetAndMetadata) {
-        self.committed
-            .entry(topic.to_string())
-            .or_default()
-            .insert(partition, offset);
+        if let Some(partitions) = self.committed.get_mut(topic) {
+            partitions.insert(partition, offset);
+        } else {
+            let mut partitions = HashMap::new();
+            partitions.insert(partition, offset);
+            self.committed.insert(topic.to_string(), partitions);
+        }
     }
 
     /// Get the committed offset for a topic-partition.
@@ -81,10 +84,13 @@ impl OffsetStore {
     /// Set the current position for a topic-partition.
     #[inline]
     pub fn set_position(&mut self, topic: &str, partition: PartitionId, offset: Offset) {
-        self.position
-            .entry(topic.to_string())
-            .or_default()
-            .insert(partition, offset);
+        if let Some(partitions) = self.position.get_mut(topic) {
+            partitions.insert(partition, offset);
+        } else {
+            let mut partitions = HashMap::new();
+            partitions.insert(partition, offset);
+            self.position.insert(topic.to_string(), partitions);
+        }
     }
 
     /// Get the current position for a topic-partition.

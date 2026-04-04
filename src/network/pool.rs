@@ -108,6 +108,12 @@ impl ConnectionRetryConfig {
         };
 
         let final_backoff = (capped_backoff + jitter).max(0.0);
+
+        // Defensive: Duration::from_secs_f64 panics on NaN/Inf
+        if !final_backoff.is_finite() {
+            return self.max_backoff;
+        }
+
         Duration::from_secs_f64(final_backoff)
     }
 }
@@ -138,9 +144,13 @@ impl ConnectionRetryConfigBuilder {
         self
     }
 
-    /// Set backoff multiplier.
+    /// Set backoff multiplier (must be finite and > 0; clamped to 1.0 otherwise).
     pub fn backoff_multiplier(mut self, multiplier: f64) -> Self {
-        self.config.backoff_multiplier = multiplier;
+        self.config.backoff_multiplier = if multiplier.is_finite() && multiplier > 0.0 {
+            multiplier
+        } else {
+            1.0
+        };
         self
     }
 
