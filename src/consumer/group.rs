@@ -2333,8 +2333,10 @@ impl GroupCoordinator {
         if topic_count < 0 {
             return Ok(MemberAssignment::empty());
         }
-        // Cap iteration by remaining buffer to prevent allocation DoS
-        let safe_topic_count = (topic_count as usize).min(buf.remaining() / 6);
+        // Cap iteration by max array length and remaining buffer to prevent allocation DoS
+        let safe_topic_count = (topic_count as usize)
+            .min(MAX_DECODE_ARRAY_LEN)
+            .min(buf.remaining() / 6);
         if safe_topic_count < topic_count as usize {
             warn!(
                 "assignment topic count {} exceeds buffer capacity, decoding {} topics",

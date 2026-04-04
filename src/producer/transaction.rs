@@ -666,14 +666,22 @@ impl TransactionalProducer {
         let mut sequence = self.next_sequence(topic, partition).await;
 
         // Build the record batch and request once before entering the retry loop.
-        let mut request = self.build_produce_request(
+        // If encoding fails, roll back the sequence so the next send attempt
+        // starts from the correct value rather than creating a gap.
+        let mut request = match self.build_produce_request(
             topic,
             partition,
             &record,
             producer_id,
             producer_epoch,
             sequence,
-        )?;
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                self.identity.rollback_sequence(topic, partition);
+                return Err(e);
+            }
+        };
 
         loop {
             // Re-acquire connection on each attempt (leader may have moved).
