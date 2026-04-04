@@ -488,7 +488,7 @@ impl AdminClient {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         // Build request
@@ -582,7 +582,7 @@ impl AdminClient {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         // Build request
@@ -657,7 +657,7 @@ impl AdminClient {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         // Build request
@@ -732,7 +732,7 @@ impl AdminClient {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         let request = DescribeConfigsRequest::for_topic(topic);
@@ -790,7 +790,7 @@ impl AdminClient {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         let request = DescribeConfigsRequest::for_broker(broker_id);
@@ -855,7 +855,7 @@ impl AdminClient {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         let request = AlterConfigsRequest::for_topic(topic, configs.into_iter().collect());
@@ -1026,7 +1026,7 @@ impl AdminClient {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         let request = DescribeAclsRequest {
@@ -1120,7 +1120,7 @@ impl AdminClient {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         let request = CreateAclsRequest {
@@ -1196,7 +1196,7 @@ impl AdminClient {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         let request = DeleteAclsRequest {
@@ -1279,7 +1279,7 @@ impl AdminClient {
         let any_broker = &brokers[0];
         let any_conn = self
             .pool
-            .get_connection_by_id(any_broker.id, &any_broker.address())
+            .get_connection_by_id(any_broker.id, any_broker.address())
             .await?;
 
         for group_id in &group_ids {
@@ -1343,7 +1343,7 @@ impl AdminClient {
                 .unwrap_or(any_broker);
             let conn = self
                 .pool
-                .get_connection_by_id(broker.id, &broker.address())
+                .get_connection_by_id(broker.id, broker.address())
                 .await?;
 
             let request = DescribeGroupsRequest {
@@ -1431,7 +1431,7 @@ impl AdminClient {
         for broker in &brokers {
             let conn = match self
                 .pool
-                .get_connection_by_id(broker.id, &broker.address())
+                .get_connection_by_id(broker.id, broker.address())
                 .await
             {
                 Ok(c) => c,
@@ -1573,7 +1573,7 @@ impl AdminClient {
                 .unwrap_or(&brokers[0]);
             let conn = self
                 .pool
-                .get_connection_by_id(broker.id, &broker.address())
+                .get_connection_by_id(broker.id, broker.address())
                 .await?;
 
             let request = DeleteRecordsRequest {
@@ -1683,7 +1683,7 @@ impl AdminClient {
                 .unwrap_or(&brokers[0]);
             let conn = self
                 .pool
-                .get_connection_by_id(broker.id, &broker.address())
+                .get_connection_by_id(broker.id, broker.address())
                 .await?;
 
             let request = OffsetForLeaderEpochRequest {

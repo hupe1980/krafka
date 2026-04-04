@@ -31,6 +31,8 @@ pub struct ConnectionRetryConfig {
     pub(crate) max_backoff: Duration,
     /// Backoff multiplier for exponential growth.
     pub(crate) backoff_multiplier: f64,
+    /// Jitter factor (0.0–1.0) to randomize backoff and prevent thundering herd.
+    pub(crate) jitter_factor: f64,
 }
 
 impl Default for ConnectionRetryConfig {
@@ -40,6 +42,7 @@ impl Default for ConnectionRetryConfig {
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(10),
             backoff_multiplier: 2.0,
+            jitter_factor: 0.2,
         }
     }
 }
@@ -70,6 +73,12 @@ impl ConnectionRetryConfig {
         self.backoff_multiplier
     }
 
+    /// Returns the jitter factor (0.0–1.0).
+    #[inline]
+    pub fn jitter_factor(&self) -> f64 {
+        self.jitter_factor
+    }
+
     /// Calculate the backoff duration for a given attempt number (1-indexed).
     #[inline]
     fn calculate_backoff(&self, attempt: u32) -> Duration {
@@ -84,7 +93,18 @@ impl ConnectionRetryConfig {
         // Cap at max backoff
         let capped_backoff = base_backoff.min(self.max_backoff.as_secs_f64());
 
-        Duration::from_secs_f64(capped_backoff)
+        // Add jitter: ±jitter_factor * backoff (randomized to prevent thundering herd)
+        let jitter_range = capped_backoff * self.jitter_factor;
+        let jitter = if self.jitter_factor > 0.0 {
+            use rand::Rng;
+            let mut rng = rand::rng();
+            rng.random_range(-jitter_range..=jitter_range)
+        } else {
+            0.0
+        };
+
+        let final_backoff = (capped_backoff + jitter).max(0.0);
+        Duration::from_secs_f64(final_backoff)
     }
 }
 
@@ -117,6 +137,12 @@ impl ConnectionRetryConfigBuilder {
     /// Set backoff multiplier.
     pub fn backoff_multiplier(mut self, multiplier: f64) -> Self {
         self.config.backoff_multiplier = multiplier;
+        self
+    }
+
+    /// Set jitter factor (0.0–1.0) to randomize backoff and prevent thundering herd.
+    pub fn jitter_factor(mut self, factor: f64) -> Self {
+        self.config.jitter_factor = factor.clamp(0.0, 1.0);
         self
     }
 
@@ -600,7 +626,10 @@ mod tests {
 
     #[test]
     fn test_calculate_backoff() {
-        let config = ConnectionRetryConfig::default();
+        let config = ConnectionRetryConfig {
+            jitter_factor: 0.0, // disable jitter for deterministic test
+            ..ConnectionRetryConfig::default()
+        };
 
         // Attempt 0 = no backoff
         assert_eq!(config.calculate_backoff(0), Duration::ZERO);
@@ -622,6 +651,7 @@ mod tests {
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(5),
             backoff_multiplier: 10.0,
+            jitter_factor: 0.0, // disable jitter for deterministic test
         };
 
         // Attempt 2 would be 10 seconds, but capped at 5
@@ -635,6 +665,7 @@ mod tests {
             initial_backoff: Duration::from_millis(50),
             max_backoff: Duration::from_secs(5),
             backoff_multiplier: 3.0,
+            jitter_factor: 0.2,
         };
         let pool = ConnectionPool::with_retry_config(ConnectionConfig::default(), retry_config);
         assert_eq!(pool.retry_config.max_retries, 5);

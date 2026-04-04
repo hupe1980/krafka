@@ -75,6 +75,7 @@ use super::config::Acks;
 use super::idempotent::ProducerIdentity;
 use super::partitioner::{DefaultPartitioner, Partitioner};
 use super::record::{ProducerRecord, RecordMetadata};
+use super::retry::RetryPolicy;
 
 /// Transaction state machine states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -377,7 +378,7 @@ impl TransactionalProducer {
 
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         // Initialize producer ID
@@ -426,7 +427,7 @@ impl TransactionalProducer {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         let request = FindCoordinatorRequest::for_transaction(&self.config.transactional_id);
@@ -595,7 +596,7 @@ impl TransactionalProducer {
 
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         let producer_id = *self.producer_id.read().await;
@@ -643,90 +644,22 @@ impl TransactionalProducer {
         partition: PartitionId,
         record: ProducerRecord,
     ) -> Result<RecordMetadata> {
-        let max_retries: u32 = 3;
+        let retry_policy = RetryPolicy::default();
         let mut attempt: u32 = 0;
-        let mut backoff = Duration::from_millis(100);
-
-        loop {
-            let result = self.do_send_to_partition(topic, partition, &record).await;
-
-            match result {
-                Ok(metadata) => {
-                    // Acknowledge sequence on success
-                    let seq = self.identity.peek_sequence(topic, partition);
-                    if seq > 0 {
-                        self.identity.acknowledge(topic, partition, seq - 1);
-                    }
-                    return Ok(metadata);
-                }
-                Err(ref e) => {
-                    // Handle OutOfOrderSequenceNumber by resetting sequence
-                    if let KrafkaError::Broker { code, .. } = e
-                        && *code == crate::error::ErrorCode::OutOfOrderSequenceNumber
-                    {
-                        warn!(
-                            "OutOfOrderSequenceNumber for {}-{}, resetting sequence",
-                            topic, partition
-                        );
-                        self.identity.reset_sequence(topic, partition);
-                    }
-
-                    // Check for fatal errors
-                    if !e.is_retriable() {
-                        return result;
-                    }
-
-                    attempt += 1;
-                    if attempt > max_retries {
-                        return result;
-                    }
-
-                    debug!(
-                        topic = topic,
-                        partition = partition,
-                        attempt = attempt,
-                        "Transient error in txn send, retrying: {}",
-                        e
-                    );
-
-                    // Refresh metadata on leader errors
-                    if let Err(refresh_err) = self.metadata.refresh_for_topics(Some(&[topic])).await
-                    {
-                        debug!(error = %refresh_err, "Metadata refresh failed during txn retry");
-                    }
-
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
-                }
-            }
-        }
-    }
-
-    /// Single attempt to send a record to a partition (no retry).
-    async fn do_send_to_partition(
-        &self,
-        topic: &str,
-        partition: PartitionId,
-        record: &ProducerRecord,
-    ) -> Result<RecordMetadata> {
-        let conn = self
-            .metadata
-            .get_leader_connection(topic, partition)
-            .await?;
 
         let producer_id = *self.producer_id.read().await;
         let producer_epoch = *self.producer_epoch.read().await;
 
-        // Get next sequence number for this topic-partition
+        // Allocate the sequence number once — retries must resend the same
+        // sequence to maintain idempotent semantics.
         let sequence = self.next_sequence(topic, partition).await;
 
-        // Build record batch with transaction info (producer ID, epoch, sequence)
+        // Build the record batch and request once before entering the retry loop.
         let mut batch_builder = RecordBatchBuilder::new()
             .compression(self.config.compression)
             .producer(producer_id, producer_epoch, sequence)
             .transactional(true);
 
-        // Propagate user-supplied timestamp to the batch
         if let Some(ts) = record.timestamp {
             batch_builder = batch_builder.base_timestamp(ts);
         }
@@ -749,7 +682,6 @@ impl TransactionalProducer {
         let batch = batch_builder.build();
         let batch_bytes = batch.encode()?;
 
-        // Build produce request with transactional ID
         let request = ProduceRequest {
             transactional_id: Some(self.config.transactional_id.clone()),
             acks: Acks::All.to_i16(),
@@ -763,38 +695,75 @@ impl TransactionalProducer {
             }],
         };
 
-        let response = conn
-            .send_request(ApiKey::Produce, 3, |buf| request.encode_v3(buf))
-            .await?;
+        loop {
+            // Re-acquire connection on each attempt (leader may have moved).
+            let send_result: Result<RecordMetadata> = async {
+                let conn = self
+                    .metadata
+                    .get_leader_connection(topic, partition)
+                    .await?;
 
-        let mut buf = response;
-        let produce_response = ProduceResponse::decode_v2(&mut buf)?;
+                let response = conn
+                    .send_request(ApiKey::Produce, 3, |buf| request.encode_v3(buf))
+                    .await?;
 
-        for topic_response in &produce_response.responses {
-            for partition_response in &topic_response.partition_responses {
-                if partition_response.index == partition {
-                    if !partition_response.error_code.is_ok() {
-                        // Check for fatal errors
-                        if is_fatal_transaction_error(partition_response.error_code) {
-                            self.set_state(TransactionState::FatalError);
+                let mut buf = response;
+                let produce_response = ProduceResponse::decode_v2(&mut buf)?;
+
+                for topic_response in &produce_response.responses {
+                    for partition_response in &topic_response.partition_responses {
+                        if partition_response.index == partition {
+                            if !partition_response.error_code.is_ok() {
+                                if is_fatal_transaction_error(partition_response.error_code) {
+                                    self.set_state(TransactionState::FatalError);
+                                }
+                                return Err(KrafkaError::broker(
+                                    partition_response.error_code,
+                                    format!("produce failed for {topic}-{partition}"),
+                                ));
+                            }
+
+                            self.identity.acknowledge(topic, partition, sequence);
+                            return Ok(RecordMetadata {
+                                topic: topic.to_string(),
+                                partition,
+                                offset: partition_response.base_offset,
+                                timestamp: partition_response.log_append_time_ms,
+                            });
                         }
-                        return Err(KrafkaError::broker(
-                            partition_response.error_code,
-                            format!("produce failed for {topic}-{partition}"),
-                        ));
+                    }
+                }
+
+                Err(KrafkaError::protocol("partition not found in response"))
+            }
+            .await;
+
+            match send_result {
+                Ok(metadata) => return Ok(metadata),
+                Err(e) => {
+                    if !retry_policy.should_retry(&e, attempt) {
+                        return Err(e);
                     }
 
-                    return Ok(RecordMetadata {
-                        topic: topic.to_string(),
-                        partition,
-                        offset: partition_response.base_offset,
-                        timestamp: partition_response.log_append_time_ms,
-                    });
+                    attempt += 1;
+
+                    debug!(
+                        topic = topic,
+                        partition = partition,
+                        attempt = attempt,
+                        "Transient error in txn send, retrying: {}",
+                        e
+                    );
+
+                    if let Err(refresh_err) = self.metadata.refresh_for_topics(Some(&[topic])).await
+                    {
+                        debug!(error = %refresh_err, "Metadata refresh failed during txn retry");
+                    }
+
+                    tokio::time::sleep(retry_policy.calculate_backoff(attempt)).await;
                 }
             }
         }
-
-        Err(KrafkaError::protocol("partition not found in response"))
     }
 
     /// Send consumer offsets within the current transaction.
@@ -827,7 +796,7 @@ impl TransactionalProducer {
 
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         let producer_id = *self.producer_id.read().await;
@@ -905,7 +874,7 @@ impl TransactionalProducer {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         let request = FindCoordinatorRequest::for_group(group_id);
@@ -1032,7 +1001,7 @@ impl TransactionalProducer {
 
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         let producer_id = *self.producer_id.read().await;

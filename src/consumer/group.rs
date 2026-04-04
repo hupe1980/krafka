@@ -1172,7 +1172,7 @@ impl GroupCoordinator {
         // Try cached brokers first
         let brokers = self.metadata.brokers();
         for broker in brokers {
-            if let Ok(conn) = self.pool.get_connection(&broker.address()).await {
+            if let Ok(conn) = self.pool.get_connection(broker.address()).await {
                 return Ok(conn);
             }
         }
@@ -1956,7 +1956,7 @@ impl GroupCoordinator {
             }
         }
 
-        for leader_partitions in partitions_by_leader.values() {
+        for (leader_id, leader_partitions) in &partitions_by_leader {
             // Group partitions by topic
             let mut topics_map: HashMap<String, Vec<ListOffsetsRequestPartition>> = HashMap::new();
             for (topic, partition) in leader_partitions {
@@ -1984,12 +1984,8 @@ impl GroupCoordinator {
                 topics,
             };
 
-            // Get connection to this leader
-            let (topic_sample, partition_sample) = &leader_partitions[0];
-            let conn = self
-                .metadata
-                .get_leader_connection(topic_sample, *partition_sample)
-                .await?;
+            // Get connection to this leader directly by ID
+            let conn = self.metadata.get_broker_connection(*leader_id).await?;
 
             let response = conn
                 .send_request(ApiKey::ListOffsets, 2, |buf| request.encode_v2(buf))

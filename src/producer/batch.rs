@@ -52,18 +52,20 @@ impl ProducerBatch {
 
     /// Try to add a record to the batch.
     ///
-    /// Returns `false` if the batch is full.
+    /// Returns `Ok(())` on success. Returns `Err(record)` if the batch is full,
+    /// giving back ownership of the record so callers avoid a clone.
     #[inline]
-    pub fn try_add(&mut self, record: ProducerRecord) -> bool {
+    #[allow(clippy::result_large_err)]
+    pub fn try_add(&mut self, record: ProducerRecord) -> Result<(), ProducerRecord> {
         let record_size = record.estimated_size();
 
         if !self.records.is_empty() && self.size + record_size > self.max_size {
-            return false;
+            return Err(record);
         }
 
         self.size += record_size;
         self.records.push(BatchRecord { record });
-        true
+        Ok(())
     }
 
     /// Check if the batch is empty.
@@ -144,7 +146,7 @@ mod tests {
         let mut batch = ProducerBatch::new("test".to_string(), 0, 1024, Compression::None);
 
         let record = ProducerRecord::new("test", b"hello".to_vec());
-        assert!(batch.try_add(record));
+        assert!(batch.try_add(record).is_ok());
 
         assert!(!batch.is_empty());
         assert_eq!(batch.len(), 1);
@@ -158,23 +160,23 @@ mod tests {
 
         // First record should fit (~70 bytes estimated)
         let record1 = ProducerRecord::new("test", vec![0u8; 20]);
-        assert!(batch.try_add(record1));
+        assert!(batch.try_add(record1).is_ok());
 
         // Second record should fit (~140 bytes total)
         let record2 = ProducerRecord::new("test", vec![0u8; 20]);
-        assert!(batch.try_add(record2));
+        assert!(batch.try_add(record2).is_ok());
 
         // Third record should not fit (~210 bytes total > max_size of 200)
         let record3 = ProducerRecord::new("test", vec![0u8; 20]);
-        assert!(!batch.try_add(record3));
+        assert!(batch.try_add(record3).is_err());
     }
 
     #[test]
     fn test_batch_drain() {
         let mut batch = ProducerBatch::new("test".to_string(), 0, 1024, Compression::None);
 
-        batch.try_add(ProducerRecord::new("test", b"hello".to_vec()));
-        batch.try_add(ProducerRecord::new("test", b"world".to_vec()));
+        let _ = batch.try_add(ProducerRecord::new("test", b"hello".to_vec()));
+        let _ = batch.try_add(ProducerRecord::new("test", b"world".to_vec()));
 
         let records = batch.drain();
         assert_eq!(records.len(), 2);
@@ -185,7 +187,8 @@ mod tests {
     fn test_batch_build() {
         let mut batch = ProducerBatch::new("test".to_string(), 0, 1024, Compression::None);
 
-        batch.try_add(ProducerRecord::new("test", b"value".to_vec()).with_key(b"key".to_vec()));
+        let _ =
+            batch.try_add(ProducerRecord::new("test", b"value".to_vec()).with_key(b"key".to_vec()));
 
         let record_batch = batch.build();
         assert_eq!(record_batch.records.len(), 1);
@@ -199,7 +202,7 @@ mod tests {
             .with_key(b"key".to_vec())
             .with_header("trace-id", b"abc123")
             .with_header("content-type", b"application/json");
-        batch.try_add(record);
+        let _ = batch.try_add(record);
 
         let record_batch = batch.build();
         assert_eq!(record_batch.records.len(), 1);

@@ -1281,7 +1281,7 @@ impl Consumer {
             };
             let conn = match self
                 .pool
-                .get_connection_by_id(leader_id, &broker_info.address())
+                .get_connection_by_id(leader_id, broker_info.address())
                 .await
             {
                 Ok(c) => c,
@@ -1748,7 +1748,7 @@ impl Consumer {
             .ok_or_else(|| KrafkaError::invalid_state(format!("broker {} not found", broker_id)))?;
         let conn = self
             .pool
-            .get_connection_by_id(broker_id, &broker.address())
+            .get_connection_by_id(broker_id, broker.address())
             .await?;
 
         // Group by topic for the request structure
@@ -1760,24 +1760,24 @@ impl Consumer {
                 .push(*partition);
         }
 
-        // Build fetch request with all topic-partitions
+        // Build fetch request with all topic-partitions.
+        // Acquire the offsets read lock once for the entire build instead of
+        // per-partition to reduce lock acquire/release overhead.
+        let offsets_snapshot = self.offsets.read().await;
         let mut fetch_topics = Vec::with_capacity(topics_map.len());
         for (topic, partitions) in &topics_map {
             let mut fetch_partitions = Vec::with_capacity(partitions.len());
             for &partition in partitions {
                 // Skip partitions with no tracked offset rather than
                 // defaulting to 0, which defeats the auto_offset_reset fix.
-                let offset = {
-                    let offsets = self.offsets.read().await;
-                    match offsets.get(&(topic.clone(), partition)).copied() {
-                        Some(o) => o,
-                        None => {
-                            warn!(
-                                "No offset for {}-{}, skipping fetch (will retry offset resolution)",
-                                topic, partition
-                            );
-                            continue;
-                        }
+                let offset = match offsets_snapshot.get(&(topic.clone(), partition)).copied() {
+                    Some(o) => o,
+                    None => {
+                        warn!(
+                            "No offset for {}-{}, skipping fetch (will retry offset resolution)",
+                            topic, partition
+                        );
+                        continue;
                     }
                 };
                 // Get leader epoch from metadata for fencing stale reads
@@ -1796,6 +1796,8 @@ impl Consumer {
                 partitions: fetch_partitions,
             });
         }
+        // Drop the read lock before the network call.
+        drop(offsets_snapshot);
 
         // Negotiate fetch API version — prefer v11 (KIP-392 closest-replica
         // fetching), fall back through v7 (sessions) to v4.
@@ -2224,7 +2226,7 @@ impl Consumer {
 
         let conn = self
             .pool
-            .get_connection_by_id(leader_id, &broker.address())
+            .get_connection_by_id(leader_id, broker.address())
             .await?;
 
         let request = OffsetForLeaderEpochRequest {
@@ -2329,8 +2331,10 @@ impl Consumer {
             match self.poll(Duration::from_secs(1)).await {
                 Ok(records) if !records.is_empty() => {
                     let mut iter = records.into_iter();
-                    // SAFETY: `!records.is_empty()` guard above guarantees at least one element
-                    let first = iter.next().unwrap();
+                    // Infallible: `!records.is_empty()` guard above guarantees ≥1 element.
+                    let first = iter
+                        .next()
+                        .expect("non-empty ConsumerRecords yields at least one element");
                     // Buffer any remaining records for subsequent recv() calls
                     if iter.len() > 0 {
                         let mut buffer = self.recv_buffer.write().await;

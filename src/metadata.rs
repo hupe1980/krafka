@@ -34,12 +34,27 @@ pub struct BrokerInfo {
     pub port: i32,
     /// Broker rack (optional).
     pub rack: Option<String>,
+    /// Cached `host:port` address string.
+    address: String,
 }
 
 impl BrokerInfo {
-    /// Get the broker address as host:port.
-    pub fn address(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+    /// Create a new `BrokerInfo`.
+    pub fn new(id: BrokerId, host: String, port: i32, rack: Option<String>) -> Self {
+        let address = format!("{host}:{port}");
+        Self {
+            id,
+            host,
+            port,
+            rack,
+            address,
+        }
+    }
+
+    /// Get the broker address as `host:port`.
+    #[inline]
+    pub fn address(&self) -> &str {
+        &self.address
     }
 }
 
@@ -250,7 +265,7 @@ impl ClusterMetadata {
         // Try to use a cached broker first
         let cache = self.cache.load();
         for broker in cache.brokers.values() {
-            if let Ok(conn) = self.pool.get_connection(&broker.address()).await {
+            if let Ok(conn) = self.pool.get_connection(broker.address()).await {
                 return Ok(conn);
             }
         }
@@ -290,12 +305,7 @@ impl ClusterMetadata {
         for broker in response.brokers {
             brokers.insert(
                 broker.node_id,
-                BrokerInfo {
-                    id: broker.node_id,
-                    host: broker.host,
-                    port: broker.port,
-                    rack: broker.rack,
-                },
+                BrokerInfo::new(broker.node_id, broker.host, broker.port, broker.rack),
             );
         }
 
@@ -441,7 +451,23 @@ impl ClusterMetadata {
             .ok_or_else(|| KrafkaError::invalid_state(format!("broker {} not found", leader_id)))?;
 
         self.pool
-            .get_connection_by_id(leader_id, &broker.address())
+            .get_connection_by_id(leader_id, broker.address())
+            .await
+    }
+
+    /// Get a connection to a specific broker by ID.
+    pub async fn get_broker_connection(
+        &self,
+        broker_id: BrokerId,
+    ) -> Result<Arc<BrokerConnection>> {
+        let cache = self.cache.load();
+        let broker = cache
+            .brokers
+            .get(&broker_id)
+            .ok_or_else(|| KrafkaError::invalid_state(format!("broker {} not found", broker_id)))?;
+
+        self.pool
+            .get_connection_by_id(broker_id, broker.address())
             .await
     }
 
@@ -477,12 +503,7 @@ mod tests {
 
     #[test]
     fn test_broker_info_address() {
-        let broker = BrokerInfo {
-            id: 1,
-            host: "localhost".to_string(),
-            port: 9092,
-            rack: None,
-        };
+        let broker = BrokerInfo::new(1, "localhost".to_string(), 9092, None);
         assert_eq!(broker.address(), "localhost:9092");
     }
 
@@ -538,12 +559,12 @@ mod tests {
 
     #[test]
     fn test_broker_info_with_rack() {
-        let broker = BrokerInfo {
-            id: 1,
-            host: "broker1.kafka.local".to_string(),
-            port: 9093,
-            rack: Some("us-east-1a".to_string()),
-        };
+        let broker = BrokerInfo::new(
+            1,
+            "broker1.kafka.local".to_string(),
+            9093,
+            Some("us-east-1a".to_string()),
+        );
         assert_eq!(broker.address(), "broker1.kafka.local:9093");
         assert_eq!(broker.rack.as_deref(), Some("us-east-1a"));
     }

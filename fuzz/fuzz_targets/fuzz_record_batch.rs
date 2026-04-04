@@ -14,7 +14,8 @@ fuzz_target!(|data: &[u8]| {
     let mut buf = Bytes::copy_from_slice(data);
 
     // Fuzz RecordBatch::decode
-    let _ = RecordBatch::decode(&mut buf.clone());
+    let mut record_batch_buf = buf.clone();
+    let _ = RecordBatch::decode(&mut record_batch_buf);
 
     // Fuzz LazyRecordBatch::decode
     if let Ok(lazy) = LazyRecordBatch::decode(&mut buf) {

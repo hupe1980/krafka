@@ -430,54 +430,64 @@ impl RecordAccumulator {
             )
         });
 
-        // Try to add to current batch
+        // Try to add to current batch. try_add returns Err(record) on
+        // full batch, giving ownership back to avoid an extra clone.
         let offset = accumulator_batch.batch.len() as i64;
-        if accumulator_batch.batch.try_add(record.clone()) {
-            accumulator_batch.pending.push(PendingRecord {
-                record,
-                response_tx,
-                offset_in_batch: offset,
-                estimated_size: record_size,
-            });
-
-            // Check if batch is full
-            if accumulator_batch.batch.is_full() {
-                trace!("Batch full for {}-{}, flushing", topic, partition);
-                self.flush_batch(&key).await;
-            } else if self.config.linger.is_zero() {
-                // linger=0 means send immediately without waiting
-                // for the next linger timer tick (up to 1ms delay otherwise).
-                trace!("Linger=0 for {}-{}, flushing immediately", topic, partition);
-                self.flush_batch(&key).await;
-            }
-        } else {
-            // Batch is full, flush it first and then add to new batch
-            self.flush_batch(&key).await;
-
-            // Create new batch and add record
-            let mut new_batch = AccumulatorBatch::new(
-                topic.clone(),
-                partition,
-                self.config.batch_size,
-                self.config.compression,
-            );
-
-            if new_batch.batch.try_add(record.clone()) {
-                new_batch.pending.push(PendingRecord {
-                    record,
+        let pending_record = record.clone();
+        match accumulator_batch.batch.try_add(record) {
+            Ok(()) => {
+                accumulator_batch.pending.push(PendingRecord {
+                    record: pending_record,
                     response_tx,
-                    offset_in_batch: 0,
+                    offset_in_batch: offset,
                     estimated_size: record_size,
                 });
-                self.batches.insert(key, new_batch);
-            } else {
-                // Record too large for batch - free the memory we reserved
-                self.memory_used = self.memory_used.saturating_sub(record_size);
-                // Wake any tasks waiting for buffer memory so they can make progress.
-                self.memory_freed.notify_waiters();
-                let _ = response_tx.send(AppendResponse::Done(Err(KrafkaError::config(
-                    "record too large for batch size",
-                ))));
+
+                // Check if batch is full
+                if accumulator_batch.batch.is_full() {
+                    trace!("Batch full for {}-{}, flushing", topic, partition);
+                    self.flush_batch(&key).await;
+                } else if self.config.linger.is_zero() {
+                    // linger=0 means send immediately without waiting
+                    // for the next linger timer tick (up to 1ms delay otherwise).
+                    trace!("Linger=0 for {}-{}, flushing immediately", topic, partition);
+                    self.flush_batch(&key).await;
+                }
+            }
+            Err(record) => {
+                // Batch is full, flush it first and then add to new batch
+                self.flush_batch(&key).await;
+
+                // Create new batch and add record — no clone needed since
+                // try_add returned ownership on failure.
+                let mut new_batch = AccumulatorBatch::new(
+                    topic.clone(),
+                    partition,
+                    self.config.batch_size,
+                    self.config.compression,
+                );
+
+                let pending_record = record.clone();
+                match new_batch.batch.try_add(record) {
+                    Ok(()) => {
+                        new_batch.pending.push(PendingRecord {
+                            record: pending_record,
+                            response_tx,
+                            offset_in_batch: 0,
+                            estimated_size: record_size,
+                        });
+                        self.batches.insert(key, new_batch);
+                    }
+                    Err(_) => {
+                        // Record too large for batch - free the memory we reserved
+                        self.memory_used = self.memory_used.saturating_sub(record_size);
+                        // Wake any tasks waiting for buffer memory so they can make progress.
+                        self.memory_freed.notify_waiters();
+                        let _ = response_tx.send(AppendResponse::Done(Err(KrafkaError::config(
+                            "record too large for batch size",
+                        ))));
+                    }
+                }
             }
         }
     }
