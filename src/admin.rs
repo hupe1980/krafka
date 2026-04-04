@@ -450,6 +450,8 @@ pub struct AdminClient {
     metadata: Arc<ClusterMetadata>,
     /// Connection pool.
     pool: Arc<ConnectionPool>,
+    /// Whether the client has been closed.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl AdminClient {
@@ -1691,6 +1693,19 @@ impl AdminClient {
     pub fn pool(&self) -> &Arc<ConnectionPool> {
         &self.pool
     }
+
+    /// Close the admin client.
+    pub async fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.pool.close_all().await;
+        info!("AdminClient closed");
+    }
+
+    /// Check if the admin client is closed.
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// Description of a Kafka cluster.
@@ -1824,6 +1839,7 @@ impl AdminClientBuilder {
             config: self.config,
             metadata,
             pool,
+            closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }

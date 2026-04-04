@@ -977,7 +977,8 @@ impl LazyRecordBatch {
     ///
     /// This is equivalent to `records().collect()` but with proper error handling.
     pub fn decode_all(&self) -> Result<Vec<Record>> {
-        let mut records = Vec::with_capacity(self.records_count as usize);
+        let mut records =
+            Vec::with_capacity((self.records_count as usize).min(super::MAX_DECODE_ARRAY_LEN));
         for result in self.records() {
             records.push(result?);
         }

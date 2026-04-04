@@ -1,6 +1,6 @@
 # Fuzz Testing for Krafka
 
-This directory contains fuzz testing targets for the krafka protocol layer
+This directory contains fuzz testing targets for the Krafka protocol layer
 using [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) (libFuzzer).
 
 ## Prerequisites

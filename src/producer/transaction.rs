@@ -1097,6 +1097,14 @@ impl TransactionalProducer {
             self.config.transactional_id
         );
     }
+
+    /// Check if the transactional producer has been closed.
+    ///
+    /// A closed producer is in `FatalError` state and cannot be used again.
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.state() == TransactionState::FatalError
+    }
 }
 
 /// Check if an error code is a fatal transaction error.

@@ -89,7 +89,7 @@ pub(crate) fn array_len_i32(len: usize) -> Result<i32> {
 pub(crate) fn check_decode_array_len(len: i32) -> Result<usize> {
     if len < 0 {
         return Err(KrafkaError::protocol(format!(
-            "negative array length {len} in decode"
+            "negative array length {len} in decode (use check_decode_nullable_array_len for fields where -1 means null)"
         )));
     }
     let len = len as usize;

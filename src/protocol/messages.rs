@@ -1121,7 +1121,7 @@ impl FetchResponse {
                 let high_watermark = i64::decode(buf)?;
                 let last_stable_offset = i64::decode(buf)?;
                 let aborted_tx_count = check_decode_nullable_array_len(i32::decode(buf)?)?;
-                let mut aborted_transactions = Vec::new();
+                let mut aborted_transactions = Vec::with_capacity(aborted_tx_count);
                 for _ in 0..aborted_tx_count {
                     aborted_transactions.push(AbortedTransaction {
                         producer_id: i64::decode(buf)?,
@@ -1185,7 +1185,7 @@ impl FetchResponse {
                 let last_stable_offset = i64::decode(buf)?;
                 let log_start_offset = i64::decode(buf)?;
                 let aborted_tx_count = check_decode_nullable_array_len(i32::decode(buf)?)?;
-                let mut aborted_transactions = Vec::new();
+                let mut aborted_transactions = Vec::with_capacity(aborted_tx_count);
                 for _ in 0..aborted_tx_count {
                     aborted_transactions.push(AbortedTransaction {
                         producer_id: i64::decode(buf)?,
