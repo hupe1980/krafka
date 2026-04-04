@@ -68,7 +68,7 @@ use crate::protocol::{
     AddPartitionsToTxnResponse, ApiKey, Compression, EndTxnRequest, EndTxnResponse,
     FindCoordinatorRequest, FindCoordinatorResponse, InitProducerIdRequest, InitProducerIdResponse,
     ProducePartitionData, ProduceRequest, ProduceResponse, ProduceTopicData, RecordBatchBuilder,
-    TxnOffsetCommitRequest, TxnOffsetCommitResponse,
+    TxnOffsetCommitRequest, TxnOffsetCommitResponse, VersionedDecode,
 };
 
 use super::config::Acks;
@@ -303,6 +303,8 @@ pub struct TransactionalProducer {
     txn_partitions: Arc<RwLock<TransactionPartitions>>,
     /// Sequence number tracking for idempotent production.
     identity: ProducerIdentity,
+    /// Retry policy for transient failures.
+    retry_policy: RetryPolicy,
     /// Explicit closed flag, separate from transaction state.
     closed: AtomicBool,
 }
@@ -647,7 +649,7 @@ impl TransactionalProducer {
         partition: PartitionId,
         record: ProducerRecord,
     ) -> Result<RecordMetadata> {
-        let retry_policy = RetryPolicy::default();
+        let retry_policy = &self.retry_policy;
         let mut attempt: u32 = 0;
 
         let producer_id = *self.producer_id.read().await;
@@ -675,12 +677,29 @@ impl TransactionalProducer {
                     .get_leader_connection(topic, partition)
                     .await?;
 
+                // Transactions require Produce v3 (transactional_id field).
+                let version = conn
+                    .negotiate_api_version_max(ApiKey::Produce, 3)
+                    .await
+                    .ok_or_else(|| {
+                        KrafkaError::protocol(
+                            "no mutually supported Produce API version; \
+                             transactional produce requires v3+",
+                        )
+                    })?;
+                if version < 3 {
+                    return Err(KrafkaError::protocol(
+                        "broker does not support Produce v3+; \
+                         transactional produce requires the transactional_id field (v3+)",
+                    ));
+                }
+
                 let response = conn
-                    .send_request(ApiKey::Produce, 3, |buf| request.encode_v3(buf))
+                    .send_request(ApiKey::Produce, version, |buf| request.encode_v3(buf))
                     .await?;
 
                 let mut buf = response;
-                let produce_response = ProduceResponse::decode_v2(&mut buf)?;
+                let produce_response = ProduceResponse::decode_versioned(version, &mut buf)?;
 
                 for topic_response in &produce_response.responses {
                     for partition_response in &topic_response.partition_responses {
@@ -1287,6 +1306,7 @@ impl TransactionalProducerBuilder {
             coordinator_id: RwLock::new(None),
             txn_partitions: Arc::new(RwLock::new(TransactionPartitions::default())),
             identity: ProducerIdentity::new(),
+            retry_policy: RetryPolicy::default(),
             closed: AtomicBool::new(false),
         })
     }

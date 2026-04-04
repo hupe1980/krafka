@@ -72,7 +72,7 @@ impl ProducerBatch {
     /// the same value is used for both the fit check and subsequent
     /// [`Self::track`] call.
     #[inline]
-    pub fn would_fit(&self, record_size: usize) -> bool {
+    pub(crate) fn would_fit(&self, record_size: usize) -> bool {
         self.is_empty() || self.size + record_size <= self.max_size
     }
 
@@ -82,7 +82,7 @@ impl ProducerBatch {
     /// separately (e.g., in `PendingRecord`). Increments `len()`, `size()`,
     /// and `is_full()` as if the record were added.
     #[inline]
-    pub fn track(&mut self, record_size: usize) {
+    pub(crate) fn track(&mut self, record_size: usize) {
         self.size += record_size;
         self.tracked_count += 1;
     }
