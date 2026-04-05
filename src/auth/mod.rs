@@ -631,12 +631,19 @@ impl AuthConfig {
         }
     }
 
-    /// If this config has an OAUTHBEARER provider, call it to obtain a fresh
-    /// token and return a new `AuthConfig` with the token set and the provider
-    /// cleared. Otherwise, return `None` (the caller should use `self` as-is).
-    pub(crate) async fn resolve_provider_to_token(
-        &self,
-    ) -> crate::error::Result<Option<AuthConfig>> {
+    /// If this config has an OAUTHBEARER provider, resolve a fresh token
+    /// and return a new `AuthConfig` with the token set and the provider
+    /// cleared. Returns `None` if no provider is configured (the caller
+    /// should use `self` as-is).
+    ///
+    /// This must be called before passing a provider-based config to
+    /// [`SaslAuthenticator::new()`](crate::network::SaslAuthenticator::new),
+    /// which requires a resolved token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provider fails to fetch a token.
+    pub async fn resolve_provider_to_token(&self) -> crate::error::Result<Option<AuthConfig>> {
         if self.sasl_mechanism == Some(SaslMechanism::OAuthBearer)
             && let Some(ref provider) = self.oauthbearer_provider
         {

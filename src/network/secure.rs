@@ -175,6 +175,11 @@ pub struct SaslAuthenticator {
 impl SaslAuthenticator {
     /// Create a new SASL authenticator from auth config.
     ///
+    /// For OAUTHBEARER with a token provider, call
+    /// [`AuthConfig::resolve_provider_to_token()`] first and pass the
+    /// resolved config. Provider-based configs without a resolved token
+    /// return `None`.
+    ///
     /// For MSK IAM, you must provide the broker host after creation using `set_msk_host()`.
     pub fn new(auth: &AuthConfig) -> Option<Self> {
         let mechanism = auth.sasl_mechanism.as_ref()?;

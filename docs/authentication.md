@@ -680,6 +680,23 @@ if authenticator.is_complete() {
 }
 ```
 
+When using OAUTHBEARER with a token provider, resolve the provider before
+creating the authenticator:
+
+```rust
+use krafka::network::SaslAuthenticator;
+use krafka::auth::{AuthConfig, OAuthBearerToken};
+
+let auth = AuthConfig::sasl_oauthbearer_provider(|| async {
+    Ok(OAuthBearerToken::new("fresh-jwt"))
+});
+
+// Resolve the provider to get a config with the token set
+let resolved = auth.resolve_provider_to_token().await?;
+let auth = resolved.as_ref().unwrap_or(&auth);
+let mut authenticator = SaslAuthenticator::new(auth).unwrap();
+```
+
 ## Example: Production Configuration
 
 ```rust
