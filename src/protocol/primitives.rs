@@ -589,19 +589,38 @@ impl<T> From<Vec<T>> for KafkaArray<T> {
 // SAFETY: All internal call sites use `TryEncode::try_encode()` instead.
 // This `Encode` impl exists for trait-bound compatibility; the `.expect()`
 // triggers only if external code calls `.encode()` on an oversized array.
-impl<T: Encode + TryEncode> Encode for KafkaArray<T> {
+impl<T: Encode> Encode for KafkaArray<T> {
     fn encode(&self, buf: &mut impl BufMut) {
-        self.try_encode(buf)
-            .expect("KafkaArray exceeds protocol size limit; validate before encoding");
+        match &self.0 {
+            None => buf.put_i32(-1),
+            Some(items) => {
+                let len = i32::try_from(items.len())
+                    .expect("KafkaArray exceeds protocol size limit; validate before encoding");
+                buf.put_i32(len);
+                for item in items {
+                    item.encode(buf);
+                }
+            }
+        }
     }
 
     fn encode_compact(&self, buf: &mut impl BufMut) {
-        self.try_encode_compact(buf)
-            .expect("compact KafkaArray exceeds protocol size limit; validate before encoding");
+        match &self.0 {
+            None => varint::encode_unsigned_varint(0, buf),
+            Some(items) => {
+                let len_plus_one = u32::try_from(items.len().saturating_add(1)).expect(
+                    "compact KafkaArray exceeds protocol size limit; validate before encoding",
+                );
+                varint::encode_unsigned_varint(len_plus_one, buf);
+                for item in items {
+                    item.encode_compact(buf);
+                }
+            }
+        }
     }
 }
 
-impl<T: Encode + TryEncode> TryEncode for KafkaArray<T> {
+impl<T: TryEncode> TryEncode for KafkaArray<T> {
     fn try_encode(&self, buf: &mut impl BufMut) -> Result<()> {
         match &self.0 {
             None => buf.put_i32(-1),

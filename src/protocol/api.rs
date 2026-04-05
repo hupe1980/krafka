@@ -6,7 +6,6 @@ use bytes::{Buf, BufMut};
 
 use super::primitives::{Decode, Encode, KafkaArray, KafkaString, TaggedFields, TryEncode};
 use crate::error::Result;
-use crate::util::varint;
 
 /// Kafka API keys.
 ///
@@ -510,7 +509,7 @@ impl Encode for ApiVersionRange {
     fn encode_compact(&self, buf: &mut impl BufMut) {
         self.encode(buf);
         // Empty tagged fields for flexible versions.
-        varint::encode_unsigned_varint(0, buf);
+        TaggedFields::default().encode(buf);
     }
 }
 
