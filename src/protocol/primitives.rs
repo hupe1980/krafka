@@ -310,8 +310,13 @@ impl TryEncode for KafkaString {
 impl Decode for KafkaString {
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         let len = i16::decode(buf)?;
-        if len < 0 {
+        if len == -1 {
             return Ok(Self(None));
+        }
+        if len < 0 {
+            return Err(KrafkaError::protocol(format!(
+                "invalid negative string length {len} (only -1 is valid for null)"
+            )));
         }
 
         let len = len as usize;
@@ -321,7 +326,7 @@ impl Decode for KafkaString {
 
         let bytes = buf.copy_to_bytes(len);
         let s = String::from_utf8(bytes.to_vec())
-            .map_err(|e| KrafkaError::protocol(format!("invalid UTF-8 string: {}", e)))?;
+            .map_err(|e| KrafkaError::protocol(format!("invalid UTF-8 string: {e}")))?;
         Ok(Self(Some(s)))
     }
 
@@ -338,7 +343,7 @@ impl Decode for KafkaString {
 
         let bytes = buf.copy_to_bytes(len);
         let s = String::from_utf8(bytes.to_vec())
-            .map_err(|e| KrafkaError::protocol(format!("invalid UTF-8 string: {}", e)))?;
+            .map_err(|e| KrafkaError::protocol(format!("invalid UTF-8 string: {e}")))?;
         Ok(Self(Some(s)))
     }
 }
@@ -442,8 +447,13 @@ impl TryEncode for KafkaBytes {
 impl Decode for KafkaBytes {
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         let len = i32::decode(buf)?;
-        if len < 0 {
+        if len == -1 {
             return Ok(Self(None));
+        }
+        if len < 0 {
+            return Err(KrafkaError::protocol(format!(
+                "invalid negative bytes length {len} (only -1 is valid for null)"
+            )));
         }
 
         let len = len as usize;
@@ -593,12 +603,23 @@ impl<T: Encode + TryEncode> TryEncode for KafkaArray<T> {
 impl<T: Decode> Decode for KafkaArray<T> {
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         let len = i32::decode(buf)?;
-        if len < 0 {
+        if len == -1 {
             return Ok(Self(None));
+        }
+        if len < 0 {
+            return Err(crate::error::KrafkaError::protocol(format!(
+                "invalid negative array length {len} (only -1 is valid for null)"
+            )));
         }
 
         let len = len as usize;
-        let mut items = Vec::with_capacity(len.min(10_000));
+        if len > super::MAX_DECODE_ARRAY_LEN {
+            return Err(crate::error::KrafkaError::protocol(format!(
+                "array length {len} exceeds safety limit {}",
+                super::MAX_DECODE_ARRAY_LEN
+            )));
+        }
+        let mut items = Vec::with_capacity(len);
         for _ in 0..len {
             items.push(T::decode(buf)?);
         }
@@ -612,7 +633,13 @@ impl<T: Decode> Decode for KafkaArray<T> {
         }
 
         let len = (len - 1) as usize;
-        let mut items = Vec::with_capacity(len.min(10_000));
+        if len > super::MAX_DECODE_ARRAY_LEN {
+            return Err(crate::error::KrafkaError::protocol(format!(
+                "array length {len} exceeds safety limit {}",
+                super::MAX_DECODE_ARRAY_LEN
+            )));
+        }
+        let mut items = Vec::with_capacity(len);
         for _ in 0..len {
             items.push(T::decode_compact(buf)?);
         }
@@ -666,8 +693,14 @@ impl TryEncode for TaggedFields {
 
 impl Decode for TaggedFields {
     fn decode(buf: &mut impl Buf) -> Result<Self> {
-        let count = varint::decode_unsigned_varint(buf)?;
-        let mut fields = Vec::with_capacity((count as usize).min(10_000));
+        let count = varint::decode_unsigned_varint(buf)? as usize;
+        if count > super::MAX_DECODE_ARRAY_LEN {
+            return Err(KrafkaError::protocol(format!(
+                "tagged fields count {count} exceeds safety limit {}",
+                super::MAX_DECODE_ARRAY_LEN
+            )));
+        }
+        let mut fields = Vec::with_capacity(count);
 
         for _ in 0..count {
             let tag = varint::decode_unsigned_varint(buf)?;
@@ -886,5 +919,52 @@ mod tests {
         let mut buf = BytesMut::new();
         assert!(fields.try_encode(&mut buf).is_ok());
         assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_tagged_fields_decode_rejects_oversized_count() {
+        use super::varint;
+        let mut buf = BytesMut::new();
+        // Encode a tagged-field count that exceeds the safety limit
+        varint::encode_unsigned_varint(100_001, &mut buf);
+        let result = TaggedFields::decode(&mut buf.freeze());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds safety limit"),
+            "expected safety limit error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_kafka_array_decode_rejects_oversized_len() {
+        // Array declaring length > MAX_DECODE_ARRAY_LEN must be rejected
+        let mut buf = BytesMut::new();
+        buf.put_i32(100_001); // exceeds limit
+        let result = KafkaArray::<i32>::decode(&mut buf.freeze());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("exceeds safety limit"), "got: {err}");
+    }
+
+    #[test]
+    fn test_kafka_array_decode_negative_is_null() {
+        // Negative length means null array (not an error)
+        let mut buf = BytesMut::new();
+        buf.put_i32(-1);
+        let arr = KafkaArray::<i32>::decode(&mut buf.freeze()).unwrap();
+        assert!(arr.0.is_none());
+    }
+
+    #[test]
+    fn test_kafka_array_decode_compact_rejects_oversized_len() {
+        use super::varint;
+        let mut buf = BytesMut::new();
+        // compact length is len+1, so 100_002 means 100_001 elements
+        varint::encode_unsigned_varint(100_002, &mut buf);
+        let result = KafkaArray::<i32>::decode_compact(&mut buf.freeze());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("exceeds safety limit"), "got: {err}");
     }
 }

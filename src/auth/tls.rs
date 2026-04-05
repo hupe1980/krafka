@@ -12,13 +12,24 @@ use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
+use rustls::client::WantsClientCert;
+#[cfg(feature = "danger-insecure-tls")]
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+#[cfg(feature = "danger-insecure-tls")]
+use rustls::crypto::CryptoProvider;
+#[cfg(feature = "danger-insecure-tls")]
+use rustls::pki_types::UnixTime;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::{ClientConfig, RootCertStore};
+use rustls::{ClientConfig, ConfigBuilder, RootCertStore};
+#[cfg(feature = "danger-insecure-tls")]
+use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use rustls_pemfile::{certs, private_key};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
+#[cfg(feature = "danger-insecure-tls")]
+use tracing::warn;
 
 use crate::auth::TlsConfig;
 use crate::error::{KrafkaError, Result};
@@ -83,53 +94,38 @@ impl AsyncWrite for MaybeSecureStream {
 
 /// Build a rustls ClientConfig from TlsConfig.
 ///
+/// When `verify_server_cert` is `false`, certificate verification is skipped
+/// entirely. This is useful for local development with self-signed certificates
+/// but **must not** be used in production — it exposes the connection to
+/// man-in-the-middle attacks.
+///
 /// # Errors
 ///
-/// Returns an error if `verify_server_cert` is `false`, as insecure mode
-/// is not supported. TLS without verification defeats the purpose of TLS.
+/// Returns an error if certificate/key files cannot be read or parsed.
 pub fn build_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
-    // Reject insecure mode - verification cannot be disabled
     if !config.verify_server_cert {
-        return Err(KrafkaError::config(
-            "Insecure TLS mode (verify_server_cert=false) is not supported. \
-             TLS without certificate verification is unsafe and defeats the purpose of TLS. \
-             If you need to use a self-signed certificate, provide it via ca_cert_path instead.",
-        ));
-    }
-
-    let mut root_store = RootCertStore::empty();
-
-    // Load CA certificates
-    if let Some(ca_path) = &config.ca_cert_path {
-        let ca_certs = load_certs(ca_path)?;
-        for cert in ca_certs {
-            root_store
-                .add(cert)
-                .map_err(|e| KrafkaError::config(format!("Failed to add CA cert: {}", e)))?;
+        #[cfg(feature = "danger-insecure-tls")]
+        {
+            warn!(
+                "TLS certificate verification is disabled (verify_server_cert=false). \
+                 This is insecure and should only be used for local development."
+            );
+            return build_insecure_tls_config(config);
         }
-    } else {
-        // Use webpki-roots for default trust anchors
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        #[cfg(not(feature = "danger-insecure-tls"))]
+        {
+            return Err(KrafkaError::config(
+                "Insecure TLS mode (verify_server_cert=false) requires the \
+                 'danger-insecure-tls' crate feature. If you need self-signed certificates, \
+                 provide the CA certificate via TlsConfig::with_ca_cert() instead.",
+            ));
+        }
     }
 
+    let root_store = load_root_store(config)?;
     let builder = ClientConfig::builder().with_root_certificates(root_store);
-
-    let client_config = if let (Some(cert_path), Some(key_path)) =
-        (&config.client_cert_path, &config.client_key_path)
-    {
-        // mTLS: client certificate authentication
-        let client_certs = load_certs(cert_path)?;
-        let client_key = load_private_key(key_path)?;
-
-        builder
-            .with_client_auth_cert(client_certs, client_key)
-            .map_err(|e| KrafkaError::config(format!("Failed to set client auth: {}", e)))?
-    } else {
-        // No client certificate
-        builder.with_no_client_auth()
-    };
-
-    Ok(client_config)
+    let client_auth = load_client_auth(config)?;
+    finish_with_client_auth(builder, client_auth)
 }
 
 /// Create a TLS connector from TlsConfig.
@@ -158,12 +154,12 @@ pub async fn connect_tls(
     let host = crate::util::extract_sni_hostname(sni_hostname)?.to_string();
 
     let server_name = ServerName::try_from(host)
-        .map_err(|e| KrafkaError::config(format!("Invalid server name: {}", e)))?;
+        .map_err(|e| KrafkaError::config(format!("Invalid server name: {e}")))?;
 
     connector
         .connect(server_name, stream)
         .await
-        .map_err(|e| KrafkaError::auth(format!("TLS handshake failed: {}", e)))
+        .map_err(|e| KrafkaError::auth(format!("TLS handshake failed: {e}")))
 }
 
 /// Load certificates from a PEM file synchronously.
@@ -172,11 +168,11 @@ pub async fn connect_tls(
 /// use [`load_certs_async`] instead.
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     let file = File::open(Path::new(path))
-        .map_err(|e| KrafkaError::config(format!("Failed to open cert file {}: {}", path, e)))?;
+        .map_err(|e| KrafkaError::config(format!("Failed to open cert file {path}: {e}")))?;
     let mut reader = BufReader::new(file);
 
     certs(&mut reader)
-        .map(|c| c.map_err(|e| KrafkaError::config(format!("Failed to parse cert: {}", e))))
+        .map(|c| c.map_err(|e| KrafkaError::config(format!("Failed to parse cert: {e}"))))
         .collect()
 }
 
@@ -187,7 +183,7 @@ pub async fn load_certs_async(path: &str) -> Result<Vec<CertificateDer<'static>>
     let path = path.to_string();
     tokio::task::spawn_blocking(move || load_certs(&path))
         .await
-        .map_err(|e| KrafkaError::config(format!("Failed to spawn blocking task: {}", e)))?
+        .map_err(|e| KrafkaError::config(format!("Failed to spawn blocking task: {e}")))?
 }
 
 /// Load a private key from a PEM file synchronously.
@@ -196,11 +192,11 @@ pub async fn load_certs_async(path: &str) -> Result<Vec<CertificateDer<'static>>
 /// use [`load_private_key_async`] instead.
 fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
     let file = File::open(Path::new(path))
-        .map_err(|e| KrafkaError::config(format!("Failed to open key file {}: {}", path, e)))?;
+        .map_err(|e| KrafkaError::config(format!("Failed to open key file {path}: {e}")))?;
     let mut reader = BufReader::new(file);
 
     private_key(&mut reader)
-        .map_err(|e| KrafkaError::config(format!("Failed to read private key: {}", e)))?
+        .map_err(|e| KrafkaError::config(format!("Failed to read private key: {e}")))?
         .ok_or_else(|| KrafkaError::config("No private key found in file"))
 }
 
@@ -211,7 +207,7 @@ pub async fn load_private_key_async(path: &str) -> Result<PrivateKeyDer<'static>
     let path = path.to_string();
     tokio::task::spawn_blocking(move || load_private_key(&path))
         .await
-        .map_err(|e| KrafkaError::config(format!("Failed to spawn blocking task: {}", e)))?
+        .map_err(|e| KrafkaError::config(format!("Failed to spawn blocking task: {e}")))?
 }
 
 /// Build a rustls ClientConfig asynchronously.
@@ -219,55 +215,217 @@ pub async fn load_private_key_async(path: &str) -> Result<PrivateKeyDer<'static>
 /// Uses `spawn_blocking` for file I/O operations to avoid blocking the async runtime.
 /// This is the recommended method for async applications.
 ///
+/// When `verify_server_cert` is `false`, certificate verification is skipped.
+/// See [`build_tls_config`] for security implications.
+///
 /// # Errors
 ///
-/// Returns an error if:
-/// - `verify_server_cert` is `false` (insecure mode not supported)
-/// - Certificate or key files cannot be read
-/// - Certificate or key parsing fails
+/// Returns an error if certificate or key files cannot be read or parsed.
 pub async fn build_tls_config_async(config: &TlsConfig) -> Result<ClientConfig> {
-    // Reject insecure mode - verification cannot be disabled
     if !config.verify_server_cert {
-        return Err(KrafkaError::config(
-            "Insecure TLS mode (verify_server_cert=false) is not supported. \
-             TLS without certificate verification is unsafe and defeats the purpose of TLS. \
-             If you need to use a self-signed certificate, provide it via ca_cert_path instead.",
-        ));
+        #[cfg(feature = "danger-insecure-tls")]
+        {
+            warn!(
+                "TLS certificate verification is disabled (verify_server_cert=false). \
+                 This is insecure and should only be used for local development."
+            );
+            return build_insecure_tls_config_async(config).await;
+        }
+        #[cfg(not(feature = "danger-insecure-tls"))]
+        {
+            return Err(KrafkaError::config(
+                "Insecure TLS mode (verify_server_cert=false) requires the \
+                 'danger-insecure-tls' crate feature. If you need self-signed certificates, \
+                 provide the CA certificate via TlsConfig::with_ca_cert() instead.",
+            ));
+        }
     }
 
-    let mut root_store = RootCertStore::empty();
+    let root_store = load_root_store_async(config).await?;
+    let builder = ClientConfig::builder().with_root_certificates(root_store);
+    let client_auth = load_client_auth_async(config).await?;
+    finish_with_client_auth(builder, client_auth)
+}
 
-    // Load CA certificates asynchronously
+// ---------------------------------------------------------------------------
+// Shared helpers — centralise logic that would otherwise be duplicated across
+// the sync/async × secure/insecure builder matrix.
+// ---------------------------------------------------------------------------
+
+/// Attach optional client‐certificate authentication to a builder that is
+/// waiting for a client‐auth decision, producing the final [`ClientConfig`].
+fn finish_with_client_auth(
+    builder: ConfigBuilder<ClientConfig, WantsClientCert>,
+    client_auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+) -> Result<ClientConfig> {
+    if let Some((certs, key)) = client_auth {
+        builder
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| KrafkaError::config(format!("Failed to set client auth: {e}")))
+    } else {
+        Ok(builder.with_no_client_auth())
+    }
+}
+
+/// Load root certificate store synchronously.
+fn load_root_store(config: &TlsConfig) -> Result<RootCertStore> {
+    let mut root_store = RootCertStore::empty();
     if let Some(ca_path) = &config.ca_cert_path {
-        let ca_certs = load_certs_async(ca_path).await?;
-        for cert in ca_certs {
+        for cert in load_certs(ca_path)? {
             root_store
                 .add(cert)
-                .map_err(|e| KrafkaError::config(format!("Failed to add CA cert: {}", e)))?;
+                .map_err(|e| KrafkaError::config(format!("Failed to add CA cert: {e}")))?;
         }
     } else {
-        // Use webpki-roots for default trust anchors
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
+    Ok(root_store)
+}
 
-    let builder = ClientConfig::builder().with_root_certificates(root_store);
-
-    let client_config = if let (Some(cert_path), Some(key_path)) =
-        (&config.client_cert_path, &config.client_key_path)
-    {
-        // mTLS: client certificate authentication
-        let client_certs = load_certs_async(cert_path).await?;
-        let client_key = load_private_key_async(key_path).await?;
-
-        builder
-            .with_client_auth_cert(client_certs, client_key)
-            .map_err(|e| KrafkaError::config(format!("Failed to set client auth: {}", e)))?
+/// Load root certificate store asynchronously.
+async fn load_root_store_async(config: &TlsConfig) -> Result<RootCertStore> {
+    let mut root_store = RootCertStore::empty();
+    if let Some(ca_path) = &config.ca_cert_path {
+        for cert in load_certs_async(ca_path).await? {
+            root_store
+                .add(cert)
+                .map_err(|e| KrafkaError::config(format!("Failed to add CA cert: {e}")))?;
+        }
     } else {
-        // No client certificate
-        builder.with_no_client_auth()
-    };
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    Ok(root_store)
+}
 
-    Ok(client_config)
+/// Load client certificate + private key synchronously, if configured.
+fn load_client_auth(
+    config: &TlsConfig,
+) -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
+    if let (Some(cert_path), Some(key_path)) = (&config.client_cert_path, &config.client_key_path) {
+        let certs = load_certs(cert_path)?;
+        let key = load_private_key(key_path)?;
+        Ok(Some((certs, key)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Load client certificate + private key asynchronously, if configured.
+///
+/// Certificate and key files are loaded concurrently via `tokio::try_join!`.
+async fn load_client_auth_async(
+    config: &TlsConfig,
+) -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
+    if let (Some(cert_path), Some(key_path)) = (&config.client_cert_path, &config.client_key_path) {
+        let (certs, key) = tokio::try_join!(
+            load_certs_async(cert_path),
+            load_private_key_async(key_path)
+        )?;
+        Ok(Some((certs, key)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Resolve the crypto provider: prefer the globally-installed default,
+/// fall back to the ring provider.
+#[cfg(feature = "danger-insecure-tls")]
+fn resolve_crypto_provider() -> Arc<CryptoProvider> {
+    CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()))
+}
+
+/// Create the insecure builder that skips certificate verification.
+#[cfg(feature = "danger-insecure-tls")]
+fn insecure_builder(
+    provider: Arc<CryptoProvider>,
+) -> Result<ConfigBuilder<ClientConfig, WantsClientCert>> {
+    let verifier = Arc::new(NoServerCertVerifier::new(Arc::clone(&provider)));
+    Ok(ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| KrafkaError::config(format!("Failed to set protocol versions: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier))
+}
+
+/// Build a rustls [`ClientConfig`] that skips all certificate verification.
+///
+/// **Warning:** This disables TLS security and must only be used for local
+/// development or testing. A `warn!` log is emitted by callers.
+///
+/// Uses synchronous file I/O for client certificates. For async contexts,
+/// use [`build_insecure_tls_config_async`] instead.
+#[cfg(feature = "danger-insecure-tls")]
+fn build_insecure_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
+    let builder = insecure_builder(resolve_crypto_provider())?;
+    let client_auth = load_client_auth(config)?;
+    finish_with_client_auth(builder, client_auth)
+}
+
+/// Async variant of [`build_insecure_tls_config`] that uses non-blocking file I/O
+/// for client certificate loading.
+#[cfg(feature = "danger-insecure-tls")]
+async fn build_insecure_tls_config_async(config: &TlsConfig) -> Result<ClientConfig> {
+    let builder = insecure_builder(resolve_crypto_provider())?;
+    let client_auth = load_client_auth_async(config).await?;
+    finish_with_client_auth(builder, client_auth)
+}
+
+/// A certificate verifier that accepts any server certificate without validation.
+///
+/// Carries a reference to the [`CryptoProvider`] used when building the
+/// [`ClientConfig`] so that [`supported_verify_schemes`] always returns schemes
+/// consistent with that provider (instead of relying on the global default).
+#[cfg(feature = "danger-insecure-tls")]
+#[derive(Debug)]
+struct NoServerCertVerifier {
+    provider: Arc<CryptoProvider>,
+}
+
+#[cfg(feature = "danger-insecure-tls")]
+impl NoServerCertVerifier {
+    fn new(provider: Arc<CryptoProvider>) -> Self {
+        Self { provider }
+    }
+}
+
+#[cfg(feature = "danger-insecure-tls")]
+impl ServerCertVerifier for NoServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 /// Create a TLS connector asynchronously.
@@ -296,15 +454,15 @@ mod tests {
     }
 
     #[test]
-    fn test_build_tls_config_insecure_rejected() {
+    #[cfg(feature = "danger-insecure-tls")]
+    fn test_build_tls_config_insecure_succeeds() {
         setup_crypto_provider();
-        // Insecure mode should now return an error
-        #[allow(deprecated)]
         let config = TlsConfig::insecure();
         let result = build_tls_config(&config);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("not supported"));
+        assert!(
+            result.is_ok(),
+            "insecure TLS config should succeed: {result:?}"
+        );
     }
 
     #[test]

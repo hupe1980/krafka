@@ -13,8 +13,10 @@ pub struct ProducerBatch {
     pub topic: String,
     /// Partition ID.
     pub partition: PartitionId,
-    /// Records in the batch.
-    records: Vec<BatchRecord>,
+    /// Records in the batch (used by `build()` / `drain()`).
+    records: Vec<ProducerRecord>,
+    /// Number of tracked records (includes those added via `track()`).
+    tracked_count: usize,
     /// Current size in bytes.
     size: usize,
     /// Maximum batch size.
@@ -23,12 +25,6 @@ pub struct ProducerBatch {
     compression: Compression,
     /// When the batch was created.
     created_at: Instant,
-}
-
-/// A record in a batch.
-#[derive(Debug)]
-struct BatchRecord {
-    record: ProducerRecord,
 }
 
 impl ProducerBatch {
@@ -43,6 +39,7 @@ impl ProducerBatch {
             topic,
             partition,
             records: Vec::new(),
+            tracked_count: 0,
             size: 0,
             max_size,
             compression,
@@ -52,30 +49,54 @@ impl ProducerBatch {
 
     /// Try to add a record to the batch.
     ///
-    /// Returns `false` if the batch is full.
+    /// Returns `Ok(())` on success. Returns `Err(record)` if the batch is full,
+    /// giving back ownership of the record so callers avoid a clone.
     #[inline]
-    pub fn try_add(&mut self, record: ProducerRecord) -> bool {
+    #[allow(clippy::result_large_err)]
+    pub fn try_add(&mut self, record: ProducerRecord) -> Result<(), ProducerRecord> {
         let record_size = record.estimated_size();
 
-        if !self.records.is_empty() && self.size + record_size > self.max_size {
-            return false;
+        if !self.is_empty() && self.size + record_size > self.max_size {
+            return Err(record);
         }
 
         self.size += record_size;
-        self.records.push(BatchRecord { record });
-        true
+        self.tracked_count += 1;
+        self.records.push(record);
+        Ok(())
+    }
+
+    /// Check if a record of the given size would fit in the batch.
+    ///
+    /// The caller provides the pre-computed `record_size` to ensure
+    /// the same value is used for both the fit check and subsequent
+    /// [`Self::track`] call.
+    #[inline]
+    pub(crate) fn would_fit(&self, record_size: usize) -> bool {
+        self.is_empty() || self.size + record_size <= self.max_size
+    }
+
+    /// Track a record's size without storing its data.
+    ///
+    /// Use with [`Self::would_fit`] when the caller manages record storage
+    /// separately (e.g., in `PendingRecord`). Increments `len()`, `size()`,
+    /// and `is_full()` as if the record were added.
+    #[inline]
+    pub(crate) fn track(&mut self, record_size: usize) {
+        self.size += record_size;
+        self.tracked_count += 1;
     }
 
     /// Check if the batch is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+        self.tracked_count == 0
     }
 
     /// Get the number of records in the batch.
     #[inline]
     pub fn len(&self) -> usize {
-        self.records.len()
+        self.tracked_count
     }
 
     /// Get the current size in bytes.
@@ -100,20 +121,20 @@ impl ProducerBatch {
     pub fn build(&self) -> RecordBatch {
         let mut builder = RecordBatchBuilder::new().compression(self.compression);
 
-        for batch_record in &self.records {
-            let key = batch_record.record.key.clone();
-            let value = batch_record.record.value.clone();
-            let headers = &batch_record.record.headers;
-
-            if headers.is_empty() {
-                builder = builder.add_record(key, Some(value));
+        for record in &self.records {
+            if record.headers.is_empty() {
+                builder = builder.add_record(record.key.clone(), Some(record.value.clone()));
             } else {
-                // Include headers so they are not silently dropped
-                let hdrs: Vec<(String, Vec<u8>)> = headers
+                let hdrs: Vec<(String, Vec<u8>)> = record
+                    .headers
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
-                builder = builder.add_record_with_headers(key, Some(value), hdrs);
+                builder = builder.add_record_with_headers(
+                    record.key.clone(),
+                    Some(record.value.clone()),
+                    hdrs,
+                );
             }
         }
 
@@ -123,7 +144,8 @@ impl ProducerBatch {
     /// Drain all records from the batch.
     pub fn drain(&mut self) -> Vec<ProducerRecord> {
         self.size = 0;
-        self.records.drain(..).map(|br| br.record).collect()
+        self.tracked_count = 0;
+        self.records.drain(..).collect()
     }
 }
 
@@ -144,7 +166,7 @@ mod tests {
         let mut batch = ProducerBatch::new("test".to_string(), 0, 1024, Compression::None);
 
         let record = ProducerRecord::new("test", b"hello".to_vec());
-        assert!(batch.try_add(record));
+        assert!(batch.try_add(record).is_ok());
 
         assert!(!batch.is_empty());
         assert_eq!(batch.len(), 1);
@@ -153,28 +175,28 @@ mod tests {
 
     #[test]
     fn test_batch_full() {
-        // With 50 bytes estimated overhead per record, a 20 byte value = ~70 bytes estimated
+        // Overhead per record: topic("test").len() + 64 = 68, plus 20 byte value = 88 bytes each
         let mut batch = ProducerBatch::new("test".to_string(), 0, 200, Compression::None);
 
-        // First record should fit (~70 bytes estimated)
+        // First record should fit (~88 bytes)
         let record1 = ProducerRecord::new("test", vec![0u8; 20]);
-        assert!(batch.try_add(record1));
+        assert!(batch.try_add(record1).is_ok());
 
-        // Second record should fit (~140 bytes total)
+        // Second record should fit (~176 bytes total)
         let record2 = ProducerRecord::new("test", vec![0u8; 20]);
-        assert!(batch.try_add(record2));
+        assert!(batch.try_add(record2).is_ok());
 
-        // Third record should not fit (~210 bytes total > max_size of 200)
+        // Third record should not fit (~264 bytes total > max_size of 200)
         let record3 = ProducerRecord::new("test", vec![0u8; 20]);
-        assert!(!batch.try_add(record3));
+        assert!(batch.try_add(record3).is_err());
     }
 
     #[test]
     fn test_batch_drain() {
         let mut batch = ProducerBatch::new("test".to_string(), 0, 1024, Compression::None);
 
-        batch.try_add(ProducerRecord::new("test", b"hello".to_vec()));
-        batch.try_add(ProducerRecord::new("test", b"world".to_vec()));
+        let _ = batch.try_add(ProducerRecord::new("test", b"hello".to_vec()));
+        let _ = batch.try_add(ProducerRecord::new("test", b"world".to_vec()));
 
         let records = batch.drain();
         assert_eq!(records.len(), 2);
@@ -185,7 +207,8 @@ mod tests {
     fn test_batch_build() {
         let mut batch = ProducerBatch::new("test".to_string(), 0, 1024, Compression::None);
 
-        batch.try_add(ProducerRecord::new("test", b"value".to_vec()).with_key(b"key".to_vec()));
+        let _ =
+            batch.try_add(ProducerRecord::new("test", b"value".to_vec()).with_key(b"key".to_vec()));
 
         let record_batch = batch.build();
         assert_eq!(record_batch.records.len(), 1);
@@ -199,7 +222,7 @@ mod tests {
             .with_key(b"key".to_vec())
             .with_header("trace-id", b"abc123")
             .with_header("content-type", b"application/json");
-        batch.try_add(record);
+        let _ = batch.try_add(record);
 
         let record_batch = batch.build();
         assert_eq!(record_batch.records.len(), 1);
@@ -210,5 +233,41 @@ mod tests {
         );
         assert_eq!(record_batch.records[0].headers[0].key, "trace-id");
         assert_eq!(record_batch.records[0].headers[1].key, "content-type");
+    }
+
+    #[test]
+    fn test_would_fit_and_track() {
+        let mut batch = ProducerBatch::new("test".to_string(), 0, 200, Compression::None);
+
+        let record = ProducerRecord::new("test", vec![0u8; 20]);
+        let size = record.estimated_size();
+
+        // First record always fits (empty batch)
+        assert!(batch.would_fit(size));
+        batch.track(size);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch.size(), size);
+        assert!(!batch.is_empty());
+
+        // Second record fits
+        assert!(batch.would_fit(size));
+        batch.track(size);
+        assert_eq!(batch.len(), 2);
+
+        // Third would exceed max_size
+        assert!(!batch.would_fit(size));
+    }
+
+    #[test]
+    fn test_would_fit_first_record_always_fits() {
+        let mut batch = ProducerBatch::new("test".to_string(), 0, 10, Compression::None);
+
+        // Even a record larger than max_size fits as the first record
+        let large_size = 100;
+        assert!(batch.would_fit(large_size));
+        batch.track(large_size);
+        assert!(batch.is_full());
+        // Second record won't fit
+        assert!(!batch.would_fit(1));
     }
 }

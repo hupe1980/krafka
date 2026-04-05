@@ -1382,8 +1382,8 @@ async fn test_admin_describe_cluster() {
     // Note: controller_id may be None in some Kafka configurations
 
     let broker = &cluster.brokers[0];
-    assert!(!broker.host.is_empty(), "Broker should have a host");
-    assert!(broker.port > 0, "Broker should have a valid port");
+    assert!(!broker.host().is_empty(), "Broker should have a host");
+    assert!(broker.port() > 0, "Broker should have a valid port");
     assert!(broker.id >= 0, "Broker should have a valid ID");
 }
 

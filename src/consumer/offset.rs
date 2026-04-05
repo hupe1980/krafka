@@ -45,12 +45,16 @@ impl OffsetAndMetadata {
 }
 
 /// Tracks committed and fetched offsets.
+///
+/// Internally uses nested maps (`topic → partition → value`) so that
+/// read-only lookups (`committed`, `position`) never allocate. Only
+/// mutating operations that introduce a new topic key allocate a `String`.
 #[derive(Debug, Default)]
 pub struct OffsetStore {
-    /// Committed offsets per topic-partition.
-    committed: HashMap<(String, PartitionId), OffsetAndMetadata>,
-    /// Current fetch position per topic-partition.
-    position: HashMap<(String, PartitionId), Offset>,
+    /// Committed offsets: topic → partition → metadata.
+    committed: HashMap<String, HashMap<PartitionId, OffsetAndMetadata>>,
+    /// Current fetch position: topic → partition → offset.
+    position: HashMap<String, HashMap<PartitionId, Offset>>,
 }
 
 impl OffsetStore {
@@ -62,44 +66,55 @@ impl OffsetStore {
     /// Set the committed offset for a topic-partition.
     #[inline]
     pub fn commit(&mut self, topic: &str, partition: PartitionId, offset: OffsetAndMetadata) {
-        self.committed
-            .insert((topic.to_string(), partition), offset);
+        if let Some(partitions) = self.committed.get_mut(topic) {
+            partitions.insert(partition, offset);
+        } else {
+            let mut partitions = HashMap::new();
+            partitions.insert(partition, offset);
+            self.committed.insert(topic.to_string(), partitions);
+        }
     }
 
     /// Get the committed offset for a topic-partition.
     #[inline]
     pub fn committed(&self, topic: &str, partition: PartitionId) -> Option<&OffsetAndMetadata> {
-        self.committed.get(&(topic.to_string(), partition))
+        self.committed.get(topic)?.get(&partition)
     }
 
     /// Set the current position for a topic-partition.
     #[inline]
     pub fn set_position(&mut self, topic: &str, partition: PartitionId, offset: Offset) {
-        self.position.insert((topic.to_string(), partition), offset);
+        if let Some(partitions) = self.position.get_mut(topic) {
+            partitions.insert(partition, offset);
+        } else {
+            let mut partitions = HashMap::new();
+            partitions.insert(partition, offset);
+            self.position.insert(topic.to_string(), partitions);
+        }
     }
 
     /// Get the current position for a topic-partition.
     #[inline]
     pub fn position(&self, topic: &str, partition: PartitionId) -> Option<Offset> {
-        self.position.get(&(topic.to_string(), partition)).copied()
+        self.position.get(topic)?.get(&partition).copied()
     }
 
     /// Get all committed offsets.
     #[inline]
-    pub fn all_committed(&self) -> &HashMap<(String, PartitionId), OffsetAndMetadata> {
+    pub fn all_committed(&self) -> &HashMap<String, HashMap<PartitionId, OffsetAndMetadata>> {
         &self.committed
     }
 
     /// Get all positions.
     #[inline]
-    pub fn all_positions(&self) -> &HashMap<(String, PartitionId), Offset> {
+    pub fn all_positions(&self) -> &HashMap<String, HashMap<PartitionId, Offset>> {
         &self.position
     }
 
     /// Clear all offsets for a topic.
     pub fn clear_topic(&mut self, topic: &str) {
-        self.committed.retain(|(t, _), _| t != topic);
-        self.position.retain(|(t, _), _| t != topic);
+        self.committed.remove(topic);
+        self.position.remove(topic);
     }
 
     /// Clear all offsets.
@@ -110,6 +125,7 @@ impl OffsetStore {
 }
 
 /// Offset reset strategy result.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetOffset {
     /// Use the earliest available offset.

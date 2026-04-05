@@ -67,8 +67,16 @@ Krafka supports the following API version ranges (clamped to match actual encode
 | LeaveGroup | 0 | 3 | v3 batch leave (KIP-345) |
 | CreateTopics | 0 | 2 | Topic creation |
 | DeleteTopics | 0 | 1 | Topic deletion |
+| CreatePartitions | 0 | 0 | Partition management |
 | DescribeConfigs | 0 | 0 | Config reading |
 | AlterConfigs | 0 | 0 | Config updates |
+| DescribeAcls | 0 | 1 | ACL queries |
+| CreateAcls | 0 | 1 | ACL creation |
+| DeleteAcls | 0 | 1 | ACL deletion |
+| DescribeGroups | 0 | 1 | Consumer group inspection |
+| ListGroups | 0 | 1 | Consumer group listing |
+| DeleteRecords | 0 | 0 | Log truncation |
+| OffsetForLeaderEpoch | 0 | 3 | Leader epoch validation |
 | InitProducerId | 0 | 0 | Idempotent/transactional |
 
 ### Version Constants
@@ -161,10 +169,11 @@ let batch = RecordBatchBuilder::new()
 
 Krafka protects against malicious or corrupted broker responses:
 
-- **Allocation caps**: All `Vec::with_capacity()` calls in protocol decoding are capped at 10,000 elements, preventing OOM from broker-supplied lengths
+- **Decode array bounds**: Every array-length field decoded from the wire is validated against `MAX_DECODE_ARRAY_LEN` (100,000), typically via `check_decode_array_len()` and in some specialized decode paths (e.g., `KafkaArray::decode`, record batch counts) via equivalent local checks. These checks reject negative counts and oversized counts across all 63+ protocol-message decode sites, `KafkaArray` decode paths, and record batch/header counts. The validation runs *before* any `Vec::with_capacity()` allocation, preventing both OOM and runaway decode loops.
 - **Decompression limits**: Decompressed record data is limited to 128 MiB via streaming `.take()` limits and post-decompression size checks
 - **Record headers**: Record headers are preserved during batch building — no silent data loss
 - **Encode validation**: The `TryEncode` trait provides fallible encoding for protocol primitives (`KafkaString`, `KafkaBytes`, `KafkaArray<T>` where `T: TryEncode`, `TaggedFields`), returning errors instead of panicking on oversized data. `ProducerRecord::validate()` checks wire-format limits at the API boundary before encoding
+- **Fuzz testing**: The `fuzz/` directory provides [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) targets for `KafkaArray` decode, `RecordBatch` decode, and response message decode across multiple API versions. See `fuzz/README.md` for usage.
 
 ## Wire Protocol
 

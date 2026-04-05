@@ -52,10 +52,11 @@ use crate::protocol::{
     DescribeAclsResponse, DescribeConfigsRequest, DescribeConfigsResponse, DescribeGroupsRequest,
     DescribeGroupsResponse, FindCoordinatorRequest, FindCoordinatorResponse, ListGroupsRequest,
     ListGroupsResponse, OffsetForLeaderEpochPartition, OffsetForLeaderEpochRequest,
-    OffsetForLeaderEpochResponse, OffsetForLeaderEpochTopic,
+    OffsetForLeaderEpochResponse, OffsetForLeaderEpochTopic, versions,
 };
 
 /// Configuration for creating a topic.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct NewTopic {
     /// Topic name.
@@ -87,6 +88,7 @@ impl NewTopic {
 }
 
 /// Result of topic creation.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct CreateTopicResult {
     /// Topic name.
@@ -96,6 +98,7 @@ pub struct CreateTopicResult {
 }
 
 /// Result of topic deletion.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DeleteTopicResult {
     /// Topic name.
@@ -105,6 +108,7 @@ pub struct DeleteTopicResult {
 }
 
 /// Result of partition creation.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct CreatePartitionsResult {
     /// Topic name.
@@ -114,6 +118,7 @@ pub struct CreatePartitionsResult {
 }
 
 /// A configuration entry.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ConfigEntry {
     /// Configuration name.
@@ -129,6 +134,7 @@ pub struct ConfigEntry {
 }
 
 /// Result of config alteration.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct AlterConfigResult {
     /// Resource name.
@@ -138,6 +144,7 @@ pub struct AlterConfigResult {
 }
 
 /// Result of describing ACLs.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DescribeAclsResult {
     /// Error message if any.
@@ -147,6 +154,7 @@ pub struct DescribeAclsResult {
 }
 
 /// Result of creating ACLs.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct CreateAclsResult {
     /// Results for each ACL creation.
@@ -154,6 +162,7 @@ pub struct CreateAclsResult {
 }
 
 /// Result of a single ACL creation.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct CreateAclResult {
     /// Error message if any.
@@ -161,6 +170,7 @@ pub struct CreateAclResult {
 }
 
 /// Result of deleting ACLs.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DeleteAclsResult {
     /// Results for each filter.
@@ -168,6 +178,7 @@ pub struct DeleteAclsResult {
 }
 
 /// Result for a single ACL filter deletion.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DeleteAclFilterResult {
     /// Error message if any.
@@ -177,6 +188,7 @@ pub struct DeleteAclFilterResult {
 }
 
 /// Description of a consumer group.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ConsumerGroupDescription {
     /// Group ID.
@@ -194,6 +206,7 @@ pub struct ConsumerGroupDescription {
 }
 
 /// A member of a consumer group.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ConsumerGroupMember {
     /// Member ID.
@@ -207,6 +220,7 @@ pub struct ConsumerGroupMember {
 }
 
 /// Listing entry for a consumer group.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ConsumerGroupListing {
     /// Group ID.
@@ -216,6 +230,7 @@ pub struct ConsumerGroupListing {
 }
 
 /// Result of deleting records from a partition.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DeleteRecordResult {
     /// Topic name.
@@ -229,6 +244,7 @@ pub struct DeleteRecordResult {
 }
 
 /// Result of an OffsetForLeaderEpoch request for a partition.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct LeaderEpochResult {
     /// Topic name.
@@ -246,6 +262,7 @@ pub struct LeaderEpochResult {
 /// Filter for ACL operations (describe, delete).
 ///
 /// This struct encapsulates all the filter parameters for ACL queries.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct AclFilter {
     /// Resource type to filter by.
@@ -331,16 +348,18 @@ impl AclFilter {
 }
 
 /// Admin client configuration.
+///
+/// Use [`AdminConfig::builder()`] or [`Default::default()`] to construct.
 #[derive(Debug, Clone)]
 pub struct AdminConfig {
     /// Bootstrap servers.
-    pub bootstrap_servers: String,
+    pub(crate) bootstrap_servers: String,
     /// Client ID.
-    pub client_id: String,
+    pub(crate) client_id: String,
     /// Request timeout.
-    pub request_timeout: Duration,
+    pub(crate) request_timeout: Duration,
     /// Authentication configuration (optional).
-    pub auth: Option<AuthConfig>,
+    pub(crate) auth: Option<AuthConfig>,
 }
 
 impl Default for AdminConfig {
@@ -354,6 +373,75 @@ impl Default for AdminConfig {
     }
 }
 
+impl AdminConfig {
+    /// Create a new config builder.
+    pub fn builder() -> AdminConfigBuilder {
+        AdminConfigBuilder::default()
+    }
+
+    /// Returns the bootstrap servers.
+    #[inline]
+    pub fn bootstrap_servers(&self) -> &str {
+        &self.bootstrap_servers
+    }
+
+    /// Returns the client ID.
+    #[inline]
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// Returns the request timeout.
+    #[inline]
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    /// Returns the authentication configuration, if set.
+    #[inline]
+    pub fn auth(&self) -> Option<&AuthConfig> {
+        self.auth.as_ref()
+    }
+}
+
+/// Builder for AdminConfig.
+#[must_use = "builders do nothing until .build() is called"]
+#[derive(Debug, Default)]
+pub struct AdminConfigBuilder {
+    config: AdminConfig,
+}
+
+impl AdminConfigBuilder {
+    /// Set bootstrap servers.
+    pub fn bootstrap_servers(mut self, servers: impl Into<String>) -> Self {
+        self.config.bootstrap_servers = servers.into();
+        self
+    }
+
+    /// Set client ID.
+    pub fn client_id(mut self, id: impl Into<String>) -> Self {
+        self.config.client_id = id.into();
+        self
+    }
+
+    /// Set request timeout.
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.config.request_timeout = timeout;
+        self
+    }
+
+    /// Set authentication configuration.
+    pub fn auth(mut self, auth: AuthConfig) -> Self {
+        self.config.auth = Some(auth);
+        self
+    }
+
+    /// Build the AdminConfig.
+    pub fn build(self) -> AdminConfig {
+        self.config
+    }
+}
+
 /// Kafka admin client for cluster administration.
 pub struct AdminClient {
     /// Configuration.
@@ -362,6 +450,8 @@ pub struct AdminClient {
     metadata: Arc<ClusterMetadata>,
     /// Connection pool.
     pool: Arc<ConnectionPool>,
+    /// Whether the client has been closed.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl AdminClient {
@@ -370,12 +460,22 @@ impl AdminClient {
         AdminClientBuilder::default()
     }
 
+    /// Return an error if the admin client has been closed.
+    #[inline]
+    fn check_not_closed(&self) -> Result<()> {
+        if self.is_closed() {
+            return Err(KrafkaError::invalid_state("AdminClient is closed"));
+        }
+        Ok(())
+    }
+
     /// Create topics.
     pub async fn create_topics(
         &self,
         topics: Vec<NewTopic>,
         timeout: Duration,
     ) -> Result<Vec<CreateTopicResult>> {
+        self.check_not_closed()?;
         // Get any broker connection (controller for leadership, but any broker forwards)
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
@@ -388,7 +488,7 @@ impl AdminClient {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         // Build request
@@ -414,14 +514,36 @@ impl AdminClient {
             validate_only: false,
         };
 
-        // Send request
+        // Send request — negotiate API version with broker
+        let version = conn
+            .negotiate_api_version_max(ApiKey::CreateTopics, versions::CREATE_TOPICS_MAX)
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported CreateTopics API version")
+            })?;
+
         let response_bytes = conn
-            .send_request(ApiKey::CreateTopics, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::CreateTopics, version, |buf| match version {
+                0 => request.encode_v0(buf),
+                1 | 2 => request.encode_v1(buf),
+                _ => Err(KrafkaError::protocol(format!(
+                    "unsupported CreateTopics version {version}"
+                ))),
+            })
             .await?;
 
         // Decode response
         let mut buf = response_bytes;
-        let response = CreateTopicsResponse::decode_v0(&mut buf)?;
+        let response = match version {
+            0 => CreateTopicsResponse::decode_v0(&mut buf)?,
+            1 => CreateTopicsResponse::decode_v1(&mut buf)?,
+            2 => CreateTopicsResponse::decode_v2(&mut buf)?,
+            _ => {
+                return Err(KrafkaError::protocol(format!(
+                    "unsupported CreateTopics version {version}"
+                )));
+            }
+        };
 
         // Convert to results
         let results = response
@@ -432,7 +554,10 @@ impl AdminClient {
                 error: if t.error_code.is_ok() {
                     None
                 } else {
-                    Some(format!("{:?}", t.error_code))
+                    Some(
+                        t.error_message
+                            .unwrap_or_else(|| format!("{:?}", t.error_code)),
+                    )
                 },
             })
             .collect();
@@ -447,6 +572,7 @@ impl AdminClient {
         topics: Vec<String>,
         timeout: Duration,
     ) -> Result<Vec<DeleteTopicResult>> {
+        self.check_not_closed()?;
         // Get any broker connection
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
@@ -459,7 +585,7 @@ impl AdminClient {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         // Build request
@@ -468,14 +594,29 @@ impl AdminClient {
             timeout_ms: crate::util::duration_to_millis_i32(timeout),
         };
 
-        // Send request
+        // Send request — negotiate API version with broker
+        let version = conn
+            .negotiate_api_version_max(ApiKey::DeleteTopics, versions::DELETE_TOPICS_MAX)
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported DeleteTopics API version")
+            })?;
+
         let response_bytes = conn
-            .send_request(ApiKey::DeleteTopics, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::DeleteTopics, version, |buf| request.encode_v0(buf))
             .await?;
 
         // Decode response
         let mut buf = response_bytes;
-        let response = DeleteTopicsResponse::decode_v0(&mut buf)?;
+        let response = match version {
+            0 => DeleteTopicsResponse::decode_v0(&mut buf)?,
+            1 => DeleteTopicsResponse::decode_v1(&mut buf)?,
+            _ => {
+                return Err(KrafkaError::protocol(format!(
+                    "unsupported DeleteTopics version {version}"
+                )));
+            }
+        };
 
         // Convert to results
         let results = response
@@ -486,7 +627,10 @@ impl AdminClient {
                 error: if r.error_code.is_ok() {
                     None
                 } else {
-                    Some(format!("{:?}", r.error_code))
+                    Some(
+                        r.error_message
+                            .unwrap_or_else(|| format!("{:?}", r.error_code)),
+                    )
                 },
             })
             .collect();
@@ -504,6 +648,7 @@ impl AdminClient {
         new_total_count: i32,
         timeout: Duration,
     ) -> Result<CreatePartitionsResult> {
+        self.check_not_closed()?;
         let topic_name = topic.into();
 
         // Get any broker connection
@@ -518,7 +663,7 @@ impl AdminClient {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         // Build request
@@ -532,9 +677,18 @@ impl AdminClient {
             validate_only: false,
         };
 
-        // Send request
+        // Send request — negotiate API version with broker
+        let version = conn
+            .negotiate_api_version_max(ApiKey::CreatePartitions, versions::CREATE_PARTITIONS_MAX)
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported CreatePartitions API version")
+            })?;
+
         let response_bytes = conn
-            .send_request(ApiKey::CreatePartitions, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::CreatePartitions, version, |buf| {
+                request.encode_v0(buf)
+            })
             .await?;
 
         // Decode response
@@ -572,6 +726,7 @@ impl AdminClient {
 
     /// Describe configuration for a topic.
     pub async fn describe_topic_config(&self, topic: &str) -> Result<Vec<ConfigEntry>> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -583,13 +738,22 @@ impl AdminClient {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         let request = DescribeConfigsRequest::for_topic(topic);
 
+        let version = conn
+            .negotiate_api_version_max(ApiKey::DescribeConfigs, versions::DESCRIBE_CONFIGS_MAX)
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported DescribeConfigs API version")
+            })?;
+
         let response_bytes = conn
-            .send_request(ApiKey::DescribeConfigs, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::DescribeConfigs, version, |buf| {
+                request.encode_v0(buf)
+            })
             .await?;
 
         let mut buf = response_bytes;
@@ -620,6 +784,7 @@ impl AdminClient {
 
     /// Describe configuration for a broker.
     pub async fn describe_broker_config(&self, broker_id: i32) -> Result<Vec<ConfigEntry>> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -631,13 +796,22 @@ impl AdminClient {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         let request = DescribeConfigsRequest::for_broker(broker_id);
 
+        let version = conn
+            .negotiate_api_version_max(ApiKey::DescribeConfigs, versions::DESCRIBE_CONFIGS_MAX)
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported DescribeConfigs API version")
+            })?;
+
         let response_bytes = conn
-            .send_request(ApiKey::DescribeConfigs, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::DescribeConfigs, version, |buf| {
+                request.encode_v0(buf)
+            })
             .await?;
 
         let mut buf = response_bytes;
@@ -675,6 +849,7 @@ impl AdminClient {
         topic: &str,
         configs: HashMap<String, String>,
     ) -> Result<AlterConfigResult> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -686,13 +861,20 @@ impl AdminClient {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         let request = AlterConfigsRequest::for_topic(topic, configs.into_iter().collect());
 
+        let version = conn
+            .negotiate_api_version_max(ApiKey::AlterConfigs, versions::ALTER_CONFIGS_MAX)
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported AlterConfigs API version")
+            })?;
+
         let response_bytes = conn
-            .send_request(ApiKey::AlterConfigs, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::AlterConfigs, version, |buf| request.encode_v0(buf))
             .await?;
 
         let mut buf = response_bytes;
@@ -726,12 +908,14 @@ impl AdminClient {
 
     /// List all topics.
     pub async fn list_topics(&self) -> Result<Vec<String>> {
+        self.check_not_closed()?;
         self.metadata.refresh().await?;
         Ok(self.metadata.topics().into_iter().map(|t| t.name).collect())
     }
 
     /// Describe topics.
     pub async fn describe_topics(&self, topics: &[String]) -> Result<Vec<TopicInfo>> {
+        self.check_not_closed()?;
         self.metadata.refresh().await?;
         let all_topics = self.metadata.topics();
 
@@ -746,6 +930,7 @@ impl AdminClient {
 
     /// Describe the cluster.
     pub async fn describe_cluster(&self) -> Result<ClusterDescription> {
+        self.check_not_closed()?;
         self.metadata.refresh().await?;
         let brokers = self.metadata.brokers();
         let controller = self.metadata.controller();
@@ -758,16 +943,19 @@ impl AdminClient {
 
     /// Get partition count for a topic.
     pub async fn partition_count(&self, topic: &str) -> Result<Option<usize>> {
+        self.check_not_closed()?;
         self.metadata.refresh().await?;
         Ok(self.metadata.partition_count(topic))
     }
 
     /// Get the client ID.
+    #[inline]
     pub fn client_id(&self) -> &str {
         &self.config.client_id
     }
 
     /// Get the request timeout.
+    #[inline]
     pub fn request_timeout(&self) -> Duration {
         self.config.request_timeout
     }
@@ -807,6 +995,7 @@ impl AdminClient {
         operation: AclOperation,
         permission_type: AclPermissionType,
     ) -> Result<DescribeAclsResult> {
+        self.check_not_closed()?;
         self.describe_acls_with_filter(AclFilter {
             resource_type,
             resource_name: resource_name.map(|s| s.to_string()),
@@ -831,6 +1020,7 @@ impl AdminClient {
     /// let result = admin.describe_acls_with_filter(filter).await?;
     /// ```
     pub async fn describe_acls_with_filter(&self, filter: AclFilter) -> Result<DescribeAclsResult> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -842,7 +1032,7 @@ impl AdminClient {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         let request = DescribeAclsRequest {
@@ -855,12 +1045,33 @@ impl AdminClient {
             permission_type: filter.permission_type,
         };
 
+        let version = conn
+            .negotiate_api_version_max(ApiKey::DescribeAcls, versions::DESCRIBE_ACLS_MAX)
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported DescribeAcls API version")
+            })?;
+
         let response_bytes = conn
-            .send_request(ApiKey::DescribeAcls, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::DescribeAcls, version, |buf| match version {
+                0 => request.encode_v0(buf),
+                1 => request.encode_v1(buf),
+                _ => Err(KrafkaError::protocol(format!(
+                    "unsupported DescribeAcls encode version {version}"
+                ))),
+            })
             .await?;
 
         let mut buf = response_bytes;
-        let response = DescribeAclsResponse::decode_v0(&mut buf)?;
+        let response = match version {
+            0 => DescribeAclsResponse::decode_v0(&mut buf)?,
+            1 => DescribeAclsResponse::decode_v1(&mut buf)?,
+            _ => {
+                return Err(KrafkaError::protocol(format!(
+                    "unsupported DescribeAcls decode version {version}"
+                )));
+            }
+        };
 
         let bindings = response
             .resources
@@ -903,6 +1114,7 @@ impl AdminClient {
     /// admin.create_acls(vec![acl]).await?;
     /// ```
     pub async fn create_acls(&self, acls: Vec<AclBinding>) -> Result<CreateAclsResult> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -914,19 +1126,37 @@ impl AdminClient {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         let request = CreateAclsRequest {
             creations: acls.clone(),
         };
 
+        let version = conn
+            .negotiate_api_version_max(ApiKey::CreateAcls, versions::CREATE_ACLS_MAX)
+            .await
+            .ok_or_else(|| KrafkaError::protocol("no mutually supported CreateAcls API version"))?;
+
         let response_bytes = conn
-            .send_request(ApiKey::CreateAcls, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::CreateAcls, version, |buf| match version {
+                0 => request.encode_v0(buf),
+                1 => request.encode_v1(buf),
+                _ => Err(KrafkaError::protocol(format!(
+                    "unsupported CreateAcls encode version {version}"
+                ))),
+            })
             .await?;
 
         let mut buf = response_bytes;
-        let response = CreateAclsResponse::decode_v0(&mut buf)?;
+        let response = match version {
+            0..=1 => CreateAclsResponse::decode_v0(&mut buf)?,
+            _ => {
+                return Err(KrafkaError::protocol(format!(
+                    "unsupported CreateAcls decode version {version}"
+                )));
+            }
+        };
 
         let results = response
             .results
@@ -967,6 +1197,7 @@ impl AdminClient {
     /// admin.delete_acls(vec![filter]).await?;
     /// ```
     pub async fn delete_acls(&self, filters: Vec<AclBindingFilter>) -> Result<DeleteAclsResult> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -978,19 +1209,38 @@ impl AdminClient {
         let broker = &brokers[0];
         let conn = self
             .pool
-            .get_connection_by_id(broker.id, &broker.address())
+            .get_connection_by_id(broker.id, broker.address())
             .await?;
 
         let request = DeleteAclsRequest {
             filters: filters.clone(),
         };
 
+        let version = conn
+            .negotiate_api_version_max(ApiKey::DeleteAcls, versions::DELETE_ACLS_MAX)
+            .await
+            .ok_or_else(|| KrafkaError::protocol("no mutually supported DeleteAcls API version"))?;
+
         let response_bytes = conn
-            .send_request(ApiKey::DeleteAcls, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::DeleteAcls, version, |buf| match version {
+                0 => request.encode_v0(buf),
+                1 => request.encode_v1(buf),
+                _ => Err(KrafkaError::protocol(format!(
+                    "unsupported DeleteAcls encode version {version}"
+                ))),
+            })
             .await?;
 
         let mut buf = response_bytes;
-        let response = DeleteAclsResponse::decode_v0(&mut buf)?;
+        let response = match version {
+            0 => DeleteAclsResponse::decode_v0(&mut buf)?,
+            1 => DeleteAclsResponse::decode_v1(&mut buf)?,
+            _ => {
+                return Err(KrafkaError::protocol(format!(
+                    "unsupported DeleteAcls decode version {version}"
+                )));
+            }
+        };
 
         let filter_results = response
             .filter_results
@@ -1028,6 +1278,7 @@ impl AdminClient {
         &self,
         group_ids: Vec<String>,
     ) -> Result<Vec<ConsumerGroupDescription>> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -1041,18 +1292,41 @@ impl AdminClient {
         let any_broker = &brokers[0];
         let any_conn = self
             .pool
-            .get_connection_by_id(any_broker.id, &any_broker.address())
+            .get_connection_by_id(any_broker.id, any_broker.address())
             .await?;
 
         for group_id in &group_ids {
             let coord_request = FindCoordinatorRequest::for_group(group_id);
+            let coord_version = any_conn
+                .negotiate_api_version_max(ApiKey::FindCoordinator, versions::FIND_COORDINATOR_MAX)
+                .await
+                .ok_or_else(|| {
+                    KrafkaError::protocol("no mutually supported FindCoordinator API version")
+                })?;
+
             let coord_response_bytes = any_conn
-                .send_request(ApiKey::FindCoordinator, 1, |buf| {
-                    coord_request.encode_v1(buf)
-                })
+                .send_request(
+                    ApiKey::FindCoordinator,
+                    coord_version,
+                    |buf| match coord_version {
+                        0 => coord_request.encode_v0(buf),
+                        1 => coord_request.encode_v1(buf),
+                        _ => Err(KrafkaError::protocol(format!(
+                            "unsupported FindCoordinator version {coord_version}"
+                        ))),
+                    },
+                )
                 .await?;
             let mut coord_buf = coord_response_bytes;
-            let coord_response = FindCoordinatorResponse::decode_v1(&mut coord_buf)?;
+            let coord_response = match coord_version {
+                0 => FindCoordinatorResponse::decode_v0(&mut coord_buf)?,
+                1 => FindCoordinatorResponse::decode_v1(&mut coord_buf)?,
+                _ => {
+                    return Err(KrafkaError::protocol(format!(
+                        "unsupported FindCoordinator version {coord_version}"
+                    )));
+                }
+            };
 
             if coord_response.error_code.is_ok() {
                 coordinator_groups
@@ -1082,19 +1356,36 @@ impl AdminClient {
                 .unwrap_or(any_broker);
             let conn = self
                 .pool
-                .get_connection_by_id(broker.id, &broker.address())
+                .get_connection_by_id(broker.id, broker.address())
                 .await?;
 
             let request = DescribeGroupsRequest {
                 groups: groups.clone(),
             };
 
+            let version = conn
+                .negotiate_api_version_max(ApiKey::DescribeGroups, versions::DESCRIBE_GROUPS_MAX)
+                .await
+                .ok_or_else(|| {
+                    KrafkaError::protocol("no mutually supported DescribeGroups API version")
+                })?;
+
             let response_bytes = conn
-                .send_request(ApiKey::DescribeGroups, 0, |buf| request.encode_v0(buf))
+                .send_request(ApiKey::DescribeGroups, version, |buf| {
+                    request.encode_v0(buf)
+                })
                 .await?;
 
             let mut buf = response_bytes;
-            let response = DescribeGroupsResponse::decode_v0(&mut buf)?;
+            let response = match version {
+                0 => DescribeGroupsResponse::decode_v0(&mut buf)?,
+                1 => DescribeGroupsResponse::decode_v1(&mut buf)?,
+                _ => {
+                    return Err(KrafkaError::protocol(format!(
+                        "unsupported DescribeGroups version {version}"
+                    )));
+                }
+            };
 
             for g in response.groups {
                 all_results.push(ConsumerGroupDescription {
@@ -1137,6 +1428,7 @@ impl AdminClient {
     /// }
     /// ```
     pub async fn list_consumer_groups(&self) -> Result<Vec<ConsumerGroupListing>> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -1152,7 +1444,7 @@ impl AdminClient {
         for broker in &brokers {
             let conn = match self
                 .pool
-                .get_connection_by_id(broker.id, &broker.address())
+                .get_connection_by_id(broker.id, broker.address())
                 .await
             {
                 Ok(c) => c,
@@ -1161,8 +1453,22 @@ impl AdminClient {
 
             let request = ListGroupsRequest;
 
+            let version = match conn
+                .negotiate_api_version_max(ApiKey::ListGroups, versions::LIST_GROUPS_MAX)
+                .await
+            {
+                Some(v) => v,
+                None => {
+                    warn!(
+                        "No mutually supported ListGroups API version for broker {}, skipping",
+                        broker.id
+                    );
+                    continue;
+                }
+            };
+
             let response_bytes = match conn
-                .send_request(ApiKey::ListGroups, 0, |buf| request.encode_v0(buf))
+                .send_request(ApiKey::ListGroups, version, |buf| request.encode_v0(buf))
                 .await
             {
                 Ok(r) => r,
@@ -1173,10 +1479,26 @@ impl AdminClient {
             };
 
             let mut buf = response_bytes;
-            let response = match ListGroupsResponse::decode_v0(&mut buf) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("ListGroups decode failed on broker {}: {}", broker.id, e);
+            let response = match version {
+                0 => match ListGroupsResponse::decode_v0(&mut buf) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("ListGroups decode failed on broker {}: {}", broker.id, e);
+                        continue;
+                    }
+                },
+                1 => match ListGroupsResponse::decode_v1(&mut buf) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("ListGroups decode failed on broker {}: {}", broker.id, e);
+                        continue;
+                    }
+                },
+                _ => {
+                    warn!(
+                        "Unsupported ListGroups version {version}, skipping broker {}",
+                        broker.id
+                    );
                     continue;
                 }
             };
@@ -1225,6 +1547,7 @@ impl AdminClient {
         offsets: HashMap<(String, i32), i64>,
         timeout: Duration,
     ) -> Result<Vec<DeleteRecordResult>> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -1263,7 +1586,7 @@ impl AdminClient {
                 .unwrap_or(&brokers[0]);
             let conn = self
                 .pool
-                .get_connection_by_id(broker.id, &broker.address())
+                .get_connection_by_id(broker.id, broker.address())
                 .await?;
 
             let request = DeleteRecordsRequest {
@@ -1274,8 +1597,15 @@ impl AdminClient {
                 timeout_ms: crate::util::duration_to_millis_i32(timeout),
             };
 
+            let version = conn
+                .negotiate_api_version_max(ApiKey::DeleteRecords, versions::DELETE_RECORDS_MAX)
+                .await
+                .ok_or_else(|| {
+                    KrafkaError::protocol("no mutually supported DeleteRecords API version")
+                })?;
+
             let response_bytes = conn
-                .send_request(ApiKey::DeleteRecords, 0, |buf| request.encode_v0(buf))
+                .send_request(ApiKey::DeleteRecords, version, |buf| request.encode_v0(buf))
                 .await?;
 
             let mut buf = response_bytes;
@@ -1324,6 +1654,7 @@ impl AdminClient {
         &self,
         partitions: Vec<(String, i32, i32)>,
     ) -> Result<Vec<LeaderEpochResult>> {
+        self.check_not_closed()?;
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -1365,7 +1696,7 @@ impl AdminClient {
                 .unwrap_or(&brokers[0]);
             let conn = self
                 .pool
-                .get_connection_by_id(broker.id, &broker.address())
+                .get_connection_by_id(broker.id, broker.address())
                 .await?;
 
             let request = OffsetForLeaderEpochRequest {
@@ -1376,14 +1707,38 @@ impl AdminClient {
                     .collect(),
             };
 
+            let version = conn
+                .negotiate_api_version_max(
+                    ApiKey::OffsetForLeaderEpoch,
+                    versions::OFFSET_FOR_LEADER_EPOCH_MAX,
+                )
+                .await
+                .ok_or_else(|| {
+                    KrafkaError::protocol("no mutually supported OffsetForLeaderEpoch API version")
+                })?;
+
             let response_bytes = conn
-                .send_request(ApiKey::OffsetForLeaderEpoch, 2, |buf| {
-                    request.encode_v2(buf)
+                .send_request(ApiKey::OffsetForLeaderEpoch, version, |buf| match version {
+                    0..=1 => request.encode_v0(buf),
+                    2 => request.encode_v2(buf),
+                    3 => request.encode_v3(buf),
+                    _ => Err(KrafkaError::protocol(format!(
+                        "unsupported OffsetForLeaderEpoch encode version {version}"
+                    ))),
                 })
                 .await?;
 
             let mut buf = response_bytes;
-            let response = OffsetForLeaderEpochResponse::decode_v2(&mut buf)?;
+            let response = match version {
+                0 => OffsetForLeaderEpochResponse::decode_v0(&mut buf)?,
+                1 => OffsetForLeaderEpochResponse::decode_v1(&mut buf)?,
+                2..=3 => OffsetForLeaderEpochResponse::decode_v2(&mut buf)?,
+                _ => {
+                    return Err(KrafkaError::protocol(format!(
+                        "unsupported OffsetForLeaderEpoch version {version}"
+                    )));
+                }
+            };
 
             for topic in response.topics {
                 for partition in topic.partitions {
@@ -1412,6 +1767,23 @@ impl AdminClient {
     /// Get access to the connection pool.
     pub fn pool(&self) -> &Arc<ConnectionPool> {
         &self.pool
+    }
+
+    /// Close the admin client.
+    ///
+    /// Calling `close()` more than once is a no-op.
+    pub async fn close(&self) {
+        if self.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        self.pool.close_all().await;
+        info!("AdminClient closed");
+    }
+
+    /// Check if the admin client is closed.
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -1507,20 +1879,11 @@ impl AdminClientBuilder {
     /// Build the admin client.
     pub async fn build(self) -> Result<AdminClient> {
         if self.config.bootstrap_servers.is_empty() {
-            return Err(KrafkaError::config("bootstrap_servers is required"));
+            return Err(KrafkaError::config("bootstrap.servers is required"));
         }
 
-        let bootstrap_servers: Vec<String> = self
-            .config
-            .bootstrap_servers
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        if bootstrap_servers.is_empty() {
-            return Err(KrafkaError::config("no bootstrap servers specified"));
-        }
+        let bootstrap_servers =
+            crate::util::parse_bootstrap_servers(&self.config.bootstrap_servers)?;
 
         // Create connection config with client ID and auth
         let mut conn_config_builder = ConnectionConfig::builder()
@@ -1555,6 +1918,7 @@ impl AdminClientBuilder {
             config: self.config,
             metadata,
             pool,
+            closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -1827,5 +2191,11 @@ mod tests {
         assert_eq!(result.leader_epoch, 5);
         assert_eq!(result.end_offset, 1000);
         assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn test_admin_client_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AdminClient>();
     }
 }

@@ -467,7 +467,7 @@ let producer = Producer::builder()
 
 ## Graceful Shutdown
 
-Always close producers properly to flush pending messages. The `close()` method guarantees that all pending batches in the accumulator are flushed to brokers before connections are torn down:
+Always close producers properly to flush pending messages. The `close()` method guarantees that all pending batches in the accumulator are flushed to brokers before connections are torn down. Calling `close()` more than once is a no-op:
 
 ```rust
 use krafka::producer::Producer;
@@ -603,6 +603,7 @@ Always close transactional producers properly. The `close()` method:
 - Aborts any active transaction to avoid dangling open transactions on the broker
 - Transitions the producer to `FatalError` state, preventing further use
 - Closes the underlying connection pool
+- Is idempotent — calling it more than once is a no-op
 
 ```rust
 // Graceful shutdown
@@ -613,9 +614,10 @@ producer.close().await;
 ### Built-in Retry Logic
 
 The transactional producer automatically retries sends on transient failures:
-- Up to **3 retry attempts** per send with exponential backoff (100ms–5s)
+- Uses the shared `RetryPolicy` (default: 3 retries, exponential backoff with jitter)
 - Metadata is refreshed on transient errors before retrying
-- `OutOfOrderSequenceNumber` errors trigger a sequence number reset and retry
+- `OutOfOrderSequenceNumber` errors trigger a sequence number reset and batch rebuild with a fresh sequence before retrying
+- Sequence numbers and the batch are allocated once and reused across normal retries to maintain idempotent semantics
 - Non-retriable errors (auth failures, invalid topics) fail immediately
 
 ### Timestamps

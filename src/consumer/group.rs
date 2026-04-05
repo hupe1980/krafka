@@ -23,10 +23,10 @@ use crate::protocol::{
     ApiKey, FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse,
     JoinGroupRequest, JoinGroupRequestProtocol, JoinGroupResponse, JoinGroupResponseMember,
     LeaveGroupMember, LeaveGroupRequest, LeaveGroupResponse, ListOffsetsRequest,
-    ListOffsetsRequestPartition, ListOffsetsRequestTopic, ListOffsetsResponse, OffsetCommitRequest,
-    OffsetCommitRequestPartition, OffsetCommitRequestTopic, OffsetCommitResponse,
-    OffsetFetchRequest, OffsetFetchRequestTopic, OffsetFetchResponse, SyncGroupRequest,
-    SyncGroupRequestAssignment, SyncGroupResponse,
+    ListOffsetsRequestPartition, ListOffsetsRequestTopic, ListOffsetsResponse,
+    MAX_DECODE_ARRAY_LEN, OffsetCommitRequest, OffsetCommitRequestPartition,
+    OffsetCommitRequestTopic, OffsetCommitResponse, OffsetFetchRequest, OffsetFetchRequestTopic,
+    OffsetFetchResponse, SyncGroupRequest, SyncGroupRequestAssignment, SyncGroupResponse,
 };
 
 /// Callback interface for partition rebalance events.
@@ -90,6 +90,7 @@ impl ConsumerRebalanceListener for NoOpRebalanceListener {
 }
 
 /// Consumer group state.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GroupState {
     /// Not yet joined.
@@ -297,14 +298,13 @@ impl ConsumerGroup {
         match state {
             GroupState::Stable => Ok(()),
             GroupState::Unjoined => Err(KrafkaError::invalid_state(
-                "Cannot commit: not part of a group",
+                "cannot commit: not part of a group",
             )),
             GroupState::PreparingRebalance | GroupState::AwaitingSync => Err(
-                KrafkaError::invalid_state("Cannot commit: rebalance in progress"),
+                KrafkaError::invalid_state("cannot commit: rebalance in progress"),
             ),
             _ => Err(KrafkaError::invalid_state(format!(
-                "Cannot commit in state: {:?}",
-                state
+                "cannot commit in state: {state:?}",
             ))),
         }
     }
@@ -833,6 +833,7 @@ impl HeartbeatController {
 }
 
 /// Heartbeat response status from the coordinator.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeartbeatStatus {
     /// Heartbeat accepted, continue normally.
@@ -1171,7 +1172,7 @@ impl GroupCoordinator {
         // Try cached brokers first
         let brokers = self.metadata.brokers();
         for broker in brokers {
-            if let Ok(conn) = self.pool.get_connection(&broker.address()).await {
+            if let Ok(conn) = self.pool.get_connection(broker.address()).await {
                 return Ok(conn);
             }
         }
@@ -1741,7 +1742,7 @@ impl GroupCoordinator {
         let state = *self.state.read().await;
         if state != GroupState::Stable {
             return Err(KrafkaError::invalid_state(format!(
-                "Cannot commit offsets: group state is {:?}",
+                "cannot commit offsets: group state is {:?}",
                 state
             )));
         }
@@ -1935,7 +1936,9 @@ impl GroupCoordinator {
                 leaderless
             );
             let topics: Vec<&str> = leaderless.iter().map(|(t, _)| t.as_str()).collect();
-            let _ = self.metadata.refresh_for_topics(Some(&topics)).await;
+            if let Err(refresh_err) = self.metadata.refresh_for_topics(Some(&topics)).await {
+                debug!(error = %refresh_err, "Metadata refresh failed for leaderless partitions");
+            }
 
             // Retry resolution after refresh
             for (topic, partition) in leaderless {
@@ -1953,7 +1956,7 @@ impl GroupCoordinator {
             }
         }
 
-        for leader_partitions in partitions_by_leader.values() {
+        for (leader_id, leader_partitions) in &partitions_by_leader {
             // Group partitions by topic
             let mut topics_map: HashMap<String, Vec<ListOffsetsRequestPartition>> = HashMap::new();
             for (topic, partition) in leader_partitions {
@@ -1981,12 +1984,8 @@ impl GroupCoordinator {
                 topics,
             };
 
-            // Get connection to this leader
-            let (topic_sample, partition_sample) = &leader_partitions[0];
-            let conn = self
-                .metadata
-                .get_leader_connection(topic_sample, *partition_sample)
-                .await?;
+            // Get connection to this leader directly by ID
+            let conn = self.metadata.get_broker_connection(*leader_id).await?;
 
             let response = conn
                 .send_request(ApiKey::ListOffsets, 2, |buf| request.encode_v2(buf))
@@ -2334,8 +2333,10 @@ impl GroupCoordinator {
         if topic_count < 0 {
             return Ok(MemberAssignment::empty());
         }
-        // Cap iteration by remaining buffer to prevent allocation DoS
-        let safe_topic_count = (topic_count as usize).min(buf.remaining() / 6);
+        // Cap iteration by max array length and remaining buffer to prevent allocation DoS
+        let safe_topic_count = (topic_count as usize)
+            .min(MAX_DECODE_ARRAY_LEN)
+            .min(buf.remaining() / 6);
         if safe_topic_count < topic_count as usize {
             warn!(
                 "assignment topic count {} exceeds buffer capacity, decoding {} topics",
@@ -2367,7 +2368,7 @@ impl GroupCoordinator {
                 break;
             }
             let safe_partition_count = (partition_count as usize)
-                .min(10_000)
+                .min(MAX_DECODE_ARRAY_LEN)
                 .min(buf.remaining() / 4);
             if safe_partition_count < partition_count as usize {
                 warn!(

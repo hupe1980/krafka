@@ -20,9 +20,10 @@ A pure Rust, async-native Apache Kafka client designed for high performance, saf
 - 🔑 **SASL authentication**: PLAIN, SCRAM-SHA-256/512, OAUTHBEARER mechanisms
 - 💯 **Transactions**: Exactly-once semantics with transactional producer
 - ☁️ **Cloud-native**: First-class AWS MSK support including IAM auth
-- 🛡️ **Security hardened**: Secret zeroization, constant-time auth (`subtle`), decompression bomb protection, allocation caps
+- 🛡️ **Security hardened**: Secret zeroization, constant-time auth (`subtle`), decompression bomb protection, decode loop bounds (`MAX_DECODE_ARRAY_LEN`)
 - 🔄 **Built-in retry**: Exponential backoff with metadata refresh on leader changes
 - 📊 **Metrics**: Lock-free counters/gauges/latency wired into all hot paths
+- 🧪 **Fuzz tested**: cargo-fuzz targets for protocol arrays, record batches, and response decoders
 ## 🚀 Quick Start
 
 Add Krafka to your `Cargo.toml`:
@@ -312,13 +313,14 @@ Krafka is feature-complete and production-ready.
 - ✅ Network layer (async connections, pooling, TLS/SSL, IPv6 support)
 - ✅ Producer (batching with linger timer, partitioning, compression, built-in retry with exponential backoff, metadata refresh on failure, max-in-flight enforcement via semaphore, buffer backpressure via `ProducerConfig::max_block`, interceptor hooks, zero-copy `Bytes` pipeline)
 - ✅ Consumer (polling, streaming `recv()` with error propagation, offset management, auto-commit timer, seek, pause/resume, configurable partition assignment strategy, rebalance listeners, cooperative sticky assignor, static group membership (KIP-345), interceptor hooks, log compaction awareness, batched offset resolution, per-partition retry backoff)
-- ✅ Admin Client (topic CRUD, partitions, configuration, ACL management, consumer groups, record deletion, leader epoch queries)
+- ✅ Admin Client (topic CRUD, partitions, configuration, ACL management, consumer groups, record deletion, leader epoch queries, automatic API version negotiation)
 - ✅ Authentication (SASL/PLAIN, SASL/SCRAM-SHA-256/512, SASL/OAUTHBEARER, AWS MSK IAM with SDK support)
 - ✅ TLS/SSL encryption (rustls, mTLS support)
 - ✅ Transactions (exactly-once semantics with transactional producer — full PID/epoch/sequence tracking)
 - ✅ Metrics (counters, gauges, latency tracking — all wired into producer/consumer hot paths)
 - ✅ Tracing (OpenTelemetry-compatible spans with properly declared fields)
-- ✅ Security hardening (secret zeroization, constant-time comparison, PBKDF2 validation, decompression limits, allocation caps)
+- ✅ Security hardening (secret zeroization, constant-time comparison, PBKDF2 validation, decompression limits, decode loop bounds)
+- ✅ Fuzz testing (cargo-fuzz targets for protocol decode paths)
 
 ## 🤝 Contributing
 

@@ -1,10 +1,13 @@
 //! Consumer record types.
 
+use std::collections::HashSet;
+
 use bytes::Bytes;
 
 use crate::{Offset, PartitionId, Timestamp};
 
 /// A record consumed from Kafka.
+#[non_exhaustive]
 #[must_use = "contains data consumed from Kafka"]
 #[derive(Debug, Clone)]
 pub struct ConsumerRecord {
@@ -163,10 +166,11 @@ impl ConsumerRecords {
 
     /// Create from a vector of records.
     pub fn from_records(records: Vec<ConsumerRecord>) -> Self {
+        let mut seen = HashSet::new();
         let mut partitions = Vec::new();
         for record in &records {
             let tp = (record.topic.clone(), record.partition);
-            if !partitions.contains(&tp) {
+            if seen.insert(tp.clone()) {
                 partitions.push(tp);
             }
         }

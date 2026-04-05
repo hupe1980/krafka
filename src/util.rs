@@ -234,6 +234,25 @@ mod tests {
     }
 }
 
+/// Parse a comma-separated bootstrap servers string into individual addresses.
+///
+/// Trims whitespace, filters empty entries, and returns an error if no
+/// valid servers remain.
+pub fn parse_bootstrap_servers(servers: &str) -> Result<Vec<String>> {
+    let addrs: Vec<String> = servers
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+
+    if addrs.is_empty() {
+        return Err(KrafkaError::config("no bootstrap servers specified"));
+    }
+
+    Ok(addrs)
+}
+
 /// Extract the hostname from an address string for TLS SNI.
 ///
 /// Handles bracketed IPv6 (`[::1]:port`), bare IPv6 (`2001:db8::1`),
@@ -248,18 +267,17 @@ pub fn extract_sni_hostname(address: &str) -> Result<&str> {
     }
 
     let has_open = address.contains('[');
-    let has_close = address.contains(']');
+    let close_pos = address.find(']');
 
-    match (has_open, has_close) {
+    match (has_open, close_pos) {
         // Bracketed: [host]:port or [host]
-        (true, true) => {
+        (true, Some(end)) => {
             // '[' must be at position 0
             if !address.starts_with('[') {
                 return Err(KrafkaError::config(format!(
                     "malformed address ('[' not at start): {address}"
                 )));
             }
-            let end = address.find(']').unwrap();
             let hostname = &address[1..end];
             if hostname.is_empty() {
                 return Err(KrafkaError::config(format!(
@@ -289,20 +307,53 @@ pub fn extract_sni_hostname(address: &str) -> Result<&str> {
             Ok(hostname)
         }
         // Mismatched brackets
-        (true, false) => Err(KrafkaError::config(format!(
+        (true, None) => Err(KrafkaError::config(format!(
             "malformed address (missing closing ']'): {address}"
         ))),
-        (false, true) => Err(KrafkaError::config(format!(
+        (false, Some(_)) => Err(KrafkaError::config(format!(
             "malformed address (unexpected ']' without '['): {address}"
         ))),
         // No brackets: bare IPv6, IPv4, or hostname
-        (false, false) => {
+        (false, None) => {
             if address.parse::<std::net::Ipv6Addr>().is_ok() {
                 Ok(address)
             } else {
                 Ok(address.rsplit_once(':').map_or(address, |(host, _)| host))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_bootstrap_servers_basic() {
+        let result = parse_bootstrap_servers("localhost:9092,broker:9093").unwrap();
+        assert_eq!(result, vec!["localhost:9092", "broker:9093"]);
+    }
+
+    #[test]
+    fn test_parse_bootstrap_servers_trims_whitespace() {
+        let result = parse_bootstrap_servers(" localhost:9092 , broker:9093 ").unwrap();
+        assert_eq!(result, vec!["localhost:9092", "broker:9093"]);
+    }
+
+    #[test]
+    fn test_parse_bootstrap_servers_filters_empty() {
+        let result = parse_bootstrap_servers(" , ,localhost:9092, , broker:9093, ").unwrap();
+        assert_eq!(result, vec!["localhost:9092", "broker:9093"]);
+    }
+
+    #[test]
+    fn test_parse_bootstrap_servers_empty_string() {
+        assert!(parse_bootstrap_servers("").is_err());
+    }
+
+    #[test]
+    fn test_parse_bootstrap_servers_only_whitespace() {
+        assert!(parse_bootstrap_servers(" , , ").is_err());
     }
 }
 

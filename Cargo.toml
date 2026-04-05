@@ -70,6 +70,10 @@ default = []
 # If binary size is critical, use manual credential loading with AwsMskIamCredentials::from_env()
 # which works without this feature.
 aws-msk = ["aws-config", "aws-credential-types"]
+# Allow disabling TLS certificate verification (MITM risk!).
+# Only enable for local development or testing with self-signed certificates.
+# Requires calling `TlsConfig::insecure()`.
+danger-insecure-tls = []
 
 [dev-dependencies]
 tokio-test = "0.4"

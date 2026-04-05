@@ -8,7 +8,6 @@
 use bytes::BytesMut;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use krafka::protocol::KafkaString;
 use krafka::util::varint::{
     decode_signed_varint, decode_unsigned_varint, encode_signed_varint, encode_unsigned_varint,
 };
@@ -178,12 +177,7 @@ fn bench_request_header(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("request_header");
 
-    let header = RequestHeader {
-        api_key: ApiKey::Produce,
-        api_version: 3,
-        correlation_id: 12345,
-        client_id: Some(KafkaString::from("krafka-benchmark".to_string())),
-    };
+    let header = RequestHeader::new(ApiKey::Produce, 3, 12345).with_client_id("krafka-benchmark");
 
     // v0 header (minimal)
     group.bench_function("encode_v0", |b| {

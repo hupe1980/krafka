@@ -380,7 +380,7 @@ and the next poll sends a full fetch. All sessions are cleared on consumer group
 - **Error handling**: ErrorCode to/from i16 conversions
 - **Utilities**: CRC32C checksum, correlation ID generation
 - **Partitioners**: All 4 partitioner implementations
-- **Batch operations**: try_add, size checking methods
+- **Batch operations**: try_add, would_fit, track, size checking methods
 - **Metadata lookups**: partition_count, partition, leader lookups
 - **Predicates**: is_empty, is_null, is_closed, is_retriable, is_ok, is_leader, is_alive
 - **Retry policy**: calculate_backoff, should_retry, max_retries_reached

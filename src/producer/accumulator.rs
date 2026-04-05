@@ -402,11 +402,9 @@ impl RecordAccumulator {
         partition: PartitionId,
         response_tx: oneshot::Sender<AppendResponse>,
     ) {
-        let topic = record.topic.clone();
-        let key = (topic.clone(), partition);
-
-        // Estimate record size for memory tracking
-        let record_size = Self::estimate_record_size(&record);
+        // Estimate record size for memory tracking and batch size-gating.
+        let record_size = record.estimated_size();
+        let key = (record.topic.clone(), partition);
 
         // Check memory limit before appending (0 = unlimited).
         // Include in-flight memory so extracted-but-unsent batches are counted.
@@ -421,18 +419,18 @@ impl RecordAccumulator {
         self.memory_used += record_size;
 
         // Get or create batch
+        let batch_size = self.config.batch_size;
+        let compression = self.config.compression;
         let accumulator_batch = self.batches.entry(key.clone()).or_insert_with(|| {
-            AccumulatorBatch::new(
-                topic.clone(),
-                partition,
-                self.config.batch_size,
-                self.config.compression,
-            )
+            AccumulatorBatch::new(key.0.clone(), partition, batch_size, compression)
         });
 
-        // Try to add to current batch
+        // Check if the record fits in the current batch. If so, move it
+        // directly into PendingRecord (zero clones). The batch only tracks
+        // size; PendingRecord owns the record data for send_extracted_batch.
         let offset = accumulator_batch.batch.len() as i64;
-        if accumulator_batch.batch.try_add(record.clone()) {
+        if accumulator_batch.batch.would_fit(record_size) {
+            accumulator_batch.batch.track(record_size);
             accumulator_batch.pending.push(PendingRecord {
                 record,
                 response_tx,
@@ -442,12 +440,12 @@ impl RecordAccumulator {
 
             // Check if batch is full
             if accumulator_batch.batch.is_full() {
-                trace!("Batch full for {}-{}, flushing", topic, partition);
+                trace!("Batch full for {}-{}, flushing", key.0, partition);
                 self.flush_batch(&key).await;
             } else if self.config.linger.is_zero() {
                 // linger=0 means send immediately without waiting
                 // for the next linger timer tick (up to 1ms delay otherwise).
-                trace!("Linger=0 for {}-{}, flushing immediately", topic, partition);
+                trace!("Linger=0 for {}-{}, flushing immediately", key.0, partition);
                 self.flush_batch(&key).await;
             }
         } else {
@@ -455,14 +453,11 @@ impl RecordAccumulator {
             self.flush_batch(&key).await;
 
             // Create new batch and add record
-            let mut new_batch = AccumulatorBatch::new(
-                topic.clone(),
-                partition,
-                self.config.batch_size,
-                self.config.compression,
-            );
+            let mut new_batch =
+                AccumulatorBatch::new(key.0.clone(), partition, batch_size, compression);
 
-            if new_batch.batch.try_add(record.clone()) {
+            if new_batch.batch.would_fit(record_size) {
+                new_batch.batch.track(record_size);
                 new_batch.pending.push(PendingRecord {
                     record,
                     response_tx,
@@ -480,21 +475,6 @@ impl RecordAccumulator {
                 ))));
             }
         }
-    }
-
-    /// Estimate the memory size of a record.
-    fn estimate_record_size(record: &ProducerRecord) -> usize {
-        // Key + value + headers + overhead for topic name, metadata, etc.
-        let key_size = record.key.as_ref().map(|k| k.len()).unwrap_or(0);
-        let value_size = record.value.len();
-        let headers_size: usize = record
-            .headers
-            .iter()
-            .map(|(k, v)| k.len() + v.len() + 8) // 8 bytes overhead per header
-            .sum();
-        let topic_overhead = record.topic.len() + 64; // 64 bytes for struct overhead
-
-        key_size + value_size + headers_size + topic_overhead
     }
 
     /// Check for batches that have exceeded linger time (concurrent flush).
@@ -712,7 +692,10 @@ impl RecordAccumulator {
                             error = %e,
                             "Batch connection error, refreshing metadata"
                         );
-                        let _ = metadata.refresh_for_topics(Some(&[&topic])).await;
+                        if let Err(refresh_err) = metadata.refresh_for_topics(Some(&[&topic])).await
+                        {
+                            debug!(error = %refresh_err, "Metadata refresh failed during batch retry");
+                        }
                     }
                     if let Some(backoff) = retry_ctx.record_failure(&e) {
                         metrics.record_retry();
@@ -769,8 +752,11 @@ impl RecordAccumulator {
                                     pr.error_code,
                                     format!("batch produce failed for {topic}-{partition}"),
                                 );
-                                if err.is_retriable() {
-                                    let _ = metadata.refresh_for_topics(Some(&[&topic])).await;
+                                if err.is_retriable()
+                                    && let Err(refresh_err) =
+                                        metadata.refresh_for_topics(Some(&[&topic])).await
+                                {
+                                    debug!(error = %refresh_err, "Metadata refresh failed during batch retry");
                                 }
                                 if let Some(backoff) = retry_ctx.record_failure(&err) {
                                     metrics.record_retry();
@@ -803,7 +789,10 @@ impl RecordAccumulator {
                             error = %e,
                             "Batch send error, refreshing metadata"
                         );
-                        let _ = metadata.refresh_for_topics(Some(&[&topic])).await;
+                        if let Err(refresh_err) = metadata.refresh_for_topics(Some(&[&topic])).await
+                        {
+                            debug!(error = %refresh_err, "Metadata refresh failed during batch retry");
+                        }
                     }
                     if let Some(backoff) = retry_ctx.record_failure(&e) {
                         metrics.record_retry();
@@ -858,9 +847,9 @@ impl RecordAccumulator {
     async fn flush_all(&mut self) -> Result<()> {
         let keys: Vec<_> = self
             .batches
-            .keys()
-            .filter(|k| self.batches.get(*k).is_some_and(|b| !b.batch.is_empty()))
-            .cloned()
+            .iter()
+            .filter(|(_, batch)| !batch.batch.is_empty())
+            .map(|(key, _)| key.clone())
             .collect();
 
         let mut extracted = Vec::with_capacity(keys.len());
@@ -941,7 +930,7 @@ mod tests {
     #[test]
     fn test_estimate_record_size() {
         let record = ProducerRecord::new("test-topic", b"value".to_vec());
-        let size = RecordAccumulator::estimate_record_size(&record);
+        let size = record.estimated_size();
         // Should be at least the value length + topic overhead
         assert!(size >= 5);
         assert!(size > 64); // overhead for topic name and struct
@@ -949,7 +938,7 @@ mod tests {
         // Record with key and headers should be larger
         let record_with_key =
             ProducerRecord::new("test-topic", b"value".to_vec()).with_key(b"key".to_vec());
-        let size_with_key = RecordAccumulator::estimate_record_size(&record_with_key);
+        let size_with_key = record_with_key.estimated_size();
         assert!(size_with_key > size);
     }
 

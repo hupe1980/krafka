@@ -68,7 +68,7 @@ use crate::network::{ConnectionConfig, ConnectionPool};
 use crate::protocol::{
     ApiKey, FetchPartitionRequest, FetchRequest, FetchResponse, FetchTopicRequest,
     ListOffsetsRequest, ListOffsetsRequestPartition, ListOffsetsRequestTopic, ListOffsetsResponse,
-    RecordBatch, VersionedDecode, VersionedEncode,
+    RecordBatch, VersionedDecode, VersionedEncode, versions,
 };
 use crate::{Offset, PartitionId};
 
@@ -237,17 +237,7 @@ impl Consumer {
 
         let pool = Arc::new(ConnectionPool::new(pool_config));
 
-        // Parse bootstrap servers — filter out empty/whitespace entries
-        let bootstrap_servers: Vec<String> = config
-            .bootstrap_servers
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        if bootstrap_servers.is_empty() {
-            return Err(KrafkaError::config("no bootstrap servers specified"));
-        }
+        let bootstrap_servers = crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
 
         let metadata = Arc::new(ClusterMetadata::new(
             bootstrap_servers,
@@ -282,8 +272,8 @@ impl Consumer {
         info!(
             "Consumer initialized with {} brokers{}",
             metadata.brokers().len(),
-            if group_coordinator.is_some() {
-                format!(", group_id='{}'", config.group_id.as_ref().unwrap())
+            if let Some(ref gid) = config.group_id {
+                format!(", group_id='{gid}'")
             } else {
                 String::new()
             }
@@ -1013,10 +1003,8 @@ impl Consumer {
             }
             None => {
                 // AutoOffsetReset::None — fail if no committed offset
-                let missing: Vec<String> = need_reset
-                    .iter()
-                    .map(|(t, p)| format!("{}-{}", t, p))
-                    .collect();
+                let missing: Vec<String> =
+                    need_reset.iter().map(|(t, p)| format!("{t}-{p}")).collect();
                 return Err(KrafkaError::invalid_state(format!(
                     "no committed offset for partitions and auto.offset.reset=none: {}",
                     missing.join(", ")
@@ -1128,10 +1116,8 @@ impl Consumer {
             }
             None => {
                 // AutoOffsetReset::None — fail if no offset
-                let missing: Vec<String> = need_reset
-                    .iter()
-                    .map(|(t, p)| format!("{}-{}", t, p))
-                    .collect();
+                let missing: Vec<String> =
+                    need_reset.iter().map(|(t, p)| format!("{t}-{p}")).collect();
                 return Err(KrafkaError::invalid_state(format!(
                     "no offset for partitions and auto.offset.reset=none: {}",
                     missing.join(", ")
@@ -1191,7 +1177,7 @@ impl Consumer {
             .get(&(topic.to_string(), partition))
             .copied()
             .ok_or_else(|| {
-                KrafkaError::protocol(format!("no offset returned for {}-{}", topic, partition))
+                KrafkaError::protocol(format!("no offset returned for {topic}-{partition}"))
             })
     }
 
@@ -1295,7 +1281,7 @@ impl Consumer {
             };
             let conn = match self
                 .pool
-                .get_connection_by_id(leader_id, &broker_info.address())
+                .get_connection_by_id(leader_id, broker_info.address())
                 .await
             {
                 Ok(c) => c,
@@ -1307,14 +1293,16 @@ impl Consumer {
             };
 
             // Negotiate ListOffsets version — require v1+, prefer v2.
-            let list_version = match conn.negotiate_api_version_max(ApiKey::ListOffsets, 2).await {
+            let list_version = match conn
+                .negotiate_api_version_max(ApiKey::ListOffsets, versions::LIST_OFFSETS_MAX)
+                .await
+            {
                 Some(v) => v,
                 None => {
                     let err = KrafkaError::protocol(format!(
-                        "broker {} does not support ListOffsets",
-                        leader_id
+                        "no mutually supported ListOffsets API version for broker {leader_id}"
                     ));
-                    warn!("{}", err);
+                    warn!("{err}");
                     last_error = Some(err);
                     continue;
                 }
@@ -1551,8 +1539,8 @@ impl Consumer {
                             }
                         }
                     }
-                } else {
-                    self.apply_auto_offset_reset(&reset_partitions).await.ok();
+                } else if let Err(e) = self.apply_auto_offset_reset(&reset_partitions).await {
+                    warn!("Auto-offset-reset failed for missing partitions: {e}");
                 }
 
                 // Recompute lag after resolving offsets for missing partitions
@@ -1685,7 +1673,7 @@ impl Consumer {
                 }
                 all_offset_updates = delivered_offsets
                     .into_iter()
-                    .map(|(key, offset)| (key, offset + 1))
+                    .map(|(key, offset)| (key, offset.saturating_add(1)))
                     .collect();
             }
         }
@@ -1760,7 +1748,7 @@ impl Consumer {
             .ok_or_else(|| KrafkaError::invalid_state(format!("broker {} not found", broker_id)))?;
         let conn = self
             .pool
-            .get_connection_by_id(broker_id, &broker.address())
+            .get_connection_by_id(broker_id, broker.address())
             .await?;
 
         // Group by topic for the request structure
@@ -1772,24 +1760,24 @@ impl Consumer {
                 .push(*partition);
         }
 
-        // Build fetch request with all topic-partitions
+        // Build fetch request with all topic-partitions.
+        // Acquire the offsets read lock once for the entire build instead of
+        // per-partition to reduce lock acquire/release overhead.
+        let offsets_snapshot = self.offsets.read().await;
         let mut fetch_topics = Vec::with_capacity(topics_map.len());
         for (topic, partitions) in &topics_map {
             let mut fetch_partitions = Vec::with_capacity(partitions.len());
             for &partition in partitions {
                 // Skip partitions with no tracked offset rather than
                 // defaulting to 0, which defeats the auto_offset_reset fix.
-                let offset = {
-                    let offsets = self.offsets.read().await;
-                    match offsets.get(&(topic.clone(), partition)).copied() {
-                        Some(o) => o,
-                        None => {
-                            warn!(
-                                "No offset for {}-{}, skipping fetch (will retry offset resolution)",
-                                topic, partition
-                            );
-                            continue;
-                        }
+                let offset = match offsets_snapshot.get(&(topic.clone(), partition)).copied() {
+                    Some(o) => o,
+                    None => {
+                        warn!(
+                            "No offset for {}-{}, skipping fetch (will retry offset resolution)",
+                            topic, partition
+                        );
+                        continue;
                     }
                 };
                 // Get leader epoch from metadata for fencing stale reads
@@ -1808,6 +1796,8 @@ impl Consumer {
                 partitions: fetch_partitions,
             });
         }
+        // Drop the read lock before the network call.
+        drop(offsets_snapshot);
 
         // Negotiate fetch API version — prefer v11 (KIP-392 closest-replica
         // fetching), fall back through v7 (sessions) to v4.
@@ -1830,8 +1820,7 @@ impl Consumer {
             .await
             .unwrap_or_else(|| {
                 debug!(
-                    "Broker {} does not support Fetch v7+, falling back to v4",
-                    broker_id
+                    "No mutually supported Fetch v7+ for broker {broker_id}, falling back to v4"
                 );
                 4
             });
@@ -1941,6 +1930,7 @@ impl Consumer {
         let mut offset_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
         let mut hw_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
         let mut lso_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
+
         // Preferred replica updates (KIP-392): Some(id) to set, None to clear.
         // Collected during the loop, applied in a single write lock afterwards.
         let mut pref_updates: Vec<((String, PartitionId), Option<crate::BrokerId>)> = Vec::new();
@@ -2039,19 +2029,44 @@ impl Consumer {
                     let mut batch_buf = record_bytes;
                     let mut last_offset_for_partition: Option<Offset> = None;
 
+                    // Fetch offset for this partition — used to skip records
+                    // already delivered in a prior poll when Kafka returns a
+                    // batch that starts before the requested offset.
+                    // Read lock is acquired and dropped inline to avoid cloning
+                    // the entire offsets map on every fetch pass.
+                    let partition_fetch_offset =
+                        self.offsets.read().await.get(&key).copied().unwrap_or(0);
+
+                    // Decode all fetched batches for this partition. `poll()`
+                    // applies `max_poll_records` after aggregation and
+                    // recomputes offsets for the returned subset, so stopping
+                    // here without buffering the remaining bytes would force a
+                    // re-fetch/re-decode of the dropped batches on subsequent
+                    // polls.
                     while batch_buf.len() >= 12 {
                         match RecordBatch::decode(&mut batch_buf) {
                             Ok(batch) => {
                                 for record in batch.records.into_iter() {
                                     // Use offset_delta for correct offset in compacted topics
                                     // where records may have been deleted (log compaction awareness).
-                                    let record_offset =
-                                        batch.base_offset + record.offset_delta as i64;
+                                    let record_offset = batch
+                                        .base_offset
+                                        .saturating_add(record.offset_delta as i64);
+
+                                    // Skip records below the fetch offset — these were
+                                    // already delivered in a prior poll but are included
+                                    // because Kafka returns whole batches.
+                                    if record_offset < partition_fetch_offset {
+                                        continue;
+                                    }
+
                                     records.push(ConsumerRecord {
                                         topic: topic_name.clone(),
                                         partition,
                                         offset: record_offset,
-                                        timestamp: batch.base_timestamp + record.timestamp_delta,
+                                        timestamp: batch
+                                            .base_timestamp
+                                            .saturating_add(record.timestamp_delta),
                                         timestamp_type: batch.attributes.timestamp_type as i8,
                                         key: record.key,
                                         value: record.value,
@@ -2074,7 +2089,7 @@ impl Consumer {
 
                     // Track offset update for this partition
                     if let Some(last_offset) = last_offset_for_partition {
-                        offset_updates.push((key, last_offset + 1));
+                        offset_updates.push((key, last_offset.saturating_add(1)));
                     }
                 }
             }
@@ -2146,6 +2161,10 @@ impl Consumer {
             None => self
                 .resolve_list_offset(topic, partition, target)
                 .await
+                .map_err(|e| {
+                    warn!("Direct list_offset failed for {topic}-{partition}: {e}");
+                    e
+                })
                 .ok(),
         };
 
@@ -2186,7 +2205,7 @@ impl Consumer {
         }
 
         let leader_id = self.metadata.leader(topic, partition).ok_or_else(|| {
-            KrafkaError::invalid_state(format!("no leader for {}-{}", topic, partition))
+            KrafkaError::invalid_state(format!("no leader for {topic}-{partition}"))
         })?;
 
         let broker = self
@@ -2196,7 +2215,7 @@ impl Consumer {
 
         let conn = self
             .pool
-            .get_connection_by_id(leader_id, &broker.address())
+            .get_connection_by_id(leader_id, broker.address())
             .await?;
 
         let request = OffsetForLeaderEpochRequest {
@@ -2211,14 +2230,38 @@ impl Consumer {
             }],
         };
 
+        let version = conn
+            .negotiate_api_version_max(
+                ApiKey::OffsetForLeaderEpoch,
+                versions::OFFSET_FOR_LEADER_EPOCH_MAX,
+            )
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported OffsetForLeaderEpoch API version")
+            })?;
+
         let response_bytes = conn
-            .send_request(ApiKey::OffsetForLeaderEpoch, 2, |buf| {
-                request.encode_v2(buf)
+            .send_request(ApiKey::OffsetForLeaderEpoch, version, |buf| match version {
+                0..=1 => request.encode_v0(buf),
+                2 => request.encode_v2(buf),
+                3 => request.encode_v3(buf),
+                _ => Err(KrafkaError::protocol(format!(
+                    "unsupported OffsetForLeaderEpoch encode version {version}"
+                ))),
             })
             .await?;
 
         let mut buf = response_bytes;
-        let response = OffsetForLeaderEpochResponse::decode_v2(&mut buf)?;
+        let response = match version {
+            0 => OffsetForLeaderEpochResponse::decode_v0(&mut buf)?,
+            1 => OffsetForLeaderEpochResponse::decode_v1(&mut buf)?,
+            2..=3 => OffsetForLeaderEpochResponse::decode_v2(&mut buf)?,
+            _ => {
+                return Err(KrafkaError::protocol(format!(
+                    "unsupported OffsetForLeaderEpoch decode version {version}"
+                )));
+            }
+        };
 
         let key = (topic.to_string(), partition);
         let mut offset_changed = false;
@@ -2277,7 +2320,10 @@ impl Consumer {
             match self.poll(Duration::from_secs(1)).await {
                 Ok(records) if !records.is_empty() => {
                     let mut iter = records.into_iter();
-                    let first = iter.next().unwrap();
+                    // Infallible: `!records.is_empty()` guard above guarantees ≥1 element.
+                    let first = iter
+                        .next()
+                        .expect("non-empty ConsumerRecords yields at least one element");
                     // Buffer any remaining records for subsequent recv() calls
                     if iter.len() > 0 {
                         let mut buffer = self.recv_buffer.write().await;
@@ -2704,8 +2750,13 @@ impl Consumer {
     }
 
     /// Close the consumer.
+    ///
+    /// Commits offsets (if auto-commit is enabled), leaves the consumer group,
+    /// and tears down connections. Calling `close()` more than once is a no-op.
     pub async fn close(&self) {
-        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        if self.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
 
         // Auto-commit on close (if enabled)
         if self.config.enable_auto_commit
@@ -2753,11 +2804,13 @@ impl Consumer {
     }
 
     /// Get the group coordinator, if one is configured.
+    #[inline]
     pub fn group_coordinator(&self) -> Option<&Arc<GroupCoordinator>> {
         self.group_coordinator.as_ref()
     }
 
     /// Get a snapshot of consumer metrics.
+    #[inline]
     pub fn metrics(&self) -> &Arc<ConsumerMetrics> {
         &self.metrics
     }
@@ -3606,26 +3659,6 @@ mod tests {
             .group_id("test-group");
         // The builder should have no group field; only group_coordinator is used
         assert!(builder.config.group_id.is_some());
-    }
-
-    #[test]
-    fn test_bootstrap_filter_empty_strings() {
-        // Empty bootstrap server entries should be filtered out
-        let servers = " , ,localhost:9092, , broker:9093, ";
-        let parsed: Vec<String> = servers
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        assert_eq!(parsed, vec!["localhost:9092", "broker:9093"]);
-
-        // Empty string should produce empty vec
-        let empty_parsed: Vec<String> = ""
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        assert!(empty_parsed.is_empty());
     }
 
     #[test]
@@ -4482,5 +4515,11 @@ mod tests {
         assert!(plan.partitions_by_broker[&1].contains(&("t".into(), 1)));
         assert!(plan.partitions_by_broker[&2].contains(&("t".into(), 2)));
         assert_eq!(plan.expired_preferred, vec![("t".into(), 1)]);
+    }
+
+    #[test]
+    fn test_consumer_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Consumer>();
     }
 }

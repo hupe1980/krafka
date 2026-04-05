@@ -98,17 +98,7 @@ impl Producer {
 
         let pool = Arc::new(ConnectionPool::new(pool_config));
 
-        // Parse bootstrap servers — filter out empty/whitespace entries
-        let bootstrap_servers: Vec<String> = config
-            .bootstrap_servers
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        if bootstrap_servers.is_empty() {
-            return Err(KrafkaError::config("no bootstrap servers specified"));
-        }
+        let bootstrap_servers = crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
 
         let metadata = Arc::new(ClusterMetadata::new(
             bootstrap_servers,
@@ -243,9 +233,10 @@ impl Producer {
         let partition = match record.partition {
             Some(p) => p,
             None => {
-                let partition_count = self.metadata.partition_count(&topic).ok_or_else(|| {
-                    KrafkaError::invalid_state(format!("unknown topic: {}", topic))
-                })?;
+                let partition_count = self
+                    .metadata
+                    .partition_count(&topic)
+                    .ok_or_else(|| KrafkaError::invalid_state(format!("unknown topic: {topic}")))?;
                 self.partitioner
                     .partition(&topic, record.key.as_deref(), partition_count)
             }
@@ -300,7 +291,7 @@ impl Producer {
                     );
                     return Ok(metadata);
                 }
-                Err(ref e) => {
+                Err(e) => {
                     self.metrics.record_error();
 
                     // Refresh metadata on leader-not-available / not-leader errors
@@ -311,16 +302,19 @@ impl Producer {
                             error = %e,
                             "Transient error, refreshing metadata"
                         );
-                        let _ = self.metadata.refresh_for_topics(Some(&[topic])).await;
+                        if let Err(refresh_err) =
+                            self.metadata.refresh_for_topics(Some(&[topic])).await
+                        {
+                            debug!(error = %refresh_err, "Metadata refresh failed during retry");
+                        }
                     }
 
-                    if let Some(backoff) = retry_ctx.record_failure(e) {
+                    if let Some(backoff) = retry_ctx.record_failure(&e) {
                         self.metrics.retries.inc();
                         retry_ctx.wait(backoff).await;
                         continue;
                     }
                     // Final failure — notify interceptor
-                    let err = result.unwrap_err();
                     let dummy_metadata = RecordMetadata {
                         topic: topic.to_string(),
                         partition,
@@ -330,9 +324,9 @@ impl Producer {
                     crate::interceptor::safe_on_acknowledgement(
                         &*self.interceptor,
                         &dummy_metadata,
-                        Some(&err),
+                        Some(&e),
                     );
-                    return Err(err);
+                    return Err(e);
                 }
             }
         }
@@ -422,7 +416,7 @@ impl Producer {
                     if !partition_response.error_code.is_ok() {
                         return Err(KrafkaError::broker(
                             partition_response.error_code,
-                            format!("produce failed for {}-{}", topic, partition),
+                            format!("produce failed for {topic}-{partition}"),
                         ));
                     }
 
@@ -449,8 +443,13 @@ impl Producer {
     }
 
     /// Close the producer.
+    ///
+    /// Flushes pending records, notifies interceptors, and tears down connections.
+    /// Calling `close()` more than once is a no-op.
     pub async fn close(&self) {
-        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        if self.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
 
         // Shutdown accumulator first to flush pending records
         if let Some(ref accumulator) = self.accumulator {
@@ -482,6 +481,7 @@ impl Producer {
     }
 
     /// Get the shared metrics handle (for external monitoring).
+    #[inline]
     pub fn metrics_handle(&self) -> Arc<ProducerMetricsInner> {
         self.metrics.clone()
     }
@@ -894,5 +894,11 @@ mod tests {
             .interceptor(Arc::new(TestInterceptor));
 
         assert!(builder.interceptor.is_some());
+    }
+
+    #[test]
+    fn test_producer_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Producer>();
     }
 }

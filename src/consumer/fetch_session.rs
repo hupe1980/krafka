@@ -107,7 +107,9 @@ impl FetchSessionState {
     pub fn build_request(&self, desired: &[FetchTopicRequest]) -> FetchSessionRequest {
         // Build a flat set of the desired partitions for fast lookup.
         // Keys borrow topic strings from `desired` to avoid per-poll cloning.
-        let mut desired_map: HashMap<(&str, PartitionId), &FetchPartitionRequest> = HashMap::new();
+        let total_partitions: usize = desired.iter().map(|t| t.partitions.len()).sum();
+        let mut desired_map: HashMap<(&str, PartitionId), &FetchPartitionRequest> =
+            HashMap::with_capacity(total_partitions);
         for topic in desired {
             for part in &topic.partitions {
                 desired_map.insert((topic.topic.as_str(), part.partition), part);

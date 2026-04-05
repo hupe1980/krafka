@@ -5,6 +5,7 @@ use std::time::Duration;
 use crate::auth::AuthConfig;
 
 /// Auto offset reset behavior.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AutoOffsetReset {
     /// Start from the earliest offset.
@@ -21,6 +22,7 @@ impl AutoOffsetReset {
     ///
     /// Returns `None` for `AutoOffsetReset::None` since that variant should
     /// produce an error rather than a valid offset.
+    #[inline]
     pub fn to_offset(&self) -> Option<i64> {
         match self {
             AutoOffsetReset::Earliest => Some(-2),
@@ -31,6 +33,7 @@ impl AutoOffsetReset {
 }
 
 /// Transaction isolation level.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IsolationLevel {
     /// Read all messages, including uncommitted transactions.
@@ -42,6 +45,7 @@ pub enum IsolationLevel {
 
 impl IsolationLevel {
     /// Convert to the protocol i8 value.
+    #[inline]
     pub fn to_i8(self) -> i8 {
         match self {
             IsolationLevel::ReadUncommitted => 0,
@@ -51,6 +55,7 @@ impl IsolationLevel {
 }
 
 /// Partition assignment strategy for consumer groups.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PartitionAssignmentStrategy {
     /// Range assignor (default) — assigns contiguous partition ranges per topic.
@@ -64,6 +69,7 @@ pub enum PartitionAssignmentStrategy {
 
 impl PartitionAssignmentStrategy {
     /// Get the Kafka protocol name for this strategy.
+    #[inline]
     pub fn protocol_name(&self) -> &'static str {
         match self {
             Self::Range => "range",
@@ -75,59 +81,57 @@ impl PartitionAssignmentStrategy {
 
 /// Consumer configuration.
 ///
-/// This struct is `#[non_exhaustive]`; use [`ConsumerConfig::builder()`] or
-/// [`Default::default()`] to construct instances.
+/// Use [`ConsumerConfig::builder()`] or [`Default::default()`] to construct.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct ConsumerConfig {
     /// Bootstrap servers (comma-separated).
-    pub bootstrap_servers: String,
+    pub(crate) bootstrap_servers: String,
     /// Consumer group ID.
-    pub group_id: Option<String>,
+    pub(crate) group_id: Option<String>,
     /// Client ID.
-    pub client_id: String,
+    pub(crate) client_id: String,
     /// Auto offset reset behavior.
-    pub auto_offset_reset: AutoOffsetReset,
+    pub(crate) auto_offset_reset: AutoOffsetReset,
     /// Enable auto commit.
-    pub enable_auto_commit: bool,
+    pub(crate) enable_auto_commit: bool,
     /// Auto commit interval.
-    pub auto_commit_interval: Duration,
+    pub(crate) auto_commit_interval: Duration,
     /// Minimum bytes to fetch.
-    pub fetch_min_bytes: i32,
+    pub(crate) fetch_min_bytes: i32,
     /// Maximum bytes to fetch.
-    pub fetch_max_bytes: i32,
+    pub(crate) fetch_max_bytes: i32,
     /// Maximum bytes per partition.
-    pub max_partition_fetch_bytes: i32,
+    pub(crate) max_partition_fetch_bytes: i32,
     /// Maximum poll records.
-    pub max_poll_records: i32,
+    pub(crate) max_poll_records: i32,
     /// Maximum poll interval.
-    pub max_poll_interval: Duration,
+    pub(crate) max_poll_interval: Duration,
     /// Request timeout.
-    pub request_timeout: Duration,
+    pub(crate) request_timeout: Duration,
     /// Session timeout for consumer groups.
-    pub session_timeout: Duration,
+    pub(crate) session_timeout: Duration,
     /// Heartbeat interval.
-    pub heartbeat_interval: Duration,
+    pub(crate) heartbeat_interval: Duration,
     /// Isolation level.
-    pub isolation_level: IsolationLevel,
+    pub(crate) isolation_level: IsolationLevel,
     /// Metadata max age.
-    pub metadata_max_age: Duration,
+    pub(crate) metadata_max_age: Duration,
     /// Partition assignment strategy.
-    pub partition_assignment_strategy: PartitionAssignmentStrategy,
+    pub(crate) partition_assignment_strategy: PartitionAssignmentStrategy,
     /// Static group membership instance ID (KIP-345).
     ///
     /// When set, the consumer uses static membership. The broker will not
     /// trigger a rebalance when a static member leaves and rejoins within the
     /// session timeout, as long as it uses the same instance ID.
-    pub group_instance_id: Option<String>,
+    pub(crate) group_instance_id: Option<String>,
     /// Client rack ID for closest-replica fetching (KIP-392).
     ///
     /// When set, the broker may direct fetches to a replica in the same rack,
     /// reducing cross-rack traffic. The value should match the `broker.rack`
     /// configuration on the brokers.
-    pub client_rack: Option<String>,
+    pub(crate) client_rack: Option<String>,
     /// Authentication configuration (optional).
-    pub auth: Option<AuthConfig>,
+    pub(crate) auth: Option<AuthConfig>,
 }
 
 impl Default for ConsumerConfig {
@@ -161,6 +165,126 @@ impl ConsumerConfig {
     /// Create a new config builder.
     pub fn builder() -> ConsumerConfigBuilder {
         ConsumerConfigBuilder::default()
+    }
+
+    /// Returns the bootstrap servers.
+    #[inline]
+    pub fn bootstrap_servers(&self) -> &str {
+        &self.bootstrap_servers
+    }
+
+    /// Returns the consumer group ID, if set.
+    #[inline]
+    pub fn group_id(&self) -> Option<&str> {
+        self.group_id.as_deref()
+    }
+
+    /// Returns the client ID.
+    #[inline]
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// Returns the auto offset reset behavior.
+    #[inline]
+    pub fn auto_offset_reset(&self) -> AutoOffsetReset {
+        self.auto_offset_reset
+    }
+
+    /// Returns whether auto commit is enabled.
+    #[inline]
+    pub fn enable_auto_commit(&self) -> bool {
+        self.enable_auto_commit
+    }
+
+    /// Returns the auto commit interval.
+    #[inline]
+    pub fn auto_commit_interval(&self) -> Duration {
+        self.auto_commit_interval
+    }
+
+    /// Returns the minimum bytes to fetch.
+    #[inline]
+    pub fn fetch_min_bytes(&self) -> i32 {
+        self.fetch_min_bytes
+    }
+
+    /// Returns the maximum bytes to fetch.
+    #[inline]
+    pub fn fetch_max_bytes(&self) -> i32 {
+        self.fetch_max_bytes
+    }
+
+    /// Returns the maximum bytes per partition.
+    #[inline]
+    pub fn max_partition_fetch_bytes(&self) -> i32 {
+        self.max_partition_fetch_bytes
+    }
+
+    /// Returns the maximum poll records.
+    #[inline]
+    pub fn max_poll_records(&self) -> i32 {
+        self.max_poll_records
+    }
+
+    /// Returns the maximum poll interval.
+    #[inline]
+    pub fn max_poll_interval(&self) -> Duration {
+        self.max_poll_interval
+    }
+
+    /// Returns the request timeout.
+    #[inline]
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    /// Returns the session timeout.
+    #[inline]
+    pub fn session_timeout(&self) -> Duration {
+        self.session_timeout
+    }
+
+    /// Returns the heartbeat interval.
+    #[inline]
+    pub fn heartbeat_interval(&self) -> Duration {
+        self.heartbeat_interval
+    }
+
+    /// Returns the isolation level.
+    #[inline]
+    pub fn isolation_level(&self) -> IsolationLevel {
+        self.isolation_level
+    }
+
+    /// Returns the metadata max age.
+    #[inline]
+    pub fn metadata_max_age(&self) -> Duration {
+        self.metadata_max_age
+    }
+
+    /// Returns the partition assignment strategy.
+    #[inline]
+    pub fn partition_assignment_strategy(&self) -> PartitionAssignmentStrategy {
+        self.partition_assignment_strategy
+    }
+
+    /// Returns the static group membership instance ID, if set.
+    #[inline]
+    pub fn group_instance_id(&self) -> Option<&str> {
+        self.group_instance_id.as_deref()
+    }
+
+    /// Returns the client rack ID, if set.
+    #[inline]
+    pub fn client_rack(&self) -> Option<&str> {
+        self.client_rack.as_deref()
+    }
+
+    /// Returns the authentication configuration, if set.
+    #[inline]
+    pub fn auth(&self) -> Option<&AuthConfig> {
+        self.auth.as_ref()
     }
 }
 

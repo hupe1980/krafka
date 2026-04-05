@@ -70,11 +70,12 @@ impl Encoder {
 
     /// Finish encoding a size-prefixed message.
     /// Updates the size at the given position.
-    pub fn finish_message(&mut self, size_pos: usize) {
-        let message_size =
-            i32::try_from(self.buffer.len() - size_pos - 4).expect("message size exceeds i32::MAX");
+    pub fn finish_message(&mut self, size_pos: usize) -> Result<()> {
+        let message_size = i32::try_from(self.buffer.len() - size_pos - 4)
+            .map_err(|_| KrafkaError::protocol("message size exceeds i32::MAX"))?;
         let size_bytes = message_size.to_be_bytes();
         self.buffer[size_pos..size_pos + 4].copy_from_slice(&size_bytes);
+        Ok(())
     }
 
     /// Take the completed message as Bytes.
@@ -180,7 +181,7 @@ mod tests {
         let mut encoder = Encoder::new();
         let pos = encoder.start_message();
         encoder.buffer_mut().put_slice(b"hello");
-        encoder.finish_message(pos);
+        encoder.finish_message(pos).unwrap();
 
         let bytes = encoder.take();
         assert_eq!(bytes.len(), 9); // 4 bytes size + 5 bytes data

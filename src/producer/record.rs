@@ -6,6 +6,7 @@ use crate::error::{KrafkaError, Result};
 use crate::{PartitionId, Timestamp};
 
 /// A record to be sent to Kafka.
+#[non_exhaustive]
 #[must_use]
 #[derive(Debug, Clone)]
 pub struct ProducerRecord {
@@ -79,14 +80,22 @@ impl ProducerRecord {
     }
 
     /// Get the estimated size in bytes.
+    ///
+    /// Accounts for key, value, headers (including per-header wire overhead),
+    /// topic name, and struct metadata overhead. This is the single source of
+    /// truth used by both batch size-gating and memory backpressure.
     #[inline]
     pub fn estimated_size(&self) -> usize {
         let key_size = self.key.as_ref().map(|k| k.len()).unwrap_or(0);
         let value_size = self.value.len();
-        let headers_size: usize = self.headers.iter().map(|(k, v)| k.len() + v.len()).sum();
+        let headers_size: usize = self
+            .headers
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 8) // 8 bytes wire overhead per header
+            .sum();
+        let topic_overhead = self.topic.len() + 64; // struct metadata overhead
 
-        // Overhead for record metadata
-        key_size + value_size + headers_size + 50
+        key_size + value_size + headers_size + topic_overhead
     }
 
     /// Validate that this record's fields do not exceed Kafka wire-format limits.
@@ -98,6 +107,11 @@ impl ProducerRecord {
     /// - Each header value fits in `i32`
     /// - Topic name fits in `i16` (Kafka string encoding limit of 32 KiB)
     pub fn validate(&self) -> Result<()> {
+        // Topic names cannot be empty
+        if self.topic.is_empty() {
+            return Err(KrafkaError::protocol("topic name cannot be empty"));
+        }
+
         // Topic names are encoded as KafkaString (i16 length prefix)
         if self.topic.len() > i16::MAX as usize {
             return Err(KrafkaError::protocol(format!(
@@ -153,8 +167,9 @@ impl ProducerRecord {
 }
 
 /// Metadata returned after successfully sending a record.
+#[non_exhaustive]
 #[must_use = "contains the result of a send operation"]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordMetadata {
     /// Topic the record was sent to.
     pub topic: String,
@@ -273,5 +288,29 @@ mod tests {
             .with_key("my-key")
             .without_key();
         assert!(record.key.is_none());
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_topic() {
+        let record = ProducerRecord::new("", b"value".to_vec());
+        let err = record.validate().unwrap_err().to_string();
+        assert!(err.contains("empty"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn test_record_metadata_equality() {
+        let a = RecordMetadata {
+            topic: "t".to_string(),
+            partition: 0,
+            offset: 1,
+            timestamp: 100,
+        };
+        let b = RecordMetadata {
+            topic: "t".to_string(),
+            partition: 0,
+            offset: 1,
+            timestamp: 100,
+        };
+        assert_eq!(a, b);
     }
 }

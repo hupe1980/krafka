@@ -10,6 +10,7 @@ use crate::error::Result;
 /// Kafka API keys.
 ///
 /// Each API key corresponds to a specific request/response pair in the Kafka protocol.
+/// Forward compatibility is provided by the `Unknown(i16)` variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i16)]
 pub enum ApiKey {
@@ -398,6 +399,15 @@ impl From<i16> for ApiKey {
     }
 }
 
+impl std::fmt::Display for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown(key) => write!(f, "Unknown({key})"),
+            other => std::fmt::Debug::fmt(other, f),
+        }
+    }
+}
+
 impl From<ApiKey> for i16 {
     fn from(key: ApiKey) -> Self {
         key.to_i16()
@@ -733,5 +743,12 @@ mod tests {
         let range = ApiVersionRange::new(ApiKey::Fetch, 0, 12);
         assert_eq!(range.negotiate_max(8), Some(8));
         assert_eq!(range.negotiate_max(15), Some(12)); // capped to broker max
+    }
+
+    #[test]
+    fn test_api_key_display() {
+        assert_eq!(ApiKey::Produce.to_string(), "Produce");
+        assert_eq!(ApiKey::Fetch.to_string(), "Fetch");
+        assert_eq!(ApiKey::Unknown(999).to_string(), "Unknown(999)");
     }
 }

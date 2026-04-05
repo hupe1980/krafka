@@ -30,6 +30,7 @@ use std::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Security protocol for Kafka connections.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SecurityProtocol {
     /// No encryption or authentication.
@@ -55,6 +56,7 @@ impl fmt::Display for SecurityProtocol {
 }
 
 /// SASL mechanism for authentication.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SaslMechanism {
     /// PLAIN authentication (username/password).
@@ -161,6 +163,7 @@ impl fmt::Debug for ScramCredentials {
 /// AWS MSK IAM credentials.
 ///
 /// Secret access key and session token are automatically zeroized on drop for security.
+#[non_exhaustive]
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct AwsMskIamCredentials {
     /// AWS access key ID.
@@ -275,7 +278,7 @@ impl AwsMskIamCredentials {
             .provide_credentials()
             .await
             .map_err(|e| {
-                crate::error::KrafkaError::config(format!("Failed to load AWS credentials: {}", e))
+                crate::error::KrafkaError::config(format!("Failed to load AWS credentials: {e}"))
             })?;
 
         Ok(Self {
@@ -302,41 +305,54 @@ impl fmt::Debug for AwsMskIamCredentials {
 }
 
 /// TLS configuration.
-#[derive(Debug, Clone, Default)]
+///
+/// Use [`TlsConfig::new()`] or [`Default::default()`] to construct.
+/// For insecure mode, enable the `danger-insecure-tls` feature and use
+/// `TlsConfig::insecure()`.
+#[derive(Debug, Clone)]
 pub struct TlsConfig {
     /// Path to CA certificate file.
-    pub ca_cert_path: Option<String>,
+    pub(crate) ca_cert_path: Option<String>,
     /// Path to client certificate file.
-    pub client_cert_path: Option<String>,
+    pub(crate) client_cert_path: Option<String>,
     /// Path to client private key file.
-    pub client_key_path: Option<String>,
-    /// Whether to verify server certificates.
-    pub verify_server_cert: bool,
+    pub(crate) client_key_path: Option<String>,
+    /// Whether to verify server certificates (defaults to `true`).
+    pub(crate) verify_server_cert: bool,
     /// Server name indication (SNI) hostname.
-    pub sni_hostname: Option<String>,
+    pub(crate) sni_hostname: Option<String>,
+}
+
+impl Default for TlsConfig {
+    /// Returns a secure default: certificate verification enabled.
+    fn default() -> Self {
+        Self {
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
+            verify_server_cert: true,
+            sni_hostname: None,
+        }
+    }
 }
 
 impl TlsConfig {
     /// Create a new TLS config that verifies server certificates.
     pub fn new() -> Self {
-        Self {
-            verify_server_cert: true,
-            ..Default::default()
-        }
+        Self::default()
     }
 
     /// Create a TLS config for self-signed certificates.
     ///
-    /// **Note:** This method is deprecated. Use `with_ca_cert()` instead.
-    /// Skipping certificate verification is not supported as it defeats
-    /// the purpose of TLS and exposes connections to man-in-the-middle attacks.
+    /// Create a TLS config that skips server certificate verification.
     ///
-    /// For testing with self-signed certificates, provide the CA certificate
-    /// using the `with_ca_cert()` method.
-    #[deprecated(
-        since = "0.1.0",
-        note = "Use with_ca_cert() with your CA certificate instead. Insecure mode is not supported."
-    )]
+    /// **Warning:** This disables TLS security entirely. Use only for local
+    /// development or testing with self-signed certificates. For production
+    /// use with self-signed certs, prefer [`with_ca_cert()`](Self::with_ca_cert)
+    /// to supply the CA certificate explicitly.
+    ///
+    /// Requires the `danger-insecure-tls` crate feature.
+    #[cfg(feature = "danger-insecure-tls")]
     pub fn insecure() -> Self {
         Self {
             verify_server_cert: false,
@@ -360,25 +376,59 @@ impl TlsConfig {
         self.client_key_path = Some(key_path.into());
         self
     }
+
+    /// Set the SNI hostname.
+    pub fn with_sni_hostname(mut self, hostname: impl Into<String>) -> Self {
+        self.sni_hostname = Some(hostname.into());
+        self
+    }
+
+    /// Returns the CA certificate path, if set.
+    pub fn ca_cert_path(&self) -> Option<&str> {
+        self.ca_cert_path.as_deref()
+    }
+
+    /// Returns the client certificate path, if set.
+    pub fn client_cert_path(&self) -> Option<&str> {
+        self.client_cert_path.as_deref()
+    }
+
+    /// Returns the client key path, if set.
+    pub fn client_key_path(&self) -> Option<&str> {
+        self.client_key_path.as_deref()
+    }
+
+    /// Returns whether server certificates are verified.
+    pub fn verify_server_cert(&self) -> bool {
+        self.verify_server_cert
+    }
+
+    /// Returns the SNI hostname, if set.
+    pub fn sni_hostname(&self) -> Option<&str> {
+        self.sni_hostname.as_deref()
+    }
 }
 
 /// Complete authentication configuration.
+///
+/// Use factory methods like [`AuthConfig::plaintext()`], [`AuthConfig::ssl()`],
+/// [`AuthConfig::sasl_plain()`], etc. to construct.
 #[derive(Debug, Clone, Default)]
 pub struct AuthConfig {
     /// Security protocol.
-    pub security_protocol: SecurityProtocol,
+    pub(crate) security_protocol: SecurityProtocol,
     /// SASL mechanism (if using SASL).
-    pub sasl_mechanism: Option<SaslMechanism>,
+    pub(crate) sasl_mechanism: Option<SaslMechanism>,
     /// SASL PLAIN credentials.
-    pub plain_credentials: Option<PlainCredentials>,
+    pub(crate) plain_credentials: Option<PlainCredentials>,
     /// SASL SCRAM credentials.
-    pub scram_credentials: Option<ScramCredentials>,
+    pub(crate) scram_credentials: Option<ScramCredentials>,
     /// AWS MSK IAM credentials.
-    pub aws_msk_iam_credentials: Option<AwsMskIamCredentials>,
+    pub(crate) aws_msk_iam_credentials: Option<AwsMskIamCredentials>,
     /// OAUTHBEARER token.
-    pub oauthbearer_token: Option<OAuthBearerToken>,
+    pub(crate) oauthbearer_token: Option<OAuthBearerToken>,
     /// TLS configuration.
-    pub tls_config: Option<TlsConfig>,
+    pub(crate) tls_config: Option<TlsConfig>,
 }
 
 impl AuthConfig {
@@ -554,6 +604,41 @@ impl AuthConfig {
             self.security_protocol,
             SecurityProtocol::SaslPlaintext | SecurityProtocol::SaslSsl
         )
+    }
+
+    /// Returns the security protocol.
+    pub fn security_protocol(&self) -> &SecurityProtocol {
+        &self.security_protocol
+    }
+
+    /// Returns the SASL mechanism, if set.
+    pub fn sasl_mechanism(&self) -> Option<&SaslMechanism> {
+        self.sasl_mechanism.as_ref()
+    }
+
+    /// Returns the PLAIN credentials, if set.
+    pub fn plain_credentials(&self) -> Option<&PlainCredentials> {
+        self.plain_credentials.as_ref()
+    }
+
+    /// Returns the SCRAM credentials, if set.
+    pub fn scram_credentials(&self) -> Option<&ScramCredentials> {
+        self.scram_credentials.as_ref()
+    }
+
+    /// Returns the AWS MSK IAM credentials, if set.
+    pub fn aws_msk_iam_credentials(&self) -> Option<&AwsMskIamCredentials> {
+        self.aws_msk_iam_credentials.as_ref()
+    }
+
+    /// Returns the OAUTHBEARER token, if set.
+    pub fn oauthbearer_token(&self) -> Option<&OAuthBearerToken> {
+        self.oauthbearer_token.as_ref()
+    }
+
+    /// Returns the TLS configuration, if set.
+    pub fn tls_config(&self) -> Option<&TlsConfig> {
+        self.tls_config.as_ref()
     }
 }
 

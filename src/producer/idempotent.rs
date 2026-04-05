@@ -164,6 +164,24 @@ impl ProducerIdentity {
         }
     }
 
+    /// Roll back the most recent sequence allocation for a partition.
+    ///
+    /// Call this when a sequence was allocated via [`Self::next_sequence`] but the
+    /// request was never sent (e.g., encode failure). Decrements `next_sequence`
+    /// by one, wrapping from 0 back to `i32::MAX`.
+    pub fn rollback_sequence(&self, topic: &str, partition: PartitionId) {
+        let key = (topic.to_string(), partition);
+
+        let mut sequences = self.sequences.write();
+        if let Some(state) = sequences.get_mut(&key) {
+            state.next_sequence = if state.next_sequence == 0 {
+                i32::MAX
+            } else {
+                state.next_sequence - 1
+            };
+        }
+    }
+
     /// Reset sequence number for a partition (e.g., after an out-of-order error).
     pub fn reset_sequence(&self, topic: &str, partition: PartitionId) {
         let key = (topic.to_string(), partition);
@@ -384,5 +402,42 @@ mod tests {
         // Should wrap to 0 (matching Kafka Java client behavior)
         assert_eq!(identity.next_sequence("topic", 0), i32::MAX);
         assert_eq!(identity.peek_sequence("topic", 0), 0);
+    }
+
+    #[test]
+    fn test_rollback_sequence() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+
+        // Allocate sequence 0, then roll back
+        assert_eq!(identity.next_sequence("topic", 0), 0);
+        assert_eq!(identity.peek_sequence("topic", 0), 1);
+        identity.rollback_sequence("topic", 0);
+        assert_eq!(identity.peek_sequence("topic", 0), 0);
+
+        // Re-allocate gives the same sequence
+        assert_eq!(identity.next_sequence("topic", 0), 0);
+    }
+
+    #[test]
+    fn test_rollback_sequence_wraps_from_zero() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+
+        // Set up state at 0 (just wrapped)
+        {
+            let mut sequences = identity.sequences.write();
+            sequences.insert(
+                ("topic".to_string(), 0),
+                SequenceState {
+                    next_sequence: 0,
+                    last_acked_sequence: i32::MAX - 1,
+                },
+            );
+        }
+
+        // Rollback from 0 should wrap to i32::MAX
+        identity.rollback_sequence("topic", 0);
+        assert_eq!(identity.peek_sequence("topic", 0), i32::MAX);
     }
 }

@@ -271,6 +271,7 @@ impl Drop for LatencyGuard<'_> {
 }
 
 /// Snapshot of latency statistics.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct LatencySnapshot {
     /// Number of recorded samples.

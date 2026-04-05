@@ -19,16 +19,20 @@ use crate::BrokerId;
 use crate::error::{KrafkaError, Result};
 
 /// Configuration for connection retry with exponential backoff.
+///
+/// Use [`ConnectionRetryConfig::builder()`] or [`Default::default()`] to construct.
 #[derive(Debug, Clone)]
 pub struct ConnectionRetryConfig {
     /// Maximum number of retries (0 = no retries).
-    pub max_retries: u32,
+    pub(crate) max_retries: u32,
     /// Initial backoff duration.
-    pub initial_backoff: Duration,
+    pub(crate) initial_backoff: Duration,
     /// Maximum backoff duration (caps exponential growth).
-    pub max_backoff: Duration,
+    pub(crate) max_backoff: Duration,
     /// Backoff multiplier for exponential growth.
-    pub backoff_multiplier: f64,
+    pub(crate) backoff_multiplier: f64,
+    /// Jitter factor (0.0–1.0) to randomize backoff and prevent thundering herd.
+    pub(crate) jitter_factor: f64,
 }
 
 impl Default for ConnectionRetryConfig {
@@ -38,11 +42,47 @@ impl Default for ConnectionRetryConfig {
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(10),
             backoff_multiplier: 2.0,
+            jitter_factor: 0.2,
         }
     }
 }
 
 impl ConnectionRetryConfig {
+    /// Create a new config builder.
+    pub fn builder() -> ConnectionRetryConfigBuilder {
+        ConnectionRetryConfigBuilder::default()
+    }
+
+    /// Returns the maximum number of retries.
+    #[inline]
+    pub fn max_retries(&self) -> u32 {
+        self.max_retries
+    }
+
+    /// Returns the initial backoff duration.
+    #[inline]
+    pub fn initial_backoff(&self) -> Duration {
+        self.initial_backoff
+    }
+
+    /// Returns the maximum backoff duration.
+    #[inline]
+    pub fn max_backoff(&self) -> Duration {
+        self.max_backoff
+    }
+
+    /// Returns the backoff multiplier.
+    #[inline]
+    pub fn backoff_multiplier(&self) -> f64 {
+        self.backoff_multiplier
+    }
+
+    /// Returns the jitter factor (0.0–1.0).
+    #[inline]
+    pub fn jitter_factor(&self) -> f64 {
+        self.jitter_factor
+    }
+
     /// Calculate the backoff duration for a given attempt number (1-indexed).
     #[inline]
     fn calculate_backoff(&self, attempt: u32) -> Duration {
@@ -57,7 +97,81 @@ impl ConnectionRetryConfig {
         // Cap at max backoff
         let capped_backoff = base_backoff.min(self.max_backoff.as_secs_f64());
 
-        Duration::from_secs_f64(capped_backoff)
+        // Add jitter: ±jitter_factor * backoff (randomized to prevent thundering herd)
+        let jitter_range = capped_backoff * self.jitter_factor;
+        let jitter = if self.jitter_factor > 0.0 {
+            use rand::Rng;
+            let mut rng = rand::rng();
+            rng.random_range(-jitter_range..=jitter_range)
+        } else {
+            0.0
+        };
+
+        let final_backoff = (capped_backoff + jitter).max(0.0);
+
+        // Defensive: Duration::from_secs_f64 panics on NaN/Inf
+        if !final_backoff.is_finite() {
+            warn!(
+                attempt,
+                final_backoff,
+                "Backoff calculation produced non-finite value, falling back to max_backoff"
+            );
+            return self.max_backoff;
+        }
+
+        Duration::from_secs_f64(final_backoff)
+    }
+}
+
+/// Builder for ConnectionRetryConfig.
+#[must_use = "builders do nothing until .build() is called"]
+#[derive(Debug, Default)]
+pub struct ConnectionRetryConfigBuilder {
+    config: ConnectionRetryConfig,
+}
+
+impl ConnectionRetryConfigBuilder {
+    /// Set maximum number of retries.
+    pub fn max_retries(mut self, retries: u32) -> Self {
+        self.config.max_retries = retries;
+        self
+    }
+
+    /// Set initial backoff duration.
+    pub fn initial_backoff(mut self, duration: Duration) -> Self {
+        self.config.initial_backoff = duration;
+        self
+    }
+
+    /// Set maximum backoff duration.
+    pub fn max_backoff(mut self, duration: Duration) -> Self {
+        self.config.max_backoff = duration;
+        self
+    }
+
+    /// Set backoff multiplier (must be finite and > 0; clamped to 1.0 otherwise).
+    pub fn backoff_multiplier(mut self, multiplier: f64) -> Self {
+        self.config.backoff_multiplier = if multiplier.is_finite() && multiplier > 0.0 {
+            multiplier
+        } else {
+            1.0
+        };
+        self
+    }
+
+    /// Set jitter factor (0.0–1.0) to randomize backoff and prevent thundering herd.
+    pub fn jitter_factor(mut self, factor: f64) -> Self {
+        self.config.jitter_factor = if factor.is_finite() {
+            factor.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self
+    }
+
+    /// Build the ConnectionRetryConfig.
+    pub fn build(self) -> ConnectionRetryConfig {
+        self.config
     }
 }
 
@@ -122,7 +236,7 @@ impl BrokerConnectionBundle {
         let mut connections = Vec::with_capacity(num_connections);
         for handle in handles {
             let conn = handle.await.map_err(|e| {
-                KrafkaError::invalid_state(format!("Connection task failed: {}", e))
+                KrafkaError::invalid_state(format!("Connection task failed: {e}"))
             })??;
             connections.push(Arc::new(conn));
         }
@@ -414,19 +528,26 @@ impl ConnectionPool {
     }
 
     /// Register a connection for a broker ID.
+    ///
+    /// Both maps are updated atomically under write locks to prevent
+    /// inconsistent state if another task reads between updates.
+    /// Lock ordering: `connections` → `connections_by_addr` (consistent
+    /// across all pool methods; no deadlock risk).
     pub async fn register(&self, broker_id: BrokerId, conn: Arc<BrokerConnection>) {
         let mut connections = self.connections.write().await;
-        connections.insert(broker_id, conn.clone());
-
         let mut connections_by_addr = self.connections_by_addr.write().await;
+        connections.insert(broker_id, conn.clone());
         connections_by_addr.insert(conn.address().to_string(), conn);
     }
 
     /// Remove a connection by broker ID.
+    ///
+    /// Lock ordering matches [`register`](Self::register): `connections` →
+    /// `connections_by_addr`.
     pub async fn remove(&self, broker_id: BrokerId) {
         let mut connections = self.connections.write().await;
+        let mut connections_by_addr = self.connections_by_addr.write().await;
         if let Some(conn) = connections.remove(&broker_id) {
-            let mut connections_by_addr = self.connections_by_addr.write().await;
             connections_by_addr.remove(conn.address());
         }
     }
@@ -528,7 +649,10 @@ mod tests {
 
     #[test]
     fn test_calculate_backoff() {
-        let config = ConnectionRetryConfig::default();
+        let config = ConnectionRetryConfig {
+            jitter_factor: 0.0, // disable jitter for deterministic test
+            ..ConnectionRetryConfig::default()
+        };
 
         // Attempt 0 = no backoff
         assert_eq!(config.calculate_backoff(0), Duration::ZERO);
@@ -550,6 +674,7 @@ mod tests {
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(5),
             backoff_multiplier: 10.0,
+            jitter_factor: 0.0, // disable jitter for deterministic test
         };
 
         // Attempt 2 would be 10 seconds, but capped at 5
@@ -563,6 +688,7 @@ mod tests {
             initial_backoff: Duration::from_millis(50),
             max_backoff: Duration::from_secs(5),
             backoff_multiplier: 3.0,
+            jitter_factor: 0.2,
         };
         let pool = ConnectionPool::with_retry_config(ConnectionConfig::default(), retry_config);
         assert_eq!(pool.retry_config.max_retries, 5);
