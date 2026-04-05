@@ -114,6 +114,28 @@ macro_rules! impl_infallible_try_encode {
     }
 }
 
+/// Same as [`impl_infallible_try_encode`] but also overrides `try_encode_compact`
+/// for types whose compact encoding differs from the standard one (e.g. varint).
+macro_rules! impl_infallible_try_encode_with_compact {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl TryEncode for $ty {
+                #[inline]
+                fn try_encode(&self, buf: &mut impl BufMut) -> Result<()> {
+                    self.encode(buf);
+                    Ok(())
+                }
+
+                #[inline]
+                fn try_encode_compact(&self, buf: &mut impl BufMut) -> Result<()> {
+                    self.encode_compact(buf);
+                    Ok(())
+                }
+            }
+        )+
+    }
+}
+
 impl Encode for i8 {
     #[inline]
     fn encode(&self, buf: &mut impl BufMut) {
@@ -160,20 +182,6 @@ impl Encode for i32 {
     }
 }
 
-impl TryEncode for i32 {
-    #[inline]
-    fn try_encode(&self, buf: &mut impl BufMut) -> Result<()> {
-        self.encode(buf);
-        Ok(())
-    }
-
-    #[inline]
-    fn try_encode_compact(&self, buf: &mut impl BufMut) -> Result<()> {
-        self.encode_compact(buf);
-        Ok(())
-    }
-}
-
 impl Decode for i32 {
     #[inline]
     fn decode(buf: &mut impl Buf) -> Result<Self> {
@@ -215,20 +223,6 @@ impl Encode for i64 {
     }
 }
 
-impl TryEncode for i64 {
-    #[inline]
-    fn try_encode(&self, buf: &mut impl BufMut) -> Result<()> {
-        self.encode(buf);
-        Ok(())
-    }
-
-    #[inline]
-    fn try_encode_compact(&self, buf: &mut impl BufMut) -> Result<()> {
-        self.encode_compact(buf);
-        Ok(())
-    }
-}
-
 impl Decode for i64 {
     #[inline]
     fn decode(buf: &mut impl Buf) -> Result<Self> {
@@ -262,6 +256,7 @@ impl Decode for bool {
 }
 
 impl_infallible_try_encode!(i8, i16, u32, bool);
+impl_infallible_try_encode_with_compact!(i32, i64);
 
 // String implementations
 
@@ -310,9 +305,9 @@ impl From<Option<String>> for KafkaString {
     }
 }
 
-// SAFETY: All internal call sites use `TryEncode::try_encode()` instead.
-// This `Encode` impl exists for trait-bound compatibility; the `.expect()`
-// triggers only if external code calls `.encode()` on an oversized string.
+// NOTE: Internal call sites use `TryEncode::try_encode()` instead.
+// This `Encode` impl exists for trait-bound compatibility.
+// PANIC: The `.expect()` triggers if `.encode()` is called on an oversized string.
 impl Encode for KafkaString {
     fn encode(&self, buf: &mut impl BufMut) {
         self.try_encode(buf)
@@ -450,9 +445,9 @@ impl From<&[u8]> for KafkaBytes {
     }
 }
 
-// SAFETY: All internal call sites use `TryEncode::try_encode()` instead.
-// This `Encode` impl exists for trait-bound compatibility; the `.expect()`
-// triggers only if external code calls `.encode()` on an oversized byte buffer.
+// NOTE: Internal call sites use `TryEncode::try_encode()` instead.
+// This `Encode` impl exists for trait-bound compatibility.
+// PANIC: The `.expect()` triggers if `.encode()` is called on an oversized byte buffer.
 impl Encode for KafkaBytes {
     fn encode(&self, buf: &mut impl BufMut) {
         self.try_encode(buf)
@@ -586,9 +581,9 @@ impl<T> From<Vec<T>> for KafkaArray<T> {
     }
 }
 
-// SAFETY: All internal call sites use `TryEncode::try_encode()` instead.
-// This `Encode` impl exists for trait-bound compatibility; the `.expect()`
-// triggers only if external code calls `.encode()` on an oversized array.
+// NOTE: Internal call sites use `TryEncode::try_encode()` instead.
+// This `Encode` impl exists for trait-bound compatibility.
+// PANIC: The `.expect()` triggers if `.encode()` is called on an oversized array.
 impl<T: Encode> Encode for KafkaArray<T> {
     fn encode(&self, buf: &mut impl BufMut) {
         match &self.0 {
@@ -721,9 +716,9 @@ pub struct TaggedField {
     pub data: Bytes,
 }
 
-// SAFETY: All internal call sites use `TryEncode::try_encode()` instead.
-// This `Encode` impl exists for trait-bound compatibility; the `.expect()`
-// triggers only if external code calls `.encode()` on oversized tagged fields.
+// NOTE: Internal call sites use `TryEncode::try_encode()` instead.
+// This `Encode` impl exists for trait-bound compatibility.
+// PANIC: The `.expect()` triggers if `.encode()` is called on oversized tagged fields.
 impl Encode for TaggedFields {
     fn encode(&self, buf: &mut impl BufMut) {
         self.try_encode(buf)
