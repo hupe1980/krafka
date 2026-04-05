@@ -56,7 +56,7 @@ use std::fmt;
 use std::time::Duration;
 
 use bytes::Bytes;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::record::ConsumerRecord;
 use super::{AutoOffsetReset, Consumer};
@@ -191,34 +191,8 @@ impl CompactedTable {
                 continue;
             };
 
-            if record.is_tombstone() {
-                self.tombstones_processed += 1;
-                let old_value = self.entries.remove(key.as_ref());
-                changes.push(TableChange {
-                    key: key.clone(),
-                    old_value,
-                    new_value: None,
-                    partition: record.partition,
-                    offset: record.offset,
-                    timestamp: record.timestamp,
-                });
-            } else {
-                // value must be Some here because is_tombstone() returned false and key is Some
-                let value = record
-                    .value
-                    .as_ref()
-                    .expect("non-tombstone compacted record must have a value")
-                    .clone();
-                let old_value = self.entries.insert(key.clone(), value.clone());
-                changes.push(TableChange {
-                    key: key.clone(),
-                    old_value,
-                    new_value: Some(value),
-                    partition: record.partition,
-                    offset: record.offset,
-                    timestamp: record.timestamp,
-                });
-            }
+            let change = self.apply_keyed_record(key, record);
+            changes.push(change);
         }
 
         changes
@@ -298,15 +272,54 @@ impl CompactedTable {
                 continue;
             };
 
-            if record.is_tombstone() {
-                self.tombstones_processed += 1;
-                self.entries.remove(key.as_ref());
-            } else {
-                let Some(value) = record.value.clone() else {
-                    continue;
-                };
-                self.entries.insert(key.clone(), value);
+            self.ingest_keyed_record(key, record);
+        }
+    }
+
+    /// Shared mutation logic for a single keyed record, returning a
+    /// [`TableChange`] describing the modification.
+    fn apply_keyed_record(&mut self, key: &Bytes, record: &ConsumerRecord) -> TableChange {
+        if record.is_tombstone() {
+            self.tombstones_processed += 1;
+            let old_value = self.entries.remove(key.as_ref());
+            TableChange {
+                key: key.clone(),
+                old_value,
+                new_value: None,
+                partition: record.partition,
+                offset: record.offset,
+                timestamp: record.timestamp,
             }
+        } else {
+            // value must be Some here because is_tombstone() returned false and key is Some
+            let value = record
+                .value
+                .as_ref()
+                .expect("non-tombstone compacted record must have a value")
+                .clone();
+            let old_value = self.entries.insert(key.clone(), value.clone());
+            TableChange {
+                key: key.clone(),
+                old_value,
+                new_value: Some(value),
+                partition: record.partition,
+                offset: record.offset,
+                timestamp: record.timestamp,
+            }
+        }
+    }
+
+    /// Shared mutation logic for a single keyed record without producing a
+    /// [`TableChange`]. Avoids extra clones needed for the change struct.
+    fn ingest_keyed_record(&mut self, key: &Bytes, record: &ConsumerRecord) {
+        if record.is_tombstone() {
+            self.tombstones_processed += 1;
+            self.entries.remove(key.as_ref());
+        } else {
+            let Some(value) = record.value.clone() else {
+                return;
+            };
+            self.entries.insert(key.clone(), value);
         }
     }
 
@@ -439,8 +452,8 @@ impl CompactedTopicConsumer {
     /// or assignment.
     ///
     /// If the consumer is subscribed/assigned to additional topics, records
-    /// from those topics are silently filtered out — only records matching
-    /// the given `topic` are applied to the table.
+    /// from those topics are filtered out with a warning logged — only
+    /// records matching the given `topic` are applied to the table.
     ///
     /// This constructor is the best fit for consumers with stable, explicit
     /// assignments. If you wrap a group-coordinated consumer whose assignment
@@ -504,7 +517,15 @@ impl CompactedTopicConsumer {
 
         loop {
             let mut records = self.consumer.poll(poll_timeout).await?;
+            let before_len = records.len();
             records.retain(|r| r.topic == self.topic);
+            let filtered = before_len - records.len();
+            if filtered > 0 {
+                warn!(
+                    "Discarded {} record(s) from other topics during scan for '{}'",
+                    filtered, self.topic
+                );
+            }
             self.table.ingest(&records);
 
             if self.check_caught_up().await {
@@ -535,7 +556,15 @@ impl CompactedTopicConsumer {
     /// Returns an error if the underlying consumer poll fails.
     pub async fn poll(&mut self, timeout: Duration) -> Result<Vec<TableChange>> {
         let mut records = self.consumer.poll(timeout).await?;
+        let before_len = records.len();
         records.retain(|r| r.topic == self.topic);
+        let filtered = before_len - records.len();
+        if filtered > 0 {
+            warn!(
+                "Discarded {} record(s) from other topics during poll for '{}'",
+                filtered, self.topic
+            );
+        }
         let changes = self.table.apply(&records);
 
         if !self.caught_up && self.check_caught_up().await {
@@ -729,6 +758,14 @@ impl CompactedTopicConsumerBuilder {
         }
 
         let consumer = consumer_builder.build().await?;
+
+        // Refresh metadata to get the latest partition count for the topic.
+        // Consumer::build() fetches an initial snapshot, but it may already
+        // be slightly stale if the topic was recently expanded.
+        consumer
+            .metadata
+            .refresh_for_topics(Some(&[&topic]))
+            .await?;
 
         // Discover partitions and assign all of them
         let partition_count = consumer.metadata.partition_count(&topic).ok_or_else(|| {

@@ -922,6 +922,7 @@ Records in compacted topics with a key but no value are **tombstones** — delet
 ```rust
 use std::time::Duration;
 
+// Assuming `consumer` is an already-configured Consumer instance
 let records = consumer.poll(Duration::from_secs(1)).await?;
 for record in &records {
     if record.is_tombstone() {
