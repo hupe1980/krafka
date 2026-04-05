@@ -41,6 +41,11 @@ mod group;
 mod offset;
 mod record;
 
+pub mod compacted;
+
+pub use compacted::{
+    CompactedTable, CompactedTopicConsumer, CompactedTopicConsumerBuilder, TableChange,
+};
 pub use config::{
     AutoOffsetReset, ConsumerConfig, ConsumerConfigBuilder, IsolationLevel,
     PartitionAssignmentStrategy,

@@ -53,6 +53,16 @@ impl ConsumerRecord {
         }
     }
 
+    /// Returns `true` if this record is a tombstone (delete marker).
+    ///
+    /// In log-compacted topics, a record with a key but no value marks the
+    /// key for deletion. After compaction, the key and all its prior values
+    /// are removed from the log.
+    #[inline]
+    pub fn is_tombstone(&self) -> bool {
+        self.key.is_some() && self.value.is_none()
+    }
+
     /// Serialized key size in bytes, or `None` if the key is absent.
     #[inline]
     pub fn serialized_key_size(&self) -> Option<usize> {
@@ -272,6 +282,31 @@ mod tests {
         let record = ConsumerRecord::new("topic", 0, 0, None, None);
         assert_eq!(record.serialized_key_size(), None);
         assert_eq!(record.serialized_value_size(), None);
+    }
+
+    #[test]
+    fn test_consumer_record_is_tombstone() {
+        // Key + no value → tombstone
+        let tombstone = ConsumerRecord::new("t", 0, 0, Some(Bytes::from("key")), None);
+        assert!(tombstone.is_tombstone());
+
+        // Key + value → not a tombstone
+        let normal = ConsumerRecord::new(
+            "t",
+            0,
+            0,
+            Some(Bytes::from("key")),
+            Some(Bytes::from("val")),
+        );
+        assert!(!normal.is_tombstone());
+
+        // No key + no value → not a tombstone (keyless record)
+        let keyless = ConsumerRecord::new("t", 0, 0, None, None);
+        assert!(!keyless.is_tombstone());
+
+        // No key + value → not a tombstone
+        let no_key = ConsumerRecord::new("t", 0, 0, None, Some(Bytes::from("val")));
+        assert!(!no_key.is_tombstone());
     }
 
     #[test]
