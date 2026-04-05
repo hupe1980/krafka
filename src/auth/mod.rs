@@ -631,20 +631,6 @@ impl AuthConfig {
         }
     }
 
-    /// Resolve the OAUTHBEARER token, preferring the provider over a static token.
-    ///
-    /// If a provider is configured, calls it to obtain a fresh token.
-    /// Otherwise, returns the static token (if any).
-    pub(crate) async fn resolve_oauthbearer_token(
-        &self,
-    ) -> crate::error::Result<Option<OAuthBearerToken>> {
-        if let Some(ref provider) = self.oauthbearer_provider {
-            Ok(Some(provider.provide_token().await?))
-        } else {
-            Ok(self.oauthbearer_token.clone())
-        }
-    }
-
     /// Check if TLS is required.
     pub fn requires_tls(&self) -> bool {
         matches!(
@@ -887,32 +873,5 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(!debug.contains("secret"));
         assert!(debug.contains("[OAuthBearerTokenProvider]"));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_oauthbearer_token_with_provider() {
-        let config =
-            AuthConfig::sasl_oauthbearer_provider(|| async { Ok(OAuthBearerToken::new("fresh")) });
-        let token = config.resolve_oauthbearer_token().await.unwrap().unwrap();
-        assert_eq!(
-            token.to_gs2_initial_response(),
-            OAuthBearerToken::new("fresh").to_gs2_initial_response()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_resolve_oauthbearer_token_falls_back_to_static() {
-        let config = AuthConfig::sasl_oauthbearer("static-token");
-        let token = config.resolve_oauthbearer_token().await.unwrap().unwrap();
-        assert_eq!(
-            token.to_gs2_initial_response(),
-            OAuthBearerToken::new("static-token").to_gs2_initial_response()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_resolve_oauthbearer_token_none_when_no_provider_or_token() {
-        let config = AuthConfig::plaintext();
-        assert!(config.resolve_oauthbearer_token().await.unwrap().is_none());
     }
 }

@@ -31,6 +31,12 @@
 //!     .with_extension("logicalCluster", "lkc-123")
 //!     .with_extension("identityPoolId", "pool-456");
 //! let config = AuthConfig::sasl_oauthbearer_token(token);
+//!
+//! // Automatic token refresh via provider (recommended for production)
+//! let config = AuthConfig::sasl_oauthbearer_provider(|| async {
+//!     let jwt = my_oauth_client.get_access_token().await?;
+//!     Ok(OAuthBearerToken::new(jwt))
+//! });
 //! ```
 
 use std::collections::HashMap;
@@ -368,7 +374,7 @@ mod tests {
             OAuthBearerTokenProviderHandle::new(|| async { Ok(OAuthBearerToken::new("tok")) });
         let cloned = handle.clone();
         // Both point to the same Arc
-        assert_eq!(format!("{handle:?}"), format!("{cloned:?}"));
+        assert!(Arc::ptr_eq(&handle.0, &cloned.0));
     }
 
     #[test]

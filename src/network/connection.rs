@@ -581,13 +581,10 @@ impl BrokerConnection {
         // creating the authenticator (which is synchronous).
         let resolved_auth;
         let auth = if auth.sasl_mechanism == Some(SaslMechanism::OAuthBearer)
-            && auth.oauthbearer_provider.is_some()
+            && let Some(ref provider) = auth.oauthbearer_provider
         {
             debug!("Resolving OAUTHBEARER token from provider for {address}");
-            let token = auth
-                .resolve_oauthbearer_token()
-                .await?
-                .ok_or_else(|| KrafkaError::auth("OAUTHBEARER provider returned no token"))?;
+            let token = provider.provide_token().await?;
             resolved_auth = AuthConfig {
                 oauthbearer_token: Some(token),
                 oauthbearer_provider: None,

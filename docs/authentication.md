@@ -155,6 +155,7 @@ All client builders support shorthand `.sasl_oauthbearer(token)` and
 `.sasl_oauthbearer_provider(provider)` methods:
 
 ```rust
+use krafka::auth::OAuthBearerToken;
 use krafka::producer::Producer;
 use krafka::consumer::Consumer;
 
