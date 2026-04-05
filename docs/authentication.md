@@ -151,25 +151,110 @@ let config = AuthConfig::sasl_oauthbearer_token_ssl(
 
 #### Builder Convenience Methods
 
-All client builders support a shorthand `.sasl_oauthbearer(token)` method:
+All client builders support shorthand `.sasl_oauthbearer(token)` and
+`.sasl_oauthbearer_provider(provider)` methods:
 
 ```rust
 use krafka::producer::Producer;
 use krafka::consumer::Consumer;
 
+// Static token
 let producer = Producer::builder()
     .bootstrap_servers("broker:9093")
     .sasl_oauthbearer("your-jwt-token")
     .build()
     .await?;
 
+// Token provider (recommended)
 let consumer = Consumer::builder()
     .bootstrap_servers("broker:9093")
     .group_id("my-group")
-    .sasl_oauthbearer("your-jwt-token")
+    .sasl_oauthbearer_provider(|| async {
+        let token = fetch_token_from_oauth_server().await?;
+        Ok(OAuthBearerToken::new(token))
+    })
     .build()
     .await?;
 ```
+
+#### Automatic Token Refresh via Provider
+
+For production use, implement the `OAuthBearerTokenProvider` trait so that
+Krafka can fetch a fresh token on every new broker connection — including
+automatic reconnections. This eliminates the need to restart clients when
+tokens expire.
+
+**Closure provider (simplest)**
+
+```rust
+use krafka::auth::{AuthConfig, OAuthBearerToken};
+
+let config = AuthConfig::sasl_oauthbearer_provider(|| async {
+    // Called on every new broker connection
+    let jwt = my_oauth_client.get_access_token().await?;
+    Ok(OAuthBearerToken::new(jwt))
+});
+```
+
+**Struct provider (when you need shared state)**
+
+```rust
+use krafka::auth::{OAuthBearerToken, OAuthBearerTokenProvider};
+use krafka::error::Result;
+use std::future::Future;
+use std::pin::Pin;
+
+struct MyTokenProvider {
+    client_id: String,
+    client_secret: String,
+    token_url: String,
+}
+
+impl OAuthBearerTokenProvider for MyTokenProvider {
+    fn provide_token(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<OAuthBearerToken>> + Send + '_>> {
+        Box::pin(async move {
+            // Use your preferred HTTP client to fetch a token
+            let jwt = fetch_oauth_token(
+                &self.token_url,
+                &self.client_id,
+                &self.client_secret,
+            ).await?;
+            Ok(OAuthBearerToken::new(jwt))
+        })
+    }
+}
+
+// Use with any client builder
+let consumer = Consumer::builder()
+    .bootstrap_servers("broker:9093")
+    .group_id("my-group")
+    .sasl_oauthbearer_provider(MyTokenProvider {
+        client_id: "my-app".into(),
+        client_secret: "secret".into(),
+        token_url: "https://auth.example.com/oauth/token".into(),
+    })
+    .build()
+    .await?;
+```
+
+**With TLS (production)**
+
+```rust
+use krafka::auth::{AuthConfig, OAuthBearerToken, TlsConfig};
+
+let config = AuthConfig::sasl_oauthbearer_provider_ssl(
+    || async { Ok(OAuthBearerToken::new("fresh-jwt")) },
+    TlsConfig::new(),
+);
+```
+
+**How it works:** The provider is called once per broker connection. When
+the connection pool detects a disconnection and reconnects, the provider
+is called again — delivering a fresh token without any client restart.
+Implementations may cache tokens internally and only refresh when
+approaching expiry.
 
 #### OAUTHBEARER Protocol Details
 

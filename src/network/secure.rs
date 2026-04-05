@@ -5,8 +5,8 @@
 use std::time::Duration;
 
 use crate::auth::{
-    AuthConfig, MskIamAuthenticator, OAuthBearerToken, PlainCredentials, SaslMechanism,
-    ScramClient, ScramMechanism, SecurityProtocol, TlsConfig,
+    AuthConfig, MskIamAuthenticator, OAuthBearerToken, OAuthBearerTokenProvider, PlainCredentials,
+    SaslMechanism, ScramClient, ScramMechanism, SecurityProtocol, TlsConfig,
 };
 use crate::error::{KrafkaError, Result};
 use zeroize::Zeroizing;
@@ -126,6 +126,18 @@ impl SecureConnectionConfigBuilder {
         self
     }
 
+    /// Configure SASL/OAUTHBEARER authentication with an async token provider.
+    ///
+    /// The provider is called on every new broker connection, ensuring
+    /// tokens are always fresh.
+    pub fn sasl_oauthbearer_provider(
+        mut self,
+        provider: impl OAuthBearerTokenProvider + 'static,
+    ) -> Self {
+        self.auth = AuthConfig::sasl_oauthbearer_provider(provider);
+        self
+    }
+
     /// Configure TLS with default settings.
     pub fn tls(mut self, tls_config: TlsConfig) -> Self {
         self.auth.tls_config = Some(tls_config);
@@ -220,7 +232,11 @@ impl SaslAuthenticator {
             }
             SaslMechanism::OAuthBearer => {
                 let token = auth.oauthbearer_token.as_ref().cloned().or_else(|| {
-                    tracing::error!("OAUTHBEARER mechanism requires an OAuth bearer token");
+                    tracing::error!(
+                        "OAUTHBEARER mechanism requires an OAuth bearer token. \
+                         If using a token provider, ensure the token is resolved \
+                         before creating the authenticator."
+                    );
                     None
                 })?;
                 Some(Self {
@@ -572,5 +588,17 @@ mod tests {
 
         assert!(config.auth.requires_sasl());
         assert_eq!(config.auth.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
+    }
+
+    #[test]
+    fn test_secure_connection_config_builder_oauthbearer_provider() {
+        let config = SecureConnectionConfig::builder()
+            .sasl_oauthbearer_provider(|| async { Ok(OAuthBearerToken::new("provider-token")) })
+            .build();
+
+        assert!(config.auth.requires_sasl());
+        assert_eq!(config.auth.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
+        assert!(config.auth.oauthbearer_provider.is_some());
+        assert!(config.auth.oauthbearer_token.is_none());
     }
 }

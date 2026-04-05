@@ -19,7 +19,7 @@ pub mod scram;
 pub mod tls;
 
 pub use msk_iam::MskIamAuthenticator;
-pub use oauthbearer::OAuthBearerToken;
+pub use oauthbearer::{OAuthBearerToken, OAuthBearerTokenProvider, OAuthBearerTokenProviderHandle};
 pub use scram::{ScramClient, ScramMechanism, ScramState};
 pub use tls::{
     MaybeSecureStream, build_tls_config, build_tls_config_async, connect_tls, create_tls_connector,
@@ -427,6 +427,8 @@ pub struct AuthConfig {
     pub(crate) aws_msk_iam_credentials: Option<AwsMskIamCredentials>,
     /// OAUTHBEARER token.
     pub(crate) oauthbearer_token: Option<OAuthBearerToken>,
+    /// OAUTHBEARER token provider for automatic token refresh.
+    pub(crate) oauthbearer_provider: Option<OAuthBearerTokenProviderHandle>,
     /// TLS configuration.
     pub(crate) tls_config: Option<TlsConfig>,
 }
@@ -527,10 +529,11 @@ impl AuthConfig {
         }
     }
 
-    /// Create a SASL/OAUTHBEARER configuration.
+    /// Create a SASL/OAUTHBEARER configuration with a static token.
     ///
-    /// Uses SASL_PLAINTEXT. For TLS, use `sasl_oauthbearer_ssl()` or
-    /// call `.sasl_oauthbearer_token()` with a pre-built `OAuthBearerToken`.
+    /// Uses SASL_PLAINTEXT. For TLS, use [`sasl_oauthbearer_ssl()`](Self::sasl_oauthbearer_ssl).
+    /// For automatic token refresh on reconnection, use
+    /// [`sasl_oauthbearer_provider()`](Self::sasl_oauthbearer_provider) instead.
     ///
     /// # Example
     ///
@@ -590,6 +593,58 @@ impl AuthConfig {
         }
     }
 
+    /// Create a SASL/OAUTHBEARER configuration with an async token provider.
+    ///
+    /// The provider is called on every new broker connection (including
+    /// automatic reconnections), so tokens are always fresh.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use krafka::auth::{AuthConfig, OAuthBearerToken};
+    ///
+    /// let config = AuthConfig::sasl_oauthbearer_provider(|| async {
+    ///     // Fetch a fresh token from your OAuth server
+    ///     Ok(OAuthBearerToken::new("fresh-jwt-token"))
+    /// });
+    /// ```
+    pub fn sasl_oauthbearer_provider(provider: impl OAuthBearerTokenProvider + 'static) -> Self {
+        Self {
+            security_protocol: SecurityProtocol::SaslPlaintext,
+            sasl_mechanism: Some(SaslMechanism::OAuthBearer),
+            oauthbearer_provider: Some(OAuthBearerTokenProviderHandle::new(provider)),
+            ..Default::default()
+        }
+    }
+
+    /// Create a SASL/OAUTHBEARER over TLS configuration with an async token provider.
+    pub fn sasl_oauthbearer_provider_ssl(
+        provider: impl OAuthBearerTokenProvider + 'static,
+        tls_config: TlsConfig,
+    ) -> Self {
+        Self {
+            security_protocol: SecurityProtocol::SaslSsl,
+            sasl_mechanism: Some(SaslMechanism::OAuthBearer),
+            oauthbearer_provider: Some(OAuthBearerTokenProviderHandle::new(provider)),
+            tls_config: Some(tls_config),
+            ..Default::default()
+        }
+    }
+
+    /// Resolve the OAUTHBEARER token, preferring the provider over a static token.
+    ///
+    /// If a provider is configured, calls it to obtain a fresh token.
+    /// Otherwise, returns the static token (if any).
+    pub(crate) async fn resolve_oauthbearer_token(
+        &self,
+    ) -> crate::error::Result<Option<OAuthBearerToken>> {
+        if let Some(ref provider) = self.oauthbearer_provider {
+            Ok(Some(provider.provide_token().await?))
+        } else {
+            Ok(self.oauthbearer_token.clone())
+        }
+    }
+
     /// Check if TLS is required.
     pub fn requires_tls(&self) -> bool {
         matches!(
@@ -634,6 +689,11 @@ impl AuthConfig {
     /// Returns the OAUTHBEARER token, if set.
     pub fn oauthbearer_token(&self) -> Option<&OAuthBearerToken> {
         self.oauthbearer_token.as_ref()
+    }
+
+    /// Returns the OAUTHBEARER token provider handle, if set.
+    pub fn oauthbearer_provider(&self) -> Option<&OAuthBearerTokenProviderHandle> {
+        self.oauthbearer_provider.as_ref()
     }
 
     /// Returns the TLS configuration, if set.
@@ -793,4 +853,66 @@ mod tests {
     // Note: from_env() is tested manually since environment variable modification
     // is unsafe in Rust 2024 edition. from_default_chain() requires async and
     // is tested via integration tests with the aws-msk feature.
+
+    #[test]
+    fn test_auth_config_sasl_oauthbearer_provider() {
+        let config =
+            AuthConfig::sasl_oauthbearer_provider(|| async { Ok(OAuthBearerToken::new("tok")) });
+        assert_eq!(config.security_protocol, SecurityProtocol::SaslPlaintext);
+        assert_eq!(config.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
+        assert!(config.oauthbearer_provider.is_some());
+        assert!(config.oauthbearer_token.is_none());
+        assert!(!config.requires_tls());
+        assert!(config.requires_sasl());
+    }
+
+    #[test]
+    fn test_auth_config_sasl_oauthbearer_provider_ssl() {
+        let config = AuthConfig::sasl_oauthbearer_provider_ssl(
+            || async { Ok(OAuthBearerToken::new("tok")) },
+            TlsConfig::new(),
+        );
+        assert_eq!(config.security_protocol, SecurityProtocol::SaslSsl);
+        assert_eq!(config.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
+        assert!(config.oauthbearer_provider.is_some());
+        assert!(config.tls_config.is_some());
+        assert!(config.requires_tls());
+        assert!(config.requires_sasl());
+    }
+
+    #[test]
+    fn test_auth_config_provider_debug_no_secrets() {
+        let config =
+            AuthConfig::sasl_oauthbearer_provider(|| async { Ok(OAuthBearerToken::new("secret")) });
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("secret"));
+        assert!(debug.contains("[OAuthBearerTokenProvider]"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_oauthbearer_token_with_provider() {
+        let config =
+            AuthConfig::sasl_oauthbearer_provider(|| async { Ok(OAuthBearerToken::new("fresh")) });
+        let token = config.resolve_oauthbearer_token().await.unwrap().unwrap();
+        assert_eq!(
+            token.to_gs2_initial_response(),
+            OAuthBearerToken::new("fresh").to_gs2_initial_response()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_oauthbearer_token_falls_back_to_static() {
+        let config = AuthConfig::sasl_oauthbearer("static-token");
+        let token = config.resolve_oauthbearer_token().await.unwrap().unwrap();
+        assert_eq!(
+            token.to_gs2_initial_response(),
+            OAuthBearerToken::new("static-token").to_gs2_initial_response()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_oauthbearer_token_none_when_no_provider_or_token() {
+        let config = AuthConfig::plaintext();
+        assert!(config.resolve_oauthbearer_token().await.unwrap().is_none());
+    }
 }

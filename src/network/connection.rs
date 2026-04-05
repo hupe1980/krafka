@@ -577,6 +577,27 @@ impl BrokerConnection {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        // For OAUTHBEARER with a provider, resolve a fresh token before
+        // creating the authenticator (which is synchronous).
+        let resolved_auth;
+        let auth = if auth.sasl_mechanism == Some(SaslMechanism::OAuthBearer)
+            && auth.oauthbearer_provider.is_some()
+        {
+            debug!("Resolving OAUTHBEARER token from provider for {address}");
+            let token = auth
+                .resolve_oauthbearer_token()
+                .await?
+                .ok_or_else(|| KrafkaError::auth("OAUTHBEARER provider returned no token"))?;
+            resolved_auth = AuthConfig {
+                oauthbearer_token: Some(token),
+                oauthbearer_provider: None,
+                ..auth.clone()
+            };
+            &resolved_auth
+        } else {
+            auth
+        };
+
         let mut authenticator = SaslAuthenticator::new(auth)
             .ok_or_else(|| KrafkaError::auth("Failed to create SASL authenticator"))?;
 
