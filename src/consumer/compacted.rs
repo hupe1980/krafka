@@ -433,6 +433,10 @@ impl CompactedTopicConsumer {
     /// partition discovery and does not modify the consumer's subscription
     /// or assignment.
     ///
+    /// If the consumer is subscribed/assigned to additional topics, records
+    /// from those topics are silently filtered out — only records matching
+    /// the given `topic` are applied to the table.
+    ///
     /// Use this when you need full control over the consumer configuration
     /// (TLS, auth, timeouts, etc.) beyond what the builder exposes.
     pub fn from_consumer(consumer: Consumer, topic: impl Into<String>) -> Self {
@@ -470,7 +474,8 @@ impl CompactedTopicConsumer {
         info!("Starting compacted topic scan for '{}'", self.topic);
 
         loop {
-            let records = self.consumer.poll(poll_timeout).await?;
+            let mut records = self.consumer.poll(poll_timeout).await?;
+            records.retain(|r| r.topic == self.topic);
             self.table.ingest(&records);
 
             if self.check_caught_up().await {
@@ -500,7 +505,8 @@ impl CompactedTopicConsumer {
     ///
     /// Returns an error if the underlying consumer poll fails.
     pub async fn poll(&mut self, timeout: Duration) -> Result<Vec<TableChange>> {
-        let records = self.consumer.poll(timeout).await?;
+        let mut records = self.consumer.poll(timeout).await?;
+        records.retain(|r| r.topic == self.topic);
         let changes = self.table.apply(&records);
 
         if !self.caught_up && self.check_caught_up().await {
