@@ -5,8 +5,8 @@
 use std::time::Duration;
 
 use crate::auth::{
-    AuthConfig, MskIamAuthenticator, OAuthBearerToken, PlainCredentials, SaslMechanism,
-    ScramClient, ScramMechanism, SecurityProtocol, TlsConfig,
+    AuthConfig, MskIamAuthenticator, OAuthBearerToken, OAuthBearerTokenProvider, PlainCredentials,
+    SaslMechanism, ScramClient, ScramMechanism, SecurityProtocol, TlsConfig,
 };
 use crate::error::{KrafkaError, Result};
 use zeroize::Zeroizing;
@@ -114,7 +114,10 @@ impl SecureConnectionConfigBuilder {
         self
     }
 
-    /// Configure SASL/OAUTHBEARER authentication.
+    /// Configure SASL/OAUTHBEARER authentication with a static token.
+    ///
+    /// For automatic token refresh, use [`sasl_oauthbearer_provider()`](Self::sasl_oauthbearer_provider).
+    /// For SASL extensions, use [`sasl_oauthbearer_token()`](Self::sasl_oauthbearer_token).
     pub fn sasl_oauthbearer(mut self, token: impl Into<String>) -> Self {
         self.auth = AuthConfig::sasl_oauthbearer(token);
         self
@@ -123,6 +126,18 @@ impl SecureConnectionConfigBuilder {
     /// Configure SASL/OAUTHBEARER authentication with a pre-built token.
     pub fn sasl_oauthbearer_token(mut self, token: OAuthBearerToken) -> Self {
         self.auth = AuthConfig::sasl_oauthbearer_token(token);
+        self
+    }
+
+    /// Configure SASL/OAUTHBEARER authentication with an async token provider.
+    ///
+    /// The provider is called on every new broker connection, ensuring
+    /// tokens are always fresh.
+    pub fn sasl_oauthbearer_provider(
+        mut self,
+        provider: impl OAuthBearerTokenProvider + 'static,
+    ) -> Self {
+        self.auth = AuthConfig::sasl_oauthbearer_provider(provider);
         self
     }
 
@@ -159,6 +174,11 @@ pub struct SaslAuthenticator {
 
 impl SaslAuthenticator {
     /// Create a new SASL authenticator from auth config.
+    ///
+    /// For OAUTHBEARER with a token provider, call
+    /// [`AuthConfig::resolve_provider_to_token()`] first and pass the
+    /// resolved config. Provider-based configs without a resolved token
+    /// return `None`.
     ///
     /// For MSK IAM, you must provide the broker host after creation using `set_msk_host()`.
     pub fn new(auth: &AuthConfig) -> Option<Self> {
@@ -220,7 +240,11 @@ impl SaslAuthenticator {
             }
             SaslMechanism::OAuthBearer => {
                 let token = auth.oauthbearer_token.as_ref().cloned().or_else(|| {
-                    tracing::error!("OAUTHBEARER mechanism requires an OAuth bearer token");
+                    tracing::error!(
+                        "OAUTHBEARER mechanism requires an OAuth bearer token. \
+                         If using a token provider, ensure the token is resolved \
+                         before creating the authenticator."
+                    );
                     None
                 })?;
                 Some(Self {
@@ -572,5 +596,17 @@ mod tests {
 
         assert!(config.auth.requires_sasl());
         assert_eq!(config.auth.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
+    }
+
+    #[test]
+    fn test_secure_connection_config_builder_oauthbearer_provider() {
+        let config = SecureConnectionConfig::builder()
+            .sasl_oauthbearer_provider(|| async { Ok(OAuthBearerToken::new("provider-token")) })
+            .build();
+
+        assert!(config.auth.requires_sasl());
+        assert_eq!(config.auth.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
+        assert!(config.auth.oauthbearer_provider.is_some());
+        assert!(config.auth.oauthbearer_token.is_none());
     }
 }

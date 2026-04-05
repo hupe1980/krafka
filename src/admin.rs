@@ -1867,12 +1867,24 @@ impl AdminClientBuilder {
         self
     }
 
-    /// Configure SASL/OAUTHBEARER authentication.
+    /// Configure SASL/OAUTHBEARER authentication with a static token.
     ///
-    /// Uses a static OAuth 2.0 bearer token. For token refresh, reconnect
-    /// with a new token. For SASL extensions, use `.auth(AuthConfig::sasl_oauthbearer_token(...))`.
+    /// For automatic token refresh, use [`sasl_oauthbearer_provider()`](Self::sasl_oauthbearer_provider).
+    /// For SASL extensions, use `.auth(AuthConfig::sasl_oauthbearer_token(...))`.
     pub fn sasl_oauthbearer(mut self, token: impl Into<String>) -> Self {
         self.config.auth = Some(AuthConfig::sasl_oauthbearer(token));
+        self
+    }
+
+    /// Configure SASL/OAUTHBEARER authentication with an async token provider.
+    ///
+    /// The provider is called on every new broker connection, ensuring
+    /// tokens are always fresh.
+    pub fn sasl_oauthbearer_provider(
+        mut self,
+        provider: impl crate::auth::OAuthBearerTokenProvider + 'static,
+    ) -> Self {
+        self.config.auth = Some(AuthConfig::sasl_oauthbearer_provider(provider));
         self
     }
 

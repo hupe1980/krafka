@@ -31,14 +31,101 @@
 //!     .with_extension("logicalCluster", "lkc-123")
 //!     .with_extension("identityPoolId", "pool-456");
 //! let config = AuthConfig::sasl_oauthbearer_token(token);
+//!
+//! // Automatic token refresh via provider (recommended for production)
+//! let config = AuthConfig::sasl_oauthbearer_provider(|| async {
+//!     let jwt = my_oauth_client.get_access_token().await?;
+//!     Ok(OAuthBearerToken::new(jwt))
+//! });
 //! ```
 
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::{KrafkaError, Result};
+
+/// Trait for providing fresh OAuth 2.0 bearer tokens on each broker connection.
+///
+/// Implement this to integrate with your OAuth/OIDC provider. The provider is
+/// called on every new broker connection (including automatic reconnections),
+/// ensuring tokens are always fresh.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use krafka::auth::{OAuthBearerToken, OAuthBearerTokenProvider};
+/// use krafka::error::Result;
+/// use std::future::Future;
+/// use std::pin::Pin;
+///
+/// struct MyProvider { /* OAuth client */ }
+///
+/// impl OAuthBearerTokenProvider for MyProvider {
+///     fn provide_token(&self) -> Pin<Box<dyn Future<Output = Result<OAuthBearerToken>> + Send + '_>> {
+///         Box::pin(async move {
+///             // Fetch a fresh token from your OAuth server
+///             let jwt = my_oauth_client.get_access_token().await?;
+///             Ok(OAuthBearerToken::new(jwt))
+///         })
+///     }
+/// }
+/// ```
+pub trait OAuthBearerTokenProvider: Send + Sync {
+    /// Fetch a fresh OAuth 2.0 bearer token.
+    ///
+    /// Called on every new broker connection. Implementations should handle
+    /// token caching and refresh internally if desired.
+    fn provide_token(&self) -> Pin<Box<dyn Future<Output = Result<OAuthBearerToken>> + Send + '_>>;
+}
+
+/// Blanket impl: any `Fn() -> Future<Output = Result<OAuthBearerToken>>` is a provider.
+///
+/// The `'static` bound on `Fut` is required because the trait method signature
+/// uses an anonymous lifetime (`+ '_`), and the compiler cannot prove the
+/// future outlives `&self` without it. In practice this is not restrictive:
+/// closures that own their captured state (the common case) produce `'static`
+/// futures. For borrowing patterns, implement `OAuthBearerTokenProvider`
+/// directly.
+impl<F, Fut> OAuthBearerTokenProvider for F
+where
+    F: Fn() -> Fut + Send + Sync,
+    Fut: Future<Output = Result<OAuthBearerToken>> + Send + 'static,
+{
+    fn provide_token(&self) -> Pin<Box<dyn Future<Output = Result<OAuthBearerToken>> + Send + '_>> {
+        Box::pin(self())
+    }
+}
+
+/// Handle wrapping an [`Arc<dyn OAuthBearerTokenProvider>`].
+///
+/// This wrapper provides `Clone` and `Debug` so it can be stored in
+/// [`AuthConfig`](super::AuthConfig) without requiring implementors to
+/// derive those traits.
+#[derive(Clone)]
+pub struct OAuthBearerTokenProviderHandle(Arc<dyn OAuthBearerTokenProvider>);
+
+impl OAuthBearerTokenProviderHandle {
+    /// Create a new handle wrapping the given provider.
+    pub fn new(provider: impl OAuthBearerTokenProvider + 'static) -> Self {
+        Self(Arc::new(provider))
+    }
+
+    /// Fetch a fresh token from the wrapped provider.
+    pub async fn provide_token(&self) -> Result<OAuthBearerToken> {
+        self.0.provide_token().await
+    }
+}
+
+impl fmt::Debug for OAuthBearerTokenProviderHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[OAuthBearerTokenProvider]")
+    }
+}
 
 /// OAuth 2.0 bearer token for SASL/OAUTHBEARER authentication.
 ///
@@ -263,6 +350,82 @@ mod tests {
         assert_eq!(
             cloned.to_gs2_initial_response(),
             token.to_gs2_initial_response()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_token_provider_closure_impl() {
+        let provider = || async { Ok(OAuthBearerToken::new("from-closure")) };
+        let token = provider.provide_token().await.unwrap();
+        assert_eq!(
+            token.to_gs2_initial_response(),
+            OAuthBearerToken::new("from-closure").to_gs2_initial_response()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_token_provider_handle() {
+        let handle = OAuthBearerTokenProviderHandle::new(|| async {
+            Ok(OAuthBearerToken::new("handle-token"))
+        });
+        let token = handle.provide_token().await.unwrap();
+        assert_eq!(
+            token.to_gs2_initial_response(),
+            OAuthBearerToken::new("handle-token").to_gs2_initial_response()
+        );
+    }
+
+    #[test]
+    fn test_token_provider_handle_clone() {
+        let handle =
+            OAuthBearerTokenProviderHandle::new(|| async { Ok(OAuthBearerToken::new("tok")) });
+        let cloned = handle.clone();
+        // Both point to the same Arc
+        assert!(Arc::ptr_eq(&handle.0, &cloned.0));
+    }
+
+    #[test]
+    fn test_token_provider_handle_debug_no_secrets() {
+        let handle = OAuthBearerTokenProviderHandle::new(|| async {
+            Ok(OAuthBearerToken::new("super-secret"))
+        });
+        let debug = format!("{handle:?}");
+        assert_eq!(debug, "[OAuthBearerTokenProvider]");
+        assert!(!debug.contains("super-secret"));
+    }
+
+    #[tokio::test]
+    async fn test_token_provider_error_propagation() {
+        let handle = OAuthBearerTokenProviderHandle::new(|| async {
+            Err(KrafkaError::auth("token expired"))
+        });
+        let result = handle.provide_token().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("token expired"));
+    }
+
+    #[tokio::test]
+    async fn test_token_provider_struct_impl() {
+        struct StaticProvider {
+            token: String,
+        }
+        impl OAuthBearerTokenProvider for StaticProvider {
+            fn provide_token(
+                &self,
+            ) -> Pin<Box<dyn Future<Output = Result<OAuthBearerToken>> + Send + '_>> {
+                let token = self.token.clone();
+                Box::pin(async move { Ok(OAuthBearerToken::new(token)) })
+            }
+        }
+
+        let provider = StaticProvider {
+            token: "struct-token".to_string(),
+        };
+        let handle = OAuthBearerTokenProviderHandle::new(provider);
+        let token = handle.provide_token().await.unwrap();
+        assert_eq!(
+            token.to_gs2_initial_response(),
+            OAuthBearerToken::new("struct-token").to_gs2_initial_response()
         );
     }
 }
