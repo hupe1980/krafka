@@ -22,7 +22,7 @@ The Krafka consumer is an async-native, feature-rich Kafka consumer with:
 - Closest-replica fetching (KIP-392)
 - Static group membership (KIP-345)
 - Interceptor hooks
-- Log compaction awareness
+- Log compaction awareness with [`CompactedTable`](#compactedtable) and [`CompactedTopicConsumer`](#compactedtopicconsumer) for key→value tables
 - Per-partition offset lag tracking
 
 ## Basic Usage
@@ -914,6 +914,152 @@ This means:
 - `consumer.position()` always returns the correct offset, even on compacted topics
 - Offset commits are accurate — no risk of re-processing or skipping records
 - No special configuration needed; compaction awareness is built-in
+
+### Tombstone Detection
+
+Records in compacted topics with a key but no value are **tombstones** — deletion markers that eventually cause the key to be removed from the log. Use `ConsumerRecord::is_tombstone()` to detect them:
+
+```rust
+use std::time::Duration;
+
+// Assuming `consumer` is an already-configured Consumer instance
+let records = consumer.poll(Duration::from_secs(1)).await?;
+for record in &records {
+    if record.is_tombstone() {
+        println!("Key {:?} was deleted", record.key);
+    } else {
+        println!("Key {:?} = {:?}", record.key, record.value);
+    }
+}
+```
+
+### CompactedTable
+
+`CompactedTable` is a standalone, Kafka-agnostic data structure that maintains an in-memory key→value snapshot from consumer records. It handles tombstones automatically and tracks changes via `TableChange`. Because it is decoupled from the consumer, it composes with **any** consumer setup — group-coordinated, standalone, or manually assigned:
+
+```rust
+use krafka::consumer::{Consumer, CompactedTable};
+use std::time::Duration;
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .build()
+    .await?;
+consumer.subscribe(&["user-profiles"]).await?;
+
+let mut table = CompactedTable::new();
+loop {
+    let records = consumer.poll(Duration::from_secs(1)).await?;
+    let changes = table.apply(&records);
+    for change in &changes {
+        if change.is_delete() {
+            println!("Deleted: {:?}", change.key);
+        } else if change.is_insert() {
+            println!("New: {:?} = {:?}", change.key, change.new_value);
+        } else {
+            println!("Updated: {:?} = {:?}", change.key, change.new_value);
+        }
+    }
+}
+```
+
+Key behaviors:
+- **Tombstone handling** — keys are removed from the table when a null-valued record arrives
+- **Keyless records** — silently skipped (compacted topics require keys)
+- **Metrics** — `records_processed()` and `tombstones_processed()` are available for monitoring
+- **Read access** — `get()`, `contains_key()`, `keys()`, `values()`, `iter()`, `snapshot()`, `len()`, `is_empty()`
+- **Bulk load** — `ingest()` applies records without building a change list (ideal for initial scans)
+- **Reset** — `clear()` removes all entries and resets counters (useful during rebalances)
+- **Clone** — `table.clone()` produces a full copy including counters; `table.snapshot()` clones only the entries
+- **Equality** — two tables are equal (`PartialEq`/`Eq`) when they contain the same entries; processing counters are ignored
+- **IntoIterator** — `for (key, value) in &table { ... }` or `for (key, value) in table { ... }` (consuming)
+
+`TableChange` derives `PartialEq` and `Eq`, so changes can be compared directly with `assert_eq!` in tests.
+
+### CompactedTopicConsumer
+
+For the common case of scanning an entire compacted topic from the beginning, `CompactedTopicConsumer` bundles a `Consumer` and `CompactedTable` together with built-in caught-up detection:
+
+```rust
+use krafka::consumer::CompactedTopicConsumer;
+use std::time::Duration;
+
+let mut ctc = CompactedTopicConsumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .topic("user-profiles")
+    .build()
+    .await?;
+
+// Build the initial snapshot (blocks until caught up)
+ctc.scan(Duration::from_secs(1)).await?;
+assert!(ctc.is_caught_up());
+
+// Read individual keys via the table
+if let Some(value) = ctc.table().get(b"user-123") {
+    println!("User profile: {:?}", value);
+}
+
+// Get the full snapshot
+let snapshot = ctc.table().snapshot();
+println!("{} keys in table", snapshot.len());
+
+// Tail for live updates
+loop {
+    let changes = ctc.poll(Duration::from_secs(1)).await?;
+    for change in &changes {
+        if change.is_delete() {
+            println!("Deleted: {:?}", change.key);
+        } else if change.is_insert() {
+            println!("New: {:?} = {:?}", change.key, change.new_value);
+        } else {
+            println!("Updated: {:?} = {:?}", change.key, change.new_value);
+        }
+    }
+}
+```
+
+Key behaviors:
+- **No consumer group** — uses standalone assignment of all partitions
+- **Starts from earliest** — `auto_offset_reset` is set to `Earliest` internally
+- **Caught-up detection** — `scan()` returns when all partitions reach their high watermarks; `poll()` also updates the flag. Because the high watermark is refreshed on each fetch, `scan()` may block indefinitely on actively written topics — treat it as a best-effort catch-up rather than a bounded snapshot
+- **Table access** — `table()` and `table_mut()` give direct access to the underlying `CompactedTable`
+- **Consumer access** — `consumer()` and `consumer_mut()` expose the underlying `Consumer` for seek, pause, commit, or metrics; `into_parts()` decomposes the wrapper into `(Consumer, CompactedTable)`
+
+For custom consumer setups (e.g., consumer groups, manual offsets), use `CompactedTable` directly.
+
+#### From an Existing Consumer
+
+If you need full control over the consumer configuration (TLS, auth, custom timeouts), build the consumer yourself and pass it in:
+
+```rust
+let consumer = Consumer::builder()
+    .bootstrap_servers("broker:9093")
+    .auto_offset_reset(AutoOffsetReset::Earliest)
+    .enable_auto_commit(false)
+    .auth(AuthConfig::sasl_scram_sha256("user", "password"))
+    .build()
+    .await?;
+consumer.assign("config-topic", vec![0, 1, 2]).await?;
+
+let mut ctc = CompactedTopicConsumer::from_consumer(consumer, "config-topic");
+ctc.scan(Duration::from_secs(1)).await?;
+```
+
+#### Authentication
+
+Pass an `AuthConfig` to connect to secured clusters:
+
+```rust
+use krafka::auth::AuthConfig;
+
+let mut ctc = CompactedTopicConsumer::builder()
+    .bootstrap_servers("broker:9093")
+    .topic("config-topic")
+    .auth(AuthConfig::sasl_scram_sha256("user", "password"))
+    .build()
+    .await?;
+```
 
 ## Offset Lag Tracking
 
