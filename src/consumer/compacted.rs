@@ -56,7 +56,7 @@ use std::fmt;
 use std::time::Duration;
 
 use bytes::Bytes;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::record::ConsumerRecord;
 use super::{AutoOffsetReset, Consumer};
@@ -140,6 +140,15 @@ impl TableChange {
 /// - Records **without a key** are skipped (compacted topics require keys).
 /// - **Tombstones** (key present, value absent) remove the key from the table.
 /// - All other records insert or update the table entry for that key.
+///
+/// # Cross-partition keys
+///
+/// The table is keyed purely by record key, not by (partition, key). If the
+/// same key appears in multiple partitions (e.g., due to a custom partitioner
+/// or producer misconfiguration), entries will be conflated with last-write-wins
+/// ordering across partitions. This matches the common single-writer pattern
+/// for compacted topics; if partition-scoped dedup is required, encode the
+/// partition into the key before feeding records to the table.
 ///
 /// # Equality
 ///
@@ -316,9 +325,12 @@ impl CompactedTable {
             self.tombstones_processed += 1;
             self.entries.remove(key.as_ref());
         } else {
-            let Some(value) = record.value.clone() else {
-                return;
-            };
+            // value must be Some here because is_tombstone() returned false and key is Some
+            let value = record
+                .value
+                .as_ref()
+                .expect("non-tombstone compacted record must have a value")
+                .clone();
             self.entries.insert(key.clone(), value);
         }
     }
@@ -452,7 +464,7 @@ impl CompactedTopicConsumer {
     /// or assignment.
     ///
     /// If the consumer is subscribed/assigned to additional topics, records
-    /// from those topics are filtered out with a warning logged — only
+    /// from those topics are filtered out (logged at debug level) — only
     /// records matching the given `topic` are applied to the table.
     ///
     /// This constructor is the best fit for consumers with stable, explicit
@@ -506,7 +518,7 @@ impl CompactedTopicConsumer {
         // of empty polls (especially when using from_consumer() without assign()).
         let assignments = self.consumer.assignment().await;
         if assignments.get(&self.topic).is_none_or(|p| p.is_empty()) {
-            return Err(KrafkaError::config(format!(
+            return Err(KrafkaError::invalid_state(format!(
                 "no partitions assigned for topic '{}'; \
                  assign partitions before calling scan()",
                 self.topic
@@ -521,8 +533,8 @@ impl CompactedTopicConsumer {
             records.retain(|r| r.topic == self.topic);
             let filtered = before_len - records.len();
             if filtered > 0 {
-                warn!(
-                    "Discarded {} record(s) from other topics during scan for '{}'",
+                debug!(
+                    "Filtered out {} record(s) from other topics during scan for '{}'",
                     filtered, self.topic
                 );
             }
@@ -560,8 +572,8 @@ impl CompactedTopicConsumer {
         records.retain(|r| r.topic == self.topic);
         let filtered = before_len - records.len();
         if filtered > 0 {
-            warn!(
-                "Discarded {} record(s) from other topics during poll for '{}'",
+            debug!(
+                "Filtered out {} record(s) from other topics during poll for '{}'",
                 filtered, self.topic
             );
         }
@@ -1247,14 +1259,12 @@ mod tests {
         assert_send_sync::<CompactedTopicConsumerBuilder>();
     }
 
-    #[test]
-    fn test_builder_missing_bootstrap_servers() {
-        let result = tokio::runtime::Runtime::new().unwrap().block_on(async {
-            CompactedTopicConsumerBuilder::default()
-                .topic("test")
-                .build()
-                .await
-        });
+    #[tokio::test]
+    async fn test_builder_missing_bootstrap_servers() {
+        let result = CompactedTopicConsumerBuilder::default()
+            .topic("test")
+            .build()
+            .await;
         assert!(result.is_err());
         assert!(
             result
@@ -1264,14 +1274,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_builder_missing_topic() {
-        let result = tokio::runtime::Runtime::new().unwrap().block_on(async {
-            CompactedTopicConsumerBuilder::default()
-                .bootstrap_servers("localhost:9092")
-                .build()
-                .await
-        });
+    #[tokio::test]
+    async fn test_builder_missing_topic() {
+        let result = CompactedTopicConsumerBuilder::default()
+            .bootstrap_servers("localhost:9092")
+            .build()
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("topic"));
     }
