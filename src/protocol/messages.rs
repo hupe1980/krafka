@@ -908,17 +908,7 @@ impl FetchRequest {
 
     /// Shared topics array encoder for v0–v4 (no log_start_offset, no leader epoch).
     fn encode_topics_v0(&self, buf: &mut impl BufMut) -> Result<()> {
-        buf.put_i32(array_len_i32(self.topics.len())?);
-        for topic in &self.topics {
-            KafkaString::new(&topic.topic).try_encode(buf)?;
-            buf.put_i32(array_len_i32(topic.partitions.len())?);
-            for partition in &topic.partitions {
-                partition.partition.encode(buf);
-                partition.fetch_offset.encode(buf);
-                partition.partition_max_bytes.encode(buf);
-            }
-        }
-        Ok(())
+        self.encode_topics_inner(buf, false)
     }
 
     /// Encode for version 5–6 (v4 + log_start_offset per partition).
@@ -928,11 +918,16 @@ impl FetchRequest {
         self.min_bytes.encode(buf);
         self.max_bytes.encode(buf);
         self.isolation_level.encode(buf);
-        self.encode_topics_v5(buf)
+        self.encode_topics_inner(buf, true)
     }
 
-    /// Shared topics array encoder for v5–v6 (adds log_start_offset per partition).
-    fn encode_topics_v5(&self, buf: &mut impl BufMut) -> Result<()> {
+    /// Shared topics array encoder for v0–v6. When `include_log_start_offset`
+    /// is true, emits `log_start_offset` per partition (v5+).
+    fn encode_topics_inner(
+        &self,
+        buf: &mut impl BufMut,
+        include_log_start_offset: bool,
+    ) -> Result<()> {
         buf.put_i32(array_len_i32(self.topics.len())?);
         for topic in &self.topics {
             KafkaString::new(&topic.topic).try_encode(buf)?;
@@ -940,7 +935,9 @@ impl FetchRequest {
             for partition in &topic.partitions {
                 partition.partition.encode(buf);
                 partition.fetch_offset.encode(buf);
-                partition.log_start_offset.encode(buf);
+                if include_log_start_offset {
+                    partition.log_start_offset.encode(buf);
+                }
                 partition.partition_max_bytes.encode(buf);
             }
         }
@@ -7023,6 +7020,192 @@ mod tests {
         let resp_v7 = FetchResponse::decode_v7(&mut buf_v7).unwrap();
         assert_eq!(resp_v7.throttle_time_ms, 50);
         assert_eq!(resp_v7.session_id, 99);
+    }
+
+    #[test]
+    fn test_fetch_request_encode_v5_includes_log_start_offset() {
+        let request = FetchRequest {
+            replica_id: -1,
+            max_wait_ms: 500,
+            min_bytes: 1,
+            max_bytes: 1048576,
+            isolation_level: 1,
+            session_id: 0,
+            session_epoch: 0,
+            topics: vec![FetchTopicRequest {
+                topic: "t".to_string(),
+                partitions: vec![FetchPartitionRequest {
+                    partition: 0,
+                    current_leader_epoch: -1,
+                    fetch_offset: 100,
+                    last_fetched_epoch: -1,
+                    log_start_offset: 42,
+                    partition_max_bytes: 1048576,
+                }],
+            }],
+            forgotten_topics: vec![],
+            rack_id: String::new(),
+        };
+
+        let mut buf_v4 = BytesMut::new();
+        request.encode_v4(&mut buf_v4).unwrap();
+
+        let mut buf_v5 = BytesMut::new();
+        request.encode_v5(&mut buf_v5).unwrap();
+
+        // v5 adds log_start_offset (8 bytes) per partition compared to v4
+        assert_eq!(
+            buf_v5.len(),
+            buf_v4.len() + 8,
+            "v5 should be 8 bytes longer than v4 (log_start_offset per partition)"
+        );
+
+        // Header is identical: replica_id(4) + max_wait_ms(4) + min_bytes(4) +
+        // max_bytes(4) + isolation_level(1) = 17 bytes
+        assert_eq!(&buf_v5[..17], &buf_v4[..17]);
+
+        // In v5 partition data, log_start_offset sits between fetch_offset and
+        // partition_max_bytes. Byte layout after the header:
+        //   topics_count(4) + topic_name(2+1) + partitions_count(4) = 11
+        //   partition_id(4) + fetch_offset(8) = 12
+        // => log_start_offset starts at offset 17 + 11 + 12 = 40
+        let log_start_bytes = &buf_v5[40..48];
+        assert_eq!(
+            i64::from_be_bytes(log_start_bytes.try_into().unwrap()),
+            42,
+            "log_start_offset should be 42 at the expected position"
+        );
+
+        // v4 has partition_max_bytes where v5 has log_start_offset
+        let v4_at_same_offset = &buf_v4[40..44];
+        assert_eq!(
+            i32::from_be_bytes(v4_at_same_offset.try_into().unwrap()),
+            1048576,
+            "v4 should have partition_max_bytes at offset 40 (no log_start_offset)"
+        );
+    }
+
+    #[test]
+    fn test_fetch_request_encode_v6_same_as_v5() {
+        let request = FetchRequest {
+            replica_id: -1,
+            max_wait_ms: 500,
+            min_bytes: 1,
+            max_bytes: 1048576,
+            isolation_level: 0,
+            session_id: 0,
+            session_epoch: 0,
+            topics: vec![FetchTopicRequest {
+                topic: "t".to_string(),
+                partitions: vec![FetchPartitionRequest {
+                    partition: 0,
+                    current_leader_epoch: -1,
+                    fetch_offset: 100,
+                    last_fetched_epoch: -1,
+                    log_start_offset: 10,
+                    partition_max_bytes: 1048576,
+                }],
+            }],
+            forgotten_topics: vec![],
+            rack_id: String::new(),
+        };
+
+        let mut buf_v5 = BytesMut::new();
+        request.encode_versioned(5, &mut buf_v5).unwrap();
+
+        let mut buf_v6 = BytesMut::new();
+        request.encode_versioned(6, &mut buf_v6).unwrap();
+
+        assert_eq!(buf_v6, buf_v5, "v6 should produce same bytes as v5");
+    }
+
+    #[test]
+    fn test_fetch_response_decode_v5_round_trip() {
+        // Build a v5 response manually: throttle(4) + topics (no error_code/session_id)
+        let mut raw = BytesMut::new();
+        raw.put_i32(100); // throttle_time_ms
+        raw.put_i32(1); // 1 topic
+        raw.put_i16(5); // topic name length
+        raw.put_slice(b"topic");
+        raw.put_i32(1); // 1 partition
+        raw.put_i32(0); // partition id
+        raw.put_i16(0); // error_code
+        raw.put_i64(1000); // high_watermark
+        raw.put_i64(999); // last_stable_offset
+        raw.put_i64(42); // log_start_offset (v5+)
+        raw.put_i32(0); // 0 aborted transactions
+        raw.put_i32(-1); // records (null)
+
+        let mut buf = raw.freeze();
+        let resp = FetchResponse::decode_v5(&mut buf).unwrap();
+
+        assert_eq!(resp.throttle_time_ms, 100);
+        assert_eq!(resp.error_code, ErrorCode::None);
+        assert_eq!(resp.session_id, 0);
+        assert_eq!(resp.responses.len(), 1);
+        assert_eq!(resp.responses[0].topic, "topic");
+        assert_eq!(resp.responses[0].partitions.len(), 1);
+
+        let p = &resp.responses[0].partitions[0];
+        assert_eq!(p.partition, 0);
+        assert_eq!(p.high_watermark, 1000);
+        assert_eq!(p.last_stable_offset, 999);
+        assert_eq!(p.log_start_offset, 42);
+        assert_eq!(p.preferred_read_replica, -1);
+    }
+
+    #[test]
+    fn test_fetch_response_decode_v5_vs_v4_log_start_offset() {
+        // v4 response: no log_start_offset per partition
+        let mut raw_v4 = BytesMut::new();
+        raw_v4.put_i32(50); // throttle_time_ms
+        raw_v4.put_i32(1); // 1 topic
+        raw_v4.put_i16(1); // topic name length
+        raw_v4.put_slice(b"t");
+        raw_v4.put_i32(1); // 1 partition
+        raw_v4.put_i32(0); // partition id
+        raw_v4.put_i16(0); // error_code
+        raw_v4.put_i64(500); // high_watermark
+        raw_v4.put_i64(499); // last_stable_offset
+        raw_v4.put_i32(-1); // aborted transactions (null)
+        raw_v4.put_i32(-1); // records (null)
+
+        let mut buf_v4 = raw_v4.freeze();
+        let resp_v4 = FetchResponse::decode_v4(&mut buf_v4).unwrap();
+        assert_eq!(resp_v4.responses[0].partitions[0].log_start_offset, -1);
+
+        // v5 response: includes log_start_offset
+        let mut raw_v5 = BytesMut::new();
+        raw_v5.put_i32(50); // throttle_time_ms
+        raw_v5.put_i32(1); // 1 topic
+        raw_v5.put_i16(1); // topic name length
+        raw_v5.put_slice(b"t");
+        raw_v5.put_i32(1); // 1 partition
+        raw_v5.put_i32(0); // partition id
+        raw_v5.put_i16(0); // error_code
+        raw_v5.put_i64(500); // high_watermark
+        raw_v5.put_i64(499); // last_stable_offset
+        raw_v5.put_i64(10); // log_start_offset (v5+)
+        raw_v5.put_i32(-1); // aborted transactions (null)
+        raw_v5.put_i32(-1); // records (null)
+
+        let mut buf_v5 = raw_v5.freeze();
+        let resp_v5 = FetchResponse::decode_v5(&mut buf_v5).unwrap();
+        assert_eq!(resp_v5.responses[0].partitions[0].log_start_offset, 10);
+    }
+
+    #[test]
+    fn test_versioned_decode_fetch_v5_v6_dispatches_to_decode_v5() {
+        let mut raw = BytesMut::new();
+        raw.put_i32(0); // throttle_time_ms
+        raw.put_i32(0); // 0 topics
+
+        let data = raw.freeze();
+        for version in 5..=6 {
+            let resp = FetchResponse::decode_versioned(version, &mut data.clone()).unwrap();
+            assert_eq!(resp.throttle_time_ms, 0);
+            assert!(resp.responses.is_empty());
+        }
     }
 
     // ── VersionedEncode / VersionedDecode tests ─────────────────────
