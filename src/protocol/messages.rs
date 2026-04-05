@@ -921,6 +921,32 @@ impl FetchRequest {
         Ok(())
     }
 
+    /// Encode for version 5–6 (v4 + log_start_offset per partition).
+    pub fn encode_v5(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.replica_id.encode(buf);
+        self.max_wait_ms.encode(buf);
+        self.min_bytes.encode(buf);
+        self.max_bytes.encode(buf);
+        self.isolation_level.encode(buf);
+        self.encode_topics_v5(buf)
+    }
+
+    /// Shared topics array encoder for v5–v6 (adds log_start_offset per partition).
+    fn encode_topics_v5(&self, buf: &mut impl BufMut) -> Result<()> {
+        buf.put_i32(array_len_i32(self.topics.len())?);
+        for topic in &self.topics {
+            KafkaString::new(&topic.topic).try_encode(buf)?;
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
+            for partition in &topic.partitions {
+                partition.partition.encode(buf);
+                partition.fetch_offset.encode(buf);
+                partition.log_start_offset.encode(buf);
+                partition.partition_max_bytes.encode(buf);
+            }
+        }
+        Ok(())
+    }
+
     /// Encode for version 7 (fetch sessions: session_id, session_epoch, forgotten_topics).
     pub fn encode_v7(&self, buf: &mut impl BufMut) -> Result<()> {
         self.encode_inner_v7(buf, false)
@@ -1106,6 +1132,17 @@ impl FetchResponse {
 
     /// Decode from version 4 (includes last_stable_offset and aborted_transactions).
     pub fn decode_v4(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode_inner_v4(buf, false)
+    }
+
+    /// Decode from version 5–6 (v4 + log_start_offset per partition).
+    pub fn decode_v5(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode_inner_v4(buf, true)
+    }
+
+    /// Shared decoder for v4–v6. When `include_log_start_offset` is true,
+    /// reads `log_start_offset` per partition (v5+); otherwise defaults to `-1`.
+    fn decode_inner_v4(buf: &mut impl Buf, include_log_start_offset: bool) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let topic_count = check_decode_array_len(i32::decode(buf)?)?;
         let mut responses = Vec::with_capacity(topic_count);
@@ -1120,6 +1157,11 @@ impl FetchResponse {
                 let error_code = ErrorCode::from_i16(i16::decode(buf)?);
                 let high_watermark = i64::decode(buf)?;
                 let last_stable_offset = i64::decode(buf)?;
+                let log_start_offset = if include_log_start_offset {
+                    i64::decode(buf)?
+                } else {
+                    -1
+                };
                 let aborted_tx_count = check_decode_nullable_array_len(i32::decode(buf)?)?;
                 let mut aborted_transactions = Vec::with_capacity(aborted_tx_count);
                 for _ in 0..aborted_tx_count {
@@ -1135,7 +1177,7 @@ impl FetchResponse {
                     error_code,
                     high_watermark,
                     last_stable_offset,
-                    log_start_offset: -1,
+                    log_start_offset,
                     aborted_transactions,
                     preferred_read_replica: -1,
                     records,
@@ -5338,8 +5380,8 @@ impl VersionedEncode for FetchRequest {
             0..=2 => self.encode_v0(buf)?,
             3 => self.encode_v3(buf)?,
             4 => self.encode_v4(buf)?,
-            // v5-v6 add fields (log_start_offset) that encode_v4 doesn't produce
-            5 | 6 => return unsupported_encode!("FetchRequest", version),
+            // v5-v6 add log_start_offset per partition
+            5 | 6 => self.encode_v5(buf)?,
             // v7-v8 share the same wire format (fetch sessions, KIP-227)
             7 | 8 => self.encode_v7(buf)?,
             // v9 adds current_leader_epoch per partition (KIP-320)
@@ -5358,8 +5400,8 @@ impl VersionedDecode for FetchResponse {
             0 => Self::decode_v0(buf),
             1..=3 => Self::decode_v1(buf),
             4 => Self::decode_v4(buf),
-            // v5-v6 add fields (log_start_offset) that decode_v4 doesn't consume
-            5 | 6 => unsupported_decode!("FetchResponse", version),
+            // v5-v6 add log_start_offset per partition
+            5 | 6 => Self::decode_v5(buf),
             // v7-v10 share the same wire format
             7..=10 => Self::decode_v7(buf),
             // v11 adds preferred_read_replica per partition (KIP-392)
