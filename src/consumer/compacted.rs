@@ -362,12 +362,16 @@ impl Eq for CompactedTable {}
 /// Convenience wrapper that pairs a [`Consumer`] with a [`CompactedTable`]
 /// for the common pattern of scanning an entire compacted topic.
 ///
-/// Internally creates a standalone (no group) consumer, assigns all
-/// partitions from the earliest offset, and provides [`scan()`](Self::scan)
-/// to block until the table is fully populated.
+/// When constructed via [`builder()`](Self::builder), it creates a
+/// standalone (no group) consumer, assigns all partitions from the earliest
+/// offset, and provides [`scan()`](Self::scan) to block until the table is
+/// fully populated.
 ///
-/// For custom consumer setups (e.g., consumer groups, manual offsets),
-/// use [`CompactedTable`] directly with your own [`Consumer`].
+/// Other constructors, such as [`from_consumer()`](Self::from_consumer),
+/// use the caller-provided consumer configuration and assignment as-is.
+///
+/// For fully custom consumer setups, you can also use [`CompactedTable`]
+/// directly with your own [`Consumer`].
 ///
 /// # Example
 ///
@@ -398,7 +402,7 @@ impl Eq for CompactedTable {}
 /// }
 /// ```
 pub struct CompactedTopicConsumer {
-    /// The underlying Kafka consumer (standalone, no group).
+    /// The underlying Kafka consumer.
     consumer: Consumer,
     /// Topic name.
     topic: String,
@@ -446,13 +450,22 @@ impl CompactedTopicConsumer {
         }
     }
 
-    /// Scan the topic from the beginning until all partitions are caught up.
+    /// Scan the topic from the consumer's current position until all
+    /// partitions are caught up.
     ///
-    /// Polls repeatedly using the given `poll_timeout` until the consumer's
-    /// position on every partition reaches or exceeds the latest known high
+    /// This method does not seek to the beginning of the topic and does not
+    /// clear or reset the current table state before polling. It repeatedly
+    /// polls using the given `poll_timeout` until the consumer's position on
+    /// every assigned partition reaches or exceeds the latest known high
     /// watermark.
     ///
-    /// Because that high watermark is refreshed on each fetch, it can keep
+    /// When this scanner is created via the builder, the internal consumer is
+    /// initialized with [`AutoOffsetReset::Earliest`], so an initial `scan()`
+    /// will typically read from the beginning of the topic. When using
+    /// [`from_consumer()`](Self::from_consumer), however, scanning starts from
+    /// whatever position that consumer already has.
+    ///
+    /// Because the high watermark is refreshed on each fetch, it can keep
     /// advancing while this scan is in progress. On actively written topics,
     /// `scan()` may therefore block indefinitely and should be treated as a
     /// best-effort catch-up operation rather than a bounded snapshot scan.
