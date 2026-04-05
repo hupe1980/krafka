@@ -84,6 +84,13 @@ pub trait OAuthBearerTokenProvider: Send + Sync {
 }
 
 /// Blanket impl: any `Fn() -> Future<Output = Result<OAuthBearerToken>>` is a provider.
+///
+/// The `'static` bound on `Fut` is required because the trait method signature
+/// uses an anonymous lifetime (`+ '_`), and the compiler cannot prove the
+/// future outlives `&self` without it. In practice this is not restrictive:
+/// closures that own their captured state (the common case) produce `'static`
+/// futures. For borrowing patterns, implement `OAuthBearerTokenProvider`
+/// directly.
 impl<F, Fut> OAuthBearerTokenProvider for F
 where
     F: Fn() -> Fut + Send + Sync,
