@@ -114,7 +114,10 @@ impl SecureConnectionConfigBuilder {
         self
     }
 
-    /// Configure SASL/OAUTHBEARER authentication.
+    /// Configure SASL/OAUTHBEARER authentication with a static token.
+    ///
+    /// For automatic token refresh, use [`sasl_oauthbearer_provider()`](Self::sasl_oauthbearer_provider).
+    /// For SASL extensions, use [`sasl_oauthbearer_token()`](Self::sasl_oauthbearer_token).
     pub fn sasl_oauthbearer(mut self, token: impl Into<String>) -> Self {
         self.auth = AuthConfig::sasl_oauthbearer(token);
         self

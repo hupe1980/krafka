@@ -199,15 +199,19 @@ let config = AuthConfig::sasl_oauthbearer_provider(|| async {
 
 **Struct provider (when you need shared state)**
 
+> **Security Note**: Wrap secrets like `client_secret` in `zeroize::Zeroizing<String>`
+> so they are erased from memory on drop and cannot appear in Debug output.
+
 ```rust
 use krafka::auth::{OAuthBearerToken, OAuthBearerTokenProvider};
 use krafka::error::Result;
 use std::future::Future;
 use std::pin::Pin;
+use zeroize::Zeroizing;
 
 struct MyTokenProvider {
     client_id: String,
-    client_secret: String,
+    client_secret: Zeroizing<String>,
     token_url: String,
 }
 
@@ -233,7 +237,7 @@ let consumer = Consumer::builder()
     .group_id("my-group")
     .sasl_oauthbearer_provider(MyTokenProvider {
         client_id: "my-app".into(),
-        client_secret: "secret".into(),
+        client_secret: Zeroizing::new("secret".into()),
         token_url: "https://auth.example.com/oauth/token".into(),
     })
     .build()

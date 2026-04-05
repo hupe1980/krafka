@@ -580,16 +580,9 @@ impl BrokerConnection {
         // For OAUTHBEARER with a provider, resolve a fresh token before
         // creating the authenticator (which is synchronous).
         let resolved_auth;
-        let auth = if auth.sasl_mechanism == Some(SaslMechanism::OAuthBearer)
-            && let Some(ref provider) = auth.oauthbearer_provider
-        {
-            debug!("Resolving OAUTHBEARER token from provider for {address}");
-            let token = provider.provide_token().await?;
-            resolved_auth = AuthConfig {
-                oauthbearer_token: Some(token),
-                oauthbearer_provider: None,
-                ..auth.clone()
-            };
+        let auth = if let Some(resolved) = auth.resolve_provider_to_token().await? {
+            debug!("Resolved OAUTHBEARER token from provider for {address}");
+            resolved_auth = resolved;
             &resolved_auth
         } else {
             auth

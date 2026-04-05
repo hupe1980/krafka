@@ -631,6 +631,26 @@ impl AuthConfig {
         }
     }
 
+    /// If this config has an OAUTHBEARER provider, call it to obtain a fresh
+    /// token and return a new `AuthConfig` with the token set and the provider
+    /// cleared. Otherwise, return `None` (the caller should use `self` as-is).
+    pub(crate) async fn resolve_provider_to_token(
+        &self,
+    ) -> crate::error::Result<Option<AuthConfig>> {
+        if self.sasl_mechanism == Some(SaslMechanism::OAuthBearer)
+            && let Some(ref provider) = self.oauthbearer_provider
+        {
+            let token = provider.provide_token().await?;
+            Ok(Some(AuthConfig {
+                oauthbearer_token: Some(token),
+                oauthbearer_provider: None,
+                ..self.clone()
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Check if TLS is required.
     pub fn requires_tls(&self) -> bool {
         matches!(
@@ -873,5 +893,60 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(!debug.contains("secret"));
         assert!(debug.contains("[OAuthBearerTokenProvider]"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_provider_to_token_calls_provider() {
+        let config =
+            AuthConfig::sasl_oauthbearer_provider(|| async { Ok(OAuthBearerToken::new("fresh")) });
+        let resolved = config.resolve_provider_to_token().await.unwrap().unwrap();
+
+        // Token is set
+        assert!(resolved.oauthbearer_token.is_some());
+        assert_eq!(
+            resolved
+                .oauthbearer_token
+                .unwrap()
+                .to_gs2_initial_response(),
+            OAuthBearerToken::new("fresh").to_gs2_initial_response()
+        );
+        // Provider is cleared
+        assert!(resolved.oauthbearer_provider.is_none());
+        // Mechanism and protocol are preserved
+        assert_eq!(resolved.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
+        assert_eq!(resolved.security_protocol, SecurityProtocol::SaslPlaintext);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_provider_to_token_preserves_tls() {
+        let config = AuthConfig::sasl_oauthbearer_provider_ssl(
+            || async { Ok(OAuthBearerToken::new("tok")) },
+            TlsConfig::new(),
+        );
+        let resolved = config.resolve_provider_to_token().await.unwrap().unwrap();
+
+        assert!(resolved.tls_config.is_some());
+        assert_eq!(resolved.security_protocol, SecurityProtocol::SaslSsl);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_provider_to_token_returns_none_for_static() {
+        let config = AuthConfig::sasl_oauthbearer("static-tok");
+        assert!(config.resolve_provider_to_token().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_provider_to_token_returns_none_for_non_oauth() {
+        let config = AuthConfig::sasl_plain("user", "pass");
+        assert!(config.resolve_provider_to_token().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_provider_to_token_propagates_error() {
+        let config = AuthConfig::sasl_oauthbearer_provider(|| async {
+            Err(crate::error::KrafkaError::auth("oauth server down"))
+        });
+        let err = config.resolve_provider_to_token().await.unwrap_err();
+        assert!(err.to_string().contains("oauth server down"));
     }
 }
