@@ -91,6 +91,50 @@ pub trait Decode: Sized {
 }
 
 // Primitive integer implementations
+//
+// Primitive types (i8, i16, i32, i64, u32, bool) have trivially infallible
+// TryEncode impls that delegate to Encode. Types i32 and i64 additionally
+// override `try_encode_compact` because their compact encoding uses varint,
+// which differs from the standard fixed-width encoding. The remaining types
+// (i8, i16, u32, bool) have identical compact and non-compact encodings,
+// so the default `try_encode_compact` → `try_encode` delegation is correct.
+
+/// Implement infallible `TryEncode` for types whose encoding never fails.
+macro_rules! impl_infallible_try_encode {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl TryEncode for $ty {
+                #[inline]
+                fn try_encode(&self, buf: &mut impl BufMut) -> Result<()> {
+                    self.encode(buf);
+                    Ok(())
+                }
+            }
+        )+
+    }
+}
+
+/// Same as [`impl_infallible_try_encode`] but also overrides `try_encode_compact`
+/// for types whose compact encoding differs from the standard one (e.g. varint).
+macro_rules! impl_infallible_try_encode_with_compact {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl TryEncode for $ty {
+                #[inline]
+                fn try_encode(&self, buf: &mut impl BufMut) -> Result<()> {
+                    self.encode(buf);
+                    Ok(())
+                }
+
+                #[inline]
+                fn try_encode_compact(&self, buf: &mut impl BufMut) -> Result<()> {
+                    self.encode_compact(buf);
+                    Ok(())
+                }
+            }
+        )+
+    }
+}
 
 impl Encode for i8 {
     #[inline]
@@ -211,6 +255,9 @@ impl Decode for bool {
     }
 }
 
+impl_infallible_try_encode!(i8, i16, u32, bool);
+impl_infallible_try_encode_with_compact!(i32, i64);
+
 // String implementations
 
 /// A Kafka protocol string (length-prefixed).
@@ -258,6 +305,9 @@ impl From<Option<String>> for KafkaString {
     }
 }
 
+// NOTE: Internal call sites use `TryEncode::try_encode()` instead.
+// This `Encode` impl exists for trait-bound compatibility.
+// PANIC: The `.expect()` triggers if `.encode()` is called on an oversized string.
 impl Encode for KafkaString {
     fn encode(&self, buf: &mut impl BufMut) {
         self.try_encode(buf)
@@ -395,6 +445,9 @@ impl From<&[u8]> for KafkaBytes {
     }
 }
 
+// NOTE: Internal call sites use `TryEncode::try_encode()` instead.
+// This `Encode` impl exists for trait-bound compatibility.
+// PANIC: The `.expect()` triggers if `.encode()` is called on an oversized byte buffer.
 impl Encode for KafkaBytes {
     fn encode(&self, buf: &mut impl BufMut) {
         self.try_encode(buf)
@@ -528,6 +581,9 @@ impl<T> From<Vec<T>> for KafkaArray<T> {
     }
 }
 
+// NOTE: Internal call sites use `TryEncode::try_encode()` instead.
+// This `Encode` impl exists for trait-bound compatibility.
+// PANIC: The `.expect()` triggers if `.encode()` is called on an oversized array.
 impl<T: Encode> Encode for KafkaArray<T> {
     fn encode(&self, buf: &mut impl BufMut) {
         match &self.0 {
@@ -559,7 +615,7 @@ impl<T: Encode> Encode for KafkaArray<T> {
     }
 }
 
-impl<T: Encode + TryEncode> TryEncode for KafkaArray<T> {
+impl<T: TryEncode> TryEncode for KafkaArray<T> {
     fn try_encode(&self, buf: &mut impl BufMut) -> Result<()> {
         match &self.0 {
             None => buf.put_i32(-1),
@@ -660,6 +716,9 @@ pub struct TaggedField {
     pub data: Bytes,
 }
 
+// NOTE: Internal call sites use `TryEncode::try_encode()` instead.
+// This `Encode` impl exists for trait-bound compatibility.
+// PANIC: The `.expect()` triggers if `.encode()` is called on oversized tagged fields.
 impl Encode for TaggedFields {
     fn encode(&self, buf: &mut impl BufMut) {
         self.try_encode(buf)

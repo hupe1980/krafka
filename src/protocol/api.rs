@@ -420,6 +420,14 @@ impl Encode for ApiKey {
     }
 }
 
+impl TryEncode for ApiKey {
+    #[inline]
+    fn try_encode(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.encode(buf);
+        Ok(())
+    }
+}
+
 impl Decode for ApiKey {
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         Ok(Self::from_i16(i16::decode(buf)?))
@@ -499,11 +507,22 @@ impl Encode for ApiVersionRange {
     }
 
     fn encode_compact(&self, buf: &mut impl BufMut) {
-        self.api_key.encode(buf);
-        self.min_version.encode(buf);
-        self.max_version.encode(buf);
-        // Tagged fields for flexible versions
+        self.encode(buf);
+        // Empty tagged fields for flexible versions.
         TaggedFields::default().encode(buf);
+    }
+}
+
+impl TryEncode for ApiVersionRange {
+    fn try_encode(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.encode(buf);
+        Ok(())
+    }
+
+    fn try_encode_compact(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.encode(buf);
+        TaggedFields::default().try_encode(buf)?;
+        Ok(())
     }
 }
 
