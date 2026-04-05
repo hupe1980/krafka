@@ -174,8 +174,11 @@ impl CompactedTable {
 
     /// Apply a batch of consumer records to the table.
     ///
-    /// Returns a list of [`TableChange`]s describing each modification.
+    /// Returns a list of [`TableChange`]s — one per keyed record applied.
     /// Records without a key are counted but produce no change.
+    /// Tombstones always produce a change for their key, even if the key was
+    /// not present in the table; in that case both `old_value` and `new_value`
+    /// are `None`.
     #[must_use = "use ingest() if changes are not needed"]
     pub fn apply(&mut self, records: &[ConsumerRecord]) -> Vec<TableChange> {
         let mut changes = Vec::with_capacity(records.len());
@@ -439,6 +442,14 @@ impl CompactedTopicConsumer {
     /// from those topics are silently filtered out — only records matching
     /// the given `topic` are applied to the table.
     ///
+    /// This constructor is the best fit for consumers with stable, explicit
+    /// assignments. If you wrap a group-coordinated consumer whose assignment
+    /// can change over time, note that [`CompactedTable`] is not
+    /// automatically pruned when partitions are revoked. Keys loaded from
+    /// partitions that are no longer assigned will remain in the table until
+    /// you clear or rebuild it (e.g., call [`table_mut().clear()`](CompactedTable::clear)
+    /// from a rebalance callback when assignments change).
+    ///
     /// Use this when you need full control over the consumer configuration
     /// (TLS, auth, timeouts, etc.) beyond what the builder exposes.
     pub fn from_consumer(consumer: Consumer, topic: impl Into<String>) -> Self {
@@ -558,6 +569,25 @@ impl CompactedTopicConsumer {
     /// Returns the topic name.
     pub fn topic(&self) -> &str {
         &self.topic
+    }
+
+    /// Returns a reference to the underlying [`Consumer`].
+    ///
+    /// Useful for calling consumer operations not exposed on this wrapper,
+    /// such as seek, pause, commit, or reading assignment/metrics.
+    pub fn consumer(&self) -> &Consumer {
+        &self.consumer
+    }
+
+    /// Returns a mutable reference to the underlying [`Consumer`].
+    pub fn consumer_mut(&mut self) -> &mut Consumer {
+        &mut self.consumer
+    }
+
+    /// Unwrap this wrapper and return the underlying [`Consumer`] and
+    /// [`CompactedTable`].
+    pub fn into_parts(self) -> (Consumer, CompactedTable) {
+        (self.consumer, self.table)
     }
 
     /// Close the underlying consumer.

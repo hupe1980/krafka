@@ -920,6 +920,8 @@ This means:
 Records in compacted topics with a key but no value are **tombstones** — deletion markers that eventually cause the key to be removed from the log. Use `ConsumerRecord::is_tombstone()` to detect them:
 
 ```rust
+use std::time::Duration;
+
 let records = consumer.poll(Duration::from_secs(1)).await?;
 for record in &records {
     if record.is_tombstone() {
@@ -1021,6 +1023,7 @@ Key behaviors:
 - **Starts from earliest** — `auto_offset_reset` is set to `Earliest` internally
 - **Caught-up detection** — `scan()` returns when all partitions reach their high watermarks; `poll()` also updates the flag. Because the high watermark is refreshed on each fetch, `scan()` may block indefinitely on actively written topics — treat it as a best-effort catch-up rather than a bounded snapshot
 - **Table access** — `table()` and `table_mut()` give direct access to the underlying `CompactedTable`
+- **Consumer access** — `consumer()` and `consumer_mut()` expose the underlying `Consumer` for seek, pause, commit, or metrics; `into_parts()` decomposes the wrapper into `(Consumer, CompactedTable)`
 
 For custom consumer setups (e.g., consumer groups, manual offsets), use `CompactedTable` directly.
 

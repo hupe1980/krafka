@@ -56,8 +56,9 @@ impl ConsumerRecord {
     /// Returns `true` if this record is a tombstone (delete marker).
     ///
     /// In log-compacted topics, a record with a key but no value marks the
-    /// key for deletion. After compaction, the key and all its prior values
-    /// are removed from the log.
+    /// key for deletion. Compaction removes older records for that key, while
+    /// the tombstone itself may remain until the topic's delete retention
+    /// period expires.
     #[inline]
     pub fn is_tombstone(&self) -> bool {
         self.key.is_some() && self.value.is_none()
