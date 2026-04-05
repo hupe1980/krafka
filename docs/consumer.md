@@ -969,6 +969,7 @@ Key behaviors:
 - **Bulk load** — `ingest()` applies records without building a change list (ideal for initial scans)
 - **Reset** — `clear()` removes all entries and resets counters (useful during rebalances)
 - **Clone** — `table.clone()` produces a full copy including counters; `table.snapshot()` clones only the entries
+- **Equality** — two tables are equal (`PartialEq`/`Eq`) when they contain the same entries; processing counters are ignored
 - **IntoIterator** — `for (key, value) in &table { ... }` or `for (key, value) in table { ... }` (consuming)
 
 `TableChange` derives `PartialEq` and `Eq`, so changes can be compared directly with `assert_eq!` in tests.
@@ -1018,7 +1019,7 @@ loop {
 Key behaviors:
 - **No consumer group** — uses standalone assignment of all partitions
 - **Starts from earliest** — `auto_offset_reset` is set to `Earliest` internally
-- **Caught-up detection** — `scan()` returns when all partitions reach their high watermarks; `poll()` also updates the flag
+- **Caught-up detection** — `scan()` returns when all partitions reach their high watermarks; `poll()` also updates the flag. Because the high watermark is refreshed on each fetch, `scan()` may block indefinitely on actively written topics — treat it as a best-effort catch-up rather than a bounded snapshot
 - **Table access** — `table()` and `table_mut()` give direct access to the underlying `CompactedTable`
 
 For custom consumer setups (e.g., consumer groups, manual offsets), use `CompactedTable` directly.

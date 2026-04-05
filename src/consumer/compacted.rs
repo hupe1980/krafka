@@ -206,13 +206,11 @@ impl CompactedTable {
                     .as_ref()
                     .expect("non-tombstone compacted record must have a value")
                     .clone();
-                let change_key = key.clone();
-                let change_value = value.clone();
-                let old_value = self.entries.insert(key.clone(), value);
+                let old_value = self.entries.insert(key.clone(), value.clone());
                 changes.push(TableChange {
-                    key: change_key,
+                    key: key.clone(),
                     old_value,
-                    new_value: Some(change_value),
+                    new_value: Some(value),
                     partition: record.partition,
                     offset: record.offset,
                     timestamp: record.timestamp,
@@ -452,9 +450,16 @@ impl CompactedTopicConsumer {
     ///
     /// Polls repeatedly using the given `poll_timeout` until the consumer's
     /// position on every partition reaches or exceeds the latest known high
-    /// watermark (which advances with each fetch). After this call returns,
-    /// [`is_caught_up()`](Self::is_caught_up) is `true` and the table
-    /// contains the latest value for every live key.
+    /// watermark.
+    ///
+    /// Because that high watermark is refreshed on each fetch, it can keep
+    /// advancing while this scan is in progress. On actively written topics,
+    /// `scan()` may therefore block indefinitely and should be treated as a
+    /// best-effort catch-up operation rather than a bounded snapshot scan.
+    ///
+    /// If this call returns, [`is_caught_up()`](Self::is_caught_up) is `true`
+    /// and the table contains the latest value for every live key observed up
+    /// to the point where the consumer determined it had caught up.
     ///
     /// # Errors
     ///
@@ -687,7 +692,13 @@ impl CompactedTopicConsumerBuilder {
             KrafkaError::config(format!("topic '{topic}' not found in cluster metadata"))
         })?;
 
-        let partitions: Vec<PartitionId> = (0..partition_count as PartitionId).collect();
+        let partition_count = PartitionId::try_from(partition_count).map_err(|_| {
+            KrafkaError::config(format!(
+                "topic '{topic}' has too many partitions to fit in PartitionId"
+            ))
+        })?;
+
+        let partitions: Vec<PartitionId> = (0..partition_count).collect();
         consumer.assign(&topic, partitions).await?;
 
         info!(
