@@ -200,7 +200,11 @@ let config = AuthConfig::sasl_oauthbearer_provider(|| async {
 **Struct provider (when you need shared state)**
 
 > **Security Note**: Wrap secrets like `client_secret` in `zeroize::Zeroizing<String>`
-> so they are erased from memory on drop and cannot appear in Debug output.
+> so they are erased from memory on drop. This does **not** by itself prevent the
+> secret from being exposed via `Debug`/`Display` if the containing struct is
+> logged or derives `Debug`. Callers must still avoid logging secrets and should
+> implement a redacted `Debug` for any struct that holds credentials (or
+> otherwise ensure secret fields are never formatted).
 
 ```rust
 use krafka::auth::{OAuthBearerToken, OAuthBearerTokenProvider};
