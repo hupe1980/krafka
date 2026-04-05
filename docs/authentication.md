@@ -259,7 +259,9 @@ let config = AuthConfig::sasl_oauthbearer_provider_ssl(
 the connection pool detects a disconnection and reconnects, the provider
 is called again — delivering a fresh token without any client restart.
 Implementations may cache tokens internally and only refresh when
-approaching expiry.
+approaching expiry. Provider resolution is bounded by the configured
+request timeout (default 30 s) to prevent hung providers from stalling
+reconnection loops.
 
 #### OAUTHBEARER Protocol Details
 

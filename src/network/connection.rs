@@ -465,6 +465,7 @@ impl BrokerConnection {
                     address,
                     &config.client_id,
                     config.max_response_size,
+                    request_timeout,
                 )
                 .await?;
 
@@ -514,6 +515,7 @@ impl BrokerConnection {
                 address,
                 &config.client_id,
                 config.max_response_size,
+                request_timeout,
             )
             .await?;
 
@@ -573,14 +575,20 @@ impl BrokerConnection {
         address: &str,
         client_id: &str,
         max_response_size: usize,
+        request_timeout: Duration,
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
         // For OAUTHBEARER with a provider, resolve a fresh token before
         // creating the authenticator (which is synchronous).
+        // Apply the request timeout so a hung provider cannot stall reconnect loops.
         let resolved_auth;
-        let auth = if let Some(resolved) = auth.resolve_provider_to_token().await? {
+        let auth = if let Some(resolved) =
+            timeout(request_timeout, auth.resolve_provider_to_token())
+                .await
+                .map_err(|_| KrafkaError::timeout("OAUTHBEARER token provider"))??
+        {
             debug!("Resolved OAUTHBEARER token from provider for {address}");
             resolved_auth = resolved;
             &resolved_auth
@@ -1520,6 +1528,89 @@ mod tests {
         assert_eq!(auth_bytes, b"\0testuser\0testpassword");
 
         conn.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_sasl_oauthbearer_provider_handshake_with_mock_broker() {
+        use crate::auth::OAuthBearerToken;
+
+        // Start a mock broker
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let addr_str = addr.to_string();
+
+        // Run mock broker in background
+        let mock_handle = tokio::spawn(run_mock_sasl_broker(listener));
+
+        // Connect with OAUTHBEARER provider (not a static token)
+        let config = ConnectionConfig::builder()
+            .client_id("test-client")
+            .auth(crate::auth::AuthConfig::sasl_oauthbearer_provider(
+                || async { Ok(OAuthBearerToken::new("provider-jwt-token")) },
+            ))
+            .build();
+
+        let conn = BrokerConnection::connect(&addr_str, config).await;
+        assert!(
+            conn.is_ok(),
+            "Connection with OAUTHBEARER provider should succeed: {:?}",
+            conn.err()
+        );
+
+        let conn = conn.unwrap();
+        assert!(conn.is_alive());
+
+        // Verify the mock received the correct OAUTHBEARER handshake
+        let (mechanism, auth_bytes) = mock_handle.await.unwrap();
+        assert_eq!(mechanism, "OAUTHBEARER");
+
+        // GS2 format: n,,\x01auth=Bearer <token>\x01\x01
+        let expected = OAuthBearerToken::new("provider-jwt-token").to_gs2_initial_response();
+        assert_eq!(auth_bytes, expected);
+
+        conn.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_sasl_oauthbearer_provider_timeout() {
+        // Provider that hangs forever
+        let config = ConnectionConfig::builder()
+            .client_id("test-client")
+            .request_timeout(Duration::from_millis(100))
+            .auth(crate::auth::AuthConfig::sasl_oauthbearer_provider(
+                || async {
+                    // Simulate a hung OAuth server
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok(crate::auth::OAuthBearerToken::new("never"))
+                },
+            ))
+            .build();
+
+        // We need a listening socket so TCP connect succeeds before the handshake
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let addr_str = addr.to_string();
+
+        // Accept in background so the connect() doesn't hang
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            // Keep the stream alive so the client side doesn't get a connection reset
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let result = BrokerConnection::connect(&addr_str, config).await;
+        assert!(
+            result.is_err(),
+            "Connection should fail when provider times out"
+        );
+        let err = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("Expected error"),
+        };
+        assert!(
+            err.contains("timed out") || err.contains("timeout"),
+            "Error should mention timeout: {err}"
+        );
     }
 
     #[tokio::test]
