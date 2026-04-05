@@ -200,13 +200,19 @@ impl CompactedTable {
                     timestamp: record.timestamp,
                 });
             } else {
-                // value is Some here because is_tombstone() returned false and key is Some
-                let value = record.value.clone().unwrap_or_default();
-                let old_value = self.entries.insert(key.clone(), value.clone());
+                // value must be Some here because is_tombstone() returned false and key is Some
+                let value = record
+                    .value
+                    .as_ref()
+                    .expect("non-tombstone compacted record must have a value")
+                    .clone();
+                let change_key = key.clone();
+                let change_value = value.clone();
+                let old_value = self.entries.insert(key.clone(), value);
                 changes.push(TableChange {
-                    key: key.clone(),
+                    key: change_key,
                     old_value,
-                    new_value: Some(value),
+                    new_value: Some(change_value),
                     partition: record.partition,
                     offset: record.offset,
                     timestamp: record.timestamp,
@@ -295,7 +301,9 @@ impl CompactedTable {
                 self.tombstones_processed += 1;
                 self.entries.remove(key.as_ref());
             } else {
-                let value = record.value.clone().unwrap_or_default();
+                let Some(value) = record.value.clone() else {
+                    continue;
+                };
                 self.entries.insert(key.clone(), value);
             }
         }
@@ -1133,8 +1141,8 @@ mod tests {
         assert_eq!(table.tombstones_processed(), 1);
     }
 
-    // Compile-time assertions: all public types must be Send + Sync.
-    fn _assert_send_sync() {
+    #[test]
+    fn test_all_public_types_are_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<CompactedTable>();
         assert_send_sync::<TableChange>();
