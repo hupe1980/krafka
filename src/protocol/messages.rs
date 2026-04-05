@@ -898,31 +898,32 @@ impl FetchRequest {
 
     /// Encode for version 4.
     pub fn encode_v4(&self, buf: &mut impl BufMut) -> Result<()> {
-        self.replica_id.encode(buf);
-        self.max_wait_ms.encode(buf);
-        self.min_bytes.encode(buf);
-        self.max_bytes.encode(buf);
-        self.isolation_level.encode(buf);
-        self.encode_topics_v0(buf)
-    }
-
-    /// Shared topics array encoder for v0–v4 (no log_start_offset, no leader epoch).
-    fn encode_topics_v0(&self, buf: &mut impl BufMut) -> Result<()> {
-        self.encode_topics_inner(buf, false)
+        self.encode_inner_v4(buf, false)
     }
 
     /// Encode for version 5–6 (v4 + log_start_offset per partition).
     pub fn encode_v5(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.encode_inner_v4(buf, true)
+    }
+
+    /// Shared encoder for v4–v6. When `include_log_start_offset` is true,
+    /// emits `log_start_offset` per partition (v5+).
+    fn encode_inner_v4(&self, buf: &mut impl BufMut, include_log_start_offset: bool) -> Result<()> {
         self.replica_id.encode(buf);
         self.max_wait_ms.encode(buf);
         self.min_bytes.encode(buf);
         self.max_bytes.encode(buf);
         self.isolation_level.encode(buf);
-        self.encode_topics_inner(buf, true)
+        self.encode_topics_inner(buf, include_log_start_offset)
     }
 
-    /// Shared topics array encoder for v0–v6. When `include_log_start_offset`
-    /// is true, emits `log_start_offset` per partition (v5+).
+    /// Shared topics array encoder for v0–v3 (no log_start_offset, no leader epoch).
+    fn encode_topics_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.encode_topics_inner(buf, false)
+    }
+
+    /// Shared topics array encoder. When `include_log_start_offset` is true,
+    /// emits `log_start_offset` per partition (v5+).
     fn encode_topics_inner(
         &self,
         buf: &mut impl BufMut,
@@ -7060,29 +7061,43 @@ mod tests {
             "v5 should be 8 bytes longer than v4 (log_start_offset per partition)"
         );
 
-        // Header is identical: replica_id(4) + max_wait_ms(4) + min_bytes(4) +
-        // max_bytes(4) + isolation_level(1) = 17 bytes
-        assert_eq!(&buf_v5[..17], &buf_v4[..17]);
+        // Helper: skip the shared v4/v5 header + first partition's common
+        // fields up to (and including) fetch_offset, returning bytes consumed.
+        fn header_and_partition_prefix_len(buf: &[u8]) -> usize {
+            let mut c: &[u8] = buf;
+            i32::decode(&mut c).unwrap(); // replica_id
+            i32::decode(&mut c).unwrap(); // max_wait_ms
+            i32::decode(&mut c).unwrap(); // min_bytes
+            i32::decode(&mut c).unwrap(); // max_bytes
+            i8::decode(&mut c).unwrap(); // isolation_level
+            i32::decode(&mut c).unwrap(); // topic_count
+            KafkaString::decode(&mut c).unwrap(); // topic_name
+            i32::decode(&mut c).unwrap(); // partition_count
+            i32::decode(&mut c).unwrap(); // partition_id
+            i64::decode(&mut c).unwrap(); // fetch_offset
+            buf.len() - c.len()
+        }
 
-        // In v5 partition data, log_start_offset sits between fetch_offset and
-        // partition_max_bytes. Byte layout after the header:
-        //   topics_count(4) + topic_name(2+1) + partitions_count(4) = 11
-        //   partition_id(4) + fetch_offset(8) = 12
-        // => log_start_offset starts at offset 17 + 11 + 12 = 40
-        let log_start_bytes = &buf_v5[40..48];
+        // v5: log_start_offset sits between fetch_offset and partition_max_bytes
+        let skip = header_and_partition_prefix_len(&buf_v5);
+        let mut cursor: &[u8] = &buf_v5[skip..];
+        let log_start_offset = i64::decode(&mut cursor).unwrap();
+        let partition_max_bytes = i32::decode(&mut cursor).unwrap();
         assert_eq!(
-            i64::from_be_bytes(log_start_bytes.try_into().unwrap()),
-            42,
-            "log_start_offset should be 42 at the expected position"
+            log_start_offset, 42,
+            "v5 log_start_offset at expected position"
         );
+        assert_eq!(partition_max_bytes, 1048576);
 
-        // v4 has partition_max_bytes where v5 has log_start_offset
-        let v4_at_same_offset = &buf_v4[40..44];
+        // v4: no log_start_offset — partition_max_bytes follows fetch_offset directly
+        let skip = header_and_partition_prefix_len(&buf_v4);
+        let mut cursor_v4: &[u8] = &buf_v4[skip..];
+        let v4_partition_max_bytes = i32::decode(&mut cursor_v4).unwrap();
         assert_eq!(
-            i32::from_be_bytes(v4_at_same_offset.try_into().unwrap()),
-            1048576,
-            "v4 should have partition_max_bytes at offset 40 (no log_start_offset)"
+            v4_partition_max_bytes, 1048576,
+            "v4 has no log_start_offset"
         );
+        assert!(cursor_v4.is_empty(), "v4 buffer fully consumed");
     }
 
     #[test]
