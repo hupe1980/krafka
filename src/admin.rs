@@ -1873,7 +1873,7 @@ impl AdminClient {
         let response = CreateDelegationTokenResponse::decode_versioned(version, &mut buf)?;
 
         let result = if response.error_code.is_ok() {
-            info!("Created delegation token: {}", response.token_id);
+            info!("Created delegation token");
             CreateDelegationTokenResult {
                 token: Some(DelegationToken {
                     principal_type: response.principal_type,
