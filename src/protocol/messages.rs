@@ -5963,7 +5963,7 @@ impl VersionedDecode for OffsetForLeaderEpochResponse {
 
 /// A principal that can renew the delegation token.
 #[derive(Debug, Clone)]
-pub struct CreatableRenewers {
+pub struct CreatableRenewer {
     /// Principal type (e.g., `"User"`).
     pub principal_type: String,
     /// Principal name.
@@ -5974,7 +5974,7 @@ pub struct CreatableRenewers {
 #[derive(Debug, Clone)]
 pub struct CreateDelegationTokenRequest {
     /// Principals authorized to renew the token.
-    pub renewers: Vec<CreatableRenewers>,
+    pub renewers: Vec<CreatableRenewer>,
     /// Maximum lifetime in milliseconds. `-1` uses the server default.
     pub max_lifetime_ms: i64,
 }
@@ -8677,7 +8677,7 @@ mod tests {
     #[test]
     fn test_create_delegation_token_request_roundtrip() {
         let request = CreateDelegationTokenRequest {
-            renewers: vec![CreatableRenewers {
+            renewers: vec![CreatableRenewer {
                 principal_type: "User".to_string(),
                 principal_name: "alice".to_string(),
             }],
@@ -8746,7 +8746,7 @@ mod tests {
     fn test_delegation_token_v1_versioned_dispatch() {
         // v0 and v1 share the same wire format — verify v1 dispatch works.
         let create_req = CreateDelegationTokenRequest {
-            renewers: vec![CreatableRenewers {
+            renewers: vec![CreatableRenewer {
                 principal_type: "User".to_string(),
                 principal_name: "alice".to_string(),
             }],

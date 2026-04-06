@@ -48,7 +48,7 @@ use crate::network::{BrokerConnection, ConnectionConfig, ConnectionPool};
 use crate::protocol::{
     AclBinding, AclBindingFilter, AclOperation, AclPatternType, AclPermissionType, AclResourceType,
     AlterClientQuotasRequest, AlterClientQuotasResponse, AlterConfigsRequest, AlterConfigsResponse,
-    AlterQuotaEntity, AlterQuotaEntry, AlterQuotaOp, ApiKey, CreatableRenewers, CreatableTopic,
+    AlterQuotaEntity, AlterQuotaEntry, AlterQuotaOp, ApiKey, CreatableRenewer, CreatableTopic,
     CreatableTopicConfig, CreateAclsRequest, CreateAclsResponse, CreateDelegationTokenRequest,
     CreateDelegationTokenResponse, CreatePartitionsRequest, CreatePartitionsResponse,
     CreatePartitionsTopic, CreateTopicsRequest, CreateTopicsResponse, DeleteAclsRequest,
@@ -637,21 +637,7 @@ impl AdminClient {
         topics: Vec<NewTopic>,
         timeout: Duration,
     ) -> Result<Vec<CreateTopicResult>> {
-        self.check_not_closed()?;
-        // Get any broker connection (controller for leadership, but any broker forwards)
-        let brokers = self.metadata.brokers();
-        if brokers.is_empty() {
-            return Err(KrafkaError::broker(
-                crate::error::ErrorCode::UnknownServerError,
-                "no brokers available",
-            ));
-        }
-
-        let broker = &brokers[0];
-        let conn = self
-            .pool
-            .get_connection_by_id(broker.id, broker.address())
-            .await?;
+        let conn = self.get_any_broker_connection().await?;
 
         // Build request
         let request = CreateTopicsRequest {
@@ -810,23 +796,8 @@ impl AdminClient {
         new_total_count: i32,
         timeout: Duration,
     ) -> Result<CreatePartitionsResult> {
-        self.check_not_closed()?;
         let topic_name = topic.into();
-
-        // Get any broker connection
-        let brokers = self.metadata.brokers();
-        if brokers.is_empty() {
-            return Err(KrafkaError::broker(
-                crate::error::ErrorCode::UnknownServerError,
-                "no brokers available",
-            ));
-        }
-
-        let broker = &brokers[0];
-        let conn = self
-            .pool
-            .get_connection_by_id(broker.id, broker.address())
-            .await?;
+        let conn = self.get_any_broker_connection().await?;
 
         // Build request
         let request = CreatePartitionsRequest {
@@ -888,20 +859,7 @@ impl AdminClient {
 
     /// Describe configuration for a topic.
     pub async fn describe_topic_config(&self, topic: &str) -> Result<Vec<ConfigEntry>> {
-        self.check_not_closed()?;
-        let brokers = self.metadata.brokers();
-        if brokers.is_empty() {
-            return Err(KrafkaError::broker(
-                crate::error::ErrorCode::UnknownServerError,
-                "no brokers available",
-            ));
-        }
-
-        let broker = &brokers[0];
-        let conn = self
-            .pool
-            .get_connection_by_id(broker.id, broker.address())
-            .await?;
+        let conn = self.get_any_broker_connection().await?;
 
         let request = DescribeConfigsRequest::for_topic(topic);
 
@@ -946,20 +904,7 @@ impl AdminClient {
 
     /// Describe configuration for a broker.
     pub async fn describe_broker_config(&self, broker_id: i32) -> Result<Vec<ConfigEntry>> {
-        self.check_not_closed()?;
-        let brokers = self.metadata.brokers();
-        if brokers.is_empty() {
-            return Err(KrafkaError::broker(
-                crate::error::ErrorCode::UnknownServerError,
-                "no brokers available",
-            ));
-        }
-
-        let broker = &brokers[0];
-        let conn = self
-            .pool
-            .get_connection_by_id(broker.id, broker.address())
-            .await?;
+        let conn = self.get_any_broker_connection().await?;
 
         let request = DescribeConfigsRequest::for_broker(broker_id);
 
@@ -1011,20 +956,7 @@ impl AdminClient {
         topic: &str,
         configs: HashMap<String, String>,
     ) -> Result<AlterConfigResult> {
-        self.check_not_closed()?;
-        let brokers = self.metadata.brokers();
-        if brokers.is_empty() {
-            return Err(KrafkaError::broker(
-                crate::error::ErrorCode::UnknownServerError,
-                "no brokers available",
-            ));
-        }
-
-        let broker = &brokers[0];
-        let conn = self
-            .pool
-            .get_connection_by_id(broker.id, broker.address())
-            .await?;
+        let conn = self.get_any_broker_connection().await?;
 
         let request = AlterConfigsRequest::for_topic(topic, configs.into_iter().collect());
 
@@ -1182,20 +1114,7 @@ impl AdminClient {
     /// let result = admin.describe_acls_with_filter(filter).await?;
     /// ```
     pub async fn describe_acls_with_filter(&self, filter: AclFilter) -> Result<DescribeAclsResult> {
-        self.check_not_closed()?;
-        let brokers = self.metadata.brokers();
-        if brokers.is_empty() {
-            return Err(KrafkaError::broker(
-                crate::error::ErrorCode::UnknownServerError,
-                "no brokers available",
-            ));
-        }
-
-        let broker = &brokers[0];
-        let conn = self
-            .pool
-            .get_connection_by_id(broker.id, broker.address())
-            .await?;
+        let conn = self.get_any_broker_connection().await?;
 
         let request = DescribeAclsRequest {
             resource_type: filter.resource_type,
@@ -1276,20 +1195,7 @@ impl AdminClient {
     /// admin.create_acls(vec![acl]).await?;
     /// ```
     pub async fn create_acls(&self, acls: Vec<AclBinding>) -> Result<CreateAclsResult> {
-        self.check_not_closed()?;
-        let brokers = self.metadata.brokers();
-        if brokers.is_empty() {
-            return Err(KrafkaError::broker(
-                crate::error::ErrorCode::UnknownServerError,
-                "no brokers available",
-            ));
-        }
-
-        let broker = &brokers[0];
-        let conn = self
-            .pool
-            .get_connection_by_id(broker.id, broker.address())
-            .await?;
+        let conn = self.get_any_broker_connection().await?;
 
         let request = CreateAclsRequest {
             creations: acls.clone(),
@@ -1359,20 +1265,7 @@ impl AdminClient {
     /// admin.delete_acls(vec![filter]).await?;
     /// ```
     pub async fn delete_acls(&self, filters: Vec<AclBindingFilter>) -> Result<DeleteAclsResult> {
-        self.check_not_closed()?;
-        let brokers = self.metadata.brokers();
-        if brokers.is_empty() {
-            return Err(KrafkaError::broker(
-                crate::error::ErrorCode::UnknownServerError,
-                "no brokers available",
-            ));
-        }
-
-        let broker = &brokers[0];
-        let conn = self
-            .pool
-            .get_connection_by_id(broker.id, broker.address())
-            .await?;
+        let conn = self.get_any_broker_connection().await?;
 
         let request = DeleteAclsRequest {
             filters: filters.clone(),
@@ -1950,7 +1843,7 @@ impl AdminClient {
         let request = CreateDelegationTokenRequest {
             renewers: renewers
                 .iter()
-                .map(|(t, n)| CreatableRenewers {
+                .map(|(t, n)| CreatableRenewer {
                     principal_type: t.to_string(),
                     principal_name: n.to_string(),
                 })
