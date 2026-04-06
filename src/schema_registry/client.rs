@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use super::{Schema, SchemaId, SchemaReference, SchemaRegistryClient, SchemaType, SchemaVersion};
 use crate::error::{KrafkaError, Result};
@@ -130,11 +131,13 @@ pub struct ConfluentSchemaRegistry {
 impl ConfluentSchemaRegistry {
     /// Create a client with the given registry URL and no authentication.
     ///
-    /// For authentication or custom timeouts, use [`builder()`](Self::builder).
+    /// If the URL contains embedded credentials (`https://user:pass@host/`),
+    /// they are stripped and a warning is logged. Use [`builder()`](Self::builder)
+    /// with [`basic_auth()`](ConfluentSchemaRegistryBuilder::basic_auth) instead.
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
-            base_url: url.into().trim_end_matches('/').to_string(),
+            base_url: sanitize_url(url.into().trim_end_matches('/').to_string()),
             auth: RegistryAuth::None,
         }
     }
@@ -423,6 +426,39 @@ impl SchemaRegistryClient for ConfluentSchemaRegistry {
     }
 }
 
+/// Strip userinfo (`user:pass@`) from a URL to prevent credential leakage
+/// through `Debug` output or logs.
+///
+/// If userinfo is detected, a warning is logged advising the caller to use
+/// `basic_auth()` instead.
+fn sanitize_url(url: String) -> String {
+    // Find the scheme separator "://"
+    let Some(scheme_end) = url.find("://") else {
+        return url;
+    };
+    let authority_start = scheme_end + 3;
+    let authority = &url[authority_start..];
+
+    // Authority ends at the first `/`, `?`, or `#` — or the end of the string.
+    let authority_end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
+    let authority_slice = &authority[..authority_end];
+
+    // Check for `@` indicating userinfo.
+    if let Some(at_pos) = authority_slice.find('@') {
+        warn!(
+            "schema registry URL contains embedded credentials — \
+             stripping userinfo; use basic_auth() instead"
+        );
+        // Rebuild: scheme + "://" + host_and_rest (skip userinfo@).
+        let mut sanitized = String::with_capacity(url.len());
+        sanitized.push_str(&url[..authority_start]);
+        sanitized.push_str(&authority[at_pos + 1..]);
+        sanitized
+    } else {
+        url
+    }
+}
+
 /// Minimal percent-encoding for subject names in URL path segments.
 fn percent_encode(input: &str) -> String {
     let mut encoded = String::with_capacity(input.len());
@@ -501,7 +537,7 @@ impl ConfluentSchemaRegistryBuilder {
 
         Ok(ConfluentSchemaRegistry {
             client,
-            base_url: url.trim_end_matches('/').to_string(),
+            base_url: sanitize_url(url.trim_end_matches('/').to_string()),
             auth: self.auth,
         })
     }
@@ -574,6 +610,50 @@ mod tests {
         let client = ConfluentSchemaRegistry::new("http://localhost:8081");
         let debug = format!("{client:?}");
         assert!(debug.contains("none"));
+    }
+
+    #[test]
+    fn test_sanitize_url_strips_userinfo() {
+        let url = sanitize_url("https://admin:s3cret@registry.example.com:8081/path".to_string());
+        assert_eq!(url, "https://registry.example.com:8081/path");
+        assert!(!url.contains("admin"));
+        assert!(!url.contains("s3cret"));
+    }
+
+    #[test]
+    fn test_sanitize_url_no_userinfo() {
+        let url = sanitize_url("https://registry.example.com:8081".to_string());
+        assert_eq!(url, "https://registry.example.com:8081");
+    }
+
+    #[test]
+    fn test_sanitize_url_user_only() {
+        let url = sanitize_url("https://admin@registry.example.com".to_string());
+        assert_eq!(url, "https://registry.example.com");
+    }
+
+    #[test]
+    fn test_sanitize_url_no_scheme() {
+        let url = sanitize_url("localhost:8081".to_string());
+        assert_eq!(url, "localhost:8081");
+    }
+
+    #[test]
+    fn test_new_strips_userinfo_from_url() {
+        let client = ConfluentSchemaRegistry::new("https://user:pass@host:8081");
+        assert_eq!(client.base_url, "https://host:8081");
+        let debug = format!("{client:?}");
+        assert!(!debug.contains("user"));
+        assert!(!debug.contains("pass"));
+    }
+
+    #[test]
+    fn test_builder_strips_userinfo_from_url() {
+        let client = ConfluentSchemaRegistryBuilder::default()
+            .url("https://user:pass@host:8081/")
+            .build()
+            .unwrap();
+        assert_eq!(client.base_url, "https://host:8081");
     }
 
     #[test]
