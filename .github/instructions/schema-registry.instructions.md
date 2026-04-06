@@ -32,6 +32,7 @@ Validation rules (non-negotiable):
 2. Validate magic/version byte — reject unknown values.
 3. For Glue: validate compression byte — reject unknown values.
 4. `decode_*_bytes()` variants use `Bytes::slice()` for zero-copy on uncompressed payloads.
+5. ZLIB decompression must be bounded (`MAX_DECOMPRESSED_SIZE = 128 MiB`) to prevent decompression bombs — use `.take()` on the decoder, matching the pattern in `protocol::record`.
 
 When adding a new wire format variant, follow the `validate_*_header()` → decode pattern.
 

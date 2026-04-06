@@ -369,6 +369,8 @@ let framed = encode_glue_wire_format(uuid, &payload, GlueCompression::Zlib)?;
 let (version_id, original) = decode_glue_wire_format(&framed)?;
 ```
 
+> **Note:** ZLIB decompression output is capped at 128 MiB to protect against decompression bombs, matching the limit used by record-batch decompression.
+
 For `Bytes` values (e.g., from `CompactedTable`), use `decode_glue_wire_format_bytes()` for zero-copy slicing on uncompressed payloads.
 
 ### Glue Client Trait

@@ -347,7 +347,9 @@ pub fn encode_glue_wire_format(
 /// Decode an AWS Glue wire format message.
 ///
 /// Validates the 18-byte header, extracts the schema version ID, and
-/// decompresses the payload if ZLIB-compressed.
+/// decompresses the payload if ZLIB-compressed. Always returns an owned
+/// `Vec<u8>` — for zero-copy decoding of uncompressed [`Bytes`] payloads,
+/// use [`decode_glue_wire_format_bytes()`] instead.
 ///
 /// # Errors
 ///
@@ -356,6 +358,7 @@ pub fn encode_glue_wire_format(
 /// - The header version byte is not `0x03`.
 /// - The compression byte is unrecognized.
 /// - ZLIB decompression fails.
+/// - The decompressed payload exceeds 128 MiB (decompression bomb protection).
 ///
 /// # Example
 ///
@@ -456,13 +459,26 @@ fn compress_zlib(data: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| KrafkaError::serialization(format!("ZLIB compression failed: {e}")))
 }
 
-/// ZLIB-decompress data.
+/// Maximum decompressed size (128 MiB) to protect against decompression bombs.
+///
+/// Matches the limit used by record-batch decompression in `protocol::record`.
+const MAX_DECOMPRESSED_SIZE: usize = 128 * 1024 * 1024;
+
+/// ZLIB-decompress data with a size limit to prevent decompression bombs.
 fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>> {
-    let mut decoder = ZlibDecoder::new(data);
+    let decoder = ZlibDecoder::new(data);
+    let mut limited = decoder.take(MAX_DECOMPRESSED_SIZE as u64 + 1);
     let mut decompressed = Vec::new();
-    decoder
+    limited
         .read_to_end(&mut decompressed)
         .map_err(|e| KrafkaError::serialization(format!("ZLIB decompression failed: {e}")))?;
+    if decompressed.len() > MAX_DECOMPRESSED_SIZE {
+        return Err(KrafkaError::serialization(format!(
+            "ZLIB decompressed size {} exceeds maximum {} bytes (possible decompression bomb)",
+            decompressed.len(),
+            MAX_DECOMPRESSED_SIZE
+        )));
+    }
     Ok(decompressed)
 }
 

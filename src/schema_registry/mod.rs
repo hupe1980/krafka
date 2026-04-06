@@ -165,7 +165,7 @@ impl std::str::FromStr for SchemaType {
         } else if s.eq_ignore_ascii_case("JSON") {
             Ok(Self::Json)
         } else {
-            Err(KrafkaError::serialization(format!(
+            Err(KrafkaError::schema_registry(format!(
                 "unknown schema type: '{s}'"
             )))
         }
