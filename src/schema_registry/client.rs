@@ -137,7 +137,7 @@ impl ConfluentSchemaRegistry {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
-            base_url: sanitize_url(url.into().trim_end_matches('/').to_string()),
+            base_url: sanitize_url(url.into()),
             auth: RegistryAuth::None,
         }
     }
@@ -162,7 +162,7 @@ impl ConfluentSchemaRegistry {
         );
         let body = RegisterSchemaRequest {
             schema,
-            schema_type: &schema_type.to_string(),
+            schema_type: schema_type.as_str(),
             references: Self::to_reference_json(references),
         };
         let result: CompatibilityResponse = self
@@ -410,7 +410,7 @@ impl SchemaRegistryClient for ConfluentSchemaRegistry {
             );
             let body = RegisterSchemaRequest {
                 schema: &schema,
-                schema_type: &schema_type.to_string(),
+                schema_type: schema_type.as_str(),
                 references: refs,
             };
             let result: RegisterSchemaResponse = self
@@ -426,12 +426,17 @@ impl SchemaRegistryClient for ConfluentSchemaRegistry {
     }
 }
 
-/// Strip userinfo (`user:pass@`) from a URL to prevent credential leakage
-/// through `Debug` output or logs.
+/// Normalize a base URL for storage: strip trailing slashes and remove
+/// userinfo (`user:pass@`) to prevent credential leakage through `Debug`
+/// output or logs.
 ///
 /// If userinfo is detected, a warning is logged advising the caller to use
 /// `basic_auth()` instead.
-fn sanitize_url(url: String) -> String {
+fn sanitize_url(mut url: String) -> String {
+    // Trim trailing slashes in-place (avoids a second allocation).
+    let trimmed_len = url.trim_end_matches('/').len();
+    url.truncate(trimmed_len);
+
     // Find the scheme separator "://"
     let Some(scheme_end) = url.find("://") else {
         return url;
@@ -537,7 +542,7 @@ impl ConfluentSchemaRegistryBuilder {
 
         Ok(ConfluentSchemaRegistry {
             client,
-            base_url: sanitize_url(url.trim_end_matches('/').to_string()),
+            base_url: sanitize_url(url),
             auth: self.auth,
         })
     }
@@ -636,6 +641,18 @@ mod tests {
     fn test_sanitize_url_no_scheme() {
         let url = sanitize_url("localhost:8081".to_string());
         assert_eq!(url, "localhost:8081");
+    }
+
+    #[test]
+    fn test_sanitize_url_strips_trailing_slashes() {
+        let url = sanitize_url("https://registry.example.com:8081/".to_string());
+        assert_eq!(url, "https://registry.example.com:8081");
+    }
+
+    #[test]
+    fn test_sanitize_url_strips_userinfo_and_trailing_slash() {
+        let url = sanitize_url("https://user:pass@host:8081/".to_string());
+        assert_eq!(url, "https://host:8081");
     }
 
     #[test]

@@ -63,8 +63,7 @@ Both cached wrappers expose: `new()`, `with_capacity()`, `inner()`, `cache_len()
 
 ## URL & Subject Encoding (Confluent)
 
-- Always strip trailing slash from base URL (both `new()` and builder).
-- Always strip userinfo (`user:pass@`) from URLs via `sanitize_url()` to prevent credential leakage through `Debug` or logs. Log a `warn!` when stripping.
+- Normalize base URLs via `sanitize_url()`: strips trailing slashes in-place and removes userinfo (`user:pass@`) to prevent credential leakage through `Debug` or logs. Log a `warn!` when stripping userinfo.
 - Percent-encode subject names in URL path segments (`%`, `/`, ` `, `#`, `?`).
 - Use the `SCHEMA_REGISTRY_CONTENT_TYPE` constant for all requests.
 

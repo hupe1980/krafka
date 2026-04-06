@@ -143,14 +143,20 @@ pub enum SchemaType {
     Json,
 }
 
-impl fmt::Display for SchemaType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
+impl SchemaType {
+    /// Return the canonical uppercase name (`"AVRO"`, `"PROTOBUF"`, `"JSON"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
             Self::Avro => "AVRO",
             Self::Protobuf => "PROTOBUF",
             Self::Json => "JSON",
-        };
-        f.write_str(s)
+        }
+    }
+}
+
+impl fmt::Display for SchemaType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -942,7 +948,10 @@ mod tests {
     }
 
     /// Verify that [`SchemaRegistryClient`] is object-safe.
-    fn _assert_object_safe(_: &dyn SchemaRegistryClient) {}
+    #[test]
+    fn test_object_safe() {
+        fn _assert_object_safe(_: &dyn SchemaRegistryClient) {}
+    }
 
     #[test]
     fn test_cached_debug() {

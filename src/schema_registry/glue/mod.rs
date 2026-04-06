@@ -206,12 +206,19 @@ pub enum GlueCompression {
     Zlib,
 }
 
+impl GlueCompression {
+    /// Return the canonical uppercase name (`"NONE"`, `"ZLIB"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::Zlib => "ZLIB",
+        }
+    }
+}
+
 impl fmt::Display for GlueCompression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::None => f.write_str("NONE"),
-            Self::Zlib => f.write_str("ZLIB"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -226,13 +233,20 @@ pub enum GlueDataFormat {
     Protobuf,
 }
 
+impl GlueDataFormat {
+    /// Return the canonical uppercase name (`"AVRO"`, `"JSON"`, `"PROTOBUF"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Avro => "AVRO",
+            Self::Json => "JSON",
+            Self::Protobuf => "PROTOBUF",
+        }
+    }
+}
+
 impl fmt::Display for GlueDataFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Avro => f.write_str("AVRO"),
-            Self::Json => f.write_str("JSON"),
-            Self::Protobuf => f.write_str("PROTOBUF"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -327,15 +341,14 @@ pub fn encode_glue_wire_format(
     payload: &[u8],
     compression: GlueCompression,
 ) -> Result<Bytes> {
-    let (compression_byte, encoded_payload) = match compression {
-        GlueCompression::None => (GLUE_COMPRESSION_NONE_BYTE, None),
+    let compressed;
+    let (compression_byte, payload_bytes): (u8, &[u8]) = match compression {
+        GlueCompression::None => (GLUE_COMPRESSION_NONE_BYTE, payload),
         GlueCompression::Zlib => {
-            let compressed = compress_zlib(payload)?;
-            (GLUE_COMPRESSION_ZLIB_BYTE, Some(compressed))
+            compressed = compress_zlib(payload)?;
+            (GLUE_COMPRESSION_ZLIB_BYTE, &compressed)
         }
     };
-
-    let payload_bytes = encoded_payload.as_deref().unwrap_or(payload);
     let mut buf = BytesMut::with_capacity(GLUE_HEADER_SIZE + payload_bytes.len());
     buf.put_u8(GLUE_HEADER_VERSION_BYTE);
     buf.put_u8(compression_byte);
@@ -1102,7 +1115,10 @@ mod tests {
     }
 
     /// Verify that [`GlueSchemaRegistryClient`] is object-safe.
-    fn _assert_object_safe(_: &dyn GlueSchemaRegistryClient) {}
+    #[test]
+    fn test_object_safe() {
+        fn _assert_object_safe(_: &dyn GlueSchemaRegistryClient) {}
+    }
 
     #[test]
     fn test_cached_debug() {
