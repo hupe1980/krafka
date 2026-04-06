@@ -683,6 +683,12 @@ let tokens = admin
 ```rust
 use std::time::Duration;
 
+// Obtain a token (e.g., from a prior create call)
+let result = admin
+    .create_delegation_token(&[("User", "alice")], Some(Duration::from_secs(86_400)))
+    .await?;
+let token = result.token.expect("token created");
+
 // Extend the token's lifetime by 1 hour
 let result = admin
     .renew_delegation_token(&token.hmac, Duration::from_secs(3_600))
@@ -697,6 +703,12 @@ match result.error {
 ### Expiring a Token
 
 ```rust
+use std::time::Duration;
+
+// Obtain a token (e.g., from describe)
+let tokens = admin.describe_delegation_tokens(None).await?;
+let token = &tokens[0];
+
 // Expire a token immediately
 let result = admin.expire_delegation_token(&token.hmac, None).await?;
 
