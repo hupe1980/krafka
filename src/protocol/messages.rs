@@ -5957,6 +5957,719 @@ impl VersionedDecode for OffsetForLeaderEpochResponse {
     }
 }
 
+// ============================================================================
+// CreateDelegationToken API (Key 38)
+// ============================================================================
+
+/// A principal that can renew the delegation token.
+#[derive(Debug, Clone)]
+pub struct CreatableRenewers {
+    /// Principal type (e.g., `"User"`).
+    pub principal_type: String,
+    /// Principal name.
+    pub principal_name: String,
+}
+
+/// CreateDelegationToken request.
+#[derive(Debug, Clone)]
+pub struct CreateDelegationTokenRequest {
+    /// Principals authorized to renew the token.
+    pub renewers: Vec<CreatableRenewers>,
+    /// Maximum lifetime in milliseconds. `-1` uses the server default.
+    pub max_lifetime_ms: i64,
+}
+
+impl CreateDelegationTokenRequest {
+    /// Get the API key.
+    pub fn api_key() -> ApiKey {
+        ApiKey::CreateDelegationToken
+    }
+
+    /// Encode for version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        buf.put_i32(array_len_i32(self.renewers.len())?);
+        for renewer in &self.renewers {
+            KafkaString::new(&renewer.principal_type).try_encode(buf)?;
+            KafkaString::new(&renewer.principal_name).try_encode(buf)?;
+        }
+        self.max_lifetime_ms.encode(buf);
+        Ok(())
+    }
+}
+
+impl VersionedEncode for CreateDelegationTokenRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 | 1 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("CreateDelegationTokenRequest", version),
+        }
+        Ok(())
+    }
+}
+
+/// CreateDelegationToken response.
+#[derive(Debug, Clone)]
+pub struct CreateDelegationTokenResponse {
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// Token owner principal type.
+    pub principal_type: String,
+    /// Token owner principal name.
+    pub principal_name: String,
+    /// When the token was issued (ms since epoch).
+    pub issue_timestamp_ms: i64,
+    /// When the token expires (ms since epoch).
+    pub expiry_timestamp_ms: i64,
+    /// Maximum timestamp at which the token can be renewed (ms since epoch).
+    pub max_timestamp_ms: i64,
+    /// Unique token ID (for logging/identification).
+    pub token_id: String,
+    /// HMAC of the delegation token (used for SASL authentication).
+    pub hmac: Bytes,
+    /// Throttle time in milliseconds.
+    pub throttle_time_ms: i32,
+}
+
+impl CreateDelegationTokenResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let principal_type = KafkaString::decode(buf)?.0.unwrap_or_default();
+        let principal_name = KafkaString::decode(buf)?.0.unwrap_or_default();
+        let issue_timestamp_ms = i64::decode(buf)?;
+        let expiry_timestamp_ms = i64::decode(buf)?;
+        let max_timestamp_ms = i64::decode(buf)?;
+        let token_id = KafkaString::decode(buf)?.0.unwrap_or_default();
+        let hmac = KafkaBytes::decode(buf)?.0.unwrap_or_default();
+        let throttle_time_ms = i32::decode(buf)?;
+        Ok(Self {
+            error_code,
+            principal_type,
+            principal_name,
+            issue_timestamp_ms,
+            expiry_timestamp_ms,
+            max_timestamp_ms,
+            token_id,
+            hmac,
+            throttle_time_ms,
+        })
+    }
+}
+
+impl VersionedDecode for CreateDelegationTokenResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 | 1 => Self::decode_v0(buf),
+            _ => unsupported_decode!("CreateDelegationTokenResponse", version),
+        }
+    }
+}
+
+// ============================================================================
+// RenewDelegationToken API (Key 39)
+// ============================================================================
+
+/// RenewDelegationToken request.
+#[derive(Debug, Clone)]
+pub struct RenewDelegationTokenRequest {
+    /// HMAC of the delegation token to renew.
+    pub hmac: Bytes,
+    /// New renewal period in milliseconds.
+    pub renew_period_ms: i64,
+}
+
+impl RenewDelegationTokenRequest {
+    /// Get the API key.
+    pub fn api_key() -> ApiKey {
+        ApiKey::RenewDelegationToken
+    }
+
+    /// Encode for version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaBytes::new(self.hmac.clone()).try_encode(buf)?;
+        self.renew_period_ms.encode(buf);
+        Ok(())
+    }
+}
+
+impl VersionedEncode for RenewDelegationTokenRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 | 1 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("RenewDelegationTokenRequest", version),
+        }
+        Ok(())
+    }
+}
+
+/// RenewDelegationToken response.
+#[derive(Debug, Clone)]
+pub struct RenewDelegationTokenResponse {
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// New expiry timestamp (ms since epoch).
+    pub expiry_timestamp_ms: i64,
+    /// Throttle time in milliseconds.
+    pub throttle_time_ms: i32,
+}
+
+impl RenewDelegationTokenResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let expiry_timestamp_ms = i64::decode(buf)?;
+        let throttle_time_ms = i32::decode(buf)?;
+        Ok(Self {
+            error_code,
+            expiry_timestamp_ms,
+            throttle_time_ms,
+        })
+    }
+}
+
+impl VersionedDecode for RenewDelegationTokenResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 | 1 => Self::decode_v0(buf),
+            _ => unsupported_decode!("RenewDelegationTokenResponse", version),
+        }
+    }
+}
+
+// ============================================================================
+// ExpireDelegationToken API (Key 40)
+// ============================================================================
+
+/// ExpireDelegationToken request.
+#[derive(Debug, Clone)]
+pub struct ExpireDelegationTokenRequest {
+    /// HMAC of the delegation token to expire.
+    pub hmac: Bytes,
+    /// New expiry period in milliseconds. Use `-1` to expire immediately.
+    pub expiry_period_ms: i64,
+}
+
+impl ExpireDelegationTokenRequest {
+    /// Get the API key.
+    pub fn api_key() -> ApiKey {
+        ApiKey::ExpireDelegationToken
+    }
+
+    /// Encode for version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaBytes::new(self.hmac.clone()).try_encode(buf)?;
+        self.expiry_period_ms.encode(buf);
+        Ok(())
+    }
+}
+
+impl VersionedEncode for ExpireDelegationTokenRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 | 1 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("ExpireDelegationTokenRequest", version),
+        }
+        Ok(())
+    }
+}
+
+/// ExpireDelegationToken response.
+#[derive(Debug, Clone)]
+pub struct ExpireDelegationTokenResponse {
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// New expiry timestamp (ms since epoch).
+    pub expiry_timestamp_ms: i64,
+    /// Throttle time in milliseconds.
+    pub throttle_time_ms: i32,
+}
+
+impl ExpireDelegationTokenResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let expiry_timestamp_ms = i64::decode(buf)?;
+        let throttle_time_ms = i32::decode(buf)?;
+        Ok(Self {
+            error_code,
+            expiry_timestamp_ms,
+            throttle_time_ms,
+        })
+    }
+}
+
+impl VersionedDecode for ExpireDelegationTokenResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 | 1 => Self::decode_v0(buf),
+            _ => unsupported_decode!("ExpireDelegationTokenResponse", version),
+        }
+    }
+}
+
+// ============================================================================
+// DescribeDelegationToken API (Key 41)
+// ============================================================================
+
+/// Owner filter for DescribeDelegationToken request.
+#[derive(Debug, Clone)]
+pub struct DescribeDelegationTokenOwner {
+    /// Principal type (e.g., `"User"`).
+    pub principal_type: String,
+    /// Principal name.
+    pub principal_name: String,
+}
+
+/// DescribeDelegationToken request.
+#[derive(Debug, Clone)]
+pub struct DescribeDelegationTokenRequest {
+    /// Owners to filter by. `None` returns all tokens visible to the caller.
+    pub owners: Option<Vec<DescribeDelegationTokenOwner>>,
+}
+
+impl DescribeDelegationTokenRequest {
+    /// Get the API key.
+    pub fn api_key() -> ApiKey {
+        ApiKey::DescribeDelegationToken
+    }
+
+    /// Encode for version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        match &self.owners {
+            None => (-1i32).encode(buf),
+            Some(owners) => {
+                buf.put_i32(array_len_i32(owners.len())?);
+                for owner in owners {
+                    KafkaString::new(&owner.principal_type).try_encode(buf)?;
+                    KafkaString::new(&owner.principal_name).try_encode(buf)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl VersionedEncode for DescribeDelegationTokenRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 | 1 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("DescribeDelegationTokenRequest", version),
+        }
+        Ok(())
+    }
+}
+
+/// A principal that can renew a delegation token (in a describe response).
+#[derive(Debug, Clone)]
+pub struct DelegationTokenRenewer {
+    /// Principal type (e.g., `"User"`).
+    pub principal_type: String,
+    /// Principal name.
+    pub principal_name: String,
+}
+
+/// A delegation token returned by DescribeDelegationToken.
+#[derive(Debug, Clone)]
+pub struct DelegationTokenInfo {
+    /// Token owner principal type.
+    pub principal_type: String,
+    /// Token owner principal name.
+    pub principal_name: String,
+    /// When the token was issued (ms since epoch).
+    pub issue_timestamp_ms: i64,
+    /// When the token expires (ms since epoch).
+    pub expiry_timestamp_ms: i64,
+    /// Maximum timestamp at which the token can be renewed (ms since epoch).
+    pub max_timestamp_ms: i64,
+    /// Unique token ID.
+    pub token_id: String,
+    /// HMAC of the delegation token.
+    pub hmac: Bytes,
+    /// Principals authorized to renew this token.
+    pub renewers: Vec<DelegationTokenRenewer>,
+}
+
+/// DescribeDelegationToken response.
+#[derive(Debug, Clone)]
+pub struct DescribeDelegationTokenResponse {
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// Delegation tokens matching the request filters.
+    pub tokens: Vec<DelegationTokenInfo>,
+    /// Throttle time in milliseconds.
+    pub throttle_time_ms: i32,
+}
+
+impl DescribeDelegationTokenResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let token_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut tokens = Vec::with_capacity(token_count);
+
+        for _ in 0..token_count {
+            let principal_type = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let principal_name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let issue_timestamp_ms = i64::decode(buf)?;
+            let expiry_timestamp_ms = i64::decode(buf)?;
+            let max_timestamp_ms = i64::decode(buf)?;
+            let token_id = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let hmac = KafkaBytes::decode(buf)?.0.unwrap_or_default();
+
+            let renewer_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut renewers = Vec::with_capacity(renewer_count);
+            for _ in 0..renewer_count {
+                let renewer_type = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let renewer_name = KafkaString::decode(buf)?.0.unwrap_or_default();
+                renewers.push(DelegationTokenRenewer {
+                    principal_type: renewer_type,
+                    principal_name: renewer_name,
+                });
+            }
+
+            tokens.push(DelegationTokenInfo {
+                principal_type,
+                principal_name,
+                issue_timestamp_ms,
+                expiry_timestamp_ms,
+                max_timestamp_ms,
+                token_id,
+                hmac,
+                renewers,
+            });
+        }
+
+        let throttle_time_ms = i32::decode(buf)?;
+        Ok(Self {
+            error_code,
+            tokens,
+            throttle_time_ms,
+        })
+    }
+}
+
+impl VersionedDecode for DescribeDelegationTokenResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 | 1 => Self::decode_v0(buf),
+            _ => unsupported_decode!("DescribeDelegationTokenResponse", version),
+        }
+    }
+}
+
+// ============================================================================
+// DescribeClientQuotas API (Key 48)
+// ============================================================================
+
+/// A component in a quota entity filter.
+#[derive(Debug, Clone)]
+pub struct QuotaFilterComponent {
+    /// Entity type (e.g., `"user"`, `"client-id"`, `"ip"`).
+    pub entity_type: String,
+    /// Match type: `0` = exact, `1` = default, `2` = any specified.
+    pub match_type: i8,
+    /// Value to match (only used when `match_type` is exact).
+    pub match_value: Option<String>,
+}
+
+/// DescribeClientQuotas request.
+#[derive(Debug, Clone)]
+pub struct DescribeClientQuotasRequest {
+    /// Filter components. The broker returns entities matching all components.
+    pub components: Vec<QuotaFilterComponent>,
+    /// If `true`, the response includes all quota defaults that apply.
+    pub strict: bool,
+}
+
+impl DescribeClientQuotasRequest {
+    /// Get the API key.
+    pub fn api_key() -> ApiKey {
+        ApiKey::DescribeClientQuotas
+    }
+
+    /// Encode for version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        buf.put_i32(array_len_i32(self.components.len())?);
+        for component in &self.components {
+            KafkaString::new(&component.entity_type).try_encode(buf)?;
+            component.match_type.encode(buf);
+            match &component.match_value {
+                None => KafkaString::null().try_encode(buf)?,
+                Some(v) => KafkaString::new(v).try_encode(buf)?,
+            }
+        }
+        self.strict.encode(buf);
+        Ok(())
+    }
+}
+
+impl VersionedEncode for DescribeClientQuotasRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("DescribeClientQuotasRequest", version),
+        }
+        Ok(())
+    }
+}
+
+/// An entity in a quota entry.
+#[derive(Debug, Clone)]
+pub struct QuotaEntity {
+    /// Entity type (e.g., `"user"`, `"client-id"`, `"ip"`).
+    pub entity_type: String,
+    /// Entity name. `None` represents the default entity.
+    pub entity_name: Option<String>,
+}
+
+/// A quota value in a quota entry.
+#[derive(Debug, Clone)]
+pub struct QuotaValue {
+    /// Quota key (e.g., `"producer_byte_rate"`, `"consumer_byte_rate"`).
+    pub key: String,
+    /// Quota value.
+    pub value: f64,
+}
+
+/// An entry returned by DescribeClientQuotas.
+#[derive(Debug, Clone)]
+pub struct QuotaEntry {
+    /// Quota entity components.
+    pub entity: Vec<QuotaEntity>,
+    /// Quota values.
+    pub values: Vec<QuotaValue>,
+}
+
+/// DescribeClientQuotas response.
+#[derive(Debug, Clone)]
+pub struct DescribeClientQuotasResponse {
+    /// Throttle time in milliseconds.
+    pub throttle_time_ms: i32,
+    /// Error code.
+    pub error_code: ErrorCode,
+    /// Error message.
+    pub error_message: Option<String>,
+    /// Quota entries matching the filter.
+    pub entries: Option<Vec<QuotaEntry>>,
+}
+
+impl DescribeClientQuotasResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let error_message = KafkaString::decode(buf)?.0;
+
+        let entry_count_raw = i32::decode(buf)?;
+        let entries = if entry_count_raw == -1 {
+            None
+        } else {
+            let entry_count = check_decode_array_len(entry_count_raw)?;
+            let mut entries = Vec::with_capacity(entry_count);
+
+            for _ in 0..entry_count {
+                let entity_count = check_decode_array_len(i32::decode(buf)?)?;
+                let mut entity = Vec::with_capacity(entity_count);
+                for _ in 0..entity_count {
+                    let entity_type = KafkaString::decode(buf)?.0.unwrap_or_default();
+                    let entity_name = KafkaString::decode(buf)?.0;
+                    entity.push(QuotaEntity {
+                        entity_type,
+                        entity_name,
+                    });
+                }
+
+                let value_count = check_decode_array_len(i32::decode(buf)?)?;
+                let mut values = Vec::with_capacity(value_count);
+                for _ in 0..value_count {
+                    let key = KafkaString::decode(buf)?.0.unwrap_or_default();
+                    if buf.remaining() < 8 {
+                        return Err(KrafkaError::protocol("not enough bytes for f64"));
+                    }
+                    let value = buf.get_f64();
+                    values.push(QuotaValue { key, value });
+                }
+
+                entries.push(QuotaEntry { entity, values });
+            }
+
+            Some(entries)
+        };
+
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            error_message,
+            entries,
+        })
+    }
+}
+
+impl VersionedDecode for DescribeClientQuotasResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            _ => unsupported_decode!("DescribeClientQuotasResponse", version),
+        }
+    }
+}
+
+// ============================================================================
+// AlterClientQuotas API (Key 49)
+// ============================================================================
+
+/// An entity component for identifying a quota entry to alter.
+#[derive(Debug, Clone)]
+pub struct AlterQuotaEntity {
+    /// Entity type (e.g., `"user"`, `"client-id"`, `"ip"`).
+    pub entity_type: String,
+    /// Entity name. `None` represents the default entity.
+    pub entity_name: Option<String>,
+}
+
+/// An operation to perform on a quota value.
+#[derive(Debug, Clone)]
+pub struct AlterQuotaOp {
+    /// Quota key (e.g., `"producer_byte_rate"`).
+    pub key: String,
+    /// New quota value. Ignored when `remove` is `true`.
+    pub value: f64,
+    /// If `true`, remove this quota key rather than setting it.
+    pub remove: bool,
+}
+
+/// A single quota entity alteration in the AlterClientQuotas request.
+#[derive(Debug, Clone)]
+pub struct AlterQuotaEntry {
+    /// Quota entity to alter.
+    pub entity: Vec<AlterQuotaEntity>,
+    /// Operations to apply to the entity's quotas.
+    pub ops: Vec<AlterQuotaOp>,
+}
+
+/// AlterClientQuotas request.
+#[derive(Debug, Clone)]
+pub struct AlterClientQuotasRequest {
+    /// Quota alterations to apply.
+    pub entries: Vec<AlterQuotaEntry>,
+    /// If `true`, validate only — do not apply changes.
+    pub validate_only: bool,
+}
+
+impl AlterClientQuotasRequest {
+    /// Get the API key.
+    pub fn api_key() -> ApiKey {
+        ApiKey::AlterClientQuotas
+    }
+
+    /// Encode for version 0.
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        buf.put_i32(array_len_i32(self.entries.len())?);
+        for entry in &self.entries {
+            buf.put_i32(array_len_i32(entry.entity.len())?);
+            for e in &entry.entity {
+                KafkaString::new(&e.entity_type).try_encode(buf)?;
+                match &e.entity_name {
+                    None => KafkaString::null().try_encode(buf)?,
+                    Some(v) => KafkaString::new(v).try_encode(buf)?,
+                }
+            }
+            buf.put_i32(array_len_i32(entry.ops.len())?);
+            for op in &entry.ops {
+                KafkaString::new(&op.key).try_encode(buf)?;
+                buf.put_f64(op.value);
+                op.remove.encode(buf);
+            }
+        }
+        self.validate_only.encode(buf);
+        Ok(())
+    }
+}
+
+impl VersionedEncode for AlterClientQuotasRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            _ => return unsupported_encode!("AlterClientQuotasRequest", version),
+        }
+        Ok(())
+    }
+}
+
+/// Per-entity result in AlterClientQuotas response.
+#[derive(Debug, Clone)]
+pub struct AlterQuotaEntityResult {
+    /// Entity type.
+    pub entity_type: String,
+    /// Entity name.
+    pub entity_name: Option<String>,
+}
+
+/// Per-entry result in AlterClientQuotas response.
+#[derive(Debug, Clone)]
+pub struct AlterQuotaEntryResult {
+    /// Error code for this entity.
+    pub error_code: ErrorCode,
+    /// Error message.
+    pub error_message: Option<String>,
+    /// Entity that was altered.
+    pub entity: Vec<AlterQuotaEntityResult>,
+}
+
+/// AlterClientQuotas response.
+#[derive(Debug, Clone)]
+pub struct AlterClientQuotasResponse {
+    /// Throttle time in milliseconds.
+    pub throttle_time_ms: i32,
+    /// Per-entry results.
+    pub entries: Vec<AlterQuotaEntryResult>,
+}
+
+impl AlterClientQuotasResponse {
+    /// Decode from version 0.
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let entry_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut entries = Vec::with_capacity(entry_count);
+
+        for _ in 0..entry_count {
+            let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+            let error_message = KafkaString::decode(buf)?.0;
+
+            let entity_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut entity = Vec::with_capacity(entity_count);
+            for _ in 0..entity_count {
+                let entity_type = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let entity_name = KafkaString::decode(buf)?.0;
+                entity.push(AlterQuotaEntityResult {
+                    entity_type,
+                    entity_name,
+                });
+            }
+
+            entries.push(AlterQuotaEntryResult {
+                error_code,
+                error_message,
+                entity,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            entries,
+        })
+    }
+}
+
+impl VersionedDecode for AlterClientQuotasResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            0 => Self::decode_v0(buf),
+            _ => unsupported_decode!("AlterClientQuotasResponse", version),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7957,5 +8670,449 @@ mod tests {
             result.is_err(),
             "VersionedEncode must propagate encoding errors"
         );
+    }
+
+    // ── Delegation Token roundtrip tests ─────────────────────────────
+
+    #[test]
+    fn test_create_delegation_token_request_roundtrip() {
+        let request = CreateDelegationTokenRequest {
+            renewers: vec![CreatableRenewers {
+                principal_type: "User".to_string(),
+                principal_name: "alice".to_string(),
+            }],
+            max_lifetime_ms: 86_400_000,
+        };
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf).unwrap();
+        assert!(!buf.is_empty());
+
+        // Verify versioned dispatch
+        let mut buf2 = BytesMut::new();
+        request.encode_versioned(0, &mut buf2).unwrap();
+        assert_eq!(buf, buf2);
+    }
+
+    #[test]
+    fn test_create_delegation_token_request_empty_renewers() {
+        let request = CreateDelegationTokenRequest {
+            renewers: vec![],
+            max_lifetime_ms: -1,
+        };
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf).unwrap();
+        // 4-byte array length (0) + 8-byte i64
+        assert_eq!(buf.len(), 4 + 8);
+        assert_eq!(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), 0);
+    }
+
+    #[test]
+    fn test_create_delegation_token_response_roundtrip() {
+        let mut buf = BytesMut::new();
+        // error_code
+        buf.put_i16(0);
+        // principal_type
+        buf.put_i16(4);
+        buf.put_slice(b"User");
+        // principal_name
+        buf.put_i16(5);
+        buf.put_slice(b"alice");
+        // issue_timestamp_ms
+        buf.put_i64(1000);
+        // expiry_timestamp_ms
+        buf.put_i64(2000);
+        // max_timestamp_ms
+        buf.put_i64(3000);
+        // token_id
+        buf.put_i16(8);
+        buf.put_slice(b"token-01");
+        // hmac
+        buf.put_i32(4);
+        buf.put_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        // throttle_time_ms
+        buf.put_i32(0);
+
+        let mut frozen = buf.freeze();
+        let resp = CreateDelegationTokenResponse::decode_v0(&mut frozen).unwrap();
+        assert!(resp.error_code.is_ok());
+        assert_eq!(resp.principal_name, "alice");
+        assert_eq!(resp.token_id, "token-01");
+        assert_eq!(&resp.hmac[..], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(resp.issue_timestamp_ms, 1000);
+        assert_eq!(resp.expiry_timestamp_ms, 2000);
+    }
+
+    #[test]
+    fn test_delegation_token_v1_versioned_dispatch() {
+        // v0 and v1 share the same wire format — verify v1 dispatch works.
+        let create_req = CreateDelegationTokenRequest {
+            renewers: vec![CreatableRenewers {
+                principal_type: "User".to_string(),
+                principal_name: "alice".to_string(),
+            }],
+            max_lifetime_ms: 60_000,
+        };
+        let mut buf_v0 = BytesMut::new();
+        let mut buf_v1 = BytesMut::new();
+        create_req.encode_versioned(0, &mut buf_v0).unwrap();
+        create_req.encode_versioned(1, &mut buf_v1).unwrap();
+        assert_eq!(buf_v0, buf_v1);
+
+        let renew_req = RenewDelegationTokenRequest {
+            hmac: Bytes::from_static(&[0x01, 0x02]),
+            renew_period_ms: 30_000,
+        };
+        let mut buf_v0 = BytesMut::new();
+        let mut buf_v1 = BytesMut::new();
+        renew_req.encode_versioned(0, &mut buf_v0).unwrap();
+        renew_req.encode_versioned(1, &mut buf_v1).unwrap();
+        assert_eq!(buf_v0, buf_v1);
+
+        let expire_req = ExpireDelegationTokenRequest {
+            hmac: Bytes::from_static(&[0xAB]),
+            expiry_period_ms: -1,
+        };
+        let mut buf_v0 = BytesMut::new();
+        let mut buf_v1 = BytesMut::new();
+        expire_req.encode_versioned(0, &mut buf_v0).unwrap();
+        expire_req.encode_versioned(1, &mut buf_v1).unwrap();
+        assert_eq!(buf_v0, buf_v1);
+
+        let describe_req = DescribeDelegationTokenRequest { owners: None };
+        let mut buf_v0 = BytesMut::new();
+        let mut buf_v1 = BytesMut::new();
+        describe_req.encode_versioned(0, &mut buf_v0).unwrap();
+        describe_req.encode_versioned(1, &mut buf_v1).unwrap();
+        assert_eq!(buf_v0, buf_v1);
+
+        // Verify response decode v1 matches v0.
+        let mut resp_buf = BytesMut::new();
+        resp_buf.put_i16(0); // error_code
+        resp_buf.put_i64(42_000); // expiry_timestamp_ms
+        resp_buf.put_i32(5); // throttle_time_ms
+        let frozen = resp_buf.freeze();
+        let resp_v0 =
+            RenewDelegationTokenResponse::decode_versioned(0, &mut frozen.clone()).unwrap();
+        let resp_v1 =
+            RenewDelegationTokenResponse::decode_versioned(1, &mut frozen.clone()).unwrap();
+        assert_eq!(resp_v0.expiry_timestamp_ms, resp_v1.expiry_timestamp_ms);
+        assert_eq!(resp_v0.throttle_time_ms, resp_v1.throttle_time_ms);
+    }
+
+    #[test]
+    fn test_renew_delegation_token_request_roundtrip() {
+        let request = RenewDelegationTokenRequest {
+            hmac: Bytes::from_static(&[0x01, 0x02, 0x03]),
+            renew_period_ms: 60_000,
+        };
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf).unwrap();
+        // 4-byte length + 3 bytes hmac + 8-byte i64
+        assert_eq!(buf.len(), 4 + 3 + 8);
+    }
+
+    #[test]
+    fn test_renew_delegation_token_response_roundtrip() {
+        let mut buf = BytesMut::new();
+        buf.put_i16(0); // error_code
+        buf.put_i64(999_999); // expiry_timestamp_ms
+        buf.put_i32(0); // throttle_time_ms
+
+        let mut frozen = buf.freeze();
+        let resp = RenewDelegationTokenResponse::decode_v0(&mut frozen).unwrap();
+        assert!(resp.error_code.is_ok());
+        assert_eq!(resp.expiry_timestamp_ms, 999_999);
+    }
+
+    #[test]
+    fn test_expire_delegation_token_request_roundtrip() {
+        let request = ExpireDelegationTokenRequest {
+            hmac: Bytes::from_static(&[0xAB]),
+            expiry_period_ms: -1,
+        };
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf).unwrap();
+        // 4-byte length + 1 byte hmac + 8-byte i64
+        assert_eq!(buf.len(), 4 + 1 + 8);
+    }
+
+    #[test]
+    fn test_expire_delegation_token_response_roundtrip() {
+        let mut buf = BytesMut::new();
+        buf.put_i16(0); // error_code
+        buf.put_i64(500_000); // expiry_timestamp_ms
+        buf.put_i32(10); // throttle_time_ms
+
+        let mut frozen = buf.freeze();
+        let resp = ExpireDelegationTokenResponse::decode_v0(&mut frozen).unwrap();
+        assert!(resp.error_code.is_ok());
+        assert_eq!(resp.expiry_timestamp_ms, 500_000);
+        assert_eq!(resp.throttle_time_ms, 10);
+    }
+
+    #[test]
+    fn test_describe_delegation_token_request_null_owners() {
+        let request = DescribeDelegationTokenRequest { owners: None };
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf).unwrap();
+        // null array: -1 encoded as i32
+        assert_eq!(buf.len(), 4);
+        assert_eq!(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), -1);
+    }
+
+    #[test]
+    fn test_describe_delegation_token_request_with_owners() {
+        let request = DescribeDelegationTokenRequest {
+            owners: Some(vec![DescribeDelegationTokenOwner {
+                principal_type: "User".to_string(),
+                principal_name: "bob".to_string(),
+            }]),
+        };
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf).unwrap();
+        // 4 (array len) + 2+4 (string "User") + 2+3 (string "bob")
+        assert_eq!(buf.len(), 4 + 6 + 5);
+    }
+
+    #[test]
+    fn test_describe_delegation_token_request_empty_owners() {
+        // Some(vec![]) encodes as array length 0, distinct from None (-1).
+        let request = DescribeDelegationTokenRequest {
+            owners: Some(vec![]),
+        };
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf).unwrap();
+        assert_eq!(buf.len(), 4);
+        assert_eq!(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), 0);
+    }
+
+    #[test]
+    fn test_describe_delegation_token_response_roundtrip() {
+        use bytes::BufMut;
+        let mut buf = BytesMut::new();
+        buf.put_i16(0); // error_code
+        buf.put_i32(1); // token count
+        // token 0
+        buf.put_i16(4);
+        buf.put_slice(b"User"); // principal_type
+        buf.put_i16(3);
+        buf.put_slice(b"bob"); // principal_name
+        buf.put_i64(100); // issue_timestamp_ms
+        buf.put_i64(200); // expiry_timestamp_ms
+        buf.put_i64(300); // max_timestamp_ms
+        buf.put_i16(2);
+        buf.put_slice(b"t1"); // token_id
+        buf.put_i32(2);
+        buf.put_slice(&[0xAA, 0xBB]); // hmac
+        buf.put_i32(2); // 2 renewers
+        // renewer 0
+        buf.put_i16(4);
+        buf.put_slice(b"User"); // principal_type
+        buf.put_i16(5);
+        buf.put_slice(b"alice"); // principal_name
+        // renewer 1
+        buf.put_i16(4);
+        buf.put_slice(b"User"); // principal_type
+        buf.put_i16(3);
+        buf.put_slice(b"eve"); // principal_name
+        buf.put_i32(0); // throttle_time_ms
+
+        let mut frozen = buf.freeze();
+        let resp = DescribeDelegationTokenResponse::decode_v0(&mut frozen).unwrap();
+        assert!(resp.error_code.is_ok());
+        assert_eq!(resp.tokens.len(), 1);
+        assert_eq!(resp.tokens[0].principal_name, "bob");
+        assert_eq!(resp.tokens[0].token_id, "t1");
+        assert_eq!(&resp.tokens[0].hmac[..], &[0xAA, 0xBB]);
+        assert_eq!(resp.tokens[0].renewers.len(), 2);
+        assert_eq!(resp.tokens[0].renewers[0].principal_name, "alice");
+        assert_eq!(resp.tokens[0].renewers[1].principal_name, "eve");
+    }
+
+    // ── Client Quotas roundtrip tests ────────────────────────────────
+
+    #[test]
+    fn test_describe_client_quotas_request_roundtrip() {
+        let request = DescribeClientQuotasRequest {
+            components: vec![QuotaFilterComponent {
+                entity_type: "user".to_string(),
+                match_type: 0,
+                match_value: Some("alice".to_string()),
+            }],
+            strict: false,
+        };
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf).unwrap();
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_describe_client_quotas_response_roundtrip() {
+        use bytes::BufMut;
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_i16(0); // error_code
+        buf.put_i16(-1); // error_message (null)
+        buf.put_i32(1); // 1 entry
+        // entry 0: entity
+        buf.put_i32(1); // 1 entity component
+        buf.put_i16(4);
+        buf.put_slice(b"user"); // entity_type
+        buf.put_i16(5);
+        buf.put_slice(b"alice"); // entity_name
+        // entry 0: values
+        buf.put_i32(1); // 1 value
+        buf.put_i16(18);
+        buf.put_slice(b"producer_byte_rate"); // key
+        buf.put_f64(1_048_576.0); // value
+
+        let mut frozen = buf.freeze();
+        let resp = DescribeClientQuotasResponse::decode_v0(&mut frozen).unwrap();
+        assert!(resp.error_code.is_ok());
+        let entries = resp.entries.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].entity[0].entity_type, "user");
+        assert_eq!(entries[0].values[0].key, "producer_byte_rate");
+        assert!((entries[0].values[0].value - 1_048_576.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_describe_client_quotas_response_entry_with_no_values() {
+        use bytes::BufMut;
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_i16(0); // error_code
+        buf.put_i16(-1); // error_message (null)
+        buf.put_i32(1); // 1 entry
+        // entry 0: entity
+        buf.put_i32(1); // 1 entity component
+        buf.put_i16(4);
+        buf.put_slice(b"user");
+        buf.put_i16(5);
+        buf.put_slice(b"alice");
+        // entry 0: zero values
+        buf.put_i32(0);
+
+        let mut frozen = buf.freeze();
+        let resp = DescribeClientQuotasResponse::decode_v0(&mut frozen).unwrap();
+        let entries = resp.entries.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].entity[0].entity_type, "user");
+        assert!(entries[0].values.is_empty());
+    }
+
+    #[test]
+    fn test_describe_client_quotas_response_multiple_entries() {
+        use bytes::BufMut;
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_i16(0); // error_code
+        buf.put_i16(-1); // error_message (null)
+        buf.put_i32(2); // 2 entries
+        // entry 0
+        buf.put_i32(1);
+        buf.put_i16(4);
+        buf.put_slice(b"user");
+        buf.put_i16(5);
+        buf.put_slice(b"alice");
+        buf.put_i32(1);
+        buf.put_i16(18);
+        buf.put_slice(b"producer_byte_rate");
+        buf.put_f64(1_048_576.0);
+        // entry 1
+        buf.put_i32(1);
+        buf.put_i16(9);
+        buf.put_slice(b"client-id");
+        buf.put_i16(6);
+        buf.put_slice(b"my-app");
+        buf.put_i32(1);
+        buf.put_i16(18);
+        buf.put_slice(b"consumer_byte_rate");
+        buf.put_f64(2_097_152.0);
+
+        let mut frozen = buf.freeze();
+        let resp = DescribeClientQuotasResponse::decode_v0(&mut frozen).unwrap();
+        let entries = resp.entries.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].entity[0].entity_name, Some("alice".to_string()));
+        assert!((entries[0].values[0].value - 1_048_576.0).abs() < f64::EPSILON);
+        assert_eq!(entries[1].entity[0].entity_type, "client-id");
+        assert!((entries[1].values[0].value - 2_097_152.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_describe_client_quotas_response_null_entries() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_i16(0); // error_code
+        buf.put_i16(-1); // error_message (null)
+        buf.put_i32(-1); // null entries
+
+        let mut frozen = buf.freeze();
+        let resp = DescribeClientQuotasResponse::decode_v0(&mut frozen).unwrap();
+        assert!(resp.entries.is_none());
+    }
+
+    #[test]
+    fn test_describe_client_quotas_response_rejects_invalid_negative() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_i16(0); // error_code
+        buf.put_i16(-1); // error_message (null)
+        buf.put_i32(-2); // invalid negative (only -1 means null)
+
+        let mut frozen = buf.freeze();
+        assert!(DescribeClientQuotasResponse::decode_v0(&mut frozen).is_err());
+    }
+
+    #[test]
+    fn test_alter_client_quotas_request_roundtrip() {
+        let request = AlterClientQuotasRequest {
+            entries: vec![AlterQuotaEntry {
+                entity: vec![AlterQuotaEntity {
+                    entity_type: "user".to_string(),
+                    entity_name: Some("alice".to_string()),
+                }],
+                ops: vec![
+                    AlterQuotaOp {
+                        key: "producer_byte_rate".to_string(),
+                        value: 1_048_576.0,
+                        remove: false,
+                    },
+                    AlterQuotaOp {
+                        key: "consumer_byte_rate".to_string(),
+                        value: 0.0,
+                        remove: true,
+                    },
+                ],
+            }],
+            validate_only: true,
+        };
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf).unwrap();
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_alter_client_quotas_response_roundtrip() {
+        use bytes::BufMut;
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_i32(1); // 1 entry result
+        // entry 0: error
+        buf.put_i16(0); // error_code (None)
+        buf.put_i16(-1); // error_message (null)
+        // entry 0: entity
+        buf.put_i32(1); // 1 entity
+        buf.put_i16(4);
+        buf.put_slice(b"user"); // entity_type
+        buf.put_i16(5);
+        buf.put_slice(b"alice"); // entity_name
+
+        let mut frozen = buf.freeze();
+        let resp = AlterClientQuotasResponse::decode_v0(&mut frozen).unwrap();
+        assert_eq!(resp.entries.len(), 1);
+        assert!(resp.entries[0].error_code.is_ok());
+        assert_eq!(resp.entries[0].entity[0].entity_type, "user");
     }
 }

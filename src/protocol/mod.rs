@@ -171,6 +171,18 @@ pub mod versions {
     pub const INIT_PRODUCER_ID_MAX: i16 = 0;
     /// Maximum supported ListOffsets version (v2 encode/decode).
     pub const LIST_OFFSETS_MAX: i16 = 2;
+    /// Maximum supported CreateDelegationToken version (v0–v1 same wire format).
+    pub const CREATE_DELEGATION_TOKEN_MAX: i16 = 1;
+    /// Maximum supported RenewDelegationToken version (v0–v1 same wire format).
+    pub const RENEW_DELEGATION_TOKEN_MAX: i16 = 1;
+    /// Maximum supported ExpireDelegationToken version (v0–v1 same wire format).
+    pub const EXPIRE_DELEGATION_TOKEN_MAX: i16 = 1;
+    /// Maximum supported DescribeDelegationToken version (v0–v1 same wire format).
+    pub const DESCRIBE_DELEGATION_TOKEN_MAX: i16 = 1;
+    /// Maximum supported DescribeClientQuotas version.
+    pub const DESCRIBE_CLIENT_QUOTAS_MAX: i16 = 0;
+    /// Maximum supported AlterClientQuotas version.
+    pub const ALTER_CLIENT_QUOTAS_MAX: i16 = 0;
 }
 
 #[cfg(test)]
