@@ -5,8 +5,7 @@
 //! client trait, and a caching wrapper.
 //!
 //! When the `aws-glue-schema-registry` feature is enabled,
-//! [`AwsGlueSchemaRegistry`](super::AwsGlueSchemaRegistry) provides a
-//! ready-made AWS SDK client.
+//! `AwsGlueSchemaRegistry` provides a ready-made AWS SDK client.
 //!
 //! # Wire Format
 //!
@@ -473,8 +472,7 @@ fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>> {
 ///
 /// Implement this trait to integrate with the Glue backend. When the
 /// `aws-glue-schema-registry` feature is enabled,
-/// [`AwsGlueSchemaRegistry`](super::AwsGlueSchemaRegistry) provides a
-/// ready-made AWS SDK implementation.
+/// `AwsGlueSchemaRegistry` provides a ready-made AWS SDK implementation.
 ///
 /// All methods return boxed futures for object safety, following the same
 /// pattern as [`SchemaRegistryClient`](super::SchemaRegistryClient).

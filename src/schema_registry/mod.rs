@@ -10,7 +10,7 @@
 //! - **Caching**: [`CachedSchemaRegistry`] wraps any client with an in-memory
 //!   schema-ID-to-schema cache.
 //!
-//! When the `schema-registry` feature is enabled, [`ConfluentSchemaRegistry`]
+//! When the `schema-registry` feature is enabled, `ConfluentSchemaRegistry`
 //! provides a ready-made HTTP client for the
 //! [Confluent Schema Registry](https://docs.confluent.io/platform/current/schema-registry/)
 //! and any compatible registry (e.g.,
@@ -414,7 +414,7 @@ impl SubjectNameStrategy {
 /// Async client interface for a schema registry.
 ///
 /// Implement this trait to integrate with any schema registry backend.
-/// When the `schema-registry` feature is enabled, [`ConfluentSchemaRegistry`]
+/// When the `schema-registry` feature is enabled, `ConfluentSchemaRegistry`
 /// provides a ready-made HTTP implementation for the Confluent Schema
 /// Registry (and compatible registries such as Karapace and Apicurio).
 ///
