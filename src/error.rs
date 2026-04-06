@@ -71,6 +71,13 @@ pub enum KrafkaError {
         /// Error message describing the serialization failure.
         message: String,
     },
+
+    /// Schema registry errors.
+    #[error("schema registry error: {message}")]
+    SchemaRegistry {
+        /// Human-readable error message.
+        message: String,
+    },
 }
 
 impl KrafkaError {
@@ -135,6 +142,14 @@ impl KrafkaError {
     #[cold]
     pub fn serialization(message: impl Into<String>) -> Self {
         Self::Serialization {
+            message: message.into(),
+        }
+    }
+
+    /// Create a new schema registry error.
+    #[cold]
+    pub fn schema_registry(message: impl Into<String>) -> Self {
+        Self::SchemaRegistry {
             message: message.into(),
         }
     }
