@@ -97,6 +97,7 @@ pub mod metrics;
 pub mod network;
 pub mod producer;
 pub mod protocol;
+pub mod schema_registry;
 pub mod tracing_ext;
 pub mod util;
 

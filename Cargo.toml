@@ -60,7 +60,13 @@ webpki-roots = "0.26"
 # works without the aws-msk feature (manual credential loading).
 aws-config = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
+aws-sdk-glue = { version = "1", optional = true }
 arc-swap = "1.9.0"
+
+# Schema Registry HTTP client (optional)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 [features]
 default = []
@@ -70,6 +76,13 @@ default = []
 # If binary size is critical, use manual credential loading with AwsMskIamCredentials::from_env()
 # which works without this feature.
 aws-msk = ["aws-config", "aws-credential-types"]
+# Enable the built-in Confluent Schema Registry HTTP client.
+# The core schema_registry module (wire format, trait, caching) is always available.
+schema-registry = ["reqwest", "serde", "serde_json"]
+# Enable the AWS Glue Schema Registry SDK client.
+# The core glue module (wire format, trait, caching) is always available.
+# This feature adds the aws-sdk-glue dependency for direct Glue API calls.
+aws-glue-schema-registry = ["aws-sdk-glue", "aws-config"]
 # Allow disabling TLS certificate verification (MITM risk!).
 # Only enable for local development or testing with self-signed certificates.
 # Requires calling `TlsConfig::insecure()`.
