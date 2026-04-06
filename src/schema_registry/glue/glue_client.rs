@@ -122,26 +122,24 @@ impl AwsGlueSchemaRegistry {
                     ))
                 })?;
 
-            if let Some(status) = response.status() {
-                match status {
-                    aws_sdk_glue::types::SchemaVersionStatus::Available => {
-                        return Ok(response);
-                    }
-                    aws_sdk_glue::types::SchemaVersionStatus::Failure => {
-                        return Err(KrafkaError::schema_registry(
-                            "schema version registration failed (status: FAILURE)",
-                        ));
-                    }
-                    aws_sdk_glue::types::SchemaVersionStatus::Deleting => {
-                        return Err(KrafkaError::schema_registry(
-                            "schema version is being deleted",
-                        ));
-                    }
-                    _ => {
-                        // PENDING or unknown — wait and retry
-                        if attempt + 1 < self.poll_max_attempts {
-                            tokio::time::sleep(self.poll_interval).await;
-                        }
+            match response.status() {
+                Some(aws_sdk_glue::types::SchemaVersionStatus::Available) => {
+                    return Ok(response);
+                }
+                Some(aws_sdk_glue::types::SchemaVersionStatus::Failure) => {
+                    return Err(KrafkaError::schema_registry(
+                        "schema version registration failed (status: FAILURE)",
+                    ));
+                }
+                Some(aws_sdk_glue::types::SchemaVersionStatus::Deleting) => {
+                    return Err(KrafkaError::schema_registry(
+                        "schema version is being deleted",
+                    ));
+                }
+                Some(_) | None => {
+                    // Pending, unknown, or missing status — wait and retry.
+                    if attempt + 1 < self.poll_max_attempts {
+                        tokio::time::sleep(self.poll_interval).await;
                     }
                 }
             }
@@ -443,11 +441,5 @@ mod tests {
             AwsGlueSchemaRegistry::to_sdk_data_format(GlueDataFormat::Protobuf),
             aws_sdk_glue::types::DataFormat::Protobuf
         ));
-    }
-
-    #[test]
-    fn test_debug_does_not_leak_client() {
-        // We can't construct a real client in tests, but verify the Debug
-        // format is safe (no credentials).
     }
 }
