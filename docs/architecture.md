@@ -70,7 +70,7 @@ krafka/
 │   ├── group.rs       # Consumer group coordination (rebalance listeners, heartbeat)
 │   ├── offset.rs      # Offset management
 │   └── record.rs      # Consumer records
-├── admin.rs           # Admin client (topics, partitions, configs, ACLs)
+├── admin.rs           # Admin client (topics, partitions, configs, ACLs, delegation tokens, quotas)
 ├── auth/              # Authentication
 │   ├── mod.rs         # Auth module (SASL mechanisms)
 │   ├── scram.rs       # SCRAM-SHA-256/512 implementation

@@ -7,6 +7,8 @@
 //! - Describe and alter configurations
 //! - Manage ACLs
 //! - Describe cluster and broker configs
+//! - Manage delegation tokens (create, renew, expire, describe)
+//! - Describe and alter client quotas
 //!
 //! # Authentication
 //!
@@ -35,24 +37,31 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use tracing::{info, warn};
 
 use crate::auth::AuthConfig;
 use crate::error::{KrafkaError, Result};
 use crate::metadata::{BrokerInfo, ClusterMetadata, TopicInfo};
-use crate::network::{ConnectionConfig, ConnectionPool};
+use crate::network::{BrokerConnection, ConnectionConfig, ConnectionPool};
 
 use crate::protocol::{
     AclBinding, AclBindingFilter, AclOperation, AclPatternType, AclPermissionType, AclResourceType,
-    AlterConfigsRequest, AlterConfigsResponse, ApiKey, CreatableTopic, CreatableTopicConfig,
-    CreateAclsRequest, CreateAclsResponse, CreatePartitionsRequest, CreatePartitionsResponse,
+    AlterClientQuotasRequest, AlterClientQuotasResponse, AlterConfigsRequest, AlterConfigsResponse,
+    AlterQuotaEntity, AlterQuotaEntry, AlterQuotaOp, ApiKey, CreatableRenewer, CreatableTopic,
+    CreatableTopicConfig, CreateAclsRequest, CreateAclsResponse, CreateDelegationTokenRequest,
+    CreateDelegationTokenResponse, CreatePartitionsRequest, CreatePartitionsResponse,
     CreatePartitionsTopic, CreateTopicsRequest, CreateTopicsResponse, DeleteAclsRequest,
     DeleteAclsResponse, DeleteRecordsPartition, DeleteRecordsRequest, DeleteRecordsResponse,
     DeleteRecordsTopic, DeleteTopicsRequest, DeleteTopicsResponse, DescribeAclsRequest,
-    DescribeAclsResponse, DescribeConfigsRequest, DescribeConfigsResponse, DescribeGroupsRequest,
-    DescribeGroupsResponse, FindCoordinatorRequest, FindCoordinatorResponse, ListGroupsRequest,
-    ListGroupsResponse, OffsetForLeaderEpochPartition, OffsetForLeaderEpochRequest,
-    OffsetForLeaderEpochResponse, OffsetForLeaderEpochTopic, versions,
+    DescribeAclsResponse, DescribeClientQuotasRequest, DescribeClientQuotasResponse,
+    DescribeConfigsRequest, DescribeConfigsResponse, DescribeDelegationTokenOwner,
+    DescribeDelegationTokenRequest, DescribeDelegationTokenResponse, DescribeGroupsRequest,
+    DescribeGroupsResponse, ExpireDelegationTokenRequest, ExpireDelegationTokenResponse,
+    FindCoordinatorRequest, FindCoordinatorResponse, ListGroupsRequest, ListGroupsResponse,
+    OffsetForLeaderEpochPartition, OffsetForLeaderEpochRequest, OffsetForLeaderEpochResponse,
+    OffsetForLeaderEpochTopic, QuotaFilterComponent, RenewDelegationTokenRequest,
+    RenewDelegationTokenResponse, VersionedDecode, VersionedEncode, versions,
 };
 
 /// Configuration for creating a topic.
@@ -257,6 +266,139 @@ pub struct LeaderEpochResult {
     pub end_offset: i64,
     /// Error message if any.
     pub error: Option<String>,
+}
+
+/// A principal authorized to renew a delegation token.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct DelegationTokenRenewer {
+    /// Principal type (e.g., `"User"`).
+    pub principal_type: String,
+    /// Principal name.
+    pub principal_name: String,
+}
+
+/// A delegation token returned by [`AdminClient::create_delegation_token()`] or
+/// [`AdminClient::describe_delegation_tokens()`].
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct DelegationToken {
+    /// Token owner principal type (e.g., `"User"`).
+    pub principal_type: String,
+    /// Token owner principal name.
+    pub principal_name: String,
+    /// When the token was issued (ms since epoch).
+    pub issue_timestamp_ms: i64,
+    /// When the token expires (ms since epoch).
+    pub expiry_timestamp_ms: i64,
+    /// Maximum timestamp at which the token can be renewed (ms since epoch).
+    pub max_timestamp_ms: i64,
+    /// Unique token ID.
+    pub token_id: String,
+    /// HMAC of the delegation token (used for SASL authentication).
+    pub hmac: Bytes,
+    /// Principals authorized to renew this token.
+    ///
+    /// Populated by [`AdminClient::describe_delegation_tokens()`]. Empty when
+    /// returned from [`AdminClient::create_delegation_token()`] because the
+    /// Create response does not include the renewer list.
+    pub renewers: Vec<DelegationTokenRenewer>,
+}
+
+/// Result of creating a delegation token.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct CreateDelegationTokenResult {
+    /// The created delegation token (present on success).
+    pub token: Option<DelegationToken>,
+    /// Error message if any.
+    pub error: Option<String>,
+}
+
+/// Result of renewing a delegation token.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct RenewDelegationTokenResult {
+    /// New expiry timestamp (ms since epoch).
+    pub expiry_timestamp_ms: i64,
+    /// Error message if any.
+    pub error: Option<String>,
+}
+
+/// Result of expiring a delegation token.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct ExpireDelegationTokenResult {
+    /// New expiry timestamp (ms since epoch).
+    pub expiry_timestamp_ms: i64,
+    /// Error message if any.
+    pub error: Option<String>,
+}
+
+/// A quota entity component describing who the quota applies to.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct QuotaEntityComponent {
+    /// Entity type (e.g., `"user"`, `"client-id"`, `"ip"`).
+    pub entity_type: String,
+    /// Entity name. `None` represents the default entity.
+    pub entity_name: Option<String>,
+}
+
+/// A quota configuration value.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct QuotaConfig {
+    /// Quota key (e.g., `"producer_byte_rate"`, `"consumer_byte_rate"`,
+    /// `"request_percentage"`).
+    pub key: String,
+    /// Quota value.
+    pub value: f64,
+}
+
+/// A quota entry describing the quotas applied to an entity.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct QuotaDescription {
+    /// Entity components (user, client-id, ip).
+    pub entity: Vec<QuotaEntityComponent>,
+    /// Quota configuration values.
+    pub values: Vec<QuotaConfig>,
+}
+
+/// Result of describing client quotas.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct DescribeClientQuotasResult {
+    /// Quota entries matching the filter.
+    pub entries: Vec<QuotaDescription>,
+    /// Error message if any.
+    pub error: Option<String>,
+}
+
+/// Result of altering a single quota entity.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct AlterClientQuotaResult {
+    /// Entity components that were altered.
+    pub entity: Vec<QuotaEntityComponent>,
+    /// Error message if any.
+    pub error: Option<String>,
+}
+
+/// Input for [`AdminClient::alter_client_quotas`].
+///
+/// Describes a set of quota operations (set or remove) to apply to a
+/// single entity. An entity is identified by a list of (type, name) pairs —
+/// for example `[("user", Some("alice")), ("client-id", None)]`.
+#[derive(Debug, Clone)]
+pub struct QuotaAlteration<'a> {
+    /// Entity components (type, optional name). `None` name targets the
+    /// default entity for that type.
+    pub entity: Vec<(&'a str, Option<&'a str>)>,
+    /// Quota operations. `Some(value)` sets the quota key;
+    /// `None` removes it.
+    pub ops: Vec<(&'a str, Option<f64>)>,
 }
 
 /// Filter for ACL operations (describe, delete).
@@ -469,14 +611,13 @@ impl AdminClient {
         Ok(())
     }
 
-    /// Create topics.
-    pub async fn create_topics(
-        &self,
-        topics: Vec<NewTopic>,
-        timeout: Duration,
-    ) -> Result<Vec<CreateTopicResult>> {
+    /// Get a connection to any available broker.
+    ///
+    /// Checks the client is not closed, picks the first available broker, and
+    /// returns a connection from the pool. Most admin commands can be sent to
+    /// any broker (the broker will forward as needed).
+    async fn get_any_broker_connection(&self) -> Result<Arc<BrokerConnection>> {
         self.check_not_closed()?;
-        // Get any broker connection (controller for leadership, but any broker forwards)
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -484,12 +625,19 @@ impl AdminClient {
                 "no brokers available",
             ));
         }
-
         let broker = &brokers[0];
-        let conn = self
-            .pool
+        self.pool
             .get_connection_by_id(broker.id, broker.address())
-            .await?;
+            .await
+    }
+
+    /// Create topics.
+    pub async fn create_topics(
+        &self,
+        topics: Vec<NewTopic>,
+        timeout: Duration,
+    ) -> Result<Vec<CreateTopicResult>> {
+        let conn = self.get_any_broker_connection().await?;
 
         // Build request
         let request = CreateTopicsRequest {
@@ -648,23 +796,8 @@ impl AdminClient {
         new_total_count: i32,
         timeout: Duration,
     ) -> Result<CreatePartitionsResult> {
-        self.check_not_closed()?;
         let topic_name = topic.into();
-
-        // Get any broker connection
-        let brokers = self.metadata.brokers();
-        if brokers.is_empty() {
-            return Err(KrafkaError::broker(
-                crate::error::ErrorCode::UnknownServerError,
-                "no brokers available",
-            ));
-        }
-
-        let broker = &brokers[0];
-        let conn = self
-            .pool
-            .get_connection_by_id(broker.id, broker.address())
-            .await?;
+        let conn = self.get_any_broker_connection().await?;
 
         // Build request
         let request = CreatePartitionsRequest {
@@ -726,20 +859,7 @@ impl AdminClient {
 
     /// Describe configuration for a topic.
     pub async fn describe_topic_config(&self, topic: &str) -> Result<Vec<ConfigEntry>> {
-        self.check_not_closed()?;
-        let brokers = self.metadata.brokers();
-        if brokers.is_empty() {
-            return Err(KrafkaError::broker(
-                crate::error::ErrorCode::UnknownServerError,
-                "no brokers available",
-            ));
-        }
-
-        let broker = &brokers[0];
-        let conn = self
-            .pool
-            .get_connection_by_id(broker.id, broker.address())
-            .await?;
+        let conn = self.get_any_broker_connection().await?;
 
         let request = DescribeConfigsRequest::for_topic(topic);
 
@@ -784,20 +904,7 @@ impl AdminClient {
 
     /// Describe configuration for a broker.
     pub async fn describe_broker_config(&self, broker_id: i32) -> Result<Vec<ConfigEntry>> {
-        self.check_not_closed()?;
-        let brokers = self.metadata.brokers();
-        if brokers.is_empty() {
-            return Err(KrafkaError::broker(
-                crate::error::ErrorCode::UnknownServerError,
-                "no brokers available",
-            ));
-        }
-
-        let broker = &brokers[0];
-        let conn = self
-            .pool
-            .get_connection_by_id(broker.id, broker.address())
-            .await?;
+        let conn = self.get_any_broker_connection().await?;
 
         let request = DescribeConfigsRequest::for_broker(broker_id);
 
@@ -849,20 +956,7 @@ impl AdminClient {
         topic: &str,
         configs: HashMap<String, String>,
     ) -> Result<AlterConfigResult> {
-        self.check_not_closed()?;
-        let brokers = self.metadata.brokers();
-        if brokers.is_empty() {
-            return Err(KrafkaError::broker(
-                crate::error::ErrorCode::UnknownServerError,
-                "no brokers available",
-            ));
-        }
-
-        let broker = &brokers[0];
-        let conn = self
-            .pool
-            .get_connection_by_id(broker.id, broker.address())
-            .await?;
+        let conn = self.get_any_broker_connection().await?;
 
         let request = AlterConfigsRequest::for_topic(topic, configs.into_iter().collect());
 
@@ -1020,20 +1114,7 @@ impl AdminClient {
     /// let result = admin.describe_acls_with_filter(filter).await?;
     /// ```
     pub async fn describe_acls_with_filter(&self, filter: AclFilter) -> Result<DescribeAclsResult> {
-        self.check_not_closed()?;
-        let brokers = self.metadata.brokers();
-        if brokers.is_empty() {
-            return Err(KrafkaError::broker(
-                crate::error::ErrorCode::UnknownServerError,
-                "no brokers available",
-            ));
-        }
-
-        let broker = &brokers[0];
-        let conn = self
-            .pool
-            .get_connection_by_id(broker.id, broker.address())
-            .await?;
+        let conn = self.get_any_broker_connection().await?;
 
         let request = DescribeAclsRequest {
             resource_type: filter.resource_type,
@@ -1114,20 +1195,7 @@ impl AdminClient {
     /// admin.create_acls(vec![acl]).await?;
     /// ```
     pub async fn create_acls(&self, acls: Vec<AclBinding>) -> Result<CreateAclsResult> {
-        self.check_not_closed()?;
-        let brokers = self.metadata.brokers();
-        if brokers.is_empty() {
-            return Err(KrafkaError::broker(
-                crate::error::ErrorCode::UnknownServerError,
-                "no brokers available",
-            ));
-        }
-
-        let broker = &brokers[0];
-        let conn = self
-            .pool
-            .get_connection_by_id(broker.id, broker.address())
-            .await?;
+        let conn = self.get_any_broker_connection().await?;
 
         let request = CreateAclsRequest {
             creations: acls.clone(),
@@ -1197,20 +1265,7 @@ impl AdminClient {
     /// admin.delete_acls(vec![filter]).await?;
     /// ```
     pub async fn delete_acls(&self, filters: Vec<AclBindingFilter>) -> Result<DeleteAclsResult> {
-        self.check_not_closed()?;
-        let brokers = self.metadata.brokers();
-        if brokers.is_empty() {
-            return Err(KrafkaError::broker(
-                crate::error::ErrorCode::UnknownServerError,
-                "no brokers available",
-            ));
-        }
-
-        let broker = &brokers[0];
-        let conn = self
-            .pool
-            .get_connection_by_id(broker.id, broker.address())
-            .await?;
+        let conn = self.get_any_broker_connection().await?;
 
         let request = DeleteAclsRequest {
             filters: filters.clone(),
@@ -1761,6 +1816,473 @@ impl AdminClient {
             "Got leader epoch offsets for {} partition(s)",
             results.len()
         );
+        Ok(results)
+    }
+
+    // ── Delegation Tokens ────────────────────────────────────────────────
+
+    /// Create a delegation token.
+    ///
+    /// Delegation tokens allow a principal to delegate authentication to
+    /// another principal without sharing credentials (KIP-48). The token
+    /// HMAC can be used for SASL/SCRAM authentication.
+    ///
+    /// # Arguments
+    ///
+    /// * `renewers` - Principals authorized to renew the token (type, name pairs).
+    ///   Pass an empty slice to allow only the token owner to renew.
+    /// * `max_lifetime` - Maximum token lifetime. Use `None` for the server
+    ///   default (typically 7 days).
+    pub async fn create_delegation_token(
+        &self,
+        renewers: &[(&str, &str)],
+        max_lifetime: Option<Duration>,
+    ) -> Result<CreateDelegationTokenResult> {
+        let conn = self.get_any_broker_connection().await?;
+
+        let request = CreateDelegationTokenRequest {
+            renewers: renewers
+                .iter()
+                .map(|(t, n)| CreatableRenewer {
+                    principal_type: t.to_string(),
+                    principal_name: n.to_string(),
+                })
+                .collect(),
+            max_lifetime_ms: max_lifetime
+                .map(crate::util::duration_to_millis_i64)
+                .unwrap_or(-1),
+        };
+
+        let version = conn
+            .negotiate_api_version_max(
+                ApiKey::CreateDelegationToken,
+                versions::CREATE_DELEGATION_TOKEN_MAX,
+            )
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported CreateDelegationToken API version")
+            })?;
+
+        let response_bytes = conn
+            .send_request(ApiKey::CreateDelegationToken, version, |buf| {
+                request.encode_versioned(version, buf)
+            })
+            .await?;
+
+        let mut buf = response_bytes;
+        let response = CreateDelegationTokenResponse::decode_versioned(version, &mut buf)?;
+
+        let result = if response.error_code.is_ok() {
+            info!("Created delegation token");
+            CreateDelegationTokenResult {
+                token: Some(DelegationToken {
+                    principal_type: response.principal_type,
+                    principal_name: response.principal_name,
+                    issue_timestamp_ms: response.issue_timestamp_ms,
+                    expiry_timestamp_ms: response.expiry_timestamp_ms,
+                    max_timestamp_ms: response.max_timestamp_ms,
+                    token_id: response.token_id,
+                    hmac: response.hmac,
+                    renewers: Vec::new(),
+                }),
+                error: None,
+            }
+        } else {
+            CreateDelegationTokenResult {
+                token: None,
+                error: Some(format!("{:?}", response.error_code)),
+            }
+        };
+
+        Ok(result)
+    }
+
+    /// Renew a delegation token, extending its expiry time.
+    ///
+    /// # Arguments
+    ///
+    /// * `hmac` - HMAC of the token to renew (from [`DelegationToken::hmac`]).
+    /// * `renew_period` - How long to extend the token's lifetime.
+    pub async fn renew_delegation_token(
+        &self,
+        hmac: &[u8],
+        renew_period: Duration,
+    ) -> Result<RenewDelegationTokenResult> {
+        let conn = self.get_any_broker_connection().await?;
+
+        let request = RenewDelegationTokenRequest {
+            hmac: Bytes::copy_from_slice(hmac),
+            renew_period_ms: crate::util::duration_to_millis_i64(renew_period),
+        };
+
+        let version = conn
+            .negotiate_api_version_max(
+                ApiKey::RenewDelegationToken,
+                versions::RENEW_DELEGATION_TOKEN_MAX,
+            )
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported RenewDelegationToken API version")
+            })?;
+
+        let response_bytes = conn
+            .send_request(ApiKey::RenewDelegationToken, version, |buf| {
+                request.encode_versioned(version, buf)
+            })
+            .await?;
+
+        let mut buf = response_bytes;
+        let response = RenewDelegationTokenResponse::decode_versioned(version, &mut buf)?;
+
+        if response.error_code.is_ok() {
+            info!("Renewed delegation token");
+        }
+
+        Ok(RenewDelegationTokenResult {
+            expiry_timestamp_ms: response.expiry_timestamp_ms,
+            error: if response.error_code.is_ok() {
+                None
+            } else {
+                Some(format!("{:?}", response.error_code))
+            },
+        })
+    }
+
+    /// Expire a delegation token, revoking it before its natural expiry.
+    ///
+    /// # Arguments
+    ///
+    /// * `hmac` - HMAC of the token to expire (from [`DelegationToken::hmac`]).
+    /// * `expiry_period` - How long until the token expires. Pass `None` to
+    ///   expire the token immediately (sends `-1` to the broker).
+    pub async fn expire_delegation_token(
+        &self,
+        hmac: &[u8],
+        expiry_period: Option<Duration>,
+    ) -> Result<ExpireDelegationTokenResult> {
+        let conn = self.get_any_broker_connection().await?;
+
+        let request = ExpireDelegationTokenRequest {
+            hmac: Bytes::copy_from_slice(hmac),
+            expiry_period_ms: expiry_period
+                .map(crate::util::duration_to_millis_i64)
+                .unwrap_or(-1),
+        };
+
+        let version = conn
+            .negotiate_api_version_max(
+                ApiKey::ExpireDelegationToken,
+                versions::EXPIRE_DELEGATION_TOKEN_MAX,
+            )
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported ExpireDelegationToken API version")
+            })?;
+
+        let response_bytes = conn
+            .send_request(ApiKey::ExpireDelegationToken, version, |buf| {
+                request.encode_versioned(version, buf)
+            })
+            .await?;
+
+        let mut buf = response_bytes;
+        let response = ExpireDelegationTokenResponse::decode_versioned(version, &mut buf)?;
+
+        if response.error_code.is_ok() {
+            info!("Expired delegation token");
+        }
+
+        Ok(ExpireDelegationTokenResult {
+            expiry_timestamp_ms: response.expiry_timestamp_ms,
+            error: if response.error_code.is_ok() {
+                None
+            } else {
+                Some(format!("{:?}", response.error_code))
+            },
+        })
+    }
+
+    /// Describe delegation tokens visible to the caller.
+    ///
+    /// # Arguments
+    ///
+    /// * `owners` - Filter by token owners (type, name pairs). Pass `None`
+    ///   to return all tokens visible to the caller.
+    pub async fn describe_delegation_tokens(
+        &self,
+        owners: Option<&[(&str, &str)]>,
+    ) -> Result<Vec<DelegationToken>> {
+        let conn = self.get_any_broker_connection().await?;
+
+        let request = DescribeDelegationTokenRequest {
+            owners: owners.map(|o| {
+                o.iter()
+                    .map(|(t, n)| DescribeDelegationTokenOwner {
+                        principal_type: t.to_string(),
+                        principal_name: n.to_string(),
+                    })
+                    .collect()
+            }),
+        };
+
+        let version = conn
+            .negotiate_api_version_max(
+                ApiKey::DescribeDelegationToken,
+                versions::DESCRIBE_DELEGATION_TOKEN_MAX,
+            )
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported DescribeDelegationToken API version")
+            })?;
+
+        let response_bytes = conn
+            .send_request(ApiKey::DescribeDelegationToken, version, |buf| {
+                request.encode_versioned(version, buf)
+            })
+            .await?;
+
+        let mut buf = response_bytes;
+        let response = DescribeDelegationTokenResponse::decode_versioned(version, &mut buf)?;
+
+        if !response.error_code.is_ok() {
+            return Err(KrafkaError::broker(
+                response.error_code,
+                "DescribeDelegationToken failed",
+            ));
+        }
+
+        let tokens: Vec<DelegationToken> = response
+            .tokens
+            .into_iter()
+            .map(|t| DelegationToken {
+                principal_type: t.principal_type,
+                principal_name: t.principal_name,
+                issue_timestamp_ms: t.issue_timestamp_ms,
+                expiry_timestamp_ms: t.expiry_timestamp_ms,
+                max_timestamp_ms: t.max_timestamp_ms,
+                token_id: t.token_id,
+                hmac: t.hmac,
+                renewers: t
+                    .renewers
+                    .into_iter()
+                    .map(|r| DelegationTokenRenewer {
+                        principal_type: r.principal_type,
+                        principal_name: r.principal_name,
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        info!("Described {} delegation token(s)", tokens.len());
+        Ok(tokens)
+    }
+
+    // ── Client Quotas ────────────────────────────────────────────────────
+
+    /// Describe client quotas matching the given filter.
+    ///
+    /// # Arguments
+    ///
+    /// * `components` - Filter components. Each component specifies an entity
+    ///   type and match criteria. The broker returns entities matching **all**
+    ///   components.
+    /// * `strict` - If `true`, exclude entities with unspecified entity types
+    ///   (i.e., only return entities that exactly match all given component types).
+    ///
+    /// # Filter Match Types
+    ///
+    /// Each component has a `match_type`:
+    /// - `0` (exact): match the entity with the given name
+    /// - `1` (default): match the default entity for this type
+    /// - `2` (any specified): match any entity with a name (non-default)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Describe all quotas for user "alice"
+    /// let results = admin.describe_client_quotas(
+    ///     &[("user", 0, Some("alice"))],
+    ///     false,
+    /// ).await?;
+    /// ```
+    pub async fn describe_client_quotas(
+        &self,
+        components: &[(&str, i8, Option<&str>)],
+        strict: bool,
+    ) -> Result<DescribeClientQuotasResult> {
+        let conn = self.get_any_broker_connection().await?;
+
+        let request = DescribeClientQuotasRequest {
+            components: components
+                .iter()
+                .map(
+                    |(entity_type, match_type, match_value)| QuotaFilterComponent {
+                        entity_type: entity_type.to_string(),
+                        match_type: *match_type,
+                        match_value: match_value.map(|v| v.to_string()),
+                    },
+                )
+                .collect(),
+            strict,
+        };
+
+        let version = conn
+            .negotiate_api_version_max(
+                ApiKey::DescribeClientQuotas,
+                versions::DESCRIBE_CLIENT_QUOTAS_MAX,
+            )
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported DescribeClientQuotas API version")
+            })?;
+
+        let response_bytes = conn
+            .send_request(ApiKey::DescribeClientQuotas, version, |buf| {
+                request.encode_versioned(version, buf)
+            })
+            .await?;
+
+        let mut buf = response_bytes;
+        let response = DescribeClientQuotasResponse::decode_versioned(version, &mut buf)?;
+
+        let entries = response
+            .entries
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| QuotaDescription {
+                entity: entry
+                    .entity
+                    .into_iter()
+                    .map(|e| QuotaEntityComponent {
+                        entity_type: e.entity_type,
+                        entity_name: e.entity_name,
+                    })
+                    .collect(),
+                values: entry
+                    .values
+                    .into_iter()
+                    .map(|v| QuotaConfig {
+                        key: v.key,
+                        value: v.value,
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+
+        if response.error_code.is_ok() {
+            info!("Described {} client quota entry(ies)", entries.len());
+        }
+
+        Ok(DescribeClientQuotasResult {
+            entries,
+            error: if response.error_code.is_ok() {
+                None
+            } else {
+                let msg = response
+                    .error_message
+                    .unwrap_or_else(|| format!("{:?}", response.error_code));
+                Some(msg)
+            },
+        })
+    }
+
+    /// Alter client quotas.
+    ///
+    /// Each entry specifies an entity (user, client-id, ip) and a set of
+    /// quota operations (set or remove). Results are returned per-entity.
+    ///
+    /// # Arguments
+    ///
+    /// * `entries` - Quota alterations. Each entry has an entity and operations.
+    /// * `validate_only` - If `true`, validate the request without applying changes.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use krafka::admin::QuotaAlteration;
+    ///
+    /// // Set producer byte rate quota for user "alice"
+    /// let results = admin.alter_client_quotas(
+    ///     &[QuotaAlteration {
+    ///         entity: vec![("user", Some("alice"))],
+    ///         ops: vec![("producer_byte_rate", Some(1_048_576.0))],
+    ///     }],
+    ///     false,
+    /// ).await?;
+    /// ```
+    pub async fn alter_client_quotas(
+        &self,
+        entries: &[QuotaAlteration<'_>],
+        validate_only: bool,
+    ) -> Result<Vec<AlterClientQuotaResult>> {
+        let conn = self.get_any_broker_connection().await?;
+
+        let request = AlterClientQuotasRequest {
+            entries: entries
+                .iter()
+                .map(|e| AlterQuotaEntry {
+                    entity: e
+                        .entity
+                        .iter()
+                        .map(|(t, n)| AlterQuotaEntity {
+                            entity_type: t.to_string(),
+                            entity_name: n.map(|v| v.to_string()),
+                        })
+                        .collect(),
+                    ops: e
+                        .ops
+                        .iter()
+                        .map(|(key, value)| AlterQuotaOp {
+                            key: key.to_string(),
+                            value: value.unwrap_or(0.0),
+                            remove: value.is_none(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            validate_only,
+        };
+
+        let version = conn
+            .negotiate_api_version_max(ApiKey::AlterClientQuotas, versions::ALTER_CLIENT_QUOTAS_MAX)
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported AlterClientQuotas API version")
+            })?;
+
+        let response_bytes = conn
+            .send_request(ApiKey::AlterClientQuotas, version, |buf| {
+                request.encode_versioned(version, buf)
+            })
+            .await?;
+
+        let mut buf = response_bytes;
+        let response = AlterClientQuotasResponse::decode_versioned(version, &mut buf)?;
+
+        let results: Vec<AlterClientQuotaResult> = response
+            .entries
+            .into_iter()
+            .map(|entry| AlterClientQuotaResult {
+                entity: entry
+                    .entity
+                    .into_iter()
+                    .map(|e| QuotaEntityComponent {
+                        entity_type: e.entity_type,
+                        entity_name: e.entity_name,
+                    })
+                    .collect(),
+                error: if entry.error_code.is_ok() {
+                    None
+                } else {
+                    let msg = entry
+                        .error_message
+                        .unwrap_or_else(|| format!("{:?}", entry.error_code));
+                    Some(msg)
+                },
+            })
+            .collect();
+
+        info!("Altered {} client quota entry(ies)", results.len());
         Ok(results)
     }
 

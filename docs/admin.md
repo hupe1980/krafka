@@ -20,6 +20,8 @@ The AdminClient provides cluster administration capabilities:
 - Cluster information
 - Partition management
 - ACL management
+- Delegation token management (create, describe, renew, expire)
+- Client quota management (describe, alter)
 
 ### API Version Negotiation
 
@@ -625,6 +627,167 @@ This API is useful for:
 - **Log truncation detection**: After a leader change, check if the log was truncated
 - **Consumer offset validation**: Ensure a consumer's saved offset is still valid
 - **Replication diagnostics**: Verify epoch boundaries across replicas
+
+## Delegation Tokens
+
+Delegation tokens (KIP-48) allow a principal to delegate authentication to
+another principal without sharing credentials. The token HMAC can be used for
+SASL/SCRAM authentication.
+
+### Creating a Token
+
+```rust
+use std::time::Duration;
+
+// Create a token that "alice" can renew, with a 24-hour lifetime
+let result = admin
+    .create_delegation_token(
+        &[("User", "alice")],
+        Some(Duration::from_secs(86_400)),
+    )
+    .await?;
+
+match result.token {
+    Some(token) => println!("Created token: {} (HMAC {} bytes)", token.token_id, token.hmac.len()),
+    None => println!("Error: {}", result.error.unwrap()),
+}
+```
+
+Pass an empty renewers slice to allow only the token owner to renew.
+Use `None` for `max_lifetime` to accept the server default (typically 7 days).
+
+### Describing Tokens
+
+```rust
+// Describe all tokens visible to the caller
+let tokens = admin.describe_delegation_tokens(None).await?;
+for token in &tokens {
+    println!(
+        "Token {} owned by {}:{}, expires at {}, {} renewer(s)",
+        token.token_id,
+        token.principal_type,
+        token.principal_name,
+        token.expiry_timestamp_ms,
+        token.renewers.len(),
+    );
+}
+
+// Describe tokens for a specific owner
+let tokens = admin
+    .describe_delegation_tokens(Some(&[("User", "alice")]))
+    .await?;
+```
+
+### Renewing a Token
+
+```rust
+use std::time::Duration;
+
+// Obtain a token (e.g., from a prior create call)
+let result = admin
+    .create_delegation_token(&[("User", "alice")], Some(Duration::from_secs(86_400)))
+    .await?;
+let token = result.token.expect("token created");
+
+// Extend the token's lifetime by 1 hour
+let result = admin
+    .renew_delegation_token(&token.hmac, Duration::from_secs(3_600))
+    .await?;
+
+match result.error {
+    None => println!("New expiry: {}", result.expiry_timestamp_ms),
+    Some(e) => println!("Renew failed: {}", e),
+}
+```
+
+### Expiring a Token
+
+```rust
+use std::time::Duration;
+
+// Obtain a token (e.g., from describe)
+let tokens = admin.describe_delegation_tokens(None).await?;
+let token = &tokens[0];
+
+// Expire a token immediately
+let result = admin.expire_delegation_token(&token.hmac, None).await?;
+
+// Expire a token after a grace period
+let result = admin
+    .expire_delegation_token(&token.hmac, Some(Duration::from_secs(60)))
+    .await?;
+```
+
+## Client Quotas
+
+Client quotas control the resource usage of clients (producer/consumer byte
+rates, request percentages, etc.). Use `describe_client_quotas` to query
+current quotas and `alter_client_quotas` to change them.
+
+### Describing Quotas
+
+```rust
+// Describe all quotas for user "alice" (match_type 0 = exact match)
+let result = admin
+    .describe_client_quotas(&[("user", 0, Some("alice"))], false)
+    .await?;
+
+for entry in &result.entries {
+    let entity: Vec<_> = entry.entity.iter().map(|e| {
+        format!("{}={}", e.entity_type, e.entity_name.as_deref().unwrap_or("<default>"))
+    }).collect();
+    println!("Entity: {}", entity.join(", "));
+    for v in &entry.values {
+        println!("  {} = {}", v.key, v.value);
+    }
+}
+```
+
+Filter match types:
+- `0` — exact: match the entity with the given name
+- `1` — default: match the default entity for this type
+- `2` — any specified: match any entity with a name (non-default)
+
+When `strict` is `true`, only entities that exactly match all given component
+types are returned (entities with additional unspecified types are excluded).
+
+### Altering Quotas
+
+```rust
+use krafka::admin::QuotaAlteration;
+
+// Set producer byte rate for user "alice"
+let results = admin
+    .alter_client_quotas(
+        &[QuotaAlteration {
+            entity: vec![("user", Some("alice"))],
+            ops: vec![
+                ("producer_byte_rate", Some(1_048_576.0)),  // set to 1 MiB/s
+                ("consumer_byte_rate", None),               // remove quota
+            ],
+        }],
+        false,
+    )
+    .await?;
+
+for result in &results {
+    match &result.error {
+        None => println!("Quota altered successfully"),
+        Some(e) => println!("Error: {}", e),
+    }
+}
+
+// Dry-run validation (validate_only = true)
+let results = admin
+    .alter_client_quotas(
+        &[QuotaAlteration {
+            entity: vec![("user", Some("alice"))],
+            ops: vec![("producer_byte_rate", Some(1_048_576.0))],
+        }],
+        true,
+    )
+    .await?;
+```
 
 ## Next Steps
 

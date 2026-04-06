@@ -15,6 +15,16 @@ pub fn duration_to_millis_i32(d: Duration) -> i32 {
     d.as_millis().min(i32::MAX as u128) as i32
 }
 
+/// Convert a `Duration` to milliseconds as `i64`, capping at `i64::MAX`.
+///
+/// `Duration::as_millis()` returns `u128`, which would silently truncate
+/// when cast to `i64`. This function caps the value at `i64::MAX` (~292 million years)
+/// to prevent silent wraparound.
+#[inline]
+pub fn duration_to_millis_i64(d: Duration) -> i64 {
+    d.as_millis().min(i64::MAX as u128) as i64
+}
+
 /// Thread-safe correlation ID generator.
 pub struct CorrelationIdGenerator {
     counter: AtomicI32,
@@ -231,6 +241,27 @@ mod tests {
         // Duration exactly at i32::MAX millis
         let exact = Duration::from_millis(i32::MAX as u64);
         assert_eq!(duration_to_millis_i32(exact), i32::MAX);
+    }
+
+    #[test]
+    fn test_duration_to_millis_i64_normal() {
+        assert_eq!(duration_to_millis_i64(Duration::from_millis(100)), 100);
+        assert_eq!(duration_to_millis_i64(Duration::from_secs(30)), 30_000);
+        assert_eq!(duration_to_millis_i64(Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn test_duration_to_millis_i64_caps_at_max() {
+        // u64::MAX seconds far exceeds i64::MAX millis
+        let huge = Duration::from_secs(u64::MAX);
+        assert_eq!(duration_to_millis_i64(huge), i64::MAX);
+    }
+
+    #[test]
+    fn test_duration_to_millis_i64_exact_max() {
+        // Duration exactly at i64::MAX millis
+        let exact = Duration::from_millis(i64::MAX as u64);
+        assert_eq!(duration_to_millis_i64(exact), i64::MAX);
     }
 }
 
