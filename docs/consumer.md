@@ -883,7 +883,8 @@ let consumer = Consumer::builder()
 KIP-848 introduces a new consumer group protocol where the server performs
 partition assignment instead of the group leader. This eliminates the
 JoinGroup/SyncGroup round-trip and replaces it with a single
-`ConsumerGroupHeartbeat` API (key 68, versions 0–1).
+`ConsumerGroupHeartbeat` API (key 68, version 0; v1 encode/decode exists but
+is not yet activated — see `CONSUMER_GROUP_HEARTBEAT_MAX`).
 
 ### Enabling KIP-848
 
@@ -928,20 +929,26 @@ list). This mirrors the cooperative-rebalance subscription-change detection.
 ### Topic UUID Resolution
 
 The ConsumerGroupHeartbeat response uses 16-byte topic UUIDs in assignments.
-Krafka resolves these UUIDs to topic names using a local UUID → name cache
-(mirroring the Java client's `AbstractMembershipManager` behavior once a name
-has been learned):
+Krafka resolves these UUIDs to topic names with a two-level lookup order:
 
-1. **Local topic names cache** — maps UUID → name from previously resolved
-   assignments and survives metadata cache flushes.
+1. **Cluster metadata lookup** — first consult `ClusterMetadata::topic_name_for_id`.
+   This path only produces results when Metadata API v10+ has been negotiated
+   and activated, because topic UUID → name mappings are not present in earlier
+   Metadata response versions.
+2. **Local topic names cache** — if metadata does not contain the mapping,
+   fall back to a local UUID → name cache built from previously resolved
+   assignments.  This cache survives metadata cache flushes and mirrors the
+   Java client's `AbstractMembershipManager` behavior once a name has been
+   learned.
 
 Successfully resolved names are cached locally. Unresolvable UUIDs still
 trigger an automatic metadata refresh, but the current client negotiates the
-Metadata API only up to v8, so metadata responses do not yet provide the topic
-UUID mapping introduced in Metadata v10+. As a result, unknown UUIDs cannot be
-resolved from metadata alone until Metadata API v10+ support is activated. The
-raw target assignment (with UUIDs) is retained so resolution can be retried
-after future updates or once a UUID → name mapping becomes available.
+Metadata API only up to v8 (`METADATA_MAX`), so metadata responses do not yet
+provide the topic UUID mapping introduced in Metadata v10+. As a result,
+unknown UUIDs cannot be resolved via cluster metadata until Metadata API v10+
+support is negotiated and activated. The raw target assignment (with UUIDs) is
+retained so resolution can be retried after future updates or once a UUID →
+name mapping becomes available.
 
 The `StaleMemberEpoch` error (113) is handled as a transient condition: the
 member epoch is updated from the response and the heartbeat retries on the

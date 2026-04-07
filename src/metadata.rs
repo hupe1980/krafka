@@ -250,10 +250,13 @@ impl ClusterMetadata {
         // Get a connection
         let conn = self.get_any_connection().await?;
 
-        // Negotiate the highest mutually supported version (v0-v12, no gaps).
-        // Cumulative: rack v1, cluster_id v2, offline replicas v5, leader_epoch v7,
-        // authorized-ops v8, flexible encoding v9, topic UUIDs v10.
-        // Falls back to v0 if the broker doesn't advertise Metadata support
+        // Negotiate the highest mutually supported Metadata version up to the
+        // client's supported maximum (`METADATA_MAX`, currently v8).
+        // Cumulative fields available through v8: rack v1, cluster_id v2,
+        // offline replicas v5, leader_epoch v7, authorized-ops v8.
+        // Encode/decode for v9–v13 exists but is not yet activated — see
+        // `METADATA_MAX` in protocol/mod.rs.
+        // Falls back to v0 if the broker doesn’t advertise Metadata support
         // (mirrors the Fetch negotiation pattern in consumer).
         let metadata_version = conn
             .negotiate_api_version_max(ApiKey::Metadata, crate::protocol::versions::METADATA_MAX)

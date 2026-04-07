@@ -268,8 +268,12 @@ pub mod versions {
     pub const DESCRIBE_CLIENT_QUOTAS_MAX: i16 = 0;
     /// Maximum supported AlterClientQuotas version.
     pub const ALTER_CLIENT_QUOTAS_MAX: i16 = 0;
-    /// Maximum supported ConsumerGroupHeartbeat version (v0–v1 — KIP-848 next-gen consumer group).
-    pub const CONSUMER_GROUP_HEARTBEAT_MAX: i16 = 1;
+    /// Maximum supported ConsumerGroupHeartbeat version (KIP-848 next-gen consumer group).
+    ///
+    /// Capped at v0: v1 (KIP-1082) requires client-generated member IDs,
+    /// which are not yet implemented.  Encode/decode for v1 exists and
+    /// will activate once client-side member ID generation is added.
+    pub const CONSUMER_GROUP_HEARTBEAT_MAX: i16 = 0;
 }
 
 #[cfg(test)]
