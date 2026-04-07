@@ -523,14 +523,15 @@ impl MetadataResponse {
     }
 }
 
-/// Decode a `KafkaArray` of newtype wrappers and unwrap each element's inner value.
+/// Decode a non-nullable `KafkaArray` (pre-flexible versions) of newtype wrappers
+/// and unwrap each element's inner value.
+///
+/// Returns an error if the wire value is null (length `-1`), since non-nullable
+/// arrays must have `length >= 0`. Use this only for fields that are
+/// defined as non-nullable in the Kafka protocol schema.
 fn decode_array<W: Decode + Into<T>, T>(buf: &mut impl Buf) -> Result<Vec<T>> {
-    Ok(KafkaArray::<W>::decode(buf)?
-        .0
-        .unwrap_or_default()
-        .into_iter()
-        .map(Into::into)
-        .collect())
+    let items = non_nullable_array(KafkaArray::<W>::decode(buf)?.0)?;
+    Ok(items.into_iter().map(Into::into).collect())
 }
 
 /// Decode a non-nullable compact `KafkaArray` (flexible versions) of newtype wrappers
@@ -559,6 +560,24 @@ fn non_nullable_array<T>(opt: Option<Vec<T>>) -> Result<Vec<T>> {
             "array length -1 (null) is invalid for a non-nullable field",
         )
     })
+}
+
+/// Reject a null value for a non-nullable string field.
+///
+/// In the Kafka wire format, a length of `-1` (non-compact) or varint `0`
+/// (compact) encodes a null string.  Non-nullable fields must never be null —
+/// this helper turns `None` into a protocol error whose message includes the
+/// given `field` name for diagnostics.
+fn non_nullable_string(field: &str, opt: Option<String>) -> Result<String> {
+    opt.ok_or_else(|| crate::error::KrafkaError::protocol(format!("{field} must not be null")))
+}
+
+/// Reject a null value for a non-nullable bytes field.
+///
+/// Same rationale as [`non_nullable_string`] but for `Bytes` payloads
+/// (e.g. member metadata, HMAC, assignment blobs).
+fn non_nullable_bytes(field: &str, opt: Option<Bytes>) -> Result<Bytes> {
+    opt.ok_or_else(|| crate::error::KrafkaError::protocol(format!("{field} must not be null")))
 }
 
 // ── Metadata decode helper newtypes ─────────────────────────────────
@@ -1131,7 +1150,7 @@ impl ProduceResponse {
         let mut responses = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partition_responses = Vec::with_capacity(partition_count);
 
@@ -1174,7 +1193,7 @@ impl ProduceResponse {
         let mut responses = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partition_responses = Vec::with_capacity(partition_count);
 
@@ -1213,7 +1232,7 @@ impl ProduceResponse {
         let mut responses = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partition_responses = Vec::with_capacity(partition_count);
 
@@ -1256,7 +1275,7 @@ impl ProduceResponse {
         let mut responses = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partition_responses = Vec::with_capacity(partition_count);
 
@@ -1305,7 +1324,7 @@ impl ProduceResponse {
         let mut responses = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let name = KafkaString::decode_compact(buf)?.0.unwrap_or_default();
+            let name = non_nullable_string("topic name", KafkaString::decode_compact(buf)?.0)?;
             let part_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
             let mut partition_responses = Vec::with_capacity(part_count);
@@ -1720,7 +1739,7 @@ impl FetchResponse {
         let mut responses = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let topic = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partitions = Vec::with_capacity(partition_count);
 
@@ -1779,7 +1798,7 @@ impl FetchResponse {
         let mut responses = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let topic = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partitions = Vec::with_capacity(partition_count);
 
@@ -1847,7 +1866,7 @@ impl FetchResponse {
         let mut responses = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let topic = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partitions = Vec::with_capacity(partition_count);
 
@@ -1900,7 +1919,7 @@ impl FetchResponse {
         let mut responses = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let topic = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partitions = Vec::with_capacity(partition_count);
 
@@ -1944,7 +1963,7 @@ impl FetchResponse {
         let mut responses = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let topic = KafkaString::decode_compact(buf)?.0.unwrap_or_default();
+            let topic = non_nullable_string("topic name", KafkaString::decode_compact(buf)?.0)?;
             let part_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
             let mut partitions = Vec::with_capacity(part_count);
@@ -2319,14 +2338,14 @@ impl JoinGroupResponse {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let generation_id = i32::decode(buf)?;
         let protocol_name = KafkaString::decode(buf)?.0;
-        let leader = KafkaString::decode(buf)?.0.unwrap_or_default();
-        let member_id = KafkaString::decode(buf)?.0.unwrap_or_default();
+        let leader = non_nullable_string("leader", KafkaString::decode(buf)?.0)?;
+        let member_id = non_nullable_string("member_id", KafkaString::decode(buf)?.0)?;
 
         let member_count = check_decode_array_len(i32::decode(buf)?)?;
         let mut members = Vec::with_capacity(member_count);
         for _ in 0..member_count {
-            let m_id = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let metadata = KafkaBytes::decode(buf)?.0.unwrap_or_default();
+            let m_id = non_nullable_string("member_id", KafkaString::decode(buf)?.0)?;
+            let metadata = non_nullable_bytes("member metadata", KafkaBytes::decode(buf)?.0)?;
             members.push(JoinGroupResponseMember {
                 member_id: m_id,
                 group_instance_id: None,
@@ -2352,14 +2371,14 @@ impl JoinGroupResponse {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let generation_id = i32::decode(buf)?;
         let protocol_name = KafkaString::decode(buf)?.0;
-        let leader = KafkaString::decode(buf)?.0.unwrap_or_default();
-        let member_id = KafkaString::decode(buf)?.0.unwrap_or_default();
+        let leader = non_nullable_string("leader", KafkaString::decode(buf)?.0)?;
+        let member_id = non_nullable_string("member_id", KafkaString::decode(buf)?.0)?;
 
         let member_count = check_decode_array_len(i32::decode(buf)?)?;
         let mut members = Vec::with_capacity(member_count);
         for _ in 0..member_count {
-            let m_id = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let metadata = KafkaBytes::decode(buf)?.0.unwrap_or_default();
+            let m_id = non_nullable_string("member_id", KafkaString::decode(buf)?.0)?;
+            let metadata = non_nullable_bytes("member metadata", KafkaBytes::decode(buf)?.0)?;
             members.push(JoinGroupResponseMember {
                 member_id: m_id,
                 group_instance_id: None,
@@ -2385,15 +2404,15 @@ impl JoinGroupResponse {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let generation_id = i32::decode(buf)?;
         let protocol_name = KafkaString::decode(buf)?.0;
-        let leader = KafkaString::decode(buf)?.0.unwrap_or_default();
-        let member_id = KafkaString::decode(buf)?.0.unwrap_or_default();
+        let leader = non_nullable_string("leader", KafkaString::decode(buf)?.0)?;
+        let member_id = non_nullable_string("member_id", KafkaString::decode(buf)?.0)?;
 
         let member_count = check_decode_array_len(i32::decode(buf)?)?;
         let mut members = Vec::with_capacity(member_count);
         for _ in 0..member_count {
-            let m_id = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let m_id = non_nullable_string("member_id", KafkaString::decode(buf)?.0)?;
             let group_instance_id = KafkaString::decode(buf)?.0;
-            let metadata = KafkaBytes::decode(buf)?.0.unwrap_or_default();
+            let metadata = non_nullable_bytes("member metadata", KafkaBytes::decode(buf)?.0)?;
             members.push(JoinGroupResponseMember {
                 member_id: m_id,
                 group_instance_id,
@@ -2510,7 +2529,7 @@ impl SyncGroupResponse {
     /// Decode from version 0.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
-        let assignment = KafkaBytes::decode(buf)?.0.unwrap_or_default();
+        let assignment = non_nullable_bytes("assignment", KafkaBytes::decode(buf)?.0)?;
 
         Ok(Self {
             throttle_time_ms: 0,
@@ -2525,7 +2544,7 @@ impl SyncGroupResponse {
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
-        let assignment = KafkaBytes::decode(buf)?.0.unwrap_or_default();
+        let assignment = non_nullable_bytes("assignment", KafkaBytes::decode(buf)?.0)?;
 
         Ok(Self {
             throttle_time_ms,
@@ -2714,7 +2733,7 @@ impl LeaveGroupResponse {
         let member_count = check_decode_array_len(i32::decode(buf)?)?;
         let mut members = Vec::with_capacity(member_count);
         for _ in 0..member_count {
-            let member_id = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let member_id = non_nullable_string("member_id", KafkaString::decode(buf)?.0)?;
             let group_instance_id = KafkaString::decode(buf)?.0;
             let member_error_code = ErrorCode::from_i16(i16::decode(buf)?);
             members.push(LeaveGroupResponseMember {
@@ -3019,7 +3038,7 @@ impl OffsetCommitResponse {
         let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partitions = Vec::with_capacity(partition_count);
 
@@ -3053,7 +3072,7 @@ impl OffsetCommitResponse {
         let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let name = KafkaString::decode_compact(buf)?.0.unwrap_or_default();
+            let name = non_nullable_string("topic name", KafkaString::decode_compact(buf)?.0)?;
             let part_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
             let mut partitions = Vec::with_capacity(part_count);
@@ -3196,7 +3215,7 @@ impl ListOffsetsResponse {
         let topic_count = check_decode_array_len(buf.get_i32())?;
         let mut topics = Vec::with_capacity(topic_count);
         for _ in 0..topic_count {
-            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             if buf.remaining() < 4 {
                 return Err(crate::error::KrafkaError::protocol(
                     "ListOffsetsResponse: truncated (no partition count)",
@@ -3519,7 +3538,7 @@ impl OffsetFetchResponse {
         let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partitions = Vec::with_capacity(partition_count);
 
@@ -3550,7 +3569,7 @@ impl OffsetFetchResponse {
         let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partitions = Vec::with_capacity(partition_count);
 
@@ -3583,7 +3602,7 @@ impl OffsetFetchResponse {
         let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let name = KafkaString::decode_compact(buf)?.0.unwrap_or_default();
+            let name = non_nullable_string("topic name", KafkaString::decode_compact(buf)?.0)?;
             let part_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
             let mut partitions = Vec::with_capacity(part_count);
@@ -3790,7 +3809,7 @@ impl CreateTopicsResponse {
         let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
 
             topics.push(CreatableTopicResult {
@@ -3831,7 +3850,7 @@ impl CreateTopicsResponse {
         let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
             let error_message = KafkaString::decode(buf)?.0;
 
@@ -4039,7 +4058,7 @@ impl CreatePartitionsResponse {
         let mut results = Vec::with_capacity(result_count);
 
         for _ in 0..result_count {
-            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
             let error_message = KafkaString::decode(buf)?.0;
 
@@ -4214,13 +4233,13 @@ impl DescribeConfigsResponse {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
             let error_message = KafkaString::decode(buf)?.0;
             let resource_type = ConfigResourceType::from_i8(i8::decode(buf)?);
-            let resource_name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let resource_name = non_nullable_string("resource name", KafkaString::decode(buf)?.0)?;
 
             let config_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut configs = Vec::with_capacity(config_count);
 
             for _ in 0..config_count {
-                let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let name = non_nullable_string("config entry name", KafkaString::decode(buf)?.0)?;
                 let value = KafkaString::decode(buf)?.0;
                 let read_only = i8::decode(buf)? != 0;
                 let is_default = i8::decode(buf)? != 0;
@@ -4357,7 +4376,7 @@ impl AlterConfigsResponse {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
             let error_message = KafkaString::decode(buf)?.0;
             let resource_type = ConfigResourceType::from_i8(i8::decode(buf)?);
-            let resource_name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let resource_name = non_nullable_string("resource name", KafkaString::decode(buf)?.0)?;
 
             results.push(AlterConfigsResult {
                 error_code,
@@ -4577,10 +4596,7 @@ impl SaslAuthenticateResponse {
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let error_message = KafkaString::decode(buf)?.0;
-        let auth_bytes = KafkaBytes::decode(buf)?
-            .0
-            .map(|b| b.to_vec())
-            .unwrap_or_default();
+        let auth_bytes = non_nullable_bytes("auth_bytes", KafkaBytes::decode(buf)?.0)?.to_vec();
 
         Ok(Self {
             error_code,
@@ -4594,10 +4610,7 @@ impl SaslAuthenticateResponse {
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let error_message = KafkaString::decode(buf)?.0;
-        let auth_bytes = KafkaBytes::decode(buf)?
-            .0
-            .map(|b| b.to_vec())
-            .unwrap_or_default();
+        let auth_bytes = non_nullable_bytes("auth_bytes", KafkaBytes::decode(buf)?.0)?.to_vec();
         let session_lifetime_ms = i64::decode(buf)?;
 
         Ok(Self {
@@ -5001,14 +5014,14 @@ impl DescribeAclsResponse {
 
         for _ in 0..resource_count {
             let resource_type = AclResourceType::from_i8(i8::decode(buf)?);
-            let resource_name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let resource_name = non_nullable_string("resource name", KafkaString::decode(buf)?.0)?;
 
             let acl_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut acls = Vec::with_capacity(acl_count);
 
             for _ in 0..acl_count {
-                let principal = KafkaString::decode(buf)?.0.unwrap_or_default();
-                let host = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let principal = non_nullable_string("principal", KafkaString::decode(buf)?.0)?;
+                let host = non_nullable_string("host", KafkaString::decode(buf)?.0)?;
                 let operation = AclOperation::from_i8(i8::decode(buf)?);
                 let permission_type = AclPermissionType::from_i8(i8::decode(buf)?);
 
@@ -5047,15 +5060,15 @@ impl DescribeAclsResponse {
 
         for _ in 0..resource_count {
             let resource_type = AclResourceType::from_i8(i8::decode(buf)?);
-            let resource_name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let resource_name = non_nullable_string("resource name", KafkaString::decode(buf)?.0)?;
             let pattern_type = AclPatternType::from_i8(i8::decode(buf)?);
 
             let acl_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut acls = Vec::with_capacity(acl_count);
 
             for _ in 0..acl_count {
-                let principal = KafkaString::decode(buf)?.0.unwrap_or_default();
-                let host = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let principal = non_nullable_string("principal", KafkaString::decode(buf)?.0)?;
+                let host = non_nullable_string("host", KafkaString::decode(buf)?.0)?;
                 let operation = AclOperation::from_i8(i8::decode(buf)?);
                 let permission_type = AclPermissionType::from_i8(i8::decode(buf)?);
 
@@ -5324,9 +5337,10 @@ impl DeleteAclsResponse {
                 let acl_error_code = ErrorCode::from_i16(i16::decode(buf)?);
                 let acl_error_message = KafkaString::decode(buf)?.0;
                 let resource_type = AclResourceType::from_i8(i8::decode(buf)?);
-                let resource_name = KafkaString::decode(buf)?.0.unwrap_or_default();
-                let principal = KafkaString::decode(buf)?.0.unwrap_or_default();
-                let host = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let resource_name =
+                    non_nullable_string("resource name", KafkaString::decode(buf)?.0)?;
+                let principal = non_nullable_string("principal", KafkaString::decode(buf)?.0)?;
+                let host = non_nullable_string("host", KafkaString::decode(buf)?.0)?;
                 let operation = AclOperation::from_i8(i8::decode(buf)?);
                 let permission_type = AclPermissionType::from_i8(i8::decode(buf)?);
 
@@ -5373,10 +5387,11 @@ impl DeleteAclsResponse {
                 let acl_error_code = ErrorCode::from_i16(i16::decode(buf)?);
                 let acl_error_message = KafkaString::decode(buf)?.0;
                 let resource_type = AclResourceType::from_i8(i8::decode(buf)?);
-                let resource_name = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let resource_name =
+                    non_nullable_string("resource name", KafkaString::decode(buf)?.0)?;
                 let pattern_type = AclPatternType::from_i8(i8::decode(buf)?);
-                let principal = KafkaString::decode(buf)?.0.unwrap_or_default();
-                let host = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let principal = non_nullable_string("principal", KafkaString::decode(buf)?.0)?;
+                let host = non_nullable_string("host", KafkaString::decode(buf)?.0)?;
                 let operation = AclOperation::from_i8(i8::decode(buf)?);
                 let permission_type = AclPermissionType::from_i8(i8::decode(buf)?);
 
@@ -5545,7 +5560,7 @@ impl AddPartitionsToTxnResponse {
         let mut results = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partitions = Vec::with_capacity(partition_count);
 
@@ -5886,7 +5901,7 @@ impl TxnOffsetCommitResponse {
         let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partitions = Vec::with_capacity(partition_count);
 
@@ -6011,20 +6026,22 @@ impl DescribeGroupsResponse {
 
         for _ in 0..group_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
-            let group_id = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let group_state = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let protocol_type = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let protocol_data = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let group_id = non_nullable_string("group_id", KafkaString::decode(buf)?.0)?;
+            let group_state = non_nullable_string("group_state", KafkaString::decode(buf)?.0)?;
+            let protocol_type = non_nullable_string("protocol_type", KafkaString::decode(buf)?.0)?;
+            let protocol_data = non_nullable_string("protocol_data", KafkaString::decode(buf)?.0)?;
 
             let member_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut members = Vec::with_capacity(member_count);
 
             for _ in 0..member_count {
-                let member_id = KafkaString::decode(buf)?.0.unwrap_or_default();
-                let client_id = KafkaString::decode(buf)?.0.unwrap_or_default();
-                let client_host = KafkaString::decode(buf)?.0.unwrap_or_default();
-                let member_metadata = KafkaBytes::decode(buf)?.0.unwrap_or_default();
-                let member_assignment = KafkaBytes::decode(buf)?.0.unwrap_or_default();
+                let member_id = non_nullable_string("member_id", KafkaString::decode(buf)?.0)?;
+                let client_id = non_nullable_string("client_id", KafkaString::decode(buf)?.0)?;
+                let client_host = non_nullable_string("client_host", KafkaString::decode(buf)?.0)?;
+                let member_metadata =
+                    non_nullable_bytes("member_metadata", KafkaBytes::decode(buf)?.0)?;
+                let member_assignment =
+                    non_nullable_bytes("member_assignment", KafkaBytes::decode(buf)?.0)?;
 
                 members.push(DescribeGroupMember {
                     member_id,
@@ -6120,8 +6137,8 @@ impl ListGroupsResponse {
         let mut groups = Vec::with_capacity(group_count);
 
         for _ in 0..group_count {
-            let group_id = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let protocol_type = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let group_id = non_nullable_string("group_id", KafkaString::decode(buf)?.0)?;
+            let protocol_type = non_nullable_string("protocol_type", KafkaString::decode(buf)?.0)?;
             groups.push(ListedGroup {
                 group_id,
                 protocol_type,
@@ -6223,7 +6240,7 @@ impl DeleteRecordsResponse {
         let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partitions = Vec::with_capacity(partition_count);
 
@@ -6371,7 +6388,7 @@ impl OffsetForLeaderEpochResponse {
         let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let topic = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partitions = Vec::with_capacity(partition_count);
 
@@ -6402,7 +6419,7 @@ impl OffsetForLeaderEpochResponse {
         let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let topic = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partitions = Vec::with_capacity(partition_count);
 
@@ -6435,7 +6452,7 @@ impl OffsetForLeaderEpochResponse {
         let mut topics = Vec::with_capacity(topic_count);
 
         for _ in 0..topic_count {
-            let topic = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let topic = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut partitions = Vec::with_capacity(partition_count);
 
@@ -7231,13 +7248,13 @@ impl CreateDelegationTokenResponse {
     /// Decode from version 0.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
-        let principal_type = KafkaString::decode(buf)?.0.unwrap_or_default();
-        let principal_name = KafkaString::decode(buf)?.0.unwrap_or_default();
+        let principal_type = non_nullable_string("principal_type", KafkaString::decode(buf)?.0)?;
+        let principal_name = non_nullable_string("principal_name", KafkaString::decode(buf)?.0)?;
         let issue_timestamp_ms = i64::decode(buf)?;
         let expiry_timestamp_ms = i64::decode(buf)?;
         let max_timestamp_ms = i64::decode(buf)?;
-        let token_id = KafkaString::decode(buf)?.0.unwrap_or_default();
-        let hmac = KafkaBytes::decode(buf)?.0.unwrap_or_default();
+        let token_id = non_nullable_string("token_id", KafkaString::decode(buf)?.0)?;
+        let hmac = non_nullable_bytes("hmac", KafkaBytes::decode(buf)?.0)?;
         let throttle_time_ms = i32::decode(buf)?;
         Ok(Self {
             error_code,
@@ -7505,19 +7522,23 @@ impl DescribeDelegationTokenResponse {
         let mut tokens = Vec::with_capacity(token_count);
 
         for _ in 0..token_count {
-            let principal_type = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let principal_name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let principal_type =
+                non_nullable_string("principal_type", KafkaString::decode(buf)?.0)?;
+            let principal_name =
+                non_nullable_string("principal_name", KafkaString::decode(buf)?.0)?;
             let issue_timestamp_ms = i64::decode(buf)?;
             let expiry_timestamp_ms = i64::decode(buf)?;
             let max_timestamp_ms = i64::decode(buf)?;
-            let token_id = KafkaString::decode(buf)?.0.unwrap_or_default();
-            let hmac = KafkaBytes::decode(buf)?.0.unwrap_or_default();
+            let token_id = non_nullable_string("token_id", KafkaString::decode(buf)?.0)?;
+            let hmac = non_nullable_bytes("hmac", KafkaBytes::decode(buf)?.0)?;
 
             let renewer_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut renewers = Vec::with_capacity(renewer_count);
             for _ in 0..renewer_count {
-                let renewer_type = KafkaString::decode(buf)?.0.unwrap_or_default();
-                let renewer_name = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let renewer_type =
+                    non_nullable_string("renewer_type", KafkaString::decode(buf)?.0)?;
+                let renewer_name =
+                    non_nullable_string("renewer_name", KafkaString::decode(buf)?.0)?;
                 renewers.push(DelegationTokenRenewer {
                     principal_type: renewer_type,
                     principal_name: renewer_name,
@@ -7668,7 +7689,8 @@ impl DescribeClientQuotasResponse {
                 let entity_count = check_decode_array_len(i32::decode(buf)?)?;
                 let mut entity = Vec::with_capacity(entity_count);
                 for _ in 0..entity_count {
-                    let entity_type = KafkaString::decode(buf)?.0.unwrap_or_default();
+                    let entity_type =
+                        non_nullable_string("entity_type", KafkaString::decode(buf)?.0)?;
                     let entity_name = KafkaString::decode(buf)?.0;
                     entity.push(QuotaEntity {
                         entity_type,
@@ -7679,7 +7701,7 @@ impl DescribeClientQuotasResponse {
                 let value_count = check_decode_array_len(i32::decode(buf)?)?;
                 let mut values = Vec::with_capacity(value_count);
                 for _ in 0..value_count {
-                    let key = KafkaString::decode(buf)?.0.unwrap_or_default();
+                    let key = non_nullable_string("quota key", KafkaString::decode(buf)?.0)?;
                     if buf.remaining() < 8 {
                         return Err(KrafkaError::protocol("not enough bytes for f64"));
                     }
@@ -7836,7 +7858,7 @@ impl AlterClientQuotasResponse {
             let entity_count = check_decode_array_len(i32::decode(buf)?)?;
             let mut entity = Vec::with_capacity(entity_count);
             for _ in 0..entity_count {
-                let entity_type = KafkaString::decode(buf)?.0.unwrap_or_default();
+                let entity_type = non_nullable_string("entity_type", KafkaString::decode(buf)?.0)?;
                 let entity_name = KafkaString::decode(buf)?.0;
                 entity.push(AlterQuotaEntityResult {
                     entity_type,

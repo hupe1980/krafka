@@ -944,15 +944,26 @@ Krafka resolves these UUIDs to topic names with a two-level lookup order:
 Successfully resolved names are cached locally. Unresolvable UUIDs still
 trigger an automatic metadata refresh, but the current client negotiates the
 Metadata API only up to v8 (`METADATA_MAX`), so metadata responses do not yet
-provide the topic UUID mapping introduced in Metadata v10+. As a result,
-unknown UUIDs cannot be resolved via cluster metadata until Metadata API v10+
-support is negotiated and activated. The raw target assignment (with UUIDs) is
-retained so resolution can be retried after future updates or once a UUID →
-name mapping becomes available.
+provide the topic UUID mapping introduced in Metadata v10+. If topic UUIDs
+remain unresolved after a metadata refresh during the initial heartbeat
+response handling, the client returns a protocol error rather than silently
+operating with an empty or partial assignment. Inside the background heartbeat
+task, unresolved UUIDs produce a `warn!` log and the assignment is retained
+for re-resolution on the next tick. The raw target assignment (with UUIDs) is
+always retained so resolution can be retried after future updates or once a
+UUID → name mapping becomes available.
 
 The `StaleMemberEpoch` error (113) is handled as a transient condition: the
 member epoch is updated from the response and the heartbeat retries on the
 next tick without triggering a rebalance.
+
+### Dynamic Heartbeat Interval
+
+The coordinator may adjust the heartbeat interval over time by returning a
+different `heartbeat_interval_ms` in the ConsumerGroupHeartbeat response. The
+KIP-848 heartbeat task honours these updates: after each successful response,
+the current interval is compared with the response value and, if changed, the
+timer is reset to the new duration (with a minimum floor of 1 000 ms).
 
 ### Version Notes
 

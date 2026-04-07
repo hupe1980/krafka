@@ -1899,13 +1899,24 @@ impl GroupCoordinator {
                     // partitions will be picked up on the next successful
                     // metadata refresh.
                 }
-                // Re-resolve after refresh (may still have unresolved UUIDs
-                // if the refresh failed, which is harmless — see above).
+                // Re-resolve after refresh. If topic UUIDs are still
+                // unresolved, KIP-848 cannot operate because UUID→name
+                // mappings require Metadata v10+ which is not yet active
+                // (METADATA_MAX = 8). Fail fast with a clear error rather
+                // than silently keeping an empty/partial assignment.
                 let target = self.target_assignment.read().await.clone();
-                let (resolved, _) =
+                let (resolved, still_unresolved) =
                     Self::resolve_assignment(&self.metadata, &self.topic_names_cache, &target)
                         .await;
                 *self.assignment.write().await = resolved;
+
+                if still_unresolved {
+                    return Err(KrafkaError::protocol(
+                        "ConsumerGroupHeartbeat assignment contains topic UUIDs that could not \
+                         be resolved after metadata refresh. KIP-848 requires Metadata v10+ \
+                         to map topic IDs to names.",
+                    ));
+                }
             }
         }
 
@@ -2081,6 +2092,7 @@ impl GroupCoordinator {
 
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut current_interval_ms = interval.as_millis() as i32;
 
             loop {
                 tokio::select! {
@@ -2151,7 +2163,7 @@ impl GroupCoordinator {
                                                         }
                                                         // Re-resolve with updated metadata.
                                                         let target = target_assignment_ref.read().await.clone();
-                                                        let (re_resolved, _) =
+                                                        let (re_resolved, still_unresolved) =
                                                             Self::resolve_assignment(
                                                                 &metadata_ref,
                                                                 &topic_names_cache_ref,
@@ -2159,13 +2171,22 @@ impl GroupCoordinator {
                                                             )
                                                             .await;
                                                         *assignment_ref.write().await = re_resolved;
+
+                                                        if still_unresolved {
+                                                            warn!(
+                                                                "KIP-848 topic UUIDs still unresolved after metadata refresh \
+                                                                 for group '{}'. Metadata v10+ is required to map topic IDs \
+                                                                 to names — current METADATA_MAX does not support this.",
+                                                                group_id
+                                                            );
+                                                        }
                                                     }
                                                 } else {
                                                     // No new assignment — re-resolve target in
                                                     // case a metadata refresh filled in UUIDs.
                                                     let target = target_assignment_ref.read().await.clone();
                                                     if !target.is_empty() {
-                                                        let (resolved, _) =
+                                                        let (resolved, still_unresolved) =
                                                             Self::resolve_assignment(
                                                                 &metadata_ref,
                                                                 &topic_names_cache_ref,
@@ -2173,10 +2194,36 @@ impl GroupCoordinator {
                                                             )
                                                             .await;
                                                         *assignment_ref.write().await = resolved;
+
+                                                        if still_unresolved {
+                                                            warn!(
+                                                                "KIP-848 topic UUIDs still unresolved \
+                                                                 for group '{}'. Metadata v10+ is required \
+                                                                 to map topic IDs to names.",
+                                                                group_id
+                                                            );
+                                                        }
                                                     }
                                                 }
 
                                                 heartbeat_controller.heartbeat_success().await;
+
+                                                // Update interval if the coordinator changed it.
+                                                let new_ms = resp.heartbeat_interval_ms.max(1000);
+                                                if new_ms != current_interval_ms {
+                                                    debug!(
+                                                        "KIP-848 heartbeat interval changed for '{}': {}ms → {}ms",
+                                                        group_id, current_interval_ms, new_ms
+                                                    );
+                                                    current_interval_ms = new_ms;
+                                                    let new_dur = Duration::from_millis(new_ms as u64);
+                                                    tick = tokio::time::interval(new_dur);
+                                                    tick.set_missed_tick_behavior(
+                                                        tokio::time::MissedTickBehavior::Delay,
+                                                    );
+                                                    // Consume the immediate first tick.
+                                                    tick.tick().await;
+                                                }
                                             } else if resp.error_code == ErrorCode::RebalanceInProgress {
                                                 heartbeat_controller.signal_rebalance();
                                             } else if resp.error_code == ErrorCode::StaleMemberEpoch {
