@@ -28,7 +28,8 @@ use crate::protocol::{
     ListOffsetsResponse, MAX_DECODE_ARRAY_LEN, OffsetCommitRequest, OffsetCommitRequestPartition,
     OffsetCommitRequestTopic, OffsetCommitResponse, OffsetFetchRequest, OffsetFetchRequestTopic,
     OffsetFetchResponse, SyncGroupRequest, SyncGroupRequestAssignment, SyncGroupResponse,
-    VersionedDecode, VersionedEncode, versions::CONSUMER_GROUP_HEARTBEAT_MAX,
+    VersionedDecode, VersionedEncode,
+    versions::{CONSUMER_GROUP_HEARTBEAT_MAX, OFFSET_COMMIT_MAX, OFFSET_FETCH_MAX},
 };
 
 /// Callback interface for partition rebalance events.
@@ -1753,10 +1754,15 @@ impl GroupCoordinator {
             self.group_id, member_id, member_epoch
         );
 
-        let hb_version = conn
+        let Some(hb_version) = conn
             .negotiate_api_version_max(ApiKey::ConsumerGroupHeartbeat, CONSUMER_GROUP_HEARTBEAT_MAX)
             .await
-            .unwrap_or(0);
+        else {
+            return Err(KrafkaError::protocol(
+                "ConsumerGroupHeartbeat is unsupported by the broker; \
+                 KIP-848/GroupProtocol::Consumer cannot be used on this cluster",
+            ));
+        };
 
         let response = conn
             .send_request(ApiKey::ConsumerGroupHeartbeat, hb_version, |buf| {
@@ -1971,14 +1977,29 @@ impl GroupCoordinator {
             let hb_version = {
                 let coordinator_conn = coordinator_conn_ref.read().await.clone();
                 if let Some(ref conn) = coordinator_conn {
-                    conn.negotiate_api_version_max(
-                        ApiKey::ConsumerGroupHeartbeat,
-                        CONSUMER_GROUP_HEARTBEAT_MAX,
-                    )
-                    .await
-                    .unwrap_or(0)
+                    match conn
+                        .negotiate_api_version_max(
+                            ApiKey::ConsumerGroupHeartbeat,
+                            CONSUMER_GROUP_HEARTBEAT_MAX,
+                        )
+                        .await
+                    {
+                        Some(v) => v,
+                        None => {
+                            error!(
+                                "ConsumerGroupHeartbeat unsupported by broker; \
+                                 KIP-848 heartbeat task for group '{}' cannot run",
+                                group_id
+                            );
+                            return;
+                        }
+                    }
                 } else {
-                    0
+                    error!(
+                        "No coordinator connection for KIP-848 heartbeat task (group '{}')",
+                        group_id
+                    );
+                    return;
                 }
             };
 
@@ -2251,12 +2272,19 @@ impl GroupCoordinator {
             self.group_id
         );
 
+        let oc_version = conn
+            .negotiate_api_version_max(ApiKey::OffsetCommit, OFFSET_COMMIT_MAX)
+            .await
+            .unwrap_or(2);
+
         let response = conn
-            .send_request(ApiKey::OffsetCommit, 2, |buf| request.encode_v2(buf))
+            .send_request(ApiKey::OffsetCommit, oc_version, |buf| {
+                request.encode_versioned(oc_version, buf)
+            })
             .await?;
 
         let mut buf = response;
-        let commit_response = OffsetCommitResponse::decode_v0(&mut buf)?;
+        let commit_response = OffsetCommitResponse::decode_versioned(oc_version, &mut buf)?;
 
         // Check for errors
         for topic in &commit_response.topics {
@@ -2266,6 +2294,8 @@ impl GroupCoordinator {
                     if partition.error_code == ErrorCode::RebalanceInProgress
                         || partition.error_code == ErrorCode::IllegalGeneration
                         || partition.error_code == ErrorCode::UnknownMemberId
+                        || partition.error_code == ErrorCode::FencedMemberEpoch
+                        || partition.error_code == ErrorCode::StaleMemberEpoch
                     {
                         *self.state.write().await = GroupState::PreparingRebalance;
                         return Err(KrafkaError::broker(
@@ -2317,12 +2347,23 @@ impl GroupCoordinator {
             })
             .collect();
 
+        // For KIP-848, populate MemberId/MemberEpoch so the broker can validate
+        // membership and surface STALE_MEMBER_EPOCH when appropriate.
+        let (offset_fetch_member_id, offset_fetch_member_epoch) = if self.is_consumer_protocol() {
+            (
+                Some(self.member_id.read().await.clone()),
+                *self.member_epoch.read().await,
+            )
+        } else {
+            (None, -1)
+        };
+
         let request = OffsetFetchRequest {
             group_id: self.group_id.clone(),
             topics: Some(topics),
             require_stable: false,
-            member_id: None,
-            member_epoch: -1,
+            member_id: offset_fetch_member_id,
+            member_epoch: offset_fetch_member_epoch,
         };
 
         debug!(
@@ -2331,18 +2372,23 @@ impl GroupCoordinator {
             partitions.len()
         );
 
-        // Use API version 1 for OffsetFetch: v0 returns UNKNOWN_TOPIC_OR_PARTITION
-        // on modern Kafka brokers (Confluent 7.x / Apache Kafka 3.x) because v0
-        // originally targeted ZooKeeper-based offset storage. v1+ correctly reads
-        // from the __consumer_offsets internal topic.
-        // v0 and v1 share identical request wire format; the only response
-        // difference is a trailing error_code in v1 that decode_v0 ignores.
+        // Negotiate version: v0 returns UNKNOWN_TOPIC_OR_PARTITION on modern
+        // brokers, so we default to v1 minimum. Versions v6+ use flexible
+        // encoding, v8-v9 use batched multi-group format with KIP-848 fields.
+        let of_version = conn
+            .negotiate_api_version_max(ApiKey::OffsetFetch, OFFSET_FETCH_MAX)
+            .await
+            .unwrap_or(1)
+            .max(1);
+
         let response = conn
-            .send_request(ApiKey::OffsetFetch, 1, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::OffsetFetch, of_version, |buf| {
+                request.encode_versioned(of_version, buf)
+            })
             .await?;
 
         let mut buf = response;
-        let offset_response = OffsetFetchResponse::decode_v0(&mut buf)?;
+        let offset_response = OffsetFetchResponse::decode_versioned(of_version, &mut buf)?;
         let mut result = HashMap::new();
         for topic in &offset_response.topics {
             for partition in &topic.partitions {
@@ -2630,10 +2676,16 @@ impl GroupCoordinator {
             self.group_id, member_id
         );
 
-        let hb_version = conn
+        let Some(hb_version) = conn
             .negotiate_api_version_max(ApiKey::ConsumerGroupHeartbeat, CONSUMER_GROUP_HEARTBEAT_MAX)
             .await
-            .unwrap_or(0);
+        else {
+            warn!(
+                "ConsumerGroupHeartbeat unsupported; cannot send KIP-848 leave for '{}'",
+                self.group_id
+            );
+            return Ok(());
+        };
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),

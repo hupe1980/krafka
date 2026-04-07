@@ -11,7 +11,10 @@ use super::array_len_i32;
 use super::primitives::{
     Decode, Encode, KafkaArray, KafkaBytes, KafkaString, TaggedFields, TryEncode,
 };
-use super::{check_compact_array_len, check_decode_array_len, check_decode_nullable_array_len};
+use super::{
+    check_compact_array_len, check_compact_nullable_array_len, check_decode_array_len,
+    check_decode_nullable_array_len,
+};
 use crate::error::{ErrorCode, KrafkaError, Result};
 
 /// Trait for encoding a request/response at a specific protocol version.
@@ -144,7 +147,7 @@ impl MetadataRequest {
     /// name string and its own tagged-fields section. `IncludeClusterAuthorizedOperations`
     /// and `IncludeTopicAuthorizedOperations` are still present.
     pub fn encode_v9(&self, buf: &mut impl BufMut) -> Result<()> {
-        self.encode_topic_entries_flexible(buf, false)?;
+        self.encode_topic_entries_flexible(buf, TopicIdMode::Omit)?;
         buf.put_u8(if self.allow_auto_topic_creation { 1 } else { 0 });
         buf.put_u8(0); // include_cluster_authorized_operations (v8-v10)
         buf.put_u8(0); // include_topic_authorized_operations  (v8+)
@@ -152,13 +155,14 @@ impl MetadataRequest {
         Ok(())
     }
 
-    /// Encode for version 10 (flexible).
+    /// Encode for version 10-11 (flexible).
     ///
-    /// v10 adds a 16-byte `TopicId` (UUID) per topic entry. Per the Kafka
-    /// protocol note, v10-v11 should NOT populate the `TopicId` field
-    /// (set to zero UUID). `IncludeClusterAuthorizedOperations` is still present.
+    /// v10 adds a 16-byte `TopicId` (UUID) per topic entry, but v10-v11
+    /// must NOT populate the field — the all-zero UUID is always written.
+    /// `IncludeClusterAuthorizedOperations` is present in v10 but not v11.
     pub fn encode_v10(&self, buf: &mut impl BufMut) -> Result<()> {
-        self.encode_topic_entries_flexible(buf, true)?;
+        // v10-v11: TopicId field present on wire but must be all zeros.
+        self.encode_topic_entries_flexible(buf, TopicIdMode::ForceZero)?;
         buf.put_u8(if self.allow_auto_topic_creation { 1 } else { 0 });
         buf.put_u8(0); // include_cluster_authorized_operations (v8-v10)
         buf.put_u8(0); // include_topic_authorized_operations  (v8+)
@@ -166,12 +170,25 @@ impl MetadataRequest {
         Ok(())
     }
 
-    /// Encode for version 11-12 (flexible).
+    /// Encode for version 11 (flexible).
     ///
     /// v11 deprecates `IncludeClusterAuthorizedOperations` (removed from wire).
-    /// v12 supports `TopicId` for real; we still set it to zeros (name-based lookup).
+    /// TopicId is still forced to zeros (see v10 note).
     pub fn encode_v11(&self, buf: &mut impl BufMut) -> Result<()> {
-        self.encode_topic_entries_flexible(buf, true)?;
+        // v10-v11: TopicId field present on wire but must be all zeros.
+        self.encode_topic_entries_flexible(buf, TopicIdMode::ForceZero)?;
+        buf.put_u8(if self.allow_auto_topic_creation { 1 } else { 0 });
+        buf.put_u8(0); // include_topic_authorized_operations (v8+)
+        TaggedFields::default().try_encode(buf)?;
+        Ok(())
+    }
+
+    /// Encode for version 12-13 (flexible).
+    ///
+    /// v12+ supports real `TopicId` lookups. We still default to the all-zero
+    /// UUID (name-based lookup) when `topic_id` is `None`.
+    pub fn encode_v12(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.encode_topic_entries_flexible(buf, TopicIdMode::UseField)?;
         buf.put_u8(if self.allow_auto_topic_creation { 1 } else { 0 });
         buf.put_u8(0); // include_topic_authorized_operations (v8+)
         TaggedFields::default().try_encode(buf)?;
@@ -184,7 +201,7 @@ impl MetadataRequest {
     fn encode_topic_entries_flexible(
         &self,
         buf: &mut impl BufMut,
-        include_topic_id: bool,
+        topic_id_mode: TopicIdMode,
     ) -> Result<()> {
         match &self.topics {
             None => {
@@ -200,9 +217,12 @@ impl MetadataRequest {
                 })?;
                 crate::util::varint::encode_unsigned_varint(len_plus_one, buf);
                 for t in topics {
-                    if include_topic_id {
-                        // TopicId — 16-byte UUID (zeros = name-based lookup)
-                        buf.put_slice(&t.topic_id.unwrap_or([0u8; 16]));
+                    match topic_id_mode {
+                        TopicIdMode::Omit => {}
+                        TopicIdMode::ForceZero => buf.put_slice(&[0u8; 16]),
+                        TopicIdMode::UseField => {
+                            buf.put_slice(&t.topic_id.unwrap_or([0u8; 16]));
+                        }
                     }
                     // Name — compact string
                     match &t.name {
@@ -216,6 +236,16 @@ impl MetadataRequest {
         }
         Ok(())
     }
+}
+
+/// Controls how `TopicId` is written in MetadataRequest flexible encoding.
+enum TopicIdMode {
+    /// No TopicId field on wire (v9 and earlier flexible versions).
+    Omit,
+    /// TopicId present on wire but forced to all-zero UUID (v10-v11).
+    ForceZero,
+    /// TopicId taken from the struct field, defaulting to zeros (v12+).
+    UseField,
 }
 
 /// Metadata response.
@@ -1871,8 +1901,9 @@ impl FetchResponse {
                 let last_stable_offset = i64::decode(buf)?;
                 let log_start_offset = i64::decode(buf)?;
                 // Aborted transactions: compact nullable array
-                let aborted_tx_count =
-                    check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
+                let aborted_tx_count = check_compact_nullable_array_len(
+                    crate::util::varint::decode_unsigned_varint(buf)?,
+                )?;
                 let mut aborted_transactions = Vec::with_capacity(aborted_tx_count);
                 for _ in 0..aborted_tx_count {
                     aborted_transactions.push(AbortedTransaction {
@@ -6398,7 +6429,8 @@ impl VersionedEncode for MetadataRequest {
             8 => self.encode_v8(buf)?,
             9 => self.encode_v9(buf)?,
             10 => self.encode_v10(buf)?,
-            11..=13 => self.encode_v11(buf)?,
+            11 => self.encode_v11(buf)?,
+            12..=13 => self.encode_v12(buf)?,
             _ => return unsupported_encode!("MetadataRequest", version),
         }
         Ok(())
@@ -9876,8 +9908,7 @@ mod tests {
         assert_eq!(buf, buf2);
     }
 
-    /// v12 routes to encode_v11 (no IncludeClusterAuthorizedOperations) and
-    /// decode_v11 (no ClusterAuthorizedOperations).
+    /// v12 body matches v11 for all_topics() (no per-topic entries to differ).
     #[test]
     fn test_metadata_versioned_v12_dispatches() {
         let request = MetadataRequest::all_topics();

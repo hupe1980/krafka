@@ -16,13 +16,13 @@
 //!
 //! | API | Min | Max | Notes |
 //! |-----|-----|-----|-------|
-//! | Produce | 0 | 11 | v3 transactions, v9 flexible, v10 CurrentLeader tagged |
-//! | Fetch | 0 | 12 | v4 isolation, v7 sessions, v11 closest-replica, v12 flexible |
+//! | Produce | 0 | 3 | v3+ for transactions |
+//! | Fetch | 0 | 11 | v0-4, v7-v11 (v5/v6 unsupported); v4 isolation level, v7 fetch sessions, v9 leader epoch fencing, v11 closest-replica fetching (KIP-392) |
 //! | ListOffsets | 0 | 2 | v2 isolation level |
-//! | Metadata | 0 | 13 | v9 flexible, v10 topic_id, v13 top-level error code |
-//! | OffsetCommit | 0 | 9 | v5 no retention, v6 leader_epoch, v7 instance_id, v8 flexible |
-//! | OffsetFetch | 0 | 9 | v5 leader_epoch, v6 flexible, v8 batched groups, v9 KIP-848 |
-//! | FindCoordinator | 0 | 4 | v3 flexible, v4 batched coordinator lookup (KIP-699) |
+//! | Metadata | 0 | 8 | v1 controller + rack, v2 cluster_id, v3 throttle, v5 offline replicas, v7 leader epoch, v8 adds cluster/topic authorized-operations (decoded and discarded) |
+//! | OffsetCommit | 0 | 2 | v2+ for retention |
+//! | OffsetFetch | 0 | 1 | v1+ for group coordinator |
+//! | FindCoordinator | 0 | 1 | Group/txn coordinator lookup |
 //! | JoinGroup | 0 | 5 | v5+ group instance id |
 //! | Heartbeat | 0 | 3 | v3+ group instance id (KIP-345) |
 //! | SyncGroup | 0 | 3 | v3+ group instance id |
@@ -54,8 +54,8 @@
 //! use krafka::protocol::ApiKey;
 //!
 //! // Negotiate the best version for Fetch
-//! // Prefer Fetch v7..=v12; fall back to v4 if the broker doesn't support v7+.
-//! let fetch_version = match conn.negotiate_api_version(ApiKey::Fetch, 12, 7).await {
+//! // Prefer Fetch v7..=v11; fall back to v4 if the broker doesn't support v7+.
+//! let fetch_version = match conn.negotiate_api_version(ApiKey::Fetch, 11, 7).await {
 //!     Some(v) => v,
 //!     None => conn.negotiate_api_version(ApiKey::Fetch, 4, 4).await
 //!         .expect("broker does not support any usable Fetch version"),
@@ -133,18 +133,41 @@ pub(crate) fn check_decode_nullable_array_len(len: i32) -> Result<usize> {
     check_decode_array_len(len)
 }
 
-/// Validate a compact array length (varint-encoded as `actual_len + 1`).
+/// Validate a non-nullable compact array length (varint-encoded as `actual_len + 1`).
 ///
-/// In flexible Kafka versions, compact arrays use a varint length equal to
-/// the element count plus one. On the wire, a raw value of `0` represents a
-/// null array, and a raw value of `1` represents an empty array (`len == 0`).
+/// In flexible Kafka versions, compact arrays encode the element count plus one
+/// as a varint. A raw value of `1` represents an empty array (`len == 0`).
+/// A raw value of `0` represents a null array and is **invalid** for
+/// non-nullable fields — use [`check_compact_nullable_array_len`] for fields
+/// where null is permitted.
 ///
-/// This helper intentionally collapses both cases to `Ok(0)`: `raw == 0`
-/// returns `Ok(0)` directly, and `raw == 1` decodes to `len == 0` via
-/// `raw - 1`. Values exceeding [`MAX_DECODE_ARRAY_LEN`] are rejected to
-/// prevent OOM from malicious or corrupted broker responses.
+/// Values exceeding [`MAX_DECODE_ARRAY_LEN`] are rejected to prevent OOM from
+/// malicious or corrupted broker responses.
 #[inline]
 pub(crate) fn check_compact_array_len(raw: u32) -> Result<usize> {
+    if raw == 0 {
+        return Err(KrafkaError::protocol(
+            "compact array raw value 0 (null) is invalid for a non-nullable field; \
+             use check_compact_nullable_array_len for nullable arrays",
+        ));
+    }
+    let len = (raw - 1) as usize;
+    if len > MAX_DECODE_ARRAY_LEN {
+        return Err(KrafkaError::protocol(format!(
+            "compact array length {len} exceeds safety limit {MAX_DECODE_ARRAY_LEN}"
+        )));
+    }
+    Ok(len)
+}
+
+/// Like [`check_compact_array_len`], but treats a raw value of `0` as a null
+/// array (returns `Ok(0)`).
+///
+/// In the Kafka wire protocol, some compact array fields are "nullable": a raw
+/// varint of `0` signals an absent/null array. Use this variant for those
+/// fields (e.g. `aborted_transactions` in FetchResponse v12+).
+#[inline]
+pub(crate) fn check_compact_nullable_array_len(raw: u32) -> Result<usize> {
     if raw == 0 {
         return Ok(0);
     }
@@ -166,18 +189,36 @@ pub(crate) fn check_compact_array_len(raw: u32) -> Result<usize> {
 /// encode+decode pair. Advertising a higher version than implemented
 /// causes protocol parse failures.
 pub mod versions {
-    /// Maximum supported Produce version (v0-v2 legacy, v3-v8 transactional, v9-v11 flexible).
-    pub const PRODUCE_MAX: i16 = 11;
-    /// Maximum supported Fetch version (v12 flexible encode/decode, KIP-227/KIP-320/KIP-392).
-    pub const FETCH_MAX: i16 = 12;
-    /// Maximum supported Metadata version (v13 top-level error code).
-    pub const METADATA_MAX: i16 = 13;
-    /// Maximum supported OffsetCommit version (v8-v9 flexible, KIP-848 STALE_MEMBER_EPOCH).
-    pub const OFFSET_COMMIT_MAX: i16 = 9;
-    /// Maximum supported OffsetFetch version (v8-v9 batched groups, KIP-848 MemberId/MemberEpoch).
-    pub const OFFSET_FETCH_MAX: i16 = 9;
-    /// Maximum supported FindCoordinator version (v3 flexible, v4 batched lookup KIP-699).
-    pub const FIND_COORDINATOR_MAX: i16 = 4;
+    /// Maximum supported Produce version (v3 for transactions).
+    ///
+    /// Encode/decode for v9-v11 (flexible) exists but is not yet activated
+    /// — the flexible paths need integration testing against a real broker.
+    pub const PRODUCE_MAX: i16 = 3;
+    /// Maximum supported Fetch version (v11 closest-replica fetching, KIP-392).
+    ///
+    /// Encode/decode for v12 (flexible) exists but is not yet activated
+    /// — needs integration testing against a real broker.
+    pub const FETCH_MAX: i16 = 11;
+    /// Maximum supported Metadata version (v8 authorized-operations).
+    ///
+    /// Encode/decode for v9-v13 (flexible) exists but is not yet activated
+    /// — the flexible paths need integration testing against a real broker.
+    pub const METADATA_MAX: i16 = 8;
+    /// Maximum supported OffsetCommit version (v2 retention).
+    ///
+    /// Encode/decode for v5-v9 exists but is not yet activated
+    /// — needs integration testing against a real broker.
+    pub const OFFSET_COMMIT_MAX: i16 = 2;
+    /// Maximum supported OffsetFetch version (v1 group coordinator).
+    ///
+    /// Encode/decode for v6-v9 exists but is not yet activated
+    /// — needs integration testing against a real broker.
+    pub const OFFSET_FETCH_MAX: i16 = 1;
+    /// Maximum supported FindCoordinator version (v1 key_type for txn coordinators).
+    ///
+    /// Encode/decode for v3-v4 exists but is not yet activated
+    /// — needs integration testing against a real broker.
+    pub const FIND_COORDINATOR_MAX: i16 = 1;
     /// Maximum supported JoinGroup version.
     pub const JOIN_GROUP_MAX: i16 = 5;
     /// Maximum supported Heartbeat version (v3 adds group_instance_id for KIP-345).

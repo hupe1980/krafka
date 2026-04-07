@@ -957,6 +957,13 @@ The ConsumerGroupHeartbeat response may return these KIP-848-specific errors:
 - Requires Kafka 4.0+ (or earlier brokers with `group.coordinator.new.enable=true`)
 - The broker must support API key 68 (`ConsumerGroupHeartbeat`)
 
+### Limitations
+
+The KIP-848 heartbeat flow is fully implemented, but offset commit and fetch
+still use the classic wire format (OffsetCommit v2, OffsetFetch v1).
+Full KIP-848 offset management (v8-v9 flexible format with member epoch)
+will be activated after integration testing against a real broker.
+
 ## Consumer Interceptors
 
 Interceptors allow you to observe records after they are fetched and monitor offset commits.

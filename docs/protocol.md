@@ -36,8 +36,8 @@ This enables dynamic version negotiation for optimal compatibility and feature u
 ```rust
 use krafka::protocol::ApiKey;
 
-// Prefer Fetch v7..=v12; fall back to v4 if the broker doesn't support v7+.
-let fetch_version = match conn.negotiate_api_version(ApiKey::Fetch, 12, 7).await {
+// Prefer Fetch v7..=v11; fall back to v4 if the broker doesn't support v7+.
+let fetch_version = match conn.negotiate_api_version(ApiKey::Fetch, 11, 7).await {
     Some(v) => v,
     None => conn.negotiate_api_version(ApiKey::Fetch, 4, 4).await
         .expect("broker does not support any usable Fetch version"),
@@ -45,7 +45,7 @@ let fetch_version = match conn.negotiate_api_version(ApiKey::Fetch, 12, 7).await
 println!("Using Fetch v{}", fetch_version);
 
 // Convenience method with min=0
-let version = conn.negotiate_api_version_max(ApiKey::Produce, 11).await;
+let version = conn.negotiate_api_version_max(ApiKey::Produce, 3).await;
 ```
 
 ### Client Supported Versions
@@ -54,13 +54,13 @@ Krafka supports the following API version ranges (clamped to match actual encode
 
 | API | Min | Max | Key Features |
 |-----|-----|-----|--------------|
-| Produce | 0 | 11 | v3 transactions, v9 flexible, v10 CurrentLeader tagged |
-| Fetch | 0 | 12 | v4 isolation level, v5–v6 log_start_offset, v7 fetch sessions (KIP-227), v9 leader epoch fencing (KIP-320), v11 closest-replica fetching (KIP-392), v12 flexible |
+| Produce | 0 | 3 | v3+ for transactions |
+| Fetch | 0 | 11 | v4 isolation level, v5–v6 log_start_offset, v7 fetch sessions (KIP-227), v9 leader epoch fencing (KIP-320), v11 closest-replica fetching (KIP-392) |
 | ListOffsets | 0 | 2 | v2 isolation level |
-| Metadata | 0 | 13 | v1 controller + rack, v2 cluster_id, v3 throttle, v5 offline replicas, v7 leader epoch, v8 authorized-ops, v9 flexible encoding, v10 topic_id (UUID), v11 deprecates cluster auth-ops, v13 top-level error code |
-| OffsetCommit | 0 | 9 | v2 retention, v5 no retention, v6 leader_epoch, v7 instance_id, v8 flexible |
-| OffsetFetch | 0 | 9 | v1 group coordinator, v5 leader_epoch, v6 flexible, v8 batched groups, v9 KIP-848 |
-| FindCoordinator | 0 | 4 | v3 flexible, v4 batched coordinator lookup (KIP-699) |
+| Metadata | 0 | 8 | v1 controller + rack, v2 cluster_id, v3 throttle, v5 offline replicas, v7 leader epoch, v8 authorized-ops |
+| OffsetCommit | 0 | 2 | v2+ for retention |
+| OffsetFetch | 0 | 1 | v1+ for group coordinator |
+| FindCoordinator | 0 | 1 | Group/txn coordinator lookup |
 | JoinGroup | 0 | 5 | v5 group instance id |
 | Heartbeat | 0 | 3 | v3 group instance id (KIP-345) |
 | SyncGroup | 0 | 3 | v3 group instance id |
@@ -94,9 +94,9 @@ Client-supported versions are defined in `krafka::protocol::versions`:
 use krafka::protocol::versions;
 
 // Maximum versions the client supports
-let max_fetch = versions::FETCH_MAX;        // 12 (v0-v12, flexible at v12)
-let max_produce = versions::PRODUCE_MAX;    // 11 (v0-v2 legacy, v3-v8 transactional, v9-v11 flexible)
-let max_metadata = versions::METADATA_MAX;  // 13 (v9 flexible, v10 topic_id, v13 top-level error)
+let max_fetch = versions::FETCH_MAX;        // 11 (v0-v11, KIP-392)
+let max_produce = versions::PRODUCE_MAX;    // 3  (v3+ transactions)
+let max_metadata = versions::METADATA_MAX;  // 8  (v8 authorized-ops)
 ```
 
 ## Record Batches
