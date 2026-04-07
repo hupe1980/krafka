@@ -312,4 +312,54 @@ mod tests {
         assert!(check_decode_nullable_array_len(-2).is_err());
         assert!(check_decode_nullable_array_len(i32::MIN).is_err());
     }
+
+    // --- compact array helpers (varint-encoded, raw = count + 1) ---
+
+    #[test]
+    fn compact_array_len_rejects_null() {
+        // raw 0 means null — invalid for non-nullable fields
+        assert!(check_compact_array_len(0).is_err());
+    }
+
+    #[test]
+    fn compact_array_len_empty() {
+        // raw 1 → actual length 0
+        assert_eq!(check_compact_array_len(1).unwrap(), 0);
+    }
+
+    #[test]
+    fn compact_array_len_valid() {
+        assert_eq!(check_compact_array_len(2).unwrap(), 1);
+        assert_eq!(check_compact_array_len(101).unwrap(), 100);
+    }
+
+    #[test]
+    fn compact_array_len_rejects_oversized() {
+        let over = (MAX_DECODE_ARRAY_LEN as u32) + 2; // raw = limit + 1 + 1
+        assert!(check_compact_array_len(over).is_err());
+    }
+
+    #[test]
+    fn compact_nullable_array_len_null() {
+        // raw 0 → null → Ok(0)
+        assert_eq!(check_compact_nullable_array_len(0).unwrap(), 0);
+    }
+
+    #[test]
+    fn compact_nullable_array_len_empty() {
+        // raw 1 → actual length 0
+        assert_eq!(check_compact_nullable_array_len(1).unwrap(), 0);
+    }
+
+    #[test]
+    fn compact_nullable_array_len_valid() {
+        assert_eq!(check_compact_nullable_array_len(2).unwrap(), 1);
+        assert_eq!(check_compact_nullable_array_len(101).unwrap(), 100);
+    }
+
+    #[test]
+    fn compact_nullable_array_len_rejects_oversized() {
+        let over = (MAX_DECODE_ARRAY_LEN as u32) + 2;
+        assert!(check_compact_nullable_array_len(over).is_err());
+    }
 }

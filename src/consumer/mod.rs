@@ -329,7 +329,29 @@ impl Consumer {
         if let Some(ref coordinator) = self.group_coordinator {
             let topic_strings: Vec<String> = topics.iter().map(|s| s.to_string()).collect();
 
-            if coordinator.is_cooperative() {
+            if coordinator.is_consumer_protocol() {
+                // KIP-848: defer to poll(), which handles incremental
+                // assignment via the background heartbeat task.  subscribe()
+                // only updates the subscription; the next heartbeat will carry
+                // the new topic list to the coordinator.
+
+                // Detect topic changes while active — trigger rejoin so the
+                // next poll sends a full heartbeat with the new subscription.
+                {
+                    let state = coordinator.state().await;
+                    if state == GroupState::Stable {
+                        let mut old_sorted = coordinator.subscribed_topics().await;
+                        old_sorted.sort();
+                        let mut new_sorted = topic_strings.clone();
+                        new_sorted.sort();
+                        if old_sorted != new_sorted {
+                            coordinator.trigger_rejoin().await;
+                        }
+                    }
+                }
+
+                coordinator.set_subscribed_topics(topic_strings).await;
+            } else if coordinator.is_cooperative() {
                 // Cooperative (KIP-429): defer the join/sync to poll(), which
                 // implements the full two-phase rebalance protocol (revocations,
                 // on_partitions_revoked callback, second rejoin). subscribe()
@@ -682,7 +704,16 @@ impl Consumer {
             if !topics.is_empty() {
                 coordinator.set_subscribed_topics(topics.clone()).await;
 
-                if coordinator.is_cooperative() {
+                if coordinator.is_consumer_protocol() {
+                    // KIP-848: when the consumer needs to (re)join — initial
+                    // join (Unjoined), post-fencing rejoin, or subscription
+                    // change — send a full heartbeat with all fields and
+                    // (re)start the background task.  When the heartbeat task
+                    // delivered a normal assignment update (Stable, same
+                    // topics), ensure_active_membership is a no-op.
+                    coordinator.ensure_active_membership(&topics).await?;
+                    self.handle_kip848_rebalance(coordinator).await?;
+                } else if coordinator.is_cooperative() {
                     if self.handle_cooperative_rebalance(coordinator).await? {
                         return Ok(true);
                     }
@@ -692,8 +723,10 @@ impl Consumer {
             }
         }
 
-        // Check if inline heartbeat is needed
-        if coordinator.is_heartbeat_overdue().await {
+        // Check if inline heartbeat is needed.
+        // Skip for KIP-848 — the background ConsumerGroupHeartbeat task handles
+        // heartbeats; sending classic Heartbeat requests would use the wrong API.
+        if !coordinator.is_consumer_protocol() && coordinator.is_heartbeat_overdue().await {
             match coordinator.send_heartbeat().await {
                 Ok(status) if coordinator.handle_inline_heartbeat_status(status).await => {
                     debug!("Heartbeat indicated rejoin needed");
@@ -828,6 +861,95 @@ impl Consumer {
         }
 
         Ok(false)
+    }
+
+    /// Handle KIP-848 server-side assignment: diff-based callbacks.
+    ///
+    /// The KIP-848 background heartbeat task stores the new assignment in
+    /// `GroupCoordinator.assignment` and signals rebalance. This method reads
+    /// the current assignment, computes the diff against the Consumer's local
+    /// assignments, fires revocation/assignment callbacks for changed
+    /// partitions, and fetches committed offsets for newly added ones.
+    async fn handle_kip848_rebalance(&self, coordinator: &Arc<GroupCoordinator>) -> Result<()> {
+        let new_assignment = coordinator.assignment().await;
+        let old_assignments = self.assignments.read().await.clone();
+
+        // Compute revoked partitions: in old but not in new.
+        let mut revoked: Vec<TopicPartition> = Vec::new();
+        for (topic, old_parts) in &old_assignments {
+            let new_parts = new_assignment.partitions.get(topic);
+            for &p in old_parts {
+                let retained = new_parts.is_some_and(|np| np.contains(&p));
+                if !retained {
+                    revoked.push(TopicPartition::new(topic, p));
+                }
+            }
+        }
+
+        // Compute newly assigned partitions: in new but not in old.
+        let mut assigned: Vec<TopicPartition> = Vec::new();
+        for (topic, new_parts) in &new_assignment.partitions {
+            let old_parts = old_assignments.get(topic);
+            for &p in new_parts {
+                let was_assigned = old_parts.is_some_and(|op| op.contains(&p));
+                if !was_assigned {
+                    assigned.push(TopicPartition::new(topic, p));
+                }
+            }
+        }
+
+        if revoked.is_empty() && assigned.is_empty() {
+            // No actual change — the heartbeat task may have signalled
+            // rebalance for state reasons (e.g. first assignment).
+            // Still need to ensure our local assignments are in sync.
+            if old_assignments.is_empty() && !new_assignment.partitions.is_empty() {
+                // First assignment: treat all partitions as newly assigned.
+                for (topic, parts) in &new_assignment.partitions {
+                    for &p in parts {
+                        assigned.push(TopicPartition::new(topic, p));
+                    }
+                }
+            } else {
+                return Ok(());
+            }
+        }
+
+        // Fire revocation callback and clean up per-partition state.
+        if !revoked.is_empty() {
+            self.rebalance_listener.on_partitions_revoked(&revoked);
+            let revoked_tuples: Vec<(String, PartitionId)> = revoked
+                .iter()
+                .map(|tp| (tp.topic.clone(), tp.partition))
+                .collect();
+            self.apply_partition_revocations(&revoked_tuples).await;
+        }
+
+        // Update assignments to the new state.
+        {
+            let mut assignments = self.assignments.write().await;
+            assignments.clear();
+            for (topic, partitions) in &new_assignment.partitions {
+                assignments.insert(topic.clone(), partitions.clone());
+            }
+        }
+
+        self.metrics.rebalances.inc();
+
+        // Fire assignment callback.
+        if !assigned.is_empty() {
+            self.rebalance_listener.on_partitions_assigned(&assigned);
+        }
+
+        let count: usize = new_assignment.partitions.values().map(|ps| ps.len()).sum();
+        self.metrics.assigned_partitions.set(count as u64);
+
+        // Fetch committed offsets only for newly assigned partitions.
+        if !assigned.is_empty() {
+            let new_parts = Self::group_partitions_by_topic(&assigned);
+            self.fetch_and_apply_committed_offsets(&new_parts).await?;
+        }
+
+        Ok(())
     }
 
     /// Handle eager rebalance: revoke all partitions, then reassign from scratch.

@@ -908,14 +908,22 @@ consumer.subscribe(&["my-topic"]).await?;
 | Client-side assignment (group leader) | Server-side assignment |
 | Generation ID | Member epoch |
 | `generation_id = -1` (unjoined) | `member_epoch = 0` (join) |
-| LeaveGroup request | `member_epoch = -1` (leave) |
+| LeaveGroup request | `member_epoch = -1` (permanent leave) or `-2` (static member temporary leave) |
 
 With the consumer protocol:
 1. A member joins by sending a heartbeat with `member_epoch = 0`
 2. The coordinator assigns partitions and returns the assignment in the response
 3. Members maintain their session by sending periodic heartbeats
 4. The heartbeat task updates the local assignment and state when the broker returns new assignments
-5. To leave, a member sends a heartbeat with `member_epoch = -1`
+5. The consumer layer computes an incremental diff (revoked vs. newly assigned partitions) and fires targeted `on_partitions_revoked` / `on_partitions_assigned` callbacks — only affected partitions are touched, not all owned partitions
+6. To leave, a dynamic member sends `member_epoch = -1` (permanent). A static member (with `group_instance_id`) sends `member_epoch = -2` (temporary leave — the broker retains the assignment for the session-timeout window so the instance can rejoin quickly)
+
+### Subscription Changes
+
+If `subscribe()` is called with a different topic list while the consumer is
+already active (state `Stable`), the existing heartbeat task is stopped and the
+next `poll()` sends a full heartbeat with all fields (including the new topic
+list). This mirrors the cooperative-rebalance subscription-change detection.
 
 ### Topic UUID Resolution
 
@@ -947,11 +955,34 @@ The ConsumerGroupHeartbeat response may return these KIP-848-specific errors:
 
 | Error Code | Name | Handling |
 |-----------|------|----------|
-| 110 | `FencedMemberEpoch` | Member epoch is stale — abandon partitions and rejoin |
-| 111 | `UnreleasedInstanceId` | Static member instance ID held by another member |
+| 8 | `RebalanceInProgress` | Signal rebalance; consumer processes assignment diff on next poll |
+| 14 | `CoordinatorLoadInProgress` | Transient — retry on next heartbeat tick |
+| 15 | `NotCoordinator` | Clear cached coordinator, trigger rediscovery |
+| 16 | `CoordinatorNotAvailable` | Clear cached coordinator, trigger rediscovery |
+| 110 | `FencedMemberEpoch` | Fenced — heartbeat task stops, member preserves its `member_id` and rejoins with epoch 0 via a full heartbeat (all top-level fields) |
+| 111 | `UnreleasedInstanceId` | Static member instance ID held by another member — same fencing recovery as `FencedMemberEpoch` |
 | 112 | `UnsupportedAssignor` | Server-side assignor not recognized |
 | 113 | `StaleMemberEpoch` | Update local epoch from response, retry on next heartbeat |
 | 128 | `InvalidRegularExpression` | Regex subscription (v1+) is malformed |
+
+### Fencing Recovery
+
+When the heartbeat task receives `FencedMemberEpoch`, `UnknownMemberId`, or
+`UnreleasedInstanceId`, it:
+
+1. Signals the consumer layer (member invalidated + rebalance needed)
+2. Stops the heartbeat task (no more skinny heartbeats with stale state)
+
+On the next `poll()`, the consumer detects the fencing via `needs_rejoin()`:
+
+1. Resets `member_epoch` to 0 and clears assignment/target state
+2. **Preserves `member_id`** — per KIP-848, a fenced member must "rejoin with
+   the same member id and epoch 0"
+3. Sets state to `Unjoined`
+
+The `handle_group_rebalance()` path then calls `ensure_active_membership()`,
+which sends a **full heartbeat** (subscription, rebalance timeout, all
+top-level fields) and starts a fresh heartbeat task.
 
 ### Requirements
 
