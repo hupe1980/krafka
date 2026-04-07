@@ -915,7 +915,7 @@ With the consumer protocol:
 2. The coordinator assigns partitions and returns the assignment in the response
 3. Members maintain their session by sending periodic heartbeats
 4. The heartbeat task updates the local assignment and state when the broker returns new assignments
-5. The consumer layer computes an incremental diff (revoked vs. newly assigned partitions) and fires targeted `on_partitions_revoked` / `on_partitions_assigned` callbacks — only affected partitions are touched, not all owned partitions
+5. The consumer layer computes an incremental diff to determine revoked vs. newly assigned partitions. `on_partitions_revoked` is fired for the affected revoked partitions, while `on_partitions_assigned` receives the **full post-rebalance assignment** (consistent with the cooperative and eager paths in this crate)
 6. To leave, a dynamic member sends `member_epoch = -1` (permanent). A static member (with `group_instance_id`) sends `member_epoch = -2` (temporary leave — the broker retains the assignment for the session-timeout window so the instance can rejoin quickly)
 
 ### Subscription Changes

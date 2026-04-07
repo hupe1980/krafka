@@ -268,6 +268,7 @@ enum TopicIdMode {
 
 /// Metadata response.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct MetadataResponse {
     /// Throttle time in milliseconds.
     pub throttle_time_ms: i32,
@@ -547,6 +548,19 @@ fn decode_compact_array<W: Decode + Into<T>, T>(buf: &mut impl Buf) -> Result<Ve
     Ok(items.into_iter().map(Into::into).collect())
 }
 
+/// Reject null for a non-nullable array field.
+///
+/// In the Kafka wire format, a length of `-1` encodes a null array.
+/// Non-nullable fields must never be null — this helper turns `None` into
+/// a protocol error instead of silently defaulting to an empty `Vec`.
+fn non_nullable_array<T>(opt: Option<Vec<T>>) -> Result<Vec<T>> {
+    opt.ok_or_else(|| {
+        crate::error::KrafkaError::protocol(
+            "array length -1 (null) is invalid for a non-nullable field",
+        )
+    })
+}
+
 // ── Metadata decode helper newtypes ─────────────────────────────────
 //
 // Each newtype decodes a specific wire format version and converts into the
@@ -644,8 +658,8 @@ impl Decode for MetadataPartitionResponseV0 {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let partition_index = i32::decode(buf)?;
         let leader_id = i32::decode(buf)?;
-        let replica_nodes = KafkaArray::<i32>::decode(buf)?.0.unwrap_or_default();
-        let isr_nodes = KafkaArray::<i32>::decode(buf)?.0.unwrap_or_default();
+        let replica_nodes = non_nullable_array(KafkaArray::<i32>::decode(buf)?.0)?;
+        let isr_nodes = non_nullable_array(KafkaArray::<i32>::decode(buf)?.0)?;
         Ok(Self(MetadataPartitionResponse {
             error_code,
             partition_index,
@@ -672,9 +686,9 @@ impl Decode for MetadataPartitionResponseV5 {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let partition_index = i32::decode(buf)?;
         let leader_id = i32::decode(buf)?;
-        let replica_nodes = KafkaArray::<i32>::decode(buf)?.0.unwrap_or_default();
-        let isr_nodes = KafkaArray::<i32>::decode(buf)?.0.unwrap_or_default();
-        let offline_replicas = KafkaArray::<i32>::decode(buf)?.0.unwrap_or_default();
+        let replica_nodes = non_nullable_array(KafkaArray::<i32>::decode(buf)?.0)?;
+        let isr_nodes = non_nullable_array(KafkaArray::<i32>::decode(buf)?.0)?;
+        let offline_replicas = non_nullable_array(KafkaArray::<i32>::decode(buf)?.0)?;
         Ok(Self(MetadataPartitionResponse {
             error_code,
             partition_index,
@@ -702,9 +716,9 @@ impl Decode for MetadataPartitionResponseV7 {
         let partition_index = i32::decode(buf)?;
         let leader_id = i32::decode(buf)?;
         let leader_epoch = i32::decode(buf)?;
-        let replica_nodes = KafkaArray::<i32>::decode(buf)?.0.unwrap_or_default();
-        let isr_nodes = KafkaArray::<i32>::decode(buf)?.0.unwrap_or_default();
-        let offline_replicas = KafkaArray::<i32>::decode(buf)?.0.unwrap_or_default();
+        let replica_nodes = non_nullable_array(KafkaArray::<i32>::decode(buf)?.0)?;
+        let isr_nodes = non_nullable_array(KafkaArray::<i32>::decode(buf)?.0)?;
+        let offline_replicas = non_nullable_array(KafkaArray::<i32>::decode(buf)?.0)?;
         Ok(Self(MetadataPartitionResponse {
             error_code,
             partition_index,
@@ -732,15 +746,26 @@ impl Decode for MetadataPartitionResponseV9 {
         let partition_index = i32::decode(buf)?;
         let leader_id = i32::decode(buf)?;
         let leader_epoch = i32::decode(buf)?;
-        let replica_nodes = KafkaArray::<i32>::decode_compact(buf)?
-            .0
-            .unwrap_or_default();
-        let isr_nodes = KafkaArray::<i32>::decode_compact(buf)?
-            .0
-            .unwrap_or_default();
-        let offline_replicas = KafkaArray::<i32>::decode_compact(buf)?
-            .0
-            .unwrap_or_default();
+        // replica_nodes, isr_nodes, offline_replicas are non-nullable in v9+.
+        // Use check_compact_array_len (rejects varint 0 → null) instead of
+        // decode_compact().unwrap_or_default() which silently coerces null.
+        let replica_count =
+            check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
+        let mut replica_nodes = Vec::with_capacity(replica_count);
+        for _ in 0..replica_count {
+            replica_nodes.push(i32::decode(buf)?);
+        }
+        let isr_count = check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
+        let mut isr_nodes = Vec::with_capacity(isr_count);
+        for _ in 0..isr_count {
+            isr_nodes.push(i32::decode(buf)?);
+        }
+        let offline_count =
+            check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
+        let mut offline_replicas = Vec::with_capacity(offline_count);
+        for _ in 0..offline_count {
+            offline_replicas.push(i32::decode(buf)?);
+        }
         let _ = TaggedFields::decode(buf)?;
         Ok(Self(MetadataPartitionResponse {
             error_code,
@@ -3233,7 +3258,10 @@ pub struct OffsetFetchRequestTopic {
 }
 
 /// OffsetFetch request.
+///
+/// Constructed internally by the consumer group coordinator.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct OffsetFetchRequest {
     /// Group ID.
     pub group_id: String,
@@ -8098,8 +8126,9 @@ impl ConsumerGroupHeartbeatResponse {
     /// Decode the assignment field.
     ///
     /// Non-tagged nullable structs in flexible versions use a single byte
-    /// as presence marker: a negative value (0xff) means null, any
-    /// non-negative value (typically 0x01) means the struct fields follow.
+    /// as presence marker: `(byte) -1` (`0xff`) means null, `(byte) 1` means
+    /// the struct fields follow. This matches the Kafka Java code generator’s
+    /// `readByte() < 0` pattern for non-tagged nullable struct fields.
     fn decode_assignment(buf: &mut impl Buf) -> Result<Option<ConsumerGroupAssignment>> {
         if buf.remaining() < 1 {
             return Err(KrafkaError::protocol(
@@ -9863,6 +9892,99 @@ mod tests {
         assert_eq!(resp.topics.len(), 1);
         assert_eq!(resp.topics[0].name.as_deref(), Some("my-t"));
         assert!(resp.topics[0].topic_id.is_none());
+    }
+
+    /// v9: exercises the partition-level decode path (replica_nodes, isr_nodes, offline_replicas)
+    /// through `check_compact_array_len` + varint, ensuring non-nullable compact arrays are
+    /// correctly decoded.
+    #[test]
+    fn test_metadata_response_decode_v9_with_partitions() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+
+        // 0 brokers
+        buf.put_u8(1); // compact array 0+1
+
+        // cluster_id = null
+        buf.put_u8(0);
+        buf.put_i32(-1); // controller_id
+
+        // 1 topic
+        buf.put_u8(2); // 1+1
+        buf.put_i16(0); // error_code
+        buf.put_u8(3); // compact string "t1" (len 2+1)
+        buf.put_slice(b"t1");
+        buf.put_u8(0); // is_internal = false
+
+        // 1 partition
+        buf.put_u8(2); // compact array 1+1
+        buf.put_i16(0); // partition error_code
+        buf.put_i32(0); // partition_index
+        buf.put_i32(1); // leader_id
+        buf.put_i32(5); // leader_epoch
+
+        // replica_nodes: [1, 2, 3]
+        buf.put_u8(4); // compact array 3+1
+        buf.put_i32(1);
+        buf.put_i32(2);
+        buf.put_i32(3);
+        // isr_nodes: [1, 2]
+        buf.put_u8(3); // compact array 2+1
+        buf.put_i32(1);
+        buf.put_i32(2);
+        // offline_replicas: [] (empty, not null)
+        buf.put_u8(1); // compact array 0+1
+        buf.put_u8(0); // tagged fields (partition)
+
+        buf.put_i32(-2147483648_i32); // topic_authorized_operations
+        buf.put_u8(0); // tagged fields (topic)
+
+        buf.put_i32(-2147483648_i32); // cluster_authorized_operations
+        buf.put_u8(0); // tagged fields (top-level)
+
+        let resp = MetadataResponse::decode_versioned(9, &mut buf.freeze()).unwrap();
+        assert_eq!(resp.topics.len(), 1);
+        let topic = &resp.topics[0];
+        assert_eq!(topic.name.as_deref(), Some("t1"));
+        assert_eq!(topic.partitions.len(), 1);
+        let part = &topic.partitions[0];
+        assert_eq!(part.partition_index, 0);
+        assert_eq!(part.leader_id, 1);
+        assert_eq!(part.leader_epoch, 5);
+        assert_eq!(part.replica_nodes, vec![1, 2, 3]);
+        assert_eq!(part.isr_nodes, vec![1, 2]);
+        assert!(part.offline_replicas.is_empty());
+    }
+
+    /// v9: null non-nullable compact array (varint 0) in partition must be rejected.
+    #[test]
+    fn test_metadata_response_decode_v9_null_replica_array_rejected() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_u8(1); // 0 brokers
+        buf.put_u8(0); // cluster_id = null
+        buf.put_i32(-1); // controller_id
+
+        // 1 topic, 1 partition
+        buf.put_u8(2); // 1 topic
+        buf.put_i16(0); // error_code
+        buf.put_u8(3); // compact string "t1"
+        buf.put_slice(b"t1");
+        buf.put_u8(0); // is_internal = false
+        buf.put_u8(2); // 1 partition
+        buf.put_i16(0); // partition error_code
+        buf.put_i32(0); // partition_index
+        buf.put_i32(1); // leader_id
+        buf.put_i32(0); // leader_epoch
+        // replica_nodes: null (varint 0 — invalid for non-nullable field)
+        buf.put_u8(0);
+
+        let err = MetadataResponse::decode_versioned(9, &mut buf.freeze()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("null") || msg.contains("0"),
+            "expected null/0 rejection error, got: {msg}"
+        );
     }
 
     /// v10: flexible encoding + topic_id UUID.

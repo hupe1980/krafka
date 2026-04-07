@@ -221,10 +221,12 @@ impl ClusterMetadata {
     /// Uses a coalescing lock to prevent concurrent metadata stampedes.
     /// If a refresh is already in-flight, callers wait for it to complete.
     ///
-    /// The Metadata API version is negotiated with the broker (v0-v12).
+    /// The Metadata API version is negotiated with the broker (v0–v8).
     /// Versions are cumulative: rack v1, cluster_id v2, offline replicas v5,
-    /// leader_epoch v7, authorized-ops v8, flexible encoding v9, topic UUIDs v10.
-    /// Falls back to v0 if the broker doesn't advertise Metadata support.
+    /// leader_epoch v7, authorized-ops v8.
+    /// Encode/decode for v9–v13 (flexible encoding v9, topic UUIDs v10) exists
+    /// but is not yet activated — see `METADATA_MAX`.
+    /// Falls back to v0 if the broker doesn’t advertise Metadata support.
     pub async fn refresh_for_topics(&self, topics: Option<&[&str]>) -> Result<()> {
         // Coalesce concurrent calls: only one refresh in-flight at a time
         let _guard = self.refresh_lock.lock().await;

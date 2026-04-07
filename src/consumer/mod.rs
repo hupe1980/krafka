@@ -932,9 +932,15 @@ impl Consumer {
                         assigned.push(TopicPartition::new(topic, p));
                     }
                 }
-            } else {
+            } else if !old_assignments.is_empty() || new_assignment.partitions.is_empty() {
+                // Truly no change (same partitions, or both empty).
                 return Ok(());
             }
+            // Remaining case: old_assignments is empty AND
+            // new_assignment is also empty — this is a first heartbeat
+            // with an empty assignment. Fall through to fire the
+            // on_partitions_assigned callback (matching cooperative/eager
+            // paths which always fire the callback on first assignment).
         }
 
         // Fire revocation callback and clean up per-partition state.
@@ -959,22 +965,21 @@ impl Consumer {
         self.metrics.rebalances.inc();
 
         // Fire assignment callback with the full post-rebalance assignment
-        // (matching Java ConsumerRebalanceListener.onPartitionsAssigned
-        // contract and the cooperative/eager paths in this crate).
-        if !assigned.is_empty() {
-            let full_assignment: Vec<TopicPartition> = new_assignment
-                .partitions
-                .iter()
-                .flat_map(|(topic, partitions)| {
-                    partitions
-                        .iter()
-                        .copied()
-                        .map(move |partition| TopicPartition::new(topic, partition))
-                })
-                .collect();
-            self.rebalance_listener
-                .on_partitions_assigned(&full_assignment);
-        }
+        // (consistent with the cooperative/eager paths in this crate).
+        // Always fire, even when the assignment is empty or only revocations
+        // occurred, so listeners can react to the post-rebalance state.
+        let full_assignment: Vec<TopicPartition> = new_assignment
+            .partitions
+            .iter()
+            .flat_map(|(topic, partitions)| {
+                partitions
+                    .iter()
+                    .copied()
+                    .map(move |partition| TopicPartition::new(topic, partition))
+            })
+            .collect();
+        self.rebalance_listener
+            .on_partitions_assigned(&full_assignment);
 
         let count: usize = new_assignment.partitions.values().map(|ps| ps.len()).sum();
         self.metrics.assigned_partitions.set(count as u64);
