@@ -2279,6 +2279,7 @@ impl GroupCoordinator {
                 }
             }
 
+            heartbeat_controller.stop();
             debug!("KIP-848 heartbeat task ended for group '{}'", group_id);
         });
     }
@@ -2933,6 +2934,7 @@ impl GroupCoordinator {
     /// coordinator revoked all partitions on fencing.
     async fn reset_for_kip848_fencing(&self) {
         *self.member_epoch.write().await = 0;
+        *self.generation_id.write().await = -1;
         *self.state.write().await = GroupState::Unjoined;
         *self.assignment.write().await = MemberAssignment::empty();
         self.target_assignment.write().await.clear();

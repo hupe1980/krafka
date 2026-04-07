@@ -148,10 +148,12 @@ struct MetadataCache {
     /// Topics by name. Wrapped in `Arc` so that partial-refresh clones of
     /// the map are O(n) ref-count bumps instead of O(n) deep copies.
     topics: HashMap<String, Arc<TopicInfo>>,
-    /// Topic UUID → topic name map. Populated from metadata v10+ responses
-    /// where each topic includes a 16-byte topic_id. Used by the KIP-848
-    /// consumer protocol to resolve topic UUIDs in assignments.
-    topic_ids: HashMap<[u8; 16], String>,
+    /// Topic UUID → topic name map. Topic names are wrapped in `Arc` so that
+    /// partial-refresh clones of the map are O(n) ref-count bumps instead of
+    /// O(n) deep copies. Populated from metadata v10+ responses where each
+    /// topic includes a 16-byte topic_id. Used by the KIP-848 consumer
+    /// protocol to resolve topic UUIDs in assignments.
+    topic_ids: HashMap<[u8; 16], Arc<String>>,
     /// When the metadata was last updated.
     last_updated: Instant,
 }
@@ -363,7 +365,7 @@ impl ClusterMetadata {
 
             // Track topic UUID → name mapping (v10+).
             if let Some(tid) = topic.topic_id {
-                topic_ids.insert(tid, topic_name.clone());
+                topic_ids.insert(tid, Arc::new(topic_name.clone()));
             }
 
             let partitions: Vec<PartitionInfo> = topic
@@ -434,7 +436,11 @@ impl ClusterMetadata {
     /// includes a `topic_id`. Returns `None` if the UUID is unknown — the
     /// caller should trigger a metadata refresh and retry.
     pub fn topic_name_for_id(&self, topic_id: &[u8; 16]) -> Option<String> {
-        self.cache.load().topic_ids.get(topic_id).cloned()
+        self.cache
+            .load()
+            .topic_ids
+            .get(topic_id)
+            .map(|name| (**name).clone())
     }
 
     /// Get all topics.
@@ -623,8 +629,13 @@ mod tests {
         assert!(cache.topic_ids.is_empty());
 
         let uuid: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-        cache.topic_ids.insert(uuid, "my-topic".to_string());
-        assert_eq!(cache.topic_ids.get(&uuid), Some(&"my-topic".to_string()));
+        cache
+            .topic_ids
+            .insert(uuid, Arc::new("my-topic".to_string()));
+        assert_eq!(
+            cache.topic_ids.get(&uuid),
+            Some(&Arc::new("my-topic".to_string()))
+        );
     }
 
     #[test]
