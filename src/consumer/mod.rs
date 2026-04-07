@@ -559,12 +559,18 @@ impl Consumer {
         assignment: &MemberAssignment,
         old_assignments: &HashMap<String, Vec<PartitionId>>,
     ) -> Result<()> {
+        // Build HashSet index for O(1) membership checks.
+        let old_sets: HashMap<&String, HashSet<PartitionId>> = old_assignments
+            .iter()
+            .map(|(t, ps)| (t, ps.iter().copied().collect()))
+            .collect();
+
         // Determine newly assigned partitions (new - old)
         let mut newly_assigned = Vec::new();
         for (topic, partitions) in &assignment.partitions {
-            let old_parts = old_assignments.get(topic);
+            let old_set = old_sets.get(topic);
             for &p in partitions {
-                let is_new = old_parts.is_none_or(|old| !old.contains(&p));
+                let is_new = old_set.is_none_or(|os| !os.contains(&p));
                 if is_new {
                     newly_assigned.push(TopicPartition::new(topic, p));
                 }
@@ -580,10 +586,9 @@ impl Consumer {
             }
         }
 
-        // Notify listener with the full post-rebalance assignment
-        // (matching Java ConsumerRebalanceListener.onPartitionsAssigned
-        // contract), not just the diff. Always fire, even when the
-        // assignment is empty (e.g., more consumers than partitions).
+        // Notify listener with the full post-rebalance assignment,
+        // not just the diff. Always fire, even when the assignment
+        // is empty (e.g., more consumers than partitions).
         let full_assigned: Vec<TopicPartition> = assignment
             .partitions
             .iter()
@@ -828,15 +833,22 @@ impl Consumer {
             // No revocations — assignment is final in one round
             let old_assignments = self.assignments.read().await.clone();
 
+            // Build HashSet index of new partitions for O(1) lookups.
+            let new_sets: HashMap<&String, HashSet<PartitionId>> = new_assignment
+                .partitions
+                .iter()
+                .map(|(t, ps)| (t, ps.iter().copied().collect()))
+                .collect();
+
             // Determine partitions removed in this rebalance
             // (e.g., reassigned to another member, topic deleted).
             // This is a clean cooperative revocation, not an unclean
             // loss, so use on_partitions_revoked (not on_partitions_lost).
             let mut revoked_parts: Vec<TopicPartition> = Vec::new();
             for (topic, partitions) in &old_assignments {
-                let new_parts = new_assignment.partitions.get(topic);
+                let new_set = new_sets.get(topic);
                 for &p in partitions {
-                    let gone = new_parts.is_none_or(|np| !np.contains(&p));
+                    let gone = new_set.is_none_or(|ns| !ns.contains(&p));
                     if gone {
                         revoked_parts.push(TopicPartition::new(topic, p));
                     }
@@ -874,26 +886,37 @@ impl Consumer {
         let new_assignment = coordinator.assignment().await;
         let old_assignments = self.assignments.read().await.clone();
 
+        // Build HashSets for O(n) diffing instead of Vec::contains.
+        let old_sets: HashMap<&String, HashSet<PartitionId>> = old_assignments
+            .iter()
+            .map(|(t, ps)| (t, ps.iter().copied().collect()))
+            .collect();
+        let new_sets: HashMap<&String, HashSet<PartitionId>> = new_assignment
+            .partitions
+            .iter()
+            .map(|(t, ps)| (t, ps.iter().copied().collect()))
+            .collect();
+
         // Compute revoked partitions: in old but not in new.
         let mut revoked: Vec<TopicPartition> = Vec::new();
-        for (topic, old_parts) in &old_assignments {
-            let new_parts = new_assignment.partitions.get(topic);
-            for &p in old_parts {
-                let retained = new_parts.is_some_and(|np| np.contains(&p));
+        for (topic, old_set) in &old_sets {
+            let new_set = new_sets.get(*topic);
+            for &p in old_set {
+                let retained = new_set.is_some_and(|ns| ns.contains(&p));
                 if !retained {
-                    revoked.push(TopicPartition::new(topic, p));
+                    revoked.push(TopicPartition::new(*topic, p));
                 }
             }
         }
 
         // Compute newly assigned partitions: in new but not in old.
         let mut assigned: Vec<TopicPartition> = Vec::new();
-        for (topic, new_parts) in &new_assignment.partitions {
-            let old_parts = old_assignments.get(topic);
-            for &p in new_parts {
-                let was_assigned = old_parts.is_some_and(|op| op.contains(&p));
+        for (topic, new_set) in &new_sets {
+            let old_set = old_sets.get(*topic);
+            for &p in new_set {
+                let was_assigned = old_set.is_some_and(|os| os.contains(&p));
                 if !was_assigned {
-                    assigned.push(TopicPartition::new(topic, p));
+                    assigned.push(TopicPartition::new(*topic, p));
                 }
             }
         }
@@ -935,9 +958,22 @@ impl Consumer {
 
         self.metrics.rebalances.inc();
 
-        // Fire assignment callback.
+        // Fire assignment callback with the full post-rebalance assignment
+        // (matching Java ConsumerRebalanceListener.onPartitionsAssigned
+        // contract and the cooperative/eager paths in this crate).
         if !assigned.is_empty() {
-            self.rebalance_listener.on_partitions_assigned(&assigned);
+            let full_assignment: Vec<TopicPartition> = new_assignment
+                .partitions
+                .iter()
+                .flat_map(|(topic, partitions)| {
+                    partitions
+                        .iter()
+                        .copied()
+                        .map(move |partition| TopicPartition::new(topic, partition))
+                })
+                .collect();
+            self.rebalance_listener
+                .on_partitions_assigned(&full_assignment);
         }
 
         let count: usize = new_assignment.partitions.values().map(|ps| ps.len()).sum();
@@ -4125,11 +4161,15 @@ mod tests {
         new: &HashMap<String, Vec<PartitionId>>,
         old: &HashMap<String, Vec<PartitionId>>,
     ) -> Vec<TopicPartition> {
+        let old_sets: HashMap<&String, HashSet<PartitionId>> = old
+            .iter()
+            .map(|(t, ps)| (t, ps.iter().copied().collect()))
+            .collect();
         let mut result = Vec::new();
         for (topic, partitions) in new {
-            let old_parts = old.get(topic);
+            let old_set = old_sets.get(topic);
             for &p in partitions {
-                let is_new = old_parts.is_none_or(|o| !o.contains(&p));
+                let is_new = old_set.is_none_or(|os| !os.contains(&p));
                 if is_new {
                     result.push(TopicPartition::new(topic, p));
                 }
@@ -4144,11 +4184,15 @@ mod tests {
         old: &HashMap<String, Vec<PartitionId>>,
         new: &HashMap<String, Vec<PartitionId>>,
     ) -> Vec<TopicPartition> {
+        let new_sets: HashMap<&String, HashSet<PartitionId>> = new
+            .iter()
+            .map(|(t, ps)| (t, ps.iter().copied().collect()))
+            .collect();
         let mut result = Vec::new();
         for (topic, partitions) in old {
-            let new_parts = new.get(topic);
+            let new_set = new_sets.get(topic);
             for &p in partitions {
-                let gone = new_parts.is_none_or(|np| !np.contains(&p));
+                let gone = new_set.is_none_or(|ns| !ns.contains(&p));
                 if gone {
                     result.push(TopicPartition::new(topic, p));
                 }

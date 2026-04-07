@@ -928,17 +928,20 @@ list). This mirrors the cooperative-rebalance subscription-change detection.
 ### Topic UUID Resolution
 
 The ConsumerGroupHeartbeat response uses 16-byte topic UUIDs in assignments.
-Krafka resolves these UUIDs to topic names using a two-level lookup (mirroring
-the Java client's `AbstractMembershipManager`):
+Krafka resolves these UUIDs to topic names using a local UUID → name cache
+(mirroring the Java client's `AbstractMembershipManager` behavior once a name
+has been learned):
 
-1. **Global metadata cache** — populated from Metadata API v10+ responses.
-2. **Local topic names cache** — maps UUID → name from previously resolved
-   assignments, survives metadata cache flushes.
+1. **Local topic names cache** — maps UUID → name from previously resolved
+   assignments and survives metadata cache flushes.
 
-Successfully resolved names are cached locally. Unresolvable UUIDs trigger an
-automatic metadata refresh. The raw target assignment (with UUIDs) is stored
-so re-resolution occurs after every metadata update — unresolved partitions are
-never permanently lost.
+Successfully resolved names are cached locally. Unresolvable UUIDs still
+trigger an automatic metadata refresh, but the current client negotiates the
+Metadata API only up to v8, so metadata responses do not yet provide the topic
+UUID mapping introduced in Metadata v10+. As a result, unknown UUIDs cannot be
+resolved from metadata alone until Metadata API v10+ support is activated. The
+raw target assignment (with UUIDs) is retained so resolution can be retried
+after future updates or once a UUID → name mapping becomes available.
 
 The `StaleMemberEpoch` error (113) is handled as a transient condition: the
 member epoch is updated from the response and the heartbeat retries on the

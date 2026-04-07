@@ -63,8 +63,11 @@ pub trait ConsumerRebalanceListener: Send + Sync {
     /// The `partitions` parameter contains the **full set** of partitions now
     /// owned by this consumer after the rebalance — not just newly added ones.
     /// It may include partitions that were already assigned before the rebalance.
-    /// This matches the Java `ConsumerRebalanceListener.onPartitionsAssigned`
-    /// contract.
+    ///
+    /// > **Note:** The Java `ConsumerRebalanceListener.onPartitionsAssigned`
+    /// > passes only *newly added* partitions for cooperative rebalances.
+    /// > This crate always passes the full set for simplicity and to avoid
+    /// > protocol-dependent callback semantics.
     fn on_partitions_assigned(&self, partitions: &[crate::consumer::TopicPartition]);
 
     /// Called before partitions are revoked from this consumer.
@@ -2357,10 +2360,19 @@ impl GroupCoordinator {
         }
 
         let conn = self.get_coordinator_connection().await?;
+
+        let oc_version = conn
+            .negotiate_api_version_max(ApiKey::OffsetCommit, OFFSET_COMMIT_MAX)
+            .await
+            .unwrap_or(2);
+
         let member_id = self.member_id.read().await.clone();
         // For KIP-848 (consumer protocol), the "generation ID" wire field
         // carries the member epoch instead of the classic generation ID.
-        let generation_id_or_member_epoch = if self.is_consumer_protocol() {
+        // This semantic overload is only valid from v9+ — at earlier versions
+        // the broker strictly validates against the classic group generation,
+        // so we fall back to the classic generation_id.
+        let generation_id = if self.is_consumer_protocol() && oc_version >= 9 {
             *self.member_epoch.read().await
         } else {
             *self.generation_id.read().await
@@ -2388,7 +2400,7 @@ impl GroupCoordinator {
 
         let request = OffsetCommitRequest {
             group_id: self.group_id.clone(),
-            generation_id: generation_id_or_member_epoch,
+            generation_id,
             member_id,
             group_instance_id: self.group_instance_id.clone(),
             retention_time_ms: -1,
@@ -2400,11 +2412,6 @@ impl GroupCoordinator {
             offsets.len(),
             self.group_id
         );
-
-        let oc_version = conn
-            .negotiate_api_version_max(ApiKey::OffsetCommit, OFFSET_COMMIT_MAX)
-            .await
-            .unwrap_or(2);
 
         let response = conn
             .send_request(ApiKey::OffsetCommit, oc_version, |buf| {
@@ -2496,16 +2503,29 @@ impl GroupCoordinator {
             })
             .collect();
 
+        // Negotiate version: v0 returns UNKNOWN_TOPIC_OR_PARTITION on modern
+        // brokers, so we floor at v1. At v6+ the wire switches to flexible
+        // encoding, v8+ uses the batched Groups format (KIP-709), and v9
+        // adds MemberId/MemberEpoch for KIP-848 epoch validation.
+        let of_version = conn
+            .negotiate_api_version_max(ApiKey::OffsetFetch, OFFSET_FETCH_MAX)
+            .await
+            .unwrap_or(1)
+            .max(1);
+
         // For KIP-848, populate MemberId/MemberEpoch so the broker can validate
         // membership and surface STALE_MEMBER_EPOCH when appropriate.
-        let (offset_fetch_member_id, offset_fetch_member_epoch) = if self.is_consumer_protocol() {
-            (
-                Some(self.member_id.read().await.clone()),
-                *self.member_epoch.read().await,
-            )
-        } else {
-            (None, -1)
-        };
+        // These fields only exist on the wire from v9+; at earlier versions
+        // the encode path ignores them, so we leave defaults.
+        let (offset_fetch_member_id, offset_fetch_member_epoch) =
+            if self.is_consumer_protocol() && of_version >= 9 {
+                (
+                    Some(self.member_id.read().await.clone()),
+                    *self.member_epoch.read().await,
+                )
+            } else {
+                (None, -1)
+            };
 
         let request = OffsetFetchRequest {
             group_id: self.group_id.clone(),
@@ -2520,16 +2540,6 @@ impl GroupCoordinator {
             self.group_id,
             partitions.len()
         );
-
-        // Negotiate version: v0 returns UNKNOWN_TOPIC_OR_PARTITION on modern
-        // brokers, so we floor at v1. At v6+ the wire switches to flexible
-        // encoding, v8+ uses the batched Groups format (KIP-709), and v9
-        // adds MemberId/MemberEpoch for KIP-848 epoch validation.
-        let of_version = conn
-            .negotiate_api_version_max(ApiKey::OffsetFetch, OFFSET_FETCH_MAX)
-            .await
-            .unwrap_or(1)
-            .max(1);
 
         let response = conn
             .send_request(ApiKey::OffsetFetch, of_version, |buf| {
