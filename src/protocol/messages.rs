@@ -219,9 +219,26 @@ impl MetadataRequest {
                 crate::util::varint::encode_unsigned_varint(len_plus_one, buf);
                 for t in topics {
                     match topic_id_mode {
-                        TopicIdMode::Omit => {}
-                        TopicIdMode::ForceZero => buf.put_slice(&[0u8; 16]),
+                        TopicIdMode::Omit | TopicIdMode::ForceZero => {
+                            // v9-v11: TopicId is absent or zero — name is required.
+                            if t.name.is_none() {
+                                return Err(crate::error::KrafkaError::protocol(
+                                    "MetadataRequest topic name must be non-null \
+                                     when TopicId is absent or zero",
+                                ));
+                            }
+                            if matches!(topic_id_mode, TopicIdMode::ForceZero) {
+                                buf.put_slice(&[0u8; 16]);
+                            }
+                        }
                         TopicIdMode::UseField => {
+                            // v12+: at least one of topic_id/name must be set.
+                            if t.topic_id.is_none() && t.name.is_none() {
+                                return Err(crate::error::KrafkaError::protocol(
+                                    "MetadataRequest topic must have at least one \
+                                     of topic_id or name set",
+                                ));
+                            }
                             buf.put_slice(&t.topic_id.unwrap_or([0u8; 16]));
                         }
                     }
@@ -543,7 +560,9 @@ struct MetadataBrokerV0(MetadataBroker);
 impl Decode for MetadataBrokerV0 {
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         let node_id = i32::decode(buf)?;
-        let host = KafkaString::decode(buf)?.0.unwrap_or_default();
+        let host = KafkaString::decode(buf)?.0.ok_or_else(|| {
+            KrafkaError::protocol("metadata broker host must be a non-null string")
+        })?;
         let port = i32::decode(buf)?;
         Ok(Self(MetadataBroker {
             node_id,
@@ -566,7 +585,9 @@ struct MetadataBrokerV1(MetadataBroker);
 impl Decode for MetadataBrokerV1 {
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         let node_id = i32::decode(buf)?;
-        let host = KafkaString::decode(buf)?.0.unwrap_or_default();
+        let host = KafkaString::decode(buf)?.0.ok_or_else(|| {
+            KrafkaError::protocol("metadata broker host must be a non-null string")
+        })?;
         let port = i32::decode(buf)?;
         let rack = KafkaString::decode(buf)?.0;
         Ok(Self(MetadataBroker {
@@ -590,7 +611,9 @@ struct MetadataBrokerV9(MetadataBroker);
 impl Decode for MetadataBrokerV9 {
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         let node_id = i32::decode(buf)?;
-        let host = KafkaString::decode_compact(buf)?.0.unwrap_or_default();
+        let host = KafkaString::decode_compact(buf)?.0.ok_or_else(|| {
+            KrafkaError::protocol("metadata broker host must be a non-null compact string")
+        })?;
         let port = i32::decode(buf)?;
         let rack = KafkaString::decode_compact(buf)?.0;
         let _ = TaggedFields::decode(buf)?;
@@ -2038,7 +2061,9 @@ impl FindCoordinatorResponse {
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let node_id = i32::decode(buf)?;
-        let host = KafkaString::decode(buf)?.0.unwrap_or_default();
+        let host = KafkaString::decode(buf)?.0.ok_or_else(|| {
+            KrafkaError::protocol("FindCoordinator host must be a non-null string")
+        })?;
         let port = i32::decode(buf)?;
 
         Ok(Self {
@@ -2057,7 +2082,9 @@ impl FindCoordinatorResponse {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let error_message = KafkaString::decode(buf)?.0;
         let node_id = i32::decode(buf)?;
-        let host = KafkaString::decode(buf)?.0.unwrap_or_default();
+        let host = KafkaString::decode(buf)?.0.ok_or_else(|| {
+            KrafkaError::protocol("FindCoordinator host must be a non-null string")
+        })?;
         let port = i32::decode(buf)?;
 
         Ok(Self {
@@ -2076,7 +2103,9 @@ impl FindCoordinatorResponse {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let error_message = KafkaString::decode_compact(buf)?.0;
         let node_id = i32::decode(buf)?;
-        let host = KafkaString::decode_compact(buf)?.0.unwrap_or_default();
+        let host = KafkaString::decode_compact(buf)?.0.ok_or_else(|| {
+            KrafkaError::protocol("FindCoordinator host must be a non-null compact string")
+        })?;
         let port = i32::decode(buf)?;
         let _ = TaggedFields::decode(buf)?;
 
@@ -2106,7 +2135,9 @@ impl FindCoordinatorResponse {
         // Decode first coordinator
         let _key = KafkaString::decode_compact(buf)?.0;
         let node_id = i32::decode(buf)?;
-        let host = KafkaString::decode_compact(buf)?.0.unwrap_or_default();
+        let host = KafkaString::decode_compact(buf)?.0.ok_or_else(|| {
+            KrafkaError::protocol("FindCoordinator host must be a non-null compact string")
+        })?;
         let port = i32::decode(buf)?;
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let error_message = KafkaString::decode_compact(buf)?.0;
@@ -3427,11 +3458,9 @@ impl OffsetFetchResponse {
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
         if group_count == 0 {
             let _ = TaggedFields::decode(buf)?;
-            return Ok(Self {
-                throttle_time_ms,
-                topics: Vec::new(),
-                error_code: ErrorCode::None,
-            });
+            return Err(KrafkaError::protocol(
+                "OffsetFetchResponse v8-v9 contained empty Groups array",
+            ));
         }
 
         // Decode first group
