@@ -1690,6 +1690,14 @@ impl GroupCoordinator {
                                 }
                                 Err(e) => {
                                     warn!("Heartbeat failed for group '{}': {}", group_id, e);
+                                    // Network error — the coordinator connection
+                                    // may be dead. Clear it and exit the heartbeat
+                                    // loop so the consumer poll loop can rediscover
+                                    // the coordinator and rejoin.
+                                    *coordinator_conn_ref.write().await = None;
+                                    heartbeat_controller.signal_rebalance();
+                                    heartbeat_controller.stop();
+                                    break;
                                 }
                             }
                         }
@@ -2266,9 +2274,13 @@ impl GroupCoordinator {
                                         group_id, e
                                     );
                                     // Network error — the coordinator connection
-                                    // may be dead. Clear it so the next attempt
-                                    // triggers rediscovery.
+                                    // may be dead. Clear it and exit the heartbeat
+                                    // loop so the consumer poll loop can rediscover
+                                    // the coordinator and rejoin via
+                                    // ensure_active_membership().
                                     *coordinator_conn_ref.write().await = None;
+                                    heartbeat_controller.signal_rebalance();
+                                    break;
                                 }
                             }
                         }
@@ -2372,6 +2384,9 @@ impl GroupCoordinator {
         // This semantic overload is only valid from v9+ — at earlier versions
         // the broker strictly validates against the classic group generation,
         // so we fall back to the classic generation_id.
+        //
+        // NOTE: Currently inactive — OFFSET_COMMIT_MAX caps negotiation
+        // below v9.  This branch activates once the MAX is bumped.
         let generation_id = if self.is_consumer_protocol() && oc_version >= 9 {
             *self.member_epoch.read().await
         } else {
@@ -2517,6 +2532,9 @@ impl GroupCoordinator {
         // membership and surface STALE_MEMBER_EPOCH when appropriate.
         // These fields only exist on the wire from v9+; at earlier versions
         // the encode path ignores them, so we leave defaults.
+        //
+        // NOTE: Currently inactive — OFFSET_FETCH_MAX caps negotiation
+        // below v9.  This branch activates once the MAX is bumped.
         let (offset_fetch_member_id, offset_fetch_member_epoch) =
             if self.is_consumer_protocol() && of_version >= 9 {
                 (

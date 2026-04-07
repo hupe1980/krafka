@@ -932,15 +932,17 @@ impl Consumer {
                         assigned.push(TopicPartition::new(topic, p));
                     }
                 }
-            } else if !old_assignments.is_empty() || new_assignment.partitions.is_empty() {
-                // Truly no change (same partitions, or both empty).
+            } else if !old_assignments.is_empty() {
+                // Had partitions before, diff shows no movement — nothing to do.
                 return Ok(());
             }
-            // Remaining case: old_assignments is empty AND
-            // new_assignment is also empty — this is a first heartbeat
-            // with an empty assignment. Fall through to fire the
-            // on_partitions_assigned callback (matching cooperative/eager
-            // paths which always fire the callback on first assignment).
+            // Remaining case: old_assignments is empty.  Either
+            //   (a) new is also empty  — first heartbeat with an empty
+            //       assignment (more consumers than partitions), or
+            //   (b) new is non-empty   — handled by the branch above.
+            // For (a) we fall through so on_partitions_assigned fires,
+            // matching cooperative/eager paths which always invoke the
+            // callback on the initial assignment.
         }
 
         // Fire revocation callback and clean up per-partition state.

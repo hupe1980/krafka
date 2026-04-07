@@ -994,10 +994,14 @@ top-level fields) and starts a fresh heartbeat task.
 
 ### Limitations
 
-Offset commit and fetch use flexible wire format at v8-v9, enabling
-member-epoch validation. Multi-group batching (OffsetFetch v8+) extracts only
-the first group — future work may expose the full batched response. Full
-transactional offset support (`TxnOffsetCommit`) is not yet implemented.
+Offset commit and fetch currently negotiate only the older protocol versions
+supported by the client (`OFFSET_COMMIT_MAX=2`, `OFFSET_FETCH_MAX=1`), so
+the flexible v8–v9 wire format with member-epoch validation and OffsetFetch
+v8+ multi-group batching are **not yet active**. Encode/decode for those
+versions exists and the version-gating code is in place — bumping the MAX
+constants will activate them once integration-tested against a v9-capable
+broker. Full transactional offset support (`TxnOffsetCommit`) is not yet
+implemented.
 
 ## Consumer Interceptors
 
