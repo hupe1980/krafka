@@ -88,10 +88,11 @@ impl MetadataRequest {
         ApiKey::Metadata
     }
 
-    /// Extract topic names as `KafkaString`s for wire encoding.
+    /// Extract topic names as `KafkaString`s for wire encoding (v0-v8).
     ///
-    /// Returns an error if any entry has `name: None` — topic IDs are only
-    /// supported from v10+, and we cap at v8.
+    /// Used only by pre-flexible encode paths. Returns an error if any
+    /// entry has `name: None`; flexible encoders (v9+) handle topic IDs
+    /// directly via [`encode_topic_entries_flexible`].
     fn topic_names(topics: &[MetadataRequestTopic]) -> Result<Vec<KafkaString>> {
         topics
             .iter()
@@ -514,14 +515,19 @@ fn decode_array<W: Decode + Into<T>, T>(buf: &mut impl Buf) -> Result<Vec<T>> {
         .collect())
 }
 
-/// Decode a compact `KafkaArray` (flexible versions) of newtype wrappers and unwrap each.
+/// Decode a non-nullable compact `KafkaArray` (flexible versions) of newtype wrappers
+/// and unwrap each.
+///
+/// Returns an error if the wire value is null (raw varint 0), since non-nullable
+/// compact arrays must have `raw >= 1`. Use this only for fields that are
+/// defined as non-nullable in the Kafka protocol schema.
 fn decode_compact_array<W: Decode + Into<T>, T>(buf: &mut impl Buf) -> Result<Vec<T>> {
-    Ok(KafkaArray::<W>::decode_compact(buf)?
-        .0
-        .unwrap_or_default()
-        .into_iter()
-        .map(Into::into)
-        .collect())
+    let items = KafkaArray::<W>::decode_compact(buf)?.0.ok_or_else(|| {
+        crate::error::KrafkaError::protocol(
+            "compact array raw value 0 (null) is invalid for a non-nullable field",
+        )
+    })?;
+    Ok(items.into_iter().map(Into::into).collect())
 }
 
 // ── Metadata decode helper newtypes ─────────────────────────────────

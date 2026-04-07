@@ -1774,26 +1774,41 @@ impl GroupCoordinator {
         let hb_response = ConsumerGroupHeartbeatResponse::decode_versioned(hb_version, &mut buf)?;
 
         if !hb_response.error_code.is_ok() {
-            // Handle fencing and unknown member errors
-            if hb_response.error_code == ErrorCode::UnknownMemberId
-                || hb_response.error_code == ErrorCode::FencedMemberEpoch
-            {
-                warn!(
-                    "ConsumerGroupHeartbeat error for group '{}': {:?} — resetting member identity",
-                    self.group_id, hb_response.error_code
+            // StaleMemberEpoch: our epoch is behind. The response carries the
+            // correct epoch — update local state and fall through to the
+            // normal state-update path so the next heartbeat uses the fresh
+            // epoch. This is recoverable and should not be surfaced as an error.
+            if hb_response.error_code == ErrorCode::StaleMemberEpoch {
+                debug!(
+                    "ConsumerGroupHeartbeat StaleMemberEpoch for group '{}' — \
+                     updating epoch to {}",
+                    self.group_id, hb_response.member_epoch
                 );
-                self.reset_member_identity().await;
+                *self.member_epoch.write().await = hb_response.member_epoch;
+                // Fall through — the rest of the method updates member_id,
+                // assignment, etc. from this same response.
+            } else {
+                // Handle fencing and unknown member errors
+                if hb_response.error_code == ErrorCode::UnknownMemberId
+                    || hb_response.error_code == ErrorCode::FencedMemberEpoch
+                {
+                    warn!(
+                        "ConsumerGroupHeartbeat error for group '{}': {:?} — resetting member identity",
+                        self.group_id, hb_response.error_code
+                    );
+                    self.reset_member_identity().await;
+                }
+                return Err(KrafkaError::broker(
+                    hb_response.error_code,
+                    format!(
+                        "ConsumerGroupHeartbeat failed: {}",
+                        hb_response
+                            .error_message
+                            .as_deref()
+                            .unwrap_or("unknown error")
+                    ),
+                ));
             }
-            return Err(KrafkaError::broker(
-                hb_response.error_code,
-                format!(
-                    "ConsumerGroupHeartbeat failed: {}",
-                    hb_response
-                        .error_message
-                        .as_deref()
-                        .unwrap_or("unknown error")
-                ),
-            ));
         }
 
         // Update member state from the response
@@ -2100,15 +2115,18 @@ impl GroupCoordinator {
                                                 heartbeat_controller.signal_rebalance();
                                             } else if resp.error_code == ErrorCode::StaleMemberEpoch {
                                                 // Stale epoch: our epoch is behind.
-                                                // The coordinator will send an updated
-                                                // epoch on the next heartbeat — just
-                                                // log and treat as success so we retry
-                                                // on the next tick (no rebalance).
+                                                // The coordinator includes the current
+                                                // epoch in the response, so update local
+                                                // state before the next heartbeat to
+                                                // avoid retrying indefinitely with a
+                                                // stale value.
+                                                *member_epoch_ref.write().await = resp.member_epoch;
                                                 debug!(
                                                     "KIP-848 StaleMemberEpoch for '{}' — \
-                                                     will retry on next heartbeat",
-                                                    group_id
+                                                     updated epoch to {}, will retry on next heartbeat",
+                                                    group_id, resp.member_epoch
                                                 );
+                                                heartbeat_controller.heartbeat_success().await;
                                             } else if resp.error_code == ErrorCode::UnknownMemberId
                                                 || resp.error_code == ErrorCode::FencedMemberEpoch
                                             {

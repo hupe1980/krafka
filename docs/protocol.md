@@ -57,7 +57,7 @@ Krafka supports the following API version ranges (clamped to match actual encode
 | Produce | 0 | 3 | v3+ for transactions |
 | Fetch | 0 | 11 | v4 isolation level, v5–v6 log_start_offset, v7 fetch sessions (KIP-227), v9 leader epoch fencing (KIP-320), v11 closest-replica fetching (KIP-392) |
 | ListOffsets | 0 | 2 | v2 isolation level |
-| Metadata | 0 | 8 | v1 controller + rack, v2 cluster_id, v3 throttle, v5 offline replicas, v7 leader epoch, v8 authorized-ops |
+| Metadata | 0 | 12 | v1 controller + rack, v2 cluster_id, v3 throttle, v5 offline replicas, v7 leader epoch, v8 authorized-ops, v9 flexible, v10 topic UUIDs (KIP-848) |
 | OffsetCommit | 0 | 2 | v2+ for retention |
 | OffsetFetch | 0 | 1 | v1+ for group coordinator |
 | FindCoordinator | 0 | 1 | Group/txn coordinator lookup |
@@ -96,7 +96,7 @@ use krafka::protocol::versions;
 // Maximum versions the client supports
 let max_fetch = versions::FETCH_MAX;        // 11 (v0-v11, KIP-392)
 let max_produce = versions::PRODUCE_MAX;    // 3  (v3+ transactions)
-let max_metadata = versions::METADATA_MAX;  // 8  (v8 authorized-ops)
+let max_metadata = versions::METADATA_MAX;  // 12 (v12 flexible + topic UUIDs)
 ```
 
 ## Record Batches

@@ -933,7 +933,8 @@ so re-resolution occurs after every metadata update — unresolved partitions ar
 never permanently lost.
 
 The `StaleMemberEpoch` error (113) is handled as a transient condition: the
-heartbeat task logs at debug level and retries on the next tick.
+member epoch is updated from the response and the heartbeat retries on the
+next tick without triggering a rebalance.
 
 ### Version Notes
 
@@ -949,7 +950,7 @@ The ConsumerGroupHeartbeat response may return these KIP-848-specific errors:
 | 110 | `FencedMemberEpoch` | Member epoch is stale — abandon partitions and rejoin |
 | 111 | `UnreleasedInstanceId` | Static member instance ID held by another member |
 | 112 | `UnsupportedAssignor` | Server-side assignor not recognized |
-| 113 | `StaleMemberEpoch` | Retry after receiving an updated epoch |
+| 113 | `StaleMemberEpoch` | Update local epoch from response, retry on next heartbeat |
 | 128 | `InvalidRegularExpression` | Regex subscription (v1+) is malformed |
 
 ### Requirements
@@ -959,10 +960,10 @@ The ConsumerGroupHeartbeat response may return these KIP-848-specific errors:
 
 ### Limitations
 
-The KIP-848 heartbeat flow is fully implemented, but offset commit and fetch
-still use the classic wire format (OffsetCommit v2, OffsetFetch v1).
-Full KIP-848 offset management (v8-v9 flexible format with member epoch)
-will be activated after integration testing against a real broker.
+Offset commit and fetch still use the classic wire format (OffsetCommit v2,
+OffsetFetch v1). Full KIP-848 offset management (v8-v9 flexible format with
+member epoch) will be activated after integration testing against a compatible
+broker.
 
 ## Consumer Interceptors
 

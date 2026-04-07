@@ -19,7 +19,7 @@
 //! | Produce | 0 | 3 | v3+ for transactions |
 //! | Fetch | 0 | 11 | v0-4, v7-v11 (v5/v6 unsupported); v4 isolation level, v7 fetch sessions, v9 leader epoch fencing, v11 closest-replica fetching (KIP-392) |
 //! | ListOffsets | 0 | 2 | v2 isolation level |
-//! | Metadata | 0 | 8 | v1 controller + rack, v2 cluster_id, v3 throttle, v5 offline replicas, v7 leader epoch, v8 adds cluster/topic authorized-operations (decoded and discarded) |
+//! | Metadata | 0 | 12 | v1 controller + rack, v2 cluster_id, v3 throttle, v5 offline replicas, v7 leader epoch, v8 authorized-ops, v9 flexible, v10 topic UUIDs (KIP-848) |
 //! | OffsetCommit | 0 | 2 | v2+ for retention |
 //! | OffsetFetch | 0 | 1 | v1+ for group coordinator |
 //! | FindCoordinator | 0 | 1 | Group/txn coordinator lookup |
@@ -199,11 +199,13 @@ pub mod versions {
     /// Encode/decode for v12 (flexible) exists but is not yet activated
     /// — needs integration testing against a real broker.
     pub const FETCH_MAX: i16 = 11;
-    /// Maximum supported Metadata version (v8 authorized-operations).
+    /// Maximum supported Metadata version (v12 flexible, topic UUIDs).
     ///
-    /// Encode/decode for v9-v13 (flexible) exists but is not yet activated
-    /// — the flexible paths need integration testing against a real broker.
-    pub const METADATA_MAX: i16 = 8;
+    /// v9 switches to flexible encoding, v10 adds topic UUIDs (required
+    /// for KIP-848 assignment resolution), v11-v12 drop
+    /// `ClusterAuthorizedOperations`. v13 encode/decode exists but is
+    /// gated behind a future bump once brokers supporting it are common.
+    pub const METADATA_MAX: i16 = 12;
     /// Maximum supported OffsetCommit version (v2 retention).
     ///
     /// Encode/decode for v5-v9 exists but is not yet activated

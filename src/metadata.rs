@@ -219,9 +219,9 @@ impl ClusterMetadata {
     /// Uses a coalescing lock to prevent concurrent metadata stampedes.
     /// If a refresh is already in-flight, callers wait for it to complete.
     ///
-    /// The Metadata API version is negotiated with the broker (v0-v8, no gaps).
-    /// Versions are cumulative: rack since v1, cluster_id since v2,
-    /// offline replicas since v5, and leader_epoch since v7.
+    /// The Metadata API version is negotiated with the broker (v0-v12).
+    /// Versions are cumulative: rack v1, cluster_id v2, offline replicas v5,
+    /// leader_epoch v7, authorized-ops v8, flexible encoding v9, topic UUIDs v10.
     /// Falls back to v0 if the broker doesn't advertise Metadata support.
     pub async fn refresh_for_topics(&self, topics: Option<&[&str]>) -> Result<()> {
         // Coalesce concurrent calls: only one refresh in-flight at a time
@@ -246,8 +246,9 @@ impl ClusterMetadata {
         // Get a connection
         let conn = self.get_any_connection().await?;
 
-        // Negotiate the highest mutually supported version (v0-v8, no gaps).
-        // Cumulative: rack since v1, cluster_id v2, offline replicas v5, leader_epoch v7.
+        // Negotiate the highest mutually supported version (v0-v12, no gaps).
+        // Cumulative: rack v1, cluster_id v2, offline replicas v5, leader_epoch v7,
+        // authorized-ops v8, flexible encoding v9, topic UUIDs v10.
         // Falls back to v0 if the broker doesn't advertise Metadata support
         // (mirrors the Fetch negotiation pattern in consumer).
         let metadata_version = conn
