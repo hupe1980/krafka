@@ -20,13 +20,15 @@ use crate::error::{ErrorCode, KrafkaError, Result};
 use crate::metadata::ClusterMetadata;
 use crate::network::{BrokerConnection, ConnectionPool};
 use crate::protocol::{
-    ApiKey, FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse,
-    JoinGroupRequest, JoinGroupRequestProtocol, JoinGroupResponse, JoinGroupResponseMember,
-    LeaveGroupMember, LeaveGroupRequest, LeaveGroupResponse, ListOffsetsRequest,
-    ListOffsetsRequestPartition, ListOffsetsRequestTopic, ListOffsetsResponse,
-    MAX_DECODE_ARRAY_LEN, OffsetCommitRequest, OffsetCommitRequestPartition,
+    ApiKey, ConsumerGroupHeartbeatRequest, ConsumerGroupHeartbeatResponse,
+    ConsumerGroupTopicPartitions, FindCoordinatorRequest, FindCoordinatorResponse,
+    HeartbeatRequest, HeartbeatResponse, JoinGroupRequest, JoinGroupRequestProtocol,
+    JoinGroupResponse, JoinGroupResponseMember, LeaveGroupMember, LeaveGroupRequest,
+    LeaveGroupResponse, ListOffsetsRequest, ListOffsetsRequestPartition, ListOffsetsRequestTopic,
+    ListOffsetsResponse, MAX_DECODE_ARRAY_LEN, OffsetCommitRequest, OffsetCommitRequestPartition,
     OffsetCommitRequestTopic, OffsetCommitResponse, OffsetFetchRequest, OffsetFetchRequestTopic,
     OffsetFetchResponse, SyncGroupRequest, SyncGroupRequestAssignment, SyncGroupResponse,
+    VersionedDecode, VersionedEncode, versions::CONSUMER_GROUP_HEARTBEAT_MAX,
 };
 
 /// Callback interface for partition rebalance events.
@@ -958,9 +960,9 @@ pub struct GroupCoordinator {
     /// Generation ID.
     generation_id: Arc<RwLock<i32>>,
     /// Current group state.
-    state: RwLock<GroupState>,
+    state: Arc<RwLock<GroupState>>,
     /// Current partition assignment.
-    assignment: RwLock<MemberAssignment>,
+    assignment: Arc<RwLock<MemberAssignment>>,
     /// Heartbeat controller.
     heartbeat_controller: Arc<HeartbeatController>,
     /// Channel to control heartbeat task.
@@ -979,6 +981,22 @@ pub struct GroupCoordinator {
     sticky_assignor: CooperativeStickyAssignor,
     /// Transaction isolation level (0 = read_uncommitted, 1 = read_committed).
     isolation_level: i8,
+    /// Group protocol selection (KIP-848).
+    group_protocol: crate::consumer::config::GroupProtocol,
+    /// Member epoch for the KIP-848 consumer protocol.
+    ///
+    /// Replaces `generation_id` semantics: 0 = join, -1 = leave,
+    /// -2 = static member temporary leave.
+    member_epoch: Arc<RwLock<i32>>,
+    /// Raw target assignment received from the KIP-848 coordinator (topic UUIDs
+    /// and partition lists). Stored so that unresolved UUIDs can be re-resolved
+    /// on the next metadata refresh instead of being permanently lost.
+    target_assignment: Arc<RwLock<Vec<ConsumerGroupTopicPartitions>>>,
+    /// Local cache of topic UUID → name mappings discovered during assignment
+    /// resolution. Serves as a fallback when the metadata cache is flushed
+    /// (e.g. during a full refresh). Mirrors the Java client's
+    /// `assignedTopicNamesCache`. Cleared on leave/reset/fencing.
+    topic_names_cache: Arc<RwLock<HashMap<[u8; 16], String>>>,
 }
 
 impl GroupCoordinator {
@@ -1002,8 +1020,8 @@ impl GroupCoordinator {
             coordinator_id: RwLock::new(None),
             member_id: Arc::new(RwLock::new(String::new())),
             generation_id: Arc::new(RwLock::new(-1)),
-            state: RwLock::new(GroupState::Unjoined),
-            assignment: RwLock::new(MemberAssignment::empty()),
+            state: Arc::new(RwLock::new(GroupState::Unjoined)),
+            assignment: Arc::new(RwLock::new(MemberAssignment::empty())),
             heartbeat_controller: Arc::new(HeartbeatController::new(
                 heartbeat_interval,
                 session_timeout,
@@ -1016,6 +1034,10 @@ impl GroupCoordinator {
             group_instance_id: None,
             sticky_assignor: CooperativeStickyAssignor::new(),
             isolation_level: 0,
+            group_protocol: crate::consumer::config::GroupProtocol::Classic,
+            member_epoch: Arc::new(RwLock::new(0)),
+            target_assignment: Arc::new(RwLock::new(Vec::new())),
+            topic_names_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1041,10 +1063,21 @@ impl GroupCoordinator {
         self
     }
 
+    /// Set the group protocol (KIP-848, builder pattern).
+    pub fn with_group_protocol(mut self, protocol: crate::consumer::config::GroupProtocol) -> Self {
+        self.group_protocol = protocol;
+        self
+    }
+
     /// Whether the current assignment strategy is cooperative.
     pub fn is_cooperative(&self) -> bool {
         self.assignment_strategy
             == crate::consumer::config::PartitionAssignmentStrategy::CooperativeSticky
+    }
+
+    /// Whether the consumer uses the KIP-848 consumer group protocol.
+    pub fn is_consumer_protocol(&self) -> bool {
+        self.group_protocol == crate::consumer::config::GroupProtocol::Consumer
     }
 
     /// Get the group ID.
@@ -1397,6 +1430,12 @@ impl GroupCoordinator {
         &self,
         topics: &[String],
     ) -> Result<(MemberAssignment, bool)> {
+        // Dispatch based on group protocol
+        if self.is_consumer_protocol() {
+            return self.ensure_active_membership_consumer(topics).await;
+        }
+
+        // Classic protocol: JoinGroup/SyncGroup/Heartbeat
         // Detect topic changes: if the subscription changed while Stable,
         // force a rejoin so the broker learns the new subscription.
         {
@@ -1675,6 +1714,426 @@ impl GroupCoordinator {
             .record_assignment(member_id, assignment);
     }
 
+    /// Send a KIP-848 ConsumerGroupHeartbeat (API key 68).
+    ///
+    /// This is the sole membership and assignment API for the new consumer
+    /// protocol. It replaces JoinGroup + SyncGroup + Heartbeat + LeaveGroup.
+    ///
+    /// - `member_epoch = 0` → join the group
+    /// - `member_epoch = -1` → leave the group
+    /// - `member_epoch = -2` → static member temporary leave
+    ///
+    /// Returns the decoded response. The caller is responsible for updating
+    /// local state (member_epoch, assignment, heartbeat interval) from the
+    /// response.
+    pub async fn consumer_group_heartbeat(
+        &self,
+        subscribed_topic_names: Option<Vec<String>>,
+        topic_partitions: Option<Vec<ConsumerGroupTopicPartitions>>,
+    ) -> Result<ConsumerGroupHeartbeatResponse> {
+        let conn = self.get_coordinator_connection().await?;
+        let member_id = self.member_id.read().await.clone();
+        let member_epoch = *self.member_epoch.read().await;
+
+        let request = ConsumerGroupHeartbeatRequest {
+            group_id: self.group_id.clone(),
+            member_id: member_id.clone(),
+            member_epoch,
+            instance_id: self.group_instance_id.clone(),
+            rack_id: None,
+            rebalance_timeout_ms: crate::util::duration_to_millis_i32(self.rebalance_timeout),
+            subscribed_topic_names,
+            subscribed_topic_regex: None,
+            server_assignor: None,
+            topic_partitions,
+        };
+
+        debug!(
+            "Sending ConsumerGroupHeartbeat for group '{}': member_id='{}', epoch={}",
+            self.group_id, member_id, member_epoch
+        );
+
+        let hb_version = conn
+            .negotiate_api_version_max(ApiKey::ConsumerGroupHeartbeat, CONSUMER_GROUP_HEARTBEAT_MAX)
+            .await
+            .unwrap_or(0);
+
+        let response = conn
+            .send_request(ApiKey::ConsumerGroupHeartbeat, hb_version, |buf| {
+                request.encode_versioned(hb_version, buf)
+            })
+            .await?;
+
+        let mut buf = response;
+        let hb_response = ConsumerGroupHeartbeatResponse::decode_versioned(hb_version, &mut buf)?;
+
+        if !hb_response.error_code.is_ok() {
+            // Handle fencing and unknown member errors
+            if hb_response.error_code == ErrorCode::UnknownMemberId
+                || hb_response.error_code == ErrorCode::FencedMemberEpoch
+            {
+                warn!(
+                    "ConsumerGroupHeartbeat error for group '{}': {:?} — resetting member identity",
+                    self.group_id, hb_response.error_code
+                );
+                self.reset_member_identity().await;
+            }
+            return Err(KrafkaError::broker(
+                hb_response.error_code,
+                format!(
+                    "ConsumerGroupHeartbeat failed: {}",
+                    hb_response
+                        .error_message
+                        .as_deref()
+                        .unwrap_or("unknown error")
+                ),
+            ));
+        }
+
+        // Update member state from the response
+        if let Some(ref new_member_id) = hb_response.member_id {
+            let old = self.member_id.read().await.clone();
+            if old != *new_member_id {
+                if !old.is_empty() {
+                    self.sticky_assignor.clear_member(&old);
+                }
+                *self.member_id.write().await = new_member_id.clone();
+            }
+        }
+        *self.member_epoch.write().await = hb_response.member_epoch;
+
+        // Update assignment if the coordinator provided one
+        if let Some(ref assignment) = hb_response.assignment {
+            // Store the raw target for re-resolution on future metadata refreshes.
+            *self.target_assignment.write().await = assignment.topic_partitions.clone();
+
+            let (new_assignment, has_unresolved) = Self::resolve_assignment(
+                &self.metadata,
+                &self.topic_names_cache,
+                &assignment.topic_partitions,
+            )
+            .await;
+            *self.assignment.write().await = new_assignment;
+            *self.state.write().await = GroupState::Stable;
+
+            if has_unresolved {
+                debug!(
+                    "Triggering metadata refresh to resolve unresolved topic UUIDs for group '{}'",
+                    self.group_id
+                );
+                if let Err(e) = self.metadata.refresh().await {
+                    warn!(
+                        "Metadata refresh for UUID resolution failed for group '{}': {}",
+                        self.group_id, e
+                    );
+                }
+                // Re-resolve after refresh.
+                let target = self.target_assignment.read().await.clone();
+                let (resolved, _) =
+                    Self::resolve_assignment(&self.metadata, &self.topic_names_cache, &target)
+                        .await;
+                *self.assignment.write().await = resolved;
+            }
+        }
+
+        info!(
+            "ConsumerGroupHeartbeat OK for group '{}': member_id='{}', epoch={}, interval={}ms",
+            self.group_id,
+            hb_response.member_id.as_deref().unwrap_or(""),
+            hb_response.member_epoch,
+            hb_response.heartbeat_interval_ms
+        );
+
+        Ok(hb_response)
+    }
+
+    /// Resolve topic UUIDs from a heartbeat assignment to topic names.
+    ///
+    /// Resolution order (mirrors the Java client's two-level lookup):
+    /// 1. Cluster metadata cache (populated from metadata v10+ responses).
+    /// 2. Local topic names cache (survives metadata cache flushes).
+    ///
+    /// Successfully resolved names are inserted into `topic_names_cache`.
+    /// Returns `(assignment, has_unresolved)`. When `has_unresolved` is
+    /// `true`, the caller should trigger a metadata refresh and store the
+    /// raw target assignment for later re-resolution.
+    async fn resolve_assignment(
+        metadata: &Arc<ClusterMetadata>,
+        topic_names_cache: &Arc<RwLock<HashMap<[u8; 16], String>>>,
+        topic_partitions: &[ConsumerGroupTopicPartitions],
+    ) -> (MemberAssignment, bool) {
+        let mut assignment = MemberAssignment::empty();
+        let mut has_unresolved = false;
+        let mut cache = topic_names_cache.write().await;
+        for tp in topic_partitions {
+            // 1. Try the global metadata cache.
+            if let Some(name) = metadata.topic_name_for_id(&tp.topic_id) {
+                cache.insert(tp.topic_id, name.clone());
+                assignment.add(name, tp.partitions.clone());
+                continue;
+            }
+            // 2. Fallback to the local names cache.
+            if let Some(name) = cache.get(&tp.topic_id) {
+                assignment.add(name.clone(), tp.partitions.clone());
+                continue;
+            }
+            warn!(
+                "Cannot resolve topic UUID {:02x?} to a name — \
+                 will retry after next metadata refresh. \
+                 Partitions {:?} skipped for now.",
+                tp.topic_id, tp.partitions
+            );
+            has_unresolved = true;
+        }
+        (assignment, has_unresolved)
+    }
+
+    /// Ensure active membership using the KIP-848 consumer protocol.
+    ///
+    /// For the initial join, sends a heartbeat with epoch 0 and subscribed
+    /// topics. For subsequent heartbeats, sends the current epoch.
+    async fn ensure_active_membership_consumer(
+        &self,
+        topics: &[String],
+    ) -> Result<(MemberAssignment, bool)> {
+        let state = *self.state.read().await;
+
+        match state {
+            GroupState::Stable => {
+                // Already stable — check if topics changed
+                let old_topics = self.subscribed_topics.read().await.clone();
+                let mut old_sorted = old_topics;
+                old_sorted.sort();
+                let mut new_sorted = topics.to_vec();
+                new_sorted.sort();
+                if old_sorted == new_sorted {
+                    return Ok((self.assignment.read().await.clone(), false));
+                }
+                // Topics changed — send heartbeat with new subscription
+            }
+            GroupState::Unjoined => {
+                // Need to find coordinator first
+                if self.coordinator_conn.read().await.is_none() {
+                    self.find_coordinator().await?;
+                }
+            }
+            _ => {}
+        }
+
+        self.set_subscribed_topics(topics.to_vec()).await;
+
+        let subscribed = Some(topics.to_vec());
+        let resp = self.consumer_group_heartbeat(subscribed, None).await?;
+
+        // Start heartbeat task for KIP-848
+        self.start_consumer_heartbeat_task(resp.heartbeat_interval_ms)
+            .await;
+
+        let assignment = self.assignment.read().await.clone();
+        Ok((assignment, true))
+    }
+
+    /// Start a background heartbeat task for the KIP-848 consumer protocol.
+    ///
+    /// Unlike the classic protocol, the KIP-848 heartbeat is the sole
+    /// communication channel — it carries assignment updates and error codes.
+    async fn start_consumer_heartbeat_task(&self, interval_ms: i32) {
+        // Stop existing task if any
+        self.stop_heartbeat_task().await;
+        self.heartbeat_controller.take_rebalance_needed();
+        self.heartbeat_controller.take_member_invalidated();
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<HeartbeatCommand>(10);
+        *self.heartbeat_cmd_tx.write().await = Some(cmd_tx);
+
+        let group_id = self.group_id.clone();
+        let interval = Duration::from_millis(interval_ms.max(1000) as u64);
+        let heartbeat_controller = self.heartbeat_controller.clone();
+        let member_id_ref = self.member_id.clone();
+        let member_epoch_ref = self.member_epoch.clone();
+        let coordinator_conn_ref = self.coordinator_conn.clone();
+        let group_instance_id = self.group_instance_id.clone();
+        let assignment_ref = self.assignment.clone();
+        let state_ref = self.state.clone();
+        let metadata_ref = self.metadata.clone();
+        let target_assignment_ref = self.target_assignment.clone();
+        let topic_names_cache_ref = self.topic_names_cache.clone();
+
+        heartbeat_controller.start();
+
+        tokio::spawn(async move {
+            debug!(
+                "Starting KIP-848 heartbeat task for group '{}' (interval={:?})",
+                group_id, interval
+            );
+
+            // Negotiate the ConsumerGroupHeartbeat version once at task start.
+            let hb_version = {
+                let coordinator_conn = coordinator_conn_ref.read().await.clone();
+                if let Some(ref conn) = coordinator_conn {
+                    conn.negotiate_api_version_max(
+                        ApiKey::ConsumerGroupHeartbeat,
+                        CONSUMER_GROUP_HEARTBEAT_MAX,
+                    )
+                    .await
+                    .unwrap_or(0)
+                } else {
+                    0
+                }
+            };
+
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        if !heartbeat_controller.is_running() {
+                            break;
+                        }
+
+                        let coordinator_conn = coordinator_conn_ref.read().await.clone();
+                        let member_id = member_id_ref.read().await.clone();
+                        let epoch = *member_epoch_ref.read().await;
+
+                        if let Some(ref conn) = coordinator_conn {
+                            let request = ConsumerGroupHeartbeatRequest {
+                                group_id: group_id.clone(),
+                                member_id,
+                                member_epoch: epoch,
+                                instance_id: group_instance_id.clone(),
+                                rack_id: None,
+                                rebalance_timeout_ms: -1,
+                                subscribed_topic_names: None,
+                                subscribed_topic_regex: None,
+                                server_assignor: None,
+                                topic_partitions: None,
+                            };
+
+                            match conn.send_request(
+                                ApiKey::ConsumerGroupHeartbeat,
+                                hb_version,
+                                |buf| request.encode_versioned(hb_version, buf),
+                            ).await {
+                                Ok(response_bytes) => {
+                                    let mut buf = response_bytes;
+                                    match ConsumerGroupHeartbeatResponse::decode_versioned(hb_version, &mut buf) {
+                                        Ok(resp) => {
+                                            if resp.error_code.is_ok() {
+                                                *member_epoch_ref.write().await = resp.member_epoch;
+
+                                                // Update assignment if the coordinator sent one.
+                                                if let Some(ref new_assign) = resp.assignment {
+                                                    *target_assignment_ref.write().await =
+                                                        new_assign.topic_partitions.clone();
+                                                    let (resolved, has_unresolved) =
+                                                        Self::resolve_assignment(
+                                                            &metadata_ref,
+                                                            &topic_names_cache_ref,
+                                                            &new_assign.topic_partitions,
+                                                        )
+                                                        .await;
+                                                    *assignment_ref.write().await = resolved;
+                                                    *state_ref.write().await = GroupState::Stable;
+
+                                                    if has_unresolved {
+                                                        debug!(
+                                                            "Triggering metadata refresh for unresolved UUIDs in group '{}'",
+                                                            group_id
+                                                        );
+                                                        if let Err(e) = metadata_ref.refresh().await {
+                                                            warn!(
+                                                                "Metadata refresh for UUID resolution failed for group '{}': {}",
+                                                                group_id, e
+                                                            );
+                                                        }
+                                                        // Re-resolve with updated metadata.
+                                                        let target = target_assignment_ref.read().await.clone();
+                                                        let (re_resolved, _) =
+                                                            Self::resolve_assignment(
+                                                                &metadata_ref,
+                                                                &topic_names_cache_ref,
+                                                                &target,
+                                                            )
+                                                            .await;
+                                                        *assignment_ref.write().await = re_resolved;
+                                                    }
+                                                } else {
+                                                    // No new assignment — re-resolve target in
+                                                    // case a metadata refresh filled in UUIDs.
+                                                    let target = target_assignment_ref.read().await.clone();
+                                                    if !target.is_empty() {
+                                                        let (resolved, _) =
+                                                            Self::resolve_assignment(
+                                                                &metadata_ref,
+                                                                &topic_names_cache_ref,
+                                                                &target,
+                                                            )
+                                                            .await;
+                                                        *assignment_ref.write().await = resolved;
+                                                    }
+                                                }
+
+                                                heartbeat_controller.heartbeat_success().await;
+                                            } else if resp.error_code == ErrorCode::RebalanceInProgress {
+                                                heartbeat_controller.signal_rebalance();
+                                            } else if resp.error_code == ErrorCode::StaleMemberEpoch {
+                                                // Stale epoch: our epoch is behind.
+                                                // The coordinator will send an updated
+                                                // epoch on the next heartbeat — just
+                                                // log and treat as success so we retry
+                                                // on the next tick (no rebalance).
+                                                debug!(
+                                                    "KIP-848 StaleMemberEpoch for '{}' — \
+                                                     will retry on next heartbeat",
+                                                    group_id
+                                                );
+                                            } else if resp.error_code == ErrorCode::UnknownMemberId
+                                                || resp.error_code == ErrorCode::FencedMemberEpoch
+                                            {
+                                                warn!(
+                                                    "KIP-848 heartbeat error for '{}': {:?}",
+                                                    group_id, resp.error_code
+                                                );
+                                                heartbeat_controller.signal_member_invalidated();
+                                                heartbeat_controller.signal_rebalance();
+                                            } else {
+                                                warn!(
+                                                    "KIP-848 heartbeat error for '{}': {:?}",
+                                                    group_id, resp.error_code
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Failed to decode KIP-848 heartbeat response for '{}': {}",
+                                                group_id, e
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to send KIP-848 heartbeat for '{}': {}",
+                                        group_id, e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    cmd = cmd_rx.recv() => {
+                        match cmd {
+                            Some(HeartbeatCommand::Stop) | None => break,
+                            Some(HeartbeatCommand::Rejoin) => break,
+                        }
+                    }
+                }
+            }
+
+            debug!("KIP-848 heartbeat task ended for group '{}'", group_id);
+        });
+    }
+
     /// Send a single heartbeat (for inline heartbeat during poll).
     pub async fn send_heartbeat(&self) -> Result<HeartbeatStatus> {
         let conn = self.get_coordinator_connection().await?;
@@ -1749,7 +2208,13 @@ impl GroupCoordinator {
 
         let conn = self.get_coordinator_connection().await?;
         let member_id = self.member_id.read().await.clone();
-        let generation_id = *self.generation_id.read().await;
+        // For KIP-848 (consumer protocol), the "generation ID" wire field
+        // carries the member epoch instead of the classic generation ID.
+        let generation_id_or_member_epoch = if self.is_consumer_protocol() {
+            *self.member_epoch.read().await
+        } else {
+            *self.generation_id.read().await
+        };
 
         // Group offsets by topic
         let mut topics_map: HashMap<String, Vec<OffsetCommitRequestPartition>> = HashMap::new();
@@ -1773,7 +2238,7 @@ impl GroupCoordinator {
 
         let request = OffsetCommitRequest {
             group_id: self.group_id.clone(),
-            generation_id,
+            generation_id: generation_id_or_member_epoch,
             member_id,
             group_instance_id: self.group_instance_id.clone(),
             retention_time_ms: -1,
@@ -1856,6 +2321,8 @@ impl GroupCoordinator {
             group_id: self.group_id.clone(),
             topics: Some(topics),
             require_stable: false,
+            member_id: None,
+            member_epoch: -1,
         };
 
         debug!(
@@ -2026,6 +2493,11 @@ impl GroupCoordinator {
         // Stop heartbeat task
         self.stop_heartbeat_task().await;
 
+        // KIP-848: leave by sending heartbeat with epoch -1
+        if self.is_consumer_protocol() {
+            return self.leave_group_consumer().await;
+        }
+
         let conn = match self.get_coordinator_connection().await {
             Ok(c) => c,
             Err(_) => {
@@ -2124,11 +2596,96 @@ impl GroupCoordinator {
         Ok(())
     }
 
+    /// Leave the group using the KIP-848 consumer protocol.
+    ///
+    /// Sends a ConsumerGroupHeartbeat with `member_epoch = -1`.
+    async fn leave_group_consumer(&self) -> Result<()> {
+        let conn = match self.get_coordinator_connection().await {
+            Ok(c) => c,
+            Err(_) => {
+                self.reset().await;
+                return Ok(());
+            }
+        };
+
+        let member_id = self.member_id.read().await.clone();
+        *self.state.write().await = GroupState::Leaving;
+        *self.member_epoch.write().await = -1;
+
+        let request = ConsumerGroupHeartbeatRequest {
+            group_id: self.group_id.clone(),
+            member_id: member_id.clone(),
+            member_epoch: -1,
+            instance_id: self.group_instance_id.clone(),
+            rack_id: None,
+            rebalance_timeout_ms: -1,
+            subscribed_topic_names: None,
+            subscribed_topic_regex: None,
+            server_assignor: None,
+            topic_partitions: None,
+        };
+
+        debug!(
+            "Leaving group '{}' via KIP-848 heartbeat, member_id='{}'",
+            self.group_id, member_id
+        );
+
+        let hb_version = conn
+            .negotiate_api_version_max(ApiKey::ConsumerGroupHeartbeat, CONSUMER_GROUP_HEARTBEAT_MAX)
+            .await
+            .unwrap_or(0);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            conn.send_request(ApiKey::ConsumerGroupHeartbeat, hb_version, |buf| {
+                request.encode_versioned(hb_version, buf)
+            }),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(response_bytes)) => {
+                let mut buf = response_bytes;
+                match ConsumerGroupHeartbeatResponse::decode_versioned(hb_version, &mut buf) {
+                    Ok(resp) if resp.error_code.is_ok() => {
+                        info!("Left group '{}' via KIP-848", self.group_id);
+                    }
+                    Ok(resp) => {
+                        warn!(
+                            "KIP-848 LeaveGroup error for '{}': {:?}",
+                            self.group_id, resp.error_code
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to decode KIP-848 leave response for '{}': {}",
+                            self.group_id, e
+                        );
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "Failed to send KIP-848 leave for '{}': {}",
+                    self.group_id, e
+                );
+            }
+            Err(_) => {
+                warn!("KIP-848 leave request timed out for '{}'", self.group_id);
+            }
+        }
+
+        self.reset().await;
+        Ok(())
+    }
+
     /// Reset coordinator state.
     async fn reset(&self) {
         self.reset_member_identity().await;
         *self.state.write().await = GroupState::Unjoined;
         *self.assignment.write().await = MemberAssignment::empty();
+        self.target_assignment.write().await.clear();
+        self.topic_names_cache.write().await.clear();
         *self.coordinator_conn.write().await = None;
         *self.coordinator_id.write().await = None;
     }
@@ -2147,6 +2704,7 @@ impl GroupCoordinator {
         }
         *self.member_id.write().await = String::new();
         *self.generation_id.write().await = -1;
+        *self.member_epoch.write().await = 0;
     }
 
     /// Encode consumer protocol metadata.

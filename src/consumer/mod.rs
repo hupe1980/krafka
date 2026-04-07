@@ -47,7 +47,7 @@ pub use compacted::{
     CompactedTable, CompactedTopicConsumer, CompactedTopicConsumerBuilder, TableChange,
 };
 pub use config::{
-    AutoOffsetReset, ConsumerConfig, ConsumerConfigBuilder, IsolationLevel,
+    AutoOffsetReset, ConsumerConfig, ConsumerConfigBuilder, GroupProtocol, IsolationLevel,
     PartitionAssignmentStrategy,
 };
 pub use group::{
@@ -266,7 +266,8 @@ impl Consumer {
                 )
                 .with_assignor_strategy(config.partition_assignment_strategy)
                 .with_group_instance_id(config.group_instance_id.clone())
-                .with_isolation_level(config.isolation_level.to_i8()),
+                .with_isolation_level(config.isolation_level.to_i8())
+                .with_group_protocol(config.group_protocol),
             ))
         } else {
             None

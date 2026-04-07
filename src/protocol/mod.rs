@@ -16,18 +16,35 @@
 //!
 //! | API | Min | Max | Notes |
 //! |-----|-----|-----|-------|
-//! | Produce | 0 | 3 | v3+ for transactions |
-//! | Fetch | 0 | 11 | v0-4, v7-v11 (v5/v6 unsupported); v4 isolation level, v7 fetch sessions, v9 leader epoch fencing, v11 closest-replica fetching (KIP-392) |
-//! | Metadata | 0 | 8 | v1 controller + rack, v2 cluster_id, v3 throttle, v5 offline replicas, v7 leader epoch, v8 adds cluster/topic authorized-operations (decoded and discarded) |
-//! | OffsetCommit | 0 | 2 | v2+ for retention |
-//! | OffsetFetch | 0 | 1 | v1+ for group coordinator |
-//! | FindCoordinator | 0 | 1 | Group/txn coordinator lookup |
+//! | Produce | 0 | 11 | v3 transactions, v9 flexible, v10 CurrentLeader tagged |
+//! | Fetch | 0 | 12 | v4 isolation, v7 sessions, v11 closest-replica, v12 flexible |
+//! | ListOffsets | 0 | 2 | v2 isolation level |
+//! | Metadata | 0 | 13 | v9 flexible, v10 topic_id, v13 top-level error code |
+//! | OffsetCommit | 0 | 9 | v5 no retention, v6 leader_epoch, v7 instance_id, v8 flexible |
+//! | OffsetFetch | 0 | 9 | v5 leader_epoch, v6 flexible, v8 batched groups, v9 KIP-848 |
+//! | FindCoordinator | 0 | 4 | v3 flexible, v4 batched coordinator lookup (KIP-699) |
 //! | JoinGroup | 0 | 5 | v5+ group instance id |
 //! | Heartbeat | 0 | 3 | v3+ group instance id (KIP-345) |
 //! | SyncGroup | 0 | 3 | v3+ group instance id |
 //! | LeaveGroup | 0 | 3 | v3+ batch leave (KIP-345) |
 //! | CreateTopics | 0 | 2 | v0 is baseline |
 //! | DeleteTopics | 0 | 1 | v0 is baseline |
+//! | CreatePartitions | 0 | 0 | v0 baseline |
+//! | DescribeConfigs | 0 | 0 | v0 baseline |
+//! | AlterConfigs | 0 | 0 | v0 baseline |
+//! | DescribeAcls | 0 | 1 | v1 prefixed ACLs |
+//! | CreateAcls | 0 | 1 | v1 prefixed ACLs |
+//! | DeleteAcls | 0 | 1 | v1 prefixed ACLs |
+//! | DescribeGroups | 0 | 1 | v0 is baseline |
+//! | ListGroups | 0 | 1 | v0 is baseline |
+//! | InitProducerId | 0 | 0 | v0 baseline |
+//! | CreateDelegationToken | 0 | 1 | v0–v1 same wire format |
+//! | RenewDelegationToken | 0 | 1 | v0–v1 same wire format |
+//! | ExpireDelegationToken | 0 | 1 | v0–v1 same wire format |
+//! | DescribeDelegationToken | 0 | 1 | v0–v1 same wire format |
+//! | DescribeClientQuotas | 0 | 0 | v0 baseline |
+//! | AlterClientQuotas | 0 | 0 | v0 baseline |
+//! | ConsumerGroupHeartbeat | 0 | 1 | KIP-848 + KIP-1082 (v1 regex, client member-id) |
 //!
 //! ## Example
 //!
@@ -114,6 +131,26 @@ pub(crate) fn check_decode_nullable_array_len(len: i32) -> Result<usize> {
     check_decode_array_len(len)
 }
 
+/// Validate a compact array length (varint-encoded as `actual_len + 1`).
+///
+/// In flexible Kafka versions, arrays are encoded with a varint length equal
+/// to the element count plus one.  A raw value of `0` signals a null /
+/// empty array (returns `Ok(0)`).  Values exceeding [`MAX_DECODE_ARRAY_LEN`]
+/// are rejected to prevent OOM from malicious or corrupted broker responses.
+#[inline]
+pub(crate) fn check_compact_array_len(raw: u32) -> Result<usize> {
+    if raw == 0 {
+        return Ok(0);
+    }
+    let len = (raw - 1) as usize;
+    if len > MAX_DECODE_ARRAY_LEN {
+        return Err(KrafkaError::protocol(format!(
+            "compact array length {len} exceeds safety limit {MAX_DECODE_ARRAY_LEN}"
+        )));
+    }
+    Ok(len)
+}
+
 /// Client-supported API version ranges.
 ///
 /// This module defines the maximum version ranges that Krafka actually implements
@@ -123,18 +160,18 @@ pub(crate) fn check_decode_nullable_array_len(len: i32) -> Result<usize> {
 /// encode+decode pair. Advertising a higher version than implemented
 /// causes protocol parse failures.
 pub mod versions {
-    /// Maximum supported Produce version (v0 encode/decode + v3 encode).
-    pub const PRODUCE_MAX: i16 = 3;
-    /// Maximum supported Fetch version (v11 encode/decode — closest-replica fetching, KIP-392).
-    pub const FETCH_MAX: i16 = 11;
-    /// Maximum supported Metadata version (v8 encode/decode — KRaft-aware metadata).
-    pub const METADATA_MAX: i16 = 8;
-    /// Maximum supported OffsetCommit version.
-    pub const OFFSET_COMMIT_MAX: i16 = 2;
-    /// Maximum supported OffsetFetch version.
-    pub const OFFSET_FETCH_MAX: i16 = 1;
-    /// Maximum supported FindCoordinator version (v1 adds key_type for txn coordinators).
-    pub const FIND_COORDINATOR_MAX: i16 = 1;
+    /// Maximum supported Produce version (v0-v2 legacy, v3-v8 transactional, v9-v11 flexible).
+    pub const PRODUCE_MAX: i16 = 11;
+    /// Maximum supported Fetch version (v12 flexible encode/decode, KIP-227/KIP-320/KIP-392).
+    pub const FETCH_MAX: i16 = 12;
+    /// Maximum supported Metadata version (v13 top-level error code).
+    pub const METADATA_MAX: i16 = 13;
+    /// Maximum supported OffsetCommit version (v8-v9 flexible, KIP-848 STALE_MEMBER_EPOCH).
+    pub const OFFSET_COMMIT_MAX: i16 = 9;
+    /// Maximum supported OffsetFetch version (v8-v9 batched groups, KIP-848 MemberId/MemberEpoch).
+    pub const OFFSET_FETCH_MAX: i16 = 9;
+    /// Maximum supported FindCoordinator version (v3 flexible, v4 batched lookup KIP-699).
+    pub const FIND_COORDINATOR_MAX: i16 = 4;
     /// Maximum supported JoinGroup version.
     pub const JOIN_GROUP_MAX: i16 = 5;
     /// Maximum supported Heartbeat version (v3 adds group_instance_id for KIP-345).
@@ -183,6 +220,8 @@ pub mod versions {
     pub const DESCRIBE_CLIENT_QUOTAS_MAX: i16 = 0;
     /// Maximum supported AlterClientQuotas version.
     pub const ALTER_CLIENT_QUOTAS_MAX: i16 = 0;
+    /// Maximum supported ConsumerGroupHeartbeat version (v0–v1 — KIP-848 next-gen consumer group).
+    pub const CONSUMER_GROUP_HEARTBEAT_MAX: i16 = 1;
 }
 
 #[cfg(test)]

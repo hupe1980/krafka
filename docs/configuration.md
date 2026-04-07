@@ -90,6 +90,7 @@ let producer = Producer::builder()
 | `heartbeat_interval` | Duration | `3s` | Heartbeat interval |
 | `max_poll_interval` | Duration | `5m` | Max time between polls (also used as the rebalance timeout) |
 | `isolation_level` | IsolationLevel | `ReadUncommitted` | Transaction isolation |
+| `group_protocol` | GroupProtocol | `Classic` | Group protocol: `Classic` or `Consumer` (KIP-848) |
 | `request_timeout` | Duration | `30s` | Timeout for broker requests |
 | `metadata_max_age` | Duration | `5m` | Max age before metadata refresh |
 

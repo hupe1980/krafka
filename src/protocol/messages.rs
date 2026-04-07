@@ -8,8 +8,10 @@ use bytes::{Buf, BufMut, Bytes};
 
 use super::api::ApiKey;
 use super::array_len_i32;
-use super::primitives::{Decode, Encode, KafkaArray, KafkaBytes, KafkaString, TryEncode};
-use super::{check_decode_array_len, check_decode_nullable_array_len};
+use super::primitives::{
+    Decode, Encode, KafkaArray, KafkaBytes, KafkaString, TaggedFields, TryEncode,
+};
+use super::{check_compact_array_len, check_decode_array_len, check_decode_nullable_array_len};
 use crate::error::{ErrorCode, KrafkaError, Result};
 
 /// Trait for encoding a request/response at a specific protocol version.
@@ -135,6 +137,85 @@ impl MetadataRequest {
         buf.put_u8(0); // include_topic_authorized_operations — not yet surfaced
         Ok(())
     }
+
+    /// Encode for version 9 (flexible).
+    ///
+    /// v9: first flexible version. Each topic entry is a struct with a compact
+    /// name string and its own tagged-fields section. `IncludeClusterAuthorizedOperations`
+    /// and `IncludeTopicAuthorizedOperations` are still present.
+    pub fn encode_v9(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.encode_topic_entries_flexible(buf, false)?;
+        buf.put_u8(if self.allow_auto_topic_creation { 1 } else { 0 });
+        buf.put_u8(0); // include_cluster_authorized_operations (v8-v10)
+        buf.put_u8(0); // include_topic_authorized_operations  (v8+)
+        TaggedFields::default().try_encode(buf)?;
+        Ok(())
+    }
+
+    /// Encode for version 10 (flexible).
+    ///
+    /// v10 adds a 16-byte `TopicId` (UUID) per topic entry. Per the Kafka
+    /// protocol note, v10-v11 should NOT populate the `TopicId` field
+    /// (set to zero UUID). `IncludeClusterAuthorizedOperations` is still present.
+    pub fn encode_v10(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.encode_topic_entries_flexible(buf, true)?;
+        buf.put_u8(if self.allow_auto_topic_creation { 1 } else { 0 });
+        buf.put_u8(0); // include_cluster_authorized_operations (v8-v10)
+        buf.put_u8(0); // include_topic_authorized_operations  (v8+)
+        TaggedFields::default().try_encode(buf)?;
+        Ok(())
+    }
+
+    /// Encode for version 11-12 (flexible).
+    ///
+    /// v11 deprecates `IncludeClusterAuthorizedOperations` (removed from wire).
+    /// v12 supports `TopicId` for real; we still set it to zeros (name-based lookup).
+    pub fn encode_v11(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.encode_topic_entries_flexible(buf, true)?;
+        buf.put_u8(if self.allow_auto_topic_creation { 1 } else { 0 });
+        buf.put_u8(0); // include_topic_authorized_operations (v8+)
+        TaggedFields::default().try_encode(buf)?;
+        Ok(())
+    }
+
+    /// Encode topic entries for flexible versions (v9+).
+    ///
+    /// Each entry is a struct: `[TopicId(v10+)] Name TaggedFields`.
+    fn encode_topic_entries_flexible(
+        &self,
+        buf: &mut impl BufMut,
+        include_topic_id: bool,
+    ) -> Result<()> {
+        match &self.topics {
+            None => {
+                // null compact array: varint 0
+                KafkaArray::<KafkaString>::null().try_encode_compact(buf)?;
+            }
+            Some(topics) => {
+                let len_plus_one = u32::try_from(topics.len().saturating_add(1)).map_err(|_| {
+                    crate::error::KrafkaError::protocol(format!(
+                        "topics array length {} exceeds u32 limit",
+                        topics.len()
+                    ))
+                })?;
+                crate::util::varint::encode_unsigned_varint(len_plus_one, buf);
+                for t in topics {
+                    if include_topic_id {
+                        // TopicId — 16-byte UUID (zeros = name-based lookup)
+                        buf.put_slice(&t.topic_id.unwrap_or([0u8; 16]));
+                    }
+                    // Name — compact string
+                    match &t.name {
+                        Some(name) => KafkaString::new(name).try_encode_compact(buf)?,
+                        None => KafkaString::null().try_encode_compact(buf)?,
+                    }
+                    // Tagged fields for the struct
+                    TaggedFields::default().try_encode(buf)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Metadata response.
@@ -150,6 +231,8 @@ pub struct MetadataResponse {
     pub controller_id: i32,
     /// Topic metadata.
     pub topics: Vec<MetadataTopicResponse>,
+    /// Top-level error code (v13+).
+    pub error_code: ErrorCode,
 }
 
 /// Broker info in metadata response.
@@ -210,6 +293,7 @@ impl MetadataResponse {
             cluster_id: None,
             controller_id: -1,
             topics,
+            error_code: ErrorCode::None,
         })
     }
 
@@ -226,6 +310,7 @@ impl MetadataResponse {
             cluster_id: None,
             controller_id,
             topics,
+            error_code: ErrorCode::None,
         })
     }
 
@@ -243,6 +328,7 @@ impl MetadataResponse {
             cluster_id,
             controller_id,
             topics,
+            error_code: ErrorCode::None,
         })
     }
 
@@ -280,6 +366,31 @@ impl MetadataResponse {
         Ok(resp)
     }
 
+    /// Decode from version 9 (flexible).
+    ///
+    /// v9 switches to flexible encoding (compact strings, compact arrays,
+    /// tagged fields) but has no new fields compared to v8.
+    pub fn decode_v9(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode_v9_plus::<MetadataTopicResponseV9>(buf, true)
+    }
+
+    /// Decode from version 10 (flexible).
+    ///
+    /// v10 adds a 16-byte topic_id (UUID) to each topic entry. The UUID
+    /// is required for KIP-848 consumer protocol assignment resolution.
+    /// `ClusterAuthorizedOperations` is still present in v10.
+    pub fn decode_v10(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode_v9_plus::<MetadataTopicResponseV10>(buf, true)
+    }
+
+    /// Decode from version 11-12 (flexible).
+    ///
+    /// v11 deprecates `ClusterAuthorizedOperations` (removed from wire).
+    /// Topic entries still include topic_id (UUID).
+    pub fn decode_v11(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode_v9_plus::<MetadataTopicResponseV10>(buf, false)
+    }
+
     /// Shared decoder for Metadata v3-v8 wire format.
     ///
     /// Layout: throttle_time_ms, brokers (v1 format), cluster_id,
@@ -296,6 +407,59 @@ impl MetadataResponse {
             cluster_id,
             controller_id,
             topics,
+            error_code: ErrorCode::None,
+        })
+    }
+
+    /// Shared decoder for Metadata v9+ flexible wire format.
+    ///
+    /// Layout: throttle_time_ms, brokers (compact), cluster_id (compact),
+    /// controller_id, topics (compact, parametrized by `T`).
+    ///
+    /// `include_cluster_auth_ops`: `true` for v9-v10 (field present),
+    /// `false` for v11-v12 (field removed from wire).
+    fn decode_v9_plus<T: Decode + Into<MetadataTopicResponse>>(
+        buf: &mut impl Buf,
+        include_cluster_auth_ops: bool,
+    ) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let brokers = decode_compact_array::<MetadataBrokerV9, _>(buf)?;
+        let cluster_id = KafkaString::decode_compact(buf)?.0;
+        let controller_id = i32::decode(buf)?;
+        let topics = decode_compact_array::<T, _>(buf)?;
+        if include_cluster_auth_ops {
+            // cluster_authorized_operations — read and discard (v8-v10)
+            let _cluster_authorized_operations = i32::decode(buf)?;
+        }
+        let _ = TaggedFields::decode(buf)?;
+        Ok(Self {
+            throttle_time_ms,
+            brokers,
+            cluster_id,
+            controller_id,
+            topics,
+            error_code: ErrorCode::None,
+        })
+    }
+
+    /// Decode from version 13 (flexible, top-level error code).
+    ///
+    /// v13 adds a top-level `ErrorCode` after the topics array.
+    pub fn decode_v13(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let brokers = decode_compact_array::<MetadataBrokerV9, _>(buf)?;
+        let cluster_id = KafkaString::decode_compact(buf)?.0;
+        let controller_id = i32::decode(buf)?;
+        let topics = decode_compact_array::<MetadataTopicResponseV10, _>(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let _ = TaggedFields::decode(buf)?;
+        Ok(Self {
+            throttle_time_ms,
+            brokers,
+            cluster_id,
+            controller_id,
+            topics,
+            error_code,
         })
     }
 
@@ -313,6 +477,16 @@ impl MetadataResponse {
 /// Decode a `KafkaArray` of newtype wrappers and unwrap each element's inner value.
 fn decode_array<W: Decode + Into<T>, T>(buf: &mut impl Buf) -> Result<Vec<T>> {
     Ok(KafkaArray::<W>::decode(buf)?
+        .0
+        .unwrap_or_default()
+        .into_iter()
+        .map(Into::into)
+        .collect())
+}
+
+/// Decode a compact `KafkaArray` (flexible versions) of newtype wrappers and unwrap each.
+fn decode_compact_array<W: Decode + Into<T>, T>(buf: &mut impl Buf) -> Result<Vec<T>> {
+    Ok(KafkaArray::<W>::decode_compact(buf)?
         .0
         .unwrap_or_default()
         .into_iter()
@@ -370,6 +544,35 @@ impl Decode for MetadataBrokerV1 {
 
 impl From<MetadataBrokerV1> for MetadataBroker {
     fn from(w: MetadataBrokerV1) -> Self {
+        w.0
+    }
+}
+
+/// v9+ broker decoder (flexible): compact strings + tagged fields.
+struct MetadataBrokerV9(MetadataBroker);
+
+impl Decode for MetadataBrokerV9 {
+    fn decode(buf: &mut impl Buf) -> Result<Self> {
+        let node_id = i32::decode(buf)?;
+        let host = KafkaString::decode_compact(buf)?.0.unwrap_or_default();
+        let port = i32::decode(buf)?;
+        let rack = KafkaString::decode_compact(buf)?.0;
+        let _ = TaggedFields::decode(buf)?;
+        Ok(Self(MetadataBroker {
+            node_id,
+            host,
+            port,
+            rack,
+        }))
+    }
+
+    fn decode_compact(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode(buf)
+    }
+}
+
+impl From<MetadataBrokerV9> for MetadataBroker {
+    fn from(w: MetadataBrokerV9) -> Self {
         w.0
     }
 }
@@ -457,6 +660,47 @@ impl Decode for MetadataPartitionResponseV7 {
 
 impl From<MetadataPartitionResponseV7> for MetadataPartitionResponse {
     fn from(w: MetadataPartitionResponseV7) -> Self {
+        w.0
+    }
+}
+
+/// v9+ partition decoder (flexible): compact arrays + tagged fields.
+struct MetadataPartitionResponseV9(MetadataPartitionResponse);
+
+impl Decode for MetadataPartitionResponseV9 {
+    fn decode(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let partition_index = i32::decode(buf)?;
+        let leader_id = i32::decode(buf)?;
+        let leader_epoch = i32::decode(buf)?;
+        let replica_nodes = KafkaArray::<i32>::decode_compact(buf)?
+            .0
+            .unwrap_or_default();
+        let isr_nodes = KafkaArray::<i32>::decode_compact(buf)?
+            .0
+            .unwrap_or_default();
+        let offline_replicas = KafkaArray::<i32>::decode_compact(buf)?
+            .0
+            .unwrap_or_default();
+        let _ = TaggedFields::decode(buf)?;
+        Ok(Self(MetadataPartitionResponse {
+            error_code,
+            partition_index,
+            leader_id,
+            leader_epoch,
+            replica_nodes,
+            isr_nodes,
+            offline_replicas,
+        }))
+    }
+
+    fn decode_compact(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode(buf)
+    }
+}
+
+impl From<MetadataPartitionResponseV9> for MetadataPartitionResponse {
+    fn from(w: MetadataPartitionResponseV9) -> Self {
         w.0
     }
 }
@@ -587,6 +831,84 @@ impl From<MetadataTopicResponseV8> for MetadataTopicResponse {
     }
 }
 
+/// v9 topic decoder (flexible): compact strings/arrays + tagged fields, no topic_id yet.
+struct MetadataTopicResponseV9(MetadataTopicResponse);
+
+impl Decode for MetadataTopicResponseV9 {
+    fn decode(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let name = KafkaString::decode_compact(buf)?.0;
+        let is_internal = bool::decode(buf)?;
+        let partitions = decode_compact_array::<MetadataPartitionResponseV9, _>(buf)?;
+        // topic_authorized_operations — read and discard
+        let _topic_authorized_operations = i32::decode(buf)?;
+        let _ = TaggedFields::decode(buf)?;
+        Ok(Self(MetadataTopicResponse {
+            error_code,
+            name,
+            topic_id: None,
+            is_internal,
+            partitions,
+        }))
+    }
+
+    fn decode_compact(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode(buf)
+    }
+}
+
+impl From<MetadataTopicResponseV9> for MetadataTopicResponse {
+    fn from(w: MetadataTopicResponseV9) -> Self {
+        w.0
+    }
+}
+
+/// v10+ topic decoder (flexible): adds topic_id (UUID).
+struct MetadataTopicResponseV10(MetadataTopicResponse);
+
+impl Decode for MetadataTopicResponseV10 {
+    fn decode(buf: &mut impl Buf) -> Result<Self> {
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let name = KafkaString::decode_compact(buf)?.0;
+        // topic_id: 16-byte UUID
+        let mut topic_id = [0u8; 16];
+        if buf.remaining() < 16 {
+            return Err(crate::error::KrafkaError::protocol(
+                "not enough bytes for topic_id UUID",
+            ));
+        }
+        buf.copy_to_slice(&mut topic_id);
+        let is_internal = bool::decode(buf)?;
+        let partitions = decode_compact_array::<MetadataPartitionResponseV9, _>(buf)?;
+        // topic_authorized_operations — read and discard
+        let _topic_authorized_operations = i32::decode(buf)?;
+        let _ = TaggedFields::decode(buf)?;
+        // Treat all-zero UUID as absent.
+        let topic_id_opt = if topic_id == [0u8; 16] {
+            None
+        } else {
+            Some(topic_id)
+        };
+        Ok(Self(MetadataTopicResponse {
+            error_code,
+            name,
+            topic_id: topic_id_opt,
+            is_internal,
+            partitions,
+        }))
+    }
+
+    fn decode_compact(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode(buf)
+    }
+}
+
+impl From<MetadataTopicResponseV10> for MetadataTopicResponse {
+    fn from(w: MetadataTopicResponseV10) -> Self {
+        w.0
+    }
+}
+
 // Produce request/response
 
 /// Produce request.
@@ -646,13 +968,41 @@ impl ProduceRequest {
         Ok(())
     }
 
-    /// Encode for version 3+.
+    /// Encode for version 3-8.
     pub fn encode_v3(&self, buf: &mut impl BufMut) -> Result<()> {
         match &self.transactional_id {
             Some(id) => KafkaString::new(id).try_encode(buf)?,
             None => KafkaString::null().try_encode(buf)?,
         }
         self.encode_v0(buf)?;
+        Ok(())
+    }
+
+    /// Encode for version 9-11 (flexible: compact strings/arrays + tagged fields).
+    pub fn encode_v9(&self, buf: &mut impl BufMut) -> Result<()> {
+        match &self.transactional_id {
+            Some(id) => KafkaString::new(id).try_encode_compact(buf)?,
+            None => KafkaString::null().try_encode_compact(buf)?,
+        }
+        self.acks.encode(buf);
+        self.timeout_ms.encode(buf);
+
+        let topics_len = u32::try_from(self.topic_data.len().saturating_add(1))
+            .map_err(|_| KrafkaError::protocol("topics array too large"))?;
+        crate::util::varint::encode_unsigned_varint(topics_len, buf);
+        for topic in &self.topic_data {
+            KafkaString::new(&topic.name).try_encode_compact(buf)?;
+            let parts_len = u32::try_from(topic.partition_data.len().saturating_add(1))
+                .map_err(|_| KrafkaError::protocol("partitions array too large"))?;
+            crate::util::varint::encode_unsigned_varint(parts_len, buf);
+            for partition in &topic.partition_data {
+                partition.index.encode(buf);
+                KafkaBytes::new(partition.records.clone()).try_encode_compact(buf)?;
+                TaggedFields::default().try_encode(buf)?;
+            }
+            TaggedFields::default().try_encode(buf)?;
+        }
+        TaggedFields::default().try_encode(buf)?;
         Ok(())
     }
 }
@@ -734,7 +1084,7 @@ impl ProduceResponse {
         Ok(response)
     }
 
-    /// Decode from version 2+.
+    /// Decode from version 2-4.
     pub fn decode_v2(buf: &mut impl Buf) -> Result<Self> {
         let topic_count = check_decode_array_len(i32::decode(buf)?)?;
         let mut responses = Vec::with_capacity(topic_count);
@@ -766,6 +1116,153 @@ impl ProduceResponse {
         }
 
         let throttle_time_ms = i32::decode(buf)?;
+
+        Ok(Self {
+            responses,
+            throttle_time_ms,
+        })
+    }
+
+    /// Decode from version 5-7 (v2 + log_start_offset per partition).
+    pub fn decode_v5(buf: &mut impl Buf) -> Result<Self> {
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut responses = Vec::with_capacity(topic_count);
+
+        for _ in 0..topic_count {
+            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut partition_responses = Vec::with_capacity(partition_count);
+
+            for _ in 0..partition_count {
+                let index = i32::decode(buf)?;
+                let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+                let base_offset = i64::decode(buf)?;
+                let log_append_time_ms = i64::decode(buf)?;
+                let log_start_offset = i64::decode(buf)?;
+
+                partition_responses.push(ProducePartitionResponse {
+                    index,
+                    error_code,
+                    base_offset,
+                    log_append_time_ms,
+                    log_start_offset,
+                });
+            }
+
+            responses.push(ProduceTopicResponse {
+                name,
+                partition_responses,
+            });
+        }
+
+        let throttle_time_ms = i32::decode(buf)?;
+
+        Ok(Self {
+            responses,
+            throttle_time_ms,
+        })
+    }
+
+    /// Decode from version 8 (v5 + record_errors + error_message per partition).
+    ///
+    /// `RecordErrors` and `ErrorMessage` are read and discarded — they only
+    /// appear for idempotent/transactional edge cases.
+    pub fn decode_v8(buf: &mut impl Buf) -> Result<Self> {
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut responses = Vec::with_capacity(topic_count);
+
+        for _ in 0..topic_count {
+            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut partition_responses = Vec::with_capacity(partition_count);
+
+            for _ in 0..partition_count {
+                let index = i32::decode(buf)?;
+                let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+                let base_offset = i64::decode(buf)?;
+                let log_append_time_ms = i64::decode(buf)?;
+                let log_start_offset = i64::decode(buf)?;
+                // RecordErrors array — read and discard
+                let record_errors_count = check_decode_nullable_array_len(i32::decode(buf)?)?;
+                for _ in 0..record_errors_count {
+                    let _ = i32::decode(buf)?; // batch_index
+                    let _ = KafkaString::decode(buf)?; // batch_index_error_message
+                }
+                // ErrorMessage — read and discard
+                let _ = KafkaString::decode(buf)?;
+
+                partition_responses.push(ProducePartitionResponse {
+                    index,
+                    error_code,
+                    base_offset,
+                    log_append_time_ms,
+                    log_start_offset,
+                });
+            }
+
+            responses.push(ProduceTopicResponse {
+                name,
+                partition_responses,
+            });
+        }
+
+        let throttle_time_ms = i32::decode(buf)?;
+
+        Ok(Self {
+            responses,
+            throttle_time_ms,
+        })
+    }
+
+    /// Decode from version 9-11 (flexible: compact strings/arrays + tagged fields).
+    pub fn decode_v9(buf: &mut impl Buf) -> Result<Self> {
+        let topic_count =
+            check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
+        let mut responses = Vec::with_capacity(topic_count);
+
+        for _ in 0..topic_count {
+            let name = KafkaString::decode_compact(buf)?.0.unwrap_or_default();
+            let part_count =
+                check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
+            let mut partition_responses = Vec::with_capacity(part_count);
+
+            for _ in 0..part_count {
+                let index = i32::decode(buf)?;
+                let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+                let base_offset = i64::decode(buf)?;
+                let log_append_time_ms = i64::decode(buf)?;
+                let log_start_offset = i64::decode(buf)?;
+                // RecordErrors compact array — read and discard
+                let re_count =
+                    check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
+                if re_count > 0 {
+                    for _ in 0..re_count {
+                        let _ = i32::decode(buf)?;
+                        let _ = KafkaString::decode_compact(buf)?;
+                        let _ = TaggedFields::decode(buf)?;
+                    }
+                }
+                // ErrorMessage — read and discard
+                let _ = KafkaString::decode_compact(buf)?;
+                let _ = TaggedFields::decode(buf)?;
+
+                partition_responses.push(ProducePartitionResponse {
+                    index,
+                    error_code,
+                    base_offset,
+                    log_append_time_ms,
+                    log_start_offset,
+                });
+            }
+            let _ = TaggedFields::decode(buf)?;
+            responses.push(ProduceTopicResponse {
+                name,
+                partition_responses,
+            });
+        }
+
+        let throttle_time_ms = i32::decode(buf)?;
+        let _ = TaggedFields::decode(buf)?;
 
         Ok(Self {
             responses,
@@ -1002,6 +1499,57 @@ impl FetchRequest {
     pub fn encode_v11(&self, buf: &mut impl BufMut) -> Result<()> {
         self.encode_v9(buf)?;
         KafkaString::new(&self.rack_id).try_encode(buf)?;
+        Ok(())
+    }
+
+    /// Encode for version 12 (flexible: compact strings/arrays + tagged fields + last_fetched_epoch).
+    pub fn encode_v12(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.replica_id.encode(buf);
+        self.max_wait_ms.encode(buf);
+        self.min_bytes.encode(buf);
+        self.max_bytes.encode(buf);
+        self.isolation_level.encode(buf);
+        self.session_id.encode(buf);
+        self.session_epoch.encode(buf);
+
+        // Topics compact array
+        let topics_len = u32::try_from(self.topics.len().saturating_add(1))
+            .map_err(|_| KrafkaError::protocol("topics array too large"))?;
+        crate::util::varint::encode_unsigned_varint(topics_len, buf);
+        for topic in &self.topics {
+            KafkaString::new(&topic.topic).try_encode_compact(buf)?;
+            let parts_len = u32::try_from(topic.partitions.len().saturating_add(1))
+                .map_err(|_| KrafkaError::protocol("partitions array too large"))?;
+            crate::util::varint::encode_unsigned_varint(parts_len, buf);
+            for partition in &topic.partitions {
+                partition.partition.encode(buf);
+                partition.current_leader_epoch.encode(buf);
+                partition.fetch_offset.encode(buf);
+                partition.last_fetched_epoch.encode(buf);
+                partition.log_start_offset.encode(buf);
+                partition.partition_max_bytes.encode(buf);
+                TaggedFields::default().try_encode(buf)?;
+            }
+            TaggedFields::default().try_encode(buf)?;
+        }
+
+        // Forgotten topics compact array
+        let forgotten_len = u32::try_from(self.forgotten_topics.len().saturating_add(1))
+            .map_err(|_| KrafkaError::protocol("forgotten topics array too large"))?;
+        crate::util::varint::encode_unsigned_varint(forgotten_len, buf);
+        for forgotten in &self.forgotten_topics {
+            KafkaString::new(&forgotten.topic).try_encode_compact(buf)?;
+            let fp_len = u32::try_from(forgotten.partitions.len().saturating_add(1))
+                .map_err(|_| KrafkaError::protocol("forgotten partitions array too large"))?;
+            crate::util::varint::encode_unsigned_varint(fp_len, buf);
+            for &partition in &forgotten.partitions {
+                partition.encode(buf);
+            }
+            TaggedFields::default().try_encode(buf)?;
+        }
+
+        KafkaString::new(&self.rack_id).try_encode_compact(buf)?;
+        TaggedFields::default().try_encode(buf)?;
         Ok(())
     }
 }
@@ -1299,6 +1847,67 @@ impl FetchResponse {
             responses,
         })
     }
+
+    /// Decode from version 12 (flexible: compact strings/arrays + tagged fields).
+    pub fn decode_v12(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let session_id = i32::decode(buf)?;
+
+        let topic_count =
+            check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
+        let mut responses = Vec::with_capacity(topic_count);
+
+        for _ in 0..topic_count {
+            let topic = KafkaString::decode_compact(buf)?.0.unwrap_or_default();
+            let part_count =
+                check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
+            let mut partitions = Vec::with_capacity(part_count);
+
+            for _ in 0..part_count {
+                let partition = i32::decode(buf)?;
+                let partition_error_code = ErrorCode::from_i16(i16::decode(buf)?);
+                let high_watermark = i64::decode(buf)?;
+                let last_stable_offset = i64::decode(buf)?;
+                let log_start_offset = i64::decode(buf)?;
+                // Aborted transactions: compact nullable array
+                let aborted_tx_count =
+                    check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
+                let mut aborted_transactions = Vec::with_capacity(aborted_tx_count);
+                for _ in 0..aborted_tx_count {
+                    aborted_transactions.push(AbortedTransaction {
+                        producer_id: i64::decode(buf)?,
+                        first_offset: i64::decode(buf)?,
+                    });
+                    let _ = TaggedFields::decode(buf)?;
+                }
+                let preferred_read_replica = i32::decode(buf)?;
+                let records = KafkaBytes::decode_compact(buf)?.0;
+                let _ = TaggedFields::decode(buf)?; // partition tagged fields
+
+                partitions.push(FetchPartitionResponse {
+                    partition,
+                    error_code: partition_error_code,
+                    high_watermark,
+                    last_stable_offset,
+                    log_start_offset,
+                    aborted_transactions,
+                    preferred_read_replica,
+                    records,
+                });
+            }
+            let _ = TaggedFields::decode(buf)?; // topic tagged fields
+            responses.push(FetchTopicResponse { topic, partitions });
+        }
+        let _ = TaggedFields::decode(buf)?; // top-level tagged fields
+
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            session_id,
+            responses,
+        })
+    }
 }
 
 // FindCoordinator request/response
@@ -1340,10 +1949,31 @@ impl FindCoordinatorRequest {
         Ok(())
     }
 
-    /// Encode for version 1+.
+    /// Encode for version 1-2.
     pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
         KafkaString::new(&self.key).try_encode(buf)?;
         self.key_type.encode(buf);
+        Ok(())
+    }
+
+    /// Encode for version 3 (flexible: compact strings + tagged fields).
+    pub fn encode_v3(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.key).try_encode_compact(buf)?;
+        self.key_type.encode(buf);
+        TaggedFields::default().try_encode(buf)?;
+        Ok(())
+    }
+
+    /// Encode for version 4 (batched coordinator lookup, KIP-699).
+    ///
+    /// v4 replaces the single `Key` field with `KeyType` + `CoordinatorKeys`
+    /// compact array. We encode our single key as a one-element array.
+    pub fn encode_v4(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.key_type.encode(buf);
+        // CoordinatorKeys: compact array with 1 element (varint len+1 = 2)
+        crate::util::varint::encode_unsigned_varint(2, buf);
+        KafkaString::new(&self.key).try_encode_compact(buf)?;
+        TaggedFields::default().try_encode(buf)?;
         Ok(())
     }
 }
@@ -1383,7 +2013,7 @@ impl FindCoordinatorResponse {
         })
     }
 
-    /// Decode from version 1+.
+    /// Decode from version 1-2.
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -1391,6 +2021,70 @@ impl FindCoordinatorResponse {
         let node_id = i32::decode(buf)?;
         let host = KafkaString::decode(buf)?.0.unwrap_or_default();
         let port = i32::decode(buf)?;
+
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            error_message,
+            node_id,
+            host,
+            port,
+        })
+    }
+
+    /// Decode from version 3 (flexible: compact strings + tagged fields).
+    pub fn decode_v3(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let error_message = KafkaString::decode_compact(buf)?.0;
+        let node_id = i32::decode(buf)?;
+        let host = KafkaString::decode_compact(buf)?.0.unwrap_or_default();
+        let port = i32::decode(buf)?;
+        let _ = TaggedFields::decode(buf)?;
+
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            error_message,
+            node_id,
+            host,
+            port,
+        })
+    }
+
+    /// Decode from version 4 (batched coordinators array, KIP-699).
+    ///
+    /// v4 returns a compact `Coordinators` array. We extract the first entry.
+    pub fn decode_v4(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let count = check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
+        if count == 0 {
+            let _ = TaggedFields::decode(buf)?;
+            return Err(KrafkaError::protocol(
+                "FindCoordinator v4: empty coordinators array",
+            ));
+        }
+
+        // Decode first coordinator
+        let _key = KafkaString::decode_compact(buf)?.0;
+        let node_id = i32::decode(buf)?;
+        let host = KafkaString::decode_compact(buf)?.0.unwrap_or_default();
+        let port = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let error_message = KafkaString::decode_compact(buf)?.0;
+        let _ = TaggedFields::decode(buf)?;
+
+        // Skip remaining coordinators
+        for _ in 1..count {
+            let _ = KafkaString::decode_compact(buf)?;
+            let _ = i32::decode(buf)?;
+            let _ = KafkaString::decode_compact(buf)?;
+            let _ = i32::decode(buf)?;
+            let _ = i16::decode(buf)?;
+            let _ = KafkaString::decode_compact(buf)?;
+            let _ = TaggedFields::decode(buf)?;
+        }
+        let _ = TaggedFields::decode(buf)?;
 
         Ok(Self {
             throttle_time_ms,
@@ -2037,7 +2731,7 @@ impl OffsetCommitRequest {
         Ok(())
     }
 
-    /// Encode for version 2+.
+    /// Encode for version 2-4.
     pub fn encode_v2(&self, buf: &mut impl BufMut) -> Result<()> {
         KafkaString::new(&self.group_id).try_encode(buf)?;
         self.generation_id.encode(buf);
@@ -2057,6 +2751,114 @@ impl OffsetCommitRequest {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Encode for version 5 (v2 without retention_time_ms).
+    pub fn encode_v5(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.group_id).try_encode(buf)?;
+        self.generation_id.encode(buf);
+        KafkaString::new(&self.member_id).try_encode(buf)?;
+
+        buf.put_i32(array_len_i32(self.topics.len())?);
+        for topic in &self.topics {
+            KafkaString::new(&topic.name).try_encode(buf)?;
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
+            for partition in &topic.partitions {
+                partition.partition_index.encode(buf);
+                partition.committed_offset.encode(buf);
+                match &partition.committed_metadata {
+                    Some(m) => KafkaString::new(m).try_encode(buf)?,
+                    None => KafkaString::null().try_encode(buf)?,
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode for version 6 (v5 + committed_leader_epoch per partition).
+    pub fn encode_v6(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.group_id).try_encode(buf)?;
+        self.generation_id.encode(buf);
+        KafkaString::new(&self.member_id).try_encode(buf)?;
+
+        buf.put_i32(array_len_i32(self.topics.len())?);
+        for topic in &self.topics {
+            KafkaString::new(&topic.name).try_encode(buf)?;
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
+            for partition in &topic.partitions {
+                partition.partition_index.encode(buf);
+                partition.committed_offset.encode(buf);
+                partition.committed_leader_epoch.encode(buf);
+                match &partition.committed_metadata {
+                    Some(m) => KafkaString::new(m).try_encode(buf)?,
+                    None => KafkaString::null().try_encode(buf)?,
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode for version 7 (v6 + group_instance_id).
+    pub fn encode_v7(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.group_id).try_encode(buf)?;
+        self.generation_id.encode(buf);
+        KafkaString::new(&self.member_id).try_encode(buf)?;
+        match &self.group_instance_id {
+            Some(id) => KafkaString::new(id).try_encode(buf)?,
+            None => KafkaString::null().try_encode(buf)?,
+        }
+
+        buf.put_i32(array_len_i32(self.topics.len())?);
+        for topic in &self.topics {
+            KafkaString::new(&topic.name).try_encode(buf)?;
+            buf.put_i32(array_len_i32(topic.partitions.len())?);
+            for partition in &topic.partitions {
+                partition.partition_index.encode(buf);
+                partition.committed_offset.encode(buf);
+                partition.committed_leader_epoch.encode(buf);
+                match &partition.committed_metadata {
+                    Some(m) => KafkaString::new(m).try_encode(buf)?,
+                    None => KafkaString::null().try_encode(buf)?,
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode for version 8-9 (flexible: compact strings/arrays + tagged fields).
+    ///
+    /// v9 is wire-identical to v8 (KIP-848 adds STALE_MEMBER_EPOCH semantics only).
+    pub fn encode_v8(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.group_id).try_encode_compact(buf)?;
+        self.generation_id.encode(buf);
+        KafkaString::new(&self.member_id).try_encode_compact(buf)?;
+        match &self.group_instance_id {
+            Some(id) => KafkaString::new(id).try_encode_compact(buf)?,
+            None => KafkaString::null().try_encode_compact(buf)?,
+        }
+
+        let topics_len = u32::try_from(self.topics.len().saturating_add(1))
+            .map_err(|_| KrafkaError::protocol("topics array too large"))?;
+        crate::util::varint::encode_unsigned_varint(topics_len, buf);
+        for topic in &self.topics {
+            KafkaString::new(&topic.name).try_encode_compact(buf)?;
+            let parts_len = u32::try_from(topic.partitions.len().saturating_add(1))
+                .map_err(|_| KrafkaError::protocol("partitions array too large"))?;
+            crate::util::varint::encode_unsigned_varint(parts_len, buf);
+            for partition in &topic.partitions {
+                partition.partition_index.encode(buf);
+                partition.committed_offset.encode(buf);
+                partition.committed_leader_epoch.encode(buf);
+                match &partition.committed_metadata {
+                    Some(m) => KafkaString::new(m).try_encode_compact(buf)?,
+                    None => KafkaString::null().try_encode_compact(buf)?,
+                }
+                TaggedFields::default().try_encode(buf)?;
+            }
+            TaggedFields::default().try_encode(buf)?;
+        }
+        TaggedFields::default().try_encode(buf)?;
         Ok(())
     }
 }
@@ -2097,7 +2899,7 @@ impl OffsetCommitResponse {
         })
     }
 
-    /// Decode from version 3+.
+    /// Decode from version 3-7 (non-flexible, adds throttle_time_ms).
     pub fn decode_v3(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         Ok(Self {
@@ -2106,7 +2908,18 @@ impl OffsetCommitResponse {
         })
     }
 
-    /// Shared topics array decoder for all versions.
+    /// Decode from version 8-9 (flexible: compact strings/arrays + tagged fields).
+    pub fn decode_v8(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let topics = Self::decode_topics_compact(buf)?;
+        let _ = TaggedFields::decode(buf)?;
+        Ok(Self {
+            throttle_time_ms,
+            topics,
+        })
+    }
+
+    /// Shared topics array decoder for non-flexible versions.
     fn decode_topics(buf: &mut impl Buf) -> Result<Vec<OffsetCommitResponseTopic>> {
         let topic_count = check_decode_array_len(i32::decode(buf)?)?;
         let mut topics = Vec::with_capacity(topic_count);
@@ -2137,6 +2950,34 @@ impl OffsetCommitResponse {
             .iter()
             .flat_map(|t| t.partitions.iter())
             .all(|p| p.error_code.is_ok())
+    }
+
+    /// Shared topics array decoder for flexible versions (v8+).
+    fn decode_topics_compact(buf: &mut impl Buf) -> Result<Vec<OffsetCommitResponseTopic>> {
+        let topic_count =
+            check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
+        let mut topics = Vec::with_capacity(topic_count);
+
+        for _ in 0..topic_count {
+            let name = KafkaString::decode_compact(buf)?.0.unwrap_or_default();
+            let part_count =
+                check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
+            let mut partitions = Vec::with_capacity(part_count);
+
+            for _ in 0..part_count {
+                let partition_index = i32::decode(buf)?;
+                let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+                let _ = TaggedFields::decode(buf)?;
+                partitions.push(OffsetCommitResponsePartition {
+                    partition_index,
+                    error_code,
+                });
+            }
+            let _ = TaggedFields::decode(buf)?;
+            topics.push(OffsetCommitResponseTopic { name, partitions });
+        }
+
+        Ok(topics)
     }
 }
 
@@ -2331,6 +3172,10 @@ pub struct OffsetFetchRequest {
     pub topics: Option<Vec<OffsetFetchRequestTopic>>,
     /// Require stable offsets (v7+).
     pub require_stable: bool,
+    /// Member ID for KIP-848 consumer protocol (v9+, nullable).
+    pub member_id: Option<String>,
+    /// Member epoch for KIP-848 consumer protocol (v9+).
+    pub member_epoch: i32,
 }
 
 impl OffsetFetchRequest {
@@ -2339,10 +3184,63 @@ impl OffsetFetchRequest {
         ApiKey::OffsetFetch
     }
 
-    /// Encode for version 0-1.
+    /// Encode for version 0-5 (non-flexible).
     pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
         KafkaString::new(&self.group_id).try_encode(buf)?;
+        self.encode_topics_non_flexible(buf)
+    }
 
+    /// Encode for version 6 (flexible: compact strings/arrays + tagged fields).
+    pub fn encode_v6(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.group_id).try_encode_compact(buf)?;
+        self.encode_topics_compact(buf)?;
+        TaggedFields::default().try_encode(buf)?;
+        Ok(())
+    }
+
+    /// Encode for version 7 (flexible + require_stable).
+    pub fn encode_v7(&self, buf: &mut impl BufMut) -> Result<()> {
+        KafkaString::new(&self.group_id).try_encode_compact(buf)?;
+        self.encode_topics_compact(buf)?;
+        buf.put_u8(u8::from(self.require_stable));
+        TaggedFields::default().try_encode(buf)?;
+        Ok(())
+    }
+
+    /// Encode for version 8 (batched multi-group format, KIP-709).
+    ///
+    /// v8 wraps the request in a `Groups` compact array. We encode our
+    /// single group as a one-element array.
+    pub fn encode_v8(&self, buf: &mut impl BufMut) -> Result<()> {
+        // Groups compact array: 1 element → varint len+1 = 2
+        crate::util::varint::encode_unsigned_varint(2, buf);
+        KafkaString::new(&self.group_id).try_encode_compact(buf)?;
+        self.encode_topics_compact(buf)?;
+        TaggedFields::default().try_encode(buf)?; // per-group tagged fields
+        buf.put_u8(u8::from(self.require_stable));
+        TaggedFields::default().try_encode(buf)?; // top-level tagged fields
+        Ok(())
+    }
+
+    /// Encode for version 9 (v8 + MemberId/MemberEpoch per group, KIP-848).
+    pub fn encode_v9(&self, buf: &mut impl BufMut) -> Result<()> {
+        // Groups compact array: 1 element
+        crate::util::varint::encode_unsigned_varint(2, buf);
+        KafkaString::new(&self.group_id).try_encode_compact(buf)?;
+        match &self.member_id {
+            Some(id) => KafkaString::new(id).try_encode_compact(buf)?,
+            None => KafkaString::null().try_encode_compact(buf)?,
+        }
+        self.member_epoch.encode(buf);
+        self.encode_topics_compact(buf)?;
+        TaggedFields::default().try_encode(buf)?; // per-group tagged fields
+        buf.put_u8(u8::from(self.require_stable));
+        TaggedFields::default().try_encode(buf)?; // top-level tagged fields
+        Ok(())
+    }
+
+    /// Encode topics for non-flexible versions (v0-v5).
+    fn encode_topics_non_flexible(&self, buf: &mut impl BufMut) -> Result<()> {
         match &self.topics {
             Some(topics) => {
                 buf.put_i32(array_len_i32(topics.len())?);
@@ -2356,6 +3254,32 @@ impl OffsetFetchRequest {
             }
             None => {
                 buf.put_i32(-1);
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode topics for flexible versions (v6+).
+    fn encode_topics_compact(&self, buf: &mut impl BufMut) -> Result<()> {
+        match &self.topics {
+            Some(topics) => {
+                let len = u32::try_from(topics.len().saturating_add(1))
+                    .map_err(|_| KrafkaError::protocol("topics array too large"))?;
+                crate::util::varint::encode_unsigned_varint(len, buf);
+                for topic in topics {
+                    KafkaString::new(&topic.name).try_encode_compact(buf)?;
+                    let parts_len = u32::try_from(topic.partition_indexes.len().saturating_add(1))
+                        .map_err(|_| KrafkaError::protocol("partitions array too large"))?;
+                    crate::util::varint::encode_unsigned_varint(parts_len, buf);
+                    for partition in &topic.partition_indexes {
+                        partition.encode(buf);
+                    }
+                    TaggedFields::default().try_encode(buf)?;
+                }
+            }
+            None => {
+                // null compact array: varint 0
+                crate::util::varint::encode_unsigned_varint(0, buf);
             }
         }
         Ok(())
@@ -2418,7 +3342,7 @@ impl OffsetFetchResponse {
         })
     }
 
-    /// Decode from version 3+.
+    /// Decode from version 3-4.
     pub fn decode_v3(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let topics = Self::decode_topics(buf)?;
@@ -2430,7 +3354,71 @@ impl OffsetFetchResponse {
         })
     }
 
-    /// Shared topics array decoder for all versions (no committed_leader_epoch on wire).
+    /// Decode from version 5 (v3 + committed_leader_epoch per partition).
+    pub fn decode_v5(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let topics = Self::decode_topics_v5(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        Ok(Self {
+            throttle_time_ms,
+            topics,
+            error_code,
+        })
+    }
+
+    /// Decode from version 6-7 (flexible + committed_leader_epoch).
+    pub fn decode_v6(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let topics = Self::decode_topics_compact(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let _ = TaggedFields::decode(buf)?;
+        Ok(Self {
+            throttle_time_ms,
+            topics,
+            error_code,
+        })
+    }
+
+    /// Decode from version 8-9 (batched multi-group format, KIP-709).
+    ///
+    /// v8-v9 wraps the response in a `Groups` compact array; we extract
+    /// the first group entry.
+    pub fn decode_v8(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let group_count =
+            check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
+        if group_count == 0 {
+            let _ = TaggedFields::decode(buf)?;
+            return Ok(Self {
+                throttle_time_ms,
+                topics: Vec::new(),
+                error_code: ErrorCode::None,
+            });
+        }
+
+        // Decode first group
+        let _group_id = KafkaString::decode_compact(buf)?;
+        let topics = Self::decode_topics_compact(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let _ = TaggedFields::decode(buf)?; // per-group tagged fields
+
+        // Skip remaining groups
+        for _ in 1..group_count {
+            let _ = KafkaString::decode_compact(buf)?;
+            Self::skip_topics_compact(buf)?;
+            let _ = i16::decode(buf)?;
+            let _ = TaggedFields::decode(buf)?;
+        }
+        let _ = TaggedFields::decode(buf)?; // top-level tagged fields
+
+        Ok(Self {
+            throttle_time_ms,
+            topics,
+            error_code,
+        })
+    }
+
+    /// Shared topics array decoder for v0-v4 (no committed_leader_epoch on wire).
     fn decode_topics(buf: &mut impl Buf) -> Result<Vec<OffsetFetchResponseTopic>> {
         let topic_count = check_decode_array_len(i32::decode(buf)?)?;
         let mut topics = Vec::with_capacity(topic_count);
@@ -2459,6 +3447,94 @@ impl OffsetFetchResponse {
         }
 
         Ok(topics)
+    }
+
+    /// Shared topics array decoder for v5 (adds committed_leader_epoch).
+    fn decode_topics_v5(buf: &mut impl Buf) -> Result<Vec<OffsetFetchResponseTopic>> {
+        let topic_count = check_decode_array_len(i32::decode(buf)?)?;
+        let mut topics = Vec::with_capacity(topic_count);
+
+        for _ in 0..topic_count {
+            let name = KafkaString::decode(buf)?.0.unwrap_or_default();
+            let partition_count = check_decode_array_len(i32::decode(buf)?)?;
+            let mut partitions = Vec::with_capacity(partition_count);
+
+            for _ in 0..partition_count {
+                let partition_index = i32::decode(buf)?;
+                let committed_offset = i64::decode(buf)?;
+                let committed_leader_epoch = i32::decode(buf)?;
+                let metadata = KafkaString::decode(buf)?.0;
+                let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+
+                partitions.push(OffsetFetchResponsePartition {
+                    partition_index,
+                    committed_offset,
+                    committed_leader_epoch,
+                    metadata,
+                    error_code,
+                });
+            }
+
+            topics.push(OffsetFetchResponseTopic { name, partitions });
+        }
+
+        Ok(topics)
+    }
+
+    /// Shared topics array decoder for flexible versions (v6+, compact encoding + leader epoch).
+    fn decode_topics_compact(buf: &mut impl Buf) -> Result<Vec<OffsetFetchResponseTopic>> {
+        let topic_count =
+            check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
+        let mut topics = Vec::with_capacity(topic_count);
+
+        for _ in 0..topic_count {
+            let name = KafkaString::decode_compact(buf)?.0.unwrap_or_default();
+            let part_count =
+                check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
+            let mut partitions = Vec::with_capacity(part_count);
+
+            for _ in 0..part_count {
+                let partition_index = i32::decode(buf)?;
+                let committed_offset = i64::decode(buf)?;
+                let committed_leader_epoch = i32::decode(buf)?;
+                let metadata = KafkaString::decode_compact(buf)?.0;
+                let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+                let _ = TaggedFields::decode(buf)?;
+
+                partitions.push(OffsetFetchResponsePartition {
+                    partition_index,
+                    committed_offset,
+                    committed_leader_epoch,
+                    metadata,
+                    error_code,
+                });
+            }
+            let _ = TaggedFields::decode(buf)?;
+            topics.push(OffsetFetchResponseTopic { name, partitions });
+        }
+
+        Ok(topics)
+    }
+
+    /// Skip a compact topics array (for skipping extra groups in v8+ batched format).
+    fn skip_topics_compact(buf: &mut impl Buf) -> Result<()> {
+        let topic_count =
+            check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
+        for _ in 0..topic_count {
+            let _ = KafkaString::decode_compact(buf)?;
+            let part_count =
+                check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
+            for _ in 0..part_count {
+                let _ = i32::decode(buf)?; // partition_index
+                let _ = i64::decode(buf)?; // committed_offset
+                let _ = i32::decode(buf)?; // committed_leader_epoch
+                let _ = KafkaString::decode_compact(buf)?; // metadata
+                let _ = i16::decode(buf)?; // error_code
+                let _ = TaggedFields::decode(buf)?;
+            }
+            let _ = TaggedFields::decode(buf)?;
+        }
+        Ok(())
     }
 
     /// Get the offset for a specific topic-partition.
@@ -3247,15 +4323,6 @@ impl InitProducerIdRequest {
     pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
         KafkaString(self.transactional_id.clone()).try_encode(buf)?;
         self.transaction_timeout_ms.encode(buf);
-        Ok(())
-    }
-
-    /// Encode as version 2 (with producer_id and epoch for recovery).
-    pub fn encode_v2(&self, buf: &mut impl BufMut) -> Result<()> {
-        KafkaString(self.transactional_id.clone()).try_encode(buf)?;
-        self.transaction_timeout_ms.encode(buf);
-        self.producer_id.encode(buf);
-        self.producer_epoch.encode(buf);
         Ok(())
     }
 }
@@ -5329,6 +6396,9 @@ impl VersionedEncode for MetadataRequest {
             1..=3 => self.encode_v1(buf)?,
             4..=7 => self.encode_v4(buf)?,
             8 => self.encode_v8(buf)?,
+            9 => self.encode_v9(buf)?,
+            10 => self.encode_v10(buf)?,
+            11..=13 => self.encode_v11(buf)?,
             _ => return unsupported_encode!("MetadataRequest", version),
         }
         Ok(())
@@ -5345,6 +6415,10 @@ impl VersionedDecode for MetadataResponse {
             5..=6 => Self::decode_v5(buf),
             7 => Self::decode_v7(buf),
             8 => Self::decode_v8(buf),
+            9 => Self::decode_v9(buf),
+            10 => Self::decode_v10(buf),
+            11..=12 => Self::decode_v11(buf),
+            13 => Self::decode_v13(buf),
             _ => unsupported_decode!("MetadataResponse", version),
         }
     }
@@ -5354,7 +6428,8 @@ impl VersionedEncode for ProduceRequest {
     fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
         match version {
             0..=2 => self.encode_v0(buf)?,
-            3 => self.encode_v3(buf)?,
+            3..=8 => self.encode_v3(buf)?,
+            9..=11 => self.encode_v9(buf)?,
             _ => return unsupported_encode!("ProduceRequest", version),
         }
         Ok(())
@@ -5366,7 +6441,10 @@ impl VersionedDecode for ProduceResponse {
         match version {
             0 => Self::decode_v0(buf),
             1 => Self::decode_v1(buf),
-            2..=3 => Self::decode_v2(buf),
+            2..=4 => Self::decode_v2(buf),
+            5..=7 => Self::decode_v5(buf),
+            8 => Self::decode_v8(buf),
+            9..=11 => Self::decode_v9(buf),
             _ => unsupported_decode!("ProduceResponse", version),
         }
     }
@@ -5386,6 +6464,8 @@ impl VersionedEncode for FetchRequest {
             9 | 10 => self.encode_v9(buf)?,
             // v11 adds rack_id for closest-replica routing (KIP-392)
             11 => self.encode_v11(buf)?,
+            // v12 flexible encoding (compact strings/arrays + tagged fields)
+            12 => self.encode_v12(buf)?,
             _ => return unsupported_encode!("FetchRequest", version),
         }
         Ok(())
@@ -5404,6 +6484,8 @@ impl VersionedDecode for FetchResponse {
             7..=10 => Self::decode_v7(buf),
             // v11 adds preferred_read_replica per partition (KIP-392)
             11 => Self::decode_v11(buf),
+            // v12 flexible encoding (compact strings/arrays + tagged fields)
+            12 => Self::decode_v12(buf),
             _ => unsupported_decode!("FetchResponse", version),
         }
     }
@@ -5413,7 +6495,9 @@ impl VersionedEncode for FindCoordinatorRequest {
     fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
         match version {
             0 => self.encode_v0(buf)?,
-            1 => self.encode_v1(buf)?,
+            1..=2 => self.encode_v1(buf)?,
+            3 => self.encode_v3(buf)?,
+            4 => self.encode_v4(buf)?,
             _ => return unsupported_encode!("FindCoordinatorRequest", version),
         }
         Ok(())
@@ -5424,7 +6508,9 @@ impl VersionedDecode for FindCoordinatorResponse {
     fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
         match version {
             0 => Self::decode_v0(buf),
-            1 => Self::decode_v1(buf),
+            1..=2 => Self::decode_v1(buf),
+            3 => Self::decode_v3(buf),
+            4 => Self::decode_v4(buf),
             _ => unsupported_decode!("FindCoordinatorResponse", version),
         }
     }
@@ -5522,7 +6608,11 @@ impl VersionedEncode for OffsetCommitRequest {
         match version {
             0 => self.encode_v0(buf)?,
             1 => self.encode_v1(buf)?,
-            2 => self.encode_v2(buf)?,
+            2..=4 => self.encode_v2(buf)?,
+            5 => self.encode_v5(buf)?,
+            6 => self.encode_v6(buf)?,
+            7 => self.encode_v7(buf)?,
+            8..=9 => self.encode_v8(buf)?,
             _ => return unsupported_encode!("OffsetCommitRequest", version),
         }
         Ok(())
@@ -5533,6 +6623,8 @@ impl VersionedDecode for OffsetCommitResponse {
     fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
         match version {
             0..=2 => Self::decode_v0(buf),
+            3..=7 => Self::decode_v3(buf),
+            8..=9 => Self::decode_v8(buf),
             _ => unsupported_decode!("OffsetCommitResponse", version),
         }
     }
@@ -5562,7 +6654,11 @@ impl VersionedDecode for ListOffsetsResponse {
 impl VersionedEncode for OffsetFetchRequest {
     fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
         match version {
-            0..=1 => self.encode_v0(buf)?,
+            0..=5 => self.encode_v0(buf)?,
+            6 => self.encode_v6(buf)?,
+            7 => self.encode_v7(buf)?,
+            8 => self.encode_v8(buf)?,
+            9 => self.encode_v9(buf)?,
             _ => return unsupported_encode!("OffsetFetchRequest", version),
         }
         Ok(())
@@ -5573,6 +6669,11 @@ impl VersionedDecode for OffsetFetchResponse {
     fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
         match version {
             0..=1 => Self::decode_v0(buf),
+            2 => Self::decode_v2(buf),
+            3..=4 => Self::decode_v3(buf),
+            5 => Self::decode_v5(buf),
+            6..=7 => Self::decode_v6(buf),
+            8..=9 => Self::decode_v8(buf),
             _ => unsupported_decode!("OffsetFetchResponse", version),
         }
     }
@@ -6666,6 +7767,352 @@ impl VersionedDecode for AlterClientQuotasResponse {
         match version {
             0 => Self::decode_v0(buf),
             _ => unsupported_decode!("AlterClientQuotasResponse", version),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ConsumerGroupHeartbeat (API key 68) — KIP-848
+// ---------------------------------------------------------------------------
+
+/// Topic-partition pair using topic IDs for the KIP-848 consumer group protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerGroupTopicPartitions {
+    /// The topic ID (16-byte UUID).
+    pub topic_id: [u8; 16],
+    /// The partition indices.
+    pub partitions: Vec<i32>,
+}
+
+/// ConsumerGroupHeartbeat request (API key 68, KIP-848).
+///
+/// Members use this to join, leave, and maintain their session with the group
+/// coordinator. All versions use flexible encoding (compact strings, compact
+/// arrays, tagged fields).
+///
+/// **Wire format:** Flexible versions 0+.
+/// - `MemberEpoch = 0`  → join the group
+/// - `MemberEpoch = -1` → leave the group
+/// - `MemberEpoch = -2` → static member temporary leave (KIP-345)
+///
+/// Nullable fields that have not changed since the last heartbeat should be
+/// sent as null to reduce bandwidth.
+#[derive(Debug, Clone)]
+pub struct ConsumerGroupHeartbeatRequest {
+    /// The group identifier.
+    pub group_id: String,
+    /// The member ID (generated by the consumer; must persist for the
+    /// lifetime of the consumer process).
+    pub member_id: String,
+    /// The current member epoch; 0 to join, -1 to leave, -2 for static
+    /// member temporary leave.
+    pub member_epoch: i32,
+    /// The instance ID for static membership (null if not provided or unchanged).
+    pub instance_id: Option<String>,
+    /// The rack ID of the consumer (null if not provided or unchanged).
+    pub rack_id: Option<String>,
+    /// The maximum time in milliseconds that the coordinator will wait for
+    /// the member to revoke its partitions. -1 if unchanged.
+    pub rebalance_timeout_ms: i32,
+    /// The subscribed topic names (null if unchanged since last heartbeat).
+    pub subscribed_topic_names: Option<Vec<String>>,
+    /// The subscribed topic regex (null if unchanged since last heartbeat).
+    /// Only present in version 1+ (KIP-848).
+    pub subscribed_topic_regex: Option<String>,
+    /// The server-side assignor to use (null if not used or unchanged).
+    pub server_assignor: Option<String>,
+    /// The partitions owned by the member (null if unchanged since last heartbeat).
+    pub topic_partitions: Option<Vec<ConsumerGroupTopicPartitions>>,
+}
+
+impl ConsumerGroupHeartbeatRequest {
+    /// Get the API key.
+    pub fn api_key() -> ApiKey {
+        ApiKey::ConsumerGroupHeartbeat
+    }
+
+    /// Encode for version 0 (flexible).
+    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        // GroupId — compact non-nullable string
+        KafkaString::new(&self.group_id).try_encode_compact(buf)?;
+        // MemberId — compact non-nullable string
+        KafkaString::new(&self.member_id).try_encode_compact(buf)?;
+        // MemberEpoch
+        self.member_epoch.encode(buf);
+        // InstanceId — compact nullable string
+        match &self.instance_id {
+            Some(id) => KafkaString::new(id).try_encode_compact(buf)?,
+            None => KafkaString::null().try_encode_compact(buf)?,
+        }
+        // RackId — compact nullable string
+        match &self.rack_id {
+            Some(id) => KafkaString::new(id).try_encode_compact(buf)?,
+            None => KafkaString::null().try_encode_compact(buf)?,
+        }
+        // RebalanceTimeoutMs
+        self.rebalance_timeout_ms.encode(buf);
+        // SubscribedTopicNames — compact nullable array of compact strings
+        match &self.subscribed_topic_names {
+            Some(names) => {
+                let items: Vec<KafkaString> = names.iter().map(KafkaString::new).collect();
+                KafkaArray::new(items).try_encode_compact(buf)?;
+            }
+            None => KafkaArray::<KafkaString>::null().try_encode_compact(buf)?,
+        }
+        // ServerAssignor — compact nullable string
+        match &self.server_assignor {
+            Some(a) => KafkaString::new(a).try_encode_compact(buf)?,
+            None => KafkaString::null().try_encode_compact(buf)?,
+        }
+        // TopicPartitions — compact nullable array of structs
+        self.encode_topic_partitions(buf)?;
+        // Tagged fields (none defined)
+        TaggedFields::default().try_encode(buf)?;
+        Ok(())
+    }
+
+    /// Encode for version 1 (flexible).
+    ///
+    /// Same as v0 but adds `SubscribedTopicRegex` (compact nullable string)
+    /// between `SubscribedTopicNames` and `ServerAssignor`.
+    pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
+        // GroupId — compact non-nullable string
+        KafkaString::new(&self.group_id).try_encode_compact(buf)?;
+        // MemberId — compact non-nullable string
+        KafkaString::new(&self.member_id).try_encode_compact(buf)?;
+        // MemberEpoch
+        self.member_epoch.encode(buf);
+        // InstanceId — compact nullable string
+        match &self.instance_id {
+            Some(id) => KafkaString::new(id).try_encode_compact(buf)?,
+            None => KafkaString::null().try_encode_compact(buf)?,
+        }
+        // RackId — compact nullable string
+        match &self.rack_id {
+            Some(id) => KafkaString::new(id).try_encode_compact(buf)?,
+            None => KafkaString::null().try_encode_compact(buf)?,
+        }
+        // RebalanceTimeoutMs
+        self.rebalance_timeout_ms.encode(buf);
+        // SubscribedTopicNames — compact nullable array of compact strings
+        match &self.subscribed_topic_names {
+            Some(names) => {
+                let items: Vec<KafkaString> = names.iter().map(KafkaString::new).collect();
+                KafkaArray::new(items).try_encode_compact(buf)?;
+            }
+            None => KafkaArray::<KafkaString>::null().try_encode_compact(buf)?,
+        }
+        // SubscribedTopicRegex — compact nullable string (v1+ only)
+        match &self.subscribed_topic_regex {
+            Some(r) => KafkaString::new(r).try_encode_compact(buf)?,
+            None => KafkaString::null().try_encode_compact(buf)?,
+        }
+        // ServerAssignor — compact nullable string
+        match &self.server_assignor {
+            Some(a) => KafkaString::new(a).try_encode_compact(buf)?,
+            None => KafkaString::null().try_encode_compact(buf)?,
+        }
+        // TopicPartitions — compact nullable array of structs
+        self.encode_topic_partitions(buf)?;
+        // Tagged fields (none defined)
+        TaggedFields::default().try_encode(buf)?;
+        Ok(())
+    }
+
+    /// Encode the topic partitions field.
+    fn encode_topic_partitions(&self, buf: &mut impl BufMut) -> Result<()> {
+        match &self.topic_partitions {
+            None => {
+                // null compact array: varint 0
+                KafkaArray::<KafkaString>::null().try_encode_compact(buf)?;
+            }
+            Some(tps) => {
+                let len_plus_one = u32::try_from(tps.len().saturating_add(1)).map_err(|_| {
+                    KrafkaError::protocol(format!(
+                        "topic partitions array length {} exceeds u32 limit",
+                        tps.len()
+                    ))
+                })?;
+                crate::util::varint::encode_unsigned_varint(len_plus_one, buf);
+                for tp in tps {
+                    // TopicId — 16-byte UUID
+                    buf.put_slice(&tp.topic_id);
+                    // Partitions — compact array of i32
+                    let part_len_plus_one = u32::try_from(tp.partitions.len().saturating_add(1))
+                        .map_err(|_| {
+                            KrafkaError::protocol(format!(
+                                "partitions array length {} exceeds u32 limit",
+                                tp.partitions.len()
+                            ))
+                        })?;
+                    crate::util::varint::encode_unsigned_varint(part_len_plus_one, buf);
+                    for &p in &tp.partitions {
+                        p.encode(buf);
+                    }
+                    // Tagged fields for the struct
+                    TaggedFields::default().try_encode(buf)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl VersionedEncode for ConsumerGroupHeartbeatRequest {
+    fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
+        match version {
+            0 => self.encode_v0(buf)?,
+            1 => self.encode_v1(buf)?,
+            _ => return unsupported_encode!("ConsumerGroupHeartbeatRequest", version),
+        }
+        Ok(())
+    }
+}
+
+/// Assignment in the ConsumerGroupHeartbeat response.
+#[derive(Debug, Clone, Default)]
+pub struct ConsumerGroupAssignment {
+    /// The partitions assigned to the member.
+    pub topic_partitions: Vec<ConsumerGroupTopicPartitions>,
+}
+
+/// ConsumerGroupHeartbeat response (API key 68, KIP-848).
+///
+/// The coordinator returns the member's current epoch and assignment.
+/// The assignment field is null until the coordinator has computed an
+/// assignment for the member.
+#[derive(Debug, Clone)]
+pub struct ConsumerGroupHeartbeatResponse {
+    /// The duration in milliseconds for which the request was throttled.
+    pub throttle_time_ms: i32,
+    /// The top-level error code, or 0 if there was no error.
+    pub error_code: ErrorCode,
+    /// The top-level error message, or None if there was no error.
+    pub error_message: Option<String>,
+    /// The member ID (assigned by the coordinator in v0, generated by
+    /// the consumer starting from v1).
+    pub member_id: Option<String>,
+    /// The member epoch.
+    pub member_epoch: i32,
+    /// The heartbeat interval in milliseconds.
+    pub heartbeat_interval_ms: i32,
+    /// The assignment for the member, or None if not yet assigned.
+    pub assignment: Option<ConsumerGroupAssignment>,
+}
+
+impl ConsumerGroupHeartbeatResponse {
+    /// Decode from version 0 (flexible).
+    pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let error_message = KafkaString::decode_compact(buf)?.0;
+        let member_id = KafkaString::decode_compact(buf)?.0;
+        let member_epoch = i32::decode(buf)?;
+        let heartbeat_interval_ms = i32::decode(buf)?;
+
+        // Assignment — nullable struct
+        let assignment = Self::decode_assignment(buf)?;
+
+        // Skip tagged fields
+        let _ = TaggedFields::decode(buf)?;
+
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            error_message,
+            member_id,
+            member_epoch,
+            heartbeat_interval_ms,
+            assignment,
+        })
+    }
+
+    /// Decode the assignment field.
+    ///
+    /// Non-tagged nullable structs in flexible versions use a single byte
+    /// as presence marker: a negative value (0xff) means null, any
+    /// non-negative value (typically 0x01) means the struct fields follow.
+    fn decode_assignment(buf: &mut impl Buf) -> Result<Option<ConsumerGroupAssignment>> {
+        if buf.remaining() < 1 {
+            return Err(KrafkaError::protocol(
+                "not enough bytes for assignment presence tag",
+            ));
+        }
+        let presence = buf.get_i8();
+        if presence < 0 {
+            return Ok(None);
+        }
+
+        // Struct is present — decode TopicPartitions compact array + tagged fields.
+        let tp_count_raw = crate::util::varint::decode_unsigned_varint(buf)?;
+        let topic_partitions = Self::decode_topic_partitions_from_count(tp_count_raw, buf)?;
+
+        // Tagged fields for the Assignment struct
+        let _ = TaggedFields::decode(buf)?;
+
+        Ok(Some(ConsumerGroupAssignment { topic_partitions }))
+    }
+
+    /// Decode topic partitions given the already-decoded compact array count.
+    fn decode_topic_partitions_from_count(
+        count: u32,
+        buf: &mut impl Buf,
+    ) -> Result<Vec<ConsumerGroupTopicPartitions>> {
+        if count == 0 {
+            return Ok(vec![]);
+        }
+        let len = (count - 1) as usize;
+        if len > super::MAX_DECODE_ARRAY_LEN {
+            return Err(KrafkaError::protocol(format!(
+                "topic partitions array length {len} exceeds safety limit {}",
+                super::MAX_DECODE_ARRAY_LEN
+            )));
+        }
+        let mut result = Vec::with_capacity(len);
+        for _ in 0..len {
+            // TopicId — 16-byte UUID
+            if buf.remaining() < 16 {
+                return Err(KrafkaError::protocol("not enough bytes for topic ID UUID"));
+            }
+            let mut topic_id = [0u8; 16];
+            buf.copy_to_slice(&mut topic_id);
+
+            // Partitions — compact array of i32
+            let part_count = crate::util::varint::decode_unsigned_varint(buf)?;
+            let part_len = if part_count == 0 {
+                0
+            } else {
+                (part_count - 1) as usize
+            };
+            if part_len > super::MAX_DECODE_ARRAY_LEN {
+                return Err(KrafkaError::protocol(format!(
+                    "partitions array length {part_len} exceeds safety limit {}",
+                    super::MAX_DECODE_ARRAY_LEN
+                )));
+            }
+            let mut partitions = Vec::with_capacity(part_len);
+            for _ in 0..part_len {
+                partitions.push(i32::decode(buf)?);
+            }
+
+            // Tagged fields for the struct
+            let _ = TaggedFields::decode(buf)?;
+
+            result.push(ConsumerGroupTopicPartitions {
+                topic_id,
+                partitions,
+            });
+        }
+        Ok(result)
+    }
+}
+
+impl VersionedDecode for ConsumerGroupHeartbeatResponse {
+    fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
+        match version {
+            // v0 and v1 have identical response wire format.
+            0 | 1 => Self::decode_v0(buf),
+            _ => unsupported_decode!("ConsumerGroupHeartbeatResponse", version),
         }
     }
 }
@@ -8000,10 +9447,10 @@ mod tests {
     }
 
     #[test]
-    fn test_versioned_encode_metadata_request_rejects_v9() {
+    fn test_versioned_encode_metadata_request_rejects_v14() {
         let request = MetadataRequest::all_topics();
         let mut buf = BytesMut::new();
-        let result = request.encode_versioned(9, &mut buf);
+        let result = request.encode_versioned(14, &mut buf);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("unsupported"), "got: {msg}");
@@ -8029,9 +9476,9 @@ mod tests {
     }
 
     #[test]
-    fn test_versioned_decode_metadata_rejects_v9() {
+    fn test_versioned_decode_metadata_rejects_v14() {
         let mut buf = bytes::Bytes::new();
-        let result = MetadataResponse::decode_versioned(9, &mut buf);
+        let result = MetadataResponse::decode_versioned(14, &mut buf);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("unsupported"), "got: {msg}");
@@ -8323,6 +9770,143 @@ mod tests {
         assert_eq!(resp.topics[0].name.as_deref(), Some("orders"));
     }
 
+    /// v9: flexible encoding, no topic_id.
+    #[test]
+    fn test_metadata_response_decode_v9() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(5); // throttle_time_ms
+
+        // 1 broker (compact array: length + 1 as unsigned varint)
+        buf.put_u8(2); // compact array count = 1 + 1
+        buf.put_i32(1); // node_id
+        // compact string "b1" (length + 1 as unsigned varint)
+        buf.put_u8(3); // len 2 + 1
+        buf.put_slice(b"b1");
+        buf.put_i32(9092); // port
+        buf.put_u8(1); // rack = null compact string (0 means null, 1 means empty)
+        buf.put_u8(0); // tagged fields (empty)
+
+        // cluster_id compact nullable string
+        buf.put_u8(6); // len 5 + 1
+        buf.put_slice(b"cls-9");
+        buf.put_i32(1); // controller_id
+
+        // 1 topic (compact array)
+        buf.put_u8(2); // 1 + 1
+        buf.put_i16(0); // error_code
+        // topic name compact string
+        buf.put_u8(5); // len 4 + 1
+        buf.put_slice(b"my-t");
+        buf.put_u8(0); // is_internal = false
+        buf.put_u8(1); // 0 partitions (compact array 0 + 1)
+        buf.put_i32(-2147483648_i32); // topic_authorized_operations
+        buf.put_u8(0); // tagged fields
+
+        // cluster_authorized_operations
+        buf.put_i32(-2147483648_i32);
+        buf.put_u8(0); // tagged fields (top-level)
+
+        let resp = MetadataResponse::decode_versioned(9, &mut buf.freeze()).unwrap();
+        assert_eq!(resp.throttle_time_ms, 5);
+        assert_eq!(resp.cluster_id.as_deref(), Some("cls-9"));
+        assert_eq!(resp.brokers.len(), 1);
+        assert_eq!(resp.brokers[0].host, "b1");
+        assert_eq!(resp.topics.len(), 1);
+        assert_eq!(resp.topics[0].name.as_deref(), Some("my-t"));
+        assert!(resp.topics[0].topic_id.is_none());
+    }
+
+    /// v10: flexible encoding + topic_id UUID.
+    #[test]
+    fn test_metadata_response_decode_v10() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+
+        // 0 brokers
+        buf.put_u8(1); // compact array count = 0 + 1
+
+        // cluster_id = null
+        buf.put_u8(0);
+        buf.put_i32(-1); // controller_id
+
+        // 1 topic
+        buf.put_u8(2); // 1 + 1
+        buf.put_i16(0); // error_code
+        // topic name compact string "events"
+        buf.put_u8(7); // len 6 + 1
+        buf.put_slice(b"events");
+        // topic_id: 16-byte UUID
+        let topic_uuid: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ];
+        buf.put_slice(&topic_uuid);
+        buf.put_u8(0); // is_internal = false
+        buf.put_u8(1); // 0 partitions
+        buf.put_i32(-2147483648_i32); // topic_authorized_operations
+        buf.put_u8(0); // tagged fields
+
+        buf.put_i32(-2147483648_i32); // cluster_authorized_operations
+        buf.put_u8(0); // tagged fields
+
+        let resp = MetadataResponse::decode_versioned(10, &mut buf.freeze()).unwrap();
+        assert_eq!(resp.topics.len(), 1);
+        assert_eq!(resp.topics[0].name.as_deref(), Some("events"));
+        assert_eq!(resp.topics[0].topic_id, Some(topic_uuid));
+    }
+
+    /// v10: all-zero topic_id is treated as absent.
+    #[test]
+    fn test_metadata_response_decode_v10_zero_uuid() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_u8(1); // 0 brokers
+        buf.put_u8(0); // cluster_id = null
+        buf.put_i32(-1); // controller_id
+
+        buf.put_u8(2); // 1 topic
+        buf.put_i16(0); // error_code
+        buf.put_u8(4); // compact string "foo"
+        buf.put_slice(b"foo");
+        buf.put_slice(&[0u8; 16]); // all-zero UUID
+        buf.put_u8(0); // is_internal = false
+        buf.put_u8(1); // 0 partitions
+        buf.put_i32(-2147483648_i32); // topic_authorized_operations
+        buf.put_u8(0); // tagged fields
+
+        buf.put_i32(-2147483648_i32); // cluster_authorized_operations
+        buf.put_u8(0); // tagged fields
+
+        let resp = MetadataResponse::decode_versioned(10, &mut buf.freeze()).unwrap();
+        assert!(resp.topics[0].topic_id.is_none());
+    }
+
+    /// v9 encode is flexible (compact arrays + tagged fields).
+    #[test]
+    fn test_metadata_request_encode_v9() {
+        let request = MetadataRequest::all_topics();
+        let mut buf = BytesMut::new();
+        request.encode_v9(&mut buf).unwrap();
+        // Compact null array (0 varint) + allow_auto_topic_creation + 2 authorized ops + tagged fields
+        assert!(!buf.is_empty());
+        // Verify VersionedEncode dispatches correctly
+        let mut buf2 = BytesMut::new();
+        request.encode_versioned(9, &mut buf2).unwrap();
+        assert_eq!(buf, buf2);
+    }
+
+    /// v12 routes to encode_v11 (no IncludeClusterAuthorizedOperations) and
+    /// decode_v11 (no ClusterAuthorizedOperations).
+    #[test]
+    fn test_metadata_versioned_v12_dispatches() {
+        let request = MetadataRequest::all_topics();
+        let mut buf_v11 = BytesMut::new();
+        request.encode_v11(&mut buf_v11).unwrap();
+        let mut buf_v12 = BytesMut::new();
+        request.encode_versioned(12, &mut buf_v12).unwrap();
+        assert_eq!(buf_v11, buf_v12);
+    }
+
     /// Encode v4 adds allow_auto_topic_creation byte on top of v1.
     #[test]
     fn test_metadata_request_encode_v4_adds_auto_create() {
@@ -8333,6 +9917,75 @@ mod tests {
         request.encode_v4(&mut buf_v4).unwrap();
         // v4 = v1 + 1 byte (allow_auto_topic_creation)
         assert_eq!(buf_v4.len(), buf_v1.len() + 1);
+    }
+
+    /// v10 encode adds 16-byte topic_id per entry vs v9.
+    #[test]
+    fn test_metadata_request_encode_v10_adds_topic_id() {
+        let request = MetadataRequest::for_topics(vec!["my-test"]);
+        let mut buf_v9 = BytesMut::new();
+        request.encode_v9(&mut buf_v9).unwrap();
+        let mut buf_v10 = BytesMut::new();
+        request.encode_v10(&mut buf_v10).unwrap();
+        // v10 adds 16-byte topic_id per topic entry
+        assert_eq!(buf_v10.len(), buf_v9.len() + 16);
+    }
+
+    /// v11 encode omits IncludeClusterAuthorizedOperations (1 byte shorter than v10).
+    #[test]
+    fn test_metadata_request_encode_v11_no_cluster_auth_ops() {
+        let request = MetadataRequest::all_topics();
+        let mut buf_v10 = BytesMut::new();
+        request.encode_v10(&mut buf_v10).unwrap();
+        let mut buf_v11 = BytesMut::new();
+        request.encode_v11(&mut buf_v11).unwrap();
+        // v11 omits include_cluster_authorized_operations (1 byte less)
+        assert_eq!(buf_v11.len(), buf_v10.len() - 1);
+    }
+
+    /// v11 decode: no ClusterAuthorizedOperations field on wire.
+    #[test]
+    fn test_metadata_response_decode_v11() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_u8(1); // 0 brokers
+        buf.put_u8(0); // cluster_id = null
+        buf.put_i32(-1); // controller_id
+
+        // 1 topic
+        buf.put_u8(2); // 1 + 1
+        buf.put_i16(0); // error_code
+        buf.put_u8(4); // compact string "foo"
+        buf.put_slice(b"foo");
+        buf.put_slice(&[0xAB; 16]); // topic_id UUID
+        buf.put_u8(0); // is_internal = false
+        buf.put_u8(1); // 0 partitions
+        buf.put_i32(-2147483648_i32); // topic_authorized_operations
+        buf.put_u8(0); // tagged fields
+
+        // NO cluster_authorized_operations for v11+
+        buf.put_u8(0); // tagged fields (top-level)
+
+        let resp = MetadataResponse::decode_versioned(11, &mut buf.freeze()).unwrap();
+        assert_eq!(resp.topics.len(), 1);
+        assert_eq!(resp.topics[0].name.as_deref(), Some("foo"));
+        assert_eq!(resp.topics[0].topic_id, Some([0xAB; 16]));
+    }
+
+    /// v9 encode with specific topics encodes each as a struct with tagged fields.
+    #[test]
+    fn test_metadata_request_encode_v9_with_topics() {
+        let request = MetadataRequest::for_topics(vec!["test-topic"]);
+        let mut buf = BytesMut::new();
+        request.encode_v9(&mut buf).unwrap();
+        // Should encode: compact array len(1+1=2), compact string("test-topic", len+1=11),
+        // tagged fields(0), allow_auto_topic_creation(1), 2x auth ops, top-level tagged fields
+        assert!(!buf.is_empty());
+
+        // Verify round-trip via VersionedEncode
+        let mut buf2 = BytesMut::new();
+        request.encode_versioned(9, &mut buf2).unwrap();
+        assert_eq!(buf, buf2);
     }
 
     /// Encode v8 adds two more boolean bytes.
@@ -9114,5 +10767,673 @@ mod tests {
         assert_eq!(resp.entries.len(), 1);
         assert!(resp.entries[0].error_code.is_ok());
         assert_eq!(resp.entries[0].entity[0].entity_type, "user");
+    }
+
+    // -----------------------------------------------------------------------
+    // ConsumerGroupHeartbeat (API key 68, KIP-848)
+    // -----------------------------------------------------------------------
+
+    /// Helper: encode a compact string into `buf`.
+    /// Non-null string: varint(len + 1) then bytes.
+    /// Null string: varint(0).
+    fn put_compact_string(buf: &mut BytesMut, s: Option<&str>) {
+        match s {
+            Some(val) => {
+                // len + 1 fits in one byte for small strings
+                buf.put_u8((val.len() + 1) as u8);
+                buf.put_slice(val.as_bytes());
+            }
+            None => buf.put_u8(0),
+        }
+    }
+
+    /// Helper: encode a compact array count (count + 1) as unsigned varint.
+    fn put_compact_array_count(buf: &mut BytesMut, count: Option<usize>) {
+        match count {
+            Some(n) => buf.put_u8((n + 1) as u8),
+            None => buf.put_u8(0),
+        }
+    }
+
+    /// Helper: write empty tagged fields (varint 0).
+    fn put_tagged_fields(buf: &mut BytesMut) {
+        buf.put_u8(0);
+    }
+
+    #[test]
+    fn test_consumer_group_heartbeat_request_encode_v0_all_fields() {
+        let topic_id: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ];
+        let request = ConsumerGroupHeartbeatRequest {
+            group_id: "grp".to_string(),
+            member_id: "m1".to_string(),
+            member_epoch: 5,
+            instance_id: Some("inst".to_string()),
+            rack_id: Some("rack-a".to_string()),
+            rebalance_timeout_ms: 30_000,
+            subscribed_topic_names: Some(vec!["topicA".to_string()]),
+            subscribed_topic_regex: None,
+            server_assignor: Some("uniform".to_string()),
+            topic_partitions: Some(vec![ConsumerGroupTopicPartitions {
+                topic_id,
+                partitions: vec![0, 1, 2],
+            }]),
+        };
+
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf).unwrap();
+
+        // Decode the buffer and verify field-by-field
+        let mut r = buf.freeze();
+
+        // group_id — compact string: varint(3+1)=4, "grp"
+        assert_eq!(r.get_u8(), 4); // len+1
+        let mut gid = vec![0u8; 3];
+        r.copy_to_slice(&mut gid);
+        assert_eq!(&gid, b"grp");
+
+        // member_id — compact string: varint(2+1)=3, "m1"
+        assert_eq!(r.get_u8(), 3);
+        let mut mid = vec![0u8; 2];
+        r.copy_to_slice(&mut mid);
+        assert_eq!(&mid, b"m1");
+
+        // member_epoch
+        assert_eq!(r.get_i32(), 5);
+
+        // instance_id — compact string: varint(4+1)=5, "inst"
+        assert_eq!(r.get_u8(), 5);
+        let mut iid = vec![0u8; 4];
+        r.copy_to_slice(&mut iid);
+        assert_eq!(&iid, b"inst");
+
+        // rack_id — compact string: varint(6+1)=7, "rack-a"
+        assert_eq!(r.get_u8(), 7);
+        let mut rid = vec![0u8; 6];
+        r.copy_to_slice(&mut rid);
+        assert_eq!(&rid, b"rack-a");
+
+        // rebalance_timeout_ms
+        assert_eq!(r.get_i32(), 30_000);
+
+        // subscribed_topic_names — compact array: varint(1+1)=2, then 1 compact string
+        assert_eq!(r.get_u8(), 2); // count+1
+        assert_eq!(r.get_u8(), 7); // "topicA" len+1
+        let mut tn = vec![0u8; 6];
+        r.copy_to_slice(&mut tn);
+        assert_eq!(&tn, b"topicA");
+
+        // server_assignor — compact string: varint(7+1)=8, "uniform"
+        assert_eq!(r.get_u8(), 8);
+        let mut sa = vec![0u8; 7];
+        r.copy_to_slice(&mut sa);
+        assert_eq!(&sa, b"uniform");
+
+        // topic_partitions — compact array: varint(1+1)=2
+        assert_eq!(r.get_u8(), 2); // count+1
+        // element: 16-byte UUID
+        let mut tid = [0u8; 16];
+        r.copy_to_slice(&mut tid);
+        assert_eq!(tid, topic_id);
+        // partitions compact array: varint(3+1)=4
+        assert_eq!(r.get_u8(), 4);
+        assert_eq!(r.get_i32(), 0);
+        assert_eq!(r.get_i32(), 1);
+        assert_eq!(r.get_i32(), 2);
+        // element tagged fields
+        assert_eq!(r.get_u8(), 0);
+
+        // top-level tagged fields
+        assert_eq!(r.get_u8(), 0);
+
+        // buffer fully consumed
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn test_consumer_group_heartbeat_request_encode_v0_null_optionals() {
+        let request = ConsumerGroupHeartbeatRequest {
+            group_id: "g".to_string(),
+            member_id: "m".to_string(),
+            member_epoch: 0,
+            instance_id: None,
+            rack_id: None,
+            rebalance_timeout_ms: -1,
+            subscribed_topic_names: None,
+            subscribed_topic_regex: None,
+            server_assignor: None,
+            topic_partitions: None,
+        };
+
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf).unwrap();
+
+        let mut r = buf.freeze();
+
+        // group_id: varint(2), "g"
+        assert_eq!(r.get_u8(), 2);
+        assert_eq!(r.get_u8(), b'g');
+
+        // member_id: varint(2), "m"
+        assert_eq!(r.get_u8(), 2);
+        assert_eq!(r.get_u8(), b'm');
+
+        // member_epoch: 0
+        assert_eq!(r.get_i32(), 0);
+
+        // instance_id: null compact string → varint(0)
+        assert_eq!(r.get_u8(), 0);
+
+        // rack_id: null compact string → varint(0)
+        assert_eq!(r.get_u8(), 0);
+
+        // rebalance_timeout_ms: -1
+        assert_eq!(r.get_i32(), -1);
+
+        // subscribed_topic_names: null compact array → varint(0)
+        assert_eq!(r.get_u8(), 0);
+
+        // server_assignor: null compact string → varint(0)
+        assert_eq!(r.get_u8(), 0);
+
+        // topic_partitions: null compact array → varint(0)
+        assert_eq!(r.get_u8(), 0);
+
+        // tagged fields
+        assert_eq!(r.get_u8(), 0);
+
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn test_consumer_group_heartbeat_request_leave_epoch() {
+        // Epoch -1 means "leave the group"
+        let request = ConsumerGroupHeartbeatRequest {
+            group_id: "g".to_string(),
+            member_id: "m".to_string(),
+            member_epoch: -1,
+            instance_id: None,
+            rack_id: None,
+            rebalance_timeout_ms: -1,
+            subscribed_topic_names: None,
+            subscribed_topic_regex: None,
+            server_assignor: None,
+            topic_partitions: None,
+        };
+
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf).unwrap();
+
+        let mut r = buf.freeze();
+        // Skip group_id + member_id
+        let _ = r.get_u8();
+        let _ = r.get_u8(); // "g"
+        let _ = r.get_u8();
+        let _ = r.get_u8(); // "m"
+        // member_epoch
+        assert_eq!(r.get_i32(), -1);
+    }
+
+    #[test]
+    fn test_consumer_group_heartbeat_request_versioned_encode_v0() {
+        let request = ConsumerGroupHeartbeatRequest {
+            group_id: "g".to_string(),
+            member_id: "m".to_string(),
+            member_epoch: 0,
+            instance_id: None,
+            rack_id: None,
+            rebalance_timeout_ms: -1,
+            subscribed_topic_names: None,
+            subscribed_topic_regex: None,
+            server_assignor: None,
+            topic_partitions: None,
+        };
+
+        let mut buf_direct = BytesMut::new();
+        request.encode_v0(&mut buf_direct).unwrap();
+
+        let mut buf_versioned = BytesMut::new();
+        request.encode_versioned(0, &mut buf_versioned).unwrap();
+
+        assert_eq!(buf_direct, buf_versioned);
+    }
+
+    #[test]
+    fn test_consumer_group_heartbeat_request_versioned_encode_unsupported() {
+        let request = ConsumerGroupHeartbeatRequest {
+            group_id: "g".to_string(),
+            member_id: "m".to_string(),
+            member_epoch: 0,
+            instance_id: None,
+            rack_id: None,
+            rebalance_timeout_ms: -1,
+            subscribed_topic_names: None,
+            subscribed_topic_regex: None,
+            server_assignor: None,
+            topic_partitions: None,
+        };
+
+        let mut buf = BytesMut::new();
+        let result = request.encode_versioned(2, &mut buf);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unsupported"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_consumer_group_heartbeat_response_decode_v0_with_assignment() {
+        let mut buf = BytesMut::new();
+
+        // throttle_time_ms
+        buf.put_i32(100);
+        // error_code
+        buf.put_i16(0);
+        // error_message — null compact string
+        put_compact_string(&mut buf, None);
+        // member_id — "member-1"
+        put_compact_string(&mut buf, Some("member-1"));
+        // member_epoch
+        buf.put_i32(3);
+        // heartbeat_interval_ms
+        buf.put_i32(5000);
+
+        // assignment — present (presence byte = 0x01)
+        buf.put_i8(1);
+        // topic_partitions compact array: 1 element → varint(1+1)=2
+        put_compact_array_count(&mut buf, Some(1));
+        // element: topic_id (16 bytes)
+        let topic_id: [u8; 16] = [
+            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99,
+        ];
+        buf.put_slice(&topic_id);
+        // partitions compact array: 2 elements → varint(2+1)=3
+        put_compact_array_count(&mut buf, Some(2));
+        buf.put_i32(0);
+        buf.put_i32(1);
+        // element tagged fields
+        put_tagged_fields(&mut buf);
+        // assignment tagged fields
+        put_tagged_fields(&mut buf);
+
+        // top-level tagged fields
+        put_tagged_fields(&mut buf);
+
+        let resp = ConsumerGroupHeartbeatResponse::decode_v0(&mut buf.freeze()).unwrap();
+        assert_eq!(resp.throttle_time_ms, 100);
+        assert!(resp.error_code.is_ok());
+        assert!(resp.error_message.is_none());
+        assert_eq!(resp.member_id.as_deref(), Some("member-1"));
+        assert_eq!(resp.member_epoch, 3);
+        assert_eq!(resp.heartbeat_interval_ms, 5000);
+
+        let assignment = resp.assignment.expect("assignment should be present");
+        assert_eq!(assignment.topic_partitions.len(), 1);
+        assert_eq!(assignment.topic_partitions[0].topic_id, topic_id);
+        assert_eq!(assignment.topic_partitions[0].partitions, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_consumer_group_heartbeat_response_decode_v0_null_assignment() {
+        let mut buf = BytesMut::new();
+
+        // throttle_time_ms
+        buf.put_i32(0);
+        // error_code
+        buf.put_i16(0);
+        // error_message — null
+        put_compact_string(&mut buf, None);
+        // member_id — "m"
+        put_compact_string(&mut buf, Some("m"));
+        // member_epoch
+        buf.put_i32(1);
+        // heartbeat_interval_ms
+        buf.put_i32(3000);
+        // assignment — null (presence byte = 0xff = -1 as i8)
+        buf.put_i8(-1);
+        // top-level tagged fields
+        put_tagged_fields(&mut buf);
+
+        let resp = ConsumerGroupHeartbeatResponse::decode_v0(&mut buf.freeze()).unwrap();
+        assert_eq!(resp.throttle_time_ms, 0);
+        assert!(resp.error_code.is_ok());
+        assert!(resp.member_id.as_deref() == Some("m"));
+        assert_eq!(resp.member_epoch, 1);
+        assert_eq!(resp.heartbeat_interval_ms, 3000);
+        assert!(resp.assignment.is_none());
+    }
+
+    #[test]
+    fn test_consumer_group_heartbeat_response_decode_v0_with_error() {
+        let mut buf = BytesMut::new();
+
+        // throttle_time_ms
+        buf.put_i32(0);
+        // error_code: FENCED_MEMBER_EPOCH (110)
+        buf.put_i16(110);
+        // error_message — "Fenced"
+        put_compact_string(&mut buf, Some("Fenced"));
+        // member_id — null
+        put_compact_string(&mut buf, None);
+        // member_epoch
+        buf.put_i32(-1);
+        // heartbeat_interval_ms
+        buf.put_i32(0);
+        // assignment — null
+        buf.put_i8(-1);
+        // tagged fields
+        put_tagged_fields(&mut buf);
+
+        let resp = ConsumerGroupHeartbeatResponse::decode_v0(&mut buf.freeze()).unwrap();
+        assert!(!resp.error_code.is_ok());
+        assert_eq!(resp.error_message.as_deref(), Some("Fenced"));
+        assert!(resp.member_id.is_none());
+        assert_eq!(resp.member_epoch, -1);
+    }
+
+    #[test]
+    fn test_consumer_group_heartbeat_response_decode_v0_empty_assignment() {
+        let mut buf = BytesMut::new();
+
+        // throttle_time_ms
+        buf.put_i32(0);
+        // error_code
+        buf.put_i16(0);
+        // error_message — null
+        put_compact_string(&mut buf, None);
+        // member_id — "m"
+        put_compact_string(&mut buf, Some("m"));
+        // member_epoch
+        buf.put_i32(2);
+        // heartbeat_interval_ms
+        buf.put_i32(5000);
+        // assignment — present with empty topic_partitions
+        buf.put_i8(1);
+        // topic_partitions compact array: 0 elements → varint(0+1)=1
+        put_compact_array_count(&mut buf, Some(0));
+        // assignment tagged fields
+        put_tagged_fields(&mut buf);
+        // top-level tagged fields
+        put_tagged_fields(&mut buf);
+
+        let resp = ConsumerGroupHeartbeatResponse::decode_v0(&mut buf.freeze()).unwrap();
+        let assignment = resp.assignment.expect("assignment should be present");
+        assert!(assignment.topic_partitions.is_empty());
+    }
+
+    #[test]
+    fn test_consumer_group_heartbeat_response_versioned_decode_v0() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle
+        buf.put_i16(0); // error_code
+        put_compact_string(&mut buf, None); // error_message
+        put_compact_string(&mut buf, Some("m")); // member_id
+        buf.put_i32(1); // member_epoch
+        buf.put_i32(5000); // heartbeat_interval_ms
+        buf.put_i8(-1); // assignment null
+        put_tagged_fields(&mut buf);
+
+        let resp = ConsumerGroupHeartbeatResponse::decode_versioned(0, &mut buf.freeze()).unwrap();
+        assert!(resp.error_code.is_ok());
+        assert!(resp.assignment.is_none());
+    }
+
+    #[test]
+    fn test_consumer_group_heartbeat_response_versioned_decode_unsupported() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(0); // dummy byte
+        let result = ConsumerGroupHeartbeatResponse::decode_versioned(2, &mut buf.freeze());
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unsupported"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_consumer_group_heartbeat_request_encode_decode_roundtrip() {
+        // Encode the request, then manually decode it field-by-field to verify
+        // the wire format is self-consistent.
+        let topic_id = [0xab_u8; 16];
+        let request = ConsumerGroupHeartbeatRequest {
+            group_id: "test-grp".to_string(),
+            member_id: "consumer-1".to_string(),
+            member_epoch: 7,
+            instance_id: Some("static-1".to_string()),
+            rack_id: None,
+            rebalance_timeout_ms: 60_000,
+            subscribed_topic_names: Some(vec!["t1".to_string(), "t2".to_string()]),
+            subscribed_topic_regex: None,
+            server_assignor: None,
+            topic_partitions: Some(vec![
+                ConsumerGroupTopicPartitions {
+                    topic_id,
+                    partitions: vec![0],
+                },
+                ConsumerGroupTopicPartitions {
+                    topic_id: [0xcd; 16],
+                    partitions: vec![1, 2, 3],
+                },
+            ]),
+        };
+
+        let mut buf = BytesMut::new();
+        request.encode_v0(&mut buf).unwrap();
+        let mut r = buf.freeze();
+
+        // group_id
+        let gid = KafkaString::decode_compact(&mut r).unwrap().0.unwrap();
+        assert_eq!(gid, "test-grp");
+        // member_id
+        let mid = KafkaString::decode_compact(&mut r).unwrap().0.unwrap();
+        assert_eq!(mid, "consumer-1");
+        // member_epoch
+        assert_eq!(i32::decode(&mut r).unwrap(), 7);
+        // instance_id
+        let iid = KafkaString::decode_compact(&mut r).unwrap().0;
+        assert_eq!(iid.as_deref(), Some("static-1"));
+        // rack_id
+        let rid = KafkaString::decode_compact(&mut r).unwrap().0;
+        assert!(rid.is_none());
+        // rebalance_timeout_ms
+        assert_eq!(i32::decode(&mut r).unwrap(), 60_000);
+        // subscribed_topic_names
+        let arr = KafkaArray::<KafkaString>::decode_compact(&mut r).unwrap();
+        let names: Vec<String> = arr.0.unwrap().into_iter().map(|s| s.0.unwrap()).collect();
+        assert_eq!(names, vec!["t1", "t2"]);
+        // server_assignor
+        let sa = KafkaString::decode_compact(&mut r).unwrap().0;
+        assert!(sa.is_none());
+        // topic_partitions — compact array with 2 elements
+        let tp_count = crate::util::varint::decode_unsigned_varint(&mut r).unwrap();
+        assert_eq!(tp_count, 3); // 2 + 1
+        // first element
+        let mut tid1 = [0u8; 16];
+        r.copy_to_slice(&mut tid1);
+        assert_eq!(tid1, [0xab; 16]);
+        let pc1 = crate::util::varint::decode_unsigned_varint(&mut r).unwrap();
+        assert_eq!(pc1, 2); // 1 + 1
+        assert_eq!(i32::decode(&mut r).unwrap(), 0);
+        let _ = TaggedFields::decode(&mut r).unwrap();
+        // second element
+        let mut tid2 = [0u8; 16];
+        r.copy_to_slice(&mut tid2);
+        assert_eq!(tid2, [0xcd; 16]);
+        let pc2 = crate::util::varint::decode_unsigned_varint(&mut r).unwrap();
+        assert_eq!(pc2, 4); // 3 + 1
+        assert_eq!(i32::decode(&mut r).unwrap(), 1);
+        assert_eq!(i32::decode(&mut r).unwrap(), 2);
+        assert_eq!(i32::decode(&mut r).unwrap(), 3);
+        let _ = TaggedFields::decode(&mut r).unwrap();
+        // top-level tagged fields
+        let _ = TaggedFields::decode(&mut r).unwrap();
+
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn test_consumer_group_heartbeat_response_multi_topic_assignment() {
+        let mut buf = BytesMut::new();
+
+        buf.put_i32(50); // throttle
+        buf.put_i16(0); // error_code
+        put_compact_string(&mut buf, None); // error_message
+        put_compact_string(&mut buf, Some("mem")); // member_id
+        buf.put_i32(10); // member_epoch
+        buf.put_i32(4000); // heartbeat_interval_ms
+
+        // assignment present with 2 topics
+        buf.put_i8(1);
+        put_compact_array_count(&mut buf, Some(2));
+
+        // topic 1: 1 partition
+        buf.put_slice(&[0x11; 16]); // topic_id
+        put_compact_array_count(&mut buf, Some(1));
+        buf.put_i32(5);
+        put_tagged_fields(&mut buf);
+
+        // topic 2: 3 partitions
+        buf.put_slice(&[0x22; 16]); // topic_id
+        put_compact_array_count(&mut buf, Some(3));
+        buf.put_i32(0);
+        buf.put_i32(1);
+        buf.put_i32(2);
+        put_tagged_fields(&mut buf);
+
+        // assignment tagged fields
+        put_tagged_fields(&mut buf);
+        // top-level tagged fields
+        put_tagged_fields(&mut buf);
+
+        let resp = ConsumerGroupHeartbeatResponse::decode_v0(&mut buf.freeze()).unwrap();
+        assert_eq!(resp.throttle_time_ms, 50);
+        assert_eq!(resp.member_epoch, 10);
+
+        let assignment = resp.assignment.unwrap();
+        assert_eq!(assignment.topic_partitions.len(), 2);
+        assert_eq!(assignment.topic_partitions[0].topic_id, [0x11; 16]);
+        assert_eq!(assignment.topic_partitions[0].partitions, vec![5]);
+        assert_eq!(assignment.topic_partitions[1].topic_id, [0x22; 16]);
+        assert_eq!(assignment.topic_partitions[1].partitions, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_consumer_group_heartbeat_request_encode_v1_with_regex() {
+        let request = ConsumerGroupHeartbeatRequest {
+            group_id: "g".to_string(),
+            member_id: "m".to_string(),
+            member_epoch: 1,
+            instance_id: None,
+            rack_id: None,
+            rebalance_timeout_ms: -1,
+            subscribed_topic_names: Some(vec!["t1".to_string()]),
+            subscribed_topic_regex: Some("topic-.*".to_string()),
+            server_assignor: None,
+            topic_partitions: None,
+        };
+
+        let mut buf = BytesMut::new();
+        request.encode_v1(&mut buf).unwrap();
+        let mut r = buf.freeze();
+
+        // group_id
+        let gid = KafkaString::decode_compact(&mut r).unwrap().0.unwrap();
+        assert_eq!(gid, "g");
+        // member_id
+        let mid = KafkaString::decode_compact(&mut r).unwrap().0.unwrap();
+        assert_eq!(mid, "m");
+        // member_epoch
+        assert_eq!(i32::decode(&mut r).unwrap(), 1);
+        // instance_id (null)
+        assert!(KafkaString::decode_compact(&mut r).unwrap().0.is_none());
+        // rack_id (null)
+        assert!(KafkaString::decode_compact(&mut r).unwrap().0.is_none());
+        // rebalance_timeout_ms
+        assert_eq!(i32::decode(&mut r).unwrap(), -1);
+        // subscribed_topic_names: 1 element
+        let stn_count = crate::util::varint::decode_unsigned_varint(&mut r).unwrap();
+        assert_eq!(stn_count, 2); // 1 + 1
+        let t = KafkaString::decode_compact(&mut r).unwrap().0.unwrap();
+        assert_eq!(t, "t1");
+        // subscribed_topic_regex: "topic-.*"
+        let regex = KafkaString::decode_compact(&mut r).unwrap().0.unwrap();
+        assert_eq!(regex, "topic-.*");
+        // server_assignor (null)
+        assert!(KafkaString::decode_compact(&mut r).unwrap().0.is_none());
+        // topic_partitions (null)
+        let tp = crate::util::varint::decode_unsigned_varint(&mut r).unwrap();
+        assert_eq!(tp, 0); // null compact array
+        // tagged fields
+        let _ = TaggedFields::decode(&mut r).unwrap();
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn test_consumer_group_heartbeat_request_encode_v1_null_regex() {
+        let request = ConsumerGroupHeartbeatRequest {
+            group_id: "g".to_string(),
+            member_id: "m".to_string(),
+            member_epoch: 0,
+            instance_id: None,
+            rack_id: None,
+            rebalance_timeout_ms: -1,
+            subscribed_topic_names: None,
+            subscribed_topic_regex: None,
+            server_assignor: None,
+            topic_partitions: None,
+        };
+
+        let mut buf_v0 = BytesMut::new();
+        request.encode_v0(&mut buf_v0).unwrap();
+        let mut buf_v1 = BytesMut::new();
+        request.encode_v1(&mut buf_v1).unwrap();
+
+        // v1 should be longer by exactly one byte (the null regex compact string = varint 0)
+        assert_eq!(buf_v1.len(), buf_v0.len() + 1);
+    }
+
+    #[test]
+    fn test_consumer_group_heartbeat_request_versioned_encode_v1() {
+        let request = ConsumerGroupHeartbeatRequest {
+            group_id: "g".to_string(),
+            member_id: "m".to_string(),
+            member_epoch: 0,
+            instance_id: None,
+            rack_id: None,
+            rebalance_timeout_ms: -1,
+            subscribed_topic_names: None,
+            subscribed_topic_regex: None,
+            server_assignor: None,
+            topic_partitions: None,
+        };
+
+        let mut buf_direct = BytesMut::new();
+        request.encode_v1(&mut buf_direct).unwrap();
+
+        let mut buf_versioned = BytesMut::new();
+        request.encode_versioned(1, &mut buf_versioned).unwrap();
+
+        assert_eq!(buf_direct, buf_versioned);
+    }
+
+    #[test]
+    fn test_consumer_group_heartbeat_response_versioned_decode_v1() {
+        // v1 response has the same wire format as v0
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle
+        buf.put_i16(0); // no error
+        put_compact_string(&mut buf, None); // error_message
+        put_compact_string(&mut buf, Some("consumer-gen-id")); // member_id
+        buf.put_i32(3); // member_epoch
+        buf.put_i32(5000); // heartbeat_interval_ms
+        buf.put_i8(-1); // null assignment
+        put_tagged_fields(&mut buf);
+
+        let resp = ConsumerGroupHeartbeatResponse::decode_versioned(1, &mut buf.freeze()).unwrap();
+        assert_eq!(resp.error_code, ErrorCode::None);
+        assert_eq!(resp.member_id.as_deref(), Some("consumer-gen-id"));
+        assert_eq!(resp.member_epoch, 3);
+        assert_eq!(resp.heartbeat_interval_ms, 5000);
+        assert!(resp.assignment.is_none());
     }
 }

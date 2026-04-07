@@ -21,6 +21,7 @@ The Krafka consumer is an async-native, feature-rich Kafka consumer with:
 - Incremental fetch sessions (KIP-227)
 - Closest-replica fetching (KIP-392)
 - Static group membership (KIP-345)
+- KIP-848 consumer group protocol (server-side assignment)
 - Interceptor hooks
 - Log compaction awareness with [`CompactedTable`](#compactedtable) and [`CompactedTopicConsumer`](#compactedtopicconsumer) for key→value tables
 - Per-partition offset lag tracking
@@ -876,6 +877,85 @@ let consumer = Consumer::builder()
     .build()
     .await?;
 ```
+
+## KIP-848 Consumer Group Protocol
+
+KIP-848 introduces a new consumer group protocol where the server performs
+partition assignment instead of the group leader. This eliminates the
+JoinGroup/SyncGroup round-trip and replaces it with a single
+`ConsumerGroupHeartbeat` API (key 68, versions 0–1).
+
+### Enabling KIP-848
+
+```rust
+use krafka::consumer::{Consumer, GroupProtocol};
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .group_protocol(GroupProtocol::Consumer)  // KIP-848
+    .build()
+    .await?;
+
+consumer.subscribe(&["my-topic"]).await?;
+```
+
+### How It Works
+
+| Classic Protocol | KIP-848 Consumer Protocol |
+|-----------------|--------------------------|
+| JoinGroup + SyncGroup + Heartbeat | ConsumerGroupHeartbeat only |
+| Client-side assignment (group leader) | Server-side assignment |
+| Generation ID | Member epoch |
+| `generation_id = -1` (unjoined) | `member_epoch = 0` (join) |
+| LeaveGroup request | `member_epoch = -1` (leave) |
+
+With the consumer protocol:
+1. A member joins by sending a heartbeat with `member_epoch = 0`
+2. The coordinator assigns partitions and returns the assignment in the response
+3. Members maintain their session by sending periodic heartbeats
+4. The heartbeat task updates the local assignment and state when the broker returns new assignments
+5. To leave, a member sends a heartbeat with `member_epoch = -1`
+
+### Topic UUID Resolution
+
+The ConsumerGroupHeartbeat response uses 16-byte topic UUIDs in assignments.
+Krafka resolves these UUIDs to topic names using a two-level lookup (mirroring
+the Java client's `AbstractMembershipManager`):
+
+1. **Global metadata cache** — populated from Metadata API v10+ responses.
+2. **Local topic names cache** — maps UUID → name from previously resolved
+   assignments, survives metadata cache flushes.
+
+Successfully resolved names are cached locally. Unresolvable UUIDs trigger an
+automatic metadata refresh. The raw target assignment (with UUIDs) is stored
+so re-resolution occurs after every metadata update — unresolved partitions are
+never permanently lost.
+
+The `StaleMemberEpoch` error (113) is handled as a transient condition: the
+heartbeat task logs at debug level and retries on the next tick.
+
+### Version Notes
+
+- **v0** — Base version; compatible with Kafka 3.7+ (EA) and 4.0+ (GA)
+- **v1** — Adds `SubscribedTopicRegex` for regex-based topic subscription (KIP-848) and requires consumer-generated member IDs (KIP-1082); available on Kafka 4.0+
+
+### Error Handling
+
+The ConsumerGroupHeartbeat response may return these KIP-848-specific errors:
+
+| Error Code | Name | Handling |
+|-----------|------|----------|
+| 110 | `FencedMemberEpoch` | Member epoch is stale — abandon partitions and rejoin |
+| 111 | `UnreleasedInstanceId` | Static member instance ID held by another member |
+| 112 | `UnsupportedAssignor` | Server-side assignor not recognized |
+| 113 | `StaleMemberEpoch` | Retry after receiving an updated epoch |
+| 128 | `InvalidRegularExpression` | Regex subscription (v1+) is malformed |
+
+### Requirements
+
+- Requires Kafka 4.0+ (or earlier brokers with `group.coordinator.new.enable=true`)
+- The broker must support API key 68 (`ConsumerGroupHeartbeat`)
 
 ## Consumer Interceptors
 

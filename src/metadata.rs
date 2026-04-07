@@ -148,6 +148,10 @@ struct MetadataCache {
     /// Topics by name. Wrapped in `Arc` so that partial-refresh clones of
     /// the map are O(n) ref-count bumps instead of O(n) deep copies.
     topics: HashMap<String, Arc<TopicInfo>>,
+    /// Topic UUID → topic name map. Populated from metadata v10+ responses
+    /// where each topic includes a 16-byte topic_id. Used by the KIP-848
+    /// consumer protocol to resolve topic UUIDs in assignments.
+    topic_ids: HashMap<[u8; 16], String>,
     /// When the metadata was last updated.
     last_updated: Instant,
 }
@@ -159,6 +163,7 @@ impl MetadataCache {
             controller_id: -1,
             brokers: HashMap::new(),
             topics: HashMap::new(),
+            topic_ids: HashMap::new(),
             last_updated: Instant::now(),
         }
     }
@@ -328,11 +333,16 @@ impl ClusterMetadata {
         }
 
         // Full refresh: response is authoritative — start empty.
-        // Partial refresh: delta-merge into existing topics.
+        // Partial refresh: delta-merge into existing topics and topic_ids.
         let mut topics = if full_refresh {
             HashMap::new()
         } else {
             old.topics.clone()
+        };
+        let mut topic_ids = if full_refresh {
+            HashMap::new()
+        } else {
+            old.topic_ids.clone()
         };
 
         for topic in response.topics {
@@ -342,8 +352,17 @@ impl ClusterMetadata {
 
             if !topic.error_code.is_ok() {
                 warn!("Topic {} has error: {:?}", topic_name, topic.error_code);
+                // Remove from both maps on error (topic may have been deleted).
+                if let Some(tid) = topic.topic_id {
+                    topic_ids.remove(&tid);
+                }
                 topics.remove(&topic_name);
                 continue;
+            }
+
+            // Track topic UUID → name mapping (v10+).
+            if let Some(tid) = topic.topic_id {
+                topic_ids.insert(tid, topic_name.clone());
             }
 
             let partitions: Vec<PartitionInfo> = topic
@@ -376,6 +395,7 @@ impl ClusterMetadata {
             controller_id: response.controller_id,
             brokers,
             topics,
+            topic_ids,
             last_updated: Instant::now(),
         };
 
@@ -405,6 +425,15 @@ impl ClusterMetadata {
             .topics
             .get(name)
             .map(|t| t.as_ref().clone())
+    }
+
+    /// Resolve a 16-byte topic UUID to a topic name.
+    ///
+    /// The mapping is populated from metadata v10+ responses where each topic
+    /// includes a `topic_id`. Returns `None` if the UUID is unknown — the
+    /// caller should trigger a metadata refresh and retry.
+    pub fn topic_name_for_id(&self, topic_id: &[u8; 16]) -> Option<String> {
+        self.cache.load().topic_ids.get(topic_id).cloned()
     }
 
     /// Get all topics.
@@ -585,5 +614,21 @@ mod tests {
         );
         assert_eq!(broker.address(), "broker1.kafka.local:9093");
         assert_eq!(broker.rack(), Some("us-east-1a"));
+    }
+
+    #[test]
+    fn test_metadata_cache_topic_ids() {
+        let mut cache = MetadataCache::new();
+        assert!(cache.topic_ids.is_empty());
+
+        let uuid: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        cache.topic_ids.insert(uuid, "my-topic".to_string());
+        assert_eq!(cache.topic_ids.get(&uuid), Some(&"my-topic".to_string()));
+    }
+
+    #[test]
+    fn test_metadata_cache_new_has_empty_topic_ids() {
+        let cache = MetadataCache::new();
+        assert!(cache.topic_ids.is_empty());
     }
 }
