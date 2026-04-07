@@ -1360,28 +1360,13 @@ impl AdminClient {
                 })?;
 
             let coord_response_bytes = any_conn
-                .send_request(
-                    ApiKey::FindCoordinator,
-                    coord_version,
-                    |buf| match coord_version {
-                        0 => coord_request.encode_v0(buf),
-                        1 => coord_request.encode_v1(buf),
-                        _ => Err(KrafkaError::protocol(format!(
-                            "unsupported FindCoordinator version {coord_version}"
-                        ))),
-                    },
-                )
+                .send_request(ApiKey::FindCoordinator, coord_version, |buf| {
+                    coord_request.encode_versioned(coord_version, buf)
+                })
                 .await?;
             let mut coord_buf = coord_response_bytes;
-            let coord_response = match coord_version {
-                0 => FindCoordinatorResponse::decode_v0(&mut coord_buf)?,
-                1 => FindCoordinatorResponse::decode_v1(&mut coord_buf)?,
-                _ => {
-                    return Err(KrafkaError::protocol(format!(
-                        "unsupported FindCoordinator version {coord_version}"
-                    )));
-                }
-            };
+            let coord_response =
+                FindCoordinatorResponse::decode_versioned(coord_version, &mut coord_buf)?;
 
             if coord_response.error_code.is_ok() {
                 coordinator_groups

@@ -1268,9 +1268,10 @@ impl ProduceResponse {
                 let base_offset = i64::decode(buf)?;
                 let log_append_time_ms = i64::decode(buf)?;
                 let log_start_offset = i64::decode(buf)?;
-                // RecordErrors compact array — read and discard
-                let re_count =
-                    check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
+                // RecordErrors compact nullable array — read and discard
+                let re_count = check_compact_nullable_array_len(
+                    crate::util::varint::decode_unsigned_varint(buf)?,
+                )?;
                 if re_count > 0 {
                     for _ in 0..re_count {
                         let _ = i32::decode(buf)?;
@@ -7962,7 +7963,7 @@ impl ConsumerGroupHeartbeatRequest {
         match &self.topic_partitions {
             None => {
                 // null compact array: varint 0
-                KafkaArray::<KafkaString>::null().try_encode_compact(buf)?;
+                crate::util::varint::encode_unsigned_varint(0, buf);
             }
             Some(tps) => {
                 let len_plus_one = u32::try_from(tps.len().saturating_add(1)).map_err(|_| {

@@ -960,10 +960,10 @@ The ConsumerGroupHeartbeat response may return these KIP-848-specific errors:
 
 ### Limitations
 
-Offset commit and fetch still use the classic wire format (OffsetCommit v2,
-OffsetFetch v1). Full KIP-848 offset management (v8-v9 flexible format with
-member epoch) will be activated after integration testing against a compatible
-broker.
+Offset commit and fetch use flexible wire format at v8-v9, enabling
+member-epoch validation. Multi-group batching (OffsetFetch v8+) extracts only
+the first group — future work may expose the full batched response. Full
+transactional offset support (`TxnOffsetCommit`) is not yet implemented.
 
 ## Consumer Interceptors
 

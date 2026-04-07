@@ -58,9 +58,9 @@ Krafka supports the following API version ranges (clamped to match actual encode
 | Fetch | 0 | 11 | v4 isolation level, v5–v6 log_start_offset, v7 fetch sessions (KIP-227), v9 leader epoch fencing (KIP-320), v11 closest-replica fetching (KIP-392) |
 | ListOffsets | 0 | 2 | v2 isolation level |
 | Metadata | 0 | 12 | v1 controller + rack, v2 cluster_id, v3 throttle, v5 offline replicas, v7 leader epoch, v8 authorized-ops, v9 flexible, v10 topic UUIDs (KIP-848) |
-| OffsetCommit | 0 | 2 | v2+ for retention |
-| OffsetFetch | 0 | 1 | v1+ for group coordinator |
-| FindCoordinator | 0 | 1 | Group/txn coordinator lookup |
+| OffsetCommit | 0 | 9 | v8 flexible, v9 KIP-848 epoch |
+| OffsetFetch | 0 | 9 | v8 batched Groups (KIP-709), v9 KIP-848 member epoch |
+| FindCoordinator | 0 | 4 | v3 flexible, v4 batched (KIP-699) |
 | JoinGroup | 0 | 5 | v5 group instance id |
 | Heartbeat | 0 | 3 | v3 group instance id (KIP-345) |
 | SyncGroup | 0 | 3 | v3 group instance id |

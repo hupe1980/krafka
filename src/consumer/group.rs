@@ -29,7 +29,9 @@ use crate::protocol::{
     OffsetCommitRequestTopic, OffsetCommitResponse, OffsetFetchRequest, OffsetFetchRequestTopic,
     OffsetFetchResponse, SyncGroupRequest, SyncGroupRequestAssignment, SyncGroupResponse,
     VersionedDecode, VersionedEncode,
-    versions::{CONSUMER_GROUP_HEARTBEAT_MAX, OFFSET_COMMIT_MAX, OFFSET_FETCH_MAX},
+    versions::{
+        CONSUMER_GROUP_HEARTBEAT_MAX, FIND_COORDINATOR_MAX, OFFSET_COMMIT_MAX, OFFSET_FETCH_MAX,
+    },
 };
 
 /// Callback interface for partition rebalance events.
@@ -1144,14 +1146,20 @@ impl GroupCoordinator {
         // Get a connection to any broker
         let conn = self.get_any_connection().await?;
 
-        // Send FindCoordinator request
+        // Send FindCoordinator request with version negotiation.
         let request = FindCoordinatorRequest::for_group(&self.group_id);
+        let fc_version = conn
+            .negotiate_api_version_max(ApiKey::FindCoordinator, FIND_COORDINATOR_MAX)
+            .await
+            .unwrap_or(1);
         let response = conn
-            .send_request(ApiKey::FindCoordinator, 1, |buf| request.encode_v1(buf))
+            .send_request(ApiKey::FindCoordinator, fc_version, |buf| {
+                request.encode_versioned(fc_version, buf)
+            })
             .await?;
 
         let mut buf = response;
-        let find_response = FindCoordinatorResponse::decode_v1(&mut buf)?;
+        let find_response = FindCoordinatorResponse::decode_versioned(fc_version, &mut buf)?;
 
         if !find_response.error_code.is_ok() {
             return Err(KrafkaError::broker(
@@ -2324,6 +2332,12 @@ impl GroupCoordinator {
                             ),
                         ));
                     }
+                    // Stale coordinator — clear cached connection for rediscovery.
+                    if partition.error_code == ErrorCode::NotCoordinator
+                        || partition.error_code == ErrorCode::CoordinatorNotAvailable
+                    {
+                        *self.coordinator_conn.write().await = None;
+                    }
                     return Err(KrafkaError::broker(
                         partition.error_code,
                         format!(
@@ -2391,8 +2405,9 @@ impl GroupCoordinator {
         );
 
         // Negotiate version: v0 returns UNKNOWN_TOPIC_OR_PARTITION on modern
-        // brokers, so we default to v1 minimum. Versions v6+ use flexible
-        // encoding, v8-v9 use batched multi-group format with KIP-848 fields.
+        // brokers, so we floor at v1. At v6+ the wire switches to flexible
+        // encoding, v8+ uses the batched Groups format (KIP-709), and v9
+        // adds MemberId/MemberEpoch for KIP-848 epoch validation.
         let of_version = conn
             .negotiate_api_version_max(ApiKey::OffsetFetch, OFFSET_FETCH_MAX)
             .await
@@ -2407,6 +2422,29 @@ impl GroupCoordinator {
 
         let mut buf = response;
         let offset_response = OffsetFetchResponse::decode_versioned(of_version, &mut buf)?;
+
+        // Check group-level error (v2+ top-level ErrorCode, v8+ per-group ErrorCode).
+        // Errors like NOT_COORDINATOR, STALE_MEMBER_EPOCH, or UNKNOWN_MEMBER_ID
+        // appear here and must be surfaced before iterating partitions.
+        if !offset_response.error_code.is_ok() {
+            if offset_response.error_code == ErrorCode::StaleMemberEpoch
+                || offset_response.error_code == ErrorCode::UnknownMemberId
+                || offset_response.error_code == ErrorCode::FencedMemberEpoch
+            {
+                *self.state.write().await = GroupState::PreparingRebalance;
+            } else if offset_response.error_code == ErrorCode::NotCoordinator
+                || offset_response.error_code == ErrorCode::CoordinatorNotAvailable
+            {
+                // Stale coordinator — clear the cached connection so the next
+                // call to get_coordinator_connection() triggers rediscovery.
+                *self.coordinator_conn.write().await = None;
+            }
+            return Err(KrafkaError::broker(
+                offset_response.error_code,
+                format!("OffsetFetch failed for group '{}'", self.group_id),
+            ));
+        }
+
         let mut result = HashMap::new();
         for topic in &offset_response.topics {
             for partition in &topic.partitions {

@@ -206,21 +206,21 @@ pub mod versions {
     /// `ClusterAuthorizedOperations`. v13 encode/decode exists but is
     /// gated behind a future bump once brokers supporting it are common.
     pub const METADATA_MAX: i16 = 12;
-    /// Maximum supported OffsetCommit version (v2 retention).
+    /// Maximum supported OffsetCommit version (v9 KIP-848 flexible).
     ///
-    /// Encode/decode for v5-v9 exists but is not yet activated
-    /// — needs integration testing against a real broker.
-    pub const OFFSET_COMMIT_MAX: i16 = 2;
-    /// Maximum supported OffsetFetch version (v1 group coordinator).
+    /// v5 drops retention_time, v6 committed_leader_epoch, v7 group_instance_id,
+    /// v8 flexible encoding, v9 KIP-848 (STALE_MEMBER_EPOCH error support).
+    pub const OFFSET_COMMIT_MAX: i16 = 9;
+    /// Maximum supported OffsetFetch version (v9 KIP-848 batched + member epoch).
     ///
-    /// Encode/decode for v6-v9 exists but is not yet activated
-    /// — needs integration testing against a real broker.
-    pub const OFFSET_FETCH_MAX: i16 = 1;
-    /// Maximum supported FindCoordinator version (v1 key_type for txn coordinators).
+    /// v6-v7 flexible encoding, v8 batched Groups format (KIP-709),
+    /// v9 KIP-848 (adds MemberId/MemberEpoch per group for epoch validation).
+    pub const OFFSET_FETCH_MAX: i16 = 9;
+    /// Maximum supported FindCoordinator version (v4 batched coordinators, KIP-699).
     ///
-    /// Encode/decode for v3-v4 exists but is not yet activated
-    /// — needs integration testing against a real broker.
-    pub const FIND_COORDINATOR_MAX: i16 = 1;
+    /// v3 flexible encoding, v4 batched CoordinatorKeys for multi-key lookups
+    /// (single key wrapped in array; extracts first coordinator from response).
+    pub const FIND_COORDINATOR_MAX: i16 = 4;
     /// Maximum supported JoinGroup version.
     pub const JOIN_GROUP_MAX: i16 = 5;
     /// Maximum supported Heartbeat version (v3 adds group_instance_id for KIP-345).
