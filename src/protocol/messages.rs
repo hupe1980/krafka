@@ -8058,16 +8058,7 @@ impl ConsumerGroupHeartbeatResponse {
         count: u32,
         buf: &mut impl Buf,
     ) -> Result<Vec<ConsumerGroupTopicPartitions>> {
-        if count == 0 {
-            return Ok(vec![]);
-        }
-        let len = (count - 1) as usize;
-        if len > super::MAX_DECODE_ARRAY_LEN {
-            return Err(KrafkaError::protocol(format!(
-                "topic partitions array length {len} exceeds safety limit {}",
-                super::MAX_DECODE_ARRAY_LEN
-            )));
-        }
+        let len = check_compact_array_len(count)?;
         let mut result = Vec::with_capacity(len);
         for _ in 0..len {
             // TopicId — 16-byte UUID
@@ -8079,17 +8070,7 @@ impl ConsumerGroupHeartbeatResponse {
 
             // Partitions — compact array of i32
             let part_count = crate::util::varint::decode_unsigned_varint(buf)?;
-            let part_len = if part_count == 0 {
-                0
-            } else {
-                (part_count - 1) as usize
-            };
-            if part_len > super::MAX_DECODE_ARRAY_LEN {
-                return Err(KrafkaError::protocol(format!(
-                    "partitions array length {part_len} exceeds safety limit {}",
-                    super::MAX_DECODE_ARRAY_LEN
-                )));
-            }
+            let part_len = check_compact_array_len(part_count)?;
             let mut partitions = Vec::with_capacity(part_len);
             for _ in 0..part_len {
                 partitions.push(i32::decode(buf)?);

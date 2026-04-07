@@ -37,6 +37,8 @@
 //! | DeleteAcls | 0 | 1 | v1 prefixed ACLs |
 //! | DescribeGroups | 0 | 1 | v0 is baseline |
 //! | ListGroups | 0 | 1 | v0 is baseline |
+//! | DeleteRecords | 0 | 0 | v0 baseline |
+//! | OffsetForLeaderEpoch | 0 | 3 | v2 leader epoch fencing, v3 replica_id |
 //! | InitProducerId | 0 | 0 | v0 baseline |
 //! | CreateDelegationToken | 0 | 1 | v0–v1 same wire format |
 //! | RenewDelegationToken | 0 | 1 | v0–v1 same wire format |
@@ -52,8 +54,8 @@
 //! use krafka::protocol::ApiKey;
 //!
 //! // Negotiate the best version for Fetch
-//! // Prefer Fetch v7..=v11; fall back to v4 if the broker doesn't support v7+.
-//! let fetch_version = match conn.negotiate_api_version(ApiKey::Fetch, 11, 7).await {
+//! // Prefer Fetch v7..=v12; fall back to v4 if the broker doesn't support v7+.
+//! let fetch_version = match conn.negotiate_api_version(ApiKey::Fetch, 12, 7).await {
 //!     Some(v) => v,
 //!     None => conn.negotiate_api_version(ApiKey::Fetch, 4, 4).await
 //!         .expect("broker does not support any usable Fetch version"),
@@ -133,10 +135,14 @@ pub(crate) fn check_decode_nullable_array_len(len: i32) -> Result<usize> {
 
 /// Validate a compact array length (varint-encoded as `actual_len + 1`).
 ///
-/// In flexible Kafka versions, arrays are encoded with a varint length equal
-/// to the element count plus one.  A raw value of `0` signals a null /
-/// empty array (returns `Ok(0)`).  Values exceeding [`MAX_DECODE_ARRAY_LEN`]
-/// are rejected to prevent OOM from malicious or corrupted broker responses.
+/// In flexible Kafka versions, compact arrays use a varint length equal to
+/// the element count plus one. On the wire, a raw value of `0` represents a
+/// null array, and a raw value of `1` represents an empty array (`len == 0`).
+///
+/// This helper intentionally collapses both cases to `Ok(0)`: `raw == 0`
+/// returns `Ok(0)` directly, and `raw == 1` decodes to `len == 0` via
+/// `raw - 1`. Values exceeding [`MAX_DECODE_ARRAY_LEN`] are rejected to
+/// prevent OOM from malicious or corrupted broker responses.
 #[inline]
 pub(crate) fn check_compact_array_len(raw: u32) -> Result<usize> {
     if raw == 0 {
