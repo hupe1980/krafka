@@ -353,6 +353,13 @@ impl ClusterMetadata {
             old.topic_ids.clone()
         };
 
+        // Build a reverse index (name → UUID) so we can remove the old UUID
+        // for a topic name in O(1) instead of scanning the entire map.
+        let mut name_to_uuid: HashMap<String, [u8; 16]> = topic_ids
+            .iter()
+            .map(|(uuid, name)| (name.as_ref().clone(), *uuid))
+            .collect();
+
         for topic in response.topics {
             let Some(topic_name) = topic.name else {
                 continue;
@@ -361,12 +368,14 @@ impl ClusterMetadata {
             if !topic.error_code.is_ok() {
                 warn!("Topic {} has error: {:?}", topic_name, topic.error_code);
                 // Remove from both maps on error (topic may have been deleted).
-                // Some error responses omit topic_id (or decode an all-zero UUID
-                // as None), so also remove any stale UUID → name mappings by name.
                 if let Some(tid) = topic.topic_id {
                     topic_ids.remove(&tid);
                 }
-                topic_ids.retain(|_, name| name.as_ref() != &topic_name);
+                // Also remove any stale UUID → name mapping by name, in case
+                // the error response omitted topic_id or it was an all-zero UUID.
+                if let Some(old_uuid) = name_to_uuid.remove(&topic_name) {
+                    topic_ids.remove(&old_uuid);
+                }
                 topics.remove(&topic_name);
                 continue;
             }
@@ -375,8 +384,11 @@ impl ClusterMetadata {
             // Remove any old UUID that previously mapped to this name first —
             // the topic may have been recreated with a new UUID.
             if let Some(tid) = topic.topic_id {
-                topic_ids.retain(|_, name| name.as_ref() != &topic_name);
+                if let Some(old_uuid) = name_to_uuid.remove(&topic_name) {
+                    topic_ids.remove(&old_uuid);
+                }
                 topic_ids.insert(tid, Arc::new(topic_name.clone()));
+                name_to_uuid.insert(topic_name.clone(), tid);
             }
 
             let partitions: Vec<PartitionInfo> = topic

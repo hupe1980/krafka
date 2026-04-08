@@ -156,13 +156,13 @@ impl MetadataRequest {
         Ok(())
     }
 
-    /// Encode for version 10-11 (flexible).
+    /// Encode for version 10 (flexible).
     ///
-    /// v10 adds a 16-byte `TopicId` (UUID) per topic entry, but v10-v11
+    /// v10 adds a 16-byte `TopicId` (UUID) per topic entry, but v10
     /// must NOT populate the field — the all-zero UUID is always written.
-    /// `IncludeClusterAuthorizedOperations` is present in v10 but not v11.
+    /// `IncludeClusterAuthorizedOperations` is still present on the wire.
     pub fn encode_v10(&self, buf: &mut impl BufMut) -> Result<()> {
-        // v10-v11: TopicId field present on wire but must be all zeros.
+        // v10: TopicId field present on wire but must be all zeros.
         self.encode_topic_entries_flexible(buf, TopicIdMode::ForceZero)?;
         buf.put_u8(if self.allow_auto_topic_creation { 1 } else { 0 });
         buf.put_u8(0); // include_cluster_authorized_operations (v8-v10)
@@ -176,7 +176,7 @@ impl MetadataRequest {
     /// v11 deprecates `IncludeClusterAuthorizedOperations` (removed from wire).
     /// TopicId is still forced to zeros (see v10 note).
     pub fn encode_v11(&self, buf: &mut impl BufMut) -> Result<()> {
-        // v10-v11: TopicId field present on wire but must be all zeros.
+        // v11: TopicId field present on wire but must be all zeros.
         self.encode_topic_entries_flexible(buf, TopicIdMode::ForceZero)?;
         buf.put_u8(if self.allow_auto_topic_creation { 1 } else { 0 });
         buf.put_u8(0); // include_topic_authorized_operations (v8+)
