@@ -888,6 +888,16 @@ is not yet activated — see `CONSUMER_GROUP_HEARTBEAT_MAX`).
 
 ### Enabling KIP-848
 
+> **Experimental.** The KIP-848 consumer protocol requires the broker to
+> support `ConsumerGroupHeartbeat` (Kafka 4.0+) and the client to resolve
+> topic UUIDs returned in heartbeat assignments.  Krafka currently negotiates
+> the Metadata API only up to v8 (`METADATA_MAX`), so the UUID → name mapping
+> introduced in Metadata v10+ is **not yet available**.  Assignments that
+> contain unresolvable UUIDs will produce a protocol error on the initial
+> heartbeat and `warn!` logs on subsequent ticks (see
+> [Topic UUID Resolution](#topic-uuid-resolution) below).  Bumping
+> `METADATA_MAX` to ≥ 10 will activate full resolution once integration-tested.
+
 ```rust
 use krafka::consumer::{Consumer, GroupProtocol};
 

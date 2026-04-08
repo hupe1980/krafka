@@ -1601,6 +1601,9 @@ impl GroupCoordinator {
         let coordinator_conn_ref = self.coordinator_conn.clone();
         let group_instance_id = self.group_instance_id.clone();
 
+        // start() before spawn is safe here — the classic task has no early-return
+        // paths before the loop. KIP-848's task calls start() *inside* spawn after
+        // version negotiation to avoid marking running=true on negotiation failure.
         heartbeat_controller.start();
 
         tokio::spawn(async move {
@@ -2052,8 +2055,6 @@ impl GroupCoordinator {
         let target_assignment_ref = self.target_assignment.clone();
         let topic_names_cache_ref = self.topic_names_cache.clone();
 
-        heartbeat_controller.start();
-
         tokio::spawn(async move {
             debug!(
                 "Starting KIP-848 heartbeat task for group '{}' (interval={:?})",
@@ -2061,6 +2062,8 @@ impl GroupCoordinator {
             );
 
             // Negotiate the ConsumerGroupHeartbeat version once at task start.
+            // Only mark the controller as running after successful negotiation
+            // so that early-return paths don't leave it stuck in a running state.
             let hb_version = {
                 let coordinator_conn = coordinator_conn_ref.read().await.clone();
                 if let Some(ref conn) = coordinator_conn {
@@ -2089,6 +2092,8 @@ impl GroupCoordinator {
                     return;
                 }
             };
+
+            heartbeat_controller.start();
 
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
