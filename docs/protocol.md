@@ -84,7 +84,7 @@ Krafka supports the following API version ranges (clamped to match actual encode
 | DescribeDelegationToken | 0 | 1 | Delegation token listing |
 | DescribeClientQuotas | 0 | 0 | Client quota queries |
 | AlterClientQuotas | 0 | 0 | Client quota updates |
-| ConsumerGroupHeartbeat | 0 | 1 | KIP-848 consumer group protocol |
+| ConsumerGroupHeartbeat | 0 | 0 | KIP-848 consumer group protocol (v1 encode/decode exists but is not negotiated yet) |
 
 ### Version Constants
 

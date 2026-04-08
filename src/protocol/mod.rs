@@ -46,7 +46,7 @@
 //! | DescribeDelegationToken | 0 | 1 | v0–v1 same wire format |
 //! | DescribeClientQuotas | 0 | 0 | v0 baseline |
 //! | AlterClientQuotas | 0 | 0 | v0 baseline |
-//! | ConsumerGroupHeartbeat | 0 | 1 | KIP-848 + KIP-1082 (v1 regex, client member-id) |
+//! | ConsumerGroupHeartbeat | 0 | 0 | KIP-848 baseline; v1 encode/decode for KIP-1082 (regex, client member-id) exists but is not activated yet |
 //!
 //! ## Example
 //!

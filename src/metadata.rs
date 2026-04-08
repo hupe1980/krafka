@@ -361,15 +361,21 @@ impl ClusterMetadata {
             if !topic.error_code.is_ok() {
                 warn!("Topic {} has error: {:?}", topic_name, topic.error_code);
                 // Remove from both maps on error (topic may have been deleted).
+                // Some error responses omit topic_id (or decode an all-zero UUID
+                // as None), so also remove any stale UUID → name mappings by name.
                 if let Some(tid) = topic.topic_id {
                     topic_ids.remove(&tid);
                 }
+                topic_ids.retain(|_, name| name.as_ref() != &topic_name);
                 topics.remove(&topic_name);
                 continue;
             }
 
             // Track topic UUID → name mapping (v10+).
+            // Remove any old UUID that previously mapped to this name first —
+            // the topic may have been recreated with a new UUID.
             if let Some(tid) = topic.topic_id {
+                topic_ids.retain(|_, name| name.as_ref() != &topic_name);
                 topic_ids.insert(tid, Arc::new(topic_name.clone()));
             }
 

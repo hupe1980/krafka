@@ -8149,8 +8149,7 @@ impl ConsumerGroupHeartbeatResponse {
     ///
     /// Non-tagged nullable structs in flexible versions use a single byte
     /// as presence marker: `(byte) -1` (`0xff`) means null, `(byte) 1` means
-    /// the struct fields follow. This matches the Kafka Java code generator’s
-    /// `readByte() < 0` pattern for non-tagged nullable struct fields.
+    /// the struct fields follow.
     fn decode_assignment(buf: &mut impl Buf) -> Result<Option<ConsumerGroupAssignment>> {
         if buf.remaining() < 1 {
             return Err(KrafkaError::protocol(
@@ -8158,8 +8157,13 @@ impl ConsumerGroupHeartbeatResponse {
             ));
         }
         let presence = buf.get_i8();
-        if presence < 0 {
+        if presence == -1 {
             return Ok(None);
+        }
+        if presence != 1 {
+            return Err(KrafkaError::protocol(format!(
+                "invalid assignment presence tag: expected -1 for null or 1 for present, got {presence}"
+            )));
         }
 
         // Struct is present — decode TopicPartitions compact array + tagged fields.
@@ -11295,6 +11299,35 @@ mod tests {
         assert_eq!(resp.member_epoch, 1);
         assert_eq!(resp.heartbeat_interval_ms, 3000);
         assert!(resp.assignment.is_none());
+    }
+
+    #[test]
+    fn test_consumer_group_heartbeat_response_decode_v0_invalid_assignment_presence() {
+        let mut buf = BytesMut::new();
+
+        // throttle_time_ms
+        buf.put_i32(0);
+        // error_code
+        buf.put_i16(0);
+        // error_message — null
+        put_compact_string(&mut buf, None);
+        // member_id — "m"
+        put_compact_string(&mut buf, Some("m"));
+        // member_epoch
+        buf.put_i32(1);
+        // heartbeat_interval_ms
+        buf.put_i32(3000);
+        // assignment — invalid presence byte (0 instead of -1 or 1)
+        buf.put_i8(0);
+        // top-level tagged fields
+        put_tagged_fields(&mut buf);
+
+        let err = ConsumerGroupHeartbeatResponse::decode_v0(&mut buf.freeze()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid assignment presence tag"),
+            "expected presence tag error, got: {msg}"
+        );
     }
 
     #[test]
