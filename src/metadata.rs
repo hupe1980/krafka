@@ -440,7 +440,11 @@ impl ClusterMetadata {
     /// The mapping is populated from metadata v10+ responses where each topic
     /// includes a `topic_id`. Returns `None` if the UUID is unknown — the
     /// caller should trigger a metadata refresh and retry.
-    pub fn topic_name_for_id(&self, topic_id: &[u8; 16]) -> Option<String> {
+    ///
+    /// Currently `pub(crate)` because `METADATA_MAX` is capped at v8, so
+    /// `topic_ids` is never populated. Will be promoted to `pub` once
+    /// Metadata v10+ negotiation is activated.
+    pub(crate) fn topic_name_for_id(&self, topic_id: &[u8; 16]) -> Option<String> {
         self.cache
             .load()
             .topic_ids

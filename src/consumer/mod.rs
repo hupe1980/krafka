@@ -3246,6 +3246,15 @@ impl ConsumerBuilder {
                  (recommended: session_timeout / 3)",
             ));
         }
+        if self.config.group_protocol == crate::consumer::config::GroupProtocol::Consumer {
+            return Err(KrafkaError::config(
+                "GroupProtocol::Consumer (KIP-848) is not yet usable: \
+                 topic UUID resolution requires Metadata v10+ but the \
+                 client currently negotiates only up to v8 (METADATA_MAX). \
+                 Use GroupProtocol::Classic until Metadata v10+ support \
+                 is activated.",
+            ));
+        }
         let mut consumer = Consumer::new(self.config).await?;
         if let Some(listener) = self.rebalance_listener {
             consumer.rebalance_listener = listener;

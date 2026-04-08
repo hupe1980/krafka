@@ -888,15 +888,12 @@ is not yet activated — see `CONSUMER_GROUP_HEARTBEAT_MAX`).
 
 ### Enabling KIP-848
 
-> **Experimental.** The KIP-848 consumer protocol requires the broker to
-> support `ConsumerGroupHeartbeat` (Kafka 4.0+) and the client to resolve
-> topic UUIDs returned in heartbeat assignments.  Krafka currently negotiates
-> the Metadata API only up to v8 (`METADATA_MAX`), so the UUID → name mapping
-> introduced in Metadata v10+ is **not yet available**.  Assignments that
-> contain unresolvable UUIDs will produce a protocol error on the initial
-> heartbeat and `warn!` logs on subsequent ticks (see
-> [Topic UUID Resolution](#topic-uuid-resolution) below).  Bumping
-> `METADATA_MAX` to ≥ 10 will activate full resolution once integration-tested.
+> **Not yet usable.** `Consumer::builder().group_protocol(GroupProtocol::Consumer).build()`
+> returns a configuration error because topic UUID resolution in heartbeat
+> assignments requires Metadata v10+, but the client currently negotiates
+> only up to v8 (`METADATA_MAX`).  Once Metadata v10+ support is activated
+> (bump `METADATA_MAX` to ≥ 10 and integration-test), the guard will be
+> removed and the following snippet will work:
 
 ```rust
 use krafka::consumer::{Consumer, GroupProtocol};
@@ -954,7 +951,15 @@ Krafka resolves these UUIDs to topic names with a two-level lookup order:
 Successfully resolved names are cached locally. Unresolvable UUIDs still
 trigger an automatic metadata refresh, but the current client negotiates the
 Metadata API only up to v8 (`METADATA_MAX`), so metadata responses do not yet
-provide the topic UUID mapping introduced in Metadata v10+. If topic UUIDs
+provide the topic UUID mapping introduced in Metadata v10+.
+
+> **Note:** External users cannot reach these code paths today —
+> `ConsumerBuilder::build()` rejects `GroupProtocol::Consumer` while
+> `METADATA_MAX < 10` (see [Enabling KIP-848](#enabling-kip-848)).
+> The error handling below exists as defense-in-depth and documents the
+> intended behaviour once the guard is lifted.
+
+If topic UUIDs
 remain unresolved after a metadata refresh during the initial heartbeat
 response handling, the client returns a protocol error rather than silently
 operating with an empty or partial assignment. Inside the background heartbeat
