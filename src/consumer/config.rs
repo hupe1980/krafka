@@ -54,6 +54,25 @@ impl IsolationLevel {
     }
 }
 
+/// Group protocol used by the consumer group (KIP-848).
+///
+/// `Classic` uses the traditional JoinGroup/SyncGroup/Heartbeat flow
+/// (API keys 11, 14, 12) where the group leader performs partition
+/// assignment on the client side.
+///
+/// `Consumer` uses the new ConsumerGroupHeartbeat flow (API key 68)
+/// introduced in KIP-848, where the server performs assignment and
+/// members communicate exclusively via heartbeats.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroupProtocol {
+    /// Classic group protocol (JoinGroup/SyncGroup/Heartbeat).
+    #[default]
+    Classic,
+    /// KIP-848 consumer group protocol (ConsumerGroupHeartbeat).
+    Consumer,
+}
+
 /// Partition assignment strategy for consumer groups.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -118,6 +137,8 @@ pub struct ConsumerConfig {
     pub(crate) metadata_max_age: Duration,
     /// Partition assignment strategy.
     pub(crate) partition_assignment_strategy: PartitionAssignmentStrategy,
+    /// Group protocol selection (KIP-848).
+    pub(crate) group_protocol: GroupProtocol,
     /// Static group membership instance ID (KIP-345).
     ///
     /// When set, the consumer uses static membership. The broker will not
@@ -154,6 +175,7 @@ impl Default for ConsumerConfig {
             isolation_level: IsolationLevel::ReadUncommitted,
             metadata_max_age: Duration::from_secs(300),
             partition_assignment_strategy: PartitionAssignmentStrategy::Range,
+            group_protocol: GroupProtocol::Classic,
             group_instance_id: None,
             client_rack: None,
             auth: None,
@@ -269,6 +291,12 @@ impl ConsumerConfig {
         self.partition_assignment_strategy
     }
 
+    /// Returns the group protocol (KIP-848).
+    #[inline]
+    pub fn group_protocol(&self) -> GroupProtocol {
+        self.group_protocol
+    }
+
     /// Returns the static group membership instance ID, if set.
     #[inline]
     pub fn group_instance_id(&self) -> Option<&str> {
@@ -349,6 +377,15 @@ impl ConsumerConfigBuilder {
     /// Set partition assignment strategy.
     pub fn partition_assignment_strategy(mut self, strategy: PartitionAssignmentStrategy) -> Self {
         self.config.partition_assignment_strategy = strategy;
+        self
+    }
+
+    /// Set the group protocol (KIP-848).
+    ///
+    /// `Classic` uses the traditional JoinGroup/SyncGroup/Heartbeat flow.
+    /// `Consumer` uses the new server-side assignment via ConsumerGroupHeartbeat.
+    pub fn group_protocol(mut self, protocol: GroupProtocol) -> Self {
+        self.config.group_protocol = protocol;
         self
     }
 
@@ -455,6 +492,7 @@ mod tests {
             config.partition_assignment_strategy,
             PartitionAssignmentStrategy::Range
         );
+        assert_eq!(config.group_protocol, GroupProtocol::Classic);
     }
 
     #[test]
@@ -563,6 +601,28 @@ mod tests {
             config.client_rack,
             Some("us-east-1a".to_string()),
             "client_rack should be set by builder"
+        );
+    }
+
+    #[test]
+    fn test_config_default_group_protocol_is_classic() {
+        let config = ConsumerConfig::default();
+        assert_eq!(
+            config.group_protocol(),
+            GroupProtocol::Classic,
+            "group_protocol should default to Classic"
+        );
+    }
+
+    #[test]
+    fn test_config_builder_group_protocol_consumer() {
+        let config = ConsumerConfig::builder()
+            .group_protocol(GroupProtocol::Consumer)
+            .build();
+        assert_eq!(
+            config.group_protocol(),
+            GroupProtocol::Consumer,
+            "group_protocol should be Consumer when set"
         );
     }
 }

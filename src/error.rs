@@ -353,6 +353,16 @@ pub enum ErrorCode {
     InvalidRecord = 87,
     /// Unstable offset commit.
     UnstableOffsetCommit = 88,
+    /// Fenced member epoch (KIP-848).
+    FencedMemberEpoch = 110,
+    /// The instance ID is still used by another member in the consumer group (KIP-848).
+    UnreleasedInstanceId = 111,
+    /// The assignor or its version range is not supported by the consumer group (KIP-848).
+    UnsupportedAssignor = 112,
+    /// The member epoch is stale; retry after receiving an updated epoch via ConsumerGroupHeartbeat (KIP-848).
+    StaleMemberEpoch = 113,
+    /// The regular expression is not valid (KIP-848 v1+).
+    InvalidRegularExpression = 128,
     /// Unknown error code.
     Unknown(i16),
 }
@@ -452,6 +462,11 @@ impl ErrorCode {
             86 => Self::GroupSubscribedToTopic,
             87 => Self::InvalidRecord,
             88 => Self::UnstableOffsetCommit,
+            110 => Self::FencedMemberEpoch,
+            111 => Self::UnreleasedInstanceId,
+            112 => Self::UnsupportedAssignor,
+            113 => Self::StaleMemberEpoch,
+            128 => Self::InvalidRegularExpression,
             other => Self::Unknown(other),
         }
     }
@@ -550,6 +565,11 @@ impl ErrorCode {
             Self::GroupSubscribedToTopic => 86,
             Self::InvalidRecord => 87,
             Self::UnstableOffsetCommit => 88,
+            Self::FencedMemberEpoch => 110,
+            Self::UnreleasedInstanceId => 111,
+            Self::UnsupportedAssignor => 112,
+            Self::StaleMemberEpoch => 113,
+            Self::InvalidRegularExpression => 128,
             Self::Unknown(code) => code,
         }
     }

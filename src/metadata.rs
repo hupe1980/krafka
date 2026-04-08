@@ -148,6 +148,12 @@ struct MetadataCache {
     /// Topics by name. Wrapped in `Arc` so that partial-refresh clones of
     /// the map are O(n) ref-count bumps instead of O(n) deep copies.
     topics: HashMap<String, Arc<TopicInfo>>,
+    /// Topic UUID → topic name map. Topic names are wrapped in `Arc` so that
+    /// partial-refresh clones of the map are O(n) ref-count bumps instead of
+    /// O(n) deep copies. Populated from metadata v10+ responses where each
+    /// topic includes a 16-byte topic_id. Used by the KIP-848 consumer
+    /// protocol to resolve topic UUIDs in assignments.
+    topic_ids: HashMap<[u8; 16], Arc<String>>,
     /// When the metadata was last updated.
     last_updated: Instant,
 }
@@ -159,6 +165,7 @@ impl MetadataCache {
             controller_id: -1,
             brokers: HashMap::new(),
             topics: HashMap::new(),
+            topic_ids: HashMap::new(),
             last_updated: Instant::now(),
         }
     }
@@ -214,10 +221,12 @@ impl ClusterMetadata {
     /// Uses a coalescing lock to prevent concurrent metadata stampedes.
     /// If a refresh is already in-flight, callers wait for it to complete.
     ///
-    /// The Metadata API version is negotiated with the broker (v0-v8, no gaps).
-    /// Versions are cumulative: rack since v1, cluster_id since v2,
-    /// offline replicas since v5, and leader_epoch since v7.
-    /// Falls back to v0 if the broker doesn't advertise Metadata support.
+    /// The Metadata API version is negotiated with the broker (v0–v8).
+    /// Versions are cumulative: rack v1, cluster_id v2, offline replicas v5,
+    /// leader_epoch v7, authorized-ops v8.
+    /// Encode/decode for v9–v13 (flexible encoding v9, topic UUIDs v10) exists
+    /// but is not yet activated — see `METADATA_MAX`.
+    /// Falls back to v0 if the broker doesn’t advertise Metadata support.
     pub async fn refresh_for_topics(&self, topics: Option<&[&str]>) -> Result<()> {
         // Coalesce concurrent calls: only one refresh in-flight at a time
         let _guard = self.refresh_lock.lock().await;
@@ -241,9 +250,13 @@ impl ClusterMetadata {
         // Get a connection
         let conn = self.get_any_connection().await?;
 
-        // Negotiate the highest mutually supported version (v0-v8, no gaps).
-        // Cumulative: rack since v1, cluster_id v2, offline replicas v5, leader_epoch v7.
-        // Falls back to v0 if the broker doesn't advertise Metadata support
+        // Negotiate the highest mutually supported Metadata version up to the
+        // client's supported maximum (`METADATA_MAX`, currently v8).
+        // Cumulative fields available through v8: rack v1, cluster_id v2,
+        // offline replicas v5, leader_epoch v7, authorized-ops v8.
+        // Encode/decode for v9–v13 exists but is not yet activated — see
+        // `METADATA_MAX` in protocol/mod.rs.
+        // Falls back to v0 if the broker doesn’t advertise Metadata support
         // (mirrors the Fetch negotiation pattern in consumer).
         let metadata_version = conn
             .negotiate_api_version_max(ApiKey::Metadata, crate::protocol::versions::METADATA_MAX)
@@ -328,12 +341,24 @@ impl ClusterMetadata {
         }
 
         // Full refresh: response is authoritative — start empty.
-        // Partial refresh: delta-merge into existing topics.
+        // Partial refresh: delta-merge into existing topics and topic_ids.
         let mut topics = if full_refresh {
             HashMap::new()
         } else {
             old.topics.clone()
         };
+        let mut topic_ids = if full_refresh {
+            HashMap::new()
+        } else {
+            old.topic_ids.clone()
+        };
+
+        // Build a reverse index (name → UUID) so we can remove the old UUID
+        // for a topic name in O(1) instead of scanning the entire map.
+        let mut name_to_uuid: HashMap<String, [u8; 16]> = topic_ids
+            .iter()
+            .map(|(uuid, name)| (name.as_ref().clone(), *uuid))
+            .collect();
 
         for topic in response.topics {
             let Some(topic_name) = topic.name else {
@@ -342,8 +367,28 @@ impl ClusterMetadata {
 
             if !topic.error_code.is_ok() {
                 warn!("Topic {} has error: {:?}", topic_name, topic.error_code);
+                // Remove from both maps on error (topic may have been deleted).
+                if let Some(tid) = topic.topic_id {
+                    topic_ids.remove(&tid);
+                }
+                // Also remove any stale UUID → name mapping by name, in case
+                // the error response omitted topic_id or it was an all-zero UUID.
+                if let Some(old_uuid) = name_to_uuid.remove(&topic_name) {
+                    topic_ids.remove(&old_uuid);
+                }
                 topics.remove(&topic_name);
                 continue;
+            }
+
+            // Track topic UUID → name mapping (v10+).
+            // Remove any old UUID that previously mapped to this name first —
+            // the topic may have been recreated with a new UUID.
+            if let Some(tid) = topic.topic_id {
+                if let Some(old_uuid) = name_to_uuid.remove(&topic_name) {
+                    topic_ids.remove(&old_uuid);
+                }
+                topic_ids.insert(tid, Arc::new(topic_name.clone()));
+                name_to_uuid.insert(topic_name.clone(), tid);
             }
 
             let partitions: Vec<PartitionInfo> = topic
@@ -376,6 +421,7 @@ impl ClusterMetadata {
             controller_id: response.controller_id,
             brokers,
             topics,
+            topic_ids,
             last_updated: Instant::now(),
         };
 
@@ -405,6 +451,23 @@ impl ClusterMetadata {
             .topics
             .get(name)
             .map(|t| t.as_ref().clone())
+    }
+
+    /// Resolve a 16-byte topic UUID to a topic name.
+    ///
+    /// The mapping is populated from metadata v10+ responses where each topic
+    /// includes a `topic_id`. Returns `None` if the UUID is unknown — the
+    /// caller should trigger a metadata refresh and retry.
+    ///
+    /// Currently `pub(crate)` because `METADATA_MAX` is capped at v8, so
+    /// `topic_ids` is never populated. Will be promoted to `pub` once
+    /// Metadata v10+ negotiation is activated.
+    pub(crate) fn topic_name_for_id(&self, topic_id: &[u8; 16]) -> Option<String> {
+        self.cache
+            .load()
+            .topic_ids
+            .get(topic_id)
+            .map(|name| (**name).clone())
     }
 
     /// Get all topics.
@@ -585,5 +648,26 @@ mod tests {
         );
         assert_eq!(broker.address(), "broker1.kafka.local:9093");
         assert_eq!(broker.rack(), Some("us-east-1a"));
+    }
+
+    #[test]
+    fn test_metadata_cache_topic_ids() {
+        let mut cache = MetadataCache::new();
+        assert!(cache.topic_ids.is_empty());
+
+        let uuid: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        cache
+            .topic_ids
+            .insert(uuid, Arc::new("my-topic".to_string()));
+        assert_eq!(
+            cache.topic_ids.get(&uuid),
+            Some(&Arc::new("my-topic".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_metadata_cache_new_has_empty_topic_ids() {
+        let cache = MetadataCache::new();
+        assert!(cache.topic_ids.is_empty());
     }
 }

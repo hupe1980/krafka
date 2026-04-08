@@ -54,13 +54,13 @@ Krafka supports the following API version ranges (clamped to match actual encode
 
 | API | Min | Max | Key Features |
 |-----|-----|-----|--------------|
-| Produce | 0 | 3 | v3 transactions, headers |
+| Produce | 0 | 3 | v3+ for transactions |
 | Fetch | 0 | 11 | v4 isolation level, v5–v6 log_start_offset, v7 fetch sessions (KIP-227), v9 leader epoch fencing (KIP-320), v11 closest-replica fetching (KIP-392) |
 | ListOffsets | 0 | 2 | v2 isolation level |
-| Metadata | 0 | 8 | v1 controller + rack, v2 cluster_id, v3 throttle, v5 offline replicas, v7 leader epoch, v8 adds cluster/topic authorized-operations (decoded and discarded) |
-| OffsetCommit | 0 | 2 | v2 retention |
-| OffsetFetch | 0 | 1 | v1 group coordinator |
-| FindCoordinator | 0 | 1 | Group/txn coordinator lookup |
+| Metadata | 0 | 8 | v1 controller + rack, v2 cluster_id, v3 throttle, v5 offline replicas, v7 leader epoch, v8 authorized-ops (v9-v13 implemented, not yet activated) |
+| OffsetCommit | 0 | 2 | v2+ for retention (v3-v9 implemented, not yet activated) |
+| OffsetFetch | 0 | 1 | v1+ for group coordinator (v2-v9 implemented, not yet activated) |
+| FindCoordinator | 0 | 1 | Group/txn coordinator lookup (v2-v4 implemented, not yet activated) |
 | JoinGroup | 0 | 5 | v5 group instance id |
 | Heartbeat | 0 | 3 | v3 group instance id (KIP-345) |
 | SyncGroup | 0 | 3 | v3 group instance id |
@@ -78,6 +78,13 @@ Krafka supports the following API version ranges (clamped to match actual encode
 | DeleteRecords | 0 | 0 | Log truncation |
 | OffsetForLeaderEpoch | 0 | 3 | Leader epoch validation |
 | InitProducerId | 0 | 0 | Idempotent/transactional |
+| CreateDelegationToken | 0 | 1 | Delegation token creation |
+| RenewDelegationToken | 0 | 1 | Delegation token renewal |
+| ExpireDelegationToken | 0 | 1 | Delegation token expiry |
+| DescribeDelegationToken | 0 | 1 | Delegation token listing |
+| DescribeClientQuotas | 0 | 0 | Client quota queries |
+| AlterClientQuotas | 0 | 0 | Client quota updates |
+| ConsumerGroupHeartbeat | 0 | 0 | KIP-848 consumer group protocol (v1 encode/decode exists but is not negotiated yet) |
 
 ### Version Constants
 
@@ -87,9 +94,9 @@ Client-supported versions are defined in `krafka::protocol::versions`:
 use krafka::protocol::versions;
 
 // Maximum versions the client supports
-let max_fetch = versions::FETCH_MAX;        // 11 (v0-4 and v7-v11; v5/v6 unsupported)
-let max_produce = versions::PRODUCE_MAX;    // 3
-let max_metadata = versions::METADATA_MAX;  // 8
+let max_fetch = versions::FETCH_MAX;        // 11 (v0-v11, KIP-392)
+let max_produce = versions::PRODUCE_MAX;    // 3  (v3+ transactions)
+let max_metadata = versions::METADATA_MAX;  // 8  (v8 KRaft-aware metadata)
 ```
 
 ## Record Batches

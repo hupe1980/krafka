@@ -21,6 +21,7 @@ The Krafka consumer is an async-native, feature-rich Kafka consumer with:
 - Incremental fetch sessions (KIP-227)
 - Closest-replica fetching (KIP-392)
 - Static group membership (KIP-345)
+- KIP-848 consumer group protocol (server-side assignment)
 - Interceptor hooks
 - Log compaction awareness with [`CompactedTable`](#compactedtable) and [`CompactedTopicConsumer`](#compactedtopicconsumer) for key→value tables
 - Per-partition offset lag tracking
@@ -876,6 +877,164 @@ let consumer = Consumer::builder()
     .build()
     .await?;
 ```
+
+## KIP-848 Consumer Group Protocol
+
+KIP-848 introduces a new consumer group protocol where the server performs
+partition assignment instead of the group leader. This eliminates the
+JoinGroup/SyncGroup round-trip and replaces it with a single
+`ConsumerGroupHeartbeat` API (key 68, version 0; v1 encode/decode exists but
+is not yet activated — see `CONSUMER_GROUP_HEARTBEAT_MAX`).
+
+### Enabling KIP-848
+
+> **Not yet usable.** `Consumer::builder().group_protocol(GroupProtocol::Consumer).build()`
+> returns a configuration error because topic UUID resolution in heartbeat
+> assignments requires Metadata v10+, but the client currently negotiates
+> only up to v8 (`METADATA_MAX`).  Once Metadata v10+ support is activated
+> (bump `METADATA_MAX` to ≥ 10 and integration-test), the guard will be
+> removed and the following snippet will work:
+
+```rust
+use krafka::consumer::{Consumer, GroupProtocol};
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .group_protocol(GroupProtocol::Consumer)  // KIP-848
+    .build()
+    .await?;
+
+consumer.subscribe(&["my-topic"]).await?;
+```
+
+### How It Works
+
+| Classic Protocol | KIP-848 Consumer Protocol |
+|-----------------|--------------------------|
+| JoinGroup + SyncGroup + Heartbeat | ConsumerGroupHeartbeat only |
+| Client-side assignment (group leader) | Server-side assignment |
+| Generation ID | Member epoch |
+| `generation_id = -1` (unjoined) | `member_epoch = 0` (join) |
+| LeaveGroup request | `member_epoch = -1` (permanent leave) or `-2` (static member temporary leave) |
+
+With the consumer protocol:
+1. A member joins by sending a heartbeat with `member_epoch = 0`
+2. The coordinator assigns partitions and returns the assignment in the response
+3. Members maintain their session by sending periodic heartbeats
+4. The heartbeat task updates the local assignment and state when the broker returns new assignments
+5. The consumer layer computes an incremental diff to determine revoked vs. newly assigned partitions. `on_partitions_revoked` is fired for the affected revoked partitions, while `on_partitions_assigned` receives the **full post-rebalance assignment** (consistent with the cooperative and eager paths in this crate)
+6. To leave, a dynamic member sends `member_epoch = -1` (permanent). A static member (with `group_instance_id`) sends `member_epoch = -2` (temporary leave — the broker retains the assignment for the session-timeout window so the instance can rejoin quickly)
+
+### Subscription Changes
+
+If `subscribe()` is called with a different topic list while the consumer is
+already active (state `Stable`), the existing heartbeat task is stopped and the
+next `poll()` sends a full heartbeat with all fields (including the new topic
+list). This mirrors the cooperative-rebalance subscription-change detection.
+
+### Topic UUID Resolution
+
+The ConsumerGroupHeartbeat response uses 16-byte topic UUIDs in assignments.
+Krafka resolves these UUIDs to topic names with a two-level lookup order:
+
+1. **Cluster metadata lookup** — first consult `ClusterMetadata::topic_name_for_id`.
+   This path only produces results when Metadata API v10+ has been negotiated
+   and activated, because topic UUID → name mappings are not present in earlier
+   Metadata response versions.
+2. **Local topic names cache** — if metadata does not contain the mapping,
+   fall back to a local UUID → name cache built from previously resolved
+   assignments.  This cache survives metadata cache flushes and mirrors the
+   Java client's `AbstractMembershipManager` behavior once a name has been
+   learned.
+
+Successfully resolved names are cached locally. Unresolvable UUIDs still
+trigger an automatic metadata refresh, but the current client negotiates the
+Metadata API only up to v8 (`METADATA_MAX`), so metadata responses do not yet
+provide the topic UUID mapping introduced in Metadata v10+.
+
+> **Note:** External users cannot reach these code paths today —
+> `ConsumerBuilder::build()` rejects `GroupProtocol::Consumer` while
+> `METADATA_MAX < 10` (see [Enabling KIP-848](#enabling-kip-848)).
+> The error handling below exists as defense-in-depth and documents the
+> intended behaviour once the guard is lifted.
+
+If topic UUIDs
+remain unresolved after a metadata refresh during the initial heartbeat
+response handling, the client returns a protocol error rather than silently
+operating with an empty or partial assignment. Inside the background heartbeat
+task, unresolved UUIDs produce a `warn!` log and the assignment is retained
+for re-resolution on the next tick. The raw target assignment (with UUIDs) is
+always retained so resolution can be retried after future updates or once a
+UUID → name mapping becomes available.
+
+The `StaleMemberEpoch` error (113) is handled as a transient condition: the
+member epoch is updated from the response and the heartbeat retries on the
+next tick without triggering a rebalance.
+
+### Dynamic Heartbeat Interval
+
+The coordinator may adjust the heartbeat interval over time by returning a
+different `heartbeat_interval_ms` in the ConsumerGroupHeartbeat response. The
+KIP-848 heartbeat task honours these updates: after each successful response,
+the current interval is compared with the response value and, if changed, the
+timer is reset to the new duration (with a minimum floor of 1 000 ms).
+
+### Version Notes
+
+- **v0** — Base version; compatible with Kafka 3.7+ (EA) and 4.0+ (GA)
+- **v1** — Adds `SubscribedTopicRegex` for regex-based topic subscription (KIP-848) and requires consumer-generated member IDs (KIP-1082); available on Kafka 4.0+
+
+### Error Handling
+
+The ConsumerGroupHeartbeat response may return these KIP-848-specific errors:
+
+| Error Code | Name | Handling |
+|-----------|------|----------|
+| 8 | `RebalanceInProgress` | Signal rebalance; consumer processes assignment diff on next poll |
+| 14 | `CoordinatorLoadInProgress` | Transient — retry on next heartbeat tick |
+| 15 | `NotCoordinator` | Clear cached coordinator, trigger rediscovery |
+| 16 | `CoordinatorNotAvailable` | Clear cached coordinator, trigger rediscovery |
+| 110 | `FencedMemberEpoch` | Fenced — heartbeat task stops, member preserves its `member_id` and rejoins with epoch 0 via a full heartbeat (all top-level fields) |
+| 111 | `UnreleasedInstanceId` | Static member instance ID held by another member — same fencing recovery as `FencedMemberEpoch` |
+| 112 | `UnsupportedAssignor` | Server-side assignor not recognized |
+| 113 | `StaleMemberEpoch` | Update local epoch from response, retry on next heartbeat |
+| 128 | `InvalidRegularExpression` | Regex subscription (v1+) is malformed |
+
+### Fencing Recovery
+
+When the heartbeat task receives `FencedMemberEpoch`, `UnknownMemberId`, or
+`UnreleasedInstanceId`, it:
+
+1. Signals the consumer layer (member invalidated + rebalance needed)
+2. Stops the heartbeat task (no more skinny heartbeats with stale state)
+
+On the next `poll()`, the consumer detects the fencing via `needs_rejoin()`:
+
+1. Resets `member_epoch` to 0 and clears assignment/target state
+2. **Preserves `member_id`** — per KIP-848, a fenced member must "rejoin with
+   the same member id and epoch 0"
+3. Sets state to `Unjoined`
+
+The `handle_group_rebalance()` path then calls `ensure_active_membership()`,
+which sends a **full heartbeat** (subscription, rebalance timeout, all
+top-level fields) and starts a fresh heartbeat task.
+
+### Requirements
+
+- Requires Kafka 4.0+ (or earlier brokers with `group.coordinator.new.enable=true`)
+- The broker must support API key 68 (`ConsumerGroupHeartbeat`)
+
+### Limitations
+
+Offset commit and fetch currently negotiate only the older protocol versions
+supported by the client (`OFFSET_COMMIT_MAX=2`, `OFFSET_FETCH_MAX=1`), so
+the flexible v8–v9 wire format with member-epoch validation and OffsetFetch
+v8+ multi-group batching are **not yet active**. Encode/decode for those
+versions exists and the version-gating code is in place — bumping the MAX
+constants will activate them once integration-tested against a v9-capable
+broker. Full transactional offset support (`TxnOffsetCommit`) is not yet
+implemented.
 
 ## Consumer Interceptors
 
