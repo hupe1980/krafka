@@ -152,6 +152,24 @@ pub enum ApiKey {
     AllocateProducerIds = 67,
     /// Consumer group heartbeat.
     ConsumerGroupHeartbeat = 68,
+    /// Consumer group describe (KIP-848).
+    ConsumerGroupDescribe = 69,
+    /// Get telemetry subscriptions (KIP-714).
+    GetTelemetrySubscriptions = 71,
+    /// Push telemetry (KIP-714).
+    PushTelemetry = 72,
+    /// List client metrics resources (KIP-714).
+    ListClientMetricsResources = 74,
+    /// Describe topic partitions (KIP-966).
+    DescribeTopicPartitions = 75,
+    /// Share group heartbeat (KIP-932).
+    ShareGroupHeartbeat = 76,
+    /// Share group describe (KIP-932).
+    ShareGroupDescribe = 77,
+    /// Share fetch (KIP-932).
+    ShareFetch = 78,
+    /// Share acknowledge (KIP-932).
+    ShareAcknowledge = 79,
     /// Unknown API key.
     Unknown(i16),
 }
@@ -230,6 +248,15 @@ impl ApiKey {
             66 => Self::ListTransactions,
             67 => Self::AllocateProducerIds,
             68 => Self::ConsumerGroupHeartbeat,
+            69 => Self::ConsumerGroupDescribe,
+            71 => Self::GetTelemetrySubscriptions,
+            72 => Self::PushTelemetry,
+            74 => Self::ListClientMetricsResources,
+            75 => Self::DescribeTopicPartitions,
+            76 => Self::ShareGroupHeartbeat,
+            77 => Self::ShareGroupDescribe,
+            78 => Self::ShareFetch,
+            79 => Self::ShareAcknowledge,
             other => Self::Unknown(other),
         }
     }
@@ -307,6 +334,15 @@ impl ApiKey {
             Self::ListTransactions => 66,
             Self::AllocateProducerIds => 67,
             Self::ConsumerGroupHeartbeat => 68,
+            Self::ConsumerGroupDescribe => 69,
+            Self::GetTelemetrySubscriptions => 71,
+            Self::PushTelemetry => 72,
+            Self::ListClientMetricsResources => 74,
+            Self::DescribeTopicPartitions => 75,
+            Self::ShareGroupHeartbeat => 76,
+            Self::ShareGroupDescribe => 77,
+            Self::ShareFetch => 78,
+            Self::ShareAcknowledge => 79,
             Self::Unknown(key) => key,
         }
     }
@@ -387,6 +423,15 @@ impl ApiKey {
             Self::ListTransactions => 0,
             Self::AllocateProducerIds => 0,
             Self::ConsumerGroupHeartbeat => 0,
+            Self::ConsumerGroupDescribe => 0,
+            Self::GetTelemetrySubscriptions => 0,
+            Self::PushTelemetry => 0,
+            Self::ListClientMetricsResources => 0,
+            Self::DescribeTopicPartitions => 0,
+            Self::ShareGroupHeartbeat => 0,
+            Self::ShareGroupDescribe => 0,
+            Self::ShareFetch => 0,
+            Self::ShareAcknowledge => 0,
             // Unknown APIs: assume never flexible (safest default).
             Self::Unknown(_) => i16::MAX,
         }
@@ -547,13 +592,39 @@ impl Decode for ApiVersionRange {
     }
 }
 
+/// A feature supported by the broker, returned in ApiVersions v3+ tagged fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupportedFeature {
+    /// Feature name.
+    pub name: String,
+    /// Minimum supported version for the feature.
+    pub min_version: i16,
+    /// Maximum supported version for the feature.
+    pub max_version: i16,
+}
+
 /// Request for API versions (ApiVersions API key = 18).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ApiVersionsRequest {
     /// Client software name (v3+).
     pub client_software_name: Option<KafkaString>,
     /// Client software version (v3+).
     pub client_software_version: Option<KafkaString>,
+    /// Cluster ID the client intends to connect to (v5+, KIP-1242).
+    pub cluster_id: Option<String>,
+    /// Node ID the client intends to connect to (v5+, KIP-1242). -1 if unknown.
+    pub node_id: i32,
+}
+
+impl Default for ApiVersionsRequest {
+    fn default() -> Self {
+        Self {
+            client_software_name: None,
+            client_software_version: None,
+            cluster_id: None,
+            node_id: -1,
+        }
+    }
 }
 
 impl ApiVersionsRequest {
@@ -596,6 +667,24 @@ impl ApiVersionsRequest {
         TaggedFields::default().try_encode(buf)?;
         Ok(())
     }
+
+    /// Encode for version 5 (KIP-1242: ClusterId + NodeId).
+    pub fn encode_v5(&self, buf: &mut impl BufMut) -> Result<()> {
+        if let Some(ref name) = self.client_software_name {
+            name.try_encode_compact(buf)?;
+        } else {
+            KafkaString::null().try_encode_compact(buf)?;
+        }
+        if let Some(ref version) = self.client_software_version {
+            version.try_encode_compact(buf)?;
+        } else {
+            KafkaString::null().try_encode_compact(buf)?;
+        }
+        KafkaString(self.cluster_id.clone()).try_encode_compact(buf)?;
+        self.node_id.encode(buf);
+        TaggedFields::default().try_encode(buf)?;
+        Ok(())
+    }
 }
 
 /// Response for API versions.
@@ -607,6 +696,8 @@ pub struct ApiVersionsResponse {
     pub api_keys: Vec<ApiVersionRange>,
     /// Throttle time in milliseconds.
     pub throttle_time_ms: i32,
+    /// Features supported by the broker (v3+ tagged field, tag 0).
+    pub supported_features: Vec<SupportedFeature>,
 }
 
 impl ApiVersionsResponse {
@@ -620,6 +711,7 @@ impl ApiVersionsResponse {
             error_code,
             api_keys,
             throttle_time_ms: 0,
+            supported_features: Vec::new(),
         })
     }
 
@@ -634,28 +726,74 @@ impl ApiVersionsResponse {
             error_code,
             api_keys,
             throttle_time_ms,
+            supported_features: Vec::new(),
         })
     }
 
-    /// Decode from version 3+ (flexible).
+    /// Decode from version 3–5 (flexible).
+    ///
+    /// v4 (KAFKA-17011) fixes SupportedFeatures.MinVersion so it can be 0;
+    /// v5 (KIP-1242) adds ClusterId/NodeId to the *request* and
+    /// REBOOTSTRAP_REQUIRED to the error codes; the response wire format is
+    /// identical to v3.
     pub fn decode_v3(buf: &mut impl Buf) -> Result<Self> {
         let error_code = i16::decode(buf)?;
         let api_keys = KafkaArray::<ApiVersionRange>::decode_compact(buf)?
             .0
             .unwrap_or_default();
         let throttle_time_ms = i32::decode(buf)?;
-        // Skip tagged fields
-        let _ = TaggedFields::decode(buf)?;
+        let tagged = TaggedFields::decode(buf)?;
+        let supported_features = Self::parse_supported_features(&tagged)?;
         Ok(Self {
             error_code,
             api_keys,
             throttle_time_ms,
+            supported_features,
         })
+    }
+
+    /// Parse SupportedFeatures from tagged field tag 0.
+    ///
+    /// Wire format: compact-array of \[compact-string Name, i16 MinVersion, i16 MaxVersion\],
+    /// each entry followed by its own empty tagged fields.
+    fn parse_supported_features(tagged: &TaggedFields) -> Result<Vec<SupportedFeature>> {
+        let Some(field) = tagged.0.iter().find(|f| f.tag == 0) else {
+            return Ok(Vec::new());
+        };
+        let mut buf = &field.data[..];
+        let count = crate::util::varint::decode_unsigned_varint(&mut buf)? as usize;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        // compact array length is count + 1; actual items = count - 1
+        let items = count.saturating_sub(1);
+        let mut features = Vec::with_capacity(items);
+        for _ in 0..items {
+            let name = super::non_nullable_string(
+                "feature name",
+                KafkaString::decode_compact(&mut buf)?.0,
+            )?;
+            let min_version = i16::decode(&mut buf)?;
+            let max_version = i16::decode(&mut buf)?;
+            // skip per-entry tagged fields
+            let _ = TaggedFields::decode(&mut buf)?;
+            features.push(SupportedFeature {
+                name,
+                min_version,
+                max_version,
+            });
+        }
+        Ok(features)
     }
 
     /// Get the version range for a specific API key.
     pub fn get_api_version(&self, api_key: ApiKey) -> Option<&ApiVersionRange> {
         self.api_keys.iter().find(|v| v.api_key == api_key)
+    }
+
+    /// Get a supported feature by name.
+    pub fn get_supported_feature(&self, name: &str) -> Option<&SupportedFeature> {
+        self.supported_features.iter().find(|f| f.name == name)
     }
 
     /// Check if an API is supported.
@@ -712,14 +850,15 @@ mod tests {
 
     #[test]
     fn test_api_versions_request() {
-        let request = ApiVersionsRequest::new().with_client_software("krafka", "0.3.1");
+        let request =
+            ApiVersionsRequest::new().with_client_software("krafka", env!("CARGO_PKG_VERSION"));
         assert_eq!(
             request.client_software_name.as_ref().unwrap().as_str(),
             Some("krafka")
         );
         assert_eq!(
             request.client_software_version.as_ref().unwrap().as_str(),
-            Some("0.3.1")
+            Some(env!("CARGO_PKG_VERSION"))
         );
     }
 
@@ -732,6 +871,7 @@ mod tests {
                 ApiVersionRange::new(ApiKey::Fetch, 0, 13),
             ],
             throttle_time_ms: 0,
+            supported_features: Vec::new(),
         };
 
         assert!(response.supports(ApiKey::Produce, 5));
@@ -769,5 +909,102 @@ mod tests {
         assert_eq!(ApiKey::Produce.to_string(), "Produce");
         assert_eq!(ApiKey::Fetch.to_string(), "Fetch");
         assert_eq!(ApiKey::Unknown(999).to_string(), "Unknown(999)");
+    }
+
+    // ── ApiVersions v3/v4 round-trip and SupportedFeatures parsing ──
+
+    #[test]
+    fn test_api_versions_request_v3_round_trip() {
+        let request = ApiVersionsRequest::new().with_client_software("krafka", "0.4.0");
+        let mut buf = BytesMut::new();
+        request.encode_v3(&mut buf).unwrap();
+        // v4 is the same wire format as v3; encoding should produce identical bytes
+        let mut buf2 = BytesMut::new();
+        request.encode_v3(&mut buf2).unwrap();
+        assert_eq!(buf, buf2);
+    }
+
+    #[test]
+    fn test_api_versions_response_decode_v3_no_tagged_features() {
+        use crate::util::varint;
+        let mut buf = BytesMut::new();
+        buf.put_i16(0); // error_code
+        // compact api_keys array: varint(count+1) = 1 means 0 items
+        varint::encode_unsigned_varint(1, &mut buf);
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_u8(0); // empty tagged fields
+        let mut data = buf.freeze();
+        let resp = ApiVersionsResponse::decode_v3(&mut data).unwrap();
+        assert_eq!(resp.error_code, 0);
+        assert!(resp.api_keys.is_empty());
+        assert!(resp.supported_features.is_empty());
+    }
+
+    #[test]
+    fn test_api_versions_response_decode_v3_with_supported_features() {
+        use crate::util::varint;
+        let mut buf = BytesMut::new();
+        buf.put_i16(0); // error_code
+        // compact api_keys array: 1 item (varint(2))
+        varint::encode_unsigned_varint(2, &mut buf);
+        // ApiVersionRange: api_key(i16) + min_version(i16) + max_version(i16)
+        buf.put_i16(0); // api_key = Produce
+        buf.put_i16(0); // min_version
+        buf.put_i16(9); // max_version
+        // per-entry tagged fields for compact api key
+        buf.put_u8(0);
+        buf.put_i32(0); // throttle_time_ms
+
+        // Tagged fields: 1 field, tag 0 = SupportedFeatures
+        let mut tag_data = BytesMut::new();
+        // compact array of features: 2 items (varint(3) = 2+1)
+        varint::encode_unsigned_varint(3, &mut tag_data);
+        // Feature 1: "metadata.version" min=1 max=20
+        let name1 = b"metadata.version";
+        varint::encode_unsigned_varint(name1.len() as u32 + 1, &mut tag_data);
+        tag_data.put_slice(name1);
+        tag_data.put_i16(1); // min_version
+        tag_data.put_i16(20); // max_version
+        tag_data.put_u8(0); // per-entry tagged fields
+        // Feature 2: "kraft.version" min=0 max=1
+        let name2 = b"kraft.version";
+        varint::encode_unsigned_varint(name2.len() as u32 + 1, &mut tag_data);
+        tag_data.put_slice(name2);
+        tag_data.put_i16(0); // min_version
+        tag_data.put_i16(1); // max_version
+        tag_data.put_u8(0); // per-entry tagged fields
+
+        // Emit top-level tagged fields: 1 field
+        varint::encode_unsigned_varint(1, &mut buf); // 1 tagged field
+        varint::encode_unsigned_varint(0, &mut buf); // tag = 0
+        varint::encode_unsigned_varint(tag_data.len() as u32, &mut buf);
+        buf.extend_from_slice(&tag_data);
+
+        let mut data = buf.freeze();
+        let resp = ApiVersionsResponse::decode_v3(&mut data).unwrap();
+        assert_eq!(resp.supported_features.len(), 2);
+        assert_eq!(resp.supported_features[0].name, "metadata.version");
+        assert_eq!(resp.supported_features[0].min_version, 1);
+        assert_eq!(resp.supported_features[0].max_version, 20);
+        assert_eq!(resp.supported_features[1].name, "kraft.version");
+        assert_eq!(resp.supported_features[1].min_version, 0);
+        assert_eq!(resp.supported_features[1].max_version, 1);
+
+        // Test feature lookup
+        let feat = resp.get_supported_feature("kraft.version").unwrap();
+        assert_eq!(feat.min_version, 0);
+        assert_eq!(feat.max_version, 1);
+        assert!(resp.get_supported_feature("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_api_versions_response_decode_v0_no_features() {
+        let mut buf = BytesMut::new();
+        buf.put_i16(0); // error_code
+        buf.put_i32(0); // api_keys count = 0
+        let mut data = buf.freeze();
+        let resp = ApiVersionsResponse::decode_v0(&mut data).unwrap();
+        assert!(resp.supported_features.is_empty());
+        assert_eq!(resp.throttle_time_ms, 0);
     }
 }

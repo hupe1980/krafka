@@ -306,7 +306,8 @@ impl CompactedTable {
                 .as_ref()
                 .expect("non-tombstone compacted record must have a value")
                 .clone();
-            let old_value = self.entries.insert(key.clone(), value.clone());
+            let key_owned = key.clone();
+            let old_value = self.entries.insert(key_owned, value.clone());
             TableChange {
                 key: key.clone(),
                 old_value,

@@ -223,9 +223,10 @@ impl BrokerConnectionBundle {
         }
 
         // Establish multiple connections in parallel
+        let addr_owned = address.to_string();
         let mut handles = Vec::with_capacity(num_connections);
         for _ in 0..num_connections {
-            let addr = address.to_string();
+            let addr = addr_owned.clone();
             let cfg = config.clone();
             handles.push(tokio::spawn(async move {
                 BrokerConnection::connect(&addr, cfg).await
@@ -244,11 +245,11 @@ impl BrokerConnectionBundle {
         debug!(
             "Created connection bundle with {} connections to {}",
             connections.len(),
-            address
+            addr_owned
         );
 
         Ok(Self {
-            address: address.to_string(),
+            address: addr_owned,
             connections,
             counter: AtomicUsize::new(0),
         })

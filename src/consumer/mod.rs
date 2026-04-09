@@ -328,6 +328,8 @@ impl Consumer {
         // If we have a group coordinator, join the group
         if let Some(ref coordinator) = self.group_coordinator {
             let topic_strings: Vec<String> = topics.iter().map(|s| s.to_string()).collect();
+            let mut topics_sorted = topic_strings.clone();
+            topics_sorted.sort();
 
             if coordinator.is_consumer_protocol() {
                 // KIP-848: defer to poll(), which handles incremental
@@ -342,9 +344,7 @@ impl Consumer {
                     if state == GroupState::Stable {
                         let mut old_sorted = coordinator.subscribed_topics().await;
                         old_sorted.sort();
-                        let mut new_sorted = topic_strings.clone();
-                        new_sorted.sort();
-                        if old_sorted != new_sorted {
+                        if old_sorted != topics_sorted {
                             coordinator.trigger_rejoin().await;
                         }
                     }
@@ -364,9 +364,7 @@ impl Consumer {
                     if state == GroupState::Stable {
                         let mut old_sorted = coordinator.subscribed_topics().await;
                         old_sorted.sort();
-                        let mut new_sorted = topic_strings.clone();
-                        new_sorted.sort();
-                        if old_sorted != new_sorted {
+                        if old_sorted != topics_sorted {
                             coordinator.set_preparing_rebalance().await;
                         }
                     }
@@ -1124,63 +1122,59 @@ impl Consumer {
         }
 
         // Apply auto_offset_reset
-        match self.config.auto_offset_reset.to_offset() {
-            Some(timestamp) => {
-                // Group partitions by topic for list_offsets call
-                let mut reset_partitions: HashMap<String, Vec<PartitionId>> = HashMap::new();
-                for (topic, partition) in &need_reset {
-                    reset_partitions
-                        .entry(topic.clone())
-                        .or_default()
-                        .push(*partition);
-                }
+        if let Some(timestamp) = self.config.auto_offset_reset.to_offset() {
+            // Group partitions by topic for list_offsets call
+            let mut reset_partitions: HashMap<String, Vec<PartitionId>> = HashMap::new();
+            for (topic, partition) in &need_reset {
+                reset_partitions
+                    .entry(topic.clone())
+                    .or_default()
+                    .push(*partition);
+            }
 
-                let resolved = coordinator
-                    .list_offsets(&reset_partitions, timestamp)
-                    .await?;
+            let resolved = coordinator
+                .list_offsets(&reset_partitions, timestamp)
+                .await?;
 
-                for (key, offset) in &resolved {
-                    offsets.insert(key.clone(), *offset);
-                }
+            for (key, offset) in &resolved {
+                offsets.insert(key.clone(), *offset);
+            }
 
-                // Fallback: if the group coordinator's list_offsets silently
-                // dropped some partitions (partition-level errors), resolve
-                // them individually via the direct ListOffsets v1 path.
-                for (topic, partition) in &need_reset {
-                    let key = (topic.clone(), *partition);
-                    if !resolved.contains_key(&key) && !offsets.contains_key(&key) {
-                        debug!(
-                            "Falling back to direct ListOffsets for {}-{} \
-                             (coordinator path returned no result)",
-                            topic, partition
-                        );
-                        // Release offsets lock temporarily for the network call
-                        drop(offsets);
-                        match self.resolve_list_offset(topic, *partition, timestamp).await {
-                            Ok(offset) => {
-                                offsets = self.offsets.write().await;
-                                offsets.insert(key, offset);
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Fallback offset resolution failed for {}-{}: {}",
-                                    topic, partition, e
-                                );
-                                offsets = self.offsets.write().await;
-                            }
+            // Fallback: if the group coordinator's list_offsets silently
+            // dropped some partitions (partition-level errors), resolve
+            // them individually via the direct ListOffsets v1 path.
+            for (topic, partition) in &need_reset {
+                let key = (topic.clone(), *partition);
+                if !resolved.contains_key(&key) && !offsets.contains_key(&key) {
+                    debug!(
+                        "Falling back to direct ListOffsets for {}-{} \
+                         (coordinator path returned no result)",
+                        topic, partition
+                    );
+                    // Release offsets lock temporarily for the network call
+                    drop(offsets);
+                    match self.resolve_list_offset(topic, *partition, timestamp).await {
+                        Ok(offset) => {
+                            offsets = self.offsets.write().await;
+                            offsets.insert(key, offset);
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Fallback offset resolution failed for {}-{}: {}",
+                                topic, partition, e
+                            );
+                            offsets = self.offsets.write().await;
                         }
                     }
                 }
             }
-            None => {
-                // AutoOffsetReset::None — fail if no committed offset
-                let missing: Vec<String> =
-                    need_reset.iter().map(|(t, p)| format!("{t}-{p}")).collect();
-                return Err(KrafkaError::invalid_state(format!(
-                    "no committed offset for partitions and auto.offset.reset=none: {}",
-                    missing.join(", ")
-                )));
-            }
+        } else {
+            // AutoOffsetReset::None — fail if no committed offset
+            let missing: Vec<String> = need_reset.iter().map(|(t, p)| format!("{t}-{p}")).collect();
+            return Err(KrafkaError::invalid_state(format!(
+                "no committed offset for partitions and auto.offset.reset=none: {}",
+                missing.join(", ")
+            )));
         }
 
         // Drop the write lock before recomputing lag metrics to avoid
@@ -1205,20 +1199,22 @@ impl Consumer {
         // Refresh metadata so we can resolve partition leaders for offset lookup
         self.metadata.refresh_for_topics(Some(&[topic])).await?;
 
+        let topic_owned = topic.to_string();
+
         let mut assignments = self.assignments.write().await;
-        assignments.insert(topic.to_string(), partitions.clone());
+        assignments.insert(topic_owned.clone(), partitions.clone());
 
         let mut subscriptions = self.subscriptions.write().await;
-        subscriptions.insert(topic.to_string());
+        subscriptions.insert(topic_owned.clone());
         drop(subscriptions);
         drop(assignments);
 
         // Apply auto_offset_reset for manually assigned partitions
         let mut assigned = HashMap::new();
-        assigned.insert(topic.to_string(), partitions.clone());
+        debug!("Assigned partitions for {}: {:?}", topic, partitions);
+        assigned.insert(topic_owned, partitions);
         self.apply_auto_offset_reset(&assigned).await?;
 
-        debug!("Assigned partitions for {}: {:?}", topic, partitions);
         Ok(())
     }
 
@@ -1237,8 +1233,9 @@ impl Consumer {
             let mut need = Vec::new();
             for (topic, partitions) in assigned {
                 for &p in partitions {
-                    if !offsets.contains_key(&(topic.clone(), p)) {
-                        need.push((topic.clone(), p));
+                    let key = (topic.clone(), p);
+                    if !offsets.contains_key(&key) {
+                        need.push(key);
                     }
                 }
             }
@@ -1249,51 +1246,50 @@ impl Consumer {
             return Ok(());
         }
 
-        match self.config.auto_offset_reset.to_offset() {
-            Some(timestamp) => {
-                // Group need_reset into HashMap<String, Vec<PartitionId>> for batched resolution
-                let mut batch: HashMap<String, Vec<PartitionId>> = HashMap::new();
-                for (topic, partition) in &need_reset {
-                    batch.entry(topic.clone()).or_default().push(*partition);
-                }
+        if let Some(timestamp) = self.config.auto_offset_reset.to_offset() {
+            // Group need_reset into HashMap<String, Vec<PartitionId>> for batched resolution
+            let mut batch: HashMap<String, Vec<PartitionId>> = HashMap::new();
+            for (topic, partition) in &need_reset {
+                batch.entry(topic.clone()).or_default().push(*partition);
+            }
 
-                let resolved = match self.resolve_list_offsets(&batch, timestamp).await {
-                    Ok(resolved) => resolved,
-                    Err(e) => {
-                        warn!(
-                            "Failed to resolve offsets via ListOffsets for {:?}: {}. \
-                             Will retry on next poll",
-                            batch.keys().collect::<Vec<_>>(),
-                            e
-                        );
-                        HashMap::new()
-                    }
-                };
-                let mut offsets = self.offsets.write().await;
-                for ((topic, partition), offset) in &resolved {
-                    offsets.insert((topic.clone(), *partition), *offset);
+            let resolved = match self.resolve_list_offsets(&batch, timestamp).await {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    warn!(
+                        "Failed to resolve offsets via ListOffsets for {:?}: {}. \
+                         Will retry on next poll",
+                        batch.keys().collect::<Vec<_>>(),
+                        e
+                    );
+                    HashMap::new()
                 }
-                drop(offsets);
+            };
+            let mut offsets = self.offsets.write().await;
+            for (key, offset) in &resolved {
+                offsets.insert(key.clone(), *offset);
+            }
+            drop(offsets);
 
-                // Log any partitions that weren't resolved (broker skipped or errored)
-                for (topic, partition) in &need_reset {
-                    if !resolved.contains_key(&(topic.clone(), *partition)) {
-                        warn!(
-                            "Failed to resolve offset for {}-{}, will retry on next poll",
-                            topic, partition
-                        );
-                    }
+            // Log any partitions that weren't resolved (broker skipped or errored)
+            for key in &need_reset {
+                if !resolved.contains_key(key) {
+                    warn!(
+                        "Failed to resolve offset for {}-{}, will retry on next poll",
+                        key.0, key.1
+                    );
                 }
             }
-            None => {
-                // AutoOffsetReset::None — fail if no offset
-                let missing: Vec<String> =
-                    need_reset.iter().map(|(t, p)| format!("{t}-{p}")).collect();
-                return Err(KrafkaError::invalid_state(format!(
-                    "no offset for partitions and auto.offset.reset=none: {}",
-                    missing.join(", ")
-                )));
-            }
+        } else {
+            // AutoOffsetReset::None — fail if no offset
+            let missing = need_reset
+                .iter()
+                .map(|(t, p)| format!("{t}-{p}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(KrafkaError::invalid_state(format!(
+                "no offset for partitions and auto.offset.reset=none: {missing}"
+            )));
         }
 
         self.recompute_lag_metrics().await;
@@ -1342,10 +1338,11 @@ impl Consumer {
         timestamp: i64,
     ) -> Result<Offset> {
         let mut partitions = HashMap::new();
-        partitions.insert(topic.to_string(), vec![partition]);
+        let topic_owned = topic.to_string();
+        partitions.insert(topic_owned.clone(), vec![partition]);
         let results = self.resolve_list_offsets(&partitions, timestamp).await?;
         results
-            .get(&(topic.to_string(), partition))
+            .get(&(topic_owned, partition))
             .copied()
             .ok_or_else(|| {
                 KrafkaError::protocol(format!("no offset returned for {topic}-{partition}"))
@@ -1436,6 +1433,7 @@ impl Consumer {
                 replica_id: -1,
                 isolation_level: self.config.isolation_level.to_i8(),
                 topics,
+                timeout_ms: None,
             };
 
             // Get a connection to this broker by leader ID
@@ -1463,9 +1461,13 @@ impl Consumer {
                 }
             };
 
-            // Negotiate ListOffsets version — require v1+, prefer v2.
+            // Negotiate ListOffsets version — require v1+ (MIN), prefer v2 (MAX).
             let list_version = match conn
-                .negotiate_api_version_max(ApiKey::ListOffsets, versions::LIST_OFFSETS_MAX)
+                .negotiate_api_version(
+                    ApiKey::ListOffsets,
+                    versions::LIST_OFFSETS_MAX,
+                    versions::LIST_OFFSETS_MIN,
+                )
                 .await
             {
                 Some(v) => v,
@@ -1960,10 +1962,13 @@ impl Consumer {
                     last_fetched_epoch: -1,
                     log_start_offset: -1,
                     partition_max_bytes: self.config.max_partition_fetch_bytes,
+                    replica_directory_id: None,
+                    high_watermark: None,
                 });
             }
             fetch_topics.push(FetchTopicRequest {
                 topic: topic.clone(),
+                topic_id: None,
                 partitions: fetch_partitions,
             });
         }
@@ -2402,9 +2407,10 @@ impl Consumer {
         };
 
         let version = conn
-            .negotiate_api_version_max(
+            .negotiate_api_version(
                 ApiKey::OffsetForLeaderEpoch,
                 versions::OFFSET_FOR_LEADER_EPOCH_MAX,
+                versions::OFFSET_FOR_LEADER_EPOCH_MIN,
             )
             .await
             .ok_or_else(|| {
@@ -2412,27 +2418,13 @@ impl Consumer {
             })?;
 
         let response_bytes = conn
-            .send_request(ApiKey::OffsetForLeaderEpoch, version, |buf| match version {
-                0..=1 => request.encode_v0(buf),
-                2 => request.encode_v2(buf),
-                3 => request.encode_v3(buf),
-                _ => Err(KrafkaError::protocol(format!(
-                    "unsupported OffsetForLeaderEpoch encode version {version}"
-                ))),
+            .send_request(ApiKey::OffsetForLeaderEpoch, version, |buf| {
+                request.encode_versioned(version, buf)
             })
             .await?;
 
         let mut buf = response_bytes;
-        let response = match version {
-            0 => OffsetForLeaderEpochResponse::decode_v0(&mut buf)?,
-            1 => OffsetForLeaderEpochResponse::decode_v1(&mut buf)?,
-            2..=3 => OffsetForLeaderEpochResponse::decode_v2(&mut buf)?,
-            _ => {
-                return Err(KrafkaError::protocol(format!(
-                    "unsupported OffsetForLeaderEpoch decode version {version}"
-                )));
-            }
-        };
+        let response = OffsetForLeaderEpochResponse::decode_versioned(version, &mut buf)?;
 
         let key = (topic.to_string(), partition);
         let mut offset_changed = false;
@@ -2896,8 +2888,9 @@ impl Consumer {
     /// Paused partitions will be skipped during poll() until resumed.
     pub async fn pause(&self, topic: &str, partitions: &[PartitionId]) {
         let mut paused = self.paused.write().await;
+        let topic_owned = topic.to_string();
         for &partition in partitions {
-            paused.insert((topic.to_string(), partition));
+            paused.insert((topic_owned.clone(), partition));
         }
         self.metrics.paused_partitions.set(paused.len() as u64);
         debug!("Paused partitions for {}: {:?}", topic, partitions);
@@ -2908,8 +2901,9 @@ impl Consumer {
     /// Resumes polling for previously paused partitions.
     pub async fn resume(&self, topic: &str, partitions: &[PartitionId]) {
         let mut paused = self.paused.write().await;
+        let topic_key = topic.to_string();
         for &partition in partitions {
-            paused.remove(&(topic.to_string(), partition));
+            paused.remove(&(topic_key.clone(), partition));
         }
         self.metrics.paused_partitions.set(paused.len() as u64);
         debug!("Resumed partitions for {}: {:?}", topic, partitions);
@@ -3249,10 +3243,9 @@ impl ConsumerBuilder {
         if self.config.group_protocol == crate::consumer::config::GroupProtocol::Consumer {
             return Err(KrafkaError::config(
                 "GroupProtocol::Consumer (KIP-848) is not yet usable: \
-                 topic UUID resolution requires Metadata v10+ but the \
-                 client currently negotiates only up to v8 (METADATA_MAX). \
-                 Use GroupProtocol::Classic until Metadata v10+ support \
-                 is activated.",
+                 the protocol path has not been integration-tested against \
+                 a live broker. Use GroupProtocol::Classic until KIP-848 \
+                 support is validated end-to-end.",
             ));
         }
         let mut consumer = Consumer::new(self.config).await?;
@@ -3941,6 +3934,7 @@ mod tests {
             replica_id: -1,
             isolation_level: 0,
             topics,
+            timeout_ms: None,
         };
 
         assert_eq!(request.replica_id, -1);
@@ -3977,12 +3971,14 @@ mod tests {
                             error_code: ErrorCode::None,
                             timestamp: -1,
                             offset: 42,
+                            leader_epoch: -1,
                         },
                         ListOffsetsResponsePartition {
                             partition_index: 1,
                             error_code: ErrorCode::None,
                             timestamp: -1,
                             offset: 100,
+                            leader_epoch: -1,
                         },
                     ],
                 },
@@ -3993,6 +3989,7 @@ mod tests {
                         error_code: ErrorCode::None,
                         timestamp: -1,
                         offset: 7,
+                        leader_epoch: -1,
                     }],
                 },
             ],
@@ -4033,18 +4030,21 @@ mod tests {
                         error_code: ErrorCode::None,
                         timestamp: -1,
                         offset: 42,
+                        leader_epoch: -1,
                     },
                     ListOffsetsResponsePartition {
                         partition_index: 1,
                         error_code: ErrorCode::NotLeaderForPartition,
                         timestamp: -1,
                         offset: -1,
+                        leader_epoch: -1,
                     },
                     ListOffsetsResponsePartition {
                         partition_index: 2,
                         error_code: ErrorCode::None,
                         timestamp: -1,
                         offset: 99,
+                        leader_epoch: -1,
                     },
                 ],
             }],
@@ -4098,6 +4098,7 @@ mod tests {
                     error_code: ErrorCode::NotLeaderForPartition,
                     timestamp: -1,
                     offset: -1,
+                    leader_epoch: -1,
                 }],
             }],
         };
@@ -4154,6 +4155,7 @@ mod tests {
                     },
                 ],
             }],
+            timeout_ms: None,
         };
 
         // v1 encode

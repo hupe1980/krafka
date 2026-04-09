@@ -67,6 +67,14 @@ ErrorCode::SaslAuthenticationFailed  // 58: SASL auth failed
 ErrorCode::UnknownProducerId         // 59: Unknown producer ID
 ErrorCode::FencedInstanceId          // 82: Fenced instance ID
 ErrorCode::UnstableOffsetCommit      // 88: Unstable offset commit
+ErrorCode::ProducerFenced            // 90: Producer fenced (zombie)
+ErrorCode::UnknownTopicId            // 100: Unknown topic ID (KIP-516)
+ErrorCode::InconsistentTopicId       // 103: Topic ID mismatch
+ErrorCode::FetchSessionTopicIdError  // 106: Fetch session topic ID error
+ErrorCode::OffsetMovedToTieredStorage // 109: Offset in tiered storage (KIP-405)
+ErrorCode::FencedMemberEpoch         // 110: Fenced member epoch (KIP-848)
+ErrorCode::StaleMemberEpoch          // 113: Stale member epoch (KIP-848)
+ErrorCode::TransactionAbortable      // 120: Transaction abortable (KIP-890)
 ```
 
 > **Note:** `OffsetOutOfRange` errors during fetch are automatically handled by the consumer — it applies the configured `auto_offset_reset` policy to recover the affected partition without returning an error to the application.

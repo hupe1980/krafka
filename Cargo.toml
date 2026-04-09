@@ -1,6 +1,6 @@
 [package]
 name = "krafka"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["hupe1980"]
@@ -87,11 +87,17 @@ aws-glue-schema-registry = ["aws-sdk-glue", "aws-config"]
 # Only enable for local development or testing with self-signed certificates.
 # Requires calling `TlsConfig::insecure()`.
 danger-insecure-tls = []
+# Enable cutting-edge protocol versions that target unreleased Kafka builds.
+# Includes Fetch v17-v18, ApiVersions v5, InitProducerId v6, and Share Groups.
+unstable-protocol = []
+# Enable KIP-714 client telemetry APIs (GetTelemetrySubscriptions, PushTelemetry).
+telemetry = []
 
 [dev-dependencies]
 tokio-test = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
+rstest = "0.25"
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["kafka"] }
 

@@ -30,7 +30,7 @@ use crate::metadata::ClusterMetadata;
 use crate::metrics::ProducerMetrics;
 use crate::protocol::{
     ApiKey, Compression, ProducePartitionData, ProduceRequest, ProduceResponse, ProduceTopicData,
-    RecordBatchBuilder,
+    RecordBatchBuilder, VersionedDecode, VersionedEncode, versions,
 };
 
 /// Response from the accumulator for an append attempt.
@@ -404,7 +404,8 @@ impl RecordAccumulator {
     ) {
         // Estimate record size for memory tracking and batch size-gating.
         let record_size = record.estimated_size();
-        let key = (record.topic.clone(), partition);
+        let topic = record.topic.clone();
+        let key = (topic, partition);
 
         // Check memory limit before appending (0 = unlimited).
         // Include in-flight memory so extracted-but-unsent batches are counted.
@@ -635,13 +636,14 @@ impl RecordAccumulator {
         // Build and encode the record batch once (immutable across retries).
         let mut batch_builder = RecordBatchBuilder::new().compression(config.compression);
         for p in &pending {
+            let key = p.record.key.clone();
+            let value = Some(p.record.value.clone());
             if p.record.headers.is_empty() {
-                batch_builder =
-                    batch_builder.add_record(p.record.key.clone(), Some(p.record.value.clone()));
+                batch_builder = batch_builder.add_record(key, value);
             } else {
                 batch_builder = batch_builder.add_record_with_headers(
-                    p.record.key.clone(),
-                    Some(p.record.value.clone()),
+                    key,
+                    value,
                     p.record
                         .headers
                         .iter()
@@ -670,6 +672,7 @@ impl RecordAccumulator {
             timeout_ms: crate::util::duration_to_millis_i32(config.request_timeout),
             topic_data: vec![ProduceTopicData {
                 name: topic.clone(),
+                topic_id: None,
                 partition_data: vec![ProducePartitionData {
                     index: partition,
                     records: batch_bytes,
@@ -706,10 +709,22 @@ impl RecordAccumulator {
                 }
             };
 
+            // Negotiate Produce version for this broker.
+            let produce_version = conn
+                .negotiate_api_version(
+                    ApiKey::Produce,
+                    versions::PRODUCE_MAX,
+                    versions::PRODUCE_MIN,
+                )
+                .await
+                .unwrap_or(versions::PRODUCE_MIN);
+
             // acks=0 (fire-and-forget): Kafka sends no response (R6.1 fix)
             if config.acks == 0 {
                 match conn
-                    .send_fire_and_forget(ApiKey::Produce, 0, |buf| request.encode_v0(buf))
+                    .send_fire_and_forget(ApiKey::Produce, produce_version, |buf| {
+                        request.encode_versioned(produce_version, buf)
+                    })
                     .await
                 {
                     Ok(()) => {
@@ -728,59 +743,63 @@ impl RecordAccumulator {
             }
 
             let response_result = conn
-                .send_request(ApiKey::Produce, 0, |buf| request.encode_v0(buf))
+                .send_request(ApiKey::Produce, produce_version, |buf| {
+                    request.encode_versioned(produce_version, buf)
+                })
                 .await;
 
             match response_result {
-                Ok(mut response_buf) => match ProduceResponse::decode_v0(&mut response_buf) {
-                    Ok(produce_response) => {
-                        let pr = produce_response
-                            .responses
-                            .iter()
-                            .find(|r| r.name == topic)
-                            .and_then(|r| {
-                                r.partition_responses.iter().find(|p| p.index == partition)
-                            });
+                Ok(mut response_buf) => {
+                    match ProduceResponse::decode_versioned(produce_version, &mut response_buf) {
+                        Ok(produce_response) => {
+                            let pr = produce_response
+                                .responses
+                                .iter()
+                                .find(|r| r.name == topic)
+                                .and_then(|r| {
+                                    r.partition_responses.iter().find(|p| p.index == partition)
+                                });
 
-                        match pr {
-                            Some(pr) if pr.error_code.is_ok() => {
-                                retry_ctx.record_success();
-                                break Ok((pr.base_offset, pr.log_append_time_ms));
-                            }
-                            Some(pr) => {
-                                let err = KrafkaError::broker(
-                                    pr.error_code,
-                                    format!("batch produce failed for {topic}-{partition}"),
-                                );
-                                if err.is_retriable()
-                                    && let Err(refresh_err) =
-                                        metadata.refresh_for_topics(Some(&[&topic])).await
-                                {
-                                    debug!(error = %refresh_err, "Metadata refresh failed during batch retry");
+                            match pr {
+                                Some(pr) if pr.error_code.is_ok() => {
+                                    retry_ctx.record_success();
+                                    break Ok((pr.base_offset, pr.log_append_time_ms));
                                 }
-                                if let Some(backoff) = retry_ctx.record_failure(&err) {
-                                    metrics.record_retry();
-                                    retry_ctx.wait(backoff).await;
-                                    continue;
+                                Some(pr) => {
+                                    let err = KrafkaError::broker(
+                                        pr.error_code,
+                                        format!("batch produce failed for {topic}-{partition}"),
+                                    );
+                                    if err.is_retriable()
+                                        && let Err(refresh_err) =
+                                            metadata.refresh_for_topics(Some(&[&topic])).await
+                                    {
+                                        debug!(error = %refresh_err, "Metadata refresh failed during batch retry");
+                                    }
+                                    if let Some(backoff) = retry_ctx.record_failure(&err) {
+                                        metrics.record_retry();
+                                        retry_ctx.wait(backoff).await;
+                                        continue;
+                                    }
+                                    break Err(err);
                                 }
-                                break Err(err);
-                            }
-                            None => {
-                                break Err(KrafkaError::protocol(
-                                    "partition not found in response",
-                                ));
+                                None => {
+                                    break Err(KrafkaError::protocol(
+                                        "partition not found in response",
+                                    ));
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        if let Some(backoff) = retry_ctx.record_failure(&e) {
-                            metrics.record_retry();
-                            retry_ctx.wait(backoff).await;
-                            continue;
+                        Err(e) => {
+                            if let Some(backoff) = retry_ctx.record_failure(&e) {
+                                metrics.record_retry();
+                                retry_ctx.wait(backoff).await;
+                                continue;
+                            }
+                            break Err(e);
                         }
-                        break Err(e);
                     }
-                },
+                }
                 Err(e) => {
                     if e.is_retriable() {
                         debug!(

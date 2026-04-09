@@ -15,48 +15,33 @@ Add Krafka to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-krafka = "0.2"
+krafka = "0.4"
 tokio = { version = "1", features = ["full"] }
 ```
 
 ## Prerequisites
 
-- Rust 1.85 or later (MSRV 1.85)
+- Rust 1.88 or later (MSRV 1.88)
+- **Apache Kafka 3.9 or later** (older brokers are not supported)
 - A running Kafka cluster (or use Docker)
 
 ### Running Kafka with Docker
 
 ```bash
-# Start Kafka with Docker Compose
+# Start Kafka in KRaft mode (no ZooKeeper required)
 docker run -d --name kafka \
   -p 9092:9092 \
-  -e KAFKA_BROKER_ID=1 \
-  -e KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181 \
-  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
-  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
-  confluentinc/cp-kafka:latest
+  apache/kafka-native:3.9.0
 ```
 
-Or use our `docker-compose.yml`:
+Or use a `docker-compose.yml`:
 
 ```yaml
-version: '3'
 services:
-  zookeeper:
-    image: confluentinc/cp-zookeeper:latest
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
   kafka:
-    image: confluentinc/cp-kafka:latest
-    depends_on:
-      - zookeeper
+    image: apache/kafka-native:3.9.0
     ports:
       - "9092:9092"
-    environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
 ```
 
 ## Your First Producer

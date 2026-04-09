@@ -221,12 +221,13 @@ impl ClusterMetadata {
     /// Uses a coalescing lock to prevent concurrent metadata stampedes.
     /// If a refresh is already in-flight, callers wait for it to complete.
     ///
-    /// The Metadata API version is negotiated with the broker (v0–v8).
+    /// The Metadata API version is negotiated with the broker (v1–v13).
     /// Versions are cumulative: rack v1, cluster_id v2, offline replicas v5,
-    /// leader_epoch v7, authorized-ops v8.
-    /// Encode/decode for v9–v13 (flexible encoding v9, topic UUIDs v10) exists
-    /// but is not yet activated — see `METADATA_MAX`.
-    /// Falls back to v0 if the broker doesn’t advertise Metadata support.
+    /// leader_epoch v7, authorized-ops v8, flexible encoding v9, topic UUIDs v10,
+    /// cluster_authorized_operations removed v11, topic_id works v12,
+    /// top-level error_code v13.
+    /// Falls back to METADATA_MIN (v1) if the broker doesn't advertise higher
+    /// Metadata support.
     pub async fn refresh_for_topics(&self, topics: Option<&[&str]>) -> Result<()> {
         // Coalesce concurrent calls: only one refresh in-flight at a time
         let _guard = self.refresh_lock.lock().await;
@@ -252,18 +253,17 @@ impl ClusterMetadata {
 
         // Negotiate the highest mutually supported Metadata version up to the
         // client's supported maximum (`METADATA_MAX`, currently v8).
-        // Cumulative fields available through v8: rack v1, cluster_id v2,
-        // offline replicas v5, leader_epoch v7, authorized-ops v8.
-        // Encode/decode for v9–v13 exists but is not yet activated — see
-        // `METADATA_MAX` in protocol/mod.rs.
-        // Falls back to v0 if the broker doesn’t advertise Metadata support
-        // (mirrors the Fetch negotiation pattern in consumer).
+        // Negotiate Metadata version — v1+ required, up to v13 (topic UUIDs, KIP-848).
         let metadata_version = conn
-            .negotiate_api_version_max(ApiKey::Metadata, crate::protocol::versions::METADATA_MAX)
+            .negotiate_api_version(
+                ApiKey::Metadata,
+                crate::protocol::versions::METADATA_MAX,
+                crate::protocol::versions::METADATA_MIN,
+            )
             .await
             .unwrap_or_else(|| {
-                debug!("Metadata API version negotiation unavailable; falling back to v0");
-                0
+                debug!("Metadata API version negotiation unavailable; falling back to MIN");
+                crate::protocol::versions::METADATA_MIN
             });
 
         // Build and send metadata request
@@ -387,7 +387,8 @@ impl ClusterMetadata {
                 if let Some(old_uuid) = name_to_uuid.remove(&topic_name) {
                     topic_ids.remove(&old_uuid);
                 }
-                topic_ids.insert(tid, Arc::new(topic_name.clone()));
+                let topic_arc = Arc::new(topic_name.clone());
+                topic_ids.insert(tid, topic_arc);
                 name_to_uuid.insert(topic_name.clone(), tid);
             }
 

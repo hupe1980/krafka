@@ -48,7 +48,7 @@ use crate::metrics::ProducerMetrics as ProducerMetricsInner;
 use crate::network::{ConnectionConfig, ConnectionPool};
 use crate::protocol::{
     ApiKey, Compression, ProducePartitionData, ProduceRequest, ProduceResponse, ProduceTopicData,
-    RecordBatchBuilder,
+    RecordBatchBuilder, VersionedDecode, VersionedEncode, versions,
 };
 
 /// A Kafka producer.
@@ -373,13 +373,16 @@ impl Producer {
         let batch = batch_builder.build();
         let batch_bytes = batch.encode()?;
 
+        let topic_owned = topic.to_string();
+
         // Build produce request
         let request = ProduceRequest {
             transactional_id: None,
             acks: self.config.acks.to_i16(),
             timeout_ms: crate::util::duration_to_millis_i32(self.config.request_timeout),
             topic_data: vec![ProduceTopicData {
-                name: topic.to_string(),
+                name: topic_owned.clone(),
+                topic_id: None,
                 partition_data: vec![ProducePartitionData {
                     index: partition,
                     records: batch_bytes,
@@ -387,13 +390,25 @@ impl Producer {
             }],
         };
 
+        // Negotiate Produce version for this broker.
+        let version = conn
+            .negotiate_api_version(
+                ApiKey::Produce,
+                versions::PRODUCE_MAX,
+                versions::PRODUCE_MIN,
+            )
+            .await
+            .ok_or_else(|| KrafkaError::protocol("no mutually supported Produce API version"))?;
+
         // acks=0 (fire-and-forget): Kafka sends no response, so don't wait for one (R6.1 fix)
         if self.config.acks == Acks::None {
-            conn.send_fire_and_forget(ApiKey::Produce, 0, |buf| request.encode_v0(buf))
-                .await?;
+            conn.send_fire_and_forget(ApiKey::Produce, version, |buf| {
+                request.encode_versioned(version, buf)
+            })
+            .await?;
 
             return Ok(RecordMetadata {
-                topic: topic.to_string(),
+                topic: topic_owned,
                 partition,
                 offset: -1, // Unknown — broker doesn't confirm
                 timestamp: -1,
@@ -402,12 +417,14 @@ impl Producer {
 
         // Send request and wait for response (acks=1 or acks=-1/all)
         let response = conn
-            .send_request(ApiKey::Produce, 0, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::Produce, version, |buf| {
+                request.encode_versioned(version, buf)
+            })
             .await?;
 
         // Decode response
         let mut buf = response;
-        let produce_response = ProduceResponse::decode_v0(&mut buf)?;
+        let produce_response = ProduceResponse::decode_versioned(version, &mut buf)?;
 
         // Check for errors
         for topic_response in &produce_response.responses {
@@ -421,7 +438,7 @@ impl Producer {
                     }
 
                     return Ok(RecordMetadata {
-                        topic: topic.to_string(),
+                        topic: topic_owned,
                         partition,
                         offset: partition_response.base_offset,
                         timestamp: partition_response.log_append_time_ms,

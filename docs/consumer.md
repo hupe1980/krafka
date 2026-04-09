@@ -187,7 +187,7 @@ let consumer = Consumer::builder()
 | `ReadUncommitted` (default) | See all records, including uncommitted transactional records |
 | `ReadCommitted` | Only see committed records; uncommitted transactional records are filtered |
 
-> **Note:** `isolation_level` affects both data fetches and offset resolution (ListOffsets). Krafka uses ListOffsets v2 protocol to pass the isolation level to the broker.
+> **Note:** `isolation_level` affects both data fetches and offset resolution (ListOffsets). Krafka passes the isolation level to the broker via ListOffsets (v2+, up to v11).
 
 ## Consumer Groups
 
@@ -883,17 +883,16 @@ let consumer = Consumer::builder()
 KIP-848 introduces a new consumer group protocol where the server performs
 partition assignment instead of the group leader. This eliminates the
 JoinGroup/SyncGroup round-trip and replaces it with a single
-`ConsumerGroupHeartbeat` API (key 68, version 0; v1 encode/decode exists but
-is not yet activated — see `CONSUMER_GROUP_HEARTBEAT_MAX`).
+`ConsumerGroupHeartbeat` API (key 68, v0–v1).
 
 ### Enabling KIP-848
 
 > **Not yet usable.** `Consumer::builder().group_protocol(GroupProtocol::Consumer).build()`
-> returns a configuration error because topic UUID resolution in heartbeat
-> assignments requires Metadata v10+, but the client currently negotiates
-> only up to v8 (`METADATA_MAX`).  Once Metadata v10+ support is activated
-> (bump `METADATA_MAX` to ≥ 10 and integration-test), the guard will be
-> removed and the following snippet will work:
+> returns a configuration error because the KIP-848 code path has not been
+> integration-tested against a live broker. The wire-protocol support is
+> complete (ConsumerGroupHeartbeat v0–v1, Metadata v1–v13 including topic
+> UUIDs at v10+), but the guard will remain until end-to-end validation is
+> done.
 
 ```rust
 use krafka::consumer::{Consumer, GroupProtocol};
@@ -939,9 +938,8 @@ The ConsumerGroupHeartbeat response uses 16-byte topic UUIDs in assignments.
 Krafka resolves these UUIDs to topic names with a two-level lookup order:
 
 1. **Cluster metadata lookup** — first consult `ClusterMetadata::topic_name_for_id`.
-   This path only produces results when Metadata API v10+ has been negotiated
-   and activated, because topic UUID → name mappings are not present in earlier
-   Metadata response versions.
+   With Metadata v10+ now activated (`METADATA_MAX = 13`), the broker returns
+   topic UUID → name mappings in metadata responses.
 2. **Local topic names cache** — if metadata does not contain the mapping,
    fall back to a local UUID → name cache built from previously resolved
    assignments.  This cache survives metadata cache flushes and mirrors the
@@ -949,15 +947,13 @@ Krafka resolves these UUIDs to topic names with a two-level lookup order:
    learned.
 
 Successfully resolved names are cached locally. Unresolvable UUIDs still
-trigger an automatic metadata refresh, but the current client negotiates the
-Metadata API only up to v8 (`METADATA_MAX`), so metadata responses do not yet
-provide the topic UUID mapping introduced in Metadata v10+.
+trigger an automatic metadata refresh.
 
 > **Note:** External users cannot reach these code paths today —
-> `ConsumerBuilder::build()` rejects `GroupProtocol::Consumer` while
-> `METADATA_MAX < 10` (see [Enabling KIP-848](#enabling-kip-848)).
-> The error handling below exists as defense-in-depth and documents the
-> intended behaviour once the guard is lifted.
+> `ConsumerBuilder::build()` rejects `GroupProtocol::Consumer` until the
+> KIP-848 path has been integration-tested end-to-end (see
+> [Enabling KIP-848](#enabling-kip-848)). The error handling below exists as
+> defense-in-depth.
 
 If topic UUIDs
 remain unresolved after a metadata refresh during the initial heartbeat
@@ -984,6 +980,8 @@ timer is reset to the new duration (with a minimum floor of 1 000 ms).
 
 - **v0** — Base version; compatible with Kafka 3.7+ (EA) and 4.0+ (GA)
 - **v1** — Adds `SubscribedTopicRegex` for regex-based topic subscription (KIP-848) and requires consumer-generated member IDs (KIP-1082); available on Kafka 4.0+
+
+Both v0 and v1 are supported (`CONSUMER_GROUP_HEARTBEAT_MIN = 0`, `CONSUMER_GROUP_HEARTBEAT_MAX = 1`).
 
 ### Error Handling
 
@@ -1024,6 +1022,13 @@ top-level fields) and starts a fresh heartbeat task.
 
 - Requires Kafka 4.0+ (or earlier brokers with `group.coordinator.new.enable=true`)
 - The broker must support API key 68 (`ConsumerGroupHeartbeat`)
+
+### Describing KIP-848 Groups
+
+To inspect a KIP-848 consumer group (state, epochs, member assignments), use
+the AdminClient's `describe_consumer_groups()` method which calls the
+ConsumerGroupDescribe API (Key 69). See the
+[Admin Client Guide](admin.md#describing-kip-848-consumer-groups) for details.
 
 ### Limitations
 

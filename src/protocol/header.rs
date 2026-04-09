@@ -45,15 +45,6 @@ impl RequestHeader {
         self
     }
 
-    /// Encode the header for header version 0.
-    #[inline]
-    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
-        self.api_key.encode(buf);
-        self.api_version.encode(buf);
-        self.correlation_id.encode(buf);
-        Ok(())
-    }
-
     /// Encode the header for header version 1.
     #[inline]
     pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
@@ -96,10 +87,12 @@ impl RequestHeader {
     }
 
     /// Encode the header using the appropriate version.
+    ///
+    /// `header_version()` returns 1 (non-flexible) or 2 (flexible);
+    /// v0 is unused because all APIs use client_id in requests.
     pub fn encode(&self, buf: &mut impl BufMut) -> Result<()> {
         let header_version = Self::header_version(self.api_key, self.api_version);
         match header_version {
-            0 => self.encode_v0(buf)?,
             1 => self.encode_v1(buf)?,
             _ => self.encode_v2(buf)?,
         }
@@ -177,15 +170,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_request_header_v0() {
+    fn test_request_header_v1_without_client_id() {
+        // Header v1 without client_id encodes api_key, api_version,
+        // correlation_id, then a null string (2-byte length = -1).
         let header = RequestHeader::new(ApiKey::ApiVersions, 0, 1);
         let mut buf = BytesMut::new();
-        header.encode_v0(&mut buf).unwrap();
+        header.encode_v1(&mut buf).unwrap();
 
         let mut buf = buf.freeze();
         assert_eq!(i16::decode(&mut buf).unwrap(), 18); // ApiVersions = 18
         assert_eq!(i16::decode(&mut buf).unwrap(), 0); // version
         assert_eq!(i32::decode(&mut buf).unwrap(), 1); // correlation_id
+        let client_id = KafkaString::decode(&mut buf).unwrap();
+        assert!(client_id.is_null());
     }
 
     #[test]

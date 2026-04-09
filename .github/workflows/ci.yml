@@ -62,8 +62,12 @@ jobs:
           RUSTDOCFLAGS: -Dwarnings
 
   integration:
-    name: Integration Tests
+    name: Integration Tests (Kafka ${{ matrix.kafka-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kafka-version: ["3.9.0", "4.0.0"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -71,7 +75,7 @@ jobs:
       - name: Pre-pull Kafka image
         run: |
           for i in 1 2 3; do
-            docker pull confluentinc/cp-kafka:7.5.0 && break
+            docker pull apache/kafka-native:${{ matrix.kafka-version }} && break
             echo "Retry $i failed, waiting..."
             sleep 10
           done

@@ -30,7 +30,10 @@ use crate::protocol::{
     OffsetFetchResponse, SyncGroupRequest, SyncGroupRequestAssignment, SyncGroupResponse,
     VersionedDecode, VersionedEncode,
     versions::{
-        CONSUMER_GROUP_HEARTBEAT_MAX, FIND_COORDINATOR_MAX, OFFSET_COMMIT_MAX, OFFSET_FETCH_MAX,
+        CONSUMER_GROUP_HEARTBEAT_MAX, CONSUMER_GROUP_HEARTBEAT_MIN, FIND_COORDINATOR_MAX,
+        FIND_COORDINATOR_MIN, HEARTBEAT_MAX, JOIN_GROUP_MAX, JOIN_GROUP_MIN, LEAVE_GROUP_MAX,
+        OFFSET_COMMIT_MAX, OFFSET_COMMIT_MIN, OFFSET_FETCH_MAX, OFFSET_FETCH_MIN, SYNC_GROUP_MAX,
+        SYNC_GROUP_MIN,
     },
 };
 
@@ -573,7 +576,8 @@ impl PartitionAssignor for CooperativeStickyAssignor {
 
         // First pass: honor previous assignments (stickiness)
         for member in members {
-            member_partition_counts.insert(member.member_id.clone(), 0);
+            let mid = member.member_id.clone();
+            member_partition_counts.entry(mid.clone()).or_insert(0);
 
             if let Some(prev) = prev_assignments.get(&member.member_id) {
                 for (topic, prev_parts) in prev {
@@ -585,10 +589,8 @@ impl PartitionAssignor for CooperativeStickyAssignor {
                                 if let std::collections::hash_map::Entry::Vacant(e) =
                                     sticky_assignments.entry(key)
                                 {
-                                    e.insert(member.member_id.clone());
-                                    *member_partition_counts
-                                        .entry(member.member_id.clone())
-                                        .or_insert(0) += 1;
+                                    e.insert(mid.clone());
+                                    *member_partition_counts.get_mut(&mid).unwrap() += 1;
                                 }
                             }
                         }
@@ -636,10 +638,9 @@ impl PartitionAssignor for CooperativeStickyAssignor {
             }
 
             if let Some(member_id) = best_member {
+                // SAFETY: member_partition_counts was populated for all members in the first pass.
+                *member_partition_counts.get_mut(member_id).unwrap() += 1;
                 sticky_assignments.insert(key, member_id.to_string());
-                *member_partition_counts
-                    .entry(member_id.to_string())
-                    .or_insert(0) += 1;
             }
         }
 
@@ -681,9 +682,9 @@ impl PartitionAssignor for CooperativeStickyAssignor {
                             if let Some(count) = member_partition_counts.get_mut(over_member) {
                                 *count = count.saturating_sub(1);
                             }
-                            *member_partition_counts
-                                .entry(under_member.clone())
-                                .or_insert(0) += 1;
+                            // SAFETY: member_partition_counts was populated for all members
+                            // in the first pass.
+                            *member_partition_counts.get_mut(under_member).unwrap() += 1;
                             moved = true;
                             break 'outer;
                         }
@@ -1174,9 +1175,13 @@ impl GroupCoordinator {
         // for group coordinator lookup and compatible with all brokers.
         let request = FindCoordinatorRequest::for_group(&self.group_id);
         let fc_version = conn
-            .negotiate_api_version_max(ApiKey::FindCoordinator, FIND_COORDINATOR_MAX)
+            .negotiate_api_version(
+                ApiKey::FindCoordinator,
+                FIND_COORDINATOR_MAX,
+                FIND_COORDINATOR_MIN,
+            )
             .await
-            .unwrap_or(0);
+            .unwrap_or(FIND_COORDINATOR_MIN);
         let response = conn
             .send_request(ApiKey::FindCoordinator, fc_version, |buf| {
                 request.encode_versioned(fc_version, buf)
@@ -1287,6 +1292,7 @@ impl GroupCoordinator {
                 name: self.assignor_name.clone(),
                 metadata: metadata.freeze(),
             }],
+            reason: None,
         };
 
         debug!(
@@ -1296,21 +1302,20 @@ impl GroupCoordinator {
 
         *self.state.write().await = GroupState::Joining;
 
-        // Use v5 for static membership (KIP-345), v0 otherwise
-        let response = if self.group_instance_id.is_some() {
-            conn.send_request(ApiKey::JoinGroup, 5, |buf| request.encode_v5(buf))
-                .await?
-        } else {
-            conn.send_request(ApiKey::JoinGroup, 0, |buf| request.encode_v0(buf))
-                .await?
-        };
+        // Negotiate JoinGroup version — v4+ required (KIP-345 static membership).
+        let jg_version = conn
+            .negotiate_api_version(ApiKey::JoinGroup, JOIN_GROUP_MAX, JOIN_GROUP_MIN)
+            .await
+            .unwrap_or(JOIN_GROUP_MIN);
+
+        let response = conn
+            .send_request(ApiKey::JoinGroup, jg_version, |buf| {
+                request.encode_versioned(jg_version, buf)
+            })
+            .await?;
 
         let mut buf = response;
-        let join_response = if self.group_instance_id.is_some() {
-            JoinGroupResponse::decode_v5(&mut buf)?
-        } else {
-            JoinGroupResponse::decode_v0(&mut buf)?
-        };
+        let join_response = JoinGroupResponse::decode_versioned(jg_version, &mut buf)?;
 
         if !join_response.error_code.is_ok() {
             // Reset member identity on session-invalidating errors so the
@@ -1388,23 +1393,20 @@ impl GroupCoordinator {
             join_response.is_leader()
         );
 
-        // Use v3 for static membership (KIP-345), v0 otherwise.
-        // v3 includes group_instance_id; v0 silently discards it.
-        let response = if self.group_instance_id.is_some() {
-            conn.send_request(ApiKey::SyncGroup, 3, |buf| request.encode_v3(buf))
-                .await?
-        } else {
-            conn.send_request(ApiKey::SyncGroup, 0, |buf| request.encode_v0(buf))
-                .await?
-        };
+        // Negotiate SyncGroup version — v3+ required (KIP-345 static membership).
+        let sg_version = conn
+            .negotiate_api_version(ApiKey::SyncGroup, SYNC_GROUP_MAX, SYNC_GROUP_MIN)
+            .await
+            .unwrap_or(SYNC_GROUP_MIN);
+
+        let response = conn
+            .send_request(ApiKey::SyncGroup, sg_version, |buf| {
+                request.encode_versioned(sg_version, buf)
+            })
+            .await?;
 
         let mut buf = response;
-        // v1+ adds throttle_time_ms; v0 omits it
-        let sync_response = if self.group_instance_id.is_some() {
-            SyncGroupResponse::decode_v1(&mut buf)?
-        } else {
-            SyncGroupResponse::decode_v0(&mut buf)?
-        };
+        let sync_response = SyncGroupResponse::decode_versioned(sg_version, &mut buf)?;
 
         if !sync_response.error_code.is_ok() {
             // Reset member identity on session-invalidating errors.
@@ -1472,6 +1474,7 @@ impl GroupCoordinator {
         // Classic protocol: JoinGroup/SyncGroup/Heartbeat
         // Detect topic changes: if the subscription changed while Stable,
         // force a rejoin so the broker learns the new subscription.
+        let new_topics = topics.to_vec();
         {
             let state = *self.state.read().await;
             if state == GroupState::Stable {
@@ -1479,7 +1482,7 @@ impl GroupCoordinator {
                 let mut old_sorted = old_topics.clone();
                 drop(old_topics);
                 old_sorted.sort();
-                let mut new_sorted = topics.to_vec();
+                let mut new_sorted = new_topics.clone();
                 new_sorted.sort();
                 if old_sorted != new_sorted {
                     // Topics changed — must rejoin to update broker subscription.
@@ -1492,19 +1495,16 @@ impl GroupCoordinator {
         }
 
         // Update subscribed topics
-        self.set_subscribed_topics(topics.to_vec()).await;
+        self.set_subscribed_topics(new_topics).await;
 
         let state = *self.state.read().await;
-        match state {
-            GroupState::Stable => {
-                // Already stable with same topics, return current assignment
-                Ok((self.assignment.read().await.clone(), false))
-            }
-            _ => {
-                // Need to join/rejoin
-                let assignment = self.perform_join_and_sync().await?;
-                Ok((assignment, true))
-            }
+        if state == GroupState::Stable {
+            // Already stable with same topics, return current assignment
+            Ok((self.assignment.read().await.clone(), false))
+        } else {
+            // Need to join/rejoin
+            let assignment = self.perform_join_and_sync().await?;
+            Ok((assignment, true))
         }
     }
 
@@ -1633,28 +1633,19 @@ impl GroupCoordinator {
                                 group_instance_id: group_instance_id.clone(),
                             };
 
-                            // Use v3 for static membership (KIP-345), v0 otherwise
-                            let send_result = if group_instance_id.is_some() {
-                                conn.send_request(ApiKey::Heartbeat, 3, |buf| {
-                                    request.encode_v3(buf)
+                            // Always use v3+ (MIN=3, KIP-345 static membership).
+                            let hb_version = HEARTBEAT_MAX;
+                            let send_result = conn
+                                .send_request(ApiKey::Heartbeat, hb_version, |buf| {
+                                    request.encode_versioned(hb_version, buf)
                                 })
-                                .await
-                            } else {
-                                conn.send_request(ApiKey::Heartbeat, 0, |buf| {
-                                    request.encode_v0(buf)
-                                })
-                                .await
-                            };
+                                .await;
 
                             match send_result
                             {
                                 Ok(response) => {
                                     let mut buf = response;
-                                    let decode_result = if group_instance_id.is_some() {
-                                        HeartbeatResponse::decode_v1(&mut buf)
-                                    } else {
-                                        HeartbeatResponse::decode_v0(&mut buf)
-                                    };
+                                    let decode_result = HeartbeatResponse::decode_versioned(hb_version, &mut buf);
                                     if let Ok(hb_response) = decode_result {
                                         let status = HeartbeatStatus::from_error_code(hb_response.error_code);
                                         match status {
@@ -1799,7 +1790,11 @@ impl GroupCoordinator {
         );
 
         let Some(hb_version) = conn
-            .negotiate_api_version_max(ApiKey::ConsumerGroupHeartbeat, CONSUMER_GROUP_HEARTBEAT_MAX)
+            .negotiate_api_version(
+                ApiKey::ConsumerGroupHeartbeat,
+                CONSUMER_GROUP_HEARTBEAT_MAX,
+                CONSUMER_GROUP_HEARTBEAT_MIN,
+            )
             .await
         else {
             return Err(KrafkaError::protocol(
@@ -1985,13 +1980,14 @@ impl GroupCoordinator {
     ) -> Result<(MemberAssignment, bool)> {
         let state = *self.state.read().await;
 
+        let new_topics = topics.to_vec();
         match state {
             GroupState::Stable => {
                 // Already stable — check if topics changed
                 let old_topics = self.subscribed_topics.read().await.clone();
                 let mut old_sorted = old_topics;
                 old_sorted.sort();
-                let mut new_sorted = topics.to_vec();
+                let mut new_sorted = new_topics.clone();
                 new_sorted.sort();
                 if old_sorted == new_sorted {
                     return Ok((self.assignment.read().await.clone(), false));
@@ -2015,9 +2011,9 @@ impl GroupCoordinator {
             _ => {}
         }
 
-        self.set_subscribed_topics(topics.to_vec()).await;
+        let subscribed = Some(new_topics.clone());
+        self.set_subscribed_topics(new_topics).await;
 
-        let subscribed = Some(topics.to_vec());
         let resp = self.consumer_group_heartbeat(subscribed, None).await?;
 
         // Start heartbeat task for KIP-848
@@ -2068,9 +2064,10 @@ impl GroupCoordinator {
                 let coordinator_conn = coordinator_conn_ref.read().await.clone();
                 if let Some(ref conn) = coordinator_conn {
                     match conn
-                        .negotiate_api_version_max(
+                        .negotiate_api_version(
                             ApiKey::ConsumerGroupHeartbeat,
                             CONSUMER_GROUP_HEARTBEAT_MAX,
+                            CONSUMER_GROUP_HEARTBEAT_MIN,
                         )
                         .await
                     {
@@ -2364,21 +2361,16 @@ impl GroupCoordinator {
             group_instance_id: self.group_instance_id.clone(),
         };
 
-        // Use v3 for static membership (KIP-345), v0 otherwise
-        let response = if self.group_instance_id.is_some() {
-            conn.send_request(ApiKey::Heartbeat, 3, |buf| request.encode_v3(buf))
-                .await?
-        } else {
-            conn.send_request(ApiKey::Heartbeat, 0, |buf| request.encode_v0(buf))
-                .await?
-        };
+        // Always use v3+ (MIN=3, KIP-345 static membership).
+        let hb_version = HEARTBEAT_MAX;
+        let response = conn
+            .send_request(ApiKey::Heartbeat, hb_version, |buf| {
+                request.encode_versioned(hb_version, buf)
+            })
+            .await?;
 
         let mut buf = response;
-        let hb_response = if self.group_instance_id.is_some() {
-            HeartbeatResponse::decode_v1(&mut buf)?
-        } else {
-            HeartbeatResponse::decode_v0(&mut buf)?
-        };
+        let hb_response = HeartbeatResponse::decode_versioned(hb_version, &mut buf)?;
 
         let status = HeartbeatStatus::from_error_code(hb_response.error_code);
         if status == HeartbeatStatus::Ok {
@@ -2426,9 +2418,9 @@ impl GroupCoordinator {
         let conn = self.get_coordinator_connection().await?;
 
         let oc_version = conn
-            .negotiate_api_version_max(ApiKey::OffsetCommit, OFFSET_COMMIT_MAX)
+            .negotiate_api_version(ApiKey::OffsetCommit, OFFSET_COMMIT_MAX, OFFSET_COMMIT_MIN)
             .await
-            .unwrap_or(2);
+            .unwrap_or(OFFSET_COMMIT_MIN);
 
         let member_id = self.member_id.read().await.clone();
         // For KIP-848 (consumer protocol), the "generation ID" wire field
@@ -2436,9 +2428,6 @@ impl GroupCoordinator {
         // This semantic overload is only valid from v9+ — at earlier versions
         // the broker strictly validates against the classic group generation,
         // so we fall back to the classic generation_id.
-        //
-        // NOTE: Currently inactive — OFFSET_COMMIT_MAX caps negotiation
-        // below v9.  This branch activates once the MAX is bumped.
         let generation_id = if self.is_consumer_protocol() && oc_version >= 9 {
             *self.member_epoch.read().await
         } else {
@@ -2462,7 +2451,11 @@ impl GroupCoordinator {
 
         let topics: Vec<OffsetCommitRequestTopic> = topics_map
             .into_iter()
-            .map(|(name, partitions)| OffsetCommitRequestTopic { name, partitions })
+            .map(|(name, partitions)| OffsetCommitRequestTopic {
+                name,
+                topic_id: None,
+                partitions,
+            })
             .collect();
 
         let request = OffsetCommitRequest {
@@ -2566,6 +2559,7 @@ impl GroupCoordinator {
             .iter()
             .map(|(topic, parts)| OffsetFetchRequestTopic {
                 name: topic.clone(),
+                topic_id: None,
                 partition_indexes: parts.clone(),
             })
             .collect();
@@ -2575,18 +2569,14 @@ impl GroupCoordinator {
         // encoding, v8+ uses the batched Groups format (KIP-709), and v9
         // adds MemberId/MemberEpoch for KIP-848 epoch validation.
         let of_version = conn
-            .negotiate_api_version_max(ApiKey::OffsetFetch, OFFSET_FETCH_MAX)
+            .negotiate_api_version(ApiKey::OffsetFetch, OFFSET_FETCH_MAX, OFFSET_FETCH_MIN)
             .await
-            .unwrap_or(1)
-            .max(1);
+            .unwrap_or(OFFSET_FETCH_MIN);
 
         // For KIP-848, populate MemberId/MemberEpoch so the broker can validate
         // membership and surface STALE_MEMBER_EPOCH when appropriate.
         // These fields only exist on the wire from v9+; at earlier versions
         // the encode path ignores them, so we leave defaults.
-        //
-        // NOTE: Currently inactive — OFFSET_FETCH_MAX caps negotiation
-        // below v9.  This branch activates once the MAX is bumped.
         let (offset_fetch_member_id, offset_fetch_member_epoch) =
             if self.is_consumer_protocol() && of_version >= 9 {
                 (
@@ -2748,6 +2738,7 @@ impl GroupCoordinator {
                 replica_id: -1,
                 isolation_level: self.isolation_level,
                 topics,
+                timeout_ms: None,
             };
 
             // Get connection to this leader directly by ID
@@ -2817,6 +2808,7 @@ impl GroupCoordinator {
                 vec![LeaveGroupMember {
                     member_id: member_id.clone(),
                     group_instance_id: self.group_instance_id.clone(),
+                    reason: None,
                 }]
             } else {
                 vec![]
@@ -2829,30 +2821,21 @@ impl GroupCoordinator {
         );
 
         // Send leave group request (don't wait too long)
-        // Use v3 for static membership (KIP-345), v0 otherwise
-        let result = if self.group_instance_id.is_some() {
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                conn.send_request(ApiKey::LeaveGroup, 3, |buf| request.encode_v3(buf)),
-            )
-            .await
-        } else {
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                conn.send_request(ApiKey::LeaveGroup, 0, |buf| request.encode_v0(buf)),
-            )
-            .await
-        };
+        // Always use v3+ (MIN=3, KIP-345 batch leave).
+        let lg_version = LEAVE_GROUP_MAX;
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            conn.send_request(ApiKey::LeaveGroup, lg_version, |buf| {
+                request.encode_versioned(lg_version, buf)
+            }),
+        )
+        .await;
 
         // Decode the response and check for errors
         match result {
             Ok(Ok(response_bytes)) => {
                 let mut buf = response_bytes;
-                let decode_result = if self.group_instance_id.is_some() {
-                    LeaveGroupResponse::decode_v3(&mut buf)
-                } else {
-                    LeaveGroupResponse::decode_v0(&mut buf)
-                };
+                let decode_result = LeaveGroupResponse::decode_versioned(lg_version, &mut buf);
                 match decode_result {
                     Ok(r) if r.error_code.is_ok() => {
                         // Check per-member errors (v3 batch leave)
@@ -2940,7 +2923,11 @@ impl GroupCoordinator {
         );
 
         let Some(hb_version) = conn
-            .negotiate_api_version_max(ApiKey::ConsumerGroupHeartbeat, CONSUMER_GROUP_HEARTBEAT_MAX)
+            .negotiate_api_version(
+                ApiKey::ConsumerGroupHeartbeat,
+                CONSUMER_GROUP_HEARTBEAT_MAX,
+                CONSUMER_GROUP_HEARTBEAT_MIN,
+            )
             .await
         else {
             warn!(
@@ -3136,7 +3123,7 @@ impl GroupCoordinator {
                 if len < 0 || buf.remaining() < len as usize {
                     return (topics, HashMap::new());
                 }
-                topics.push(String::from_utf8_lossy(&buf.copy_to_bytes(len as usize)).to_string());
+                topics.push(String::from_utf8_lossy(&buf.copy_to_bytes(len as usize)).into_owned());
             }
         }
 
@@ -3172,7 +3159,7 @@ impl GroupCoordinator {
                 if len < 0 || buf.remaining() < len as usize {
                     return (topics, owned);
                 }
-                let topic = String::from_utf8_lossy(&buf.copy_to_bytes(len as usize)).to_string();
+                let topic = String::from_utf8_lossy(&buf.copy_to_bytes(len as usize)).into_owned();
                 if buf.remaining() < 4 {
                     return (topics, owned);
                 }
@@ -3247,7 +3234,7 @@ impl GroupCoordinator {
             if buf.remaining() < topic_len {
                 break;
             }
-            let topic = String::from_utf8_lossy(&buf.copy_to_bytes(topic_len)).to_string();
+            let topic = String::from_utf8_lossy(&buf.copy_to_bytes(topic_len)).into_owned();
 
             if buf.remaining() < 4 {
                 break;

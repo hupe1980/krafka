@@ -68,7 +68,7 @@ use crate::protocol::{
     AddPartitionsToTxnResponse, ApiKey, Compression, EndTxnRequest, EndTxnResponse,
     FindCoordinatorRequest, FindCoordinatorResponse, InitProducerIdRequest, InitProducerIdResponse,
     ProducePartitionData, ProduceRequest, ProduceResponse, ProduceTopicData, RecordBatchBuilder,
-    TxnOffsetCommitRequest, TxnOffsetCommitResponse, VersionedDecode,
+    TxnOffsetCommitRequest, TxnOffsetCommitResponse, VersionedDecode, VersionedEncode, versions,
 };
 
 use super::config::Acks;
@@ -442,10 +442,13 @@ impl TransactionalProducer {
 
         let request = FindCoordinatorRequest::for_transaction(&self.config.transactional_id);
 
-        // Transaction coordinator lookup requires v1 (key_type field).
-        // Verify the broker supports it.
+        // Transaction coordinator lookup requires v1+ (key_type field).
         let fc_version = conn
-            .negotiate_api_version_max(ApiKey::FindCoordinator, 1)
+            .negotiate_api_version(
+                ApiKey::FindCoordinator,
+                versions::FIND_COORDINATOR_MAX,
+                versions::FIND_COORDINATOR_MIN,
+            )
             .await
             .ok_or_else(|| {
                 KrafkaError::protocol(
@@ -691,9 +694,13 @@ impl TransactionalProducer {
                     .get_leader_connection(topic, partition)
                     .await?;
 
-                // Transactions require Produce v3 (transactional_id field).
+                // Transactions require Produce v3+ (transactional_id field).
                 let version = conn
-                    .negotiate_api_version_max(ApiKey::Produce, 3)
+                    .negotiate_api_version(
+                        ApiKey::Produce,
+                        versions::PRODUCE_MAX,
+                        versions::PRODUCE_MIN,
+                    )
                     .await
                     .ok_or_else(|| {
                         KrafkaError::protocol(
@@ -701,15 +708,11 @@ impl TransactionalProducer {
                              transactional produce requires v3+",
                         )
                     })?;
-                if version < 3 {
-                    return Err(KrafkaError::protocol(
-                        "broker does not support Produce v3+; \
-                         transactional produce requires the transactional_id field (v3+)",
-                    ));
-                }
 
                 let response = conn
-                    .send_request(ApiKey::Produce, version, |buf| request.encode_v3(buf))
+                    .send_request(ApiKey::Produce, version, |buf| {
+                        request.encode_versioned(version, buf)
+                    })
                     .await?;
 
                 let mut buf = response;
@@ -851,6 +854,7 @@ impl TransactionalProducer {
             timeout_ms: crate::util::duration_to_millis_i32(self.config.request_timeout),
             topic_data: vec![ProduceTopicData {
                 name: topic.to_string(),
+                topic_id: None,
                 partition_data: vec![ProducePartitionData {
                     index: partition,
                     records: batch_bytes,
@@ -972,10 +976,13 @@ impl TransactionalProducer {
 
         let request = FindCoordinatorRequest::for_group(group_id);
 
-        // Negotiate FindCoordinator version — prefer v1, fall back to v0.
-        // Group coordinator lookup works with both v0 and v1.
+        // Negotiate FindCoordinator version — requires v1+ (MIN).
         let fc_version = conn
-            .negotiate_api_version_max(ApiKey::FindCoordinator, 1)
+            .negotiate_api_version(
+                ApiKey::FindCoordinator,
+                versions::FIND_COORDINATOR_MAX,
+                versions::FIND_COORDINATOR_MIN,
+            )
             .await
             .ok_or_else(|| {
                 KrafkaError::protocol("no mutually supported FindCoordinator API version")
@@ -983,20 +990,12 @@ impl TransactionalProducer {
 
         let response_bytes = conn
             .send_request(ApiKey::FindCoordinator, fc_version, |buf| {
-                if fc_version >= 1 {
-                    request.encode_v1(buf)
-                } else {
-                    request.encode_v0(buf)
-                }
+                request.encode_versioned(fc_version, buf)
             })
             .await?;
 
         let mut buf = response_bytes;
-        let response = if fc_version >= 1 {
-            FindCoordinatorResponse::decode_v1(&mut buf)?
-        } else {
-            FindCoordinatorResponse::decode_v0(&mut buf)?
-        };
+        let response = FindCoordinatorResponse::decode_versioned(fc_version, &mut buf)?;
 
         if !response.error_code.is_ok() {
             return Err(KrafkaError::broker(

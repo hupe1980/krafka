@@ -22,7 +22,8 @@ target
 
 # Custom additions
 _prompts/
-BACKLOG.md
+API_VERSIONS.md
+BACKLOG*.md
 CONCEPT.md
 FINDINGS.md
 .DS_Store

@@ -47,18 +47,22 @@ use crate::network::{BrokerConnection, ConnectionConfig, ConnectionPool};
 
 use crate::protocol::{
     AclBinding, AclBindingFilter, AclOperation, AclPatternType, AclPermissionType, AclResourceType,
-    AlterClientQuotasRequest, AlterClientQuotasResponse, AlterConfigsRequest, AlterConfigsResponse,
-    AlterQuotaEntity, AlterQuotaEntry, AlterQuotaOp, ApiKey, CreatableRenewer, CreatableTopic,
-    CreatableTopicConfig, CreateAclsRequest, CreateAclsResponse, CreateDelegationTokenRequest,
+    AlterClientQuotasRequest, AlterClientQuotasResponse, AlterConfigOp, AlterQuotaEntity,
+    AlterQuotaEntry, AlterQuotaOp, AlterableConfig, ApiKey, ConsumerGroupDescribeRequest,
+    ConsumerGroupDescribeResponse, CreatableRenewer, CreatableTopic, CreatableTopicConfig,
+    CreateAclsRequest, CreateAclsResponse, CreateDelegationTokenRequest,
     CreateDelegationTokenResponse, CreatePartitionsRequest, CreatePartitionsResponse,
     CreatePartitionsTopic, CreateTopicsRequest, CreateTopicsResponse, DeleteAclsRequest,
-    DeleteAclsResponse, DeleteRecordsPartition, DeleteRecordsRequest, DeleteRecordsResponse,
-    DeleteRecordsTopic, DeleteTopicsRequest, DeleteTopicsResponse, DescribeAclsRequest,
-    DescribeAclsResponse, DescribeClientQuotasRequest, DescribeClientQuotasResponse,
+    DeleteAclsResponse, DeleteGroupsRequest, DeleteGroupsResponse, DeleteRecordsPartition,
+    DeleteRecordsRequest, DeleteRecordsResponse, DeleteRecordsTopic, DeleteTopicsRequest,
+    DeleteTopicsResponse, DescribeAclsRequest, DescribeAclsResponse, DescribeClientQuotasRequest,
+    DescribeClientQuotasResponse, DescribeClusterRequest, DescribeClusterResponse,
     DescribeConfigsRequest, DescribeConfigsResponse, DescribeDelegationTokenOwner,
     DescribeDelegationTokenRequest, DescribeDelegationTokenResponse, DescribeGroupsRequest,
-    DescribeGroupsResponse, ExpireDelegationTokenRequest, ExpireDelegationTokenResponse,
-    FindCoordinatorRequest, FindCoordinatorResponse, ListGroupsRequest, ListGroupsResponse,
+    DescribeGroupsResponse, DescribeTopicPartitionsCursor, DescribeTopicPartitionsRequest,
+    DescribeTopicPartitionsResponse, ExpireDelegationTokenRequest, ExpireDelegationTokenResponse,
+    FindCoordinatorRequest, FindCoordinatorResponse, IncrementalAlterConfigsRequest,
+    IncrementalAlterConfigsResponse, ListGroupsRequest, ListGroupsResponse,
     OffsetForLeaderEpochPartition, OffsetForLeaderEpochRequest, OffsetForLeaderEpochResponse,
     OffsetForLeaderEpochTopic, QuotaFilterComponent, RenewDelegationTokenRequest,
     RenewDelegationTokenResponse, VersionedDecode, VersionedEncode, versions,
@@ -136,10 +140,30 @@ pub struct ConfigEntry {
     pub value: Option<String>,
     /// Whether the config is read-only.
     pub read_only: bool,
-    /// Whether this is the default value.
+    /// Whether this is the default value (v0 only; v1+ uses config_source).
     pub is_default: bool,
     /// Whether the config is sensitive (passwords, etc.).
     pub is_sensitive: bool,
+    /// Configuration source (v1+). -1 if not available.
+    pub config_source: i8,
+    /// Synonyms for this configuration key (v1+).
+    pub synonyms: Vec<ConfigSynonymEntry>,
+    /// Configuration data type (v3+). 0 = UNKNOWN.
+    pub config_type: i8,
+    /// Configuration documentation (v3+).
+    pub documentation: Option<String>,
+}
+
+/// A synonym for a configuration key.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct ConfigSynonymEntry {
+    /// Synonym name.
+    pub name: String,
+    /// Synonym value.
+    pub value: Option<String>,
+    /// Synonym source.
+    pub source: i8,
 }
 
 /// Result of config alteration.
@@ -236,6 +260,122 @@ pub struct ConsumerGroupListing {
     pub group_id: String,
     /// Protocol type (e.g., "consumer").
     pub protocol_type: String,
+}
+
+/// Description of a KIP-848 consumer group (from ConsumerGroupDescribe API).
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct Kip848GroupDescription {
+    /// Group ID.
+    pub group_id: String,
+    /// Group state (e.g., "Stable", "Empty", "Dead", "Assigning").
+    pub state: String,
+    /// Group epoch.
+    pub group_epoch: i32,
+    /// Assignment epoch.
+    pub assignment_epoch: i32,
+    /// Assignor name (e.g., "uniform").
+    pub assignor_name: String,
+    /// Group members.
+    pub members: Vec<Kip848GroupMember>,
+    /// Authorized operations bitfield (-2^31 if not requested).
+    pub authorized_operations: i32,
+    /// Error message if any.
+    pub error: Option<String>,
+}
+
+/// A member of a KIP-848 consumer group.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct Kip848GroupMember {
+    /// Member ID.
+    pub member_id: String,
+    /// Instance ID (static membership).
+    pub instance_id: Option<String>,
+    /// Rack ID.
+    pub rack_id: Option<String>,
+    /// Current member epoch.
+    pub member_epoch: i32,
+    /// Client ID.
+    pub client_id: String,
+    /// Client host.
+    pub client_host: String,
+    /// Subscribed topic names.
+    pub subscribed_topic_names: Vec<String>,
+    /// Subscribed topic regex.
+    pub subscribed_topic_regex: Option<String>,
+    /// Current partition assignment.
+    pub assignment: Vec<Kip848TopicPartition>,
+    /// Target partition assignment.
+    pub target_assignment: Vec<Kip848TopicPartition>,
+    /// Member type. -1 = unknown, 0 = classic, 1 = consumer (v1+).
+    pub member_type: i8,
+}
+
+/// Topic-partition assignment within a KIP-848 consumer group description.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct Kip848TopicPartition {
+    /// Topic ID (UUID).
+    pub topic_id: [u8; 16],
+    /// Topic name.
+    pub topic_name: String,
+    /// Assigned partition indices.
+    pub partitions: Vec<i32>,
+}
+
+/// Result of [`AdminClient::describe_topic_partitions()`].
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct DescribeTopicPartitionsResult {
+    /// Described topics.
+    pub topics: Vec<TopicPartitionDescription>,
+    /// Pagination cursor topic name for the next page, if more pages remain.
+    pub next_cursor_topic: Option<String>,
+    /// Pagination cursor partition index for the next page.
+    pub next_cursor_partition: Option<i32>,
+}
+
+/// Per-topic result from [`AdminClient::describe_topic_partitions()`].
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct TopicPartitionDescription {
+    /// Topic name.
+    pub name: Option<String>,
+    /// Topic ID (UUID).
+    pub topic_id: [u8; 16],
+    /// Whether the topic is internal.
+    pub is_internal: bool,
+    /// Partitions.
+    pub partitions: Vec<PartitionDescription>,
+    /// Authorized operations bitfield.
+    pub topic_authorized_operations: i32,
+    /// Error message if any.
+    pub error: Option<String>,
+}
+
+/// Per-partition detail from [`AdminClient::describe_topic_partitions()`].
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct PartitionDescription {
+    /// Partition index.
+    pub partition_index: i32,
+    /// Leader broker ID.
+    pub leader_id: i32,
+    /// Leader epoch.
+    pub leader_epoch: i32,
+    /// Replica broker IDs.
+    pub replica_nodes: Vec<i32>,
+    /// ISR broker IDs.
+    pub isr_nodes: Vec<i32>,
+    /// Eligible leader replicas (KIP-966).
+    pub eligible_leader_replicas: Option<Vec<i32>>,
+    /// Last known ELR (KIP-966).
+    pub last_known_elr: Option<Vec<i32>>,
+    /// Offline replica broker IDs.
+    pub offline_replicas: Vec<i32>,
+    /// Error message if any.
+    pub error: Option<String>,
 }
 
 /// Result of deleting records from a partition.
@@ -584,6 +724,44 @@ impl AdminConfigBuilder {
     }
 }
 
+/// Result of deleting a single consumer group.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct DeleteGroupResult {
+    /// Group ID.
+    pub group_id: String,
+    /// Error message if any.
+    pub error: Option<String>,
+}
+
+/// Cluster description returned by [`AdminClient::describe_cluster`].
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct DescribeClusterResult {
+    /// Cluster ID.
+    pub cluster_id: String,
+    /// Controller broker ID.
+    pub controller_id: i32,
+    /// Brokers in the cluster.
+    pub brokers: Vec<DescribeClusterBrokerInfo>,
+    /// Authorized operations bitfield (-2^31 if not requested).
+    pub cluster_authorized_operations: i32,
+}
+
+/// Broker entry in [`DescribeClusterResult`].
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct DescribeClusterBrokerInfo {
+    /// Broker ID.
+    pub broker_id: i32,
+    /// Hostname.
+    pub host: String,
+    /// Port.
+    pub port: i32,
+    /// Rack (if assigned).
+    pub rack: Option<String>,
+}
+
 /// Kafka admin client for cluster administration.
 pub struct AdminClient {
     /// Configuration.
@@ -664,34 +842,25 @@ impl AdminClient {
 
         // Send request — negotiate API version with broker
         let version = conn
-            .negotiate_api_version_max(ApiKey::CreateTopics, versions::CREATE_TOPICS_MAX)
+            .negotiate_api_version(
+                ApiKey::CreateTopics,
+                versions::CREATE_TOPICS_MAX,
+                versions::CREATE_TOPICS_MIN,
+            )
             .await
             .ok_or_else(|| {
                 KrafkaError::protocol("no mutually supported CreateTopics API version")
             })?;
 
         let response_bytes = conn
-            .send_request(ApiKey::CreateTopics, version, |buf| match version {
-                0 => request.encode_v0(buf),
-                1 | 2 => request.encode_v1(buf),
-                _ => Err(KrafkaError::protocol(format!(
-                    "unsupported CreateTopics version {version}"
-                ))),
+            .send_request(ApiKey::CreateTopics, version, |buf| {
+                request.encode_versioned(version, buf)
             })
             .await?;
 
         // Decode response
         let mut buf = response_bytes;
-        let response = match version {
-            0 => CreateTopicsResponse::decode_v0(&mut buf)?,
-            1 => CreateTopicsResponse::decode_v1(&mut buf)?,
-            2 => CreateTopicsResponse::decode_v2(&mut buf)?,
-            _ => {
-                return Err(KrafkaError::protocol(format!(
-                    "unsupported CreateTopics version {version}"
-                )));
-            }
-        };
+        let response = CreateTopicsResponse::decode_versioned(version, &mut buf)?;
 
         // Convert to results
         let results = response
@@ -739,32 +908,31 @@ impl AdminClient {
         // Build request
         let request = DeleteTopicsRequest {
             topic_names: topics.clone(),
+            topics: vec![],
             timeout_ms: crate::util::duration_to_millis_i32(timeout),
         };
 
         // Send request — negotiate API version with broker
         let version = conn
-            .negotiate_api_version_max(ApiKey::DeleteTopics, versions::DELETE_TOPICS_MAX)
+            .negotiate_api_version(
+                ApiKey::DeleteTopics,
+                versions::DELETE_TOPICS_MAX,
+                versions::DELETE_TOPICS_MIN,
+            )
             .await
             .ok_or_else(|| {
                 KrafkaError::protocol("no mutually supported DeleteTopics API version")
             })?;
 
         let response_bytes = conn
-            .send_request(ApiKey::DeleteTopics, version, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::DeleteTopics, version, |buf| {
+                request.encode_versioned(version, buf)
+            })
             .await?;
 
         // Decode response
         let mut buf = response_bytes;
-        let response = match version {
-            0 => DeleteTopicsResponse::decode_v0(&mut buf)?,
-            1 => DeleteTopicsResponse::decode_v1(&mut buf)?,
-            _ => {
-                return Err(KrafkaError::protocol(format!(
-                    "unsupported DeleteTopics version {version}"
-                )));
-            }
-        };
+        let response = DeleteTopicsResponse::decode_versioned(version, &mut buf)?;
 
         // Convert to results
         let results = response
@@ -812,7 +980,11 @@ impl AdminClient {
 
         // Send request — negotiate API version with broker
         let version = conn
-            .negotiate_api_version_max(ApiKey::CreatePartitions, versions::CREATE_PARTITIONS_MAX)
+            .negotiate_api_version(
+                ApiKey::CreatePartitions,
+                versions::CREATE_PARTITIONS_MAX,
+                versions::CREATE_PARTITIONS_MIN,
+            )
             .await
             .ok_or_else(|| {
                 KrafkaError::protocol("no mutually supported CreatePartitions API version")
@@ -864,7 +1036,11 @@ impl AdminClient {
         let request = DescribeConfigsRequest::for_topic(topic);
 
         let version = conn
-            .negotiate_api_version_max(ApiKey::DescribeConfigs, versions::DESCRIBE_CONFIGS_MAX)
+            .negotiate_api_version(
+                ApiKey::DescribeConfigs,
+                versions::DESCRIBE_CONFIGS_MAX,
+                versions::DESCRIBE_CONFIGS_MIN,
+            )
             .await
             .ok_or_else(|| {
                 KrafkaError::protocol("no mutually supported DescribeConfigs API version")
@@ -872,12 +1048,12 @@ impl AdminClient {
 
         let response_bytes = conn
             .send_request(ApiKey::DescribeConfigs, version, |buf| {
-                request.encode_v0(buf)
+                request.encode_versioned(version, buf)
             })
             .await?;
 
         let mut buf = response_bytes;
-        let response = DescribeConfigsResponse::decode_v0(&mut buf)?;
+        let response = DescribeConfigsResponse::decode_versioned(version, &mut buf)?;
 
         let entries = response
             .results
@@ -894,6 +1070,18 @@ impl AdminClient {
                         read_only: c.read_only,
                         is_default: c.is_default,
                         is_sensitive: c.is_sensitive,
+                        config_source: c.config_source,
+                        synonyms: c
+                            .synonyms
+                            .into_iter()
+                            .map(|s| ConfigSynonymEntry {
+                                name: s.name,
+                                value: s.value,
+                                source: s.source,
+                            })
+                            .collect(),
+                        config_type: c.config_type,
+                        documentation: c.documentation,
                     })
                     .collect()
             })
@@ -909,7 +1097,11 @@ impl AdminClient {
         let request = DescribeConfigsRequest::for_broker(broker_id);
 
         let version = conn
-            .negotiate_api_version_max(ApiKey::DescribeConfigs, versions::DESCRIBE_CONFIGS_MAX)
+            .negotiate_api_version(
+                ApiKey::DescribeConfigs,
+                versions::DESCRIBE_CONFIGS_MAX,
+                versions::DESCRIBE_CONFIGS_MIN,
+            )
             .await
             .ok_or_else(|| {
                 KrafkaError::protocol("no mutually supported DescribeConfigs API version")
@@ -917,12 +1109,12 @@ impl AdminClient {
 
         let response_bytes = conn
             .send_request(ApiKey::DescribeConfigs, version, |buf| {
-                request.encode_v0(buf)
+                request.encode_versioned(version, buf)
             })
             .await?;
 
         let mut buf = response_bytes;
-        let response = DescribeConfigsResponse::decode_v0(&mut buf)?;
+        let response = DescribeConfigsResponse::decode_versioned(version, &mut buf)?;
 
         let entries = response
             .results
@@ -939,6 +1131,18 @@ impl AdminClient {
                         read_only: c.read_only,
                         is_default: c.is_default,
                         is_sensitive: c.is_sensitive,
+                        config_source: c.config_source,
+                        synonyms: c
+                            .synonyms
+                            .into_iter()
+                            .map(|s| ConfigSynonymEntry {
+                                name: s.name,
+                                value: s.value,
+                                source: s.source,
+                            })
+                            .collect(),
+                        config_type: c.config_type,
+                        documentation: c.documentation,
                     })
                     .collect()
             })
@@ -949,8 +1153,9 @@ impl AdminClient {
 
     /// Alter configuration for a topic.
     ///
-    /// Note: This replaces all dynamic configs. To modify a single config,
-    /// first describe the topic config and then set all desired values.
+    /// Uses IncrementalAlterConfigs (API Key 44) to set individual config keys
+    /// without replacing the entire config. Each key-value pair is applied as a
+    /// SET operation.
     pub async fn alter_topic_config(
         &self,
         topic: &str,
@@ -958,21 +1163,37 @@ impl AdminClient {
     ) -> Result<AlterConfigResult> {
         let conn = self.get_any_broker_connection().await?;
 
-        let request = AlterConfigsRequest::for_topic(topic, configs.into_iter().collect());
+        let request = IncrementalAlterConfigsRequest::for_topic(
+            topic,
+            configs
+                .into_iter()
+                .map(|(name, value)| AlterableConfig {
+                    name,
+                    config_operation: AlterConfigOp::Set,
+                    value: Some(value),
+                })
+                .collect(),
+        );
 
         let version = conn
-            .negotiate_api_version_max(ApiKey::AlterConfigs, versions::ALTER_CONFIGS_MAX)
+            .negotiate_api_version(
+                ApiKey::IncrementalAlterConfigs,
+                versions::INCREMENTAL_ALTER_CONFIGS_MAX,
+                versions::INCREMENTAL_ALTER_CONFIGS_MIN,
+            )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported AlterConfigs API version")
+                KrafkaError::protocol("no mutually supported IncrementalAlterConfigs API version")
             })?;
 
         let response_bytes = conn
-            .send_request(ApiKey::AlterConfigs, version, |buf| request.encode_v0(buf))
+            .send_request(ApiKey::IncrementalAlterConfigs, version, |buf| {
+                request.encode_versioned(version, buf)
+            })
             .await?;
 
         let mut buf = response_bytes;
-        let response = AlterConfigsResponse::decode_v0(&mut buf)?;
+        let response = IncrementalAlterConfigsResponse::decode_versioned(version, &mut buf)?;
 
         let result = response
             .results
@@ -1127,32 +1348,24 @@ impl AdminClient {
         };
 
         let version = conn
-            .negotiate_api_version_max(ApiKey::DescribeAcls, versions::DESCRIBE_ACLS_MAX)
+            .negotiate_api_version(
+                ApiKey::DescribeAcls,
+                versions::DESCRIBE_ACLS_MAX,
+                versions::DESCRIBE_ACLS_MIN,
+            )
             .await
             .ok_or_else(|| {
                 KrafkaError::protocol("no mutually supported DescribeAcls API version")
             })?;
 
         let response_bytes = conn
-            .send_request(ApiKey::DescribeAcls, version, |buf| match version {
-                0 => request.encode_v0(buf),
-                1 => request.encode_v1(buf),
-                _ => Err(KrafkaError::protocol(format!(
-                    "unsupported DescribeAcls encode version {version}"
-                ))),
+            .send_request(ApiKey::DescribeAcls, version, |buf| {
+                request.encode_versioned(version, buf)
             })
             .await?;
 
         let mut buf = response_bytes;
-        let response = match version {
-            0 => DescribeAclsResponse::decode_v0(&mut buf)?,
-            1 => DescribeAclsResponse::decode_v1(&mut buf)?,
-            _ => {
-                return Err(KrafkaError::protocol(format!(
-                    "unsupported DescribeAcls decode version {version}"
-                )));
-            }
-        };
+        let response = DescribeAclsResponse::decode_versioned(version, &mut buf)?;
 
         let bindings = response
             .resources
@@ -1202,29 +1415,22 @@ impl AdminClient {
         };
 
         let version = conn
-            .negotiate_api_version_max(ApiKey::CreateAcls, versions::CREATE_ACLS_MAX)
+            .negotiate_api_version(
+                ApiKey::CreateAcls,
+                versions::CREATE_ACLS_MAX,
+                versions::CREATE_ACLS_MIN,
+            )
             .await
             .ok_or_else(|| KrafkaError::protocol("no mutually supported CreateAcls API version"))?;
 
         let response_bytes = conn
-            .send_request(ApiKey::CreateAcls, version, |buf| match version {
-                0 => request.encode_v0(buf),
-                1 => request.encode_v1(buf),
-                _ => Err(KrafkaError::protocol(format!(
-                    "unsupported CreateAcls encode version {version}"
-                ))),
+            .send_request(ApiKey::CreateAcls, version, |buf| {
+                request.encode_versioned(version, buf)
             })
             .await?;
 
         let mut buf = response_bytes;
-        let response = match version {
-            0..=1 => CreateAclsResponse::decode_v0(&mut buf)?,
-            _ => {
-                return Err(KrafkaError::protocol(format!(
-                    "unsupported CreateAcls decode version {version}"
-                )));
-            }
-        };
+        let response = CreateAclsResponse::decode_versioned(version, &mut buf)?;
 
         let results = response
             .results
@@ -1272,30 +1478,22 @@ impl AdminClient {
         };
 
         let version = conn
-            .negotiate_api_version_max(ApiKey::DeleteAcls, versions::DELETE_ACLS_MAX)
+            .negotiate_api_version(
+                ApiKey::DeleteAcls,
+                versions::DELETE_ACLS_MAX,
+                versions::DELETE_ACLS_MIN,
+            )
             .await
             .ok_or_else(|| KrafkaError::protocol("no mutually supported DeleteAcls API version"))?;
 
         let response_bytes = conn
-            .send_request(ApiKey::DeleteAcls, version, |buf| match version {
-                0 => request.encode_v0(buf),
-                1 => request.encode_v1(buf),
-                _ => Err(KrafkaError::protocol(format!(
-                    "unsupported DeleteAcls encode version {version}"
-                ))),
+            .send_request(ApiKey::DeleteAcls, version, |buf| {
+                request.encode_versioned(version, buf)
             })
             .await?;
 
         let mut buf = response_bytes;
-        let response = match version {
-            0 => DeleteAclsResponse::decode_v0(&mut buf)?,
-            1 => DeleteAclsResponse::decode_v1(&mut buf)?,
-            _ => {
-                return Err(KrafkaError::protocol(format!(
-                    "unsupported DeleteAcls decode version {version}"
-                )));
-            }
-        };
+        let response = DeleteAclsResponse::decode_versioned(version, &mut buf)?;
 
         let filter_results = response
             .filter_results
@@ -1353,7 +1551,11 @@ impl AdminClient {
         for group_id in &group_ids {
             let coord_request = FindCoordinatorRequest::for_group(group_id);
             let coord_version = any_conn
-                .negotiate_api_version_max(ApiKey::FindCoordinator, versions::FIND_COORDINATOR_MAX)
+                .negotiate_api_version(
+                    ApiKey::FindCoordinator,
+                    versions::FIND_COORDINATOR_MAX,
+                    versions::FIND_COORDINATOR_MIN,
+                )
                 .await
                 .ok_or_else(|| {
                     KrafkaError::protocol("no mutually supported FindCoordinator API version")
@@ -1401,10 +1603,15 @@ impl AdminClient {
 
             let request = DescribeGroupsRequest {
                 groups: groups.clone(),
+                include_authorized_operations: false,
             };
 
             let version = conn
-                .negotiate_api_version_max(ApiKey::DescribeGroups, versions::DESCRIBE_GROUPS_MAX)
+                .negotiate_api_version(
+                    ApiKey::DescribeGroups,
+                    versions::DESCRIBE_GROUPS_MAX,
+                    versions::DESCRIBE_GROUPS_MIN,
+                )
                 .await
                 .ok_or_else(|| {
                     KrafkaError::protocol("no mutually supported DescribeGroups API version")
@@ -1412,20 +1619,12 @@ impl AdminClient {
 
             let response_bytes = conn
                 .send_request(ApiKey::DescribeGroups, version, |buf| {
-                    request.encode_v0(buf)
+                    request.encode_versioned(version, buf)
                 })
                 .await?;
 
             let mut buf = response_bytes;
-            let response = match version {
-                0 => DescribeGroupsResponse::decode_v0(&mut buf)?,
-                1 => DescribeGroupsResponse::decode_v1(&mut buf)?,
-                _ => {
-                    return Err(KrafkaError::protocol(format!(
-                        "unsupported DescribeGroups version {version}"
-                    )));
-                }
-            };
+            let response = DescribeGroupsResponse::decode_versioned(version, &mut buf)?;
 
             for g in response.groups {
                 all_results.push(ConsumerGroupDescription {
@@ -1491,10 +1690,17 @@ impl AdminClient {
                 Err(_) => continue, // Skip unreachable brokers
             };
 
-            let request = ListGroupsRequest;
+            let request = ListGroupsRequest {
+                states_filter: Vec::new(),
+                types_filter: Vec::new(),
+            };
 
             let version = match conn
-                .negotiate_api_version_max(ApiKey::ListGroups, versions::LIST_GROUPS_MAX)
+                .negotiate_api_version(
+                    ApiKey::ListGroups,
+                    versions::LIST_GROUPS_MAX,
+                    versions::LIST_GROUPS_MIN,
+                )
                 .await
             {
                 Some(v) => v,
@@ -1508,7 +1714,9 @@ impl AdminClient {
             };
 
             let response_bytes = match conn
-                .send_request(ApiKey::ListGroups, version, |buf| request.encode_v0(buf))
+                .send_request(ApiKey::ListGroups, version, |buf| {
+                    request.encode_versioned(version, buf)
+                })
                 .await
             {
                 Ok(r) => r,
@@ -1519,26 +1727,10 @@ impl AdminClient {
             };
 
             let mut buf = response_bytes;
-            let response = match version {
-                0 => match ListGroupsResponse::decode_v0(&mut buf) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!("ListGroups decode failed on broker {}: {}", broker.id, e);
-                        continue;
-                    }
-                },
-                1 => match ListGroupsResponse::decode_v1(&mut buf) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!("ListGroups decode failed on broker {}: {}", broker.id, e);
-                        continue;
-                    }
-                },
-                _ => {
-                    warn!(
-                        "Unsupported ListGroups version {version}, skipping broker {}",
-                        broker.id
-                    );
+            let response = match ListGroupsResponse::decode_versioned(version, &mut buf) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("ListGroups decode failed on broker {}: {}", broker.id, e);
                     continue;
                 }
             };
@@ -1638,7 +1830,11 @@ impl AdminClient {
             };
 
             let version = conn
-                .negotiate_api_version_max(ApiKey::DeleteRecords, versions::DELETE_RECORDS_MAX)
+                .negotiate_api_version(
+                    ApiKey::DeleteRecords,
+                    versions::DELETE_RECORDS_MAX,
+                    versions::DELETE_RECORDS_MIN,
+                )
                 .await
                 .ok_or_else(|| {
                     KrafkaError::protocol("no mutually supported DeleteRecords API version")
@@ -1652,9 +1848,10 @@ impl AdminClient {
             let response = DeleteRecordsResponse::decode_v0(&mut buf)?;
 
             for topic in response.topics {
+                let topic_name = topic.name;
                 for partition in topic.partitions {
                     results.push(DeleteRecordResult {
-                        topic: topic.name.clone(),
+                        topic: topic_name.clone(),
                         partition: partition.partition_index,
                         low_watermark: partition.low_watermark,
                         error: if partition.error_code.is_ok() {
@@ -1748,9 +1945,10 @@ impl AdminClient {
             };
 
             let version = conn
-                .negotiate_api_version_max(
+                .negotiate_api_version(
                     ApiKey::OffsetForLeaderEpoch,
                     versions::OFFSET_FOR_LEADER_EPOCH_MAX,
+                    versions::OFFSET_FOR_LEADER_EPOCH_MIN,
                 )
                 .await
                 .ok_or_else(|| {
@@ -1758,32 +1956,19 @@ impl AdminClient {
                 })?;
 
             let response_bytes = conn
-                .send_request(ApiKey::OffsetForLeaderEpoch, version, |buf| match version {
-                    0..=1 => request.encode_v0(buf),
-                    2 => request.encode_v2(buf),
-                    3 => request.encode_v3(buf),
-                    _ => Err(KrafkaError::protocol(format!(
-                        "unsupported OffsetForLeaderEpoch encode version {version}"
-                    ))),
+                .send_request(ApiKey::OffsetForLeaderEpoch, version, |buf| {
+                    request.encode_versioned(version, buf)
                 })
                 .await?;
 
             let mut buf = response_bytes;
-            let response = match version {
-                0 => OffsetForLeaderEpochResponse::decode_v0(&mut buf)?,
-                1 => OffsetForLeaderEpochResponse::decode_v1(&mut buf)?,
-                2..=3 => OffsetForLeaderEpochResponse::decode_v2(&mut buf)?,
-                _ => {
-                    return Err(KrafkaError::protocol(format!(
-                        "unsupported OffsetForLeaderEpoch version {version}"
-                    )));
-                }
-            };
+            let response = OffsetForLeaderEpochResponse::decode_versioned(version, &mut buf)?;
 
             for topic in response.topics {
+                let topic_name = topic.topic;
                 for partition in topic.partitions {
                     results.push(LeaderEpochResult {
-                        topic: topic.topic.clone(),
+                        topic: topic_name.clone(),
                         partition: partition.partition,
                         leader_epoch: partition.leader_epoch,
                         end_offset: partition.end_offset,
@@ -1836,12 +2021,15 @@ impl AdminClient {
             max_lifetime_ms: max_lifetime
                 .map(crate::util::duration_to_millis_i64)
                 .unwrap_or(-1),
+            owner_principal_type: None,
+            owner_principal_name: None,
         };
 
         let version = conn
-            .negotiate_api_version_max(
+            .negotiate_api_version(
                 ApiKey::CreateDelegationToken,
                 versions::CREATE_DELEGATION_TOKEN_MAX,
+                versions::CREATE_DELEGATION_TOKEN_MIN,
             )
             .await
             .ok_or_else(|| {
@@ -1901,9 +2089,10 @@ impl AdminClient {
         };
 
         let version = conn
-            .negotiate_api_version_max(
+            .negotiate_api_version(
                 ApiKey::RenewDelegationToken,
                 versions::RENEW_DELEGATION_TOKEN_MAX,
+                versions::RENEW_DELEGATION_TOKEN_MIN,
             )
             .await
             .ok_or_else(|| {
@@ -1955,9 +2144,10 @@ impl AdminClient {
         };
 
         let version = conn
-            .negotiate_api_version_max(
+            .negotiate_api_version(
                 ApiKey::ExpireDelegationToken,
                 versions::EXPIRE_DELEGATION_TOKEN_MAX,
+                versions::EXPIRE_DELEGATION_TOKEN_MIN,
             )
             .await
             .ok_or_else(|| {
@@ -2011,9 +2201,10 @@ impl AdminClient {
         };
 
         let version = conn
-            .negotiate_api_version_max(
+            .negotiate_api_version(
                 ApiKey::DescribeDelegationToken,
                 versions::DESCRIBE_DELEGATION_TOKEN_MAX,
+                versions::DESCRIBE_DELEGATION_TOKEN_MIN,
             )
             .await
             .ok_or_else(|| {
@@ -2112,9 +2303,10 @@ impl AdminClient {
         };
 
         let version = conn
-            .negotiate_api_version_max(
+            .negotiate_api_version(
                 ApiKey::DescribeClientQuotas,
                 versions::DESCRIBE_CLIENT_QUOTAS_MAX,
+                versions::DESCRIBE_CLIENT_QUOTAS_MIN,
             )
             .await
             .ok_or_else(|| {
@@ -2229,7 +2421,11 @@ impl AdminClient {
         };
 
         let version = conn
-            .negotiate_api_version_max(ApiKey::AlterClientQuotas, versions::ALTER_CLIENT_QUOTAS_MAX)
+            .negotiate_api_version(
+                ApiKey::AlterClientQuotas,
+                versions::ALTER_CLIENT_QUOTAS_MAX,
+                versions::ALTER_CLIENT_QUOTAS_MIN,
+            )
             .await
             .ok_or_else(|| {
                 KrafkaError::protocol("no mutually supported AlterClientQuotas API version")
@@ -2269,6 +2465,396 @@ impl AdminClient {
 
         info!("Altered {} client quota entry(ies)", results.len());
         Ok(results)
+    }
+
+    /// Delete consumer groups by ID.
+    ///
+    /// Returns one [`DeleteGroupResult`] per group. Each result may contain
+    /// an error if that particular group could not be deleted (e.g., it has
+    /// active members).
+    pub async fn delete_groups(&self, group_ids: Vec<String>) -> Result<Vec<DeleteGroupResult>> {
+        self.check_not_closed()?;
+        let conn = self.get_any_broker_connection().await?;
+
+        let request = DeleteGroupsRequest::new(group_ids);
+        let version = conn
+            .negotiate_api_version(
+                ApiKey::DeleteGroups,
+                versions::DELETE_GROUPS_MAX,
+                versions::DELETE_GROUPS_MIN,
+            )
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported DeleteGroups API version")
+            })?;
+
+        let response_bytes = conn
+            .send_request(ApiKey::DeleteGroups, version, |buf| {
+                request.encode_versioned(version, buf)
+            })
+            .await?;
+
+        let mut buf = response_bytes;
+        let response = DeleteGroupsResponse::decode_versioned(version, &mut buf)?;
+
+        let results = response
+            .results
+            .into_iter()
+            .map(|r| DeleteGroupResult {
+                group_id: r.group_id,
+                error: if r.error_code.is_ok() {
+                    None
+                } else {
+                    Some(format!("{:?}", r.error_code))
+                },
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Describe the cluster using the DescribeCluster API (Key 60).
+    ///
+    /// Returns richer cluster info than [`describe_cluster`](Self::describe_cluster),
+    /// including cluster ID and authorized operations.
+    pub async fn describe_cluster_detailed(&self) -> Result<DescribeClusterResult> {
+        self.check_not_closed()?;
+        let conn = self.get_any_broker_connection().await?;
+
+        let request = DescribeClusterRequest::default();
+        let version = conn
+            .negotiate_api_version(
+                ApiKey::DescribeCluster,
+                versions::DESCRIBE_CLUSTER_MAX,
+                versions::DESCRIBE_CLUSTER_MIN,
+            )
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported DescribeCluster API version")
+            })?;
+
+        let response_bytes = conn
+            .send_request(ApiKey::DescribeCluster, version, |buf| {
+                request.encode_versioned(version, buf)
+            })
+            .await?;
+
+        let mut buf = response_bytes;
+        let response = DescribeClusterResponse::decode_versioned(version, &mut buf)?;
+
+        if !response.error_code.is_ok() {
+            let msg = response
+                .error_message
+                .unwrap_or_else(|| format!("{:?}", response.error_code));
+            return Err(KrafkaError::protocol(msg));
+        }
+
+        Ok(DescribeClusterResult {
+            cluster_id: response.cluster_id,
+            controller_id: response.controller_id,
+            brokers: response
+                .brokers
+                .into_iter()
+                .map(|b| DescribeClusterBrokerInfo {
+                    broker_id: b.broker_id,
+                    host: b.host,
+                    port: b.port,
+                    rack: b.rack,
+                })
+                .collect(),
+            cluster_authorized_operations: response.cluster_authorized_operations,
+        })
+    }
+
+    /// Describe KIP-848 consumer groups using the ConsumerGroupDescribe API (Key 69).
+    ///
+    /// Returns rich group information including group epoch, assignment epoch,
+    /// assignor name, and per-member target/current assignments with topic UUIDs.
+    ///
+    /// This API is available on Kafka 4.0+ and is the native way to describe
+    /// consumer groups that use the new consumer group protocol (KIP-848).
+    ///
+    /// # Example
+    /// ```ignore
+    /// let groups = admin
+    ///     .describe_consumer_groups(vec!["my-group".to_string()])
+    ///     .await?;
+    /// for group in &groups {
+    ///     println!("{}: state={}, epoch={}", group.group_id, group.state, group.group_epoch);
+    /// }
+    /// ```
+    pub async fn describe_consumer_groups(
+        &self,
+        group_ids: Vec<String>,
+    ) -> Result<Vec<Kip848GroupDescription>> {
+        self.check_not_closed()?;
+        let brokers = self.metadata.brokers();
+        if brokers.is_empty() {
+            return Err(KrafkaError::broker(
+                crate::error::ErrorCode::UnknownServerError,
+                "no brokers available",
+            ));
+        }
+
+        // Group the group_ids by their coordinator broker.
+        let mut coordinator_groups: HashMap<i32, Vec<String>> = HashMap::new();
+        let any_broker = &brokers[0];
+        let any_conn = self
+            .pool
+            .get_connection_by_id(any_broker.id, any_broker.address())
+            .await?;
+
+        for group_id in &group_ids {
+            let coord_request = FindCoordinatorRequest::for_group(group_id);
+            let coord_version = any_conn
+                .negotiate_api_version(
+                    ApiKey::FindCoordinator,
+                    versions::FIND_COORDINATOR_MAX,
+                    versions::FIND_COORDINATOR_MIN,
+                )
+                .await
+                .ok_or_else(|| {
+                    KrafkaError::protocol("no mutually supported FindCoordinator API version")
+                })?;
+
+            let coord_response_bytes = any_conn
+                .send_request(ApiKey::FindCoordinator, coord_version, |buf| {
+                    coord_request.encode_versioned(coord_version, buf)
+                })
+                .await?;
+            let mut coord_buf = coord_response_bytes;
+            let coord_response =
+                FindCoordinatorResponse::decode_versioned(coord_version, &mut coord_buf)?;
+
+            if coord_response.error_code.is_ok() {
+                coordinator_groups
+                    .entry(coord_response.node_id)
+                    .or_default()
+                    .push(group_id.clone());
+            } else {
+                warn!(
+                    "FindCoordinator failed for group '{}': {:?}, falling back to broker {}",
+                    group_id, coord_response.error_code, any_broker.id
+                );
+                coordinator_groups
+                    .entry(any_broker.id)
+                    .or_default()
+                    .push(group_id.clone());
+            }
+        }
+
+        let mut all_results = Vec::new();
+
+        for (broker_id, groups) in coordinator_groups {
+            let broker = brokers
+                .iter()
+                .find(|b| b.id == broker_id)
+                .unwrap_or(any_broker);
+            let conn = self
+                .pool
+                .get_connection_by_id(broker.id, broker.address())
+                .await?;
+
+            let request = ConsumerGroupDescribeRequest::new(groups);
+
+            let version = conn
+                .negotiate_api_version(
+                    ApiKey::ConsumerGroupDescribe,
+                    versions::CONSUMER_GROUP_DESCRIBE_MAX,
+                    versions::CONSUMER_GROUP_DESCRIBE_MIN,
+                )
+                .await
+                .ok_or_else(|| {
+                    KrafkaError::protocol("no mutually supported ConsumerGroupDescribe API version")
+                })?;
+
+            let response_bytes = conn
+                .send_request(ApiKey::ConsumerGroupDescribe, version, |buf| {
+                    request.encode_v0(buf)
+                })
+                .await?;
+
+            let mut buf = response_bytes;
+            let response = if version >= 1 {
+                ConsumerGroupDescribeResponse::decode_v1(&mut buf)?
+            } else {
+                ConsumerGroupDescribeResponse::decode_v0(&mut buf)?
+            };
+
+            for g in response.groups {
+                all_results.push(Kip848GroupDescription {
+                    group_id: g.group_id,
+                    state: g.group_state,
+                    group_epoch: g.group_epoch,
+                    assignment_epoch: g.assignment_epoch,
+                    assignor_name: g.assignor_name,
+                    members: g
+                        .members
+                        .into_iter()
+                        .map(|m| Kip848GroupMember {
+                            member_id: m.member_id,
+                            instance_id: m.instance_id,
+                            rack_id: m.rack_id,
+                            member_epoch: m.member_epoch,
+                            client_id: m.client_id,
+                            client_host: m.client_host,
+                            subscribed_topic_names: m.subscribed_topic_names,
+                            subscribed_topic_regex: m.subscribed_topic_regex,
+                            assignment: m
+                                .assignment
+                                .topic_partitions
+                                .into_iter()
+                                .map(|tp| Kip848TopicPartition {
+                                    topic_id: tp.topic_id,
+                                    topic_name: tp.topic_name,
+                                    partitions: tp.partitions,
+                                })
+                                .collect(),
+                            target_assignment: m
+                                .target_assignment
+                                .topic_partitions
+                                .into_iter()
+                                .map(|tp| Kip848TopicPartition {
+                                    topic_id: tp.topic_id,
+                                    topic_name: tp.topic_name,
+                                    partitions: tp.partitions,
+                                })
+                                .collect(),
+                            member_type: m.member_type,
+                        })
+                        .collect(),
+                    authorized_operations: g.authorized_operations,
+                    error: if g.error_code.is_ok() {
+                        None
+                    } else {
+                        let msg = g
+                            .error_message
+                            .unwrap_or_else(|| format!("{:?}", g.error_code));
+                        Some(msg)
+                    },
+                });
+            }
+        }
+
+        info!("Described {} consumer groups (KIP-848)", all_results.len());
+        Ok(all_results)
+    }
+
+    /// Describe topic partitions using the DescribeTopicPartitions API (Key 75).
+    ///
+    /// Returns detailed per-partition information including leader, replicas, ISR,
+    /// eligible leader replicas (ELR), and offline replicas. Supports pagination
+    /// for topics with many partitions.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let result = admin
+    ///     .describe_topic_partitions(vec!["my-topic".to_string()])
+    ///     .await?;
+    /// for topic in &result.topics {
+    ///     println!("{}: {} partitions", topic.name.as_deref().unwrap_or("?"), topic.partitions.len());
+    ///     for p in &topic.partitions {
+    ///         println!("  partition {}: leader={}, isr={:?}", p.partition_index, p.leader_id, p.isr_nodes);
+    ///     }
+    /// }
+    /// ```
+    pub async fn describe_topic_partitions(
+        &self,
+        topics: Vec<String>,
+    ) -> Result<DescribeTopicPartitionsResult> {
+        self.check_not_closed()?;
+        let conn = self.get_any_broker_connection().await?;
+
+        let version = conn
+            .negotiate_api_version(
+                ApiKey::DescribeTopicPartitions,
+                versions::DESCRIBE_TOPIC_PARTITIONS_MAX,
+                versions::DESCRIBE_TOPIC_PARTITIONS_MIN,
+            )
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol("no mutually supported DescribeTopicPartitions API version")
+            })?;
+
+        // Collect all pages into a single result.
+        let mut all_topics: Vec<TopicPartitionDescription> = Vec::new();
+        let mut cursor = None;
+
+        loop {
+            let request = DescribeTopicPartitionsRequest {
+                topics: topics.clone(),
+                response_partition_limit: 2000,
+                cursor,
+            };
+
+            let response_bytes = conn
+                .send_request(ApiKey::DescribeTopicPartitions, version, |buf| {
+                    request.encode_v0(buf)
+                })
+                .await?;
+
+            let mut buf = response_bytes;
+            let response = DescribeTopicPartitionsResponse::decode_v0(&mut buf)?;
+
+            for t in response.topics {
+                // Find existing topic entry (pagination may split partitions across pages).
+                let existing = all_topics.iter_mut().find(|e| e.name == t.name);
+                let partitions: Vec<PartitionDescription> = t
+                    .partitions
+                    .into_iter()
+                    .map(|p| PartitionDescription {
+                        partition_index: p.partition_index,
+                        leader_id: p.leader_id,
+                        leader_epoch: p.leader_epoch,
+                        replica_nodes: p.replica_nodes,
+                        isr_nodes: p.isr_nodes,
+                        eligible_leader_replicas: p.eligible_leader_replicas,
+                        last_known_elr: p.last_known_elr,
+                        offline_replicas: p.offline_replicas,
+                        error: if p.error_code.is_ok() {
+                            None
+                        } else {
+                            Some(format!("{:?}", p.error_code))
+                        },
+                    })
+                    .collect();
+
+                if let Some(entry) = existing {
+                    entry.partitions.extend(partitions);
+                } else {
+                    all_topics.push(TopicPartitionDescription {
+                        name: t.name,
+                        topic_id: t.topic_id,
+                        is_internal: t.is_internal,
+                        partitions,
+                        topic_authorized_operations: t.topic_authorized_operations,
+                        error: if t.error_code.is_ok() {
+                            None
+                        } else {
+                            Some(format!("{:?}", t.error_code))
+                        },
+                    });
+                }
+            }
+
+            // Check for more pages.
+            match response.next_cursor {
+                Some(c) => {
+                    cursor = Some(DescribeTopicPartitionsCursor {
+                        topic_name: c.topic_name,
+                        partition_index: c.partition_index,
+                    });
+                }
+                None => break,
+            }
+        }
+
+        info!("Described partitions for {} topics", all_topics.len());
+        Ok(DescribeTopicPartitionsResult {
+            topics: all_topics,
+            next_cursor_topic: None,
+            next_cursor_partition: None,
+        })
     }
 
     /// Get access to the connection pool.

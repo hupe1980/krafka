@@ -14,7 +14,8 @@ This guide covers administrative operations using the Krafka AdminClient.
 The AdminClient provides cluster administration capabilities:
 
 - Topic management (create, delete, describe, list)
-- Consumer group management (describe, list)
+- Consumer group management (describe, list, KIP-848 describe)
+- Topic partition details (paginated describe with ELR)
 - Record deletion (delete records before an offset)
 - Leader epoch queries (detect log truncation)
 - Cluster information
@@ -558,6 +559,85 @@ for group in &groups {
 ```
 
 > **Note:** `list_consumer_groups()` queries all brokers in the cluster and deduplicates results, since consumer groups are managed by their respective group coordinators.
+
+### Describing KIP-848 Consumer Groups
+
+Use `describe_consumer_groups()` for groups that use the new consumer group
+protocol (KIP-848, Kafka 4.0+). This API returns richer information than
+`describe_groups()`, including group/assignment epochs, assignor name, and
+per-member topic-UUID-based assignments:
+
+```rust
+let descriptions = admin
+    .describe_consumer_groups(vec!["my-group".to_string()])
+    .await?;
+
+for group in &descriptions {
+    println!(
+        "Group: {} (state: {}, epoch: {}, assignor: {})",
+        group.group_id, group.state, group.group_epoch, group.assignor_name
+    );
+    for member in &group.members {
+        println!(
+            "  Member: {} (client: {}, epoch: {}, type: {})",
+            member.member_id, member.client_id, member.member_epoch, member.member_type
+        );
+        println!("    Subscribed: {:?}", member.subscribed_topic_names);
+        println!("    Current assignment: {} topic(s)", member.assignment.len());
+        println!("    Target assignment:  {} topic(s)", member.target_assignment.len());
+    }
+    if let Some(error) = &group.error {
+        println!("  Error: {}", error);
+    }
+}
+```
+
+> **Note:** `describe_consumer_groups()` uses the ConsumerGroupDescribe API
+> (Key 69) and routes requests to each group's coordinator. The broker must
+> support this API (Kafka 4.0+). For classic-protocol groups, use
+> `describe_groups()` instead.
+
+## Topic Partition Details
+
+### Describing Topic Partitions
+
+Use `describe_topic_partitions()` for paginated, detailed partition information
+including ELR (eligible leader replicas) from KIP-966:
+
+```rust
+let result = admin
+    .describe_topic_partitions(vec!["my-topic".to_string()])
+    .await?;
+
+for topic in &result.topics {
+    println!(
+        "Topic: {} (internal: {}, id: {:?})",
+        topic.name.as_deref().unwrap_or("?"),
+        topic.is_internal,
+        topic.topic_id
+    );
+    for p in &topic.partitions {
+        println!(
+            "  Partition {}: leader={}, epoch={}, replicas={:?}, isr={:?}",
+            p.partition_index, p.leader_id, p.leader_epoch,
+            p.replica_nodes, p.isr_nodes
+        );
+        if let Some(elr) = &p.eligible_leader_replicas {
+            println!("    ELR: {:?}", elr);
+        }
+        if let Some(last_elr) = &p.last_known_elr {
+            println!("    Last known ELR: {:?}", last_elr);
+        }
+        if !p.offline_replicas.is_empty() {
+            println!("    Offline: {:?}", p.offline_replicas);
+        }
+    }
+}
+```
+
+> **Note:** The DescribeTopicPartitions API (Key 75) is available on Kafka 4.0+.
+> It automatically handles pagination for topics with many partitions (default
+> limit 2000 partitions per page). All pages are collected into a single result.
 
 ## Record Deletion
 

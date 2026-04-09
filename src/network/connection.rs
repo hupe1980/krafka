@@ -443,6 +443,7 @@ impl BrokerConnection {
 
         if needs_tls {
             // TLS path: upgrade stream then optionally do SASL
+            // SAFETY: needs_tls is true only when config.auth.is_some_and(requires_tls)
             let auth = config.auth.as_ref().unwrap();
             let tls_config = auth
                 .tls_config
@@ -507,6 +508,7 @@ impl BrokerConnection {
             }
         } else if needs_sasl {
             // SASL without TLS
+            // SAFETY: needs_sasl is true only when config.auth.is_some_and(requires_sasl)
             let auth = config.auth.as_ref().unwrap();
             let mut stream = stream;
             Self::perform_sasl_handshake(
@@ -610,8 +612,8 @@ impl BrokerConnection {
             );
         }
 
-        // For MSK IAM, set the broker host
-        let hostname = address.split(':').next().unwrap_or(address);
+        // For MSK IAM, set the broker host (handles IPv6 brackets like [::1]:9092)
+        let hostname = extract_sni_hostname(address)?;
         authenticator.set_msk_host(auth, hostname);
 
         let mechanism_name = authenticator.mechanism_name().to_string();
@@ -634,8 +636,7 @@ impl BrokerConnection {
         stream.flush().await.map_err(KrafkaError::Network)?;
 
         // Read handshake response
-        let response_bytes = Self::read_framed_response(stream, max_response_size).await?;
-        let mut response_buf = response_bytes.clone();
+        let mut response_buf = Self::read_framed_response(stream, max_response_size).await?;
         let _header = ResponseHeader::decode(&mut response_buf, ApiKey::SaslHandshake, 1)?;
 
         let handshake_response = SaslHandshakeResponse::decode_v0(&mut response_buf)?;
@@ -724,8 +725,7 @@ impl BrokerConnection {
     where
         S: AsyncRead + Unpin,
     {
-        let response_bytes = Self::read_framed_response(stream, max_response_size).await?;
-        let mut buf = response_bytes.clone();
+        let mut buf = Self::read_framed_response(stream, max_response_size).await?;
         let _header = ResponseHeader::decode(&mut buf, ApiKey::SaslAuthenticate, 0)?;
         SaslAuthenticateResponse::decode_v0(&mut buf)
     }

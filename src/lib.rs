@@ -37,7 +37,7 @@
 //! for i in 0..10 {
 //!     let producer = producer.clone();
 //!     tokio::spawn(async move {
-//!         producer.send("topic", None, b"message").await.ok();
+//!         let _ = producer.send("topic", None, b"message").await;
 //!     });
 //! }
 //! # Ok(())
