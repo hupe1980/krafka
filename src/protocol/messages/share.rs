@@ -1,15 +1,11 @@
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes};
 
-use super::{VersionedDecode, VersionedEncode, non_nullable_bytes, non_nullable_string};
+use super::{VersionedDecode, VersionedEncode};
 use crate::error::{ErrorCode, KrafkaError, Result};
-use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{
-    Decode, Encode, KafkaArray, KafkaBytes, KafkaString, TaggedField, TaggedFields, TryEncode,
+    Decode, Encode, KafkaBytes, KafkaString, TaggedFields, TryEncode,
 };
-use crate::protocol::{
-    array_len_i32, check_compact_array_len, check_compact_nullable_array_len,
-    check_decode_array_len, check_decode_nullable_array_len, encode_compact_array_len,
-};
+use crate::protocol::{check_compact_array_len, encode_compact_array_len};
 macro_rules! unsupported_encode {
     ($type:expr, $version:expr) => {
         Err(KrafkaError::protocol(format!(
@@ -967,7 +963,6 @@ impl VersionedDecode for ShareAcknowledgeResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::*;
     use crate::util::varint;
     use bytes::BytesMut;
 
