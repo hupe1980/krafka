@@ -54,19 +54,23 @@ use crate::protocol::{
     CreateDelegationTokenResponse, CreatePartitionsRequest, CreatePartitionsResponse,
     CreatePartitionsTopic, CreateTopicsRequest, CreateTopicsResponse, DeleteAclsRequest,
     DeleteAclsResponse, DeleteGroupsRequest, DeleteGroupsResponse, DeleteRecordsPartition,
-    DeleteRecordsRequest, DeleteRecordsResponse, DeleteRecordsTopic, DeleteTopicsRequest,
-    DeleteTopicsResponse, DescribeAclsRequest, DescribeAclsResponse, DescribeClientQuotasRequest,
-    DescribeClientQuotasResponse, DescribeClusterRequest, DescribeClusterResponse,
-    DescribeConfigsRequest, DescribeConfigsResponse, DescribeDelegationTokenOwner,
-    DescribeDelegationTokenRequest, DescribeDelegationTokenResponse, DescribeGroupsRequest,
-    DescribeGroupsResponse, DescribeTopicPartitionsCursor, DescribeTopicPartitionsRequest,
-    DescribeTopicPartitionsResponse, ExpireDelegationTokenRequest, ExpireDelegationTokenResponse,
-    FindCoordinatorRequest, FindCoordinatorResponse, IncrementalAlterConfigsRequest,
-    IncrementalAlterConfigsResponse, ListGroupsRequest, ListGroupsResponse,
-    OffsetForLeaderEpochPartition, OffsetForLeaderEpochRequest, OffsetForLeaderEpochResponse,
-    OffsetForLeaderEpochTopic, QuotaFilterComponent, RenewDelegationTokenRequest,
-    RenewDelegationTokenResponse, VersionedDecode, VersionedEncode, versions,
+    DeleteRecordsRequest, DeleteRecordsResponse, DeleteRecordsTopic, DeleteTopicState,
+    DeleteTopicsRequest, DeleteTopicsResponse, DescribeAclsRequest, DescribeAclsResponse,
+    DescribeClientQuotasRequest, DescribeClientQuotasResponse, DescribeClusterRequest,
+    DescribeClusterResponse, DescribeConfigsRequest, DescribeConfigsResponse,
+    DescribeDelegationTokenOwner, DescribeDelegationTokenRequest, DescribeDelegationTokenResponse,
+    DescribeGroupsRequest, DescribeGroupsResponse, DescribeTopicPartitionsCursor,
+    DescribeTopicPartitionsRequest, DescribeTopicPartitionsResponse, ExpireDelegationTokenRequest,
+    ExpireDelegationTokenResponse, FindCoordinatorRequest, FindCoordinatorResponse,
+    IncrementalAlterConfigsRequest, IncrementalAlterConfigsResponse, ListGroupsRequest,
+    ListGroupsResponse, OffsetForLeaderEpochPartition, OffsetForLeaderEpochRequest,
+    OffsetForLeaderEpochResponse, OffsetForLeaderEpochTopic, QuotaFilterComponent,
+    RenewDelegationTokenRequest, RenewDelegationTokenResponse, VersionedDecode, VersionedEncode,
+    versions,
 };
+
+/// Default partition limit for DescribeTopicPartitions pagination.
+const DEFAULT_RESPONSE_PARTITION_LIMIT: i32 = 2000;
 
 /// Configuration for creating a topic.
 #[non_exhaustive]
@@ -905,10 +909,20 @@ impl AdminClient {
             .get_connection_by_id(broker.id, broker.address())
             .await?;
 
-        // Build request
+        // Build request — populate both fields so the correct one is used
+        // regardless of the negotiated version (v1–v5 use topic_names, v6+ use topics).
+        let delete_topic_states: Vec<DeleteTopicState> = topics
+            .iter()
+            .map(|name| DeleteTopicState {
+                name: Some(name.clone()),
+                // Null UUID: deletion by topic name, not UUID.
+                topic_id: [0u8; 16],
+            })
+            .collect();
+        let topic_count = topics.len();
         let request = DeleteTopicsRequest {
-            topic_names: topics.clone(),
-            topics: vec![],
+            topic_names: topics,
+            topics: delete_topic_states,
             timeout_ms: crate::util::duration_to_millis_i32(timeout),
         };
 
@@ -951,7 +965,7 @@ impl AdminClient {
             })
             .collect();
 
-        info!("Deleted {} topics", topics.len());
+        info!("Deleted {} topics", topic_count);
         Ok(results)
     }
 
@@ -2781,7 +2795,7 @@ impl AdminClient {
         loop {
             let request = DescribeTopicPartitionsRequest {
                 topics: topics.clone(),
-                response_partition_limit: 2000,
+                response_partition_limit: DEFAULT_RESPONSE_PARTITION_LIMIT,
                 cursor,
             };
 
@@ -2796,7 +2810,14 @@ impl AdminClient {
 
             for t in response.topics {
                 // Find existing topic entry (pagination may split partitions across pages).
-                let existing = all_topics.iter_mut().find(|e| e.name == t.name);
+                // Use topic_id as merge key; Kafka always assigns a non-zero UUID.
+                // Fall back to name comparison if topic_id is the null UUID (defensive).
+                let null_uuid = [0u8; 16];
+                let existing = if t.topic_id != null_uuid {
+                    all_topics.iter_mut().find(|e| e.topic_id == t.topic_id)
+                } else {
+                    all_topics.iter_mut().find(|e| e.name == t.name)
+                };
                 let partitions: Vec<PartitionDescription> = t
                     .partitions
                     .into_iter()

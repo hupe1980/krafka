@@ -4,9 +4,7 @@ use super::{VersionedDecode, VersionedEncode};
 use crate::error::{ErrorCode, KrafkaError, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::check_compact_array_len;
-use crate::protocol::primitives::{
-    Decode, Encode, KafkaArray, KafkaString, TaggedFields, TryEncode,
-};
+use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 macro_rules! unsupported_encode {
     ($type:expr, $version:expr) => {
         Err(KrafkaError::protocol(format!(
@@ -106,13 +104,7 @@ impl ConsumerGroupHeartbeatRequest {
         // RebalanceTimeoutMs
         self.rebalance_timeout_ms.encode(buf);
         // SubscribedTopicNames — compact nullable array of compact strings
-        match &self.subscribed_topic_names {
-            Some(names) => {
-                let items: Vec<KafkaString> = names.iter().map(KafkaString::new).collect();
-                KafkaArray::new(items).try_encode_compact(buf)?;
-            }
-            None => KafkaArray::<KafkaString>::null().try_encode_compact(buf)?,
-        }
+        Self::encode_subscribed_topic_names(&self.subscribed_topic_names, buf)?;
         // ServerAssignor — compact nullable string
         match &self.server_assignor {
             Some(a) => KafkaString::new(a).try_encode_compact(buf)?,
@@ -149,13 +141,7 @@ impl ConsumerGroupHeartbeatRequest {
         // RebalanceTimeoutMs
         self.rebalance_timeout_ms.encode(buf);
         // SubscribedTopicNames — compact nullable array of compact strings
-        match &self.subscribed_topic_names {
-            Some(names) => {
-                let items: Vec<KafkaString> = names.iter().map(KafkaString::new).collect();
-                KafkaArray::new(items).try_encode_compact(buf)?;
-            }
-            None => KafkaArray::<KafkaString>::null().try_encode_compact(buf)?,
-        }
+        Self::encode_subscribed_topic_names(&self.subscribed_topic_names, buf)?;
         // SubscribedTopicRegex — compact nullable string (v1+ only)
         match &self.subscribed_topic_regex {
             Some(r) => KafkaString::new(r).try_encode_compact(buf)?,
@@ -173,7 +159,34 @@ impl ConsumerGroupHeartbeatRequest {
         Ok(())
     }
 
-    /// Encode the topic partitions field.
+    /// Encode `SubscribedTopicNames` as a compact nullable array of compact
+    /// strings without allocating an intermediate `Vec<KafkaString>`.
+    fn encode_subscribed_topic_names(
+        names: &Option<Vec<String>>,
+        buf: &mut impl BufMut,
+    ) -> Result<()> {
+        match names {
+            None => {
+                // null compact array: varint 0
+                crate::util::varint::encode_unsigned_varint(0, buf);
+            }
+            Some(names) => {
+                let len_plus_one = u32::try_from(names.len().saturating_add(1)).map_err(|_| {
+                    KrafkaError::protocol(format!(
+                        "subscribed topic names array length {} exceeds u32 limit",
+                        names.len()
+                    ))
+                })?;
+                crate::util::varint::encode_unsigned_varint(len_plus_one, buf);
+                for name in names {
+                    KafkaString::new(name).try_encode_compact(buf)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode the `TopicPartitions` field as a compact nullable array.
     fn encode_topic_partitions(&self, buf: &mut impl BufMut) -> Result<()> {
         match &self.topic_partitions {
             None => {
@@ -362,6 +375,7 @@ impl VersionedDecode for ConsumerGroupHeartbeatResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::primitives::KafkaArray;
     use crate::protocol::*;
 
     use bytes::BytesMut;
