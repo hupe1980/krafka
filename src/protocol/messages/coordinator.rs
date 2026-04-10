@@ -1,6 +1,6 @@
 use bytes::{Buf, BufMut};
 
-use super::{VersionedDecode, VersionedEncode};
+use super::{VersionedDecode, VersionedEncode, non_nullable_string};
 use crate::error::{ErrorCode, KrafkaError, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::check_compact_array_len;
@@ -159,8 +159,9 @@ impl FindCoordinatorResponse {
             ));
         }
 
-        // Decode first coordinator
-        let _key = KafkaString::decode_compact(buf)?.0;
+        // Decode first coordinator — key is validated for wire-format correctness
+        // but not returned (the caller already knows which key it requested).
+        let _key = non_nullable_string("coordinator key", KafkaString::decode_compact(buf)?.0)?;
         let node_id = i32::decode(buf)?;
         let host = KafkaString::decode_compact(buf)?.0.ok_or_else(|| {
             KrafkaError::protocol("FindCoordinator host must be a non-null compact string")

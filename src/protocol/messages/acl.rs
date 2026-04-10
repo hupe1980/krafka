@@ -1026,26 +1026,20 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.put_i32(0); // throttle_time_ms
         buf.put_i16(0); // error_code
-        buf.put_u8(1); // error_message: compact null (0+1=1 → 0 bytes, but 1 means len 0 compact string)
-        // Actually compact nullable string null = varint(0), non-null = varint(len+1) + bytes
-        // null = 0
-        let mut buf = BytesMut::new();
-        buf.put_i32(0); // throttle_time_ms
-        buf.put_i16(0); // error_code
-        buf.put_u8(0); // error_message: compact null
+        buf.put_u8(0); // error_message: compact nullable string null = varint(0)
         buf.put_u8(2); // resources: compact array count = 1+1 = 2
         // resource 0
         buf.put_i8(2); // resource_type = TOPIC
         buf.put_u8(6); // resource_name: compact string len=5+1=6
         buf.put_slice(b"test1");
-        buf.put_i8(3); // pattern_type = LITERAL
+        buf.put_i8(2); // pattern_type = LITERAL
         buf.put_u8(2); // acls: compact array count = 1+1 = 2
         // acl 0
         buf.put_u8(6); // principal: compact string len=5+1=6
         buf.put_slice(b"User:");
         buf.put_u8(2); // host: compact string len=1+1=2
         buf.put_slice(b"*");
-        buf.put_i8(2); // operation = WRITE
+        buf.put_i8(4); // operation = WRITE (4, not 2 which is ALL)
         buf.put_i8(3); // permission_type = ALLOW
         buf.put_u8(0); // per-acl tagged fields
         buf.put_u8(0); // per-resource tagged fields
@@ -1055,9 +1049,16 @@ mod tests {
         let resp = DescribeAclsResponse::decode_v2(&mut frozen).unwrap();
         assert!(resp.error_code.is_ok());
         assert_eq!(resp.resources.len(), 1);
-        assert_eq!(resp.resources[0].resource_name, "test1");
-        assert_eq!(resp.resources[0].acls.len(), 1);
-        assert_eq!(resp.resources[0].acls[0].principal, "User:");
+        let resource = &resp.resources[0];
+        assert_eq!(resource.resource_type, AclResourceType::Topic);
+        assert_eq!(resource.resource_name, "test1");
+        assert_eq!(resource.pattern_type, AclPatternType::Literal);
+        assert_eq!(resource.acls.len(), 1);
+        let acl = &resource.acls[0];
+        assert_eq!(acl.principal, "User:");
+        assert_eq!(acl.host, "*");
+        assert_eq!(acl.operation, AclOperation::Write);
+        assert_eq!(acl.permission_type, AclPermissionType::Allow);
     }
 
     #[test]

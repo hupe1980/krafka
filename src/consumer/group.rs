@@ -31,9 +31,9 @@ use crate::protocol::{
     VersionedDecode, VersionedEncode,
     versions::{
         CONSUMER_GROUP_HEARTBEAT_MAX, CONSUMER_GROUP_HEARTBEAT_MIN, FIND_COORDINATOR_MAX,
-        FIND_COORDINATOR_MIN, HEARTBEAT_MAX, JOIN_GROUP_MAX, JOIN_GROUP_MIN, LEAVE_GROUP_MAX,
-        OFFSET_COMMIT_MAX, OFFSET_COMMIT_MIN, OFFSET_FETCH_MAX, OFFSET_FETCH_MIN, SYNC_GROUP_MAX,
-        SYNC_GROUP_MIN,
+        FIND_COORDINATOR_MIN, HEARTBEAT_MAX, HEARTBEAT_MIN, JOIN_GROUP_MAX, JOIN_GROUP_MIN,
+        LEAVE_GROUP_MAX, LEAVE_GROUP_MIN, OFFSET_COMMIT_MAX, OFFSET_COMMIT_MIN, OFFSET_FETCH_MAX,
+        OFFSET_FETCH_MIN, SYNC_GROUP_MAX, SYNC_GROUP_MIN,
     },
 };
 
@@ -1633,8 +1633,15 @@ impl GroupCoordinator {
                                 group_instance_id: group_instance_id.clone(),
                             };
 
-                            // Always use v3+ (MIN=3, KIP-345 static membership).
-                            let hb_version = HEARTBEAT_MAX;
+                            // Negotiate heartbeat version with broker (MIN=3, KIP-345 static membership).
+                            let hb_version = conn
+                                .negotiate_api_version(
+                                    ApiKey::Heartbeat,
+                                    HEARTBEAT_MAX,
+                                    HEARTBEAT_MIN,
+                                )
+                                .await
+                                .unwrap_or(HEARTBEAT_MIN);
                             let send_result = conn
                                 .send_request(ApiKey::Heartbeat, hb_version, |buf| {
                                     request.encode_versioned(hb_version, buf)
@@ -2821,8 +2828,11 @@ impl GroupCoordinator {
         );
 
         // Send leave group request (don't wait too long)
-        // Always use v3+ (MIN=3, KIP-345 batch leave).
-        let lg_version = LEAVE_GROUP_MAX;
+        // Negotiate version with broker (MIN=3, KIP-345 batch leave).
+        let lg_version = conn
+            .negotiate_api_version(ApiKey::LeaveGroup, LEAVE_GROUP_MAX, LEAVE_GROUP_MIN)
+            .await
+            .unwrap_or(LEAVE_GROUP_MIN);
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             conn.send_request(ApiKey::LeaveGroup, lg_version, |buf| {

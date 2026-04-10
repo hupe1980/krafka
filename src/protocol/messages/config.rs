@@ -541,13 +541,15 @@ pub enum AlterConfigOp {
 
 impl AlterConfigOp {
     /// Convert from raw i8 value.
-    pub fn from_i8(v: i8) -> Self {
+    ///
+    /// Returns `None` for unrecognized operation codes.
+    pub fn from_i8(v: i8) -> Option<Self> {
         match v {
-            0 => Self::Set,
-            1 => Self::Delete,
-            2 => Self::Append,
-            3 => Self::Subtract,
-            _ => Self::Set,
+            0 => Some(Self::Set),
+            1 => Some(Self::Delete),
+            2 => Some(Self::Append),
+            3 => Some(Self::Subtract),
+            _ => None,
         }
     }
 

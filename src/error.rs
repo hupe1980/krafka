@@ -363,7 +363,7 @@ pub enum ErrorCode {
     DuplicateResource = 92,
     /// Requested credential would not meet criteria for acceptability.
     UnacceptableCredential = 93,
-    /// The either the sender or recipient of a voter-only request is not one of the expected voters.
+    /// Either the sender or recipient of a voter-only request is not one of the expected voters.
     InconsistentVoterSet = 94,
     /// The given update version was invalid.
     InvalidUpdateVersion = 95,

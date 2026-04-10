@@ -7,6 +7,9 @@ use bytes::{Buf, BufMut};
 use super::primitives::{Decode, Encode, KafkaArray, KafkaString, TaggedFields, TryEncode};
 use crate::error::Result;
 
+/// Maximum number of supported features we'll accept from a broker.
+const MAX_SUPPORTED_FEATURES: usize = 256;
+
 /// Kafka API keys.
 ///
 /// Each API key corresponds to a specific request/response pair in the Kafka protocol.
@@ -761,12 +764,17 @@ impl ApiVersionsResponse {
             return Ok(Vec::new());
         };
         let mut buf = &field.data[..];
-        let count = crate::util::varint::decode_unsigned_varint(&mut buf)? as usize;
-        if count == 0 {
+        let raw_count = crate::util::varint::decode_unsigned_varint(&mut buf)? as usize;
+        if raw_count == 0 {
             return Ok(Vec::new());
         }
         // compact array length is count + 1; actual items = count - 1
-        let items = count.saturating_sub(1);
+        let items = raw_count.saturating_sub(1);
+        if items > MAX_SUPPORTED_FEATURES {
+            return Err(crate::error::KrafkaError::protocol(format!(
+                "SupportedFeatures array too large: {items}"
+            )));
+        }
         let mut features = Vec::with_capacity(items);
         for _ in 0..items {
             let name = super::non_nullable_string(
@@ -782,6 +790,12 @@ impl ApiVersionsResponse {
                 min_version,
                 max_version,
             });
+        }
+        if buf.has_remaining() {
+            return Err(crate::error::KrafkaError::protocol(format!(
+                "SupportedFeatures: {} trailing bytes after parsing {items} entries",
+                buf.remaining()
+            )));
         }
         Ok(features)
     }
@@ -918,7 +932,7 @@ mod tests {
         let request = ApiVersionsRequest::new().with_client_software("krafka", "0.4.0");
         let mut buf = BytesMut::new();
         request.encode_v3(&mut buf).unwrap();
-        // v4 is the same wire format as v3; encoding should produce identical bytes
+        // v3 and v4 share the same wire format; a second encode must produce identical bytes
         let mut buf2 = BytesMut::new();
         request.encode_v3(&mut buf2).unwrap();
         assert_eq!(buf, buf2);
