@@ -929,7 +929,8 @@ mod tests {
 
     #[test]
     fn test_api_versions_request_v3_round_trip() {
-        let request = ApiVersionsRequest::new().with_client_software("krafka", "0.4.0");
+        let request =
+            ApiVersionsRequest::new().with_client_software("krafka", env!("CARGO_PKG_VERSION"));
         let mut buf = BytesMut::new();
         request.encode_v3(&mut buf).unwrap();
         // v3 and v4 share the same wire format; a second encode must produce identical bytes

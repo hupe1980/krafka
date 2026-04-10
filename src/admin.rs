@@ -992,13 +992,13 @@ impl AdminClient {
 
         let response_bytes = conn
             .send_request(ApiKey::CreatePartitions, version, |buf| {
-                request.encode_v0(buf)
+                request.encode_versioned(version, buf)
             })
             .await?;
 
         // Decode response
         let mut buf = response_bytes;
-        let response = CreatePartitionsResponse::decode_v0(&mut buf)?;
+        let response = CreatePartitionsResponse::decode_versioned(version, &mut buf)?;
 
         let result = response
             .results
@@ -1841,11 +1841,13 @@ impl AdminClient {
                 })?;
 
             let response_bytes = conn
-                .send_request(ApiKey::DeleteRecords, version, |buf| request.encode_v0(buf))
+                .send_request(ApiKey::DeleteRecords, version, |buf| {
+                    request.encode_versioned(version, buf)
+                })
                 .await?;
 
             let mut buf = response_bytes;
-            let response = DeleteRecordsResponse::decode_v0(&mut buf)?;
+            let response = DeleteRecordsResponse::decode_versioned(version, &mut buf)?;
 
             for topic in response.topics {
                 let topic_name = topic.name;
@@ -2670,16 +2672,12 @@ impl AdminClient {
 
             let response_bytes = conn
                 .send_request(ApiKey::ConsumerGroupDescribe, version, |buf| {
-                    request.encode_v0(buf)
+                    request.encode_versioned(version, buf)
                 })
                 .await?;
 
             let mut buf = response_bytes;
-            let response = if version >= 1 {
-                ConsumerGroupDescribeResponse::decode_v1(&mut buf)?
-            } else {
-                ConsumerGroupDescribeResponse::decode_v0(&mut buf)?
-            };
+            let response = ConsumerGroupDescribeResponse::decode_versioned(version, &mut buf)?;
 
             for g in response.groups {
                 all_results.push(Kip848GroupDescription {
@@ -2789,12 +2787,12 @@ impl AdminClient {
 
             let response_bytes = conn
                 .send_request(ApiKey::DescribeTopicPartitions, version, |buf| {
-                    request.encode_v0(buf)
+                    request.encode_versioned(version, buf)
                 })
                 .await?;
 
             let mut buf = response_bytes;
-            let response = DescribeTopicPartitionsResponse::decode_v0(&mut buf)?;
+            let response = DescribeTopicPartitionsResponse::decode_versioned(version, &mut buf)?;
 
             for t in response.topics {
                 // Find existing topic entry (pagination may split partitions across pages).

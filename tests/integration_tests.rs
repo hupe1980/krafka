@@ -150,25 +150,44 @@ impl Image for ApacheKafka {
 /// Uses the `apache/kafka-native` image. The image tag is read from the
 /// `KAFKA_VERSION` environment variable (set by CI matrix); defaults to
 /// `3.9.0` for local development.
+///
+/// The GraalVM native image occasionally segfaults during startup
+/// (`Pwd.getpwuid` in class initialization), so we retry up to 3 times.
 async fn kafka_container() -> (ContainerAsync<ApacheKafka>, String) {
     let tag = std::env::var("KAFKA_VERSION").unwrap_or_else(|_| "3.9.0".to_string());
 
-    let container = ApacheKafka::new(&tag)
-        .start()
-        .await
-        .expect("Failed to start Kafka container");
+    let max_attempts = 3;
+    let mut last_err = None;
 
-    // Wait for Kafka to be fully ready
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    for attempt in 1..=max_attempts {
+        match ApacheKafka::new(&tag).start().await {
+            Ok(container) => {
+                // Wait for Kafka to be fully ready
+                tokio::time::sleep(Duration::from_secs(10)).await;
 
-    let host_port = container
-        .get_host_port_ipv4(KAFKA_PORT)
-        .await
-        .expect("Failed to get host port");
+                let host_port = container
+                    .get_host_port_ipv4(KAFKA_PORT)
+                    .await
+                    .expect("Failed to get host port");
 
-    let bootstrap_servers = format!("127.0.0.1:{}", host_port);
+                let bootstrap_servers = format!("127.0.0.1:{}", host_port);
+                return (container, bootstrap_servers);
+            }
+            Err(e) => {
+                eprintln!("Kafka container start attempt {attempt}/{max_attempts} failed: {e}");
+                last_err = Some(e);
+                if attempt < max_attempts {
+                    let backoff = Duration::from_secs(2u64.pow(attempt as u32));
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+    }
 
-    (container, bootstrap_servers)
+    panic!(
+        "Failed to start Kafka container after {max_attempts} attempts: {}",
+        last_err.unwrap()
+    );
 }
 
 /// Helper to subscribe with retry for coordinator availability.
@@ -2011,7 +2030,7 @@ async fn test_producer_flush() {
     }
 
     // Give the accumulator time to receive all records
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Explicit flush should ensure all messages are sent
     producer.flush().await.expect("flush failed");
@@ -2123,12 +2142,15 @@ async fn test_consumer_close_leaves_group() {
         .await
         .expect("describe_groups failed");
 
-    if !descriptions.is_empty() {
-        assert!(
-            descriptions[0].members.is_empty(),
-            "After close(), group should have no active members"
-        );
-    }
+    assert!(
+        !descriptions.is_empty(),
+        "describe_groups should return the group even after close"
+    );
+    assert!(
+        descriptions[0].members.is_empty(),
+        "After close(), group should have no active members, got {} member(s)",
+        descriptions[0].members.len()
+    );
 }
 
 /// Test empty value messages roundtrip correctly.

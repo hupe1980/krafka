@@ -1302,11 +1302,17 @@ impl GroupCoordinator {
 
         *self.state.write().await = GroupState::Joining;
 
-        // Negotiate JoinGroup version — v4+ required (KIP-345 static membership).
+        // Negotiate JoinGroup version. Static membership (group_instance_id)
+        // requires v5+ where the GroupInstanceId field is available.
+        let join_group_min = if self.group_instance_id.is_some() {
+            5
+        } else {
+            JOIN_GROUP_MIN
+        };
         let jg_version = conn
-            .negotiate_api_version(ApiKey::JoinGroup, JOIN_GROUP_MAX, JOIN_GROUP_MIN)
+            .negotiate_api_version(ApiKey::JoinGroup, JOIN_GROUP_MAX, join_group_min)
             .await
-            .unwrap_or(JOIN_GROUP_MIN);
+            .unwrap_or(join_group_min);
 
         let response = conn
             .send_request(ApiKey::JoinGroup, jg_version, |buf| {
