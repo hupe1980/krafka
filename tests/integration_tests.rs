@@ -10,32 +10,159 @@
 //! Note: These tests are ignored by default as they require Docker.
 //! Enable with: `cargo test --test integration_tests -- --ignored`
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::time::Duration;
 
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
-use testcontainers_modules::kafka::Kafka;
+use testcontainers::core::{ContainerPort, ContainerState, ExecCommand, WaitFor};
+use testcontainers::{ContainerAsync, Image, runners::AsyncRunner};
+
+// ---------------------------------------------------------------------------
+// Custom Kafka image – works with `apache/kafka-native` 3.8 – 4.x
+// ---------------------------------------------------------------------------
+
+const KAFKA_PORT: ContainerPort = ContainerPort::Tcp(9092);
+const START_SCRIPT: &str = "/tmp/testcontainers_start.sh";
+
+/// Minimal [`Image`] for `apache/kafka-native` that follows the same
+/// start-script pattern as Java testcontainers.
+///
+/// 1. The container command loops until `START_SCRIPT` exists.
+/// 2. `exec_after_start` writes that script — after the host port is known —
+///    exporting `KAFKA_ADVERTISED_LISTENERS` and calling `/etc/kafka/docker/run`.
+/// 3. Wait condition: "Kafka Server started" appears in container logs.
+#[derive(Debug, Clone)]
+struct ApacheKafka {
+    tag: String,
+    env_vars: HashMap<String, String>,
+}
+
+impl ApacheKafka {
+    fn new(tag: impl Into<String>) -> Self {
+        let tag = tag.into();
+        let mut env_vars = HashMap::new();
+
+        env_vars.insert("CLUSTER_ID".into(), "5L6g3nShT-eMCtK--X86sw".into());
+        env_vars.insert("KAFKA_NODE_ID".into(), "1".into());
+        env_vars.insert("KAFKA_PROCESS_ROLES".into(), "broker,controller".into());
+        env_vars.insert(
+            "KAFKA_LISTENERS".into(),
+            format!(
+                "PLAINTEXT://0.0.0.0:{},BROKER://0.0.0.0:9093,CONTROLLER://0.0.0.0:9094",
+                KAFKA_PORT.as_u16()
+            ),
+        );
+        env_vars.insert(
+            "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP".into(),
+            "BROKER:PLAINTEXT,PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT".into(),
+        );
+        env_vars.insert("KAFKA_INTER_BROKER_LISTENER_NAME".into(), "BROKER".into());
+        env_vars.insert(
+            "KAFKA_CONTROLLER_LISTENER_NAMES".into(),
+            "CONTROLLER".into(),
+        );
+        env_vars.insert(
+            "KAFKA_CONTROLLER_QUORUM_VOTERS".into(),
+            "1@localhost:9094".into(),
+        );
+        env_vars.insert("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR".into(), "1".into());
+        env_vars.insert("KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS".into(), "1".into());
+        env_vars.insert(
+            "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR".into(),
+            "1".into(),
+        );
+        env_vars.insert("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR".into(), "1".into());
+        env_vars.insert("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS".into(), "0".into());
+        env_vars.insert(
+            "KAFKA_LOG_FLUSH_INTERVAL_MESSAGES".into(),
+            i64::MAX.to_string(),
+        );
+
+        Self { tag, env_vars }
+    }
+}
+
+impl Image for ApacheKafka {
+    fn name(&self) -> &str {
+        "apache/kafka-native"
+    }
+
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    fn ready_conditions(&self) -> Vec<WaitFor> {
+        // The entrypoint waits for START_SCRIPT; readiness is checked
+        // via `exec_after_start` container-level conditions instead.
+        vec![]
+    }
+
+    fn entrypoint(&self) -> Option<&str> {
+        Some("bash")
+    }
+
+    fn cmd(&self) -> impl IntoIterator<Item = impl Into<Cow<'_, str>>> {
+        vec![
+            "-c".to_string(),
+            format!(
+                "while [ ! -f {START_SCRIPT} ]; do sleep 0.1; done; \
+                 chmod 755 {START_SCRIPT} && {START_SCRIPT}"
+            ),
+        ]
+    }
+
+    fn env_vars(
+        &self,
+    ) -> impl IntoIterator<Item = (impl Into<Cow<'_, str>>, impl Into<Cow<'_, str>>)> {
+        &self.env_vars
+    }
+
+    fn expose_ports(&self) -> &[ContainerPort] {
+        &[KAFKA_PORT]
+    }
+
+    fn exec_after_start(
+        &self,
+        cs: ContainerState,
+    ) -> Result<Vec<ExecCommand>, testcontainers::TestcontainersError> {
+        let host_port = cs.host_port_ipv4(KAFKA_PORT)?;
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             export KAFKA_ADVERTISED_LISTENERS=\
+             PLAINTEXT://127.0.0.1:{host_port},BROKER://localhost:9093,CONTROLLER://localhost:9094\n\
+             /etc/kafka/docker/run\n"
+        );
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("echo '{script}' > {START_SCRIPT}"),
+        ];
+        // Both older (3.8) and newer (3.9+/4.x) images eventually log this.
+        let ready = vec![WaitFor::message_on_stdout("Kafka Server started")];
+        Ok(vec![
+            ExecCommand::new(cmd).with_container_ready_conditions(ready),
+        ])
+    }
+}
 
 /// Helper to get a Kafka container.
-async fn kafka_container() -> (ContainerAsync<Kafka>, String) {
-    let container = Kafka::default()
-        .with_tag("7.5.0")
-        // Enable transactions and offsets for single-broker setup
-        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
-        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
-        .with_env_var("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1")
-        .with_env_var("KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS", "1")
-        // Group coordinator settings for single-broker
-        .with_env_var("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0")
+///
+/// Uses the `apache/kafka-native` image. The image tag is read from the
+/// `KAFKA_VERSION` environment variable (set by CI matrix); defaults to
+/// `3.9.0` for local development.
+async fn kafka_container() -> (ContainerAsync<ApacheKafka>, String) {
+    let tag = std::env::var("KAFKA_VERSION").unwrap_or_else(|_| "3.9.0".to_string());
+
+    let container = ApacheKafka::new(&tag)
         .start()
         .await
         .expect("Failed to start Kafka container");
 
-    // Wait for Kafka to be fully ready (broker startup can take time)
-    // Increased from 15s to 20s for group coordinator initialization
-    tokio::time::sleep(Duration::from_secs(20)).await;
+    // Wait for Kafka to be fully ready
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     let host_port = container
-        .get_host_port_ipv4(9093)
+        .get_host_port_ipv4(KAFKA_PORT)
         .await
         .expect("Failed to get host port");
 
@@ -245,7 +372,7 @@ async fn test_compression_roundtrip() {
         Compression::Gzip,
         Compression::Snappy,
         Compression::Lz4,
-        Compression::Zstd,
+        // Zstd is not supported by the apache/kafka-native GraalVM image.
     ] {
         let topic = format!("compression-test-{:?}", compression).to_lowercase();
         create_topic(&bootstrap_servers, &topic, 1).await;
@@ -1854,28 +1981,46 @@ async fn test_consumer_recv() {
 async fn test_producer_flush() {
     use krafka::consumer::{AutoOffsetReset, Consumer};
     use krafka::producer::Producer;
+    use std::sync::Arc;
 
     let (_container, bootstrap_servers) = kafka_container().await;
 
     let topic = "flush-test-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .linger(Duration::from_secs(30)) // Long linger to accumulate
-        .build()
-        .await
-        .unwrap();
-
-    for i in 0..5 {
-        let _ = producer
-            .send(topic, None, format!("flush-{}", i).as_bytes())
+    let producer = Arc::new(
+        Producer::builder()
+            .bootstrap_servers(&bootstrap_servers)
+            .linger(Duration::from_secs(30)) // Long linger to accumulate
+            .build()
             .await
-            .unwrap();
+            .unwrap(),
+    );
+
+    // Spawn sends in background — they block until the batch is flushed
+    let mut handles = Vec::new();
+    for i in 0..5 {
+        let p = Arc::clone(&producer);
+        let t = topic.to_string();
+        handles.push(tokio::spawn(async move {
+            let _ = p
+                .send(&t, None, format!("flush-{}", i).as_bytes())
+                .await
+                .unwrap();
+        }));
     }
+
+    // Give the accumulator time to receive all records
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Explicit flush should ensure all messages are sent
     producer.flush().await.expect("flush failed");
+
+    // All spawned sends should now complete
+    for h in handles {
+        h.await.unwrap();
+    }
+
     producer.close().await;
 
     let consumer = Consumer::builder()

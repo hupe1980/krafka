@@ -81,6 +81,8 @@ jobs:
           done
       - run: cargo test --test integration_tests -- --ignored --test-threads=1
         timeout-minutes: 45
+        env:
+          KAFKA_VERSION: ${{ matrix.kafka-version }}
 
   msrv:
     name: MSRV (1.88)

@@ -59,14 +59,20 @@ impl RequestHeader {
     }
 
     /// Encode the header for header version 2 (flexible).
+    ///
+    /// Per the Kafka protocol spec, `ClientId` has `flexibleVersions: "none"`:
+    /// it is always serialized with the old-style two-byte length prefix, even
+    /// in header v2, so that older brokers can still parse ApiVersionsRequest
+    /// headers from newer clients.
     #[inline]
     pub fn encode_v2(&self, buf: &mut impl BufMut) -> Result<()> {
         self.api_key.encode(buf);
         self.api_version.encode(buf);
         self.correlation_id.encode(buf);
+        // ClientId uses standard (non-compact) encoding — see doc comment.
         match &self.client_id {
-            Some(client_id) => client_id.try_encode_compact(buf)?,
-            None => KafkaString::null().try_encode_compact(buf)?,
+            Some(client_id) => client_id.try_encode(buf)?,
+            None => KafkaString::null().try_encode(buf)?,
         }
         TaggedFields::default().try_encode(buf)?;
         Ok(())

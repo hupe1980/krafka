@@ -32,8 +32,8 @@ use crate::protocol::{
     versions::{
         CONSUMER_GROUP_HEARTBEAT_MAX, CONSUMER_GROUP_HEARTBEAT_MIN, FIND_COORDINATOR_MAX,
         FIND_COORDINATOR_MIN, HEARTBEAT_MAX, HEARTBEAT_MIN, JOIN_GROUP_MAX, JOIN_GROUP_MIN,
-        LEAVE_GROUP_MAX, LEAVE_GROUP_MIN, OFFSET_COMMIT_MAX, OFFSET_COMMIT_MIN, OFFSET_FETCH_MAX,
-        OFFSET_FETCH_MIN, SYNC_GROUP_MAX, SYNC_GROUP_MIN,
+        LEAVE_GROUP_MAX, LEAVE_GROUP_MIN, LIST_OFFSETS_MAX, LIST_OFFSETS_MIN, OFFSET_COMMIT_MAX,
+        OFFSET_COMMIT_MIN, OFFSET_FETCH_MAX, OFFSET_FETCH_MIN, SYNC_GROUP_MAX, SYNC_GROUP_MIN,
     },
 };
 
@@ -1315,7 +1315,35 @@ impl GroupCoordinator {
             .await?;
 
         let mut buf = response;
-        let join_response = JoinGroupResponse::decode_versioned(jg_version, &mut buf)?;
+        let mut join_response = JoinGroupResponse::decode_versioned(jg_version, &mut buf)?;
+
+        // KIP-394 (v4+): broker returns MemberIdRequired with a newly
+        // assigned member_id.  Save the id and retry the JoinGroup request
+        // exactly once, which is the expected two-step join handshake.
+        if join_response.error_code == ErrorCode::MemberIdRequired {
+            debug!(
+                "Received MemberIdRequired for group '{}', retrying with assigned member_id '{}'",
+                self.group_id, join_response.member_id
+            );
+
+            // Persist the broker-assigned member_id.
+            *self.member_id.write().await = join_response.member_id.clone();
+
+            // Rebuild the request with the assigned member_id.
+            let retry_request = JoinGroupRequest {
+                member_id: join_response.member_id.clone(),
+                ..request.clone()
+            };
+
+            let retry_response = conn
+                .send_request(ApiKey::JoinGroup, jg_version, |buf| {
+                    retry_request.encode_versioned(jg_version, buf)
+                })
+                .await?;
+
+            let mut retry_buf = retry_response;
+            join_response = JoinGroupResponse::decode_versioned(jg_version, &mut retry_buf)?;
+        }
 
         if !join_response.error_code.is_ok() {
             // Reset member identity on session-invalidating errors so the
@@ -2368,8 +2396,11 @@ impl GroupCoordinator {
             group_instance_id: self.group_instance_id.clone(),
         };
 
-        // Always use v3+ (MIN=3, KIP-345 static membership).
-        let hb_version = HEARTBEAT_MAX;
+        // Negotiate heartbeat version with broker (MIN=3, KIP-345 static membership).
+        let hb_version = conn
+            .negotiate_api_version(ApiKey::Heartbeat, HEARTBEAT_MAX, HEARTBEAT_MIN)
+            .await
+            .unwrap_or(HEARTBEAT_MIN);
         let response = conn
             .send_request(ApiKey::Heartbeat, hb_version, |buf| {
                 request.encode_versioned(hb_version, buf)
@@ -2751,12 +2782,18 @@ impl GroupCoordinator {
             // Get connection to this leader directly by ID
             let conn = self.metadata.get_broker_connection(*leader_id).await?;
 
+            let lo_version = conn
+                .negotiate_api_version(ApiKey::ListOffsets, LIST_OFFSETS_MAX, LIST_OFFSETS_MIN)
+                .await
+                .unwrap_or(LIST_OFFSETS_MIN);
             let response = conn
-                .send_request(ApiKey::ListOffsets, 2, |buf| request.encode_v2(buf))
+                .send_request(ApiKey::ListOffsets, lo_version, |buf| {
+                    request.encode_versioned(lo_version, buf)
+                })
                 .await?;
 
             let mut buf = response;
-            let list_response = ListOffsetsResponse::decode_v2(&mut buf)?;
+            let list_response = ListOffsetsResponse::decode_versioned(lo_version, &mut buf)?;
 
             for topic_resp in &list_response.topics {
                 for part_resp in &topic_resp.partitions {
@@ -2811,15 +2848,11 @@ impl GroupCoordinator {
         let request = LeaveGroupRequest {
             group_id: self.group_id.clone(),
             member_id: member_id.clone(),
-            members: if self.group_instance_id.is_some() {
-                vec![LeaveGroupMember {
-                    member_id: member_id.clone(),
-                    group_instance_id: self.group_instance_id.clone(),
-                    reason: None,
-                }]
-            } else {
-                vec![]
-            },
+            members: vec![LeaveGroupMember {
+                member_id: member_id.clone(),
+                group_instance_id: self.group_instance_id.clone(),
+                reason: None,
+            }],
         };
 
         debug!(

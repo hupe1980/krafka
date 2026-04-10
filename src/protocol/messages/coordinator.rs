@@ -76,8 +76,9 @@ impl FindCoordinatorRequest {
     /// v5 (KIP-890) and v6 (KIP-932) share the same wire format.
     pub fn encode_v4(&self, buf: &mut impl BufMut) -> Result<()> {
         self.key_type.encode(buf);
-        // CoordinatorKeys: compact array with 1 element (varint len+1 = 2)
-        crate::util::varint::encode_unsigned_varint(2, buf);
+        // CoordinatorKeys: compact array — varint encodes count + 1.
+        let key_count: u32 = 1;
+        crate::util::varint::encode_unsigned_varint(key_count + 1, buf);
         KafkaString::new(&self.key).try_encode_compact(buf)?;
         TaggedFields::default().try_encode(buf)?;
         Ok(())

@@ -283,9 +283,11 @@ impl ConsumerGroupHeartbeatResponse {
 
     /// Decode the assignment field.
     ///
-    /// Non-tagged nullable structs in flexible versions use a single byte
-    /// as presence marker: `(byte) -1` (`0xff`) means null, `(byte) 1` means
-    /// the struct fields follow.
+    /// Non-tagged nullable structs in flexible versions use a single signed
+    /// byte as presence marker: a negative value (broker writes `-1`) means
+    /// null, `1` means the struct fields follow.  This matches the Kafka
+    /// generator's reader:
+    /// `if (_readable.readByte() < 0) { … null … } else { … read struct … }`.
     fn decode_assignment(buf: &mut impl Buf) -> Result<Option<ConsumerGroupAssignment>> {
         if buf.remaining() < 1 {
             return Err(KrafkaError::protocol(
@@ -293,12 +295,12 @@ impl ConsumerGroupHeartbeatResponse {
             ));
         }
         let presence = buf.get_i8();
-        if presence == -1 {
+        if presence < 0 {
             return Ok(None);
         }
         if presence != 1 {
             return Err(KrafkaError::protocol(format!(
-                "invalid assignment presence tag: expected -1 for null or 1 for present, got {presence}"
+                "invalid assignment presence tag: expected negative for null or 1 for present, got {presence}"
             )));
         }
 
@@ -716,7 +718,7 @@ mod tests {
         buf.put_i32(1);
         // heartbeat_interval_ms
         buf.put_i32(3000);
-        // assignment — invalid presence byte (0 instead of -1 or 1)
+        // assignment — invalid presence byte (0 is non-negative but != 1)
         buf.put_i8(0);
         // top-level tagged fields
         put_tagged_fields(&mut buf);

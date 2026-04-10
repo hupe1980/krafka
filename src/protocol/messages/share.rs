@@ -133,12 +133,12 @@ impl ShareGroupHeartbeatResponse {
             ));
         }
         let presence = buf.get_i8();
-        if presence == -1 {
+        if presence < 0 {
             return Ok(None);
         }
         if presence != 1 {
             return Err(KrafkaError::protocol(format!(
-                "invalid assignment presence tag: expected -1 for null or 1 for present, got {presence}"
+                "invalid assignment presence tag: expected negative for null or 1 for present, got {presence}"
             )));
         }
 

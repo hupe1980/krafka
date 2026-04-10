@@ -221,72 +221,92 @@ pub mod versions {
     // ── Produce (API key 0) ──────────────────────────────────────────────
     /// Minimum supported Produce version. Kafka 4.0 removed v0–v2.
     pub const PRODUCE_MIN: i16 = 3;
-    /// Maximum supported Produce version (v13 topic ID replaces name, KIP-516).
-    pub const PRODUCE_MAX: i16 = 13;
+    /// Maximum supported Produce version (v3 for transactions).
+    ///
+    /// Encode/decode for v9-v13 (flexible) exists but is not yet activated
+    /// — the flexible paths need integration testing against a real broker.
+    pub const PRODUCE_MAX: i16 = 3;
 
     // ── Fetch (API key 1) ────────────────────────────────────────────────
     /// Minimum supported Fetch version. Kafka 4.0 removed v0–v3.
     pub const FETCH_MIN: i16 = 4;
-    /// Maximum supported Fetch version (v16 KIP-951 NodeEndpoints).
-    #[cfg(not(feature = "unstable-protocol"))]
-    pub const FETCH_MAX: i16 = 16;
-    /// Maximum supported Fetch version (v18 KIP-1166 HighWatermark).
-    #[cfg(feature = "unstable-protocol")]
-    pub const FETCH_MAX: i16 = 18;
+    /// Maximum supported Fetch version (v11 closest-replica fetching, KIP-392).
+    ///
+    /// Encode/decode for v12+ (flexible) exists but is not yet activated
+    /// — needs integration testing against a real broker.
+    pub const FETCH_MAX: i16 = 11;
 
     // ── ListOffsets (API key 2) ──────────────────────────────────────────
     /// Minimum supported ListOffsets version. Kafka 4.0 removed v0.
     pub const LIST_OFFSETS_MIN: i16 = 1;
-    /// Maximum supported ListOffsets version.
-    pub const LIST_OFFSETS_MAX: i16 = 11;
+    /// Maximum supported ListOffsets version (v2 isolation level).
+    ///
+    /// Encode/decode for v4+ exists but is not yet activated
+    /// — needs integration testing against a real broker.
+    pub const LIST_OFFSETS_MAX: i16 = 2;
 
     // ── Metadata (API key 3) ─────────────────────────────────────────────
     /// Minimum supported Metadata version. v0 lacks essential fields.
     pub const METADATA_MIN: i16 = 1;
-    /// Maximum supported Metadata version (v13 topic UUIDs + error code).
-    pub const METADATA_MAX: i16 = 13;
+    /// Maximum supported Metadata version (v8 KRaft-aware metadata).
+    ///
+    /// Encode/decode for v9-v13 (flexible, topic UUIDs) exists but is not
+    /// yet activated — the flexible paths need integration testing.
+    pub const METADATA_MAX: i16 = 8;
 
     // ── OffsetCommit (API key 8) ─────────────────────────────────────────
     /// Minimum supported OffsetCommit version. Kafka 4.0 removed v0–v1.
     pub const OFFSET_COMMIT_MIN: i16 = 2;
-    /// Maximum supported OffsetCommit version (v10 topic ID replaces name, KIP-848).
-    pub const OFFSET_COMMIT_MAX: i16 = 10;
+    /// Maximum supported OffsetCommit version (v2 for retention).
+    ///
+    /// Encode/decode for v3-v10 exists but is not yet activated
+    /// — needs integration testing.
+    pub const OFFSET_COMMIT_MAX: i16 = 2;
 
     // ── OffsetFetch (API key 9) ──────────────────────────────────────────
     /// Minimum supported OffsetFetch version. Kafka 4.0 removed v0.
     pub const OFFSET_FETCH_MIN: i16 = 1;
-    /// Maximum supported OffsetFetch version (v9 KIP-848 member_epoch).
-    pub const OFFSET_FETCH_MAX: i16 = 10;
+    /// Maximum supported OffsetFetch version (v1 for group coordinator).
+    ///
+    /// Encode/decode for v2-v10 exists but is not yet activated
+    /// — needs integration testing.
+    pub const OFFSET_FETCH_MAX: i16 = 1;
 
     // ── FindCoordinator (API key 10) ─────────────────────────────────────
     /// Minimum supported FindCoordinator version.
     pub const FIND_COORDINATOR_MIN: i16 = 1;
-    /// Maximum supported FindCoordinator version (v4+ batched keys; v5 KIP-890; v6 KIP-932).
-    pub const FIND_COORDINATOR_MAX: i16 = 6;
+    /// Maximum supported FindCoordinator version (v1 adds key_type for txn).
+    ///
+    /// Encode/decode for v2-v6 exists but is not yet activated
+    /// — needs integration testing.
+    pub const FIND_COORDINATOR_MAX: i16 = 1;
 
     // ── JoinGroup (API key 11) ───────────────────────────────────────────
     /// Minimum supported JoinGroup version. v4+ adds group_instance_id (KIP-345).
     pub const JOIN_GROUP_MIN: i16 = 4;
-    /// Maximum supported JoinGroup version. v9 adds SkipAssignment (KIP-848).
-    pub const JOIN_GROUP_MAX: i16 = 9;
+    /// Maximum supported JoinGroup version (v5 group_instance_id).
+    ///
+    /// Encode/decode for v6-v9 exists but is not yet activated
+    /// — needs integration testing.
+    pub const JOIN_GROUP_MAX: i16 = 5;
 
     // ── Heartbeat (API key 12) ───────────────────────────────────────────
     /// Minimum supported Heartbeat version. v3+ adds group_instance_id (KIP-345).
     pub const HEARTBEAT_MIN: i16 = 3;
-    /// Maximum supported Heartbeat version. v4 adds flexible encoding.
-    pub const HEARTBEAT_MAX: i16 = 4;
+    /// Maximum supported Heartbeat version (v3 group_instance_id, KIP-345).
+    pub const HEARTBEAT_MAX: i16 = 3;
 
     // ── LeaveGroup (API key 13) ──────────────────────────────────────────
     /// Minimum supported LeaveGroup version. v3+ adds batch leave (KIP-345).
     pub const LEAVE_GROUP_MIN: i16 = 3;
-    /// Maximum supported LeaveGroup version. v5 adds reason field (KIP-800).
-    pub const LEAVE_GROUP_MAX: i16 = 5;
+    /// Maximum supported LeaveGroup version (v3 batch leave, KIP-345).
+    pub const LEAVE_GROUP_MAX: i16 = 3;
 
     // ── SyncGroup (API key 14) ───────────────────────────────────────────
     /// Minimum supported SyncGroup version. v3+ adds group_instance_id (KIP-345).
     pub const SYNC_GROUP_MIN: i16 = 3;
-    /// Maximum supported SyncGroup version. v5 adds protocol_type/protocol_name (KIP-559).
-    pub const SYNC_GROUP_MAX: i16 = 5;
+    /// Maximum supported SyncGroup version (v3 group_instance_id).
+    pub const SYNC_GROUP_MAX: i16 = 3;
 
     // ── ApiVersions (API key 18) ─────────────────────────────────────────
     /// Minimum supported ApiVersions version.
@@ -301,136 +321,167 @@ pub mod versions {
     // ── CreateTopics (API key 19) ────────────────────────────────────────
     /// Minimum supported CreateTopics version. Kafka 4.0 removed v0–v1.
     pub const CREATE_TOPICS_MIN: i16 = 2;
-    /// Maximum supported CreateTopics version.
-    pub const CREATE_TOPICS_MAX: i16 = 7;
+    /// Maximum supported CreateTopics version (v2 baseline).
+    ///
+    /// Encode/decode for v3-v7 exists but is not yet activated
+    /// — needs integration testing.
+    pub const CREATE_TOPICS_MAX: i16 = 2;
 
     // ── DeleteTopics (API key 20) ────────────────────────────────────────
     /// Minimum supported DeleteTopics version. Kafka 4.0 removed v0.
     pub const DELETE_TOPICS_MIN: i16 = 1;
-    /// Maximum supported DeleteTopics version.
-    pub const DELETE_TOPICS_MAX: i16 = 6;
+    /// Maximum supported DeleteTopics version (v1 baseline).
+    ///
+    /// Encode/decode for v2-v6 exists but is not yet activated
+    /// — needs integration testing.
+    pub const DELETE_TOPICS_MAX: i16 = 1;
 
     // ── CreatePartitions (API key 37) ────────────────────────────────────
     /// Minimum supported CreatePartitions version.
     pub const CREATE_PARTITIONS_MIN: i16 = 0;
-    /// Maximum supported CreatePartitions version.
-    pub const CREATE_PARTITIONS_MAX: i16 = 3;
+    /// Maximum supported CreatePartitions version (v0 baseline).
+    ///
+    /// Encode/decode for v1-v3 exists but is not yet activated.
+    pub const CREATE_PARTITIONS_MAX: i16 = 0;
 
     // ── DescribeConfigs (API key 32) ─────────────────────────────────────
     /// Minimum supported DescribeConfigs version.
     pub const DESCRIBE_CONFIGS_MIN: i16 = 0;
-    /// Maximum supported DescribeConfigs version.
-    pub const DESCRIBE_CONFIGS_MAX: i16 = 4;
+    /// Maximum supported DescribeConfigs version (v1 adds synonyms).
+    ///
+    /// Kafka 4.0 removed v0; v1 is the minimum common version.
+    /// Encode/decode for v2-v4 exists but is not yet activated.
+    pub const DESCRIBE_CONFIGS_MAX: i16 = 1;
 
     // ── DescribeAcls (API key 29) ────────────────────────────────────────
     /// Minimum supported DescribeAcls version. Kafka 4.0 removed v0.
     pub const DESCRIBE_ACLS_MIN: i16 = 1;
-    /// Maximum supported DescribeAcls version.
-    pub const DESCRIBE_ACLS_MAX: i16 = 3;
+    /// Maximum supported DescribeAcls version (v1 prefixed ACLs).
+    ///
+    /// Encode/decode for v2-v3 exists but is not yet activated.
+    pub const DESCRIBE_ACLS_MAX: i16 = 1;
 
     // ── CreateAcls (API key 30) ──────────────────────────────────────────
     /// Minimum supported CreateAcls version. Kafka 4.0 removed v0.
     pub const CREATE_ACLS_MIN: i16 = 1;
-    /// Maximum supported CreateAcls version.
-    pub const CREATE_ACLS_MAX: i16 = 3;
+    /// Maximum supported CreateAcls version (v1 prefixed ACLs).
+    ///
+    /// Encode/decode for v2-v3 exists but is not yet activated.
+    pub const CREATE_ACLS_MAX: i16 = 1;
 
     // ── DeleteAcls (API key 31) ──────────────────────────────────────────
     /// Minimum supported DeleteAcls version. Kafka 4.0 removed v0.
     pub const DELETE_ACLS_MIN: i16 = 1;
-    /// Maximum supported DeleteAcls version.
-    pub const DELETE_ACLS_MAX: i16 = 3;
+    /// Maximum supported DeleteAcls version (v1 prefixed ACLs).
+    ///
+    /// Encode/decode for v2-v3 exists but is not yet activated.
+    pub const DELETE_ACLS_MAX: i16 = 1;
 
     // ── DescribeGroups (API key 15) ──────────────────────────────────────
     /// Minimum supported DescribeGroups version.
     pub const DESCRIBE_GROUPS_MIN: i16 = 1;
-    /// Maximum supported DescribeGroups version.
-    pub const DESCRIBE_GROUPS_MAX: i16 = 6;
+    /// Maximum supported DescribeGroups version (v1 baseline).
+    ///
+    /// Encode/decode for v2-v6 exists but is not yet activated.
+    pub const DESCRIBE_GROUPS_MAX: i16 = 1;
 
     // ── ListGroups (API key 16) ──────────────────────────────────────────
     /// Minimum supported ListGroups version.
     pub const LIST_GROUPS_MIN: i16 = 1;
-    /// Maximum supported ListGroups version.
-    pub const LIST_GROUPS_MAX: i16 = 5;
+    /// Maximum supported ListGroups version (v1 baseline).
+    ///
+    /// Encode/decode for v2-v5 exists but is not yet activated.
+    pub const LIST_GROUPS_MAX: i16 = 1;
 
     // ── DeleteRecords (API key 21) ───────────────────────────────────────
     /// Minimum supported DeleteRecords version.
     pub const DELETE_RECORDS_MIN: i16 = 0;
-    /// Maximum supported DeleteRecords version.
-    pub const DELETE_RECORDS_MAX: i16 = 2;
+    /// Maximum supported DeleteRecords version (v0 baseline).
+    ///
+    /// Encode/decode for v1-v2 exists but is not yet activated.
+    pub const DELETE_RECORDS_MAX: i16 = 0;
 
     // ── OffsetForLeaderEpoch (API key 23) ────────────────────────────────
     /// Minimum supported OffsetForLeaderEpoch version. v2+ adds leader epoch.
     pub const OFFSET_FOR_LEADER_EPOCH_MIN: i16 = 2;
-    /// Maximum supported OffsetForLeaderEpoch version. v4 adds flexible encoding.
-    pub const OFFSET_FOR_LEADER_EPOCH_MAX: i16 = 4;
+    /// Maximum supported OffsetForLeaderEpoch version (v3 replica_id).
+    ///
+    /// Encode/decode for v4 exists but is not yet activated.
+    pub const OFFSET_FOR_LEADER_EPOCH_MAX: i16 = 3;
 
     // ── InitProducerId (API key 22) ──────────────────────────────────────
     /// Minimum supported InitProducerId version.
     pub const INIT_PRODUCER_ID_MIN: i16 = 0;
-    /// Maximum supported InitProducerId version (v5 KIP-890 TRANSACTION_ABORTABLE).
-    #[cfg(not(feature = "unstable-protocol"))]
-    pub const INIT_PRODUCER_ID_MAX: i16 = 5;
-    /// Maximum supported InitProducerId version (v6 KIP-939 two-phase commit).
-    #[cfg(feature = "unstable-protocol")]
-    pub const INIT_PRODUCER_ID_MAX: i16 = 6;
+    /// Maximum supported InitProducerId version (v0 baseline).
+    ///
+    /// Encode/decode for v1-v6 exists but is not yet activated.
+    pub const INIT_PRODUCER_ID_MAX: i16 = 0;
 
     // ── AddPartitionsToTxn (API key 24) ──────────────────────────────────
     /// Minimum supported AddPartitionsToTxn version.
     pub const ADD_PARTITIONS_TO_TXN_MIN: i16 = 0;
-    /// Maximum supported AddPartitionsToTxn version (v3 flexible, v4+ broker batched, v5 KIP-890).
-    pub const ADD_PARTITIONS_TO_TXN_MAX: i16 = 5;
+    /// Maximum supported AddPartitionsToTxn version.
+    ///
+    /// Encode/decode for v1-v5 exists but is not yet activated.
+    pub const ADD_PARTITIONS_TO_TXN_MAX: i16 = 0;
 
     // ── AddOffsetsToTxn (API key 25) ─────────────────────────────────────
     /// Minimum supported AddOffsetsToTxn version.
     pub const ADD_OFFSETS_TO_TXN_MIN: i16 = 0;
-    /// Maximum supported AddOffsetsToTxn version (v3 flexible, v4 KIP-890).
-    pub const ADD_OFFSETS_TO_TXN_MAX: i16 = 4;
+    /// Maximum supported AddOffsetsToTxn version.
+    ///
+    /// Encode/decode for v1-v4 exists but is not yet activated.
+    pub const ADD_OFFSETS_TO_TXN_MAX: i16 = 0;
 
     // ── EndTxn (API key 26) ──────────────────────────────────────────────
     /// Minimum supported EndTxn version.
     pub const END_TXN_MIN: i16 = 0;
-    /// Maximum supported EndTxn version (v3 flexible, v4-v5 KIP-890).
-    pub const END_TXN_MAX: i16 = 5;
+    /// Maximum supported EndTxn version.
+    ///
+    /// Encode/decode for v1-v5 exists but is not yet activated.
+    pub const END_TXN_MAX: i16 = 0;
 
     // ── TxnOffsetCommit (API key 28) ─────────────────────────────────────
     /// Minimum supported TxnOffsetCommit version.
     pub const TXN_OFFSET_COMMIT_MIN: i16 = 0;
-    /// Maximum supported TxnOffsetCommit version (v3 flexible + consumer fields, v4-v5 KIP-890).
-    pub const TXN_OFFSET_COMMIT_MAX: i16 = 5;
+    /// Maximum supported TxnOffsetCommit version.
+    ///
+    /// Encode/decode for v1-v5 exists but is not yet activated.
+    pub const TXN_OFFSET_COMMIT_MAX: i16 = 0;
 
     // ── Delegation Token APIs (38–41) ────────────────────────────────────
     /// Minimum supported CreateDelegationToken version. Kafka 4.0 removed v0.
     pub const CREATE_DELEGATION_TOKEN_MIN: i16 = 1;
     /// Maximum supported CreateDelegationToken version.
-    pub const CREATE_DELEGATION_TOKEN_MAX: i16 = 3;
+    pub const CREATE_DELEGATION_TOKEN_MAX: i16 = 1;
     /// Minimum supported RenewDelegationToken version. Kafka 4.0 removed v0.
     pub const RENEW_DELEGATION_TOKEN_MIN: i16 = 1;
     /// Maximum supported RenewDelegationToken version.
-    pub const RENEW_DELEGATION_TOKEN_MAX: i16 = 2;
+    pub const RENEW_DELEGATION_TOKEN_MAX: i16 = 1;
     /// Minimum supported ExpireDelegationToken version. Kafka 4.0 removed v0.
     pub const EXPIRE_DELEGATION_TOKEN_MIN: i16 = 1;
     /// Maximum supported ExpireDelegationToken version.
-    pub const EXPIRE_DELEGATION_TOKEN_MAX: i16 = 2;
+    pub const EXPIRE_DELEGATION_TOKEN_MAX: i16 = 1;
     /// Minimum supported DescribeDelegationToken version. Kafka 4.0 removed v0.
     pub const DESCRIBE_DELEGATION_TOKEN_MIN: i16 = 1;
     /// Maximum supported DescribeDelegationToken version.
-    pub const DESCRIBE_DELEGATION_TOKEN_MAX: i16 = 3;
+    pub const DESCRIBE_DELEGATION_TOKEN_MAX: i16 = 1;
 
     // ── Client Quotas APIs (48–49) ───────────────────────────────────────
     /// Minimum supported DescribeClientQuotas version.
     pub const DESCRIBE_CLIENT_QUOTAS_MIN: i16 = 0;
     /// Maximum supported DescribeClientQuotas version.
-    pub const DESCRIBE_CLIENT_QUOTAS_MAX: i16 = 1;
+    pub const DESCRIBE_CLIENT_QUOTAS_MAX: i16 = 0;
     /// Minimum supported AlterClientQuotas version.
     pub const ALTER_CLIENT_QUOTAS_MIN: i16 = 0;
     /// Maximum supported AlterClientQuotas version.
-    pub const ALTER_CLIENT_QUOTAS_MAX: i16 = 1;
+    pub const ALTER_CLIENT_QUOTAS_MAX: i16 = 0;
 
     // ── ConsumerGroupHeartbeat (API key 68) ──────────────────────────────
     /// Minimum supported ConsumerGroupHeartbeat version.
     pub const CONSUMER_GROUP_HEARTBEAT_MIN: i16 = 0;
-    /// Maximum supported ConsumerGroupHeartbeat version (KIP-848 + KIP-1082).
-    pub const CONSUMER_GROUP_HEARTBEAT_MAX: i16 = 1;
+    /// Maximum supported ConsumerGroupHeartbeat version (KIP-848).
+    pub const CONSUMER_GROUP_HEARTBEAT_MAX: i16 = 0;
 
     // ── IncrementalAlterConfigs (API key 44) ─────────────────────────────
     /// Minimum supported IncrementalAlterConfigs version.

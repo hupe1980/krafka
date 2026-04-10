@@ -784,7 +784,7 @@ mod tests {
     use bytes::BytesMut;
 
     // -----------------------------------------------------------------------
-    // ConsumerGroupHeartbeat (API key 68, KIP-848)
+    // DescribeConfigs / IncrementalAlterConfigs
     // -----------------------------------------------------------------------
 
     /// Helper: encode a compact string into `buf`.
@@ -1095,5 +1095,108 @@ mod tests {
         assert!(!resp.results[0].error_code.is_ok());
         assert_eq!(resp.results[0].error_message.as_deref(), Some("fail"));
         assert_eq!(resp.results[0].resource_name, "0");
+    }
+
+    #[test]
+    fn test_incremental_alter_configs_full_frame_v1() {
+        use crate::protocol::api::ApiKey;
+        use crate::protocol::codec::Encoder;
+        use crate::protocol::header::RequestHeader;
+
+        let request = IncrementalAlterConfigsRequest::for_topic(
+            "config-alter-topic",
+            vec![AlterableConfig {
+                name: "retention.ms".to_string(),
+                config_operation: AlterConfigOp::Set,
+                value: Some("3600000".to_string()),
+            }],
+        );
+
+        let mut encoder = Encoder::new();
+        let pos = encoder.start_message();
+        let header =
+            RequestHeader::new(ApiKey::IncrementalAlterConfigs, 1, 42).with_client_id("krafka");
+        header.encode(encoder.buffer_mut()).unwrap();
+        request.encode_v1(encoder.buffer_mut()).unwrap();
+        encoder.finish_message(pos).unwrap();
+        let bytes = encoder.take();
+
+        // Parse it back manually to verify correctness
+        let mut cur = &bytes[..];
+        // 4-byte length prefix
+        let frame_len = i32::decode(&mut cur).unwrap();
+        assert_eq!(frame_len as usize, bytes.len() - 4);
+
+        // Request header v2 (flexible for IncrementalAlterConfigs v1)
+        let api_key = i16::decode(&mut cur).unwrap();
+        assert_eq!(api_key, 44);
+        let api_version = i16::decode(&mut cur).unwrap();
+        assert_eq!(api_version, 1);
+        let correlation_id = i32::decode(&mut cur).unwrap();
+        assert_eq!(correlation_id, 42);
+
+        // client_id uses standard (non-compact) encoding per Kafka spec.
+        // flexibleVersions: "none" — always uses old-style 2-byte length prefix.
+        let client_id_len = i16::decode(&mut cur).unwrap();
+        assert_eq!(client_id_len, 6); // "krafka" = 6 bytes
+        let mut client_id_bytes = vec![0u8; 6];
+        cur.copy_to_slice(&mut client_id_bytes);
+        assert_eq!(&client_id_bytes, b"krafka");
+
+        // tagged fields for header
+        let tags = varint::decode_unsigned_varint(&mut cur).unwrap();
+        assert_eq!(tags, 0);
+
+        // Now the request body - compact array of resources
+        let resources_len = varint::decode_unsigned_varint(&mut cur).unwrap();
+        assert_eq!(resources_len, 2); // 1 + 1
+
+        // First resource
+        let resource_type = cur.get_i8();
+        assert_eq!(resource_type, 2); // Topic
+
+        let name_len = varint::decode_unsigned_varint(&mut cur).unwrap();
+        assert_eq!(name_len, 19); // "config-alter-topic" = 18 + 1
+        let mut name_bytes = vec![0u8; 18];
+        cur.copy_to_slice(&mut name_bytes);
+        assert_eq!(&name_bytes, b"config-alter-topic");
+
+        // configs array
+        let configs_len = varint::decode_unsigned_varint(&mut cur).unwrap();
+        assert_eq!(configs_len, 2); // 1 + 1
+
+        // First config
+        let config_name_len = varint::decode_unsigned_varint(&mut cur).unwrap();
+        assert_eq!(config_name_len, 13); // "retention.ms" = 12 + 1
+        let mut config_name = vec![0u8; 12];
+        cur.copy_to_slice(&mut config_name);
+        assert_eq!(&config_name, b"retention.ms");
+
+        let config_op = cur.get_i8();
+        assert_eq!(config_op, 0); // SET
+
+        let config_val_len = varint::decode_unsigned_varint(&mut cur).unwrap();
+        assert_eq!(config_val_len, 8); // "3600000" = 7 + 1
+        let mut config_val = vec![0u8; 7];
+        cur.copy_to_slice(&mut config_val);
+        assert_eq!(&config_val, b"3600000");
+
+        // config tagged fields
+        let config_tags = varint::decode_unsigned_varint(&mut cur).unwrap();
+        assert_eq!(config_tags, 0);
+
+        // resource tagged fields
+        let resource_tags = varint::decode_unsigned_varint(&mut cur).unwrap();
+        assert_eq!(resource_tags, 0);
+
+        // validate_only
+        let validate_only = cur.get_u8();
+        assert_eq!(validate_only, 0);
+
+        // top-level tagged fields
+        let top_tags = varint::decode_unsigned_varint(&mut cur).unwrap();
+        assert_eq!(top_tags, 0);
+
+        assert!(cur.is_empty(), "should have consumed all bytes");
     }
 }

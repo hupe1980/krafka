@@ -710,14 +710,36 @@ impl RecordAccumulator {
             };
 
             // Negotiate Produce version for this broker.
-            let produce_version = conn
+            let produce_version = match conn
                 .negotiate_api_version(
                     ApiKey::Produce,
                     versions::PRODUCE_MAX,
                     versions::PRODUCE_MIN,
                 )
                 .await
-                .unwrap_or(versions::PRODUCE_MIN);
+            {
+                Some(v) => v,
+                None => {
+                    let e = KrafkaError::protocol("no mutually supported Produce API version");
+                    debug!(
+                        topic = %topic,
+                        partition = partition,
+                        "Produce version negotiation failed, refreshing metadata"
+                    );
+                    if let Err(refresh_err) = metadata.refresh_for_topics(Some(&[&topic])).await {
+                        debug!(
+                            error = %refresh_err,
+                            "Metadata refresh failed during batch retry"
+                        );
+                    }
+                    if let Some(backoff) = retry_ctx.record_failure(&e) {
+                        metrics.record_retry();
+                        retry_ctx.wait(backoff).await;
+                        continue;
+                    }
+                    break Err(e);
+                }
+            };
 
             // acks=0 (fire-and-forget): Kafka sends no response (R6.1 fix)
             if config.acks == 0 {
