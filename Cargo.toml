@@ -22,6 +22,9 @@ bytes = "1"
 # Error handling
 thiserror = "2"
 
+# Stream trait for async iteration
+futures-core = "0.3"
+
 # Logging and tracing
 tracing = "0.1"
 

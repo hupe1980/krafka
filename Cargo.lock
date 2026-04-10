@@ -1771,6 +1771,7 @@ dependencies = [
  "crc32c",
  "criterion",
  "flate2",
+ "futures-core",
  "hmac",
  "lz4_flex",
  "parking_lot",

@@ -621,6 +621,34 @@ async fn consume_stream(consumer: &Consumer) -> Result<()> {
 }
 ```
 
+### Async `Stream` API
+
+The `stream()` method returns a [`futures_core::Stream`](https://docs.rs/futures-core/latest/futures_core/stream/trait.Stream.html)
+of `Result<ConsumerRecord>`, enabling use with `tokio-stream` combinators
+(`.map()`, `.filter()`, `.take()`, `.buffer_unordered()`, etc.):
+
+```rust
+use krafka::consumer::Consumer;
+use krafka::error::Result;
+use tokio_stream::StreamExt; // requires tokio-stream dependency
+
+async fn consume_with_stream(consumer: &Consumer) -> Result<()> {
+    let mut stream = consumer.stream();
+    while let Some(result) = stream.next().await {
+        let record = result?;
+        println!(
+            "topic={}, partition={}, offset={}",
+            record.topic, record.partition, record.offset
+        );
+    }
+    Ok(())
+}
+```
+
+The stream terminates when the consumer is closed. Internally it delegates to
+`recv()`, so all features (auto-commit, rebalancing, fetch sessions, buffering)
+work identically.
+
 ### Graceful Shutdown
 
 Always close consumers properly:

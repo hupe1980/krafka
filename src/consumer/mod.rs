@@ -40,6 +40,7 @@ mod fetch_session;
 mod group;
 mod offset;
 mod record;
+mod stream;
 
 pub mod compacted;
 
@@ -57,6 +58,7 @@ pub use group::{
 };
 pub use offset::{OffsetAndMetadata, OffsetStore, ResetOffset};
 pub use record::{ConsumerRecord, ConsumerRecords, TopicPartition};
+pub use stream::ConsumerStream;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -2505,6 +2507,30 @@ impl Consumer {
         }
     }
 
+    /// Create an async [`Stream`](futures_core::Stream) of records.
+    ///
+    /// Each element is a `Result<ConsumerRecord>`. The stream terminates
+    /// when the consumer is closed (returns `None`). Broker and network
+    /// errors are propagated as `Some(Err(...))`.
+    ///
+    /// Internally delegates to [`recv()`](Self::recv), which handles
+    /// polling, buffering, auto-commit, rebalancing, and shutdown.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use tokio_stream::StreamExt;
+    ///
+    /// let mut stream = consumer.stream();
+    /// while let Some(result) = stream.next().await {
+    ///     let record = result?;
+    ///     println!("{}: {}", record.topic, record.offset);
+    /// }
+    /// ```
+    pub fn stream(&self) -> ConsumerStream<'_> {
+        ConsumerStream::new(self)
+    }
+
     /// Commit offsets for all consumed records.
     ///
     /// This stores the current offsets for assigned partitions only.
@@ -4723,5 +4749,13 @@ mod tests {
     fn test_consumer_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Consumer>();
+    }
+
+    #[test]
+    fn test_consumer_stream_is_send() {
+        fn assert_send<T: Send>() {}
+        // ConsumerStream must be Send so it can be used across .await in
+        // spawned tasks (e.g., tokio::spawn with an Arc<Consumer>).
+        assert_send::<ConsumerStream<'_>>();
     }
 }
