@@ -16,7 +16,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpSocket;
 use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::CorrelationId;
@@ -479,6 +479,11 @@ pub struct BrokerConnection {
     api_versions: Arc<Mutex<HashMap<ApiKey, ApiVersionRange>>>,
     /// Whether the connection is alive.
     alive: Arc<std::sync::atomic::AtomicBool>,
+    /// When the SASL session expires (KIP-368).
+    ///
+    /// `None` when authentication is not used or the broker reported a
+    /// session lifetime of zero (no expiry).
+    session_expiry: Option<Instant>,
     /// Statistics for monitoring.
     stats: Arc<ConnectionStats>,
 }
@@ -541,7 +546,7 @@ impl BrokerConnection {
         let stats = Arc::new(ConnectionStats::default());
         let stats_clone = stats.clone();
 
-        let connection = Self {
+        let mut connection = Self {
             address: address.to_string(),
             config: config.clone(),
             correlation_id_gen: Arc::new(CorrelationIdGenerator::new()),
@@ -549,6 +554,7 @@ impl BrokerConnection {
             normal_priority_tx,
             api_versions: Arc::new(Mutex::new(HashMap::new())),
             alive,
+            session_expiry: None,
             stats,
         };
 
@@ -577,7 +583,7 @@ impl BrokerConnection {
             if needs_sasl {
                 // TLS + SASL: authenticate on the TLS stream, then run event loop
                 let mut tls_stream = tls_stream;
-                Self::perform_sasl_handshake(
+                let session_lifetime_ms = Self::perform_sasl_handshake(
                     &mut tls_stream,
                     auth,
                     address,
@@ -586,6 +592,8 @@ impl BrokerConnection {
                     request_timeout,
                 )
                 .await?;
+
+                connection.session_expiry = Self::compute_session_expiry(session_lifetime_ms);
 
                 // Spawn the connection task with TLS stream
                 let (reader, writer) = tokio::io::split(tls_stream);
@@ -628,7 +636,7 @@ impl BrokerConnection {
             // SAFETY: needs_sasl is true only when config.auth.is_some_and(requires_sasl)
             let auth = config.auth.as_ref().unwrap();
             let mut stream = stream;
-            Self::perform_sasl_handshake(
+            let session_lifetime_ms = Self::perform_sasl_handshake(
                 &mut stream,
                 auth,
                 address,
@@ -637,6 +645,8 @@ impl BrokerConnection {
                 request_timeout,
             )
             .await?;
+
+            connection.session_expiry = Self::compute_session_expiry(session_lifetime_ms);
 
             let (reader, writer) = stream.into_split();
             tokio::spawn(async move {
@@ -737,14 +747,15 @@ impl BrokerConnection {
 
         debug!("Connecting to {address} via SOCKS5 proxy {}", proxy.address);
 
+        // Use a single deadline for the entire proxy connect path (DNS + TCP + SOCKS5)
+        // so the overall wall-clock time never exceeds connect_timeout.
+        let deadline = tokio::time::Instant::now() + config.connect_timeout;
+
         // Resolve proxy address and create a socket with buffer sizes applied.
-        let mut addrs = timeout(
-            config.connect_timeout,
-            tokio::net::lookup_host(&proxy.address),
-        )
-        .await
-        .map_err(|_| KrafkaError::timeout("SOCKS5 proxy DNS resolution"))?
-        .map_err(KrafkaError::Network)?;
+        let mut addrs = timeout_at(deadline, tokio::net::lookup_host(&proxy.address))
+            .await
+            .map_err(|_| KrafkaError::timeout("SOCKS5 proxy DNS resolution"))?
+            .map_err(KrafkaError::Network)?;
         let first_addr = addrs.next().ok_or_else(|| {
             KrafkaError::invalid_state(format!(
                 "no addresses resolved for SOCKS5 proxy '{}'",
@@ -755,9 +766,9 @@ impl BrokerConnection {
 
         let socket = Self::create_socket(proxy_addr, config)?;
 
-        // Connect to the proxy first, then perform the SOCKS5 handshake.
-        // The entire sequence (TCP + SOCKS5) is bounded by connect_timeout.
-        let proxy_stream = timeout(config.connect_timeout, async {
+        // Connect to the proxy and perform the SOCKS5 handshake, bounded by
+        // the remaining budget from the same deadline.
+        let proxy_stream = timeout_at(deadline, async {
             let tcp = socket
                 .connect(proxy_addr)
                 .await
@@ -824,6 +835,10 @@ impl BrokerConnection {
     ///
     /// For multi-step mechanisms (SCRAM-SHA-*), the challenge-response
     /// loop is handled automatically.
+    ///
+    /// Returns the session lifetime in milliseconds reported by the broker
+    /// (KIP-368). A value of `0` means the broker does not enforce
+    /// session expiry.
     async fn perform_sasl_handshake<S>(
         stream: &mut S,
         auth: &AuthConfig,
@@ -831,7 +846,7 @@ impl BrokerConnection {
         client_id: &str,
         max_response_size: usize,
         request_timeout: Duration,
-    ) -> Result<()>
+    ) -> Result<i64>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -919,11 +934,24 @@ impl BrokerConnection {
             )));
         }
 
+        let mut session_lifetime_ms = auth_response.session_lifetime_ms;
+
         // Step 3: Challenge-response loop (for SCRAM-SHA-*)
+        // Capped at MAX_SASL_ROUNDS to guard against malicious brokers.
+        const MAX_SASL_ROUNDS: usize = 10;
+
         if !authenticator.is_complete() {
             let mut challenge = auth_response.auth_bytes;
+            let mut rounds = 0;
 
             while let Some(response_bytes) = authenticator.process_challenge(&challenge)? {
+                rounds += 1;
+                if rounds > MAX_SASL_ROUNDS {
+                    return Err(KrafkaError::auth(format!(
+                        "SASL challenge-response exceeded {MAX_SASL_ROUNDS} rounds"
+                    )));
+                }
+
                 Self::send_sasl_authenticate(stream, &response_bytes, client_id).await?;
                 let resp = Self::read_sasl_authenticate_response(stream, max_response_size).await?;
                 if !resp.error_code.is_ok() {
@@ -933,6 +961,9 @@ impl BrokerConnection {
                         resp.error_message.unwrap_or_default()
                     )));
                 }
+
+                // The last successful response carries the session lifetime.
+                session_lifetime_ms = resp.session_lifetime_ms;
                 challenge = resp.auth_bytes;
 
                 if authenticator.is_complete() {
@@ -942,10 +973,18 @@ impl BrokerConnection {
         }
 
         info!("SASL authentication completed ({mechanism_name}) for {address}");
-        Ok(())
+
+        if session_lifetime_ms > 0 {
+            debug!("Broker reported session lifetime of {session_lifetime_ms}ms for {address}");
+        }
+
+        Ok(session_lifetime_ms)
     }
 
-    /// Send a SaslAuthenticate request on a raw stream.
+    /// Send a SaslAuthenticate v1 request on a raw stream.
+    ///
+    /// Uses API version 1 so the broker returns `session_lifetime_ms`
+    /// in the response (KIP-368).
     async fn send_sasl_authenticate<S>(
         stream: &mut S,
         auth_bytes: &[u8],
@@ -957,9 +996,9 @@ impl BrokerConnection {
         let request = SaslAuthenticateRequest::new(auth_bytes.to_vec());
         let mut encoder = Encoder::new();
         let pos = encoder.start_message();
-        let header = RequestHeader::new(ApiKey::SaslAuthenticate, 0, 1).with_client_id(client_id);
+        let header = RequestHeader::new(ApiKey::SaslAuthenticate, 1, 1).with_client_id(client_id);
         header.encode(encoder.buffer_mut())?;
-        request.encode_v0(encoder.buffer_mut())?;
+        request.encode_v1(encoder.buffer_mut())?;
         encoder.finish_message(pos)?;
 
         stream
@@ -970,7 +1009,9 @@ impl BrokerConnection {
         Ok(())
     }
 
-    /// Read a SaslAuthenticate response from a raw stream.
+    /// Read a SaslAuthenticate v1 response from a raw stream.
+    ///
+    /// Decodes using v1 to obtain the `session_lifetime_ms` field (KIP-368).
     async fn read_sasl_authenticate_response<S>(
         stream: &mut S,
         max_response_size: usize,
@@ -979,8 +1020,8 @@ impl BrokerConnection {
         S: AsyncRead + Unpin,
     {
         let mut buf = Self::read_framed_response(stream, max_response_size).await?;
-        let _header = ResponseHeader::decode(&mut buf, ApiKey::SaslAuthenticate, 0)?;
-        SaslAuthenticateResponse::decode_v0(&mut buf)
+        let _header = ResponseHeader::decode(&mut buf, ApiKey::SaslAuthenticate, 1)?;
+        SaslAuthenticateResponse::decode_v1(&mut buf)
     }
 
     /// Read a length-prefixed Kafka response from a stream.
@@ -1480,10 +1521,56 @@ impl BrokerConnection {
         self.negotiate_api_version(api_key, client_max, 0).await
     }
 
+    /// Compute the session expiry instant from a broker-reported lifetime.
+    ///
+    /// Returns `None` when `session_lifetime_ms` is zero or negative (no expiry).
+    /// Otherwise picks a random reauthentication point between 85 % and 95 %
+    /// of the session lifetime.  The jitter avoids a thundering-herd where
+    /// many connections to the same broker all need replacement at the same
+    /// instant.  This matches the approach taken by the Java Kafka client.
+    fn compute_session_expiry(session_lifetime_ms: i64) -> Option<Instant> {
+        if session_lifetime_ms <= 0 {
+            return None;
+        }
+        // Randomised window: 85 % base + up to 10 % jitter = 85-95 % of lifetime.
+        // Mirrors Java client's pctWindowFactor (0.85) + jitter (0.10).
+        let base_factor: f64 = 0.85;
+        let jitter_range: f64 = 0.10;
+        let jitter: f64 = rand::random::<f64>() * jitter_range;
+        let factor = base_factor + jitter;
+        let reauth_ms = (session_lifetime_ms as f64 * factor) as u64;
+        Some(Instant::now() + Duration::from_millis(reauth_ms))
+    }
+
+    /// Whether the SASL session is approaching expiry and the connection
+    /// should be replaced (KIP-368).
+    ///
+    /// Returns `false` when no session lifetime was reported by the broker.
+    #[inline]
+    pub fn needs_reauthentication(&self) -> bool {
+        self.session_expiry
+            .is_some_and(|expiry| Instant::now() >= expiry)
+    }
+
+    /// The instant at which the client should start reauthentication, if any.
+    #[inline]
+    pub fn session_expiry(&self) -> Option<Instant> {
+        self.session_expiry
+    }
+
     /// Check if the connection is alive.
     #[inline]
     pub fn is_alive(&self) -> bool {
         self.alive.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether the connection is alive and its SASL session has not expired.
+    ///
+    /// This is the primary check used by the connection pool to decide if an
+    /// existing connection can be reused or must be replaced.
+    #[inline]
+    pub fn is_usable(&self) -> bool {
+        self.is_alive() && !self.needs_reauthentication()
     }
 
     /// Get the broker address.
@@ -1656,8 +1743,19 @@ mod tests {
     ///
     /// Accepts a connection, reads SaslHandshakeRequest, SaslAuthenticateRequest,
     /// and ApiVersionsRequest, responding to each with valid responses.
+    /// The `session_lifetime_ms` value is included in the SaslAuthenticate v1
+    /// response (KIP-368).
     /// Returns the captured auth bytes from SaslAuthenticate for verification.
     async fn run_mock_sasl_broker(listener: tokio::net::TcpListener) -> (String, Vec<u8>) {
+        run_mock_sasl_broker_with_lifetime(listener, 0).await
+    }
+
+    /// Like [`run_mock_sasl_broker`] but lets the caller set the session
+    /// lifetime reported in the SaslAuthenticateResponse (KIP-368).
+    async fn run_mock_sasl_broker_with_lifetime(
+        listener: tokio::net::TcpListener,
+        session_lifetime_ms: i64,
+    ) -> (String, Vec<u8>) {
         use bytes::BufMut;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1722,12 +1820,13 @@ mod tests {
             i32::from_be_bytes(req[auth_offset..auth_offset + 4].try_into().unwrap()) as usize;
         let auth_bytes = req[auth_offset + 4..auth_offset + 4 + auth_bytes_len].to_vec();
 
-        // Send SaslAuthenticateResponse: correlation_id + error_code(0) + null message + empty bytes
+        // Send SaslAuthenticateResponse v1: correlation_id + error_code(0) + null message + empty bytes + session_lifetime_ms
         let mut resp = BytesMut::new();
         resp.put_i32(correlation_id);
         resp.put_i16(0); // error_code = NONE
         resp.put_i16(-1_i16); // error_message = null (KafkaString)
         resp.put_i32(0); // auth_bytes = empty (KafkaBytes, 0 length)
+        resp.put_i64(session_lifetime_ms); // session_lifetime_ms (v1)
         write_frame(&mut stream, &resp).await;
 
         // 3. Read ApiVersionsRequest
@@ -2011,7 +2110,7 @@ mod tests {
             stream.write_all(&resp).await.unwrap();
             stream.flush().await.unwrap();
 
-            // 2. SaslAuthenticate — reject with auth error
+            // 2. SaslAuthenticate — reject with auth error (v1 format)
             let req = read_frame(&mut stream).await;
             let correlation_id = i32::from_be_bytes(req[4..8].try_into().unwrap());
             let mut resp = BytesMut::new();
@@ -2022,6 +2121,7 @@ mod tests {
             resp.put_i16(msg.len() as i16);
             resp.put_slice(msg);
             resp.put_i32(0); // empty auth_bytes
+            resp.put_i64(0); // session_lifetime_ms (v1)
             let len = resp.len() as i32;
             stream.write_all(&len.to_be_bytes()).await.unwrap();
             stream.write_all(&resp).await.unwrap();
@@ -2273,5 +2373,134 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ========================================================================
+    // KIP-368: Session lifetime / reauthentication
+    // ========================================================================
+
+    #[test]
+    fn test_compute_session_expiry_zero_means_no_expiry() {
+        assert!(
+            BrokerConnection::compute_session_expiry(0).is_none(),
+            "session_lifetime_ms = 0 should mean no expiry"
+        );
+    }
+
+    #[test]
+    fn test_compute_session_expiry_negative_means_no_expiry() {
+        assert!(
+            BrokerConnection::compute_session_expiry(-1).is_none(),
+            "negative session_lifetime_ms should mean no expiry"
+        );
+    }
+
+    #[test]
+    fn test_compute_session_expiry_applies_jittered_margin() {
+        let before = Instant::now();
+        let expiry = BrokerConnection::compute_session_expiry(10_000).unwrap();
+        let after = Instant::now();
+
+        // Randomised window: 85-95% of 10_000ms = 8_500-9_500ms
+        let expected_low = before + Duration::from_millis(8_500);
+        let expected_high = after + Duration::from_millis(9_500);
+
+        assert!(
+            expiry >= expected_low && expiry <= expected_high,
+            "expiry should be between 8.5s and 9.5s from now (85-95% of 10s)"
+        );
+    }
+
+    #[test]
+    fn test_compute_session_expiry_jitter_varies() {
+        // Call multiple times and verify we don't always get the exact same value.
+        // With 10% jitter on a 100s lifetime, outcomes should vary.
+        let results: Vec<Instant> = (0..20)
+            .map(|_| BrokerConnection::compute_session_expiry(100_000).unwrap())
+            .collect();
+        let first = results[0];
+        let any_different = results.iter().any(|r| *r != first);
+        assert!(
+            any_different,
+            "20 calls should produce at least one different expiry (randomised jitter)"
+        );
+    }
+
+    #[test]
+    fn test_compute_session_expiry_small_lifetime() {
+        // Even very short lifetimes should produce a valid expiry
+        let expiry = BrokerConnection::compute_session_expiry(100);
+        assert!(expiry.is_some(), "100ms lifetime should produce an expiry");
+    }
+
+    #[tokio::test]
+    async fn test_session_lifetime_tracked_from_broker() {
+        // Mock broker that reports a 60-second session lifetime
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let mock_handle = tokio::spawn(run_mock_sasl_broker_with_lifetime(listener, 60_000));
+
+        let config = ConnectionConfig::builder()
+            .client_id("test-client")
+            .auth(crate::auth::AuthConfig::sasl_plain("user", "pass"))
+            .build();
+
+        let conn = BrokerConnection::connect(&addr, config).await.unwrap();
+
+        // The connection should have a session expiry set
+        assert!(
+            conn.session_expiry().is_some(),
+            "session_expiry should be set when broker reports a lifetime"
+        );
+
+        // The expiry should be roughly 51-57s from now (85-95% of 60s, randomised)
+        let remaining = conn.session_expiry().unwrap() - Instant::now();
+        assert!(
+            remaining > Duration::from_secs(49) && remaining < Duration::from_secs(58),
+            "session expiry should be ~51-57s from now (85-95% of 60s), got {:?}",
+            remaining
+        );
+
+        // Should not need reauthentication immediately
+        assert!(
+            !conn.needs_reauthentication(),
+            "fresh connection should not need reauthentication"
+        );
+
+        // is_usable should be true
+        assert!(conn.is_usable(), "fresh connection should be usable");
+
+        mock_handle.await.unwrap();
+        conn.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_no_session_expiry_when_lifetime_zero() {
+        // Mock broker that reports 0 session lifetime (no expiry)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let mock_handle = tokio::spawn(run_mock_sasl_broker_with_lifetime(listener, 0));
+
+        let config = ConnectionConfig::builder()
+            .client_id("test-client")
+            .auth(crate::auth::AuthConfig::sasl_plain("user", "pass"))
+            .build();
+
+        let conn = BrokerConnection::connect(&addr, config).await.unwrap();
+
+        assert!(
+            conn.session_expiry().is_none(),
+            "session_expiry should be None when broker reports 0"
+        );
+        assert!(
+            !conn.needs_reauthentication(),
+            "should never need reauth with no session lifetime"
+        );
+        assert!(conn.is_usable());
+
+        mock_handle.await.unwrap();
+        conn.close().await;
     }
 }

@@ -59,44 +59,44 @@ this range are rejected with a protocol error.
 
 | API | Min | Max | Key Features |
 |-----|-----|-----|--------------|
-| Produce | 3 | 3 | v3 transactions |
-| Fetch | 4 | 11 | v4 isolation level, v7 fetch sessions (KIP-227), v9 leader epoch (KIP-320), v11 closest-replica (KIP-392) |
-| ListOffsets | 1 | 2 | v1 timestamp queries, v2 isolation level |
-| Metadata | 1 | 8 | v1 controller + rack, v7 leader epoch, v8 authorized-ops |
-| OffsetCommit | 2 | 2 | v2 retention |
-| OffsetFetch | 1 | 1 | v1 group coordinator |
-| FindCoordinator | 1 | 1 | v1 key_type field |
-| JoinGroup | 4 | 5 | v4 flexible encoding, v5 group instance id |
-| Heartbeat | 3 | 3 | v3 group instance id (KIP-345) |
-| SyncGroup | 3 | 3 | v3 group instance id |
-| LeaveGroup | 3 | 3 | v3 batch leave (KIP-345) |
-| CreateTopics | 2 | 2 | v2 topic validation |
-| DeleteTopics | 1 | 1 | v1 baseline |
-| CreatePartitions | 0 | 0 | v0 baseline |
-| DescribeConfigs | 0 | 1 | v1 resource type + synonyms |
-| IncrementalAlterConfigs | 0 | 1 | Incremental config updates |
-| DescribeAcls | 1 | 1 | v1 prefixed ACLs |
-| CreateAcls | 1 | 1 | v1 prefixed ACLs |
-| DeleteAcls | 1 | 1 | v1 prefixed ACLs |
-| DescribeGroups | 1 | 1 | v1 baseline |
-| ListGroups | 1 | 1 | v1 baseline |
-| DeleteRecords | 0 | 0 | v0 baseline |
-| OffsetForLeaderEpoch | 2 | 3 | v2 leader epoch validation, v3 replica_id |
-| InitProducerId | 0 | 0 | v0 idempotent |
-| AddPartitionsToTxn | 0 | 0 | Transactional partition registration |
-| AddOffsetsToTxn | 0 | 0 | Transactional offset coordination |
-| EndTxn | 0 | 0 | v0 baseline |
-| TxnOffsetCommit | 0 | 0 | Transactional offset commits |
-| CreateDelegationToken | 1 | 1 | Delegation token creation |
-| RenewDelegationToken | 1 | 1 | Delegation token renewal |
-| ExpireDelegationToken | 1 | 1 | Delegation token expiry |
-| DescribeDelegationToken | 1 | 1 | Delegation token listing |
-| DescribeClientQuotas | 0 | 0 | Client quota queries |
-| AlterClientQuotas | 0 | 0 | Client quota updates |
+| Produce | 3 | 11 | v3 transactions, v9 flexible encoding, v11 ZStd compression |
+| Fetch | 4 | 12 | v4 isolation level, v7 fetch sessions (KIP-227), v9 leader epoch (KIP-320), v11 closest-replica (KIP-392), v12 flexible |
+| ListOffsets | 1 | 8 | v1 timestamp queries, v2 isolation level, v4 leader epoch, v6 flexible, v7 max_timestamp, v8 tiered-storage |
+| Metadata | 1 | 12 | v1 controller + rack, v7 leader epoch, v8 authorized-ops, v9 flexible, v10 topic UUIDs, v12 topic-ID lookup |
+| OffsetCommit | 2 | 9 | v2 retention, v5 drops retention_time, v6 leader epoch, v8 flexible, v9 KIP-848 |
+| OffsetFetch | 1 | 9 | v1 group coordinator, v2 top-level error, v6 flexible, v8 batched groups, v9 KIP-848 |
+| FindCoordinator | 1 | 6 | v1 key_type, v3 flexible, v4 batched keys (KIP-699), v6 share groups (KIP-932) |
+| JoinGroup | 4 | 9 | v4 group_instance_id (KIP-345), v6 flexible, v8 reason (KIP-800) |
+| Heartbeat | 3 | 4 | v3 group_instance_id (KIP-345), v4 flexible |
+| SyncGroup | 3 | 5 | v3 group_instance_id, v4 flexible, v5 protocol_type/name (KIP-559) |
+| LeaveGroup | 3 | 5 | v3 batch leave (KIP-345), v4 flexible, v5 reason (KIP-800) |
+| CreateTopics | 2 | 7 | v2 topic validation, v5 flexible, v7 topic_id (KIP-464, KIP-525) |
+| DeleteTopics | 1 | 6 | v1 baseline, v4 flexible, v6 topic-ID-based deletion |
+| CreatePartitions | 0 | 3 | v0 baseline, v2 flexible, v3 KIP-599 |
+| DescribeConfigs | 0 | 4 | v1 synonyms, v3 config_type + documentation, v4 flexible |
+| IncrementalAlterConfigs | 0 | 1 | v0 non-flexible, v1 flexible encoding |
+| DescribeAcls | 1 | 3 | v1 prefixed ACLs, v2 flexible, v3 user resource type |
+| CreateAcls | 1 | 3 | v1 prefixed ACLs, v2 flexible, v3 user resource type |
+| DeleteAcls | 1 | 3 | v1 prefixed ACLs, v2 flexible, v3 user resource type |
+| DescribeGroups | 1 | 6 | v3 authorized_operations, v4 static members, v5 flexible, v6 KIP-1043 |
+| ListGroups | 1 | 5 | v3 flexible, v4 state filter (KIP-518), v5 type filter (KIP-848) |
+| DeleteRecords | 0 | 2 | v0 baseline, v2 flexible encoding |
+| OffsetForLeaderEpoch | 2 | 4 | v2 leader epoch validation, v3 replica_id, v4 flexible |
+| InitProducerId | 0 | 4 | v0 idempotent, v2 flexible, v3 epoch recovery, v4 latest stable |
+| AddPartitionsToTxn | 0 | 3 | v0 baseline, v3 flexible encoding |
+| AddOffsetsToTxn | 0 | 3 | v0 baseline, v3 flexible encoding |
+| EndTxn | 0 | 3 | v0 baseline, v3 flexible encoding |
+| TxnOffsetCommit | 0 | 3 | v0 baseline, v2 leader epoch, v3 flexible + consumer fields |
+| CreateDelegationToken | 1 | 3 | v2 flexible, v3 owner override |
+| RenewDelegationToken | 1 | 2 | v2 flexible encoding |
+| ExpireDelegationToken | 1 | 2 | v2 flexible encoding |
+| DescribeDelegationToken | 1 | 3 | v2 flexible, v3 token requester |
+| DescribeClientQuotas | 0 | 1 | v1 flexible encoding |
+| AlterClientQuotas | 0 | 1 | v1 flexible encoding |
 | DeleteGroups | 0 | 2 | Consumer group deletion |
 | DescribeCluster | 0 | 2 | Cluster metadata |
 | ApiVersions | 0 | 4 (5¹) | API version negotiation |
-| ConsumerGroupHeartbeat | 0 | 0 | KIP-848 consumer group protocol |
+| ConsumerGroupHeartbeat | 0 | 1 | KIP-848 consumer group protocol, v1 KIP-1082 regex |
 | ConsumerGroupDescribe | 0 | 1 | KIP-848 group description |
 | DescribeTopicPartitions | 0 | 0 | Topic partition metadata (KIP-966) |
 | GetTelemetrySubscriptions² | 0 | 0 | KIP-714 client telemetry subscription discovery |
@@ -110,7 +110,7 @@ this range are rejected with a protocol error.
 >
 > ² Requires `telemetry` feature flag.
 >
-> **Note:** Encode/decode implementations exist for higher versions of many APIs (e.g., Produce up to v13, Fetch up to v16, Metadata up to v13) but are not yet activated — the negotiated MAX is set conservatively until those paths have been integration-tested against a real broker.
+> **Note:** Encode/decode implementations exist for even higher versions of some APIs (e.g., Produce up to v13, Fetch up to v18, Metadata up to v13) but the negotiated MAX is set conservatively for topic-UUID-based paths until those have been integration-tested against a real broker.
 
 ### Version Constants
 
@@ -121,10 +121,10 @@ use krafka::protocol::versions;
 
 // Each API has both MIN and MAX constants
 let min_fetch = versions::FETCH_MIN;        // 4  (Kafka 3.9+ baseline)
-let max_fetch = versions::FETCH_MAX;        // 11 (v11 closest-replica, KIP-392)
+let max_fetch = versions::FETCH_MAX;        // 12 (v12 flexible encoding)
 let min_produce = versions::PRODUCE_MIN;    // 3  (v3+ transactions)
-let max_produce = versions::PRODUCE_MAX;    // 3  (v3 transactions)
-let max_metadata = versions::METADATA_MAX;  // 8  (v8 authorized-ops)
+let max_produce = versions::PRODUCE_MAX;    // 11 (v11 ZStd compression)
+let max_metadata = versions::METADATA_MAX;  // 12 (v12 topic-ID lookup)
 ```
 
 ## Record Batches

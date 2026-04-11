@@ -620,6 +620,20 @@ The transactional producer automatically retries sends on transient failures:
 - Sequence numbers and the batch are allocated once and reused across normal retries to maintain idempotent semantics
 - Non-retriable errors (auth failures, invalid topics) fail immediately
 
+### Coordinator Re-discovery
+
+All coordinator RPCs (`InitProducerId`, `AddPartitionsToTxn`, `AddOffsetsToTxn`, `EndTxn`)
+automatically handle coordinator failover:
+
+- On `NotCoordinator`, `CoordinatorNotAvailable`, or `CoordinatorLoadInProgress` the cached
+  coordinator is invalidated and a fresh `FindCoordinator` is issued before retrying.
+- Network and timeout errors to the coordinator trigger the same invalidation + re-discovery flow.
+- The retry uses the producer's `RetryPolicy` for exponential backoff between attempts.
+- Fatal errors (`TransactionCoordinatorFenced`, `ProducerFenced`, `InvalidProducerEpoch`,
+  `InvalidTxnState`) are never retried.
+- If no coordinator is cached (e.g. after invalidation), `coordinator_connection()` auto-discovers
+  one transparently before returning the connection.
+
 ### Timestamps
 
 Both `Producer` and `TransactionalProducer` propagate the `timestamp` field from `ProducerRecord` to the Kafka record batch. If set, the timestamp is used as the `base_timestamp` of the record batch:

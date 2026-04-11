@@ -221,92 +221,95 @@ pub mod versions {
     // ── Produce (API key 0) ──────────────────────────────────────────────
     /// Minimum supported Produce version. Kafka 4.0 removed v0–v2.
     pub const PRODUCE_MIN: i16 = 3;
-    /// Maximum supported Produce version (v3 for transactions).
+    /// Maximum supported Produce version (v11 ZStd compression).
     ///
-    /// Encode/decode for v9-v13 (flexible) exists but is not yet activated
-    /// — the flexible paths need integration testing against a real broker.
-    pub const PRODUCE_MAX: i16 = 3;
+    /// v9 introduces flexible encoding, v11 adds ZStd compression support.
+    /// Encode/decode for v12-v13 exists but is not yet activated (topic-UUID
+    /// based producing needs end-to-end integration testing).
+    pub const PRODUCE_MAX: i16 = 11;
 
     // ── Fetch (API key 1) ────────────────────────────────────────────────
     /// Minimum supported Fetch version. Kafka 4.0 removed v0–v3.
     pub const FETCH_MIN: i16 = 4;
-    /// Maximum supported Fetch version (v11 closest-replica fetching, KIP-392).
+    /// Maximum supported Fetch version (v12 flexible encoding).
     ///
-    /// Encode/decode for v12+ (flexible) exists but is not yet activated
-    /// — needs integration testing against a real broker.
-    pub const FETCH_MAX: i16 = 11;
+    /// v12 adds flexible encoding. Encode/decode for v13+ exists but uses
+    /// topic-UUID-based fetching which needs end-to-end integration testing.
+    pub const FETCH_MAX: i16 = 12;
 
     // ── ListOffsets (API key 2) ──────────────────────────────────────────
     /// Minimum supported ListOffsets version. Kafka 4.0 removed v0.
     pub const LIST_OFFSETS_MIN: i16 = 1;
-    /// Maximum supported ListOffsets version (v2 isolation level).
+    /// Maximum supported ListOffsets version (v8 tiered-storage awareness).
     ///
-    /// Encode/decode for v4+ exists but is not yet activated
-    /// — needs integration testing against a real broker.
-    pub const LIST_OFFSETS_MAX: i16 = 2;
+    /// v4 adds leader epoch validation, v6 flexible encoding, v7 max_timestamp,
+    /// v8 tiered-storage. Encode/decode for v9+ exists but is not yet activated.
+    pub const LIST_OFFSETS_MAX: i16 = 8;
 
     // ── Metadata (API key 3) ─────────────────────────────────────────────
     /// Minimum supported Metadata version. v0 lacks essential fields.
     pub const METADATA_MIN: i16 = 1;
-    /// Maximum supported Metadata version (v8 KRaft-aware metadata).
+    /// Maximum supported Metadata version (v12 topic UUID lookup).
     ///
-    /// Encode/decode for v9-v13 (flexible, topic UUIDs) exists but is not
-    /// yet activated — the flexible paths need integration testing.
-    pub const METADATA_MAX: i16 = 8;
+    /// v9 flexible encoding, v10 topic UUIDs (enables KIP-848 topic name
+    /// resolution), v12 real topic_id-based lookup.
+    /// Encode/decode for v13 (top-level error_code) exists but is not yet
+    /// activated — needs integration testing.
+    pub const METADATA_MAX: i16 = 12;
 
     // ── OffsetCommit (API key 8) ─────────────────────────────────────────
     /// Minimum supported OffsetCommit version. Kafka 4.0 removed v0–v1.
     pub const OFFSET_COMMIT_MIN: i16 = 2;
-    /// Maximum supported OffsetCommit version (v2 for retention).
+    /// Maximum supported OffsetCommit version (v9 KIP-848 member_epoch).
     ///
-    /// Encode/decode for v3-v10 exists but is not yet activated
-    /// — needs integration testing.
-    pub const OFFSET_COMMIT_MAX: i16 = 2;
+    /// v5 drops retention_time, v6 leader epoch, v7 group_instance_id,
+    /// v8 flexible encoding, v9 KIP-848 member_epoch.
+    /// Encode/decode for v10 exists but is not yet activated.
+    pub const OFFSET_COMMIT_MAX: i16 = 9;
 
     // ── OffsetFetch (API key 9) ──────────────────────────────────────────
     /// Minimum supported OffsetFetch version. Kafka 4.0 removed v0.
     pub const OFFSET_FETCH_MIN: i16 = 1;
-    /// Maximum supported OffsetFetch version (v1 for group coordinator).
+    /// Maximum supported OffsetFetch version (v9 KIP-848 member_epoch).
     ///
-    /// Encode/decode for v2-v10 exists but is not yet activated
-    /// — needs integration testing.
-    pub const OFFSET_FETCH_MAX: i16 = 1;
+    /// v2 top-level error, v6 flexible, v8 batched groups, v9 KIP-848.
+    /// Encode/decode for v10 exists but is not yet activated.
+    pub const OFFSET_FETCH_MAX: i16 = 9;
 
     // ── FindCoordinator (API key 10) ─────────────────────────────────────
     /// Minimum supported FindCoordinator version.
     pub const FIND_COORDINATOR_MIN: i16 = 1;
-    /// Maximum supported FindCoordinator version (v1 adds key_type for txn).
+    /// Maximum supported FindCoordinator version (v6 share groups, KIP-932).
     ///
-    /// Encode/decode for v2-v6 exists but is not yet activated
-    /// — needs integration testing.
-    pub const FIND_COORDINATOR_MAX: i16 = 1;
+    /// v2 same wire as v1, v3 flexible, v4 batched keys (KIP-699),
+    /// v5 KIP-890, v6 share groups (KIP-932).
+    pub const FIND_COORDINATOR_MAX: i16 = 6;
 
     // ── JoinGroup (API key 11) ───────────────────────────────────────────
     /// Minimum supported JoinGroup version. v4+ adds group_instance_id (KIP-345).
     pub const JOIN_GROUP_MIN: i16 = 4;
-    /// Maximum supported JoinGroup version (v5 group_instance_id).
+    /// Maximum supported JoinGroup version (v9 latest).
     ///
-    /// Encode/decode for v6-v9 exists but is not yet activated
-    /// — needs integration testing.
-    pub const JOIN_GROUP_MAX: i16 = 5;
+    /// v6 flexible, v7 skip_assignment, v8 reason (KIP-800), v9 latest.
+    pub const JOIN_GROUP_MAX: i16 = 9;
 
     // ── Heartbeat (API key 12) ───────────────────────────────────────────
     /// Minimum supported Heartbeat version. v3+ adds group_instance_id (KIP-345).
     pub const HEARTBEAT_MIN: i16 = 3;
-    /// Maximum supported Heartbeat version (v3 group_instance_id, KIP-345).
-    pub const HEARTBEAT_MAX: i16 = 3;
+    /// Maximum supported Heartbeat version (v4 flexible encoding).
+    pub const HEARTBEAT_MAX: i16 = 4;
 
     // ── LeaveGroup (API key 13) ──────────────────────────────────────────
     /// Minimum supported LeaveGroup version. v3+ adds batch leave (KIP-345).
     pub const LEAVE_GROUP_MIN: i16 = 3;
-    /// Maximum supported LeaveGroup version (v3 batch leave, KIP-345).
-    pub const LEAVE_GROUP_MAX: i16 = 3;
+    /// Maximum supported LeaveGroup version (v5 reason, KIP-800).
+    pub const LEAVE_GROUP_MAX: i16 = 5;
 
     // ── SyncGroup (API key 14) ───────────────────────────────────────────
     /// Minimum supported SyncGroup version. v3+ adds group_instance_id (KIP-345).
     pub const SYNC_GROUP_MIN: i16 = 3;
-    /// Maximum supported SyncGroup version (v3 group_instance_id).
-    pub const SYNC_GROUP_MAX: i16 = 3;
+    /// Maximum supported SyncGroup version (v5 protocol_type/name, KIP-559).
+    pub const SYNC_GROUP_MAX: i16 = 5;
 
     // ── ApiVersions (API key 18) ─────────────────────────────────────────
     /// Minimum supported ApiVersions version.
@@ -321,133 +324,126 @@ pub mod versions {
     // ── CreateTopics (API key 19) ────────────────────────────────────────
     /// Minimum supported CreateTopics version. Kafka 4.0 removed v0–v1.
     pub const CREATE_TOPICS_MIN: i16 = 2;
-    /// Maximum supported CreateTopics version (v2 baseline).
+    /// Maximum supported CreateTopics version (v7 topic_id in response).
     ///
-    /// Encode/decode for v3-v7 exists but is not yet activated
-    /// — needs integration testing.
-    pub const CREATE_TOPICS_MAX: i16 = 2;
+    /// v5 flexible encoding, v7 topic_id (KIP-464, KIP-525).
+    pub const CREATE_TOPICS_MAX: i16 = 7;
 
     // ── DeleteTopics (API key 20) ────────────────────────────────────────
     /// Minimum supported DeleteTopics version. Kafka 4.0 removed v0.
     pub const DELETE_TOPICS_MIN: i16 = 1;
-    /// Maximum supported DeleteTopics version (v1 baseline).
+    /// Maximum supported DeleteTopics version (v6 topic-ID-based deletion).
     ///
-    /// Encode/decode for v2-v6 exists but is not yet activated
-    /// — needs integration testing.
-    pub const DELETE_TOPICS_MAX: i16 = 1;
+    /// v4 flexible, v5 error_message, v6 topic-ID-based deletion.
+    pub const DELETE_TOPICS_MAX: i16 = 6;
 
     // ── CreatePartitions (API key 37) ────────────────────────────────────
     /// Minimum supported CreatePartitions version.
     pub const CREATE_PARTITIONS_MIN: i16 = 0;
-    /// Maximum supported CreatePartitions version (v0 baseline).
+    /// Maximum supported CreatePartitions version (v3 KIP-599).
     ///
-    /// Encode/decode for v1-v3 exists but is not yet activated.
-    pub const CREATE_PARTITIONS_MAX: i16 = 0;
+    /// v2 flexible encoding, v3 KIP-599.
+    pub const CREATE_PARTITIONS_MAX: i16 = 3;
 
     // ── DescribeConfigs (API key 32) ─────────────────────────────────────
     /// Minimum supported DescribeConfigs version.
     pub const DESCRIBE_CONFIGS_MIN: i16 = 0;
-    /// Maximum supported DescribeConfigs version (v1 adds synonyms).
+    /// Maximum supported DescribeConfigs version (v4 flexible encoding).
     ///
-    /// Kafka 4.0 removed v0; v1 is the minimum common version.
-    /// Encode/decode for v2-v4 exists but is not yet activated.
-    pub const DESCRIBE_CONFIGS_MAX: i16 = 1;
+    /// v1 synonyms, v3 config_type + documentation, v4 flexible.
+    pub const DESCRIBE_CONFIGS_MAX: i16 = 4;
 
     // ── DescribeAcls (API key 29) ────────────────────────────────────────
     /// Minimum supported DescribeAcls version. Kafka 4.0 removed v0.
     pub const DESCRIBE_ACLS_MIN: i16 = 1;
-    /// Maximum supported DescribeAcls version (v1 prefixed ACLs).
-    ///
-    /// Encode/decode for v2-v3 exists but is not yet activated.
-    pub const DESCRIBE_ACLS_MAX: i16 = 1;
+    /// Maximum supported DescribeAcls version (v3 user resource type).
+    pub const DESCRIBE_ACLS_MAX: i16 = 3;
 
     // ── CreateAcls (API key 30) ──────────────────────────────────────────
     /// Minimum supported CreateAcls version. Kafka 4.0 removed v0.
     pub const CREATE_ACLS_MIN: i16 = 1;
-    /// Maximum supported CreateAcls version (v1 prefixed ACLs).
-    ///
-    /// Encode/decode for v2-v3 exists but is not yet activated.
-    pub const CREATE_ACLS_MAX: i16 = 1;
+    /// Maximum supported CreateAcls version (v3 user resource type).
+    pub const CREATE_ACLS_MAX: i16 = 3;
 
     // ── DeleteAcls (API key 31) ──────────────────────────────────────────
     /// Minimum supported DeleteAcls version. Kafka 4.0 removed v0.
     pub const DELETE_ACLS_MIN: i16 = 1;
-    /// Maximum supported DeleteAcls version (v1 prefixed ACLs).
-    ///
-    /// Encode/decode for v2-v3 exists but is not yet activated.
-    pub const DELETE_ACLS_MAX: i16 = 1;
+    /// Maximum supported DeleteAcls version (v3 user resource type).
+    pub const DELETE_ACLS_MAX: i16 = 3;
 
     // ── DescribeGroups (API key 15) ──────────────────────────────────────
     /// Minimum supported DescribeGroups version.
     pub const DESCRIBE_GROUPS_MIN: i16 = 1;
-    /// Maximum supported DescribeGroups version (v1 baseline).
+    /// Maximum supported DescribeGroups version (v6 KIP-1043).
     ///
-    /// Encode/decode for v2-v6 exists but is not yet activated.
-    pub const DESCRIBE_GROUPS_MAX: i16 = 1;
+    /// v3 authorized_operations, v4 static members, v5 flexible, v6 KIP-1043.
+    pub const DESCRIBE_GROUPS_MAX: i16 = 6;
 
     // ── ListGroups (API key 16) ──────────────────────────────────────────
     /// Minimum supported ListGroups version.
     pub const LIST_GROUPS_MIN: i16 = 1;
-    /// Maximum supported ListGroups version (v1 baseline).
+    /// Maximum supported ListGroups version (v5 type filter, KIP-848).
     ///
-    /// Encode/decode for v2-v5 exists but is not yet activated.
-    pub const LIST_GROUPS_MAX: i16 = 1;
+    /// v3 flexible, v4 state filter (KIP-518), v5 type filter (KIP-848).
+    pub const LIST_GROUPS_MAX: i16 = 5;
 
     // ── DeleteRecords (API key 21) ───────────────────────────────────────
     /// Minimum supported DeleteRecords version.
     pub const DELETE_RECORDS_MIN: i16 = 0;
-    /// Maximum supported DeleteRecords version (v0 baseline).
-    ///
-    /// Encode/decode for v1-v2 exists but is not yet activated.
-    pub const DELETE_RECORDS_MAX: i16 = 0;
+    /// Maximum supported DeleteRecords version (v2 flexible encoding).
+    pub const DELETE_RECORDS_MAX: i16 = 2;
 
     // ── OffsetForLeaderEpoch (API key 23) ────────────────────────────────
     /// Minimum supported OffsetForLeaderEpoch version. v2+ adds leader epoch.
     pub const OFFSET_FOR_LEADER_EPOCH_MIN: i16 = 2;
-    /// Maximum supported OffsetForLeaderEpoch version (v3 replica_id).
-    ///
-    /// Encode/decode for v4 exists but is not yet activated.
-    pub const OFFSET_FOR_LEADER_EPOCH_MAX: i16 = 3;
+    /// Maximum supported OffsetForLeaderEpoch version (v4 flexible encoding).
+    pub const OFFSET_FOR_LEADER_EPOCH_MAX: i16 = 4;
 
     // ── InitProducerId (API key 22) ──────────────────────────────────────
     /// Minimum supported InitProducerId version.
     pub const INIT_PRODUCER_ID_MIN: i16 = 0;
-    /// Maximum supported InitProducerId version (v0 baseline).
+    /// Maximum supported InitProducerId version (v4 producer_id/epoch recovery).
     ///
-    /// Encode/decode for v1-v6 exists but is not yet activated.
-    pub const INIT_PRODUCER_ID_MAX: i16 = 0;
+    /// v2 flexible, v3 epoch recovery (producer_id + epoch for fencing),
+    /// v4 latest stable. Encode/decode for v5-v6 (KIP-890) exists but is
+    /// not yet activated.
+    pub const INIT_PRODUCER_ID_MAX: i16 = 4;
 
     // ── AddPartitionsToTxn (API key 24) ──────────────────────────────────
     /// Minimum supported AddPartitionsToTxn version.
     pub const ADD_PARTITIONS_TO_TXN_MIN: i16 = 0;
-    /// Maximum supported AddPartitionsToTxn version.
+    /// Maximum supported AddPartitionsToTxn version (v3 flexible encoding).
     ///
-    /// Encode/decode for v1-v5 exists but is not yet activated.
-    pub const ADD_PARTITIONS_TO_TXN_MAX: i16 = 0;
+    /// v3 flexible. Encode/decode for v4-v5 (broker batched, KIP-890)
+    /// exists but is not yet activated.
+    pub const ADD_PARTITIONS_TO_TXN_MAX: i16 = 3;
 
     // ── AddOffsetsToTxn (API key 25) ─────────────────────────────────────
     /// Minimum supported AddOffsetsToTxn version.
     pub const ADD_OFFSETS_TO_TXN_MIN: i16 = 0;
-    /// Maximum supported AddOffsetsToTxn version.
+    /// Maximum supported AddOffsetsToTxn version (v3 flexible encoding).
     ///
-    /// Encode/decode for v1-v4 exists but is not yet activated.
-    pub const ADD_OFFSETS_TO_TXN_MAX: i16 = 0;
+    /// v3 flexible. Encode/decode for v4 (KIP-890) exists but is not yet
+    /// activated.
+    pub const ADD_OFFSETS_TO_TXN_MAX: i16 = 3;
 
     // ── EndTxn (API key 26) ──────────────────────────────────────────────
     /// Minimum supported EndTxn version.
     pub const END_TXN_MIN: i16 = 0;
-    /// Maximum supported EndTxn version.
+    /// Maximum supported EndTxn version (v3 flexible encoding).
     ///
-    /// Encode/decode for v1-v5 exists but is not yet activated.
-    pub const END_TXN_MAX: i16 = 0;
+    /// v3 flexible. Encode/decode for v4-v5 (KIP-890 epoch bump) exists
+    /// but is not yet activated.
+    pub const END_TXN_MAX: i16 = 3;
 
     // ── TxnOffsetCommit (API key 28) ─────────────────────────────────────
     /// Minimum supported TxnOffsetCommit version.
     pub const TXN_OFFSET_COMMIT_MIN: i16 = 0;
-    /// Maximum supported TxnOffsetCommit version.
+    /// Maximum supported TxnOffsetCommit version (v3 flexible + consumer fields).
     ///
-    /// Encode/decode for v1-v5 exists but is not yet activated.
-    pub const TXN_OFFSET_COMMIT_MAX: i16 = 0;
+    /// v2 leader epoch, v3 flexible + group_instance_id + generation_id.
+    /// Encode/decode for v4-v5 (KIP-890) exists but is not yet activated.
+    pub const TXN_OFFSET_COMMIT_MAX: i16 = 3;
 
     // ── Delegation Token APIs (38–41) ────────────────────────────────────
     /// Minimum supported CreateDelegationToken version. Kafka 4.0 removed v0.
@@ -470,18 +466,18 @@ pub mod versions {
     // ── Client Quotas APIs (48–49) ───────────────────────────────────────
     /// Minimum supported DescribeClientQuotas version.
     pub const DESCRIBE_CLIENT_QUOTAS_MIN: i16 = 0;
-    /// Maximum supported DescribeClientQuotas version.
-    pub const DESCRIBE_CLIENT_QUOTAS_MAX: i16 = 0;
+    /// Maximum supported DescribeClientQuotas version (v1 flexible encoding).
+    pub const DESCRIBE_CLIENT_QUOTAS_MAX: i16 = 1;
     /// Minimum supported AlterClientQuotas version.
     pub const ALTER_CLIENT_QUOTAS_MIN: i16 = 0;
-    /// Maximum supported AlterClientQuotas version.
-    pub const ALTER_CLIENT_QUOTAS_MAX: i16 = 0;
+    /// Maximum supported AlterClientQuotas version (v1 flexible encoding).
+    pub const ALTER_CLIENT_QUOTAS_MAX: i16 = 1;
 
     // ── ConsumerGroupHeartbeat (API key 68) ──────────────────────────────
     /// Minimum supported ConsumerGroupHeartbeat version.
     pub const CONSUMER_GROUP_HEARTBEAT_MIN: i16 = 0;
-    /// Maximum supported ConsumerGroupHeartbeat version (KIP-848).
-    pub const CONSUMER_GROUP_HEARTBEAT_MAX: i16 = 0;
+    /// Maximum supported ConsumerGroupHeartbeat version (v1 KIP-1082 regex + client member-id).
+    pub const CONSUMER_GROUP_HEARTBEAT_MAX: i16 = 1;
 
     // ── IncrementalAlterConfigs (API key 44) ─────────────────────────────
     /// Minimum supported IncrementalAlterConfigs version.

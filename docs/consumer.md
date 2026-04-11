@@ -966,7 +966,7 @@ The ConsumerGroupHeartbeat response uses 16-byte topic UUIDs in assignments.
 Krafka resolves these UUIDs to topic names with a two-level lookup order:
 
 1. **Cluster metadata lookup** — first consult `ClusterMetadata::topic_name_for_id`.
-   With Metadata v10+ now activated (`METADATA_MAX = 13`), the broker returns
+   With Metadata v10+ now activated (`METADATA_MAX = 12`), the broker returns
    topic UUID → name mappings in metadata responses.
 2. **Local topic names cache** — if metadata does not contain the mapping,
    fall back to a local UUID → name cache built from previously resolved

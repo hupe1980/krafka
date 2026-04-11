@@ -1468,7 +1468,7 @@ impl Consumer {
                 }
             };
 
-            // Negotiate ListOffsets version — require v1+ (MIN), prefer v2 (MAX).
+            // Negotiate ListOffsets version — require v1+ (MIN).
             let list_version = match conn
                 .negotiate_api_version(
                     ApiKey::ListOffsets,
@@ -1500,11 +1500,7 @@ impl Consumer {
 
             let response = match conn
                 .send_request(ApiKey::ListOffsets, list_version, |buf| {
-                    if list_version >= 2 {
-                        request.encode_v2(buf)
-                    } else {
-                        request.encode_v1(buf)
-                    }
+                    request.encode_versioned(list_version, buf)
                 })
                 .await
             {
@@ -1520,11 +1516,8 @@ impl Consumer {
             };
 
             let mut buf = response;
-            let list_response = match if list_version >= 2 {
-                ListOffsetsResponse::decode_v2(&mut buf)
-            } else {
-                ListOffsetsResponse::decode_v1(&mut buf)
-            } {
+            let list_response = match ListOffsetsResponse::decode_versioned(list_version, &mut buf)
+            {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(

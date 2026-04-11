@@ -1222,18 +1222,18 @@ impl GroupCoordinator {
     }
 
     /// Get the coordinator connection, finding it if necessary.
-    /// Checks liveness of cached connections and re-discovers if dead.
+    /// Checks liveness and SASL session expiry of cached connections and re-discovers if unusable.
     async fn get_coordinator_connection(&self) -> Result<Arc<BrokerConnection>> {
         {
             let conn = self.coordinator_conn.read().await;
             if let Some(ref c) = *conn {
-                if c.is_alive() {
+                if c.is_usable() {
                     return Ok(c.clone());
                 }
-                // Connection is dead, clear it and re-discover
+                // Connection is dead or SASL session expired, clear it and re-discover
                 drop(conn);
                 *self.coordinator_conn.write().await = None;
-                debug!("Coordinator connection is dead, re-discovering");
+                debug!("Coordinator connection is unusable, re-discovering");
             }
         }
 
@@ -1661,6 +1661,13 @@ impl GroupCoordinator {
             let mut interval = tokio::time::interval(heartbeat_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+            // Cache the negotiated heartbeat version per coordinator connection.
+            // The version is stable for a given connection (API versions don't
+            // change until reconnect), so we only re-negotiate when the
+            // connection identity changes.
+            let mut cached_hb_version: Option<i16> = None;
+            let mut cached_conn_id: Option<usize> = None;
+
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
@@ -1675,33 +1682,44 @@ impl GroupCoordinator {
 
                         // Send heartbeat
                         if let Some(ref conn) = coordinator_conn {
+                            // Re-negotiate only when the coordinator connection changes.
+                            let conn_id = std::sync::Arc::as_ptr(conn) as usize;
+                            let hb_version = if cached_conn_id == Some(conn_id) {
+                                // Safe to unwrap: cached_hb_version is always set
+                                // together with cached_conn_id.
+                                cached_hb_version.unwrap()
+                            } else {
+                                match conn
+                                    .negotiate_api_version(
+                                        ApiKey::Heartbeat,
+                                        HEARTBEAT_MAX,
+                                        HEARTBEAT_MIN,
+                                    )
+                                    .await
+                                {
+                                    Some(v) => {
+                                        cached_conn_id = Some(conn_id);
+                                        cached_hb_version = Some(v);
+                                        v
+                                    }
+                                    None => {
+                                        warn!(
+                                            "Broker does not support Heartbeat v{}-v{} for group '{}', triggering rebalance",
+                                            HEARTBEAT_MIN, HEARTBEAT_MAX, group_id
+                                        );
+                                        *coordinator_conn_ref.write().await = None;
+                                        heartbeat_controller.signal_rebalance();
+                                        heartbeat_controller.stop();
+                                        break;
+                                    }
+                                }
+                            };
+
                             let request = HeartbeatRequest {
                                 group_id: group_id.clone(),
                                 generation_id,
                                 member_id: member_id.clone(),
                                 group_instance_id: group_instance_id.clone(),
-                            };
-
-                            // Negotiate heartbeat version with broker (MIN=3, KIP-345 static membership).
-                            let hb_version = match conn
-                                .negotiate_api_version(
-                                    ApiKey::Heartbeat,
-                                    HEARTBEAT_MAX,
-                                    HEARTBEAT_MIN,
-                                )
-                                .await
-                            {
-                                Some(v) => v,
-                                None => {
-                                    warn!(
-                                        "Broker does not support Heartbeat v{}-v{} for group '{}', triggering rebalance",
-                                        HEARTBEAT_MIN, HEARTBEAT_MAX, group_id
-                                    );
-                                    *coordinator_conn_ref.write().await = None;
-                                    heartbeat_controller.signal_rebalance();
-                                    heartbeat_controller.stop();
-                                    break;
-                                }
                             };
                             let send_result = conn
                                 .send_request(ApiKey::Heartbeat, hb_version, |buf| {
@@ -1967,8 +1985,8 @@ impl GroupCoordinator {
                 }
                 // Re-resolve after refresh. If topic UUIDs are still
                 // unresolved, KIP-848 cannot operate because UUID→name
-                // mappings require Metadata v10+ which is not yet active
-                // (METADATA_MAX = 8). Fail fast with a clear error rather
+                // mappings require Metadata v10+.
+                // Fail fast with a clear error rather
                 // than silently keeping an empty/partial assignment.
                 let target = self.target_assignment.read().await.clone();
                 let (resolved, still_unresolved) =
@@ -2246,7 +2264,7 @@ impl GroupCoordinator {
                                                             warn!(
                                                                 "KIP-848 topic UUIDs still unresolved after metadata refresh \
                                                                  for group '{}'. Metadata v10+ is required to map topic IDs \
-                                                                 to names — current METADATA_MAX does not support this.",
+                                                                 to names.",
                                                                 group_id
                                                             );
                                                         }

@@ -304,28 +304,29 @@ impl BrokerConnectionBundle {
         self.connections.is_empty()
     }
 
-    /// Check if all connections in the bundle are alive.
+    /// Check if all connections in the bundle are usable (alive and
+    /// not past their SASL session expiry).
     #[inline]
     pub fn all_alive(&self) -> bool {
-        self.connections.iter().all(|c| c.is_alive())
+        self.connections.iter().all(|c| c.is_usable())
     }
 
-    /// Check if any connection in the bundle is alive.
+    /// Check if any connection in the bundle is usable.
     #[inline]
     pub fn any_alive(&self) -> bool {
-        self.connections.iter().any(|c| c.is_alive())
+        self.connections.iter().any(|c| c.is_usable())
     }
 
-    /// Get the number of alive connections.
+    /// Get the number of usable connections.
     #[inline]
     pub fn alive_count(&self) -> usize {
-        self.connections.iter().filter(|c| c.is_alive()).count()
+        self.connections.iter().filter(|c| c.is_usable()).count()
     }
 
-    /// Select an alive connection.
+    /// Select a usable connection.
     ///
-    /// Uses round-robin selection but skips dead connections.
-    /// Returns None if all connections are dead.
+    /// Uses round-robin selection but skips dead or session-expired connections.
+    /// Returns None if no usable connection exists.
     pub fn select_alive(&self) -> Option<Arc<BrokerConnection>> {
         let len = self.connections.len();
         let start = self.counter.fetch_add(1, Ordering::Relaxed) % len;
@@ -333,7 +334,7 @@ impl BrokerConnectionBundle {
         // Check up to len connections starting from the round-robin position
         for i in 0..len {
             let index = (start + i) % len;
-            if self.connections[index].is_alive() {
+            if self.connections[index].is_usable() {
                 return Some(self.connections[index].clone());
             }
         }
@@ -462,13 +463,24 @@ impl ConnectionPool {
     /// callers while a reconnection is in progress.
     pub async fn get_connection(&self, address: &str) -> Result<Arc<BrokerConnection>> {
         // Fast path: check under read lock
+        let needs_reauth;
         {
             let connections = self.connections_by_addr.read().await;
             if let Some(conn) = connections.get(address)
-                && conn.is_alive()
+                && conn.is_usable()
             {
                 return Ok(conn.clone());
             }
+            needs_reauth = connections
+                .get(address)
+                .is_some_and(|c| c.is_alive() && c.needs_reauthentication());
+        }
+
+        if needs_reauth {
+            info!(
+                address = %address,
+                "Replacing connection due to SASL session expiry (KIP-368)"
+            );
         }
 
         // Slow path: reconnect WITHOUT holding any lock
@@ -478,7 +490,7 @@ impl ConnectionPool {
         let mut connections = self.connections_by_addr.write().await;
         // Double-check: another task may have reconnected while we were connecting
         if let Some(existing) = connections.get(address)
-            && existing.is_alive()
+            && existing.is_usable()
         {
             return Ok(existing.clone());
         }
@@ -498,13 +510,25 @@ impl ConnectionPool {
         address: &str,
     ) -> Result<Arc<BrokerConnection>> {
         // Fast path: check under read lock
+        let needs_reauth;
         {
             let connections = self.connections.read().await;
             if let Some(conn) = connections.get(&broker_id)
-                && conn.is_alive()
+                && conn.is_usable()
             {
                 return Ok(conn.clone());
             }
+            needs_reauth = connections
+                .get(&broker_id)
+                .is_some_and(|c| c.is_alive() && c.needs_reauthentication());
+        }
+
+        if needs_reauth {
+            info!(
+                broker_id = %broker_id,
+                address = %address,
+                "Replacing connection due to SASL session expiry (KIP-368)"
+            );
         }
 
         // Slow path: reconnect WITHOUT holding any lock
@@ -516,7 +540,7 @@ impl ConnectionPool {
 
         // Double-check: another task may have reconnected while we were connecting
         if let Some(existing) = connections.get(&broker_id)
-            && existing.is_alive()
+            && existing.is_usable()
         {
             return Ok(existing.clone());
         }
@@ -553,46 +577,62 @@ impl ConnectionPool {
         }
     }
 
-    /// Clean up all dead connections from the pool.
+    /// Clean up all unusable connections (dead or session-expired) from the pool.
     ///
-    /// This method removes connections that are no longer alive from both
-    /// the broker ID and address maps.
+    /// Removes connections from both maps and then closes them outside
+    /// the lock to avoid holding the write lock across async I/O.
     pub async fn cleanup_dead_connections(&self) {
-        let mut connections = self.connections.write().await;
-        let mut connections_by_addr = self.connections_by_addr.write().await;
+        let removed: Vec<Arc<BrokerConnection>>;
+        {
+            let mut connections = self.connections.write().await;
+            let mut connections_by_addr = self.connections_by_addr.write().await;
 
-        // Collect dead broker IDs and their addresses
-        let dead_entries: Vec<(BrokerId, String)> = connections
-            .iter()
-            .filter(|(_, conn)| !conn.is_alive())
-            .map(|(id, conn)| (*id, conn.address().to_string()))
-            .collect();
+            // Collect dead or session-expired broker IDs and their addresses
+            let dead_entries: Vec<(BrokerId, String)> = connections
+                .iter()
+                .filter(|(_, conn)| !conn.is_usable())
+                .map(|(id, conn)| (*id, conn.address().to_string()))
+                .collect();
 
-        // Remove dead connections by broker ID
-        for (broker_id, address) in &dead_entries {
-            connections.remove(broker_id);
-            connections_by_addr.remove(address);
-            debug!(broker_id = %broker_id, address = %address, "Cleaned up dead connection");
+            // Remove dead/expired connections by broker ID
+            let mut removed_conns: Vec<Arc<BrokerConnection>> =
+                Vec::with_capacity(dead_entries.len());
+            for (broker_id, address) in &dead_entries {
+                if let Some(conn) = connections.remove(broker_id) {
+                    removed_conns.push(conn);
+                }
+                connections_by_addr.remove(address);
+                debug!(broker_id = %broker_id, address = %address, "Cleaned up unusable connection");
+            }
+
+            // Also clean up orphaned dead/expired connections in connections_by_addr
+            // (connections that were added by address only, not by broker ID)
+            let dead_addrs: Vec<String> = connections_by_addr
+                .iter()
+                .filter(|(_, conn)| !conn.is_usable())
+                .map(|(addr, _)| addr.clone())
+                .collect();
+
+            for addr in &dead_addrs {
+                if let Some(conn) = connections_by_addr.remove(addr) {
+                    removed_conns.push(conn);
+                }
+                debug!(address = %addr, "Cleaned up unusable orphaned connection");
+            }
+
+            if !dead_entries.is_empty() {
+                info!(
+                    count = dead_entries.len(),
+                    "Cleaned up unusable connections from pool"
+                );
+            }
+
+            removed = removed_conns;
         }
 
-        // Also clean up orphaned dead connections in connections_by_addr
-        // (connections that were added by address only, not by broker ID)
-        let dead_addrs: Vec<String> = connections_by_addr
-            .iter()
-            .filter(|(_, conn)| !conn.is_alive())
-            .map(|(addr, _)| addr.clone())
-            .collect();
-
-        for addr in dead_addrs {
-            connections_by_addr.remove(&addr);
-            debug!(address = %addr, "Cleaned up dead orphaned connection");
-        }
-
-        if !dead_entries.is_empty() {
-            info!(
-                count = dead_entries.len(),
-                "Cleaned up dead connections from pool"
-            );
+        // Close removed connections outside the lock
+        for conn in &removed {
+            conn.close().await;
         }
     }
 
@@ -616,10 +656,10 @@ impl ConnectionPool {
         }
     }
 
-    /// Get the number of active connections.
+    /// Get the number of usable connections (alive and not session-expired).
     pub async fn len(&self) -> usize {
         let connections = self.connections.read().await;
-        connections.values().filter(|c| c.is_alive()).count()
+        connections.values().filter(|c| c.is_usable()).count()
     }
 
     /// Check if the pool is empty.

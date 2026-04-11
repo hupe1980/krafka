@@ -59,10 +59,12 @@ impl FindCoordinatorRequest {
     /// v5 (KIP-890) and v6 (KIP-932) share the same wire format.
     pub fn encode_v4(&self, buf: &mut impl BufMut) -> Result<()> {
         self.key_type.encode(buf);
-        // CoordinatorKeys: compact array — varint encodes count + 1.
+        // CoordinatorKeys: compact array of strings — varint encodes count + 1.
+        // This is []string (primitive), not []struct, so no per-element tagged fields.
         let key_count: u32 = 1;
         crate::util::varint::encode_unsigned_varint(key_count + 1, buf);
         KafkaString::new(&self.key).try_encode_compact(buf)?;
+        // Top-level tagged fields.
         TaggedFields::default().try_encode(buf)?;
         Ok(())
     }
@@ -424,6 +426,34 @@ mod tests {
         let mut buf = BytesMut::new();
         request.encode_versioned(version, &mut buf).unwrap();
         assert_eq!(buf, buf_v4, "v{version} encode should equal v4");
+    }
+
+    /// Byte-exact test for FindCoordinator v4 request encoding.
+    ///
+    /// CoordinatorKeys is `[]string` (primitive array), so no per-element
+    /// tagged fields — only the top-level tagged fields at the end.
+    #[test]
+    fn test_find_coordinator_request_v4_exact_bytes() {
+        let request = FindCoordinatorRequest {
+            key: "grp".to_string(),
+            key_type: 0,
+        };
+        let mut buf = BytesMut::new();
+        request.encode_versioned(4, &mut buf).unwrap();
+
+        let mut expected = BytesMut::new();
+        expected.put_i8(0); // key_type
+        varint::encode_unsigned_varint(2, &mut expected); // compact array len = 1 + 1
+        // compact string "grp": varint(3+1) then bytes
+        varint::encode_unsigned_varint(4, &mut expected);
+        expected.put_slice(b"grp");
+        varint::encode_unsigned_varint(0, &mut expected); // top-level tagged fields (empty)
+        // No per-element tagged fields — CoordinatorKeys is []string, not []struct.
+
+        assert_eq!(
+            buf, expected,
+            "v4 wire bytes mismatch: got {buf:?}, expected {expected:?}"
+        );
     }
 
     #[rstest]

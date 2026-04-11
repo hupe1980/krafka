@@ -252,8 +252,8 @@ impl ClusterMetadata {
         let conn = self.get_any_connection().await?;
 
         // Negotiate the highest mutually supported Metadata version up to the
-        // client's supported maximum (`METADATA_MAX`, currently v8).
-        // Negotiate Metadata version — v1+ required, up to v13 (topic UUIDs, KIP-848).
+        // client's supported maximum (`METADATA_MAX`).
+        // Negotiate Metadata version — v1+ required, up to v12 (topic UUIDs, KIP-848).
         let metadata_version = conn
             .negotiate_api_version(
                 ApiKey::Metadata,
@@ -459,11 +459,7 @@ impl ClusterMetadata {
     /// The mapping is populated from metadata v10+ responses where each topic
     /// includes a `topic_id`. Returns `None` if the UUID is unknown — the
     /// caller should trigger a metadata refresh and retry.
-    ///
-    /// Currently `pub(crate)` because `METADATA_MAX` is capped at v8, so
-    /// `topic_ids` is never populated. Will be promoted to `pub` once
-    /// Metadata v10+ negotiation is activated.
-    pub(crate) fn topic_name_for_id(&self, topic_id: &[u8; 16]) -> Option<String> {
+    pub fn topic_name_for_id(&self, topic_id: &[u8; 16]) -> Option<String> {
         self.cache
             .load()
             .topic_ids

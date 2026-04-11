@@ -527,6 +527,7 @@ Krafka includes the following production-ready features:
 - ✅ **TLS/SSL encryption**: Secure connections with rustls and mTLS support
 - ✅ **AWS MSK IAM authentication**: Native support with optional SDK integration
 - ✅ **SASL/SCRAM Authentication**: SHA-256 and SHA-512 mechanisms
+- ✅ **Session Reauthentication (KIP-368)**: Proactive session lifetime tracking with automatic connection replacement before SASL session expiry
 - ✅ **Metrics and Observability**: Producer, consumer, and connection metrics
 - ✅ **ACL Management**: Create, describe, and delete ACLs
 - ✅ **Security Hardening**: Secret zeroization, constant-time auth, PBKDF2 validation, decompression limits, allocation caps

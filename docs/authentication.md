@@ -629,6 +629,19 @@ let consumer = Consumer::builder()
     .await?;
 ```
 
+## Session Reauthentication (KIP-368)
+
+Krafka supports [KIP-368](https://cwiki.apache.org/confluence/display/KAFKA/KIP-368%3A+Allow+SASL+Connections+to+Periodically+Re-Authenticate) session lifetime tracking. When a broker reports a session lifetime via `SaslAuthenticateResponse` v1, krafka tracks the expiry and proactively replaces the connection before the session expires.
+
+### How It Works
+
+1. During SASL handshake, the broker may include a `session_lifetime_ms` value in its v1 response.
+2. If non-zero, krafka calculates a reauthentication deadline at a **randomised** point between 85% and 95% of the lifetime. The jitter prevents a thundering-herd where many connections to the same broker all expire simultaneously.
+3. When the connection pool serves a connection request, it checks `is_usable()` — which verifies the connection is both alive **and** not past its reauthentication deadline.
+4. Expired-session connections are transparently replaced with a fresh connection that performs a new SASL handshake.
+
+This behaviour matches the Java Kafka client and is fully automatic — no client configuration is required. It works with all SASL mechanisms and is especially important for OAUTHBEARER, where tokens have a natural expiry.
+
 ## Security Best Practices
 
 1. **Always use TLS in production** - Use `SASL_SSL` instead of `SASL_PLAINTEXT`
