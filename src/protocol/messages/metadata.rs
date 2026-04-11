@@ -1981,7 +1981,7 @@ mod tests {
         let req = ApiVersionsRequest {
             client_software_name: Some(KafkaString::new("krafka")),
             client_software_version: Some(KafkaString::new("0.4.0")),
-            cluster_id: Some("my-cluster".to_string()),
+            cluster_id: Some(KafkaString::new("my-cluster")),
             node_id: 42,
         };
         let mut buf = BytesMut::new();

@@ -23,6 +23,7 @@ The AdminClient provides cluster administration capabilities:
 - ACL management
 - Delegation token management (create, describe, renew, expire)
 - Client quota management (describe, alter)
+- Cluster feature versioning (describe, update — KIP-584)
 
 ### API Version Negotiation
 
@@ -868,6 +869,65 @@ let results = admin
     )
     .await?;
 ```
+
+## Feature Versioning (KIP-584)
+
+Kafka 2.7+ supports cluster-wide feature flags that control the finalized
+version range for features like `metadata.version`. Use `describe_features` to
+discover what the cluster supports and `update_features` to upgrade, downgrade,
+or delete finalized feature levels.
+
+### Describing Features
+
+```rust
+let features = admin.describe_features().await?;
+println!("Epoch: {}", features.finalized_features_epoch);
+for f in &features.supported_features {
+    println!("supported: {} [{}, {}]", f.name, f.min_version, f.max_version);
+}
+for f in &features.finalized_features {
+    println!("finalized: {} [{}, {}]", f.name, f.min_version_level, f.max_version_level);
+}
+```
+
+### Updating Features
+
+```rust
+use krafka::protocol::messages::FeatureUpdateKey;
+
+// Upgrade metadata.version to level 17
+let results = admin
+    .update_features(
+        vec![FeatureUpdateKey::upgrade("metadata.version", 17)],
+        false, // validate_only
+    )
+    .await?;
+
+for r in &results.results {
+    match &r.error {
+        None => println!("{}: ok", r.feature),
+        Some(e) => println!("{}: {}", r.feature, e),
+    }
+}
+
+// Dry-run validation (validate_only = true, requires v1+)
+let results = admin
+    .update_features(
+        vec![FeatureUpdateKey::upgrade("metadata.version", 17)],
+        true,
+    )
+    .await?;
+```
+
+Upgrade types:
+- `FeatureUpdateKey::upgrade(name, level)` — raise to a higher level
+- `FeatureUpdateKey::safe_downgrade(name, level)` — lower the level safely
+- `FeatureUpdateKey::unsafe_downgrade(name, level)` — forceful downgrade (may lose data)
+- `FeatureUpdateKey::delete(name)` — remove the finalized feature entirely
+
+When the broker supports `UpdateFeatures` v1+, the request uses the typed
+`UpgradeType` field. On older v0 brokers, the client falls back to the boolean
+`AllowDowngrade` flag.
 
 ## Next Steps
 

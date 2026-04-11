@@ -307,19 +307,19 @@ impl BrokerConnectionBundle {
     /// Check if all connections in the bundle are usable (alive and
     /// not past their SASL session expiry).
     #[inline]
-    pub fn all_alive(&self) -> bool {
+    pub fn all_usable(&self) -> bool {
         self.connections.iter().all(|c| c.is_usable())
     }
 
     /// Check if any connection in the bundle is usable.
     #[inline]
-    pub fn any_alive(&self) -> bool {
+    pub fn any_usable(&self) -> bool {
         self.connections.iter().any(|c| c.is_usable())
     }
 
     /// Get the number of usable connections.
     #[inline]
-    pub fn alive_count(&self) -> usize {
+    pub fn usable_count(&self) -> usize {
         self.connections.iter().filter(|c| c.is_usable()).count()
     }
 
@@ -327,7 +327,7 @@ impl BrokerConnectionBundle {
     ///
     /// Uses round-robin selection but skips dead or session-expired connections.
     /// Returns None if no usable connection exists.
-    pub fn select_alive(&self) -> Option<Arc<BrokerConnection>> {
+    pub fn select_usable(&self) -> Option<Arc<BrokerConnection>> {
         let len = self.connections.len();
         let start = self.counter.fetch_add(1, Ordering::Relaxed) % len;
 

@@ -1536,11 +1536,21 @@ impl BrokerConnection {
         }
         // Randomised window: 85 % base + up to 10 % jitter = 85-95 % of lifetime.
         // Mirrors Java client's pctWindowFactor (0.85) + jitter (0.10).
+        const MIN_REAUTH_MS: u64 = 100;
         let base_factor: f64 = 0.85;
         let jitter_range: f64 = 0.10;
         let jitter: f64 = rand::random::<f64>() * jitter_range;
         let factor = base_factor + jitter;
-        let reauth_ms = (session_lifetime_ms as f64 * factor) as u64;
+        let computed_reauth_ms = (session_lifetime_ms as f64 * factor) as u64;
+        let reauth_ms = computed_reauth_ms.max(MIN_REAUTH_MS);
+        if computed_reauth_ms < MIN_REAUTH_MS {
+            warn!(
+                session_lifetime_ms,
+                computed_reauth_ms,
+                reauth_ms,
+                "broker reported unusually small SASL session lifetime; clamping reauthentication delay"
+            );
+        }
         Some(Instant::now() + Duration::from_millis(reauth_ms))
     }
 

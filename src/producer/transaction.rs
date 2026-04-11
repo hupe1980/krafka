@@ -50,6 +50,7 @@
 //! producer.commit_transaction().await?;
 //! ```
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
@@ -384,6 +385,54 @@ impl TransactionalProducer {
         *self.coordinator_id.write().await = None;
     }
 
+    /// Retry a coordinator RPC with exponential backoff.
+    ///
+    /// On coordinator errors (`NotCoordinator`, `CoordinatorNotAvailable`,
+    /// `CoordinatorLoadInProgress`) or transient network/timeout failures the
+    /// cached coordinator is invalidated and re-discovered before the next
+    /// attempt.  Non-retriable errors are returned immediately.
+    ///
+    /// `op_name` is used in log messages to identify the RPC.
+    async fn retry_with_coordinator<F, Fut>(&self, op_name: &str, op: F) -> Result<()>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        let max_retries = self.retry_policy.max_retries;
+
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                tokio::time::sleep(self.retry_policy.calculate_backoff(attempt)).await;
+            }
+
+            let result = op().await;
+
+            match &result {
+                Ok(()) => return Ok(()),
+                Err(e) if Self::needs_coordinator_refresh(e) && attempt < max_retries => {
+                    warn!(
+                        attempt,
+                        error = %e,
+                        op_name,
+                        "Coordinator error, refreshing and retrying"
+                    );
+                    self.invalidate_coordinator().await;
+                }
+                Err(e) if e.is_retriable() && attempt < max_retries => {
+                    warn!(
+                        attempt,
+                        error = %e,
+                        op_name,
+                        "Retriable error, retrying"
+                    );
+                }
+                Err(_) => return result,
+            }
+        }
+
+        unreachable!()
+    }
+
     fn set_state(&self, state: TransactionState) {
         self.state.store(state as u8, Ordering::SeqCst);
     }
@@ -438,86 +487,53 @@ impl TransactionalProducer {
     /// exponential backoff. On each retry the cached coordinator is invalidated
     /// and re-discovered via `FindCoordinator`.
     async fn do_init_transactions(&self) -> Result<()> {
-        let max_retries = self.retry_policy.max_retries;
+        self.retry_with_coordinator("InitProducerId", || async {
+            let (_coordinator_id, conn) = self.coordinator_connection().await?;
 
-        for attempt in 0..=max_retries {
-            if attempt > 0 {
-                tokio::time::sleep(self.retry_policy.calculate_backoff(attempt)).await;
+            let ip_version = conn
+                .negotiate_api_version(
+                    ApiKey::InitProducerId,
+                    versions::INIT_PRODUCER_ID_MAX,
+                    versions::INIT_PRODUCER_ID_MIN,
+                )
+                .await
+                .ok_or_else(|| {
+                    KrafkaError::protocol("no mutually supported InitProducerId API version")
+                })?;
+
+            let request = InitProducerIdRequest::transactional(
+                &self.config.transactional_id,
+                self.config.transaction_timeout_ms,
+            );
+
+            let response_bytes = conn
+                .send_request(ApiKey::InitProducerId, ip_version, |buf| {
+                    request.encode_versioned(ip_version, buf)
+                })
+                .await?;
+
+            let mut buf = response_bytes;
+            let response = InitProducerIdResponse::decode_versioned(ip_version, &mut buf)?;
+
+            if !response.is_ok() {
+                return Err(KrafkaError::broker(
+                    response.error_code,
+                    "failed to initialize producer ID",
+                ));
             }
 
-            let result: Result<()> = async {
-                let coordinator = self.find_coordinator().await?;
-                *self.coordinator_id.write().await = Some(coordinator);
+            self.identity
+                .initialize(response.producer_id, response.producer_epoch);
 
-                let (_coordinator_id, conn) = self.coordinator_connection().await?;
+            self.set_state(TransactionState::Ready);
+            info!(
+                "Transactional producer initialized: PID={}, epoch={}",
+                response.producer_id, response.producer_epoch
+            );
 
-                let ip_version = conn
-                    .negotiate_api_version(
-                        ApiKey::InitProducerId,
-                        versions::INIT_PRODUCER_ID_MAX,
-                        versions::INIT_PRODUCER_ID_MIN,
-                    )
-                    .await
-                    .ok_or_else(|| {
-                        KrafkaError::protocol("no mutually supported InitProducerId API version")
-                    })?;
-
-                let request = InitProducerIdRequest::transactional(
-                    &self.config.transactional_id,
-                    self.config.transaction_timeout_ms,
-                );
-
-                let response_bytes = conn
-                    .send_request(ApiKey::InitProducerId, ip_version, |buf| {
-                        request.encode_versioned(ip_version, buf)
-                    })
-                    .await?;
-
-                let mut buf = response_bytes;
-                let response = InitProducerIdResponse::decode_versioned(ip_version, &mut buf)?;
-
-                if !response.is_ok() {
-                    return Err(KrafkaError::broker(
-                        response.error_code,
-                        "failed to initialize producer ID",
-                    ));
-                }
-
-                self.identity
-                    .initialize(response.producer_id, response.producer_epoch);
-
-                self.set_state(TransactionState::Ready);
-                info!(
-                    "Transactional producer initialized: PID={}, epoch={}",
-                    response.producer_id, response.producer_epoch
-                );
-
-                Ok(())
-            }
-            .await;
-
-            match &result {
-                Ok(()) => return Ok(()),
-                Err(e) if Self::needs_coordinator_refresh(e) && attempt < max_retries => {
-                    warn!(
-                        attempt,
-                        error = %e,
-                        "Coordinator error in init_transactions, refreshing and retrying"
-                    );
-                    self.invalidate_coordinator().await;
-                }
-                Err(e) if e.is_retriable() && attempt < max_retries => {
-                    warn!(
-                        attempt,
-                        error = %e,
-                        "Retriable error in init_transactions, retrying"
-                    );
-                }
-                Err(_) => return result,
-            }
-        }
-
-        unreachable!()
+            Ok(())
+        })
+        .await
     }
 
     /// Find the transaction coordinator.
@@ -536,6 +552,8 @@ impl TransactionalProducer {
         let request = FindCoordinatorRequest::for_transaction(&self.config.transactional_id);
 
         // Transaction coordinator lookup requires v1+ (key_type field).
+        // FIND_COORDINATOR_MIN is 1, so negotiate_api_version returns None
+        // (handled above) rather than v0 when the broker lacks v1+.
         let fc_version = conn
             .negotiate_api_version(
                 ApiKey::FindCoordinator,
@@ -549,12 +567,6 @@ impl TransactionalProducer {
                      transactional coordinator lookup requires v1+",
                 )
             })?;
-        if fc_version < 1 {
-            return Err(KrafkaError::protocol(
-                "no mutually supported FindCoordinator v1+; \
-                 transactional coordinator lookup requires key_type (v1+)",
-            ));
-        }
 
         let response_bytes = conn
             .send_request(ApiKey::FindCoordinator, fc_version, |buf| {
@@ -693,92 +705,62 @@ impl TransactionalProducer {
     /// Retries on coordinator errors with exponential backoff, re-discovering
     /// the transaction coordinator between attempts.
     async fn add_partition_to_txn(&self, topic: &str, partition: PartitionId) -> Result<()> {
-        let max_retries = self.retry_policy.max_retries;
+        self.retry_with_coordinator("AddPartitionsToTxn", || async {
+            let (_coordinator_id, conn) = self.coordinator_connection().await?;
 
-        for attempt in 0..=max_retries {
-            if attempt > 0 {
-                tokio::time::sleep(self.retry_policy.calculate_backoff(attempt)).await;
-            }
+            let producer_id = self.identity.producer_id();
+            let producer_epoch = self.identity.producer_epoch();
 
-            let result: Result<()> = async {
-                let (_coordinator_id, conn) = self.coordinator_connection().await?;
-
-                let producer_id = self.identity.producer_id();
-                let producer_epoch = self.identity.producer_epoch();
-
-                let apt_version = conn
-                    .negotiate_api_version(
-                        ApiKey::AddPartitionsToTxn,
-                        versions::ADD_PARTITIONS_TO_TXN_MAX,
-                        versions::ADD_PARTITIONS_TO_TXN_MIN,
-                    )
-                    .await
-                    .ok_or_else(|| {
-                        KrafkaError::protocol(
-                            "no mutually supported AddPartitionsToTxn API version",
-                        )
-                    })?;
-
-                let request = AddPartitionsToTxnRequest::new(
-                    &self.config.transactional_id,
-                    producer_id,
-                    producer_epoch,
+            let apt_version = conn
+                .negotiate_api_version(
+                    ApiKey::AddPartitionsToTxn,
+                    versions::ADD_PARTITIONS_TO_TXN_MAX,
+                    versions::ADD_PARTITIONS_TO_TXN_MIN,
                 )
-                .add_partition(topic, partition);
+                .await
+                .ok_or_else(|| {
+                    KrafkaError::protocol("no mutually supported AddPartitionsToTxn API version")
+                })?;
 
-                let response_bytes = conn
-                    .send_request(ApiKey::AddPartitionsToTxn, apt_version, |buf| {
-                        request.encode_versioned(apt_version, buf)
-                    })
-                    .await?;
+            let request = AddPartitionsToTxnRequest::new(
+                &self.config.transactional_id,
+                producer_id,
+                producer_epoch,
+            )
+            .add_partition(topic, partition);
 
-                let mut buf = response_bytes;
-                let response = AddPartitionsToTxnResponse::decode_versioned(apt_version, &mut buf)?;
+            let response_bytes = conn
+                .send_request(ApiKey::AddPartitionsToTxn, apt_version, |buf| {
+                    request.encode_versioned(apt_version, buf)
+                })
+                .await?;
 
-                if !response.is_ok() {
-                    for topic_result in &response.results {
-                        for partition_result in &topic_result.partitions {
-                            if !partition_result.error_code.is_ok() {
-                                return Err(KrafkaError::broker(
-                                    partition_result.error_code,
-                                    format!("failed to add {}-{} to transaction", topic, partition),
-                                ));
-                            }
+            let mut buf = response_bytes;
+            let response = AddPartitionsToTxnResponse::decode_versioned(apt_version, &mut buf)?;
+
+            if !response.is_ok() {
+                for topic_result in &response.results {
+                    for partition_result in &topic_result.partitions {
+                        if !partition_result.error_code.is_ok() {
+                            return Err(KrafkaError::broker(
+                                partition_result.error_code,
+                                format!("failed to add {}-{} to transaction", topic, partition),
+                            ));
                         }
                     }
                 }
-
-                debug!("Added partition {}-{} to transaction", topic, partition);
-                Ok(())
+                // Fallback: is_ok() was false but no individual partition error found
+                // (e.g. the target partition is missing from the response).
+                return Err(KrafkaError::protocol(format!(
+                    "failed to add {}-{} to transaction: response indicated error but no per-partition error found",
+                    topic, partition
+                )));
             }
-            .await;
 
-            match &result {
-                Ok(()) => return Ok(()),
-                Err(e) if Self::needs_coordinator_refresh(e) && attempt < max_retries => {
-                    warn!(
-                        attempt,
-                        error = %e,
-                        topic,
-                        partition,
-                        "Coordinator error in AddPartitionsToTxn, refreshing and retrying"
-                    );
-                    self.invalidate_coordinator().await;
-                }
-                Err(e) if e.is_retriable() && attempt < max_retries => {
-                    warn!(
-                        attempt,
-                        error = %e,
-                        topic,
-                        partition,
-                        "Retriable error in AddPartitionsToTxn, retrying"
-                    );
-                }
-                Err(_) => return result,
-            }
-        }
-
-        unreachable!()
+            debug!("Added partition {}-{} to transaction", topic, partition);
+            Ok(())
+        })
+        .await
     }
 
     /// Send a record to a specific partition.
@@ -1002,7 +984,8 @@ impl TransactionalProducer {
     /// This allows atomic commit of consumed offsets along with produced messages.
     /// The `AddOffsetsToTxn` RPC (sent to the transaction coordinator) is retried
     /// on coordinator errors. The `TxnOffsetCommit` RPC (sent to the group
-    /// coordinator) is not retried here.
+    /// coordinator) is retried with group coordinator re-discovery on
+    /// coordinator and retriable errors.
     pub async fn send_offsets_to_transaction(
         &self,
         offsets: std::collections::HashMap<(String, PartitionId), i64>,
@@ -1020,79 +1003,50 @@ impl TransactionalProducer {
         let producer_epoch = self.identity.producer_epoch();
 
         // Phase 1: AddOffsetsToTxn — sent to transaction coordinator, with retry.
-        let max_retries = self.retry_policy.max_retries;
+        self.retry_with_coordinator("AddOffsetsToTxn", || async {
+            let (_coordinator_id, conn) = self.coordinator_connection().await?;
 
-        for attempt in 0..=max_retries {
-            if attempt > 0 {
-                tokio::time::sleep(self.retry_policy.calculate_backoff(attempt)).await;
+            let add_request = AddOffsetsToTxnRequest::new(
+                &self.config.transactional_id,
+                producer_id,
+                producer_epoch,
+                group_id,
+            );
+
+            let aot_version = conn
+                .negotiate_api_version(
+                    ApiKey::AddOffsetsToTxn,
+                    versions::ADD_OFFSETS_TO_TXN_MAX,
+                    versions::ADD_OFFSETS_TO_TXN_MIN,
+                )
+                .await
+                .ok_or_else(|| {
+                    KrafkaError::protocol("no mutually supported AddOffsetsToTxn API version")
+                })?;
+
+            let response_bytes = conn
+                .send_request(ApiKey::AddOffsetsToTxn, aot_version, |buf| {
+                    add_request.encode_versioned(aot_version, buf)
+                })
+                .await?;
+
+            let mut buf = response_bytes;
+            let add_response = AddOffsetsToTxnResponse::decode_versioned(aot_version, &mut buf)?;
+
+            if !add_response.is_ok() {
+                return Err(KrafkaError::broker(
+                    add_response.error_code,
+                    "failed to add offsets to transaction",
+                ));
             }
 
-            let result: Result<()> = async {
-                let (_coordinator_id, conn) = self.coordinator_connection().await?;
+            Ok(())
+        })
+        .await?;
 
-                let add_request = AddOffsetsToTxnRequest::new(
-                    &self.config.transactional_id,
-                    producer_id,
-                    producer_epoch,
-                    group_id,
-                );
-
-                let aot_version = conn
-                    .negotiate_api_version(
-                        ApiKey::AddOffsetsToTxn,
-                        versions::ADD_OFFSETS_TO_TXN_MAX,
-                        versions::ADD_OFFSETS_TO_TXN_MIN,
-                    )
-                    .await
-                    .ok_or_else(|| {
-                        KrafkaError::protocol("no mutually supported AddOffsetsToTxn API version")
-                    })?;
-
-                let response_bytes = conn
-                    .send_request(ApiKey::AddOffsetsToTxn, aot_version, |buf| {
-                        add_request.encode_versioned(aot_version, buf)
-                    })
-                    .await?;
-
-                let mut buf = response_bytes;
-                let add_response =
-                    AddOffsetsToTxnResponse::decode_versioned(aot_version, &mut buf)?;
-
-                if !add_response.is_ok() {
-                    return Err(KrafkaError::broker(
-                        add_response.error_code,
-                        "failed to add offsets to transaction",
-                    ));
-                }
-
-                Ok(())
-            }
-            .await;
-
-            match &result {
-                Ok(()) => break, // Fall through to Phase 2 (TxnOffsetCommit).
-                Err(e) if Self::needs_coordinator_refresh(e) && attempt < max_retries => {
-                    warn!(
-                        attempt,
-                        error = %e,
-                        group_id,
-                        "Coordinator error in AddOffsetsToTxn, refreshing and retrying"
-                    );
-                    self.invalidate_coordinator().await;
-                }
-                Err(e) if e.is_retriable() && attempt < max_retries => {
-                    warn!(
-                        attempt,
-                        error = %e,
-                        group_id,
-                        "Retriable error in AddOffsetsToTxn, retrying"
-                    );
-                }
-                Err(_) => return result,
-            }
-        }
-
-        // Phase 2: TxnOffsetCommit — sent to the group coordinator.
+        // Phase 2: TxnOffsetCommit — sent to the group coordinator, with retry.
+        // The Java client re-discovers the group coordinator and re-enqueues
+        // on coordinator or retriable errors; we mirror that with a retry loop.
         let mut commit_request = TxnOffsetCommitRequest::new(
             &self.config.transactional_id,
             group_id,
@@ -1104,58 +1058,93 @@ impl TransactionalProducer {
             commit_request = commit_request.add_offset(&topic, partition, offset, None);
         }
 
-        // Find the group coordinator for offset commit
-        let (group_node_id, group_host, group_port) = self.find_group_coordinator(group_id).await?;
-        let group_addr = format!("{group_host}:{group_port}");
+        let max_retries = self.retry_policy.max_retries;
 
-        let group_conn = self
-            .pool
-            .get_connection_by_id(group_node_id, &group_addr)
-            .await?;
-
-        let toc_version = group_conn
-            .negotiate_api_version(
-                ApiKey::TxnOffsetCommit,
-                versions::TXN_OFFSET_COMMIT_MAX,
-                versions::TXN_OFFSET_COMMIT_MIN,
-            )
-            .await
-            .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported TxnOffsetCommit API version")
-            })?;
-
-        let response_bytes = group_conn
-            .send_request(ApiKey::TxnOffsetCommit, toc_version, |buf| {
-                commit_request.encode_versioned(toc_version, buf)
-            })
-            .await?;
-
-        let mut buf = response_bytes;
-        let commit_response = TxnOffsetCommitResponse::decode_versioned(toc_version, &mut buf)?;
-
-        if !commit_response.is_ok() {
-            // Extract the first per-partition error for actionable diagnostics.
-            for topic_result in &commit_response.topics {
-                for part_result in &topic_result.partitions {
-                    if !part_result.error_code.is_ok() {
-                        return Err(KrafkaError::broker(
-                            part_result.error_code,
-                            format!(
-                                "failed to commit offset for {}-{} in transaction",
-                                topic_result.name, part_result.partition
-                            ),
-                        ));
-                    }
-                }
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                tokio::time::sleep(self.retry_policy.calculate_backoff(attempt)).await;
             }
-            // Fallback if is_ok was false but no individual error found
-            return Err(KrafkaError::protocol(
-                "failed to commit offsets in transaction",
-            ));
+
+            let result: Result<()> = async {
+                let (group_node_id, group_host, group_port) =
+                    self.find_group_coordinator(group_id).await?;
+                let group_addr = format!("{group_host}:{group_port}");
+
+                let group_conn = self
+                    .pool
+                    .get_connection_by_id(group_node_id, &group_addr)
+                    .await?;
+
+                let toc_version = group_conn
+                    .negotiate_api_version(
+                        ApiKey::TxnOffsetCommit,
+                        versions::TXN_OFFSET_COMMIT_MAX,
+                        versions::TXN_OFFSET_COMMIT_MIN,
+                    )
+                    .await
+                    .ok_or_else(|| {
+                        KrafkaError::protocol("no mutually supported TxnOffsetCommit API version")
+                    })?;
+
+                let response_bytes = group_conn
+                    .send_request(ApiKey::TxnOffsetCommit, toc_version, |buf| {
+                        commit_request.encode_versioned(toc_version, buf)
+                    })
+                    .await?;
+
+                let mut buf = response_bytes;
+                let commit_response =
+                    TxnOffsetCommitResponse::decode_versioned(toc_version, &mut buf)?;
+
+                if !commit_response.is_ok() {
+                    // Extract the first per-partition error for actionable diagnostics.
+                    for topic_result in &commit_response.topics {
+                        for part_result in &topic_result.partitions {
+                            if !part_result.error_code.is_ok() {
+                                return Err(KrafkaError::broker(
+                                    part_result.error_code,
+                                    format!(
+                                        "failed to commit offset for {}-{} in transaction",
+                                        topic_result.name, part_result.partition
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    // Fallback if is_ok was false but no individual error found
+                    return Err(KrafkaError::protocol(
+                        "failed to commit offsets in transaction",
+                    ));
+                }
+
+                Ok(())
+            }
+            .await;
+
+            match &result {
+                Ok(()) => {
+                    debug!("Added offsets to transaction for group {}", group_id);
+                    return Ok(());
+                }
+                Err(e) if Self::needs_coordinator_refresh(e) && attempt < max_retries => {
+                    warn!(
+                        attempt,
+                        error = %e,
+                        "TxnOffsetCommit group coordinator error, re-discovering and retrying"
+                    );
+                }
+                Err(e) if e.is_retriable() && attempt < max_retries => {
+                    warn!(
+                        attempt,
+                        error = %e,
+                        "TxnOffsetCommit retriable error, retrying"
+                    );
+                }
+                Err(_) => return result,
+            }
         }
 
-        debug!("Added offsets to transaction for group {}", group_id);
-        Ok(())
+        unreachable!()
     }
 
     /// Find the group coordinator, returning (node_id, host, port).
@@ -1288,88 +1277,46 @@ impl TransactionalProducer {
     /// Retries on coordinator errors with exponential backoff, re-discovering
     /// the transaction coordinator between attempts.
     async fn end_transaction(&self, commit: bool) -> Result<()> {
-        let max_retries = self.retry_policy.max_retries;
+        self.retry_with_coordinator("EndTxn", || async {
+            let (_coordinator_id, conn) = self.coordinator_connection().await?;
 
-        for attempt in 0..=max_retries {
-            if attempt > 0 {
-                tokio::time::sleep(self.retry_policy.calculate_backoff(attempt)).await;
+            let producer_id = self.identity.producer_id();
+            let producer_epoch = self.identity.producer_epoch();
+
+            let et_version = conn
+                .negotiate_api_version(ApiKey::EndTxn, versions::END_TXN_MAX, versions::END_TXN_MIN)
+                .await
+                .ok_or_else(|| KrafkaError::protocol("no mutually supported EndTxn API version"))?;
+
+            let request = if commit {
+                EndTxnRequest::commit(&self.config.transactional_id, producer_id, producer_epoch)
+            } else {
+                EndTxnRequest::abort(&self.config.transactional_id, producer_id, producer_epoch)
+            };
+
+            let response_bytes = conn
+                .send_request(ApiKey::EndTxn, et_version, |buf| {
+                    request.encode_versioned(et_version, buf)
+                })
+                .await?;
+
+            let mut buf = response_bytes;
+            let response = EndTxnResponse::decode_versioned(et_version, &mut buf)?;
+
+            if !response.is_ok() {
+                return Err(KrafkaError::broker(
+                    response.error_code,
+                    if commit {
+                        "failed to commit transaction"
+                    } else {
+                        "failed to abort transaction"
+                    },
+                ));
             }
 
-            let result: Result<()> = async {
-                let (_coordinator_id, conn) = self.coordinator_connection().await?;
-
-                let producer_id = self.identity.producer_id();
-                let producer_epoch = self.identity.producer_epoch();
-
-                let et_version = conn
-                    .negotiate_api_version(
-                        ApiKey::EndTxn,
-                        versions::END_TXN_MAX,
-                        versions::END_TXN_MIN,
-                    )
-                    .await
-                    .ok_or_else(|| {
-                        KrafkaError::protocol("no mutually supported EndTxn API version")
-                    })?;
-
-                let request = if commit {
-                    EndTxnRequest::commit(
-                        &self.config.transactional_id,
-                        producer_id,
-                        producer_epoch,
-                    )
-                } else {
-                    EndTxnRequest::abort(&self.config.transactional_id, producer_id, producer_epoch)
-                };
-
-                let response_bytes = conn
-                    .send_request(ApiKey::EndTxn, et_version, |buf| {
-                        request.encode_versioned(et_version, buf)
-                    })
-                    .await?;
-
-                let mut buf = response_bytes;
-                let response = EndTxnResponse::decode_versioned(et_version, &mut buf)?;
-
-                if !response.is_ok() {
-                    return Err(KrafkaError::broker(
-                        response.error_code,
-                        if commit {
-                            "failed to commit transaction"
-                        } else {
-                            "failed to abort transaction"
-                        },
-                    ));
-                }
-
-                Ok(())
-            }
-            .await;
-
-            match &result {
-                Ok(()) => return Ok(()),
-                Err(e) if Self::needs_coordinator_refresh(e) && attempt < max_retries => {
-                    warn!(
-                        attempt,
-                        error = %e,
-                        commit,
-                        "Coordinator error in EndTxn, refreshing and retrying"
-                    );
-                    self.invalidate_coordinator().await;
-                }
-                Err(e) if e.is_retriable() && attempt < max_retries => {
-                    warn!(
-                        attempt,
-                        error = %e,
-                        commit,
-                        "Retriable error in EndTxn, retrying"
-                    );
-                }
-                Err(_) => return result,
-            }
-        }
-
-        unreachable!()
+            Ok(())
+        })
+        .await
     }
 
     /// Get the transactional ID.

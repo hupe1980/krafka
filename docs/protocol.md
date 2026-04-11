@@ -99,6 +99,7 @@ this range are rejected with a protocol error.
 | ConsumerGroupHeartbeat | 0 | 1 | KIP-848 consumer group protocol, v1 KIP-1082 regex |
 | ConsumerGroupDescribe | 0 | 1 | KIP-848 group description |
 | DescribeTopicPartitions | 0 | 0 | Topic partition metadata (KIP-966) |
+| UpdateFeatures | 0 | 1 | Cluster feature versioning (KIP-584), v1 UpgradeType + ValidateOnly |
 | GetTelemetrySubscriptions² | 0 | 0 | KIP-714 client telemetry subscription discovery |
 | PushTelemetry² | 0 | 0 | KIP-714 client telemetry push |
 | ShareGroupHeartbeat¹ | 1 | 1 | KIP-932 share group heartbeat |

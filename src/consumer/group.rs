@@ -2916,9 +2916,11 @@ impl GroupCoordinator {
 
         *self.state.write().await = GroupState::Leaving;
 
+        // v3+ uses only the `members` array; the top-level `member_id`
+        // must be empty to avoid ambiguous single-vs-batch leave semantics.
         let request = LeaveGroupRequest {
             group_id: self.group_id.clone(),
-            member_id: member_id.clone(),
+            member_id: String::new(),
             members: vec![LeaveGroupMember {
                 member_id: member_id.clone(),
                 group_instance_id: self.group_instance_id.clone(),

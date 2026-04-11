@@ -109,7 +109,7 @@ let conn = bundle.select();
 let conn = bundle.get(0).unwrap();
 
 // Check bundle health
-println!("Alive connections: {}/{}", bundle.alive_count(), bundle.len());
+println!("Alive connections: {}/{}", bundle.usable_count(), bundle.len());
 ```
 
 ### Automatic Selection

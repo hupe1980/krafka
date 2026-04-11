@@ -56,6 +56,7 @@
 //! | DescribeCluster | 0 | 2 | v0 flexible (KIP-700), v1 endpoint_type (KIP-919), v2 is_fenced (KIP-1073) |
 //! | ConsumerGroupDescribe | 0 | 1 | v0 KIP-848, v1 member_type (KIP-1099) |
 //! | DescribeTopicPartitions | 0 | 0 | v0 KIP-966 paginated partition describe |
+//! | UpdateFeatures | 0 | 1 | v0 AllowDowngrade, v1 UpgradeType + ValidateOnly (KIP-584) |
 //! | ListClientMetricsResources | 0 | 0 | v0 KIP-714 telemetry discovery |
 //!
 //! ## Example
@@ -80,7 +81,10 @@ mod messages;
 mod primitives;
 mod record;
 
-pub use api::{ApiKey, ApiVersionRange, ApiVersionsRequest, ApiVersionsResponse, SupportedFeature};
+pub use api::{
+    ApiKey, ApiVersionRange, ApiVersionsRequest, ApiVersionsResponse, FinalizedFeature,
+    SupportedFeature,
+};
 pub use codec::{Decoder, Encoder, MAX_MESSAGE_SIZE};
 pub use header::{RequestHeader, ResponseHeader};
 pub use messages::*;
@@ -496,6 +500,12 @@ pub mod versions {
     pub const DESCRIBE_CLUSTER_MIN: i16 = 0;
     /// Maximum supported DescribeCluster version.
     pub const DESCRIBE_CLUSTER_MAX: i16 = 2;
+
+    // ── UpdateFeatures (API key 57) — KIP-584 ───────────────────────────
+    /// Minimum supported UpdateFeatures version.
+    pub const UPDATE_FEATURES_MIN: i16 = 0;
+    /// Maximum supported UpdateFeatures version (v1 adds UpgradeType + ValidateOnly).
+    pub const UPDATE_FEATURES_MAX: i16 = 1;
 
     // ── ConsumerGroupDescribe (API key 69) ───────────────────────────────
     /// Minimum supported ConsumerGroupDescribe version.
