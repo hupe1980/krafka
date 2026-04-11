@@ -388,8 +388,11 @@ async fn test_compression_roundtrip() {
 
     for compression in [
         Compression::None,
+        #[cfg(feature = "gzip")]
         Compression::Gzip,
+        #[cfg(feature = "snappy")]
         Compression::Snappy,
+        #[cfg(feature = "lz4")]
         Compression::Lz4,
         // Zstd is not supported by the apache/kafka-native GraalVM image.
     ] {

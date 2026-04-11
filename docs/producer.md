@@ -116,13 +116,21 @@ let producer = Producer::builder()
     .await?;
 ```
 
-| Codec | Speed | Ratio | Use Case |
-|-------|-------|-------|----------|
-| None | N/A | 1:1 | Low CPU, high bandwidth |
-| Gzip | Slow | Best | Archival, infrequent writes |
-| Snappy | Fast | Good | General purpose |
-| LZ4 | Fastest | Good | High-throughput, real-time |
-| Zstd | Medium | Best | Best balance of speed/ratio |
+| Codec | Cargo Feature | Speed | Ratio | Use Case |
+|-------|---------------|-------|-------|----------|
+| None | — | N/A | 1:1 | Low CPU, high bandwidth |
+| Gzip | `gzip` | Slow | Best | Archival, infrequent writes |
+| Snappy | `snappy` | Fast | Good | General purpose |
+| LZ4 | `lz4` | Fastest | Good | High-throughput, real-time |
+| Zstd | `zstd` | Medium | Best | Best balance of speed/ratio |
+
+All codecs are enabled by default via the `compression` convenience feature.
+To trim binary size or avoid the C toolchain (needed by `zstd`), disable defaults
+and select only the codecs you need:
+
+```toml
+krafka = { version = "0.4", default-features = false, features = ["lz4"] }
+```
 
 ### Batching
 

@@ -82,10 +82,33 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! ## Cargo Features
+//!
+//! | Feature | Default | Description |
+//! |---------|---------|-------------|
+//! | `compression` | **yes** | Enables all compression codecs (`gzip` + `snappy` + `lz4` + `zstd`). |
+//! | `gzip` | via `compression` | Gzip record batch compression via `flate2`. |
+//! | `snappy` | via `compression` | Snappy compression via `snap`. |
+//! | `lz4` | via `compression` | LZ4 compression via `lz4_flex`. |
+//! | `zstd` | via `compression` | Zstd compression via `zstd` (requires C toolchain). |
+//! | `aws-msk` | no | AWS MSK IAM authentication with SDK credential chain. |
+//! | `schema-registry` | no | Confluent Schema Registry HTTP client. |
+//! | `aws-glue-schema-registry` | no | AWS Glue Schema Registry SDK client. |
+//! | `socks5` | no | SOCKS5 proxy support via `tokio-socks`. |
+//! | `danger-insecure-tls` | no | Allow disabling TLS certificate verification (MITM risk!). |
+//!
+//! To disable the default compression codecs and pick only what you need:
+//!
+//! ```toml
+//! [dependencies]
+//! krafka = { version = "0.4", default-features = false, features = ["lz4"] }
+//! ```
 
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 #![deny(unsafe_code)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod admin;
 pub mod auth;

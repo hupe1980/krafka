@@ -43,6 +43,7 @@
 mod glue_client;
 
 #[cfg(feature = "aws-glue-schema-registry")]
+#[cfg_attr(docsrs, doc(cfg(feature = "aws-glue-schema-registry")))]
 pub use glue_client::{AwsGlueSchemaRegistry, AwsGlueSchemaRegistryBuilder};
 
 use std::collections::HashMap;

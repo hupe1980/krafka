@@ -38,14 +38,18 @@ Acks::All     // -1: Wait for all in-sync replicas
 
 ### Compression Values
 
+Each codec requires its corresponding Cargo feature (`gzip`, `snappy`, `lz4`, `zstd`).
+All are enabled by default via the `compression` feature.
+Use [`Compression::is_available()`] to check at runtime.
+
 ```rust
 use krafka::protocol::Compression;
 
-Compression::None    // No compression
-Compression::Gzip    // Gzip compression
-Compression::Snappy  // Snappy compression
-Compression::Lz4     // LZ4 compression
-Compression::Zstd    // Zstandard compression
+Compression::None    // No compression (always available)
+Compression::Gzip    // Gzip compression (feature = "gzip")
+Compression::Snappy  // Snappy compression (feature = "snappy")
+Compression::Lz4     // LZ4 compression (feature = "lz4")
+Compression::Zstd    // Zstandard compression (feature = "zstd")
 ```
 
 ### Producer Builder Example

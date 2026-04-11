@@ -60,9 +60,13 @@ fn bench_decompression(c: &mut Criterion) {
         .collect();
 
     for compression in [
+        #[cfg(feature = "gzip")]
         Compression::Gzip,
+        #[cfg(feature = "snappy")]
         Compression::Snappy,
+        #[cfg(feature = "lz4")]
         Compression::Lz4,
+        #[cfg(feature = "zstd")]
         Compression::Zstd,
     ] {
         let mut builder = RecordBatchBuilder::new().compression(compression);
@@ -141,7 +145,12 @@ fn bench_lazy_vs_eager_decoding(c: &mut Criterion) {
     let mut group = c.benchmark_group("lazy_vs_eager");
 
     for batch_size in [10, 100, 500] {
-        let mut builder = RecordBatchBuilder::new().compression(Compression::Lz4);
+        #[cfg(feature = "lz4")]
+        let compression = Compression::Lz4;
+        #[cfg(not(feature = "lz4"))]
+        let compression = Compression::None;
+
+        let mut builder = RecordBatchBuilder::new().compression(compression);
         for i in 0..batch_size {
             let key = format!("key-{i}");
             let value = format!("value-{i}-with-payload-data");

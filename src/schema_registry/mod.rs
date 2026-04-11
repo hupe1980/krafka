@@ -112,6 +112,7 @@ mod client;
 pub mod glue;
 
 #[cfg(feature = "schema-registry")]
+#[cfg_attr(docsrs, doc(cfg(feature = "schema-registry")))]
 pub use client::{ConfluentSchemaRegistry, ConfluentSchemaRegistryBuilder};
 
 use std::collections::HashMap;

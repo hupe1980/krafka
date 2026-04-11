@@ -212,7 +212,7 @@ let admin = AdminClient::builder()
 
 ## 🗜️ Compression
 
-Krafka supports all Kafka compression codecs:
+Krafka supports all Kafka compression codecs, individually feature-gated:
 
 ```rust
 use krafka::producer::Producer;
@@ -225,12 +225,18 @@ let producer = Producer::builder()
     .await?;
 ```
 
-| Codec | Crate | Characteristics |
-|-------|-------|-----------------|
-| `Compression::Gzip` | flate2 | Best ratio, slower |
-| `Compression::Snappy` | snap | Good balance |
-| `Compression::Lz4` | lz4_flex | Fastest |
-| `Compression::Zstd` | zstd | Best modern choice |
+| Codec | Cargo Feature | Crate | Characteristics |
+|-------|---------------|-------|-----------------|
+| `Compression::Gzip` | `gzip` | flate2 | Best ratio, slower |
+| `Compression::Snappy` | `snappy` | snap | Good balance |
+| `Compression::Lz4` | `lz4` | lz4_flex | Fastest |
+| `Compression::Zstd` | `zstd` | zstd | Best modern choice (requires C toolchain) |
+
+All codecs are enabled by default via the `compression` feature. To select only what you need:
+
+```toml
+krafka = { version = "0.4", default-features = false, features = ["lz4", "snappy"] }
+```
 
 ## ⚡ Performance Tuning
 

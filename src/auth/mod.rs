@@ -353,6 +353,7 @@ impl TlsConfig {
     ///
     /// Requires the `danger-insecure-tls` crate feature.
     #[cfg(feature = "danger-insecure-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "danger-insecure-tls")))]
     pub fn insecure() -> Self {
         Self {
             verify_server_cert: false,

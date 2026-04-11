@@ -9,6 +9,15 @@ use crate::error::{KrafkaError, Result};
 use crate::util::{crc32c, varint};
 
 /// Compression codec.
+///
+/// All variants are always available because they represent wire-format values
+/// (bits 0–2 of the record batch attributes field). The actual
+/// compress/decompress implementation for each codec is gated behind
+/// its Cargo feature (`gzip`, `snappy`, `lz4`, `zstd`). All four are
+/// enabled by the `compression` convenience feature (on by default).
+///
+/// Use [`Compression::is_available`] to check at runtime whether the
+/// underlying codec implementation was compiled in.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
@@ -17,12 +26,21 @@ pub enum Compression {
     #[default]
     None = 0,
     /// Gzip compression.
+    ///
+    /// Requires the `gzip` Cargo feature for compression/decompression.
     Gzip = 1,
     /// Snappy compression.
+    ///
+    /// Requires the `snappy` Cargo feature for compression/decompression.
     Snappy = 2,
     /// LZ4 compression.
+    ///
+    /// Requires the `lz4` Cargo feature for compression/decompression.
     Lz4 = 3,
     /// Zstd compression.
+    ///
+    /// Requires the `zstd` Cargo feature for compression/decompression.
+    /// Note: `zstd` pulls in `zstd-sys` which requires a C toolchain.
     Zstd = 4,
 }
 
@@ -37,6 +55,45 @@ impl Compression {
             3 => Self::Lz4,
             4 => Self::Zstd,
             _ => Self::None,
+        }
+    }
+
+    /// Returns `true` if the codec's feature was enabled at compile time.
+    ///
+    /// `Compression::None` is always available. Other codecs require their
+    /// corresponding Cargo feature (`gzip`, `snappy`, `lz4`, `zstd`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use krafka::protocol::Compression;
+    ///
+    /// assert!(Compression::None.is_available());
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn is_available(&self) -> bool {
+        match self {
+            Self::None => true,
+            Self::Gzip => cfg!(feature = "gzip"),
+            Self::Snappy => cfg!(feature = "snappy"),
+            Self::Lz4 => cfg!(feature = "lz4"),
+            Self::Zstd => cfg!(feature = "zstd"),
+        }
+    }
+
+    /// Returns the Cargo feature name required for this codec, if any.
+    ///
+    /// Returns `None` for `Compression::None` (always available).
+    #[inline]
+    #[must_use]
+    pub const fn required_feature(&self) -> Option<&'static str> {
+        match self {
+            Self::None => Option::None,
+            Self::Gzip => Option::Some("gzip"),
+            Self::Snappy => Option::Some("snappy"),
+            Self::Lz4 => Option::Some("lz4"),
+            Self::Zstd => Option::Some("zstd"),
         }
     }
 }
@@ -456,6 +513,7 @@ impl RecordBatch {
     fn compress_records(&self, records: &[u8]) -> Result<Bytes> {
         match self.attributes.compression {
             Compression::None => Ok(Bytes::copy_from_slice(records)),
+            #[cfg(feature = "gzip")]
             Compression::Gzip => {
                 use flate2::write::GzEncoder;
                 use std::io::Write;
@@ -469,6 +527,11 @@ impl RecordBatch {
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
                 Ok(Bytes::from(compressed))
             }
+            #[cfg(not(feature = "gzip"))]
+            Compression::Gzip => Err(KrafkaError::compression(
+                "gzip compression requires the `gzip` Cargo feature",
+            )),
+            #[cfg(feature = "snappy")]
             Compression::Snappy => {
                 let mut encoder = snap::raw::Encoder::new();
                 let compressed = encoder
@@ -476,6 +539,11 @@ impl RecordBatch {
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
                 Ok(Bytes::from(compressed))
             }
+            #[cfg(not(feature = "snappy"))]
+            Compression::Snappy => Err(KrafkaError::compression(
+                "snappy compression requires the `snappy` Cargo feature",
+            )),
+            #[cfg(feature = "lz4")]
             Compression::Lz4 => {
                 use std::io::Write;
                 let mut compressed = Vec::new();
@@ -488,11 +556,20 @@ impl RecordBatch {
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
                 Ok(Bytes::from(compressed))
             }
+            #[cfg(not(feature = "lz4"))]
+            Compression::Lz4 => Err(KrafkaError::compression(
+                "lz4 compression requires the `lz4` Cargo feature",
+            )),
+            #[cfg(feature = "zstd")]
             Compression::Zstd => {
                 let compressed = zstd::encode_all(records, 3)
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
                 Ok(Bytes::from(compressed))
             }
+            #[cfg(not(feature = "zstd"))]
+            Compression::Zstd => Err(KrafkaError::compression(
+                "zstd compression requires the `zstd` Cargo feature",
+            )),
         }
     }
 
@@ -610,8 +687,10 @@ impl RecordBatch {
     const MAX_DECOMPRESSED_SIZE: usize = 128 * 1024 * 1024;
 
     fn decompress_records(compression: Compression, data: &[u8]) -> Result<Bytes> {
-        let result = match compression {
+        #[allow(unused_variables)]
+        let result: Vec<u8> = match compression {
             Compression::None => return Ok(Bytes::copy_from_slice(data)),
+            #[cfg(feature = "gzip")]
             Compression::Gzip => {
                 use flate2::read::GzDecoder;
                 use std::io::Read;
@@ -624,6 +703,13 @@ impl RecordBatch {
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
                 decompressed
             }
+            #[cfg(not(feature = "gzip"))]
+            Compression::Gzip => {
+                return Err(KrafkaError::compression(
+                    "gzip decompression requires the `gzip` Cargo feature",
+                ));
+            }
+            #[cfg(feature = "snappy")]
             Compression::Snappy => {
                 // Pre-check decompressed length from snappy header before allocating.
                 // snap::raw::decompress_len reads the varint length prefix without decompressing.
@@ -641,6 +727,13 @@ impl RecordBatch {
                     .decompress_vec(data)
                     .map_err(|e| KrafkaError::compression(e.to_string()))?
             }
+            #[cfg(not(feature = "snappy"))]
+            Compression::Snappy => {
+                return Err(KrafkaError::compression(
+                    "snappy decompression requires the `snappy` Cargo feature",
+                ));
+            }
+            #[cfg(feature = "lz4")]
             Compression::Lz4 => {
                 use std::io::Read;
                 let decoder = lz4_flex::frame::FrameDecoder::new(data);
@@ -651,6 +744,13 @@ impl RecordBatch {
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
                 decompressed
             }
+            #[cfg(not(feature = "lz4"))]
+            Compression::Lz4 => {
+                return Err(KrafkaError::compression(
+                    "lz4 decompression requires the `lz4` Cargo feature",
+                ));
+            }
+            #[cfg(feature = "zstd")]
             Compression::Zstd => {
                 // Use streaming decoder with size limit instead of decode_all
                 // to prevent decompression bombs from causing OOM.
@@ -664,17 +764,28 @@ impl RecordBatch {
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
                 decompressed
             }
+            #[cfg(not(feature = "zstd"))]
+            Compression::Zstd => {
+                return Err(KrafkaError::compression(
+                    "zstd decompression requires the `zstd` Cargo feature",
+                ));
+            }
         };
 
-        if result.len() > Self::MAX_DECOMPRESSED_SIZE {
-            return Err(KrafkaError::compression(format!(
-                "decompressed size {} exceeds maximum {} bytes (possible compression bomb)",
-                result.len(),
-                Self::MAX_DECOMPRESSED_SIZE
-            )));
-        }
+        // When all compression features are disabled, every non-None arm
+        // diverges via `return Err(...)`, making this code unreachable.
+        #[allow(unreachable_code)]
+        {
+            if result.len() > Self::MAX_DECOMPRESSED_SIZE {
+                return Err(KrafkaError::compression(format!(
+                    "decompressed size {} exceeds maximum {} bytes (possible compression bomb)",
+                    result.len(),
+                    Self::MAX_DECOMPRESSED_SIZE
+                )));
+            }
 
-        Ok(Bytes::from(result))
+            Ok(Bytes::from(result))
+        }
     }
 }
 
@@ -1094,6 +1205,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gzip")]
     fn test_record_batch_compression_gzip() {
         let batch = RecordBatchBuilder::new()
             .compression(Compression::Gzip)
@@ -1109,6 +1221,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "snappy")]
     fn test_record_batch_compression_snappy() {
         let batch = RecordBatchBuilder::new()
             .compression(Compression::Snappy)
@@ -1124,6 +1237,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lz4")]
     fn test_record_batch_compression_lz4() {
         let batch = RecordBatchBuilder::new()
             .compression(Compression::Lz4)
@@ -1139,6 +1253,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_record_batch_compression_zstd() {
         let batch = RecordBatchBuilder::new()
             .compression(Compression::Zstd)
@@ -1154,12 +1269,65 @@ mod tests {
     }
 
     #[test]
-    fn test_compression_roundtrip() {
+    fn test_compression_is_available() {
+        // None is always available.
+        assert!(Compression::None.is_available());
+
+        // The other codecs depend on their features.
+        assert_eq!(Compression::Gzip.is_available(), cfg!(feature = "gzip"));
+        assert_eq!(Compression::Snappy.is_available(), cfg!(feature = "snappy"));
+        assert_eq!(Compression::Lz4.is_available(), cfg!(feature = "lz4"));
+        assert_eq!(Compression::Zstd.is_available(), cfg!(feature = "zstd"));
+    }
+
+    #[test]
+    fn test_compression_required_feature() {
+        assert_eq!(Compression::None.required_feature(), None);
+        assert_eq!(Compression::Gzip.required_feature(), Some("gzip"));
+        assert_eq!(Compression::Snappy.required_feature(), Some("snappy"));
+        assert_eq!(Compression::Lz4.required_feature(), Some("lz4"));
+        assert_eq!(Compression::Zstd.required_feature(), Some("zstd"));
+    }
+
+    #[test]
+    fn test_disabled_codec_returns_error() {
+        // For every codec whose feature is disabled, verify that encoding
+        // produces a descriptive error mentioning the Cargo feature.
         for compression in [
-            Compression::None,
             Compression::Gzip,
             Compression::Snappy,
             Compression::Lz4,
+            Compression::Zstd,
+        ] {
+            if compression.is_available() {
+                continue;
+            }
+            let batch = RecordBatchBuilder::new()
+                .compression(compression)
+                .add_record(Some("k"), Some("v"))
+                .build();
+            let err = batch.encode().unwrap_err();
+            let msg = err.to_string();
+            let feature = compression.required_feature().unwrap();
+            assert!(
+                msg.contains(feature),
+                "error for {compression:?} should mention feature `{feature}`, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compression_roundtrip() {
+        #[allow(clippy::single_element_loop)]
+        for compression in [
+            Compression::None,
+            #[cfg(feature = "gzip")]
+            Compression::Gzip,
+            #[cfg(feature = "snappy")]
+            Compression::Snappy,
+            #[cfg(feature = "lz4")]
+            Compression::Lz4,
+            #[cfg(feature = "zstd")]
             Compression::Zstd,
         ] {
             let batch = RecordBatchBuilder::new()
@@ -1225,6 +1393,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lz4")]
     fn test_lazy_record_batch_into_eager() {
         let batch = RecordBatchBuilder::new()
             .compression(Compression::Lz4)
@@ -1243,11 +1412,16 @@ mod tests {
 
     #[test]
     fn test_lazy_record_batch_with_compression() {
+        #[allow(clippy::single_element_loop)]
         for compression in [
             Compression::None,
+            #[cfg(feature = "gzip")]
             Compression::Gzip,
+            #[cfg(feature = "snappy")]
             Compression::Snappy,
+            #[cfg(feature = "lz4")]
             Compression::Lz4,
+            #[cfg(feature = "zstd")]
             Compression::Zstd,
         ] {
             let batch = RecordBatchBuilder::new()
@@ -1269,6 +1443,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gzip")]
     fn test_decompress_normal_data_within_limit() {
         // A normally compressed batch should be well under the 128 MiB limit
         let batch = RecordBatchBuilder::new()
@@ -1288,6 +1463,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "snappy")]
     fn test_snappy_decompression_bomb_rejected() {
         // Craft a snappy frame with a declared uncompressed length exceeding MAX_DECOMPRESSED_SIZE.
         // The snappy format stores the uncompressed length as a varint at the start.
@@ -1314,6 +1490,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_zstd_decompression_uses_streaming_limit() {
         // Verify that zstd uses a streaming decoder with size limit
         // by compressing normal data and ensuring it round-trips correctly

@@ -52,11 +52,16 @@ fn bench_compression(c: &mut Criterion) {
         })
         .collect();
 
+    #[allow(clippy::single_element_loop)]
     for compression in [
         Compression::None,
+        #[cfg(feature = "gzip")]
         Compression::Gzip,
+        #[cfg(feature = "snappy")]
         Compression::Snappy,
+        #[cfg(feature = "lz4")]
         Compression::Lz4,
+        #[cfg(feature = "zstd")]
         Compression::Zstd,
     ] {
         group.throughput(Throughput::Elements(100));

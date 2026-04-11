@@ -28,11 +28,11 @@ futures-core = "0.3"
 # Logging and tracing
 tracing = "0.1"
 
-# Compression
-flate2 = "1"           # gzip
-snap = "1"             # snappy
-lz4_flex = "0.11"      # lz4
-zstd = "0.13"          # zstd (requires C toolchain via zstd-sys)
+# Compression (each codec is individually feature-gated)
+flate2 = "1"                                          # always needed: record batch gzip + Glue ZLIB
+snap = { version = "1", optional = true }             # snappy
+lz4_flex = { version = "0.11", optional = true }      # lz4
+zstd = { version = "0.13", optional = true }          # zstd (requires C toolchain via zstd-sys)
 
 # CRC32 for protocol
 crc32c = "0.6"
@@ -75,7 +75,17 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 
 [features]
-default = []
+default = ["compression"]
+# Enable all compression codecs.
+compression = ["gzip", "snappy", "lz4", "zstd"]
+# Enable gzip record batch compression (flate2 is always available for Glue ZLIB).
+gzip = []
+# Enable Snappy compression.
+snappy = ["dep:snap"]
+# Enable LZ4 compression.
+lz4 = ["dep:lz4_flex"]
+# Enable Zstd compression (requires C toolchain via zstd-sys).
+zstd = ["dep:zstd"]
 # Enable AWS MSK IAM authentication with full SDK credential chain support.
 # This adds the AWS SDK for automatic credential discovery (EC2, ECS, EKS, SSO).
 # Binary size impact: +2-3 MB (release build).
@@ -120,3 +130,10 @@ harness = false
 [[bench]]
 name = "protocol"
 harness = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
