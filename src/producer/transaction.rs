@@ -130,6 +130,9 @@ pub struct TransactionalProducerConfig {
     pub metadata_max_age: Duration,
     /// Authentication configuration.
     pub auth: Option<AuthConfig>,
+    /// SOCKS5 proxy configuration (optional).
+    #[cfg(feature = "socks5")]
+    pub proxy: Option<crate::network::ProxyConfig>,
 }
 
 impl Default for TransactionalProducerConfig {
@@ -143,6 +146,8 @@ impl Default for TransactionalProducerConfig {
             compression: Compression::None,
             metadata_max_age: Duration::from_secs(300),
             auth: None,
+            #[cfg(feature = "socks5")]
+            proxy: None,
         }
     }
 }
@@ -1250,6 +1255,15 @@ impl TransactionalProducerBuilder {
         self
     }
 
+    /// Set SOCKS5 proxy configuration.
+    ///
+    /// Routes all broker connections through the specified SOCKS5 proxy.
+    #[cfg(feature = "socks5")]
+    pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
+        self.config.proxy = Some(proxy);
+        self
+    }
+
     /// Configure SASL/PLAIN authentication.
     pub fn sasl_plain(mut self, username: &str, password: &str) -> Self {
         self.config.auth = Some(AuthConfig::sasl_plain(username, password));
@@ -1286,6 +1300,11 @@ impl TransactionalProducerBuilder {
 
         if let Some(ref auth) = self.config.auth {
             pool_config_builder = pool_config_builder.auth(auth.clone());
+        }
+
+        #[cfg(feature = "socks5")]
+        if let Some(ref proxy) = self.config.proxy {
+            pool_config_builder = pool_config_builder.proxy(proxy.clone());
         }
 
         let pool_config = pool_config_builder.build();

@@ -171,6 +171,67 @@ Internal connection settings (advanced):
 | `max_message_size` | usize | `10MB` | Maximum message size |
 | `max_response_size` | usize | `100MB` | Maximum response size from broker |
 
+## SOCKS5 Proxy
+
+Route all broker connections through a SOCKS5 proxy. This is useful for
+VPN/bastion setups where brokers are not directly reachable. The proxy handles
+DNS resolution, so broker hostnames are sent as-is (not pre-resolved).
+
+Enable the `socks5` feature:
+
+```toml
+krafka = { version = "0.4", features = ["socks5"] }
+```
+
+### Proxy Without Authentication
+
+```rust
+use krafka::network::ProxyConfig;
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("kafka.internal:9092")
+    .group_id("my-group")
+    .proxy(ProxyConfig::new("socks5-proxy.corp:1080"))
+    .build()
+    .await?;
+```
+
+### Proxy With Authentication
+
+```rust
+use krafka::network::ProxyConfig;
+
+let producer = Producer::builder()
+    .bootstrap_servers("kafka.internal:9092")
+    .proxy(ProxyConfig::with_credentials(
+        "socks5-proxy.corp:1080",
+        "proxy-user",
+        "proxy-password",
+    ))
+    .build()
+    .await?;
+```
+
+Proxy credentials are zeroized from memory on drop and redacted in `Debug` output.
+
+### Proxy With TLS/SASL
+
+Proxy and authentication can be combined — the SOCKS5 tunnel is established first,
+then TLS and/or SASL negotiation proceeds over the tunneled connection:
+
+```rust
+use krafka::auth::AuthConfig;
+use krafka::network::ProxyConfig;
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("kafka.secure.internal:9093")
+    .group_id("secure-group")
+    .auth(AuthConfig::tls())
+    .proxy(ProxyConfig::new("bastion:1080"))
+    .build()
+    .await?;
+```
+
 ## Topic Configuration
 
 For `NewTopic` when creating topics:

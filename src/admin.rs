@@ -646,6 +646,9 @@ pub struct AdminConfig {
     pub(crate) request_timeout: Duration,
     /// Authentication configuration (optional).
     pub(crate) auth: Option<AuthConfig>,
+    /// SOCKS5 proxy configuration (optional).
+    #[cfg(feature = "socks5")]
+    pub(crate) proxy: Option<crate::network::ProxyConfig>,
 }
 
 impl Default for AdminConfig {
@@ -655,6 +658,8 @@ impl Default for AdminConfig {
             client_id: "krafka-admin".to_string(),
             request_timeout: Duration::from_secs(30),
             auth: None,
+            #[cfg(feature = "socks5")]
+            proxy: None,
         }
     }
 }
@@ -688,6 +693,13 @@ impl AdminConfig {
     pub fn auth(&self) -> Option<&AuthConfig> {
         self.auth.as_ref()
     }
+
+    /// Returns the SOCKS5 proxy configuration, if set.
+    #[cfg(feature = "socks5")]
+    #[inline]
+    pub fn proxy(&self) -> Option<&crate::network::ProxyConfig> {
+        self.proxy.as_ref()
+    }
 }
 
 /// Builder for AdminConfig.
@@ -719,6 +731,13 @@ impl AdminConfigBuilder {
     /// Set authentication configuration.
     pub fn auth(mut self, auth: AuthConfig) -> Self {
         self.config.auth = Some(auth);
+        self
+    }
+
+    /// Set SOCKS5 proxy configuration.
+    #[cfg(feature = "socks5")]
+    pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
+        self.config.proxy = Some(proxy);
         self
     }
 
@@ -2953,6 +2972,15 @@ impl AdminClientBuilder {
         self
     }
 
+    /// Set SOCKS5 proxy configuration.
+    ///
+    /// Routes all broker connections through the specified SOCKS5 proxy.
+    #[cfg(feature = "socks5")]
+    pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
+        self.config.proxy = Some(proxy);
+        self
+    }
+
     /// Configure SASL/PLAIN authentication.
     pub fn sasl_plain(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
         self.config.auth = Some(AuthConfig::sasl_plain(username, password));
@@ -3016,6 +3044,11 @@ impl AdminClientBuilder {
 
         if let Some(ref auth) = self.config.auth {
             conn_config_builder = conn_config_builder.auth(auth.clone());
+        }
+
+        #[cfg(feature = "socks5")]
+        if let Some(ref proxy) = self.config.proxy {
+            conn_config_builder = conn_config_builder.proxy(proxy.clone());
         }
 
         let conn_config = conn_config_builder.build();
@@ -3321,5 +3354,15 @@ mod tests {
     fn test_admin_client_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<AdminClient>();
+    }
+
+    #[cfg(feature = "socks5")]
+    #[test]
+    fn test_admin_config_builder_proxy_round_trip() {
+        let config = AdminConfig::builder()
+            .proxy(crate::network::ProxyConfig::new("proxy:1080"))
+            .build();
+        let proxy = config.proxy().expect("proxy should be set");
+        assert_eq!(proxy.address(), "proxy:1080");
     }
 }

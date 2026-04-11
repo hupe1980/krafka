@@ -22,6 +22,128 @@ use tracing::{debug, error, info, trace, warn};
 use crate::CorrelationId;
 use crate::auth::{AuthConfig, SaslMechanism, SecurityProtocol, connect_tls};
 use crate::error::{KrafkaError, Result};
+
+/// SOCKS5 proxy configuration for connecting to brokers through a proxy.
+///
+/// When set on a [`ConnectionConfig`], all TCP connections to Kafka brokers
+/// are tunneled through the specified SOCKS5 proxy. The proxy performs DNS
+/// resolution of the broker address, which is essential for VPN/bastion
+/// setups where broker hostnames are not resolvable from the client network.
+///
+/// TLS and SASL authentication are layered on top of the proxied connection
+/// transparently — no additional configuration is needed.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use krafka::network::{ConnectionConfig, ProxyConfig};
+///
+/// let proxy = ProxyConfig::new("socks5-proxy:1080");
+/// let config = ConnectionConfig::builder()
+///     .proxy(proxy)
+///     .build();
+/// ```
+#[cfg(feature = "socks5")]
+#[derive(Clone)]
+pub struct ProxyConfig {
+    /// SOCKS5 proxy address (`host:port`).
+    address: String,
+    /// Optional proxy authentication credentials.
+    credentials: Option<ProxyCredentials>,
+}
+
+#[cfg(feature = "socks5")]
+impl ProxyConfig {
+    /// Create a new SOCKS5 proxy configuration.
+    pub fn new(address: impl Into<String>) -> Self {
+        Self {
+            address: address.into(),
+            credentials: None,
+        }
+    }
+
+    /// Create a SOCKS5 proxy configuration with username/password authentication.
+    pub fn with_credentials(
+        address: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        Self {
+            address: address.into(),
+            credentials: Some(ProxyCredentials {
+                username: username.into(),
+                password: password.into(),
+            }),
+        }
+    }
+
+    /// Returns the proxy address.
+    #[inline]
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    /// Returns the proxy credentials, if set.
+    #[inline]
+    pub fn credentials(&self) -> Option<&ProxyCredentials> {
+        self.credentials.as_ref()
+    }
+}
+
+#[cfg(feature = "socks5")]
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("address", &self.address)
+            .field(
+                "credentials",
+                if self.credentials.is_some() {
+                    &"[REDACTED]"
+                } else {
+                    &"None"
+                },
+            )
+            .finish()
+    }
+}
+
+/// Credentials for SOCKS5 proxy authentication.
+///
+/// Implements [`Zeroize`](zeroize::Zeroize) to ensure the password is scrubbed
+/// from memory on drop.
+#[cfg(feature = "socks5")]
+#[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+pub struct ProxyCredentials {
+    /// Proxy username.
+    username: String,
+    /// Proxy password.
+    password: String,
+}
+
+#[cfg(feature = "socks5")]
+impl ProxyCredentials {
+    /// Returns the proxy username.
+    #[inline]
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    /// Returns the proxy password.
+    #[inline]
+    pub fn password(&self) -> &str {
+        &self.password
+    }
+}
+
+#[cfg(feature = "socks5")]
+impl std::fmt::Debug for ProxyCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyCredentials")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
 use crate::protocol::{
     ApiKey, ApiVersionRange, ApiVersionsRequest, ApiVersionsResponse, Decoder, Encoder,
     RequestHeader, ResponseHeader, SaslAuthenticateRequest, SaslAuthenticateResponse,
@@ -108,6 +230,12 @@ pub struct ConnectionConfig {
     /// When set, the connection will perform TLS upgrade and/or SASL
     /// authentication handshake during establishment.
     pub(crate) auth: Option<AuthConfig>,
+    /// SOCKS5 proxy configuration (optional).
+    ///
+    /// When set, all connections are tunneled through the proxy.
+    /// Requires the `socks5` feature.
+    #[cfg(feature = "socks5")]
+    pub(crate) proxy: Option<ProxyConfig>,
 }
 
 impl Default for ConnectionConfig {
@@ -124,6 +252,8 @@ impl Default for ConnectionConfig {
             normal_priority_channel_capacity: 256,
             max_response_size: crate::protocol::MAX_MESSAGE_SIZE,
             auth: None,
+            #[cfg(feature = "socks5")]
+            proxy: None,
         }
     }
 }
@@ -199,6 +329,15 @@ impl ConnectionConfig {
     pub fn auth(&self) -> Option<&AuthConfig> {
         self.auth.as_ref()
     }
+
+    /// Returns the SOCKS5 proxy configuration, if set.
+    ///
+    /// Requires the `socks5` feature.
+    #[cfg(feature = "socks5")]
+    #[inline]
+    pub fn proxy(&self) -> Option<&ProxyConfig> {
+        self.proxy.as_ref()
+    }
 }
 
 /// Builder for ConnectionConfig.
@@ -270,6 +409,19 @@ impl ConnectionConfigBuilder {
     /// authentication handshake during establishment.
     pub fn auth(mut self, auth: AuthConfig) -> Self {
         self.0.auth = Some(auth);
+        self
+    }
+
+    /// Set SOCKS5 proxy configuration.
+    ///
+    /// When set, all connections are tunneled through the specified SOCKS5
+    /// proxy. The proxy performs DNS resolution, which is essential for
+    /// VPN/bastion setups where broker hostnames are not directly resolvable.
+    ///
+    /// Requires the `socks5` feature.
+    #[cfg(feature = "socks5")]
+    pub fn proxy(mut self, proxy: ProxyConfig) -> Self {
+        self.0.proxy = Some(proxy);
         self
     }
 
@@ -371,43 +523,8 @@ impl BrokerConnection {
     /// 3. Perform SASL authentication handshake if required
     /// 4. Fetch API versions
     pub async fn connect(address: &str, config: ConnectionConfig) -> Result<Self> {
-        // Use tokio::net::lookup_host to support both IP:port and hostname:port
-        // (e.g. "kafka:9092" when brokers run inside containers).
-        // Bound DNS resolution by the connect timeout so a slow resolver cannot
-        // make connect() block indefinitely.
-        let mut addrs = timeout(config.connect_timeout, tokio::net::lookup_host(address))
-            .await
-            .map_err(|_| KrafkaError::timeout("DNS resolution"))?
-            .map_err(KrafkaError::Network)?;
-        let first_addr = addrs.next().ok_or_else(|| {
-            KrafkaError::invalid_state(format!("no addresses resolved for '{address}'"))
-        })?;
-        // Prefer IPv4 when available — IPv6 may be resolved first but not routable.
-        let addr = addrs.find(|a| a.is_ipv4()).unwrap_or(first_addr);
-
-        let socket = if addr.is_ipv6() {
-            TcpSocket::new_v6()
-        } else {
-            TcpSocket::new_v4()
-        }
-        .map_err(KrafkaError::Network)?;
-
-        // Apply socket buffer sizes before connecting
-        if let Some(size) = config.send_buffer_size {
-            socket
-                .set_send_buffer_size(size as u32)
-                .map_err(KrafkaError::Network)?;
-        }
-        if let Some(size) = config.recv_buffer_size {
-            socket
-                .set_recv_buffer_size(size as u32)
-                .map_err(KrafkaError::Network)?;
-        }
-
-        let stream = timeout(config.connect_timeout, socket.connect(addr))
-            .await
-            .map_err(|_| KrafkaError::timeout("connection"))?
-            .map_err(KrafkaError::Network)?;
+        // Establish TCP stream — either direct or through a SOCKS5 proxy.
+        let stream = Self::establish_tcp(address, &config).await?;
 
         stream.set_nodelay(config.nodelay)?;
 
@@ -561,6 +678,142 @@ impl BrokerConnection {
         connection.fetch_api_versions().await?;
 
         Ok(connection)
+    }
+
+    /// Establish a TCP connection — direct or through a SOCKS5 proxy.
+    async fn establish_tcp(
+        address: &str,
+        config: &ConnectionConfig,
+    ) -> Result<tokio::net::TcpStream> {
+        #[cfg(feature = "socks5")]
+        if let Some(ref proxy) = config.proxy {
+            return Self::connect_via_proxy(address, proxy, config).await;
+        }
+
+        Self::connect_direct(address, config).await
+    }
+
+    /// Direct TCP connection: resolve DNS locally, create socket, connect.
+    async fn connect_direct(
+        address: &str,
+        config: &ConnectionConfig,
+    ) -> Result<tokio::net::TcpStream> {
+        // Use tokio::net::lookup_host to support both IP:port and hostname:port
+        // (e.g. "kafka:9092" when brokers run inside containers).
+        // Bound DNS resolution by the connect timeout so a slow resolver cannot
+        // make connect() block indefinitely.
+        let mut addrs = timeout(config.connect_timeout, tokio::net::lookup_host(address))
+            .await
+            .map_err(|_| KrafkaError::timeout("DNS resolution"))?
+            .map_err(KrafkaError::Network)?;
+        let first_addr = addrs.next().ok_or_else(|| {
+            KrafkaError::invalid_state(format!("no addresses resolved for '{address}'"))
+        })?;
+        // Prefer IPv4 when available — IPv6 may be resolved first but not routable.
+        let addr = addrs.find(|a| a.is_ipv4()).unwrap_or(first_addr);
+
+        let socket = Self::create_socket(addr, config)?;
+
+        let stream = timeout(config.connect_timeout, socket.connect(addr))
+            .await
+            .map_err(|_| KrafkaError::timeout("connection"))?
+            .map_err(KrafkaError::Network)?;
+
+        Ok(stream)
+    }
+
+    /// Connect through a SOCKS5 proxy.
+    ///
+    /// The proxy performs DNS resolution of the broker address, which is
+    /// essential for VPN/bastion setups where broker hostnames are not
+    /// resolvable from the client network.
+    #[cfg(feature = "socks5")]
+    async fn connect_via_proxy(
+        address: &str,
+        proxy: &ProxyConfig,
+        config: &ConnectionConfig,
+    ) -> Result<tokio::net::TcpStream> {
+        use tokio_socks::tcp::Socks5Stream;
+
+        debug!("Connecting to {address} via SOCKS5 proxy {}", proxy.address);
+
+        // Resolve proxy address and create a socket with buffer sizes applied.
+        let mut addrs = timeout(
+            config.connect_timeout,
+            tokio::net::lookup_host(&proxy.address),
+        )
+        .await
+        .map_err(|_| KrafkaError::timeout("SOCKS5 proxy DNS resolution"))?
+        .map_err(KrafkaError::Network)?;
+        let first_addr = addrs.next().ok_or_else(|| {
+            KrafkaError::invalid_state(format!(
+                "no addresses resolved for SOCKS5 proxy '{}'",
+                proxy.address
+            ))
+        })?;
+        let proxy_addr = addrs.find(|a| a.is_ipv4()).unwrap_or(first_addr);
+
+        let socket = Self::create_socket(proxy_addr, config)?;
+
+        // Connect to the proxy first, then perform the SOCKS5 handshake.
+        // The entire sequence (TCP + SOCKS5) is bounded by connect_timeout.
+        let proxy_stream = timeout(config.connect_timeout, async {
+            let tcp = socket
+                .connect(proxy_addr)
+                .await
+                .map_err(KrafkaError::Network)?;
+
+            // SOCKS5 handshake — pass the broker address as a string so the
+            // proxy performs DNS resolution (remote resolution).
+            let socks = if let Some(ref creds) = proxy.credentials {
+                Socks5Stream::connect_with_password_and_socket(
+                    tcp,
+                    address,
+                    creds.username(),
+                    creds.password(),
+                )
+                .await
+            } else {
+                Socks5Stream::connect_with_socket(tcp, address).await
+            }
+            .map_err(|e| {
+                KrafkaError::Network(std::io::Error::other(format!("SOCKS5 proxy error: {e}")))
+            })?;
+
+            Ok::<_, KrafkaError>(socks.into_inner())
+        })
+        .await
+        .map_err(|_| KrafkaError::timeout("SOCKS5 proxy connection"))??;
+
+        info!(
+            "SOCKS5 tunnel established to {address} via {}",
+            proxy.address
+        );
+
+        Ok(proxy_stream)
+    }
+
+    /// Create a TCP socket for the given address with buffer sizes applied.
+    fn create_socket(addr: std::net::SocketAddr, config: &ConnectionConfig) -> Result<TcpSocket> {
+        let socket = if addr.is_ipv6() {
+            TcpSocket::new_v6()
+        } else {
+            TcpSocket::new_v4()
+        }
+        .map_err(KrafkaError::Network)?;
+
+        if let Some(size) = config.send_buffer_size {
+            socket
+                .set_send_buffer_size(size as u32)
+                .map_err(KrafkaError::Network)?;
+        }
+        if let Some(size) = config.recv_buffer_size {
+            socket
+                .set_recv_buffer_size(size as u32)
+                .map_err(KrafkaError::Network)?;
+        }
+
+        Ok(socket)
     }
 
     /// Perform the SASL handshake and authentication on a stream.
@@ -1928,6 +2181,95 @@ mod tests {
                 assert!(
                     err.is_retriable(),
                     "DNS resolution failure should be retriable (Network), got: {err}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "socks5")]
+    #[test]
+    fn test_proxy_config_new() {
+        let proxy = ProxyConfig::new("proxy.example.com:1080");
+        assert_eq!(proxy.address(), "proxy.example.com:1080");
+        assert!(proxy.credentials().is_none());
+    }
+
+    #[cfg(feature = "socks5")]
+    #[test]
+    fn test_proxy_config_with_credentials() {
+        let proxy = ProxyConfig::with_credentials("proxy.example.com:1080", "user", "s3cret");
+        assert_eq!(proxy.address(), "proxy.example.com:1080");
+        let creds = proxy.credentials().expect("should have credentials");
+        assert_eq!(creds.username(), "user");
+        assert_eq!(creds.password(), "s3cret");
+    }
+
+    #[cfg(feature = "socks5")]
+    #[test]
+    fn test_proxy_config_debug_redacts_credentials() {
+        let proxy = ProxyConfig::with_credentials("proxy.example.com:1080", "admin", "hunter2");
+        let debug_str = format!("{proxy:?}");
+        assert!(
+            debug_str.contains("proxy.example.com:1080"),
+            "Debug should contain the address"
+        );
+        assert!(
+            !debug_str.contains("hunter2"),
+            "Debug must NOT contain the password"
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "Debug should show [REDACTED] for credentials"
+        );
+    }
+
+    #[cfg(feature = "socks5")]
+    #[test]
+    fn test_proxy_credentials_debug_redacts() {
+        let proxy = ProxyConfig::with_credentials("proxy.example.com:1080", "user", "password123");
+        let creds = proxy.credentials().expect("should have credentials");
+        let debug_str = format!("{creds:?}");
+        assert!(
+            !debug_str.contains("password123"),
+            "Debug must NOT contain the password"
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "Debug should show [REDACTED]"
+        );
+    }
+
+    #[cfg(feature = "socks5")]
+    #[test]
+    fn test_connection_config_builder_with_proxy() {
+        let proxy = ProxyConfig::new("socks5.internal:1080");
+        let config = ConnectionConfig::builder()
+            .client_id("proxy-test")
+            .proxy(proxy)
+            .build();
+
+        assert!(config.proxy.is_some());
+        assert_eq!(
+            config.proxy.as_ref().unwrap().address(),
+            "socks5.internal:1080"
+        );
+    }
+
+    #[cfg(feature = "socks5")]
+    #[tokio::test]
+    async fn test_connect_via_proxy_dns_failure_is_retriable() {
+        let proxy = ProxyConfig::new("this-proxy-does-not-exist.invalid:1080");
+        let config = ConnectionConfig::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .proxy(proxy)
+            .build();
+        let result = BrokerConnection::connect("broker:9092", config).await;
+        match result {
+            Ok(_) => panic!("connect through non-existent proxy should fail"),
+            Err(err) => {
+                assert!(
+                    err.is_retriable(),
+                    "proxy DNS failure should be retriable (Network or Timeout), got: {err}"
                 );
             }
         }

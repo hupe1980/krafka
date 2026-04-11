@@ -34,5 +34,7 @@ mod secure;
 pub use connection::{
     BrokerConnection, ConnectionConfig, ConnectionConfigBuilder, ConnectionStats, RequestPriority,
 };
+#[cfg(feature = "socks5")]
+pub use connection::{ProxyConfig, ProxyCredentials};
 pub use pool::{BrokerConnectionBundle, ConnectionPool, ConnectionRetryConfig};
 pub use secure::{SaslAuthenticator, SecureConnectionConfig, SecureConnectionConfigBuilder};

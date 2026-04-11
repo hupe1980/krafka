@@ -240,6 +240,11 @@ impl Consumer {
             pool_config_builder = pool_config_builder.auth(auth.clone());
         }
 
+        #[cfg(feature = "socks5")]
+        if let Some(ref proxy) = config.proxy {
+            pool_config_builder = pool_config_builder.proxy(proxy.clone());
+        }
+
         let pool_config = pool_config_builder.build();
 
         let pool = Arc::new(ConnectionPool::new(pool_config));
@@ -3186,6 +3191,15 @@ impl ConsumerBuilder {
     /// ```
     pub fn auth(mut self, auth: AuthConfig) -> Self {
         self.config.auth = Some(auth);
+        self
+    }
+
+    /// Set SOCKS5 proxy configuration.
+    ///
+    /// Routes all broker connections through the specified SOCKS5 proxy.
+    #[cfg(feature = "socks5")]
+    pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
+        self.config.proxy = Some(proxy);
         self
     }
 

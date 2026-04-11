@@ -94,6 +94,11 @@ impl Producer {
             pool_config_builder = pool_config_builder.auth(auth.clone());
         }
 
+        #[cfg(feature = "socks5")]
+        if let Some(ref proxy) = config.proxy {
+            pool_config_builder = pool_config_builder.proxy(proxy.clone());
+        }
+
         let pool_config = pool_config_builder.build();
 
         let pool = Arc::new(ConnectionPool::new(pool_config));

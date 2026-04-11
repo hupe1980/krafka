@@ -153,6 +153,9 @@ pub struct ConsumerConfig {
     pub(crate) client_rack: Option<String>,
     /// Authentication configuration (optional).
     pub(crate) auth: Option<AuthConfig>,
+    /// SOCKS5 proxy configuration (optional).
+    #[cfg(feature = "socks5")]
+    pub(crate) proxy: Option<crate::network::ProxyConfig>,
 }
 
 impl Default for ConsumerConfig {
@@ -179,6 +182,8 @@ impl Default for ConsumerConfig {
             group_instance_id: None,
             client_rack: None,
             auth: None,
+            #[cfg(feature = "socks5")]
+            proxy: None,
         }
     }
 }
@@ -314,6 +319,13 @@ impl ConsumerConfig {
     pub fn auth(&self) -> Option<&AuthConfig> {
         self.auth.as_ref()
     }
+
+    /// Returns the SOCKS5 proxy configuration, if set.
+    #[cfg(feature = "socks5")]
+    #[inline]
+    pub fn proxy(&self) -> Option<&crate::network::ProxyConfig> {
+        self.proxy.as_ref()
+    }
 }
 
 /// Builder for ConsumerConfig.
@@ -371,6 +383,15 @@ impl ConsumerConfigBuilder {
     /// Enables TLS and/or SASL authentication for all connections.
     pub fn auth(mut self, auth: AuthConfig) -> Self {
         self.config.auth = Some(auth);
+        self
+    }
+
+    /// Set SOCKS5 proxy configuration.
+    ///
+    /// Routes all broker connections through the specified SOCKS5 proxy.
+    #[cfg(feature = "socks5")]
+    pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
+        self.config.proxy = Some(proxy);
         self
     }
 
@@ -624,5 +645,15 @@ mod tests {
             GroupProtocol::Consumer,
             "group_protocol should be Consumer when set"
         );
+    }
+
+    #[cfg(feature = "socks5")]
+    #[test]
+    fn test_config_builder_proxy_round_trip() {
+        let config = ConsumerConfig::builder()
+            .proxy(crate::network::ProxyConfig::new("proxy:1080"))
+            .build();
+        let proxy = config.proxy().expect("proxy should be set");
+        assert_eq!(proxy.address(), "proxy:1080");
     }
 }

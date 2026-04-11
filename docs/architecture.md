@@ -530,3 +530,4 @@ Krafka includes the following production-ready features:
 - ✅ **Metrics and Observability**: Producer, consumer, and connection metrics
 - ✅ **ACL Management**: Create, describe, and delete ACLs
 - ✅ **Security Hardening**: Secret zeroization, constant-time auth, PBKDF2 validation, decompression limits, allocation caps
+- ✅ **SOCKS5 Proxy**: Route all broker connections through a SOCKS5 proxy (VPN/bastion setups)
