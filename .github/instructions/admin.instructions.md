@@ -15,11 +15,7 @@ Callers must check individual results — a successful RPC does not mean every r
 Admin requests use **automatic version negotiation** via `negotiate_api_version(api_key, max, min)` on each broker connection.
 The negotiated version is clamped to the client's supported `[min, max]` range for each API.
 When adding or updating an admin RPC, pass the API key plus the client-supported max and the minimum version required by that request shape/behavior rather than negotiating only against a max bound.
-Multi-version encode/decode dispatch is implemented for: CreateTopics (v0–v2), DeleteTopics (v0–v1), FindCoordinator (v0–v1), DescribeGroups (v0–v1), ListGroups (v0–v1), OffsetForLeaderEpoch (v0–v3), DescribeAcls (v0–v1), CreateAcls (v0–v1), DeleteAcls (v0–v1), ConsumerGroupDescribe (v0–v1), CreatePartitions (v0–v3), DeleteRecords (v0–v2), DescribeTopicPartitions (v0).
-Single-version APIs (v0 only): DescribeClientQuotas, AlterClientQuotas.
-DescribeConfigs supports v0–v4 (v0 baseline through v4 flexible encoding).
-IncrementalAlterConfigs supports v0–v1 (v0 non-flexible, v1 flexible encoding).
-Delegation token APIs support v0–v1 (same wire format; v0 removed in Kafka 4.0, v1 is baseline): CreateDelegationToken, RenewDelegationToken, ExpireDelegationToken, DescribeDelegationToken.
+Multi-version encode/decode dispatch is implemented for: CreateTopics (v2–v7), DeleteTopics (v1–v6), FindCoordinator (v1–v6), DescribeGroups (v1–v6), ListGroups (v1–v5), OffsetForLeaderEpoch (v2–v4), DescribeAcls (v1–v3), CreateAcls (v1–v3), DeleteAcls (v1–v3), ConsumerGroupDescribe (v0–v1), CreatePartitions (v0–v3), DeleteRecords (v0–v2), DescribeTopicPartitions (v0), DeleteGroups (v0–v2), DescribeCluster (v0–v2), DescribeClientQuotas (v0–v1), AlterClientQuotas (v0–v1), CreateDelegationToken (v1–v3), RenewDelegationToken (v1–v2), ExpireDelegationToken (v1–v2), DescribeDelegationToken (v1–v3), DescribeConfigs (v0–v4), IncrementalAlterConfigs (v0–v1).
 When adding a new version, update the version constant in `src/protocol/mod.rs::versions`, add the `encode_vN`/`decode_vN` methods in `src/protocol/messages/`, and add version dispatch in the admin method.
 
 ## Destructive Operations

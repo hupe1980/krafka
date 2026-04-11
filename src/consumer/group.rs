@@ -1181,7 +1181,12 @@ impl GroupCoordinator {
                 FIND_COORDINATOR_MIN,
             )
             .await
-            .unwrap_or(FIND_COORDINATOR_MIN);
+            .ok_or_else(|| {
+                KrafkaError::protocol(format!(
+                    "broker does not support FindCoordinator v{}-v{}",
+                    FIND_COORDINATOR_MIN, FIND_COORDINATOR_MAX,
+                ))
+            })?;
         let response = conn
             .send_request(ApiKey::FindCoordinator, fc_version, |buf| {
                 request.encode_versioned(fc_version, buf)
@@ -1312,7 +1317,12 @@ impl GroupCoordinator {
         let jg_version = conn
             .negotiate_api_version(ApiKey::JoinGroup, JOIN_GROUP_MAX, join_group_min)
             .await
-            .unwrap_or(join_group_min);
+            .ok_or_else(|| {
+                KrafkaError::protocol(format!(
+                    "broker does not support JoinGroup v{}-v{}",
+                    join_group_min, JOIN_GROUP_MAX,
+                ))
+            })?;
 
         let response = conn
             .send_request(ApiKey::JoinGroup, jg_version, |buf| {
@@ -1431,7 +1441,12 @@ impl GroupCoordinator {
         let sg_version = conn
             .negotiate_api_version(ApiKey::SyncGroup, SYNC_GROUP_MAX, SYNC_GROUP_MIN)
             .await
-            .unwrap_or(SYNC_GROUP_MIN);
+            .ok_or_else(|| {
+                KrafkaError::protocol(format!(
+                    "broker does not support SyncGroup v{}-v{}",
+                    SYNC_GROUP_MIN, SYNC_GROUP_MAX,
+                ))
+            })?;
 
         let response = conn
             .send_request(ApiKey::SyncGroup, sg_version, |buf| {
@@ -1668,14 +1683,26 @@ impl GroupCoordinator {
                             };
 
                             // Negotiate heartbeat version with broker (MIN=3, KIP-345 static membership).
-                            let hb_version = conn
+                            let hb_version = match conn
                                 .negotiate_api_version(
                                     ApiKey::Heartbeat,
                                     HEARTBEAT_MAX,
                                     HEARTBEAT_MIN,
                                 )
                                 .await
-                                .unwrap_or(HEARTBEAT_MIN);
+                            {
+                                Some(v) => v,
+                                None => {
+                                    warn!(
+                                        "Broker does not support Heartbeat v{}-v{} for group '{}', triggering rebalance",
+                                        HEARTBEAT_MIN, HEARTBEAT_MAX, group_id
+                                    );
+                                    *coordinator_conn_ref.write().await = None;
+                                    heartbeat_controller.signal_rebalance();
+                                    heartbeat_controller.stop();
+                                    break;
+                                }
+                            };
                             let send_result = conn
                                 .send_request(ApiKey::Heartbeat, hb_version, |buf| {
                                     request.encode_versioned(hb_version, buf)
@@ -2406,7 +2433,12 @@ impl GroupCoordinator {
         let hb_version = conn
             .negotiate_api_version(ApiKey::Heartbeat, HEARTBEAT_MAX, HEARTBEAT_MIN)
             .await
-            .unwrap_or(HEARTBEAT_MIN);
+            .ok_or_else(|| {
+                KrafkaError::protocol(format!(
+                    "broker does not support Heartbeat v{}-v{}",
+                    HEARTBEAT_MIN, HEARTBEAT_MAX,
+                ))
+            })?;
         let response = conn
             .send_request(ApiKey::Heartbeat, hb_version, |buf| {
                 request.encode_versioned(hb_version, buf)
@@ -2464,7 +2496,12 @@ impl GroupCoordinator {
         let oc_version = conn
             .negotiate_api_version(ApiKey::OffsetCommit, OFFSET_COMMIT_MAX, OFFSET_COMMIT_MIN)
             .await
-            .unwrap_or(OFFSET_COMMIT_MIN);
+            .ok_or_else(|| {
+                KrafkaError::protocol(format!(
+                    "broker does not support OffsetCommit v{}-v{}",
+                    OFFSET_COMMIT_MIN, OFFSET_COMMIT_MAX,
+                ))
+            })?;
 
         let member_id = self.member_id.read().await.clone();
         // For KIP-848 (consumer protocol), the "generation ID" wire field
@@ -2615,7 +2652,12 @@ impl GroupCoordinator {
         let of_version = conn
             .negotiate_api_version(ApiKey::OffsetFetch, OFFSET_FETCH_MAX, OFFSET_FETCH_MIN)
             .await
-            .unwrap_or(OFFSET_FETCH_MIN);
+            .ok_or_else(|| {
+                KrafkaError::protocol(format!(
+                    "broker does not support OffsetFetch v{}-v{}",
+                    OFFSET_FETCH_MIN, OFFSET_FETCH_MAX,
+                ))
+            })?;
 
         // For KIP-848, populate MemberId/MemberEpoch so the broker can validate
         // membership and surface STALE_MEMBER_EPOCH when appropriate.
@@ -2791,7 +2833,12 @@ impl GroupCoordinator {
             let lo_version = conn
                 .negotiate_api_version(ApiKey::ListOffsets, LIST_OFFSETS_MAX, LIST_OFFSETS_MIN)
                 .await
-                .unwrap_or(LIST_OFFSETS_MIN);
+                .ok_or_else(|| {
+                    KrafkaError::protocol(format!(
+                        "broker does not support ListOffsets v{}-v{}",
+                        LIST_OFFSETS_MIN, LIST_OFFSETS_MAX,
+                    ))
+                })?;
             let response = conn
                 .send_request(ApiKey::ListOffsets, lo_version, |buf| {
                     request.encode_versioned(lo_version, buf)
@@ -2871,7 +2918,12 @@ impl GroupCoordinator {
         let lg_version = conn
             .negotiate_api_version(ApiKey::LeaveGroup, LEAVE_GROUP_MAX, LEAVE_GROUP_MIN)
             .await
-            .unwrap_or(LEAVE_GROUP_MIN);
+            .ok_or_else(|| {
+                KrafkaError::protocol(format!(
+                    "broker does not support LeaveGroup v{}-v{}",
+                    LEAVE_GROUP_MIN, LEAVE_GROUP_MAX,
+                ))
+            })?;
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             conn.send_request(ApiKey::LeaveGroup, lg_version, |buf| {

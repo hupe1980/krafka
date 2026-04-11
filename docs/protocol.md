@@ -59,44 +59,44 @@ this range are rejected with a protocol error.
 
 | API | Min | Max | Key Features |
 |-----|-----|-----|--------------|
-| Produce | 3 | 13 | v3 transactions, v9 flexible encoding, v13 topic-ID (KIP-516) |
-| Fetch | 4 | 16¹ | v4 isolation level, v7 fetch sessions (KIP-227), v9 leader epoch (KIP-320), v11 closest-replica (KIP-392), v12 flexible encoding, v13 topic-ID (KIP-516), v15 ReplicaState (KIP-951) |
-| ListOffsets | 1 | 11 | v1 timestamp queries, v2 isolation level, v4 leader epoch, v6 flexible encoding, v7 max-timestamp (KIP-734), v10 timeout_ms (KIP-1075) |
-| Metadata | 1 | 13 | v1 controller + rack, v7 leader epoch, v8 authorized-ops, v9+ flexible encoding, v10+ topic UUIDs |
-| OffsetCommit | 2 | 10 | v2 retention, v5+ retention field removed, v8+ flexible encoding, v10 topic-ID (KIP-848) |
-| OffsetFetch | 1 | 10 | v1 group coordinator, v8 batched-groups, v9 member_epoch (KIP-848), v10 topic-ID (KIP-848) |
-| FindCoordinator | 1 | 6 | v1 key_type field, v4 batched-keys, v5 KIP-890, v6 KIP-932 |
-| JoinGroup | 4 | 9 | v4 flexible encoding, v5 group instance id, v9 KIP-848 skip-assignment |
-| Heartbeat | 3 | 4 | v3 group instance id (KIP-345), v4 flexible encoding |
-| SyncGroup | 3 | 5 | v3 group instance id, v5 KIP-559 |
-| LeaveGroup | 3 | 5 | v3 batch leave (KIP-345), v5 reason string (KIP-800) |
-| CreateTopics | 2 | 7 | v2 topic validation, v5 flexible encoding |
-| DeleteTopics | 1 | 6 | v4 flexible encoding, v6 topic-ID |
-| CreatePartitions | 0 | 3 | v2 flexible encoding |
-| DescribeConfigs | 0 | 4 | v1+ resource type, v4 flexible encoding |
+| Produce | 3 | 3 | v3 transactions |
+| Fetch | 4 | 11 | v4 isolation level, v7 fetch sessions (KIP-227), v9 leader epoch (KIP-320), v11 closest-replica (KIP-392) |
+| ListOffsets | 1 | 2 | v1 timestamp queries, v2 isolation level |
+| Metadata | 1 | 8 | v1 controller + rack, v7 leader epoch, v8 authorized-ops |
+| OffsetCommit | 2 | 2 | v2 retention |
+| OffsetFetch | 1 | 1 | v1 group coordinator |
+| FindCoordinator | 1 | 1 | v1 key_type field |
+| JoinGroup | 4 | 5 | v4 flexible encoding, v5 group instance id |
+| Heartbeat | 3 | 3 | v3 group instance id (KIP-345) |
+| SyncGroup | 3 | 3 | v3 group instance id |
+| LeaveGroup | 3 | 3 | v3 batch leave (KIP-345) |
+| CreateTopics | 2 | 2 | v2 topic validation |
+| DeleteTopics | 1 | 1 | v1 baseline |
+| CreatePartitions | 0 | 0 | v0 baseline |
+| DescribeConfigs | 0 | 1 | v1 resource type + synonyms |
 | IncrementalAlterConfigs | 0 | 1 | Incremental config updates |
-| DescribeAcls | 1 | 3 | v2 flexible encoding |
-| CreateAcls | 1 | 3 | v2 flexible encoding |
-| DeleteAcls | 1 | 3 | v2 flexible encoding |
-| DescribeGroups | 1 | 6 | v3 flexible encoding, v5+ authorized-ops |
-| ListGroups | 1 | 5 | v3 flexible encoding, v4+ state/type filters |
-| DeleteRecords | 0 | 2 | v2 flexible encoding |
-| OffsetForLeaderEpoch | 2 | 4 | v2 leader epoch validation, v3 flexible encoding |
-| InitProducerId | 0 | 5¹ | v0 idempotent, v3+ epoch recovery, v5 KIP-890 |
-| AddPartitionsToTxn | 0 | 5 | Transactional partition registration |
-| AddOffsetsToTxn | 0 | 4 | Transactional offset coordination |
-| EndTxn | 0 | 5 | v5 epoch bumping (KIP-890) |
-| TxnOffsetCommit | 0 | 5 | Transactional offset commits |
-| CreateDelegationToken | 1 | 3 | Delegation token creation |
-| RenewDelegationToken | 1 | 2 | Delegation token renewal |
-| ExpireDelegationToken | 1 | 2 | Delegation token expiry |
-| DescribeDelegationToken | 1 | 3 | Delegation token listing |
-| DescribeClientQuotas | 0 | 1 | Client quota queries |
-| AlterClientQuotas | 0 | 1 | Client quota updates |
+| DescribeAcls | 1 | 1 | v1 prefixed ACLs |
+| CreateAcls | 1 | 1 | v1 prefixed ACLs |
+| DeleteAcls | 1 | 1 | v1 prefixed ACLs |
+| DescribeGroups | 1 | 1 | v1 baseline |
+| ListGroups | 1 | 1 | v1 baseline |
+| DeleteRecords | 0 | 0 | v0 baseline |
+| OffsetForLeaderEpoch | 2 | 3 | v2 leader epoch validation, v3 replica_id |
+| InitProducerId | 0 | 0 | v0 idempotent |
+| AddPartitionsToTxn | 0 | 0 | Transactional partition registration |
+| AddOffsetsToTxn | 0 | 0 | Transactional offset coordination |
+| EndTxn | 0 | 0 | v0 baseline |
+| TxnOffsetCommit | 0 | 0 | Transactional offset commits |
+| CreateDelegationToken | 1 | 1 | Delegation token creation |
+| RenewDelegationToken | 1 | 1 | Delegation token renewal |
+| ExpireDelegationToken | 1 | 1 | Delegation token expiry |
+| DescribeDelegationToken | 1 | 1 | Delegation token listing |
+| DescribeClientQuotas | 0 | 0 | Client quota queries |
+| AlterClientQuotas | 0 | 0 | Client quota updates |
 | DeleteGroups | 0 | 2 | Consumer group deletion |
 | DescribeCluster | 0 | 2 | Cluster metadata |
-| ApiVersions | 0 | 4¹ | API version negotiation |
-| ConsumerGroupHeartbeat | 0 | 1 | KIP-848 consumer group protocol, v1 regex subscriptions (KIP-1082) |
+| ApiVersions | 0 | 4 (5¹) | API version negotiation |
+| ConsumerGroupHeartbeat | 0 | 0 | KIP-848 consumer group protocol |
 | ConsumerGroupDescribe | 0 | 1 | KIP-848 group description |
 | DescribeTopicPartitions | 0 | 0 | Topic partition metadata (KIP-966) |
 | GetTelemetrySubscriptions² | 0 | 0 | KIP-714 client telemetry subscription discovery |
@@ -106,9 +106,11 @@ this range are rejected with a protocol error.
 | ShareFetch¹ | 1 | 2 | KIP-932 share fetch, v2 acquire mode (KIP-1206) + renew ack (KIP-1222) |
 | ShareAcknowledge¹ | 1 | 2 | KIP-932 share acknowledge, v2 renew ack (KIP-1222) |
 
-> ¹ Requires `unstable-protocol` feature flag. Max shown is the feature-gated max.
+> ¹ Requires `unstable-protocol` feature flag. Max shown in parentheses is the feature-gated max.
 >
 > ² Requires `telemetry` feature flag.
+>
+> **Note:** Encode/decode implementations exist for higher versions of many APIs (e.g., Produce up to v13, Fetch up to v16, Metadata up to v13) but are not yet activated — the negotiated MAX is set conservatively until those paths have been integration-tested against a real broker.
 
 ### Version Constants
 
@@ -119,10 +121,10 @@ use krafka::protocol::versions;
 
 // Each API has both MIN and MAX constants
 let min_fetch = versions::FETCH_MIN;        // 4  (Kafka 3.9+ baseline)
-let max_fetch = versions::FETCH_MAX;        // 16 (v16 KIP-951 NodeEndpoints)
+let max_fetch = versions::FETCH_MAX;        // 11 (v11 closest-replica, KIP-392)
 let min_produce = versions::PRODUCE_MIN;    // 3  (v3+ transactions)
-let max_produce = versions::PRODUCE_MAX;    // 13 (v13 topic-ID, KIP-516)
-let max_metadata = versions::METADATA_MAX;  // 13 (v13 topic UUIDs + error code)
+let max_produce = versions::PRODUCE_MAX;    // 3  (v3 transactions)
+let max_metadata = versions::METADATA_MAX;  // 8  (v8 authorized-ops)
 ```
 
 ## Record Batches

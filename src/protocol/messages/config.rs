@@ -130,7 +130,7 @@ impl DescribeConfigsRequest {
         Ok(())
     }
 
-    /// Encode for version 1–3 (non-flexible; v1 adds include_synonyms, v3 adds include_documentation).
+    /// Encode for versions 1–2 (non-flexible; v1 adds include_synonyms).
     pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
         array_len_i32(self.resources.len())?.encode(buf);
         for resource in &self.resources {
