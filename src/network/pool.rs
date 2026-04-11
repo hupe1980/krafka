@@ -329,6 +329,9 @@ impl BrokerConnectionBundle {
     /// Returns None if no usable connection exists.
     pub fn select_usable(&self) -> Option<Arc<BrokerConnection>> {
         let len = self.connections.len();
+        if len == 0 {
+            return None;
+        }
         let start = self.counter.fetch_add(1, Ordering::Relaxed) % len;
 
         // Check up to len connections starting from the round-robin position

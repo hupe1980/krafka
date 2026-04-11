@@ -253,7 +253,7 @@ impl ClusterMetadata {
 
         // Negotiate the highest mutually supported Metadata version up to the
         // client's supported maximum (`METADATA_MAX`).
-        // Negotiate Metadata version — v1+ required, up to v12 (topic UUIDs, KIP-848).
+        // v1+ required, up to v13 (top-level error_code).
         let metadata_version = conn
             .negotiate_api_version(
                 ApiKey::Metadata,
@@ -281,6 +281,15 @@ impl ClusterMetadata {
         // Decode response
         let mut buf = response;
         let metadata = MetadataResponse::decode_versioned(metadata_version, &mut buf)?;
+
+        // v13+ includes a top-level error code. Check it before processing
+        // topics. Per-topic errors are still handled individually in update_cache.
+        if !metadata.error_code.is_ok() {
+            return Err(KrafkaError::broker(
+                metadata.error_code,
+                "metadata request failed",
+            ));
+        }
 
         // Update cache. A full refresh (topics=None) is authoritative — the
         // response contains every topic currently in the cluster, so we rebuild

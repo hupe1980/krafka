@@ -4,6 +4,22 @@
 //! producer and consumer pipelines. They are modeled after the Kafka Java
 //! client's `ProducerInterceptor` and `ConsumerInterceptor` interfaces.
 //!
+//! # Interceptor Chaining
+//!
+//! Multiple interceptors can be registered and execute as an ordered chain,
+//! matching the Java client's behavior. Each interceptor is individually
+//! panic-isolated — a panic in one interceptor is caught and logged, and
+//! the remaining interceptors still execute.
+//!
+//! ```rust,ignore
+//! let producer = Producer::builder()
+//!     .bootstrap_servers("localhost:9092")
+//!     .add_interceptor(Arc::new(TracingInterceptor))
+//!     .add_interceptor(Arc::new(MetricsInterceptor))
+//!     .build()
+//!     .await?;
+//! ```
+//!
 //! # Producer Interceptors
 //!
 //! Producer interceptors can inspect or modify records before they are sent,
@@ -32,7 +48,7 @@
 //!
 //! let producer = Producer::builder()
 //!     .bootstrap_servers("localhost:9092")
-//!     .interceptor(Arc::new(LoggingInterceptor))
+//!     .add_interceptor(Arc::new(LoggingInterceptor))
 //!     .build()
 //!     .await?;
 //! ```
@@ -57,7 +73,7 @@
 //! let consumer = Consumer::builder()
 //!     .bootstrap_servers("localhost:9092")
 //!     .group_id("my-group")
-//!     .interceptor(Arc::new(MetricsInterceptor))
+//!     .add_interceptor(Arc::new(MetricsInterceptor))
 //!     .build()
 //!     .await?;
 //! ```
@@ -65,6 +81,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 
 use crate::consumer::ConsumerRecord;
 use crate::error::KrafkaError;
@@ -134,6 +151,144 @@ impl ProducerInterceptor for NoOpProducerInterceptor {}
 pub(crate) struct NoOpConsumerInterceptor;
 
 impl ConsumerInterceptor for NoOpConsumerInterceptor {}
+
+/// An ordered chain of producer interceptors.
+///
+/// Executes each interceptor in registration order. Each interceptor is
+/// individually panic-isolated — a panic in one interceptor is caught and
+/// logged, and the remaining interceptors still execute. This matches the
+/// Java Kafka client's `ProducerInterceptors` behavior.
+///
+/// For `on_send`, each interceptor sees the record as modified by the
+/// previous interceptors in the chain.
+///
+/// **Panic semantics vs Java:** In Java, `onSend` returns a new record;
+/// if interceptor N throws, interceptor N+1 receives the record from the
+/// last *successful* interceptor. In Rust, `on_send` mutates in-place
+/// (`&mut`); if interceptor N panics mid-mutation, interceptor N+1 sees
+/// a partially-mutated record. Avoid building chains where later
+/// interceptors depend on invariants set by earlier ones.
+pub(crate) struct ProducerInterceptorChain {
+    interceptors: Vec<Arc<dyn ProducerInterceptor>>,
+}
+
+impl fmt::Debug for ProducerInterceptorChain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProducerInterceptorChain")
+            .field("len", &self.interceptors.len())
+            .finish()
+    }
+}
+
+impl ProducerInterceptorChain {
+    /// Create a chain from a list of interceptors.
+    pub fn new(interceptors: Vec<Arc<dyn ProducerInterceptor>>) -> Self {
+        Self { interceptors }
+    }
+}
+
+impl ProducerInterceptor for ProducerInterceptorChain {
+    fn on_send(&self, record: &mut ProducerRecord) {
+        for interceptor in &self.interceptors {
+            if let Err(e) = catch_unwind(AssertUnwindSafe(|| interceptor.on_send(record))) {
+                tracing::error!(
+                    interceptor = ?interceptor,
+                    "ProducerInterceptor.on_send panicked: {:?}", e,
+                );
+            }
+        }
+    }
+
+    fn on_acknowledgement(&self, metadata: &RecordMetadata, error: Option<&KrafkaError>) {
+        for interceptor in &self.interceptors {
+            if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
+                interceptor.on_acknowledgement(metadata, error);
+            })) {
+                tracing::error!(
+                    interceptor = ?interceptor,
+                    "ProducerInterceptor.on_acknowledgement panicked: {:?}", e,
+                );
+            }
+        }
+    }
+
+    fn close(&self) {
+        for interceptor in &self.interceptors {
+            if let Err(e) = catch_unwind(AssertUnwindSafe(|| interceptor.close())) {
+                tracing::error!(
+                    interceptor = ?interceptor,
+                    "ProducerInterceptor.close panicked: {:?}", e,
+                );
+            }
+        }
+    }
+}
+
+/// An ordered chain of consumer interceptors.
+///
+/// Executes each interceptor in registration order. Each interceptor is
+/// individually panic-isolated — a panic in one interceptor is caught and
+/// logged, and the remaining interceptors still execute. This matches the
+/// Java Kafka client's `ConsumerInterceptors` behavior.
+pub(crate) struct ConsumerInterceptorChain {
+    interceptors: Vec<Arc<dyn ConsumerInterceptor>>,
+}
+
+impl fmt::Debug for ConsumerInterceptorChain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConsumerInterceptorChain")
+            .field("len", &self.interceptors.len())
+            .finish()
+    }
+}
+
+impl ConsumerInterceptorChain {
+    /// Create a chain from a list of interceptors.
+    pub fn new(interceptors: Vec<Arc<dyn ConsumerInterceptor>>) -> Self {
+        Self { interceptors }
+    }
+}
+
+impl ConsumerInterceptor for ConsumerInterceptorChain {
+    fn on_consume(&self, records: &[ConsumerRecord]) {
+        for interceptor in &self.interceptors {
+            if let Err(e) = catch_unwind(AssertUnwindSafe(|| interceptor.on_consume(records))) {
+                tracing::error!(
+                    interceptor = ?interceptor,
+                    "ConsumerInterceptor.on_consume panicked: {:?}", e,
+                );
+            }
+        }
+    }
+
+    fn on_commit(
+        &self,
+        offsets: &HashMap<(String, PartitionId), Offset>,
+        error: Option<&KrafkaError>,
+    ) {
+        for interceptor in &self.interceptors {
+            if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
+                interceptor.on_commit(offsets, error);
+            })) {
+                tracing::error!(
+                    interceptor = ?interceptor,
+                    "ConsumerInterceptor.on_commit panicked: {:?}", e,
+                );
+            }
+        }
+    }
+
+    fn close(&self) {
+        for interceptor in &self.interceptors {
+            if let Err(e) = catch_unwind(AssertUnwindSafe(|| interceptor.close())) {
+                tracing::error!(
+                    interceptor = ?interceptor,
+                    "ConsumerInterceptor.close panicked: {:?}", e,
+                );
+            }
+        }
+    }
+}
 
 /// Panic-safe wrapper for producer interceptor `on_send`.
 ///
@@ -428,5 +583,295 @@ mod tests {
 
         let c = NoOpConsumerInterceptor;
         c.close();
+    }
+
+    // --- Interceptor chain tests ---
+
+    /// Records the order of interceptor invocations into a shared log.
+    #[derive(Debug)]
+    struct OrderedProducerInterceptor {
+        name: &'static str,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ProducerInterceptor for OrderedProducerInterceptor {
+        fn on_send(&self, _record: &mut ProducerRecord) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}.on_send", self.name));
+        }
+
+        fn on_acknowledgement(&self, _metadata: &RecordMetadata, _error: Option<&KrafkaError>) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}.on_ack", self.name));
+        }
+
+        fn close(&self) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}.close", self.name));
+        }
+    }
+
+    #[test]
+    fn test_producer_chain_executes_in_order() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let chain = ProducerInterceptorChain::new(vec![
+            Arc::new(OrderedProducerInterceptor {
+                name: "first",
+                log: Arc::clone(&log),
+            }),
+            Arc::new(OrderedProducerInterceptor {
+                name: "second",
+                log: Arc::clone(&log),
+            }),
+            Arc::new(OrderedProducerInterceptor {
+                name: "third",
+                log: Arc::clone(&log),
+            }),
+        ]);
+
+        let mut record = ProducerRecord::new("test", b"value".to_vec());
+        chain.on_send(&mut record);
+
+        let metadata = RecordMetadata {
+            topic: "test".to_string(),
+            partition: 0,
+            offset: 0,
+            timestamp: 0,
+        };
+        chain.on_acknowledgement(&metadata, None);
+        chain.close();
+
+        let log = log.lock().unwrap();
+        assert_eq!(
+            *log,
+            vec![
+                "first.on_send",
+                "second.on_send",
+                "third.on_send",
+                "first.on_ack",
+                "second.on_ack",
+                "third.on_ack",
+                "first.close",
+                "second.close",
+                "third.close",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_producer_chain_on_send_mutations_visible_to_next() {
+        /// Appends a header with its name.
+        #[derive(Debug)]
+        struct HeaderAdder(&'static str);
+
+        impl ProducerInterceptor for HeaderAdder {
+            fn on_send(&self, record: &mut ProducerRecord) {
+                record
+                    .headers
+                    .push((self.0.to_string(), self.0.as_bytes().to_vec()));
+            }
+        }
+
+        let chain = ProducerInterceptorChain::new(vec![
+            Arc::new(HeaderAdder("first")),
+            Arc::new(HeaderAdder("second")),
+        ]);
+
+        let mut record = ProducerRecord::new("test", b"value".to_vec());
+        chain.on_send(&mut record);
+
+        assert_eq!(record.headers.len(), 2);
+        assert_eq!(record.headers[0].0, "first");
+        assert_eq!(record.headers[1].0, "second");
+    }
+
+    #[test]
+    fn test_producer_chain_panic_isolation() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let chain = ProducerInterceptorChain::new(vec![
+            Arc::new(OrderedProducerInterceptor {
+                name: "before",
+                log: Arc::clone(&log),
+            }),
+            Arc::new(PanickingProducerInterceptor),
+            Arc::new(OrderedProducerInterceptor {
+                name: "after",
+                log: Arc::clone(&log),
+            }),
+        ]);
+
+        let mut record = ProducerRecord::new("test", b"value".to_vec());
+        chain.on_send(&mut record);
+
+        let metadata = RecordMetadata {
+            topic: "test".to_string(),
+            partition: 0,
+            offset: 0,
+            timestamp: 0,
+        };
+        chain.on_acknowledgement(&metadata, None);
+        chain.close();
+
+        let log = log.lock().unwrap();
+        // Both "before" and "after" run; the panicking interceptor is skipped
+        assert_eq!(
+            *log,
+            vec![
+                "before.on_send",
+                "after.on_send",
+                "before.on_ack",
+                "after.on_ack",
+                "before.close",
+                "after.close",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_producer_chain_empty() {
+        let chain = ProducerInterceptorChain::new(vec![]);
+        let mut record = ProducerRecord::new("test", b"value".to_vec());
+        // Empty chain is a no-op — should not panic
+        chain.on_send(&mut record);
+        chain.close();
+    }
+
+    #[derive(Debug)]
+    struct OrderedConsumerInterceptor {
+        name: &'static str,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ConsumerInterceptor for OrderedConsumerInterceptor {
+        fn on_consume(&self, _records: &[ConsumerRecord]) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}.on_consume", self.name));
+        }
+
+        fn on_commit(
+            &self,
+            _offsets: &HashMap<(String, PartitionId), Offset>,
+            _error: Option<&KrafkaError>,
+        ) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}.on_commit", self.name));
+        }
+
+        fn close(&self) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}.close", self.name));
+        }
+    }
+
+    #[test]
+    fn test_consumer_chain_executes_in_order() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let chain = ConsumerInterceptorChain::new(vec![
+            Arc::new(OrderedConsumerInterceptor {
+                name: "first",
+                log: Arc::clone(&log),
+            }),
+            Arc::new(OrderedConsumerInterceptor {
+                name: "second",
+                log: Arc::clone(&log),
+            }),
+        ]);
+
+        chain.on_consume(&[]);
+        chain.on_commit(&HashMap::new(), None);
+        chain.close();
+
+        let log = log.lock().unwrap();
+        assert_eq!(
+            *log,
+            vec![
+                "first.on_consume",
+                "second.on_consume",
+                "first.on_commit",
+                "second.on_commit",
+                "first.close",
+                "second.close",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_consumer_chain_panic_isolation() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let chain = ConsumerInterceptorChain::new(vec![
+            Arc::new(OrderedConsumerInterceptor {
+                name: "before",
+                log: Arc::clone(&log),
+            }),
+            Arc::new(PanickingConsumerInterceptor),
+            Arc::new(OrderedConsumerInterceptor {
+                name: "after",
+                log: Arc::clone(&log),
+            }),
+        ]);
+
+        chain.on_consume(&[]);
+        chain.on_commit(&HashMap::new(), None);
+        chain.close();
+
+        let log = log.lock().unwrap();
+        assert_eq!(
+            *log,
+            vec![
+                "before.on_consume",
+                "after.on_consume",
+                "before.on_commit",
+                "after.on_commit",
+                "before.close",
+                "after.close",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_consumer_chain_empty() {
+        let chain = ConsumerInterceptorChain::new(vec![]);
+        chain.on_consume(&[]);
+        chain.on_commit(&HashMap::new(), None);
+        chain.close();
+    }
+
+    #[test]
+    fn test_chain_via_safe_wrappers() {
+        // Verify chains work through the safe_* wrappers (belt-and-suspenders)
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let chain = ProducerInterceptorChain::new(vec![
+            Arc::new(OrderedProducerInterceptor {
+                name: "a",
+                log: Arc::clone(&log),
+            }),
+            Arc::new(OrderedProducerInterceptor {
+                name: "b",
+                log: Arc::clone(&log),
+            }),
+        ]);
+
+        let mut record = ProducerRecord::new("test", b"v".to_vec());
+        safe_on_send(&chain, &mut record);
+
+        let log = log.lock().unwrap();
+        assert_eq!(*log, vec!["a.on_send", "b.on_send"]);
     }
 }

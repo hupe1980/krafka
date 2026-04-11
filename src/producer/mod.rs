@@ -529,7 +529,7 @@ pub struct ProducerMetricsSnapshot {
 #[must_use = "builders do nothing until .build() is called"]
 pub struct ProducerBuilder {
     config: ProducerConfig,
-    interceptor: Option<Arc<dyn crate::interceptor::ProducerInterceptor>>,
+    interceptors: Vec<Arc<dyn crate::interceptor::ProducerInterceptor>>,
 }
 
 impl ProducerBuilder {
@@ -689,15 +689,34 @@ impl ProducerBuilder {
         self
     }
 
-    /// Set a producer interceptor.
+    /// Set a producer interceptor, replacing any previously added interceptors.
     ///
     /// The interceptor's `on_send` method is called before each record is sent,
     /// and `on_acknowledgement` is called after a send succeeds or fails.
+    ///
+    /// To register multiple interceptors as an ordered chain, use
+    /// [`add_interceptor`](Self::add_interceptor) instead.
     pub fn interceptor(
         mut self,
         interceptor: Arc<dyn crate::interceptor::ProducerInterceptor>,
     ) -> Self {
-        self.interceptor = Some(interceptor);
+        self.interceptors = vec![interceptor];
+        self
+    }
+
+    /// Append a producer interceptor to the chain.
+    ///
+    /// Interceptors execute in the order they are added. Each interceptor is
+    /// individually panic-isolated — a panic in one will not prevent the
+    /// remaining interceptors from running.
+    ///
+    /// For `on_send`, each interceptor sees the record as modified by all
+    /// preceding interceptors.
+    pub fn add_interceptor(
+        mut self,
+        interceptor: Arc<dyn crate::interceptor::ProducerInterceptor>,
+    ) -> Self {
+        self.interceptors.push(interceptor);
         self
     }
 
@@ -712,9 +731,17 @@ impl ProducerBuilder {
         if self.config.batch_size == 0 {
             return Err(KrafkaError::config("batch_size must be >= 1"));
         }
-        let interceptor: Arc<dyn crate::interceptor::ProducerInterceptor> = self
-            .interceptor
-            .unwrap_or_else(|| Arc::new(crate::interceptor::NoOpProducerInterceptor));
+        let interceptor: Arc<dyn crate::interceptor::ProducerInterceptor> =
+            if self.interceptors.is_empty() {
+                Arc::new(crate::interceptor::NoOpProducerInterceptor)
+            } else if self.interceptors.len() == 1 {
+                // infallible: len == 1 guaranteed above
+                self.interceptors.into_iter().next().unwrap()
+            } else {
+                Arc::new(crate::interceptor::ProducerInterceptorChain::new(
+                    self.interceptors,
+                ))
+            };
         let producer = Producer::new(self.config, interceptor).await?;
         Ok(producer)
     }
@@ -927,7 +954,48 @@ mod tests {
             .bootstrap_servers("localhost:9092")
             .interceptor(Arc::new(TestInterceptor));
 
-        assert!(builder.interceptor.is_some());
+        assert_eq!(builder.interceptors.len(), 1);
+    }
+
+    #[test]
+    fn test_producer_builder_add_interceptor() {
+        use crate::interceptor::ProducerInterceptor;
+
+        #[derive(Debug)]
+        struct A;
+        impl ProducerInterceptor for A {}
+
+        #[derive(Debug)]
+        struct B;
+        impl ProducerInterceptor for B {}
+
+        // add_interceptor appends to chain
+        let builder = Producer::builder()
+            .bootstrap_servers("localhost:9092")
+            .add_interceptor(Arc::new(A))
+            .add_interceptor(Arc::new(B));
+        assert_eq!(builder.interceptors.len(), 2);
+    }
+
+    #[test]
+    fn test_producer_builder_interceptor_replaces_chain() {
+        use crate::interceptor::ProducerInterceptor;
+
+        #[derive(Debug)]
+        struct A;
+        impl ProducerInterceptor for A {}
+
+        #[derive(Debug)]
+        struct B;
+        impl ProducerInterceptor for B {}
+
+        // interceptor() replaces any previously added interceptors
+        let builder = Producer::builder()
+            .bootstrap_servers("localhost:9092")
+            .add_interceptor(Arc::new(A))
+            .add_interceptor(Arc::new(A))
+            .interceptor(Arc::new(B));
+        assert_eq!(builder.interceptors.len(), 1);
     }
 
     #[test]

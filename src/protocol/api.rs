@@ -777,7 +777,11 @@ impl ApiVersionsResponse {
         let tagged = TaggedFields::decode(buf)?;
         let supported_features = Self::parse_supported_features(&tagged)?;
         let finalized_features_epoch = Self::parse_finalized_features_epoch(&tagged);
-        let finalized_features = Self::parse_finalized_features(&tagged)?;
+        let finalized_features = if finalized_features_epoch >= 0 {
+            Self::parse_finalized_features(&tagged)?
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             error_code,
             api_keys,
@@ -838,11 +842,10 @@ impl ApiVersionsResponse {
             .iter()
             .find(|f| f.tag == 1)
             .and_then(|f| {
-                if f.data.len() >= 8 {
-                    Some(i64::from_be_bytes(f.data[..8].try_into().unwrap()))
-                } else {
-                    None
-                }
+                f.data
+                    .get(..8)
+                    .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+                    .map(i64::from_be_bytes)
             })
             .unwrap_or(-1)
     }
@@ -1330,6 +1333,40 @@ mod tests {
         let mut data = buf.freeze();
         let resp = ApiVersionsResponse::decode_v0(&mut data).unwrap();
         assert_eq!(resp.finalized_features_epoch, -1);
+        assert!(resp.finalized_features.is_empty());
+    }
+
+    #[test]
+    fn test_api_versions_response_v3_finalized_features_ignored_when_epoch_absent() {
+        // Tag 2 (FinalizedFeatures) present but tag 1 (epoch) absent → epoch defaults
+        // to -1, so decode_v3 must NOT parse tag 2 (the struct doc says finalized_features
+        // is valid only when epoch ≥ 0).
+        use crate::util::varint;
+        let mut buf = BytesMut::new();
+        buf.put_i16(0); // error_code
+        varint::encode_unsigned_varint(1, &mut buf); // 0 api_keys
+        buf.put_i32(0); // throttle_time_ms
+
+        // Build tag 2 only (no tag 1)
+        let mut tag2 = BytesMut::new();
+        varint::encode_unsigned_varint(2, &mut tag2); // 1 entry
+        let name = b"metadata.version";
+        varint::encode_unsigned_varint(name.len() as u32 + 1, &mut tag2);
+        tag2.put_slice(name);
+        tag2.put_i16(17); // max_version_level
+        tag2.put_i16(1); // min_version_level
+        tag2.put_u8(0); // per-entry tagged fields
+
+        // Emit 1 tagged field (tag 2 only, no tag 1)
+        varint::encode_unsigned_varint(1, &mut buf);
+        varint::encode_unsigned_varint(2, &mut buf); // tag id = 2
+        varint::encode_unsigned_varint(tag2.len() as u32, &mut buf);
+        buf.extend_from_slice(&tag2);
+
+        let mut data = buf.freeze();
+        let resp = ApiVersionsResponse::decode_v3(&mut data).unwrap();
+        assert_eq!(resp.finalized_features_epoch, -1);
+        // Tag 2 data is present in the wire but must be ignored since epoch < 0
         assert!(resp.finalized_features.is_empty());
     }
 }

@@ -2357,12 +2357,26 @@ mod tests {
         let mut buf = BytesMut::new();
         request.encode_v0(&mut buf).unwrap();
 
-        let bytes = buf.freeze();
-        assert!(!bytes.is_empty());
-        // Decode timeout_ms from start
-        let mut reader = &bytes[..];
-        let timeout = i32::decode(&mut reader).unwrap();
-        assert_eq!(timeout, 30_000);
+        let mut cur = &buf[..];
+        // timeout_ms
+        assert_eq!(i32::decode(&mut cur).unwrap(), 30_000);
+        // compact array: 2 entries → varint(3)
+        assert_eq!(varint::decode_unsigned_varint(&mut cur).unwrap(), 3);
+        // entry 0: "metadata.version", max_version_level=17, AllowDowngrade=false
+        let name0 = KafkaString::decode_compact(&mut cur).unwrap().0.unwrap();
+        assert_eq!(name0, "metadata.version");
+        assert_eq!(i16::decode(&mut cur).unwrap(), 17);
+        assert_eq!(cur.get_u8(), 0); // AllowDowngrade=false (upgrade)
+        assert_eq!(cur.get_u8(), 0); // per-entry tagged fields
+        // entry 1: "group.version", max_version_level=0, AllowDowngrade=true
+        let name1 = KafkaString::decode_compact(&mut cur).unwrap().0.unwrap();
+        assert_eq!(name1, "group.version");
+        assert_eq!(i16::decode(&mut cur).unwrap(), 0);
+        assert_eq!(cur.get_u8(), 1); // AllowDowngrade=true (delete → SafeDowngrade)
+        assert_eq!(cur.get_u8(), 0); // per-entry tagged fields
+        // top-level tagged fields
+        assert_eq!(cur.get_u8(), 0);
+        assert!(cur.is_empty());
     }
 
     #[test]
@@ -2376,11 +2390,22 @@ mod tests {
         let mut buf = BytesMut::new();
         request.encode_v1(&mut buf).unwrap();
 
-        let bytes = buf.freeze();
-        assert!(!bytes.is_empty());
-        let mut reader = &bytes[..];
-        let timeout = i32::decode(&mut reader).unwrap();
-        assert_eq!(timeout, 60_000); // default
+        let mut cur = &buf[..];
+        // timeout_ms
+        assert_eq!(i32::decode(&mut cur).unwrap(), 60_000);
+        // compact array: 1 entry → varint(2)
+        assert_eq!(varint::decode_unsigned_varint(&mut cur).unwrap(), 2);
+        // entry: "metadata.version", max_version_level=15, UpgradeType=2 (SafeDowngrade)
+        let name = KafkaString::decode_compact(&mut cur).unwrap().0.unwrap();
+        assert_eq!(name, "metadata.version");
+        assert_eq!(i16::decode(&mut cur).unwrap(), 15);
+        assert_eq!(cur.get_i8(), 2); // UpgradeType::SafeDowngrade
+        assert_eq!(cur.get_u8(), 0); // per-entry tagged fields
+        // validate_only=true
+        assert_eq!(cur.get_u8(), 1);
+        // top-level tagged fields
+        assert_eq!(cur.get_u8(), 0);
+        assert!(cur.is_empty());
     }
 
     #[test]
@@ -2403,8 +2428,7 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.put_i32(100); // throttle_time_ms
         buf.put_i16(0); // error_code (None)
-        // Nullable compact string: null = varint(0)
-        varint::encode_unsigned_varint(1, &mut buf); // empty string (len+1=1)
+        varint::encode_unsigned_varint(0, &mut buf); // null error_message
         // Results array: 1 entry
         varint::encode_unsigned_varint(2, &mut buf); // count+1 = 2 → 1 entry
         // Feature name: "metadata.version"
@@ -2412,16 +2436,18 @@ mod tests {
         varint::encode_unsigned_varint((name.len() + 1) as u32, &mut buf);
         buf.put_slice(name.as_bytes());
         buf.put_i16(0); // error_code
-        varint::encode_unsigned_varint(1, &mut buf); // empty error_message
+        varint::encode_unsigned_varint(0, &mut buf); // null error_message
         put_tagged_fields(&mut buf); // per-entry tagged fields
         put_tagged_fields(&mut buf); // top-level tagged fields
 
         let resp = UpdateFeaturesResponse::decode_v0(&mut buf.freeze()).unwrap();
         assert_eq!(resp.throttle_time_ms, 100);
         assert!(resp.is_ok());
+        assert!(resp.error_message.is_none());
         assert_eq!(resp.results.len(), 1);
         assert_eq!(resp.results[0].feature, "metadata.version");
         assert!(resp.results[0].error_code.is_ok());
+        assert!(resp.results[0].error_message.is_none());
     }
 
     #[test]

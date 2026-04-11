@@ -2957,7 +2957,13 @@ impl AdminClient {
             })?;
 
         let response_bytes = conn
-            .send_request(ApiKey::ApiVersions, version, |buf| request.encode_v3(buf))
+            .send_request(ApiKey::ApiVersions, version, |buf| {
+                if version >= 5 {
+                    request.encode_v5(buf)
+                } else {
+                    request.encode_v3(buf)
+                }
+            })
             .await?;
 
         let mut buf = response_bytes;

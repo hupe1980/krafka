@@ -3011,7 +3011,7 @@ impl Consumer {
 pub struct ConsumerBuilder {
     config: ConsumerConfig,
     rebalance_listener: Option<Arc<dyn ConsumerRebalanceListener>>,
-    interceptor: Option<Arc<dyn crate::interceptor::ConsumerInterceptor>>,
+    interceptors: Vec<Arc<dyn crate::interceptor::ConsumerInterceptor>>,
 }
 
 impl ConsumerBuilder {
@@ -3243,16 +3243,32 @@ impl ConsumerBuilder {
         self
     }
 
-    /// Set a consumer interceptor.
+    /// Set a consumer interceptor, replacing any previously added interceptors.
     ///
     /// The interceptor's `on_consume` method is called after records are fetched
     /// but before they are returned from `poll()`, and `on_commit` is called
     /// after offsets are committed.
+    ///
+    /// To register multiple interceptors as an ordered chain, use
+    /// [`add_interceptor`](Self::add_interceptor) instead.
     pub fn interceptor(
         mut self,
         interceptor: Arc<dyn crate::interceptor::ConsumerInterceptor>,
     ) -> Self {
-        self.interceptor = Some(interceptor);
+        self.interceptors = vec![interceptor];
+        self
+    }
+
+    /// Append a consumer interceptor to the chain.
+    ///
+    /// Interceptors execute in the order they are added. Each interceptor is
+    /// individually panic-isolated — a panic in one will not prevent the
+    /// remaining interceptors from running.
+    pub fn add_interceptor(
+        mut self,
+        interceptor: Arc<dyn crate::interceptor::ConsumerInterceptor>,
+    ) -> Self {
+        self.interceptors.push(interceptor);
         self
     }
 
@@ -3285,8 +3301,15 @@ impl ConsumerBuilder {
         if let Some(listener) = self.rebalance_listener {
             consumer.rebalance_listener = listener;
         }
-        if let Some(interceptor) = self.interceptor {
-            consumer.interceptor = interceptor;
+        if !self.interceptors.is_empty() {
+            consumer.interceptor = if self.interceptors.len() == 1 {
+                // infallible: len == 1 guaranteed above
+                self.interceptors.into_iter().next().unwrap()
+            } else {
+                Arc::new(crate::interceptor::ConsumerInterceptorChain::new(
+                    self.interceptors,
+                ))
+            };
         }
         Ok(consumer)
     }
@@ -3680,7 +3703,48 @@ mod tests {
             .group_id("test-group")
             .interceptor(Arc::new(TestInterceptor));
 
-        assert!(builder.interceptor.is_some());
+        assert_eq!(builder.interceptors.len(), 1);
+    }
+
+    #[test]
+    fn test_consumer_builder_add_interceptor() {
+        use crate::interceptor::ConsumerInterceptor;
+
+        #[derive(Debug)]
+        struct A;
+        impl ConsumerInterceptor for A {}
+
+        #[derive(Debug)]
+        struct B;
+        impl ConsumerInterceptor for B {}
+
+        let builder = Consumer::builder()
+            .bootstrap_servers("localhost:9092")
+            .group_id("test-group")
+            .add_interceptor(Arc::new(A))
+            .add_interceptor(Arc::new(B));
+        assert_eq!(builder.interceptors.len(), 2);
+    }
+
+    #[test]
+    fn test_consumer_builder_interceptor_replaces_chain() {
+        use crate::interceptor::ConsumerInterceptor;
+
+        #[derive(Debug)]
+        struct A;
+        impl ConsumerInterceptor for A {}
+
+        #[derive(Debug)]
+        struct B;
+        impl ConsumerInterceptor for B {}
+
+        let builder = Consumer::builder()
+            .bootstrap_servers("localhost:9092")
+            .group_id("test-group")
+            .add_interceptor(Arc::new(A))
+            .add_interceptor(Arc::new(A))
+            .interceptor(Arc::new(B));
+        assert_eq!(builder.interceptors.len(), 1);
     }
 
     // recv() buffers remaining records so none are lost.

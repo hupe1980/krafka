@@ -9,7 +9,7 @@ description: "Producer and consumer interceptor hooks for observability and reco
 
 Interceptors allow you to hook into the producer and consumer pipelines at key points.
 They are modeled after the Kafka Java client's `ProducerInterceptor` and `ConsumerInterceptor`
-interfaces.
+interfaces, including support for **ordered interceptor chains**.
 
 ## Overview
 
@@ -86,7 +86,7 @@ impl ProducerInterceptor for TracingInterceptor {
 
 let producer = Producer::builder()
     .bootstrap_servers("localhost:9092")
-    .interceptor(Arc::new(TracingInterceptor))
+    .add_interceptor(Arc::new(TracingInterceptor))
     .build()
     .await?;
 ```
@@ -172,7 +172,7 @@ impl ConsumerInterceptor for LoggingInterceptor {
 let consumer = Consumer::builder()
     .bootstrap_servers("localhost:9092")
     .group_id("my-group")
-    .interceptor(Arc::new(LoggingInterceptor))
+    .add_interceptor(Arc::new(LoggingInterceptor))
     .build()
     .await?;
 ```
@@ -208,7 +208,7 @@ impl ConsumerInterceptor for CommitMonitor {
 
 ## Wiring Interceptors
 
-### Producer
+### Single Interceptor
 
 ```rust
 use std::sync::Arc;
@@ -220,7 +220,33 @@ let producer = Producer::builder()
     .await?;
 ```
 
-### Consumer
+### Interceptor Chain
+
+Multiple interceptors execute in the order they are added. Each interceptor is
+individually panic-isolated — a panic in one interceptor will not prevent the
+remaining interceptors from running.
+
+For `on_send`, each interceptor sees the record as modified by all preceding
+interceptors in the chain.
+
+> **Panic semantics:** In Java, `onSend` returns a new record — if an
+> interceptor throws, the next one receives the record from the last
+> *successful* interceptor. In Rust, `on_send` mutates in-place (`&mut`);
+> if an interceptor panics mid-mutation, the next interceptor sees a
+> partially-mutated record. Avoid building chains where later interceptors
+> depend on invariants set by earlier ones.
+
+```rust
+use std::sync::Arc;
+
+let producer = Producer::builder()
+    .bootstrap_servers("localhost:9092")
+    .add_interceptor(Arc::new(TracingInterceptor))
+    .add_interceptor(Arc::new(MetricsInterceptor))
+    .add_interceptor(Arc::new(AuditInterceptor))
+    .build()
+    .await?;
+```
 
 ```rust
 use std::sync::Arc;
@@ -228,10 +254,15 @@ use std::sync::Arc;
 let consumer = Consumer::builder()
     .bootstrap_servers("localhost:9092")
     .group_id("my-group")
-    .interceptor(Arc::new(MyConsumerInterceptor))
+    .add_interceptor(Arc::new(LoggingInterceptor))
+    .add_interceptor(Arc::new(MetricsInterceptor))
     .build()
     .await?;
 ```
+
+> **Note:** `interceptor()` replaces any previously added interceptors with a
+> single one. `add_interceptor()` appends to the chain. Don't mix both in the
+> same builder.
 
 ### No Interceptor (Default)
 

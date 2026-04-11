@@ -253,13 +253,11 @@ pub mod versions {
     // ── Metadata (API key 3) ─────────────────────────────────────────────
     /// Minimum supported Metadata version. v0 lacks essential fields.
     pub const METADATA_MIN: i16 = 1;
-    /// Maximum supported Metadata version (v12 topic UUID lookup).
+    /// Maximum supported Metadata version (v13 top-level error_code).
     ///
     /// v9 flexible encoding, v10 topic UUIDs (enables KIP-848 topic name
-    /// resolution), v12 real topic_id-based lookup.
-    /// Encode/decode for v13 (top-level error_code) exists but is not yet
-    /// activated — needs integration testing.
-    pub const METADATA_MAX: i16 = 12;
+    /// resolution), v12 real topic_id-based lookup, v13 top-level error_code.
+    pub const METADATA_MAX: i16 = 13;
 
     // ── OffsetCommit (API key 8) ─────────────────────────────────────────
     /// Minimum supported OffsetCommit version. Kafka 4.0 removed v0–v1.
