@@ -69,6 +69,36 @@ struct SequenceState {
     last_acked_sequence: i32,
 }
 
+const SEQUENCE_SPACE: u32 = i32::MAX as u32 + 1;
+const HALF_SEQUENCE_SPACE: u32 = SEQUENCE_SPACE / 2;
+
+fn next_sequence_after(sequence: i32) -> i32 {
+    if !(0..i32::MAX).contains(&sequence) {
+        0
+    } else {
+        sequence + 1
+    }
+}
+
+fn is_newer_sequence(last_acked_sequence: i32, candidate_sequence: i32) -> bool {
+    if last_acked_sequence < 0 {
+        return true;
+    }
+    if candidate_sequence == last_acked_sequence {
+        return false;
+    }
+
+    let last = last_acked_sequence as u32;
+    let candidate = candidate_sequence as u32;
+    let forward_distance = if candidate >= last {
+        candidate - last
+    } else {
+        (SEQUENCE_SPACE - last) + candidate
+    };
+
+    forward_distance < HALF_SEQUENCE_SPACE
+}
+
 impl Default for SequenceState {
     fn default() -> Self {
         Self {
@@ -158,7 +188,7 @@ impl ProducerIdentity {
 
         let mut sequences = self.sequences.write();
         if let Some(state) = sequences.get_mut(&key)
-            && sequence > state.last_acked_sequence
+            && is_newer_sequence(state.last_acked_sequence, sequence)
         {
             state.last_acked_sequence = sequence;
         }
@@ -189,7 +219,7 @@ impl ProducerIdentity {
         let mut sequences = self.sequences.write();
         if let Some(state) = sequences.get_mut(&key) {
             // Reset to the last acknowledged + 1
-            state.next_sequence = state.last_acked_sequence.wrapping_add(1);
+            state.next_sequence = next_sequence_after(state.last_acked_sequence);
         }
     }
 
@@ -350,6 +380,49 @@ mod tests {
         // Reset should go back to last_acked + 1
         identity.reset_sequence("topic", 0);
         assert_eq!(identity.peek_sequence("topic", 0), 2);
+    }
+
+    #[test]
+    fn test_acknowledge_wraps_from_max_to_zero() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+
+        {
+            let mut sequences = identity.sequences.write();
+            sequences.insert(
+                ("topic".to_string(), 0),
+                SequenceState {
+                    next_sequence: 1,
+                    last_acked_sequence: i32::MAX,
+                },
+            );
+        }
+
+        identity.acknowledge("topic", 0, 0);
+        assert_eq!(identity.last_acked_sequence("topic", 0), 0);
+
+        identity.acknowledge("topic", 0, i32::MAX);
+        assert_eq!(identity.last_acked_sequence("topic", 0), 0);
+    }
+
+    #[test]
+    fn test_reset_sequence_wraps_to_zero_after_max_ack() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+
+        {
+            let mut sequences = identity.sequences.write();
+            sequences.insert(
+                ("topic".to_string(), 0),
+                SequenceState {
+                    next_sequence: 1,
+                    last_acked_sequence: i32::MAX,
+                },
+            );
+        }
+
+        identity.reset_sequence("topic", 0);
+        assert_eq!(identity.peek_sequence("topic", 0), 0);
     }
 
     #[test]

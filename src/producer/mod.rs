@@ -10,6 +10,7 @@
 //! - Transactional production for exactly-once delivery
 
 mod accumulator;
+mod barrier;
 mod batch;
 mod config;
 mod idempotent;
@@ -51,6 +52,8 @@ use crate::protocol::{
     RecordBatchBuilder, VersionedDecode, VersionedEncode, versions,
 };
 
+use self::barrier::InFlightBarrier;
+
 /// A Kafka producer.
 pub struct Producer {
     /// Producer configuration.
@@ -63,8 +66,8 @@ pub struct Producer {
     partitioner: Arc<dyn Partitioner>,
     /// Record accumulator for batching (when linger > 0).
     accumulator: Option<RecordAccumulatorHandle>,
-    /// Whether the producer is closed.
-    closed: std::sync::atomic::AtomicBool,
+    /// Barrier over all started send operations and shutdown state.
+    in_flight_barrier: Arc<InFlightBarrier>,
     /// Retry policy for transient failures.
     retry_policy: RetryPolicy,
     /// Shared metrics.
@@ -132,6 +135,7 @@ impl Producer {
 
         // In-flight semaphore (shared between direct and batched send paths)
         let in_flight_semaphore = Arc::new(Semaphore::new(config.max_in_flight));
+        let in_flight_barrier = Arc::new(InFlightBarrier::new());
 
         // Create accumulator if linger > 0 for batching
         let accumulator = if !config.linger.is_zero() {
@@ -151,6 +155,7 @@ impl Producer {
                 metadata.clone(),
                 retry_policy.clone(),
                 metrics.clone(),
+                in_flight_barrier.clone(),
             ))
         } else {
             None
@@ -162,7 +167,7 @@ impl Producer {
             pool,
             partitioner,
             accumulator,
-            closed: std::sync::atomic::AtomicBool::new(false),
+            in_flight_barrier,
             retry_policy,
             metrics,
             in_flight_semaphore,
@@ -220,9 +225,7 @@ impl Producer {
 
     /// Send a producer record.
     pub async fn send_record(&self, record: ProducerRecord) -> Result<RecordMetadata> {
-        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(KrafkaError::invalid_state("producer is closed"));
-        }
+        let operation_guard = self.in_flight_barrier.start("producer")?;
 
         // Invoke interceptor before send
         let mut record = record;
@@ -249,10 +252,13 @@ impl Producer {
 
         // Use accumulator for batching if available (linger > 0)
         if let Some(ref accumulator) = self.accumulator {
-            return accumulator.append(record, partition).await;
+            return accumulator
+                .append_with_guard(record, partition, operation_guard)
+                .await;
         }
 
         // Direct send (non-batched mode when linger = 0)
+        let _operation_guard = operation_guard;
         self.send_to_partition(&topic, partition, record).await
     }
 
@@ -288,7 +294,7 @@ impl Producer {
                         record.value.len() as u64
                             + record.key.as_ref().map(|k| k.len() as u64).unwrap_or(0),
                     );
-                    self.metrics.connections.set(self.pool.len().await as u64);
+                    self.metrics.connections.set(self.pool.len() as u64);
                     crate::interceptor::safe_on_acknowledgement(
                         &*self.interceptor,
                         &metadata,
@@ -457,10 +463,12 @@ impl Producer {
 
     /// Flush all pending records.
     pub async fn flush(&self) -> Result<()> {
+        let target = self.in_flight_barrier.snapshot();
         if let Some(ref accumulator) = self.accumulator {
-            return accumulator.flush().await;
+            accumulator.flush().await?;
         }
-        // In direct send mode, nothing to flush
+
+        self.in_flight_barrier.wait_for(target).await;
         Ok(())
     }
 
@@ -469,32 +477,59 @@ impl Producer {
     /// Flushes pending records, notifies interceptors, and tears down connections.
     /// Calling `close()` more than once is a no-op.
     pub async fn close(&self) {
-        if self.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
+        let _ = self.close_inner(None).await;
+    }
 
-        // Shutdown accumulator first to flush pending records
-        if let Some(ref accumulator) = self.accumulator {
-            accumulator.shutdown().await;
-        }
+    /// Close the producer, giving up on graceful shutdown once `timeout` expires.
+    ///
+    /// If the timeout elapses before all started sends cross the acknowledgment
+    /// boundary, remaining work is failed by tearing down the connection pool.
+    pub async fn close_with_timeout(&self, timeout: Duration) -> Result<()> {
+        self.close_inner(Some(timeout)).await
+    }
+
+    async fn close_inner(&self, timeout: Option<Duration>) -> Result<()> {
+        let Some(target) = self.in_flight_barrier.begin_close() else {
+            return Ok(());
+        };
+
+        let graceful_close = async {
+            // Shutdown accumulator first to flush pending records.
+            if let Some(ref accumulator) = self.accumulator {
+                accumulator.shutdown().await;
+            }
+
+            self.in_flight_barrier.wait_for(target).await;
+        };
+
+        let close_result = if let Some(timeout) = timeout {
+            tokio::time::timeout(timeout, graceful_close)
+                .await
+                .map_err(|_| KrafkaError::timeout("producer close"))
+        } else {
+            graceful_close.await;
+            Ok(())
+        };
 
         // Notify interceptor of shutdown
         crate::interceptor::safe_producer_close(&*self.interceptor);
 
         self.pool.close_all().await;
         info!("Producer closed");
+
+        close_result
     }
 
     /// Check if the producer is closed.
     #[inline]
     pub fn is_closed(&self) -> bool {
-        self.closed.load(std::sync::atomic::Ordering::SeqCst)
+        self.in_flight_barrier.is_closing()
     }
 
     /// Get producer metrics.
     pub async fn metrics(&self) -> ProducerMetricsSnapshot {
         ProducerMetricsSnapshot {
-            connections: self.pool.len().await,
+            connections: self.pool.len(),
             records_sent: self.metrics.records_sent.get(),
             bytes_sent: self.metrics.bytes_sent.get(),
             errors: self.metrics.errors.get(),

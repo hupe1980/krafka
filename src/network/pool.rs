@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tokio::sync::RwLock;
+use parking_lot::RwLock;
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tracing::{debug, info, warn};
 
 use super::connection::{BrokerConnection, ConnectionConfig};
@@ -357,12 +358,72 @@ impl BrokerConnectionBundle {
 // Connection Pool
 // ============================================================================
 
+/// Waiters for coalesced reconnection attempts, keyed by address.
+type ConnectingWaiters = HashMap<String, Vec<oneshot::Sender<Result<Arc<BrokerConnection>>>>>;
+
+/// Guard that ensures the `connecting` map entry is cleaned up if the
+/// reconnecting task's future is cancelled (dropped).  Without this,
+/// cancellation would leave a stale entry causing all future callers for
+/// that address to wait forever.
+struct ReconnectGuard<'a> {
+    connecting: &'a AsyncMutex<ConnectingWaiters>,
+    address: Option<String>,
+}
+
+impl<'a> ReconnectGuard<'a> {
+    fn new(connecting: &'a AsyncMutex<ConnectingWaiters>, address: String) -> Self {
+        Self {
+            connecting,
+            address: Some(address),
+        }
+    }
+
+    /// Mark the reconnection as completed, preventing cleanup on drop.
+    fn defuse(&mut self) {
+        self.address = None;
+    }
+}
+
+impl Drop for ReconnectGuard<'_> {
+    fn drop(&mut self) {
+        let Some(address) = self.address.take() else {
+            return;
+        };
+        // Synchronous cleanup via try_lock.  This succeeds in all practical
+        // scenarios because the async mutex is only held briefly for HashMap
+        // bookkeeping.  If it fails (astronomically rare), the waiters'
+        // oneshot senders remain in the map — their receivers will see
+        // `RecvError` once the senders are eventually dropped.
+        if let Ok(mut guard) = self.connecting.try_lock() {
+            let waiters = guard.remove(&address).unwrap_or_default();
+            let err = KrafkaError::Network(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                format!("reconnection to {address} was cancelled"),
+            ));
+            for waiter in waiters {
+                let _ = waiter.send(Err(err.clone()));
+            }
+        }
+    }
+}
+
 /// A pool of connections to Kafka brokers.
+///
+/// Uses `parking_lot::RwLock` (reader-preferring, non-async) for connection
+/// maps so that the hot `get_connection*` read path never blocks behind a
+/// pending writer.  Reconnection attempts to the same address are coalesced:
+/// only the first caller performs the TCP/TLS/SASL handshake while subsequent
+/// callers wait on oneshot channels, preventing thundering-herd reconnection
+/// storms.
 pub struct ConnectionPool {
     /// Connections by broker ID.
     connections: RwLock<HashMap<BrokerId, Arc<BrokerConnection>>>,
     /// Connections by address (for bootstrap).
     connections_by_addr: RwLock<HashMap<String, Arc<BrokerConnection>>>,
+    /// Coalesces concurrent reconnection attempts to the same address.
+    /// Only the first task to discover a dead connection performs the
+    /// handshake; subsequent tasks push a oneshot sender and wait.
+    connecting: AsyncMutex<ConnectingWaiters>,
     /// Connection config.
     config: ConnectionConfig,
     /// Retry configuration for reconnection attempts.
@@ -375,6 +436,7 @@ impl ConnectionPool {
         Self {
             connections: RwLock::new(HashMap::new()),
             connections_by_addr: RwLock::new(HashMap::new()),
+            connecting: AsyncMutex::new(HashMap::new()),
             config,
             retry_config: ConnectionRetryConfig::default(),
         }
@@ -388,6 +450,7 @@ impl ConnectionPool {
         Self {
             connections: RwLock::new(HashMap::new()),
             connections_by_addr: RwLock::new(HashMap::new()),
+            connecting: AsyncMutex::new(HashMap::new()),
             config,
             retry_config,
         }
@@ -460,214 +523,203 @@ impl ConnectionPool {
         }))
     }
 
-    /// Get or create a connection to a broker by address.
+    /// Coalesced reconnection: only one task reconnects per address.
     ///
-    /// Drops the lock before performing network I/O to avoid blocking other
-    /// callers while a reconnection is in progress.
-    pub async fn get_connection(&self, address: &str) -> Result<Arc<BrokerConnection>> {
-        // Fast path: check under read lock
-        let needs_reauth;
+    /// When the first task discovers a dead connection it registers in the
+    /// `connecting` map, performs the handshake, stores the result, and
+    /// notifies all waiters.  Subsequent tasks that arrive while the
+    /// reconnection is in-flight push a oneshot sender and wait instead of
+    /// opening redundant TCP connections.
+    ///
+    /// A [`ReconnectGuard`] ensures cleanup if the reconnecting task's future
+    /// is cancelled (dropped), preventing a stale `connecting` entry from
+    /// blocking all future callers for that address.
+    async fn get_or_reconnect(&self, address: &str) -> Result<Arc<BrokerConnection>> {
+        // Log reauth hint (sync read lock, tiny critical section)
         {
-            let connections = self.connections_by_addr.read().await;
-            if let Some(conn) = connections.get(address)
+            let conns = self.connections_by_addr.read();
+            if conns
+                .get(address)
+                .is_some_and(|c| c.is_alive() && c.needs_reauthentication())
+            {
+                info!(
+                    address = %address,
+                    "Replacing connection due to SASL session expiry (KIP-368)"
+                );
+            }
+        }
+
+        let mut connecting = self.connecting.lock().await;
+
+        // Double-check under the coalescing lock: another task may have
+        // finished reconnecting between our fast-path miss and now.
+        {
+            let conns = self.connections_by_addr.read();
+            if let Some(conn) = conns.get(address)
                 && conn.is_usable()
             {
                 return Ok(conn.clone());
             }
-            needs_reauth = connections
-                .get(address)
-                .is_some_and(|c| c.is_alive() && c.needs_reauthentication());
         }
 
-        if needs_reauth {
-            info!(
-                address = %address,
-                "Replacing connection due to SASL session expiry (KIP-368)"
-            );
+        // If a reconnection to this address is already in-flight, wait for it.
+        if let Some(waiters) = connecting.get_mut(address) {
+            let (tx, rx) = oneshot::channel();
+            waiters.push(tx);
+            drop(connecting);
+            return rx.await.map_err(|_| {
+                KrafkaError::Network(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    format!("reconnection to {address} was cancelled"),
+                ))
+            })?;
         }
 
-        // Slow path: reconnect WITHOUT holding any lock
-        let conn = self.reconnect_with_backoff(address).await?;
+        // First caller: register as the reconnector.
+        // Build the owned address once and reuse for both maps.
+        let addr_owned = address.to_string();
+        connecting.insert(addr_owned.clone(), Vec::new());
+        drop(connecting);
 
-        // Re-acquire write lock to store the new connection
-        let mut connections = self.connections_by_addr.write().await;
-        // Double-check: another task may have reconnected while we were connecting
-        if let Some(existing) = connections.get(address)
-            && existing.is_usable()
+        // Guard: if this future is cancelled, the stale `connecting` entry is
+        // removed and all waiters are notified with an error.
+        let mut guard = ReconnectGuard::new(&self.connecting, addr_owned.clone());
+
+        // Reconnect WITHOUT holding any lock
+        let result = self.reconnect_with_backoff(address).await;
+
+        // Store successful connection in the address map
+        if let Ok(conn) = &result {
+            self.connections_by_addr
+                .write()
+                .insert(addr_owned, conn.clone());
+        }
+
+        // Notify waiting tasks
+        let waiters = self
+            .connecting
+            .lock()
+            .await
+            .remove(address)
+            .unwrap_or_default();
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
+
+        // Reconnection completed — prevent guard cleanup.
+        guard.defuse();
+
+        result
+    }
+
+    /// Get or create a connection to a broker by address.
+    ///
+    /// The read path uses a `parking_lot::RwLock` (reader-preferring, no
+    /// async overhead) so concurrent callers never convoy behind a pending
+    /// writer.  On a cache miss the reconnection is coalesced per address.
+    pub async fn get_connection(&self, address: &str) -> Result<Arc<BrokerConnection>> {
+        // Fast path: sync read lock (nanosecond-scale critical section)
         {
-            return Ok(existing.clone());
+            let conns = self.connections_by_addr.read();
+            if let Some(conn) = conns.get(address)
+                && conn.is_usable()
+            {
+                return Ok(conn.clone());
+            }
         }
-        connections.insert(address.to_string(), conn.clone());
 
-        debug!("Created connection to {}", address);
-        Ok(conn)
+        self.get_or_reconnect(address).await
     }
 
     /// Get or create a connection to a broker by ID.
     ///
-    /// Drops locks before performing network I/O to avoid blocking other
-    /// callers while a reconnection is in progress.
+    /// Same reader-preferring fast path as [`get_connection`](Self::get_connection).
+    /// On reconnection the connection is registered under both the broker ID
+    /// and its address for future lookups.
     pub async fn get_connection_by_id(
         &self,
         broker_id: BrokerId,
         address: &str,
     ) -> Result<Arc<BrokerConnection>> {
-        // Fast path: check under read lock
-        let needs_reauth;
+        // Fast path: sync read lock
         {
-            let connections = self.connections.read().await;
-            if let Some(conn) = connections.get(&broker_id)
+            let conns = self.connections.read();
+            if let Some(conn) = conns.get(&broker_id)
                 && conn.is_usable()
             {
                 return Ok(conn.clone());
             }
-            needs_reauth = connections
-                .get(&broker_id)
-                .is_some_and(|c| c.is_alive() && c.needs_reauthentication());
         }
 
-        if needs_reauth {
-            info!(
-                broker_id = %broker_id,
-                address = %address,
-                "Replacing connection due to SASL session expiry (KIP-368)"
-            );
-        }
+        let conn = self.get_or_reconnect(address).await?;
 
-        // Slow path: reconnect WITHOUT holding any lock
-        let conn = self.reconnect_with_backoff(address).await?;
-
-        // Re-acquire write locks to store the new connection
-        let mut connections = self.connections.write().await;
-        let mut connections_by_addr = self.connections_by_addr.write().await;
-
-        // Double-check: another task may have reconnected while we were connecting
-        if let Some(existing) = connections.get(&broker_id)
-            && existing.is_usable()
+        // Register under this broker ID so future fast-path lookups hit.
         {
-            return Ok(existing.clone());
+            let mut by_id = self.connections.write();
+            if !by_id.get(&broker_id).is_some_and(|c| c.is_usable()) {
+                by_id.insert(broker_id, conn.clone());
+            }
         }
 
-        connections.insert(broker_id, conn.clone());
-        connections_by_addr.insert(address.to_string(), conn.clone());
-
-        info!("Created connection to broker {} at {}", broker_id, address);
         Ok(conn)
     }
 
-    /// Register a connection for a broker ID.
+    /// Close all connections and drain both maps.
     ///
-    /// Both maps are updated atomically under write locks to prevent
-    /// inconsistent state if another task reads between updates.
-    /// Lock ordering: `connections` → `connections_by_addr` (consistent
-    /// across all pool methods; no deadlock risk).
-    pub async fn register(&self, broker_id: BrokerId, conn: Arc<BrokerConnection>) {
-        let mut connections = self.connections.write().await;
-        let mut connections_by_addr = self.connections_by_addr.write().await;
-        connections.insert(broker_id, conn.clone());
-        connections_by_addr.insert(conn.address().to_string(), conn);
-    }
-
-    /// Remove a connection by broker ID.
-    ///
-    /// Lock ordering matches [`register`](Self::register): `connections` →
-    /// `connections_by_addr`.
-    pub async fn remove(&self, broker_id: BrokerId) {
-        let mut connections = self.connections.write().await;
-        let mut connections_by_addr = self.connections_by_addr.write().await;
-        if let Some(conn) = connections.remove(&broker_id) {
-            connections_by_addr.remove(conn.address());
-        }
-    }
-
-    /// Clean up all unusable connections (dead or session-expired) from the pool.
-    ///
-    /// Removes connections from both maps and then closes them outside
-    /// the lock to avoid holding the write lock across async I/O.
-    pub async fn cleanup_dead_connections(&self) {
-        let removed: Vec<Arc<BrokerConnection>>;
-        {
-            let mut connections = self.connections.write().await;
-            let mut connections_by_addr = self.connections_by_addr.write().await;
-
-            // Collect dead or session-expired broker IDs and their addresses
-            let dead_entries: Vec<(BrokerId, String)> = connections
-                .iter()
-                .filter(|(_, conn)| !conn.is_usable())
-                .map(|(id, conn)| (*id, conn.address().to_string()))
-                .collect();
-
-            // Remove dead/expired connections by broker ID
-            let mut removed_conns: Vec<Arc<BrokerConnection>> =
-                Vec::with_capacity(dead_entries.len());
-            for (broker_id, address) in &dead_entries {
-                if let Some(conn) = connections.remove(broker_id) {
-                    removed_conns.push(conn);
-                }
-                connections_by_addr.remove(address);
-                debug!(broker_id = %broker_id, address = %address, "Cleaned up unusable connection");
-            }
-
-            // Also clean up orphaned dead/expired connections in connections_by_addr
-            // (connections that were added by address only, not by broker ID)
-            let dead_addrs: Vec<String> = connections_by_addr
-                .iter()
-                .filter(|(_, conn)| !conn.is_usable())
-                .map(|(addr, _)| addr.clone())
-                .collect();
-
-            for addr in &dead_addrs {
-                if let Some(conn) = connections_by_addr.remove(addr) {
-                    removed_conns.push(conn);
-                }
-                debug!(address = %addr, "Cleaned up unusable orphaned connection");
-            }
-
-            if !dead_entries.is_empty() {
-                info!(
-                    count = dead_entries.len(),
-                    "Cleaned up unusable connections from pool"
-                );
-            }
-
-            removed = removed_conns;
-        }
-
-        // Close removed connections outside the lock
-        for conn in &removed {
-            conn.close().await;
-        }
-    }
-
-    /// Close all connections.
-    ///
-    /// Closes connections from both the broker-ID map and the address map
-    /// to ensure bootstrap connections (by address only) are not leaked (R6.3 fix).
+    /// Drains the broker-ID and address maps under short write locks (one at
+    /// a time, never held simultaneously), deduplicates by `Arc` pointer,
+    /// then closes each unique connection outside any lock.  Any in-flight
+    /// reconnection waiters in the `connecting` map are notified with an
+    /// error so they do not hang during shutdown.
     pub async fn close_all(&self) {
-        let connections = self.connections.read().await;
-        for conn in connections.values() {
-            conn.close().await;
-        }
-        drop(connections);
+        // Drain both maps, acquiring each write lock independently.
+        let by_id: Vec<Arc<BrokerConnection>> =
+            self.connections.write().drain().map(|(_, c)| c).collect();
+        let by_addr: Vec<Arc<BrokerConnection>> = self
+            .connections_by_addr
+            .write()
+            .drain()
+            .map(|(_, c)| c)
+            .collect();
 
-        // Also close any by-address connections that aren't in the by-ID map.
-        // This covers bootstrap connections that were created before broker IDs
-        // were known from metadata.
-        let by_addr = self.connections_by_addr.read().await;
-        for conn in by_addr.values() {
+        // Dedup: same Arc may appear in both maps.
+        let mut seen = HashMap::with_capacity(by_id.len() + by_addr.len());
+        for conn in by_id.into_iter().chain(by_addr) {
+            seen.entry(Arc::as_ptr(&conn) as usize).or_insert(conn);
+        }
+
+        // Cancel in-flight reconnections so waiters don't hang.
+        {
+            let mut connecting = self.connecting.lock().await;
+            for (addr, waiters) in connecting.drain() {
+                let err = KrafkaError::Network(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    format!("pool closed while reconnecting to {addr}"),
+                ));
+                for waiter in waiters {
+                    let _ = waiter.send(Err(err.clone()));
+                }
+            }
+        }
+
+        // Close connections outside any lock.
+        for conn in seen.into_values() {
             conn.close().await;
         }
     }
 
-    /// Get the number of usable connections (alive and not session-expired).
-    pub async fn len(&self) -> usize {
-        let connections = self.connections.read().await;
+    /// Number of usable connections known by broker ID.
+    ///
+    /// Bootstrap connections that have not yet been associated with a broker
+    /// ID (i.e. only in the address map) are **not** counted.
+    pub fn len(&self) -> usize {
+        let connections = self.connections.read();
         connections.values().filter(|c| c.is_usable()).count()
     }
 
-    /// Check if the pool is empty.
-    pub async fn is_empty(&self) -> bool {
-        self.len().await == 0
+    /// Returns `true` if no usable connections known by broker ID exist.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -763,8 +815,8 @@ mod tests {
         // Verify close_all operates on both connections and connections_by_addr maps
         let pool = ConnectionPool::new(ConnectionConfig::default());
         // Both maps start empty
-        assert!(pool.connections.read().await.is_empty());
-        assert!(pool.connections_by_addr.read().await.is_empty());
+        assert!(pool.connections.read().is_empty());
+        assert!(pool.connections_by_addr.read().is_empty());
         // close_all on empty pool should not panic
         pool.close_all().await;
     }

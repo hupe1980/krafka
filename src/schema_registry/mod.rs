@@ -115,13 +115,14 @@ pub mod glue;
 #[cfg_attr(docsrs, doc(cfg(feature = "schema-registry")))]
 pub use client::{ConfluentSchemaRegistry, ConfluentSchemaRegistryBuilder};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::RwLock;
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
 use crate::error::{KrafkaError, Result};
 
@@ -496,6 +497,12 @@ pub struct CachedSchemaRegistry<C> {
     inner: C,
     /// Schema ID → Schema cache. Entries are immutable once inserted.
     cache: RwLock<HashMap<SchemaId, Schema>>,
+    /// Insertion order for bounded-cache eviction.
+    insertion_order: RwLock<VecDeque<SchemaId>>,
+    /// Optional maximum number of cached entries.
+    max_entries: Option<usize>,
+    /// Waiters for coalescing concurrent cold misses by schema ID.
+    in_flight: AsyncMutex<HashMap<SchemaId, Vec<oneshot::Sender<Result<Schema>>>>>,
 }
 
 impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
@@ -504,6 +511,9 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         Self {
             inner,
             cache: RwLock::new(HashMap::new()),
+            insertion_order: RwLock::new(VecDeque::new()),
+            max_entries: None,
+            in_flight: AsyncMutex::new(HashMap::new()),
         }
     }
 
@@ -512,6 +522,23 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         Self {
             inner,
             cache: RwLock::new(HashMap::with_capacity(capacity)),
+            insertion_order: RwLock::new(VecDeque::with_capacity(capacity)),
+            max_entries: None,
+            in_flight: AsyncMutex::new(HashMap::new()),
+        }
+    }
+
+    /// Wrap the given client with a bounded in-memory cache.
+    ///
+    /// When the cache reaches `max_entries`, the oldest inserted schema ID is evicted.
+    pub fn with_max_entries(inner: C, max_entries: usize) -> Self {
+        let max_entries = max_entries.max(1);
+        Self {
+            inner,
+            cache: RwLock::new(HashMap::with_capacity(max_entries)),
+            insertion_order: RwLock::new(VecDeque::with_capacity(max_entries)),
+            max_entries: Some(max_entries),
+            in_flight: AsyncMutex::new(HashMap::new()),
         }
     }
 
@@ -533,6 +560,30 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
     /// Clear the schema cache.
     pub fn clear_cache(&self) {
         self.cache.write().clear();
+        self.insertion_order.write().clear();
+    }
+
+    fn insert_cache_entry(&self, id: SchemaId, schema: Schema) {
+        let mut cache = self.cache.write();
+
+        // Fast path: update existing entry without touching insertion_order.
+        if let Some(existing) = cache.get_mut(&id) {
+            *existing = schema;
+            return;
+        }
+
+        // New entry: evict oldest if bounded.
+        if let Some(max_entries) = self.max_entries {
+            let mut insertion_order = self.insertion_order.write();
+            if cache.len() >= max_entries
+                && let Some(evicted) = insertion_order.pop_front()
+            {
+                cache.remove(&evicted);
+            }
+            insertion_order.push_back(id);
+        }
+
+        cache.insert(id, schema);
     }
 }
 
@@ -540,6 +591,7 @@ impl<C> fmt::Debug for CachedSchemaRegistry<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CachedSchemaRegistry")
             .field("cache_len", &self.cache.read().len())
+            .field("max_entries", &self.max_entries)
             .finish()
     }
 }
@@ -555,10 +607,34 @@ impl<C: SchemaRegistryClient> SchemaRegistryClient for CachedSchemaRegistry<C> {
                 return Ok(schema.clone());
             }
 
-            // Slow path: fetch from inner client, then cache.
-            let schema = self.inner.get_schema_by_id(id).await?;
-            self.cache.write().insert(id, schema.clone());
-            Ok(schema)
+            let mut in_flight = self.in_flight.lock().await;
+            if let Some(schema) = self.cache.read().get(&id) {
+                return Ok(schema.clone());
+            }
+
+            if let Some(waiters) = in_flight.get_mut(&id) {
+                let (tx, rx) = oneshot::channel();
+                waiters.push(tx);
+                drop(in_flight);
+                return rx
+                    .await
+                    .map_err(|_| KrafkaError::invalid_state("schema lookup coalescer dropped"))?;
+            }
+
+            in_flight.insert(id, Vec::new());
+            drop(in_flight);
+
+            let result = self.inner.get_schema_by_id(id).await;
+            if let Ok(schema) = &result {
+                self.insert_cache_entry(id, schema.clone());
+            }
+
+            let waiters = self.in_flight.lock().await.remove(&id).unwrap_or_default();
+            for waiter in waiters {
+                let _ = waiter.send(result.clone());
+            }
+
+            result
         })
     }
 
@@ -570,7 +646,7 @@ impl<C: SchemaRegistryClient> SchemaRegistryClient for CachedSchemaRegistry<C> {
         Box::pin(async move {
             // Always forward (latest may change), but cache by ID.
             let schema = self.inner.get_latest_schema(&subject).await?;
-            self.cache.write().insert(schema.id, schema.clone());
+            self.insert_cache_entry(schema.id, schema.clone());
             Ok(schema)
         })
     }
@@ -583,7 +659,7 @@ impl<C: SchemaRegistryClient> SchemaRegistryClient for CachedSchemaRegistry<C> {
         let subject = subject.to_string();
         Box::pin(async move {
             let schema = self.inner.get_schema_by_version(&subject, version).await?;
-            self.cache.write().insert(schema.id, schema.clone());
+            self.insert_cache_entry(schema.id, schema.clone());
             Ok(schema)
         })
     }
@@ -611,7 +687,9 @@ impl<C: SchemaRegistryClient> SchemaRegistryClient for CachedSchemaRegistry<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio::sync::Notify;
 
     // ── Wire format ──────────────────────────────────────────────────────
 
@@ -846,6 +924,81 @@ mod tests {
         }
     }
 
+    struct BlockingMockRegistry {
+        get_by_id_calls: AtomicU32,
+        started: Notify,
+        release: Notify,
+    }
+
+    impl BlockingMockRegistry {
+        fn new() -> Self {
+            Self {
+                get_by_id_calls: AtomicU32::new(0),
+                started: Notify::new(),
+                release: Notify::new(),
+            }
+        }
+
+        fn get_by_id_call_count(&self) -> u32 {
+            self.get_by_id_calls.load(Ordering::SeqCst)
+        }
+
+        async fn wait_started(&self) {
+            self.started.notified().await;
+        }
+
+        fn release(&self) {
+            self.release.notify_waiters();
+        }
+    }
+
+    impl SchemaRegistryClient for BlockingMockRegistry {
+        fn get_schema_by_id(
+            &self,
+            id: SchemaId,
+        ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
+            self.get_by_id_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                self.started.notify_waiters();
+                self.release.notified().await;
+                Ok(Schema::new(id, SchemaType::Avro, r#"{"type":"string"}"#))
+            })
+        }
+
+        fn get_latest_schema(
+            &self,
+            subject: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
+            let subject = subject.to_string();
+            Box::pin(async move {
+                Ok(Schema::new(100, SchemaType::Avro, r#"{"type":"string"}"#)
+                    .with_subject(subject, 1))
+            })
+        }
+
+        fn get_schema_by_version(
+            &self,
+            subject: &str,
+            version: SchemaVersion,
+        ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
+            let subject = subject.to_string();
+            Box::pin(async move {
+                Ok(Schema::new(100, SchemaType::Avro, r#"{"type":"string"}"#)
+                    .with_subject(subject, version))
+            })
+        }
+
+        fn register_schema(
+            &self,
+            _subject: &str,
+            _schema: &str,
+            _schema_type: SchemaType,
+            _references: &[SchemaReference],
+        ) -> Pin<Box<dyn Future<Output = Result<SchemaId>> + Send + '_>> {
+            Box::pin(async { Ok(42) })
+        }
+    }
+
     #[tokio::test]
     async fn test_cache_miss_then_hit() {
         let mock = MockRegistry::new();
@@ -893,6 +1046,32 @@ mod tests {
         // After clear, next call hits mock again
         cached.get_schema_by_id(1).await.unwrap();
         assert_eq!(cached.inner().get_by_id_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cache_coalesces_concurrent_misses() {
+        let cached = Arc::new(CachedSchemaRegistry::new(BlockingMockRegistry::new()));
+
+        let first = {
+            let cached = cached.clone();
+            tokio::spawn(async move { cached.get_schema_by_id(7).await.unwrap() })
+        };
+
+        cached.inner().wait_started().await;
+
+        let second = {
+            let cached = cached.clone();
+            tokio::spawn(async move { cached.get_schema_by_id(7).await.unwrap() })
+        };
+
+        tokio::task::yield_now().await;
+        cached.inner().release();
+
+        let first_schema = first.await.unwrap();
+        let second_schema = second.await.unwrap();
+
+        assert_eq!(first_schema, second_schema);
+        assert_eq!(cached.inner().get_by_id_call_count(), 1);
     }
 
     #[tokio::test]
@@ -1038,5 +1217,20 @@ mod tests {
 
         cached.get_schema_by_id(1).await.unwrap();
         assert_eq!(cached.cache_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cache_with_max_entries_evicts_oldest_entry() {
+        let mock = MockRegistry::new();
+        let cached = CachedSchemaRegistry::with_max_entries(mock, 1);
+
+        cached.get_schema_by_id(1).await.unwrap();
+        cached.get_schema_by_id(2).await.unwrap();
+
+        assert_eq!(cached.cache_len(), 1);
+        assert_eq!(cached.inner().get_by_id_call_count(), 2);
+
+        cached.get_schema_by_id(1).await.unwrap();
+        assert_eq!(cached.inner().get_by_id_call_count(), 3);
     }
 }

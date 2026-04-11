@@ -20,6 +20,7 @@ use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use tokio::time::interval;
 use tracing::{debug, trace};
 
+use super::barrier::{InFlightBarrier, InFlightOpGuard};
 use super::batch::ProducerBatch;
 use super::record::{ProducerRecord, RecordMetadata};
 use super::retry::{RetryContext, RetryPolicy};
@@ -40,7 +41,10 @@ enum AppendResponse {
     Done(Result<RecordMetadata>),
     /// Buffer is full — the record is returned so the caller can retry
     /// without cloning.
-    BufferFull(ProducerRecord),
+    BufferFull {
+        record: ProducerRecord,
+        operation_guard: InFlightOpGuard,
+    },
 }
 
 /// Message sent to the accumulator background task.
@@ -51,6 +55,7 @@ enum AccumulatorMessage {
         record: ProducerRecord,
         partition: PartitionId,
         response_tx: oneshot::Sender<AppendResponse>,
+        operation_guard: InFlightOpGuard,
     },
     /// Flush all batches.
     Flush {
@@ -68,6 +73,8 @@ pub struct RecordAccumulatorHandle {
     memory_freed: Arc<Notify>,
     /// Maximum time to block waiting for buffer memory.
     max_block_ms: Duration,
+    /// Barrier over all producer sends, including detached batch tasks.
+    in_flight_barrier: Arc<InFlightBarrier>,
 }
 
 impl RecordAccumulatorHandle {
@@ -81,7 +88,19 @@ impl RecordAccumulatorHandle {
         record: ProducerRecord,
         partition: PartitionId,
     ) -> Result<RecordMetadata> {
+        let operation_guard = self.in_flight_barrier.start("producer")?;
+        self.append_with_guard(record, partition, operation_guard)
+            .await
+    }
+
+    pub(crate) async fn append_with_guard(
+        &self,
+        record: ProducerRecord,
+        partition: PartitionId,
+        operation_guard: InFlightOpGuard,
+    ) -> Result<RecordMetadata> {
         let deadline = tokio::time::Instant::now() + self.max_block_ms;
+        let mut operation_guard = Some(operation_guard);
         // Hold the record in an Option so the first send moves it into the
         // channel without cloning. On BufferFull the accumulator returns it,
         // so retries are also zero-copy.
@@ -91,6 +110,7 @@ impl RecordAccumulatorHandle {
             // SAFETY: `pending` is always `Some` here — either set by the
             // initial call or replenished by `AppendResponse::BufferFull`.
             let rec = pending.take().expect("pending record missing");
+            let guard = operation_guard.take().expect("operation guard missing");
             let (response_tx, response_rx) = oneshot::channel();
 
             // Pre-register interest in memory_freed BEFORE sending so that
@@ -109,6 +129,7 @@ impl RecordAccumulatorHandle {
                     record: rec,
                     partition,
                     response_tx,
+                    operation_guard: guard,
                 }),
             )
             .await
@@ -124,7 +145,10 @@ impl RecordAccumulatorHandle {
                 .map_err(|_| KrafkaError::invalid_state("accumulator response dropped"))?;
 
             match response {
-                AppendResponse::BufferFull(returned_record) => {
+                AppendResponse::BufferFull {
+                    record: returned_record,
+                    operation_guard: guard,
+                } => {
                     // The accumulator returned the record without touching it.
                     // Wait for memory to be freed, then retry with the same
                     // record instance — zero clones on the retry path.
@@ -145,6 +169,7 @@ impl RecordAccumulatorHandle {
                     }
                     // Replenish pending for the next iteration.
                     pending = Some(returned_record);
+                    operation_guard = Some(guard);
                 }
                 AppendResponse::Done(result) => return result,
             }
@@ -255,6 +280,8 @@ struct PendingRecord {
     offset_in_batch: i64,
     /// Estimated size in bytes for memory tracking.
     estimated_size: usize,
+    /// Producer-wide operation guard that completes only after ack/failure.
+    _operation_guard: InFlightOpGuard,
 }
 
 /// RAII guard that releases in-flight memory and notifies waiters on drop.
@@ -324,11 +351,12 @@ pub struct RecordAccumulator {
 
 impl RecordAccumulator {
     /// Create a new record accumulator and return a handle.
-    pub fn spawn(
+    pub(crate) fn spawn(
         config: AccumulatorConfig,
         metadata: Arc<ClusterMetadata>,
         retry_policy: RetryPolicy,
         metrics: Arc<ProducerMetrics>,
+        in_flight_barrier: Arc<InFlightBarrier>,
     ) -> RecordAccumulatorHandle {
         let (sender, receiver) = mpsc::channel(1024);
         let memory_freed = Arc::new(Notify::new());
@@ -352,6 +380,7 @@ impl RecordAccumulator {
             sender,
             memory_freed,
             max_block_ms,
+            in_flight_barrier,
         }
     }
 
@@ -366,8 +395,13 @@ impl RecordAccumulator {
             tokio::select! {
                 msg = receiver.recv() => {
                     match msg {
-                        Some(AccumulatorMessage::Append { record, partition, response_tx }) => {
-                            self.handle_append(record, partition, response_tx).await;
+                        Some(AccumulatorMessage::Append {
+                            record,
+                            partition,
+                            response_tx,
+                            operation_guard,
+                        }) => {
+                            self.handle_append(record, partition, response_tx, operation_guard).await;
                         }
                         Some(AccumulatorMessage::Flush { response_tx }) => {
                             let result = self.flush_all().await;
@@ -401,6 +435,7 @@ impl RecordAccumulator {
         record: ProducerRecord,
         partition: PartitionId,
         response_tx: oneshot::Sender<AppendResponse>,
+        operation_guard: InFlightOpGuard,
     ) {
         // Estimate record size for memory tracking and batch size-gating.
         let record_size = record.estimated_size();
@@ -412,7 +447,10 @@ impl RecordAccumulator {
         let total_memory = self.memory_used + self.in_flight_memory.load(Ordering::Relaxed);
         if self.config.buffer_memory > 0 && total_memory + record_size > self.config.buffer_memory {
             // Return the record to the caller so it can retry without cloning.
-            let _ = response_tx.send(AppendResponse::BufferFull(record));
+            let _ = response_tx.send(AppendResponse::BufferFull {
+                record,
+                operation_guard,
+            });
             return;
         }
 
@@ -437,6 +475,7 @@ impl RecordAccumulator {
                 response_tx,
                 offset_in_batch: offset,
                 estimated_size: record_size,
+                _operation_guard: operation_guard,
             });
 
             // Check if batch is full
@@ -464,6 +503,7 @@ impl RecordAccumulator {
                     response_tx,
                     offset_in_batch: 0,
                     estimated_size: record_size,
+                    _operation_guard: operation_guard,
                 });
                 self.batches.insert(key, new_batch);
             } else {
@@ -656,11 +696,8 @@ impl RecordAccumulator {
         let batch_bytes = match batch.encode() {
             Ok(b) => b,
             Err(e) => {
-                let error_msg = e.to_string();
                 for p in pending {
-                    let _ = p
-                        .response_tx
-                        .send(AppendResponse::Done(Err(KrafkaError::protocol(&error_msg))));
+                    let _ = p.response_tx.send(AppendResponse::Done(Err(e.clone())));
                 }
                 return;
             }
@@ -864,7 +901,6 @@ impl RecordAccumulator {
             }
             Err(e) => {
                 metrics.record_error();
-                let error_msg = e.to_string();
                 for p in pending {
                     let meta = RecordMetadata {
                         topic: topic.clone(),
@@ -872,13 +908,12 @@ impl RecordAccumulator {
                         offset: p.offset_in_batch,
                         timestamp: 0,
                     };
-                    let err = KrafkaError::protocol(&error_msg);
                     crate::interceptor::safe_on_acknowledgement(
                         &*config.interceptor,
                         &meta,
-                        Some(&err),
+                        Some(&e),
                     );
-                    let _ = p.response_tx.send(AppendResponse::Done(Err(err)));
+                    let _ = p.response_tx.send(AppendResponse::Done(Err(e.clone())));
                 }
             }
         }
@@ -1022,6 +1057,7 @@ mod tests {
             sender,
             memory_freed,
             max_block_ms: Duration::from_millis(50),
+            in_flight_barrier: Arc::new(InFlightBarrier::new()),
         };
 
         // Spawn a fake accumulator that always responds BufferFull
@@ -1030,10 +1066,14 @@ mod tests {
                 if let AccumulatorMessage::Append {
                     record,
                     response_tx,
+                    operation_guard,
                     ..
                 } = msg
                 {
-                    let _ = response_tx.send(AppendResponse::BufferFull(record));
+                    let _ = response_tx.send(AppendResponse::BufferFull {
+                        record,
+                        operation_guard,
+                    });
                 }
             }
         });

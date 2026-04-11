@@ -3,8 +3,8 @@ use bytes::{Buf, BufMut};
 use super::{VersionedDecode, VersionedEncode, non_nullable_string};
 use crate::error::{ErrorCode, KrafkaError, Result};
 use crate::protocol::api::ApiKey;
-use crate::protocol::check_compact_array_len;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
+use crate::protocol::{check_compact_array_len, encode_compact_array_len};
 
 /// Find coordinator request.
 #[derive(Debug, Clone)]
@@ -61,8 +61,7 @@ impl FindCoordinatorRequest {
         self.key_type.encode(buf);
         // CoordinatorKeys: compact array of strings — varint encodes count + 1.
         // This is []string (primitive), not []struct, so no per-element tagged fields.
-        let key_count: u32 = 1;
-        crate::util::varint::encode_unsigned_varint(key_count + 1, buf);
+        encode_compact_array_len(1, buf)?;
         KafkaString::new(&self.key).try_encode_compact(buf)?;
         // Top-level tagged fields.
         TaggedFields::default().try_encode(buf)?;
@@ -87,6 +86,14 @@ pub struct FindCoordinatorResponse {
     pub port: i32,
 }
 
+struct BatchedCoordinatorEntry {
+    node_id: i32,
+    host: String,
+    port: i32,
+    error_code: ErrorCode,
+    error_message: Option<String>,
+}
+
 impl FindCoordinatorResponse {
     /// Decode from version 1-2.
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
@@ -94,9 +101,7 @@ impl FindCoordinatorResponse {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let error_message = KafkaString::decode(buf)?.0;
         let node_id = i32::decode(buf)?;
-        let host = KafkaString::decode(buf)?.0.ok_or_else(|| {
-            KrafkaError::protocol("FindCoordinator host must be a non-null string")
-        })?;
+        let host = non_nullable_string("coordinator host", KafkaString::decode(buf)?.0)?;
         let port = i32::decode(buf)?;
 
         Ok(Self {
@@ -115,9 +120,7 @@ impl FindCoordinatorResponse {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let error_message = KafkaString::decode_compact(buf)?.0;
         let node_id = i32::decode(buf)?;
-        let host = KafkaString::decode_compact(buf)?.0.ok_or_else(|| {
-            KrafkaError::protocol("FindCoordinator host must be a non-null compact string")
-        })?;
+        let host = non_nullable_string("coordinator host", KafkaString::decode_compact(buf)?.0)?;
         let port = i32::decode(buf)?;
         let _ = TaggedFields::decode(buf)?;
 
@@ -128,6 +131,24 @@ impl FindCoordinatorResponse {
             node_id,
             host,
             port,
+        })
+    }
+
+    fn decode_batched_coordinator(buf: &mut impl Buf) -> Result<BatchedCoordinatorEntry> {
+        let _ = non_nullable_string("coordinator key", KafkaString::decode_compact(buf)?.0)?;
+        let node_id = i32::decode(buf)?;
+        let host = non_nullable_string("coordinator host", KafkaString::decode_compact(buf)?.0)?;
+        let port = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let error_message = KafkaString::decode_compact(buf)?.0;
+        let _ = TaggedFields::decode(buf)?;
+
+        Ok(BatchedCoordinatorEntry {
+            node_id,
+            host,
+            port,
+            error_code,
+            error_message,
         })
     }
 
@@ -145,27 +166,17 @@ impl FindCoordinatorResponse {
             ));
         }
 
-        // Decode first coordinator — key is validated for wire-format correctness
-        // but not returned (the caller already knows which key it requested).
-        let _key = non_nullable_string("coordinator key", KafkaString::decode_compact(buf)?.0)?;
-        let node_id = i32::decode(buf)?;
-        let host = KafkaString::decode_compact(buf)?.0.ok_or_else(|| {
-            KrafkaError::protocol("FindCoordinator host must be a non-null compact string")
-        })?;
-        let port = i32::decode(buf)?;
-        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
-        let error_message = KafkaString::decode_compact(buf)?.0;
-        let _ = TaggedFields::decode(buf)?;
+        let BatchedCoordinatorEntry {
+            node_id,
+            host,
+            port,
+            error_code,
+            error_message,
+        } = Self::decode_batched_coordinator(buf)?;
 
         // Skip remaining coordinators
         for _ in 1..count {
-            let _ = KafkaString::decode_compact(buf)?;
-            let _ = i32::decode(buf)?;
-            let _ = KafkaString::decode_compact(buf)?;
-            let _ = i32::decode(buf)?;
-            let _ = i16::decode(buf)?;
-            let _ = KafkaString::decode_compact(buf)?;
-            let _ = TaggedFields::decode(buf)?;
+            let _ = Self::decode_batched_coordinator(buf)?;
         }
         let _ = TaggedFields::decode(buf)?;
 
@@ -409,6 +420,87 @@ mod tests {
         assert_eq!(resp.host, "broker-3");
         assert_eq!(resp.port, 9094);
         assert!(resp.error_code.is_ok());
+    }
+
+    #[test]
+    fn test_find_coordinator_response_decode_v4_rejects_null_key_in_remaining_entry() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        // Coordinators compact array: 2 + 1
+        varint::encode_unsigned_varint(3, &mut buf);
+
+        // First coordinator is valid.
+        let key = b"my-group";
+        varint::encode_unsigned_varint(key.len() as u32 + 1, &mut buf);
+        buf.put_slice(key);
+        buf.put_i32(3); // node_id
+        let host = b"broker-3";
+        varint::encode_unsigned_varint(host.len() as u32 + 1, &mut buf);
+        buf.put_slice(host);
+        buf.put_i32(9094); // port
+        buf.put_i16(0); // error_code
+        varint::encode_unsigned_varint(0, &mut buf); // error_message null compact string
+        varint::encode_unsigned_varint(0, &mut buf); // coordinator tagged fields
+
+        // Second coordinator is malformed: null key is not allowed.
+        varint::encode_unsigned_varint(0, &mut buf); // invalid null compact string key
+        buf.put_i32(4); // node_id
+        let host = b"broker-4";
+        varint::encode_unsigned_varint(host.len() as u32 + 1, &mut buf);
+        buf.put_slice(host);
+        buf.put_i32(9095); // port
+        buf.put_i16(0); // error_code
+        varint::encode_unsigned_varint(0, &mut buf); // error_message null compact string
+        varint::encode_unsigned_varint(0, &mut buf); // coordinator tagged fields
+
+        varint::encode_unsigned_varint(0, &mut buf); // top-level tagged fields
+
+        let err = FindCoordinatorResponse::decode_versioned(4, &mut buf.freeze()).unwrap_err();
+        assert!(
+            err.to_string().contains("coordinator key must not be null"),
+            "expected non-null coordinator key error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_find_coordinator_response_decode_v4_rejects_null_host_in_remaining_entry() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        // Coordinators compact array: 2 + 1
+        varint::encode_unsigned_varint(3, &mut buf);
+
+        // First coordinator is valid.
+        let key = b"my-group";
+        varint::encode_unsigned_varint(key.len() as u32 + 1, &mut buf);
+        buf.put_slice(key);
+        buf.put_i32(3); // node_id
+        let host = b"broker-3";
+        varint::encode_unsigned_varint(host.len() as u32 + 1, &mut buf);
+        buf.put_slice(host);
+        buf.put_i32(9094); // port
+        buf.put_i16(0); // error_code
+        varint::encode_unsigned_varint(0, &mut buf); // error_message null compact string
+        varint::encode_unsigned_varint(0, &mut buf); // coordinator tagged fields
+
+        // Second coordinator is malformed: null host is not allowed.
+        let key = b"other-group";
+        varint::encode_unsigned_varint(key.len() as u32 + 1, &mut buf);
+        buf.put_slice(key);
+        buf.put_i32(4); // node_id
+        varint::encode_unsigned_varint(0, &mut buf); // invalid null compact string host
+        buf.put_i32(9095); // port
+        buf.put_i16(0); // error_code
+        varint::encode_unsigned_varint(0, &mut buf); // error_message null compact string
+        varint::encode_unsigned_varint(0, &mut buf); // coordinator tagged fields
+
+        varint::encode_unsigned_varint(0, &mut buf); // top-level tagged fields
+
+        let err = FindCoordinatorResponse::decode_versioned(4, &mut buf.freeze()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("coordinator host must not be null"),
+            "expected non-null coordinator host error, got: {err}"
+        );
     }
 
     // ── FindCoordinator v5–v6 (same wire format as v4) ──

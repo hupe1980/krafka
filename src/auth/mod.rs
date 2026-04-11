@@ -317,6 +317,8 @@ pub struct TlsConfig {
     pub(crate) client_cert_path: Option<String>,
     /// Path to client private key file.
     pub(crate) client_key_path: Option<String>,
+    /// Whether to load root certificates from the platform trust store.
+    pub(crate) use_native_roots: bool,
     /// Whether to verify server certificates (defaults to `true`).
     pub(crate) verify_server_cert: bool,
     /// Server name indication (SNI) hostname.
@@ -330,6 +332,7 @@ impl Default for TlsConfig {
             ca_cert_path: None,
             client_cert_path: None,
             client_key_path: None,
+            use_native_roots: false,
             verify_server_cert: true,
             sni_hostname: None,
         }
@@ -367,6 +370,16 @@ impl TlsConfig {
         self
     }
 
+    /// Load root certificates from the platform trust store.
+    ///
+    /// Requires the `native-tls-roots` crate feature. When enabled, the native
+    /// trust anchors are used as the base trust store and any CA certificate
+    /// configured via [`with_ca_cert()`](Self::with_ca_cert) is added on top.
+    pub fn with_native_roots(mut self) -> Self {
+        self.use_native_roots = true;
+        self
+    }
+
     /// Set client certificate and key paths.
     pub fn with_client_cert(
         mut self,
@@ -397,6 +410,11 @@ impl TlsConfig {
     /// Returns the client key path, if set.
     pub fn client_key_path(&self) -> Option<&str> {
         self.client_key_path.as_deref()
+    }
+
+    /// Returns whether platform-native root certificates are enabled.
+    pub fn use_native_roots(&self) -> bool {
+        self.use_native_roots
     }
 
     /// Returns whether server certificates are verified.
@@ -777,9 +795,11 @@ mod tests {
     fn test_tls_config() {
         let config = TlsConfig::new()
             .with_ca_cert("/path/to/ca.pem")
-            .with_client_cert("/path/to/client.pem", "/path/to/client.key");
+            .with_client_cert("/path/to/client.pem", "/path/to/client.key")
+            .with_native_roots();
 
         assert!(config.verify_server_cert);
+        assert!(config.use_native_roots);
         assert_eq!(config.ca_cert_path, Some("/path/to/ca.pem".to_string()));
         assert_eq!(
             config.client_cert_path,

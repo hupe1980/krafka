@@ -1780,6 +1780,7 @@ dependencies = [
  "reqwest",
  "rstest",
  "rustls 0.23.37",
+ "rustls-native-certs",
  "rustls-pemfile",
  "serde",
  "serde_json",

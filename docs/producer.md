@@ -205,7 +205,7 @@ When batching/accumulation is enabled (i.e., `linger > 0`) and the buffer memory
 
 ## Flushing
 
-When using linger-based batching, call `flush()` to ensure all pending records are sent:
+Call `flush()` whenever you need a durability barrier over records that have already been handed to the producer. This now covers both linger-based batching and direct-send mode (`linger = 0`):
 
 ```rust
 // Send multiple records
@@ -475,7 +475,7 @@ let producer = Producer::builder()
 
 ## Graceful Shutdown
 
-Always close producers properly to flush pending messages. The `close()` method guarantees that all pending batches in the accumulator are flushed to brokers before connections are torn down. Calling `close()` more than once is a no-op:
+Always close producers properly to flush pending messages. The `close()` method is a barrier over all started sends, not just batches still resident in the accumulator. It blocks new sends, waits for buffered and already-in-flight work to finish, then tears down connections. Calling `close()` more than once is a no-op:
 
 ```rust
 use krafka::producer::Producer;
@@ -490,6 +490,14 @@ let producer = Producer::builder()
 // Flush and close — waits for all in-flight batches to complete
 producer.flush().await?;
 producer.close().await;
+```
+
+If you need a bounded shutdown window, use `close_with_timeout()` instead. On timeout, Krafka tears down the connection pool and returns a timeout error, causing any remaining in-flight work to fail fast instead of hanging shutdown indefinitely:
+
+```rust
+use std::time::Duration;
+
+producer.close_with_timeout(Duration::from_secs(10)).await?;
 ```
 
 ## Transactional Producer
@@ -608,6 +616,7 @@ producer.close().await;
 ### Graceful Shutdown (Transactional)
 
 Always close transactional producers properly. The `close()` method:
+- Blocks new sends and waits for already-started transactional produce requests to finish
 - Aborts any active transaction to avoid dangling open transactions on the broker
 - Transitions the producer to `FatalError` state, preventing further use
 - Closes the underlying connection pool
@@ -617,6 +626,14 @@ Always close transactional producers properly. The `close()` method:
 // Graceful shutdown
 producer.close().await;
 // Producer is no longer usable after close()
+```
+
+For bounded shutdown windows, `close_with_timeout()` provides the same semantics with an explicit deadline:
+
+```rust
+use std::time::Duration;
+
+producer.close_with_timeout(Duration::from_secs(10)).await?;
 ```
 
 ### Built-in Retry Logic

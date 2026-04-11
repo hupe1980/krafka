@@ -80,6 +80,42 @@ pub enum KrafkaError {
     },
 }
 
+impl Clone for KrafkaError {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Network(err) => Self::Network(io::Error::new(err.kind(), err.to_string())),
+            Self::Protocol { message } => Self::Protocol {
+                message: message.clone(),
+            },
+            Self::Auth { message } => Self::Auth {
+                message: message.clone(),
+            },
+            Self::Timeout { operation } => Self::Timeout {
+                operation: operation.clone(),
+            },
+            Self::Broker { code, message } => Self::Broker {
+                code: *code,
+                message: message.clone(),
+            },
+            Self::Config { message } => Self::Config {
+                message: message.clone(),
+            },
+            Self::Compression { message } => Self::Compression {
+                message: message.clone(),
+            },
+            Self::InvalidState { message } => Self::InvalidState {
+                message: message.clone(),
+            },
+            Self::Serialization { message } => Self::Serialization {
+                message: message.clone(),
+            },
+            Self::SchemaRegistry { message } => Self::SchemaRegistry {
+                message: message.clone(),
+            },
+        }
+    }
+}
+
 impl KrafkaError {
     /// Create a new protocol error.
     #[cold]

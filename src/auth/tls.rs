@@ -23,6 +23,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ConfigBuilder, RootCertStore};
 #[cfg(feature = "danger-insecure-tls")]
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
+#[cfg(feature = "native-tls-roots")]
+use rustls_native_certs::load_native_certs;
 use rustls_pemfile::{certs, private_key};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -270,14 +272,15 @@ fn finish_with_client_auth(
 /// Load root certificate store synchronously.
 fn load_root_store(config: &TlsConfig) -> Result<RootCertStore> {
     let mut root_store = RootCertStore::empty();
+
+    load_default_roots(&mut root_store, config)?;
+
     if let Some(ca_path) = &config.ca_cert_path {
         for cert in load_certs(ca_path)? {
             root_store
                 .add(cert)
                 .map_err(|e| KrafkaError::config(format!("Failed to add CA cert: {e}")))?;
         }
-    } else {
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
     Ok(root_store)
 }
@@ -285,16 +288,78 @@ fn load_root_store(config: &TlsConfig) -> Result<RootCertStore> {
 /// Load root certificate store asynchronously.
 async fn load_root_store_async(config: &TlsConfig) -> Result<RootCertStore> {
     let mut root_store = RootCertStore::empty();
+
+    load_default_roots_async(&mut root_store, config).await?;
+
     if let Some(ca_path) = &config.ca_cert_path {
         for cert in load_certs_async(ca_path).await? {
             root_store
                 .add(cert)
                 .map_err(|e| KrafkaError::config(format!("Failed to add CA cert: {e}")))?;
         }
-    } else {
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
     Ok(root_store)
+}
+
+fn load_default_roots(root_store: &mut RootCertStore, config: &TlsConfig) -> Result<()> {
+    if config.use_native_roots {
+        #[cfg(feature = "native-tls-roots")]
+        {
+            for cert in load_native_certs().map_err(|e| {
+                KrafkaError::config(format!("Failed to load native TLS root certificates: {e}"))
+            })? {
+                root_store.add(cert).map_err(|e| {
+                    KrafkaError::config(format!("Failed to add native TLS root certificate: {e}"))
+                })?;
+            }
+            return Ok(());
+        }
+
+        #[cfg(not(feature = "native-tls-roots"))]
+        {
+            return Err(KrafkaError::config(
+                "TlsConfig::with_native_roots() requires the 'native-tls-roots' crate feature",
+            ));
+        }
+    }
+
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    Ok(())
+}
+
+async fn load_default_roots_async(
+    root_store: &mut RootCertStore,
+    config: &TlsConfig,
+) -> Result<()> {
+    if config.use_native_roots {
+        #[cfg(feature = "native-tls-roots")]
+        {
+            let certs = tokio::task::spawn_blocking(load_native_certs)
+                .await
+                .map_err(|e| {
+                    KrafkaError::config(format!("Failed to spawn native TLS root loader: {e}"))
+                })?
+                .map_err(|e| {
+                    KrafkaError::config(format!("Failed to load native TLS root certificates: {e}"))
+                })?;
+            for cert in certs {
+                root_store.add(cert).map_err(|e| {
+                    KrafkaError::config(format!("Failed to add native TLS root certificate: {e}"))
+                })?;
+            }
+            return Ok(());
+        }
+
+        #[cfg(not(feature = "native-tls-roots"))]
+        {
+            return Err(KrafkaError::config(
+                "TlsConfig::with_native_roots() requires the 'native-tls-roots' crate feature",
+            ));
+        }
+    }
+
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    Ok(())
 }
 
 /// Load client certificate + private key synchronously, if configured.
@@ -451,6 +516,18 @@ mod tests {
         let config = TlsConfig::new();
         let result = build_tls_config(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    #[cfg(not(feature = "native-tls-roots"))]
+    fn test_build_tls_config_native_roots_requires_feature() {
+        setup_crypto_provider();
+        let config = TlsConfig::new().with_native_roots();
+        let err = build_tls_config(&config).unwrap_err();
+        assert!(
+            err.to_string().contains("native-tls-roots"),
+            "expected native root feature error, got: {err}"
+        );
     }
 
     #[test]

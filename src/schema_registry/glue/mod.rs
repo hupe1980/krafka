@@ -46,7 +46,7 @@ mod glue_client;
 #[cfg_attr(docsrs, doc(cfg(feature = "aws-glue-schema-registry")))]
 pub use glue_client::{AwsGlueSchemaRegistry, AwsGlueSchemaRegistryBuilder};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::io::{Read, Write};
@@ -58,6 +58,7 @@ use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use parking_lot::RwLock;
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
 use crate::error::{KrafkaError, Result};
 
@@ -557,6 +558,12 @@ pub struct CachedGlueSchemaRegistry<C> {
     inner: C,
     /// Schema version ID → GlueSchema cache.
     cache: RwLock<HashMap<GlueSchemaVersionId, GlueSchema>>,
+    /// Insertion order for bounded-cache eviction.
+    insertion_order: RwLock<VecDeque<GlueSchemaVersionId>>,
+    /// Optional maximum number of cached entries.
+    max_entries: Option<usize>,
+    /// Waiters for coalescing concurrent cold misses by schema version ID.
+    in_flight: AsyncMutex<HashMap<GlueSchemaVersionId, Vec<oneshot::Sender<Result<GlueSchema>>>>>,
 }
 
 impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
@@ -565,6 +572,9 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
         Self {
             inner,
             cache: RwLock::new(HashMap::new()),
+            insertion_order: RwLock::new(VecDeque::new()),
+            max_entries: None,
+            in_flight: AsyncMutex::new(HashMap::new()),
         }
     }
 
@@ -573,6 +583,23 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
         Self {
             inner,
             cache: RwLock::new(HashMap::with_capacity(capacity)),
+            insertion_order: RwLock::new(VecDeque::with_capacity(capacity)),
+            max_entries: None,
+            in_flight: AsyncMutex::new(HashMap::new()),
+        }
+    }
+
+    /// Wrap the given client with a bounded in-memory cache.
+    ///
+    /// When the cache reaches `max_entries`, the oldest inserted schema version ID is evicted.
+    pub fn with_max_entries(inner: C, max_entries: usize) -> Self {
+        let max_entries = max_entries.max(1);
+        Self {
+            inner,
+            cache: RwLock::new(HashMap::with_capacity(max_entries)),
+            insertion_order: RwLock::new(VecDeque::with_capacity(max_entries)),
+            max_entries: Some(max_entries),
+            in_flight: AsyncMutex::new(HashMap::new()),
         }
     }
 
@@ -594,6 +621,30 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
     /// Clear the schema cache.
     pub fn clear_cache(&self) {
         self.cache.write().clear();
+        self.insertion_order.write().clear();
+    }
+
+    fn insert_cache_entry(&self, id: GlueSchemaVersionId, schema: GlueSchema) {
+        let mut cache = self.cache.write();
+
+        // Fast path: update existing entry without touching insertion_order.
+        if let Some(existing) = cache.get_mut(&id) {
+            *existing = schema;
+            return;
+        }
+
+        // New entry: evict oldest if bounded.
+        if let Some(max_entries) = self.max_entries {
+            let mut insertion_order = self.insertion_order.write();
+            if cache.len() >= max_entries
+                && let Some(evicted) = insertion_order.pop_front()
+            {
+                cache.remove(&evicted);
+            }
+            insertion_order.push_back(id);
+        }
+
+        cache.insert(id, schema);
     }
 }
 
@@ -601,6 +652,7 @@ impl<C> fmt::Debug for CachedGlueSchemaRegistry<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CachedGlueSchemaRegistry")
             .field("cache_len", &self.cache.read().len())
+            .field("max_entries", &self.max_entries)
             .finish()
     }
 }
@@ -616,10 +668,34 @@ impl<C: GlueSchemaRegistryClient> GlueSchemaRegistryClient for CachedGlueSchemaR
                 return Ok(schema.clone());
             }
 
-            // Slow path: fetch from inner client, then cache.
-            let schema = self.inner.get_schema_by_version_id(id).await?;
-            self.cache.write().insert(id, schema.clone());
-            Ok(schema)
+            let mut in_flight = self.in_flight.lock().await;
+            if let Some(schema) = self.cache.read().get(&id) {
+                return Ok(schema.clone());
+            }
+
+            if let Some(waiters) = in_flight.get_mut(&id) {
+                let (tx, rx) = oneshot::channel();
+                waiters.push(tx);
+                drop(in_flight);
+                return rx.await.map_err(|_| {
+                    KrafkaError::invalid_state("glue schema lookup coalescer dropped")
+                })?;
+            }
+
+            in_flight.insert(id, Vec::new());
+            drop(in_flight);
+
+            let result = self.inner.get_schema_by_version_id(id).await;
+            if let Ok(schema) = &result {
+                self.insert_cache_entry(id, schema.clone());
+            }
+
+            let waiters = self.in_flight.lock().await.remove(&id).unwrap_or_default();
+            for waiter in waiters {
+                let _ = waiter.send(result.clone());
+            }
+
+            result
         })
     }
 
@@ -644,7 +720,9 @@ impl<C: GlueSchemaRegistryClient> GlueSchemaRegistryClient for CachedGlueSchemaR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio::sync::Notify;
 
     const TEST_UUID_STR: &str = "550e8400-e29b-41d4-a716-446655440000";
     const TEST_UUID_BYTES: [u8; 16] = [
@@ -1026,6 +1104,61 @@ mod tests {
         }
     }
 
+    struct BlockingMockGlueRegistry {
+        get_calls: AtomicU32,
+        started: Notify,
+        release: Notify,
+    }
+
+    impl BlockingMockGlueRegistry {
+        fn new() -> Self {
+            Self {
+                get_calls: AtomicU32::new(0),
+                started: Notify::new(),
+                release: Notify::new(),
+            }
+        }
+
+        fn get_call_count(&self) -> u32 {
+            self.get_calls.load(Ordering::SeqCst)
+        }
+
+        async fn wait_started(&self) {
+            self.started.notified().await;
+        }
+
+        fn release(&self) {
+            self.release.notify_waiters();
+        }
+    }
+
+    impl GlueSchemaRegistryClient for BlockingMockGlueRegistry {
+        fn get_schema_by_version_id(
+            &self,
+            id: GlueSchemaVersionId,
+        ) -> Pin<Box<dyn Future<Output = Result<GlueSchema>> + Send + '_>> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                self.started.notify_waiters();
+                self.release.notified().await;
+                Ok(GlueSchema::new(
+                    id,
+                    GlueDataFormat::Avro,
+                    r#"{"type":"string"}"#,
+                ))
+            })
+        }
+
+        fn register_schema(
+            &self,
+            _schema_name: &str,
+            _schema: &str,
+            _data_format: GlueDataFormat,
+        ) -> Pin<Box<dyn Future<Output = Result<GlueSchemaVersionId>> + Send + '_>> {
+            Box::pin(async { Ok(TEST_UUID_STR.parse().unwrap()) })
+        }
+    }
+
     #[tokio::test]
     async fn test_cache_miss_then_hit() {
         let mock = MockGlueRegistry::new();
@@ -1081,6 +1214,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cache_coalesces_concurrent_misses() {
+        let cached = Arc::new(CachedGlueSchemaRegistry::new(
+            BlockingMockGlueRegistry::new(),
+        ));
+        let id: GlueSchemaVersionId = TEST_UUID_STR.parse().unwrap();
+
+        let first = {
+            let cached = cached.clone();
+            tokio::spawn(async move { cached.get_schema_by_version_id(id).await.unwrap() })
+        };
+
+        cached.inner().wait_started().await;
+
+        let second = {
+            let cached = cached.clone();
+            tokio::spawn(async move { cached.get_schema_by_version_id(id).await.unwrap() })
+        };
+
+        tokio::task::yield_now().await;
+        cached.inner().release();
+
+        let first_schema = first.await.unwrap();
+        let second_schema = second.await.unwrap();
+
+        assert_eq!(first_schema, second_schema);
+        assert_eq!(cached.inner().get_call_count(), 1);
+    }
+
+    #[tokio::test]
     async fn test_cache_register_forwards() {
         let mock = MockGlueRegistry::new();
         let cached = CachedGlueSchemaRegistry::new(mock);
@@ -1101,6 +1263,23 @@ mod tests {
         let id: GlueSchemaVersionId = TEST_UUID_STR.parse().unwrap();
         cached.get_schema_by_version_id(id).await.unwrap();
         assert_eq!(cached.cache_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cache_with_max_entries_evicts_oldest_entry() {
+        let mock = MockGlueRegistry::new();
+        let cached = CachedGlueSchemaRegistry::with_max_entries(mock, 1);
+        let id1: GlueSchemaVersionId = TEST_UUID_STR.parse().unwrap();
+        let id2: GlueSchemaVersionId = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+
+        cached.get_schema_by_version_id(id1).await.unwrap();
+        cached.get_schema_by_version_id(id2).await.unwrap();
+
+        assert_eq!(cached.cache_len(), 1);
+        assert_eq!(cached.inner().get_call_count(), 2);
+
+        cached.get_schema_by_version_id(id1).await.unwrap();
+        assert_eq!(cached.inner().get_call_count(), 3);
     }
 
     // ── Type assertions ──────────────────────────────────────────────────

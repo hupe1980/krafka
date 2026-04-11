@@ -194,7 +194,7 @@ impl ProducerInterceptor for ProducerInterceptorChain {
                 tracing::warn!(
                     chain_index = i,
                     chain_len = self.interceptors.len(),
-                    topic = record.topic,
+                    topic = record.topic.as_str(),
                     "ProducerInterceptor.on_send panicked: {:?}",
                     e,
                 );
@@ -210,7 +210,7 @@ impl ProducerInterceptor for ProducerInterceptorChain {
                 tracing::warn!(
                     chain_index = i,
                     chain_len = self.interceptors.len(),
-                    topic = metadata.topic,
+                    topic = metadata.topic.as_str(),
                     partition = metadata.partition,
                     "ProducerInterceptor.on_acknowledgement panicked: {:?}",
                     e,
@@ -314,7 +314,7 @@ impl ConsumerInterceptor for ConsumerInterceptorChain {
 pub(crate) fn safe_on_send(interceptor: &dyn ProducerInterceptor, record: &mut ProducerRecord) {
     if let Err(e) = catch_unwind(AssertUnwindSafe(|| interceptor.on_send(record))) {
         tracing::warn!(
-            topic = record.topic,
+            topic = record.topic.as_str(),
             "ProducerInterceptor.on_send panicked: {:?}",
             e,
         );
@@ -331,7 +331,7 @@ pub(crate) fn safe_on_acknowledgement(
         interceptor.on_acknowledgement(metadata, error);
     })) {
         tracing::warn!(
-            topic = metadata.topic,
+            topic = metadata.topic.as_str(),
             partition = metadata.partition,
             "ProducerInterceptor.on_acknowledgement panicked: {:?}",
             e,

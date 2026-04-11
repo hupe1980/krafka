@@ -52,7 +52,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -72,6 +72,7 @@ use crate::protocol::{
     TxnOffsetCommitRequest, TxnOffsetCommitResponse, VersionedDecode, VersionedEncode, versions,
 };
 
+use super::barrier::InFlightBarrier;
 use super::config::Acks;
 use super::idempotent::ProducerIdentity;
 use super::partitioner::{DefaultPartitioner, Partitioner};
@@ -313,8 +314,8 @@ pub struct TransactionalProducer {
     identity: ProducerIdentity,
     /// Retry policy for transient failures.
     retry_policy: RetryPolicy,
-    /// Explicit closed flag, separate from transaction state.
-    closed: AtomicBool,
+    /// Barrier over started transactional operations and shutdown state.
+    in_flight_barrier: Arc<InFlightBarrier>,
 }
 
 impl TransactionalProducer {
@@ -626,6 +627,7 @@ impl TransactionalProducer {
 
     /// Send a producer record within the current transaction.
     pub async fn send_record(&self, record: ProducerRecord) -> Result<RecordMetadata> {
+        let _operation_guard = self.in_flight_barrier.start("transactional producer")?;
         let current = self.state();
         if current != TransactionState::InTransaction {
             return Err(KrafkaError::invalid_state(format!(
@@ -1348,19 +1350,45 @@ impl TransactionalProducer {
     /// After calling `close()`, the producer cannot be used again.
     /// Calling `close()` more than once is a no-op.
     pub async fn close(&self) {
-        // Atomic swap — only the first caller proceeds.
-        if self.closed.swap(true, Ordering::SeqCst) {
-            return;
-        }
+        let _ = self.close_inner(None).await;
+    }
 
-        // If in-transaction, abort first to clean up broker state
-        let current = self.state();
-        if current == TransactionState::InTransaction {
-            warn!("Closing transactional producer with active transaction — aborting");
-            if let Err(abort_err) = self.abort_transaction().await {
-                warn!(error = %abort_err, "Failed to abort transaction during close");
+    /// Close the transactional producer, giving up on graceful shutdown once
+    /// `timeout` expires.
+    ///
+    /// On timeout, the connection pool is still torn down, causing any
+    /// remaining in-flight operations to fail fast.
+    pub async fn close_with_timeout(&self, timeout: Duration) -> Result<()> {
+        self.close_inner(Some(timeout)).await
+    }
+
+    async fn close_inner(&self, timeout: Option<Duration>) -> Result<()> {
+        let Some(target) = self.in_flight_barrier.begin_close() else {
+            return Ok(());
+        };
+
+        let graceful_close = async {
+            // Let already-started sends cross the ack boundary before aborting the
+            // active transaction or tearing down sockets.
+            self.in_flight_barrier.wait_for(target).await;
+
+            // If in-transaction, abort first to clean up broker state.
+            let current = self.state();
+            if current == TransactionState::InTransaction {
+                warn!("Closing transactional producer with active transaction — aborting");
+                self.abort_transaction().await?;
             }
-        }
+
+            Ok::<(), KrafkaError>(())
+        };
+
+        let close_result = if let Some(timeout) = timeout {
+            tokio::time::timeout(timeout, graceful_close)
+                .await
+                .map_err(|_| KrafkaError::timeout("transactional producer close"))?
+        } else {
+            graceful_close.await
+        };
 
         // Set state to prevent further use
         self.set_state(TransactionState::FatalError);
@@ -1371,6 +1399,8 @@ impl TransactionalProducer {
             "TransactionalProducer closed: txn.id={}",
             self.config.transactional_id
         );
+
+        close_result
     }
 
     /// Check if the transactional producer has been explicitly closed.
@@ -1380,7 +1410,7 @@ impl TransactionalProducer {
     /// considered closed — use [`Self::state`] to check for fatal errors.
     #[inline]
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+        self.in_flight_barrier.is_closing()
     }
 }
 
@@ -1528,7 +1558,7 @@ impl TransactionalProducerBuilder {
             txn_partitions: Arc::new(RwLock::new(TransactionPartitions::default())),
             identity: ProducerIdentity::new(),
             retry_policy: RetryPolicy::default(),
-            closed: AtomicBool::new(false),
+            in_flight_barrier: Arc::new(InFlightBarrier::new()),
         })
     }
 }

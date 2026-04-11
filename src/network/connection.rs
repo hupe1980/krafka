@@ -607,6 +607,7 @@ impl BrokerConnection {
                         normal_priority_rx,
                         request_timeout,
                         stats_clone,
+                        config.max_response_size,
                     )
                     .await
                     {
@@ -625,6 +626,7 @@ impl BrokerConnection {
                         normal_priority_rx,
                         request_timeout,
                         stats_clone,
+                        config.max_response_size,
                     )
                     .await
                     {
@@ -659,6 +661,7 @@ impl BrokerConnection {
                     normal_priority_rx,
                     request_timeout,
                     stats_clone,
+                    config.max_response_size,
                 )
                 .await
                 {
@@ -677,6 +680,7 @@ impl BrokerConnection {
                     normal_priority_rx,
                     request_timeout,
                     stats_clone,
+                    config.max_response_size,
                 )
                 .await
                 {
@@ -1069,6 +1073,7 @@ impl BrokerConnection {
         mut normal_priority_rx: mpsc::Receiver<ConnectionCommand>,
         request_timeout: Duration,
         stats: Arc<ConnectionStats>,
+        max_response_size: usize,
     ) -> Result<()>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -1107,34 +1112,44 @@ impl BrokerConnection {
             }
         });
 
+        let (reader_result_tx, mut reader_result_rx) = oneshot::channel();
+
         // Spawn reader task
         let reader_handle = tokio::spawn(async move {
-            let mut decoder = Decoder::new();
-            let mut buf = vec![0u8; 65536];
+            let result = async move {
+                let mut decoder = Decoder::with_max_size(max_response_size);
+                let mut buf = vec![0u8; 65536];
 
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => {
-                        debug!("Connection closed by peer");
-                        break;
-                    }
-                    Ok(n) => {
-                        decoder.extend(&buf[..n]);
+                loop {
+                    match reader.read(&mut buf).await {
+                        Ok(0) => {
+                            debug!("Connection closed by peer");
+                            break;
+                        }
+                        Ok(n) => {
+                            decoder.extend(&buf[..n]);
 
-                        // Process all complete messages
-                        while let Some(response) = decoder.decode()? {
-                            Self::handle_response(&pending_clone, response).await?;
+                            // Process all complete messages
+                            while let Some(response) = decoder.decode()? {
+                                Self::handle_response(&pending_clone, response).await?;
+                            }
+                        }
+                        Err(e) => {
+                            error!("Read error: {}", e);
+                            return Err(KrafkaError::Network(e));
                         }
                     }
-                    Err(e) => {
-                        error!("Read error: {}", e);
-                        return Err(KrafkaError::Network(e));
-                    }
                 }
-            }
 
-            Ok::<_, KrafkaError>(())
+                Ok::<_, KrafkaError>(())
+            }
+            .await;
+
+            let _ = reader_result_tx.send(result.clone());
+            result
         });
+
+        let mut terminal_error: Option<KrafkaError> = None;
 
         // Process commands with priority
         loop {
@@ -1151,6 +1166,15 @@ impl BrokerConnection {
             tokio::select! {
                 // Bias towards high-priority
                 biased;
+
+                reader_result = &mut reader_result_rx => {
+                    terminal_error = match reader_result {
+                        Ok(Ok(())) => None,
+                        Ok(Err(err)) => Some(err),
+                        Err(_) => Some(KrafkaError::invalid_state("reader task result dropped")),
+                    };
+                    break;
+                }
 
                 cmd = high_priority_rx.recv() => {
                     match cmd {
@@ -1178,16 +1202,36 @@ impl BrokerConnection {
         // Wait for reader to finish
         drop(writer);
         timeout_sweep_handle.abort();
-        let _ = reader_handle.await;
+
+        match reader_handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                if terminal_error.is_none() {
+                    terminal_error = Some(err);
+                }
+            }
+            Err(join_err) => {
+                if terminal_error.is_none() {
+                    terminal_error = Some(KrafkaError::invalid_state(format!(
+                        "reader task failed: {join_err}"
+                    )));
+                }
+            }
+        }
 
         // Drain pending requests and notify callers that the connection is closed
         {
             let mut pending_map = pending.lock().await;
+            let pending_error = terminal_error
+                .clone()
+                .unwrap_or_else(|| KrafkaError::invalid_state("connection closed"));
             for (_, req) in pending_map.drain() {
-                let _ = req
-                    .response_tx
-                    .send(Err(KrafkaError::invalid_state("connection closed")));
+                let _ = req.response_tx.send(Err(pending_error.clone()));
             }
+        }
+
+        if let Some(err) = terminal_error {
+            return Err(err);
         }
 
         Ok(())
@@ -1756,10 +1800,14 @@ mod tests {
     /// Accepts a connection, reads SaslHandshakeRequest, SaslAuthenticateRequest,
     /// and ApiVersionsRequest, responding to each with valid responses.
     /// The `session_lifetime_ms` value is included in the SaslAuthenticate v1
-    /// response (KIP-368).
+    /// response (KIP-368). The broker stays open until the test signals
+    /// shutdown so the connection remains usable after the initial handshake.
     /// Returns the captured auth bytes from SaslAuthenticate for verification.
-    async fn run_mock_sasl_broker(listener: tokio::net::TcpListener) -> (String, Vec<u8>) {
-        run_mock_sasl_broker_with_lifetime(listener, 0).await
+    async fn run_mock_sasl_broker(
+        listener: tokio::net::TcpListener,
+        shutdown_rx: oneshot::Receiver<()>,
+    ) -> (String, Vec<u8>) {
+        run_mock_sasl_broker_with_lifetime(listener, 0, shutdown_rx).await
     }
 
     /// Like [`run_mock_sasl_broker`] but lets the caller set the session
@@ -1767,6 +1815,7 @@ mod tests {
     async fn run_mock_sasl_broker_with_lifetime(
         listener: tokio::net::TcpListener,
         session_lifetime_ms: i64,
+        shutdown_rx: oneshot::Receiver<()>,
     ) -> (String, Vec<u8>) {
         use bytes::BufMut;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1852,6 +1901,8 @@ mod tests {
         resp.put_i32(0); // 0 api keys
         write_frame(&mut stream, &resp).await;
 
+        let _ = shutdown_rx.await;
+
         (mechanism, auth_bytes)
     }
 
@@ -1863,7 +1914,8 @@ mod tests {
         let addr_str = addr.to_string();
 
         // Run mock broker in background
-        let mock_handle = tokio::spawn(run_mock_sasl_broker(listener));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mock_handle = tokio::spawn(run_mock_sasl_broker(listener, shutdown_rx));
 
         // Connect with SASL/PLAIN auth
         let config = ConnectionConfig::builder()
@@ -1884,14 +1936,15 @@ mod tests {
         let conn = conn.unwrap();
         assert!(conn.is_alive());
 
+        conn.close().await;
+        let _ = shutdown_tx.send(());
+
         // Verify the mock received the correct handshake
         let (mechanism, auth_bytes) = mock_handle.await.unwrap();
         assert_eq!(mechanism, "PLAIN");
 
         // SASL PLAIN format: \0username\0password
         assert_eq!(auth_bytes, b"\0testuser\0testpassword");
-
-        conn.close().await;
     }
 
     #[tokio::test]
@@ -1904,7 +1957,8 @@ mod tests {
         let addr_str = addr.to_string();
 
         // Run mock broker in background
-        let mock_handle = tokio::spawn(run_mock_sasl_broker(listener));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mock_handle = tokio::spawn(run_mock_sasl_broker(listener, shutdown_rx));
 
         // Connect with OAUTHBEARER provider (not a static token)
         let config = ConnectionConfig::builder()
@@ -1924,6 +1978,9 @@ mod tests {
         let conn = conn.unwrap();
         assert!(conn.is_alive());
 
+        conn.close().await;
+        let _ = shutdown_tx.send(());
+
         // Verify the mock received the correct OAUTHBEARER handshake
         let (mechanism, auth_bytes) = mock_handle.await.unwrap();
         assert_eq!(mechanism, "OAUTHBEARER");
@@ -1931,8 +1988,6 @@ mod tests {
         // GS2 format: n,,\x01auth=Bearer <token>\x01\x01
         let expected = OAuthBearerToken::new("provider-jwt-token").to_gs2_initial_response();
         assert_eq!(auth_bytes, expected);
-
-        conn.close().await;
     }
 
     #[tokio::test]
@@ -2207,6 +2262,60 @@ mod tests {
         assert!(result.is_err(), "zero frame length should be rejected");
     }
 
+    #[tokio::test]
+    async fn test_connection_loop_enforces_configured_max_response_size() {
+        let (client, mut server) = tokio::io::duplex(256);
+        let (reader, writer) = tokio::io::split(client);
+        let (_high_tx, high_rx) = mpsc::channel(4);
+        let (normal_tx, normal_rx) = mpsc::channel(4);
+        let stats = Arc::new(ConnectionStats::default());
+
+        let loop_task = tokio::spawn(BrokerConnection::run_connection_loop(
+            reader,
+            writer,
+            high_rx,
+            normal_rx,
+            Duration::from_secs(30),
+            stats,
+            16,
+        ));
+
+        let (response_tx, response_rx) = oneshot::channel();
+        normal_tx
+            .send(ConnectionCommand::Request {
+                data: Bytes::from_static(b"ping"),
+                correlation_id: 7,
+                api_key: ApiKey::Metadata,
+                api_version: 0,
+                response_tx,
+            })
+            .await
+            .unwrap();
+
+        let mut request = [0u8; 4];
+        server.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"ping");
+
+        server.write_all(&(32i32).to_be_bytes()).await.unwrap();
+        server.write_all(&[0u8; 32]).await.unwrap();
+        server.flush().await.unwrap();
+
+        let err = response_rx.await.unwrap().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("message size 32 exceeds maximum 16"),
+            "pending request should receive the configured frame-limit error: {err}"
+        );
+
+        let loop_err = loop_task.await.unwrap().unwrap_err();
+        assert!(
+            loop_err
+                .to_string()
+                .contains("message size 32 exceeds maximum 16"),
+            "connection loop should stop on oversized steady-state frames: {loop_err}"
+        );
+    }
+
     #[test]
     fn test_connection_config_default_max_response_size() {
         let config = ConnectionConfig::default();
@@ -2451,7 +2560,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
 
-        let mock_handle = tokio::spawn(run_mock_sasl_broker_with_lifetime(listener, 60_000));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mock_handle = tokio::spawn(run_mock_sasl_broker_with_lifetime(
+            listener,
+            60_000,
+            shutdown_rx,
+        ));
 
         let config = ConnectionConfig::builder()
             .client_id("test-client")
@@ -2483,8 +2597,9 @@ mod tests {
         // is_usable should be true
         assert!(conn.is_usable(), "fresh connection should be usable");
 
-        mock_handle.await.unwrap();
         conn.close().await;
+        let _ = shutdown_tx.send(());
+        mock_handle.await.unwrap();
     }
 
     #[tokio::test]
@@ -2493,7 +2608,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
 
-        let mock_handle = tokio::spawn(run_mock_sasl_broker_with_lifetime(listener, 0));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mock_handle =
+            tokio::spawn(run_mock_sasl_broker_with_lifetime(listener, 0, shutdown_rx));
 
         let config = ConnectionConfig::builder()
             .client_id("test-client")
@@ -2512,7 +2629,8 @@ mod tests {
         );
         assert!(conn.is_usable());
 
-        mock_handle.await.unwrap();
         conn.close().await;
+        let _ = shutdown_tx.send(());
+        mock_handle.await.unwrap();
     }
 }

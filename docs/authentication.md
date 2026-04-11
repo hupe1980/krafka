@@ -305,6 +305,26 @@ let tls_config = TlsConfig::new()
     .with_ca_cert("/path/to/ca.pem");
 ```
 
+`with_ca_cert()` adds the PEM file to the selected base trust store. By default that base trust store is Krafka's compiled-in Mozilla roots.
+
+### Native Platform Trust Stores
+
+By default, Krafka uses compiled-in `webpki-roots`. To use the operating system trust store on macOS, Windows, or Linux, enable the `native-tls-roots` feature and opt in explicitly:
+
+```toml
+[dependencies]
+krafka = { version = "0.4", features = ["native-tls-roots"] }
+```
+
+```rust
+use krafka::auth::TlsConfig;
+
+let tls_config = TlsConfig::new()
+    .with_native_roots();
+```
+
+You can combine `with_native_roots()` and `with_ca_cert()` to trust both platform roots and an additional private CA bundle.
+
 ### Mutual TLS (mTLS)
 
 Client certificate authentication:
@@ -453,6 +473,7 @@ The implementation uses AWS Signature v4 signing:
 | `ca_cert_path` | `Option<String>` | Path to CA certificate PEM file |
 | `client_cert_path` | `Option<String>` | Path to client certificate PEM file |
 | `client_key_path` | `Option<String>` | Path to client private key PEM file |
+| `use_native_roots` | `bool` | Whether to load root certificates from the platform trust store |
 | `verify_server_cert` | `bool` | Whether to verify server certificates (default: true) |
 | `sni_hostname` | `Option<String>` | SNI hostname for TLS handshake |
 
