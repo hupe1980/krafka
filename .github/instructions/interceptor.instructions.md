@@ -8,7 +8,11 @@ description: "Use when editing interceptors: panic safety wrappers, credential e
 ## Panic Safety
 
 All interceptor calls must go through the `safe_*` wrappers (`safe_on_send`, `safe_on_acknowledgement`, `safe_on_consume`, `safe_on_commit`).
-Panics are caught and logged at `error!` — they must **never** crash the producer or consumer.
+Panics are caught and logged — they must **never** crash the producer or consumer.
+
+**Log levels** (matching Java Kafka client convention):
+- Callback panics (`on_send`, `on_acknowledgement`, `on_consume`, `on_commit`) → `warn!` (recoverable, chain continues)
+- `close()` panics → `error!` (lifecycle failure)
 
 Interceptor chains (`ProducerInterceptorChain`, `ConsumerInterceptorChain`) provide per-interceptor panic isolation: a panic in one interceptor is caught and logged, and the remaining interceptors still execute. The outer `safe_*` wrapper provides belt-and-suspenders protection.
 
@@ -17,6 +21,8 @@ Interceptor chains (`ProducerInterceptorChain`, `ConsumerInterceptorChain`) prov
 - `on_send()` receives `&mut ProducerRecord` with **all headers** — headers may contain auth tokens.
 - `on_acknowledgement()` error messages from auth failures may contain broker-echoed details.
 - Never log full record contents in interceptor implementations without sanitization.
+- **Never log `interceptor = ?interceptor`** — user-provided `Debug` implementations may expose secrets (API keys, tokens, endpoints). Log `chain_index` and `chain_len` instead to identify the panicking interceptor.
+- Add contextual domain data (topic, partition) where available, matching Java's approach.
 
 ## Performance
 

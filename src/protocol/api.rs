@@ -776,7 +776,7 @@ impl ApiVersionsResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let tagged = TaggedFields::decode(buf)?;
         let supported_features = Self::parse_supported_features(&tagged)?;
-        let finalized_features_epoch = Self::parse_finalized_features_epoch(&tagged);
+        let finalized_features_epoch = Self::parse_finalized_features_epoch(&tagged)?;
         let finalized_features = if finalized_features_epoch >= 0 {
             Self::parse_finalized_features(&tagged)?
         } else {
@@ -836,18 +836,22 @@ impl ApiVersionsResponse {
     /// Parse FinalizedFeaturesEpoch from tagged field tag 1.
     ///
     /// Wire format: raw i64 (8 bytes). Returns −1 (unknown) when absent.
-    fn parse_finalized_features_epoch(tagged: &TaggedFields) -> i64 {
-        tagged
-            .0
-            .iter()
-            .find(|f| f.tag == 1)
-            .and_then(|f| {
-                f.data
-                    .get(..8)
-                    .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
-                    .map(i64::from_be_bytes)
-            })
-            .unwrap_or(-1)
+    /// Returns a protocol error if the field is present but has an invalid length.
+    fn parse_finalized_features_epoch(tagged: &TaggedFields) -> Result<i64> {
+        let Some(field) = tagged.0.iter().find(|f| f.tag == 1) else {
+            return Ok(-1);
+        };
+
+        if field.data.len() != 8 {
+            return Err(crate::error::KrafkaError::protocol(format!(
+                "FinalizedFeaturesEpoch (tag 1) has invalid length {}, expected 8",
+                field.data.len()
+            )));
+        }
+
+        // Length verified to be exactly 8 bytes above.
+        let bytes: [u8; 8] = field.data[..8].try_into().expect("length checked above");
+        Ok(i64::from_be_bytes(bytes))
     }
 
     /// Parse FinalizedFeatures from tagged field tag 2 (KIP-584).
@@ -1201,7 +1205,7 @@ mod tests {
             data: epoch_bytes.freeze(),
         }]);
         assert_eq!(
-            ApiVersionsResponse::parse_finalized_features_epoch(&tagged),
+            ApiVersionsResponse::parse_finalized_features_epoch(&tagged).unwrap(),
             42
         );
     }
@@ -1210,21 +1214,36 @@ mod tests {
     fn test_parse_finalized_features_epoch_absent() {
         let tagged = TaggedFields(vec![]);
         assert_eq!(
-            ApiVersionsResponse::parse_finalized_features_epoch(&tagged),
+            ApiVersionsResponse::parse_finalized_features_epoch(&tagged).unwrap(),
             -1
         );
     }
 
     #[test]
     fn test_parse_finalized_features_epoch_short_data() {
-        // Less than 8 bytes → treated as absent
+        // Less than 8 bytes → protocol error (not silently treated as absent)
         let tagged = TaggedFields(vec![TaggedField {
             tag: 1,
             data: bytes::Bytes::from_static(&[0, 0, 0]),
         }]);
-        assert_eq!(
-            ApiVersionsResponse::parse_finalized_features_epoch(&tagged),
-            -1
+        let err = ApiVersionsResponse::parse_finalized_features_epoch(&tagged).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid length 3"),
+            "expected error mentioning invalid length, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_finalized_features_epoch_too_long() {
+        // More than 8 bytes → protocol error (trailing bytes not silently ignored)
+        let tagged = TaggedFields(vec![TaggedField {
+            tag: 1,
+            data: bytes::Bytes::from_static(&[0, 0, 0, 0, 0, 0, 0, 42, 0xFF]),
+        }]);
+        let err = ApiVersionsResponse::parse_finalized_features_epoch(&tagged).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid length 9"),
+            "expected error mentioning invalid length, got: {err}"
         );
     }
 

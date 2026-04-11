@@ -189,35 +189,44 @@ impl ProducerInterceptorChain {
 
 impl ProducerInterceptor for ProducerInterceptorChain {
     fn on_send(&self, record: &mut ProducerRecord) {
-        for interceptor in &self.interceptors {
+        for (i, interceptor) in self.interceptors.iter().enumerate() {
             if let Err(e) = catch_unwind(AssertUnwindSafe(|| interceptor.on_send(record))) {
-                tracing::error!(
-                    interceptor = ?interceptor,
-                    "ProducerInterceptor.on_send panicked: {:?}", e,
+                tracing::warn!(
+                    chain_index = i,
+                    chain_len = self.interceptors.len(),
+                    topic = record.topic,
+                    "ProducerInterceptor.on_send panicked: {:?}",
+                    e,
                 );
             }
         }
     }
 
     fn on_acknowledgement(&self, metadata: &RecordMetadata, error: Option<&KrafkaError>) {
-        for interceptor in &self.interceptors {
+        for (i, interceptor) in self.interceptors.iter().enumerate() {
             if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
                 interceptor.on_acknowledgement(metadata, error);
             })) {
-                tracing::error!(
-                    interceptor = ?interceptor,
-                    "ProducerInterceptor.on_acknowledgement panicked: {:?}", e,
+                tracing::warn!(
+                    chain_index = i,
+                    chain_len = self.interceptors.len(),
+                    topic = metadata.topic,
+                    partition = metadata.partition,
+                    "ProducerInterceptor.on_acknowledgement panicked: {:?}",
+                    e,
                 );
             }
         }
     }
 
     fn close(&self) {
-        for interceptor in &self.interceptors {
+        for (i, interceptor) in self.interceptors.iter().enumerate() {
             if let Err(e) = catch_unwind(AssertUnwindSafe(|| interceptor.close())) {
                 tracing::error!(
-                    interceptor = ?interceptor,
-                    "ProducerInterceptor.close panicked: {:?}", e,
+                    chain_index = i,
+                    chain_len = self.interceptors.len(),
+                    "ProducerInterceptor.close panicked: {:?}",
+                    e,
                 );
             }
         }
@@ -251,11 +260,14 @@ impl ConsumerInterceptorChain {
 
 impl ConsumerInterceptor for ConsumerInterceptorChain {
     fn on_consume(&self, records: &[ConsumerRecord]) {
-        for interceptor in &self.interceptors {
+        for (i, interceptor) in self.interceptors.iter().enumerate() {
             if let Err(e) = catch_unwind(AssertUnwindSafe(|| interceptor.on_consume(records))) {
-                tracing::error!(
-                    interceptor = ?interceptor,
-                    "ConsumerInterceptor.on_consume panicked: {:?}", e,
+                tracing::warn!(
+                    chain_index = i,
+                    chain_len = self.interceptors.len(),
+                    record_count = records.len(),
+                    "ConsumerInterceptor.on_consume panicked: {:?}",
+                    e,
                 );
             }
         }
@@ -266,24 +278,29 @@ impl ConsumerInterceptor for ConsumerInterceptorChain {
         offsets: &HashMap<(String, PartitionId), Offset>,
         error: Option<&KrafkaError>,
     ) {
-        for interceptor in &self.interceptors {
+        for (i, interceptor) in self.interceptors.iter().enumerate() {
             if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
                 interceptor.on_commit(offsets, error);
             })) {
-                tracing::error!(
-                    interceptor = ?interceptor,
-                    "ConsumerInterceptor.on_commit panicked: {:?}", e,
+                tracing::warn!(
+                    chain_index = i,
+                    chain_len = self.interceptors.len(),
+                    offset_count = offsets.len(),
+                    "ConsumerInterceptor.on_commit panicked: {:?}",
+                    e,
                 );
             }
         }
     }
 
     fn close(&self) {
-        for interceptor in &self.interceptors {
+        for (i, interceptor) in self.interceptors.iter().enumerate() {
             if let Err(e) = catch_unwind(AssertUnwindSafe(|| interceptor.close())) {
                 tracing::error!(
-                    interceptor = ?interceptor,
-                    "ConsumerInterceptor.close panicked: {:?}", e,
+                    chain_index = i,
+                    chain_len = self.interceptors.len(),
+                    "ConsumerInterceptor.close panicked: {:?}",
+                    e,
                 );
             }
         }
@@ -296,7 +313,11 @@ impl ConsumerInterceptor for ConsumerInterceptorChain {
 /// interceptor cannot crash the producer.
 pub(crate) fn safe_on_send(interceptor: &dyn ProducerInterceptor, record: &mut ProducerRecord) {
     if let Err(e) = catch_unwind(AssertUnwindSafe(|| interceptor.on_send(record))) {
-        tracing::error!("ProducerInterceptor.on_send panicked: {:?}", e);
+        tracing::warn!(
+            topic = record.topic,
+            "ProducerInterceptor.on_send panicked: {:?}",
+            e,
+        );
     }
 }
 
@@ -309,7 +330,12 @@ pub(crate) fn safe_on_acknowledgement(
     if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
         interceptor.on_acknowledgement(metadata, error);
     })) {
-        tracing::error!("ProducerInterceptor.on_acknowledgement panicked: {:?}", e);
+        tracing::warn!(
+            topic = metadata.topic,
+            partition = metadata.partition,
+            "ProducerInterceptor.on_acknowledgement panicked: {:?}",
+            e,
+        );
     }
 }
 
@@ -323,7 +349,11 @@ pub(crate) fn safe_producer_close(interceptor: &dyn ProducerInterceptor) {
 /// Panic-safe wrapper for consumer interceptor `on_consume`.
 pub(crate) fn safe_on_consume(interceptor: &dyn ConsumerInterceptor, records: &[ConsumerRecord]) {
     if let Err(e) = catch_unwind(AssertUnwindSafe(|| interceptor.on_consume(records))) {
-        tracing::error!("ConsumerInterceptor.on_consume panicked: {:?}", e);
+        tracing::warn!(
+            record_count = records.len(),
+            "ConsumerInterceptor.on_consume panicked: {:?}",
+            e,
+        );
     }
 }
 
@@ -334,7 +364,11 @@ pub(crate) fn safe_on_commit(
     error: Option<&KrafkaError>,
 ) {
     if let Err(e) = catch_unwind(AssertUnwindSafe(|| interceptor.on_commit(offsets, error))) {
-        tracing::error!("ConsumerInterceptor.on_commit panicked: {:?}", e);
+        tracing::warn!(
+            offset_count = offsets.len(),
+            "ConsumerInterceptor.on_commit panicked: {:?}",
+            e,
+        );
     }
 }
 
