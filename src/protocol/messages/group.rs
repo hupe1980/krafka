@@ -7,23 +7,6 @@ use crate::protocol::primitives::{
     Decode, Encode, KafkaBytes, KafkaString, TaggedFields, TryEncode,
 };
 use crate::protocol::{array_len_i32, check_compact_array_len, check_decode_array_len};
-macro_rules! unsupported_encode {
-    ($type:expr, $version:expr) => {
-        Err(KrafkaError::protocol(format!(
-            "unsupported {} encode version {}",
-            $type, $version
-        )))
-    };
-}
-
-macro_rules! unsupported_decode {
-    ($type:expr, $version:expr) => {
-        Err(KrafkaError::protocol(format!(
-            "unsupported {} decode version {}",
-            $type, $version
-        )))
-    };
-}
 
 // ============================================================================
 // JoinGroup request/response

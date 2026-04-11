@@ -6,23 +6,6 @@ use crate::protocol::primitives::{
     Decode, Encode, KafkaBytes, KafkaString, TaggedFields, TryEncode,
 };
 use crate::protocol::{check_compact_array_len, encode_compact_array_len};
-macro_rules! unsupported_encode {
-    ($type:expr, $version:expr) => {
-        Err(KrafkaError::protocol(format!(
-            "unsupported {} encode version {}",
-            $type, $version
-        )))
-    };
-}
-
-macro_rules! unsupported_decode {
-    ($type:expr, $version:expr) => {
-        Err(KrafkaError::protocol(format!(
-            "unsupported {} decode version {}",
-            $type, $version
-        )))
-    };
-}
 
 // ============================================================================
 // ShareGroupHeartbeat (API Key 76) — KIP-932

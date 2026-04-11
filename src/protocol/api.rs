@@ -764,15 +764,11 @@ impl ApiVersionsResponse {
             return Ok(Vec::new());
         };
         let mut buf = &field.data[..];
-        let raw_count = crate::util::varint::decode_unsigned_varint(&mut buf)? as usize;
-        if raw_count == 0 {
-            return Ok(Vec::new());
-        }
-        // compact array length is count + 1; actual items = count - 1
-        let items = raw_count.saturating_sub(1);
+        let raw_count = crate::util::varint::decode_unsigned_varint(&mut buf)?;
+        let items = super::check_compact_array_len(raw_count)?;
         if items > MAX_SUPPORTED_FEATURES {
             return Err(crate::error::KrafkaError::protocol(format!(
-                "SupportedFeatures array too large: {items}"
+                "SupportedFeatures array length {items} exceeds limit {MAX_SUPPORTED_FEATURES}"
             )));
         }
         let mut features = Vec::with_capacity(items);
@@ -822,6 +818,7 @@ mod tests {
     use bytes::BytesMut;
 
     use super::*;
+    use crate::protocol::primitives::TaggedField;
 
     #[test]
     fn test_api_key_roundtrip() {
@@ -1021,5 +1018,73 @@ mod tests {
         let resp = ApiVersionsResponse::decode_v0(&mut data).unwrap();
         assert!(resp.supported_features.is_empty());
         assert_eq!(resp.throttle_time_ms, 0);
+    }
+
+    #[test]
+    fn test_parse_supported_features_null_rejected() {
+        use crate::util::varint;
+        // raw varint 0 means null — non-nullable field must reject it
+        let mut tag_data = BytesMut::new();
+        varint::encode_unsigned_varint(0, &mut tag_data);
+        let tagged = TaggedFields(vec![TaggedField {
+            tag: 0,
+            data: tag_data.freeze(),
+        }]);
+        let err = ApiVersionsResponse::parse_supported_features(&tagged).unwrap_err();
+        assert!(
+            err.to_string().contains("null"),
+            "expected null rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_supported_features_exceeds_max() {
+        use crate::util::varint;
+        // 257 items exceeds MAX_SUPPORTED_FEATURES (256)
+        let mut tag_data = BytesMut::new();
+        varint::encode_unsigned_varint(258, &mut tag_data); // 257 + 1
+        // Append 257 minimal feature entries
+        for i in 0..257u16 {
+            let name = format!("f{i}");
+            varint::encode_unsigned_varint(name.len() as u32 + 1, &mut tag_data);
+            tag_data.put_slice(name.as_bytes());
+            tag_data.put_i16(0); // min_version
+            tag_data.put_i16(1); // max_version
+            tag_data.put_u8(0); // per-entry tagged fields
+        }
+        let tagged = TaggedFields(vec![TaggedField {
+            tag: 0,
+            data: tag_data.freeze(),
+        }]);
+        let err = ApiVersionsResponse::parse_supported_features(&tagged).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds limit"),
+            "expected limit error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_supported_features_trailing_bytes() {
+        use crate::util::varint;
+        let mut tag_data = BytesMut::new();
+        // 1 feature (varint(2) = 1+1)
+        varint::encode_unsigned_varint(2, &mut tag_data);
+        let name = b"test.feature";
+        varint::encode_unsigned_varint(name.len() as u32 + 1, &mut tag_data);
+        tag_data.put_slice(name);
+        tag_data.put_i16(0); // min_version
+        tag_data.put_i16(1); // max_version
+        tag_data.put_u8(0); // per-entry tagged fields
+        // Append garbage trailing byte
+        tag_data.put_u8(0xFF);
+        let tagged = TaggedFields(vec![TaggedField {
+            tag: 0,
+            data: tag_data.freeze(),
+        }]);
+        let err = ApiVersionsResponse::parse_supported_features(&tagged).unwrap_err();
+        assert!(
+            err.to_string().contains("trailing bytes"),
+            "expected trailing bytes error, got: {err}"
+        );
     }
 }

@@ -4,23 +4,6 @@ use super::{VersionedDecode, VersionedEncode};
 use crate::error::{ErrorCode, KrafkaError, Result};
 use crate::protocol::check_compact_array_len;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
-macro_rules! unsupported_encode {
-    ($type:expr, $version:expr) => {
-        Err(KrafkaError::protocol(format!(
-            "unsupported {} encode version {}",
-            $type, $version
-        )))
-    };
-}
-
-macro_rules! unsupported_decode {
-    ($type:expr, $version:expr) => {
-        Err(KrafkaError::protocol(format!(
-            "unsupported {} decode version {}",
-            $type, $version
-        )))
-    };
-}
 
 // ============================================================================
 // GetTelemetrySubscriptions (API Key 71) — KIP-714

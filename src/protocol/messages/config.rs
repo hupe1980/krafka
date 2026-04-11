@@ -1,28 +1,11 @@
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_string};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, Result};
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{
     array_len_i32, check_compact_array_len, check_decode_array_len, encode_compact_array_len,
 };
-macro_rules! unsupported_encode {
-    ($type:expr, $version:expr) => {
-        Err(KrafkaError::protocol(format!(
-            "unsupported {} encode version {}",
-            $type, $version
-        )))
-    };
-}
-
-macro_rules! unsupported_decode {
-    ($type:expr, $version:expr) => {
-        Err(KrafkaError::protocol(format!(
-            "unsupported {} decode version {}",
-            $type, $version
-        )))
-    };
-}
 
 // ============================================================================
 // DescribeConfigs API (Key 32)

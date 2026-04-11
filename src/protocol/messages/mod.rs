@@ -64,6 +64,32 @@ pub(crate) fn non_nullable_bytes(field: &str, opt: Option<Bytes>) -> Result<Byte
     opt.ok_or_else(|| crate::error::KrafkaError::protocol(format!("{field} must not be null")))
 }
 
+/// Generate a protocol error for an unsupported encode version.
+///
+/// Used in `VersionedEncode::encode_versioned` match arms for versions
+/// outside the implemented range.
+macro_rules! unsupported_encode {
+    ($type:expr, $version:expr) => {
+        Err($crate::error::KrafkaError::protocol(format!(
+            "unsupported {} encode version {}",
+            $type, $version
+        )))
+    };
+}
+
+/// Generate a protocol error for an unsupported decode version.
+///
+/// Used in `VersionedDecode::decode_versioned` match arms for versions
+/// outside the implemented range.
+macro_rules! unsupported_decode {
+    ($type:expr, $version:expr) => {
+        Err($crate::error::KrafkaError::protocol(format!(
+            "unsupported {} decode version {}",
+            $type, $version
+        )))
+    };
+}
+
 mod acl;
 pub use acl::*;
 

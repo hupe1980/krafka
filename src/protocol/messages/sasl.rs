@@ -1,26 +1,9 @@
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_bytes};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, Result};
 use crate::protocol::check_decode_array_len;
 use crate::protocol::primitives::{Decode, KafkaBytes, KafkaString, TryEncode};
-macro_rules! unsupported_encode {
-    ($type:expr, $version:expr) => {
-        Err(KrafkaError::protocol(format!(
-            "unsupported {} encode version {}",
-            $type, $version
-        )))
-    };
-}
-
-macro_rules! unsupported_decode {
-    ($type:expr, $version:expr) => {
-        Err(KrafkaError::protocol(format!(
-            "unsupported {} decode version {}",
-            $type, $version
-        )))
-    };
-}
 
 // ============================================================================
 // SaslHandshake (API Key 17) - SASL Mechanism Negotiation
