@@ -16,7 +16,9 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpSocket;
 use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio::time::{timeout, timeout_at};
+use tokio::time::timeout;
+#[cfg(feature = "socks5")]
+use tokio::time::timeout_at;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::CorrelationId;
