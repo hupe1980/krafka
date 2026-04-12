@@ -40,9 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for broker in &cluster.brokers {
         println!(
             "  - ID: {}, Address: {}:{}",
-            broker.id,
-            broker.host(),
-            broker.port()
+            broker.broker_id, broker.host, broker.port
         );
     }
 

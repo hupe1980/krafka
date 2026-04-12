@@ -33,7 +33,11 @@ struct PartitionState {
 /// Per-broker fetch session state.
 #[derive(Debug)]
 pub struct FetchSessionState {
-    /// Broker ID this session belongs to (used in Debug output and tests).
+    /// Broker ID this session belongs to.
+    ///
+    /// Not read in production code but included in `Debug` output for
+    /// diagnostics (the compiler intentionally ignores derive usage for
+    /// dead-code analysis).
     #[allow(dead_code)]
     broker_id: BrokerId,
     /// Session ID returned by the broker (0 = no session).

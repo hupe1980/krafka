@@ -58,6 +58,16 @@
 //! | DescribeTopicPartitions | 0 | 0 | v0 KIP-966 paginated partition describe |
 //! | UpdateFeatures | 0 | 1 | v0 AllowDowngrade, v1 UpgradeType + ValidateOnly (KIP-584) |
 //! | ListClientMetricsResources | 0 | 0 | v0 KIP-714 telemetry discovery |
+//! | AlterReplicaLogDirs | 1 | 2 | v1 non-flexible, v2 flexible encoding |
+//! | OffsetDelete | 0 | 0 | v0 non-flexible (flexibleVersions: none) |
+//! | DescribeUserScramCredentials | 0 | 0 | v0 KIP-554 |
+//! | AlterUserScramCredentials | 0 | 0 | v0 KIP-554 |
+//! | DescribeProducers | 0 | 0 | v0 KIP-664 transaction debug |
+//! | DescribeTransactions | 0 | 0 | v0 KIP-664 transaction debug |
+//! | ListTransactions | 0 | 1 | v0 KIP-664, v1 DurationFilter (KIP-994) |
+//! | ElectLeaders | 0 | 2 | v1 ElectionType (KIP-460), v2 flexible |
+//! | AlterPartitionReassignments | 0 | 0 | v0 all flexible (KIP-455) |
+//! | ListPartitionReassignments | 0 | 0 | v0 all flexible (KIP-455) |
 //!
 //! ## Example
 //!
@@ -395,6 +405,16 @@ pub mod versions {
     /// Maximum supported DeleteRecords version (v2 flexible encoding).
     pub const DELETE_RECORDS_MAX: i16 = 2;
 
+    // ── DescribeLogDirs (API key 35) ─────────────────────────────────────
+    /// Minimum supported DescribeLogDirs version.
+    /// v0 was removed in Kafka 4.0; v1 is the baseline.
+    pub const DESCRIBE_LOG_DIRS_MIN: i16 = 1;
+    /// Maximum supported DescribeLogDirs version (v4 adds TotalBytes/UsableBytes).
+    ///
+    /// v1 baseline, v2 flexible encoding, v3 top-level error_code,
+    /// v4 TotalBytes + UsableBytes per log dir.
+    pub const DESCRIBE_LOG_DIRS_MAX: i16 = 4;
+
     // ── OffsetForLeaderEpoch (API key 23) ────────────────────────────────
     /// Minimum supported OffsetForLeaderEpoch version. v2+ adds leader epoch.
     pub const OFFSET_FOR_LEADER_EPOCH_MIN: i16 = 2;
@@ -451,19 +471,23 @@ pub mod versions {
     /// Minimum supported CreateDelegationToken version. Kafka 4.0 removed v0.
     pub const CREATE_DELEGATION_TOKEN_MIN: i16 = 1;
     /// Maximum supported CreateDelegationToken version.
-    pub const CREATE_DELEGATION_TOKEN_MAX: i16 = 1;
+    /// v2 flexible encoding, v3 adds owner principal override.
+    pub const CREATE_DELEGATION_TOKEN_MAX: i16 = 3;
     /// Minimum supported RenewDelegationToken version. Kafka 4.0 removed v0.
     pub const RENEW_DELEGATION_TOKEN_MIN: i16 = 1;
     /// Maximum supported RenewDelegationToken version.
-    pub const RENEW_DELEGATION_TOKEN_MAX: i16 = 1;
+    /// v2 flexible encoding.
+    pub const RENEW_DELEGATION_TOKEN_MAX: i16 = 2;
     /// Minimum supported ExpireDelegationToken version. Kafka 4.0 removed v0.
     pub const EXPIRE_DELEGATION_TOKEN_MIN: i16 = 1;
     /// Maximum supported ExpireDelegationToken version.
-    pub const EXPIRE_DELEGATION_TOKEN_MAX: i16 = 1;
+    /// v2 flexible encoding.
+    pub const EXPIRE_DELEGATION_TOKEN_MAX: i16 = 2;
     /// Minimum supported DescribeDelegationToken version. Kafka 4.0 removed v0.
     pub const DESCRIBE_DELEGATION_TOKEN_MIN: i16 = 1;
     /// Maximum supported DescribeDelegationToken version.
-    pub const DESCRIBE_DELEGATION_TOKEN_MAX: i16 = 1;
+    /// v2 flexible encoding, v3 adds token requester fields.
+    pub const DESCRIBE_DELEGATION_TOKEN_MAX: i16 = 3;
 
     // ── Client Quotas APIs (48–49) ───────────────────────────────────────
     /// Minimum supported DescribeClientQuotas version.
@@ -505,6 +529,78 @@ pub mod versions {
     /// Maximum supported UpdateFeatures version (v1 adds UpgradeType + ValidateOnly).
     pub const UPDATE_FEATURES_MAX: i16 = 1;
 
+    // ── ElectLeaders (API key 43) ────────────────────────────────────────
+    /// Minimum supported ElectLeaders version.
+    /// v0 preferred-only election; v1 adds ElectionType (KIP-460);
+    /// v2 flexible encoding.
+    pub const ELECT_LEADERS_MIN: i16 = 0;
+    /// Maximum supported ElectLeaders version.
+    pub const ELECT_LEADERS_MAX: i16 = 2;
+
+    // ── AlterPartitionReassignments (API key 45) ─────────────────────────
+    /// Minimum supported AlterPartitionReassignments version.
+    /// All versions use flexible encoding.
+    pub const ALTER_PARTITION_REASSIGNMENTS_MIN: i16 = 0;
+    /// Maximum supported AlterPartitionReassignments version.
+    pub const ALTER_PARTITION_REASSIGNMENTS_MAX: i16 = 0;
+
+    // ── ListPartitionReassignments (API key 46) ──────────────────────────
+    /// Minimum supported ListPartitionReassignments version.
+    /// All versions use flexible encoding.
+    pub const LIST_PARTITION_REASSIGNMENTS_MIN: i16 = 0;
+    /// Maximum supported ListPartitionReassignments version.
+    pub const LIST_PARTITION_REASSIGNMENTS_MAX: i16 = 0;
+
+    // ── AlterReplicaLogDirs (API key 34) ─────────────────────────────────
+    /// Minimum supported AlterReplicaLogDirs version.
+    /// v1 non-flexible; v2 flexible encoding.
+    pub const ALTER_REPLICA_LOG_DIRS_MIN: i16 = 1;
+    /// Maximum supported AlterReplicaLogDirs version.
+    pub const ALTER_REPLICA_LOG_DIRS_MAX: i16 = 2;
+
+    // ── OffsetDelete (API key 47) ────────────────────────────────────────
+    /// Minimum supported OffsetDelete version.
+    /// flexibleVersions: "none" — always non-flexible.
+    pub const OFFSET_DELETE_MIN: i16 = 0;
+    /// Maximum supported OffsetDelete version.
+    pub const OFFSET_DELETE_MAX: i16 = 0;
+
+    // ── DescribeUserScramCredentials (API key 50) ────────────────────────
+    /// Minimum supported DescribeUserScramCredentials version.
+    /// All versions use flexible encoding.
+    pub const DESCRIBE_USER_SCRAM_CREDENTIALS_MIN: i16 = 0;
+    /// Maximum supported DescribeUserScramCredentials version.
+    pub const DESCRIBE_USER_SCRAM_CREDENTIALS_MAX: i16 = 0;
+
+    // ── AlterUserScramCredentials (API key 51) ───────────────────────────
+    /// Minimum supported AlterUserScramCredentials version.
+    /// All versions use flexible encoding.
+    pub const ALTER_USER_SCRAM_CREDENTIALS_MIN: i16 = 0;
+    /// Maximum supported AlterUserScramCredentials version.
+    pub const ALTER_USER_SCRAM_CREDENTIALS_MAX: i16 = 0;
+
+    // ── DescribeProducers (API key 61) ───────────────────────────────────
+    /// Minimum supported DescribeProducers version.
+    /// All versions use flexible encoding.
+    pub const DESCRIBE_PRODUCERS_MIN: i16 = 0;
+    /// Maximum supported DescribeProducers version.
+    pub const DESCRIBE_PRODUCERS_MAX: i16 = 0;
+
+    // ── DescribeTransactions (API key 65) ────────────────────────────────
+    /// Minimum supported DescribeTransactions version.
+    /// All versions use flexible encoding.
+    pub const DESCRIBE_TRANSACTIONS_MIN: i16 = 0;
+    /// Maximum supported DescribeTransactions version.
+    pub const DESCRIBE_TRANSACTIONS_MAX: i16 = 0;
+
+    // ── ListTransactions (API key 66) ────────────────────────────────────
+    /// Minimum supported ListTransactions version.
+    /// All versions use flexible encoding.
+    pub const LIST_TRANSACTIONS_MIN: i16 = 0;
+    /// Maximum supported ListTransactions version.
+    /// v1 adds DurationFilter (KIP-994).
+    pub const LIST_TRANSACTIONS_MAX: i16 = 1;
+
     // ── ConsumerGroupDescribe (API key 69) ───────────────────────────────
     /// Minimum supported ConsumerGroupDescribe version.
     pub const CONSUMER_GROUP_DESCRIBE_MIN: i16 = 0;
@@ -522,6 +618,22 @@ pub mod versions {
     pub const LIST_CLIENT_METRICS_RESOURCES_MIN: i16 = 0;
     /// Maximum supported ListClientMetricsResources version.
     pub const LIST_CLIENT_METRICS_RESOURCES_MAX: i16 = 0;
+
+    // ── WriteTxnMarkers (API key 27) ─────────────────────────────────────
+    /// Minimum supported WriteTxnMarkers version.
+    /// v0 was removed in Kafka 4.0; v1 is the baseline (flexible encoding).
+    pub const WRITE_TXN_MARKERS_MIN: i16 = 1;
+    /// Maximum supported WriteTxnMarkers version.
+    /// v1 flexible baseline; v2 adds TransactionVersion (KIP-1228).
+    pub const WRITE_TXN_MARKERS_MAX: i16 = 1;
+
+    // ── DescribeQuorum (API key 55) ──────────────────────────────────────
+    /// Minimum supported DescribeQuorum version.
+    /// All versions use flexible encoding.
+    pub const DESCRIBE_QUORUM_MIN: i16 = 0;
+    /// Maximum supported DescribeQuorum version.
+    /// v0 baseline; v1 adds timestamps (KIP-836); v2 adds Nodes (KIP-853).
+    pub const DESCRIBE_QUORUM_MAX: i16 = 0;
 
     // ── GetTelemetrySubscriptions (API key 71) — KIP-714 ─────────────────
     /// Minimum supported GetTelemetrySubscriptions version.

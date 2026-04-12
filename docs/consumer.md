@@ -1079,9 +1079,9 @@ top-level fields) and starts a fresh heartbeat task.
 ### Describing KIP-848 Groups
 
 To inspect a KIP-848 consumer group (state, epochs, member assignments), use
-the AdminClient's `describe_consumer_groups()` method which calls the
-ConsumerGroupDescribe API (Key 69). See the
-[Admin Client Guide](admin.md#describing-kip-848-consumer-groups) for details.
+the AdminClient's `describe_consumer_groups()` method which auto-detects the
+group type and dispatches to the appropriate API. See the
+[Admin Client Guide](admin.md#describing-consumer-groups) for details.
 
 ### Limitations
 

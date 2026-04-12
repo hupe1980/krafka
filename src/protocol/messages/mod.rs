@@ -9,18 +9,52 @@
 //! - [`produce`] — Produce request/response
 //! - [`fetch`] — Fetch request/response
 //! - [`coordinator`] — FindCoordinator request/response
-//! - [`group`] — JoinGroup, SyncGroup, Heartbeat, LeaveGroup
-//! - [`offset`] — OffsetCommit, ListOffsets, OffsetFetch, OffsetForLeaderEpoch
-//! - [`topic`] — CreateTopics, DeleteTopics, CreatePartitions, DescribeTopicPartitions
-//! - [`config`] — DescribeConfigs, IncrementalAlterConfigs
-//! - [`admin`] — DescribeGroups, ListGroups, DeleteGroups, DescribeCluster, ConsumerGroupDescribe
+//! - [`join_group`] — JoinGroup
+//! - [`sync_group`] — SyncGroup
+//! - [`heartbeat`] — Heartbeat
+//! - [`leave_group`] — LeaveGroup
+//! - [`offset_commit`] — OffsetCommit
+//! - [`list_offsets`] — ListOffsets
+//! - [`offset_fetch`] — OffsetFetch
+//! - [`offset_for_leader_epoch`] — OffsetForLeaderEpoch
+//! - [`create_topics`] — CreateTopics
+//! - [`delete_topics`] — DeleteTopics
+//! - [`create_partitions`] — CreatePartitions
+//! - [`describe_topic_partitions`] — DescribeTopicPartitions
+//! - [`describe_configs`] — DescribeConfigs
+//! - [`incremental_alter_configs`] — IncrementalAlterConfigs
+//! - [`consumer_group_describe`] — ConsumerGroupDescribe (Key 69, KIP-848)
+//! - [`delete_groups`] — DeleteGroups (Key 42)
+//! - [`describe_cluster`] — DescribeCluster (Key 60)
+//! - [`describe_groups`] — DescribeGroups (Key 15)
+//! - [`list_client_metrics_resources`] — ListClientMetricsResources (Key 74)
+//! - [`list_groups`] — ListGroups (Key 16)
+//! - [`update_features`] — UpdateFeatures (Key 57, KIP-584)
 //! - [`sasl`] — SaslHandshake, SaslAuthenticate
 //! - [`acl`] — ACL management (DescribeAcls, CreateAcls, DeleteAcls)
-//! - [`txn`] — InitProducerId, AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit
+//! - [`init_producer_id`] — InitProducerId
+//! - [`add_partitions_to_txn`] — AddPartitionsToTxn
+//! - [`add_offsets_to_txn`] — AddOffsetsToTxn
+//! - [`end_txn`] — EndTxn, TransactionResult
+//! - [`txn_offset_commit`] — TxnOffsetCommit
 //! - [`delete_records`] — DeleteRecords
 //! - [`delegation_token`] — Delegation token management
-//! - [`quota`] — DescribeClientQuotas, AlterClientQuotas
+//! - [`describe_client_quotas`] — DescribeClientQuotas
+//! - [`alter_client_quotas`] — AlterClientQuotas
 //! - [`consumer_group_heartbeat`] — KIP-848 consumer group heartbeat
+//! - [`alter_partition_reassignments`] — AlterPartitionReassignments
+//! - [`alter_replica_log_dirs`] — AlterReplicaLogDirs
+//! - [`describe_log_dirs`] — DescribeLogDirs
+//! - [`describe_producers`] — DescribeProducers
+//! - [`describe_transactions`] — DescribeTransactions
+//! - [`describe_quorum`] — DescribeQuorum
+//! - [`elect_leaders`] — ElectLeaders
+//! - [`list_partition_reassignments`] — ListPartitionReassignments
+//! - [`list_transactions`] — ListTransactions
+//! - [`offset_delete`] — OffsetDelete
+//! - [`describe_user_scram_credentials`] — DescribeUserScramCredentials
+//! - [`alter_user_scram_credentials`] — AlterUserScramCredentials
+//! - [`write_txn_markers`] — WriteTxnMarkers
 //! - [`telemetry`] — KIP-714 telemetry (feature-gated)
 //! - [`share`] — KIP-932 share groups (feature-gated)
 
@@ -93,11 +127,38 @@ macro_rules! unsupported_decode {
 mod acl;
 pub use acl::*;
 
-mod admin;
-pub use admin::*;
+mod consumer_group_describe;
+pub use consumer_group_describe::*;
 
-mod config;
-pub use config::*;
+mod delete_groups;
+pub use delete_groups::*;
+
+mod describe_cluster;
+pub use describe_cluster::*;
+
+mod describe_groups;
+pub use describe_groups::*;
+
+mod list_client_metrics_resources;
+pub use list_client_metrics_resources::*;
+
+mod list_groups;
+pub use list_groups::*;
+
+mod update_features;
+pub use update_features::*;
+
+mod alter_partition_reassignments;
+pub use alter_partition_reassignments::*;
+
+mod alter_replica_log_dirs;
+pub use alter_replica_log_dirs::*;
+
+mod describe_configs;
+pub use describe_configs::*;
+
+mod incremental_alter_configs;
+pub use incremental_alter_configs::*;
 
 mod consumer_group_heartbeat;
 pub use consumer_group_heartbeat::*;
@@ -111,23 +172,68 @@ pub use delegation_token::*;
 mod delete_records;
 pub use delete_records::*;
 
+mod describe_log_dirs;
+pub use describe_log_dirs::*;
+
+mod describe_producers;
+pub use describe_producers::*;
+
+mod describe_transactions;
+pub use describe_transactions::*;
+
+mod describe_quorum;
+pub use describe_quorum::*;
+
+mod elect_leaders;
+pub use elect_leaders::*;
+
 mod fetch;
 pub use fetch::*;
 
-mod group;
-pub use group::*;
+mod heartbeat;
+pub use heartbeat::*;
+
+mod join_group;
+pub use join_group::*;
+
+mod leave_group;
+pub use leave_group::*;
+
+mod sync_group;
+pub use sync_group::*;
+
+mod list_partition_reassignments;
+pub use list_partition_reassignments::*;
+
+mod list_transactions;
+pub use list_transactions::*;
 
 mod metadata;
 pub use metadata::*;
 
-mod offset;
-pub use offset::*;
+mod list_offsets;
+pub use list_offsets::*;
+
+mod offset_commit;
+pub use offset_commit::*;
+
+mod offset_fetch;
+pub use offset_fetch::*;
+
+mod offset_for_leader_epoch;
+pub use offset_for_leader_epoch::*;
+
+mod offset_delete;
+pub use offset_delete::*;
 
 mod produce;
 pub use produce::*;
 
-mod quota;
-pub use quota::*;
+mod describe_client_quotas;
+pub use describe_client_quotas::*;
+
+mod alter_client_quotas;
+pub use alter_client_quotas::*;
 
 mod sasl;
 pub use sasl::*;
@@ -144,8 +250,38 @@ mod telemetry;
 #[cfg_attr(docsrs, doc(cfg(feature = "telemetry")))]
 pub use telemetry::*;
 
-mod topic;
-pub use topic::*;
+mod create_topics;
+pub use create_topics::*;
 
-mod txn;
-pub use txn::*;
+mod delete_topics;
+pub use delete_topics::*;
+
+mod create_partitions;
+pub use create_partitions::*;
+
+mod describe_topic_partitions;
+pub use describe_topic_partitions::*;
+
+mod add_offsets_to_txn;
+pub use add_offsets_to_txn::*;
+
+mod add_partitions_to_txn;
+pub use add_partitions_to_txn::*;
+
+mod end_txn;
+pub use end_txn::*;
+
+mod init_producer_id;
+pub use init_producer_id::*;
+
+mod txn_offset_commit;
+pub use txn_offset_commit::*;
+
+mod describe_user_scram_credentials;
+pub use describe_user_scram_credentials::*;
+
+mod alter_user_scram_credentials;
+pub use alter_user_scram_credentials::*;
+
+mod write_txn_markers;
+pub use write_txn_markers::*;

@@ -1181,8 +1181,9 @@ async fn test_admin_describe_configs() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Describe topic configs
+    use krafka::admin::DescribeConfigsRequest;
     let configs = admin
-        .describe_topic_config(topic_name)
+        .describe_configs(DescribeConfigsRequest::for_topic(topic_name))
         .await
         .expect("Failed to describe configs");
 
@@ -1478,8 +1479,9 @@ async fn test_admin_alter_topic_config() {
     assert!(result.error.is_none(), "Config alteration should succeed");
 
     // Verify the config was changed
+    use krafka::admin::DescribeConfigsRequest;
     let topic_configs = admin
-        .describe_topic_config(topic_name)
+        .describe_configs(DescribeConfigsRequest::for_topic(topic_name))
         .await
         .expect("Failed to describe config");
 
@@ -1526,9 +1528,9 @@ async fn test_admin_describe_cluster() {
     // Note: controller_id may be None in some Kafka configurations
 
     let broker = &cluster.brokers[0];
-    assert!(!broker.host().is_empty(), "Broker should have a host");
-    assert!(broker.port() > 0, "Broker should have a valid port");
-    assert!(broker.id >= 0, "Broker should have a valid ID");
+    assert!(!broker.host.is_empty(), "Broker should have a host");
+    assert!(broker.port > 0, "Broker should have a valid port");
+    assert!(broker.broker_id >= 0, "Broker should have a valid ID");
 }
 
 #[tokio::test]
@@ -2087,9 +2089,9 @@ async fn test_admin_describe_consumer_group() {
         .unwrap();
 
     let descriptions = admin
-        .describe_groups(vec![group_id.to_string()])
+        .describe_consumer_groups(vec![group_id.to_string()])
         .await
-        .expect("describe_groups failed");
+        .expect("describe_consumer_groups failed");
 
     assert_eq!(descriptions.len(), 1);
     assert_eq!(descriptions[0].group_id, group_id);
@@ -2136,13 +2138,13 @@ async fn test_consumer_close_leaves_group() {
         .unwrap();
 
     let descriptions = admin
-        .describe_groups(vec![group_id.to_string()])
+        .describe_consumer_groups(vec![group_id.to_string()])
         .await
-        .expect("describe_groups failed");
+        .expect("describe_consumer_groups failed");
 
     assert!(
         !descriptions.is_empty(),
-        "describe_groups should return the group even after close"
+        "describe_consumer_groups should return the group even after close"
     );
     assert!(
         descriptions[0].members.is_empty(),
@@ -2193,11 +2195,12 @@ async fn test_empty_value_message() {
     consumer.close().await;
 }
 
-/// Test admin describe_broker_config returns broker configuration.
+/// Test admin describe_configs returns broker configuration.
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_admin_describe_broker_config() {
     use krafka::admin::AdminClient;
+    use krafka::admin::DescribeConfigsRequest;
 
     let (_container, bootstrap_servers) = kafka_container().await;
 
@@ -2208,12 +2211,12 @@ async fn test_admin_describe_broker_config() {
         .unwrap();
 
     let cluster = admin.describe_cluster().await.unwrap();
-    let broker_id = cluster.brokers[0].id;
+    let broker_id = cluster.brokers[0].broker_id;
 
     let configs = admin
-        .describe_broker_config(broker_id)
+        .describe_configs(DescribeConfigsRequest::for_broker(broker_id))
         .await
-        .expect("describe_broker_config failed");
+        .expect("describe_configs failed");
 
     assert!(!configs.is_empty(), "Broker should have config entries");
 
@@ -2426,7 +2429,10 @@ async fn test_admin_create_topic_with_config() {
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let configs = admin.describe_topic_config(topic).await.unwrap();
+    let configs = admin
+        .describe_configs(krafka::admin::DescribeConfigsRequest::for_topic(topic))
+        .await
+        .unwrap();
     let retention = configs.iter().find(|c| c.name == "retention.ms");
     assert!(retention.is_some(), "Should have retention.ms config");
     assert_eq!(
