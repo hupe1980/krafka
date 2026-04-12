@@ -914,6 +914,9 @@ pub enum HeartbeatCommand {
     Stop,
     /// Trigger a rejoin.
     Rejoin,
+    /// Send an immediate heartbeat with current owned partitions to
+    /// acknowledge a revocation (KIP-848 §revocation-ack).
+    AcknowledgeRevocation,
 }
 
 /// Group coordinator that manages group membership, heartbeats, and offset commits.
@@ -1794,6 +1797,9 @@ impl GroupCoordinator {
                                 heartbeat_controller.stop();
                                 break;
                             }
+                            Some(HeartbeatCommand::AcknowledgeRevocation) => {
+                                // Not applicable to the classic protocol — ignore.
+                            }
                         }
                     }
                 }
@@ -1818,6 +1824,15 @@ impl GroupCoordinator {
         let tx = self.heartbeat_cmd_tx.read().await.clone();
         if let Some(tx) = tx {
             let _ = tx.send(HeartbeatCommand::Rejoin).await;
+        }
+    }
+
+    /// Signal the heartbeat task to send an immediate full heartbeat with
+    /// the current owned partitions, acknowledging a revocation (KIP-848).
+    pub async fn acknowledge_revocation(&self) {
+        let tx = self.heartbeat_cmd_tx.read().await.clone();
+        if let Some(tx) = tx {
+            let _ = tx.send(HeartbeatCommand::AcknowledgeRevocation).await;
         }
     }
 
@@ -1854,6 +1869,17 @@ impl GroupCoordinator {
         topic_partitions: Option<Vec<ConsumerGroupTopicPartitions>>,
     ) -> Result<ConsumerGroupHeartbeatResponse> {
         let conn = self.get_coordinator_connection().await?;
+
+        // KIP-1082 (v1+): member ID must be client-generated. Generate a
+        // UUID on the first heartbeat and persist it for the member lifetime.
+        // Use a single write lock to avoid a TOCTOU race where two concurrent
+        // callers could both see an empty ID and both generate a UUID.
+        {
+            let mut id = self.member_id.write().await;
+            if id.is_empty() {
+                *id = crate::util::random_uuid_v4();
+            }
+        }
         let member_id = self.member_id.read().await.clone();
         let member_epoch = *self.member_epoch.read().await;
 
@@ -2136,6 +2162,8 @@ impl GroupCoordinator {
         let metadata_ref = self.metadata.clone();
         let target_assignment_ref = self.target_assignment.clone();
         let topic_names_cache_ref = self.topic_names_cache.clone();
+        let subscribed_topics_snapshot = self.subscribed_topics.read().await.clone();
+        let rebalance_timeout = self.rebalance_timeout;
 
         tokio::spawn(async move {
             debug!(
@@ -2181,6 +2209,10 @@ impl GroupCoordinator {
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut current_interval_ms = interval.as_millis() as i32;
+            // KIP-848 spec: "The member must set all (top-level) fields when
+            // it joins for the first time or when an error/timeout occurs."
+            // Start `true` so the very first tick sends a full heartbeat.
+            let mut send_full_heartbeat = true;
 
             loop {
                 tokio::select! {
@@ -2194,17 +2226,34 @@ impl GroupCoordinator {
                         let epoch = *member_epoch_ref.read().await;
 
                         if let Some(ref conn) = coordinator_conn {
+                            // Build owned-partition snapshot from target
+                            // assignment for revocation acknowledgment.
+                            let owned_partitions = {
+                                let ta = target_assignment_ref.read().await;
+                                if ta.is_empty() { None } else { Some(ta.clone()) }
+                            };
+
+                            let (sub_names, rebal_timeout_ms, topic_parts) = if send_full_heartbeat {
+                                (
+                                    Some(subscribed_topics_snapshot.clone()),
+                                    crate::util::duration_to_millis_i32(rebalance_timeout),
+                                    owned_partitions,
+                                )
+                            } else {
+                                (None, -1, None)
+                            };
+
                             let request = ConsumerGroupHeartbeatRequest {
                                 group_id: group_id.clone(),
                                 member_id,
                                 member_epoch: epoch,
                                 instance_id: group_instance_id.clone(),
                                 rack_id: None,
-                                rebalance_timeout_ms: -1,
-                                subscribed_topic_names: None,
+                                rebalance_timeout_ms: rebal_timeout_ms,
+                                subscribed_topic_names: sub_names,
                                 subscribed_topic_regex: None,
                                 server_assignor: None,
-                                topic_partitions: None,
+                                topic_partitions: topic_parts,
                             };
 
                             match conn.send_request(
@@ -2295,6 +2344,7 @@ impl GroupCoordinator {
                                                 }
 
                                                 heartbeat_controller.heartbeat_success().await;
+                                                send_full_heartbeat = false;
 
                                                 // Update interval if the coordinator changed it.
                                                 let new_ms = resp.heartbeat_interval_ms.max(1000);
@@ -2313,6 +2363,7 @@ impl GroupCoordinator {
                                                     tick.tick().await;
                                                 }
                                             } else if resp.error_code == ErrorCode::RebalanceInProgress {
+                                                send_full_heartbeat = true;
                                                 heartbeat_controller.signal_rebalance();
                                             } else if resp.error_code == ErrorCode::StaleMemberEpoch {
                                                 // Stale epoch: our epoch is behind.
@@ -2327,6 +2378,7 @@ impl GroupCoordinator {
                                                      updated epoch to {}, will retry on next heartbeat",
                                                     group_id, resp.member_epoch
                                                 );
+                                                send_full_heartbeat = true;
                                                 heartbeat_controller.heartbeat_success().await;
                                             } else if resp.error_code == ErrorCode::UnknownMemberId
                                                 || resp.error_code == ErrorCode::FencedMemberEpoch
@@ -2350,6 +2402,7 @@ impl GroupCoordinator {
                                                     "KIP-848 unsupported assignor for '{}': {:?}",
                                                     group_id, resp.error_message
                                                 );
+                                                send_full_heartbeat = true;
                                                 heartbeat_controller.signal_rebalance();
                                             } else if resp.error_code
                                                 == ErrorCode::InvalidRegularExpression
@@ -2384,11 +2437,13 @@ impl GroupCoordinator {
                                                 // Transient: coordinator is loading state.
                                                 // Keep the connection and retry on the
                                                 // next heartbeat tick.
+                                                send_full_heartbeat = true;
                                                 debug!(
                                                     "KIP-848 coordinator loading for '{}', will retry",
                                                     group_id
                                                 );
                                             } else {
+                                                send_full_heartbeat = true;
                                                 warn!(
                                                     "KIP-848 heartbeat error for '{}': {:?}",
                                                     group_id, resp.error_code
@@ -2396,6 +2451,7 @@ impl GroupCoordinator {
                                             }
                                         }
                                         Err(e) => {
+                                            send_full_heartbeat = true;
                                             warn!(
                                                 "Failed to decode KIP-848 heartbeat response for '{}': {}",
                                                 group_id, e
@@ -2424,6 +2480,17 @@ impl GroupCoordinator {
                         match cmd {
                             Some(HeartbeatCommand::Stop) | None => break,
                             Some(HeartbeatCommand::Rejoin) => break,
+                            Some(HeartbeatCommand::AcknowledgeRevocation) => {
+                                // KIP-848 §revocation-ack: after the consumer
+                                // layer processes revocations, send an immediate
+                                // heartbeat with the updated owned partitions so
+                                // the coordinator can proceed.
+                                send_full_heartbeat = true;
+                                tick.reset();
+                                // The next tick fires immediately because we
+                                // just reset the interval, which means the
+                                // loop will go around and send the full HB.
+                            }
                         }
                     }
                 }

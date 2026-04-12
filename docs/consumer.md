@@ -123,7 +123,7 @@ let consumer = Consumer::builder()
 
 ### Offset Commit
 
-Control how offsets are committed. When auto-commit is enabled (the default), Krafka automatically commits offsets during each `poll()` call when the commit interval has elapsed, and also during `close()`:
+Control how offsets are committed. When auto-commit is enabled (the default), Krafka automatically commits offsets during each `poll()` call when the commit interval has elapsed, during `close()`, and **before partition revocations** during rebalances (so the new partition owner sees up-to-date committed positions):
 
 ```rust
 use krafka::consumer::Consumer;
@@ -939,12 +939,8 @@ JoinGroup/SyncGroup round-trip and replaces it with a single
 
 ### Enabling KIP-848
 
-> **Not yet usable.** `Consumer::builder().group_protocol(GroupProtocol::Consumer).build()`
-> returns a configuration error because the KIP-848 code path has not been
-> integration-tested against a live broker. The wire-protocol support is
-> complete (ConsumerGroupHeartbeat v0–v1, Metadata v1–v13 including topic
-> UUIDs at v10+), but the guard will remain until end-to-end validation is
-> done.
+Set `GroupProtocol::Consumer` on the builder to use the KIP-848 consumer
+protocol. Requires Kafka 3.7+ (KIP-848 GA in Kafka 4.0).
 
 ```rust
 use krafka::consumer::{Consumer, GroupProtocol};
@@ -1001,12 +997,6 @@ Krafka resolves these UUIDs to topic names with a two-level lookup order:
 
 Successfully resolved names are cached locally. Unresolvable UUIDs still
 trigger an automatic metadata refresh.
-
-> **Note:** External users cannot reach these code paths today —
-> `ConsumerBuilder::build()` rejects `GroupProtocol::Consumer` until the
-> KIP-848 path has been integration-tested end-to-end (see
-> [Enabling KIP-848](#enabling-kip-848)). The error handling below exists as
-> defense-in-depth.
 
 If topic UUIDs
 remain unresolved after a metadata refresh during the initial heartbeat
@@ -1085,13 +1075,7 @@ group type and dispatches to the appropriate API. See the
 
 ### Limitations
 
-Offset commit and fetch currently negotiate only the older protocol versions
-supported by the client (`OFFSET_COMMIT_MAX=2`, `OFFSET_FETCH_MAX=1`), so
-the flexible v8–v9 wire format with member-epoch validation and OffsetFetch
-v8+ multi-group batching are **not yet active**. Encode/decode for those
-versions exists and the version-gating code is in place — bumping the MAX
-constants will activate them once integration-tested against a v9-capable
-broker. Full transactional offset support (`TxnOffsetCommit`) is not yet
+Full transactional offset support (`TxnOffsetCommit`) is not yet
 implemented.
 
 ## Consumer Interceptors

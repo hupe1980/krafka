@@ -684,6 +684,13 @@ impl Consumer {
             }
             _ => {}
         }
+        // Commit offsets for the partitions we are about to lose so the
+        // new owner sees up-to-date committed positions.
+        if self.config.enable_auto_commit
+            && let Err(e) = self.commit().await
+        {
+            warn!("Auto-commit before cooperative revocation failed: {}", e);
+        }
         self.rebalance_listener.on_partitions_revoked(revoked_tps);
         self.apply_partition_revocations(revoked_tuples).await;
 
@@ -955,6 +962,15 @@ impl Consumer {
 
         // Fire revocation callback and clean up per-partition state.
         if !revoked.is_empty() {
+            // KIP-848 §revocation: commit offsets for the partitions we are
+            // about to lose before invoking the user callback, so the new
+            // owner sees up-to-date committed positions. The old assignments
+            // are still active at this point, so `commit()` includes them.
+            if self.config.enable_auto_commit
+                && let Err(e) = self.commit().await
+            {
+                warn!("Auto-commit before KIP-848 revocation failed: {}", e);
+            }
             self.rebalance_listener.on_partitions_revoked(&revoked);
             let revoked_tuples: Vec<(String, PartitionId)> = revoked
                 .iter()
@@ -1000,6 +1016,13 @@ impl Consumer {
             self.fetch_and_apply_committed_offsets(&new_parts).await?;
         }
 
+        // KIP-848 §revocation-ack: after processing revocations, send an
+        // immediate heartbeat with the updated owned partitions so the
+        // coordinator can proceed with the rebalance.
+        if !revoked.is_empty() {
+            coordinator.acknowledge_revocation().await;
+        }
+
         Ok(())
     }
 
@@ -1015,6 +1038,13 @@ impl Consumer {
                 .iter()
                 .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
                 .collect();
+            // Commit offsets for all partitions before the eager revoke-all,
+            // so the group has up-to-date committed positions.
+            if self.config.enable_auto_commit
+                && let Err(e) = self.commit().await
+            {
+                warn!("Auto-commit before eager revocation failed: {}", e);
+            }
             self.rebalance_listener.on_partitions_revoked(&revoked);
             self.clear_partition_state().await;
 
@@ -3326,14 +3356,6 @@ impl ConsumerBuilder {
             return Err(KrafkaError::config(
                 "heartbeat_interval must be less than session_timeout \
                  (recommended: session_timeout / 3)",
-            ));
-        }
-        if self.config.group_protocol == crate::consumer::config::GroupProtocol::Consumer {
-            return Err(KrafkaError::config(
-                "GroupProtocol::Consumer (KIP-848) is not yet usable: \
-                 the protocol path has not been integration-tested against \
-                 a live broker. Use GroupProtocol::Classic until KIP-848 \
-                 support is validated end-to-end.",
             ));
         }
         let mut consumer = Consumer::new(self.config).await?;
