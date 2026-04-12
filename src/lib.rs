@@ -121,6 +121,9 @@ pub mod network;
 pub mod producer;
 pub mod protocol;
 pub mod schema_registry;
+#[cfg(feature = "unstable-protocol")]
+#[cfg_attr(docsrs, doc(cfg(feature = "unstable-protocol")))]
+pub mod share_consumer;
 #[cfg(feature = "telemetry")]
 #[cfg_attr(docsrs, doc(cfg(feature = "telemetry")))]
 pub mod telemetry;

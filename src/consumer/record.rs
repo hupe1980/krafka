@@ -29,6 +29,12 @@ pub struct ConsumerRecord {
     pub headers: Vec<(String, Option<Bytes>)>,
     /// Leader epoch.
     pub leader_epoch: Option<i32>,
+    /// Delivery count for share group records (KIP-932).
+    ///
+    /// The number of times this record has been delivered to consumers.
+    /// `None` for records consumed via regular consumer groups.
+    /// A value of 1 means the record is being delivered for the first time.
+    pub delivery_count: Option<i16>,
 }
 
 impl ConsumerRecord {
@@ -50,6 +56,7 @@ impl ConsumerRecord {
             value,
             headers: Vec::new(),
             leader_epoch: None,
+            delivery_count: None,
         }
     }
 

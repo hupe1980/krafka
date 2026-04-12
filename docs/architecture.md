@@ -489,6 +489,7 @@ All Krafka types are designed for concurrent use:
 
 - `Producer`: `Send + Sync` - can be shared across tasks
 - `Consumer`: `Send + Sync` - can be shared across tasks
+- `ShareConsumer`: `Send + Sync` - can be shared across tasks (unstable-protocol feature)
 - `AdminClient`: `Send + Sync` - can be shared across tasks
 
 Internal state is protected by:

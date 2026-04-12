@@ -657,6 +657,21 @@ impl ClusterMetadata {
             .map(|name| (**name).clone())
     }
 
+    /// Resolve a topic name to its 16-byte UUID.
+    ///
+    /// The mapping is populated from metadata v10+ responses. Returns `None`
+    /// if the topic is unknown or the broker did not return a topic ID — the
+    /// caller should trigger a metadata refresh and retry.
+    pub fn topic_id_for_name(&self, name: &str) -> Option<[u8; 16]> {
+        let cache = self.cache.load();
+        for (uuid, topic_name) in &cache.topic_ids {
+            if topic_name.as_ref() == name {
+                return Some(*uuid);
+            }
+        }
+        None
+    }
+
     /// Get all topics.
     pub fn topics(&self) -> Vec<TopicInfo> {
         self.cache

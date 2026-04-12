@@ -838,6 +838,7 @@ mod tests {
             value: value.map(|v| Bytes::from(v.to_string())),
             headers: Vec::new(),
             leader_epoch: None,
+            delivery_count: None,
         }
     }
 

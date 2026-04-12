@@ -2301,6 +2301,7 @@ impl Consumer {
                                             .map(|h| (h.key, h.value))
                                             .collect(),
                                         leader_epoch: None,
+                                        delivery_count: None,
                                     });
                                     last_offset_for_partition = Some(record_offset);
                                 }
@@ -3644,6 +3645,7 @@ mod tests {
                 value: Some(bytes::Bytes::from(format!("val-{i}"))),
                 headers: vec![],
                 leader_epoch: None,
+                delivery_count: None,
             })
             .collect();
 
@@ -3695,6 +3697,7 @@ mod tests {
                 value: Some(bytes::Bytes::from("val")),
                 headers: vec![],
                 leader_epoch: None,
+                delivery_count: None,
             });
         }
         // 3 records from partition 1
@@ -3709,6 +3712,7 @@ mod tests {
                 value: Some(bytes::Bytes::from("val")),
                 headers: vec![],
                 leader_epoch: None,
+                delivery_count: None,
             });
         }
 
@@ -3825,6 +3829,7 @@ mod tests {
             value: Some(bytes::Bytes::from("r1")),
             headers: vec![],
             leader_epoch: None,
+            delivery_count: None,
         });
         buffer.push_back(ConsumerRecord {
             topic: "t".into(),
@@ -3836,6 +3841,7 @@ mod tests {
             value: Some(bytes::Bytes::from("r2")),
             headers: vec![],
             leader_epoch: None,
+            delivery_count: None,
         });
 
         assert_eq!(buffer.len(), 2);
@@ -3921,6 +3927,7 @@ mod tests {
                 value: None,
                 headers: vec![],
                 leader_epoch: None,
+                delivery_count: None,
             });
 
             // Simulate unsubscribe clearing
