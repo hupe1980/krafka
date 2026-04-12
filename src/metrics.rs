@@ -458,6 +458,13 @@ impl MetricsExport for ConsumerMetrics {
             "Currently paused partitions",
             self.paused_partitions.get(),
         );
+        write_prometheus_gauge(
+            &mut output,
+            prefix,
+            "buffered_records",
+            "Currently buffered records in recv() buffer",
+            self.buffered_records.get(),
+        );
         write_prometheus_latency(
             &mut output,
             prefix,
@@ -692,6 +699,7 @@ impl KrafkaMetrics {
         self.consumer.lag_max.set(0);
         self.consumer.assigned_partitions.set(0);
         self.consumer.paused_partitions.set(0);
+        self.consumer.buffered_records.set(0);
 
         self.producer.connections.set(0);
         self.producer.buffered_records.set(0);
@@ -825,6 +833,8 @@ pub struct ConsumerMetrics {
     pub assigned_partitions: Gauge,
     /// Current number of paused partitions.
     pub paused_partitions: Gauge,
+    /// Current number of records buffered in the recv() buffer.
+    pub buffered_records: Gauge,
 }
 
 impl ConsumerMetrics {
@@ -890,6 +900,7 @@ impl ConsumerMetrics {
             lag_max: self.lag_max.get(),
             assigned_partitions: self.assigned_partitions.get(),
             paused_partitions: self.paused_partitions.get(),
+            buffered_records: self.buffered_records.get(),
         }
     }
 }
@@ -926,6 +937,8 @@ pub struct ConsumerMetricsSnapshot {
     pub assigned_partitions: u64,
     /// Paused partitions.
     pub paused_partitions: u64,
+    /// Buffered records in recv() buffer.
+    pub buffered_records: u64,
 }
 
 /// Connection pool metrics.

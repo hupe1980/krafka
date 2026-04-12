@@ -172,6 +172,7 @@ async fn main() {
 | `lag_max` | Gauge | Maximum per-partition consumer lag |
 | `assigned_partitions` | Gauge | Currently assigned partitions |
 | `paused_partitions` | Gauge | Currently paused partitions |
+| `buffered_records` | Gauge | Currently buffered records in recv() buffer |
 | `poll_latency_seconds` | Summary | Poll latency statistics |
 | `fetch_latency_seconds` | Summary | Fetch latency statistics |
 

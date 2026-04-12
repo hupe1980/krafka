@@ -42,3 +42,12 @@ Test logic via:
 
 See `docs/consumer.md` for cooperative vs eager rebalance semantics.
 Key invariant: `on_partitions_revoked` fires only for moved partitions in cooperative mode; `on_partitions_lost` fires for unexpectedly vanished ones (session timeout, fencing).
+
+## Buffer Cap (`max_buffered_records`)
+
+- `recv()` buffers excess records from `poll()` in `recv_buffer: RwLock<VecDeque<ConsumerRecord>>`
+- When `max_buffered_records > 0` and the buffer reaches the limit, `poll()` skips fetching
+- Auto-commit and rebalance handling still run — only the fetch is skipped
+- The `buffered_records` gauge must be updated at **every** `recv_buffer` mutation: `pop_front`, `extend`, `clear`, and `retain`
+- Set to `0` to disable (unlimited buffering)
+- For single-caller `recv()` the buffer is naturally bounded by `max_poll_records`; the cap primarily guards mixed `poll()`/`recv()` and concurrent `recv()` callers

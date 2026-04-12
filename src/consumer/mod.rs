@@ -521,6 +521,7 @@ impl Consumer {
                 revoked_keys.iter().map(|(t, p)| (t.as_str(), *p)).collect();
             let mut buf = self.recv_buffer.write().await;
             buf.retain(|r| !revoked_set.contains(&(r.topic.as_str(), r.partition)));
+            self.metrics.buffered_records.set(buf.len() as u64);
         }
         // Clear paused state for revoked partitions
         {
@@ -635,6 +636,7 @@ impl Consumer {
         self.high_watermarks.write().await.clear();
         self.log_start_offsets.write().await.clear();
         self.preferred_replicas.write().await.clear();
+        self.metrics.buffered_records.set(0);
         self.metrics.paused_partitions.set(0);
         self.metrics.lag.set(0);
         self.metrics.lag_max.set(0);
@@ -1626,6 +1628,22 @@ impl Consumer {
             return Ok(Vec::new());
         }
 
+        // Buffer cap: skip fetching when the recv() buffer has accumulated
+        // too many unconsumed records.  Auto-commit and rebalance handling
+        // above still run so the consumer remains healthy in the group.
+        if self.config.max_buffered_records > 0 {
+            let buffered = self.recv_buffer.read().await.len();
+            if buffered >= self.config.max_buffered_records as usize {
+                debug!(
+                    buffered = buffered,
+                    max = self.config.max_buffered_records,
+                    "Buffer cap reached, skipping fetch"
+                );
+                self.metrics.empty_polls.inc();
+                return Ok(Vec::new());
+            }
+        }
+
         // Retry offset resolution for partitions that are missing tracked offsets.
         // This fulfils the "will retry on next poll" contract when initial offset
         // resolution fails (e.g., due to a transient ListOffsets error or a
@@ -2473,6 +2491,7 @@ impl Consumer {
             {
                 let mut buffer = self.recv_buffer.write().await;
                 if let Some(record) = buffer.pop_front() {
+                    self.metrics.buffered_records.set(buffer.len() as u64);
                     return Ok(Some(record));
                 }
             }
@@ -2492,6 +2511,7 @@ impl Consumer {
                     if iter.len() > 0 {
                         let mut buffer = self.recv_buffer.write().await;
                         buffer.extend(iter);
+                        self.metrics.buffered_records.set(buffer.len() as u64);
                     }
                     return Ok(Some(first));
                 }

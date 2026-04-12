@@ -123,6 +123,22 @@ pub struct ConsumerConfig {
     pub(crate) max_partition_fetch_bytes: i32,
     /// Maximum poll records.
     pub(crate) max_poll_records: i32,
+    /// Maximum records buffered internally by [`recv()`](super::Consumer::recv).
+    ///
+    /// When the internal buffer reaches this limit, [`poll()`](super::Consumer::poll)
+    /// skips fetching new data until the buffer drains below the threshold.
+    /// This prevents unbounded memory growth when the consumer reads faster
+    /// than the application processes records.
+    ///
+    /// For `recv()`-only callers the buffer is naturally bounded by
+    /// [`max_poll_records`](Self::max_poll_records) (one `poll()` batch);
+    /// this cap adds an additional guard for mixed `poll()`/`recv()` usage
+    /// and concurrent `recv()` callers.
+    ///
+    /// Set to 0 to disable the buffer cap (unlimited). Defaults to 500.
+    /// Comparable to librdkafka's `queued.max.messages.kbytes` (count-based
+    /// rather than size-based).
+    pub(crate) max_buffered_records: i32,
     /// Maximum poll interval.
     pub(crate) max_poll_interval: Duration,
     /// Request timeout.
@@ -171,6 +187,7 @@ impl Default for ConsumerConfig {
             fetch_max_bytes: 52428800,          // 50 MB
             max_partition_fetch_bytes: 1048576, // 1 MB
             max_poll_records: 500,
+            max_buffered_records: 500,
             max_poll_interval: Duration::from_secs(300),
             request_timeout: Duration::from_secs(30),
             session_timeout: Duration::from_secs(10),
@@ -252,6 +269,12 @@ impl ConsumerConfig {
     #[inline]
     pub fn max_poll_records(&self) -> i32 {
         self.max_poll_records
+    }
+
+    /// Returns the maximum buffered records.
+    #[inline]
+    pub fn max_buffered_records(&self) -> i32 {
+        self.max_buffered_records
     }
 
     /// Returns the maximum poll interval.
@@ -441,6 +464,19 @@ impl ConsumerConfigBuilder {
     /// Set maximum records per poll.
     pub fn max_poll_records(mut self, max: i32) -> Self {
         self.config.max_poll_records = max;
+        self
+    }
+
+    /// Set maximum records buffered internally by `recv()`.
+    ///
+    /// When the internal buffer reaches this limit, `poll()` skips fetching
+    /// new data until the buffer drains below the threshold. For
+    /// `recv()`-only callers the buffer is naturally bounded by
+    /// `max_poll_records`; this cap guards against mixed `poll()`/`recv()`
+    /// usage and concurrent `recv()` callers.  Set to 0 to disable
+    /// (unlimited). Defaults to 500.
+    pub fn max_buffered_records(mut self, max: i32) -> Self {
+        self.config.max_buffered_records = max;
         self
     }
 

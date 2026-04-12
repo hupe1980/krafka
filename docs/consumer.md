@@ -162,7 +162,29 @@ let consumer = Consumer::builder()
     .fetch_max_bytes(52428800)                   // Max bytes per fetch (50MB)
     .max_partition_fetch_bytes(1048576)          // Max bytes per partition (1MB)
     .max_poll_records(500)                       // Max records per poll
+    .max_buffered_records(500)                   // Buffer cap for recv()
     .fetch_max_wait(Duration::from_millis(500))  // Max wait time
+    .build()
+    .await?;
+```
+
+### Buffer Cap
+
+When using `recv()`, records from `poll()` that are not immediately returned are buffered internally. The `max_buffered_records` setting controls the maximum number of records held in this buffer. When the buffer reaches the limit, `poll()` skips fetching new data until the buffer drains below the threshold. Auto-commit and rebalance handling still run so the consumer remains healthy in the group.
+
+For single-caller `recv()` usage the buffer is naturally bounded by `max_poll_records` (one `poll()` batch minus the record returned to the caller). The cap adds an additional guard for:
+- Mixed `poll()` / `recv()` usage on the same consumer
+- Multiple tasks calling `recv()` concurrently
+
+Set to `0` to disable the buffer cap (unlimited). Defaults to `500`.
+
+```rust
+use krafka::consumer::Consumer;
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .max_buffered_records(1000) // Allow up to 1000 buffered records
     .build()
     .await?;
 ```
@@ -812,6 +834,7 @@ let consumer = Consumer::builder()
     .fetch_max_bytes(104857600)              // 100MB max fetch
     .max_partition_fetch_bytes(10485760)     // 10MB per partition
     .max_poll_records(10000)                 // Many records per poll
+    .max_buffered_records(10000)              // Match poll batch size
     .fetch_max_wait(Duration::from_millis(100))
     .build()
     .await?;
@@ -845,6 +868,7 @@ let consumer = Consumer::builder()
     .fetch_max_bytes(1048576)                // Limit to 1MB
     .max_partition_fetch_bytes(262144)       // 256KB per partition
     .max_poll_records(100)                   // Limit in-memory records
+    .max_buffered_records(200)               // Tight buffer cap
     .build()
     .await?;
 ```
