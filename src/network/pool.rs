@@ -365,15 +365,15 @@ type ConnectingWaiters = HashMap<String, Vec<oneshot::Sender<Result<Arc<BrokerCo
 /// reconnecting task's future is cancelled (dropped).  Without this,
 /// cancellation would leave a stale entry causing all future callers for
 /// that address to wait forever.
-struct ReconnectGuard<'a> {
-    connecting: &'a AsyncMutex<ConnectingWaiters>,
+struct ReconnectGuard {
+    connecting: Arc<AsyncMutex<ConnectingWaiters>>,
     address: Option<String>,
 }
 
-impl<'a> ReconnectGuard<'a> {
-    fn new(connecting: &'a AsyncMutex<ConnectingWaiters>, address: String) -> Self {
+impl ReconnectGuard {
+    fn new(connecting: &Arc<AsyncMutex<ConnectingWaiters>>, address: String) -> Self {
         Self {
-            connecting,
+            connecting: Arc::clone(connecting),
             address: Some(address),
         }
     }
@@ -384,16 +384,14 @@ impl<'a> ReconnectGuard<'a> {
     }
 }
 
-impl Drop for ReconnectGuard<'_> {
+impl Drop for ReconnectGuard {
     fn drop(&mut self) {
         let Some(address) = self.address.take() else {
             return;
         };
-        // Synchronous cleanup via try_lock.  This succeeds in all practical
-        // scenarios because the async mutex is only held briefly for HashMap
-        // bookkeeping.  If it fails (astronomically rare), the waiters'
-        // oneshot senders remain in the map — their receivers will see
-        // `RecvError` once the senders are eventually dropped.
+        // Try fast-path synchronous cleanup first.  This succeeds in all
+        // practical scenarios because the async mutex is only held briefly for
+        // HashMap bookkeeping.
         if let Ok(mut guard) = self.connecting.try_lock() {
             let waiters = guard.remove(&address).unwrap_or_default();
             let err = KrafkaError::Network(std::io::Error::new(
@@ -403,6 +401,21 @@ impl Drop for ReconnectGuard<'_> {
             for waiter in waiters {
                 let _ = waiter.send(Err(err.clone()));
             }
+        } else {
+            // Slow path: spawn a cleanup task that acquires the lock
+            // asynchronously so we never leave a stale entry.
+            let connecting = Arc::clone(&self.connecting);
+            tokio::spawn(async move {
+                let mut guard = connecting.lock().await;
+                let waiters = guard.remove(&address).unwrap_or_default();
+                let err = KrafkaError::Network(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    format!("reconnection to {address} was cancelled"),
+                ));
+                for waiter in waiters {
+                    let _ = waiter.send(Err(err.clone()));
+                }
+            });
         }
     }
 }
@@ -423,7 +436,7 @@ pub struct ConnectionPool {
     /// Coalesces concurrent reconnection attempts to the same address.
     /// Only the first task to discover a dead connection performs the
     /// handshake; subsequent tasks push a oneshot sender and wait.
-    connecting: AsyncMutex<ConnectingWaiters>,
+    connecting: Arc<AsyncMutex<ConnectingWaiters>>,
     /// Connection config.
     config: ConnectionConfig,
     /// Retry configuration for reconnection attempts.
@@ -436,7 +449,7 @@ impl ConnectionPool {
         Self {
             connections: RwLock::new(HashMap::new()),
             connections_by_addr: RwLock::new(HashMap::new()),
-            connecting: AsyncMutex::new(HashMap::new()),
+            connecting: Arc::new(AsyncMutex::new(HashMap::new())),
             config,
             retry_config: ConnectionRetryConfig::default(),
         }
@@ -450,7 +463,7 @@ impl ConnectionPool {
         Self {
             connections: RwLock::new(HashMap::new()),
             connections_by_addr: RwLock::new(HashMap::new()),
-            connecting: AsyncMutex::new(HashMap::new()),
+            connecting: Arc::new(AsyncMutex::new(HashMap::new())),
             config,
             retry_config,
         }

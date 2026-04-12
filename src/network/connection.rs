@@ -19,9 +19,11 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::timeout;
 #[cfg(feature = "socks5")]
 use tokio::time::timeout_at;
+use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::CorrelationId;
+use crate::auth::tls::build_tls_config;
 use crate::auth::{AuthConfig, SaslMechanism, SecurityProtocol, connect_tls};
 use crate::error::{KrafkaError, Result};
 
@@ -197,7 +199,10 @@ impl RequestPriority {
 /// Configuration for broker connections.
 ///
 /// Use [`ConnectionConfig::builder()`] or [`Default::default()`] to construct.
-#[derive(Debug, Clone)]
+/// Call [`init_tls()`](ConnectionConfig::init_tls) after building when TLS is
+/// configured to pre-build and cache the TLS connector, avoiding repeated disk
+/// I/O for certificates on every reconnection.
+#[derive(Clone)]
 pub struct ConnectionConfig {
     /// Connection timeout.
     pub(crate) connect_timeout: Duration,
@@ -232,12 +237,45 @@ pub struct ConnectionConfig {
     /// When set, the connection will perform TLS upgrade and/or SASL
     /// authentication handshake during establishment.
     pub(crate) auth: Option<AuthConfig>,
+    /// Cached TLS connector built from [`AuthConfig::tls_config`].
+    ///
+    /// Populated by [`init_tls()`](ConnectionConfig::init_tls). When present,
+    /// connections reuse this connector instead of reading certificate files
+    /// from disk on every connection attempt.
+    pub(crate) tls_connector: Option<TlsConnector>,
     /// SOCKS5 proxy configuration (optional).
     ///
     /// When set, all connections are tunneled through the proxy.
     /// Requires the `socks5` feature.
     #[cfg(feature = "socks5")]
     pub(crate) proxy: Option<ProxyConfig>,
+}
+
+impl std::fmt::Debug for ConnectionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("ConnectionConfig");
+        s.field("connect_timeout", &self.connect_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .field("send_buffer_size", &self.send_buffer_size)
+            .field("recv_buffer_size", &self.recv_buffer_size)
+            .field("nodelay", &self.nodelay)
+            .field("client_id", &self.client_id)
+            .field("connections_per_broker", &self.connections_per_broker)
+            .field(
+                "high_priority_channel_capacity",
+                &self.high_priority_channel_capacity,
+            )
+            .field(
+                "normal_priority_channel_capacity",
+                &self.normal_priority_channel_capacity,
+            )
+            .field("max_response_size", &self.max_response_size)
+            .field("auth", &self.auth)
+            .field("tls_connector", &self.tls_connector.as_ref().map(|_| ".."));
+        #[cfg(feature = "socks5")]
+        s.field("proxy", &self.proxy);
+        s.finish()
+    }
 }
 
 impl Default for ConnectionConfig {
@@ -254,6 +292,7 @@ impl Default for ConnectionConfig {
             normal_priority_channel_capacity: 256,
             max_response_size: crate::protocol::MAX_MESSAGE_SIZE,
             auth: None,
+            tls_connector: None,
             #[cfg(feature = "socks5")]
             proxy: None,
         }
@@ -264,6 +303,28 @@ impl ConnectionConfig {
     /// Create a new connection config builder.
     pub fn builder() -> ConnectionConfigBuilder {
         ConnectionConfigBuilder::default()
+    }
+
+    /// Pre-build and cache the TLS connector from the configured certificates.
+    ///
+    /// When TLS is configured, this reads the certificate and key files once
+    /// (via `spawn_blocking`) and stores the resulting [`TlsConnector`] for
+    /// reuse across all connections and reconnections. Without this call,
+    /// every connection attempt re-reads the files from disk.
+    ///
+    /// This is a no-op when no TLS configuration is present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if certificate or key files cannot be read or parsed.
+    pub async fn init_tls(&mut self) -> Result<()> {
+        if let Some(ref auth) = self.auth
+            && let Some(ref tls_config) = auth.tls_config
+        {
+            let client_config = build_tls_config(tls_config).await?;
+            self.tls_connector = Some(TlsConnector::from(Arc::new(client_config)));
+        }
+        Ok(())
     }
 
     /// Returns the connection timeout.
@@ -575,10 +636,21 @@ impl BrokerConnection {
                 .as_ref()
                 .ok_or_else(|| KrafkaError::config("TLS required but no TLS config provided"))?;
 
+            // Use cached TLS connector or build one from config. Calling
+            // `init_tls()` before first use avoids this fallback and the
+            // repeated disk I/O it entails.
+            let connector = match config.tls_connector {
+                Some(ref c) => c.clone(),
+                None => {
+                    let client_config = build_tls_config(tls_config).await?;
+                    TlsConnector::from(Arc::new(client_config))
+                }
+            };
+
             // Extract hostname (without port) for TLS SNI.
             // Handle IPv6 bracket notation like [::1]:9092.
             let hostname = extract_sni_hostname(address)?;
-            let tls_stream = connect_tls(stream, hostname, tls_config).await?;
+            let tls_stream = connect_tls(stream, hostname, tls_config, &connector).await?;
 
             info!("TLS handshake completed for {address}");
 
@@ -1322,15 +1394,23 @@ impl BrokerConnection {
         if let Some(req) = pending.remove(&correlation_id) {
             trace!("Received response for correlation_id={}", correlation_id);
 
-            // Decode response header
+            // Decode response header — send any decode error to the caller
+            // instead of tearing down the entire connection.
             let mut response_buf = response.slice(..);
-            let _header = ResponseHeader::decode(&mut response_buf, req.api_key, req.api_version)?;
-
-            // Return the remaining bytes as the response body
-            let header_size = response.len() - response_buf.len();
-            let body = response.slice(header_size..);
-
-            let _ = req.response_tx.send(Ok(body));
+            match ResponseHeader::decode(&mut response_buf, req.api_key, req.api_version) {
+                Ok(_header) => {
+                    let header_size = response.len() - response_buf.len();
+                    let body = response.slice(header_size..);
+                    let _ = req.response_tx.send(Ok(body));
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to decode response header for correlation_id={}: {}",
+                        correlation_id, e
+                    );
+                    let _ = req.response_tx.send(Err(e));
+                }
+            }
         } else {
             warn!(
                 "Received response for unknown correlation_id={}",

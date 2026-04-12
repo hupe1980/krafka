@@ -21,10 +21,7 @@ pub mod tls;
 pub use msk_iam::MskIamAuthenticator;
 pub use oauthbearer::{OAuthBearerToken, OAuthBearerTokenProvider, OAuthBearerTokenProviderHandle};
 pub use scram::{ScramClient, ScramMechanism, ScramState};
-pub use tls::{
-    MaybeSecureStream, build_tls_config, build_tls_config_async, connect_tls, create_tls_connector,
-    create_tls_connector_async, load_certs_async, load_private_key_async,
-};
+pub use tls::{MaybeSecureStream, build_tls_config, connect_tls};
 
 use std::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};

@@ -102,7 +102,8 @@ impl Producer {
             pool_config_builder = pool_config_builder.proxy(proxy.clone());
         }
 
-        let pool_config = pool_config_builder.build();
+        let mut pool_config = pool_config_builder.build();
+        pool_config.init_tls().await?;
 
         let pool = Arc::new(ConnectionPool::new(pool_config));
 

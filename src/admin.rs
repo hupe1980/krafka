@@ -1721,7 +1721,13 @@ impl AdminClient {
                 .await
             {
                 Ok(c) => c,
-                Err(_) => continue, // Skip unreachable brokers
+                Err(e) => {
+                    warn!(
+                        "Failed to connect to broker {} for ListGroups, skipping: {}",
+                        broker.id, e
+                    );
+                    continue;
+                }
             };
 
             let request = ListGroupsRequest {
@@ -3233,7 +3239,8 @@ impl AdminClientBuilder {
             conn_config_builder = conn_config_builder.proxy(proxy.clone());
         }
 
-        let conn_config = conn_config_builder.build();
+        let mut conn_config = conn_config_builder.build();
+        conn_config.init_tls().await?;
 
         let pool = Arc::new(ConnectionPool::new(conn_config));
         let metadata = Arc::new(ClusterMetadata::new(
