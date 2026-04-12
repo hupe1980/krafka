@@ -15,7 +15,7 @@ Complete reference for all Krafka configuration options.
 |--------|------|---------|-------------|
 | `bootstrap_servers` | String | Required | Comma-separated list of host:port pairs |
 | `client_id` | String | `"krafka"` | Client identifier sent with requests |
-| `acks` | Acks | `Leader` | Acknowledgment level for durability |
+| `acks` | Acks | `All` | Acknowledgment level for durability (default changed to All for idempotent) |
 | `compression` | Compression | `None` | Compression codec for messages |
 | `batch_size` | usize | `16384` | Maximum bytes per batch (must be >= 1) |
 | `linger` | Duration | `0ms` | Time to wait for batching |
@@ -24,7 +24,7 @@ Complete reference for all Krafka configuration options.
 | `retry_backoff` | Duration | `100ms` | Wait between retries |
 | `max_in_flight` | usize | `5` | Max concurrent in-flight requests per connection |
 | `metadata_max_age` | Duration | `5m` | Max age before metadata refresh |
-| `enable_idempotence` | bool | `false` | Enable exactly-once semantics |
+| `idempotent` | bool | `true` | Enable idempotent production (KIP-679, requires acks=All) |
 
 ### Acks Values
 
@@ -62,14 +62,12 @@ use std::time::Duration;
 let producer = Producer::builder()
     .bootstrap_servers("kafka1:9092,kafka2:9092")
     .client_id("my-producer")
-    .acks(Acks::All)
     .compression(Compression::Lz4)
     .batch_size(65536)
     .linger(Duration::from_millis(5))
     .request_timeout(Duration::from_secs(30))
     .retries(5)
     .retry_backoff(Duration::from_millis(200))
-    .enable_idempotence(true)
     .build()
     .await?;
 ```

@@ -446,16 +446,25 @@ use std::time::Duration;
 
 let producer = Producer::builder()
     .bootstrap_servers("localhost:9092")
-    .acks(Acks::All)                         // Wait for all ISR
     .retries(10)                             // Retry on failure
     .build()
     .await?;
 ```
 
-> **Note:** For idempotent/exactly-once semantics, use `TransactionalProducer` instead.
-> The `enable_idempotence()` method on the regular `Producer` is deprecated since v0.2.0.
-> `TransactionalProducer` handles PID/epoch allocation, sequence numbers, and
-> transactional batch marking automatically via `init_transactions()`.
+> **Idempotent by default (KIP-679):** Since Kafka 3.0, idempotent production is the default.
+> The regular `Producer` now obtains a Producer ID via `InitProducerId` at startup,
+> tracks sequence numbers per partition, and de-duplicates retries automatically.
+> `acks = All` and `max_in_flight <= 5` are enforced when idempotent is enabled.
+>
+> **Error handling:**
+> - `OutOfOrderSequenceNumber` triggers a sequence reset and batch rebuild before retrying.
+> - `DuplicateSequenceNumber` is treated as success (broker already committed the batch;
+>   idempotent dedup worked). The returned offset is `-1` since the broker does not echo
+>   the original offset for duplicates.
+> - Multi-record batches acknowledge the *last* sequence (`base + count − 1`), matching
+>   the Kafka Java client's `ProducerBatch.lastSequence()` semantics.
+>
+> For cross-session exactly-once semantics (transactions), use `TransactionalProducer`.
 
 ### Concurrency Control
 

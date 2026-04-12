@@ -29,12 +29,21 @@
 //!
 //! # Example
 //!
+//! Idempotent production is enabled by default (KIP-679 / Kafka 3.0+):
+//!
 //! ```ignore
 //! use krafka::producer::{Producer, ProducerConfig};
 //!
+//! // Idempotent by default — no extra configuration needed.
 //! let producer = Producer::builder()
 //!     .bootstrap_servers("localhost:9092")
-//!     .idempotence(true)  // Enable idempotent producer
+//!     .build()
+//!     .await?;
+//!
+//! // To explicitly disable idempotency:
+//! let producer = Producer::builder()
+//!     .bootstrap_servers("localhost:9092")
+//!     .idempotent(false)
 //!     .build()
 //!     .await?;
 //! ```
@@ -56,8 +65,9 @@ pub struct ProducerIdentity {
     producer_id: AtomicI64,
     /// Producer epoch assigned by the broker (-1 if not initialized).
     producer_epoch: AtomicI32,
-    /// Sequence numbers per topic-partition.
-    sequences: RwLock<HashMap<(String, PartitionId), SequenceState>>,
+    /// Sequence numbers per topic-partition (two-level map avoids
+    /// per-call `String` allocations on lookups).
+    sequences: RwLock<HashMap<String, HashMap<PartitionId, SequenceState>>>,
 }
 
 /// Sequence number state for a partition.
@@ -71,6 +81,16 @@ struct SequenceState {
 
 const SEQUENCE_SPACE: u32 = i32::MAX as u32 + 1;
 const HALF_SEQUENCE_SPACE: u32 = SEQUENCE_SPACE / 2;
+
+/// Compute the last sequence number in a multi-record batch.
+///
+/// Given a `base_sequence` and `count` records, returns
+/// `base_sequence + count - 1`, wrapping at the sequence space boundary.
+/// Matches the Kafka Java client's `ProducerBatch.lastSequence()`.
+pub(crate) fn last_sequence_of_batch(base_sequence: i32, count: i32) -> i32 {
+    debug_assert!(count > 0, "count must be positive");
+    ((base_sequence as u32).wrapping_add((count - 1) as u32) % SEQUENCE_SPACE) as i32
+}
 
 fn next_sequence_after(sequence: i32) -> i32 {
     if !(0..i32::MAX).contains(&sequence) {
@@ -139,55 +159,79 @@ impl ProducerIdentity {
     /// Initialize with the producer ID and epoch from the broker.
     ///
     /// This should be called once with the response from InitProducerId.
+    /// The sequences lock is acquired first so concurrent readers
+    /// cannot observe a half-updated identity.
     pub fn initialize(&self, producer_id: i64, producer_epoch: i16) {
+        let mut sequences = self.sequences.write();
         self.producer_id.store(producer_id, Ordering::SeqCst);
         self.producer_epoch
             .store(producer_epoch as i32, Ordering::SeqCst);
-
-        // Clear all sequence numbers on initialization.
-        self.sequences.write().clear();
+        sequences.clear();
     }
 
     /// Reset the identity (e.g., after a fatal error).
+    ///
+    /// The sequences lock is acquired first so concurrent readers
+    /// cannot observe a half-updated identity.
     pub fn reset(&self) {
+        let mut sequences = self.sequences.write();
         self.producer_id.store(-1, Ordering::SeqCst);
         self.producer_epoch.store(-1, Ordering::SeqCst);
-
-        self.sequences.write().clear();
+        sequences.clear();
     }
 
-    /// Get the next sequence number for a topic-partition.
+    /// Get the next sequence number for a topic-partition (single-record batch).
     ///
     /// This allocates a new sequence number for the next batch.
     /// Sequence numbers wrap to 0 at `i32::MAX`, matching the Kafka Java client
     /// behavior (`DefaultRecordBatch.incrementSequence()`).
+    ///
+    /// For multi-record batches, use [`allocate_sequence`](Self::allocate_sequence).
     pub fn next_sequence(&self, topic: &str, partition: PartitionId) -> i32 {
-        let key = (topic.to_string(), partition);
+        self.allocate_sequence(topic, partition, 1)
+    }
+
+    /// Allocate a contiguous range of `count` sequence numbers for a batch.
+    ///
+    /// Returns the base sequence. The internal counter advances by `count`,
+    /// wrapping at the sequence space boundary (`i32::MAX` → 0).
+    pub fn allocate_sequence(&self, topic: &str, partition: PartitionId, count: i32) -> i32 {
+        debug_assert!(count > 0, "count must be positive");
 
         let mut sequences = self.sequences.write();
-        let state = sequences.entry(key).or_default();
-        let seq = state.next_sequence;
-        state.next_sequence = if seq == i32::MAX { 0 } else { seq + 1 };
-        seq
+        if !sequences.contains_key(topic) {
+            sequences.insert(topic.to_string(), HashMap::new());
+        }
+        // Safety: key was just ensured to exist above.
+        let state = sequences
+            .get_mut(topic)
+            .unwrap()
+            .entry(partition)
+            .or_default();
+        let base = state.next_sequence;
+        state.next_sequence = ((base as u32).wrapping_add(count as u32) % SEQUENCE_SPACE) as i32;
+        base
     }
 
     /// Peek at the next sequence number without incrementing.
     #[inline]
     pub fn peek_sequence(&self, topic: &str, partition: PartitionId) -> i32 {
-        let key = (topic.to_string(), partition);
-
         let sequences = self.sequences.read();
-        sequences.get(&key).map(|s| s.next_sequence).unwrap_or(0)
+        sequences
+            .get(topic)
+            .and_then(|parts| parts.get(&partition))
+            .map(|s| s.next_sequence)
+            .unwrap_or(0)
     }
 
     /// Acknowledge a sequence number for a partition.
     ///
     /// Call this when a batch is successfully acknowledged by the broker.
     pub fn acknowledge(&self, topic: &str, partition: PartitionId, sequence: i32) {
-        let key = (topic.to_string(), partition);
-
         let mut sequences = self.sequences.write();
-        if let Some(state) = sequences.get_mut(&key)
+        if let Some(state) = sequences
+            .get_mut(topic)
+            .and_then(|parts| parts.get_mut(&partition))
             && is_newer_sequence(state.last_acked_sequence, sequence)
         {
             state.last_acked_sequence = sequence;
@@ -200,37 +244,72 @@ impl ProducerIdentity {
     /// request was never sent (e.g., encode failure). Decrements `next_sequence`
     /// by one, wrapping from 0 back to `i32::MAX`.
     pub fn rollback_sequence(&self, topic: &str, partition: PartitionId) {
-        let key = (topic.to_string(), partition);
+        self.rollback_sequence_range(topic, partition, 1);
+    }
+
+    /// Roll back a range of `count` sequence numbers.
+    ///
+    /// Used when a multi-record batch was allocated a sequence range via
+    /// [`allocate_sequence`](Self::allocate_sequence) but failed before being
+    /// sent (e.g., encode failure), preventing sequence gaps.
+    pub fn rollback_sequence_range(&self, topic: &str, partition: PartitionId, count: i32) {
+        debug_assert!(count > 0, "count must be positive");
 
         let mut sequences = self.sequences.write();
-        if let Some(state) = sequences.get_mut(&key) {
-            state.next_sequence = if state.next_sequence == 0 {
-                i32::MAX
-            } else {
-                state.next_sequence - 1
-            };
+        if let Some(state) = sequences
+            .get_mut(topic)
+            .and_then(|parts| parts.get_mut(&partition))
+        {
+            let current = state.next_sequence as u32;
+            state.next_sequence =
+                ((current + SEQUENCE_SPACE - count as u32) % SEQUENCE_SPACE) as i32;
         }
     }
 
     /// Reset sequence number for a partition (e.g., after an out-of-order error).
     pub fn reset_sequence(&self, topic: &str, partition: PartitionId) {
-        let key = (topic.to_string(), partition);
-
         let mut sequences = self.sequences.write();
-        if let Some(state) = sequences.get_mut(&key) {
+        if let Some(state) = sequences
+            .get_mut(topic)
+            .and_then(|parts| parts.get_mut(&partition))
+        {
             // Reset to the last acknowledged + 1
             state.next_sequence = next_sequence_after(state.last_acked_sequence);
         }
     }
 
+    /// Atomically reset the partition sequence and allocate a fresh range.
+    ///
+    /// Equivalent to [`reset_sequence`](Self::reset_sequence) +
+    /// [`allocate_sequence`](Self::allocate_sequence) under a single lock,
+    /// preventing TOCTOU races when multiple concurrent sends hit
+    /// `OutOfOrderSequenceNumber` for the same partition.
+    pub fn reset_and_allocate(&self, topic: &str, partition: PartitionId, count: i32) -> i32 {
+        debug_assert!(count > 0, "count must be positive");
+
+        let mut sequences = self.sequences.write();
+        if !sequences.contains_key(topic) {
+            sequences.insert(topic.to_string(), HashMap::new());
+        }
+        // Safety: key was just ensured to exist above.
+        let state = sequences
+            .get_mut(topic)
+            .unwrap()
+            .entry(partition)
+            .or_default();
+        state.next_sequence = next_sequence_after(state.last_acked_sequence);
+        let base = state.next_sequence;
+        state.next_sequence = ((base as u32).wrapping_add(count as u32) % SEQUENCE_SPACE) as i32;
+        base
+    }
+
     /// Get the last acknowledged sequence for a partition.
     #[inline]
     pub fn last_acked_sequence(&self, topic: &str, partition: PartitionId) -> i32 {
-        let key = (topic.to_string(), partition);
-
         let sequences = self.sequences.read();
         sequences
-            .get(&key)
+            .get(topic)
+            .and_then(|parts| parts.get(&partition))
             .map(|s| s.last_acked_sequence)
             .unwrap_or(-1)
     }
@@ -241,11 +320,15 @@ impl ProducerIdentity {
             let sequences = self.sequences.read();
             sequences
                 .iter()
-                .map(|((topic, part), state)| PartitionSequenceSnapshot {
-                    topic: topic.clone(),
-                    partition: *part,
-                    next_sequence: state.next_sequence,
-                    last_acked_sequence: state.last_acked_sequence,
+                .flat_map(|(topic, parts)| {
+                    parts
+                        .iter()
+                        .map(move |(part, state)| PartitionSequenceSnapshot {
+                            topic: topic.clone(),
+                            partition: *part,
+                            next_sequence: state.next_sequence,
+                            last_acked_sequence: state.last_acked_sequence,
+                        })
                 })
                 .collect()
         };
@@ -265,6 +348,7 @@ impl Default for ProducerIdentity {
 }
 
 /// Snapshot of producer identity state for metrics/debugging.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ProducerIdentitySnapshot {
     /// Producer ID.
@@ -276,6 +360,7 @@ pub struct ProducerIdentitySnapshot {
 }
 
 /// Snapshot of sequence state for a single partition.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct PartitionSequenceSnapshot {
     /// Topic name.
@@ -389,8 +474,8 @@ mod tests {
 
         {
             let mut sequences = identity.sequences.write();
-            sequences.insert(
-                ("topic".to_string(), 0),
+            sequences.entry("topic".to_string()).or_default().insert(
+                0,
                 SequenceState {
                     next_sequence: 1,
                     last_acked_sequence: i32::MAX,
@@ -412,8 +497,8 @@ mod tests {
 
         {
             let mut sequences = identity.sequences.write();
-            sequences.insert(
-                ("topic".to_string(), 0),
+            sequences.entry("topic".to_string()).or_default().insert(
+                0,
                 SequenceState {
                     next_sequence: 1,
                     last_acked_sequence: i32::MAX,
@@ -463,8 +548,8 @@ mod tests {
         // Set up state near max
         {
             let mut sequences = identity.sequences.write();
-            sequences.insert(
-                ("topic".to_string(), 0),
+            sequences.entry("topic".to_string()).or_default().insert(
+                0,
                 SequenceState {
                     next_sequence: i32::MAX,
                     last_acked_sequence: i32::MAX - 1,
@@ -500,8 +585,8 @@ mod tests {
         // Set up state at 0 (just wrapped)
         {
             let mut sequences = identity.sequences.write();
-            sequences.insert(
-                ("topic".to_string(), 0),
+            sequences.entry("topic".to_string()).or_default().insert(
+                0,
                 SequenceState {
                     next_sequence: 0,
                     last_acked_sequence: i32::MAX - 1,
@@ -512,5 +597,95 @@ mod tests {
         // Rollback from 0 should wrap to i32::MAX
         identity.rollback_sequence("topic", 0);
         assert_eq!(identity.peek_sequence("topic", 0), i32::MAX);
+    }
+
+    #[test]
+    fn test_last_sequence_of_batch_single_record() {
+        assert_eq!(last_sequence_of_batch(0, 1), 0);
+        assert_eq!(last_sequence_of_batch(5, 1), 5);
+        assert_eq!(last_sequence_of_batch(i32::MAX, 1), i32::MAX);
+    }
+
+    #[test]
+    fn test_last_sequence_of_batch_multi_record() {
+        assert_eq!(last_sequence_of_batch(0, 5), 4);
+        assert_eq!(last_sequence_of_batch(10, 3), 12);
+        assert_eq!(last_sequence_of_batch(100, 100), 199);
+    }
+
+    #[test]
+    fn test_last_sequence_of_batch_wrapping() {
+        // Near max: base = i32::MAX - 2, count = 5
+        // Last = i32::MAX - 2 + 4 = i32::MAX + 2 → wraps to 1
+        assert_eq!(last_sequence_of_batch(i32::MAX - 2, 5), 1);
+
+        // At boundary: base = i32::MAX, count = 2
+        // Last = i32::MAX + 1 → wraps to 0
+        assert_eq!(last_sequence_of_batch(i32::MAX, 2), 0);
+    }
+
+    #[test]
+    fn test_multi_record_batch_ack_then_reset() {
+        // Verify that acknowledging the last sequence of a multi-record batch
+        // makes reset_sequence compute the correct next value.
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+
+        // Allocate a 5-record batch: base=0, sequences 0..4
+        let base = identity.allocate_sequence("topic", 0, 5);
+        assert_eq!(base, 0);
+        assert_eq!(identity.peek_sequence("topic", 0), 5);
+
+        // Acknowledge the last sequence (4), not the base (0)
+        let last_seq = last_sequence_of_batch(base, 5);
+        assert_eq!(last_seq, 4);
+        identity.acknowledge("topic", 0, last_seq);
+        assert_eq!(identity.last_acked_sequence("topic", 0), 4);
+
+        // Reset should compute next = last_acked + 1 = 5
+        identity.reset_sequence("topic", 0);
+        assert_eq!(identity.peek_sequence("topic", 0), 5);
+    }
+
+    #[test]
+    fn test_reset_and_allocate_atomic() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+
+        // Allocate sequences 0..2, acknowledge up to 1
+        identity.allocate_sequence("topic", 0, 3);
+        identity.acknowledge("topic", 0, 1);
+
+        // reset_and_allocate should atomically:
+        // 1. Reset next_sequence = last_acked + 1 = 2
+        // 2. Allocate 5 sequences: base=2, next=7
+        let base = identity.reset_and_allocate("topic", 0, 5);
+        assert_eq!(base, 2);
+        assert_eq!(identity.peek_sequence("topic", 0), 7);
+    }
+
+    #[test]
+    fn test_reset_and_allocate_no_prior_ack() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+
+        // Allocate without any ack — last_acked = -1
+        identity.allocate_sequence("topic", 0, 3);
+
+        // reset_and_allocate: next_sequence_after(-1) = 0, allocate 2 → base=0, next=2
+        let base = identity.reset_and_allocate("topic", 0, 2);
+        assert_eq!(base, 0);
+        assert_eq!(identity.peek_sequence("topic", 0), 2);
+    }
+
+    #[test]
+    fn test_reset_and_allocate_fresh_partition() {
+        // Called on a partition that has never been seen
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+
+        let base = identity.reset_and_allocate("topic", 99, 3);
+        assert_eq!(base, 0);
+        assert_eq!(identity.peek_sequence("topic", 99), 3);
     }
 }

@@ -39,17 +39,18 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::Semaphore;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::PartitionId;
 use crate::auth::AuthConfig;
-use crate::error::{KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, Result};
 use crate::metadata::ClusterMetadata;
 use crate::metrics::ProducerMetrics as ProducerMetricsInner;
 use crate::network::{ConnectionConfig, ConnectionPool};
 use crate::protocol::{
-    ApiKey, Compression, ProducePartitionData, ProduceRequest, ProduceResponse, ProduceTopicData,
-    RecordBatchBuilder, VersionedDecode, VersionedEncode, versions,
+    ApiKey, Compression, InitProducerIdRequest, InitProducerIdResponse, ProducePartitionData,
+    ProduceRequest, ProduceResponse, ProduceTopicData, RecordBatchBuilder, VersionedDecode,
+    VersionedEncode, versions,
 };
 
 use self::barrier::InFlightBarrier;
@@ -76,6 +77,8 @@ pub struct Producer {
     in_flight_semaphore: Arc<Semaphore>,
     /// Producer interceptor.
     interceptor: Arc<dyn crate::interceptor::ProducerInterceptor>,
+    /// Producer identity for idempotent production (PID, epoch, sequences).
+    identity: Option<Arc<ProducerIdentity>>,
 }
 
 impl Producer {
@@ -123,6 +126,60 @@ impl Producer {
             metadata.brokers().len()
         );
 
+        // Initialize idempotent producer identity (PID + epoch) if enabled.
+        let identity = if config.idempotent {
+            let identity = Arc::new(ProducerIdentity::new());
+
+            let brokers = metadata.brokers();
+            if brokers.is_empty() {
+                return Err(KrafkaError::protocol(
+                    "no brokers available for InitProducerId",
+                ));
+            }
+            let broker = &brokers[0];
+            let conn = pool
+                .get_connection_by_id(broker.id, broker.address())
+                .await?;
+
+            let ip_version = conn
+                .negotiate_api_version(
+                    ApiKey::InitProducerId,
+                    versions::INIT_PRODUCER_ID_MAX,
+                    versions::INIT_PRODUCER_ID_MIN,
+                )
+                .await
+                .ok_or_else(|| {
+                    KrafkaError::protocol("no mutually supported InitProducerId API version")
+                })?;
+
+            let request = InitProducerIdRequest::idempotent();
+            let response_bytes = conn
+                .send_request(ApiKey::InitProducerId, ip_version, |buf| {
+                    request.encode_versioned(ip_version, buf)
+                })
+                .await?;
+
+            let mut buf = response_bytes;
+            let response = InitProducerIdResponse::decode_versioned(ip_version, &mut buf)?;
+
+            if !response.is_ok() {
+                return Err(KrafkaError::broker(
+                    response.error_code,
+                    "failed to initialize producer ID",
+                ));
+            }
+
+            identity.initialize(response.producer_id, response.producer_epoch);
+            info!(
+                "Idempotent producer initialized: PID={}, epoch={}",
+                response.producer_id, response.producer_epoch
+            );
+
+            Some(identity)
+        } else {
+            None
+        };
+
         let partitioner: Arc<dyn Partitioner> = Arc::new(DefaultPartitioner::new());
 
         // Build retry policy from config
@@ -150,6 +207,7 @@ impl Producer {
                 max_block_ms: config.max_block,
                 in_flight_semaphore: in_flight_semaphore.clone(),
                 interceptor: interceptor.clone(),
+                identity: identity.clone(),
             };
             Some(accumulator::RecordAccumulator::spawn(
                 acc_config,
@@ -173,6 +231,7 @@ impl Producer {
             metrics,
             in_flight_semaphore,
             interceptor,
+            identity,
         })
     }
 
@@ -268,6 +327,8 @@ impl Producer {
     /// Retries transient failures with exponential backoff.
     /// Triggers metadata refresh on leader-change errors.
     /// Limits concurrent in-flight requests via semaphore (max_in_flight).
+    /// For idempotent producers, tracks sequence numbers and handles
+    /// `OutOfOrderSequenceNumber` with sequence reset + batch rebuild.
     async fn send_to_partition(
         &self,
         topic: &str,
@@ -281,16 +342,61 @@ impl Producer {
             .await
             .map_err(|_| KrafkaError::invalid_state("in-flight semaphore closed"))?;
 
+        // Allocate sequence for idempotent production (before retry loop — retries
+        // must resend the same sequence for the broker to de-duplicate).
+        let mut sequence: Option<i32> = self
+            .identity
+            .as_ref()
+            .map(|id| id.next_sequence(topic, partition));
+
+        // Build the produce request once (reused across retries).
+        let mut request = match self.build_produce_request(topic, partition, &record, sequence) {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(ref identity) = self.identity {
+                    identity.rollback_sequence(topic, partition);
+                }
+                return Err(e);
+            }
+        };
+
         let mut retry_ctx = RetryContext::new(
             self.retry_policy.clone(),
             format!("produce({topic}-{partition})"),
         );
 
         loop {
-            let result = self.do_send_to_partition(topic, partition, &record).await;
+            let result = self.do_send(topic, partition, &request).await;
+            // Convert DuplicateSequenceNumber to success — the broker
+            // already committed this batch (idempotent dedup worked).
+            let result = if let Err(KrafkaError::Broker { code, .. }) = &result
+                && *code == ErrorCode::DuplicateSequenceNumber
+                && self.identity.is_some()
+            {
+                debug!(
+                    topic = topic,
+                    partition = partition,
+                    "DuplicateSequenceNumber — dedup confirmed"
+                );
+                Ok(RecordMetadata {
+                    topic: topic.to_string(),
+                    partition,
+                    offset: -1,
+                    timestamp: -1,
+                })
+            } else {
+                result
+            };
+
             match result {
                 Ok(metadata) => {
                     retry_ctx.record_success();
+
+                    // Acknowledge sequence on success
+                    if let (Some(identity), Some(seq)) = (&self.identity, sequence) {
+                        identity.acknowledge(topic, partition, seq);
+                    }
+
                     self.metrics.record_send(
                         record.value.len() as u64
                             + record.key.as_ref().map(|k| k.len() as u64).unwrap_or(0),
@@ -304,10 +410,44 @@ impl Producer {
                     return Ok(metadata);
                 }
                 Err(e) => {
-                    self.metrics.record_error();
-
-                    // Refresh metadata on leader-not-available / not-leader errors
-                    if e.is_retriable() {
+                    // OutOfOrderSequenceNumber: atomically reset the
+                    // partition sequence and rebuild the batch with a fresh
+                    // sequence before retrying. Skip the metadata refresh —
+                    // OOSN is a sequence mismatch, not a leader-change error.
+                    if let KrafkaError::Broker { code, .. } = &e
+                        && *code == ErrorCode::OutOfOrderSequenceNumber
+                        && let Some(ref identity) = self.identity
+                    {
+                        warn!(
+                            topic = topic,
+                            partition = partition,
+                            "OutOfOrderSequenceNumber, resetting sequence and rebuilding batch"
+                        );
+                        let new_seq = identity.reset_and_allocate(topic, partition, 1);
+                        sequence = Some(new_seq);
+                        match self.build_produce_request(topic, partition, &record, sequence) {
+                            Ok(r) => request = r,
+                            Err(build_err) => {
+                                // Rollback the freshly allocated sequence
+                                identity.rollback_sequence(topic, partition);
+                                self.metrics.record_error();
+                                let dummy_metadata = RecordMetadata {
+                                    topic: topic.to_string(),
+                                    partition,
+                                    offset: -1,
+                                    timestamp: 0,
+                                };
+                                crate::interceptor::safe_on_acknowledgement(
+                                    &*self.interceptor,
+                                    &dummy_metadata,
+                                    Some(&build_err),
+                                );
+                                return Err(build_err);
+                            }
+                        }
+                        // Fall through to retry logic (OOSN is retriable)
+                    } else if e.is_retriable() {
+                        // Refresh metadata on leader-not-available / not-leader errors
                         debug!(
                             topic = topic,
                             partition = partition,
@@ -326,7 +466,12 @@ impl Producer {
                         retry_ctx.wait(backoff).await;
                         continue;
                     }
-                    // Final failure — notify interceptor
+                    // Final failure — rollback unused sequence so the next
+                    // send doesn't trigger an unnecessary OOSN round-trip.
+                    if let Some(ref identity) = self.identity {
+                        identity.rollback_sequence(topic, partition);
+                    }
+                    self.metrics.record_error();
                     let dummy_metadata = RecordMetadata {
                         topic: topic.to_string(),
                         partition,
@@ -344,27 +489,28 @@ impl Producer {
         }
     }
 
-    /// Single attempt to send a record to a partition (no retry).
-    async fn do_send_to_partition(
+    /// Build a produce request for a single record.
+    ///
+    /// When `sequence` is `Some`, the batch is tagged with the idempotent
+    /// producer identity (PID, epoch, base_sequence).
+    fn build_produce_request(
         &self,
         topic: &str,
         partition: PartitionId,
         record: &ProducerRecord,
-    ) -> Result<RecordMetadata> {
-        let _timer = self.metrics.send_latency.start();
-
-        // Get connection to the leader
-        let conn = self
-            .metadata
-            .get_leader_connection(topic, partition)
-            .await?;
-
-        // Build record batch
+        sequence: Option<i32>,
+    ) -> Result<ProduceRequest> {
         let mut batch_builder = RecordBatchBuilder::new().compression(self.config.compression);
 
         // Propagate user-supplied timestamp to the batch
         if let Some(ts) = record.timestamp {
             batch_builder = batch_builder.base_timestamp(ts);
+        }
+
+        // Tag with idempotent producer identity
+        if let (Some(identity), Some(seq)) = (&self.identity, sequence) {
+            batch_builder =
+                batch_builder.producer(identity.producer_id(), identity.producer_epoch(), seq);
         }
 
         if record.headers.is_empty() {
@@ -385,22 +531,35 @@ impl Producer {
         let batch = batch_builder.build();
         let batch_bytes = batch.encode()?;
 
-        let topic_owned = topic.to_string();
-
-        // Build produce request
-        let request = ProduceRequest {
+        Ok(ProduceRequest {
             transactional_id: None,
             acks: self.config.acks.to_i16(),
             timeout_ms: crate::util::duration_to_millis_i32(self.config.request_timeout),
             topic_data: vec![ProduceTopicData {
-                name: topic_owned.clone(),
+                name: topic.to_string(),
                 topic_id: None,
                 partition_data: vec![ProducePartitionData {
                     index: partition,
                     records: batch_bytes,
                 }],
             }],
-        };
+        })
+    }
+
+    /// Single attempt to send a pre-built produce request to a partition.
+    async fn do_send(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+        request: &ProduceRequest,
+    ) -> Result<RecordMetadata> {
+        let _timer = self.metrics.send_latency.start();
+
+        // Get connection to the leader
+        let conn = self
+            .metadata
+            .get_leader_connection(topic, partition)
+            .await?;
 
         // Negotiate Produce version for this broker.
         let version = conn
@@ -420,7 +579,7 @@ impl Producer {
             .await?;
 
             return Ok(RecordMetadata {
-                topic: topic_owned,
+                topic: topic.to_string(),
                 partition,
                 offset: -1, // Unknown — broker doesn't confirm
                 timestamp: -1,
@@ -450,7 +609,7 @@ impl Producer {
                     }
 
                     return Ok(RecordMetadata {
-                        topic: topic_owned,
+                        topic: topic.to_string(),
                         partition,
                         offset: partition_response.base_offset,
                         timestamp: partition_response.log_append_time_ms,
@@ -639,21 +798,16 @@ impl ProducerBuilder {
         self
     }
 
-    /// Enable idempotent producer.
+    /// Enable or disable idempotent production.
     ///
-    /// **Note**: For full idempotent exactly-once semantics, use
-    /// [`TransactionalProducer`] which handles producer ID initialization,
-    /// epoch management, and sequence numbering automatically.
+    /// Idempotent production is enabled by default (matching KIP-679 / Kafka 3.0+).
+    /// When enabled, the producer obtains a Producer ID from the broker and
+    /// attaches sequence numbers to every batch, allowing the broker to
+    /// de-duplicate retries.
     ///
-    /// Setting this on the regular `Producer` currently stores the config value
-    /// but does not wire the full `InitProducerId` → PID/epoch → sequence flow.
-    /// Use `TransactionalProducer` for production exactly-once guarantees.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Use TransactionalProducer for idempotent/exactly-once semantics"
-    )]
-    pub fn enable_idempotence(mut self, enable: bool) -> Self {
-        self.config.enable_idempotence = enable;
+    /// Requires `acks = All` and `max_in_flight <= 5`.
+    pub fn idempotent(mut self, enable: bool) -> Self {
+        self.config.idempotent = enable;
         self
     }
 
@@ -766,6 +920,18 @@ impl ProducerBuilder {
         }
         if self.config.batch_size == 0 {
             return Err(KrafkaError::config("batch_size must be >= 1"));
+        }
+        if self.config.idempotent {
+            if self.config.acks != Acks::All {
+                return Err(KrafkaError::config(
+                    "idempotent producer requires acks = All",
+                ));
+            }
+            if self.config.max_in_flight > 5 {
+                return Err(KrafkaError::config(
+                    "idempotent producer requires max_in_flight <= 5",
+                ));
+            }
         }
         let interceptor: Arc<dyn crate::interceptor::ProducerInterceptor> =
             if self.interceptors.is_empty() {
@@ -943,13 +1109,42 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
-    fn test_enable_idempotence_deprecated() {
-        // Verify the deprecated method still works (sets the flag)
+    fn test_idempotent_builder() {
+        // Idempotent is enabled by default
+        let builder = Producer::builder().bootstrap_servers("broker:9092");
+        assert!(builder.config.idempotent);
+
+        // Can be explicitly disabled
         let builder = Producer::builder()
             .bootstrap_servers("broker:9092")
-            .enable_idempotence(true);
-        assert!(builder.config.enable_idempotence);
+            .idempotent(false);
+        assert!(!builder.config.idempotent);
+    }
+
+    #[tokio::test]
+    async fn test_idempotent_requires_acks_all() {
+        let builder = Producer::builder()
+            .bootstrap_servers("localhost:9092")
+            .acks(Acks::Leader)
+            .idempotent(true);
+
+        let result = builder.build().await;
+        match result {
+            Err(e) => assert!(e.to_string().contains("acks")),
+            Ok(_) => panic!("expected config error for idempotent with acks != All"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_idempotent_requires_max_in_flight_le_5() {
+        let mut builder = Producer::builder().bootstrap_servers("localhost:9092");
+        builder.config.max_in_flight = 10;
+
+        let result = builder.build().await;
+        match result {
+            Err(e) => assert!(e.to_string().contains("max_in_flight")),
+            Ok(_) => panic!("expected config error for idempotent with max_in_flight > 5"),
+        }
     }
 
     #[tokio::test]

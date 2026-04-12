@@ -12,9 +12,9 @@ pub enum Acks {
     /// Don't wait for any acknowledgment.
     None,
     /// Wait for leader acknowledgment.
-    #[default]
     Leader,
     /// Wait for all in-sync replicas.
+    #[default]
     All,
 }
 
@@ -73,7 +73,13 @@ pub struct ProducerConfig {
     /// Max in-flight requests per connection.
     pub(crate) max_in_flight: usize,
     /// Enable idempotent producer.
-    pub(crate) enable_idempotence: bool,
+    ///
+    /// When `true` (the default, matching KIP-679 / Kafka 3.0+), the producer
+    /// obtains a Producer ID from the broker and tracks sequence numbers per
+    /// partition to guarantee exactly-once delivery within a session.
+    ///
+    /// Requires `acks = All` and `max_in_flight <= 5`.
+    pub(crate) idempotent: bool,
     /// Max block time when buffer is full.
     pub(crate) max_block: Duration,
     /// Buffer memory size.
@@ -92,7 +98,7 @@ impl Default for ProducerConfig {
         Self {
             bootstrap_servers: String::new(),
             client_id: "krafka".to_string(),
-            acks: Acks::Leader,
+            acks: Acks::All,
             compression: Compression::None,
             batch_size: 16384,
             linger: Duration::from_millis(0),
@@ -100,7 +106,7 @@ impl Default for ProducerConfig {
             retries: 3,
             retry_backoff: Duration::from_millis(100),
             max_in_flight: 5,
-            enable_idempotence: false,
+            idempotent: true,
             max_block: Duration::from_secs(60),
             buffer_memory: 32 * 1024 * 1024, // 32 MB
             metadata_max_age: Duration::from_secs(300),
@@ -177,10 +183,10 @@ impl ProducerConfig {
         self.max_in_flight
     }
 
-    /// Returns whether idempotent producer is enabled.
+    /// Returns whether idempotent production is enabled.
     #[inline]
-    pub fn enable_idempotence(&self) -> bool {
-        self.enable_idempotence
+    pub fn idempotent(&self) -> bool {
+        self.idempotent
     }
 
     /// Returns the max block time when buffer is full.
@@ -300,13 +306,16 @@ impl ProducerConfigBuilder {
         self
     }
 
-    /// Set whether to enable idempotent producer.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Use TransactionalProducer for idempotent/exactly-once semantics"
-    )]
-    pub fn enable_idempotence(mut self, enable: bool) -> Self {
-        self.config.enable_idempotence = enable;
+    /// Enable or disable idempotent production.
+    ///
+    /// Idempotent production is enabled by default (matching KIP-679 / Kafka 3.0+).
+    /// When enabled, the producer obtains a Producer ID from the broker and
+    /// attaches sequence numbers to every batch, allowing the broker to
+    /// de-duplicate retries.
+    ///
+    /// Requires `acks = All` and `max_in_flight <= 5`.
+    pub fn idempotent(mut self, enable: bool) -> Self {
+        self.config.idempotent = enable;
         self
     }
 
@@ -355,7 +364,8 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = ProducerConfig::default();
-        assert_eq!(config.acks, Acks::Leader);
+        assert_eq!(config.acks, Acks::All);
+        assert!(config.idempotent);
         assert_eq!(config.compression, Compression::None);
         assert_eq!(config.batch_size, 16384);
         assert_eq!(config.retries, 3);

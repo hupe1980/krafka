@@ -953,22 +953,17 @@ async fn test_message_headers() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_idempotent_producer() {
-    use krafka::producer::{Acks, Producer};
+    use krafka::producer::Producer;
 
     let (_container, bootstrap_servers) = kafka_container().await;
 
     let topic = "idempotent-test-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    // Create idempotent producer
-    // Note: Full idempotence requires TransactionalProducer. This test
-    // verifies the producer works with the idempotence config flag set.
-    #[allow(deprecated)]
+    // Create idempotent producer (enabled by default since KIP-679)
     let producer = Producer::builder()
         .bootstrap_servers(&bootstrap_servers)
         .client_id("idempotent-producer-test")
-        .acks(Acks::All) // Required for idempotence
-        .enable_idempotence(true)
         .build()
         .await
         .expect("Failed to create idempotent producer");

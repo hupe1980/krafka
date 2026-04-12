@@ -18,14 +18,14 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use tokio::time::interval;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use super::barrier::{InFlightBarrier, InFlightOpGuard};
 use super::batch::ProducerBatch;
 use super::record::{ProducerRecord, RecordMetadata};
 use super::retry::{RetryContext, RetryPolicy};
 use crate::PartitionId;
-use crate::error::{KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, Result};
 use crate::interceptor::ProducerInterceptor;
 use crate::metadata::ClusterMetadata;
 use crate::metrics::ProducerMetrics;
@@ -224,6 +224,8 @@ pub struct AccumulatorConfig {
     pub in_flight_semaphore: Arc<Semaphore>,
     /// Producer interceptor for on_acknowledgement callbacks.
     pub interceptor: Arc<dyn ProducerInterceptor>,
+    /// Producer identity for idempotent production (PID, epoch, sequences).
+    pub identity: Option<Arc<super::idempotent::ProducerIdentity>>,
 }
 
 impl Clone for AccumulatorConfig {
@@ -238,6 +240,7 @@ impl Clone for AccumulatorConfig {
             max_block_ms: self.max_block_ms,
             in_flight_semaphore: self.in_flight_semaphore.clone(),
             interceptor: self.interceptor.clone(),
+            identity: self.identity.clone(),
         }
     }
 }
@@ -269,6 +272,7 @@ impl Default for AccumulatorConfig {
             max_block_ms: Duration::from_secs(60), // 60 seconds default
             in_flight_semaphore: Arc::new(Semaphore::new(5)), // default max_in_flight
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
+            identity: None,
         }
     }
 }
@@ -673,48 +677,73 @@ impl RecordAccumulator {
         let _permit = config.in_flight_semaphore.acquire().await;
         let _timer = metrics.send_latency.start();
 
-        // Build and encode the record batch once (immutable across retries).
-        let mut batch_builder = RecordBatchBuilder::new().compression(config.compression);
-        for p in &pending {
-            let key = p.record.key.clone();
-            let value = Some(p.record.value.clone());
-            if p.record.headers.is_empty() {
-                batch_builder = batch_builder.add_record(key, value);
-            } else {
-                batch_builder = batch_builder.add_record_with_headers(
-                    key,
-                    value,
-                    p.record
-                        .headers
-                        .iter()
-                        .map(|(k, v)| (k.clone(), Bytes::from(v.clone())))
-                        .collect(),
-                );
+        let record_count = pending.len() as i32;
+
+        // Allocate sequence range for idempotent production.
+        let mut sequence: Option<i32> = config
+            .identity
+            .as_ref()
+            .map(|id| id.allocate_sequence(&topic, partition, record_count));
+
+        // Build and encode the record batch (rebuilt on OutOfOrderSequenceNumber).
+        let build_batch = |seq: Option<i32>,
+                           cfg: &AccumulatorConfig|
+         -> crate::error::Result<ProduceRequest> {
+            let mut batch_builder = RecordBatchBuilder::new().compression(cfg.compression);
+
+            // Tag with idempotent producer identity
+            if let (Some(identity), Some(s)) = (&cfg.identity, seq) {
+                batch_builder =
+                    batch_builder.producer(identity.producer_id(), identity.producer_epoch(), s);
             }
-        }
-        let batch = batch_builder.build();
-        let batch_bytes = match batch.encode() {
-            Ok(b) => b,
+
+            for p in &pending {
+                let key = p.record.key.clone();
+                let value = Some(p.record.value.clone());
+                if p.record.headers.is_empty() {
+                    batch_builder = batch_builder.add_record(key, value);
+                } else {
+                    batch_builder = batch_builder.add_record_with_headers(
+                        key,
+                        value,
+                        p.record
+                            .headers
+                            .iter()
+                            .map(|(k, v)| (k.clone(), Bytes::from(v.clone())))
+                            .collect(),
+                    );
+                }
+            }
+            let batch = batch_builder.build();
+            let batch_bytes = batch.encode()?;
+
+            Ok(ProduceRequest {
+                transactional_id: None,
+                acks: cfg.acks,
+                timeout_ms: crate::util::duration_to_millis_i32(cfg.request_timeout),
+                topic_data: vec![ProduceTopicData {
+                    name: topic.clone(),
+                    topic_id: None,
+                    partition_data: vec![ProducePartitionData {
+                        index: partition,
+                        records: batch_bytes,
+                    }],
+                }],
+            })
+        };
+
+        let mut request = match build_batch(sequence, &config) {
+            Ok(r) => r,
             Err(e) => {
+                // Rollback sequence on encode failure
+                if let Some(ref identity) = config.identity {
+                    identity.rollback_sequence_range(&topic, partition, record_count);
+                }
                 for p in pending {
                     let _ = p.response_tx.send(AppendResponse::Done(Err(e.clone())));
                 }
                 return;
             }
-        };
-
-        let request = ProduceRequest {
-            transactional_id: None,
-            acks: config.acks,
-            timeout_ms: crate::util::duration_to_millis_i32(config.request_timeout),
-            topic_data: vec![ProduceTopicData {
-                name: topic.clone(),
-                topic_id: None,
-                partition_data: vec![ProducePartitionData {
-                    index: partition,
-                    records: batch_bytes,
-                }],
-            }],
         };
 
         // Retry loop
@@ -824,12 +853,53 @@ impl RecordAccumulator {
                                     retry_ctx.record_success();
                                     break Ok((pr.base_offset, pr.log_append_time_ms));
                                 }
+                                // DuplicateSequenceNumber: the broker already
+                                // committed this batch — idempotent dedup worked.
+                                // Treat as success with unknown offset, matching
+                                // the Kafka Java client's completeBatch() path.
+                                Some(pr)
+                                    if pr.error_code == ErrorCode::DuplicateSequenceNumber
+                                        && config.identity.is_some() =>
+                                {
+                                    debug!(
+                                        topic = %topic,
+                                        partition = partition,
+                                        "DuplicateSequenceNumber in batch — dedup confirmed"
+                                    );
+                                    retry_ctx.record_success();
+                                    break Ok((-1, -1));
+                                }
                                 Some(pr) => {
                                     let err = KrafkaError::broker(
                                         pr.error_code,
                                         format!("batch produce failed for {topic}-{partition}"),
                                     );
-                                    if err.is_retriable()
+
+                                    // OutOfOrderSequenceNumber: atomically reset
+                                    // sequence and rebuild batch before retrying.
+                                    // Skip metadata refresh — OOSN is a sequence
+                                    // mismatch, not a leader-change error.
+                                    if pr.error_code == ErrorCode::OutOfOrderSequenceNumber
+                                        && let Some(identity) = config.identity.as_ref()
+                                    {
+                                        warn!(
+                                            topic = %topic,
+                                            partition = partition,
+                                            "OutOfOrderSequenceNumber in batch, resetting sequence"
+                                        );
+                                        let new_seq = identity.reset_and_allocate(
+                                            &topic,
+                                            partition,
+                                            record_count,
+                                        );
+                                        sequence = Some(new_seq);
+                                        match build_batch(sequence, &config) {
+                                            Ok(r) => request = r,
+                                            Err(encode_err) => {
+                                                break Err(encode_err);
+                                            }
+                                        }
+                                    } else if err.is_retriable()
                                         && let Err(refresh_err) =
                                             metadata.refresh_for_topics(Some(&[&topic])).await
                                     {
@@ -885,6 +955,15 @@ impl RecordAccumulator {
         // Complete pending records
         match result {
             Ok((base_offset, timestamp)) => {
+                // Acknowledge the last sequence in the batch (base + count - 1),
+                // matching Kafka Java client's batch.lastSequence() semantics.
+                // This ensures reset_sequence() computes the correct next value
+                // for multi-record batches after OOSN recovery.
+                if let (Some(identity), Some(seq)) = (&config.identity, sequence) {
+                    let last_seq = super::idempotent::last_sequence_of_batch(seq, record_count);
+                    identity.acknowledge(&topic, partition, last_seq);
+                }
+
                 let batch_bytes_total: u64 = pending.iter().map(|p| p.estimated_size as u64).sum();
                 metrics.record_batch(pending.len() as u64);
                 metrics.bytes_sent.add(batch_bytes_total);
@@ -892,7 +971,11 @@ impl RecordAccumulator {
                     let meta = RecordMetadata {
                         topic: topic.clone(),
                         partition,
-                        offset: base_offset + p.offset_in_batch,
+                        offset: if base_offset >= 0 {
+                            base_offset + p.offset_in_batch
+                        } else {
+                            -1
+                        },
                         timestamp,
                     };
                     crate::interceptor::safe_on_acknowledgement(&*config.interceptor, &meta, None);
@@ -900,12 +983,17 @@ impl RecordAccumulator {
                 }
             }
             Err(e) => {
+                // Rollback unused sequence range so the next batch to
+                // this partition doesn't trigger unnecessary OOSN.
+                if let Some(identity) = config.identity.as_ref() {
+                    identity.rollback_sequence_range(&topic, partition, record_count);
+                }
                 metrics.record_error();
                 for p in pending {
                     let meta = RecordMetadata {
                         topic: topic.clone(),
                         partition,
-                        offset: p.offset_in_batch,
+                        offset: -1,
                         timestamp: 0,
                     };
                     crate::interceptor::safe_on_acknowledgement(
@@ -996,6 +1084,7 @@ mod tests {
             max_block_ms: Duration::from_secs(30),
             in_flight_semaphore: Arc::new(Semaphore::new(5)),
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
+            identity: None,
         };
         assert_eq!(config.batch_size, 65536);
         assert_eq!(config.linger, Duration::from_millis(50));
