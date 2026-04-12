@@ -262,6 +262,18 @@ where
 - Topic-specific refresh when subscribing
 - API version negotiation: negotiates the highest mutually supported Metadata version (v0-v8, no gaps); versions are cumulative (rack since v1, cluster_id since v2, offline replicas since v5), and v7 specifically adds leader_epoch
 
+### KIP-899 Metadata Recovery (Rebootstrap)
+
+When `MetadataRecoveryStrategy::Rebootstrap` is configured and no broker is
+reachable for longer than the rebootstrap trigger (default 5 min), the client
+automatically closes all connections, clears the metadata cache, and falls back
+to bootstrap servers to re-discover the cluster. This handles scenarios like
+full-cluster rolling restarts where every cached broker IP becomes stale.
+
+The server can also request a rebootstrap by returning `REBOOTSTRAP_REQUIRED`
+(error code 124) in a metadata response. Runtime seed-broker updates are
+supported via `update_seed_brokers()`.
+
 ## Producer Architecture
 
 ### Send Path

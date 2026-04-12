@@ -25,6 +25,8 @@ Complete reference for all Krafka configuration options.
 | `max_in_flight` | usize | `5` | Max concurrent in-flight requests per connection |
 | `metadata_max_age` | Duration | `5m` | Max age before metadata refresh |
 | `idempotent` | bool | `true` | Enable idempotent production (KIP-679, requires acks=All) |
+| `metadata_recovery_strategy` | MetadataRecoveryStrategy | `None` | Recovery strategy when metadata refresh fails (KIP-899) |
+| `metadata_recovery_rebootstrap_trigger` | Duration | `5m` | Duration after which failing refreshes trigger a rebootstrap |
 
 ### Acks Values
 
@@ -95,6 +97,8 @@ let producer = Producer::builder()
 | `group_protocol` | GroupProtocol | `Classic` | Group protocol: `Classic` or `Consumer` (KIP-848) |
 | `request_timeout` | Duration | `30s` | Timeout for broker requests |
 | `metadata_max_age` | Duration | `5m` | Max age before metadata refresh |
+| `metadata_recovery_strategy` | MetadataRecoveryStrategy | `None` | Recovery strategy when metadata refresh fails (KIP-899) |
+| `metadata_recovery_rebootstrap_trigger` | Duration | `5m` | Duration after which failing refreshes trigger a rebootstrap |
 
 ### AutoOffsetReset Values
 
@@ -147,6 +151,8 @@ let consumer = Consumer::builder()
 | `bootstrap_servers` | String | Required | Comma-separated list of host:port pairs |
 | `client_id` | String | `"krafka-admin"` | Client identifier |
 | `request_timeout` | Duration | `30s` | Timeout for admin operations |
+| `metadata_recovery_strategy` | MetadataRecoveryStrategy | `None` | Recovery strategy when metadata refresh fails (KIP-899) |
+| `metadata_recovery_rebootstrap_trigger` | Duration | `5m` | Duration after which failing refreshes trigger a rebootstrap |
 
 ### Admin Client Builder Example
 

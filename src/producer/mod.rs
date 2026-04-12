@@ -112,11 +112,11 @@ impl Producer {
 
         let bootstrap_servers = crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
 
-        let metadata = Arc::new(ClusterMetadata::new(
-            bootstrap_servers,
-            pool.clone(),
-            config.metadata_max_age,
-        ));
+        let metadata = Arc::new(
+            ClusterMetadata::new(bootstrap_servers, pool.clone(), config.metadata_max_age)
+                .with_recovery_strategy(config.metadata_recovery_strategy)
+                .with_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger),
+        );
 
         // Initial metadata fetch
         metadata.refresh().await?;
@@ -630,6 +630,24 @@ impl Producer {
 
         self.in_flight_barrier.wait_for(target).await;
         Ok(())
+    }
+
+    /// Replace the bootstrap server list at runtime (KIP-899).
+    ///
+    /// The new addresses are used on the next metadata refresh that falls back
+    /// to bootstrap servers. Does not close existing connections.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `servers` is empty.
+    pub fn update_seed_brokers(&self, servers: Vec<String>) -> Result<()> {
+        self.metadata.update_seed_brokers(servers)
+    }
+
+    /// Force a rebootstrap: close all connections, clear the metadata cache,
+    /// and fall back to bootstrap servers (KIP-899).
+    pub async fn rebootstrap(&self) {
+        self.metadata.rebootstrap().await;
     }
 
     /// Close the producer.

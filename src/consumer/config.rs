@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::auth::AuthConfig;
+use crate::metadata::MetadataRecoveryStrategy;
 
 /// Auto offset reset behavior.
 #[non_exhaustive]
@@ -167,6 +168,16 @@ pub struct ConsumerConfig {
     /// reducing cross-rack traffic. The value should match the `broker.rack`
     /// configuration on the brokers.
     pub(crate) client_rack: Option<String>,
+    /// Metadata recovery strategy (KIP-899).
+    ///
+    /// When set to [`MetadataRecoveryStrategy::Rebootstrap`], the consumer
+    /// falls back to bootstrap servers if metadata refresh fails for longer
+    /// than [`metadata_recovery_rebootstrap_trigger`](Self::metadata_recovery_rebootstrap_trigger).
+    pub(crate) metadata_recovery_strategy: MetadataRecoveryStrategy,
+    /// Duration after which failing metadata refreshes trigger a rebootstrap
+    /// (KIP-899). Only effective with
+    /// [`MetadataRecoveryStrategy::Rebootstrap`]. Default: 300 s.
+    pub(crate) metadata_recovery_rebootstrap_trigger: Duration,
     /// Authentication configuration (optional).
     pub(crate) auth: Option<AuthConfig>,
     /// SOCKS5 proxy configuration (optional).
@@ -198,6 +209,8 @@ impl Default for ConsumerConfig {
             group_protocol: GroupProtocol::Classic,
             group_instance_id: None,
             client_rack: None,
+            metadata_recovery_strategy: MetadataRecoveryStrategy::None,
+            metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             auth: None,
             #[cfg(feature = "socks5")]
             proxy: None,
@@ -335,6 +348,18 @@ impl ConsumerConfig {
     #[inline]
     pub fn client_rack(&self) -> Option<&str> {
         self.client_rack.as_deref()
+    }
+
+    /// Returns the metadata recovery strategy (KIP-899).
+    #[inline]
+    pub fn metadata_recovery_strategy(&self) -> MetadataRecoveryStrategy {
+        self.metadata_recovery_strategy
+    }
+
+    /// Returns the rebootstrap trigger duration (KIP-899).
+    #[inline]
+    pub fn metadata_recovery_rebootstrap_trigger(&self) -> Duration {
+        self.metadata_recovery_rebootstrap_trigger
     }
 
     /// Returns the authentication configuration, if set.
@@ -516,6 +541,20 @@ impl ConsumerConfigBuilder {
         self
     }
 
+    /// Set the metadata recovery strategy (KIP-899).
+    pub fn metadata_recovery_strategy(mut self, strategy: MetadataRecoveryStrategy) -> Self {
+        self.config.metadata_recovery_strategy = strategy;
+        self
+    }
+
+    /// Set the rebootstrap trigger duration (KIP-899).
+    ///
+    /// Only effective when [`MetadataRecoveryStrategy::Rebootstrap`] is set.
+    pub fn metadata_recovery_rebootstrap_trigger(mut self, duration: Duration) -> Self {
+        self.config.metadata_recovery_rebootstrap_trigger = duration;
+        self
+    }
+
     /// Build the config.
     pub fn build(self) -> ConsumerConfig {
         self.config
@@ -691,5 +730,34 @@ mod tests {
             .build();
         let proxy = config.proxy().expect("proxy should be set");
         assert_eq!(proxy.address(), "proxy:1080");
+    }
+
+    #[test]
+    fn test_config_default_recovery_strategy() {
+        let config = ConsumerConfig::default();
+        assert_eq!(
+            config.metadata_recovery_strategy,
+            MetadataRecoveryStrategy::None,
+        );
+        assert_eq!(
+            config.metadata_recovery_rebootstrap_trigger,
+            Duration::from_secs(300),
+        );
+    }
+
+    #[test]
+    fn test_config_builder_recovery_strategy() {
+        let config = ConsumerConfig::builder()
+            .metadata_recovery_strategy(MetadataRecoveryStrategy::Rebootstrap)
+            .metadata_recovery_rebootstrap_trigger(Duration::from_secs(60))
+            .build();
+        assert_eq!(
+            config.metadata_recovery_strategy(),
+            MetadataRecoveryStrategy::Rebootstrap,
+        );
+        assert_eq!(
+            config.metadata_recovery_rebootstrap_trigger(),
+            Duration::from_secs(60),
+        );
     }
 }

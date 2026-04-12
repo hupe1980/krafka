@@ -1255,7 +1255,7 @@ impl GroupCoordinator {
         }
 
         // Fall back to bootstrap servers
-        for server in self.metadata.bootstrap_servers() {
+        for server in &self.metadata.bootstrap_servers() {
             if let Ok(conn) = self.pool.get_connection(server).await {
                 return Ok(conn);
             }

@@ -42,7 +42,7 @@ use tracing::{info, warn};
 
 use crate::auth::AuthConfig;
 use crate::error::{KrafkaError, Result};
-use crate::metadata::{BrokerInfo, ClusterMetadata, TopicInfo};
+use crate::metadata::{BrokerInfo, ClusterMetadata, MetadataRecoveryStrategy, TopicInfo};
 use crate::network::{BrokerConnection, ConnectionConfig, ConnectionPool};
 
 use crate::protocol::{
@@ -645,6 +645,12 @@ pub struct AdminConfig {
     pub(crate) client_id: String,
     /// Request timeout.
     pub(crate) request_timeout: Duration,
+    /// Metadata recovery strategy (KIP-899).
+    pub(crate) metadata_recovery_strategy: MetadataRecoveryStrategy,
+    /// Duration after which failing metadata refreshes trigger a rebootstrap
+    /// (KIP-899). Only effective with
+    /// [`MetadataRecoveryStrategy::Rebootstrap`]. Default: 300 s.
+    pub(crate) metadata_recovery_rebootstrap_trigger: Duration,
     /// Authentication configuration (optional).
     pub(crate) auth: Option<AuthConfig>,
     /// SOCKS5 proxy configuration (optional).
@@ -658,6 +664,8 @@ impl Default for AdminConfig {
             bootstrap_servers: String::new(),
             client_id: "krafka-admin".to_string(),
             request_timeout: Duration::from_secs(30),
+            metadata_recovery_strategy: MetadataRecoveryStrategy::None,
+            metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             auth: None,
             #[cfg(feature = "socks5")]
             proxy: None,
@@ -687,6 +695,18 @@ impl AdminConfig {
     #[inline]
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
+    }
+
+    /// Returns the metadata recovery strategy (KIP-899).
+    #[inline]
+    pub fn metadata_recovery_strategy(&self) -> MetadataRecoveryStrategy {
+        self.metadata_recovery_strategy
+    }
+
+    /// Returns the rebootstrap trigger duration (KIP-899).
+    #[inline]
+    pub fn metadata_recovery_rebootstrap_trigger(&self) -> Duration {
+        self.metadata_recovery_rebootstrap_trigger
     }
 
     /// Returns the authentication configuration, if set.
@@ -726,6 +746,20 @@ impl AdminConfigBuilder {
     /// Set request timeout.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.config.request_timeout = timeout;
+        self
+    }
+
+    /// Set the metadata recovery strategy (KIP-899).
+    pub fn metadata_recovery_strategy(mut self, strategy: MetadataRecoveryStrategy) -> Self {
+        self.config.metadata_recovery_strategy = strategy;
+        self
+    }
+
+    /// Set the rebootstrap trigger duration (KIP-899).
+    ///
+    /// Only effective when [`MetadataRecoveryStrategy::Rebootstrap`] is set.
+    pub fn metadata_recovery_rebootstrap_trigger(mut self, duration: Duration) -> Self {
+        self.config.metadata_recovery_rebootstrap_trigger = duration;
         self
     }
 
@@ -2907,6 +2941,24 @@ impl AdminClient {
         &self.pool
     }
 
+    /// Replace the bootstrap server list at runtime (KIP-899).
+    ///
+    /// The new addresses are used on the next metadata refresh that falls back
+    /// to bootstrap servers. Does not close existing connections.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `servers` is empty.
+    pub fn update_seed_brokers(&self, servers: Vec<String>) -> Result<()> {
+        self.metadata.update_seed_brokers(servers)
+    }
+
+    /// Force a rebootstrap: close all connections, clear the metadata cache,
+    /// and fall back to bootstrap servers (KIP-899).
+    pub async fn rebootstrap(&self) {
+        self.metadata.rebootstrap().await;
+    }
+
     /// Close the admin client.
     ///
     /// Calling `close()` more than once is a no-op.
@@ -3243,11 +3295,11 @@ impl AdminClientBuilder {
         conn_config.init_tls().await?;
 
         let pool = Arc::new(ConnectionPool::new(conn_config));
-        let metadata = Arc::new(ClusterMetadata::new(
-            bootstrap_servers,
-            pool.clone(),
-            Duration::from_secs(300),
-        ));
+        let metadata = Arc::new(
+            ClusterMetadata::new(bootstrap_servers, pool.clone(), Duration::from_secs(300))
+                .with_recovery_strategy(self.config.metadata_recovery_strategy)
+                .with_rebootstrap_trigger(self.config.metadata_recovery_rebootstrap_trigger),
+        );
 
         metadata.refresh().await?;
 

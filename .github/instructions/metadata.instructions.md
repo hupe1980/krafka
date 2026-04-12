@@ -36,3 +36,16 @@ atomic pointer store at the end.
 
 - `needs_refresh()` checks `last_updated.elapsed() > max_age` — it does **not** trigger a refresh.
 - Callers (consumer, producer) are responsible for refreshing when `needs_refresh()` returns true or when a `NotLeaderForPartition` error occurs.
+
+## KIP-899 Rebootstrap
+
+- `bootstrap_servers` is wrapped in `ArcSwap<Vec<String>>` — lock-free reads, atomic swap via `update_seed_brokers()`.
+- `MetadataRecoveryStrategy::Rebootstrap` enables automatic recovery when metadata refresh fails.
+- `metadata_attempt_start` (`std::sync::Mutex<Option<Instant>>`) tracks the failure streak start:
+  - Set via `get_or_insert_with(Instant::now)` at the **start** of every `refresh_for_topics` call.
+  - Cleared to `None` on successful refresh.
+  - Set to `Some(Instant::now())` after rebootstrap (matches Java's `metadataAttemptStartMs = Optional.of(now)`) so the next cycle starts timing immediately.
+- `needs_rebootstrap()` is a pure predicate — returns `bool`, no side effects. The caller (`refresh_for_topics`) awaits `rebootstrap()` if it returns `true`.
+- `rebootstrap()` is the async public method — awaits `pool.close_all()`, resets cache, sets timer to now.
+- `refresh_for_topics` handles both client-initiated rebootstrap (connection failure + trigger exceeded) and server-initiated rebootstrap (`ErrorCode::RebootstrapRequired` = 124, KIP-899) via a loop with a single-retry guard.
+- `update_seed_brokers()` only swaps the address list; it does not close connections or trigger a refresh.

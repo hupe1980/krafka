@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::auth::AuthConfig;
+use crate::metadata::MetadataRecoveryStrategy;
 use crate::protocol::Compression;
 
 /// Required acknowledgments for produce requests.
@@ -86,6 +87,16 @@ pub struct ProducerConfig {
     pub(crate) buffer_memory: usize,
     /// Metadata max age.
     pub(crate) metadata_max_age: Duration,
+    /// Metadata recovery strategy (KIP-899).
+    ///
+    /// When set to [`MetadataRecoveryStrategy::Rebootstrap`], the producer
+    /// falls back to bootstrap servers if metadata refresh fails for longer
+    /// than [`metadata_recovery_rebootstrap_trigger`](Self::metadata_recovery_rebootstrap_trigger).
+    pub(crate) metadata_recovery_strategy: MetadataRecoveryStrategy,
+    /// Duration after which failing metadata refreshes trigger a rebootstrap
+    /// (KIP-899). Only effective with
+    /// [`MetadataRecoveryStrategy::Rebootstrap`]. Default: 300 s.
+    pub(crate) metadata_recovery_rebootstrap_trigger: Duration,
     /// Authentication configuration (optional).
     pub(crate) auth: Option<AuthConfig>,
     /// SOCKS5 proxy configuration (optional).
@@ -110,6 +121,8 @@ impl Default for ProducerConfig {
             max_block: Duration::from_secs(60),
             buffer_memory: 32 * 1024 * 1024, // 32 MB
             metadata_max_age: Duration::from_secs(300),
+            metadata_recovery_strategy: MetadataRecoveryStrategy::None,
+            metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             auth: None,
             #[cfg(feature = "socks5")]
             proxy: None,
@@ -205,6 +218,18 @@ impl ProducerConfig {
     #[inline]
     pub fn metadata_max_age(&self) -> Duration {
         self.metadata_max_age
+    }
+
+    /// Returns the metadata recovery strategy (KIP-899).
+    #[inline]
+    pub fn metadata_recovery_strategy(&self) -> MetadataRecoveryStrategy {
+        self.metadata_recovery_strategy
+    }
+
+    /// Returns the rebootstrap trigger duration (KIP-899).
+    #[inline]
+    pub fn metadata_recovery_rebootstrap_trigger(&self) -> Duration {
+        self.metadata_recovery_rebootstrap_trigger
     }
 
     /// Returns the authentication configuration, if set.
@@ -337,6 +362,20 @@ impl ProducerConfigBuilder {
         self
     }
 
+    /// Set the metadata recovery strategy (KIP-899).
+    pub fn metadata_recovery_strategy(mut self, strategy: MetadataRecoveryStrategy) -> Self {
+        self.config.metadata_recovery_strategy = strategy;
+        self
+    }
+
+    /// Set the rebootstrap trigger duration (KIP-899).
+    ///
+    /// Only effective when [`MetadataRecoveryStrategy::Rebootstrap`] is set.
+    pub fn metadata_recovery_rebootstrap_trigger(mut self, duration: Duration) -> Self {
+        self.config.metadata_recovery_rebootstrap_trigger = duration;
+        self
+    }
+
     /// Build the config.
     pub fn build(self) -> ProducerConfig {
         self.config
@@ -453,5 +492,34 @@ mod tests {
             .build();
         let proxy = config.proxy().expect("proxy should be set");
         assert_eq!(proxy.address(), "proxy:1080");
+    }
+
+    #[test]
+    fn test_config_default_recovery_strategy() {
+        let config = ProducerConfig::default();
+        assert_eq!(
+            config.metadata_recovery_strategy,
+            MetadataRecoveryStrategy::None,
+        );
+        assert_eq!(
+            config.metadata_recovery_rebootstrap_trigger,
+            Duration::from_secs(300),
+        );
+    }
+
+    #[test]
+    fn test_config_builder_recovery_strategy() {
+        let config = ProducerConfig::builder()
+            .metadata_recovery_strategy(MetadataRecoveryStrategy::Rebootstrap)
+            .metadata_recovery_rebootstrap_trigger(Duration::from_secs(120))
+            .build();
+        assert_eq!(
+            config.metadata_recovery_strategy(),
+            MetadataRecoveryStrategy::Rebootstrap,
+        );
+        assert_eq!(
+            config.metadata_recovery_rebootstrap_trigger(),
+            Duration::from_secs(120),
+        );
     }
 }

@@ -453,6 +453,8 @@ pub enum ErrorCode {
     InvalidRegistration = 119,
     /// The server encountered an error with the transaction. The client can abort the transaction to continue (KIP-890).
     TransactionAbortable = 120,
+    /// The client should rebootstrap to connect to the appropriate seed broker (KIP-899).
+    RebootstrapRequired = 124,
     /// The regular expression is not valid (KIP-848 v1+).
     InvalidRegularExpression = 128,
     /// Unknown error code.
@@ -586,6 +588,7 @@ impl ErrorCode {
             118 => Self::TelemetryTooLarge,
             119 => Self::InvalidRegistration,
             120 => Self::TransactionAbortable,
+            124 => Self::RebootstrapRequired,
             128 => Self::InvalidRegularExpression,
             other => Self::Unknown(other),
         }
@@ -717,6 +720,7 @@ impl ErrorCode {
             Self::TelemetryTooLarge => 118,
             Self::InvalidRegistration => 119,
             Self::TransactionAbortable => 120,
+            Self::RebootstrapRequired => 124,
             Self::InvalidRegularExpression => 128,
             Self::Unknown(code) => code,
         }

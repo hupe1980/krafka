@@ -128,6 +128,7 @@ pub mod tracing_ext;
 pub mod util;
 
 pub use error::{KrafkaError, Result};
+pub use metadata::MetadataRecoveryStrategy;
 
 /// Kafka protocol API version.
 pub type ApiVersion = i16;
