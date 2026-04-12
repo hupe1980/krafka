@@ -121,6 +121,9 @@ pub mod network;
 pub mod producer;
 pub mod protocol;
 pub mod schema_registry;
+#[cfg(feature = "telemetry")]
+#[cfg_attr(docsrs, doc(cfg(feature = "telemetry")))]
+pub mod telemetry;
 pub mod tracing_ext;
 pub mod util;
 

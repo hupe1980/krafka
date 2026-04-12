@@ -1,19 +1,28 @@
 ---
 applyTo: "src/metrics.rs"
-description: "Use when editing metrics: gauge vs counter semantics, Prometheus export format, snapshot structs, and reset completeness."
+description: "Use when editing metrics: gauge vs counter semantics, pluggable exporter traits, snapshot structs, and reset completeness."
 ---
 
 # Metrics Module Rules
 
 ## Adding a New Metric
 
-Every new metric must appear in **all five** locations:
+Every new metric must appear in **all six** locations:
 
 1. Field on the metrics struct (`ConsumerMetrics`, `ProducerMetrics`, or `ConnectionMetrics`)
-2. Prometheus text export in `to_prometheus_text()` with correct `# HELP` and `# TYPE`
-3. Snapshot struct field + `snapshot()` method
-4. `KrafkaMetrics::reset()` — counters via `.reset()`, gauges via `.set(0)`
-5. `docs/metrics.md` — in the correct table with type and description
+2. `export_metrics()` impl for `MetricsVisitable` — call the matching `export_counter()`, `export_gauge()`, or `export_latency()` on the exporter
+3. Prometheus text export via `PrometheusExporter` (verified by existing `export_metrics` path)
+4. Snapshot struct field + `snapshot()` method
+5. `KrafkaMetrics::reset()` — counters via `.reset()`, gauges via `.set(0)`
+6. `docs/metrics.md` — in the correct table with type and description
+
+## Pluggable Export Traits
+
+- **`MetricsExporter`** (visitor trait): backends implement `export_counter()`, `export_gauge()`, `export_latency()`. Built-in: `PrometheusExporter`, `JsonExporter`, and `OtlpExporter` (feature `telemetry`).
+- **`MetricsVisitable`**: implemented on each metrics struct (`ProducerMetrics`, `ConsumerMetrics`, `ConnectionMetrics`). The `export_metrics(&self, prefix, &mut dyn MetricsExporter)` method drives the visitor.
+- Convenience methods: `to_prometheus_text()` and `to_json()` are provided as default impls on `MetricsVisitable`.
+
+When adding a new exporter, implement `MetricsExporter`. When adding a new metric, update the `export_metrics()` impl on the corresponding struct.
 
 ## Gauge vs Counter
 
