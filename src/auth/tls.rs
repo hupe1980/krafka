@@ -11,7 +11,6 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
-#[cfg(any(feature = "danger-insecure-tls", test))]
 use std::sync::Arc;
 
 use rustls::client::WantsClientCert;
@@ -121,6 +120,19 @@ pub async fn build_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
         .map_err(|e| KrafkaError::config(format!("Failed to spawn blocking task: {e}")))?
 }
 
+/// Build a [`TlsConnector`] from [`TlsConfig`].
+///
+/// Convenience wrapper around [`build_tls_config`] that produces a ready-to-use
+/// connector for [`connect_tls`].
+///
+/// # Errors
+///
+/// Returns an error if certificate/key files cannot be read or parsed.
+pub async fn build_tls_connector(config: &TlsConfig) -> Result<TlsConnector> {
+    let client_config = build_tls_config(config).await?;
+    Ok(TlsConnector::from(Arc::new(client_config)))
+}
+
 /// Connect with TLS using a pre-built connector.
 ///
 /// Performs the TLS handshake on the provided TCP stream using the given
@@ -180,10 +192,14 @@ fn build_tls_config_sync(config: &TlsConfig) -> Result<ClientConfig> {
     if !config.verify_server_cert {
         #[cfg(feature = "danger-insecure-tls")]
         {
-            warn!(
-                "TLS certificate verification is disabled (verify_server_cert=false). \
-                 This is insecure and should only be used for local development."
-            );
+            use std::sync::Once;
+            static WARN_ONCE: Once = Once::new();
+            WARN_ONCE.call_once(|| {
+                warn!(
+                    "TLS certificate verification is disabled (verify_server_cert=false). \
+                     This is insecure and should only be used for local development."
+                );
+            });
             return build_insecure_tls_config(config);
         }
         #[cfg(not(feature = "danger-insecure-tls"))]

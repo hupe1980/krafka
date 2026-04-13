@@ -134,13 +134,22 @@ impl Gauge {
     }
 
     /// Decrement the gauge by 1 (saturates at 0 to prevent underflow).
+    ///
+    /// In debug builds, logs a warning if the gauge was already zero,
+    /// which typically indicates a mismatched `inc()`/`dec()` pair.
     #[inline]
     pub fn dec(&self) {
-        let _ = self
+        let prev = self
             .value
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             });
+        #[cfg(debug_assertions)]
+        if let Ok(0) = prev {
+            tracing::warn!(
+                "Gauge::dec() called when value was already 0 — possible inc/dec mismatch"
+            );
+        }
     }
 }
 

@@ -79,6 +79,11 @@ use crate::protocol::{
 };
 use crate::{Offset, PartitionId};
 
+/// Maximum number of cooperative rebalance rejoin rounds before deferring
+/// to the next poll cycle. Cascading membership changes in large groups
+/// may require multiple rounds; this cap prevents unbounded looping.
+const MAX_COOPERATIVE_ROUNDS: usize = 5;
+
 use fetch_session::FetchSessionCache;
 
 /// A Kafka consumer.
@@ -840,8 +845,7 @@ impl Consumer {
             // additional revocations may be needed. Loop with a bound.
             coordinator.trigger_rejoin().await;
             let mut final_assignment = MemberAssignment::empty();
-            let max_cooperative_rounds = 3;
-            for round in 0..max_cooperative_rounds {
+            for round in 0..MAX_COOPERATIVE_ROUNDS {
                 let (assignment, extra_revoke) =
                     coordinator.perform_cooperative_join_and_sync().await?;
                 final_assignment = assignment;
@@ -862,12 +866,12 @@ impl Consumer {
                     return Ok(true);
                 }
 
-                if round == max_cooperative_rounds - 1 {
+                if round == MAX_COOPERATIVE_ROUNDS - 1 {
                     warn!(
                         "Cooperative rebalance exceeded {} rounds with pending revocations; \
                          this may indicate cascading membership changes. \
                          Deferring assignment to next poll cycle.",
-                        max_cooperative_rounds
+                        MAX_COOPERATIVE_ROUNDS
                     );
                     // Start heartbeat to avoid session timeout while we
                     // defer the additional cooperative rebalance round

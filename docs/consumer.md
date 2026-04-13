@@ -125,6 +125,8 @@ let consumer = Consumer::builder()
 
 Control how offsets are committed. When auto-commit is enabled (the default), Krafka automatically commits offsets during each `poll()` call when the commit interval has elapsed, during `close()`, and **before partition revocations** during rebalances (so the new partition owner sees up-to-date committed positions):
 
+> **Warning — at-least-once caveat:** Auto-commit commits the offset of the last record *returned* by `poll()`, not the last record *processed* by the application. If the application crashes after `poll()` returns but before processing completes, those records may be skipped on restart. For strict at-least-once guarantees, disable auto-commit and call `commit()` explicitly after processing each batch.
+
 ```rust
 use krafka::consumer::Consumer;
 use std::time::Duration;
@@ -505,6 +507,8 @@ Paused partitions are skipped during `poll()` until resumed. This is useful for:
 - Back-pressure handling when downstream is slow
 - Prioritizing certain partitions
 - Implementing rate limiting
+
+> **Rebalance caveat:** During an eager rebalance (or unsubscribe), *all* pause state is cleared — even for partitions that are re-assigned to the same consumer. In cooperative rebalance mode, only revoked partitions lose their pause state; retained partitions stay paused. If your application relies on pause for backpressure, re-apply `pause()` in your `on_partitions_assigned` callback.
 
 ## Manual Partition Assignment
 

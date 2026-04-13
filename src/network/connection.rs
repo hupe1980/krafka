@@ -25,7 +25,7 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::CorrelationId;
-use crate::auth::tls::build_tls_config;
+use crate::auth::tls::build_tls_connector;
 use crate::auth::{
     AuthConfig, ChannelBinding, SaslMechanism, SecurityProtocol, connect_tls,
     extract_tls_server_end_point,
@@ -370,9 +370,8 @@ impl ConnectionConfig {
         if let Some(ref auth) = self.auth
             && let Some(ref tls_config) = auth.tls_config
         {
-            let client_config = build_tls_config(tls_config).await?;
-            self.tls_connector
-                .store(Arc::new(Some(TlsConnector::from(Arc::new(client_config)))));
+            let connector = build_tls_connector(tls_config).await?;
+            self.tls_connector.store(Arc::new(Some(connector)));
         }
         Ok(())
     }
@@ -398,9 +397,8 @@ impl ConnectionConfig {
         if let Some(ref auth) = self.auth
             && let Some(ref tls_config) = auth.tls_config
         {
-            let client_config = build_tls_config(tls_config).await?;
-            self.tls_connector
-                .store(Arc::new(Some(TlsConnector::from(Arc::new(client_config)))));
+            let connector = build_tls_connector(tls_config).await?;
+            self.tls_connector.store(Arc::new(Some(connector)));
             info!("TLS connector refreshed from disk");
         }
         Ok(())
@@ -765,10 +763,7 @@ impl BrokerConnection {
             // repeated disk I/O it entails.
             let connector = match &**config.tls_connector.load() {
                 Some(c) => c.clone(),
-                None => {
-                    let client_config = build_tls_config(tls_config).await?;
-                    TlsConnector::from(Arc::new(client_config))
-                }
+                None => build_tls_connector(tls_config).await?,
             };
 
             // Extract hostname (without port) for TLS SNI.

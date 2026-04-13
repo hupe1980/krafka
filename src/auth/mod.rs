@@ -24,7 +24,10 @@ pub use scram::{
     ChannelBinding, MAX_PBKDF2_ITERATIONS, MIN_PBKDF2_ITERATIONS, ScramClient, ScramMechanism,
     ScramState,
 };
-pub use tls::{MaybeSecureStream, build_tls_config, connect_tls, extract_tls_server_end_point};
+pub use tls::{
+    MaybeSecureStream, build_tls_config, build_tls_connector, connect_tls,
+    extract_tls_server_end_point,
+};
 
 use std::fmt;
 use std::future::Future;

@@ -277,6 +277,10 @@ impl Drop for PendingAddGuard {
                 tp.cancel_add(&topic, partition, &notify);
             } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let txn_partitions = self.txn_partitions.clone();
+                // Note: during runtime shutdown the spawned task may be
+                // cancelled before it runs. This is acceptable because
+                // the transaction state is ephemeral to the producer
+                // instance and will be abandoned on shutdown.
                 handle.spawn(async move {
                     let mut tp = txn_partitions.write().await;
                     tp.cancel_add(&topic, partition, &notify);
@@ -784,7 +788,7 @@ impl TransactionalProducer {
 
         // Allocate the sequence number once — retries must resend the same
         // sequence to maintain idempotent semantics.
-        let mut sequence = self.next_sequence(topic, partition).await;
+        let mut sequence = self.next_sequence(topic, partition).await?;
 
         // Build the record batch and request once before entering the retry loop.
         // If encoding fails, roll back the sequence so the next send attempt
@@ -799,7 +803,7 @@ impl TransactionalProducer {
         ) {
             Ok(req) => req,
             Err(e) => {
-                self.identity.rollback_sequence(topic, partition);
+                let _ = self.identity.rollback_sequence(topic, partition);
                 return Err(e);
             }
         };
@@ -884,7 +888,7 @@ impl TransactionalProducer {
                             "OutOfOrderSequenceNumber, resetting sequence and rebuilding batch"
                         );
                         self.identity.reset_sequence(topic, partition);
-                        sequence = self.next_sequence(topic, partition).await;
+                        sequence = self.next_sequence(topic, partition).await?;
                         request = self.build_produce_request(
                             topic,
                             partition,
@@ -1346,7 +1350,7 @@ impl TransactionalProducer {
     }
 
     /// Get the next sequence number for a topic-partition.
-    async fn next_sequence(&self, topic: &str, partition: PartitionId) -> i32 {
+    async fn next_sequence(&self, topic: &str, partition: PartitionId) -> Result<i32> {
         self.identity.next_sequence(topic, partition)
     }
 

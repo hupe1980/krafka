@@ -112,7 +112,20 @@ pub struct ConsumerConfig {
     pub(crate) client_id: String,
     /// Auto offset reset behavior.
     pub(crate) auto_offset_reset: AutoOffsetReset,
-    /// Enable auto commit.
+    /// Enable automatic offset commit.
+    ///
+    /// When `true` (the default), offsets are committed periodically in
+    /// the background at the interval specified by
+    /// [`auto_commit_interval`](Self::auto_commit_interval) (default: 5 s).
+    /// Commits also occur during cooperative revocation and consumer close.
+    ///
+    /// **Important**: auto-commit commits the offset of the last record
+    /// *returned* by [`poll()`](super::Consumer::poll), not the last record
+    /// *processed* by the application. If the application crashes after
+    /// `poll()` returns but before processing completes, some records may
+    /// be skipped on restart. For at-least-once processing guarantees,
+    /// disable auto-commit and call
+    /// [`commit()`](super::Consumer::commit) after processing.
     pub(crate) enable_auto_commit: bool,
     /// Auto commit interval.
     pub(crate) auto_commit_interval: Duration,
@@ -423,7 +436,9 @@ impl ConsumerConfigBuilder {
         self
     }
 
-    /// Enable auto commit.
+    /// Enable automatic offset commit.
+    ///
+    /// See [`ConsumerConfig::enable_auto_commit`] for semantics and caveats.
     pub fn enable_auto_commit(mut self, enable: bool) -> Self {
         self.config.enable_auto_commit = enable;
         self

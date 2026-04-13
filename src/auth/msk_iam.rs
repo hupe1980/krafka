@@ -129,11 +129,22 @@ impl MskIamAuthenticator {
     ///
     /// The `clock_offset_secs` is added to `SystemTime::now()` when signing
     /// requests. Positive values mean the local clock is behind the broker.
+    ///
+    /// The offset is clamped to ±86 400 s (24 hours). AWS SigV4 only
+    /// tolerates ±5 minutes, so larger offsets indicate a configuration
+    /// error, but we allow a generous margin for testing.
     pub fn new_with_clock_offset(
         credentials: &AwsMskIamCredentials,
         host: impl Into<String>,
         clock_offset_secs: i64,
     ) -> crate::Result<Self> {
+        const MAX_OFFSET_SECS: i64 = 86_400;
+        if clock_offset_secs.abs() > MAX_OFFSET_SECS {
+            return Err(crate::error::KrafkaError::config(format!(
+                "clock_offset_secs ({clock_offset_secs}) exceeds ±{MAX_OFFSET_SECS}s; \
+                 AWS SigV4 only tolerates ±300s"
+            )));
+        }
         let mut auth = Self::new(credentials, host)?;
         auth.clock_offset_secs = clock_offset_secs;
         Ok(auth)

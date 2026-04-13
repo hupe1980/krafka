@@ -598,6 +598,7 @@ impl RecordAccumulator {
                 topic,
                 partition,
                 batch.pending,
+                batch.created_at,
                 guard,
                 metadata,
                 config,
@@ -638,6 +639,7 @@ impl RecordAccumulator {
                 topic,
                 partition,
                 batch.pending,
+                batch.created_at,
                 guard,
                 metadata,
                 config,
@@ -688,6 +690,7 @@ impl RecordAccumulator {
                 topic,
                 partition,
                 batch.pending,
+                batch.created_at,
                 guard,
                 metadata,
                 config,
@@ -706,6 +709,7 @@ impl RecordAccumulator {
         topic: String,
         partition: PartitionId,
         pending: Vec<PendingRecord>,
+        enqueued_at: Instant,
         _in_flight_guard: InFlightGuard,
         metadata: Arc<ClusterMetadata>,
         config: AccumulatorConfig,
@@ -720,10 +724,20 @@ impl RecordAccumulator {
         let record_count = pending.len() as i32;
 
         // Allocate sequence range for idempotent production.
-        let mut sequence: Option<i32> = config
+        let mut sequence: Option<i32> = match config
             .identity
             .as_ref()
-            .map(|id| id.allocate_sequence(&topic, partition, record_count));
+            .map(|id| id.allocate_sequence(&topic, partition, record_count))
+            .transpose()
+        {
+            Ok(s) => s,
+            Err(e) => {
+                for p in pending {
+                    let _ = p.response_tx.send(AppendResponse::Done(Err(e.clone())));
+                }
+                return;
+            }
+        };
 
         // Build and encode the record batch (rebuilt on OutOfOrderSequenceNumber).
         let build_batch = |seq: Option<i32>,
@@ -777,7 +791,7 @@ impl RecordAccumulator {
             Err(e) => {
                 // Rollback sequence on encode failure
                 if let Some(ref identity) = config.identity {
-                    identity.rollback_sequence_range(&topic, partition, record_count);
+                    let _ = identity.rollback_sequence_range(&topic, partition, record_count);
                 }
                 for p in pending {
                     let _ = p.response_tx.send(AppendResponse::Done(Err(e.clone())));
@@ -786,8 +800,15 @@ impl RecordAccumulator {
             }
         };
 
-        // Retry loop
-        let mut retry_ctx = RetryContext::new(retry_policy, format!("batch({topic}-{partition})"));
+        // Retry loop — delivery timeout starts from when the first record
+        // entered the batch (enqueued_at), not from the first send attempt,
+        // so that time spent in the linger window / backpressure counts
+        // against the delivery budget (matching Java client behavior).
+        let mut retry_ctx = RetryContext::new_with_start(
+            retry_policy,
+            format!("batch({topic}-{partition})"),
+            enqueued_at,
+        );
 
         let result: std::result::Result<(i64, i64), KrafkaError> = loop {
             // Get connection to leader
@@ -930,11 +951,14 @@ impl RecordAccumulator {
                                             partition = partition,
                                             "OutOfOrderSequenceNumber in batch, resetting sequence"
                                         );
-                                        let new_seq = identity.reset_and_allocate(
+                                        let new_seq = match identity.reset_and_allocate(
                                             &topic,
                                             partition,
                                             record_count,
-                                        );
+                                        ) {
+                                            Ok(s) => s,
+                                            Err(e) => break Err(e),
+                                        };
                                         sequence = Some(new_seq);
                                         match build_batch(sequence, &config) {
                                             Ok(r) => request = r,
@@ -1002,8 +1026,10 @@ impl RecordAccumulator {
                 // matching Kafka Java client's batch.lastSequence() semantics.
                 // This ensures reset_sequence() computes the correct next value
                 // for multi-record batches after OOSN recovery.
-                if let (Some(identity), Some(seq)) = (&config.identity, sequence) {
-                    let last_seq = super::idempotent::last_sequence_of_batch(seq, record_count);
+                if let (Some(identity), Some(seq)) = (&config.identity, sequence)
+                    && let Ok(last_seq) =
+                        super::idempotent::last_sequence_of_batch(seq, record_count)
+                {
                     identity.acknowledge(&topic, partition, last_seq);
                 }
 
@@ -1029,7 +1055,7 @@ impl RecordAccumulator {
                 // Rollback unused sequence range so the next batch to
                 // this partition doesn't trigger unnecessary OOSN.
                 if let Some(identity) = config.identity.as_ref() {
-                    identity.rollback_sequence_range(&topic, partition, record_count);
+                    let _ = identity.rollback_sequence_range(&topic, partition, record_count);
                 }
                 metrics.record_error();
                 for p in pending {
@@ -1077,6 +1103,7 @@ impl RecordAccumulator {
                 topic,
                 partition,
                 batch.pending,
+                batch.created_at,
                 guard,
                 metadata,
                 config,

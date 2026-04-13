@@ -159,6 +159,24 @@ impl RetryContext {
         }
     }
 
+    /// Create a retry context with a custom start time.
+    ///
+    /// Use this when the delivery timeout should cover time spent waiting
+    /// in a buffer (e.g., the accumulator's linger window) rather than
+    /// starting from the first send attempt.
+    pub fn new_with_start(
+        policy: RetryPolicy,
+        operation: impl Into<String>,
+        started_at: Instant,
+    ) -> Self {
+        Self {
+            policy,
+            attempt: 0,
+            operation: operation.into(),
+            started_at,
+        }
+    }
+
     /// Get the current attempt number.
     #[inline]
     pub fn attempt(&self) -> u32 {
@@ -177,14 +195,16 @@ impl RetryContext {
     pub fn record_failure(&mut self, error: &KrafkaError) -> Option<Duration> {
         self.attempt += 1;
 
+        let elapsed = self.started_at.elapsed();
+
         // Check delivery timeout first — elapsed time trumps retry count.
         if let Some(deadline) = self.policy.delivery_timeout
-            && self.started_at.elapsed() >= deadline
+            && elapsed >= deadline
         {
             warn!(
                 operation = %self.operation,
                 attempt = self.attempt,
-                elapsed_ms = self.started_at.elapsed().as_millis(),
+                elapsed_ms = elapsed.as_millis(),
                 error = %error,
                 "Delivery timeout exceeded, giving up"
             );
@@ -197,7 +217,7 @@ impl RetryContext {
             // Clamp backoff so it doesn't exceed remaining delivery budget.
             // If the remaining budget is zero, give up rather than busy-spinning.
             let backoff = if let Some(deadline) = self.policy.delivery_timeout {
-                let remaining = deadline.saturating_sub(self.started_at.elapsed());
+                let remaining = deadline.saturating_sub(elapsed);
                 if remaining.is_zero() {
                     return None;
                 }

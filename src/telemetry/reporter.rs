@@ -50,6 +50,10 @@ pub struct TelemetryConfig {
     pub metrics_prefix: String,
     /// Resource attributes to attach to every OTLP payload
     /// (e.g., `("client_rack", "us-east-1a")`).
+    ///
+    /// **Privacy**: these key-value pairs are sent to the broker verbatim
+    /// on every telemetry push. Do not include personally identifiable
+    /// information (PII) such as `user_id`, `email`, or `ip_address`.
     pub resource_attributes: Vec<(String, String)>,
 }
 

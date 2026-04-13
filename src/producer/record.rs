@@ -3,6 +3,7 @@
 use bytes::Bytes;
 
 use crate::error::{KrafkaError, Result};
+use crate::protocol::MAX_RECORD_HEADERS;
 use crate::{PartitionId, Timestamp};
 
 /// A record to be sent to Kafka.
@@ -144,10 +145,9 @@ impl ProducerRecord {
         // Header keys and values are encoded with varint i32 length prefixes
         // in the record batch v2 format. Limit header count to prevent
         // excessively large batches from bypassing max_request_size.
-        const MAX_HEADERS: usize = 10_000;
-        if self.headers.len() > MAX_HEADERS {
+        if self.headers.len() > MAX_RECORD_HEADERS {
             return Err(KrafkaError::protocol(format!(
-                "record has {} headers, exceeding limit of {MAX_HEADERS}",
+                "record has {} headers, exceeding limit of {MAX_RECORD_HEADERS}",
                 self.headers.len()
             )));
         }

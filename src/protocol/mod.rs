@@ -117,6 +117,13 @@ use crate::error::{KrafkaError, Result};
 /// preventing CPU-based denial-of-service amplification.
 pub const MAX_DECODE_ARRAY_LEN: usize = 100_000;
 
+/// Maximum number of headers allowed on a single producer record.
+///
+/// Header keys and values are encoded with varint-length prefixes in the
+/// record-batch v2 format. This cap prevents excessively large batches from
+/// bypassing `max_request_size` checks.
+pub const MAX_RECORD_HEADERS: usize = 10_000;
+
 /// Convert a collection length to i32, returning an error if it overflows.
 #[inline]
 pub(crate) fn array_len_i32(len: usize) -> Result<i32> {

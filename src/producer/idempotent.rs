@@ -54,6 +54,7 @@ use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use parking_lot::RwLock;
 
 use crate::PartitionId;
+use crate::error::{KrafkaError, Result};
 
 /// Producer identity for idempotent production.
 ///
@@ -88,12 +89,14 @@ const HALF_SEQUENCE_SPACE: u32 = SEQUENCE_SPACE / 2;
 /// `base_sequence + count - 1`, wrapping at the sequence space boundary.
 /// Matches the Kafka Java client's `ProducerBatch.lastSequence()`.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `count <= 0`.
-pub(crate) fn last_sequence_of_batch(base_sequence: i32, count: i32) -> i32 {
-    assert!(count > 0, "count must be positive");
-    ((base_sequence as u32).wrapping_add((count - 1) as u32) % SEQUENCE_SPACE) as i32
+/// Returns an error if `count <= 0`.
+pub(crate) fn last_sequence_of_batch(base_sequence: i32, count: i32) -> Result<i32> {
+    if count <= 0 {
+        return Err(KrafkaError::protocol("count must be positive"));
+    }
+    Ok(((base_sequence as u32).wrapping_add((count - 1) as u32) % SEQUENCE_SPACE) as i32)
 }
 
 fn next_sequence_after(sequence: i32) -> i32 {
@@ -196,7 +199,7 @@ impl ProducerIdentity {
     /// behavior (`DefaultRecordBatch.incrementSequence()`).
     ///
     /// For multi-record batches, use [`allocate_sequence`](Self::allocate_sequence).
-    pub fn next_sequence(&self, topic: &str, partition: PartitionId) -> i32 {
+    pub fn next_sequence(&self, topic: &str, partition: PartitionId) -> Result<i32> {
         self.allocate_sequence(topic, partition, 1)
     }
 
@@ -205,11 +208,18 @@ impl ProducerIdentity {
     /// Returns the base sequence. The internal counter advances by `count`,
     /// wrapping at the sequence space boundary (`i32::MAX` → 0).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `count <= 0`.
-    pub fn allocate_sequence(&self, topic: &str, partition: PartitionId, count: i32) -> i32 {
-        assert!(count > 0, "count must be positive");
+    /// Returns an error if `count <= 0`.
+    pub fn allocate_sequence(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+        count: i32,
+    ) -> Result<i32> {
+        if count <= 0 {
+            return Err(KrafkaError::protocol("count must be positive"));
+        }
 
         let mut sequences = self.sequences.write();
         let state = sequences
@@ -219,7 +229,7 @@ impl ProducerIdentity {
             .or_default();
         let base = state.next_sequence;
         state.next_sequence = ((base as u32).wrapping_add(count as u32) % SEQUENCE_SPACE) as i32;
-        base
+        Ok(base)
     }
 
     /// Peek at the next sequence number without incrementing.
@@ -252,8 +262,8 @@ impl ProducerIdentity {
     /// Call this when a sequence was allocated via [`Self::next_sequence`] but the
     /// request was never sent (e.g., encode failure). Decrements `next_sequence`
     /// by one, wrapping from 0 back to `i32::MAX`.
-    pub fn rollback_sequence(&self, topic: &str, partition: PartitionId) {
-        self.rollback_sequence_range(topic, partition, 1);
+    pub fn rollback_sequence(&self, topic: &str, partition: PartitionId) -> Result<()> {
+        self.rollback_sequence_range(topic, partition, 1)
     }
 
     /// Roll back a range of `count` sequence numbers.
@@ -262,11 +272,18 @@ impl ProducerIdentity {
     /// [`allocate_sequence`](Self::allocate_sequence) but failed before being
     /// sent (e.g., encode failure), preventing sequence gaps.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `count <= 0`.
-    pub fn rollback_sequence_range(&self, topic: &str, partition: PartitionId, count: i32) {
-        assert!(count > 0, "count must be positive");
+    /// Returns an error if `count <= 0`.
+    pub fn rollback_sequence_range(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+        count: i32,
+    ) -> Result<()> {
+        if count <= 0 {
+            return Err(KrafkaError::protocol("count must be positive"));
+        }
 
         let mut sequences = self.sequences.write();
         if let Some(state) = sequences
@@ -277,6 +294,7 @@ impl ProducerIdentity {
             state.next_sequence =
                 ((current + SEQUENCE_SPACE - count as u32) % SEQUENCE_SPACE) as i32;
         }
+        Ok(())
     }
 
     /// Reset sequence number for a partition (e.g., after an out-of-order error).
@@ -298,11 +316,18 @@ impl ProducerIdentity {
     /// preventing TOCTOU races when multiple concurrent sends hit
     /// `OutOfOrderSequenceNumber` for the same partition.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `count <= 0`.
-    pub fn reset_and_allocate(&self, topic: &str, partition: PartitionId, count: i32) -> i32 {
-        assert!(count > 0, "count must be positive");
+    /// Returns an error if `count <= 0`.
+    pub fn reset_and_allocate(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+        count: i32,
+    ) -> Result<i32> {
+        if count <= 0 {
+            return Err(KrafkaError::protocol("count must be positive"));
+        }
 
         let mut sequences = self.sequences.write();
         let state = sequences
@@ -313,7 +338,7 @@ impl ProducerIdentity {
         state.next_sequence = next_sequence_after(state.last_acked_sequence);
         let base = state.next_sequence;
         state.next_sequence = ((base as u32).wrapping_add(count as u32) % SEQUENCE_SPACE) as i32;
-        base
+        Ok(base)
     }
 
     /// Get the last acknowledged sequence for a partition.
@@ -414,15 +439,15 @@ mod tests {
         identity.initialize(1, 0);
 
         // First sequence should be 0
-        assert_eq!(identity.next_sequence("topic", 0), 0);
-        assert_eq!(identity.next_sequence("topic", 0), 1);
-        assert_eq!(identity.next_sequence("topic", 0), 2);
+        assert_eq!(identity.next_sequence("topic", 0).unwrap(), 0);
+        assert_eq!(identity.next_sequence("topic", 0).unwrap(), 1);
+        assert_eq!(identity.next_sequence("topic", 0).unwrap(), 2);
 
         // Different partition starts at 0
-        assert_eq!(identity.next_sequence("topic", 1), 0);
+        assert_eq!(identity.next_sequence("topic", 1).unwrap(), 0);
 
         // Different topic starts at 0
-        assert_eq!(identity.next_sequence("other-topic", 0), 0);
+        assert_eq!(identity.next_sequence("other-topic", 0).unwrap(), 0);
     }
 
     #[test]
@@ -435,7 +460,7 @@ mod tests {
         assert_eq!(identity.peek_sequence("topic", 0), 0);
 
         // After getting next, peek should show new value
-        identity.next_sequence("topic", 0);
+        identity.next_sequence("topic", 0).unwrap();
         assert_eq!(identity.peek_sequence("topic", 0), 1);
     }
 
@@ -445,9 +470,9 @@ mod tests {
         identity.initialize(1, 0);
 
         // Get some sequences
-        identity.next_sequence("topic", 0);
-        identity.next_sequence("topic", 0);
-        identity.next_sequence("topic", 0);
+        identity.next_sequence("topic", 0).unwrap();
+        identity.next_sequence("topic", 0).unwrap();
+        identity.next_sequence("topic", 0).unwrap();
 
         // Acknowledge sequence 1
         identity.acknowledge("topic", 0, 1);
@@ -468,9 +493,9 @@ mod tests {
         identity.initialize(1, 0);
 
         // Advance sequence
-        identity.next_sequence("topic", 0);
-        identity.next_sequence("topic", 0);
-        identity.next_sequence("topic", 0);
+        identity.next_sequence("topic", 0).unwrap();
+        identity.next_sequence("topic", 0).unwrap();
+        identity.next_sequence("topic", 0).unwrap();
 
         // Acknowledge up to 1
         identity.acknowledge("topic", 0, 1);
@@ -527,7 +552,7 @@ mod tests {
     fn test_reset_identity() {
         let identity = ProducerIdentity::new();
         identity.initialize(12345, 5);
-        identity.next_sequence("topic", 0);
+        identity.next_sequence("topic", 0).unwrap();
 
         identity.reset();
 
@@ -542,10 +567,10 @@ mod tests {
     fn test_snapshot() {
         let identity = ProducerIdentity::new();
         identity.initialize(100, 1);
-        identity.next_sequence("topic1", 0);
-        identity.next_sequence("topic1", 0);
+        identity.next_sequence("topic1", 0).unwrap();
+        identity.next_sequence("topic1", 0).unwrap();
         identity.acknowledge("topic1", 0, 0);
-        identity.next_sequence("topic2", 0);
+        identity.next_sequence("topic2", 0).unwrap();
 
         let snapshot = identity.snapshot();
         assert_eq!(snapshot.producer_id, 100);
@@ -571,7 +596,7 @@ mod tests {
         }
 
         // Should wrap to 0 (matching Kafka Java client behavior)
-        assert_eq!(identity.next_sequence("topic", 0), i32::MAX);
+        assert_eq!(identity.next_sequence("topic", 0).unwrap(), i32::MAX);
         assert_eq!(identity.peek_sequence("topic", 0), 0);
     }
 
@@ -581,13 +606,13 @@ mod tests {
         identity.initialize(1, 0);
 
         // Allocate sequence 0, then roll back
-        assert_eq!(identity.next_sequence("topic", 0), 0);
+        assert_eq!(identity.next_sequence("topic", 0).unwrap(), 0);
         assert_eq!(identity.peek_sequence("topic", 0), 1);
-        identity.rollback_sequence("topic", 0);
+        identity.rollback_sequence("topic", 0).unwrap();
         assert_eq!(identity.peek_sequence("topic", 0), 0);
 
         // Re-allocate gives the same sequence
-        assert_eq!(identity.next_sequence("topic", 0), 0);
+        assert_eq!(identity.next_sequence("topic", 0).unwrap(), 0);
     }
 
     #[test]
@@ -608,33 +633,33 @@ mod tests {
         }
 
         // Rollback from 0 should wrap to i32::MAX
-        identity.rollback_sequence("topic", 0);
+        identity.rollback_sequence("topic", 0).unwrap();
         assert_eq!(identity.peek_sequence("topic", 0), i32::MAX);
     }
 
     #[test]
     fn test_last_sequence_of_batch_single_record() {
-        assert_eq!(last_sequence_of_batch(0, 1), 0);
-        assert_eq!(last_sequence_of_batch(5, 1), 5);
-        assert_eq!(last_sequence_of_batch(i32::MAX, 1), i32::MAX);
+        assert_eq!(last_sequence_of_batch(0, 1).unwrap(), 0);
+        assert_eq!(last_sequence_of_batch(5, 1).unwrap(), 5);
+        assert_eq!(last_sequence_of_batch(i32::MAX, 1).unwrap(), i32::MAX);
     }
 
     #[test]
     fn test_last_sequence_of_batch_multi_record() {
-        assert_eq!(last_sequence_of_batch(0, 5), 4);
-        assert_eq!(last_sequence_of_batch(10, 3), 12);
-        assert_eq!(last_sequence_of_batch(100, 100), 199);
+        assert_eq!(last_sequence_of_batch(0, 5).unwrap(), 4);
+        assert_eq!(last_sequence_of_batch(10, 3).unwrap(), 12);
+        assert_eq!(last_sequence_of_batch(100, 100).unwrap(), 199);
     }
 
     #[test]
     fn test_last_sequence_of_batch_wrapping() {
         // Near max: base = i32::MAX - 2, count = 5
         // Last = i32::MAX - 2 + 4 = i32::MAX + 2 → wraps to 1
-        assert_eq!(last_sequence_of_batch(i32::MAX - 2, 5), 1);
+        assert_eq!(last_sequence_of_batch(i32::MAX - 2, 5).unwrap(), 1);
 
         // At boundary: base = i32::MAX, count = 2
         // Last = i32::MAX + 1 → wraps to 0
-        assert_eq!(last_sequence_of_batch(i32::MAX, 2), 0);
+        assert_eq!(last_sequence_of_batch(i32::MAX, 2).unwrap(), 0);
     }
 
     #[test]
@@ -645,12 +670,12 @@ mod tests {
         identity.initialize(1, 0);
 
         // Allocate a 5-record batch: base=0, sequences 0..4
-        let base = identity.allocate_sequence("topic", 0, 5);
+        let base = identity.allocate_sequence("topic", 0, 5).unwrap();
         assert_eq!(base, 0);
         assert_eq!(identity.peek_sequence("topic", 0), 5);
 
         // Acknowledge the last sequence (4), not the base (0)
-        let last_seq = last_sequence_of_batch(base, 5);
+        let last_seq = last_sequence_of_batch(base, 5).unwrap();
         assert_eq!(last_seq, 4);
         identity.acknowledge("topic", 0, last_seq);
         assert_eq!(identity.last_acked_sequence("topic", 0), 4);
@@ -666,13 +691,13 @@ mod tests {
         identity.initialize(1, 0);
 
         // Allocate sequences 0..2, acknowledge up to 1
-        identity.allocate_sequence("topic", 0, 3);
+        identity.allocate_sequence("topic", 0, 3).unwrap();
         identity.acknowledge("topic", 0, 1);
 
         // reset_and_allocate should atomically:
         // 1. Reset next_sequence = last_acked + 1 = 2
         // 2. Allocate 5 sequences: base=2, next=7
-        let base = identity.reset_and_allocate("topic", 0, 5);
+        let base = identity.reset_and_allocate("topic", 0, 5).unwrap();
         assert_eq!(base, 2);
         assert_eq!(identity.peek_sequence("topic", 0), 7);
     }
@@ -683,10 +708,10 @@ mod tests {
         identity.initialize(1, 0);
 
         // Allocate without any ack — last_acked = -1
-        identity.allocate_sequence("topic", 0, 3);
+        identity.allocate_sequence("topic", 0, 3).unwrap();
 
         // reset_and_allocate: next_sequence_after(-1) = 0, allocate 2 → base=0, next=2
-        let base = identity.reset_and_allocate("topic", 0, 2);
+        let base = identity.reset_and_allocate("topic", 0, 2).unwrap();
         assert_eq!(base, 0);
         assert_eq!(identity.peek_sequence("topic", 0), 2);
     }
@@ -697,7 +722,7 @@ mod tests {
         let identity = ProducerIdentity::new();
         identity.initialize(1, 0);
 
-        let base = identity.reset_and_allocate("topic", 99, 3);
+        let base = identity.reset_and_allocate("topic", 99, 3).unwrap();
         assert_eq!(base, 0);
         assert_eq!(identity.peek_sequence("topic", 99), 3);
     }

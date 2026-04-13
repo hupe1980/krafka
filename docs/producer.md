@@ -323,6 +323,27 @@ let producer = Producer::builder()
 producer.send("topic", None, b"value").await?;
 ```
 
+### Delivery Timeout
+
+The `delivery_timeout` setting (analogous to the Java client's `delivery.timeout.ms`) caps the total time from when a record enters the producer to when it must be acknowledged. This includes time spent in the accumulator's linger window, backpressure waits, and all retry attempts.
+
+```rust
+use krafka::producer::Producer;
+use std::time::Duration;
+
+let producer = Producer::builder()
+    .bootstrap_servers("localhost:9092")
+    .delivery_timeout(Duration::from_secs(120))  // Total delivery budget
+    .linger(Duration::from_millis(5))             // Batching window
+    .retries(u32::MAX)                            // Retry until timeout
+    .build()
+    .await?;
+```
+
+When `delivery_timeout` is set, backoff durations are clamped to the remaining budget so the producer does not overshoot. If the budget is exhausted, the send fails immediately regardless of the remaining retry count.
+
+> **Note:** By default `linger` is `0` (no batching delay), so the delivery timeout is nearly equivalent to network time + retry time. With `linger > 0`, add the maximum linger window to your delivery timeout budget.
+
 ### Manual Retry
 
 For additional retry control beyond the built-in behavior, handle errors explicitly:

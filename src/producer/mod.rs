@@ -417,17 +417,22 @@ impl Producer {
 
         // Allocate sequence for idempotent production (before retry loop — retries
         // must resend the same sequence for the broker to de-duplicate).
-        let mut sequence: Option<i32> = self
+        let mut sequence: Option<i32> = match self
             .identity
             .as_ref()
-            .map(|id| id.next_sequence(topic, partition));
+            .map(|id| id.next_sequence(topic, partition))
+            .transpose()
+        {
+            Ok(s) => s,
+            Err(e) => return Err(e),
+        };
 
         // Build the produce request once (reused across retries).
         let mut request = match self.build_produce_request(topic, partition, &record, sequence) {
             Ok(r) => r,
             Err(e) => {
                 if let Some(ref identity) = self.identity {
-                    identity.rollback_sequence(topic, partition);
+                    let _ = identity.rollback_sequence(topic, partition);
                 }
                 return Err(e);
             }
@@ -496,13 +501,19 @@ impl Producer {
                             partition = partition,
                             "OutOfOrderSequenceNumber, resetting sequence and rebuilding batch"
                         );
-                        let new_seq = identity.reset_and_allocate(topic, partition, 1);
+                        let new_seq = match identity.reset_and_allocate(topic, partition, 1) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                self.metrics.record_error();
+                                return Err(e);
+                            }
+                        };
                         sequence = Some(new_seq);
                         match self.build_produce_request(topic, partition, &record, sequence) {
                             Ok(r) => request = r,
                             Err(build_err) => {
                                 // Rollback the freshly allocated sequence
-                                identity.rollback_sequence(topic, partition);
+                                let _ = identity.rollback_sequence(topic, partition);
                                 self.metrics.record_error();
                                 let dummy_metadata = RecordMetadata {
                                     topic: topic_owned.clone(),
@@ -542,7 +553,7 @@ impl Producer {
                     // Final failure — rollback unused sequence so the next
                     // send doesn't trigger an unnecessary OOSN round-trip.
                     if let Some(ref identity) = self.identity {
-                        identity.rollback_sequence(topic, partition);
+                        let _ = identity.rollback_sequence(topic, partition);
                     }
                     self.metrics.record_error();
                     let dummy_metadata = RecordMetadata {

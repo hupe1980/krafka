@@ -1667,6 +1667,7 @@ impl AdminClient {
                 .await;
 
             let mut classic_fallback: Vec<String> = Vec::new();
+            let mut maybe_classic: Vec<(String, ConsumerGroupDescription)> = Vec::new();
 
             if let Some(version) = kip848_version {
                 let request = ConsumerGroupDescribeRequest::new(groups.clone());
@@ -1679,6 +1680,11 @@ impl AdminClient {
                 let mut buf = response_bytes;
                 let response = ConsumerGroupDescribeResponse::decode_versioned(version, &mut buf)?;
 
+                // Collect groups that ConsumerGroupDescribe returned as "OK but
+                // empty". On Kafka 3.7–3.9 (KIP-848 Early Access), this
+                // happens for classic-protocol groups. We'll try the classic
+                // DescribeGroups as well and use whichever has members.
+
                 for g in response.groups {
                     if g.error_code == crate::error::ErrorCode::GroupIdNotFound {
                         // Classic-protocol group — fall back to DescribeGroups (Key 15).
@@ -1686,7 +1692,10 @@ impl AdminClient {
                         continue;
                     }
 
-                    all_results.push(ConsumerGroupDescription {
+                    let members_empty = g.members.is_empty() && g.error_code.is_ok();
+                    let group_id_clone = g.group_id.clone();
+
+                    let desc = ConsumerGroupDescription {
                         group_id: g.group_id,
                         group_type: GroupType::Consumer,
                         state: g.group_state,
@@ -1740,7 +1749,18 @@ impl AdminClient {
                                 .unwrap_or_else(|| format!("{:?}", g.error_code));
                             Some(msg)
                         },
-                    });
+                    };
+
+                    // Kafka 3.7–3.9 (KIP-848 Early Access) may return OK
+                    // with empty members for classic-protocol groups instead
+                    // of GroupIdNotFound.  Try the classic DescribeGroups
+                    // path as well; if it reports members, use that result.
+                    if members_empty {
+                        maybe_classic.push((group_id_clone.clone(), desc));
+                        classic_fallback.push(group_id_clone);
+                    } else {
+                        all_results.push(desc);
+                    }
                 }
             } else {
                 // Broker does not support Key 69 — all groups are classic.
@@ -1775,7 +1795,7 @@ impl AdminClient {
                 let response = DescribeGroupsResponse::decode_versioned(version, &mut buf)?;
 
                 for g in response.groups {
-                    all_results.push(ConsumerGroupDescription {
+                    let classic_desc = ConsumerGroupDescription {
                         group_id: g.group_id,
                         group_type: GroupType::Classic,
                         state: g.group_state,
@@ -1806,8 +1826,33 @@ impl AdminClient {
                         } else {
                             Some(format!("{:?}", g.error_code))
                         },
-                    });
+                    };
+
+                    // If this group was a maybe_classic candidate from
+                    // ConsumerGroupDescribe, prefer whichever path found
+                    // members. Remove from maybe_classic so we don't
+                    // double-add it later.
+                    if let Some(idx) = maybe_classic
+                        .iter()
+                        .position(|(id, _)| *id == classic_desc.group_id)
+                    {
+                        let (_, consumer_desc) = maybe_classic.swap_remove(idx);
+                        if classic_desc.members.is_empty() {
+                            // Neither path found members — keep the consumer result.
+                            all_results.push(consumer_desc);
+                        } else {
+                            all_results.push(classic_desc);
+                        }
+                    } else {
+                        all_results.push(classic_desc);
+                    }
                 }
+            }
+
+            // Any remaining maybe_classic entries that weren't resolved
+            // by the classic fallback (shouldn't happen, but be safe).
+            for (_, desc) in maybe_classic {
+                all_results.push(desc);
             }
         }
 
@@ -2900,6 +2945,11 @@ impl AdminClient {
     }
 
     /// Close the admin client.
+    ///
+    /// Sets the closed flag and tears down all broker connections.
+    /// In-flight RPCs that have not yet received a response will fail
+    /// with a network error. Callers should ensure long-running admin
+    /// operations have completed before calling `close()`.
     ///
     /// Calling `close()` more than once is a no-op.
     pub async fn close(&self) {
