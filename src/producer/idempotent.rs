@@ -112,6 +112,11 @@ fn is_newer_sequence(last_acked_sequence: i32, candidate_sequence: i32) -> bool 
         return false;
     }
 
+    // Negative candidate sequences are invalid; reject before casting to u32.
+    if candidate_sequence < 0 {
+        return false;
+    }
+
     let last = last_acked_sequence as u32;
     let candidate = candidate_sequence as u32;
     let forward_distance = if candidate >= last {
@@ -207,13 +212,9 @@ impl ProducerIdentity {
         assert!(count > 0, "count must be positive");
 
         let mut sequences = self.sequences.write();
-        if !sequences.contains_key(topic) {
-            sequences.insert(topic.to_string(), HashMap::new());
-        }
-        // Safety: key was just ensured to exist above.
         let state = sequences
-            .get_mut(topic)
-            .unwrap()
+            .entry(topic.to_string())
+            .or_default()
             .entry(partition)
             .or_default();
         let base = state.next_sequence;
@@ -304,13 +305,9 @@ impl ProducerIdentity {
         assert!(count > 0, "count must be positive");
 
         let mut sequences = self.sequences.write();
-        if !sequences.contains_key(topic) {
-            sequences.insert(topic.to_string(), HashMap::new());
-        }
-        // Safety: key was just ensured to exist above.
         let state = sequences
-            .get_mut(topic)
-            .unwrap()
+            .entry(topic.to_string())
+            .or_default()
             .entry(partition)
             .or_default();
         state.next_sequence = next_sequence_after(state.last_acked_sequence);

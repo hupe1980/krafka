@@ -615,7 +615,7 @@ mod tests {
     #[test]
     fn test_debug_redacts_basic_auth() {
         let client = ConfluentSchemaRegistryBuilder::default()
-            .url("http://localhost:8081")
+            .url("https://localhost:8081")
             .basic_auth("admin", "s3cret")
             .build()
             .unwrap();

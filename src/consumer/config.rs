@@ -597,7 +597,7 @@ impl ConsumerConfigBuilder {
     /// Returns an error if timing constraints are violated:
     /// - `heartbeat_interval` must be less than `session_timeout`
     /// - `session_timeout` must be less than or equal to `max_poll_interval`
-    pub fn build(self) -> Result<ConsumerConfig, crate::error::KrafkaError> {
+    pub fn build(self) -> crate::Result<ConsumerConfig> {
         if self.config.heartbeat_interval >= self.config.session_timeout {
             return Err(crate::error::KrafkaError::config(format!(
                 "heartbeat_interval ({:?}) must be less than session_timeout ({:?})",

@@ -372,14 +372,13 @@ impl RecordAccumulator {
         metrics: Arc<ProducerMetrics>,
         in_flight_barrier: Arc<InFlightBarrier>,
     ) -> RecordAccumulatorHandle {
-        // Cap the channel at 64 (down from 1024) to limit untracked memory
-        // sitting in the channel before the accumulator's memory-check runs.
-        // At 1 KB/record this is ≈ 64 KB; at 1 MB/record ≈ 64 MB.  When
+        // Cap the channel at 256 to limit untracked memory sitting in the
+        // channel before the accumulator's memory-check runs.  When
         // buffer_memory is configured, we shrink further so at most ~10% of
         // the budget can be untracked.
         let channel_capacity = if config.buffer_memory > 0 {
             let batch = config.batch_size.max(1);
-            (config.buffer_memory / 10 / batch).clamp(1, 64)
+            (config.buffer_memory / 10 / batch).clamp(1, 256)
         } else {
             64
         };

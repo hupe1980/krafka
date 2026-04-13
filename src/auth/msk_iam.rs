@@ -43,6 +43,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::auth::AwsMskIamCredentials;
 
@@ -265,14 +266,21 @@ impl MskIamAuthenticator {
     }
 
     /// Derive the signing key using the AWS v4 key derivation.
-    fn derive_signing_key(&self, date_stamp: &str, region: &str, service: &str) -> Vec<u8> {
-        let k_date = hmac_sha256(
-            format!("AWS4{}", self.secret_access_key).as_bytes(),
-            date_stamp.as_bytes(),
-        );
-        let k_region = hmac_sha256(&k_date, region.as_bytes());
-        let k_service = hmac_sha256(&k_region, service.as_bytes());
-        hmac_sha256(&k_service, b"aws4_request")
+    ///
+    /// All intermediate HMAC keys are wrapped in [`Zeroizing`] to ensure
+    /// they are scrubbed from memory on drop, preventing credential
+    /// extraction from core dumps or swap files.
+    fn derive_signing_key(
+        &self,
+        date_stamp: &str,
+        region: &str,
+        service: &str,
+    ) -> Zeroizing<Vec<u8>> {
+        let secret = Zeroizing::new(format!("AWS4{}", self.secret_access_key));
+        let k_date = Zeroizing::new(hmac_sha256(secret.as_bytes(), date_stamp.as_bytes()));
+        let k_region = Zeroizing::new(hmac_sha256(&k_date, region.as_bytes()));
+        let k_service = Zeroizing::new(hmac_sha256(&k_region, service.as_bytes()));
+        Zeroizing::new(hmac_sha256(&k_service, b"aws4_request"))
     }
 }
 

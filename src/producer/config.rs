@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::auth::AuthConfig;
+use crate::error::{KrafkaError, Result};
 use crate::metadata::MetadataRecoveryStrategy;
 use crate::protocol::Compression;
 
@@ -377,8 +378,35 @@ impl ProducerConfigBuilder {
     }
 
     /// Build the config.
-    pub fn build(self) -> ProducerConfig {
-        self.config
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration is invalid:
+    /// - `batch_size` must be >= 1
+    /// - Idempotent mode requires `acks = All` and `max_in_flight <= 5`
+    /// - `batch_size` must not exceed `buffer_memory` (when `buffer_memory > 0`)
+    pub fn build(self) -> Result<ProducerConfig> {
+        if self.config.batch_size == 0 {
+            return Err(KrafkaError::config("batch_size must be >= 1"));
+        }
+        if self.config.idempotent {
+            if self.config.acks != Acks::All {
+                return Err(KrafkaError::config(
+                    "idempotent producer requires acks = All",
+                ));
+            }
+            if self.config.max_in_flight > 5 {
+                return Err(KrafkaError::config(
+                    "idempotent producer requires max_in_flight <= 5",
+                ));
+            }
+        }
+        if self.config.buffer_memory > 0 && self.config.batch_size > self.config.buffer_memory {
+            return Err(KrafkaError::config(
+                "batch_size must not exceed buffer_memory",
+            ));
+        }
+        Ok(self.config)
     }
 }
 
@@ -418,7 +446,8 @@ mod tests {
             .acks(Acks::All)
             .compression(Compression::Lz4)
             .batch_size(32768)
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(config.bootstrap_servers, "localhost:9092");
         assert_eq!(config.client_id, "test");
@@ -431,7 +460,8 @@ mod tests {
     fn test_config_builder_request_timeout() {
         let config = ProducerConfig::builder()
             .request_timeout(Duration::from_secs(60))
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             config.request_timeout,
             Duration::from_secs(60),
@@ -441,7 +471,12 @@ mod tests {
 
     #[test]
     fn test_config_builder_max_in_flight() {
-        let config = ProducerConfig::builder().max_in_flight(10).build();
+        // max_in_flight=10 requires idempotent=false
+        let config = ProducerConfig::builder()
+            .idempotent(false)
+            .max_in_flight(10)
+            .build()
+            .unwrap();
         assert_eq!(
             config.max_in_flight, 10,
             "max_in_flight should be set by builder"
@@ -452,7 +487,8 @@ mod tests {
     fn test_config_builder_metadata_max_age() {
         let config = ProducerConfig::builder()
             .metadata_max_age(Duration::from_secs(120))
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             config.metadata_max_age,
             Duration::from_secs(120),
@@ -489,7 +525,8 @@ mod tests {
     fn test_config_builder_proxy_round_trip() {
         let config = ProducerConfig::builder()
             .proxy(crate::network::ProxyConfig::new("proxy:1080"))
-            .build();
+            .build()
+            .unwrap();
         let proxy = config.proxy().expect("proxy should be set");
         assert_eq!(proxy.address(), "proxy:1080");
     }
@@ -512,7 +549,8 @@ mod tests {
         let config = ProducerConfig::builder()
             .metadata_recovery_strategy(MetadataRecoveryStrategy::Rebootstrap)
             .metadata_recovery_rebootstrap_trigger(Duration::from_secs(120))
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             config.metadata_recovery_strategy(),
             MetadataRecoveryStrategy::Rebootstrap,
@@ -521,5 +559,38 @@ mod tests {
             config.metadata_recovery_rebootstrap_trigger(),
             Duration::from_secs(120),
         );
+    }
+
+    #[test]
+    fn test_config_builder_rejects_zero_batch_size() {
+        let err = ProducerConfig::builder().batch_size(0).build();
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_config_builder_rejects_idempotent_with_acks_leader() {
+        let err = ProducerConfig::builder()
+            .idempotent(true)
+            .acks(Acks::Leader)
+            .build();
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_config_builder_rejects_idempotent_with_high_in_flight() {
+        let err = ProducerConfig::builder()
+            .idempotent(true)
+            .max_in_flight(6)
+            .build();
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_config_builder_rejects_batch_exceeding_buffer() {
+        let err = ProducerConfig::builder()
+            .batch_size(1024)
+            .buffer_memory(512)
+            .build();
+        assert!(err.is_err());
     }
 }

@@ -1892,8 +1892,12 @@ async fn test_admin_describe_consumer_group() {
         .unwrap();
 
     subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
-    // Poll multiple times to ensure group join completes (first poll does rebalance)
-    let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 5).await;
+
+    // Drive the rebalance: poll multiple times so JoinGroup/SyncGroup completes.
+    // poll_for_records with min_records=0 exits after one poll, so loop explicitly.
+    for _ in 0..5 {
+        let _ = consumer.poll(Duration::from_secs(3)).await;
+    }
 
     let admin = AdminClient::builder()
         .bootstrap_servers(&bootstrap_servers)
@@ -1902,9 +1906,10 @@ async fn test_admin_describe_consumer_group() {
         .unwrap();
 
     // Retry describe_consumer_groups — the broker may take a moment to
-    // report the member after the rebalance completes.
+    // report the member after the rebalance completes. Keep polling the
+    // consumer between attempts so it stays in the group (heartbeats).
     let mut descriptions = Vec::new();
-    for attempt in 0..10 {
+    for attempt in 0..15 {
         descriptions = admin
             .describe_consumer_groups(vec![group_id.to_string()])
             .await
@@ -1913,11 +1918,13 @@ async fn test_admin_describe_consumer_group() {
             break;
         }
         eprintln!(
-            "describe_consumer_groups attempt {}/10: {} members, retrying in 2s...",
+            "describe_consumer_groups attempt {}/15: {} members, retrying in 2s...",
             attempt + 1,
             descriptions.first().map_or(0, |d| d.members.len()),
         );
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Keep polling so the consumer maintains its group membership
+        let _ = consumer.poll(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
     assert_eq!(descriptions.len(), 1);

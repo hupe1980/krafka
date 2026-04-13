@@ -407,7 +407,7 @@ impl Consumer {
                             .iter()
                             .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
                             .collect();
-                        self.rebalance_listener.on_partitions_revoked(&revoked);
+                        self.safe_on_partitions_revoked(&revoked);
                         self.clear_partition_state().await;
                     }
 
@@ -432,7 +432,7 @@ impl Consumer {
                         .iter()
                         .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
                         .collect();
-                    self.rebalance_listener.on_partitions_assigned(&assigned);
+                    self.safe_on_partitions_assigned(&assigned);
 
                     // Update assigned_partitions metric
                     self.metrics.assigned_partitions.set(assigned.len() as u64);
@@ -647,6 +647,49 @@ impl Consumer {
         self.metrics.lag_max.set(0);
     }
 
+    // ── Panic-safe rebalance listener wrappers ──────────────────────────
+    //
+    // User-provided `ConsumerRebalanceListener` callbacks are wrapped in
+    // `catch_unwind` to prevent a panicking listener from unwinding through
+    // the consumer task, which would skip `leave_group()` and other cleanup.
+    // This mirrors the interceptor subsystem's panic isolation pattern.
+
+    /// Invoke `on_partitions_assigned` on the rebalance listener, catching panics.
+    fn safe_on_partitions_assigned(&self, partitions: &[TopicPartition]) {
+        if let Err(_panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.rebalance_listener.on_partitions_assigned(partitions);
+        })) {
+            tracing::error!(
+                partition_count = partitions.len(),
+                "ConsumerRebalanceListener::on_partitions_assigned panicked"
+            );
+        }
+    }
+
+    /// Invoke `on_partitions_revoked` on the rebalance listener, catching panics.
+    fn safe_on_partitions_revoked(&self, partitions: &[TopicPartition]) {
+        if let Err(_panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.rebalance_listener.on_partitions_revoked(partitions);
+        })) {
+            tracing::error!(
+                partition_count = partitions.len(),
+                "ConsumerRebalanceListener::on_partitions_revoked panicked"
+            );
+        }
+    }
+
+    /// Invoke `on_partitions_lost` on the rebalance listener, catching panics.
+    fn safe_on_partitions_lost(&self, partitions: &[TopicPartition]) {
+        if let Err(_panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.rebalance_listener.on_partitions_lost(partitions);
+        })) {
+            tracing::error!(
+                partition_count = partitions.len(),
+                "ConsumerRebalanceListener::on_partitions_lost panicked"
+            );
+        }
+    }
+
     /// Recompute lag and lag_max gauges from cached offsets and high watermarks.
     ///
     /// Call after any mutation of `self.offsets` or `self.high_watermarks` so
@@ -696,7 +739,7 @@ impl Consumer {
         {
             warn!("Auto-commit before cooperative revocation failed: {}", e);
         }
-        self.rebalance_listener.on_partitions_revoked(revoked_tps);
+        self.safe_on_partitions_revoked(revoked_tps);
         self.apply_partition_revocations(revoked_tuples).await;
 
         // Update metric and owned-partition state in a single lock
@@ -875,8 +918,7 @@ impl Consumer {
                 }
             }
             if !revoked_parts.is_empty() {
-                self.rebalance_listener
-                    .on_partitions_revoked(&revoked_parts);
+                self.safe_on_partitions_revoked(&revoked_parts);
                 let revoked_tuples: Vec<(String, PartitionId)> = revoked_parts
                     .iter()
                     .map(|tp| (tp.topic.clone(), tp.partition))
@@ -976,7 +1018,7 @@ impl Consumer {
             {
                 warn!("Auto-commit before KIP-848 revocation failed: {}", e);
             }
-            self.rebalance_listener.on_partitions_revoked(&revoked);
+            self.safe_on_partitions_revoked(&revoked);
             let revoked_tuples: Vec<(String, PartitionId)> = revoked
                 .iter()
                 .map(|tp| (tp.topic.clone(), tp.partition))
@@ -1009,8 +1051,7 @@ impl Consumer {
                     .map(move |partition| TopicPartition::new(topic, partition))
             })
             .collect();
-        self.rebalance_listener
-            .on_partitions_assigned(&full_assignment);
+        self.safe_on_partitions_assigned(&full_assignment);
 
         let count: usize = new_assignment.partitions.values().map(|ps| ps.len()).sum();
         self.metrics.assigned_partitions.set(count as u64);
@@ -1050,7 +1091,7 @@ impl Consumer {
             {
                 warn!("Auto-commit before eager revocation failed: {}", e);
             }
-            self.rebalance_listener.on_partitions_revoked(&revoked);
+            self.safe_on_partitions_revoked(&revoked);
             self.clear_partition_state().await;
 
             // Clear assignments immediately after revocation so that
@@ -1083,7 +1124,7 @@ impl Consumer {
             .iter()
             .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
             .collect();
-        self.rebalance_listener.on_partitions_assigned(&assigned);
+        self.safe_on_partitions_assigned(&assigned);
         self.metrics.assigned_partitions.set(assigned.len() as u64);
 
         // Fetch committed offsets for new assignment
@@ -3024,7 +3065,7 @@ impl Consumer {
                 .iter()
                 .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
                 .collect();
-            self.rebalance_listener.on_partitions_revoked(&revoked);
+            self.safe_on_partitions_revoked(&revoked);
         }
         drop(assignments);
 
@@ -3115,7 +3156,7 @@ impl Consumer {
                 .iter()
                 .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
                 .collect();
-            self.rebalance_listener.on_partitions_lost(&lost);
+            self.safe_on_partitions_lost(&lost);
         }
         drop(assignments);
 

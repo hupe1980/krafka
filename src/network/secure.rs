@@ -439,6 +439,7 @@ impl SaslAuthenticator {
                     Err(e) => {
                         // RFC 7628 §3.2.3: client MUST send a single \x01 byte to
                         // acknowledge the server's error before closing the connection.
+                        self.oauthbearer_complete = true;
                         self.oauthbearer_pending_error = Some(e);
                         Ok(Some(vec![0x01]))
                     }
