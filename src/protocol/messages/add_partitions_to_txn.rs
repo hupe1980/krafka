@@ -214,7 +214,13 @@ impl AddPartitionsToTxnResponse {
     /// Extracts results from the first transaction in the batched response.
     pub fn decode_v4(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
-        let _error_code = i16::decode(buf)?; // top-level error code (v4+)
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?); // top-level error code (v4+)
+        if !error_code.is_ok() {
+            return Err(crate::error::KrafkaError::broker(
+                error_code,
+                "AddPartitionsToTxn v4+ top-level error",
+            ));
+        }
 
         let txn_count = check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
         let mut results = Vec::new();
@@ -434,6 +440,19 @@ mod tests {
         let resp = AddPartitionsToTxnResponse::decode_v4(&mut buf.freeze()).unwrap();
         assert_eq!(resp.results.len(), 1);
         assert_eq!(resp.results[0].name, "t1");
+    }
+
+    #[test]
+    fn test_add_partitions_to_txn_response_v4_top_level_error() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_i16(16); // top-level error code: NOT_COORDINATOR
+        // rest of the buffer doesn't matter — decode should fail at the error check
+        crate::util::varint::encode_unsigned_varint(1, &mut buf); // txn count: 0
+        buf.put_u8(0); // top-level tagged fields
+
+        let err = AddPartitionsToTxnResponse::decode_v4(&mut buf.freeze()).unwrap_err();
+        assert!(err.to_string().contains("top-level error"));
     }
 
     #[test]

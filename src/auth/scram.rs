@@ -35,9 +35,9 @@ use zeroize::Zeroize;
 use crate::error::{KrafkaError, Result};
 
 /// Minimum allowed PBKDF2 iteration count to prevent downgrade attacks.
-const MIN_PBKDF2_ITERATIONS: u32 = 4096;
+pub const MIN_PBKDF2_ITERATIONS: u32 = 4096;
 /// Maximum allowed PBKDF2 iteration count to prevent DoS via excessive CPU usage.
-const MAX_PBKDF2_ITERATIONS: u32 = 1_000_000;
+pub const MAX_PBKDF2_ITERATIONS: u32 = 1_000_000;
 
 /// SCRAM mechanism variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +64,32 @@ impl ScramMechanism {
         match self {
             ScramMechanism::Sha256 => 32,
             ScramMechanism::Sha512 => 64,
+        }
+    }
+
+    /// Convert to the Kafka wire-format byte value.
+    ///
+    /// Kafka uses `1` for SCRAM-SHA-256 and `2` for SCRAM-SHA-512
+    /// (as defined in KIP-554).
+    #[inline]
+    pub fn to_wire_byte(self) -> i8 {
+        match self {
+            ScramMechanism::Sha256 => 1,
+            ScramMechanism::Sha512 => 2,
+        }
+    }
+
+    /// Construct from the Kafka wire-format byte value.
+    ///
+    /// Returns an error for unknown mechanism codes.
+    #[inline]
+    pub fn from_wire_byte(b: i8) -> Result<Self> {
+        match b {
+            1 => Ok(ScramMechanism::Sha256),
+            2 => Ok(ScramMechanism::Sha512),
+            other => Err(KrafkaError::protocol(format!(
+                "unknown SCRAM mechanism code: {other}"
+            ))),
         }
     }
 }

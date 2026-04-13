@@ -1,7 +1,7 @@
 //! KIP-714 client telemetry: subscription polling and metric push (feature-gated).
 //!
 //! When a broker supports `GetTelemetrySubscriptions` (API Key 71), the
-//! [`TelemetryReporter`] background task periodically:
+//! [`TelemetryReporter`](reporter::TelemetryReporter) background task periodically:
 //!
 //! 1. Fetches the broker's metrics subscription via `GetTelemetrySubscriptions`.
 //! 2. Serialises matching metrics as OTLP `MetricsData` v1 protobuf.

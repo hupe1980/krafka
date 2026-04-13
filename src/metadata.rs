@@ -25,7 +25,7 @@ use crate::{BrokerId, PartitionId};
 ///
 /// Mirrors Java's `MetadataRecoveryStrategy` from KIP-899. When the client
 /// cannot reach any broker in its current metadata for longer than
-/// [`ClusterMetadata::rebootstrap_trigger`], it can automatically fall back
+/// [`ClusterMetadata::with_rebootstrap_trigger`], it can automatically fall back
 /// to the bootstrap servers to re-discover the cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MetadataRecoveryStrategy {

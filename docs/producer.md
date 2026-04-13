@@ -455,6 +455,8 @@ let producer = Producer::builder()
 > The regular `Producer` now obtains a Producer ID via `InitProducerId` at startup,
 > tracks sequence numbers per partition, and de-duplicates retries automatically.
 > `acks = All` and `max_in_flight <= 5` are enforced when idempotent is enabled.
+> The `InitProducerId` call retries on retriable errors (e.g. `CoordinatorLoadInProgress`)
+> with exponential backoff, rotating through available brokers on each attempt.
 >
 > **Error handling:**
 > - `OutOfOrderSequenceNumber` triggers a sequence reset and batch rebuild before retrying.

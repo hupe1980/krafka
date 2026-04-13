@@ -411,7 +411,7 @@ impl Drop for ReconnectGuard {
 /// via a `parking_lot::Mutex`: only the first caller performs the
 /// TCP/TLS/SASL handshake while subsequent callers wait on oneshot channels,
 /// preventing thundering-herd reconnection storms.  The sync mutex ensures
-/// deterministic cleanup in [`ReconnectGuard`]'s `Drop` impl without
+/// deterministic cleanup in `ReconnectGuard`'s `Drop` impl without
 /// requiring a `tokio::spawn` fallback.
 pub struct ConnectionPool {
     /// Connections by broker ID.

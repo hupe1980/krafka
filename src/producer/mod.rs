@@ -129,52 +129,7 @@ impl Producer {
         // Initialize idempotent producer identity (PID + epoch) if enabled.
         let identity = if config.idempotent {
             let identity = Arc::new(ProducerIdentity::new());
-
-            let brokers = metadata.brokers();
-            if brokers.is_empty() {
-                return Err(KrafkaError::protocol(
-                    "no brokers available for InitProducerId",
-                ));
-            }
-            let broker = &brokers[0];
-            let conn = pool
-                .get_connection_by_id(broker.id, broker.address())
-                .await?;
-
-            let ip_version = conn
-                .negotiate_api_version(
-                    ApiKey::InitProducerId,
-                    versions::INIT_PRODUCER_ID_MAX,
-                    versions::INIT_PRODUCER_ID_MIN,
-                )
-                .await
-                .ok_or_else(|| {
-                    KrafkaError::protocol("no mutually supported InitProducerId API version")
-                })?;
-
-            let request = InitProducerIdRequest::idempotent();
-            let response_bytes = conn
-                .send_request(ApiKey::InitProducerId, ip_version, |buf| {
-                    request.encode_versioned(ip_version, buf)
-                })
-                .await?;
-
-            let mut buf = response_bytes;
-            let response = InitProducerIdResponse::decode_versioned(ip_version, &mut buf)?;
-
-            if !response.is_ok() {
-                return Err(KrafkaError::broker(
-                    response.error_code,
-                    "failed to initialize producer ID",
-                ));
-            }
-
-            identity.initialize(response.producer_id, response.producer_epoch);
-            info!(
-                "Idempotent producer initialized: PID={}, epoch={}",
-                response.producer_id, response.producer_epoch
-            );
-
+            Self::init_producer_id(&identity, &metadata, &pool, &config).await?;
             Some(identity)
         } else {
             None
@@ -233,6 +188,118 @@ impl Producer {
             interceptor,
             identity,
         })
+    }
+
+    /// Obtain a producer ID and epoch via `InitProducerId`.
+    ///
+    /// Retries on retriable errors (e.g. `CoordinatorLoadInProgress`) with
+    /// exponential backoff and jitter, rotating through available brokers on
+    /// each attempt so that transient per-broker failures are tolerated.
+    async fn init_producer_id(
+        identity: &ProducerIdentity,
+        metadata: &ClusterMetadata,
+        pool: &ConnectionPool,
+        config: &ProducerConfig,
+    ) -> Result<()> {
+        let retry_policy = RetryPolicy::new()
+            .with_max_retries(config.retries)
+            .with_initial_backoff(config.retry_backoff)
+            .with_max_backoff(Duration::from_secs(10));
+
+        for attempt in 0..=retry_policy.max_retries {
+            if attempt > 0 {
+                let backoff = retry_policy.calculate_backoff(attempt);
+                tokio::time::sleep(backoff).await;
+            }
+
+            let brokers = metadata.brokers();
+            if brokers.is_empty() {
+                if attempt < retry_policy.max_retries {
+                    warn!(attempt, "No brokers available for InitProducerId, retrying");
+                    continue;
+                }
+                return Err(KrafkaError::protocol(
+                    "no brokers available for InitProducerId",
+                ));
+            }
+
+            // Rotate through brokers across attempts.
+            let broker = &brokers[attempt as usize % brokers.len()];
+            let conn = match pool.get_connection_by_id(broker.id, broker.address()).await {
+                Ok(c) => c,
+                Err(e) if e.is_retriable() && attempt < retry_policy.max_retries => {
+                    warn!(
+                        attempt,
+                        error = %e,
+                        "Connection failed for InitProducerId, retrying"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            let ip_version = match conn
+                .negotiate_api_version(
+                    ApiKey::InitProducerId,
+                    versions::INIT_PRODUCER_ID_MAX,
+                    versions::INIT_PRODUCER_ID_MIN,
+                )
+                .await
+            {
+                Some(v) => v,
+                None => {
+                    return Err(KrafkaError::protocol(
+                        "no mutually supported InitProducerId API version",
+                    ));
+                }
+            };
+
+            let request = InitProducerIdRequest::idempotent();
+            let response_bytes = match conn
+                .send_request(ApiKey::InitProducerId, ip_version, |buf| {
+                    request.encode_versioned(ip_version, buf)
+                })
+                .await
+            {
+                Ok(b) => b,
+                Err(e) if e.is_retriable() && attempt < retry_policy.max_retries => {
+                    warn!(
+                        attempt,
+                        error = %e,
+                        "InitProducerId request failed, retrying"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            let mut buf = response_bytes;
+            let response = InitProducerIdResponse::decode_versioned(ip_version, &mut buf)?;
+
+            if response.is_ok() {
+                identity.initialize(response.producer_id, response.producer_epoch);
+                info!(
+                    "Idempotent producer initialized: PID={}, epoch={}",
+                    response.producer_id, response.producer_epoch
+                );
+                return Ok(());
+            }
+
+            if response.error_code.is_retriable() && attempt < retry_policy.max_retries {
+                warn!(
+                    error_code = ?response.error_code,
+                    attempt,
+                    "InitProducerId returned retriable error, retrying"
+                );
+            } else {
+                return Err(KrafkaError::broker(
+                    response.error_code,
+                    "failed to initialize producer ID",
+                ));
+            }
+        }
+
+        unreachable!("retry loop always returns")
     }
 
     /// Send a record to a topic.

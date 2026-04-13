@@ -1133,18 +1133,20 @@ let result = admin
 
 ```rust
 use krafka::protocol::{ScramCredentialDeletion, ScramCredentialUpsertion};
+use krafka::auth::ScramMechanism;
+use zeroize::Zeroizing;
 
 let results = admin.alter_user_scram_credentials(
     vec![ScramCredentialDeletion {
         name: "alice".into(),
-        mechanism: 2, // SCRAM-SHA-512
+        mechanism: ScramMechanism::Sha512,
     }],
     vec![ScramCredentialUpsertion {
         name: "bob".into(),
-        mechanism: 1, // SCRAM-SHA-256
+        mechanism: ScramMechanism::Sha256,
         iterations: 8192,
-        salt: vec![1, 2, 3].into(),
-        salted_password: vec![4, 5, 6].into(),
+        salt: Zeroizing::new(vec![1, 2, 3]),
+        salted_password: Zeroizing::new(vec![4, 5, 6]),
     }],
 ).await?;
 ```

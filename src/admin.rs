@@ -51,7 +51,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tracing::{info, warn};
 
-use crate::auth::AuthConfig;
+use crate::auth::{AuthConfig, ScramMechanism};
 use crate::error::{KrafkaError, Result};
 use crate::metadata::{ClusterMetadata, MetadataRecoveryStrategy, TopicInfo};
 use crate::network::{BrokerConnection, ConnectionConfig, ConnectionPool};
@@ -458,7 +458,7 @@ pub struct DelegationTokenRenewer {
 }
 
 /// A delegation token returned by [`AdminClient::create_delegation_token()`] or
-/// [`AdminClient::describe_delegation_tokens()`].
+/// [`AdminClient::describe_delegation_token()`].
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DelegationToken {
@@ -478,7 +478,7 @@ pub struct DelegationToken {
     pub hmac: Bytes,
     /// Principals authorized to renew this token.
     ///
-    /// Populated by [`AdminClient::describe_delegation_tokens()`]. Empty when
+    /// Populated by [`AdminClient::describe_delegation_token()`]. Empty when
     /// returned from [`AdminClient::create_delegation_token()`] because the
     /// Create response does not include the renewer list.
     pub renewers: Vec<DelegationTokenRenewer>,
@@ -3768,18 +3768,20 @@ impl AdminClient {
     ///
     /// ```ignore
     /// use krafka::protocol::{ScramCredentialDeletion, ScramCredentialUpsertion};
+    /// use krafka::auth::ScramMechanism;
+    /// use zeroize::Zeroizing;
     ///
     /// let results = admin.alter_user_scram_credentials(
     ///     vec![ScramCredentialDeletion {
     ///         name: "alice".into(),
-    ///         mechanism: 2, // SCRAM-SHA-512
+    ///         mechanism: ScramMechanism::Sha512,
     ///     }],
     ///     vec![ScramCredentialUpsertion {
     ///         name: "bob".into(),
-    ///         mechanism: 1, // SCRAM-SHA-256
+    ///         mechanism: ScramMechanism::Sha256,
     ///         iterations: 8192,
-    ///         salt: vec![1, 2, 3].into(),
-    ///         salted_password: vec![4, 5, 6].into(),
+    ///         salt: Zeroizing::new(vec![1, 2, 3]),
+    ///         salted_password: Zeroizing::new(vec![4, 5, 6]),
     ///     }],
     /// ).await?;
     /// ```
@@ -4782,7 +4784,7 @@ pub struct AlterReplicaLogDirsPartitionResult {
     pub error: Option<String>,
 }
 
-/// Result from [`AdminClient::delete_offsets`].
+/// Result from `AdminClient::delete_offsets`.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct OffsetDeleteResult {
@@ -4792,7 +4794,7 @@ pub struct OffsetDeleteResult {
     pub topics: Vec<OffsetDeleteTopicResult>,
 }
 
-/// Per-topic result from [`AdminClient::delete_offsets`].
+/// Per-topic result from `AdminClient::delete_offsets`.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct OffsetDeleteTopicResult {
@@ -4802,7 +4804,7 @@ pub struct OffsetDeleteTopicResult {
     pub partitions: Vec<OffsetDeletePartitionResult>,
 }
 
-/// Per-partition result from [`AdminClient::delete_offsets`].
+/// Per-partition result from `AdminClient::delete_offsets`.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct OffsetDeletePartitionResult {
@@ -4838,8 +4840,8 @@ pub struct ScramCredentialUserResult {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ScramCredentialInfoResult {
-    /// SCRAM mechanism (1 = SCRAM-SHA-256, 2 = SCRAM-SHA-512).
-    pub mechanism: i8,
+    /// SCRAM mechanism.
+    pub mechanism: ScramMechanism,
     /// Number of iterations.
     pub iterations: i32,
 }
@@ -4980,7 +4982,7 @@ pub struct WriteTxnMarkersResult {
     pub topics: Vec<WriteTxnMarkersTopicResult>,
 }
 
-/// Replica (voter or observer) info from [`AdminClient::describe_quorum`].
+/// Replica (voter or observer) info from `AdminClient::describe_quorum`.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct QuorumReplicaInfo {
@@ -4990,7 +4992,7 @@ pub struct QuorumReplicaInfo {
     pub log_end_offset: i64,
 }
 
-/// Per-partition quorum info from [`AdminClient::describe_quorum`].
+/// Per-partition quorum info from `AdminClient::describe_quorum`.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct QuorumPartitionResult {
@@ -5010,7 +5012,7 @@ pub struct QuorumPartitionResult {
     pub observers: Vec<QuorumReplicaInfo>,
 }
 
-/// Per-topic quorum info from [`AdminClient::describe_quorum`].
+/// Per-topic quorum info from `AdminClient::describe_quorum`.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct QuorumTopicResult {
@@ -5020,7 +5022,7 @@ pub struct QuorumTopicResult {
     pub partitions: Vec<QuorumPartitionResult>,
 }
 
-/// Result from [`AdminClient::describe_quorum`].
+/// Result from `AdminClient::describe_quorum`.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DescribeQuorumResult {

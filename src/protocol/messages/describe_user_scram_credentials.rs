@@ -1,6 +1,7 @@
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_string};
+use crate::auth::scram::ScramMechanism;
 use crate::error::{ErrorCode, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, KafkaString, TaggedFields, TryEncode};
@@ -61,8 +62,8 @@ impl VersionedEncode for DescribeUserScramCredentialsRequest {
 /// SCRAM mechanism and iteration count for a credential.
 #[derive(Debug, Clone)]
 pub struct ScramCredentialInfo {
-    /// SCRAM mechanism (1 = SCRAM-SHA-256, 2 = SCRAM-SHA-512).
-    pub mechanism: i8,
+    /// SCRAM mechanism.
+    pub mechanism: ScramMechanism,
     /// Iteration count used for the credential.
     pub iterations: i32,
 }
@@ -112,7 +113,7 @@ impl DescribeUserScramCredentialsResponse {
             )?;
             let mut credential_infos = Vec::with_capacity(cred_count);
             for _ in 0..cred_count {
-                let mechanism = i8::decode(buf)?;
+                let mechanism = ScramMechanism::from_wire_byte(i8::decode(buf)?)?;
                 let iterations = i32::decode(buf)?;
                 let _ = TaggedFields::decode(buf)?;
                 credential_infos.push(ScramCredentialInfo {
@@ -152,6 +153,7 @@ impl VersionedDecode for DescribeUserScramCredentialsResponse {
 mod tests {
     use super::*;
 
+    use crate::auth::scram::ScramMechanism;
     use bytes::BytesMut;
 
     /// Build a compact (flexible) string: varint(len+1) followed by raw bytes.
@@ -232,7 +234,10 @@ mod tests {
         assert_eq!(resp.results[0].user, "alice");
         assert!(resp.results[0].error_code.is_ok());
         assert_eq!(resp.results[0].credential_infos.len(), 1);
-        assert_eq!(resp.results[0].credential_infos[0].mechanism, 1);
+        assert_eq!(
+            resp.results[0].credential_infos[0].mechanism,
+            ScramMechanism::Sha256
+        );
         assert_eq!(resp.results[0].credential_infos[0].iterations, 8192);
     }
 
