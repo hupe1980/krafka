@@ -5,8 +5,8 @@
 use std::time::Duration;
 
 use crate::auth::{
-    AuthConfig, MskIamAuthenticator, OAuthBearerToken, OAuthBearerTokenProvider, PlainCredentials,
-    SaslMechanism, ScramClient, ScramMechanism, SecurityProtocol, TlsConfig,
+    AuthConfig, ChannelBinding, MskIamAuthenticator, OAuthBearerToken, OAuthBearerTokenProvider,
+    PlainCredentials, SaslMechanism, ScramClient, ScramMechanism, SecurityProtocol, TlsConfig,
 };
 use crate::error::{KrafkaError, Result};
 use zeroize::Zeroizing;
@@ -78,9 +78,13 @@ impl SecureConnectionConfigBuilder {
     }
 
     /// Configure SASL/PLAIN authentication.
-    pub fn sasl_plain(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
-        self.auth = AuthConfig::sasl_plain(username, password);
-        self
+    pub fn sasl_plain(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> crate::Result<Self> {
+        self.auth = AuthConfig::sasl_plain(username, password)?;
+        Ok(self)
     }
 
     /// Configure SASL/SCRAM-SHA-256 authentication.
@@ -170,10 +174,18 @@ pub struct SaslAuthenticator {
     msk_iam_complete: bool,
     oauthbearer_token: Option<OAuthBearerToken>,
     oauthbearer_complete: bool,
+    /// Deferred error from OAuthBearer failure — returned after the `\x01` ack is sent.
+    oauthbearer_pending_error: Option<KrafkaError>,
 }
 
 impl SaslAuthenticator {
     /// Create a new SASL authenticator from auth config.
+    ///
+    /// # Arguments
+    ///
+    /// * `auth` - The authentication configuration
+    /// * `channel_binding` - Channel binding data for SCRAM mechanisms; pass
+    ///   [`ChannelBinding::TlsServerEndPoint`] when authenticating over TLS
     ///
     /// For OAUTHBEARER with a token provider, call
     /// [`AuthConfig::resolve_provider_to_token()`] first and pass the
@@ -181,7 +193,7 @@ impl SaslAuthenticator {
     /// return `None`.
     ///
     /// For MSK IAM, you must provide the broker host after creation using `set_msk_host()`.
-    pub fn new(auth: &AuthConfig) -> Option<Self> {
+    pub fn new(auth: &AuthConfig, channel_binding: ChannelBinding) -> Option<Self> {
         let mechanism = auth.sasl_mechanism.as_ref()?;
 
         match mechanism {
@@ -193,6 +205,7 @@ impl SaslAuthenticator {
                 msk_iam_complete: false,
                 oauthbearer_token: None,
                 oauthbearer_complete: false,
+                oauthbearer_pending_error: None,
             }),
             SaslMechanism::ScramSha256 => {
                 let creds = auth.scram_credentials.as_ref()?;
@@ -203,11 +216,13 @@ impl SaslAuthenticator {
                         &creds.username,
                         &creds.password,
                         ScramMechanism::Sha256,
+                        channel_binding,
                     )),
                     msk_iam_authenticator: None,
                     msk_iam_complete: false,
                     oauthbearer_token: None,
                     oauthbearer_complete: false,
+                    oauthbearer_pending_error: None,
                 })
             }
             SaslMechanism::ScramSha512 => {
@@ -219,11 +234,13 @@ impl SaslAuthenticator {
                         &creds.username,
                         &creds.password,
                         ScramMechanism::Sha512,
+                        channel_binding,
                     )),
                     msk_iam_authenticator: None,
                     msk_iam_complete: false,
                     oauthbearer_token: None,
                     oauthbearer_complete: false,
+                    oauthbearer_pending_error: None,
                 })
             }
             SaslMechanism::AwsMskIam => {
@@ -236,6 +253,7 @@ impl SaslAuthenticator {
                     msk_iam_complete: false,
                     oauthbearer_token: None,
                     oauthbearer_complete: false,
+                    oauthbearer_pending_error: None,
                 })
             }
             SaslMechanism::OAuthBearer => {
@@ -255,6 +273,7 @@ impl SaslAuthenticator {
                     msk_iam_complete: false,
                     oauthbearer_token: Some(token),
                     oauthbearer_complete: false,
+                    oauthbearer_pending_error: None,
                 })
             }
             SaslMechanism::Gssapi => {
@@ -275,7 +294,7 @@ impl SaslAuthenticator {
         }
 
         let creds = auth.aws_msk_iam_credentials.as_ref()?;
-        let authenticator = MskIamAuthenticator::new(creds, host);
+        let authenticator = MskIamAuthenticator::new(creds, host).ok()?;
 
         Some(Self {
             mechanism: SaslMechanism::AwsMskIam,
@@ -285,6 +304,7 @@ impl SaslAuthenticator {
             msk_iam_complete: false,
             oauthbearer_token: None,
             oauthbearer_complete: false,
+            oauthbearer_pending_error: None,
         })
     }
 
@@ -295,7 +315,7 @@ impl SaslAuthenticator {
         if self.mechanism == SaslMechanism::AwsMskIam
             && let Some(creds) = auth.aws_msk_iam_credentials.as_ref()
         {
-            self.msk_iam_authenticator = Some(MskIamAuthenticator::new(creds, host));
+            self.msk_iam_authenticator = MskIamAuthenticator::new(creds, host).ok();
         }
     }
 
@@ -377,6 +397,11 @@ impl SaslAuthenticator {
                 Ok(None)
             }
             SaslMechanism::OAuthBearer => {
+                // If a previous round stored a deferred error, return it now.
+                if let Some(err) = self.oauthbearer_pending_error.take() {
+                    return Err(err);
+                }
+
                 // Process server response after initial GS2 token message
                 let token = self
                     .oauthbearer_token
@@ -389,11 +414,10 @@ impl SaslAuthenticator {
                         Ok(None) // Authentication complete
                     }
                     Err(e) => {
-                        // RFC 7628 §3.2.3: client must send \x01 to acknowledge the error
-                        self.oauthbearer_complete = true;
-                        // Return the failure ack byte, then propagate error on next call
-                        // Actually, we should fail immediately — the connection will know
-                        Err(e)
+                        // RFC 7628 §3.2.3: client MUST send a single \x01 byte to
+                        // acknowledge the server's error before closing the connection.
+                        self.oauthbearer_pending_error = Some(e);
+                        Ok(Some(vec![0x01]))
                     }
                 }
             }
@@ -436,6 +460,7 @@ mod tests {
             .client_id("test-client")
             .connect_timeout(Duration::from_secs(5))
             .sasl_plain("user", "pass")
+            .unwrap()
             .build();
 
         assert_eq!(config.connection.client_id, "test-client");
@@ -454,8 +479,8 @@ mod tests {
 
     #[test]
     fn test_sasl_authenticator_plain() {
-        let auth = AuthConfig::sasl_plain("user", "pass");
-        let mut authenticator = SaslAuthenticator::new(&auth).unwrap();
+        let auth = AuthConfig::sasl_plain("user", "pass").unwrap();
+        let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None).unwrap();
 
         assert_eq!(authenticator.mechanism_name(), "PLAIN");
 
@@ -467,7 +492,7 @@ mod tests {
     #[test]
     fn test_sasl_authenticator_scram() {
         let auth = AuthConfig::sasl_scram_sha256("user", "pass");
-        let mut authenticator = SaslAuthenticator::new(&auth).unwrap();
+        let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None).unwrap();
 
         assert_eq!(authenticator.mechanism_name(), "SCRAM-SHA-256");
 
@@ -515,7 +540,7 @@ mod tests {
     #[test]
     fn test_sasl_authenticator_oauthbearer() {
         let auth = AuthConfig::sasl_oauthbearer("my-jwt-token");
-        let mut authenticator = SaslAuthenticator::new(&auth).unwrap();
+        let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None).unwrap();
 
         assert_eq!(authenticator.mechanism_name(), "OAUTHBEARER");
 
@@ -534,7 +559,7 @@ mod tests {
     fn test_sasl_authenticator_oauthbearer_with_extensions() {
         let token = OAuthBearerToken::new("tok").with_extension("logicalCluster", "lkc-123");
         let auth = AuthConfig::sasl_oauthbearer_token(token);
-        let mut authenticator = SaslAuthenticator::new(&auth).unwrap();
+        let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None).unwrap();
 
         let initial = authenticator.initial_response();
         let initial_str = String::from_utf8_lossy(&initial);
@@ -546,10 +571,15 @@ mod tests {
     #[test]
     fn test_sasl_authenticator_oauthbearer_server_error() {
         let auth = AuthConfig::sasl_oauthbearer("bad-token");
-        let mut authenticator = SaslAuthenticator::new(&auth).unwrap();
+        let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None).unwrap();
         let _ = authenticator.initial_response();
 
+        // First call returns the RFC 7628 §3.2.3 failure-ack byte (\x01).
         let result = authenticator.process_challenge(br#"{"status":"invalid_token"}"#);
+        assert_eq!(result.unwrap(), Some(vec![0x01]));
+
+        // Second call surfaces the deferred error.
+        let result = authenticator.process_challenge(&[]);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("invalid_token"));
     }
@@ -563,7 +593,7 @@ mod tests {
             oauthbearer_token: None,
             ..Default::default()
         };
-        assert!(SaslAuthenticator::new(&auth).is_none());
+        assert!(SaslAuthenticator::new(&auth, ChannelBinding::None).is_none());
     }
 
     #[test]
@@ -573,7 +603,7 @@ mod tests {
             sasl_mechanism: Some(SaslMechanism::Gssapi),
             ..Default::default()
         };
-        assert!(SaslAuthenticator::new(&auth).is_none());
+        assert!(SaslAuthenticator::new(&auth, ChannelBinding::None).is_none());
     }
 
     #[test]

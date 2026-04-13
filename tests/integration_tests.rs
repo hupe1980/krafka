@@ -267,7 +267,7 @@ async fn create_topic(bootstrap_servers: &str, topic: &str, partitions: i32) {
 
     admin
         .create_topics(
-            vec![NewTopic::new(topic, partitions, 1)],
+            vec![NewTopic::new(topic, partitions, 1).unwrap()],
             Duration::from_secs(10),
         )
         .await
@@ -346,7 +346,7 @@ async fn test_admin_client() {
 
     // Create a topic
     let topic_name = "admin-test-topic";
-    let new_topic = NewTopic::new(topic_name, 3, 1);
+    let new_topic = NewTopic::new(topic_name, 3, 1).unwrap();
 
     admin
         .create_topics(vec![new_topic], Duration::from_secs(10))
@@ -463,7 +463,7 @@ async fn test_multiple_partitions() {
         .expect("Failed to create admin client");
 
     let topic_name = "multi-partition-topic";
-    let new_topic = NewTopic::new(topic_name, 6, 1);
+    let new_topic = NewTopic::new(topic_name, 6, 1).unwrap();
 
     admin
         .create_topics(vec![new_topic], Duration::from_secs(10))
@@ -519,7 +519,7 @@ async fn test_consumer_group_rebalance() {
         .await
         .expect("Failed to create admin client");
 
-    let new_topic = NewTopic::new(topic_name, 4, 1);
+    let new_topic = NewTopic::new(topic_name, 4, 1).unwrap();
     admin
         .create_topics(vec![new_topic], Duration::from_secs(10))
         .await
@@ -606,7 +606,7 @@ async fn test_consumer_commit_and_resume() {
         .await
         .expect("Failed to create admin client");
 
-    let new_topic = NewTopic::new(topic_name, 1, 1);
+    let new_topic = NewTopic::new(topic_name, 1, 1).unwrap();
     admin
         .create_topics(vec![new_topic], Duration::from_secs(10))
         .await
@@ -1172,7 +1172,7 @@ async fn test_admin_describe_configs() {
 
     // Create a topic first
     let topic_name = "config-test-topic";
-    let new_topic = NewTopic::new(topic_name, 1, 1);
+    let new_topic = NewTopic::new(topic_name, 1, 1).unwrap();
     admin
         .create_topics(vec![new_topic], Duration::from_secs(10))
         .await
@@ -1404,7 +1404,7 @@ async fn test_admin_create_partitions() {
     // Create topic with 2 partitions
     admin
         .create_topics(
-            vec![NewTopic::new(topic_name, 2, 1)],
+            vec![NewTopic::new(topic_name, 2, 1).unwrap()],
             Duration::from_secs(10),
         )
         .await
@@ -1459,7 +1459,7 @@ async fn test_admin_alter_topic_config() {
     // Create topic
     admin
         .create_topics(
-            vec![NewTopic::new(topic_name, 1, 1)],
+            vec![NewTopic::new(topic_name, 1, 1).unwrap()],
             Duration::from_secs(10),
         )
         .await
@@ -1552,7 +1552,10 @@ async fn test_admin_describe_topics() {
 
     admin
         .create_topics(
-            vec![NewTopic::new(topic1, 2, 1), NewTopic::new(topic2, 3, 1)],
+            vec![
+                NewTopic::new(topic1, 2, 1).unwrap(),
+                NewTopic::new(topic2, 3, 1).unwrap(),
+            ],
             Duration::from_secs(10),
         )
         .await
@@ -2246,7 +2249,10 @@ async fn test_many_partitions_topic() {
 
     let topic = "many-partitions-topic";
     admin
-        .create_topics(vec![NewTopic::new(topic, 12, 1)], Duration::from_secs(10))
+        .create_topics(
+            vec![NewTopic::new(topic, 12, 1).unwrap()],
+            Duration::from_secs(10),
+        )
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -2419,6 +2425,7 @@ async fn test_admin_create_topic_with_config() {
 
     let topic = "configured-topic";
     let new_topic = NewTopic::new(topic, 3, 1)
+        .unwrap()
         .with_config("retention.ms", "3600000")
         .with_config("cleanup.policy", "compact");
 

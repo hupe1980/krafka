@@ -39,7 +39,7 @@
 //! // With authentication
 //! let client = AdminClient::builder()
 //!     .bootstrap_servers("localhost:9092")
-//!     .auth(AuthConfig::sasl_plain("user", "password"))
+//!     .auth(AuthConfig::sasl_plain("user", "password")?)
 //!     .build()
 //!     .await?;
 //! ```
@@ -116,13 +116,37 @@ pub struct NewTopic {
 
 impl NewTopic {
     /// Create a new topic configuration.
-    pub fn new(name: impl Into<String>, num_partitions: i32, replication_factor: i16) -> Self {
-        Self {
+    ///
+    /// # Arguments
+    ///
+    /// * `num_partitions` — Must be positive or -1 (use broker default).
+    /// * `replication_factor` — Must be positive or -1 (use broker default).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `num_partitions` or `replication_factor` is zero or
+    /// less than -1.
+    pub fn new(
+        name: impl Into<String>,
+        num_partitions: i32,
+        replication_factor: i16,
+    ) -> Result<Self> {
+        if num_partitions == 0 || num_partitions < -1 {
+            return Err(KrafkaError::config(format!(
+                "num_partitions must be positive or -1, got {num_partitions}"
+            )));
+        }
+        if replication_factor == 0 || replication_factor < -1 {
+            return Err(KrafkaError::config(format!(
+                "replication_factor must be positive or -1, got {replication_factor}"
+            )));
+        }
+        Ok(Self {
             name: name.into(),
             num_partitions,
             replication_factor,
             configs: HashMap::new(),
-        }
+        })
     }
 
     /// Add a configuration option.
@@ -1811,6 +1835,8 @@ impl AdminClient {
         // ListGroups returns groups managed by each broker, so we query all brokers
         let mut all_groups = Vec::new();
         let mut seen_ids = HashSet::new();
+        let mut broker_failures = 0usize;
+        let broker_count = brokers.len();
 
         for broker in &brokers {
             let conn = match self
@@ -1824,6 +1850,7 @@ impl AdminClient {
                         "Failed to connect to broker {} for ListGroups, skipping: {}",
                         broker.id, e
                     );
+                    broker_failures += 1;
                     continue;
                 }
             };
@@ -1847,6 +1874,7 @@ impl AdminClient {
                         "No mutually supported ListGroups API version for broker {}, skipping",
                         broker.id
                     );
+                    broker_failures += 1;
                     continue;
                 }
             };
@@ -1860,6 +1888,7 @@ impl AdminClient {
                 Ok(r) => r,
                 Err(e) => {
                     warn!("ListGroups RPC failed on broker {}: {}", broker.id, e);
+                    broker_failures += 1;
                     continue;
                 }
             };
@@ -1869,6 +1898,7 @@ impl AdminClient {
                 Ok(r) => r,
                 Err(e) => {
                     warn!("ListGroups decode failed on broker {}: {}", broker.id, e);
+                    broker_failures += 1;
                     continue;
                 }
             };
@@ -1879,6 +1909,7 @@ impl AdminClient {
                     broker.id,
                     response.error_code
                 );
+                broker_failures += 1;
                 continue;
             }
 
@@ -1896,6 +1927,19 @@ impl AdminClient {
                     });
                 }
             }
+        }
+
+        if broker_failures == broker_count {
+            return Err(KrafkaError::invalid_state(
+                "list_consumer_groups failed: all brokers returned errors",
+            ));
+        }
+
+        if broker_failures > 0 {
+            warn!(
+                "list_consumer_groups: {broker_failures}/{broker_count} brokers failed; \
+                 results may be incomplete"
+            );
         }
 
         info!("Listed {} consumer groups", all_groups.len());
@@ -5068,7 +5112,7 @@ impl AdminClientBuilder {
     ///
     /// let client = AdminClient::builder()
     ///     .bootstrap_servers("localhost:9092")
-    ///     .auth(AuthConfig::sasl_plain("user", "password"))
+    ///     .auth(AuthConfig::sasl_plain("user", "password")?)
     ///     .build()
     ///     .await?;
     /// ```
@@ -5087,9 +5131,13 @@ impl AdminClientBuilder {
     }
 
     /// Configure SASL/PLAIN authentication.
-    pub fn sasl_plain(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
-        self.config.auth = Some(AuthConfig::sasl_plain(username, password));
-        self
+    pub fn sasl_plain(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> crate::Result<Self> {
+        self.config.auth = Some(AuthConfig::sasl_plain(username, password)?);
+        Ok(self)
     }
 
     /// Configure SASL/SCRAM-SHA-256 authentication.
@@ -5193,6 +5241,7 @@ mod tests {
     #[test]
     fn test_new_topic() {
         let topic = NewTopic::new("test-topic", 3, 2)
+            .unwrap()
             .with_config("cleanup.policy", "compact")
             .with_config("retention.ms", "86400000");
 
@@ -5200,6 +5249,16 @@ mod tests {
         assert_eq!(topic.num_partitions, 3);
         assert_eq!(topic.replication_factor, 2);
         assert_eq!(topic.configs.len(), 2);
+    }
+
+    #[test]
+    fn test_new_topic_validation() {
+        assert!(NewTopic::new("t", 1, 1).is_ok());
+        assert!(NewTopic::new("t", -1, -1).is_ok());
+        assert!(NewTopic::new("t", 0, 1).is_err());
+        assert!(NewTopic::new("t", -2, 1).is_err());
+        assert!(NewTopic::new("t", 1, 0).is_err());
+        assert!(NewTopic::new("t", 1, -2).is_err());
     }
 
     #[test]
@@ -5302,7 +5361,7 @@ mod tests {
 
         let builder = AdminClient::builder()
             .bootstrap_servers("broker:9093")
-            .auth(AuthConfig::sasl_plain("user", "pass"));
+            .auth(AuthConfig::sasl_plain("user", "pass").unwrap());
 
         let auth = builder.config.auth.as_ref().unwrap();
         assert!(auth.requires_sasl());
@@ -5314,7 +5373,8 @@ mod tests {
     fn test_admin_builder_sasl_plain() {
         let builder = AdminClient::builder()
             .bootstrap_servers("broker:9093")
-            .sasl_plain("admin", "admin-secret");
+            .sasl_plain("admin", "admin-secret")
+            .unwrap();
 
         let auth = builder.config.auth.as_ref().unwrap();
         assert_eq!(

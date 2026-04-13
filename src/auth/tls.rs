@@ -147,6 +147,26 @@ pub async fn connect_tls(
         .map_err(|e| KrafkaError::auth(format!("TLS handshake failed: {e}")))
 }
 
+/// Extract `tls-server-end-point` channel binding data from a TLS stream (RFC 5929 §4.1).
+///
+/// Returns the SHA-256 hash of the server's DER-encoded end-entity certificate.
+/// This binding type works with both TLS 1.2 and TLS 1.3.
+///
+/// Returns `None` if the server did not present any certificates (should not
+/// happen after a successful handshake with certificate verification enabled).
+pub fn extract_tls_server_end_point(stream: &TlsStream<TcpStream>) -> Option<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+
+    let (_, conn) = stream.get_ref();
+    let certs = conn.peer_certificates()?;
+    let end_entity = certs.first()?;
+
+    // RFC 5929 §4.1: for certificates using a signature algorithm with
+    // SHA-256 or stronger, the binding data is SHA-256(cert).  Since
+    // MD5/SHA-1 certs are rejected by rustls, SHA-256 is always correct.
+    Some(Sha256::digest(end_entity.as_ref()).to_vec())
+}
+
 // ---------------------------------------------------------------------------
 // Private sync implementation — single source of truth for all TLS
 // configuration logic. Wrapped by the public async API above.
@@ -209,9 +229,27 @@ fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 /// Load a private key from a PEM file.
+///
+/// On Unix, warns if the file is world-readable (permissions `& 0o077 != 0`).
 fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
     let file = File::open(Path::new(path))
         .map_err(|e| KrafkaError::config(format!("Failed to open key file {path}: {e}")))?;
+
+    // Warn on overly permissive file permissions (Unix only).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = file.metadata() {
+            let mode = meta.mode();
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    "Private key file {path} has world/group-readable permissions \
+                     (mode {mode:#o}). Consider restricting to owner-only (chmod 600)."
+                );
+            }
+        }
+    }
+
     let mut reader = BufReader::new(file);
 
     private_key(&mut reader)

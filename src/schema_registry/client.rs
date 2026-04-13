@@ -77,6 +77,9 @@ fn default_avro_type() -> String {
 // ── Auth ─────────────────────────────────────────────────────────────────
 
 /// Authentication method for the schema registry.
+///
+/// Credentials are zeroized on drop to reduce the window during which
+/// plaintext secrets remain in process memory.
 #[derive(Clone, Default)]
 enum RegistryAuth {
     #[default]
@@ -88,6 +91,22 @@ enum RegistryAuth {
     Bearer {
         token: String,
     },
+}
+
+impl Drop for RegistryAuth {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        match self {
+            Self::Basic { username, password } => {
+                username.zeroize();
+                password.zeroize();
+            }
+            Self::Bearer { token } => {
+                token.zeroize();
+            }
+            Self::None => {}
+        }
+    }
 }
 
 // ── Client ───────────────────────────────────────────────────────────────

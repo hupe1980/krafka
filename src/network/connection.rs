@@ -24,7 +24,10 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::CorrelationId;
 use crate::auth::tls::build_tls_config;
-use crate::auth::{AuthConfig, SaslMechanism, SecurityProtocol, connect_tls};
+use crate::auth::{
+    AuthConfig, ChannelBinding, SaslMechanism, SecurityProtocol, connect_tls,
+    extract_tls_server_end_point,
+};
 use crate::error::{KrafkaError, Result};
 
 /// SOCKS5 proxy configuration for connecting to brokers through a proxy.
@@ -232,6 +235,15 @@ pub struct ConnectionConfig {
     /// Responses larger than this are rejected to prevent excessive memory allocation.
     /// Default: 100 MB (matching `MAX_MESSAGE_SIZE`).
     pub(crate) max_response_size: usize,
+    /// Maximum number of in-flight requests per connection.
+    ///
+    /// When this limit is reached, new requests are rejected with an error
+    /// until existing requests complete or time out. This prevents unbounded
+    /// memory growth from a stalled broker or runaway producer.
+    ///
+    /// Default: 256. Use 5 for idempotent producers to match Kafka's
+    /// `max.in.flight.requests.per.connection` guarantee.
+    pub(crate) max_in_flight_requests: usize,
     /// Authentication configuration (optional).
     ///
     /// When set, the connection will perform TLS upgrade and/or SASL
@@ -270,6 +282,7 @@ impl std::fmt::Debug for ConnectionConfig {
                 &self.normal_priority_channel_capacity,
             )
             .field("max_response_size", &self.max_response_size)
+            .field("max_in_flight_requests", &self.max_in_flight_requests)
             .field("auth", &self.auth)
             .field("tls_connector", &self.tls_connector.as_ref().map(|_| ".."));
         #[cfg(feature = "socks5")]
@@ -291,6 +304,7 @@ impl Default for ConnectionConfig {
             high_priority_channel_capacity: 64,
             normal_priority_channel_capacity: 256,
             max_response_size: crate::protocol::MAX_MESSAGE_SIZE,
+            max_in_flight_requests: 256,
             auth: None,
             tls_connector: None,
             #[cfg(feature = "socks5")]
@@ -387,6 +401,12 @@ impl ConnectionConfig {
         self.max_response_size
     }
 
+    /// Returns the maximum number of in-flight requests per connection.
+    #[inline]
+    pub fn max_in_flight_requests(&self) -> usize {
+        self.max_in_flight_requests
+    }
+
     /// Returns the authentication configuration, if set.
     #[inline]
     pub fn auth(&self) -> Option<&AuthConfig> {
@@ -463,6 +483,15 @@ impl ConnectionConfigBuilder {
     /// Responses exceeding this limit are rejected. Default: 100 MB.
     pub fn max_response_size(mut self, size: usize) -> Self {
         self.0.max_response_size = size.max(1024); // at least 1 KB
+        self
+    }
+
+    /// Set the maximum number of in-flight requests per connection.
+    ///
+    /// Limits the number of requests waiting for a response on a single
+    /// connection. Default: 256. Use 5 for idempotent producers.
+    pub fn max_in_flight_requests(mut self, max: usize) -> Self {
+        self.0.max_in_flight_requests = max.max(1);
         self
     }
 
@@ -657,6 +686,14 @@ impl BrokerConnection {
             if needs_sasl {
                 // TLS + SASL: authenticate on the TLS stream, then run event loop
                 let mut tls_stream = tls_stream;
+
+                // Extract tls-server-end-point channel binding data (RFC 5929 §4.1)
+                // before the stream is consumed. This binds the SCRAM exchange to
+                // this specific TLS session.
+                let channel_binding = extract_tls_server_end_point(&tls_stream)
+                    .map(ChannelBinding::TlsServerEndPoint)
+                    .unwrap_or(ChannelBinding::None);
+
                 let session_lifetime_ms = Self::perform_sasl_handshake(
                     &mut tls_stream,
                     auth,
@@ -664,6 +701,7 @@ impl BrokerConnection {
                     &config.client_id,
                     config.max_response_size,
                     request_timeout,
+                    channel_binding,
                 )
                 .await?;
 
@@ -680,6 +718,7 @@ impl BrokerConnection {
                         request_timeout,
                         stats_clone,
                         config.max_response_size,
+                        config.max_in_flight_requests,
                     )
                     .await
                     {
@@ -699,6 +738,7 @@ impl BrokerConnection {
                         request_timeout,
                         stats_clone,
                         config.max_response_size,
+                        config.max_in_flight_requests,
                     )
                     .await
                     {
@@ -719,6 +759,7 @@ impl BrokerConnection {
                 &config.client_id,
                 config.max_response_size,
                 request_timeout,
+                ChannelBinding::None,
             )
             .await?;
 
@@ -734,6 +775,7 @@ impl BrokerConnection {
                     request_timeout,
                     stats_clone,
                     config.max_response_size,
+                    config.max_in_flight_requests,
                 )
                 .await
                 {
@@ -753,6 +795,7 @@ impl BrokerConnection {
                     request_timeout,
                     stats_clone,
                     config.max_response_size,
+                    config.max_in_flight_requests,
                 )
                 .await
                 {
@@ -914,6 +957,11 @@ impl BrokerConnection {
     /// For multi-step mechanisms (SCRAM-SHA-*), the challenge-response
     /// loop is handled automatically.
     ///
+    /// The `channel_binding` parameter is forwarded to the SCRAM client when
+    /// the mechanism is SCRAM-SHA-*. Pass [`ChannelBinding::TlsServerEndPoint`]
+    /// when the underlying transport is TLS, or [`ChannelBinding::None`] for
+    /// plaintext SASL.
+    ///
     /// Returns the session lifetime in milliseconds reported by the broker
     /// (KIP-368). A value of `0` means the broker does not enforce
     /// session expiry.
@@ -924,6 +972,7 @@ impl BrokerConnection {
         client_id: &str,
         max_response_size: usize,
         request_timeout: Duration,
+        channel_binding: ChannelBinding,
     ) -> Result<i64>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -944,7 +993,7 @@ impl BrokerConnection {
             auth
         };
 
-        let mut authenticator = SaslAuthenticator::new(auth)
+        let mut authenticator = SaslAuthenticator::new(auth, channel_binding)
             .ok_or_else(|| KrafkaError::auth("Failed to create SASL authenticator"))?;
 
         // Warn about SASL PLAIN over cleartext — credentials sent unencrypted
@@ -1138,6 +1187,7 @@ impl BrokerConnection {
     /// This is generic over the stream type, supporting both plain TCP and TLS.
     /// High-priority requests are always checked first using try_recv,
     /// ensuring heartbeats are never starved by backpressure on data requests.
+    #[allow(clippy::too_many_arguments)]
     async fn run_connection_loop<R, W>(
         mut reader: R,
         mut writer: W,
@@ -1146,6 +1196,7 @@ impl BrokerConnection {
         request_timeout: Duration,
         stats: Arc<ConnectionStats>,
         max_response_size: usize,
+        max_in_flight_requests: usize,
     ) -> Result<()>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -1228,7 +1279,7 @@ impl BrokerConnection {
             // Try high-priority first (non-blocking)
             if let Ok(cmd) = high_priority_rx.try_recv() {
                 stats.high_priority_bypasses.fetch_add(1, Ordering::Relaxed);
-                if Self::handle_command(&mut writer, &pending, cmd).await? {
+                if Self::handle_command(&mut writer, &pending, cmd, max_in_flight_requests).await? {
                     break;
                 }
                 continue;
@@ -1251,7 +1302,7 @@ impl BrokerConnection {
                 cmd = high_priority_rx.recv() => {
                     match cmd {
                         Some(cmd) => {
-                            if Self::handle_command(&mut writer, &pending, cmd).await? {
+                            if Self::handle_command(&mut writer, &pending, cmd, max_in_flight_requests).await? {
                                 break;
                             }
                         }
@@ -1261,7 +1312,7 @@ impl BrokerConnection {
                 cmd = normal_priority_rx.recv() => {
                     match cmd {
                         Some(cmd) => {
-                            if Self::handle_command(&mut writer, &pending, cmd).await? {
+                            if Self::handle_command(&mut writer, &pending, cmd, max_in_flight_requests).await? {
                                 break;
                             }
                         }
@@ -1316,6 +1367,7 @@ impl BrokerConnection {
         writer: &mut W,
         pending: &Mutex<HashMap<CorrelationId, PendingRequest>>,
         cmd: ConnectionCommand,
+        max_in_flight_requests: usize,
     ) -> Result<bool> {
         match cmd {
             ConnectionCommand::Request {
@@ -1325,6 +1377,22 @@ impl BrokerConnection {
                 api_version,
                 response_tx,
             } => {
+                // Reject if at capacity to prevent unbounded memory growth
+                {
+                    let pending_map = pending.lock().await;
+                    if pending_map.len() >= max_in_flight_requests {
+                        warn!(
+                            pending = pending_map.len(),
+                            max = max_in_flight_requests,
+                            "Rejecting request: max in-flight requests reached"
+                        );
+                        let _ = response_tx.send(Err(KrafkaError::invalid_state(format!(
+                            "max in-flight requests ({max_in_flight_requests}) reached"
+                        ))));
+                        return Ok(false);
+                    }
+                }
+
                 // Store pending request
                 {
                     let mut pending = pending.lock().await;
@@ -1412,10 +1480,11 @@ impl BrokerConnection {
                 }
             }
         } else {
-            warn!(
-                "Received response for unknown correlation_id={}",
-                correlation_id
-            );
+            // Unknown correlation ID indicates a protocol desync — the
+            // connection is no longer reliable. Return an error to close it.
+            return Err(KrafkaError::protocol(format!(
+                "Received response for unknown correlation_id={correlation_id}, closing connection"
+            )));
         }
 
         Ok(())
@@ -1778,7 +1847,7 @@ mod tests {
         use crate::auth::AuthConfig;
         let config = ConnectionConfig::builder()
             .client_id("test")
-            .auth(AuthConfig::sasl_plain("user", "pass"))
+            .auth(AuthConfig::sasl_plain("user", "pass").unwrap())
             .build();
 
         assert_eq!(config.client_id, "test");
@@ -2000,10 +2069,7 @@ mod tests {
         // Connect with SASL/PLAIN auth
         let config = ConnectionConfig::builder()
             .client_id("test-client")
-            .auth(crate::auth::AuthConfig::sasl_plain(
-                "testuser",
-                "testpassword",
-            ))
+            .auth(crate::auth::AuthConfig::sasl_plain("testuser", "testpassword").unwrap())
             .build();
 
         let conn = BrokerConnection::connect(&addr_str, config).await;
@@ -2201,7 +2267,7 @@ mod tests {
 
         let config = ConnectionConfig::builder()
             .client_id("test-client")
-            .auth(crate::auth::AuthConfig::sasl_plain("user", "pass"))
+            .auth(crate::auth::AuthConfig::sasl_plain("user", "pass").unwrap())
             .build();
 
         let result = BrokerConnection::connect(&addr_str, config).await;
@@ -2277,7 +2343,7 @@ mod tests {
 
         let config = ConnectionConfig::builder()
             .client_id("test-client")
-            .auth(crate::auth::AuthConfig::sasl_plain("user", "wrongpass"))
+            .auth(crate::auth::AuthConfig::sasl_plain("user", "wrongpass").unwrap())
             .build();
 
         let result = BrokerConnection::connect(&addr_str, config).await;
@@ -2358,6 +2424,7 @@ mod tests {
             Duration::from_secs(30),
             stats,
             16,
+            256,
         ));
 
         let (response_tx, response_rx) = oneshot::channel();
@@ -2649,7 +2716,7 @@ mod tests {
 
         let config = ConnectionConfig::builder()
             .client_id("test-client")
-            .auth(crate::auth::AuthConfig::sasl_plain("user", "pass"))
+            .auth(crate::auth::AuthConfig::sasl_plain("user", "pass").unwrap())
             .build();
 
         let conn = BrokerConnection::connect(&addr, config).await.unwrap();
@@ -2694,7 +2761,7 @@ mod tests {
 
         let config = ConnectionConfig::builder()
             .client_id("test-client")
-            .auth(crate::auth::AuthConfig::sasl_plain("user", "pass"))
+            .auth(crate::auth::AuthConfig::sasl_plain("user", "pass").unwrap())
             .build();
 
         let conn = BrokerConnection::connect(&addr, config).await.unwrap();

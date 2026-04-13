@@ -22,8 +22,8 @@ atomic pointer store at the end.
 
 ## Error Filtering
 
-- Topics with error codes are **not** inserted into the cache (deleted/unauthorized topics filtered out).
-- On partial refresh, error topics are **removed** from the cache (may have been deleted).
+- Topics with **permanent** error codes (UnknownTopicOrPartition, TopicAuthorizationFailed, InvalidTopic, etc.) are **removed** from the cache.
+- Topics with **transient** error codes (LeaderNotAvailable, RequestTimedOut, etc.) are **kept** as stale entries so callers don't lose visibility. Use `ErrorCode::is_retriable()` to distinguish.
 - Partitions with error codes are **excluded** from their topic's partition list.
 - `leader_epoch` of `-1` means unknown — treat accordingly.
 

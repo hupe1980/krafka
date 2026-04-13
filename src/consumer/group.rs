@@ -2962,18 +2962,20 @@ impl GroupCoordinator {
             return Ok(());
         }
 
-        // Stop heartbeat task
-        self.stop_heartbeat_task().await;
-
-        // KIP-848: leave by sending heartbeat with epoch -1
+        // KIP-848: stop heartbeat first (prevent normal heartbeat from
+        // racing with the leave-epoch heartbeat), then send the leave.
         if self.is_consumer_protocol() {
+            self.stop_heartbeat_task().await;
             return self.leave_group_consumer().await;
         }
 
+        // Classic protocol: send LeaveGroup while heartbeat still keeps the
+        // member alive on the broker, then stop heartbeat afterward.
         let conn = match self.get_coordinator_connection().await {
             Ok(c) => c,
             Err(_) => {
-                // If we can't get a connection, just reset state
+                // If we can't get a connection, just stop heartbeat and reset state
+                self.stop_heartbeat_task().await;
                 self.reset().await;
                 return Ok(());
             }
@@ -3062,6 +3064,7 @@ impl GroupCoordinator {
             }
         }
 
+        self.stop_heartbeat_task().await;
         self.reset().await;
         Ok(())
     }

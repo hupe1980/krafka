@@ -166,11 +166,16 @@ impl ShareConsumer {
 
         let bootstrap_servers = crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
 
-        let metadata = Arc::new(
-            ClusterMetadata::new(bootstrap_servers, pool.clone(), config.metadata_max_age)
-                .with_recovery_strategy(config.metadata_recovery_strategy)
-                .with_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger),
-        );
+        let metadata = Arc::new({
+            let mut meta =
+                ClusterMetadata::new(bootstrap_servers, pool.clone(), config.metadata_max_age)
+                    .with_recovery_strategy(config.metadata_recovery_strategy)
+                    .with_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger);
+            if let Some(ttl) = config.metadata_topic_cache_ttl {
+                meta = meta.with_topic_cache_ttl(ttl);
+            }
+            meta
+        });
 
         metadata.refresh().await?;
 
@@ -485,7 +490,10 @@ impl ShareConsumer {
                             if let Some(ref raw) = partition_response.records {
                                 let mut cursor = raw.as_ref();
                                 while !cursor.is_empty() {
-                                    match RecordBatch::decode(&mut cursor) {
+                                    match RecordBatch::decode_with_limit(
+                                        &mut cursor,
+                                        self.config.max_decompressed_size,
+                                    ) {
                                         Ok(batch) => {
                                             for record in batch.records {
                                                 let record_offset =
@@ -1360,10 +1368,30 @@ impl ShareConsumerBuilder {
         self
     }
 
+    /// Set the topic cache TTL for partial metadata refreshes.
+    ///
+    /// During partial refreshes, cached topics that have not been refreshed
+    /// within this duration are evicted to prevent unbounded cache growth.
+    /// `None` disables TTL eviction (the default).
+    pub fn metadata_topic_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.config.metadata_topic_cache_ttl = Some(ttl);
+        self
+    }
+
     /// Set SOCKS5 proxy configuration.
     #[cfg(feature = "socks5")]
     pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
         self.config.proxy = Some(proxy);
+        self
+    }
+
+    /// Set the maximum decompressed size for record batches.
+    ///
+    /// Compressed payloads that decompress beyond this limit are rejected as
+    /// potential compression bombs. Defaults to
+    /// [`RecordBatch::MAX_DECOMPRESSED_SIZE`](crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE) (128 MiB).
+    pub fn max_decompressed_size(mut self, size: usize) -> Self {
+        self.config.max_decompressed_size = size;
         self
     }
 

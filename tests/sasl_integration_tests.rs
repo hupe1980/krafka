@@ -223,6 +223,7 @@ async fn test_sasl_admin_client() {
     let admin = AdminClient::builder()
         .bootstrap_servers(&bootstrap_servers)
         .sasl_plain("testuser", "testpassword")
+        .unwrap()
         .build()
         .await
         .expect("Failed to create SASL admin client");
@@ -230,7 +231,10 @@ async fn test_sasl_admin_client() {
     // Create a topic
     let topic = "sasl-admin-test";
     admin
-        .create_topics(vec![NewTopic::new(topic, 1, 1)], Duration::from_secs(10))
+        .create_topics(
+            vec![NewTopic::new(topic, 1, 1).unwrap()],
+            Duration::from_secs(10),
+        )
         .await
         .expect("Failed to create topic via SASL");
 
@@ -262,12 +266,16 @@ async fn test_sasl_producer_consumer() {
     let admin = AdminClient::builder()
         .bootstrap_servers(&bootstrap_servers)
         .sasl_plain("admin", "admin-secret")
+        .unwrap()
         .build()
         .await
         .expect("Failed to create admin client");
 
     admin
-        .create_topics(vec![NewTopic::new(topic, 1, 1)], Duration::from_secs(10))
+        .create_topics(
+            vec![NewTopic::new(topic, 1, 1).unwrap()],
+            Duration::from_secs(10),
+        )
         .await
         .expect("Failed to create topic");
 
@@ -278,6 +286,7 @@ async fn test_sasl_producer_consumer() {
         .bootstrap_servers(&bootstrap_servers)
         .client_id("sasl-producer")
         .sasl_plain("testuser", "testpassword")
+        .unwrap()
         .build()
         .await
         .expect("Failed to create SASL producer");
@@ -300,6 +309,7 @@ async fn test_sasl_producer_consumer() {
         .group_id("sasl-test-group")
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .sasl_plain("testuser", "testpassword")
+        .unwrap()
         .build()
         .await
         .expect("Failed to create SASL consumer");
@@ -343,6 +353,7 @@ async fn test_sasl_wrong_credentials_rejected() {
     let result = krafka::admin::AdminClient::builder()
         .bootstrap_servers(&bootstrap_servers)
         .sasl_plain("testuser", "wrong-password")
+        .unwrap()
         .build()
         .await;
 

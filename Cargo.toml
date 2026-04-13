@@ -141,3 +141,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
+
+[profile.release]
+lto = true
+codegen-units = 1

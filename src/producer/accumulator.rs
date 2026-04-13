@@ -190,14 +190,24 @@ impl RecordAccumulatorHandle {
     }
 
     /// Shutdown the accumulator, flushing all pending batches before returning.
-    pub async fn shutdown(&self) {
+    ///
+    /// Returns an error if the accumulator task has already exited (e.g. due to
+    /// a panic) and the shutdown message cannot be delivered.
+    pub async fn shutdown(&self) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
-        let _ = self
-            .sender
+        self.sender
             .send(AccumulatorMessage::Shutdown { response_tx })
-            .await;
+            .await
+            .map_err(|_| {
+                warn!("Accumulator shutdown failed: task already exited");
+                KrafkaError::invalid_state("accumulator already shut down")
+            })?;
         // Wait for the accumulator to finish flushing before returning.
-        let _ = response_rx.await;
+        response_rx.await.map_err(|_| {
+            warn!("Accumulator shutdown: response channel dropped before completion");
+            KrafkaError::invalid_state("accumulator shutdown interrupted")
+        })?;
+        Ok(())
     }
 }
 
@@ -366,6 +376,13 @@ impl RecordAccumulator {
         let memory_freed = Arc::new(Notify::new());
         let in_flight_memory = Arc::new(AtomicUsize::new(0));
         let max_block_ms = config.max_block_ms;
+
+        if config.buffer_memory == 0 {
+            warn!(
+                "buffer_memory=0 disables producer backpressure; \
+                 memory usage is unbounded. Not recommended for production."
+            );
+        }
 
         let accumulator = Self {
             config,

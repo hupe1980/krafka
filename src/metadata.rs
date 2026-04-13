@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use parking_lot::Mutex as SyncMutex;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -170,6 +171,12 @@ struct MetadataCache {
     /// topic includes a 16-byte topic_id. Used by the KIP-848 consumer
     /// protocol to resolve topic UUIDs in assignments.
     topic_ids: HashMap<[u8; 16], Arc<String>>,
+    /// Reverse index: topic name → topic UUID. Kept in sync with `topic_ids`
+    /// for O(1) lookups.
+    name_to_topic_id: HashMap<String, [u8; 16]>,
+    /// Per-topic timestamp of the last refresh that included this topic.
+    /// Used for TTL-based eviction during partial refreshes.
+    topic_last_refreshed: HashMap<String, Instant>,
     /// When the metadata was last updated.
     last_updated: Instant,
 }
@@ -182,6 +189,8 @@ impl MetadataCache {
             brokers: HashMap::new(),
             topics: HashMap::new(),
             topic_ids: HashMap::new(),
+            name_to_topic_id: HashMap::new(),
+            topic_last_refreshed: HashMap::new(),
             last_updated: Instant::now(),
         }
     }
@@ -214,7 +223,12 @@ pub struct ClusterMetadata {
     /// Reset to `None` on every successful refresh. After a rebootstrap
     /// it is set to the *current* instant (matching Java) so the next cycle
     /// starts timing immediately.
-    metadata_attempt_start: std::sync::Mutex<Option<Instant>>,
+    metadata_attempt_start: SyncMutex<Option<Instant>>,
+    /// Maximum age of a cached topic entry before it is evicted during partial
+    /// refresh. `None` disables TTL eviction (default). When set, topics not
+    /// refreshed within this duration are pruned on the next partial refresh,
+    /// preventing unbounded cache growth from topic churn.
+    topic_cache_ttl: Option<Duration>,
 }
 
 impl ClusterMetadata {
@@ -232,7 +246,8 @@ impl ClusterMetadata {
             refresh_lock: Mutex::new(()),
             recovery_strategy: MetadataRecoveryStrategy::None,
             rebootstrap_trigger: Duration::from_secs(300),
-            metadata_attempt_start: std::sync::Mutex::new(None),
+            metadata_attempt_start: SyncMutex::new(None),
+            topic_cache_ttl: None,
         }
     }
 
@@ -254,6 +269,18 @@ impl ClusterMetadata {
     #[must_use]
     pub fn with_rebootstrap_trigger(mut self, duration: Duration) -> Self {
         self.rebootstrap_trigger = duration;
+        self
+    }
+
+    /// Set the topic cache TTL for partial refreshes.
+    ///
+    /// During partial refreshes, cached topics that have not been refreshed
+    /// within this duration are evicted to prevent unbounded cache growth.
+    /// Full refreshes always rebuild from scratch regardless of this setting.
+    /// `None` disables TTL eviction (the default).
+    #[must_use]
+    pub fn with_topic_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.topic_cache_ttl = Some(ttl);
         self
     }
 
@@ -308,7 +335,7 @@ impl ClusterMetadata {
         // If there is already a recorded start (from a previous failing attempt),
         // keep it — we only care about how long the *streak* has lasted.
         {
-            let mut start = self.metadata_attempt_start.lock().expect("poisoned");
+            let mut start = self.metadata_attempt_start.lock();
             start.get_or_insert_with(Instant::now);
         }
 
@@ -388,7 +415,7 @@ impl ClusterMetadata {
 
             // Success — clear the failure-tracking timestamp.
             {
-                let mut start = self.metadata_attempt_start.lock().expect("poisoned");
+                let mut start = self.metadata_attempt_start.lock();
                 *start = None;
             }
 
@@ -446,7 +473,7 @@ impl ClusterMetadata {
         // timing immediately — if the rebootstrap itself doesn't help, we'll
         // know how long it's been since we last rebootstrapped.
         {
-            let mut start = self.metadata_attempt_start.lock().expect("poisoned");
+            let mut start = self.metadata_attempt_start.lock();
             *start = Some(Instant::now());
         }
     }
@@ -461,7 +488,7 @@ impl ClusterMetadata {
             return false;
         }
 
-        let start = self.metadata_attempt_start.lock().expect("poisoned");
+        let start = self.metadata_attempt_start.lock();
         let Some(attempt_start) = *start else {
             return false;
         };
@@ -514,6 +541,7 @@ impl ClusterMetadata {
     /// and broker entries referenced by preserved topics remain available.
     fn update_cache(&self, response: MetadataResponse, full_refresh: bool) {
         let old = self.cache.load();
+        let now = Instant::now();
 
         // Full refresh: response is authoritative — start empty.
         // Partial refresh: merge into the existing broker map so preserved
@@ -531,14 +559,32 @@ impl ClusterMetadata {
         }
 
         // Full refresh: response is authoritative — start empty.
-        // Partial refresh: delta-merge into existing topics and topic_ids.
+        // Partial refresh: delta-merge into existing topics and topic_ids,
+        // optionally evicting entries older than `topic_cache_ttl`.
         let mut topics = if full_refresh {
             HashMap::new()
+        } else if let Some(ttl) = self.topic_cache_ttl {
+            old.topics
+                .iter()
+                .filter(|(name, _)| {
+                    old.topic_last_refreshed
+                        .get(*name)
+                        .is_some_and(|ts| now.duration_since(*ts) <= ttl)
+                })
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect()
         } else {
             old.topics.clone()
         };
         let mut topic_ids = if full_refresh {
             HashMap::new()
+        } else if self.topic_cache_ttl.is_some() {
+            // Keep only topic_ids whose names survived TTL eviction.
+            old.topic_ids
+                .iter()
+                .filter(|(_, name)| topics.contains_key(name.as_str()))
+                .map(|(k, v)| (*k, Arc::clone(v)))
+                .collect()
         } else {
             old.topic_ids.clone()
         };
@@ -556,17 +602,28 @@ impl ClusterMetadata {
             };
 
             if !topic.error_code.is_ok() {
-                warn!("Topic {} has error: {:?}", topic_name, topic.error_code);
-                // Remove from both maps on error (topic may have been deleted).
-                if let Some(tid) = topic.topic_id {
-                    topic_ids.remove(&tid);
+                if topic.error_code.is_retriable() {
+                    // Transient errors (LeaderNotAvailable, RequestTimedOut, etc.)
+                    // — keep stale cache entry so callers don't see the topic as
+                    // "unknown" until the next successful refresh.
+                    debug!(
+                        "Topic {} has transient error: {:?}, keeping stale cache entry",
+                        topic_name, topic.error_code
+                    );
+                } else {
+                    // Permanent errors (UnknownTopicOrPartition, TopicAuthorizationFailed,
+                    // InvalidTopic, etc.) — remove from cache.
+                    warn!("Topic {} has error: {:?}", topic_name, topic.error_code);
+                    if let Some(tid) = topic.topic_id {
+                        topic_ids.remove(&tid);
+                    }
+                    // Also remove any stale UUID → name mapping by name, in case
+                    // the error response omitted topic_id or it was an all-zero UUID.
+                    if let Some(old_uuid) = name_to_uuid.remove(&topic_name) {
+                        topic_ids.remove(&old_uuid);
+                    }
+                    topics.remove(&topic_name);
                 }
-                // Also remove any stale UUID → name mapping by name, in case
-                // the error response omitted topic_id or it was an all-zero UUID.
-                if let Some(old_uuid) = name_to_uuid.remove(&topic_name) {
-                    topic_ids.remove(&old_uuid);
-                }
-                topics.remove(&topic_name);
                 continue;
             }
 
@@ -607,13 +664,35 @@ impl ClusterMetadata {
             );
         }
 
+        // Build topic_last_refreshed: carry forward surviving entries (those
+        // that survived TTL eviction), then stamp every topic in this response.
+        let mut topic_last_refreshed = if full_refresh {
+            HashMap::with_capacity(topics.len())
+        } else if let Some(ttl) = self.topic_cache_ttl {
+            old.topic_last_refreshed
+                .iter()
+                .filter(|(_name, ts)| now.duration_since(**ts) <= ttl)
+                .map(|(k, v)| (k.clone(), *v))
+                .collect()
+        } else {
+            old.topic_last_refreshed.clone()
+        };
+        // Mark every topic currently in the cache as refreshed now.
+        // On full refresh this stamps everything; on partial refresh this
+        // stamps the topics from the response (which were just inserted/updated).
+        for name in topics.keys() {
+            topic_last_refreshed.insert(name.clone(), now);
+        }
+
         let new_cache = MetadataCache {
             cluster_id: response.cluster_id,
             controller_id: response.controller_id,
             brokers,
             topics,
             topic_ids,
-            last_updated: Instant::now(),
+            name_to_topic_id: name_to_uuid,
+            topic_last_refreshed,
+            last_updated: now,
         };
 
         debug!(
@@ -663,13 +742,7 @@ impl ClusterMetadata {
     /// if the topic is unknown or the broker did not return a topic ID — the
     /// caller should trigger a metadata refresh and retry.
     pub fn topic_id_for_name(&self, name: &str) -> Option<[u8; 16]> {
-        let cache = self.cache.load();
-        for (uuid, topic_name) in &cache.topic_ids {
-            if topic_name.as_ref() == name {
-                return Some(*uuid);
-            }
-        }
-        None
+        self.cache.load().name_to_topic_id.get(name).copied()
     }
 
     /// Get all topics.
@@ -972,14 +1045,14 @@ mod tests {
 
         // Simulate that a refresh attempt has started.
         {
-            let mut start = meta.metadata_attempt_start.lock().unwrap();
+            let mut start = meta.metadata_attempt_start.lock();
             *start = Some(Instant::now());
         }
 
         // Still shouldn't trigger — trigger is 300s, elapsed is ~0.
         assert!(!meta.needs_rebootstrap());
         // Timestamp should still be recorded.
-        assert!(meta.metadata_attempt_start.lock().unwrap().is_some());
+        assert!(meta.metadata_attempt_start.lock().is_some());
     }
 
     #[tokio::test]
@@ -997,7 +1070,7 @@ mod tests {
 
         // Simulate that a refresh attempt has started.
         {
-            let mut start = meta.metadata_attempt_start.lock().unwrap();
+            let mut start = meta.metadata_attempt_start.lock();
             *start = Some(Instant::now());
         }
 
@@ -1008,7 +1081,7 @@ mod tests {
         meta.rebootstrap().await;
 
         // After rebootstrap, the attempt start should be set to Some(now) — not None.
-        assert!(meta.metadata_attempt_start.lock().unwrap().is_some());
+        assert!(meta.metadata_attempt_start.lock().is_some());
         // Cache should be reset.
         assert!(meta.cache.load().brokers.is_empty());
     }
@@ -1036,6 +1109,6 @@ mod tests {
 
         assert!(meta.cache.load().brokers.is_empty());
         // After rebootstrap, timer is set to Some(now) — not cleared.
-        assert!(meta.metadata_attempt_start.lock().unwrap().is_some());
+        assert!(meta.metadata_attempt_start.lock().is_some());
     }
 }

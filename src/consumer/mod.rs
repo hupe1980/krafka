@@ -252,11 +252,16 @@ impl Consumer {
 
         let bootstrap_servers = crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
 
-        let metadata = Arc::new(
-            ClusterMetadata::new(bootstrap_servers, pool.clone(), config.metadata_max_age)
-                .with_recovery_strategy(config.metadata_recovery_strategy)
-                .with_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger),
-        );
+        let metadata = Arc::new({
+            let mut meta =
+                ClusterMetadata::new(bootstrap_servers, pool.clone(), config.metadata_max_age)
+                    .with_recovery_strategy(config.metadata_recovery_strategy)
+                    .with_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger);
+            if let Some(ttl) = config.metadata_topic_cache_ttl {
+                meta = meta.with_topic_cache_ttl(ttl);
+            }
+            meta
+        });
 
         // Initial metadata fetch
         metadata.refresh().await?;
@@ -2223,15 +2228,20 @@ impl Consumer {
                             "Leader epoch error for {}-{}: {:?}, validating offset via OffsetForLeaderEpoch",
                             topic_name, partition, partition_response.error_code
                         );
-                        // Trigger metadata refresh and reset offset if truncation detected
+                        // Trigger metadata refresh and reset offset if truncation detected.
+                        // On validation failure (e.g. network error), fall back to
+                        // auto_offset_reset so the consumer does not get stuck on a
+                        // potentially truncated partition.
                         if let Err(e) = self
                             .validate_offset_for_leader_epoch(topic_name, partition)
                             .await
                         {
                             warn!(
-                                "OffsetForLeaderEpoch validation failed for {}-{}: {}",
+                                "OffsetForLeaderEpoch validation failed for {}-{}: {}, \
+                                 falling back to auto_offset_reset",
                                 topic_name, partition, e
                             );
+                            self.handle_offset_out_of_range(topic_name, partition).await;
                         }
                     } else if partition_response.error_code
                         == crate::error::ErrorCode::OffsetOutOfRange
@@ -2259,8 +2269,22 @@ impl Consumer {
                     // batch that starts before the requested offset.
                     // Read lock is acquired and dropped inline to avoid cloning
                     // the entire offsets map on every fetch pass.
-                    let partition_fetch_offset =
-                        self.offsets.read().await.get(&key).copied().unwrap_or(0);
+                    // Missing entry means this is the first fetch; accept all
+                    // records (offset 0 skips nothing since Kafka offsets ≥ 0).
+                    let partition_fetch_offset = {
+                        let offsets = self.offsets.read().await;
+                        match offsets.get(&key).copied() {
+                            Some(offset) => offset,
+                            None => {
+                                debug!(
+                                    topic = %topic_name,
+                                    partition,
+                                    "No tracked offset for partition, accepting all records"
+                                );
+                                0
+                            }
+                        }
+                    };
 
                     // Decode all fetched batches for this partition. `poll()`
                     // applies `max_poll_records` after aggregation and
@@ -2269,7 +2293,10 @@ impl Consumer {
                     // re-fetch/re-decode of the dropped batches on subsequent
                     // polls.
                     while batch_buf.len() >= 12 {
-                        match RecordBatch::decode(&mut batch_buf) {
+                        match RecordBatch::decode_with_limit(
+                            &mut batch_buf,
+                            self.config.max_decompressed_size,
+                        ) {
                             Ok(batch) => {
                                 for record in batch.records.into_iter() {
                                     // Use offset_delta for correct offset in compacted topics
@@ -2487,7 +2514,17 @@ impl Consumer {
                 if partition_result.error_code.is_ok() && partition_result.end_offset >= 0 {
                     let current_offset = {
                         let offsets = self.offsets.read().await;
-                        offsets.get(&key).copied().unwrap_or(0)
+                        match offsets.get(&key).copied() {
+                            Some(offset) => offset,
+                            None => {
+                                debug!(
+                                    topic = %topic,
+                                    partition,
+                                    "No tracked offset for partition during epoch validation"
+                                );
+                                0
+                            }
+                        }
                     };
 
                     if current_offset > partition_result.end_offset {
@@ -3248,7 +3285,7 @@ impl ConsumerBuilder {
     /// let consumer = Consumer::builder()
     ///     .bootstrap_servers("broker:9093")
     ///     .group_id("my-group")
-    ///     .auth(AuthConfig::sasl_plain("user", "password"))
+    ///     .auth(AuthConfig::sasl_plain("user", "password")?)
     ///     .build()
     ///     .await?;
     /// ```
@@ -3267,9 +3304,13 @@ impl ConsumerBuilder {
     }
 
     /// Configure SASL/PLAIN authentication.
-    pub fn sasl_plain(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
-        self.config.auth = Some(AuthConfig::sasl_plain(username, password));
-        self
+    pub fn sasl_plain(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> crate::Result<Self> {
+        self.config.auth = Some(AuthConfig::sasl_plain(username, password)?);
+        Ok(self)
     }
 
     /// Configure SASL/SCRAM-SHA-256 authentication.
@@ -3407,7 +3448,7 @@ mod tests {
         let builder = Consumer::builder()
             .bootstrap_servers("broker:9093")
             .group_id("secure-group")
-            .auth(AuthConfig::sasl_plain("user", "pass"));
+            .auth(AuthConfig::sasl_plain("user", "pass").unwrap());
 
         let auth = builder.config.auth.as_ref().unwrap();
         assert!(auth.requires_sasl());
@@ -3451,7 +3492,8 @@ mod tests {
     fn test_consumer_builder_sasl_plain() {
         let builder = Consumer::builder()
             .bootstrap_servers("broker:9093")
-            .sasl_plain("user", "pass");
+            .sasl_plain("user", "pass")
+            .unwrap();
 
         let auth = builder.config.auth.as_ref().unwrap();
         assert!(auth.requires_sasl());

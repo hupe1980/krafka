@@ -87,8 +87,15 @@ pub struct ShareConsumerConfig {
     pub(crate) metadata_recovery_strategy: MetadataRecoveryStrategy,
     /// Rebootstrap trigger duration (KIP-899).
     pub(crate) metadata_recovery_rebootstrap_trigger: Duration,
+    /// Maximum age of cached topic entries during partial metadata refreshes.
+    /// When set, topics not refreshed within this duration are evicted to
+    /// prevent unbounded cache growth. `None` disables TTL eviction (default).
+    pub(crate) metadata_topic_cache_ttl: Option<Duration>,
     /// Authentication configuration.
     pub(crate) auth: Option<AuthConfig>,
+    /// Maximum decompressed size for record batches (compression bomb protection).
+    /// Defaults to [`RecordBatch::MAX_DECOMPRESSED_SIZE`](crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE) (128 MiB).
+    pub(crate) max_decompressed_size: usize,
     /// SOCKS5 proxy configuration.
     #[cfg(feature = "socks5")]
     pub(crate) proxy: Option<crate::network::ProxyConfig>,
@@ -114,7 +121,9 @@ impl Default for ShareConsumerConfig {
             metadata_max_age: Duration::from_secs(300),
             metadata_recovery_strategy: MetadataRecoveryStrategy::None,
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
+            metadata_topic_cache_ttl: None,
             auth: None,
+            max_decompressed_size: crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE,
             #[cfg(feature = "socks5")]
             proxy: None,
         }

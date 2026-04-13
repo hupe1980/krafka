@@ -740,8 +740,10 @@ impl Producer {
 
         let graceful_close = async {
             // Shutdown accumulator first to flush pending records.
-            if let Some(ref accumulator) = self.accumulator {
-                accumulator.shutdown().await;
+            if let Some(ref accumulator) = self.accumulator
+                && let Err(e) = accumulator.shutdown().await
+            {
+                warn!("Accumulator shutdown error during close: {e}");
             }
 
             self.in_flight_barrier.wait_for(target).await;
@@ -908,7 +910,7 @@ impl ProducerBuilder {
     ///
     /// let producer = Producer::builder()
     ///     .bootstrap_servers("broker:9093")
-    ///     .auth(AuthConfig::sasl_plain("user", "password"))
+    ///     .auth(AuthConfig::sasl_plain("user", "password")?)
     ///     .build()
     ///     .await?;
     /// ```
@@ -918,9 +920,13 @@ impl ProducerBuilder {
     }
 
     /// Configure SASL/PLAIN authentication.
-    pub fn sasl_plain(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
-        self.config.auth = Some(AuthConfig::sasl_plain(username, password));
-        self
+    pub fn sasl_plain(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> crate::Result<Self> {
+        self.config.auth = Some(AuthConfig::sasl_plain(username, password)?);
+        Ok(self)
     }
 
     /// Configure SASL/SCRAM-SHA-256 authentication.
@@ -1061,7 +1067,7 @@ mod tests {
     fn test_producer_builder_with_auth() {
         let builder = Producer::builder()
             .bootstrap_servers("broker:9093")
-            .auth(AuthConfig::sasl_plain("user", "pass"));
+            .auth(AuthConfig::sasl_plain("user", "pass").unwrap());
 
         let auth = builder.config.auth.as_ref().unwrap();
         assert!(auth.requires_sasl());
@@ -1102,7 +1108,8 @@ mod tests {
     fn test_producer_builder_sasl_plain() {
         let builder = Producer::builder()
             .bootstrap_servers("broker:9093")
-            .sasl_plain("user", "pass");
+            .sasl_plain("user", "pass")
+            .unwrap();
 
         let auth = builder.config.auth.as_ref().unwrap();
         assert!(auth.requires_sasl());

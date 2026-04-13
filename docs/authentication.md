@@ -52,11 +52,11 @@ Simple username/password authentication. **Always use with TLS in production!**
 use krafka::auth::AuthConfig;
 
 // Without TLS (development only!)
-let config = AuthConfig::sasl_plain("username", "password");
+let config = AuthConfig::sasl_plain("username", "password")?;
 
 // With TLS (recommended for production)
 use krafka::auth::TlsConfig;
-let config = AuthConfig::sasl_plain_ssl("username", "password", TlsConfig::new());
+let config = AuthConfig::sasl_plain_ssl("username", "password", TlsConfig::new())?;
 ```
 
 ### SASL/SCRAM-SHA-256
@@ -91,15 +91,21 @@ The SCRAM client implements RFC 5802 with:
 - Debug output redacts the password as `[REDACTED]`
 
 ```rust
-use krafka::auth::{ScramClient, ScramMechanism, ScramState};
+use krafka::auth::{ChannelBinding, ScramClient, ScramMechanism, ScramState};
 
-// Create SCRAM client
-let mut scram = ScramClient::new("alice", "secret", ScramMechanism::Sha256);
+// Create SCRAM client (no channel binding for SASL_PLAINTEXT)
+let mut scram = ScramClient::new("alice", "secret", ScramMechanism::Sha256, ChannelBinding::None);
 assert_eq!(scram.state(), ScramState::Initial);
 
 // Generate client-first message
 let client_first = scram.client_first_message();
 // -> "n,,n=alice,r=<nonce>"
+
+// When using SASL_SSL, pass channel binding data to tie SCRAM to the TLS session:
+// let cb_data = extract_tls_server_end_point(&tls_stream).unwrap();
+// let mut scram = ScramClient::new("alice", "secret", ScramMechanism::Sha256,
+//     ChannelBinding::TlsServerEndPoint(cb_data));
+// -> client-first: "p=tls-server-end-point,,n=alice,r=<nonce>"
 
 // Process server-first message
 // scram.process_server_first(server_response)?;
@@ -447,7 +453,7 @@ For low-level control over the authentication process:
 use krafka::auth::{AwsMskIamCredentials, MskIamAuthenticator};
 
 let creds = AwsMskIamCredentials::new("AKID", "secret", "us-east-1");
-let authenticator = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com");
+let authenticator = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com")?;
 
 // Generate signed authentication payload
 let payload = authenticator.create_auth_payload();
@@ -698,10 +704,10 @@ For handling SASL handshakes, use `SaslAuthenticator`:
 
 ```rust
 use krafka::network::SaslAuthenticator;
-use krafka::auth::AuthConfig;
+use krafka::auth::{AuthConfig, ChannelBinding};
 
 let auth = AuthConfig::sasl_scram_sha256("user", "pass");
-let mut authenticator = SaslAuthenticator::new(&auth).unwrap();
+let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None).unwrap();
 
 // Get mechanism name for SASL handshake
 let mechanism = authenticator.mechanism_name(); // "SCRAM-SHA-256"
@@ -732,7 +738,7 @@ let auth = AuthConfig::sasl_oauthbearer_provider(|| async {
 // Resolve the provider to get a config with the token set
 let resolved = auth.resolve_provider_to_token().await?;
 let auth = resolved.as_ref().unwrap_or(&auth);
-let mut authenticator = SaslAuthenticator::new(auth).unwrap();
+let mut authenticator = SaslAuthenticator::new(auth, ChannelBinding::None).unwrap();
 ```
 
 ## Example: Production Configuration

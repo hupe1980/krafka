@@ -574,7 +574,19 @@ impl RecordBatch {
     }
 
     /// Decode a record batch from bytes.
+    ///
+    /// Uses [`MAX_DECOMPRESSED_SIZE`](Self::MAX_DECOMPRESSED_SIZE) as the
+    /// decompression limit. For a configurable limit, use
+    /// [`decode_with_limit`](Self::decode_with_limit).
     pub fn decode(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode_with_limit(buf, Self::MAX_DECOMPRESSED_SIZE)
+    }
+
+    /// Decode a record batch from bytes with a custom decompression size limit.
+    ///
+    /// Compressed payloads that decompress beyond `max_decompressed_size` bytes
+    /// are rejected as potential compression bombs.
+    pub fn decode_with_limit(buf: &mut impl Buf, max_decompressed_size: usize) -> Result<Self> {
         if buf.remaining() < 12 {
             return Err(KrafkaError::protocol(
                 "not enough bytes for record batch header",
@@ -651,7 +663,11 @@ impl RecordBatch {
         }
 
         // Decompress records
-        let decompressed = Self::decompress_records(attributes.compression, &compressed_records)?;
+        let decompressed = Self::decompress_records(
+            attributes.compression,
+            &compressed_records,
+            max_decompressed_size,
+        )?;
         let mut records_buf = decompressed.as_ref();
 
         // Decode records — records_count already validated as non-negative above;
@@ -683,10 +699,18 @@ impl RecordBatch {
         })
     }
 
-    /// Maximum decompressed size (128 MiB) to protect against compression bombs.
-    const MAX_DECOMPRESSED_SIZE: usize = 128 * 1024 * 1024;
+    /// Maximum decompressed size to protect against compression bombs.
+    ///
+    /// Set to 128 MiB. Records exceeding this limit after decompression are rejected.
+    /// Kafka's `max.message.bytes` defaults to 1 MiB; this is much higher to
+    /// accommodate edge cases. Future versions may make this runtime-configurable.
+    pub const MAX_DECOMPRESSED_SIZE: usize = 128 * 1024 * 1024;
 
-    fn decompress_records(compression: Compression, data: &[u8]) -> Result<Bytes> {
+    fn decompress_records(
+        compression: Compression,
+        data: &[u8],
+        max_decompressed_size: usize,
+    ) -> Result<Bytes> {
         #[allow(unused_variables)]
         let result: Vec<u8> = match compression {
             Compression::None => return Ok(Bytes::copy_from_slice(data)),
@@ -696,7 +720,7 @@ impl RecordBatch {
                 use std::io::Read;
 
                 let decoder = GzDecoder::new(data);
-                let mut limited = decoder.take(Self::MAX_DECOMPRESSED_SIZE as u64 + 1);
+                let mut limited = decoder.take(max_decompressed_size as u64 + 1);
                 let mut decompressed = Vec::new();
                 limited
                     .read_to_end(&mut decompressed)
@@ -715,11 +739,10 @@ impl RecordBatch {
                 // snap::raw::decompress_len reads the varint length prefix without decompressing.
                 let declared_len = snap::raw::decompress_len(data)
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
-                if declared_len > Self::MAX_DECOMPRESSED_SIZE {
+                if declared_len > max_decompressed_size {
                     return Err(KrafkaError::compression(format!(
                         "snappy declared decompressed size {} exceeds maximum {} bytes (possible compression bomb)",
-                        declared_len,
-                        Self::MAX_DECOMPRESSED_SIZE
+                        declared_len, max_decompressed_size
                     )));
                 }
                 let mut decoder = snap::raw::Decoder::new();
@@ -737,7 +760,7 @@ impl RecordBatch {
             Compression::Lz4 => {
                 use std::io::Read;
                 let decoder = lz4_flex::frame::FrameDecoder::new(data);
-                let mut limited = decoder.take(Self::MAX_DECOMPRESSED_SIZE as u64 + 1);
+                let mut limited = decoder.take(max_decompressed_size as u64 + 1);
                 let mut decompressed = Vec::new();
                 limited
                     .read_to_end(&mut decompressed)
@@ -757,7 +780,7 @@ impl RecordBatch {
                 use std::io::Read;
                 let decoder = zstd::Decoder::new(data)
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
-                let mut limited = decoder.take(Self::MAX_DECOMPRESSED_SIZE as u64 + 1);
+                let mut limited = decoder.take(max_decompressed_size as u64 + 1);
                 let mut decompressed = Vec::new();
                 limited
                     .read_to_end(&mut decompressed)
@@ -776,11 +799,11 @@ impl RecordBatch {
         // diverges via `return Err(...)`, making this code unreachable.
         #[allow(unreachable_code)]
         {
-            if result.len() > Self::MAX_DECOMPRESSED_SIZE {
+            if result.len() > max_decompressed_size {
                 return Err(KrafkaError::compression(format!(
                     "decompressed size {} exceeds maximum {} bytes (possible compression bomb)",
                     result.len(),
-                    Self::MAX_DECOMPRESSED_SIZE
+                    max_decompressed_size
                 )));
             }
 
@@ -959,7 +982,17 @@ impl LazyRecordBatch {
     /// Decode a lazy record batch from bytes.
     ///
     /// This performs decompression but defers record parsing.
+    /// Uses [`RecordBatch::MAX_DECOMPRESSED_SIZE`] as the decompression limit.
+    /// For a configurable limit, use [`decode_with_limit`](Self::decode_with_limit).
     pub fn decode(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode_with_limit(buf, RecordBatch::MAX_DECOMPRESSED_SIZE)
+    }
+
+    /// Decode a lazy record batch with a custom decompression size limit.
+    ///
+    /// Compressed payloads that decompress beyond `max_decompressed_size` bytes
+    /// are rejected as potential compression bombs.
+    pub fn decode_with_limit(buf: &mut impl Buf, max_decompressed_size: usize) -> Result<Self> {
         if buf.remaining() < 12 {
             return Err(KrafkaError::protocol(
                 "not enough bytes for record batch header",
@@ -1043,8 +1076,11 @@ impl LazyRecordBatch {
         }
 
         // Decompress but don't parse records
-        let raw_records =
-            RecordBatch::decompress_records(attributes.compression, &compressed_records)?;
+        let raw_records = RecordBatch::decompress_records(
+            attributes.compression,
+            &compressed_records,
+            max_decompressed_size,
+        )?;
 
         Ok(Self {
             base_offset,
@@ -1480,7 +1516,11 @@ mod tests {
         // Append some garbage bytes (won't be decompressed)
         fake_snappy.extend_from_slice(&[0u8; 16]);
 
-        let result = RecordBatch::decompress_records(Compression::Snappy, &fake_snappy);
+        let result = RecordBatch::decompress_records(
+            Compression::Snappy,
+            &fake_snappy,
+            RecordBatch::MAX_DECOMPRESSED_SIZE,
+        );
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(

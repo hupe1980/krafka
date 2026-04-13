@@ -36,7 +36,7 @@ This document describes the internal architecture of Krafka, a pure Rust Apache 
 - Constant-time comparison via `subtle` crate (timing-attack resistant)
 - PBKDF2 iteration count validated to prevent DoS
 - Protocol allocations capped to prevent OOM from malicious brokers
-- Decompression bomb protection (128 MiB limit)
+- Decompression bomb protection (128 MiB default, configurable)
 - Debug output redacts all credentials
 
 ## Module Architecture

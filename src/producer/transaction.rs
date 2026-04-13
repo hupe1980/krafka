@@ -282,11 +282,11 @@ impl Drop for PendingAddGuard {
                     tp.cancel_add(&topic, partition, &notify);
                 });
             } else {
-                warn!(
-                    topic = %topic,
-                    partition,
-                    "PendingAddGuard dropped without cleanup: lock contended and no runtime available"
-                );
+                // No runtime available — use blocking write as last resort.
+                // This is safe because Handle::try_current() confirmed we are
+                // NOT on a runtime thread, so blocking_write() won't panic.
+                let mut tp = self.txn_partitions.blocking_write();
+                tp.cancel_add(&topic, partition, &notify);
             }
         }
     }
@@ -1486,9 +1486,9 @@ impl TransactionalProducerBuilder {
     }
 
     /// Configure SASL/PLAIN authentication.
-    pub fn sasl_plain(mut self, username: &str, password: &str) -> Self {
-        self.config.auth = Some(AuthConfig::sasl_plain(username, password));
-        self
+    pub fn sasl_plain(mut self, username: &str, password: &str) -> crate::Result<Self> {
+        self.config.auth = Some(AuthConfig::sasl_plain(username, password)?);
+        Ok(self)
     }
 
     /// Configure SASL/SCRAM-SHA-256 authentication.
@@ -1749,7 +1749,8 @@ mod tests {
         let builder = TransactionalProducer::builder()
             .bootstrap_servers("broker:9093")
             .transactional_id("txn-1")
-            .sasl_plain("user", "pass");
+            .sasl_plain("user", "pass")
+            .unwrap();
 
         let auth = builder.config.auth.as_ref().unwrap();
         assert!(auth.requires_sasl());

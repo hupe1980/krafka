@@ -16,7 +16,7 @@
 //! use krafka::auth::{MskIamAuthenticator, AwsMskIamCredentials};
 //!
 //! let credentials = AwsMskIamCredentials::new("AKID", "secret", "us-east-1");
-//! let authenticator = MskIamAuthenticator::new(&credentials, "broker.kafka.us-east-1.amazonaws.com");
+//! let authenticator = MskIamAuthenticator::new(&credentials, "broker.kafka.us-east-1.amazonaws.com")?;
 //! let payload = authenticator.create_auth_payload();
 //! ```
 //!
@@ -102,18 +102,20 @@ impl Drop for MskIamAuthenticator {
 
 impl MskIamAuthenticator {
     /// Create a new MSK IAM authenticator.
-    pub fn new(credentials: &AwsMskIamCredentials, host: impl Into<String>) -> Self {
+    ///
+    /// The `host` may include a port suffix (e.g. `broker:9098` or `[::1]:9092`);
+    /// IPv6 addresses in brackets are handled correctly.
+    pub fn new(credentials: &AwsMskIamCredentials, host: impl Into<String>) -> crate::Result<Self> {
         let host_str = host.into();
-        // Strip port from host if present
-        let host_without_port = host_str.split(':').next().unwrap_or(&host_str).to_string();
+        let host_without_port = crate::util::extract_sni_hostname(&host_str)?.to_string();
 
-        Self {
+        Ok(Self {
             access_key_id: credentials.access_key_id.clone(),
             secret_access_key: credentials.secret_access_key.clone(),
             session_token: credentials.session_token.clone(),
             region: credentials.region.clone(),
             host: host_without_port,
-        }
+        })
     }
 
     /// Create the authentication payload to send to MSK.
@@ -339,7 +341,8 @@ mod tests {
     #[test]
     fn test_msk_iam_authenticator_creation() {
         let creds = test_credentials();
-        let auth = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com:9098");
+        let auth =
+            MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com:9098").unwrap();
         assert_eq!(auth.host, "broker.kafka.us-east-1.amazonaws.com");
         assert_eq!(auth.region, "us-east-1");
     }
@@ -347,7 +350,8 @@ mod tests {
     #[test]
     fn test_auth_payload_is_valid_json() {
         let creds = test_credentials();
-        let auth = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com");
+        let auth =
+            MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com").unwrap();
         let payload = auth.create_auth_payload();
 
         // Should be valid UTF-8
@@ -377,7 +381,8 @@ mod tests {
             "FwoGZXIvYXdzEBYaDNZSNzRZzDJiLuQ8l==",
             "us-east-1",
         );
-        let auth = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com");
+        let auth =
+            MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com").unwrap();
         let payload = auth.create_auth_payload();
 
         let payload_str = String::from_utf8(payload).unwrap();
@@ -387,7 +392,8 @@ mod tests {
     #[test]
     fn test_deterministic_signature_at_same_time() {
         let creds = test_credentials();
-        let auth = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com");
+        let auth =
+            MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com").unwrap();
 
         // Use a fixed timestamp
         let fixed_time = UNIX_EPOCH + Duration::from_secs(1700000000); // Nov 14, 2023
@@ -420,7 +426,8 @@ mod tests {
     #[test]
     fn test_signing_key_derivation() {
         let creds = test_credentials();
-        let auth = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com");
+        let auth =
+            MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com").unwrap();
 
         // This tests the key derivation follows AWS v4 spec
         let key = auth.derive_signing_key("20231114", "us-east-1", "kafka-cluster");
@@ -430,7 +437,8 @@ mod tests {
     #[test]
     fn test_different_regions() {
         let creds = AwsMskIamCredentials::new("AKID", "secret", "eu-west-1");
-        let auth = MskIamAuthenticator::new(&creds, "broker.kafka.eu-west-1.amazonaws.com");
+        let auth =
+            MskIamAuthenticator::new(&creds, "broker.kafka.eu-west-1.amazonaws.com").unwrap();
 
         let payload_str = String::from_utf8(auth.create_auth_payload()).unwrap();
         assert!(payload_str.contains("eu-west-1"));
@@ -446,7 +454,8 @@ mod tests {
             "FwoGZXIvYXdzEBYaDNZSNzRZzDJiLuQ8l==",
             "us-east-1",
         );
-        let auth = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com");
+        let auth =
+            MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com").unwrap();
         let debug_output = format!("{:?}", auth);
 
         // Must NOT contain the actual secret key or session token
@@ -468,7 +477,7 @@ mod tests {
     fn test_msk_iam_zeroize_on_drop() {
         // Verify Drop does not panic
         let creds = test_credentials();
-        let auth = MskIamAuthenticator::new(&creds, "broker:9098");
+        let auth = MskIamAuthenticator::new(&creds, "broker:9098").unwrap();
         drop(auth);
     }
 }

@@ -178,8 +178,15 @@ pub struct ConsumerConfig {
     /// (KIP-899). Only effective with
     /// [`MetadataRecoveryStrategy::Rebootstrap`]. Default: 300 s.
     pub(crate) metadata_recovery_rebootstrap_trigger: Duration,
+    /// Maximum age of cached topic entries during partial metadata refreshes.
+    /// When set, topics not refreshed within this duration are evicted to
+    /// prevent unbounded cache growth. `None` disables TTL eviction (default).
+    pub(crate) metadata_topic_cache_ttl: Option<Duration>,
     /// Authentication configuration (optional).
     pub(crate) auth: Option<AuthConfig>,
+    /// Maximum decompressed size for record batches (compression bomb protection).
+    /// Defaults to [`RecordBatch::MAX_DECOMPRESSED_SIZE`](crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE) (128 MiB).
+    pub(crate) max_decompressed_size: usize,
     /// SOCKS5 proxy configuration (optional).
     #[cfg(feature = "socks5")]
     pub(crate) proxy: Option<crate::network::ProxyConfig>,
@@ -211,7 +218,9 @@ impl Default for ConsumerConfig {
             client_rack: None,
             metadata_recovery_strategy: MetadataRecoveryStrategy::None,
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
+            metadata_topic_cache_ttl: None,
             auth: None,
+            max_decompressed_size: crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE,
             #[cfg(feature = "socks5")]
             proxy: None,
         }
@@ -368,6 +377,12 @@ impl ConsumerConfig {
         self.auth.as_ref()
     }
 
+    /// Returns the maximum decompressed size for record batches.
+    #[inline]
+    pub fn max_decompressed_size(&self) -> usize {
+        self.max_decompressed_size
+    }
+
     /// Returns the SOCKS5 proxy configuration, if set.
     #[cfg(feature = "socks5")]
     #[inline]
@@ -431,6 +446,16 @@ impl ConsumerConfigBuilder {
     /// Enables TLS and/or SASL authentication for all connections.
     pub fn auth(mut self, auth: AuthConfig) -> Self {
         self.config.auth = Some(auth);
+        self
+    }
+
+    /// Set the maximum decompressed size for record batches.
+    ///
+    /// Compressed payloads that decompress beyond this limit are rejected as
+    /// potential compression bombs. Defaults to
+    /// [`RecordBatch::MAX_DECOMPRESSED_SIZE`](crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE) (128 MiB).
+    pub fn max_decompressed_size(mut self, size: usize) -> Self {
+        self.config.max_decompressed_size = size;
         self
     }
 
@@ -552,6 +577,16 @@ impl ConsumerConfigBuilder {
     /// Only effective when [`MetadataRecoveryStrategy::Rebootstrap`] is set.
     pub fn metadata_recovery_rebootstrap_trigger(mut self, duration: Duration) -> Self {
         self.config.metadata_recovery_rebootstrap_trigger = duration;
+        self
+    }
+
+    /// Set the topic cache TTL for partial metadata refreshes.
+    ///
+    /// During partial refreshes, cached topics that have not been refreshed
+    /// within this duration are evicted to prevent unbounded cache growth.
+    /// `None` disables TTL eviction (the default).
+    pub fn metadata_topic_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.config.metadata_topic_cache_ttl = Some(ttl);
         self
     }
 

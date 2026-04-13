@@ -21,9 +21,10 @@ pub mod tls;
 pub use msk_iam::MskIamAuthenticator;
 pub use oauthbearer::{OAuthBearerToken, OAuthBearerTokenProvider, OAuthBearerTokenProviderHandle};
 pub use scram::{
-    MAX_PBKDF2_ITERATIONS, MIN_PBKDF2_ITERATIONS, ScramClient, ScramMechanism, ScramState,
+    ChannelBinding, MAX_PBKDF2_ITERATIONS, MIN_PBKDF2_ITERATIONS, ScramClient, ScramMechanism,
+    ScramState,
 };
-pub use tls::{MaybeSecureStream, build_tls_config, connect_tls};
+pub use tls::{MaybeSecureStream, build_tls_config, connect_tls, extract_tls_server_end_point};
 
 use std::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -98,11 +99,23 @@ pub struct PlainCredentials {
 
 impl PlainCredentials {
     /// Create new PLAIN credentials.
-    pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
-        Self {
-            username: username.into(),
-            password: password.into(),
+    ///
+    /// Returns an error if username or password contains a null byte (`\0`),
+    /// which is used as the delimiter in the SASL PLAIN wire format.
+    pub fn new(username: impl Into<String>, password: impl Into<String>) -> crate::Result<Self> {
+        let username = username.into();
+        let password = password.into();
+        if username.contains('\0') {
+            return Err(crate::error::KrafkaError::config(
+                "PLAIN username must not contain null bytes",
+            ));
         }
+        if password.contains('\0') {
+            return Err(crate::error::KrafkaError::config(
+                "PLAIN password must not contain null bytes",
+            ));
+        }
+        Ok(Self { username, password })
     }
 
     /// Build the SASL PLAIN authentication message.
@@ -470,13 +483,16 @@ impl AuthConfig {
     }
 
     /// Create a SASL/PLAIN configuration.
-    pub fn sasl_plain(username: impl Into<String>, password: impl Into<String>) -> Self {
-        Self {
+    pub fn sasl_plain(
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> crate::Result<Self> {
+        Ok(Self {
             security_protocol: SecurityProtocol::SaslPlaintext,
             sasl_mechanism: Some(SaslMechanism::Plain),
-            plain_credentials: Some(PlainCredentials::new(username, password)),
+            plain_credentials: Some(PlainCredentials::new(username, password)?),
             ..Default::default()
-        }
+        })
     }
 
     /// Create a SASL/PLAIN over TLS configuration.
@@ -484,14 +500,14 @@ impl AuthConfig {
         username: impl Into<String>,
         password: impl Into<String>,
         tls_config: TlsConfig,
-    ) -> Self {
-        Self {
+    ) -> crate::Result<Self> {
+        Ok(Self {
             security_protocol: SecurityProtocol::SaslSsl,
             sasl_mechanism: Some(SaslMechanism::Plain),
-            plain_credentials: Some(PlainCredentials::new(username, password)),
+            plain_credentials: Some(PlainCredentials::new(username, password)?),
             tls_config: Some(tls_config),
             ..Default::default()
-        }
+        })
     }
 
     /// Create a SASL/SCRAM-SHA-256 configuration.
@@ -757,7 +773,7 @@ mod tests {
 
     #[test]
     fn test_plain_credentials() {
-        let creds = PlainCredentials::new("user", "pass");
+        let creds = PlainCredentials::new("user", "pass").unwrap();
         let auth_bytes = creds.to_auth_bytes();
         assert_eq!(&*auth_bytes, b"\0user\0pass");
     }
@@ -772,7 +788,7 @@ mod tests {
 
     #[test]
     fn test_auth_config_sasl_plain() {
-        let config = AuthConfig::sasl_plain("user", "pass");
+        let config = AuthConfig::sasl_plain("user", "pass").unwrap();
         assert_eq!(config.security_protocol, SecurityProtocol::SaslPlaintext);
         assert_eq!(config.sasl_mechanism, Some(SaslMechanism::Plain));
         assert!(config.plain_credentials.is_some());
@@ -808,7 +824,7 @@ mod tests {
 
     #[test]
     fn test_credentials_debug_redacts_password() {
-        let creds = PlainCredentials::new("user", "secret");
+        let creds = PlainCredentials::new("user", "secret").unwrap();
         let debug_str = format!("{creds:?}");
         assert!(debug_str.contains("user"));
         assert!(debug_str.contains("[REDACTED]"));
@@ -964,7 +980,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_provider_to_token_returns_none_for_non_oauth() {
-        let config = AuthConfig::sasl_plain("user", "pass");
+        let config = AuthConfig::sasl_plain("user", "pass").unwrap();
         assert!(config.resolve_provider_to_token().await.unwrap().is_none());
     }
 

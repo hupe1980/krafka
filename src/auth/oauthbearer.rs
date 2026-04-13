@@ -39,7 +39,7 @@
 //! });
 //! ```
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -150,8 +150,9 @@ pub struct OAuthBearerToken {
     /// The OAuth 2.0 bearer token value (zeroized on drop).
     token_value: String,
     /// Optional SASL extensions (key=value pairs). Not secrets; skipped for zeroize.
+    /// Uses `BTreeMap` for deterministic ordering.
     #[zeroize(skip)]
-    extensions: HashMap<String, String>,
+    extensions: BTreeMap<String, String>,
 }
 
 impl OAuthBearerToken {
@@ -168,7 +169,7 @@ impl OAuthBearerToken {
     pub fn new(token_value: impl Into<String>) -> Self {
         Self {
             token_value: token_value.into(),
-            extensions: HashMap::new(),
+            extensions: BTreeMap::new(),
         }
     }
 
