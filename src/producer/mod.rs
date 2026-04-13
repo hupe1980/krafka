@@ -1191,12 +1191,14 @@ mod tests {
 
     #[test]
     fn test_producer_builder_interceptor() {
-        use crate::interceptor::ProducerInterceptor;
+        use crate::interceptor::{InterceptorResult, ProducerInterceptor};
 
         #[derive(Debug)]
         struct TestInterceptor;
         impl ProducerInterceptor for TestInterceptor {
-            fn on_send(&self, _record: &mut ProducerRecord) {}
+            fn on_send(&self, _record: &mut ProducerRecord) -> InterceptorResult {
+                Ok(())
+            }
         }
 
         let builder = Producer::builder()

@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use parking_lot::RwLock;
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
+use parking_lot::{Mutex, RwLock};
+use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
 use super::connection::{BrokerConnection, ConnectionConfig};
@@ -366,12 +366,12 @@ type ConnectingWaiters = HashMap<String, Vec<oneshot::Sender<Result<Arc<BrokerCo
 /// cancellation would leave a stale entry causing all future callers for
 /// that address to wait forever.
 struct ReconnectGuard {
-    connecting: Arc<AsyncMutex<ConnectingWaiters>>,
+    connecting: Arc<Mutex<ConnectingWaiters>>,
     address: Option<String>,
 }
 
 impl ReconnectGuard {
-    fn new(connecting: &Arc<AsyncMutex<ConnectingWaiters>>, address: String) -> Self {
+    fn new(connecting: &Arc<Mutex<ConnectingWaiters>>, address: String) -> Self {
         Self {
             connecting: Arc::clone(connecting),
             address: Some(address),
@@ -389,45 +389,30 @@ impl Drop for ReconnectGuard {
         let Some(address) = self.address.take() else {
             return;
         };
-        // Try fast-path synchronous cleanup first.  This succeeds in all
-        // practical scenarios because the async mutex is only held briefly for
-        // HashMap bookkeeping.
-        if let Ok(mut guard) = self.connecting.try_lock() {
-            let waiters = guard.remove(&address).unwrap_or_default();
-            let err = KrafkaError::Network(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
-                format!("reconnection to {address} was cancelled"),
-            ));
-            for waiter in waiters {
-                let _ = waiter.send(Err(err.clone()));
-            }
-        } else {
-            // Slow path: spawn a cleanup task that acquires the lock
-            // asynchronously so we never leave a stale entry.
-            let connecting = Arc::clone(&self.connecting);
-            tokio::spawn(async move {
-                let mut guard = connecting.lock().await;
-                let waiters = guard.remove(&address).unwrap_or_default();
-                let err = KrafkaError::Network(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionReset,
-                    format!("reconnection to {address} was cancelled"),
-                ));
-                for waiter in waiters {
-                    let _ = waiter.send(Err(err.clone()));
-                }
-            });
+        // parking_lot::Mutex::lock() is always available in Drop — no
+        // need for try_lock/spawn fallback.
+        let mut guard = self.connecting.lock();
+        let waiters = guard.remove(&address).unwrap_or_default();
+        let err = KrafkaError::network(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            format!("reconnection to {address} was cancelled"),
+        ));
+        for waiter in waiters {
+            let _ = waiter.send(Err(err.clone()));
         }
     }
 }
 
 /// A pool of connections to Kafka brokers.
 ///
-/// Uses `parking_lot::RwLock` (reader-preferring, non-async) for connection
-/// maps so that the hot `get_connection*` read path never blocks behind a
-/// pending writer.  Reconnection attempts to the same address are coalesced:
-/// only the first caller performs the TCP/TLS/SASL handshake while subsequent
-/// callers wait on oneshot channels, preventing thundering-herd reconnection
-/// storms.
+/// Uses `parking_lot::RwLock` (writer-fair, non-async) for connection
+/// maps so that the hot `get_connection*` read path is lock-free when
+/// there are no concurrent writers.  Reconnection attempts to the same address are coalesced
+/// via a `parking_lot::Mutex`: only the first caller performs the
+/// TCP/TLS/SASL handshake while subsequent callers wait on oneshot channels,
+/// preventing thundering-herd reconnection storms.  The sync mutex ensures
+/// deterministic cleanup in [`ReconnectGuard`]'s `Drop` impl without
+/// requiring a `tokio::spawn` fallback.
 pub struct ConnectionPool {
     /// Connections by broker ID.
     connections: RwLock<HashMap<BrokerId, Arc<BrokerConnection>>>,
@@ -436,7 +421,7 @@ pub struct ConnectionPool {
     /// Coalesces concurrent reconnection attempts to the same address.
     /// Only the first task to discover a dead connection performs the
     /// handshake; subsequent tasks push a oneshot sender and wait.
-    connecting: Arc<AsyncMutex<ConnectingWaiters>>,
+    connecting: Arc<Mutex<ConnectingWaiters>>,
     /// Connection config.
     config: ConnectionConfig,
     /// Retry configuration for reconnection attempts.
@@ -449,7 +434,7 @@ impl ConnectionPool {
         Self {
             connections: RwLock::new(HashMap::new()),
             connections_by_addr: RwLock::new(HashMap::new()),
-            connecting: Arc::new(AsyncMutex::new(HashMap::new())),
+            connecting: Arc::new(Mutex::new(HashMap::new())),
             config,
             retry_config: ConnectionRetryConfig::default(),
         }
@@ -463,7 +448,7 @@ impl ConnectionPool {
         Self {
             connections: RwLock::new(HashMap::new()),
             connections_by_addr: RwLock::new(HashMap::new()),
-            connecting: Arc::new(AsyncMutex::new(HashMap::new())),
+            connecting: Arc::new(Mutex::new(HashMap::new())),
             config,
             retry_config,
         }
@@ -526,7 +511,7 @@ impl ConnectionPool {
 
         // All retries exhausted
         Err(last_error.unwrap_or_else(|| {
-            KrafkaError::Network(std::io::Error::new(
+            KrafkaError::network(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 format!(
                     "Failed to connect to {} after {} retries",
@@ -562,37 +547,54 @@ impl ConnectionPool {
             }
         }
 
-        let mut connecting = self.connecting.lock().await;
+        // Acquire the coalescing lock in a block so the !Send MutexGuard is
+        // dropped before any `.await`, keeping the outer future Send.
+        enum CoalesceAction {
+            AlreadyConnected(Arc<BrokerConnection>),
+            WaitForPeer(oneshot::Receiver<Result<Arc<BrokerConnection>>>),
+            Reconnect(String),
+        }
 
-        // Double-check under the coalescing lock: another task may have
-        // finished reconnecting between our fast-path miss and now.
-        {
-            let conns = self.connections_by_addr.read();
-            if let Some(conn) = conns.get(address)
-                && conn.is_usable()
-            {
-                return Ok(conn.clone());
+        let action = {
+            let mut connecting = self.connecting.lock();
+
+            // Double-check under the coalescing lock: another task may have
+            // finished reconnecting between our fast-path miss and now.
+            // Scope the RwLock read guard tightly so it is released before
+            // the decision tree touches the `connecting` map.
+            let existing = {
+                let conns = self.connections_by_addr.read();
+                conns.get(address).filter(|c| c.is_usable()).cloned()
+            };
+
+            if let Some(conn) = existing {
+                CoalesceAction::AlreadyConnected(conn)
+            } else if let Some(waiters) = connecting.get_mut(address) {
+                // A reconnection to this address is already in-flight.
+                let (tx, rx) = oneshot::channel();
+                waiters.push(tx);
+                CoalesceAction::WaitForPeer(rx)
+            } else {
+                // First caller: register as the reconnector.
+                let addr_owned = address.to_string();
+                connecting.insert(addr_owned.clone(), Vec::new());
+                CoalesceAction::Reconnect(addr_owned)
             }
-        }
+        };
+        // MutexGuard is now dropped — safe to .await below.
 
-        // If a reconnection to this address is already in-flight, wait for it.
-        if let Some(waiters) = connecting.get_mut(address) {
-            let (tx, rx) = oneshot::channel();
-            waiters.push(tx);
-            drop(connecting);
-            return rx.await.map_err(|_| {
-                KrafkaError::Network(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionReset,
-                    format!("reconnection to {address} was cancelled"),
-                ))
-            })?;
-        }
-
-        // First caller: register as the reconnector.
-        // Build the owned address once and reuse for both maps.
-        let addr_owned = address.to_string();
-        connecting.insert(addr_owned.clone(), Vec::new());
-        drop(connecting);
+        let addr_owned = match action {
+            CoalesceAction::AlreadyConnected(conn) => return Ok(conn),
+            CoalesceAction::WaitForPeer(rx) => {
+                return rx.await.map_err(|_| {
+                    KrafkaError::network(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        format!("reconnection to {address} was cancelled"),
+                    ))
+                })?;
+            }
+            CoalesceAction::Reconnect(addr_owned) => addr_owned,
+        };
 
         // Guard: if this future is cancelled, the stale `connecting` entry is
         // removed and all waiters are notified with an error.
@@ -609,12 +611,7 @@ impl ConnectionPool {
         }
 
         // Notify waiting tasks
-        let waiters = self
-            .connecting
-            .lock()
-            .await
-            .remove(address)
-            .unwrap_or_default();
+        let waiters = self.connecting.lock().remove(address).unwrap_or_default();
         for waiter in waiters {
             let _ = waiter.send(result.clone());
         }
@@ -627,8 +624,8 @@ impl ConnectionPool {
 
     /// Get or create a connection to a broker by address.
     ///
-    /// The read path uses a `parking_lot::RwLock` (reader-preferring, no
-    /// async overhead) so concurrent callers never convoy behind a pending
+    /// The read path uses a `parking_lot::RwLock` (writer-fair, no
+    /// async overhead) so concurrent callers rarely convoy behind a pending
     /// writer.  On a cache miss the reconnection is coalesced per address.
     pub async fn get_connection(&self, address: &str) -> Result<Arc<BrokerConnection>> {
         // Fast path: sync read lock (nanosecond-scale critical section)
@@ -646,7 +643,7 @@ impl ConnectionPool {
 
     /// Get or create a connection to a broker by ID.
     ///
-    /// Same reader-preferring fast path as [`get_connection`](Self::get_connection).
+    /// Same writer-fair fast path as [`get_connection`](Self::get_connection).
     /// On reconnection the connection is registered under both the broker ID
     /// and its address for future lookups.
     pub async fn get_connection_by_id(
@@ -703,9 +700,9 @@ impl ConnectionPool {
 
         // Cancel in-flight reconnections so waiters don't hang.
         {
-            let mut connecting = self.connecting.lock().await;
+            let mut connecting = self.connecting.lock();
             for (addr, waiters) in connecting.drain() {
-                let err = KrafkaError::Network(std::io::Error::new(
+                let err = KrafkaError::network(std::io::Error::new(
                     std::io::ErrorKind::ConnectionReset,
                     format!("pool closed while reconnecting to {addr}"),
                 ));

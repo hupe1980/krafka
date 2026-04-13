@@ -33,18 +33,20 @@ Use cases:
 ### Trait Definition
 
 ```rust
+pub type InterceptorResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
 pub trait ProducerInterceptor: Send + Sync + fmt::Debug {
     /// Called before a record is sent (before partitioning).
     /// The record can be mutated (e.g., adding headers).
-    fn on_send(&self, _record: &mut ProducerRecord) {}
+    fn on_send(&self, _record: &mut ProducerRecord) -> InterceptorResult { Ok(()) }
 
     /// Called after a record is acknowledged or fails.
     /// `error` is `None` on success.
-    fn on_acknowledgement(&self, _metadata: &RecordMetadata, _error: Option<&KrafkaError>) {}
+    fn on_acknowledgement(&self, _metadata: &RecordMetadata, _error: Option<&KrafkaError>) -> InterceptorResult { Ok(()) }
 
     /// Called when the producer is being closed.
     /// Use this to release any resources held by the interceptor.
-    fn close(&self) {}
+    fn close(&self) -> InterceptorResult { Ok(()) }
 }
 ```
 
@@ -56,7 +58,7 @@ All methods have default no-op implementations, so you only need to override the
 ### Example: Tracing Headers
 
 ```rust
-use krafka::interceptor::ProducerInterceptor;
+use krafka::interceptor::{InterceptorResult, ProducerInterceptor};
 use krafka::producer::{Producer, ProducerRecord, RecordMetadata};
 use krafka::error::KrafkaError;
 use std::sync::Arc;
@@ -66,12 +68,13 @@ use uuid::Uuid;
 struct TracingInterceptor;
 
 impl ProducerInterceptor for TracingInterceptor {
-    fn on_send(&self, record: &mut ProducerRecord) {
+    fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
         let trace_id = Uuid::new_v4().to_string();
         record.headers.push(("x-trace-id".to_string(), trace_id.into_bytes()));
+        Ok(())
     }
 
-    fn on_acknowledgement(&self, metadata: &RecordMetadata, error: Option<&KrafkaError>) {
+    fn on_acknowledgement(&self, metadata: &RecordMetadata, error: Option<&KrafkaError>) -> InterceptorResult {
         match error {
             None => tracing::info!(
                 topic = %metadata.topic,
@@ -81,6 +84,7 @@ impl ProducerInterceptor for TracingInterceptor {
             ),
             Some(e) => tracing::error!("send failed: {}", e),
         }
+        Ok(())
     }
 }
 
@@ -94,7 +98,7 @@ let producer = Producer::builder()
 ### Example: Metrics Counter
 
 ```rust
-use krafka::interceptor::ProducerInterceptor;
+use krafka::interceptor::{InterceptorResult, ProducerInterceptor};
 use krafka::producer::{ProducerRecord, RecordMetadata};
 use krafka::error::KrafkaError;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -115,12 +119,13 @@ impl MetricsInterceptor {
 }
 
 impl ProducerInterceptor for MetricsInterceptor {
-    fn on_acknowledgement(&self, _metadata: &RecordMetadata, error: Option<&KrafkaError>) {
+    fn on_acknowledgement(&self, _metadata: &RecordMetadata, error: Option<&KrafkaError>) -> InterceptorResult {
         if error.is_some() {
             self.errors.fetch_add(1, Ordering::Relaxed);
         } else {
             self.sent.fetch_add(1, Ordering::Relaxed);
         }
+        Ok(())
     }
 }
 ```
@@ -132,7 +137,7 @@ impl ProducerInterceptor for MetricsInterceptor {
 ```rust
 pub trait ConsumerInterceptor: Send + Sync + fmt::Debug {
     /// Called after records are fetched, before returned to the application.
-    fn on_consume(&self, _records: &[ConsumerRecord]) {}
+    fn on_consume(&self, _records: &[ConsumerRecord]) -> InterceptorResult { Ok(()) }
 
     /// Called after offsets are committed.
     /// The map keys are `(topic, partition)` and values are the committed offsets.
@@ -140,18 +145,18 @@ pub trait ConsumerInterceptor: Send + Sync + fmt::Debug {
         &self,
         _offsets: &HashMap<(String, PartitionId), Offset>,
         _error: Option<&KrafkaError>,
-    ) {}
+    ) -> InterceptorResult { Ok(()) }
 
     /// Called when the consumer is being closed.
     /// Use this to release any resources held by the interceptor.
-    fn close(&self) {}
+    fn close(&self) -> InterceptorResult { Ok(()) }
 }
 ```
 
 ### Example: Consumption Logging
 
 ```rust
-use krafka::interceptor::ConsumerInterceptor;
+use krafka::interceptor::{ConsumerInterceptor, InterceptorResult};
 use krafka::consumer::{Consumer, ConsumerRecord};
 use std::sync::Arc;
 
@@ -159,13 +164,14 @@ use std::sync::Arc;
 struct LoggingInterceptor;
 
 impl ConsumerInterceptor for LoggingInterceptor {
-    fn on_consume(&self, records: &[ConsumerRecord]) {
+    fn on_consume(&self, records: &[ConsumerRecord]) -> InterceptorResult {
         for record in records {
             println!(
                 "Consumed: topic={}, partition={}, offset={}",
                 record.topic, record.partition, record.offset
             );
         }
+        Ok(())
     }
 }
 
@@ -180,7 +186,7 @@ let consumer = Consumer::builder()
 ### Example: Commit Monitoring
 
 ```rust
-use krafka::interceptor::ConsumerInterceptor;
+use krafka::interceptor::{ConsumerInterceptor, InterceptorResult};
 use krafka::error::KrafkaError;
 use krafka::{Offset, PartitionId};
 use std::collections::HashMap;
@@ -193,7 +199,7 @@ impl ConsumerInterceptor for CommitMonitor {
         &self,
         offsets: &HashMap<(String, PartitionId), Offset>,
         error: Option<&KrafkaError>,
-    ) {
+    ) -> InterceptorResult {
         match error {
             None => {
                 for ((topic, partition), offset) in offsets {
@@ -202,6 +208,7 @@ impl ConsumerInterceptor for CommitMonitor {
             }
             Some(e) => eprintln!("Commit failed: {}", e),
         }
+        Ok(())
     }
 }
 ```
@@ -223,18 +230,18 @@ let producer = Producer::builder()
 ### Interceptor Chain
 
 Multiple interceptors execute in the order they are added. Each interceptor is
-individually panic-isolated — a panic in one interceptor will not prevent the
-remaining interceptors from running.
+individually error- and panic-isolated — a failure in one interceptor will
+not prevent the remaining interceptors from running.
 
 For `on_send`, each interceptor sees the record as modified by all preceding
 interceptors in the chain.
 
-> **Panic semantics:** In Java, `onSend` returns a new record — if an
+> **Error semantics:** In Java, `onSend` returns a new record — if an
 > interceptor throws, the next one receives the record from the last
 > *successful* interceptor. In Rust, `on_send` mutates in-place (`&mut`);
-> if an interceptor panics mid-mutation, the next interceptor sees a
-> partially-mutated record. Avoid building chains where later interceptors
-> depend on invariants set by earlier ones.
+> if an interceptor returns an error or panics mid-mutation, the next
+> interceptor sees a partially-mutated record. Avoid building chains
+> where later interceptors depend on invariants set by earlier ones.
 
 ```rust
 use std::sync::Arc;
@@ -327,12 +334,31 @@ struct SafeInterceptor {
 // AtomicU64 is Send + Sync, so SafeInterceptor is too
 ```
 
-## Panic Safety
+## Security Considerations
 
-All interceptor method calls are wrapped in `catch_unwind`. If your interceptor panics,
-the panic is caught and logged as an error — it will **not** crash the producer or consumer.
-This means interceptors can never bring down the application, though a panicking interceptor
-will silently stop executing for that invocation.
+- **Headers may contain credentials:** `on_send()` receives all record headers, which
+  may include auth tokens or API keys. Do not log full record contents without sanitization.
+- **Error messages may leak secrets:** `on_acknowledgement()` error messages from auth
+  failures may contain broker-echoed details.
+- **Debug impls may expose secrets:** Never log the interceptor instance itself
+  (e.g. `{:?}`) — user-provided `Debug` implementations may expose credentials.
+
+## Error Handling & Panic Safety
+
+All interceptor methods return `InterceptorResult` (`Result<(), Box<dyn Error + Send + Sync>>`).
+Errors are **non-fatal** — the chain continues and the error is logged at `warn!`.
+This gives interceptor authors a clean, idiomatic way to signal failures
+(e.g. a metrics backend is down) without resorting to panics.
+
+As a safety net, all calls are additionally wrapped in `catch_unwind`.
+Panics are caught and logged at `error!` with the panic payload **redacted**
+(user-provided `Debug` impls may leak secrets). The chain continues even after a panic.
+
+| Outcome | Log level | Chain continues? |
+|---------|-----------|------------------|
+| `Ok(())` | — | Yes |
+| `Err(e)` | `warn!` | Yes |
+| panic | `error!` (payload redacted) | Yes |
 
 ## Next Steps
 

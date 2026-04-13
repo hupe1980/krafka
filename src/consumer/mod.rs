@@ -3755,12 +3755,14 @@ mod tests {
 
     #[test]
     fn test_consumer_builder_interceptor() {
-        use crate::interceptor::ConsumerInterceptor;
+        use crate::interceptor::{ConsumerInterceptor, InterceptorResult};
 
         #[derive(Debug)]
         struct TestInterceptor;
         impl ConsumerInterceptor for TestInterceptor {
-            fn on_consume(&self, _records: &[ConsumerRecord]) {}
+            fn on_consume(&self, _records: &[ConsumerRecord]) -> InterceptorResult {
+                Ok(())
+            }
         }
 
         let builder = Consumer::builder()

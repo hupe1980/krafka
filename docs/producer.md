@@ -730,7 +730,7 @@ observe the acknowledgement (or error) after a send completes.
 See the [Interceptors Guide](interceptors.md) for full details.
 
 ```rust
-use krafka::interceptor::ProducerInterceptor;
+use krafka::interceptor::{InterceptorResult, ProducerInterceptor};
 use krafka::producer::{Producer, ProducerRecord, RecordMetadata};
 use krafka::error::KrafkaError;
 use std::sync::Arc;
@@ -739,17 +739,19 @@ use std::sync::Arc;
 struct AuditInterceptor;
 
 impl ProducerInterceptor for AuditInterceptor {
-    fn on_send(&self, record: &mut ProducerRecord) {
+    fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
         // Add a tracing header to every record
         record.headers.push(("x-trace-id".to_string(), b"abc123".to_vec()));
+        Ok(())
     }
 
-    fn on_acknowledgement(&self, metadata: &RecordMetadata, error: Option<&KrafkaError>) {
+    fn on_acknowledgement(&self, metadata: &RecordMetadata, error: Option<&KrafkaError>) -> InterceptorResult {
         if let Some(err) = error {
             eprintln!("Send failed: {}", err);
         } else {
             println!("Sent to {}:{}", metadata.topic, metadata.partition);
         }
+        Ok(())
     }
 }
 

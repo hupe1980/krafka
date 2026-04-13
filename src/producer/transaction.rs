@@ -1658,7 +1658,7 @@ mod tests {
 
         // Network and timeout errors → true (coordinator may have moved)
         assert!(TransactionalProducer::needs_coordinator_refresh(
-            &KrafkaError::Network(std::io::Error::new(
+            &KrafkaError::network(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 "refused"
             ))

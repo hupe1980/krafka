@@ -1084,7 +1084,7 @@ Interceptors allow you to observe records after they are fetched and monitor off
 See the [Interceptors Guide](interceptors.md) for full details.
 
 ```rust
-use krafka::interceptor::ConsumerInterceptor;
+use krafka::interceptor::{ConsumerInterceptor, InterceptorResult};
 use krafka::consumer::{Consumer, ConsumerRecord};
 use std::sync::Arc;
 
@@ -1092,8 +1092,9 @@ use std::sync::Arc;
 struct MetricsInterceptor;
 
 impl ConsumerInterceptor for MetricsInterceptor {
-    fn on_consume(&self, records: &[ConsumerRecord]) {
+    fn on_consume(&self, records: &[ConsumerRecord]) -> InterceptorResult {
         println!("Consumed {} records", records.len());
+        Ok(())
     }
 }
 

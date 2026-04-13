@@ -793,7 +793,7 @@ impl BrokerConnection {
         let mut addrs = timeout(config.connect_timeout, tokio::net::lookup_host(address))
             .await
             .map_err(|_| KrafkaError::timeout("DNS resolution"))?
-            .map_err(KrafkaError::Network)?;
+            .map_err(KrafkaError::network)?;
         let first_addr = addrs.next().ok_or_else(|| {
             KrafkaError::invalid_state(format!("no addresses resolved for '{address}'"))
         })?;
@@ -805,7 +805,7 @@ impl BrokerConnection {
         let stream = timeout(config.connect_timeout, socket.connect(addr))
             .await
             .map_err(|_| KrafkaError::timeout("connection"))?
-            .map_err(KrafkaError::Network)?;
+            .map_err(KrafkaError::network)?;
 
         Ok(stream)
     }
@@ -833,7 +833,7 @@ impl BrokerConnection {
         let mut addrs = timeout_at(deadline, tokio::net::lookup_host(&proxy.address))
             .await
             .map_err(|_| KrafkaError::timeout("SOCKS5 proxy DNS resolution"))?
-            .map_err(KrafkaError::Network)?;
+            .map_err(KrafkaError::network)?;
         let first_addr = addrs.next().ok_or_else(|| {
             KrafkaError::invalid_state(format!(
                 "no addresses resolved for SOCKS5 proxy '{}'",
@@ -850,7 +850,7 @@ impl BrokerConnection {
             let tcp = socket
                 .connect(proxy_addr)
                 .await
-                .map_err(KrafkaError::Network)?;
+                .map_err(KrafkaError::network)?;
 
             // SOCKS5 handshake — pass the broker address as a string so the
             // proxy performs DNS resolution (remote resolution).
@@ -866,7 +866,7 @@ impl BrokerConnection {
                 Socks5Stream::connect_with_socket(tcp, address).await
             }
             .map_err(|e| {
-                KrafkaError::Network(std::io::Error::other(format!("SOCKS5 proxy error: {e}")))
+                KrafkaError::network(std::io::Error::other(format!("SOCKS5 proxy error: {e}")))
             })?;
 
             Ok::<_, KrafkaError>(socks.into_inner())
@@ -889,17 +889,17 @@ impl BrokerConnection {
         } else {
             TcpSocket::new_v4()
         }
-        .map_err(KrafkaError::Network)?;
+        .map_err(KrafkaError::network)?;
 
         if let Some(size) = config.send_buffer_size {
             socket
                 .set_send_buffer_size(size as u32)
-                .map_err(KrafkaError::Network)?;
+                .map_err(KrafkaError::network)?;
         }
         if let Some(size) = config.recv_buffer_size {
             socket
                 .set_recv_buffer_size(size as u32)
-                .map_err(KrafkaError::Network)?;
+                .map_err(KrafkaError::network)?;
         }
 
         Ok(socket)
@@ -978,8 +978,8 @@ impl BrokerConnection {
         stream
             .write_all(&encoder.take())
             .await
-            .map_err(KrafkaError::Network)?;
-        stream.flush().await.map_err(KrafkaError::Network)?;
+            .map_err(KrafkaError::network)?;
+        stream.flush().await.map_err(KrafkaError::network)?;
 
         // Read handshake response
         let mut response_buf = Self::read_framed_response(stream, max_response_size).await?;
@@ -1082,8 +1082,8 @@ impl BrokerConnection {
         stream
             .write_all(&encoder.take())
             .await
-            .map_err(KrafkaError::Network)?;
-        stream.flush().await.map_err(KrafkaError::Network)?;
+            .map_err(KrafkaError::network)?;
+        stream.flush().await.map_err(KrafkaError::network)?;
         Ok(())
     }
 
@@ -1112,7 +1112,7 @@ impl BrokerConnection {
         stream
             .read_exact(&mut len_buf)
             .await
-            .map_err(KrafkaError::Network)?;
+            .map_err(KrafkaError::network)?;
         let len_i32 = i32::from_be_bytes(len_buf);
 
         if len_i32 <= 0 || (len_i32 as usize) > max_response_size {
@@ -1128,7 +1128,7 @@ impl BrokerConnection {
         stream
             .read_exact(&mut body)
             .await
-            .map_err(KrafkaError::Network)?;
+            .map_err(KrafkaError::network)?;
 
         Ok(Bytes::from(body))
     }
@@ -1208,7 +1208,7 @@ impl BrokerConnection {
                         }
                         Err(e) => {
                             error!("Read error: {}", e);
-                            return Err(KrafkaError::Network(e));
+                            return Err(KrafkaError::network(e));
                         }
                     }
                 }
@@ -1344,7 +1344,7 @@ impl BrokerConnection {
                     error!("Write error: {}", e);
                     let mut pending = pending.lock().await;
                     if let Some(req) = pending.remove(&correlation_id) {
-                        let _ = req.response_tx.send(Err(KrafkaError::Network(e)));
+                        let _ = req.response_tx.send(Err(KrafkaError::network(e)));
                     }
                     return Ok(false);
                 }
@@ -1355,7 +1355,7 @@ impl BrokerConnection {
                     // doesn't hang waiting for a response that will never arrive.
                     let mut pending = pending.lock().await;
                     if let Some(req) = pending.remove(&correlation_id) {
-                        let _ = req.response_tx.send(Err(KrafkaError::Network(e)));
+                        let _ = req.response_tx.send(Err(KrafkaError::network(e)));
                     }
                     return Ok(false);
                 }

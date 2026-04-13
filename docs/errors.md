@@ -16,7 +16,7 @@ Krafka uses a single error enum for all error conditions:
 ```rust
 pub enum KrafkaError {
     /// Network-related errors (connection, I/O)
-    Network(io::Error),
+    Network(Arc<io::Error>),
 
     /// Protocol encoding/decoding errors
     Protocol { message: String },

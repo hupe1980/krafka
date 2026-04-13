@@ -3,6 +3,7 @@
 //! This module provides structured error types for all Krafka operations.
 
 use std::io;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -11,8 +12,11 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum KrafkaError {
     /// Network-related errors (connection, I/O).
+    ///
+    /// Wrapped in `Arc` so that cloning preserves the full error chain
+    /// (including `raw_os_error()` and `source()`).
     #[error("network error: {0}")]
-    Network(#[from] io::Error),
+    Network(#[source] Arc<io::Error>),
 
     /// Protocol encoding/decoding errors.
     #[error("protocol error: {message}")]
@@ -83,7 +87,7 @@ pub enum KrafkaError {
 impl Clone for KrafkaError {
     fn clone(&self) -> Self {
         match self {
-            Self::Network(err) => Self::Network(io::Error::new(err.kind(), err.to_string())),
+            Self::Network(err) => Self::Network(Arc::clone(err)),
             Self::Protocol { message } => Self::Protocol {
                 message: message.clone(),
             },
@@ -116,7 +120,19 @@ impl Clone for KrafkaError {
     }
 }
 
+impl From<io::Error> for KrafkaError {
+    fn from(err: io::Error) -> Self {
+        Self::Network(Arc::new(err))
+    }
+}
+
 impl KrafkaError {
+    /// Create a new network error from an I/O error.
+    #[cold]
+    pub fn network(err: io::Error) -> Self {
+        Self::Network(Arc::new(err))
+    }
+
     /// Create a new protocol error.
     #[cold]
     pub fn protocol(message: impl Into<String>) -> Self {
@@ -832,6 +848,38 @@ mod tests {
         assert!(KrafkaError::timeout("test").is_retriable());
         assert!(KrafkaError::broker(ErrorCode::LeaderNotAvailable, "test").is_retriable());
         assert!(!KrafkaError::config("test").is_retriable());
+        assert!(
+            KrafkaError::network(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "refused",
+            ))
+            .is_retriable()
+        );
+    }
+
+    #[test]
+    fn test_network_error_source_preserved_through_arc() {
+        use std::error::Error;
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let krafka_err = KrafkaError::network(io_err);
+        // source() must return Some — the Arc<io::Error> is the source
+        let source = krafka_err.source().expect("source() must not be None");
+        assert!(source.to_string().contains("refused"));
+    }
+
+    #[test]
+    fn test_network_error_clone_preserves_source() {
+        use std::error::Error;
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let original = KrafkaError::network(io_err);
+        let cloned = original.clone();
+        // Both original and clone must have source()
+        assert!(original.source().is_some());
+        assert!(cloned.source().is_some());
+        assert_eq!(
+            original.source().unwrap().to_string(),
+            cloned.source().unwrap().to_string()
+        );
     }
 
     // ── R9.10: ErrorCode 56–88 from_i16 / to_i16 round-trip ──
