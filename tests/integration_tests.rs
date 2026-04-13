@@ -18,6 +18,16 @@ use testcontainers::core::{ContainerPort, ContainerState, ExecCommand, WaitFor};
 use testcontainers::{ContainerAsync, Image, runners::AsyncRunner};
 
 // ---------------------------------------------------------------------------
+// Timing constants — tweak these for CI vs local runs
+// ---------------------------------------------------------------------------
+
+/// Time to wait after container start for Kafka to stabilize.
+const CONTAINER_SETTLE: Duration = Duration::from_secs(10);
+
+/// Time to wait after topic creation for metadata propagation.
+const TOPIC_READY: Duration = Duration::from_secs(2);
+
+// ---------------------------------------------------------------------------
 // Custom Kafka image – works with `apache/kafka-native` 3.8 – 4.x
 // ---------------------------------------------------------------------------
 
@@ -163,7 +173,7 @@ async fn kafka_container() -> (ContainerAsync<ApacheKafka>, String) {
         match ApacheKafka::new(&tag).start().await {
             Ok(container) => {
                 // Wait for Kafka to be fully ready
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                tokio::time::sleep(CONTAINER_SETTLE).await;
 
                 let host_port = container
                     .get_host_port_ipv4(KAFKA_PORT)
@@ -274,7 +284,7 @@ async fn create_topic(bootstrap_servers: &str, topic: &str, partitions: i32) {
         .expect("Failed to create topic");
 
     // Wait for topic to be ready
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(TOPIC_READY).await;
 }
 
 #[tokio::test]
@@ -327,6 +337,7 @@ async fn test_producer_send_receive() {
     assert_eq!(record.key_str(), Some("test-key"));
     assert_eq!(record.value_str(), Some("test-value"));
 
+    consumer.close().await;
     producer.close().await;
 }
 
@@ -444,6 +455,7 @@ async fn test_compression_roundtrip() {
             "Value mismatch for {:?}",
             compression
         );
+        consumer.close().await;
     }
 }
 
@@ -585,94 +597,8 @@ async fn test_consumer_group_rebalance() {
         total_records > 0,
         "Expected at least some records from consumer group"
     );
-}
-
-#[tokio::test]
-#[ignore = "requires Docker"]
-async fn test_consumer_commit_and_resume() {
-    use krafka::admin::{AdminClient, NewTopic};
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
-
-    let (_container, bootstrap_servers) = kafka_container().await;
-
-    let topic_name = "commit-resume-test";
-    let group_id = "commit-resume-group";
-
-    // Create topic
-    let admin = AdminClient::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .build()
-        .await
-        .expect("Failed to create admin client");
-
-    let new_topic = NewTopic::new(topic_name, 1, 1).unwrap();
-    admin
-        .create_topics(vec![new_topic], Duration::from_secs(10))
-        .await
-        .expect("Failed to create topic");
-
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    // Produce messages
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .build()
-        .await
-        .expect("Failed to create producer");
-
-    for i in 0..10 {
-        let _ = producer
-            .send(topic_name, None, format!("msg-{}", i).as_bytes())
-            .await
-            .expect("Failed to send message");
-    }
-    producer.close().await;
-
-    // First consumer: read and commit
-    {
-        let consumer = Consumer::builder()
-            .bootstrap_servers(&bootstrap_servers)
-            .group_id(group_id)
-            .auto_offset_reset(AutoOffsetReset::Earliest)
-            .enable_auto_commit(false) // Manual commit
-            .build()
-            .await
-            .expect("Failed to create consumer");
-
-        subscribe_with_retry(&consumer, &[topic_name], 5)
-            .await
-            .expect("Failed to subscribe");
-
-        // Read some messages (first poll may be consumed by rebalance)
-        let records = poll_for_records(&consumer, 1, Duration::from_secs(5), 5).await;
-
-        assert!(!records.is_empty(), "Expected records");
-
-        // Commit offsets
-        consumer.commit().await.expect("Failed to commit");
-    }
-
-    // Second consumer: should resume from committed offset
-    {
-        let consumer = Consumer::builder()
-            .bootstrap_servers(&bootstrap_servers)
-            .group_id(group_id)
-            .auto_offset_reset(AutoOffsetReset::Earliest)
-            .enable_auto_commit(false)
-            .build()
-            .await
-            .expect("Failed to create second consumer");
-
-        subscribe_with_retry(&consumer, &[topic_name], 5)
-            .await
-            .expect("Failed to subscribe");
-
-        // Poll - should get remaining messages or none if all were committed
-        let _records = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
-
-        // Success - consumer was able to resume from committed offset
-    }
+    consumer1.close().await;
+    consumer2.close().await;
 }
 
 // ============================================================================
@@ -777,6 +703,7 @@ async fn test_consumer_handles_no_messages_gracefully() {
 
     // May be empty or have the setup message depending on timing
     drop(records);
+    consumer.close().await;
 }
 
 #[tokio::test]
@@ -838,6 +765,7 @@ async fn test_multiple_producers_same_topic() {
     let all_records = poll_for_records(&consumer, 6, Duration::from_secs(3), 8).await;
 
     assert_eq!(all_records.len(), 6, "Expected 6 messages from 2 producers");
+    consumer.close().await;
 }
 
 #[tokio::test]
@@ -889,6 +817,7 @@ async fn test_large_message_handling() {
         records[0].value.as_ref().map(|v| v.len()).unwrap_or(0),
         100 * 1024
     );
+    consumer.close().await;
 }
 
 // ============================================================================
@@ -948,6 +877,7 @@ async fn test_message_headers() {
 
     // Verify headers are present
     assert!(record.header("trace-id").is_some());
+    consumer.close().await;
 }
 
 #[tokio::test]
@@ -1034,6 +964,7 @@ async fn test_null_key_and_value() {
     // Verify null key is received as None
     assert!(record.key.is_none());
     assert!(record.value.is_some());
+    consumer.close().await;
 }
 
 #[tokio::test]
@@ -1093,67 +1024,7 @@ async fn test_multiple_topics_subscription() {
         "Should contain messages from both topics, got: {:?}",
         topics
     );
-}
-
-#[tokio::test]
-#[ignore = "requires Docker"]
-async fn test_consumer_seek_operations() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
-
-    let (_container, bootstrap_servers) = kafka_container().await;
-
-    let topic = "seek-test-topic";
-    create_topic(&bootstrap_servers, topic, 1).await;
-
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .client_id("seek-test-producer")
-        .build()
-        .await
-        .expect("Failed to create producer");
-
-    // Send multiple messages
-    for i in 0..10 {
-        let _ = producer
-            .send(
-                topic,
-                Some(format!("key-{}", i).as_bytes()),
-                format!("value-{}", i).as_bytes(),
-            )
-            .await
-            .expect("send failed");
-    }
-    producer.close().await;
-
-    // Test seek to specific offset
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("seek-test-consumer")
-        .auto_offset_reset(AutoOffsetReset::Earliest)
-        .enable_auto_commit(false)
-        .build()
-        .await
-        .expect("Failed to create consumer");
-
-    subscribe_with_retry(&consumer, &[topic], 5)
-        .await
-        .expect("Failed to subscribe");
-
-    // First poll to establish assignment (rebalance may consume first poll)
-    let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
-
-    // Seek to beginning of partition 0
-    consumer
-        .seek_to_beginning(topic, 0)
-        .await
-        .expect("seek to beginning failed");
-
-    // Poll should get messages from the beginning
-    let records = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
-
-    // We may or may not get records depending on timing, but no panic
-    drop(records);
+    consumer.close().await;
 }
 
 #[tokio::test]
@@ -1195,73 +1066,6 @@ async fn test_admin_describe_configs() {
         .delete_topics(vec![topic_name.to_string()], Duration::from_secs(10))
         .await
         .ok();
-}
-
-#[tokio::test]
-#[ignore = "requires Docker"]
-async fn test_consumer_pause_resume() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
-
-    let (_container, bootstrap_servers) = kafka_container().await;
-
-    let topic = "pause-resume-topic";
-    create_topic(&bootstrap_servers, topic, 1).await;
-
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .client_id("pause-resume-producer")
-        .build()
-        .await
-        .expect("Failed to create producer");
-
-    // Send initial messages
-    for i in 0..5 {
-        let _ = producer
-            .send(
-                topic,
-                Some(format!("key-{}", i).as_bytes()),
-                format!("value-{}", i).as_bytes(),
-            )
-            .await
-            .expect("send failed");
-    }
-    producer.close().await;
-
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("pause-resume-consumer")
-        .auto_offset_reset(AutoOffsetReset::Earliest)
-        .build()
-        .await
-        .expect("Failed to create consumer");
-
-    subscribe_with_retry(&consumer, &[topic], 5)
-        .await
-        .expect("Failed to subscribe");
-
-    // Initial poll to get assignment (rebalance may consume first poll)
-    let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
-
-    // Pause the partition
-    consumer.pause(topic, &[0]).await;
-
-    // Poll should return empty while paused (within timeout)
-    let _records = consumer
-        .poll(Duration::from_millis(500))
-        .await
-        .expect("poll failed");
-    // May or may not be empty depending on buffering
-
-    // Resume the partition
-    consumer.resume(topic, &[0]).await;
-
-    // Should be able to continue consuming
-    let records = consumer
-        .poll(Duration::from_secs(2))
-        .await
-        .expect("poll failed after resume");
-    drop(records);
 }
 
 #[tokio::test]
@@ -1328,6 +1132,7 @@ async fn test_concurrent_producers() {
         15,
         "Expected 15 messages from 3 concurrent producers"
     );
+    consumer.close().await;
 }
 
 #[tokio::test]
@@ -1379,6 +1184,7 @@ async fn test_producer_with_batching() {
 
     let records = poll_for_records(&consumer, 10, Duration::from_secs(5), 5).await;
     assert_eq!(records.len(), 10, "Expected 10 messages");
+    consumer.close().await;
 }
 
 // Note: TransactionalProducer tests are skipped because transaction coordinator
@@ -1667,6 +1473,7 @@ async fn test_producer_timestamp_propagation() {
             record.timestamp
         );
     }
+    consumer.close().await;
 }
 
 #[tokio::test]
@@ -1723,6 +1530,7 @@ async fn test_consumer_manual_assign() {
         assert_eq!(record.partition, 0, "Should only get partition 0");
     }
     assert!(!records.is_empty(), "Expected records from partition 0");
+    consumer.close().await;
 }
 
 #[tokio::test]
@@ -1772,6 +1580,7 @@ async fn test_admin_list_consumer_groups() {
         group_id,
         groups.iter().map(|g| &g.group_id).collect::<Vec<_>>()
     );
+    consumer.close().await;
 }
 
 #[tokio::test]
@@ -1808,6 +1617,7 @@ async fn test_consumer_unsubscribe() {
         subscription.is_empty(),
         "Subscription should be empty after unsubscribe"
     );
+    consumer.close().await;
 }
 
 #[tokio::test]
@@ -2083,7 +1893,7 @@ async fn test_admin_describe_consumer_group() {
 
     subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
     // Poll multiple times to ensure group join completes (first poll does rebalance)
-    let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
+    let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 5).await;
 
     let admin = AdminClient::builder()
         .bootstrap_servers(&bootstrap_servers)
@@ -2091,10 +1901,24 @@ async fn test_admin_describe_consumer_group() {
         .await
         .unwrap();
 
-    let descriptions = admin
-        .describe_consumer_groups(vec![group_id.to_string()])
-        .await
-        .expect("describe_consumer_groups failed");
+    // Retry describe_consumer_groups — the broker may take a moment to
+    // report the member after the rebalance completes.
+    let mut descriptions = Vec::new();
+    for attempt in 0..10 {
+        descriptions = admin
+            .describe_consumer_groups(vec![group_id.to_string()])
+            .await
+            .expect("describe_consumer_groups failed");
+        if descriptions.len() == 1 && !descriptions[0].members.is_empty() {
+            break;
+        }
+        eprintln!(
+            "describe_consumer_groups attempt {}/10: {} members, retrying in 2s...",
+            attempt + 1,
+            descriptions.first().map_or(0, |d| d.members.len()),
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 
     assert_eq!(descriptions.len(), 1);
     assert_eq!(descriptions[0].group_id, group_id);

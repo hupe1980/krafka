@@ -87,8 +87,12 @@ const HALF_SEQUENCE_SPACE: u32 = SEQUENCE_SPACE / 2;
 /// Given a `base_sequence` and `count` records, returns
 /// `base_sequence + count - 1`, wrapping at the sequence space boundary.
 /// Matches the Kafka Java client's `ProducerBatch.lastSequence()`.
+///
+/// # Panics
+///
+/// Panics if `count <= 0`.
 pub(crate) fn last_sequence_of_batch(base_sequence: i32, count: i32) -> i32 {
-    debug_assert!(count > 0, "count must be positive");
+    assert!(count > 0, "count must be positive");
     ((base_sequence as u32).wrapping_add((count - 1) as u32) % SEQUENCE_SPACE) as i32
 }
 
@@ -195,8 +199,12 @@ impl ProducerIdentity {
     ///
     /// Returns the base sequence. The internal counter advances by `count`,
     /// wrapping at the sequence space boundary (`i32::MAX` → 0).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `count <= 0`.
     pub fn allocate_sequence(&self, topic: &str, partition: PartitionId, count: i32) -> i32 {
-        debug_assert!(count > 0, "count must be positive");
+        assert!(count > 0, "count must be positive");
 
         let mut sequences = self.sequences.write();
         if !sequences.contains_key(topic) {
@@ -252,8 +260,12 @@ impl ProducerIdentity {
     /// Used when a multi-record batch was allocated a sequence range via
     /// [`allocate_sequence`](Self::allocate_sequence) but failed before being
     /// sent (e.g., encode failure), preventing sequence gaps.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `count <= 0`.
     pub fn rollback_sequence_range(&self, topic: &str, partition: PartitionId, count: i32) {
-        debug_assert!(count > 0, "count must be positive");
+        assert!(count > 0, "count must be positive");
 
         let mut sequences = self.sequences.write();
         if let Some(state) = sequences
@@ -284,8 +296,12 @@ impl ProducerIdentity {
     /// [`allocate_sequence`](Self::allocate_sequence) under a single lock,
     /// preventing TOCTOU races when multiple concurrent sends hit
     /// `OutOfOrderSequenceNumber` for the same partition.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `count <= 0`.
     pub fn reset_and_allocate(&self, topic: &str, partition: PartitionId, count: i32) -> i32 {
-        debug_assert!(count > 0, "count must be positive");
+        assert!(count > 0, "count must be positive");
 
         let mut sequences = self.sequences.write();
         if !sequences.contains_key(topic) {

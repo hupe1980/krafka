@@ -146,9 +146,11 @@ impl MskIamAuthenticator {
     pub fn create_auth_payload(&self) -> Vec<u8> {
         let now = SystemTime::now();
         let adjusted = if self.clock_offset_secs >= 0 {
-            now + std::time::Duration::from_secs(self.clock_offset_secs as u64)
+            let offset = std::time::Duration::from_secs(self.clock_offset_secs as u64);
+            now.checked_add(offset).unwrap_or(now)
         } else {
-            now - std::time::Duration::from_secs(self.clock_offset_secs.unsigned_abs())
+            let offset = std::time::Duration::from_secs(self.clock_offset_secs.unsigned_abs());
+            now.checked_sub(offset).unwrap_or(std::time::UNIX_EPOCH)
         };
         self.create_auth_payload_at(adjusted)
     }

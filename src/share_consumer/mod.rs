@@ -54,7 +54,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::RwLock;
-use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::auth::AuthConfig;
@@ -291,7 +290,8 @@ impl ShareConsumer {
         // Send heartbeat to maintain membership and receive assignments.
         // Cap the heartbeat RPC at 10 s so a slow/stuck coordinator does not
         // block the entire poll() for the full connection-level request_timeout.
-        let heartbeat_result = timeout(Duration::from_secs(10), self.send_heartbeat(false)).await;
+        let heartbeat_result =
+            tokio::time::timeout(Duration::from_secs(10), self.send_heartbeat(false)).await;
         let heartbeat_err = match heartbeat_result {
             Ok(Ok(())) => None,
             Ok(Err(e)) => Some(e),

@@ -233,7 +233,7 @@ impl ScramClient {
     /// Returns the raw bytes to send in the SASL authenticate request.
     pub fn client_first_message(&mut self) -> Vec<u8> {
         // GS2 header per RFC 5802 §7
-        let gs2_header = match self.channel_binding {
+        let gs2_header = match &self.channel_binding {
             ChannelBinding::None => "n,,".to_string(),
             ChannelBinding::TlsServerEndPoint(_) => "p=tls-server-end-point,,".to_string(),
         };
@@ -509,20 +509,18 @@ fn xor_bytes(a: &[u8], b: &[u8]) -> Vec<u8> {
 
 /// Constant-time comparison to prevent timing attacks.
 ///
-/// Uses the `subtle` crate's `ConstantTimeEq` for formally verified
-/// constant-time comparison. Both slices are padded to equal length
-/// so that the length difference is never leaked via an early return.
+/// Uses the `subtle` crate's `ConstantTimeEq`. Returns `false` early
+/// when lengths differ — this is intentional: it reveals only that the
+/// lengths differ, not any content. This matches Go's
+/// `subtle.ConstantTimeCompare` and libsodium's `crypto_verify`.
+///
+/// For SCRAM, both inputs are fixed-length HMAC outputs, so the
+/// early-return path is never taken in practice.
 fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
-    let len = a.len().max(b.len());
-    let mut a_padded = vec![0u8; len];
-    let mut b_padded = vec![0u8; len];
-    a_padded[..a.len()].copy_from_slice(a);
-    b_padded[..b.len()].copy_from_slice(b);
-
-    // Length equality is checked in constant time via the XOR of the booleans.
-    let lengths_equal = a.len().ct_eq(&b.len());
-    let contents_equal = a_padded.ct_eq(&b_padded);
-    (lengths_equal & contents_equal).into()
+    if a.len() != b.len() {
+        return false;
+    }
+    a.ct_eq(b).into()
 }
 
 #[cfg(test)]

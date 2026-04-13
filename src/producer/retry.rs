@@ -195,8 +195,12 @@ impl RetryContext {
             let backoff = self.policy.calculate_backoff(self.attempt);
 
             // Clamp backoff so it doesn't exceed remaining delivery budget.
+            // If the remaining budget is zero, give up rather than busy-spinning.
             let backoff = if let Some(deadline) = self.policy.delivery_timeout {
                 let remaining = deadline.saturating_sub(self.started_at.elapsed());
+                if remaining.is_zero() {
+                    return None;
+                }
                 backoff.min(remaining)
             } else {
                 backoff
