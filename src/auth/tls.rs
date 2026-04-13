@@ -239,9 +239,14 @@ fn load_default_roots(root_store: &mut RootCertStore, config: &TlsConfig) -> Res
     if config.use_native_roots {
         #[cfg(feature = "native-tls-roots")]
         {
-            for cert in load_native_certs().map_err(|e| {
-                KrafkaError::config(format!("Failed to load native TLS root certificates: {e}"))
-            })? {
+            let result = load_native_certs();
+            if !result.errors.is_empty() {
+                return Err(KrafkaError::config(format!(
+                    "Failed to load native TLS root certificates: {:?}",
+                    result.errors
+                )));
+            }
+            for cert in result.certs {
                 root_store.add(cert).map_err(|e| {
                     KrafkaError::config(format!("Failed to add native TLS root certificate: {e}"))
                 })?;
