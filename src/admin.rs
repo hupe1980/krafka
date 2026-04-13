@@ -897,6 +897,10 @@ impl AdminClient {
     }
 
     /// Return an error if the admin client has been closed.
+    ///
+    /// **Note:** This is a best-effort check. A concurrent call to [`close()`](Self::close)
+    /// can race with the RPC that follows, in which case the RPC itself will fail
+    /// with a network error rather than an "AdminClient is closed" message.
     #[inline]
     fn check_not_closed(&self) -> Result<()> {
         if self.is_closed() {
@@ -1968,94 +1972,114 @@ impl AdminClient {
         timeout: Duration,
     ) -> Result<Vec<DeleteRecordResult>> {
         self.check_not_closed()?;
-        let brokers = self.metadata.brokers();
-        if brokers.is_empty() {
-            return Err(KrafkaError::broker(
-                crate::error::ErrorCode::UnknownServerError,
-                "no brokers available",
-            ));
-        }
 
-        // Group offsets by partition leader
-        let mut leader_offsets: HashMap<i32, HashMap<String, Vec<DeleteRecordsPartition>>> =
-            HashMap::new();
-        let fallback_broker_id = brokers[0].id;
+        for attempt in 0u8..2 {
+            if attempt == 1 {
+                let topics: Vec<&str> = offsets.keys().map(|(t, _)| t.as_str()).collect();
+                let _ = self.metadata.refresh_for_topics(Some(&topics)).await;
+            }
 
-        for ((topic, partition), offset) in &offsets {
-            let leader_id = self
-                .metadata
-                .leader(topic, *partition)
-                .unwrap_or(fallback_broker_id);
-            leader_offsets
-                .entry(leader_id)
-                .or_default()
-                .entry(topic.clone())
-                .or_default()
-                .push(DeleteRecordsPartition {
-                    partition_index: *partition,
-                    offset: *offset,
-                });
-        }
+            let brokers = self.metadata.brokers();
+            if brokers.is_empty() {
+                return Err(KrafkaError::broker(
+                    crate::error::ErrorCode::UnknownServerError,
+                    "no brokers available",
+                ));
+            }
 
-        let mut results = Vec::new();
+            // Group offsets by partition leader
+            let mut leader_offsets: HashMap<i32, HashMap<String, Vec<DeleteRecordsPartition>>> =
+                HashMap::new();
+            let fallback_broker_id = brokers[0].id;
 
-        for (broker_id, topics_map) in leader_offsets {
-            let broker = brokers
-                .iter()
-                .find(|b| b.id == broker_id)
-                .unwrap_or(&brokers[0]);
-            let conn = self
-                .pool
-                .get_connection_by_id(broker.id, broker.address())
-                .await?;
-
-            let request = DeleteRecordsRequest {
-                topics: topics_map
-                    .into_iter()
-                    .map(|(name, partitions)| DeleteRecordsTopic { name, partitions })
-                    .collect(),
-                timeout_ms: crate::util::duration_to_millis_i32(timeout),
-            };
-
-            let version = conn
-                .negotiate_api_version(
-                    ApiKey::DeleteRecords,
-                    versions::DELETE_RECORDS_MAX,
-                    versions::DELETE_RECORDS_MIN,
-                )
-                .await
-                .ok_or_else(|| {
-                    KrafkaError::protocol("no mutually supported DeleteRecords API version")
-                })?;
-
-            let response_bytes = conn
-                .send_request(ApiKey::DeleteRecords, version, |buf| {
-                    request.encode_versioned(version, buf)
-                })
-                .await?;
-
-            let mut buf = response_bytes;
-            let response = DeleteRecordsResponse::decode_versioned(version, &mut buf)?;
-
-            for topic in response.topics {
-                let topic_name = topic.name;
-                for partition in topic.partitions {
-                    results.push(DeleteRecordResult {
-                        topic: topic_name.clone(),
-                        partition: partition.partition_index,
-                        low_watermark: partition.low_watermark,
-                        error: if partition.error_code.is_ok() {
-                            None
-                        } else {
-                            Some(format!("{:?}", partition.error_code))
-                        },
+            for ((topic, partition), offset) in &offsets {
+                let leader_id = self
+                    .metadata
+                    .leader(topic, *partition)
+                    .unwrap_or(fallback_broker_id);
+                leader_offsets
+                    .entry(leader_id)
+                    .or_default()
+                    .entry(topic.clone())
+                    .or_default()
+                    .push(DeleteRecordsPartition {
+                        partition_index: *partition,
+                        offset: *offset,
                     });
+            }
+
+            let mut results = Vec::new();
+            let mut has_stale_leader = false;
+
+            for (broker_id, topics_map) in leader_offsets {
+                let broker = brokers
+                    .iter()
+                    .find(|b| b.id == broker_id)
+                    .unwrap_or(&brokers[0]);
+                let conn = self
+                    .pool
+                    .get_connection_by_id(broker.id, broker.address())
+                    .await?;
+
+                let request = DeleteRecordsRequest {
+                    topics: topics_map
+                        .into_iter()
+                        .map(|(name, partitions)| DeleteRecordsTopic { name, partitions })
+                        .collect(),
+                    timeout_ms: crate::util::duration_to_millis_i32(timeout),
+                };
+
+                let version = conn
+                    .negotiate_api_version(
+                        ApiKey::DeleteRecords,
+                        versions::DELETE_RECORDS_MAX,
+                        versions::DELETE_RECORDS_MIN,
+                    )
+                    .await
+                    .ok_or_else(|| {
+                        KrafkaError::protocol("no mutually supported DeleteRecords API version")
+                    })?;
+
+                let response_bytes = conn
+                    .send_request(ApiKey::DeleteRecords, version, |buf| {
+                        request.encode_versioned(version, buf)
+                    })
+                    .await?;
+
+                let mut buf = response_bytes;
+                let response = DeleteRecordsResponse::decode_versioned(version, &mut buf)?;
+
+                for topic in response.topics {
+                    let topic_name = topic.name;
+                    for partition in topic.partitions {
+                        if partition.error_code == crate::error::ErrorCode::NotLeaderForPartition {
+                            has_stale_leader = true;
+                        }
+                        results.push(DeleteRecordResult {
+                            topic: topic_name.clone(),
+                            partition: partition.partition_index,
+                            low_watermark: partition.low_watermark,
+                            error: if partition.error_code.is_ok() {
+                                None
+                            } else {
+                                Some(format!("{:?}", partition.error_code))
+                            },
+                        });
+                    }
                 }
             }
-        }
 
-        info!("Deleted records from {} partition(s)", results.len());
-        Ok(results)
+            if has_stale_leader && attempt == 0 {
+                warn!(
+                    "NotLeaderForPartition in DeleteRecords response, retrying with refreshed metadata"
+                );
+                continue;
+            }
+
+            info!("Deleted records from {} partition(s)", results.len());
+            return Ok(results);
+        }
+        unreachable!()
     }
 
     /// Get the end offset for each partition at the given leader epoch.
@@ -2082,101 +2106,123 @@ impl AdminClient {
         partitions: Vec<(String, i32, i32)>,
     ) -> Result<Vec<LeaderEpochResult>> {
         self.check_not_closed()?;
-        let brokers = self.metadata.brokers();
-        if brokers.is_empty() {
-            return Err(KrafkaError::broker(
-                crate::error::ErrorCode::UnknownServerError,
-                "no brokers available",
-            ));
-        }
 
-        // Group partitions by their leader broker
-        let fallback_broker_id = brokers[0].id;
-        let mut leader_partitions: HashMap<
-            i32,
-            HashMap<String, Vec<OffsetForLeaderEpochPartition>>,
-        > = HashMap::new();
+        for attempt in 0u8..2 {
+            if attempt == 1 {
+                let topics: Vec<&str> = partitions.iter().map(|(t, _, _)| t.as_str()).collect();
+                let _ = self.metadata.refresh_for_topics(Some(&topics)).await;
+            }
 
-        for (topic, partition, leader_epoch) in &partitions {
-            let leader_id = self
-                .metadata
-                .leader(topic, *partition)
-                .unwrap_or(fallback_broker_id);
-            leader_partitions
-                .entry(leader_id)
-                .or_default()
-                .entry(topic.clone())
-                .or_default()
-                .push(OffsetForLeaderEpochPartition {
-                    partition: *partition,
-                    current_leader_epoch: -1, // consumer perspective
-                    leader_epoch: *leader_epoch,
-                });
-        }
+            let brokers = self.metadata.brokers();
+            if brokers.is_empty() {
+                return Err(KrafkaError::broker(
+                    crate::error::ErrorCode::UnknownServerError,
+                    "no brokers available",
+                ));
+            }
 
-        let mut results = Vec::new();
+            // Group partitions by their leader broker
+            let fallback_broker_id = brokers[0].id;
+            let mut leader_partitions: HashMap<
+                i32,
+                HashMap<String, Vec<OffsetForLeaderEpochPartition>>,
+            > = HashMap::new();
 
-        for (broker_id, topics_map) in leader_partitions {
-            let broker = brokers
-                .iter()
-                .find(|b| b.id == broker_id)
-                .unwrap_or(&brokers[0]);
-            let conn = self
-                .pool
-                .get_connection_by_id(broker.id, broker.address())
-                .await?;
-
-            let request = OffsetForLeaderEpochRequest {
-                replica_id: -1, // -1 for consumer
-                topics: topics_map
-                    .into_iter()
-                    .map(|(topic, partitions)| OffsetForLeaderEpochTopic { topic, partitions })
-                    .collect(),
-            };
-
-            let version = conn
-                .negotiate_api_version(
-                    ApiKey::OffsetForLeaderEpoch,
-                    versions::OFFSET_FOR_LEADER_EPOCH_MAX,
-                    versions::OFFSET_FOR_LEADER_EPOCH_MIN,
-                )
-                .await
-                .ok_or_else(|| {
-                    KrafkaError::protocol("no mutually supported OffsetForLeaderEpoch API version")
-                })?;
-
-            let response_bytes = conn
-                .send_request(ApiKey::OffsetForLeaderEpoch, version, |buf| {
-                    request.encode_versioned(version, buf)
-                })
-                .await?;
-
-            let mut buf = response_bytes;
-            let response = OffsetForLeaderEpochResponse::decode_versioned(version, &mut buf)?;
-
-            for topic in response.topics {
-                let topic_name = topic.topic;
-                for partition in topic.partitions {
-                    results.push(LeaderEpochResult {
-                        topic: topic_name.clone(),
-                        partition: partition.partition,
-                        leader_epoch: partition.leader_epoch,
-                        end_offset: partition.end_offset,
-                        error: if partition.error_code.is_ok() {
-                            None
-                        } else {
-                            Some(format!("{:?}", partition.error_code))
-                        },
+            for (topic, partition, leader_epoch) in &partitions {
+                let leader_id = self
+                    .metadata
+                    .leader(topic, *partition)
+                    .unwrap_or(fallback_broker_id);
+                leader_partitions
+                    .entry(leader_id)
+                    .or_default()
+                    .entry(topic.clone())
+                    .or_default()
+                    .push(OffsetForLeaderEpochPartition {
+                        partition: *partition,
+                        current_leader_epoch: -1, // consumer perspective
+                        leader_epoch: *leader_epoch,
                     });
+            }
+
+            let mut results = Vec::new();
+            let mut has_stale_leader = false;
+
+            for (broker_id, topics_map) in leader_partitions {
+                let broker = brokers
+                    .iter()
+                    .find(|b| b.id == broker_id)
+                    .unwrap_or(&brokers[0]);
+                let conn = self
+                    .pool
+                    .get_connection_by_id(broker.id, broker.address())
+                    .await?;
+
+                let request = OffsetForLeaderEpochRequest {
+                    replica_id: -1, // -1 for consumer
+                    topics: topics_map
+                        .into_iter()
+                        .map(|(topic, partitions)| OffsetForLeaderEpochTopic { topic, partitions })
+                        .collect(),
+                };
+
+                let version = conn
+                    .negotiate_api_version(
+                        ApiKey::OffsetForLeaderEpoch,
+                        versions::OFFSET_FOR_LEADER_EPOCH_MAX,
+                        versions::OFFSET_FOR_LEADER_EPOCH_MIN,
+                    )
+                    .await
+                    .ok_or_else(|| {
+                        KrafkaError::protocol(
+                            "no mutually supported OffsetForLeaderEpoch API version",
+                        )
+                    })?;
+
+                let response_bytes = conn
+                    .send_request(ApiKey::OffsetForLeaderEpoch, version, |buf| {
+                        request.encode_versioned(version, buf)
+                    })
+                    .await?;
+
+                let mut buf = response_bytes;
+                let response = OffsetForLeaderEpochResponse::decode_versioned(version, &mut buf)?;
+
+                for topic in response.topics {
+                    let topic_name = topic.topic;
+                    for partition in topic.partitions {
+                        if partition.error_code == crate::error::ErrorCode::NotLeaderForPartition {
+                            has_stale_leader = true;
+                        }
+                        results.push(LeaderEpochResult {
+                            topic: topic_name.clone(),
+                            partition: partition.partition,
+                            leader_epoch: partition.leader_epoch,
+                            end_offset: partition.end_offset,
+                            error: if partition.error_code.is_ok() {
+                                None
+                            } else {
+                                Some(format!("{:?}", partition.error_code))
+                            },
+                        });
+                    }
                 }
             }
-        }
 
-        info!(
-            "Got leader epoch offsets for {} partition(s)",
-            results.len()
-        );
-        Ok(results)
+            if has_stale_leader && attempt == 0 {
+                warn!(
+                    "NotLeaderForPartition in OffsetForLeaderEpoch response, retrying with refreshed metadata"
+                );
+                continue;
+            }
+
+            info!(
+                "Got leader epoch offsets for {} partition(s)",
+                results.len()
+            );
+            return Ok(results);
+        }
+        unreachable!()
     }
 
     // ── Delegation Tokens ────────────────────────────────────────────────
@@ -3059,6 +3105,11 @@ impl AdminClient {
             ));
         }
 
+        let topic_scope = match &topics {
+            None => "all".to_string(),
+            Some(t) => format!("{} topic(s)", t.len()),
+        };
+
         let request = match &topics {
             None => DescribeLogDirsRequest::all(),
             Some(t) => DescribeLogDirsRequest::for_topics(t.clone()),
@@ -3092,8 +3143,8 @@ impl AdminClient {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     warn!(
-                        "DescribeLogDirs request failed on broker {}: {}",
-                        broker.id, e
+                        "DescribeLogDirs request failed on broker {} ({}): {}",
+                        broker.id, topic_scope, e
                     );
                     continue;
                 }
@@ -3104,8 +3155,8 @@ impl AdminClient {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(
-                        "DescribeLogDirs decode failed on broker {}: {}",
-                        broker.id, e
+                        "DescribeLogDirs decode failed on broker {} ({}): {}",
+                        broker.id, topic_scope, e
                     );
                     continue;
                 }
@@ -3114,8 +3165,8 @@ impl AdminClient {
             // v3+ top-level error code
             if !response.error_code.is_ok() {
                 warn!(
-                    "DescribeLogDirs top-level error on broker {}: {:?}",
-                    broker.id, response.error_code
+                    "DescribeLogDirs top-level error on broker {} ({}): {:?}",
+                    broker.id, topic_scope, response.error_code
                 );
             }
 
@@ -3123,9 +3174,9 @@ impl AdminClient {
             // signal CLUSTER_AUTHORIZATION_FAILED (matches Java client heuristic).
             if response.results.is_empty() && version < 3 {
                 warn!(
-                    "DescribeLogDirs returned empty results on broker {} (v{}); \
+                    "DescribeLogDirs returned empty results on broker {} (v{}, {}); \
                      likely CLUSTER_AUTHORIZATION_FAILED",
-                    broker.id, version
+                    broker.id, version, topic_scope
                 );
             }
 
@@ -3526,8 +3577,10 @@ impl AdminClient {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     warn!(
-                        "AlterReplicaLogDirs request failed on broker {}: {}",
-                        broker.id, e
+                        "AlterReplicaLogDirs request failed on broker {} ({} dir(s)): {}",
+                        broker.id,
+                        request.dirs.len(),
+                        e
                     );
                     continue;
                 }
@@ -3538,8 +3591,10 @@ impl AdminClient {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(
-                        "AlterReplicaLogDirs decode failed on broker {}: {}",
-                        broker.id, e
+                        "AlterReplicaLogDirs decode failed on broker {} ({} dir(s)): {}",
+                        broker.id,
+                        request.dirs.len(),
+                        e
                     );
                     continue;
                 }
@@ -3907,134 +3962,153 @@ impl AdminClient {
         topic_partitions: &[(&str, &[i32])],
     ) -> Result<Vec<DescribeProducersTopicResult>> {
         self.check_not_closed()?;
-        let brokers = self.metadata.brokers();
-        if brokers.is_empty() {
-            return Err(KrafkaError::broker(
-                crate::error::ErrorCode::UnknownServerError,
-                "no brokers available",
-            ));
-        }
 
-        let fallback_id = brokers[0].id;
-
-        // Group topic-partitions by leader broker.
-        // Key: broker_id, Value: map of topic -> partitions
-        let mut by_leader: HashMap<i32, HashMap<String, Vec<i32>>> = HashMap::new();
-
-        for &(topic, partitions) in topic_partitions {
-            for &pid in partitions {
-                let leader = self.metadata.leader(topic, pid).unwrap_or(fallback_id);
-                by_leader
-                    .entry(leader)
-                    .or_default()
-                    .entry(topic.to_string())
-                    .or_default()
-                    .push(pid);
+        for attempt in 0u8..2 {
+            if attempt == 1 {
+                // Refresh metadata after a stale-leader error.
+                let topics: Vec<&str> = topic_partitions.iter().map(|&(t, _)| t).collect();
+                let _ = self.metadata.refresh_for_topics(Some(&topics)).await;
             }
-        }
 
-        let mut all_results: HashMap<String, DescribeProducersTopicResult> = HashMap::new();
+            let brokers = self.metadata.brokers();
+            if brokers.is_empty() {
+                return Err(KrafkaError::broker(
+                    crate::error::ErrorCode::UnknownServerError,
+                    "no brokers available",
+                ));
+            }
 
-        for (broker_id, topic_map) in by_leader {
-            let broker = brokers
-                .iter()
-                .find(|b| b.id == broker_id)
-                .unwrap_or(&brokers[0]);
-            let conn = self
-                .pool
-                .get_connection_by_id(broker.id, broker.address())
-                .await?;
+            let fallback_id = brokers[0].id;
 
-            let topics = topic_map
-                .into_iter()
-                .map(|(name, partition_indexes)| DescribeProducersTopicRequest {
-                    name,
-                    partition_indexes,
-                })
-                .collect();
-
-            let request = DescribeProducersRequest { topics };
-
-            let version = conn
-                .negotiate_api_version(
-                    ApiKey::DescribeProducers,
-                    versions::DESCRIBE_PRODUCERS_MAX,
-                    versions::DESCRIBE_PRODUCERS_MIN,
-                )
-                .await
-                .ok_or_else(|| {
-                    KrafkaError::protocol("no mutually supported DescribeProducers API version")
-                })?;
-
-            let response_bytes = match conn
-                .send_request(ApiKey::DescribeProducers, version, |buf| {
-                    request.encode_versioned(version, buf)
-                })
-                .await
-            {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    warn!(
-                        "DescribeProducers request failed on broker {}: {}",
-                        broker.id, e
-                    );
-                    continue;
+            // Group topic-partitions by leader broker.
+            let mut by_leader: HashMap<i32, HashMap<String, Vec<i32>>> = HashMap::new();
+            for &(topic, partitions) in topic_partitions {
+                for &pid in partitions {
+                    let leader = self.metadata.leader(topic, pid).unwrap_or(fallback_id);
+                    by_leader
+                        .entry(leader)
+                        .or_default()
+                        .entry(topic.to_string())
+                        .or_default()
+                        .push(pid);
                 }
-            };
+            }
 
-            let mut buf = response_bytes;
-            let response = match DescribeProducersResponse::decode_versioned(version, &mut buf) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(
-                        "DescribeProducers decode failed on broker {}: {}",
-                        broker.id, e
-                    );
-                    continue;
-                }
-            };
+            let mut all_results: HashMap<String, DescribeProducersTopicResult> = HashMap::new();
+            let mut has_stale_leader = false;
 
-            for topic in response.topics {
-                let entry = all_results.entry(topic.name.clone()).or_insert_with(|| {
-                    DescribeProducersTopicResult {
-                        name: topic.name,
-                        partitions: Vec::new(),
+            for (broker_id, topic_map) in by_leader {
+                let broker = brokers
+                    .iter()
+                    .find(|b| b.id == broker_id)
+                    .unwrap_or(&brokers[0]);
+                let conn = self
+                    .pool
+                    .get_connection_by_id(broker.id, broker.address())
+                    .await?;
+
+                let topics = topic_map
+                    .into_iter()
+                    .map(|(name, partition_indexes)| DescribeProducersTopicRequest {
+                        name,
+                        partition_indexes,
+                    })
+                    .collect();
+
+                let request = DescribeProducersRequest { topics };
+
+                let version = conn
+                    .negotiate_api_version(
+                        ApiKey::DescribeProducers,
+                        versions::DESCRIBE_PRODUCERS_MAX,
+                        versions::DESCRIBE_PRODUCERS_MIN,
+                    )
+                    .await
+                    .ok_or_else(|| {
+                        KrafkaError::protocol("no mutually supported DescribeProducers API version")
+                    })?;
+
+                let response_bytes = match conn
+                    .send_request(ApiKey::DescribeProducers, version, |buf| {
+                        request.encode_versioned(version, buf)
+                    })
+                    .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        warn!(
+                            "DescribeProducers request failed on broker {}: {}",
+                            broker.id, e
+                        );
+                        continue;
                     }
-                });
-                entry
-                    .partitions
-                    .extend(topic.partitions.into_iter().map(|p| {
-                        DescribeProducersPartitionInfo {
-                            partition_index: p.partition_index,
-                            error: if p.error_code.is_ok() {
-                                None
-                            } else {
-                                Some(
-                                    p.error_message
-                                        .unwrap_or_else(|| format!("{:?}", p.error_code)),
-                                )
-                            },
-                            active_producers: p
-                                .active_producers
-                                .into_iter()
-                                .map(|pr| ProducerStateInfo {
-                                    producer_id: pr.producer_id,
-                                    producer_epoch: pr.producer_epoch,
-                                    last_sequence: pr.last_sequence,
-                                    last_timestamp: pr.last_timestamp,
-                                    coordinator_epoch: pr.coordinator_epoch,
-                                    current_txn_start_offset: pr.current_txn_start_offset,
-                                })
-                                .collect(),
+                };
+
+                let mut buf = response_bytes;
+                let response = match DescribeProducersResponse::decode_versioned(version, &mut buf)
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(
+                            "DescribeProducers decode failed on broker {}: {}",
+                            broker.id, e
+                        );
+                        continue;
+                    }
+                };
+
+                for topic in response.topics {
+                    let entry = all_results.entry(topic.name.clone()).or_insert_with(|| {
+                        DescribeProducersTopicResult {
+                            name: topic.name,
+                            partitions: Vec::new(),
                         }
-                    }));
+                    });
+                    entry
+                        .partitions
+                        .extend(topic.partitions.into_iter().map(|p| {
+                            if p.error_code == crate::error::ErrorCode::NotLeaderForPartition {
+                                has_stale_leader = true;
+                            }
+                            DescribeProducersPartitionInfo {
+                                partition_index: p.partition_index,
+                                error: if p.error_code.is_ok() {
+                                    None
+                                } else {
+                                    Some(
+                                        p.error_message
+                                            .unwrap_or_else(|| format!("{:?}", p.error_code)),
+                                    )
+                                },
+                                active_producers: p
+                                    .active_producers
+                                    .into_iter()
+                                    .map(|pr| ProducerStateInfo {
+                                        producer_id: pr.producer_id,
+                                        producer_epoch: pr.producer_epoch,
+                                        last_sequence: pr.last_sequence,
+                                        last_timestamp: pr.last_timestamp,
+                                        coordinator_epoch: pr.coordinator_epoch,
+                                        current_txn_start_offset: pr.current_txn_start_offset,
+                                    })
+                                    .collect(),
+                            }
+                        }));
+                }
             }
+
+            if has_stale_leader && attempt == 0 {
+                warn!(
+                    "NotLeaderForPartition in DescribeProducers response, retrying with refreshed metadata"
+                );
+                continue;
+            }
+
+            let results: Vec<DescribeProducersTopicResult> = all_results.into_values().collect();
+            info!("DescribeProducers returned {} topic(s)", results.len());
+            return Ok(results);
         }
-
-        let results: Vec<DescribeProducersTopicResult> = all_results.into_values().collect();
-
-        info!("DescribeProducers returned {} topic(s)", results.len());
-        Ok(results)
+        unreachable!()
     }
 
     // ════════════════════════════════════════════════════════════════════

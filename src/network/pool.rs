@@ -454,6 +454,15 @@ impl ConnectionPool {
         }
     }
 
+    /// Re-read TLS certificate files from disk and atomically update the
+    /// shared connector used by all future connections and reconnections.
+    ///
+    /// Existing TLS sessions are unaffected. On error the previous connector
+    /// remains active.
+    pub async fn refresh_tls(&self) -> crate::error::Result<()> {
+        self.config.refresh_tls().await
+    }
+
     /// Attempt to connect with exponential backoff retry logic.
     ///
     /// This method will retry connection attempts up to `max_retries` times,

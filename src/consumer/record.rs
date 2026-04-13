@@ -140,6 +140,7 @@ impl ConsumerRecord {
 
 /// Represents a topic-partition pair.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct TopicPartition {
     /// Topic name.
     pub topic: String,

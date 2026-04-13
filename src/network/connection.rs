@@ -9,11 +9,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
+use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(feature = "socks5")]
 use tokio::net::TcpSocket;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::timeout;
@@ -254,7 +256,31 @@ pub struct ConnectionConfig {
     /// Populated by [`init_tls()`](ConnectionConfig::init_tls). When present,
     /// connections reuse this connector instead of reading certificate files
     /// from disk on every connection attempt.
-    pub(crate) tls_connector: Option<TlsConnector>,
+    ///
+    /// Wrapped in `Arc<ArcSwap<…>>` so that all clones of this config share
+    /// the same connector and [`refresh_tls()`](ConnectionConfig::refresh_tls)
+    /// atomically updates it for every future connection.
+    pub(crate) tls_connector: Arc<ArcSwap<Option<TlsConnector>>>,
+    /// TCP keepalive interval.
+    ///
+    /// When set, enables TCP keepalive on all broker connections with the
+    /// given interval. This prevents idle connections from being silently
+    /// dropped by firewalls and load balancers.
+    pub(crate) tcp_keepalive: Option<Duration>,
+    /// Happy Eyeballs connection attempt delay (RFC 8305 §5).
+    ///
+    /// The delay between staggered connection attempts when racing multiple
+    /// addresses. Clamped to 100 ms – 2 s at connect time (RFC 8305 §5).
+    /// Default: 250 ms.
+    pub(crate) connection_attempt_delay: Duration,
+    /// Shared clock offset for MSK IAM signing (seconds).
+    ///
+    /// When SASL/MSK_IAM authentication fails with a signature-mismatch
+    /// that looks like clock skew, the connection layer stores the estimated
+    /// offset here.  Subsequent reconnection attempts apply this offset to
+    /// `SystemTime::now()` so the SigV4 timestamp matches the broker's
+    /// clock.  Default: 0 (no adjustment).
+    pub(crate) msk_iam_clock_offset_secs: Arc<AtomicI64>,
     /// SOCKS5 proxy configuration (optional).
     ///
     /// When set, all connections are tunneled through the proxy.
@@ -284,7 +310,13 @@ impl std::fmt::Debug for ConnectionConfig {
             .field("max_response_size", &self.max_response_size)
             .field("max_in_flight_requests", &self.max_in_flight_requests)
             .field("auth", &self.auth)
-            .field("tls_connector", &self.tls_connector.as_ref().map(|_| ".."));
+            .field("tls_connector", &self.tls_connector.load().is_some())
+            .field("tcp_keepalive", &self.tcp_keepalive)
+            .field("connection_attempt_delay", &self.connection_attempt_delay)
+            .field(
+                "msk_iam_clock_offset_secs",
+                &self.msk_iam_clock_offset_secs.load(Ordering::Relaxed),
+            );
         #[cfg(feature = "socks5")]
         s.field("proxy", &self.proxy);
         s.finish()
@@ -306,7 +338,10 @@ impl Default for ConnectionConfig {
             max_response_size: crate::protocol::MAX_MESSAGE_SIZE,
             max_in_flight_requests: 256,
             auth: None,
-            tls_connector: None,
+            tls_connector: Arc::new(ArcSwap::new(Arc::new(None))),
+            tcp_keepalive: Some(Duration::from_secs(60)),
+            connection_attempt_delay: Duration::from_millis(250),
+            msk_iam_clock_offset_secs: Arc::new(AtomicI64::new(0)),
             #[cfg(feature = "socks5")]
             proxy: None,
         }
@@ -336,7 +371,37 @@ impl ConnectionConfig {
             && let Some(ref tls_config) = auth.tls_config
         {
             let client_config = build_tls_config(tls_config).await?;
-            self.tls_connector = Some(TlsConnector::from(Arc::new(client_config)));
+            self.tls_connector
+                .store(Arc::new(Some(TlsConnector::from(Arc::new(client_config)))));
+        }
+        Ok(())
+    }
+
+    /// Re-read certificate files from disk and atomically replace the cached
+    /// TLS connector.
+    ///
+    /// All future connections (including reconnections from the pool) will use
+    /// the new certificates. Existing TLS sessions are unaffected — they
+    /// continue using the connector that was active at handshake time.
+    ///
+    /// Call this after rotating certificates on disk, or on a periodic timer
+    /// (e.g. once per hour) to pick up renewed certificates without a client
+    /// restart.
+    ///
+    /// This is a no-op when no TLS configuration is present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the new certificate or key files cannot be read or
+    /// parsed. The existing (old) connector remains active on failure.
+    pub async fn refresh_tls(&self) -> Result<()> {
+        if let Some(ref auth) = self.auth
+            && let Some(ref tls_config) = auth.tls_config
+        {
+            let client_config = build_tls_config(tls_config).await?;
+            self.tls_connector
+                .store(Arc::new(Some(TlsConnector::from(Arc::new(client_config)))));
+            info!("TLS connector refreshed from disk");
         }
         Ok(())
     }
@@ -411,6 +476,12 @@ impl ConnectionConfig {
     #[inline]
     pub fn auth(&self) -> Option<&AuthConfig> {
         self.auth.as_ref()
+    }
+
+    /// Returns the Happy Eyeballs connection attempt delay.
+    #[inline]
+    pub fn connection_attempt_delay(&self) -> Duration {
+        self.connection_attempt_delay
     }
 
     /// Returns the SOCKS5 proxy configuration, if set.
@@ -504,6 +575,25 @@ impl ConnectionConfigBuilder {
         self
     }
 
+    /// Set the TCP keepalive interval.
+    ///
+    /// When set, enables TCP keepalive on all broker connections.
+    /// Pass `None` to disable keepalive. Default: 60 seconds.
+    pub fn tcp_keepalive(mut self, interval: Option<Duration>) -> Self {
+        self.0.tcp_keepalive = interval;
+        self
+    }
+
+    /// Set the Happy Eyeballs connection attempt delay (RFC 8305 §5).
+    ///
+    /// This controls the stagger interval between parallel connection
+    /// attempts. Clamped to 100 ms – 2 s at connect time.
+    /// Default: 250 ms.
+    pub fn connection_attempt_delay(mut self, delay: Duration) -> Self {
+        self.0.connection_attempt_delay = delay;
+        self
+    }
+
     /// Set SOCKS5 proxy configuration.
     ///
     /// When set, all connections are tunneled through the specified SOCKS5
@@ -578,10 +668,14 @@ pub struct BrokerConnection {
     session_expiry: Option<Instant>,
     /// Statistics for monitoring.
     stats: Arc<ConnectionStats>,
+    /// KIP-219: deadline until which normal-priority requests should be
+    /// delayed because the broker signalled quota throttling.
+    throttle_until: Arc<parking_lot::Mutex<Instant>>,
 }
 
 /// Connection statistics for monitoring.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct ConnectionStats {
     /// Total high-priority requests sent.
     pub high_priority_requests: AtomicU64,
@@ -648,6 +742,7 @@ impl BrokerConnection {
             alive,
             session_expiry: None,
             stats,
+            throttle_until: Arc::new(parking_lot::Mutex::new(Instant::now())),
         };
 
         let request_timeout = config.request_timeout;
@@ -668,8 +763,8 @@ impl BrokerConnection {
             // Use cached TLS connector or build one from config. Calling
             // `init_tls()` before first use avoids this fallback and the
             // repeated disk I/O it entails.
-            let connector = match config.tls_connector {
-                Some(ref c) => c.clone(),
+            let connector = match &**config.tls_connector.load() {
+                Some(c) => c.clone(),
                 None => {
                     let client_config = build_tls_config(tls_config).await?;
                     TlsConnector::from(Arc::new(client_config))
@@ -702,10 +797,12 @@ impl BrokerConnection {
                     config.max_response_size,
                     request_timeout,
                     channel_binding,
+                    &config.msk_iam_clock_offset_secs,
                 )
                 .await?;
 
-                connection.session_expiry = Self::compute_session_expiry(session_lifetime_ms);
+                connection.session_expiry =
+                    Self::effective_session_expiry(session_lifetime_ms, auth);
 
                 // Spawn the connection task with TLS stream
                 let (reader, writer) = tokio::io::split(tls_stream);
@@ -760,10 +857,11 @@ impl BrokerConnection {
                 config.max_response_size,
                 request_timeout,
                 ChannelBinding::None,
+                &config.msk_iam_clock_offset_secs,
             )
             .await?;
 
-            connection.session_expiry = Self::compute_session_expiry(session_lifetime_ms);
+            connection.session_expiry = Self::effective_session_expiry(session_lifetime_ms, auth);
 
             let (reader, writer) = stream.into_split();
             tokio::spawn(async move {
@@ -824,33 +922,15 @@ impl BrokerConnection {
         Self::connect_direct(address, config).await
     }
 
-    /// Direct TCP connection: resolve DNS locally, create socket, connect.
+    /// Direct TCP connection using Happy Eyeballs v2 (RFC 8305).
+    ///
+    /// Resolves DNS, interleaves IPv6/IPv4 addresses, and races staggered
+    /// connection attempts — returning the first successful socket.
     async fn connect_direct(
         address: &str,
         config: &ConnectionConfig,
     ) -> Result<tokio::net::TcpStream> {
-        // Use tokio::net::lookup_host to support both IP:port and hostname:port
-        // (e.g. "kafka:9092" when brokers run inside containers).
-        // Bound DNS resolution by the connect timeout so a slow resolver cannot
-        // make connect() block indefinitely.
-        let mut addrs = timeout(config.connect_timeout, tokio::net::lookup_host(address))
-            .await
-            .map_err(|_| KrafkaError::timeout("DNS resolution"))?
-            .map_err(KrafkaError::network)?;
-        let first_addr = addrs.next().ok_or_else(|| {
-            KrafkaError::invalid_state(format!("no addresses resolved for '{address}'"))
-        })?;
-        // Prefer IPv4 when available — IPv6 may be resolved first but not routable.
-        let addr = addrs.find(|a| a.is_ipv4()).unwrap_or(first_addr);
-
-        let socket = Self::create_socket(addr, config)?;
-
-        let stream = timeout(config.connect_timeout, socket.connect(addr))
-            .await
-            .map_err(|_| KrafkaError::timeout("connection"))?
-            .map_err(KrafkaError::network)?;
-
-        Ok(stream)
+        super::happy_eyeballs::connect_happy_eyeballs(address, config).await
     }
 
     /// Connect through a SOCKS5 proxy.
@@ -873,17 +953,22 @@ impl BrokerConnection {
         let deadline = tokio::time::Instant::now() + config.connect_timeout;
 
         // Resolve proxy address and create a socket with buffer sizes applied.
-        let mut addrs = timeout_at(deadline, tokio::net::lookup_host(&proxy.address))
-            .await
-            .map_err(|_| KrafkaError::timeout("SOCKS5 proxy DNS resolution"))?
-            .map_err(KrafkaError::network)?;
-        let first_addr = addrs.next().ok_or_else(|| {
-            KrafkaError::invalid_state(format!(
+        let addrs: Vec<std::net::SocketAddr> =
+            timeout_at(deadline, tokio::net::lookup_host(&proxy.address))
+                .await
+                .map_err(|_| KrafkaError::timeout("SOCKS5 proxy DNS resolution"))?
+                .map_err(KrafkaError::network)?
+                .collect();
+
+        if addrs.is_empty() {
+            return Err(KrafkaError::invalid_state(format!(
                 "no addresses resolved for SOCKS5 proxy '{}'",
                 proxy.address
-            ))
-        })?;
-        let proxy_addr = addrs.find(|a| a.is_ipv4()).unwrap_or(first_addr);
+            )));
+        }
+
+        // Try proxy addresses in resolver order.
+        let proxy_addr = addrs[0];
 
         let socket = Self::create_socket(proxy_addr, config)?;
 
@@ -925,27 +1010,10 @@ impl BrokerConnection {
         Ok(proxy_stream)
     }
 
-    /// Create a TCP socket for the given address with buffer sizes applied.
+    /// Create a TCP socket for the given address with buffer sizes and keepalive applied.
+    #[cfg(feature = "socks5")]
     fn create_socket(addr: std::net::SocketAddr, config: &ConnectionConfig) -> Result<TcpSocket> {
-        let socket = if addr.is_ipv6() {
-            TcpSocket::new_v6()
-        } else {
-            TcpSocket::new_v4()
-        }
-        .map_err(KrafkaError::network)?;
-
-        if let Some(size) = config.send_buffer_size {
-            socket
-                .set_send_buffer_size(size as u32)
-                .map_err(KrafkaError::network)?;
-        }
-        if let Some(size) = config.recv_buffer_size {
-            socket
-                .set_recv_buffer_size(size as u32)
-                .map_err(KrafkaError::network)?;
-        }
-
-        Ok(socket)
+        super::happy_eyeballs::create_socket(addr, config)
     }
 
     /// Perform the SASL handshake and authentication on a stream.
@@ -965,6 +1033,7 @@ impl BrokerConnection {
     /// Returns the session lifetime in milliseconds reported by the broker
     /// (KIP-368). A value of `0` means the broker does not enforce
     /// session expiry.
+    #[allow(clippy::too_many_arguments)]
     async fn perform_sasl_handshake<S>(
         stream: &mut S,
         auth: &AuthConfig,
@@ -973,10 +1042,25 @@ impl BrokerConnection {
         max_response_size: usize,
         request_timeout: Duration,
         channel_binding: ChannelBinding,
+        msk_iam_clock_offset_secs: &Arc<AtomicI64>,
     ) -> Result<i64>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        // For MSK IAM with a credential provider, resolve fresh credentials
+        // before creating the authenticator.
+        let resolved_msk_iam;
+        let auth = if let Some(resolved) = timeout(request_timeout, auth.resolve_msk_iam_provider())
+            .await
+            .map_err(|_| KrafkaError::timeout("MSK IAM credential provider"))??
+        {
+            debug!("Resolved MSK IAM credentials from provider for {address}");
+            resolved_msk_iam = resolved;
+            &resolved_msk_iam
+        } else {
+            auth
+        };
+
         // For OAUTHBEARER with a provider, resolve a fresh token before
         // creating the authenticator (which is synchronous).
         // Apply the request timeout so a hung provider cannot stall reconnect loops.
@@ -1009,7 +1093,8 @@ impl BrokerConnection {
 
         // For MSK IAM, set the broker host (handles IPv6 brackets like [::1]:9092)
         let hostname = extract_sni_hostname(address)?;
-        authenticator.set_msk_host(auth, hostname);
+        let clock_offset = msk_iam_clock_offset_secs.load(Ordering::Relaxed);
+        authenticator.set_msk_host(auth, hostname, clock_offset);
 
         let mechanism_name = authenticator.mechanism_name().to_string();
 
@@ -1048,16 +1133,53 @@ impl BrokerConnection {
         );
 
         // Step 2: SaslAuthenticate - initial response
-        let initial_bytes = authenticator.initial_response();
+        let initial_bytes = authenticator.initial_response()?;
         Self::send_sasl_authenticate(stream, &initial_bytes, client_id).await?;
 
         let auth_response =
             Self::read_sasl_authenticate_response(stream, max_response_size).await?;
         if !auth_response.error_code.is_ok() {
+            let err_msg = auth_response.error_message.unwrap_or_default();
+            // Best-effort clock skew detection for MSK IAM (C4).
+            // AWS SigV4 errors for clock skew typically contain
+            // phrases like "Signature expired" or "request time
+            // too skewed".  When detected, apply a ±5 min offset
+            // so the next reconnection attempt uses a corrected
+            // timestamp.  This is a single-shot heuristic; more
+            // sophisticated NTP-style correction is out of scope.
+            if mechanism_name == "AWS_MSK_IAM" {
+                let lower = err_msg.to_ascii_lowercase();
+                if lower.contains("signature expired")
+                    || lower.contains("signature not yet current")
+                    || lower.contains("request time too")
+                    || lower.contains("clock")
+                    || lower.contains("time skew")
+                {
+                    // Try to extract an ISO-8601 timestamp from the error to
+                    // compute the exact offset; fall back to a ±5 min nudge.
+                    let skew = Self::extract_clock_skew_secs(&err_msg);
+                    let prev = msk_iam_clock_offset_secs.load(Ordering::Relaxed);
+                    let nudge = if skew != 0 {
+                        skew
+                    } else if lower.contains("expired") || lower.contains("past") {
+                        // Signature expired → local clock is behind broker.
+                        300
+                    } else {
+                        // Not yet current → local clock is ahead of broker.
+                        -300
+                    };
+                    msk_iam_clock_offset_secs.store(prev + nudge, Ordering::Relaxed);
+                    warn!(
+                        "MSK IAM auth failed with possible clock skew ({}); \
+                         adjusted clock offset to {}s for next attempt",
+                        err_msg,
+                        prev + nudge,
+                    );
+                }
+            }
             return Err(KrafkaError::auth(format!(
                 "SASL authentication failed: {:?} - {}",
-                auth_response.error_code,
-                auth_response.error_message.unwrap_or_default()
+                auth_response.error_code, err_msg
             )));
         }
 
@@ -1182,6 +1304,73 @@ impl BrokerConnection {
         Ok(Bytes::from(body))
     }
 
+    /// Try to extract a clock skew (in seconds) from an AWS SigV4 error message.
+    ///
+    /// AWS error messages for clock skew often embed an ISO-8601 timestamp
+    /// (e.g. `20250413T120000Z`). If we can parse such a timestamp, we
+    /// compare it to `SystemTime::now()` and return the difference in
+    /// seconds.  Returns `0` if no parseable timestamp is found.
+    fn extract_clock_skew_secs(error_msg: &str) -> i64 {
+        // Look for an ISO-8601 basic-format timestamp: YYYYMMDDTHHMMSSz
+        // These show up in AWS error messages as the server's view of "now".
+        let Some(pos) = error_msg.find('T') else {
+            return 0;
+        };
+        // Need at least 8 chars before T (date) and 7 after (HHMMSSZ)
+        if pos < 8 || pos + 7 > error_msg.len() {
+            return 0;
+        }
+        let candidate = &error_msg[pos - 8..pos + 7];
+        // Validate format: digits, T, digits, Z
+        if candidate.len() != 15
+            || !candidate[..8].chars().all(|c| c.is_ascii_digit())
+            || candidate.as_bytes()[8] != b'T'
+            || !candidate[9..15].chars().all(|c| c.is_ascii_digit())
+        {
+            return 0;
+        }
+        // Check for trailing Z
+        let has_z = error_msg.len() > pos + 7 && error_msg.as_bytes()[pos + 7] == b'Z';
+        if !has_z {
+            return 0;
+        }
+        // Parse components
+        let year: i64 = candidate[..4].parse().unwrap_or(0);
+        let month: i64 = candidate[4..6].parse().unwrap_or(0);
+        let day: i64 = candidate[6..8].parse().unwrap_or(0);
+        let hour: i64 = candidate[9..11].parse().unwrap_or(0);
+        let min: i64 = candidate[11..13].parse().unwrap_or(0);
+        let sec: i64 = candidate[13..15].parse().unwrap_or(0);
+
+        if !(1..=12).contains(&month)
+            || !(1..=31).contains(&day)
+            || hour > 23
+            || min > 59
+            || sec > 59
+        {
+            return 0;
+        }
+        // Rough conversion to Unix epoch seconds (ignoring leap seconds).
+        // Good enough for computing a skew offset; we don't need sub-second
+        // precision.
+        let days_since_epoch = (year - 1970) * 365 + (year - 1969) / 4 - (year - 1901) / 100
+            + (year - 1601) / 400
+            + [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334][(month - 1) as usize]
+            + day
+            - 1
+            + if month > 2 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) {
+                1
+            } else {
+                0
+            };
+        let server_unix = days_since_epoch * 86400 + hour * 3600 + min * 60 + sec;
+        let local_unix = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        server_unix - local_unix
+    }
+
     /// Run the connection event loop with priority handling.
     ///
     /// This is generic over the stream type, supporting both plain TCP and TLS.
@@ -1214,12 +1403,24 @@ impl BrokerConnection {
             loop {
                 interval.tick().await;
                 let now = Instant::now();
+
+                // Phase 1: identify timed-out IDs under lock (no channel sends).
+                let timed_out: Vec<CorrelationId> = {
+                    let pending_map = pending_for_timeout.lock().await;
+                    pending_map
+                        .iter()
+                        .filter(|(_, req)| now.duration_since(req.sent_at) > request_timeout)
+                        .map(|(&id, _)| id)
+                        .collect()
+                };
+
+                if timed_out.is_empty() {
+                    continue;
+                }
+
+                // Phase 2: remove and notify outside the hot path — reacquire
+                // lock only when there is actual work to do.
                 let mut pending_map = pending_for_timeout.lock().await;
-                let timed_out: Vec<CorrelationId> = pending_map
-                    .iter()
-                    .filter(|(_, req)| now.duration_since(req.sent_at) > request_timeout)
-                    .map(|(&id, _)| id)
-                    .collect();
                 for id in timed_out {
                     if let Some(req) = pending_map.remove(&id) {
                         warn!(
@@ -1472,11 +1673,19 @@ impl BrokerConnection {
                     let _ = req.response_tx.send(Ok(body));
                 }
                 Err(e) => {
+                    // A header decode failure means the stream is desynchronized
+                    // — the remaining bytes are corrupt. Notify the caller and
+                    // close the connection to prevent further damage.
                     warn!(
-                        "Failed to decode response header for correlation_id={}: {}",
+                        "Failed to decode response header for correlation_id={}, closing connection: {}",
                         correlation_id, e
                     );
-                    let _ = req.response_tx.send(Err(e));
+                    let _ = req.response_tx.send(Err(KrafkaError::protocol(format!(
+                        "response header decode failed for correlation_id={correlation_id}: {e}"
+                    ))));
+                    return Err(KrafkaError::protocol(
+                        "response header decode failure — stream desynchronized",
+                    ));
                 }
             }
         } else {
@@ -1559,6 +1768,27 @@ impl BrokerConnection {
         }
     }
 
+    /// Record a broker-reported throttle time (KIP-219).
+    ///
+    /// When the broker returns `throttle_time_ms > 0` in a response, the
+    /// client should voluntarily delay subsequent normal-priority requests
+    /// by that amount. High-priority requests (heartbeats, metadata) are
+    /// never delayed.
+    pub fn notify_throttle(&self, throttle_time_ms: i32) {
+        if throttle_time_ms > 0 {
+            let new_deadline = Instant::now() + Duration::from_millis(throttle_time_ms as u64);
+            let mut deadline = self.throttle_until.lock();
+            if new_deadline > *deadline {
+                debug!(
+                    throttle_ms = throttle_time_ms,
+                    broker = %self.address,
+                    "Broker throttle applied (KIP-219)"
+                );
+                *deadline = new_deadline;
+            }
+        }
+    }
+
     /// Send a request with automatic priority based on API key.
     ///
     /// Priority is determined automatically:
@@ -1578,6 +1808,8 @@ impl BrokerConnection {
     /// Send a request with explicit priority.
     ///
     /// Use this when you need to override the automatic priority selection.
+    /// Normal-priority requests are delayed when the broker has signalled
+    /// quota throttling (KIP-219).
     pub async fn send_request_with_priority(
         &self,
         api_key: ApiKey,
@@ -1585,6 +1817,22 @@ impl BrokerConnection {
         priority: RequestPriority,
         request_body: impl FnOnce(&mut BytesMut) -> Result<()>,
     ) -> Result<Bytes> {
+        // KIP-219: honour broker throttle for normal-priority requests.
+        if priority == RequestPriority::Normal {
+            let remaining = {
+                let deadline = self.throttle_until.lock();
+                deadline.checked_duration_since(Instant::now())
+            };
+            if let Some(delay) = remaining {
+                debug!(
+                    delay_ms = delay.as_millis() as u64,
+                    broker = %self.address,
+                    "Delaying request due to broker throttle (KIP-219)"
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+
         let correlation_id = self.correlation_id_gen.next();
         let mut encoder = Encoder::new();
 
@@ -1745,6 +1993,34 @@ impl BrokerConnection {
             );
         }
         Some(Instant::now() + Duration::from_millis(reauth_ms))
+    }
+
+    /// Compute session expiry, falling back to an OAuthBearer token lifetime
+    /// when the broker does not report `session_lifetime_ms` (KIP-368).
+    ///
+    /// The token's `lifetime_ms` is an epoch-millisecond timestamp. We convert
+    /// it to a remaining duration before passing it through the standard
+    /// jittered-window logic.
+    fn effective_session_expiry(session_lifetime_ms: i64, auth: &AuthConfig) -> Option<Instant> {
+        if session_lifetime_ms > 0 {
+            return Self::compute_session_expiry(session_lifetime_ms);
+        }
+
+        // Fall back to OAuthBearer token lifetime if available.
+        if let Some(token) = auth.oauthbearer_token.as_ref()
+            && let Some(expiry_epoch_ms) = token.lifetime_ms()
+        {
+            let now_epoch_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let remaining_ms = expiry_epoch_ms.saturating_sub(now_epoch_ms);
+            if remaining_ms > 0 {
+                return Self::compute_session_expiry(remaining_ms);
+            }
+        }
+
+        None
     }
 
     /// Whether the SASL session is approaching expiry and the connection
@@ -2779,5 +3055,67 @@ mod tests {
         conn.close().await;
         let _ = shutdown_tx.send(());
         mock_handle.await.unwrap();
+    }
+
+    // ========================================================================
+    // KIP-219: Broker throttle compliance
+    // ========================================================================
+
+    #[test]
+    fn test_throttle_initial_state_is_past() {
+        // The throttle_until starts at Instant::now() which is immediately
+        // in the past (or at most the current instant), meaning no delay.
+        let deadline = Instant::now();
+        let throttle = parking_lot::Mutex::new(deadline);
+        let guard = throttle.lock();
+        assert!(guard.checked_duration_since(Instant::now()).is_none());
+    }
+
+    #[test]
+    fn test_throttle_future_deadline_yields_delay() {
+        let future = Instant::now() + Duration::from_secs(10);
+        let throttle = parking_lot::Mutex::new(future);
+        let guard = throttle.lock();
+        let remaining = guard.checked_duration_since(Instant::now());
+        assert!(remaining.is_some());
+        assert!(remaining.unwrap() > Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_throttle_past_deadline_yields_no_delay() {
+        // A deadline 1ms in the past means no delay.
+        let past = Instant::now() - Duration::from_millis(1);
+        let throttle = parking_lot::Mutex::new(past);
+        let guard = throttle.lock();
+        assert!(guard.checked_duration_since(Instant::now()).is_none());
+    }
+
+    #[test]
+    fn test_extract_clock_skew_secs_valid_timestamp() {
+        // Simulate an AWS error containing a server timestamp.
+        // The exact skew depends on when the test runs, but the function
+        // should return a non-zero value for a timestamp far from now.
+        let msg = "Signature expired: 20200101T000000Z is now past";
+        let skew = BrokerConnection::extract_clock_skew_secs(msg);
+        // 2020-01-01 is in the past, so skew should be negative.
+        assert!(skew < 0, "expected negative skew, got {skew}");
+    }
+
+    #[test]
+    fn test_extract_clock_skew_secs_no_timestamp() {
+        let msg = "some random error message";
+        assert_eq!(BrokerConnection::extract_clock_skew_secs(msg), 0);
+    }
+
+    #[test]
+    fn test_extract_clock_skew_secs_malformed_timestamp() {
+        let msg = "Signature expired: 2020XXYYT000000Z";
+        assert_eq!(BrokerConnection::extract_clock_skew_secs(msg), 0);
+    }
+
+    #[test]
+    fn test_msk_iam_clock_offset_default() {
+        let config = ConnectionConfig::default();
+        assert_eq!(config.msk_iam_clock_offset_secs.load(Ordering::Relaxed), 0);
     }
 }

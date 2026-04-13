@@ -1,6 +1,6 @@
 //! Producer retry policy with exponential backoff.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
 
@@ -19,6 +19,12 @@ pub struct RetryPolicy {
     pub backoff_multiplier: f64,
     /// Jitter factor (0.0-1.0) to add randomness to backoff.
     pub jitter_factor: f64,
+    /// Total time budget for all retries.
+    ///
+    /// When set, retries stop once the elapsed time since the first attempt
+    /// exceeds this duration, even if `max_retries` has not been reached.
+    /// Similar to Kafka's `delivery.timeout.ms`.
+    pub delivery_timeout: Option<Duration>,
 }
 
 impl Default for RetryPolicy {
@@ -29,6 +35,7 @@ impl Default for RetryPolicy {
             max_backoff: Duration::from_secs(10),
             backoff_multiplier: 2.0,
             jitter_factor: 0.1,
+            delivery_timeout: Some(Duration::from_secs(120)),
         }
     }
 }
@@ -74,6 +81,16 @@ impl RetryPolicy {
     /// Set the jitter factor (0.0-1.0).
     pub fn with_jitter_factor(mut self, factor: f64) -> Self {
         self.jitter_factor = factor.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Set the total delivery timeout.
+    ///
+    /// When set, retries stop once this much time has elapsed since the
+    /// first attempt, regardless of `max_retries`. Pass `None` to disable.
+    /// Default: 120 seconds.
+    pub fn with_delivery_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.delivery_timeout = timeout;
         self
     }
 
@@ -127,6 +144,8 @@ pub struct RetryContext {
     attempt: u32,
     /// The operation being retried.
     operation: String,
+    /// When the first attempt started (for delivery_timeout).
+    started_at: Instant,
 }
 
 impl RetryContext {
@@ -136,6 +155,7 @@ impl RetryContext {
             policy,
             attempt: 0,
             operation: operation.into(),
+            started_at: Instant::now(),
         }
     }
 
@@ -157,8 +177,31 @@ impl RetryContext {
     pub fn record_failure(&mut self, error: &KrafkaError) -> Option<Duration> {
         self.attempt += 1;
 
+        // Check delivery timeout first — elapsed time trumps retry count.
+        if let Some(deadline) = self.policy.delivery_timeout
+            && self.started_at.elapsed() >= deadline
+        {
+            warn!(
+                operation = %self.operation,
+                attempt = self.attempt,
+                elapsed_ms = self.started_at.elapsed().as_millis(),
+                error = %error,
+                "Delivery timeout exceeded, giving up"
+            );
+            return None;
+        }
+
         if self.policy.should_retry(error, self.attempt) {
             let backoff = self.policy.calculate_backoff(self.attempt);
+
+            // Clamp backoff so it doesn't exceed remaining delivery budget.
+            let backoff = if let Some(deadline) = self.policy.delivery_timeout {
+                let remaining = deadline.saturating_sub(self.started_at.elapsed());
+                backoff.min(remaining)
+            } else {
+                backoff
+            };
+
             debug!(
                 operation = %self.operation,
                 attempt = self.attempt,

@@ -543,12 +543,20 @@ impl ConfluentSchemaRegistryBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the URL is not set or the HTTP client cannot be
+    /// Returns an error if the URL is not set, basic auth is used over
+    /// plain HTTP (credential exposure risk), or the HTTP client cannot be
     /// constructed.
     pub fn build(self) -> Result<ConfluentSchemaRegistry> {
         let url = self
             .url
             .ok_or_else(|| KrafkaError::config("schema registry URL is required"))?;
+
+        // Reject basic auth over plain HTTP to prevent credential exposure.
+        if matches!(self.auth, RegistryAuth::Basic { .. }) && url.starts_with("http://") {
+            return Err(KrafkaError::config(
+                "basic auth requires HTTPS — credentials would be sent in cleartext over HTTP",
+            ));
+        }
 
         let mut http_builder = reqwest::Client::builder();
         if let Some(timeout) = self.request_timeout {

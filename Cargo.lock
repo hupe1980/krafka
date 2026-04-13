@@ -1786,6 +1786,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "snap",
+ "socket2 0.5.10",
  "subtle",
  "testcontainers",
  "thiserror 2.0.18",

@@ -268,9 +268,8 @@ impl ScramClient {
             ));
         }
 
-        let server_first_str = std::str::from_utf8(server_first).map_err(|e| {
-            KrafkaError::auth(format!("Invalid UTF-8 in server-first message: {e}"))
-        })?;
+        let server_first_str = std::str::from_utf8(server_first)
+            .map_err(|_| KrafkaError::auth("Invalid UTF-8 in server-first message"))?;
 
         // Parse server-first-message
         let mut server_nonce = None;
@@ -390,9 +389,8 @@ impl ScramClient {
             ));
         }
 
-        let server_final_str = std::str::from_utf8(server_final).map_err(|e| {
-            KrafkaError::auth(format!("Invalid UTF-8 in server-final message: {e}"))
-        })?;
+        let server_final_str = std::str::from_utf8(server_final)
+            .map_err(|_| KrafkaError::auth("Invalid UTF-8 in server-final message"))?;
 
         // Check for error
         if let Some(error) = server_final_str.strip_prefix("e=") {

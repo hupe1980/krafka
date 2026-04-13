@@ -28,7 +28,9 @@ pub fn duration_to_millis_i64(d: Duration) -> i64 {
 /// Generate a random UUID v4 string (KIP-1082 client-generated member ID).
 ///
 /// Format: `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx` where `y` is one of
-/// `{8, 9, a, b}`. Uses `rand::random` for the 122 random bits.
+/// `{8, 9, a, b}`. Uses `rand::random` (non-cryptographic PRNG) for the
+/// 122 random bits. This is suitable for uniqueness (member IDs, client
+/// IDs) but **not** for security-sensitive tokens.
 pub fn random_uuid_v4() -> String {
     let bytes: [u8; 16] = rand::random();
     // Set version (4) and variant (RFC 4122).
@@ -56,6 +58,11 @@ pub fn random_uuid_v4() -> String {
 }
 
 /// Thread-safe correlation ID generator.
+///
+/// The counter wraps around from `i32::MAX` to `i32::MIN` (roughly every
+/// 2.1 billion IDs). With a bounded in-flight window (default 256),
+/// collision between a recycled ID and a still-pending request is
+/// extremely unlikely.
 pub struct CorrelationIdGenerator {
     counter: AtomicI32,
 }
@@ -69,6 +76,9 @@ impl CorrelationIdGenerator {
     }
 
     /// Generate the next correlation ID.
+    ///
+    /// IDs are unique modulo `i32` wraparound. Negative values are valid
+    /// Kafka correlation IDs.
     #[inline]
     pub fn next(&self) -> i32 {
         self.counter.fetch_add(1, Ordering::Relaxed)

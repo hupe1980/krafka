@@ -591,8 +591,26 @@ impl ConsumerConfigBuilder {
     }
 
     /// Build the config.
-    pub fn build(self) -> ConsumerConfig {
-        self.config
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if timing constraints are violated:
+    /// - `heartbeat_interval` must be less than `session_timeout`
+    /// - `session_timeout` must be less than or equal to `max_poll_interval`
+    pub fn build(self) -> Result<ConsumerConfig, crate::error::KrafkaError> {
+        if self.config.heartbeat_interval >= self.config.session_timeout {
+            return Err(crate::error::KrafkaError::config(format!(
+                "heartbeat_interval ({:?}) must be less than session_timeout ({:?})",
+                self.config.heartbeat_interval, self.config.session_timeout,
+            )));
+        }
+        if self.config.session_timeout > self.config.max_poll_interval {
+            return Err(crate::error::KrafkaError::config(format!(
+                "session_timeout ({:?}) must be <= max_poll_interval ({:?})",
+                self.config.session_timeout, self.config.max_poll_interval,
+            )));
+        }
+        Ok(self.config)
     }
 }
 
@@ -635,7 +653,8 @@ mod tests {
             .enable_auto_commit(false)
             .isolation_level(IsolationLevel::ReadCommitted)
             .partition_assignment_strategy(PartitionAssignmentStrategy::CooperativeSticky)
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(config.bootstrap_servers, "localhost:9092");
         assert_eq!(config.group_id, Some("test-group".to_string()));
@@ -663,7 +682,10 @@ mod tests {
 
     #[test]
     fn test_config_builder_fetch_min_bytes() {
-        let config = ConsumerConfig::builder().fetch_min_bytes(1024).build();
+        let config = ConsumerConfig::builder()
+            .fetch_min_bytes(1024)
+            .build()
+            .unwrap();
         assert_eq!(
             config.fetch_min_bytes, 1024,
             "fetch_min_bytes should be set by builder"
@@ -674,7 +696,8 @@ mod tests {
     fn test_config_builder_fetch_max_bytes() {
         let config = ConsumerConfig::builder()
             .fetch_max_bytes(10 * 1024 * 1024)
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             config.fetch_max_bytes,
             10 * 1024 * 1024,
@@ -686,7 +709,8 @@ mod tests {
     fn test_config_builder_metadata_max_age() {
         let config = ConsumerConfig::builder()
             .metadata_max_age(Duration::from_secs(60))
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             config.metadata_max_age,
             Duration::from_secs(60),
@@ -708,7 +732,8 @@ mod tests {
         let config = ConsumerConfig::builder()
             .group_id("my-group")
             .group_instance_id("instance-1")
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             config.group_instance_id,
             Some("instance-1".to_string()),
@@ -727,7 +752,10 @@ mod tests {
 
     #[test]
     fn test_config_builder_client_rack() {
-        let config = ConsumerConfig::builder().client_rack("us-east-1a").build();
+        let config = ConsumerConfig::builder()
+            .client_rack("us-east-1a")
+            .build()
+            .unwrap();
         assert_eq!(
             config.client_rack,
             Some("us-east-1a".to_string()),
@@ -749,7 +777,8 @@ mod tests {
     fn test_config_builder_group_protocol_consumer() {
         let config = ConsumerConfig::builder()
             .group_protocol(GroupProtocol::Consumer)
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             config.group_protocol(),
             GroupProtocol::Consumer,
@@ -762,7 +791,8 @@ mod tests {
     fn test_config_builder_proxy_round_trip() {
         let config = ConsumerConfig::builder()
             .proxy(crate::network::ProxyConfig::new("proxy:1080"))
-            .build();
+            .build()
+            .unwrap();
         let proxy = config.proxy().expect("proxy should be set");
         assert_eq!(proxy.address(), "proxy:1080");
     }
@@ -785,7 +815,8 @@ mod tests {
         let config = ConsumerConfig::builder()
             .metadata_recovery_strategy(MetadataRecoveryStrategy::Rebootstrap)
             .metadata_recovery_rebootstrap_trigger(Duration::from_secs(60))
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             config.metadata_recovery_strategy(),
             MetadataRecoveryStrategy::Rebootstrap,

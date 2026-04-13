@@ -1221,14 +1221,20 @@ impl TransactionalProducer {
                     // Use CAS to safely revert Committing → InTransaction.
                     // If abort_transaction() raced and moved to Aborting,
                     // the CAS fails and we leave the state alone.
-                    if self
-                        .try_transition(
-                            TransactionState::Committing,
-                            TransactionState::InTransaction,
-                        )
-                        .is_ok()
-                    {
-                        warn!("Transaction commit failed (retriable): {}", e);
+                    match self.try_transition(
+                        TransactionState::Committing,
+                        TransactionState::InTransaction,
+                    ) {
+                        Ok(()) => {
+                            warn!("Transaction commit failed (retriable): {}", e);
+                        }
+                        Err(actual) => {
+                            warn!(
+                                "Transaction commit failed (retriable): {}; \
+                                 state is now {:?} (concurrent abort may be in progress)",
+                                e, actual
+                            );
+                        }
                     }
                 } else {
                     // Fatal error — caller must abort
@@ -1428,9 +1434,10 @@ fn is_fatal_transaction_error(error_code: ErrorCode) -> bool {
 
 /// Builder for TransactionalProducer.
 #[must_use = "builders do nothing until .build() is called"]
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct TransactionalProducerBuilder {
     config: TransactionalProducerConfig,
+    partitioner: Option<Arc<dyn Partitioner>>,
 }
 
 impl TransactionalProducerBuilder {
@@ -1467,6 +1474,15 @@ impl TransactionalProducerBuilder {
     /// Set compression.
     pub fn compression(mut self, compression: Compression) -> Self {
         self.config.compression = compression;
+        self
+    }
+
+    /// Set a custom partitioner.
+    ///
+    /// If not set, [`DefaultPartitioner`] is used, which applies murmur2 hashing
+    /// for keyed messages and round-robin for unkeyed messages.
+    pub fn partitioner(mut self, partitioner: impl Partitioner + 'static) -> Self {
+        self.partitioner = Some(Arc::new(partitioner));
         self
     }
 
@@ -1553,7 +1569,9 @@ impl TransactionalProducerBuilder {
             config: self.config,
             metadata,
             pool,
-            partitioner: Arc::new(DefaultPartitioner::new()),
+            partitioner: self
+                .partitioner
+                .unwrap_or_else(|| Arc::new(DefaultPartitioner::new())),
             state: AtomicU8::new(TransactionState::Uninitialized as u8),
             coordinator_id: RwLock::new(None),
             txn_partitions: Arc::new(RwLock::new(TransactionPartitions::default())),

@@ -445,6 +445,50 @@ let config = SecureConnectionConfig::builder()
     .build();
 ```
 
+### Automatic Credential Refresh (Recommended)
+
+For production workloads using temporary credentials (STS, IRSA, ECS task role, EC2 instance profile), use a credential provider so that credentials are automatically refreshed on every broker reconnection:
+
+```rust
+use krafka::auth::{AuthConfig, AwsMskIamCredentials};
+
+// With a closure (requires `aws-msk` feature for from_default_chain)
+let config = AuthConfig::aws_msk_iam_provider(|| async {
+    AwsMskIamCredentials::from_default_chain("us-east-1").await
+});
+
+// Or implement AwsMskIamCredentialProvider for custom logic
+use krafka::auth::AwsMskIamCredentialProvider;
+
+struct MyCredentialProvider;
+impl AwsMskIamCredentialProvider for MyCredentialProvider {
+    fn provide_credentials(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = krafka::error::Result<AwsMskIamCredentials>> + Send + '_>> {
+        Box::pin(async {
+            // Custom credential loading logic
+            AwsMskIamCredentials::from_env()
+        })
+    }
+}
+
+let config = AuthConfig::aws_msk_iam_provider(MyCredentialProvider);
+```
+
+The provider pattern mirrors OAUTHBEARER's `sasl_oauthbearer_provider()`. The `SecureConnectionConfig` builder also supports it:
+
+```rust
+use krafka::network::SecureConnectionConfig;
+use krafka::auth::AwsMskIamCredentials;
+
+let config = SecureConnectionConfig::builder()
+    .client_id("msk-client")
+    .aws_msk_iam_provider(|| async {
+        AwsMskIamCredentials::from_default_chain("us-east-1").await
+    })
+    .build();
+```
+
 ### Direct MskIamAuthenticator Usage
 
 For low-level control over the authentication process:
@@ -482,6 +526,21 @@ The implementation uses AWS Signature v4 signing:
 | `use_native_roots` | `bool` | Whether to load root certificates from the platform trust store |
 | `verify_server_cert` | `bool` | Whether to verify server certificates (default: true) |
 | `sni_hostname` | `Option<String>` | SNI hostname for TLS handshake |
+| `alpn_protocols` | `Vec<Vec<u8>>` | ALPN protocol names to advertise (default: empty) |
+
+#### ALPN Protocol Negotiation
+
+Some environments (service meshes, load balancers like Envoy or AWS ALB) require ALPN for protocol multiplexing. Use `with_kafka_alpn()` as a convenience or `with_alpn_protocols()` for custom protocols:
+
+```rust
+use krafka::auth::TlsConfig;
+
+// Advertise "kafka" ALPN protocol
+let tls = TlsConfig::new().with_kafka_alpn();
+
+// Or custom protocols
+let tls = TlsConfig::new().with_alpn_protocols(vec![b"kafka".to_vec()]);
+```
 
 ### AuthConfig
 
@@ -713,7 +772,7 @@ let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None).unwr
 let mechanism = authenticator.mechanism_name(); // "SCRAM-SHA-256"
 
 // Get initial authentication bytes
-let initial = authenticator.initial_response();
+let initial = authenticator.initial_response()?;
 
 // Process server challenges
 // let response = authenticator.process_challenge(&server_bytes)?;

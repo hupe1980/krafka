@@ -169,6 +169,13 @@ Each connection maintains two request channels to prevent consumer group ejectio
 High-priority requests (Heartbeat, Metadata, FindCoordinator, ApiVersions) are always processed
 first, ensuring consumer group membership is maintained even under heavy produce/fetch load.
 
+### KIP-219: Client-Side Throttle Compliance
+
+When a broker returns `throttle_time_ms > 0` in a response, the client voluntarily delays
+subsequent normal-priority requests by the indicated duration. High-priority requests (heartbeats,
+metadata) are never delayed, preserving group membership. Throttle state is tracked per
+`BrokerConnection` using a `parking_lot::Mutex<Instant>` deadline.
+
 ### Automatic Reconnection
 
 When connections fail, Krafka automatically attempts to reconnect with exponential backoff:

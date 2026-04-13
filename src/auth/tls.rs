@@ -199,7 +199,13 @@ fn build_tls_config_sync(config: &TlsConfig) -> Result<ClientConfig> {
     let root_store = load_root_store(config)?;
     let builder = ClientConfig::builder().with_root_certificates(root_store);
     let client_auth = load_client_auth(config)?;
-    finish_with_client_auth(builder, client_auth)
+    let mut tls_config = finish_with_client_auth(builder, client_auth)?;
+
+    if !config.alpn_protocols.is_empty() {
+        tls_config.alpn_protocols.clone_from(&config.alpn_protocols);
+    }
+
+    Ok(tls_config)
 }
 
 /// Attach optional client‐certificate authentication to a builder that is
@@ -347,7 +353,13 @@ fn insecure_builder(
 fn build_insecure_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
     let builder = insecure_builder(resolve_crypto_provider())?;
     let client_auth = load_client_auth(config)?;
-    finish_with_client_auth(builder, client_auth)
+    let mut tls_config = finish_with_client_auth(builder, client_auth)?;
+
+    if !config.alpn_protocols.is_empty() {
+        tls_config.alpn_protocols.clone_from(&config.alpn_protocols);
+    }
+
+    Ok(tls_config)
 }
 
 /// A certificate verifier that accepts any server certificate without validation.
@@ -465,5 +477,32 @@ mod tests {
         let config = TlsConfig::new();
         let result = build_tls_config_sync(&config).map(|c| TlsConnector::from(Arc::new(c)));
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_alpn_protocols_set() {
+        setup_crypto_provider();
+        let config = TlsConfig::new().with_kafka_alpn();
+        let tls_config = build_tls_config_sync(&config).unwrap();
+        assert_eq!(tls_config.alpn_protocols, vec![b"kafka".to_vec()]);
+    }
+
+    #[test]
+    fn test_alpn_protocols_empty_by_default() {
+        setup_crypto_provider();
+        let config = TlsConfig::new();
+        let tls_config = build_tls_config_sync(&config).unwrap();
+        assert!(tls_config.alpn_protocols.is_empty());
+    }
+
+    #[test]
+    fn test_alpn_custom_protocols() {
+        setup_crypto_provider();
+        let config = TlsConfig::new().with_alpn_protocols(vec![b"kafka".to_vec(), b"h2".to_vec()]);
+        let tls_config = build_tls_config_sync(&config).unwrap();
+        assert_eq!(
+            tls_config.alpn_protocols,
+            vec![b"kafka".to_vec(), b"h2".to_vec()]
+        );
     }
 }

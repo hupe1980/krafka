@@ -6,6 +6,7 @@ use crate::{Offset, PartitionId};
 
 /// Offset commit metadata.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct OffsetAndMetadata {
     /// The offset to commit.
     pub offset: Offset,

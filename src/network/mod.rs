@@ -28,6 +28,7 @@
 //! ```
 
 mod connection;
+mod happy_eyeballs;
 mod pool;
 mod secure;
 

@@ -372,7 +372,18 @@ impl RecordAccumulator {
         metrics: Arc<ProducerMetrics>,
         in_flight_barrier: Arc<InFlightBarrier>,
     ) -> RecordAccumulatorHandle {
-        let (sender, receiver) = mpsc::channel(1024);
+        // Cap the channel at 64 (down from 1024) to limit untracked memory
+        // sitting in the channel before the accumulator's memory-check runs.
+        // At 1 KB/record this is ≈ 64 KB; at 1 MB/record ≈ 64 MB.  When
+        // buffer_memory is configured, we shrink further so at most ~10% of
+        // the budget can be untracked.
+        let channel_capacity = if config.buffer_memory > 0 {
+            let batch = config.batch_size.max(1);
+            (config.buffer_memory / 10 / batch).clamp(1, 64)
+        } else {
+            64
+        };
+        let (sender, receiver) = mpsc::channel(channel_capacity);
         let memory_freed = Arc::new(Notify::new());
         let in_flight_memory = Arc::new(AtomicUsize::new(0));
         let max_block_ms = config.max_block_ms;
@@ -395,7 +406,20 @@ impl RecordAccumulator {
             memory_freed: memory_freed.clone(),
         };
 
-        tokio::spawn(accumulator.run(receiver));
+        let memory_freed_panic = memory_freed.clone();
+        tokio::spawn(async move {
+            let join_handle = tokio::spawn(accumulator.run(receiver));
+            if let Err(join_err) = join_handle.await {
+                if join_err.is_panic() {
+                    tracing::error!("Accumulator task panicked: {join_err}");
+                } else {
+                    tracing::error!("Accumulator task cancelled: {join_err}");
+                }
+                // Wake all blocked append() callers so they observe the
+                // closed channel and return an error instead of hanging.
+                memory_freed_panic.notify_waiters();
+            }
+        });
 
         RecordAccumulatorHandle {
             sender,
@@ -857,6 +881,9 @@ impl RecordAccumulator {
                 Ok(mut response_buf) => {
                     match ProduceResponse::decode_versioned(produce_version, &mut response_buf) {
                         Ok(produce_response) => {
+                            // KIP-219: honour broker-reported throttle time.
+                            conn.notify_throttle(produce_response.throttle_time_ms);
+
                             let pr = produce_response
                                 .responses
                                 .iter()

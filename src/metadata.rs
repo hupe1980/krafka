@@ -315,18 +315,29 @@ impl ClusterMetadata {
         // Coalesce concurrent calls: only one refresh in-flight at a time
         let _guard = self.refresh_lock.lock().await;
 
-        // After acquiring the lock, check if metadata was just refreshed by another caller.
-        // If it was refreshed within the last 100ms, skip the redundant request — but only
-        // for partial refreshes where all requested topics are already present. Full refreshes
-        // are never skipped: a recent partial refresh does not guarantee a full-cluster snapshot.
+        // After acquiring the lock, check if the requested data is already fresh.
+        //
+        // For partial refreshes: skip if every requested topic is present in the
+        // cache and was refreshed within `max_age`. This deduplicates work when
+        // multiple callers ask for overlapping topic sets — the second caller
+        // finds the first caller's result still fresh and returns immediately.
+        //
+        // Full refreshes (`topics=None`) are never skipped: a recent partial
+        // refresh does not guarantee a full-cluster snapshot.
         let cache = self.cache.load();
-        if cache.last_updated.elapsed() < Duration::from_millis(100) && !cache.brokers.is_empty() {
-            let all_present = match topics {
+        if !cache.brokers.is_empty() {
+            let all_fresh = match topics {
                 None => false,
-                Some(names) => names.iter().all(|name| cache.topics.contains_key(*name)),
+                Some(names) => names.iter().all(|name| {
+                    cache.topics.contains_key(*name)
+                        && cache
+                            .topic_last_refreshed
+                            .get(*name)
+                            .is_some_and(|ts| ts.elapsed() <= self.max_age)
+                }),
             };
-            if all_present {
-                debug!("Metadata was recently refreshed, skipping redundant request");
+            if all_fresh {
+                debug!("All requested topics are fresh in cache, skipping redundant request");
                 return Ok(());
             }
         }
@@ -413,16 +424,20 @@ impl ClusterMetadata {
                 ));
             }
 
-            // Success — clear the failure-tracking timestamp.
-            {
-                let mut start = self.metadata_attempt_start.lock();
-                *start = None;
-            }
+            // Success — clear the failure-tracking timestamp only on full
+            // refreshes. A partial refresh succeeding does not prove that all
+            // brokers are reachable, so keep the rebootstrap timer running.
 
             // Update cache. A full refresh (topics=None) is authoritative — the
             // response contains every topic currently in the cluster, so we rebuild
             // from scratch. A partial refresh delta-merges into the existing cache.
             let full_refresh = topics.is_none();
+
+            if full_refresh {
+                let mut start = self.metadata_attempt_start.lock();
+                *start = None;
+            }
+
             self.update_cache(metadata, full_refresh);
 
             return Ok(());

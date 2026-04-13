@@ -54,6 +54,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::RwLock;
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::auth::AuthConfig;
@@ -288,7 +289,15 @@ impl ShareConsumer {
         }
 
         // Send heartbeat to maintain membership and receive assignments.
-        if let Err(e) = self.send_heartbeat(false).await {
+        // Cap the heartbeat RPC at 10 s so a slow/stuck coordinator does not
+        // block the entire poll() for the full connection-level request_timeout.
+        let heartbeat_result = timeout(Duration::from_secs(10), self.send_heartbeat(false)).await;
+        let heartbeat_err = match heartbeat_result {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e),
+            Err(_elapsed) => Some(KrafkaError::timeout("share group heartbeat")),
+        };
+        if let Some(e) = heartbeat_err {
             warn!("Heartbeat failed during poll: {e}");
             self.invalidate_coordinator().await;
             if let Err(e2) = self.ensure_coordinator().await {
@@ -413,6 +422,9 @@ impl ShareConsumer {
                     version,
                     &mut buf.as_ref(),
                 )?;
+
+                // KIP-219: honour broker-reported throttle time.
+                conn.notify_throttle(response.throttle_time_ms);
 
                 Result::<(BrokerId, crate::protocol::ShareFetchResponse)>::Ok((bid, response))
             });

@@ -57,8 +57,8 @@ const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 /// MSK IAM action for connect.
 const ACTION: &str = "kafka-cluster:Connect";
 
-/// User agent for MSK IAM.
-const USER_AGENT: &str = "krafka-rust-client";
+/// User agent for MSK IAM (includes crate version for diagnostics).
+const USER_AGENT: &str = concat!("krafka-rust-client/", env!("CARGO_PKG_VERSION"));
 
 /// MSK IAM authenticator using AWS Signature v4.
 pub struct MskIamAuthenticator {
@@ -72,6 +72,11 @@ pub struct MskIamAuthenticator {
     region: String,
     /// Broker host (without port).
     host: String,
+    /// Clock offset in seconds applied when creating the auth payload.
+    ///
+    /// Positive values move the signing timestamp into the future (local
+    /// clock is behind the broker); negative values move it into the past.
+    clock_offset_secs: i64,
 }
 
 impl std::fmt::Debug for MskIamAuthenticator {
@@ -115,14 +120,37 @@ impl MskIamAuthenticator {
             session_token: credentials.session_token.clone(),
             region: credentials.region.clone(),
             host: host_without_port,
+            clock_offset_secs: 0,
         })
+    }
+
+    /// Create a new MSK IAM authenticator with a clock offset.
+    ///
+    /// The `clock_offset_secs` is added to `SystemTime::now()` when signing
+    /// requests. Positive values mean the local clock is behind the broker.
+    pub fn new_with_clock_offset(
+        credentials: &AwsMskIamCredentials,
+        host: impl Into<String>,
+        clock_offset_secs: i64,
+    ) -> crate::Result<Self> {
+        let mut auth = Self::new(credentials, host)?;
+        auth.clock_offset_secs = clock_offset_secs;
+        Ok(auth)
     }
 
     /// Create the authentication payload to send to MSK.
     ///
-    /// Returns JSON-formatted signed authentication payload.
+    /// Applies [`clock_offset_secs`](Self::new_with_clock_offset) (if any) to
+    /// `SystemTime::now()` before signing. Returns JSON-formatted signed
+    /// authentication payload.
     pub fn create_auth_payload(&self) -> Vec<u8> {
-        self.create_auth_payload_at(SystemTime::now())
+        let now = SystemTime::now();
+        let adjusted = if self.clock_offset_secs >= 0 {
+            now + std::time::Duration::from_secs(self.clock_offset_secs as u64)
+        } else {
+            now - std::time::Duration::from_secs(self.clock_offset_secs.unsigned_abs())
+        };
+        self.create_auth_payload_at(adjusted)
     }
 
     /// Create the authentication payload at a specific timestamp (for testing).
@@ -360,7 +388,7 @@ mod tests {
         // Should contain expected fields
         assert!(payload_str.contains("\"version\":\"2020_10_22\""));
         assert!(payload_str.contains("\"host\":\"broker.kafka.us-east-1.amazonaws.com\""));
-        assert!(payload_str.contains("\"user-agent\":\"krafka-rust-client\""));
+        assert!(payload_str.contains("\"user-agent\":\"krafka-rust-client/"));
         assert!(payload_str.contains("\"action\":\"kafka-cluster:Connect\""));
         assert!(payload_str.contains("\"x-amz-algorithm\":\"AWS4-HMAC-SHA256\""));
         assert!(payload_str.contains("\"x-amz-credential\":"));
@@ -479,5 +507,46 @@ mod tests {
         let creds = test_credentials();
         let auth = MskIamAuthenticator::new(&creds, "broker:9098").unwrap();
         drop(auth);
+    }
+
+    #[test]
+    fn test_msk_iam_clock_offset_positive() {
+        let creds = test_credentials();
+        let auth_no_offset = MskIamAuthenticator::new(&creds, "broker:9098").unwrap();
+        let auth_offset =
+            MskIamAuthenticator::new_with_clock_offset(&creds, "broker:9098", 3600).unwrap();
+
+        let payload_no = String::from_utf8(auth_no_offset.create_auth_payload()).unwrap();
+        let payload_off = String::from_utf8(auth_offset.create_auth_payload()).unwrap();
+
+        // Both should be valid JSON, but the x-amz-date values should differ
+        // because one is shifted by 1 hour.
+        assert!(payload_no.contains("\"x-amz-date\":"));
+        assert!(payload_off.contains("\"x-amz-date\":"));
+
+        // Extract dates to compare
+        let date_no = extract_amz_date(&payload_no);
+        let date_off = extract_amz_date(&payload_off);
+        assert_ne!(
+            date_no, date_off,
+            "clock offset should produce different timestamps"
+        );
+    }
+
+    #[test]
+    fn test_msk_iam_clock_offset_negative() {
+        let creds = test_credentials();
+        let auth =
+            MskIamAuthenticator::new_with_clock_offset(&creds, "broker:9098", -3600).unwrap();
+        let payload = String::from_utf8(auth.create_auth_payload()).unwrap();
+        assert!(payload.contains("\"x-amz-date\":"));
+    }
+
+    /// Helper to extract `x-amz-date` value from the JSON payload.
+    fn extract_amz_date(json: &str) -> String {
+        let key = "\"x-amz-date\":\"";
+        let start = json.find(key).unwrap() + key.len();
+        let end = json[start..].find('"').unwrap() + start;
+        json[start..end].to_string()
     }
 }

@@ -43,6 +43,9 @@ rand = "0.9"
 # Synchronization (non-poisoning RwLock)
 parking_lot = "0.12"
 
+# TCP keepalive configuration
+socket2 = "0.5"
+
 # Cryptography for SASL/SCRAM
 sha2 = "0.10"
 hmac = "0.12"

@@ -104,6 +104,10 @@ use crate::{Offset, PartitionId};
 /// Interceptor errors are **non-fatal**: the chain continues and the error is
 /// logged at `warn!`. Return `Err` to signal that something went wrong
 /// (e.g. a metrics backend is unreachable) without panicking.
+///
+/// The error type is intentionally `Box<dyn Error>` rather than a concrete type:
+/// interceptor errors are only logged, never programmatically matched, so callers
+/// don't need to downcast. Use the `Display` impl to provide diagnostic context.
 pub type InterceptorResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 /// Interceptor for the Kafka producer pipeline.
@@ -235,6 +239,9 @@ impl ProducerInterceptorChain {
 impl ProducerInterceptor for ProducerInterceptorChain {
     fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
         for (i, interceptor) in self.interceptors.iter().enumerate() {
+            // Snapshot before mutation so a panic mid-`on_send` doesn't leave
+            // the record in a partially-mutated state for subsequent interceptors.
+            let snapshot = record.clone();
             match catch_unwind(AssertUnwindSafe(|| interceptor.on_send(record))) {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
@@ -247,11 +254,14 @@ impl ProducerInterceptor for ProducerInterceptorChain {
                     );
                 }
                 Err(_) => {
+                    // Restore the pre-panic snapshot so the next interceptor
+                    // sees a consistent record (matches Java's behavior).
+                    *record = snapshot;
                     tracing::error!(
                         chain_index = i,
                         chain_len = self.interceptors.len(),
                         topic = record.topic.as_str(),
-                        "ProducerInterceptor.on_send panicked (payload redacted)",
+                        "ProducerInterceptor.on_send panicked — record restored (payload redacted)",
                     );
                 }
             }

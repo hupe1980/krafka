@@ -44,6 +44,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -153,6 +154,13 @@ pub struct OAuthBearerToken {
     /// Uses `BTreeMap` for deterministic ordering.
     #[zeroize(skip)]
     extensions: BTreeMap<String, String>,
+    /// Optional token expiry as milliseconds since the Unix epoch.
+    ///
+    /// When set, the client validates the token is not expired before sending
+    /// it to the broker— preventing wasted authentication round-trips
+    /// and potential infinite retry loops with stale tokens.
+    #[zeroize(skip)]
+    lifetime_ms: Option<i64>,
 }
 
 impl OAuthBearerToken {
@@ -170,6 +178,7 @@ impl OAuthBearerToken {
         Self {
             token_value: token_value.into(),
             extensions: BTreeMap::new(),
+            lifetime_ms: None,
         }
     }
 
@@ -189,6 +198,42 @@ impl OAuthBearerToken {
     pub fn with_extension(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.extensions.insert(key.into(), value.into());
         self
+    }
+
+    /// Set the token expiry time as milliseconds since the Unix epoch.
+    ///
+    /// When set, the client validates the token is not expired before sending
+    /// it to the broker. This prevents futile authentication attempts with
+    /// stale tokens.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use krafka::auth::OAuthBearerToken;
+    /// let token = OAuthBearerToken::new("my-jwt-token")
+    ///     .with_lifetime_ms(1700000000000); // expires at this epoch-ms
+    /// ```
+    pub fn with_lifetime_ms(mut self, lifetime_ms: i64) -> Self {
+        self.lifetime_ms = Some(lifetime_ms);
+        self
+    }
+
+    /// Returns the token expiry time in milliseconds since the Unix epoch, if set.
+    pub fn lifetime_ms(&self) -> Option<i64> {
+        self.lifetime_ms
+    }
+
+    /// Returns `true` if the token has a known expiry and that expiry is in the past.
+    pub fn is_expired(&self) -> bool {
+        if let Some(lifetime_ms) = self.lifetime_ms {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            now_ms >= lifetime_ms
+        } else {
+            false
+        }
     }
 
     /// Build the initial client response in GS2 framing format (RFC 7628).
@@ -251,6 +296,7 @@ impl fmt::Debug for OAuthBearerToken {
         f.debug_struct("OAuthBearerToken")
             .field("token_value", &"[REDACTED]")
             .field("extensions", &self.extensions)
+            .field("lifetime_ms", &self.lifetime_ms)
             .finish()
     }
 }
@@ -428,5 +474,37 @@ mod tests {
             token.to_gs2_initial_response(),
             OAuthBearerToken::new("struct-token").to_gs2_initial_response()
         );
+    }
+
+    #[test]
+    fn test_oauthbearer_token_not_expired_without_lifetime() {
+        let token = OAuthBearerToken::new("tok");
+        assert!(!token.is_expired());
+        assert!(token.lifetime_ms().is_none());
+    }
+
+    #[test]
+    fn test_oauthbearer_token_not_expired_future_lifetime() {
+        // Set expiry 1 hour in the future
+        let future_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + 3_600_000;
+        let token = OAuthBearerToken::new("tok").with_lifetime_ms(future_ms);
+        assert!(!token.is_expired());
+        assert_eq!(token.lifetime_ms(), Some(future_ms));
+    }
+
+    #[test]
+    fn test_oauthbearer_token_expired_past_lifetime() {
+        // Set expiry 1 hour in the past
+        let past_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - 3_600_000;
+        let token = OAuthBearerToken::new("tok").with_lifetime_ms(past_ms);
+        assert!(token.is_expired());
     }
 }

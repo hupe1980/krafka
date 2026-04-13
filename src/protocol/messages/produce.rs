@@ -116,7 +116,10 @@ impl ProduceRequest {
             .map_err(|_| KrafkaError::protocol("topics array too large"))?;
         crate::util::varint::encode_unsigned_varint(topics_len, buf);
         for topic in &self.topic_data {
-            buf.put_slice(&topic.topic_id.unwrap_or([0u8; 16]));
+            let topic_id = topic.topic_id.ok_or_else(|| {
+                KrafkaError::protocol("topic_id is required for Produce v13+ (KIP-516)")
+            })?;
+            buf.put_slice(&topic_id);
             let parts_len = u32::try_from(topic.partition_data.len().saturating_add(1))
                 .map_err(|_| KrafkaError::protocol("partitions array too large"))?;
             crate::util::varint::encode_unsigned_varint(parts_len, buf);

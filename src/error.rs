@@ -774,6 +774,8 @@ impl ErrorCode {
                 | Self::EligibleLeadersNotAvailable
                 | Self::UnstableOffsetCommit
                 | Self::ThrottlingQuotaExceeded
+                | Self::FencedMemberEpoch
+                | Self::StaleMemberEpoch
                 | Self::NewLeaderElected
         )
     }

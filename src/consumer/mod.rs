@@ -2134,6 +2134,9 @@ impl Consumer {
             }
         };
 
+        // KIP-219: honour broker-reported throttle time.
+        conn.notify_throttle(fetch_response.throttle_time_ms);
+
         // Handle top-level session errors (v7+)
         if fetch_version >= 7 {
             if fetch_response.error_code == crate::error::ErrorCode::FetchSessionIdNotFound
@@ -2673,6 +2676,46 @@ impl Consumer {
                         None,
                     );
                 }
+                Err(e) if e.is_retriable() => {
+                    // Retry retriable errors up to 2 more times with short backoff.
+                    let mut last_err = e;
+                    let backoffs = [Duration::from_millis(100), Duration::from_millis(250)];
+                    for delay in &backoffs {
+                        debug!(
+                            "Commit failed with retriable error, retrying in {:?}: {last_err}",
+                            delay
+                        );
+                        tokio::time::sleep(*delay).await;
+                        match coordinator.commit_offsets(&commit_offsets).await {
+                            Ok(()) => {
+                                crate::interceptor::safe_on_commit(
+                                    &*self.interceptor,
+                                    &committed_offsets,
+                                    None,
+                                );
+                                return Ok(());
+                            }
+                            Err(e) if e.is_retriable() => {
+                                last_err = e;
+                            }
+                            Err(e) => {
+                                crate::interceptor::safe_on_commit(
+                                    &*self.interceptor,
+                                    &committed_offsets,
+                                    Some(&e),
+                                );
+                                return Err(e);
+                            }
+                        }
+                    }
+                    // All retries exhausted.
+                    crate::interceptor::safe_on_commit(
+                        &*self.interceptor,
+                        &committed_offsets,
+                        Some(&last_err),
+                    );
+                    return Err(last_err);
+                }
                 Err(e) => {
                     crate::interceptor::safe_on_commit(
                         &*self.interceptor,
@@ -2890,7 +2933,11 @@ impl Consumer {
         offsets.get(&(topic.to_string(), partition)).copied()
     }
 
-    /// Get all assigned partitions.
+    /// Returns a **snapshot** of the current partition assignments.
+    ///
+    /// The returned `HashMap` is a clone — modifying it has no effect on the
+    /// consumer's internal state. Assignments may change asynchronously due
+    /// to rebalances.
     pub async fn assignment(&self) -> HashMap<String, Vec<PartitionId>> {
         let assignments = self.assignments.read().await;
         assignments.clone()

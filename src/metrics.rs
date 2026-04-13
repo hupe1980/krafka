@@ -170,34 +170,8 @@ impl LatencyTracker {
         let nanos = duration.as_nanos() as u64;
         self.count.fetch_add(1, Ordering::Relaxed);
         self.sum_nanos.fetch_add(nanos, Ordering::Relaxed);
-
-        // Update min (compare-and-swap loop)
-        let mut current_min = self.min_nanos.load(Ordering::Relaxed);
-        while nanos < current_min {
-            match self.min_nanos.compare_exchange_weak(
-                current_min,
-                nanos,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(x) => current_min = x,
-            }
-        }
-
-        // Update max (compare-and-swap loop)
-        let mut current_max = self.max_nanos.load(Ordering::Relaxed);
-        while nanos > current_max {
-            match self.max_nanos.compare_exchange_weak(
-                current_max,
-                nanos,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(x) => current_max = x,
-            }
-        }
+        self.min_nanos.fetch_min(nanos, Ordering::Relaxed);
+        self.max_nanos.fetch_max(nanos, Ordering::Relaxed);
     }
 
     /// Start timing an operation. Returns a guard that records when dropped.
@@ -398,20 +372,43 @@ impl Default for PrometheusExporter {
     }
 }
 
+/// Sanitize a metric name to conform to Prometheus naming conventions.
+///
+/// Replaces any character that is not `[a-zA-Z0-9_:]` with `_`.
+/// Ensures the name starts with a letter or underscore.
+fn sanitize_prometheus_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    // Ensure it starts with a letter or underscore.
+    if out.starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert(0, '_');
+    }
+    out
+}
+
 impl MetricsExporter for PrometheusExporter {
     fn export_counter(&mut self, name: &str, help: &str, value: u64) {
+        let name = sanitize_prometheus_name(name);
         let _ = writeln!(self.output, "# HELP {}_total {}", name, help);
         let _ = writeln!(self.output, "# TYPE {}_total counter", name);
         let _ = writeln!(self.output, "{}_total {}", name, value);
     }
 
     fn export_gauge(&mut self, name: &str, help: &str, value: u64) {
+        let name = sanitize_prometheus_name(name);
         let _ = writeln!(self.output, "# HELP {} {}", name, help);
         let _ = writeln!(self.output, "# TYPE {} gauge", name);
         let _ = writeln!(self.output, "{} {}", name, value);
     }
 
     fn export_latency(&mut self, name: &str, help: &str, snapshot: &LatencySnapshot) {
+        let name = sanitize_prometheus_name(name);
         let _ = writeln!(self.output, "# HELP {}_seconds {}", name, help);
         let _ = writeln!(self.output, "# TYPE {}_seconds summary", name);
         let _ = writeln!(self.output, "{}_seconds_count {}", name, snapshot.count);
@@ -1565,5 +1562,46 @@ mod tests {
         assert_eq!(json_escape("he\"llo"), "he\\\"llo");
         assert_eq!(json_escape("he\\llo"), "he\\\\llo");
         assert_eq!(json_escape("he\nllo"), "he\\nllo");
+    }
+
+    #[test]
+    fn test_sanitize_prometheus_name_valid() {
+        assert_eq!(
+            sanitize_prometheus_name("krafka_requests_total"),
+            "krafka_requests_total"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_prometheus_name_dots_hyphens() {
+        assert_eq!(
+            sanitize_prometheus_name("kafka.producer-send.rate"),
+            "kafka_producer_send_rate"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_prometheus_name_leading_digit() {
+        assert_eq!(sanitize_prometheus_name("9lives"), "_9lives");
+    }
+
+    #[test]
+    fn test_sanitize_prometheus_name_colons_preserved() {
+        assert_eq!(
+            sanitize_prometheus_name("namespace:metric"),
+            "namespace:metric"
+        );
+    }
+
+    #[test]
+    fn test_latency_fetch_min_max() {
+        let tracker = LatencyTracker::new();
+        tracker.record(Duration::from_millis(100));
+        tracker.record(Duration::from_millis(50));
+        tracker.record(Duration::from_millis(200));
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.count, 3);
+        assert_eq!(snapshot.min, Some(Duration::from_millis(50)));
+        assert_eq!(snapshot.max, Some(Duration::from_millis(200)));
     }
 }

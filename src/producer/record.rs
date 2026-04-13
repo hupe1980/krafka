@@ -142,7 +142,15 @@ impl ProducerRecord {
         }
 
         // Header keys and values are encoded with varint i32 length prefixes
-        // in the record batch v2 format.
+        // in the record batch v2 format. Limit header count to prevent
+        // excessively large batches from bypassing max_request_size.
+        const MAX_HEADERS: usize = 10_000;
+        if self.headers.len() > MAX_HEADERS {
+            return Err(KrafkaError::protocol(format!(
+                "record has {} headers, exceeding limit of {MAX_HEADERS}",
+                self.headers.len()
+            )));
+        }
         for (i, (key, value)) in self.headers.iter().enumerate() {
             if key.len() > i32::MAX as usize {
                 return Err(KrafkaError::protocol(format!(

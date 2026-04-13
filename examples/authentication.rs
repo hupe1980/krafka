@@ -177,7 +177,9 @@ fn main() {
     let auth_config = AuthConfig::sasl_scram_sha256("alice", "secret");
     let mut authenticator = SaslAuthenticator::new(&auth_config, ChannelBinding::None).unwrap();
     println!("Mechanism: {}", authenticator.mechanism_name());
-    let initial = authenticator.initial_response();
+    let initial = authenticator
+        .initial_response()
+        .expect("initial_response failed");
     println!(
         "Initial response (client-first): {:?}...",
         String::from_utf8_lossy(&initial[..40.min(initial.len())])

@@ -91,6 +91,7 @@ impl Producer {
     async fn new(
         config: ProducerConfig,
         interceptor: Arc<dyn crate::interceptor::ProducerInterceptor>,
+        partitioner: Option<Arc<dyn Partitioner>>,
     ) -> Result<Self> {
         let mut pool_config_builder = ConnectionConfig::builder()
             .client_id(&config.client_id)
@@ -135,7 +136,8 @@ impl Producer {
             None
         };
 
-        let partitioner: Arc<dyn Partitioner> = Arc::new(DefaultPartitioner::new());
+        let partitioner: Arc<dyn Partitioner> =
+            partitioner.unwrap_or_else(|| Arc::new(DefaultPartitioner::new()));
 
         // Build retry policy from config
         let retry_policy = RetryPolicy::new()
@@ -402,6 +404,10 @@ impl Producer {
         partition: PartitionId,
         record: ProducerRecord,
     ) -> Result<RecordMetadata> {
+        // Build the owned topic string once for RecordMetadata construction,
+        // avoiding repeated allocations in the retry loop.
+        let topic_owned = topic.to_string();
+
         // Acquire in-flight permit before sending
         let _permit = self
             .in_flight_semaphore
@@ -446,7 +452,7 @@ impl Producer {
                     "DuplicateSequenceNumber — dedup confirmed"
                 );
                 Ok(RecordMetadata {
-                    topic: topic.to_string(),
+                    topic: topic_owned.clone(),
                     partition,
                     offset: -1,
                     timestamp: -1,
@@ -499,7 +505,7 @@ impl Producer {
                                 identity.rollback_sequence(topic, partition);
                                 self.metrics.record_error();
                                 let dummy_metadata = RecordMetadata {
-                                    topic: topic.to_string(),
+                                    topic: topic_owned.clone(),
                                     partition,
                                     offset: -1,
                                     timestamp: 0,
@@ -540,7 +546,7 @@ impl Producer {
                     }
                     self.metrics.record_error();
                     let dummy_metadata = RecordMetadata {
-                        topic: topic.to_string(),
+                        topic: topic_owned.clone(),
                         partition,
                         offset: -1,
                         timestamp: 0,
@@ -729,6 +735,7 @@ impl Producer {
     ///
     /// If the timeout elapses before all started sends cross the acknowledgment
     /// boundary, remaining work is failed by tearing down the connection pool.
+    /// Batches in retry backoff will be aborted without notification.
     pub async fn close_with_timeout(&self, timeout: Duration) -> Result<()> {
         self.close_inner(Some(timeout)).await
     }
@@ -752,7 +759,10 @@ impl Producer {
         let close_result = if let Some(timeout) = timeout {
             tokio::time::timeout(timeout, graceful_close)
                 .await
-                .map_err(|_| KrafkaError::timeout("producer close"))
+                .map_err(|_| {
+                    warn!("Producer close timed out; batches in retry backoff may be lost");
+                    KrafkaError::timeout("producer close")
+                })
         } else {
             graceful_close.await;
             Ok(())
@@ -812,6 +822,7 @@ pub struct ProducerMetricsSnapshot {
 pub struct ProducerBuilder {
     config: ProducerConfig,
     interceptors: Vec<Arc<dyn crate::interceptor::ProducerInterceptor>>,
+    partitioner: Option<Arc<dyn Partitioner>>,
 }
 
 impl ProducerBuilder {
@@ -970,6 +981,29 @@ impl ProducerBuilder {
         self
     }
 
+    /// Set a custom partitioner.
+    ///
+    /// The partitioner determines which partition a record is sent to when
+    /// [`ProducerRecord::partition`] is `None`. The default is
+    /// [`DefaultPartitioner`] (murmur2 hash for keyed records, round-robin
+    /// for null keys — matching the Java Kafka client).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use krafka::producer::{Producer, Partitioner, RoundRobinPartitioner};
+    ///
+    /// let producer = Producer::builder()
+    ///     .bootstrap_servers("localhost:9092")
+    ///     .partitioner(RoundRobinPartitioner::new())
+    ///     .build()
+    ///     .await?;
+    /// ```
+    pub fn partitioner(mut self, partitioner: impl Partitioner + 'static) -> Self {
+        self.partitioner = Some(Arc::new(partitioner));
+        self
+    }
+
     /// Set a producer interceptor, replacing any previously added interceptors.
     ///
     /// The interceptor's `on_send` method is called before each record is sent,
@@ -1035,7 +1069,7 @@ impl ProducerBuilder {
                     self.interceptors,
                 ))
             };
-        let producer = Producer::new(self.config, interceptor).await?;
+        let producer = Producer::new(self.config, interceptor, self.partitioner).await?;
         Ok(producer)
     }
 }

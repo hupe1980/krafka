@@ -42,6 +42,26 @@ use crate::protocol::{
 /// Implement this trait to receive notifications when the consumer's
 /// partition assignment changes during a rebalance.
 ///
+/// # Synchronous execution contract
+///
+/// All methods are **synchronous** and are invoked on the consumer's
+/// poll/rebalance task.  The consumer **blocks** until the callback
+/// returns, so:
+///
+/// - Do **not** spawn detached async tasks that race with the
+///   rebalance (e.g., committing offsets in a `tokio::spawn`).  The
+///   consumer will continue reassigning partitions immediately after
+///   the callback returns, and the spawned task may see stale state.
+/// - Blocking I/O (e.g., offset commits) is safe to issue here when
+///   wrapped in `tokio::task::block_in_place` or by using a
+///   synchronous Kafka commit helper.
+/// - Keep callbacks fast.  Long-running work should be deferred to a
+///   separate channel that the application drains at its own pace.
+///
+/// If you need **async** work inside a callback, block on it inside
+/// the callback (e.g., `Handle::current().block_on(my_future)`) so
+/// it completes before the callback returns.
+///
 /// # Example
 ///
 /// ```rust,ignore
@@ -67,6 +87,9 @@ pub trait ConsumerRebalanceListener: Send + Sync {
     /// owned by this consumer after the rebalance — not just newly added ones.
     /// It may include partitions that were already assigned before the rebalance.
     ///
+    /// **Must complete synchronously** — see the [trait-level docs](ConsumerRebalanceListener)
+    /// for the execution contract.
+    ///
     /// > **Note:** The Java `ConsumerRebalanceListener.onPartitionsAssigned`
     /// > passes only *newly added* partitions for cooperative rebalances.
     /// > This crate always passes the full set for simplicity and to avoid
@@ -78,6 +101,9 @@ pub trait ConsumerRebalanceListener: Send + Sync {
     /// This is triggered during a rebalance before the consumer loses
     /// its current partitions. Use this to commit offsets synchronously
     /// if needed.
+    ///
+    /// **Must complete synchronously** — see the [trait-level docs](ConsumerRebalanceListener)
+    /// for the execution contract.
     fn on_partitions_revoked(&self, partitions: &[crate::consumer::TopicPartition]);
 
     /// Called when partitions are lost due to an unclean shutdown.
@@ -85,6 +111,9 @@ pub trait ConsumerRebalanceListener: Send + Sync {
     /// This is called when the consumer unexpectedly loses its partition
     /// assignment (e.g., session timeout). Unlike `on_partitions_revoked`,
     /// offsets may already be committed by another consumer.
+    ///
+    /// **Must complete synchronously** — see the [trait-level docs](ConsumerRebalanceListener)
+    /// for the execution contract.
     fn on_partitions_lost(&self, partitions: &[crate::consumer::TopicPartition]) {
         // Default implementation delegates to revoked
         self.on_partitions_revoked(partitions);
@@ -590,6 +619,8 @@ impl PartitionAssignor for CooperativeStickyAssignor {
                                     sticky_assignments.entry(key)
                                 {
                                     e.insert(mid.clone());
+                                    // SAFETY: member_partition_counts was populated for all
+                                    // members in the first pass.
                                     *member_partition_counts.get_mut(&mid).unwrap() += 1;
                                 }
                             }

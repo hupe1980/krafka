@@ -5,8 +5,9 @@
 use std::time::Duration;
 
 use crate::auth::{
-    AuthConfig, ChannelBinding, MskIamAuthenticator, OAuthBearerToken, OAuthBearerTokenProvider,
-    PlainCredentials, SaslMechanism, ScramClient, ScramMechanism, SecurityProtocol, TlsConfig,
+    AuthConfig, AwsMskIamCredentialProvider, ChannelBinding, MskIamAuthenticator, OAuthBearerToken,
+    OAuthBearerTokenProvider, PlainCredentials, SaslMechanism, ScramClient, ScramMechanism,
+    SecurityProtocol, TlsConfig,
 };
 use crate::error::{KrafkaError, Result};
 use zeroize::Zeroizing;
@@ -115,6 +116,18 @@ impl SecureConnectionConfigBuilder {
         region: impl Into<String>,
     ) -> Self {
         self.auth = AuthConfig::aws_msk_iam(access_key_id, secret_access_key, region);
+        self
+    }
+
+    /// Configure AWS MSK IAM authentication with a credential provider.
+    ///
+    /// The provider is called on every new broker connection, ensuring
+    /// credentials are always fresh. Recommended for temporary credentials.
+    pub fn aws_msk_iam_provider(
+        mut self,
+        provider: impl AwsMskIamCredentialProvider + 'static,
+    ) -> Self {
+        self.auth = AuthConfig::aws_msk_iam_provider(provider);
         self
     }
 
@@ -288,13 +301,14 @@ impl SaslAuthenticator {
     }
 
     /// Create a new SASL authenticator for MSK IAM with the broker host.
-    pub fn new_msk_iam(auth: &AuthConfig, host: &str) -> Option<Self> {
+    pub fn new_msk_iam(auth: &AuthConfig, host: &str, clock_offset_secs: i64) -> Option<Self> {
         if !matches!(auth.sasl_mechanism, Some(SaslMechanism::AwsMskIam)) {
             return None;
         }
 
         let creds = auth.aws_msk_iam_credentials.as_ref()?;
-        let authenticator = MskIamAuthenticator::new(creds, host).ok()?;
+        let authenticator =
+            MskIamAuthenticator::new_with_clock_offset(creds, host, clock_offset_secs).ok()?;
 
         Some(Self {
             mechanism: SaslMechanism::AwsMskIam,
@@ -311,11 +325,12 @@ impl SaslAuthenticator {
     /// Set the broker host for MSK IAM authentication.
     ///
     /// Must be called before `initial_response()` for MSK IAM.
-    pub fn set_msk_host(&mut self, auth: &AuthConfig, host: &str) {
+    pub fn set_msk_host(&mut self, auth: &AuthConfig, host: &str, clock_offset_secs: i64) {
         if self.mechanism == SaslMechanism::AwsMskIam
             && let Some(creds) = auth.aws_msk_iam_credentials.as_ref()
         {
-            self.msk_iam_authenticator = MskIamAuthenticator::new(creds, host).ok();
+            self.msk_iam_authenticator =
+                MskIamAuthenticator::new_with_clock_offset(creds, host, clock_offset_secs).ok();
         }
     }
 
@@ -335,32 +350,40 @@ impl SaslAuthenticator {
     ///
     /// For PLAIN mechanism, the returned bytes are wrapped in `Zeroizing`
     /// to ensure the password is erased from memory after being sent on the wire.
-    pub fn initial_response(&mut self) -> Zeroizing<Vec<u8>> {
+    ///
+    /// Returns an error if the OAuthBearer token is known to be expired.
+    pub fn initial_response(&mut self) -> Result<Zeroizing<Vec<u8>>> {
         match self.mechanism {
-            SaslMechanism::Plain => self
+            SaslMechanism::Plain => Ok(self
                 .plain_credentials
                 .as_ref()
                 .map(|c| c.to_auth_bytes())
-                .unwrap_or_default(),
-            SaslMechanism::ScramSha256 | SaslMechanism::ScramSha512 => Zeroizing::new(
+                .unwrap_or_default()),
+            SaslMechanism::ScramSha256 | SaslMechanism::ScramSha512 => Ok(Zeroizing::new(
                 self.scram_client
                     .as_mut()
                     .map(|c| c.client_first_message())
                     .unwrap_or_default(),
-            ),
-            SaslMechanism::AwsMskIam => Zeroizing::new(
+            )),
+            SaslMechanism::AwsMskIam => Ok(Zeroizing::new(
                 self.msk_iam_authenticator
                     .as_ref()
                     .map(|a| a.create_auth_payload())
                     .unwrap_or_default(),
-            ),
-            SaslMechanism::OAuthBearer => Zeroizing::new(
-                self.oauthbearer_token
-                    .as_ref()
-                    .map(|t| t.to_gs2_initial_response())
-                    .unwrap_or_default(),
-            ),
-            SaslMechanism::Gssapi => Zeroizing::new(Vec::new()),
+            )),
+            SaslMechanism::OAuthBearer => {
+                if let Some(token) = &self.oauthbearer_token {
+                    if token.is_expired() {
+                        return Err(KrafkaError::auth(
+                            "OAuthBearer token is expired; obtain a fresh token before connecting",
+                        ));
+                    }
+                    Ok(Zeroizing::new(token.to_gs2_initial_response()))
+                } else {
+                    Ok(Zeroizing::new(Vec::new()))
+                }
+            }
+            SaslMechanism::Gssapi => Ok(Zeroizing::new(Vec::new())),
         }
     }
 
@@ -484,7 +507,7 @@ mod tests {
 
         assert_eq!(authenticator.mechanism_name(), "PLAIN");
 
-        let initial = authenticator.initial_response();
+        let initial = authenticator.initial_response().unwrap();
         assert_eq!(&*initial, b"\0user\0pass");
         assert!(authenticator.is_complete());
     }
@@ -496,7 +519,7 @@ mod tests {
 
         assert_eq!(authenticator.mechanism_name(), "SCRAM-SHA-256");
 
-        let initial = authenticator.initial_response();
+        let initial = authenticator.initial_response().unwrap();
         assert!(initial.starts_with(b"n,,n=user,r="));
         assert!(!authenticator.is_complete());
     }
@@ -505,11 +528,12 @@ mod tests {
     fn test_sasl_authenticator_msk_iam() {
         let auth = AuthConfig::aws_msk_iam("AKIAIOSFODNN7EXAMPLE", "secret", "us-east-1");
         let mut authenticator =
-            SaslAuthenticator::new_msk_iam(&auth, "broker.kafka.us-east-1.amazonaws.com").unwrap();
+            SaslAuthenticator::new_msk_iam(&auth, "broker.kafka.us-east-1.amazonaws.com", 0)
+                .unwrap();
 
         assert_eq!(authenticator.mechanism_name(), "AWS_MSK_IAM");
 
-        let initial = authenticator.initial_response();
+        let initial = authenticator.initial_response().unwrap();
         let payload_str = String::from_utf8(initial.to_vec()).unwrap();
 
         // Verify JSON payload structure
@@ -544,7 +568,7 @@ mod tests {
 
         assert_eq!(authenticator.mechanism_name(), "OAUTHBEARER");
 
-        let initial = authenticator.initial_response();
+        let initial = authenticator.initial_response().unwrap();
         assert_eq!(&*initial, b"n,,\x01auth=Bearer my-jwt-token\x01\x01");
 
         // Not complete until server responds
@@ -561,7 +585,7 @@ mod tests {
         let auth = AuthConfig::sasl_oauthbearer_token(token);
         let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None).unwrap();
 
-        let initial = authenticator.initial_response();
+        let initial = authenticator.initial_response().unwrap();
         let initial_str = String::from_utf8_lossy(&initial);
         assert!(initial_str.starts_with("n,,\x01auth=Bearer tok"));
         assert!(initial_str.contains("logicalCluster=lkc-123"));
@@ -572,7 +596,7 @@ mod tests {
     fn test_sasl_authenticator_oauthbearer_server_error() {
         let auth = AuthConfig::sasl_oauthbearer("bad-token");
         let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None).unwrap();
-        let _ = authenticator.initial_response();
+        let _ = authenticator.initial_response().unwrap();
 
         // First call returns the RFC 7628 §3.2.3 failure-ack byte (\x01).
         let result = authenticator.process_challenge(br#"{"status":"invalid_token"}"#);
@@ -638,5 +662,42 @@ mod tests {
         assert_eq!(config.auth.sasl_mechanism, Some(SaslMechanism::OAuthBearer));
         assert!(config.auth.oauthbearer_provider.is_some());
         assert!(config.auth.oauthbearer_token.is_none());
+    }
+
+    #[test]
+    fn test_sasl_authenticator_oauthbearer_expired_token_rejected() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Token expired 1 hour ago
+        let past_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - 3_600_000;
+        let token = OAuthBearerToken::new("expired-jwt").with_lifetime_ms(past_ms);
+        let auth = AuthConfig::sasl_oauthbearer_token(token);
+        let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None).unwrap();
+
+        let result = authenticator.initial_response();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("expired"));
+    }
+
+    #[test]
+    fn test_sasl_authenticator_oauthbearer_valid_token_accepted() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Token expires 1 hour from now
+        let future_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + 3_600_000;
+        let token = OAuthBearerToken::new("valid-jwt").with_lifetime_ms(future_ms);
+        let auth = AuthConfig::sasl_oauthbearer_token(token);
+        let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None).unwrap();
+
+        let result = authenticator.initial_response();
+        assert!(result.is_ok());
     }
 }

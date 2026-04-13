@@ -638,17 +638,21 @@ pub mod versions {
     // ── GetTelemetrySubscriptions (API key 71) — KIP-714 ─────────────────
     /// Minimum supported GetTelemetrySubscriptions version.
     #[cfg(feature = "telemetry")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "telemetry")))]
     pub const GET_TELEMETRY_SUBSCRIPTIONS_MIN: i16 = 0;
     /// Maximum supported GetTelemetrySubscriptions version.
     #[cfg(feature = "telemetry")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "telemetry")))]
     pub const GET_TELEMETRY_SUBSCRIPTIONS_MAX: i16 = 0;
 
     // ── PushTelemetry (API key 72) — KIP-714 ────────────────────────────
     /// Minimum supported PushTelemetry version.
     #[cfg(feature = "telemetry")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "telemetry")))]
     pub const PUSH_TELEMETRY_MIN: i16 = 0;
     /// Maximum supported PushTelemetry version.
     #[cfg(feature = "telemetry")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "telemetry")))]
     pub const PUSH_TELEMETRY_MAX: i16 = 0;
 
     // ── ShareGroupHeartbeat (API key 76) — KIP-932 ──────────────────────
