@@ -1895,43 +1895,76 @@ async fn test_admin_describe_consumer_group() {
 
     // Drive the rebalance until the consumer actually has partitions assigned.
     // On Kafka 3.9 under CI load, JoinGroup/SyncGroup can take many polls.
+    let mut got_assignment = false;
     for i in 0..20 {
         let _ = consumer.poll(Duration::from_secs(3)).await;
         let assignment = consumer.assignment().await;
         if !assignment.is_empty() {
             eprintln!("Consumer got assignment after {} poll(s)", i + 1);
+            got_assignment = true;
             break;
         }
     }
+    assert!(
+        got_assignment,
+        "Consumer should have received partition assignment"
+    );
 
+    // Let the group stabilize — poll several more times so that the
+    // coordinator finishes SyncGroup and at least one heartbeat succeeds.
+    // Without this, Kafka 3.9 under CI load may not report the member yet.
+    for _ in 0..5 {
+        let _ = consumer.poll(Duration::from_secs(2)).await;
+    }
+
+    // Verify the group is listed by the broker before describing it.
     let admin = AdminClient::builder()
         .bootstrap_servers(&bootstrap_servers)
         .build()
         .await
         .unwrap();
 
+    let listed = admin.list_consumer_groups().await.unwrap();
+    eprintln!(
+        "list_consumer_groups: [{}]",
+        listed
+            .iter()
+            .map(|g| format!("{}({})", g.group_id, g.protocol_type))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
     // Retry describe_consumer_groups — the broker may take a moment to
     // report the member after the rebalance completes. Keep polling the
     // consumer between attempts so it stays in the group (heartbeats).
     let mut descriptions = Vec::new();
-    for attempt in 0..20 {
+    for attempt in 0..30 {
+        // Poll first to keep the consumer alive and heartbeating
+        let _ = consumer.poll(Duration::from_secs(2)).await;
+
         descriptions = admin
             .describe_consumer_groups(vec![group_id.to_string()])
             .await
             .expect("describe_consumer_groups failed");
         if descriptions.len() == 1 && !descriptions[0].members.is_empty() {
+            eprintln!(
+                "describe_consumer_groups succeeded on attempt {}/30: {} members, state={}, type={:?}",
+                attempt + 1,
+                descriptions[0].members.len(),
+                descriptions[0].state,
+                descriptions[0].group_type,
+            );
             break;
         }
         eprintln!(
-            "describe_consumer_groups attempt {}/20: {} members, state={}, retrying in 2s...",
+            "describe_consumer_groups attempt {}/30: {} members, state={}, type={:?}, retrying...",
             attempt + 1,
             descriptions.first().map_or(0, |d| d.members.len()),
             descriptions
                 .first()
                 .map_or("N/A".to_string(), |d| d.state.clone()),
+            descriptions.first().map(|d| d.group_type.clone()),
         );
-        // Keep polling so the consumer maintains its group membership
-        let _ = consumer.poll(Duration::from_secs(2)).await;
     }
 
     assert_eq!(descriptions.len(), 1);

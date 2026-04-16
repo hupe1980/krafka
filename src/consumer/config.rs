@@ -605,6 +605,15 @@ impl ConsumerConfigBuilder {
         self
     }
 
+    /// Disable topic cache TTL eviction for partial metadata refreshes.
+    ///
+    /// This clears any previously configured TTL and restores the default
+    /// behavior where cached topics are not evicted based on age.
+    pub fn clear_metadata_topic_cache_ttl(mut self) -> Self {
+        self.config.metadata_topic_cache_ttl = None;
+        self
+    }
+
     /// Build the config.
     ///
     /// # Errors

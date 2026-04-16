@@ -226,12 +226,8 @@ impl LatencyTracker {
     /// Get the average latency.
     pub fn avg(&self) -> Option<Duration> {
         let count = self.count();
-        if count == 0 {
-            None
-        } else {
-            let sum = self.sum_nanos.load(Ordering::Relaxed);
-            Some(Duration::from_nanos(sum / count))
-        }
+        let sum = self.sum_nanos.load(Ordering::Relaxed);
+        sum.checked_div(count).map(Duration::from_nanos)
     }
 
     /// Get a snapshot of the latency statistics.

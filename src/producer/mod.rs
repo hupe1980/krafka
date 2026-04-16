@@ -1077,6 +1077,12 @@ impl ProducerBuilder {
                 )));
             }
         }
+        if self.config.buffer_memory > 0 && self.config.batch_size > self.config.buffer_memory {
+            return Err(KrafkaError::config(format!(
+                "batch_size must not exceed buffer_memory (got batch_size={}, buffer_memory={})",
+                self.config.batch_size, self.config.buffer_memory
+            )));
+        }
         let interceptor: Arc<dyn crate::interceptor::ProducerInterceptor> =
             if self.interceptors.is_empty() {
                 Arc::new(crate::interceptor::NoOpProducerInterceptor)

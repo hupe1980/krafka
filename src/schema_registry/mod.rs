@@ -365,6 +365,7 @@ fn validate_wire_header(data: &[u8]) -> Result<SchemaId> {
 /// The default [`TopicName`](Self::TopicName) strategy produces subjects
 /// like `my-topic-key` and `my-topic-value`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub enum SubjectNameStrategy {
     /// `{topic}-key` / `{topic}-value`.
     ///

@@ -3520,10 +3520,17 @@ impl ConsumerBuilder {
             );
         }
         if self.config.heartbeat_interval >= self.config.session_timeout {
-            return Err(KrafkaError::config(
-                "heartbeat_interval must be less than session_timeout \
+            return Err(KrafkaError::config(format!(
+                "heartbeat_interval ({:?}) must be less than session_timeout ({:?}) \
                  (recommended: session_timeout / 3)",
-            ));
+                self.config.heartbeat_interval, self.config.session_timeout,
+            )));
+        }
+        if self.config.session_timeout > self.config.max_poll_interval {
+            return Err(KrafkaError::config(format!(
+                "session_timeout ({:?}) must be <= max_poll_interval ({:?})",
+                self.config.session_timeout, self.config.max_poll_interval,
+            )));
         }
         let mut consumer = Consumer::new(self.config).await?;
         if let Some(listener) = self.rebalance_listener {

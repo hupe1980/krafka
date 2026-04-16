@@ -13,6 +13,7 @@ use crate::protocol::{check_compact_array_len, encode_compact_array_len};
 ///
 /// Replaces the v0-only `AllowDowngrade` boolean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 #[repr(i8)]
 pub enum FeatureUpgradeType {
     /// Upgrade only — the default.

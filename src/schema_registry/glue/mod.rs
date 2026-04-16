@@ -200,6 +200,7 @@ fn hex_digit(c: u8) -> Option<u8> {
 
 /// Compression type used in the AWS Glue wire format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub enum GlueCompression {
     /// No compression (wire format byte `0x00`).
     #[default]

@@ -1390,6 +1390,15 @@ impl ShareConsumerBuilder {
         self
     }
 
+    /// Disable topic cache TTL eviction for partial metadata refreshes.
+    ///
+    /// This clears any previously configured TTL and restores the default
+    /// behavior where cached topics are not evicted based on age.
+    pub fn clear_metadata_topic_cache_ttl(mut self) -> Self {
+        self.config.metadata_topic_cache_ttl = None;
+        self
+    }
+
     /// Set SOCKS5 proxy configuration.
     #[cfg(feature = "socks5")]
     pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
@@ -1418,9 +1427,10 @@ impl ShareConsumerBuilder {
             ));
         }
         if self.config.heartbeat_interval >= self.config.session_timeout {
-            return Err(KrafkaError::config(
-                "heartbeat_interval must be less than session_timeout",
-            ));
+            return Err(KrafkaError::config(format!(
+                "heartbeat_interval ({:?}) must be less than session_timeout ({:?})",
+                self.config.heartbeat_interval, self.config.session_timeout,
+            )));
         }
         ShareConsumer::new(self.config).await
     }

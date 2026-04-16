@@ -2138,12 +2138,11 @@ impl GroupCoordinator {
                 }
                 // Topics changed — send heartbeat with new subscription
             }
-            GroupState::Unjoined => {
+            GroupState::Unjoined if self.coordinator_conn.read().await.is_none() => {
                 // Need to find coordinator first
-                if self.coordinator_conn.read().await.is_none() {
-                    self.find_coordinator().await?;
-                }
+                self.find_coordinator().await?;
             }
+            GroupState::Unjoined => {}
             GroupState::Leaving | GroupState::Dead => {
                 return Err(KrafkaError::invalid_state(format!(
                     "Cannot send consumer heartbeat: group state is {state:?}"

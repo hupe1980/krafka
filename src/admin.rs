@@ -49,7 +49,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::auth::{AuthConfig, ScramMechanism};
 use crate::error::{KrafkaError, Result};
@@ -1695,14 +1695,33 @@ impl AdminClient {
                 let mut buf = response_bytes;
                 let response = ConsumerGroupDescribeResponse::decode_versioned(version, &mut buf)?;
 
-                // Collect groups that ConsumerGroupDescribe returned as "OK but
-                // empty". On Kafka 3.7–3.9 (KIP-848 Early Access), this
-                // happens for classic-protocol groups. We'll try the classic
-                // DescribeGroups as well and use whichever has members.
+                // ConsumerGroupDescribe (Key 69) returns per-group error codes
+                // that tell us which groups need the classic DescribeGroups path:
+                //
+                //  • GroupIdNotFound  — classic group (Kafka 3.7–3.8 or 4.0+
+                //                       with a group that was never a consumer group)
+                //  • UnsupportedVersion — classic group (Kafka 3.9)
+                //  • OK + empty members — ambiguous on 3.7–3.8; we try the
+                //                         classic path too and prefer whichever
+                //                         reports members.
 
                 for g in response.groups {
-                    if g.error_code == crate::error::ErrorCode::GroupIdNotFound {
+                    debug!(
+                        "ConsumerGroupDescribe for '{}': error={:?}, state='{}', members={}",
+                        g.group_id,
+                        g.error_code,
+                        g.group_state,
+                        g.members.len()
+                    );
+                    if g.error_code == crate::error::ErrorCode::GroupIdNotFound
+                        || g.error_code == crate::error::ErrorCode::UnsupportedVersion
+                    {
                         // Classic-protocol group — fall back to DescribeGroups (Key 15).
+                        debug!(
+                            "ConsumerGroupDescribe for '{}' returned {:?}, \
+                             will retry with DescribeGroups (Key 15)",
+                            g.group_id, g.error_code
+                        );
                         classic_fallback.push(g.group_id);
                         continue;
                     }
@@ -1766,10 +1785,11 @@ impl AdminClient {
                         },
                     };
 
-                    // Kafka 3.7–3.9 (KIP-848 Early Access) may return OK
+                    // Kafka 3.7–3.8 (KIP-848 Early Access) may return OK
                     // with empty members for classic-protocol groups instead
-                    // of GroupIdNotFound.  Try the classic DescribeGroups
-                    // path as well; if it reports members, use that result.
+                    // of GroupIdNotFound / UnsupportedVersion.  Try the
+                    // classic DescribeGroups path and prefer whichever has
+                    // members.
                     if members_empty {
                         maybe_classic.push((group_id_clone.clone(), desc));
                         classic_fallback.push(group_id_clone);
@@ -1810,6 +1830,13 @@ impl AdminClient {
                 let response = DescribeGroupsResponse::decode_versioned(version, &mut buf)?;
 
                 for g in response.groups {
+                    debug!(
+                        "DescribeGroups (classic) for '{}': error={:?}, state='{}', members={}",
+                        g.group_id,
+                        g.error_code,
+                        g.group_state,
+                        g.members.len()
+                    );
                     let classic_desc = ConsumerGroupDescription {
                         group_id: g.group_id,
                         group_type: GroupType::Classic,

@@ -581,6 +581,12 @@ mod tests {
     }
 
     #[test]
+    fn test_config_builder_rejects_zero_max_in_flight() {
+        let err = ProducerConfig::builder().max_in_flight(0).build();
+        assert!(err.is_err());
+    }
+
+    #[test]
     fn test_config_builder_rejects_idempotent_with_acks_leader() {
         let err = ProducerConfig::builder()
             .idempotent(true)

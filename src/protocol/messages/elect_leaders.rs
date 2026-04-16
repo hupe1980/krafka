@@ -19,6 +19,7 @@ use crate::protocol::{
 
 /// Type of leader election to perform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 #[repr(i8)]
 pub enum ElectionType {
     /// Elect the preferred replica as leader.

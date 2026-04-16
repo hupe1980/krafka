@@ -25,6 +25,10 @@ fuzz_target!(|data: &[u8]| {
     // Use first two bytes to select one API and version per iteration,
     // dramatically improving fuzzing throughput over decoding all 206
     // API/version pairs for every input.
+    //
+    // Version ranges below match each type's `VersionedDecode::decode_versioned`
+    // match arms exactly. Out-of-range versions hit `unsupported_decode!` and
+    // return an error immediately, wasting the fuzz input.
     if data.len() < 2 {
         return;
     }
