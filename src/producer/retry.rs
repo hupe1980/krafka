@@ -94,7 +94,10 @@ impl RetryPolicy {
         self
     }
 
-    /// Calculate the backoff duration for a given attempt number (0-indexed).
+    /// Calculate the backoff duration for a given attempt number.
+    ///
+    /// Attempt 0 returns `Duration::ZERO` (no retry yet). Attempt 1 = first
+    /// retry = `initial_backoff`. Subsequent attempts grow exponentially.
     #[inline]
     pub fn calculate_backoff(&self, attempt: u32) -> Duration {
         if attempt == 0 {
@@ -193,8 +196,6 @@ impl RetryContext {
     ///
     /// Returns `Some(backoff_duration)` if we should retry, `None` if we should give up.
     pub fn record_failure(&mut self, error: &KrafkaError) -> Option<Duration> {
-        self.attempt += 1;
-
         let elapsed = self.started_at.elapsed();
 
         // Check delivery timeout first — elapsed time trumps retry count.
@@ -211,7 +212,11 @@ impl RetryContext {
             return None;
         }
 
+        // Check retriability *before* incrementing so that `max_retries = N`
+        // yields exactly N retries (matching the transaction.rs retry loops
+        // which use `for attempt in 0..=max_retries`).
         if self.policy.should_retry(error, self.attempt) {
+            self.attempt += 1;
             let backoff = self.policy.calculate_backoff(self.attempt);
 
             // Clamp backoff so it doesn't exceed remaining delivery budget.
@@ -234,7 +239,7 @@ impl RetryContext {
             );
             Some(backoff)
         } else {
-            if self.policy.max_retries_reached(self.attempt) {
+            if self.policy.max_retries_reached(self.attempt + 1) {
                 warn!(
                     operation = %self.operation,
                     attempt = self.attempt,
@@ -358,26 +363,32 @@ mod tests {
 
     #[test]
     fn test_retry_context() {
-        // max_retries=3 means: initial try + up to 3 retries = 4 total attempts
-        // But we check attempt < max_retries, so we get 3 retries after initial
+        // max_retries=3 → 3 retries (4 total attempts including the initial).
+        // should_retry is checked before incrementing attempt, so
+        // attempt 0, 1, 2 all pass the `< 3` gate.
         let policy = RetryPolicy::new().with_max_retries(3);
         let mut ctx = RetryContext::new(policy, "test_operation");
 
         assert_eq!(ctx.attempt(), 0);
         assert_eq!(ctx.operation(), "test_operation");
 
-        // First failure (attempt becomes 1, 1 < 3 = true)
+        // First failure — should_retry(0) = true, then attempt becomes 1
         let error = KrafkaError::timeout("test");
         let backoff = ctx.record_failure(&error);
         assert!(backoff.is_some());
         assert_eq!(ctx.attempt(), 1);
 
-        // Second failure (attempt becomes 2, 2 < 3 = true)
+        // Second failure — should_retry(1) = true, then attempt becomes 2
         let backoff = ctx.record_failure(&error);
         assert!(backoff.is_some());
         assert_eq!(ctx.attempt(), 2);
 
-        // Third failure (attempt becomes 3, 3 < 3 = false)
+        // Third failure — should_retry(2) = true, then attempt becomes 3
+        let backoff = ctx.record_failure(&error);
+        assert!(backoff.is_some());
+        assert_eq!(ctx.attempt(), 3);
+
+        // Fourth failure — should_retry(3) = false, max retries exhausted
         let backoff = ctx.record_failure(&error);
         assert!(backoff.is_none());
         assert_eq!(ctx.attempt(), 3);

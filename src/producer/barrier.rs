@@ -86,6 +86,9 @@ impl InFlightBarrier {
 
     fn complete_one(&self) {
         self.completed.fetch_add(1, Ordering::Relaxed);
+        // `notify_waiters` (broadcast) is intentional: concurrent `flush()`
+        // and `close_inner()` can wait on different targets simultaneously,
+        // so `notify_one()` could leave the other waiter stuck.
         self.notify.notify_waiters();
     }
 }
