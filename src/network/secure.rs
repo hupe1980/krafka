@@ -301,16 +301,27 @@ impl SaslAuthenticator {
     }
 
     /// Create a new SASL authenticator for MSK IAM with the broker host.
-    pub fn new_msk_iam(auth: &AuthConfig, host: &str, clock_offset_secs: i64) -> Option<Self> {
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if MSK IAM signing payload creation fails.
+    /// Returns `Ok(None)` if the mechanism is not MSK IAM or credentials are missing.
+    pub fn new_msk_iam(
+        auth: &AuthConfig,
+        host: &str,
+        clock_offset_secs: i64,
+    ) -> Result<Option<Self>> {
         if !matches!(auth.sasl_mechanism, Some(SaslMechanism::AwsMskIam)) {
-            return None;
+            return Ok(None);
         }
 
-        let creds = auth.aws_msk_iam_credentials.as_ref()?;
+        let Some(creds) = auth.aws_msk_iam_credentials.as_ref() else {
+            return Ok(None);
+        };
         let authenticator =
-            MskIamAuthenticator::new_with_clock_offset(creds, host, clock_offset_secs).ok()?;
+            MskIamAuthenticator::new_with_clock_offset(creds, host, clock_offset_secs)?;
 
-        Some(Self {
+        Ok(Some(Self {
             mechanism: SaslMechanism::AwsMskIam,
             plain_credentials: None,
             scram_client: None,
@@ -319,19 +330,33 @@ impl SaslAuthenticator {
             oauthbearer_token: None,
             oauthbearer_complete: false,
             oauthbearer_pending_error: None,
-        })
+        }))
     }
 
     /// Set the broker host for MSK IAM authentication.
     ///
     /// Must be called before `initial_response()` for MSK IAM.
-    pub fn set_msk_host(&mut self, auth: &AuthConfig, host: &str, clock_offset_secs: i64) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if MSK IAM signing payload creation fails (e.g.
+    /// invalid credentials or host).
+    pub fn set_msk_host(
+        &mut self,
+        auth: &AuthConfig,
+        host: &str,
+        clock_offset_secs: i64,
+    ) -> Result<()> {
         if self.mechanism == SaslMechanism::AwsMskIam
             && let Some(creds) = auth.aws_msk_iam_credentials.as_ref()
         {
-            self.msk_iam_authenticator =
-                MskIamAuthenticator::new_with_clock_offset(creds, host, clock_offset_secs).ok();
+            self.msk_iam_authenticator = Some(MskIamAuthenticator::new_with_clock_offset(
+                creds,
+                host,
+                clock_offset_secs,
+            )?);
         }
+        Ok(())
     }
 
     /// Get the mechanism name for SASL handshake.
@@ -460,7 +485,9 @@ impl SaslAuthenticator {
                 .as_ref()
                 .is_some_and(|c| *c.state() == crate::auth::ScramState::Complete),
             SaslMechanism::AwsMskIam => self.msk_iam_complete,
-            SaslMechanism::OAuthBearer => self.oauthbearer_complete,
+            SaslMechanism::OAuthBearer => {
+                self.oauthbearer_complete && self.oauthbearer_pending_error.is_none()
+            }
             SaslMechanism::Gssapi => false,
         }
     }
@@ -530,6 +557,7 @@ mod tests {
         let auth = AuthConfig::aws_msk_iam("AKIAIOSFODNN7EXAMPLE", "secret", "us-east-1");
         let mut authenticator =
             SaslAuthenticator::new_msk_iam(&auth, "broker.kafka.us-east-1.amazonaws.com", 0)
+                .unwrap()
                 .unwrap();
 
         assert_eq!(authenticator.mechanism_name(), "AWS_MSK_IAM");
@@ -602,6 +630,12 @@ mod tests {
         // First call returns the RFC 7628 §3.2.3 failure-ack byte (\x01).
         let result = authenticator.process_challenge(br#"{"status":"invalid_token"}"#);
         assert_eq!(result.unwrap(), Some(vec![0x01]));
+
+        // Exchange is NOT complete while the deferred error is pending.
+        assert!(
+            !authenticator.is_complete(),
+            "is_complete() must be false while a deferred error is pending"
+        );
 
         // Second call surfaces the deferred error.
         let result = authenticator.process_challenge(&[]);

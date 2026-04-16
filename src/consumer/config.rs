@@ -618,9 +618,10 @@ impl ConsumerConfigBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if timing constraints are violated:
+    /// Returns an error if timing or value constraints are violated:
     /// - `heartbeat_interval` must be less than `session_timeout`
     /// - `session_timeout` must be less than or equal to `max_poll_interval`
+    /// - `max_buffered_records` must be >= 0 (0 disables the cap)
     pub fn build(self) -> crate::Result<ConsumerConfig> {
         if self.config.heartbeat_interval >= self.config.session_timeout {
             return Err(crate::error::KrafkaError::config(format!(
@@ -632,6 +633,12 @@ impl ConsumerConfigBuilder {
             return Err(crate::error::KrafkaError::config(format!(
                 "session_timeout ({:?}) must be <= max_poll_interval ({:?})",
                 self.config.session_timeout, self.config.max_poll_interval,
+            )));
+        }
+        if self.config.max_buffered_records < 0 {
+            return Err(crate::error::KrafkaError::config(format!(
+                "max_buffered_records ({}) must be >= 0",
+                self.config.max_buffered_records,
             )));
         }
         Ok(self.config)
@@ -849,5 +856,27 @@ mod tests {
             config.metadata_recovery_rebootstrap_trigger(),
             Duration::from_secs(60),
         );
+    }
+
+    #[test]
+    fn test_config_builder_rejects_negative_max_buffered_records() {
+        let result = ConsumerConfig::builder().max_buffered_records(-1).build();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("max_buffered_records"),
+            "error message should mention max_buffered_records"
+        );
+    }
+
+    #[test]
+    fn test_config_builder_accepts_zero_max_buffered_records() {
+        let config = ConsumerConfig::builder()
+            .max_buffered_records(0)
+            .build()
+            .unwrap();
+        assert_eq!(config.max_buffered_records(), 0);
     }
 }

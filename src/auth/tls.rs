@@ -283,14 +283,18 @@ fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
 fn load_root_store(config: &TlsConfig) -> Result<RootCertStore> {
     let mut root_store = RootCertStore::empty();
 
-    load_default_roots(&mut root_store, config)?;
-
     if let Some(ca_path) = &config.ca_cert_path {
+        // Explicit CA path: trust only the provided CA bundle (pinning semantics).
+        // Default/native roots are NOT loaded so that users who supply their own
+        // CA can restrict the trust store to exactly those certificates.
         for cert in load_certs(ca_path)? {
             root_store
                 .add(cert)
                 .map_err(|e| KrafkaError::config(format!("Failed to add CA cert: {e}")))?;
         }
+    } else {
+        // No explicit CA path: fall back to webpki or native roots.
+        load_default_roots(&mut root_store, config)?;
     }
     Ok(root_store)
 }

@@ -1095,7 +1095,7 @@ impl BrokerConnection {
         // For MSK IAM, set the broker host (handles IPv6 brackets like [::1]:9092)
         let hostname = extract_sni_hostname(address)?;
         let clock_offset = msk_iam_clock_offset_secs.load(Ordering::Relaxed);
-        authenticator.set_msk_host(auth, hostname, clock_offset);
+        authenticator.set_msk_host(auth, hostname, clock_offset)?;
 
         let mechanism_name = authenticator.mechanism_name().to_string();
 
