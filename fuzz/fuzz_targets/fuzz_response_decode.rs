@@ -25,10 +25,7 @@ fuzz_target!(|data: &[u8]| {
     // Use first two bytes to select one API and version per iteration,
     // dramatically improving fuzzing throughput over decoding all 206
     // API/version pairs for every input.
-    //
-    // Version ranges below match each type's `VersionedDecode::decode_versioned`
-    // match arms exactly. Out-of-range versions hit `unsupported_decode!` and
-    // return an error immediately, wasting the fuzz input.
+
     if data.len() < 2 {
         return;
     }
@@ -37,55 +34,66 @@ fuzz_target!(|data: &[u8]| {
     let ver_byte = data[1];
     let mut buf = Bytes::copy_from_slice(&data[2..]);
 
+    // Version ranges below must match each type's `VersionedDecode::decode_versioned`
+    // match arms exactly. Out-of-range versions hit `unsupported_decode!` and
+    // return an error immediately, wasting the fuzz input.
+    macro_rules! fuzz_decode {
+        // Decode `$ty` at version `$min + (ver_byte % $count)`.
+        ($ty:ty, $min:expr, $count:expr) => {{
+            let version = $min + (ver_byte % $count) as i16;
+            let _ = <$ty>::decode_versioned(version, &mut buf);
+        }};
+    }
+
     match api % 48 {
-        0 => { let _ = ProduceResponse::decode_versioned(3 + (ver_byte % 11) as i16, &mut buf); }
-        1 => { let _ = FetchResponse::decode_versioned(4 + (ver_byte % 15) as i16, &mut buf); }
-        2 => { let _ = MetadataResponse::decode_versioned(1 + (ver_byte % 13) as i16, &mut buf); }
-        3 => { let _ = ListOffsetsResponse::decode_versioned(1 + (ver_byte % 11) as i16, &mut buf); }
-        4 => { let _ = OffsetCommitResponse::decode_versioned(2 + (ver_byte % 9) as i16, &mut buf); }
-        5 => { let _ = OffsetFetchResponse::decode_versioned(1 + (ver_byte % 10) as i16, &mut buf); }
-        6 => { let _ = FindCoordinatorResponse::decode_versioned(1 + (ver_byte % 6) as i16, &mut buf); }
-        7 => { let _ = JoinGroupResponse::decode_versioned(4 + (ver_byte % 6) as i16, &mut buf); }
-        8 => { let _ = SyncGroupResponse::decode_versioned(3 + (ver_byte % 3) as i16, &mut buf); }
-        9 => { let _ = HeartbeatResponse::decode_versioned(3 + (ver_byte % 2) as i16, &mut buf); }
-        10 => { let _ = LeaveGroupResponse::decode_versioned(3 + (ver_byte % 3) as i16, &mut buf); }
-        11 => { let _ = CreateTopicsResponse::decode_versioned(2 + (ver_byte % 6) as i16, &mut buf); }
-        12 => { let _ = DeleteTopicsResponse::decode_versioned(1 + (ver_byte % 6) as i16, &mut buf); }
-        13 => { let _ = DescribeAclsResponse::decode_versioned(1 + (ver_byte % 3) as i16, &mut buf); }
-        14 => { let _ = CreateAclsResponse::decode_versioned(1 + (ver_byte % 3) as i16, &mut buf); }
-        15 => { let _ = DeleteAclsResponse::decode_versioned(1 + (ver_byte % 3) as i16, &mut buf); }
-        16 => { let _ = DescribeGroupsResponse::decode_versioned(1 + (ver_byte % 6) as i16, &mut buf); }
-        17 => { let _ = ListGroupsResponse::decode_versioned(1 + (ver_byte % 5) as i16, &mut buf); }
-        18 => { let _ = OffsetForLeaderEpochResponse::decode_versioned(2 + (ver_byte % 3) as i16, &mut buf); }
-        19 => { let _ = ConsumerGroupHeartbeatResponse::decode_versioned((ver_byte % 2) as i16, &mut buf); }
-        20 => { let _ = InitProducerIdResponse::decode_versioned((ver_byte % 7) as i16, &mut buf); }
-        21 => { let _ = AddPartitionsToTxnResponse::decode_versioned((ver_byte % 6) as i16, &mut buf); }
-        22 => { let _ = AddOffsetsToTxnResponse::decode_versioned((ver_byte % 5) as i16, &mut buf); }
-        23 => { let _ = EndTxnResponse::decode_versioned((ver_byte % 6) as i16, &mut buf); }
-        24 => { let _ = TxnOffsetCommitResponse::decode_versioned((ver_byte % 6) as i16, &mut buf); }
-        25 => { let _ = SaslHandshakeResponse::decode_versioned((ver_byte % 2) as i16, &mut buf); }
-        26 => { let _ = SaslAuthenticateResponse::decode_versioned((ver_byte % 2) as i16, &mut buf); }
-        27 => { let _ = DescribeConfigsResponse::decode_versioned((ver_byte % 5) as i16, &mut buf); }
-        28 => { let _ = IncrementalAlterConfigsResponse::decode_versioned((ver_byte % 2) as i16, &mut buf); }
-        29 => { let _ = CreatePartitionsResponse::decode_versioned((ver_byte % 4) as i16, &mut buf); }
-        30 => { let _ = DeleteRecordsResponse::decode_versioned((ver_byte % 3) as i16, &mut buf); }
-        31 => { let _ = DeleteGroupsResponse::decode_versioned((ver_byte % 3) as i16, &mut buf); }
-        32 => { let _ = DescribeClusterResponse::decode_versioned((ver_byte % 3) as i16, &mut buf); }
-        33 => { let _ = ConsumerGroupDescribeResponse::decode_versioned((ver_byte % 2) as i16, &mut buf); }
-        34 => { let _ = ListClientMetricsResourcesResponse::decode_versioned(0, &mut buf); }
-        35 => { let _ = DescribeTopicPartitionsResponse::decode_versioned(0, &mut buf); }
-        36 => { let _ = DescribeClientQuotasResponse::decode_versioned((ver_byte % 2) as i16, &mut buf); }
-        37 => { let _ = AlterClientQuotasResponse::decode_versioned((ver_byte % 2) as i16, &mut buf); }
-        38 => { let _ = CreateDelegationTokenResponse::decode_versioned(1 + (ver_byte % 3) as i16, &mut buf); }
-        39 => { let _ = RenewDelegationTokenResponse::decode_versioned(1 + (ver_byte % 2) as i16, &mut buf); }
-        40 => { let _ = ExpireDelegationTokenResponse::decode_versioned(1 + (ver_byte % 2) as i16, &mut buf); }
-        41 => { let _ = DescribeDelegationTokenResponse::decode_versioned(1 + (ver_byte % 3) as i16, &mut buf); }
-        42 => { let _ = GetTelemetrySubscriptionsResponse::decode_versioned(0, &mut buf); }
-        43 => { let _ = PushTelemetryResponse::decode_versioned(0, &mut buf); }
-        44 => { let _ = ShareGroupHeartbeatResponse::decode_versioned(1, &mut buf); }
-        45 => { let _ = ShareGroupDescribeResponse::decode_versioned(1, &mut buf); }
-        46 => { let _ = ShareFetchResponse::decode_versioned(1 + (ver_byte % 2) as i16, &mut buf); }
-        47 => { let _ = ShareAcknowledgeResponse::decode_versioned(1 + (ver_byte % 2) as i16, &mut buf); }
+        0  => fuzz_decode!(ProduceResponse, 3, 11),
+        1  => fuzz_decode!(FetchResponse, 4, 15),
+        2  => fuzz_decode!(MetadataResponse, 1, 13),
+        3  => fuzz_decode!(ListOffsetsResponse, 1, 11),
+        4  => fuzz_decode!(OffsetCommitResponse, 2, 9),
+        5  => fuzz_decode!(OffsetFetchResponse, 1, 10),
+        6  => fuzz_decode!(FindCoordinatorResponse, 1, 6),
+        7  => fuzz_decode!(JoinGroupResponse, 4, 6),
+        8  => fuzz_decode!(SyncGroupResponse, 3, 3),
+        9  => fuzz_decode!(HeartbeatResponse, 3, 2),
+        10 => fuzz_decode!(LeaveGroupResponse, 3, 3),
+        11 => fuzz_decode!(CreateTopicsResponse, 2, 6),
+        12 => fuzz_decode!(DeleteTopicsResponse, 1, 6),
+        13 => fuzz_decode!(DescribeAclsResponse, 1, 3),
+        14 => fuzz_decode!(CreateAclsResponse, 1, 3),
+        15 => fuzz_decode!(DeleteAclsResponse, 1, 3),
+        16 => fuzz_decode!(DescribeGroupsResponse, 1, 6),
+        17 => fuzz_decode!(ListGroupsResponse, 1, 5),
+        18 => fuzz_decode!(OffsetForLeaderEpochResponse, 2, 3),
+        19 => fuzz_decode!(ConsumerGroupHeartbeatResponse, 0, 2),
+        20 => fuzz_decode!(InitProducerIdResponse, 0, 7),
+        21 => fuzz_decode!(AddPartitionsToTxnResponse, 0, 6),
+        22 => fuzz_decode!(AddOffsetsToTxnResponse, 0, 5),
+        23 => fuzz_decode!(EndTxnResponse, 0, 6),
+        24 => fuzz_decode!(TxnOffsetCommitResponse, 0, 6),
+        25 => fuzz_decode!(SaslHandshakeResponse, 0, 2),
+        26 => fuzz_decode!(SaslAuthenticateResponse, 0, 2),
+        27 => fuzz_decode!(DescribeConfigsResponse, 0, 5),
+        28 => fuzz_decode!(IncrementalAlterConfigsResponse, 0, 2),
+        29 => fuzz_decode!(CreatePartitionsResponse, 0, 4),
+        30 => fuzz_decode!(DeleteRecordsResponse, 0, 3),
+        31 => fuzz_decode!(DeleteGroupsResponse, 0, 3),
+        32 => fuzz_decode!(DescribeClusterResponse, 0, 3),
+        33 => fuzz_decode!(ConsumerGroupDescribeResponse, 0, 2),
+        34 => fuzz_decode!(ListClientMetricsResourcesResponse, 0, 1),
+        35 => fuzz_decode!(DescribeTopicPartitionsResponse, 0, 1),
+        36 => fuzz_decode!(DescribeClientQuotasResponse, 0, 2),
+        37 => fuzz_decode!(AlterClientQuotasResponse, 0, 2),
+        38 => fuzz_decode!(CreateDelegationTokenResponse, 1, 3),
+        39 => fuzz_decode!(RenewDelegationTokenResponse, 1, 2),
+        40 => fuzz_decode!(ExpireDelegationTokenResponse, 1, 2),
+        41 => fuzz_decode!(DescribeDelegationTokenResponse, 1, 3),
+        42 => fuzz_decode!(GetTelemetrySubscriptionsResponse, 0, 1),
+        43 => fuzz_decode!(PushTelemetryResponse, 0, 1),
+        44 => fuzz_decode!(ShareGroupHeartbeatResponse, 1, 1),
+        45 => fuzz_decode!(ShareGroupDescribeResponse, 1, 1),
+        46 => fuzz_decode!(ShareFetchResponse, 1, 2),
+        47 => fuzz_decode!(ShareAcknowledgeResponse, 1, 2),
         _ => unreachable!(),
     }
 });

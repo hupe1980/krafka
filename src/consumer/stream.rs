@@ -19,18 +19,15 @@
 //!
 //! [`Stream`]: futures_core::Stream
 
-use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures_core::Stream;
+use tokio_util::sync::ReusableBoxFuture;
 
 use super::Consumer;
 use super::record::ConsumerRecord;
 use crate::error::Result;
-
-/// Boxed future type for the in-progress `recv()` call.
-type RecvFuture<'a> = Pin<Box<dyn Future<Output = Result<Option<ConsumerRecord>>> + Send + 'a>>;
 
 /// Async stream of [`ConsumerRecord`]s from a [`Consumer`].
 ///
@@ -42,16 +39,19 @@ type RecvFuture<'a> = Pin<Box<dyn Future<Output = Result<Option<ConsumerRecord>>
 /// Errors from the broker or network are propagated as `Some(Err(...))`.
 pub struct ConsumerStream<'a> {
     consumer: &'a Consumer,
-    /// In-progress `recv()` future, lazily created on each `poll_next`.
-    fut: Option<RecvFuture<'a>>,
+    /// Reusable boxed future for the in-progress `recv()` call.
+    /// Avoids a fresh heap allocation per record by reusing the box
+    /// when the future's size and alignment match (which they always
+    /// do since `recv()` returns the same concrete type each time).
+    fut: ReusableBoxFuture<'a, Result<Option<ConsumerRecord>>>,
 }
 
 impl<'a> ConsumerStream<'a> {
     /// Create a new stream wrapping the given consumer.
     pub(super) fn new(consumer: &'a Consumer) -> Self {
         Self {
+            fut: ReusableBoxFuture::new(consumer.recv()),
             consumer,
-            fut: None,
         }
     }
 }
@@ -62,16 +62,11 @@ impl Stream for ConsumerStream<'_> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        // Lazily create the recv() future if we don't have one in flight.
-        let fut = this
-            .fut
-            .get_or_insert_with(|| Box::pin(this.consumer.recv()));
-
-        match fut.as_mut().poll(cx) {
+        match this.fut.poll(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(result) => {
-                // Clear the completed future so we create a fresh one next time.
-                this.fut = None;
+                // Reuse the allocation for the next recv() call.
+                this.fut.set(this.consumer.recv());
                 match result {
                     Ok(Some(record)) => Poll::Ready(Some(Ok(record))),
                     Ok(None) => Poll::Ready(None), // consumer closed

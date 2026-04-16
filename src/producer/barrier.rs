@@ -1,6 +1,6 @@
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::sync::Notify;
 
@@ -35,15 +35,13 @@ impl InFlightBarrier {
             return Err(KrafkaError::invalid_state(format!("{owner} is closed")));
         }
 
-        self.started.fetch_add(1, Ordering::Relaxed);
+        self.started.fetch_add(1, Ordering::SeqCst);
 
-        // Paired SeqCst fence: together with the fence in `begin_close()`,
-        // this prevents the store-buffering hazard. Either `begin_close`
-        // observes our incremented `started`, or we observe `closing = true`
-        // below — at least one must hold.
-        fence(Ordering::SeqCst);
+        // SeqCst on both `started` and `closing` prevents the store-buffering
+        // hazard: either `begin_close` observes our incremented `started`,
+        // or we observe `closing = true` below — at least one must hold.
 
-        if self.closing.load(Ordering::Relaxed) {
+        if self.closing.load(Ordering::SeqCst) {
             self.complete_one();
             return Err(KrafkaError::invalid_state(format!("{owner} is closed")));
         }
@@ -61,14 +59,13 @@ impl InFlightBarrier {
 
     /// Begin shutdown and capture the final target count.
     pub(crate) fn begin_close(&self) -> Option<u64> {
-        if self.closing.swap(true, Ordering::AcqRel) {
+        if self.closing.swap(true, Ordering::SeqCst) {
             return None;
         }
 
-        // Paired SeqCst fence: see comment in `start()`.
-        fence(Ordering::SeqCst);
-
-        Some(self.started.load(Ordering::Relaxed))
+        // SeqCst on `closing` and `started` pairs with `start()` to prevent
+        // store-buffering; see comment there.
+        Some(self.started.load(Ordering::SeqCst))
     }
 
     pub(crate) async fn wait_for(&self, target: u64) {
