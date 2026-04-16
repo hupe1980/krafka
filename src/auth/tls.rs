@@ -280,22 +280,42 @@ fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
 }
 
 /// Load root certificate store.
+///
+/// Trust store construction follows the Kafka ecosystem convention (pinning):
+///
+/// | Configuration                         | Trust store contents                    |
+/// |---------------------------------------|-----------------------------------------|
+/// | Neither                               | webpki (Mozilla) roots — the default    |
+/// | `with_ca_cert()` only                 | **CA certs only** (pinning)             |
+/// | `with_native_roots()` only            | Platform roots only                     |
+/// | `with_native_roots()` + `with_ca_cert()` | Platform roots + CA certs (additive) |
+///
+/// Pinning is the industry-standard behaviour for TLS clients (Java Kafka
+/// client, librdkafka, Go `tls.Config`): when the caller explicitly provides
+/// a CA, only that CA is trusted — default/native roots are **not** loaded
+/// unless the caller also opts into them via `with_native_roots()`.
 fn load_root_store(config: &TlsConfig) -> Result<RootCertStore> {
     let mut root_store = RootCertStore::empty();
 
     if let Some(ca_path) = &config.ca_cert_path {
-        // Explicit CA path: trust only the provided CA bundle (pinning semantics).
-        // Default/native roots are NOT loaded so that users who supply their own
-        // CA can restrict the trust store to exactly those certificates.
+        // When native roots are also requested, load them first so the
+        // explicit CA certs are added on top (additive mode).
+        if config.use_native_roots {
+            load_default_roots(&mut root_store, config)?;
+        }
+
+        // Pinning: only the provided CA bundle is trusted (unless
+        // `use_native_roots` was set above).
         for cert in load_certs(ca_path)? {
             root_store
                 .add(cert)
                 .map_err(|e| KrafkaError::config(format!("Failed to add CA cert: {e}")))?;
         }
     } else {
-        // No explicit CA path: fall back to webpki or native roots.
+        // No explicit CA: fall back to webpki or native roots.
         load_default_roots(&mut root_store, config)?;
     }
+
     Ok(root_store)
 }
 

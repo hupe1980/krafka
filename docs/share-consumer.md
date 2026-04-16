@@ -118,7 +118,7 @@ consumer.commit_async();
 The share consumer also supports a `Stream`-based API:
 
 ```rust
-use futures_core::Stream;
+use tokio_stream::StreamExt;
 
 let mut stream = consumer.stream();
 while let Some(record) = stream.next().await {

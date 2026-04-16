@@ -44,6 +44,9 @@ pub struct ConsumerStream<'a> {
     /// when the future's size and alignment match (which they always
     /// do since `recv()` returns the same concrete type each time).
     fut: ReusableBoxFuture<'a, Result<Option<ConsumerRecord>>>,
+    /// Set to `true` once `recv()` returns `Ok(None)` (consumer closed).
+    /// After that, `poll_next` returns `None` without starting new calls.
+    done: bool,
 }
 
 impl<'a> ConsumerStream<'a> {
@@ -52,6 +55,7 @@ impl<'a> ConsumerStream<'a> {
         Self {
             fut: ReusableBoxFuture::new(consumer.recv()),
             consumer,
+            done: false,
         }
     }
 }
@@ -62,17 +66,29 @@ impl Stream for ConsumerStream<'_> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
+        if this.done {
+            return Poll::Ready(None);
+        }
+
         match this.fut.poll(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(result) => {
-                // Reuse the allocation for the next recv() call.
-                this.fut.set(this.consumer.recv());
-                match result {
-                    Ok(Some(record)) => Poll::Ready(Some(Ok(record))),
-                    Ok(None) => Poll::Ready(None), // consumer closed
-                    Err(e) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(result) => match result {
+                Ok(Some(record)) => {
+                    // Reuse the allocation for the next recv() call.
+                    this.fut.set(this.consumer.recv());
+                    Poll::Ready(Some(Ok(record)))
                 }
-            }
+                Ok(None) => {
+                    // Consumer closed — fuse the stream.
+                    this.done = true;
+                    Poll::Ready(None)
+                }
+                Err(e) => {
+                    // Reuse the allocation for the next recv() call.
+                    this.fut.set(this.consumer.recv());
+                    Poll::Ready(Some(Err(e)))
+                }
+            },
         }
     }
 }

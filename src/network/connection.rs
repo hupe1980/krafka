@@ -1203,7 +1203,18 @@ impl BrokerConnection {
                 }
 
                 Self::send_sasl_authenticate(stream, &response_bytes, client_id).await?;
-                let resp = Self::read_sasl_authenticate_response(stream, max_response_size).await?;
+
+                // If reading the response fails (e.g. server closes the
+                // connection after the OAuthBearer failure-ack), surface
+                // any deferred auth error instead of a generic network error.
+                let resp =
+                    match Self::read_sasl_authenticate_response(stream, max_response_size).await {
+                        Ok(resp) => resp,
+                        Err(network_err) => {
+                            authenticator.process_challenge(&[])?;
+                            return Err(network_err);
+                        }
+                    };
                 if !resp.error_code.is_ok() {
                     return Err(KrafkaError::auth(format!(
                         "SASL authentication step failed: {:?} - {}",

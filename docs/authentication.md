@@ -311,7 +311,7 @@ let tls_config = TlsConfig::new()
     .with_ca_cert("/path/to/ca.pem");
 ```
 
-`with_ca_cert()` adds the PEM file to the selected base trust store. By default that base trust store is Krafka's compiled-in Mozilla roots.
+`with_ca_cert()` **pins** the trust store to the provided CA bundle — the default WebPKI (Mozilla) roots are **not** loaded. This matches the Java Kafka client (`ssl.truststore.location`) and librdkafka (`ssl.ca.location`).
 
 ### Native Platform Trust Stores
 

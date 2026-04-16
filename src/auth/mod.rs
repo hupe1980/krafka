@@ -469,7 +469,15 @@ impl TlsConfig {
         }
     }
 
-    /// Set the CA certificate path.
+    /// Set the CA certificate path (pinning).
+    ///
+    /// When set, **only** the PEM-encoded certificates at this path are
+    /// trusted — the compiled-in WebPKI (Mozilla) roots are **not** loaded.
+    /// This matches the pinning semantics of the Java Kafka client
+    /// (`ssl.truststore.location`) and librdkafka (`ssl.ca.location`).
+    ///
+    /// To trust both platform roots **and** the custom CA, combine with
+    /// [`with_native_roots()`](Self::with_native_roots).
     pub fn with_ca_cert(mut self, path: impl Into<String>) -> Self {
         self.ca_cert_path = Some(path.into());
         self
@@ -477,9 +485,10 @@ impl TlsConfig {
 
     /// Load root certificates from the platform trust store.
     ///
-    /// Requires the `native-tls-roots` crate feature. When enabled, the native
-    /// trust anchors are used as the base trust store and any CA certificate
-    /// configured via [`with_ca_cert()`](Self::with_ca_cert) is added on top.
+    /// Requires the `native-tls-roots` crate feature. When used alone, native
+    /// trust anchors replace the default WebPKI roots. When combined with
+    /// [`with_ca_cert()`](Self::with_ca_cert), native roots are loaded first
+    /// and the explicit CA certificates are added on top.
     pub fn with_native_roots(mut self) -> Self {
         self.use_native_roots = true;
         self
