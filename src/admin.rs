@@ -484,7 +484,7 @@ pub struct DelegationTokenRenewer {
 /// A delegation token returned by [`AdminClient::create_delegation_token()`] or
 /// [`AdminClient::describe_delegation_token()`].
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DelegationToken {
     /// Token owner principal type (e.g., `"User"`).
     pub principal_type: String,
@@ -506,6 +506,21 @@ pub struct DelegationToken {
     /// returned from [`AdminClient::create_delegation_token()`] because the
     /// Create response does not include the renewer list.
     pub renewers: Vec<DelegationTokenRenewer>,
+}
+
+impl std::fmt::Debug for DelegationToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DelegationToken")
+            .field("principal_type", &self.principal_type)
+            .field("principal_name", &self.principal_name)
+            .field("issue_timestamp_ms", &self.issue_timestamp_ms)
+            .field("expiry_timestamp_ms", &self.expiry_timestamp_ms)
+            .field("max_timestamp_ms", &self.max_timestamp_ms)
+            .field("token_id", &self.token_id)
+            .field("hmac", &"[REDACTED]")
+            .field("renewers", &self.renewers)
+            .finish()
+    }
 }
 
 /// Result of creating a delegation token.

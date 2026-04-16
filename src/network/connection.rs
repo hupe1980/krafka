@@ -769,7 +769,13 @@ impl BrokerConnection {
             // Extract hostname (without port) for TLS SNI.
             // Handle IPv6 bracket notation like [::1]:9092.
             let hostname = extract_sni_hostname(address)?;
-            let tls_stream = connect_tls(stream, hostname, tls_config, &connector).await?;
+            let tls_stream = connect_tls(
+                stream,
+                hostname,
+                tls_config.sni_hostname.as_deref(),
+                &connector,
+            )
+            .await?;
 
             info!("TLS handshake completed for {address}");
 

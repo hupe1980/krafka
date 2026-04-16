@@ -29,6 +29,7 @@ use crate::{BrokerId, PartitionId};
 /// [`ClusterMetadata::with_rebootstrap_trigger`], it can automatically fall back
 /// to the bootstrap servers to re-discover the cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum MetadataRecoveryStrategy {
     /// No automatic recovery — behave like pre-KIP-899 clients.
     #[default]

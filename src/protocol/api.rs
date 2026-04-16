@@ -15,6 +15,7 @@ const MAX_SUPPORTED_FEATURES: usize = 256;
 /// Each API key corresponds to a specific request/response pair in the Kafka protocol.
 /// Forward compatibility is provided by the `Unknown(i16)` variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 #[repr(i16)]
 pub enum ApiKey {
     /// Produce messages to topics.

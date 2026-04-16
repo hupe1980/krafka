@@ -383,28 +383,41 @@ impl ProducerConfigBuilder {
     ///
     /// Returns an error if the configuration is invalid:
     /// - `batch_size` must be >= 1
+    /// - `max_in_flight` must be >= 1
     /// - Idempotent mode requires `acks = All` and `max_in_flight <= 5`
     /// - `batch_size` must not exceed `buffer_memory` (when `buffer_memory > 0`)
     pub fn build(self) -> Result<ProducerConfig> {
         if self.config.batch_size == 0 {
-            return Err(KrafkaError::config("batch_size must be >= 1"));
+            return Err(KrafkaError::config(format!(
+                "batch_size must be >= 1 (got {})",
+                self.config.batch_size
+            )));
+        }
+        if self.config.max_in_flight == 0 {
+            return Err(KrafkaError::config(format!(
+                "max_in_flight must be >= 1 (got {})",
+                self.config.max_in_flight
+            )));
         }
         if self.config.idempotent {
             if self.config.acks != Acks::All {
-                return Err(KrafkaError::config(
-                    "idempotent producer requires acks = All",
-                ));
+                return Err(KrafkaError::config(format!(
+                    "idempotent producer requires acks = All (got {:?})",
+                    self.config.acks
+                )));
             }
             if self.config.max_in_flight > 5 {
-                return Err(KrafkaError::config(
-                    "idempotent producer requires max_in_flight <= 5",
-                ));
+                return Err(KrafkaError::config(format!(
+                    "idempotent producer requires max_in_flight <= 5 (got {})",
+                    self.config.max_in_flight
+                )));
             }
         }
         if self.config.buffer_memory > 0 && self.config.batch_size > self.config.buffer_memory {
-            return Err(KrafkaError::config(
-                "batch_size must not exceed buffer_memory",
-            ));
+            return Err(KrafkaError::config(format!(
+                "batch_size must not exceed buffer_memory (got batch_size={}, buffer_memory={})",
+                self.config.batch_size, self.config.buffer_memory
+            )));
         }
         Ok(self.config)
     }

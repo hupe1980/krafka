@@ -303,13 +303,13 @@ impl ScramClient {
         if iteration_count < MIN_PBKDF2_ITERATIONS {
             self.state = ScramState::Failed;
             return Err(KrafkaError::auth(format!(
-                "PBKDF2 iteration count is below minimum {MIN_PBKDF2_ITERATIONS}"
+                "PBKDF2 iteration count {iteration_count} is below minimum {MIN_PBKDF2_ITERATIONS}"
             )));
         }
         if iteration_count > MAX_PBKDF2_ITERATIONS {
             self.state = ScramState::Failed;
             return Err(KrafkaError::auth(format!(
-                "PBKDF2 iteration count exceeds maximum {MAX_PBKDF2_ITERATIONS}"
+                "PBKDF2 iteration count {iteration_count} exceeds maximum {MAX_PBKDF2_ITERATIONS}"
             )));
         }
 

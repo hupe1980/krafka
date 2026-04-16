@@ -226,6 +226,7 @@ impl fmt::Display for GlueCompression {
 
 /// Data format supported by the AWS Glue Schema Registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum GlueDataFormat {
     /// Apache Avro.
     Avro,

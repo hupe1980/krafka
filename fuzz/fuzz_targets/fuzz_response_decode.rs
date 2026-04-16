@@ -22,307 +22,66 @@ use krafka::protocol::{
 };
 
 fuzz_target!(|data: &[u8]| {
-    let buf = Bytes::copy_from_slice(data);
-
-    // ProduceResponse v3–v13
-    for v in 3..=13 {
-        let mut tmp = buf.clone();
-        let _ = ProduceResponse::decode_versioned(v, &mut tmp);
+    // Use first two bytes to select one API and version per iteration,
+    // dramatically improving fuzzing throughput over decoding all 206
+    // API/version pairs for every input.
+    if data.len() < 2 {
+        return;
     }
 
-    // FetchResponse v4–v18
-    for v in 4..=18 {
-        let mut tmp = buf.clone();
-        let _ = FetchResponse::decode_versioned(v, &mut tmp);
-    }
+    let api = data[0];
+    let ver_byte = data[1];
+    let mut buf = Bytes::copy_from_slice(&data[2..]);
 
-    // MetadataResponse v1–v13 (MIN=1, MAX=13)
-    for v in 1..=13 {
-        let mut tmp = buf.clone();
-        let _ = MetadataResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // ListOffsetsResponse v1–v11
-    for v in 1..=11 {
-        let mut tmp = buf.clone();
-        let _ = ListOffsetsResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // OffsetCommitResponse v2–v10
-    for v in 2..=10 {
-        let mut tmp = buf.clone();
-        let _ = OffsetCommitResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // OffsetFetchResponse v1–v10
-    for v in 1..=10 {
-        let mut tmp = buf.clone();
-        let _ = OffsetFetchResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // FindCoordinatorResponse v1–v6 (MIN=1, MAX=6)
-    for v in 1..=6 {
-        let mut tmp = buf.clone();
-        let _ = FindCoordinatorResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // JoinGroupResponse v4–v9
-    for v in 4..=9 {
-        let mut tmp = buf.clone();
-        let _ = JoinGroupResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // SyncGroupResponse v3–v5 (MIN=3, MAX=5)
-    for v in 3..=5 {
-        let mut tmp = buf.clone();
-        let _ = SyncGroupResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // HeartbeatResponse v3–v4 (MIN=3, MAX=4)
-    for v in 3..=4 {
-        let mut tmp = buf.clone();
-        let _ = HeartbeatResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // LeaveGroupResponse v3–v5 (MIN=3, MAX=5)
-    for v in 3..=5 {
-        let mut tmp = buf.clone();
-        let _ = LeaveGroupResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // CreateTopicsResponse v2–v7
-    for v in 2..=7 {
-        let mut tmp = buf.clone();
-        let _ = CreateTopicsResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // DeleteTopicsResponse v1–v6
-    for v in 1..=6 {
-        let mut tmp = buf.clone();
-        let _ = DeleteTopicsResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // DescribeAclsResponse v1–v3 (MIN=1, MAX=3)
-    for v in 1..=3 {
-        let mut tmp = buf.clone();
-        let _ = DescribeAclsResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // CreateAclsResponse v1–v3 (MIN=1, MAX=3)
-    for v in 1..=3 {
-        let mut tmp = buf.clone();
-        let _ = CreateAclsResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // DeleteAclsResponse v1–v3 (MIN=1, MAX=3)
-    for v in 1..=3 {
-        let mut tmp = buf.clone();
-        let _ = DeleteAclsResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // DescribeGroupsResponse v1–v6
-    for v in 1..=6 {
-        let mut tmp = buf.clone();
-        let _ = DescribeGroupsResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // ListGroupsResponse v1–v5
-    for v in 1..=5 {
-        let mut tmp = buf.clone();
-        let _ = ListGroupsResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // OffsetForLeaderEpochResponse v2–v4 (MIN=2, MAX=4)
-    for v in 2..=4 {
-        let mut tmp = buf.clone();
-        let _ = OffsetForLeaderEpochResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // ConsumerGroupHeartbeatResponse v0–v1 (MIN=0, MAX=1)
-    for v in 0..=1 {
-        let mut tmp = buf.clone();
-        let _ = ConsumerGroupHeartbeatResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // InitProducerIdResponse v0–v6
-    for v in 0..=6 {
-        let mut tmp = buf.clone();
-        let _ = InitProducerIdResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // AddPartitionsToTxnResponse v0–v5 (MIN=0, MAX=5)
-    for v in 0..=5 {
-        let mut tmp = buf.clone();
-        let _ = AddPartitionsToTxnResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // AddOffsetsToTxnResponse v0–v4 (MIN=0, MAX=4)
-    for v in 0..=4 {
-        let mut tmp = buf.clone();
-        let _ = AddOffsetsToTxnResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // EndTxnResponse v0–v5 (MIN=0, MAX=5)
-    for v in 0..=5 {
-        let mut tmp = buf.clone();
-        let _ = EndTxnResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // TxnOffsetCommitResponse v0–v5 (MIN=0, MAX=5)
-    for v in 0..=5 {
-        let mut tmp = buf.clone();
-        let _ = TxnOffsetCommitResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // --- SASL (security-sensitive) ---
-
-    // SaslHandshakeResponse v0–v1
-    for v in 0..=1 {
-        let mut tmp = buf.clone();
-        let _ = SaslHandshakeResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // SaslAuthenticateResponse v0–v1
-    for v in 0..=1 {
-        let mut tmp = buf.clone();
-        let _ = SaslAuthenticateResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // --- Config ---
-
-    // DescribeConfigsResponse v0–v4
-    for v in 0..=4 {
-        let mut tmp = buf.clone();
-        let _ = DescribeConfigsResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // IncrementalAlterConfigsResponse v0–v1
-    for v in 0..=1 {
-        let mut tmp = buf.clone();
-        let _ = IncrementalAlterConfigsResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // --- Admin ---
-
-    // CreatePartitionsResponse v0–v3
-    for v in 0..=3 {
-        let mut tmp = buf.clone();
-        let _ = CreatePartitionsResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // DeleteRecordsResponse v0–v2
-    for v in 0..=2 {
-        let mut tmp = buf.clone();
-        let _ = DeleteRecordsResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // DeleteGroupsResponse v0–v2
-    for v in 0..=2 {
-        let mut tmp = buf.clone();
-        let _ = DeleteGroupsResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // DescribeClusterResponse v0–v2
-    for v in 0..=2 {
-        let mut tmp = buf.clone();
-        let _ = DescribeClusterResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // ConsumerGroupDescribeResponse v0–v1 (KIP-848)
-    for v in 0..=1 {
-        let mut tmp = buf.clone();
-        let _ = ConsumerGroupDescribeResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // ListClientMetricsResourcesResponse v0 (KIP-714)
-    {
-        let mut tmp = buf.clone();
-        let _ = ListClientMetricsResourcesResponse::decode_versioned(0, &mut tmp);
-    }
-
-    // DescribeTopicPartitionsResponse v0 (KIP-966)
-    {
-        let mut tmp = buf.clone();
-        let _ = DescribeTopicPartitionsResponse::decode_versioned(0, &mut tmp);
-    }
-
-    // --- Quota ---
-
-    // DescribeClientQuotasResponse v0–v1
-    for v in 0..=1 {
-        let mut tmp = buf.clone();
-        let _ = DescribeClientQuotasResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // AlterClientQuotasResponse v0–v1
-    for v in 0..=1 {
-        let mut tmp = buf.clone();
-        let _ = AlterClientQuotasResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // --- Delegation token ---
-
-    // CreateDelegationTokenResponse v1–v3
-    for v in 1..=3 {
-        let mut tmp = buf.clone();
-        let _ = CreateDelegationTokenResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // RenewDelegationTokenResponse v1–v2
-    for v in 1..=2 {
-        let mut tmp = buf.clone();
-        let _ = RenewDelegationTokenResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // ExpireDelegationTokenResponse v1–v2
-    for v in 1..=2 {
-        let mut tmp = buf.clone();
-        let _ = ExpireDelegationTokenResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // DescribeDelegationTokenResponse v1–v3
-    for v in 1..=3 {
-        let mut tmp = buf.clone();
-        let _ = DescribeDelegationTokenResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // --- Telemetry (feature: telemetry) ---
-
-    // GetTelemetrySubscriptionsResponse v0
-    {
-        let mut tmp = buf.clone();
-        let _ = GetTelemetrySubscriptionsResponse::decode_versioned(0, &mut tmp);
-    }
-
-    // PushTelemetryResponse v0
-    {
-        let mut tmp = buf.clone();
-        let _ = PushTelemetryResponse::decode_versioned(0, &mut tmp);
-    }
-
-    // --- Share groups (feature: unstable-protocol, KIP-932) ---
-
-    // ShareGroupHeartbeatResponse v1
-    {
-        let mut tmp = buf.clone();
-        let _ = ShareGroupHeartbeatResponse::decode_versioned(1, &mut tmp);
-    }
-
-    // ShareGroupDescribeResponse v1
-    {
-        let mut tmp = buf.clone();
-        let _ = ShareGroupDescribeResponse::decode_versioned(1, &mut tmp);
-    }
-
-    // ShareFetchResponse v1–v2
-    for v in 1..=2 {
-        let mut tmp = buf.clone();
-        let _ = ShareFetchResponse::decode_versioned(v, &mut tmp);
-    }
-
-    // ShareAcknowledgeResponse v1–v2
-    for v in 1..=2 {
-        let mut tmp = buf.clone();
-        let _ = ShareAcknowledgeResponse::decode_versioned(v, &mut tmp);
+    match api % 48 {
+        0 => { let _ = ProduceResponse::decode_versioned(3 + (ver_byte % 11) as i16, &mut buf); }
+        1 => { let _ = FetchResponse::decode_versioned(4 + (ver_byte % 15) as i16, &mut buf); }
+        2 => { let _ = MetadataResponse::decode_versioned(1 + (ver_byte % 13) as i16, &mut buf); }
+        3 => { let _ = ListOffsetsResponse::decode_versioned(1 + (ver_byte % 11) as i16, &mut buf); }
+        4 => { let _ = OffsetCommitResponse::decode_versioned(2 + (ver_byte % 9) as i16, &mut buf); }
+        5 => { let _ = OffsetFetchResponse::decode_versioned(1 + (ver_byte % 10) as i16, &mut buf); }
+        6 => { let _ = FindCoordinatorResponse::decode_versioned(1 + (ver_byte % 6) as i16, &mut buf); }
+        7 => { let _ = JoinGroupResponse::decode_versioned(4 + (ver_byte % 6) as i16, &mut buf); }
+        8 => { let _ = SyncGroupResponse::decode_versioned(3 + (ver_byte % 3) as i16, &mut buf); }
+        9 => { let _ = HeartbeatResponse::decode_versioned(3 + (ver_byte % 2) as i16, &mut buf); }
+        10 => { let _ = LeaveGroupResponse::decode_versioned(3 + (ver_byte % 3) as i16, &mut buf); }
+        11 => { let _ = CreateTopicsResponse::decode_versioned(2 + (ver_byte % 6) as i16, &mut buf); }
+        12 => { let _ = DeleteTopicsResponse::decode_versioned(1 + (ver_byte % 6) as i16, &mut buf); }
+        13 => { let _ = DescribeAclsResponse::decode_versioned(1 + (ver_byte % 3) as i16, &mut buf); }
+        14 => { let _ = CreateAclsResponse::decode_versioned(1 + (ver_byte % 3) as i16, &mut buf); }
+        15 => { let _ = DeleteAclsResponse::decode_versioned(1 + (ver_byte % 3) as i16, &mut buf); }
+        16 => { let _ = DescribeGroupsResponse::decode_versioned(1 + (ver_byte % 6) as i16, &mut buf); }
+        17 => { let _ = ListGroupsResponse::decode_versioned(1 + (ver_byte % 5) as i16, &mut buf); }
+        18 => { let _ = OffsetForLeaderEpochResponse::decode_versioned(2 + (ver_byte % 3) as i16, &mut buf); }
+        19 => { let _ = ConsumerGroupHeartbeatResponse::decode_versioned((ver_byte % 2) as i16, &mut buf); }
+        20 => { let _ = InitProducerIdResponse::decode_versioned((ver_byte % 7) as i16, &mut buf); }
+        21 => { let _ = AddPartitionsToTxnResponse::decode_versioned((ver_byte % 6) as i16, &mut buf); }
+        22 => { let _ = AddOffsetsToTxnResponse::decode_versioned((ver_byte % 5) as i16, &mut buf); }
+        23 => { let _ = EndTxnResponse::decode_versioned((ver_byte % 6) as i16, &mut buf); }
+        24 => { let _ = TxnOffsetCommitResponse::decode_versioned((ver_byte % 6) as i16, &mut buf); }
+        25 => { let _ = SaslHandshakeResponse::decode_versioned((ver_byte % 2) as i16, &mut buf); }
+        26 => { let _ = SaslAuthenticateResponse::decode_versioned((ver_byte % 2) as i16, &mut buf); }
+        27 => { let _ = DescribeConfigsResponse::decode_versioned((ver_byte % 5) as i16, &mut buf); }
+        28 => { let _ = IncrementalAlterConfigsResponse::decode_versioned((ver_byte % 2) as i16, &mut buf); }
+        29 => { let _ = CreatePartitionsResponse::decode_versioned((ver_byte % 4) as i16, &mut buf); }
+        30 => { let _ = DeleteRecordsResponse::decode_versioned((ver_byte % 3) as i16, &mut buf); }
+        31 => { let _ = DeleteGroupsResponse::decode_versioned((ver_byte % 3) as i16, &mut buf); }
+        32 => { let _ = DescribeClusterResponse::decode_versioned((ver_byte % 3) as i16, &mut buf); }
+        33 => { let _ = ConsumerGroupDescribeResponse::decode_versioned((ver_byte % 2) as i16, &mut buf); }
+        34 => { let _ = ListClientMetricsResourcesResponse::decode_versioned(0, &mut buf); }
+        35 => { let _ = DescribeTopicPartitionsResponse::decode_versioned(0, &mut buf); }
+        36 => { let _ = DescribeClientQuotasResponse::decode_versioned((ver_byte % 2) as i16, &mut buf); }
+        37 => { let _ = AlterClientQuotasResponse::decode_versioned((ver_byte % 2) as i16, &mut buf); }
+        38 => { let _ = CreateDelegationTokenResponse::decode_versioned(1 + (ver_byte % 3) as i16, &mut buf); }
+        39 => { let _ = RenewDelegationTokenResponse::decode_versioned(1 + (ver_byte % 2) as i16, &mut buf); }
+        40 => { let _ = ExpireDelegationTokenResponse::decode_versioned(1 + (ver_byte % 2) as i16, &mut buf); }
+        41 => { let _ = DescribeDelegationTokenResponse::decode_versioned(1 + (ver_byte % 3) as i16, &mut buf); }
+        42 => { let _ = GetTelemetrySubscriptionsResponse::decode_versioned(0, &mut buf); }
+        43 => { let _ = PushTelemetryResponse::decode_versioned(0, &mut buf); }
+        44 => { let _ = ShareGroupHeartbeatResponse::decode_versioned(1, &mut buf); }
+        45 => { let _ = ShareGroupDescribeResponse::decode_versioned(1, &mut buf); }
+        46 => { let _ = ShareFetchResponse::decode_versioned(1 + (ver_byte % 2) as i16, &mut buf); }
+        47 => { let _ = ShareAcknowledgeResponse::decode_versioned(1 + (ver_byte % 2) as i16, &mut buf); }
+        _ => unreachable!(),
     }
 });

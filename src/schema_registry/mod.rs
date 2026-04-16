@@ -136,6 +136,7 @@ pub type SchemaVersion = i32;
 
 /// Schema type supported by the registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum SchemaType {
     /// Apache Avro schema.
     Avro,

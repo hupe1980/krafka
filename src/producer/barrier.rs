@@ -1,6 +1,6 @@
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 
 use tokio::sync::Notify;
 
@@ -26,18 +26,24 @@ impl InFlightBarrier {
 
     #[inline]
     pub(crate) fn is_closing(&self) -> bool {
-        self.closing.load(Ordering::SeqCst)
+        self.closing.load(Ordering::Acquire)
     }
 
     /// Register a new operation unless shutdown has already started.
     pub(crate) fn start(self: &Arc<Self>, owner: &str) -> Result<InFlightOpGuard> {
-        if self.is_closing() {
+        if self.closing.load(Ordering::Acquire) {
             return Err(KrafkaError::invalid_state(format!("{owner} is closed")));
         }
 
-        self.started.fetch_add(1, Ordering::SeqCst);
+        self.started.fetch_add(1, Ordering::Relaxed);
 
-        if self.is_closing() {
+        // Paired SeqCst fence: together with the fence in `begin_close()`,
+        // this prevents the store-buffering hazard. Either `begin_close`
+        // observes our incremented `started`, or we observe `closing = true`
+        // below — at least one must hold.
+        fence(Ordering::SeqCst);
+
+        if self.closing.load(Ordering::Relaxed) {
             self.complete_one();
             return Err(KrafkaError::invalid_state(format!("{owner} is closed")));
         }
@@ -50,25 +56,31 @@ impl InFlightBarrier {
     /// Capture a flush snapshot without blocking new operations.
     #[inline]
     pub(crate) fn snapshot(&self) -> u64 {
-        self.started.load(Ordering::SeqCst)
+        self.started.load(Ordering::Relaxed)
     }
 
     /// Begin shutdown and capture the final target count.
     pub(crate) fn begin_close(&self) -> Option<u64> {
-        if self.closing.swap(true, Ordering::SeqCst) {
+        if self.closing.swap(true, Ordering::AcqRel) {
             return None;
         }
-        Some(self.snapshot())
+
+        // Paired SeqCst fence: see comment in `start()`.
+        fence(Ordering::SeqCst);
+
+        Some(self.started.load(Ordering::Relaxed))
     }
 
     pub(crate) async fn wait_for(&self, target: u64) {
         loop {
-            if self.completed.load(Ordering::SeqCst) >= target {
+            // Relaxed is sufficient: `Notify` provides the synchronization
+            // barrier between `complete_one` and this loop.
+            if self.completed.load(Ordering::Relaxed) >= target {
                 return;
             }
 
             let notified = self.notify.notified();
-            if self.completed.load(Ordering::SeqCst) >= target {
+            if self.completed.load(Ordering::Relaxed) >= target {
                 return;
             }
             notified.await;
@@ -76,7 +88,7 @@ impl InFlightBarrier {
     }
 
     fn complete_one(&self) {
-        self.completed.fetch_add(1, Ordering::SeqCst);
+        self.completed.fetch_add(1, Ordering::Relaxed);
         self.notify.notify_waiters();
     }
 }
@@ -90,9 +102,9 @@ impl Default for InFlightBarrier {
 impl fmt::Debug for InFlightBarrier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("InFlightBarrier")
-            .field("closing", &self.is_closing())
-            .field("started", &self.started.load(Ordering::SeqCst))
-            .field("completed", &self.completed.load(Ordering::SeqCst))
+            .field("closing", &self.closing.load(Ordering::Relaxed))
+            .field("started", &self.started.load(Ordering::Relaxed))
+            .field("completed", &self.completed.load(Ordering::Relaxed))
             .finish()
     }
 }

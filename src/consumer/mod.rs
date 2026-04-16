@@ -65,7 +65,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::auth::AuthConfig;
 use crate::error::{KrafkaError, Result};
@@ -144,6 +144,12 @@ pub struct Consumer {
 /// Returns `(total_lag, max_lag)` where `total_lag` is the sum across all
 /// partitions (using `saturating_add`) and `max_lag` is the per-partition
 /// maximum. Only partitions present in both maps contribute.
+///
+/// **Staleness caveat**: high watermarks are updated only when a fetch
+/// response contains records. If no new data arrives on a partition, the
+/// cached watermark stales and the reported lag becomes increasingly
+/// inaccurate. Lag should be treated as *eventually consistent*. For
+/// precise lag values, issue a `ListOffsets` RPC externally.
 fn compute_aggregate_lag(
     offsets: &HashMap<(String, PartitionId), Offset>,
     high_watermarks: &HashMap<(String, PartitionId), Offset>,
@@ -742,7 +748,17 @@ impl Consumer {
         if self.config.enable_auto_commit
             && let Err(e) = self.commit().await
         {
-            warn!("Auto-commit before cooperative revocation failed: {}", e);
+            if e.is_retriable() {
+                warn!(
+                    "Auto-commit before cooperative revocation failed (retriable): {}",
+                    e
+                );
+            } else {
+                error!(
+                    "Auto-commit before cooperative revocation failed (fatal): {}",
+                    e
+                );
+            }
         }
         self.safe_on_partitions_revoked(revoked_tps);
         self.apply_partition_revocations(revoked_tuples).await;
@@ -1020,7 +1036,17 @@ impl Consumer {
             if self.config.enable_auto_commit
                 && let Err(e) = self.commit().await
             {
-                warn!("Auto-commit before KIP-848 revocation failed: {}", e);
+                if e.is_retriable() {
+                    warn!(
+                        "Auto-commit before KIP-848 revocation failed (retriable): {}",
+                        e
+                    );
+                } else {
+                    error!(
+                        "Auto-commit before KIP-848 revocation failed (fatal): {}",
+                        e
+                    );
+                }
             }
             self.safe_on_partitions_revoked(&revoked);
             let revoked_tuples: Vec<(String, PartitionId)> = revoked
@@ -1093,7 +1119,14 @@ impl Consumer {
             if self.config.enable_auto_commit
                 && let Err(e) = self.commit().await
             {
-                warn!("Auto-commit before eager revocation failed: {}", e);
+                if e.is_retriable() {
+                    warn!(
+                        "Auto-commit before eager revocation failed (retriable): {}",
+                        e
+                    );
+                } else {
+                    error!("Auto-commit before eager revocation failed (fatal): {}", e);
+                }
             }
             self.safe_on_partitions_revoked(&revoked);
             self.clear_partition_state().await;

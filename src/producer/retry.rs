@@ -219,6 +219,13 @@ impl RetryContext {
             let backoff = if let Some(deadline) = self.policy.delivery_timeout {
                 let remaining = deadline.saturating_sub(elapsed);
                 if remaining.is_zero() {
+                    warn!(
+                        operation = %self.operation,
+                        attempt = self.attempt,
+                        elapsed_ms = elapsed.as_millis(),
+                        error = %error,
+                        "Delivery timeout exceeded, giving up"
+                    );
                     return None;
                 }
                 backoff.min(remaining)

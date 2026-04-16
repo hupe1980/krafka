@@ -1052,21 +1052,29 @@ impl ProducerBuilder {
             return Err(KrafkaError::config("bootstrap.servers is required"));
         }
         if self.config.max_in_flight == 0 {
-            return Err(KrafkaError::config("max_in_flight must be >= 1"));
+            return Err(KrafkaError::config(format!(
+                "max_in_flight must be >= 1 (got {})",
+                self.config.max_in_flight
+            )));
         }
         if self.config.batch_size == 0 {
-            return Err(KrafkaError::config("batch_size must be >= 1"));
+            return Err(KrafkaError::config(format!(
+                "batch_size must be >= 1 (got {})",
+                self.config.batch_size
+            )));
         }
         if self.config.idempotent {
             if self.config.acks != Acks::All {
-                return Err(KrafkaError::config(
-                    "idempotent producer requires acks = All",
-                ));
+                return Err(KrafkaError::config(format!(
+                    "idempotent producer requires acks = All (got {:?})",
+                    self.config.acks
+                )));
             }
             if self.config.max_in_flight > 5 {
-                return Err(KrafkaError::config(
-                    "idempotent producer requires max_in_flight <= 5",
-                ));
+                return Err(KrafkaError::config(format!(
+                    "idempotent producer requires max_in_flight <= 5 (got {})",
+                    self.config.max_in_flight
+                )));
             }
         }
         let interceptor: Arc<dyn crate::interceptor::ProducerInterceptor> =

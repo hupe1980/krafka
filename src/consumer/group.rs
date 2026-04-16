@@ -940,6 +940,7 @@ impl HeartbeatStatus {
 
 /// Commands for the heartbeat background task.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum HeartbeatCommand {
     /// Stop the heartbeat task.
     Stop,

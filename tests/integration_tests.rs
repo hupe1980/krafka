@@ -1893,10 +1893,15 @@ async fn test_admin_describe_consumer_group() {
 
     subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
 
-    // Drive the rebalance: poll multiple times so JoinGroup/SyncGroup completes.
-    // poll_for_records with min_records=0 exits after one poll, so loop explicitly.
-    for _ in 0..5 {
+    // Drive the rebalance until the consumer actually has partitions assigned.
+    // On Kafka 3.9 under CI load, JoinGroup/SyncGroup can take many polls.
+    for i in 0..20 {
         let _ = consumer.poll(Duration::from_secs(3)).await;
+        let assignment = consumer.assignment().await;
+        if !assignment.is_empty() {
+            eprintln!("Consumer got assignment after {} poll(s)", i + 1);
+            break;
+        }
     }
 
     let admin = AdminClient::builder()
@@ -1909,7 +1914,7 @@ async fn test_admin_describe_consumer_group() {
     // report the member after the rebalance completes. Keep polling the
     // consumer between attempts so it stays in the group (heartbeats).
     let mut descriptions = Vec::new();
-    for attempt in 0..15 {
+    for attempt in 0..20 {
         descriptions = admin
             .describe_consumer_groups(vec![group_id.to_string()])
             .await
@@ -1918,13 +1923,15 @@ async fn test_admin_describe_consumer_group() {
             break;
         }
         eprintln!(
-            "describe_consumer_groups attempt {}/15: {} members, retrying in 2s...",
+            "describe_consumer_groups attempt {}/20: {} members, state={}, retrying in 2s...",
             attempt + 1,
             descriptions.first().map_or(0, |d| d.members.len()),
+            descriptions
+                .first()
+                .map_or("N/A".to_string(), |d| d.state.clone()),
         );
         // Keep polling so the consumer maintains its group membership
-        let _ = consumer.poll(Duration::from_secs(1)).await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        let _ = consumer.poll(Duration::from_secs(2)).await;
     }
 
     assert_eq!(descriptions.len(), 1);

@@ -610,10 +610,7 @@ impl ErrorCode {
             120 => Self::TransactionAbortable,
             124 => Self::RebootstrapRequired,
             128 => Self::InvalidRegularExpression,
-            other => {
-                tracing::debug!(error_code = other, "Unrecognized Kafka error code");
-                Self::Unknown(other)
-            }
+            other => Self::Unknown(other),
         }
     }
 

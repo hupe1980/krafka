@@ -1303,6 +1303,13 @@ Lag is also exposed via metrics (recomputed after every offset or high-watermark
 
 High watermarks and log start offsets are automatically cleared when partitions are revoked or the consumer unsubscribes. Lag metrics are recomputed accordingly.
 
+> **Staleness caveat** — High watermarks are only updated when a fetch
+> response is received from the broker. If the consumer is paused, slow, or
+> not polling, the cached watermarks (and therefore `current_lag`,
+> `compute_aggregate_lag`, and the `lag`/`lag_max` metrics) can become stale
+> and undercount the true lag. Treat lag values as eventually consistent
+> rather than real-time.
+
 ## Next Steps
 
 - [Interceptors Guide](interceptors.md) - Producer and consumer interceptor hooks

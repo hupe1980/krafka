@@ -136,16 +136,16 @@ pub async fn build_tls_connector(config: &TlsConfig) -> Result<TlsConnector> {
 /// Connect with TLS using a pre-built connector.
 ///
 /// Performs the TLS handshake on the provided TCP stream using the given
-/// [`TlsConnector`]. The SNI hostname is taken from [`TlsConfig::sni_hostname`]
-/// if set, otherwise from the connection `hostname`.
+/// [`TlsConnector`]. When `sni_hostname` is `Some`, it overrides the
+/// connection `hostname` for SNI (Server Name Indication).
 pub async fn connect_tls(
     stream: TcpStream,
     hostname: &str,
-    tls_config: &TlsConfig,
+    sni_hostname: Option<&str>,
     connector: &TlsConnector,
 ) -> Result<TlsStream<TcpStream>> {
-    // Use SNI hostname if specified, otherwise use the connection hostname
-    let sni_hostname = tls_config.sni_hostname.as_deref().unwrap_or(hostname);
+    // Use explicit SNI hostname override if provided, otherwise connection hostname
+    let sni_hostname = sni_hostname.unwrap_or(hostname);
 
     // Extract the bare hostname (no port, no brackets) using the shared helper
     let host = crate::util::extract_sni_hostname(sni_hostname)?.to_string();

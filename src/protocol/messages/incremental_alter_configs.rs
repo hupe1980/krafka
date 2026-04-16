@@ -13,6 +13,7 @@ use crate::protocol::{
 
 /// Operation type for incremental config alteration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 #[repr(i8)]
 pub enum AlterConfigOp {
     /// Set the config value.
