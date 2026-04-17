@@ -564,17 +564,18 @@ impl ConnectionPool {
             Reconnect(String),
         }
 
+        // Double-check before acquiring the coalescing lock: another task
+        // may have finished reconnecting between our fast-path miss and now.
+        // Done *outside* the `connecting` critical section to enforce a
+        // consistent lock order (connections_by_addr before connecting) and
+        // prevent deadlocking with the reconnector completion path.
+        let existing = {
+            let conns = self.connections_by_addr.read();
+            conns.get(address).filter(|c| c.is_usable()).cloned()
+        };
+
         let action = {
             let mut connecting = self.connecting.lock();
-
-            // Double-check under the coalescing lock: another task may have
-            // finished reconnecting between our fast-path miss and now.
-            // Scope the RwLock read guard tightly so it is released before
-            // the decision tree touches the `connecting` map.
-            let existing = {
-                let conns = self.connections_by_addr.read();
-                conns.get(address).filter(|c| c.is_usable()).cloned()
-            };
 
             if let Some(conn) = existing {
                 CoalesceAction::AlreadyConnected(conn)
@@ -612,15 +613,19 @@ impl ConnectionPool {
         // Reconnect WITHOUT holding any lock
         let result = self.reconnect_with_backoff(address).await;
 
-        // Store successful connection in the address map
+        // Notify waiting tasks and store the connection.
+        // Lock order: `connecting` before `connections_by_addr` (consistent
+        // with `get_or_reconnect` which reads `connections_by_addr` before
+        // locking `connecting`; a concurrent reader finishing its read before
+        // we write is safe — no nested hold in either direction).
+        let waiters = self.connecting.lock().remove(address).unwrap_or_default();
+
         if let Ok(conn) = &result {
             self.connections_by_addr
                 .write()
                 .insert(addr_owned, conn.clone());
         }
 
-        // Notify waiting tasks
-        let waiters = self.connecting.lock().remove(address).unwrap_or_default();
         for waiter in waiters {
             let _ = waiter.send(result.clone());
         }
