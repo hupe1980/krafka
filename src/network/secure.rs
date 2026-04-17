@@ -182,7 +182,10 @@ impl SecureConnectionConfigBuilder {
 #[derive(Debug)]
 pub enum ChallengeResponse {
     /// Send these bytes and continue the handshake.
-    Continue(Vec<u8>),
+    ///
+    /// Wrapped in [`Zeroizing`] because SCRAM challenge responses contain
+    /// proof data derived from the password.
+    Continue(Zeroizing<Vec<u8>>),
     /// Send these bytes to satisfy a protocol requirement (e.g., the
     /// OAuthBearer `\x01` failure-ack per RFC 7628 §3.2.3), then fail
     /// with the given auth error. The caller must **not** attempt to read
@@ -452,7 +455,7 @@ impl SaslAuthenticator {
                 match scram.state() {
                     crate::auth::ScramState::WaitingServerFirst => {
                         let response = scram.process_server_first(challenge)?;
-                        Ok(ChallengeResponse::Continue(response))
+                        Ok(ChallengeResponse::Continue(Zeroizing::new(response)))
                     }
                     crate::auth::ScramState::WaitingServerFinal => {
                         scram.verify_server_final(challenge)?;

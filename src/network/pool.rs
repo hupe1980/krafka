@@ -406,8 +406,8 @@ impl Drop for ReconnectGuard {
 /// A pool of connections to Kafka brokers.
 ///
 /// Uses `parking_lot::RwLock` (writer-fair, non-async) for connection
-/// maps so that the hot `get_connection*` read path is lock-free when
-/// there are no concurrent writers.  Reconnection attempts to the same address are coalesced
+/// maps so that the hot `get_connection*` read path stays fast and avoids
+/// async lock overhead when there are no concurrent writers.  Reconnection attempts to the same address are coalesced
 /// via a `parking_lot::Mutex`: only the first caller performs the
 /// TCP/TLS/SASL handshake while subsequent callers wait on oneshot channels,
 /// preventing thundering-herd reconnection storms.  The sync mutex ensures

@@ -70,14 +70,12 @@ impl InFlightBarrier {
 
     pub(crate) async fn wait_for(&self, target: u64) {
         loop {
-            // Relaxed is sufficient: `Notify` provides the synchronization
-            // barrier between `complete_one` and this loop.
-            if self.completed.load(Ordering::Relaxed) >= target {
+            if self.completed.load(Ordering::Acquire) >= target {
                 return;
             }
 
             let notified = self.notify.notified();
-            if self.completed.load(Ordering::Relaxed) >= target {
+            if self.completed.load(Ordering::Acquire) >= target {
                 return;
             }
             notified.await;
@@ -85,7 +83,7 @@ impl InFlightBarrier {
     }
 
     fn complete_one(&self) {
-        self.completed.fetch_add(1, Ordering::Relaxed);
+        self.completed.fetch_add(1, Ordering::Release);
         // `notify_waiters` (broadcast) is intentional: concurrent `flush()`
         // and `close_inner()` can wait on different targets simultaneously,
         // so `notify_one()` could leave the other waiter stuck.

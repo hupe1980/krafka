@@ -212,29 +212,27 @@ impl RetryContext {
             return None;
         }
 
-        // 2. Non-retriable errors are never retried.
-        if !error.is_retriable() {
-            debug!(
-                operation = %self.operation,
-                error = %error,
-                "Non-retriable error, not retrying"
-            );
+        // 2. Delegate retriability + count check to RetryPolicy.
+        if !self.policy.should_retry(error, self.attempt) {
+            if !error.is_retriable() {
+                debug!(
+                    operation = %self.operation,
+                    error = %error,
+                    "Non-retriable error, not retrying"
+                );
+            } else {
+                warn!(
+                    operation = %self.operation,
+                    attempt = self.attempt,
+                    max_retries = self.policy.max_retries,
+                    error = %error,
+                    "Max retries reached, giving up"
+                );
+            }
             return None;
         }
 
-        // 3. Retry count exhausted.
-        if self.attempt >= self.policy.max_retries {
-            warn!(
-                operation = %self.operation,
-                attempt = self.attempt,
-                max_retries = self.policy.max_retries,
-                error = %error,
-                "Max retries reached, giving up"
-            );
-            return None;
-        }
-
-        // 4. Retry — increment *after* all give-up checks pass.
+        // 3. Retry — increment *after* all give-up checks pass.
         self.attempt += 1;
         let backoff = self.policy.calculate_backoff(self.attempt);
 
