@@ -98,14 +98,14 @@ zstd = ["dep:zstd"]
 # Binary size impact: +2-3 MB (release build).
 # If binary size is critical, use manual credential loading with AwsMskIamCredentials::from_env()
 # which works without this feature.
-aws-msk = ["aws-config", "aws-credential-types"]
+aws-msk = ["dep:aws-config", "dep:aws-credential-types"]
 # Enable the built-in Confluent Schema Registry HTTP client.
 # The core schema_registry module (wire format, trait, caching) is always available.
-schema-registry = ["reqwest", "serde", "serde_json"]
+schema-registry = ["dep:reqwest", "dep:serde", "dep:serde_json"]
 # Enable the AWS Glue Schema Registry SDK client.
 # The core glue module (wire format, trait, caching) is always available.
 # This feature adds the aws-sdk-glue dependency for direct Glue API calls.
-aws-glue-schema-registry = ["aws-sdk-glue", "aws-config"]
+aws-glue-schema-registry = ["dep:aws-sdk-glue", "dep:aws-config"]
 # Allow disabling TLS certificate verification (MITM risk!).
 # Only enable for local development or testing with self-signed certificates.
 # Requires calling `TlsConfig::insecure()`.
@@ -120,7 +120,7 @@ unstable-protocol = []
 telemetry = []
 # Enable SOCKS5 proxy support for connecting to brokers through a proxy.
 # Useful for VPN/bastion host setups where brokers are not directly reachable.
-socks5 = ["tokio-socks"]
+socks5 = ["dep:tokio-socks"]
 
 [dev-dependencies]
 tokio-test = "0.4"
