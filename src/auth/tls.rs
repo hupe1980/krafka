@@ -484,7 +484,10 @@ mod tests {
     #[cfg(not(feature = "native-tls-roots"))]
     fn test_build_tls_config_native_roots_requires_feature() {
         setup_crypto_provider();
-        let config = TlsConfig::new().with_native_roots();
+        // `with_native_roots()` is feature-gated, so set the field directly
+        // to exercise the runtime fallback in `load_default_roots`.
+        let mut config = TlsConfig::new();
+        config.use_native_roots = true;
         let err = build_tls_config_sync(&config).unwrap_err();
         assert!(
             err.to_string().contains("native-tls-roots"),

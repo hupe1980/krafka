@@ -489,6 +489,8 @@ impl TlsConfig {
     /// trust anchors replace the default WebPKI roots. When combined with
     /// [`with_ca_cert()`](Self::with_ca_cert), native roots are loaded first
     /// and the explicit CA certificates are added on top.
+    #[cfg(feature = "native-tls-roots")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls-roots")))]
     pub fn with_native_roots(mut self) -> Self {
         self.use_native_roots = true;
         self
@@ -990,6 +992,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native-tls-roots")]
     fn test_tls_config() {
         let config = TlsConfig::new()
             .with_ca_cert("/path/to/ca.pem")
@@ -997,7 +1000,7 @@ mod tests {
             .with_native_roots();
 
         assert!(config.verify_server_cert);
-        assert!(config.use_native_roots);
+        assert!(config.use_native_roots());
         assert_eq!(config.ca_cert_path, Some("/path/to/ca.pem".to_string()));
         assert_eq!(
             config.client_cert_path,
