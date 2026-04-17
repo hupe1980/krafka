@@ -161,7 +161,7 @@ use crate::protocol::{
 use crate::util::CorrelationIdGenerator;
 use crate::util::extract_sni_hostname;
 
-use super::secure::SaslAuthenticator;
+use super::secure::{ChallengeResponse, SaslAuthenticator};
 
 /// Request priority level.
 ///
@@ -1194,41 +1194,44 @@ impl BrokerConnection {
             let mut challenge = auth_response.auth_bytes;
             let mut rounds = 0;
 
-            while let Some(response_bytes) = authenticator.process_challenge(&challenge)? {
-                rounds += 1;
-                if rounds > MAX_SASL_ROUNDS {
-                    return Err(KrafkaError::auth(format!(
-                        "SASL challenge-response exceeded {MAX_SASL_ROUNDS} rounds"
-                    )));
-                }
-
-                Self::send_sasl_authenticate(stream, &response_bytes, client_id).await?;
-
-                // If reading the response fails (e.g. server closes the
-                // connection after the OAuthBearer failure-ack), surface
-                // any deferred auth error instead of a generic network error.
-                let resp =
-                    match Self::read_sasl_authenticate_response(stream, max_response_size).await {
-                        Ok(resp) => resp,
-                        Err(network_err) => {
-                            authenticator.process_challenge(&[])?;
-                            return Err(network_err);
+            loop {
+                match authenticator.process_challenge(&challenge)? {
+                    ChallengeResponse::Done => break,
+                    ChallengeResponse::AckThenFail { ack, error } => {
+                        // Send the protocol-required ack (e.g., OAuthBearer \x01)
+                        // then surface the auth error without reading a response —
+                        // the server may close the connection immediately.
+                        let _ = Self::send_sasl_authenticate(stream, &ack, client_id).await;
+                        return Err(error);
+                    }
+                    ChallengeResponse::Continue(response_bytes) => {
+                        rounds += 1;
+                        if rounds > MAX_SASL_ROUNDS {
+                            return Err(KrafkaError::auth(format!(
+                                "SASL challenge-response exceeded {MAX_SASL_ROUNDS} rounds"
+                            )));
                         }
-                    };
-                if !resp.error_code.is_ok() {
-                    return Err(KrafkaError::auth(format!(
-                        "SASL authentication step failed: {:?} - {}",
-                        resp.error_code,
-                        resp.error_message.unwrap_or_default()
-                    )));
-                }
 
-                // The last successful response carries the session lifetime.
-                session_lifetime_ms = resp.session_lifetime_ms;
-                challenge = resp.auth_bytes;
+                        Self::send_sasl_authenticate(stream, &response_bytes, client_id).await?;
 
-                if authenticator.is_complete() {
-                    break;
+                        let resp = Self::read_sasl_authenticate_response(stream, max_response_size)
+                            .await?;
+                        if !resp.error_code.is_ok() {
+                            return Err(KrafkaError::auth(format!(
+                                "SASL authentication step failed: {:?} - {}",
+                                resp.error_code,
+                                resp.error_message.unwrap_or_default()
+                            )));
+                        }
+
+                        // The last successful response carries the session lifetime.
+                        session_lifetime_ms = resp.session_lifetime_ms;
+                        challenge = resp.auth_bytes;
+
+                        if authenticator.is_complete() {
+                            break;
+                        }
+                    }
                 }
             }
         }

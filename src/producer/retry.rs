@@ -143,7 +143,7 @@ impl RetryPolicy {
 pub struct RetryContext {
     /// The retry policy.
     policy: RetryPolicy,
-    /// Current attempt number (0 = first attempt).
+    /// Number of retries attempted so far (0 = no retries yet, only the initial attempt).
     attempt: u32,
     /// The operation being retried.
     operation: String,
@@ -198,7 +198,7 @@ impl RetryContext {
     pub fn record_failure(&mut self, error: &KrafkaError) -> Option<Duration> {
         let elapsed = self.started_at.elapsed();
 
-        // Check delivery timeout first — elapsed time trumps retry count.
+        // 1. Delivery timeout — elapsed time trumps everything else.
         if let Some(deadline) = self.policy.delivery_timeout
             && elapsed >= deadline
         {
@@ -212,50 +212,51 @@ impl RetryContext {
             return None;
         }
 
-        // Check retriability *before* incrementing so that `max_retries = N`
-        // yields exactly N retries (matching the transaction.rs retry loops
-        // which use `for attempt in 0..=max_retries`).
-        if self.policy.should_retry(error, self.attempt) {
-            self.attempt += 1;
-            let backoff = self.policy.calculate_backoff(self.attempt);
-
-            // Clamp backoff so it doesn't exceed remaining delivery budget.
-            // The `elapsed >= deadline` check above already handles the
-            // zero-remaining case, so `remaining` is always positive here.
-            let backoff = if let Some(deadline) = self.policy.delivery_timeout {
-                let remaining = deadline.saturating_sub(elapsed);
-                backoff.min(remaining)
-            } else {
-                backoff
-            };
-
+        // 2. Non-retriable errors are never retried.
+        if !error.is_retriable() {
             debug!(
+                operation = %self.operation,
+                error = %error,
+                "Non-retriable error, not retrying"
+            );
+            return None;
+        }
+
+        // 3. Retry count exhausted.
+        if self.attempt >= self.policy.max_retries {
+            warn!(
                 operation = %self.operation,
                 attempt = self.attempt,
                 max_retries = self.policy.max_retries,
-                backoff_ms = backoff.as_millis(),
                 error = %error,
-                "Retrying after failure"
+                "Max retries reached, giving up"
             );
-            Some(backoff)
-        } else {
-            if self.policy.max_retries_reached(self.attempt + 1) {
-                warn!(
-                    operation = %self.operation,
-                    attempt = self.attempt,
-                    max_retries = self.policy.max_retries,
-                    error = %error,
-                    "Max retries reached, giving up"
-                );
-            } else {
-                debug!(
-                    operation = %self.operation,
-                    error = %error,
-                    "Non-retriable error, not retrying"
-                );
-            }
-            None
+            return None;
         }
+
+        // 4. Retry — increment *after* all give-up checks pass.
+        self.attempt += 1;
+        let backoff = self.policy.calculate_backoff(self.attempt);
+
+        // Clamp backoff so it doesn't exceed remaining delivery budget.
+        // The `elapsed >= deadline` check above already handles the
+        // zero-remaining case, so `remaining` is always positive here.
+        let backoff = if let Some(deadline) = self.policy.delivery_timeout {
+            let remaining = deadline.saturating_sub(elapsed);
+            backoff.min(remaining)
+        } else {
+            backoff
+        };
+
+        debug!(
+            operation = %self.operation,
+            attempt = self.attempt,
+            max_retries = self.policy.max_retries,
+            backoff_ms = backoff.as_millis(),
+            error = %error,
+            "Retrying after failure"
+        );
+        Some(backoff)
     }
 
     /// Record a successful attempt.
@@ -437,6 +438,69 @@ mod tests {
             unique_count > 1,
             "with jitter_factor > 0, calculate_backoff should produce varying results, but got {} unique values",
             unique_count
+        );
+    }
+
+    #[test]
+    fn test_delivery_timeout_gives_up_when_exceeded() {
+        let policy = RetryPolicy::new()
+            .with_max_retries(10) // Plenty of retries remaining
+            .with_delivery_timeout(Some(Duration::from_millis(50)));
+
+        // Start 100ms in the past — elapsed already exceeds the 50ms deadline.
+        let started_at = Instant::now() - Duration::from_millis(100);
+        let mut ctx = RetryContext::new_with_start(policy, "test_timeout", started_at);
+
+        let error = KrafkaError::timeout("test");
+        let result = ctx.record_failure(&error);
+
+        assert!(
+            result.is_none(),
+            "should give up when delivery timeout exceeded"
+        );
+        // Attempt counter is not incremented on timeout (failure is immediate).
+        assert_eq!(ctx.attempt(), 0);
+    }
+
+    #[test]
+    fn test_delivery_timeout_clamps_backoff_to_remaining_budget() {
+        let policy = RetryPolicy::new()
+            .with_max_retries(5)
+            .with_initial_backoff(Duration::from_secs(10)) // Very large backoff
+            .with_jitter_factor(0.0)
+            .with_delivery_timeout(Some(Duration::from_secs(1)));
+
+        // 900ms elapsed — 100ms remaining in the 1s budget.
+        let started_at = Instant::now() - Duration::from_millis(900);
+        let mut ctx = RetryContext::new_with_start(policy, "test_clamp", started_at);
+
+        let error = KrafkaError::timeout("test");
+        let backoff = ctx
+            .record_failure(&error)
+            .expect("should still retry within budget");
+
+        // The raw backoff would be 10s, but it must be clamped to ≤ remaining (~100ms).
+        assert!(
+            backoff <= Duration::from_millis(150),
+            "backoff ({backoff:?}) should be clamped to remaining delivery budget"
+        );
+    }
+
+    #[test]
+    fn test_delivery_timeout_disabled_does_not_limit_retries() {
+        let policy = RetryPolicy::new()
+            .with_max_retries(2)
+            .with_delivery_timeout(None);
+
+        // Even with a very old start time, timeout never fires.
+        let started_at = Instant::now() - Duration::from_secs(3600);
+        let mut ctx = RetryContext::new_with_start(policy, "test_no_timeout", started_at);
+
+        let error = KrafkaError::timeout("test");
+        let backoff = ctx.record_failure(&error);
+        assert!(
+            backoff.is_some(),
+            "should retry when delivery_timeout is None"
         );
     }
 }

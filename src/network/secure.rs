@@ -178,6 +178,25 @@ impl SecureConnectionConfigBuilder {
     }
 }
 
+/// Response from processing a SASL challenge.
+#[derive(Debug)]
+pub enum ChallengeResponse {
+    /// Send these bytes and continue the handshake.
+    Continue(Vec<u8>),
+    /// Send these bytes to satisfy a protocol requirement (e.g., the
+    /// OAuthBearer `\x01` failure-ack per RFC 7628 §3.2.3), then fail
+    /// with the given auth error. The caller must **not** attempt to read
+    /// a broker response after sending — the server may close immediately.
+    AckThenFail {
+        /// Bytes the protocol requires the client to send before giving up.
+        ack: Vec<u8>,
+        /// The underlying authentication error.
+        error: KrafkaError,
+    },
+    /// Authentication step complete, no response to send.
+    Done,
+}
+
 /// SASL authenticator for handling authentication handshakes.
 pub struct SaslAuthenticator {
     mechanism: SaslMechanism,
@@ -187,8 +206,6 @@ pub struct SaslAuthenticator {
     msk_iam_complete: bool,
     oauthbearer_token: Option<OAuthBearerToken>,
     oauthbearer_complete: bool,
-    /// Deferred error from OAuthBearer failure — returned after the `\x01` ack is sent.
-    oauthbearer_pending_error: Option<KrafkaError>,
 }
 
 impl SaslAuthenticator {
@@ -218,7 +235,6 @@ impl SaslAuthenticator {
                 msk_iam_complete: false,
                 oauthbearer_token: None,
                 oauthbearer_complete: false,
-                oauthbearer_pending_error: None,
             }),
             SaslMechanism::ScramSha256 => {
                 let creds = auth.scram_credentials.as_ref()?;
@@ -235,7 +251,6 @@ impl SaslAuthenticator {
                     msk_iam_complete: false,
                     oauthbearer_token: None,
                     oauthbearer_complete: false,
-                    oauthbearer_pending_error: None,
                 })
             }
             SaslMechanism::ScramSha512 => {
@@ -253,7 +268,6 @@ impl SaslAuthenticator {
                     msk_iam_complete: false,
                     oauthbearer_token: None,
                     oauthbearer_complete: false,
-                    oauthbearer_pending_error: None,
                 })
             }
             SaslMechanism::AwsMskIam => {
@@ -266,7 +280,6 @@ impl SaslAuthenticator {
                     msk_iam_complete: false,
                     oauthbearer_token: None,
                     oauthbearer_complete: false,
-                    oauthbearer_pending_error: None,
                 })
             }
             SaslMechanism::OAuthBearer => {
@@ -286,7 +299,6 @@ impl SaslAuthenticator {
                     msk_iam_complete: false,
                     oauthbearer_token: Some(token),
                     oauthbearer_complete: false,
-                    oauthbearer_pending_error: None,
                 })
             }
             SaslMechanism::Gssapi => {
@@ -329,7 +341,6 @@ impl SaslAuthenticator {
             msk_iam_complete: false,
             oauthbearer_token: None,
             oauthbearer_complete: false,
-            oauthbearer_pending_error: None,
         }))
     }
 
@@ -339,17 +350,23 @@ impl SaslAuthenticator {
     ///
     /// # Errors
     ///
-    /// Returns an error if MSK IAM signing payload creation fails (e.g.
-    /// invalid credentials or host).
+    /// Returns an error if the mechanism is MSK IAM but credentials are
+    /// missing (e.g. `resolve_msk_iam_provider()` was not called) or if
+    /// MSK IAM signing payload creation fails.
     pub fn set_msk_host(
         &mut self,
         auth: &AuthConfig,
         host: &str,
         clock_offset_secs: i64,
     ) -> Result<()> {
-        if self.mechanism == SaslMechanism::AwsMskIam
-            && let Some(creds) = auth.aws_msk_iam_credentials.as_ref()
-        {
+        if self.mechanism == SaslMechanism::AwsMskIam {
+            let creds = auth.aws_msk_iam_credentials.as_ref().ok_or_else(|| {
+                KrafkaError::auth(
+                    "AWS MSK IAM mechanism selected but no credentials available; \
+                     if using a credential provider, ensure resolve_msk_iam_provider() \
+                     is called before creating the authenticator",
+                )
+            })?;
             self.msk_iam_authenticator = Some(MskIamAuthenticator::new_with_clock_offset(
                 creds,
                 host,
@@ -412,12 +429,18 @@ impl SaslAuthenticator {
         }
     }
 
-    /// Process a challenge response and return the next message.
-    pub fn process_challenge(&mut self, challenge: &[u8]) -> Result<Option<Vec<u8>>> {
+    /// Process a challenge response from the broker.
+    ///
+    /// Returns a [`ChallengeResponse`] indicating what the caller should do next:
+    /// - [`Continue`](ChallengeResponse::Continue) — send the bytes, read the next challenge.
+    /// - [`AckThenFail`](ChallengeResponse::AckThenFail) — send the ack bytes, then
+    ///   return the error **without** reading a response (the server may close immediately).
+    /// - [`Done`](ChallengeResponse::Done) — handshake complete, nothing to send.
+    pub fn process_challenge(&mut self, challenge: &[u8]) -> Result<ChallengeResponse> {
         match self.mechanism {
             SaslMechanism::Plain => {
                 // PLAIN has no challenge-response, just initial auth
-                Ok(None)
+                Ok(ChallengeResponse::Done)
             }
             SaslMechanism::ScramSha256 | SaslMechanism::ScramSha512 => {
                 let scram = self
@@ -429,11 +452,11 @@ impl SaslAuthenticator {
                 match scram.state() {
                     crate::auth::ScramState::WaitingServerFirst => {
                         let response = scram.process_server_first(challenge)?;
-                        Ok(Some(response))
+                        Ok(ChallengeResponse::Continue(response))
                     }
                     crate::auth::ScramState::WaitingServerFinal => {
                         scram.verify_server_final(challenge)?;
-                        Ok(None) // Authentication complete
+                        Ok(ChallengeResponse::Done)
                     }
                     _ => Err(KrafkaError::auth("Unexpected SCRAM state")),
                 }
@@ -442,14 +465,9 @@ impl SaslAuthenticator {
                 // MSK IAM authentication is complete after the server accepts the signed payload
                 // The server sends back a success response (which may be empty)
                 self.msk_iam_complete = true;
-                Ok(None)
+                Ok(ChallengeResponse::Done)
             }
             SaslMechanism::OAuthBearer => {
-                // If a previous round stored a deferred error, return it now.
-                if let Some(err) = self.oauthbearer_pending_error.take() {
-                    return Err(err);
-                }
-
                 // Process server response after initial GS2 token message
                 let token = self
                     .oauthbearer_token
@@ -459,14 +477,17 @@ impl SaslAuthenticator {
                 match token.process_server_response(challenge) {
                     Ok(()) => {
                         self.oauthbearer_complete = true;
-                        Ok(None) // Authentication complete
+                        Ok(ChallengeResponse::Done)
                     }
                     Err(e) => {
                         // RFC 7628 §3.2.3: client MUST send a single \x01 byte to
                         // acknowledge the server's error before closing the connection.
-                        self.oauthbearer_complete = true;
-                        self.oauthbearer_pending_error = Some(e);
-                        Ok(Some(vec![0x01]))
+                        // Return AckThenFail so the caller can send the ack and
+                        // propagate the real auth error deterministically.
+                        Ok(ChallengeResponse::AckThenFail {
+                            ack: vec![0x01],
+                            error: e,
+                        })
                     }
                 }
             }
@@ -485,9 +506,7 @@ impl SaslAuthenticator {
                 .as_ref()
                 .is_some_and(|c| *c.state() == crate::auth::ScramState::Complete),
             SaslMechanism::AwsMskIam => self.msk_iam_complete,
-            SaslMechanism::OAuthBearer => {
-                self.oauthbearer_complete && self.oauthbearer_pending_error.is_none()
-            }
+            SaslMechanism::OAuthBearer => self.oauthbearer_complete,
             SaslMechanism::Gssapi => false,
         }
     }
@@ -627,20 +646,20 @@ mod tests {
         let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None).unwrap();
         let _ = authenticator.initial_response().unwrap();
 
-        // First call returns the RFC 7628 §3.2.3 failure-ack byte (\x01).
-        let result = authenticator.process_challenge(br#"{"status":"invalid_token"}"#);
-        assert_eq!(result.unwrap(), Some(vec![0x01]));
+        // Server error returns AckThenFail: the \x01 byte and the auth error together.
+        let result = authenticator
+            .process_challenge(br#"{"status":"invalid_token"}"#)
+            .unwrap();
+        match result {
+            ChallengeResponse::AckThenFail { ack, error } => {
+                assert_eq!(ack, vec![0x01]);
+                assert!(error.to_string().contains("invalid_token"));
+            }
+            other => panic!("expected AckThenFail, got {other:?}"),
+        }
 
-        // Exchange is NOT complete while the deferred error is pending.
-        assert!(
-            !authenticator.is_complete(),
-            "is_complete() must be false while a deferred error is pending"
-        );
-
-        // Second call surfaces the deferred error.
-        let result = authenticator.process_challenge(&[]);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("invalid_token"));
+        // Authentication was not completed successfully.
+        assert!(!authenticator.is_complete());
     }
 
     #[test]
