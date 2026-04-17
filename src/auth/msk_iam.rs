@@ -73,10 +73,11 @@ pub struct MskIamAuthenticator {
     region: String,
     /// Broker host (without port).
     host: String,
-    /// Clock offset in seconds applied when creating the auth payload.
+    /// Internal clock offset in seconds for automatic skew compensation.
     ///
-    /// Positive values move the signing timestamp into the future (local
-    /// clock is behind the broker); negative values move it into the past.
+    /// Set by the connection layer when MSK IAM authentication fails with a
+    /// clock-skew error. Not exposed publicly — SigV4 timestamps should
+    /// come from the system clock; skew is handled operationally via NTP.
     clock_offset_secs: i64,
 }
 
@@ -127,13 +128,15 @@ impl MskIamAuthenticator {
 
     /// Create a new MSK IAM authenticator with a clock offset.
     ///
-    /// The `clock_offset_secs` is added to `SystemTime::now()` when signing
-    /// requests. Positive values mean the local clock is behind the broker.
+    /// Used internally by the connection layer for automatic clock-skew
+    /// compensation when MSK IAM authentication fails with a signature
+    /// mismatch. Not part of the public API — SigV4 timestamps should
+    /// come from the system clock.
     ///
     /// The offset is clamped to ±86 400 s (24 hours). AWS SigV4 only
-    /// tolerates ±5 minutes, so larger offsets indicate a configuration
-    /// error, but we allow a generous margin for testing.
-    pub fn new_with_clock_offset(
+    /// tolerates ±5 minutes, so larger offsets indicate a misconfigured
+    /// clock.
+    pub(crate) fn new_with_clock_offset(
         credentials: &AwsMskIamCredentials,
         host: impl Into<String>,
         clock_offset_secs: i64,
@@ -152,9 +155,9 @@ impl MskIamAuthenticator {
 
     /// Create the authentication payload to send to MSK.
     ///
-    /// Applies [`clock_offset_secs`](Self::new_with_clock_offset) (if any) to
-    /// `SystemTime::now()` before signing. Returns JSON-formatted signed
-    /// authentication payload.
+    /// Returns JSON-formatted signed authentication payload. If an internal
+    /// clock offset has been set (for automatic skew compensation), it is
+    /// applied to `SystemTime::now()` before signing.
     pub fn create_auth_payload(&self) -> Vec<u8> {
         let now = SystemTime::now();
         let adjusted = if self.clock_offset_secs >= 0 {
