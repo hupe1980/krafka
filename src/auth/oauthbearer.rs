@@ -226,10 +226,13 @@ impl OAuthBearerToken {
     /// Returns `true` if the token has a known expiry and that expiry is in the past.
     pub fn is_expired(&self) -> bool {
         if let Some(lifetime_ms) = self.lifetime_ms {
-            let now_ms = SystemTime::now()
+            let now_u128 = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_millis() as i64;
+                .as_millis();
+            // Clamp to i64::MAX so an overflow is treated as "definitely expired"
+            // rather than wrapping to a negative value.
+            let now_ms = i64::try_from(now_u128).unwrap_or(i64::MAX);
             now_ms >= lifetime_ms
         } else {
             false
