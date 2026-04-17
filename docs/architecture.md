@@ -36,7 +36,7 @@ This document describes the internal architecture of Krafka, a pure Rust Apache 
 - Constant-time comparison via `subtle` crate (timing-attack resistant)
 - PBKDF2 iteration count validated to prevent DoS
 - Protocol allocations capped to prevent OOM from malicious brokers
-- Decompression bomb protection (128 MiB limit)
+- Decompression bomb protection (128 MiB default, configurable)
 - Debug output redacts all credentials
 
 ## Module Architecture
@@ -169,6 +169,13 @@ Each connection maintains two request channels to prevent consumer group ejectio
 High-priority requests (Heartbeat, Metadata, FindCoordinator, ApiVersions) are always processed
 first, ensuring consumer group membership is maintained even under heavy produce/fetch load.
 
+### KIP-219: Client-Side Throttle Compliance
+
+When a broker returns `throttle_time_ms > 0` in a response, the client voluntarily delays
+subsequent normal-priority requests by the indicated duration. High-priority requests (heartbeats,
+metadata) are never delayed, preserving group membership. Throttle state is tracked per
+`BrokerConnection` using a `parking_lot::Mutex<Instant>` deadline.
+
 ### Automatic Reconnection
 
 When connections fail, Krafka automatically attempts to reconnect with exponential backoff:
@@ -261,6 +268,18 @@ where
 - Forced refresh on NotLeaderForPartition errors
 - Topic-specific refresh when subscribing
 - API version negotiation: negotiates the highest mutually supported Metadata version (v0-v8, no gaps); versions are cumulative (rack since v1, cluster_id since v2, offline replicas since v5), and v7 specifically adds leader_epoch
+
+### KIP-899 Metadata Recovery (Rebootstrap)
+
+When `MetadataRecoveryStrategy::Rebootstrap` is configured and no broker is
+reachable for longer than the rebootstrap trigger (default 5 min), the client
+automatically closes all connections, clears the metadata cache, and falls back
+to bootstrap servers to re-discover the cluster. This handles scenarios like
+full-cluster rolling restarts where every cached broker IP becomes stale.
+
+The server can also request a rebootstrap by returning `REBOOTSTRAP_REQUIRED`
+(error code 124) in a metadata response. Runtime seed-broker updates are
+supported via `update_seed_brokers()`.
 
 ## Producer Architecture
 
@@ -477,6 +496,7 @@ All Krafka types are designed for concurrent use:
 
 - `Producer`: `Send + Sync` - can be shared across tasks
 - `Consumer`: `Send + Sync` - can be shared across tasks
+- `ShareConsumer`: `Send + Sync` - can be shared across tasks (unstable-protocol feature)
 - `AdminClient`: `Send + Sync` - can be shared across tasks
 
 Internal state is protected by:
@@ -527,6 +547,8 @@ Krafka includes the following production-ready features:
 - ✅ **TLS/SSL encryption**: Secure connections with rustls and mTLS support
 - ✅ **AWS MSK IAM authentication**: Native support with optional SDK integration
 - ✅ **SASL/SCRAM Authentication**: SHA-256 and SHA-512 mechanisms
+- ✅ **Session Reauthentication (KIP-368)**: Proactive session lifetime tracking with automatic connection replacement before SASL session expiry
 - ✅ **Metrics and Observability**: Producer, consumer, and connection metrics
 - ✅ **ACL Management**: Create, describe, and delete ACLs
 - ✅ **Security Hardening**: Secret zeroization, constant-time auth, PBKDF2 validation, decompression limits, allocation caps
+- ✅ **SOCKS5 Proxy**: Route all broker connections through a SOCKS5 proxy (VPN/bastion setups)

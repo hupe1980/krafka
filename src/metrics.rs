@@ -3,32 +3,45 @@
 //! This module provides metrics collection for producers and consumers,
 //! including counters, gauges, and latency tracking.
 //!
-//! # Metrics Export
+//! # Pluggable Metrics Export
 //!
-//! Krafka provides built-in Prometheus text format export without external dependencies.
-//! This allows easy integration with Prometheus, Grafana, and other monitoring tools.
+//! Krafka supports pluggable metrics export through the [`MetricsExporter`] trait.
+//! Built-in exporters include [`PrometheusExporter`] and [`JsonExporter`].
+//! Implement the trait to add custom backends (StatsD, OpenTelemetry, etc.).
 //!
 //! ```rust
-//! use krafka::metrics::{ProducerMetrics, MetricsExport};
+//! use krafka::metrics::{ProducerMetrics, PrometheusExporter, MetricsVisitable};
 //!
 //! let metrics = ProducerMetrics::new();
 //! metrics.record_send(100);
 //! metrics.record_batch(5);
 //!
 //! // Export in Prometheus text format
-//! let prometheus_output = metrics.to_prometheus_text("krafka_producer");
+//! let mut exporter = PrometheusExporter::new();
+//! metrics.export_metrics("krafka_producer", &mut exporter);
+//! let prometheus_output = exporter.finish();
 //! println!("{}", prometheus_output);
 //! ```
 //!
-//! Example output:
-//! ```text
-//! # HELP krafka_producer_records_sent_total Total number of records sent
-//! # TYPE krafka_producer_records_sent_total counter
-//! krafka_producer_records_sent_total 6
-//! # HELP krafka_producer_bytes_sent_total Total bytes sent
-//! # TYPE krafka_producer_bytes_sent_total counter
-//! krafka_producer_bytes_sent_total 100
-//! ...
+//! Or use the convenience method:
+//! ```rust
+//! use krafka::metrics::{ProducerMetrics, MetricsVisitable};
+//!
+//! let metrics = ProducerMetrics::new();
+//! let output = metrics.to_prometheus_text("krafka_producer");
+//! ```
+//!
+//! # JSON Export
+//!
+//! ```rust
+//! use krafka::metrics::{ProducerMetrics, JsonExporter, MetricsVisitable};
+//!
+//! let metrics = ProducerMetrics::new();
+//! metrics.record_send(100);
+//!
+//! let mut exporter = JsonExporter::new();
+//! metrics.export_metrics("krafka_producer", &mut exporter);
+//! let json_output = exporter.finish();
 //! ```
 //!
 //! # All-in-One Export
@@ -121,13 +134,22 @@ impl Gauge {
     }
 
     /// Decrement the gauge by 1 (saturates at 0 to prevent underflow).
+    ///
+    /// In debug builds, logs a warning if the gauge was already zero,
+    /// which typically indicates a mismatched `inc()`/`dec()` pair.
     #[inline]
     pub fn dec(&self) {
-        let _ = self
+        let prev = self
             .value
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             });
+        #[cfg(debug_assertions)]
+        if let Ok(0) = prev {
+            tracing::warn!(
+                "Gauge::dec() called when value was already 0 — possible inc/dec mismatch"
+            );
+        }
     }
 }
 
@@ -157,34 +179,8 @@ impl LatencyTracker {
         let nanos = duration.as_nanos() as u64;
         self.count.fetch_add(1, Ordering::Relaxed);
         self.sum_nanos.fetch_add(nanos, Ordering::Relaxed);
-
-        // Update min (compare-and-swap loop)
-        let mut current_min = self.min_nanos.load(Ordering::Relaxed);
-        while nanos < current_min {
-            match self.min_nanos.compare_exchange_weak(
-                current_min,
-                nanos,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(x) => current_min = x,
-            }
-        }
-
-        // Update max (compare-and-swap loop)
-        let mut current_max = self.max_nanos.load(Ordering::Relaxed);
-        while nanos > current_max {
-            match self.max_nanos.compare_exchange_weak(
-                current_max,
-                nanos,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(x) => current_max = x,
-            }
-        }
+        self.min_nanos.fetch_min(nanos, Ordering::Relaxed);
+        self.max_nanos.fetch_max(nanos, Ordering::Relaxed);
     }
 
     /// Start timing an operation. Returns a guard that records when dropped.
@@ -230,12 +226,8 @@ impl LatencyTracker {
     /// Get the average latency.
     pub fn avg(&self) -> Option<Duration> {
         let count = self.count();
-        if count == 0 {
-            None
-        } else {
-            let sum = self.sum_nanos.load(Ordering::Relaxed);
-            Some(Duration::from_nanos(sum / count))
-        }
+        let sum = self.sum_nanos.load(Ordering::Relaxed);
+        sum.checked_div(count).map(Duration::from_nanos)
     }
 
     /// Get a snapshot of the latency statistics.
@@ -286,287 +278,440 @@ pub struct LatencySnapshot {
     pub avg: Option<Duration>,
 }
 
-/// Trait for exporting metrics in various formats.
-pub trait MetricsExport {
-    /// Export metrics in Prometheus text format.
-    ///
-    /// # Arguments
-    ///
-    /// * `prefix` - Prefix for metric names (e.g., "krafka_producer")
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use krafka::metrics::{ProducerMetrics, MetricsExport};
-    ///
-    /// let metrics = ProducerMetrics::new();
-    /// let output = metrics.to_prometheus_text("krafka_producer");
-    /// ```
-    fn to_prometheus_text(&self, prefix: &str) -> String;
+/// Trait for exporting metrics to a pluggable backend.
+///
+/// Implement this trait to create custom metrics exporters for any
+/// monitoring system (Prometheus, StatsD, OpenTelemetry, Datadog, etc.).
+///
+/// Each method receives the metric's fully-qualified name (with prefix),
+/// a human-readable help string, and the current value.
+///
+/// # Example
+///
+/// ```rust
+/// use krafka::metrics::{MetricsExporter, LatencySnapshot};
+///
+/// struct StdoutExporter;
+///
+/// impl MetricsExporter for StdoutExporter {
+///     fn export_counter(&mut self, name: &str, help: &str, value: u64) {
+///         println!("COUNTER {name} = {value} ({help})");
+///     }
+///     fn export_gauge(&mut self, name: &str, help: &str, value: u64) {
+///         println!("GAUGE {name} = {value} ({help})");
+///     }
+///     fn export_latency(&mut self, name: &str, help: &str, snapshot: &LatencySnapshot) {
+///         println!("LATENCY {name} count={} ({help})", snapshot.count);
+///     }
+/// }
+/// ```
+pub trait MetricsExporter {
+    /// Export a monotonically increasing counter metric.
+    fn export_counter(&mut self, name: &str, help: &str, value: u64);
+
+    /// Export a gauge metric (current value that can go up or down).
+    fn export_gauge(&mut self, name: &str, help: &str, value: u64);
+
+    /// Export a latency tracker metric with count, sum, min, max, and avg.
+    fn export_latency(&mut self, name: &str, help: &str, snapshot: &LatencySnapshot);
 }
 
-impl MetricsExport for ProducerMetrics {
-    fn to_prometheus_text(&self, prefix: &str) -> String {
-        let mut output = String::with_capacity(2048);
+/// Trait for types that can export their metrics through a [`MetricsExporter`].
+///
+/// Each metrics struct (producer, consumer, connection) implements this trait
+/// to emit its metrics to any exporter backend.
+pub trait MetricsVisitable {
+    /// Export all metrics to the given exporter using the provided prefix.
+    ///
+    /// The prefix is prepended to each metric name (e.g. `"krafka_producer"`),
+    /// separated by an underscore.
+    fn export_metrics(&self, prefix: &str, exporter: &mut dyn MetricsExporter);
 
-        write_prometheus_counter(
-            &mut output,
-            prefix,
-            "records_sent",
+    /// Convenience: export metrics as Prometheus text format.
+    fn to_prometheus_text(&self, prefix: &str) -> String {
+        let mut exporter = PrometheusExporter::new();
+        self.export_metrics(prefix, &mut exporter);
+        exporter.finish()
+    }
+
+    /// Convenience: export metrics as JSON.
+    fn to_json(&self, prefix: &str) -> String {
+        let mut exporter = JsonExporter::new();
+        self.export_metrics(prefix, &mut exporter);
+        exporter.finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PrometheusExporter
+// ---------------------------------------------------------------------------
+
+/// Exports metrics in Prometheus text exposition format.
+///
+/// Produces output compatible with Prometheus, Grafana Agent, and
+/// OpenTelemetry's Prometheus receiver.
+///
+/// Each counter is emitted with a `_total` suffix, latency trackers emit
+/// `_seconds_count`, `_seconds_sum`, `_seconds_min`, and `_seconds_max`.
+pub struct PrometheusExporter {
+    output: String,
+}
+
+impl PrometheusExporter {
+    /// Create a new Prometheus exporter.
+    pub fn new() -> Self {
+        Self {
+            output: String::with_capacity(4096),
+        }
+    }
+
+    /// Consume the exporter and return the Prometheus text output.
+    pub fn finish(self) -> String {
+        self.output
+    }
+}
+
+impl Default for PrometheusExporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Sanitize a metric name to conform to Prometheus naming conventions.
+///
+/// Replaces any character that is not `[a-zA-Z0-9_:]` with `_`.
+/// Ensures the name starts with a letter or underscore.
+fn sanitize_prometheus_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    // Ensure it starts with a letter or underscore.
+    if out.starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert(0, '_');
+    }
+    out
+}
+
+impl MetricsExporter for PrometheusExporter {
+    fn export_counter(&mut self, name: &str, help: &str, value: u64) {
+        let name = sanitize_prometheus_name(name);
+        let _ = writeln!(self.output, "# HELP {}_total {}", name, help);
+        let _ = writeln!(self.output, "# TYPE {}_total counter", name);
+        let _ = writeln!(self.output, "{}_total {}", name, value);
+    }
+
+    fn export_gauge(&mut self, name: &str, help: &str, value: u64) {
+        let name = sanitize_prometheus_name(name);
+        let _ = writeln!(self.output, "# HELP {} {}", name, help);
+        let _ = writeln!(self.output, "# TYPE {} gauge", name);
+        let _ = writeln!(self.output, "{} {}", name, value);
+    }
+
+    fn export_latency(&mut self, name: &str, help: &str, snapshot: &LatencySnapshot) {
+        let name = sanitize_prometheus_name(name);
+        let _ = writeln!(self.output, "# HELP {}_seconds {}", name, help);
+        let _ = writeln!(self.output, "# TYPE {}_seconds summary", name);
+        let _ = writeln!(self.output, "{}_seconds_count {}", name, snapshot.count);
+        let _ = writeln!(
+            self.output,
+            "{}_seconds_sum {:.9}",
+            name,
+            snapshot.sum.as_secs_f64()
+        );
+
+        if let Some(min) = snapshot.min {
+            let _ = writeln!(self.output, "{}_seconds_min {:.9}", name, min.as_secs_f64());
+        }
+        if let Some(max) = snapshot.max {
+            let _ = writeln!(self.output, "{}_seconds_max {:.9}", name, max.as_secs_f64());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JsonExporter
+// ---------------------------------------------------------------------------
+
+/// Exports metrics as a JSON array of metric objects.
+///
+/// Each metric becomes a JSON object with `name`, `type`, `help`, and
+/// type-specific value fields. No `serde` dependency required.
+///
+/// # Output Format
+///
+/// ```json
+/// [
+///   {"name":"krafka_producer_records_sent","type":"counter","help":"Total records sent","value":42},
+///   {"name":"krafka_producer_connections","type":"gauge","help":"Active connections","value":3},
+///   {"name":"krafka_producer_send_latency","type":"latency","help":"Send latency","count":10,"sum_seconds":0.5,"min_seconds":0.01,"max_seconds":0.1,"avg_seconds":0.05}
+/// ]
+/// ```
+pub struct JsonExporter {
+    entries: Vec<String>,
+}
+
+impl JsonExporter {
+    /// Create a new JSON exporter.
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Consume the exporter and return the JSON output.
+    pub fn finish(self) -> String {
+        let mut output = String::with_capacity(self.entries.iter().map(|e| e.len() + 1).sum());
+        output.push('[');
+        for (i, entry) in self.entries.iter().enumerate() {
+            if i > 0 {
+                output.push(',');
+            }
+            output.push_str(entry);
+        }
+        output.push(']');
+        output
+    }
+}
+
+impl Default for JsonExporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Escape a string for JSON output (handles `"`, `\`, and control characters).
+fn json_escape(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            c if c.is_control() => {
+                let _ = write!(escaped, "\\u{:04x}", c as u32);
+            }
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+impl MetricsExporter for JsonExporter {
+    fn export_counter(&mut self, name: &str, help: &str, value: u64) {
+        self.entries.push(format!(
+            "{{\"name\":\"{}\",\"type\":\"counter\",\"help\":\"{}\",\"value\":{}}}",
+            json_escape(name),
+            json_escape(help),
+            value,
+        ));
+    }
+
+    fn export_gauge(&mut self, name: &str, help: &str, value: u64) {
+        self.entries.push(format!(
+            "{{\"name\":\"{}\",\"type\":\"gauge\",\"help\":\"{}\",\"value\":{}}}",
+            json_escape(name),
+            json_escape(help),
+            value,
+        ));
+    }
+
+    fn export_latency(&mut self, name: &str, help: &str, snapshot: &LatencySnapshot) {
+        let min_str = snapshot
+            .min
+            .map(|d| format!("{:.9}", d.as_secs_f64()))
+            .unwrap_or_else(|| "null".to_string());
+        let max_str = snapshot
+            .max
+            .map(|d| format!("{:.9}", d.as_secs_f64()))
+            .unwrap_or_else(|| "null".to_string());
+        let avg_str = snapshot
+            .avg
+            .map(|d| format!("{:.9}", d.as_secs_f64()))
+            .unwrap_or_else(|| "null".to_string());
+
+        self.entries.push(format!(
+            "{{\"name\":\"{}\",\"type\":\"latency\",\"help\":\"{}\",\"count\":{},\"sum_seconds\":{:.9},\"min_seconds\":{},\"max_seconds\":{},\"avg_seconds\":{}}}",
+            json_escape(name),
+            json_escape(help),
+            snapshot.count,
+            snapshot.sum.as_secs_f64(),
+            min_str,
+            max_str,
+            avg_str,
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MetricsVisitable — ProducerMetrics
+// ---------------------------------------------------------------------------
+
+impl MetricsVisitable for ProducerMetrics {
+    fn export_metrics(&self, prefix: &str, exporter: &mut dyn MetricsExporter) {
+        exporter.export_counter(
+            &format!("{prefix}_records_sent"),
             "Total number of records sent",
             self.records_sent.get(),
         );
-        write_prometheus_counter(
-            &mut output,
-            prefix,
-            "bytes_sent",
+        exporter.export_counter(
+            &format!("{prefix}_bytes_sent"),
             "Total bytes sent",
             self.bytes_sent.get(),
         );
-        write_prometheus_counter(
-            &mut output,
-            prefix,
-            "batches_sent",
+        exporter.export_counter(
+            &format!("{prefix}_batches_sent"),
             "Total batches sent",
             self.batches_sent.get(),
         );
-        write_prometheus_counter(
-            &mut output,
-            prefix,
-            "errors",
+        exporter.export_counter(
+            &format!("{prefix}_errors"),
             "Total send errors",
             self.errors.get(),
         );
-        write_prometheus_counter(
-            &mut output,
-            prefix,
-            "retries",
+        exporter.export_counter(
+            &format!("{prefix}_retries"),
             "Total retries",
             self.retries.get(),
         );
-        write_prometheus_gauge(
-            &mut output,
-            prefix,
-            "connections",
+        exporter.export_gauge(
+            &format!("{prefix}_connections"),
             "Current active connections",
             self.connections.get(),
         );
-        write_prometheus_gauge(
-            &mut output,
-            prefix,
-            "buffered_records",
+        exporter.export_gauge(
+            &format!("{prefix}_buffered_records"),
             "Currently buffered records",
             self.buffered_records.get(),
         );
-        write_prometheus_latency(
-            &mut output,
-            prefix,
-            "send_latency",
+        exporter.export_latency(
+            &format!("{prefix}_send_latency"),
             "Send latency",
-            &self.send_latency,
+            &self.send_latency.snapshot(),
         );
-
-        output
     }
 }
 
-impl MetricsExport for ConsumerMetrics {
-    fn to_prometheus_text(&self, prefix: &str) -> String {
-        let mut output = String::with_capacity(2048);
+// ---------------------------------------------------------------------------
+// MetricsVisitable — ConsumerMetrics
+// ---------------------------------------------------------------------------
 
-        write_prometheus_counter(
-            &mut output,
-            prefix,
-            "records_received",
+impl MetricsVisitable for ConsumerMetrics {
+    fn export_metrics(&self, prefix: &str, exporter: &mut dyn MetricsExporter) {
+        exporter.export_counter(
+            &format!("{prefix}_records_received"),
             "Total records received",
             self.records_received.get(),
         );
-        write_prometheus_counter(
-            &mut output,
-            prefix,
-            "bytes_received",
+        exporter.export_counter(
+            &format!("{prefix}_bytes_received"),
             "Total bytes received",
             self.bytes_received.get(),
         );
-        write_prometheus_counter(
-            &mut output,
-            prefix,
-            "fetches",
+        exporter.export_counter(
+            &format!("{prefix}_fetches"),
             "Total fetch requests",
             self.fetches.get(),
         );
-        write_prometheus_counter(
-            &mut output,
-            prefix,
-            "polls",
+        exporter.export_counter(
+            &format!("{prefix}_polls"),
             "Total poll operations",
             self.polls.get(),
         );
-        write_prometheus_counter(
-            &mut output,
-            prefix,
-            "empty_polls",
+        exporter.export_counter(
+            &format!("{prefix}_empty_polls"),
             "Total empty polls",
             self.empty_polls.get(),
         );
-        write_prometheus_counter(
-            &mut output,
-            prefix,
-            "commits",
+        exporter.export_counter(
+            &format!("{prefix}_commits"),
             "Total commit operations",
             self.commits.get(),
         );
-        write_prometheus_counter(
-            &mut output,
-            prefix,
-            "errors",
+        exporter.export_counter(
+            &format!("{prefix}_errors"),
             "Total errors",
             self.errors.get(),
         );
-        write_prometheus_counter(
-            &mut output,
-            prefix,
-            "rebalances",
+        exporter.export_counter(
+            &format!("{prefix}_rebalances"),
             "Total rebalances",
             self.rebalances.get(),
         );
-        write_prometheus_gauge(
-            &mut output,
-            prefix,
-            "lag",
+        exporter.export_gauge(
+            &format!("{prefix}_lag"),
             "Total consumer lag across all assigned partitions",
             self.lag.get(),
         );
-        write_prometheus_gauge(
-            &mut output,
-            prefix,
-            "lag_max",
+        exporter.export_gauge(
+            &format!("{prefix}_lag_max"),
             "Maximum per-partition consumer lag",
             self.lag_max.get(),
         );
-        write_prometheus_gauge(
-            &mut output,
-            prefix,
-            "assigned_partitions",
+        exporter.export_gauge(
+            &format!("{prefix}_assigned_partitions"),
             "Currently assigned partitions",
             self.assigned_partitions.get(),
         );
-        write_prometheus_gauge(
-            &mut output,
-            prefix,
-            "paused_partitions",
+        exporter.export_gauge(
+            &format!("{prefix}_paused_partitions"),
             "Currently paused partitions",
             self.paused_partitions.get(),
         );
-        write_prometheus_latency(
-            &mut output,
-            prefix,
-            "poll_latency",
+        exporter.export_gauge(
+            &format!("{prefix}_buffered_records"),
+            "Currently buffered records in recv() buffer",
+            self.buffered_records.get(),
+        );
+        exporter.export_latency(
+            &format!("{prefix}_poll_latency"),
             "Poll latency",
-            &self.poll_latency,
+            &self.poll_latency.snapshot(),
         );
-        write_prometheus_latency(
-            &mut output,
-            prefix,
-            "fetch_latency",
+        exporter.export_latency(
+            &format!("{prefix}_fetch_latency"),
             "Fetch latency",
-            &self.fetch_latency,
+            &self.fetch_latency.snapshot(),
         );
-
-        output
     }
 }
 
-impl MetricsExport for ConnectionMetrics {
-    fn to_prometheus_text(&self, prefix: &str) -> String {
-        let mut output = String::with_capacity(1024);
+// ---------------------------------------------------------------------------
+// MetricsVisitable — ConnectionMetrics
+// ---------------------------------------------------------------------------
 
-        write_prometheus_counter(
-            &mut output,
-            prefix,
-            "connections_created",
+impl MetricsVisitable for ConnectionMetrics {
+    fn export_metrics(&self, prefix: &str, exporter: &mut dyn MetricsExporter) {
+        exporter.export_counter(
+            &format!("{prefix}_connections_created"),
             "Total connections created",
             self.connections_created.get(),
         );
-        write_prometheus_counter(
-            &mut output,
-            prefix,
-            "connections_closed",
+        exporter.export_counter(
+            &format!("{prefix}_connections_closed"),
             "Total connections closed",
             self.connections_closed.get(),
         );
-        write_prometheus_counter(
-            &mut output,
-            prefix,
-            "connection_errors",
+        exporter.export_counter(
+            &format!("{prefix}_connection_errors"),
             "Total connection errors",
             self.connection_errors.get(),
         );
-        write_prometheus_gauge(
-            &mut output,
-            prefix,
-            "active_connections",
+        exporter.export_gauge(
+            &format!("{prefix}_active_connections"),
             "Current active connections",
             self.active_connections.get(),
         );
-        write_prometheus_latency(
-            &mut output,
-            prefix,
-            "connect_latency",
+        exporter.export_latency(
+            &format!("{prefix}_connect_latency"),
             "Connection establishment latency",
-            &self.connect_latency,
-        );
-
-        output
-    }
-}
-
-/// Write a counter metric in Prometheus format.
-fn write_prometheus_counter(output: &mut String, prefix: &str, name: &str, help: &str, value: u64) {
-    let _ = writeln!(output, "# HELP {}_{}_total {}", prefix, name, help);
-    let _ = writeln!(output, "# TYPE {}_{}_total counter", prefix, name);
-    let _ = writeln!(output, "{}_{}_total {}", prefix, name, value);
-}
-
-/// Write a gauge metric in Prometheus format.
-fn write_prometheus_gauge(output: &mut String, prefix: &str, name: &str, help: &str, value: u64) {
-    let _ = writeln!(output, "# HELP {}_{} {}", prefix, name, help);
-    let _ = writeln!(output, "# TYPE {}_{} gauge", prefix, name);
-    let _ = writeln!(output, "{}_{} {}", prefix, name, value);
-}
-
-/// Write latency metrics in Prometheus format (as a summary).
-fn write_prometheus_latency(
-    output: &mut String,
-    prefix: &str,
-    name: &str,
-    help: &str,
-    tracker: &LatencyTracker,
-) {
-    let count = tracker.count();
-    let sum_seconds = tracker.sum().as_secs_f64();
-
-    let _ = writeln!(output, "# HELP {}_{}_seconds {}", prefix, name, help);
-    let _ = writeln!(output, "# TYPE {}_{}_seconds summary", prefix, name);
-    let _ = writeln!(output, "{}_{}_seconds_count {}", prefix, name, count);
-    let _ = writeln!(output, "{}_{}_seconds_sum {:.9}", prefix, name, sum_seconds);
-
-    if let Some(min) = tracker.min() {
-        let _ = writeln!(
-            output,
-            "{}_{}_seconds_min {:.9}",
-            prefix,
-            name,
-            min.as_secs_f64()
-        );
-    }
-    if let Some(max) = tracker.max() {
-        let _ = writeln!(
-            output,
-            "{}_{}_seconds_max {:.9}",
-            prefix,
-            name,
-            max.as_secs_f64()
+            &self.connect_latency.snapshot(),
         );
     }
 }
@@ -574,7 +719,8 @@ fn write_prometheus_latency(
 /// Aggregated metrics registry for all Krafka components.
 ///
 /// This provides a convenient way to collect and export metrics from
-/// multiple producers, consumers, and connections.
+/// multiple producers, consumers, and connections through any
+/// [`MetricsExporter`] backend.
 ///
 /// # Example
 ///
@@ -594,6 +740,10 @@ fn write_prometheus_latency(
 /// // Export all metrics in Prometheus format
 /// let output = metrics.to_prometheus_text();
 /// println!("{}", output);
+///
+/// // Export all metrics as JSON
+/// let json = metrics.to_json();
+/// println!("{}", json);
 /// ```
 #[derive(Debug, Clone)]
 pub struct KrafkaMetrics {
@@ -639,6 +789,24 @@ impl KrafkaMetrics {
         self.connection.clone()
     }
 
+    /// Export all metrics through a custom [`MetricsExporter`].
+    ///
+    /// Uses the standard `"krafka"` prefix (`krafka_producer_*`,
+    /// `krafka_consumer_*`, `krafka_connection_*`).
+    pub fn export_all(&self, exporter: &mut dyn MetricsExporter) {
+        self.export_all_with_prefix("krafka", exporter);
+    }
+
+    /// Export all metrics through a custom [`MetricsExporter`] with a custom prefix.
+    pub fn export_all_with_prefix(&self, prefix: &str, exporter: &mut dyn MetricsExporter) {
+        self.producer
+            .export_metrics(&format!("{prefix}_producer"), exporter);
+        self.consumer
+            .export_metrics(&format!("{prefix}_consumer"), exporter);
+        self.connection
+            .export_metrics(&format!("{prefix}_connection"), exporter);
+    }
+
     /// Export all metrics in Prometheus text format.
     ///
     /// Uses the standard "krafka_" prefix for all metric names.
@@ -648,25 +816,23 @@ impl KrafkaMetrics {
 
     /// Export all metrics in Prometheus text format with custom prefix.
     pub fn to_prometheus_text_with_prefix(&self, prefix: &str) -> String {
-        let mut output = String::with_capacity(8192);
+        let mut exporter = PrometheusExporter::new();
+        self.export_all_with_prefix(prefix, &mut exporter);
+        exporter.finish()
+    }
 
-        output.push_str(
-            &self
-                .producer
-                .to_prometheus_text(&format!("{}_producer", prefix)),
-        );
-        output.push_str(
-            &self
-                .consumer
-                .to_prometheus_text(&format!("{}_consumer", prefix)),
-        );
-        output.push_str(
-            &self
-                .connection
-                .to_prometheus_text(&format!("{}_connection", prefix)),
-        );
+    /// Export all metrics as JSON.
+    ///
+    /// Uses the standard "krafka_" prefix for all metric names.
+    pub fn to_json(&self) -> String {
+        self.to_json_with_prefix("krafka")
+    }
 
-        output
+    /// Export all metrics as JSON with custom prefix.
+    pub fn to_json_with_prefix(&self, prefix: &str) -> String {
+        let mut exporter = JsonExporter::new();
+        self.export_all_with_prefix(prefix, &mut exporter);
+        exporter.finish()
     }
 
     /// Reset all metrics.
@@ -692,6 +858,7 @@ impl KrafkaMetrics {
         self.consumer.lag_max.set(0);
         self.consumer.assigned_partitions.set(0);
         self.consumer.paused_partitions.set(0);
+        self.consumer.buffered_records.set(0);
 
         self.producer.connections.set(0);
         self.producer.buffered_records.set(0);
@@ -825,6 +992,8 @@ pub struct ConsumerMetrics {
     pub assigned_partitions: Gauge,
     /// Current number of paused partitions.
     pub paused_partitions: Gauge,
+    /// Current number of records buffered in the recv() buffer.
+    pub buffered_records: Gauge,
 }
 
 impl ConsumerMetrics {
@@ -890,6 +1059,7 @@ impl ConsumerMetrics {
             lag_max: self.lag_max.get(),
             assigned_partitions: self.assigned_partitions.get(),
             paused_partitions: self.paused_partitions.get(),
+            buffered_records: self.buffered_records.get(),
         }
     }
 }
@@ -926,6 +1096,8 @@ pub struct ConsumerMetricsSnapshot {
     pub assigned_partitions: u64,
     /// Paused partitions.
     pub paused_partitions: u64,
+    /// Buffered records in recv() buffer.
+    pub buffered_records: u64,
 }
 
 /// Connection pool metrics.
@@ -1283,5 +1455,158 @@ mod tests {
         assert!(output.contains("# HELP c_lag_max Maximum per-partition consumer lag"));
         assert!(output.contains("# TYPE c_lag_max gauge"));
         assert!(output.contains("c_lag_max 30"));
+    }
+
+    #[test]
+    fn test_json_exporter_counter() {
+        let metrics = ProducerMetrics::new();
+        metrics.record_send(100);
+        metrics.record_batch(5);
+
+        let json = metrics.to_json("p");
+        assert!(json.starts_with('['));
+        assert!(json.ends_with(']'));
+        assert!(json.contains("\"name\":\"p_records_sent\""));
+        assert!(json.contains("\"type\":\"counter\""));
+        assert!(json.contains("\"value\":6"));
+    }
+
+    #[test]
+    fn test_json_exporter_gauge() {
+        let metrics = ConsumerMetrics::new();
+        metrics.assigned_partitions.set(4);
+
+        let json = metrics.to_json("c");
+        assert!(json.contains("\"name\":\"c_assigned_partitions\""));
+        assert!(json.contains("\"type\":\"gauge\""));
+        assert!(json.contains("\"value\":4"));
+    }
+
+    #[test]
+    fn test_json_exporter_latency() {
+        let metrics = ProducerMetrics::new();
+        metrics.send_latency.record(Duration::from_millis(50));
+        metrics.send_latency.record(Duration::from_millis(100));
+
+        let json = metrics.to_json("p");
+        assert!(json.contains("\"name\":\"p_send_latency\""));
+        assert!(json.contains("\"type\":\"latency\""));
+        assert!(json.contains("\"count\":2"));
+        assert!(json.contains("\"sum_seconds\":"));
+    }
+
+    #[test]
+    fn test_json_exporter_empty() {
+        let exporter = JsonExporter::new();
+        assert_eq!(exporter.finish(), "[]");
+    }
+
+    #[test]
+    fn test_krafka_metrics_json() {
+        let registry = KrafkaMetrics::new();
+        let producer = registry.producer_metrics();
+        producer.record_send(42);
+
+        let json = registry.to_json();
+        assert!(json.contains("\"name\":\"krafka_producer_records_sent\""));
+        assert!(json.contains("\"value\":1"));
+    }
+
+    #[test]
+    fn test_krafka_metrics_export_all() {
+        let registry = KrafkaMetrics::new();
+        let producer = registry.producer_metrics();
+        producer.record_send(100);
+
+        let mut exporter = PrometheusExporter::new();
+        registry.export_all(&mut exporter);
+        let output = exporter.finish();
+
+        assert!(output.contains("krafka_producer_records_sent_total 1"));
+        assert!(output.contains("krafka_consumer_polls_total 0"));
+        assert!(output.contains("krafka_connection_connections_created_total 0"));
+    }
+
+    #[test]
+    fn test_custom_exporter() {
+        struct CountingExporter {
+            counters: usize,
+            gauges: usize,
+            latencies: usize,
+        }
+
+        impl MetricsExporter for CountingExporter {
+            fn export_counter(&mut self, _name: &str, _help: &str, _value: u64) {
+                self.counters += 1;
+            }
+            fn export_gauge(&mut self, _name: &str, _help: &str, _value: u64) {
+                self.gauges += 1;
+            }
+            fn export_latency(&mut self, _name: &str, _help: &str, _snapshot: &LatencySnapshot) {
+                self.latencies += 1;
+            }
+        }
+
+        let metrics = ProducerMetrics::new();
+        let mut exporter = CountingExporter {
+            counters: 0,
+            gauges: 0,
+            latencies: 0,
+        };
+        metrics.export_metrics("test", &mut exporter);
+
+        // ProducerMetrics has 5 counters, 2 gauges, 1 latency
+        assert_eq!(exporter.counters, 5);
+        assert_eq!(exporter.gauges, 2);
+        assert_eq!(exporter.latencies, 1);
+    }
+
+    #[test]
+    fn test_json_escape() {
+        assert_eq!(json_escape("hello"), "hello");
+        assert_eq!(json_escape("he\"llo"), "he\\\"llo");
+        assert_eq!(json_escape("he\\llo"), "he\\\\llo");
+        assert_eq!(json_escape("he\nllo"), "he\\nllo");
+    }
+
+    #[test]
+    fn test_sanitize_prometheus_name_valid() {
+        assert_eq!(
+            sanitize_prometheus_name("krafka_requests_total"),
+            "krafka_requests_total"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_prometheus_name_dots_hyphens() {
+        assert_eq!(
+            sanitize_prometheus_name("kafka.producer-send.rate"),
+            "kafka_producer_send_rate"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_prometheus_name_leading_digit() {
+        assert_eq!(sanitize_prometheus_name("9lives"), "_9lives");
+    }
+
+    #[test]
+    fn test_sanitize_prometheus_name_colons_preserved() {
+        assert_eq!(
+            sanitize_prometheus_name("namespace:metric"),
+            "namespace:metric"
+        );
+    }
+
+    #[test]
+    fn test_latency_fetch_min_max() {
+        let tracker = LatencyTracker::new();
+        tracker.record(Duration::from_millis(100));
+        tracker.record(Duration::from_millis(50));
+        tracker.record(Duration::from_millis(200));
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.count, 3);
+        assert_eq!(snapshot.min, Some(Duration::from_millis(50)));
+        assert_eq!(snapshot.max, Some(Duration::from_millis(200)));
     }
 }

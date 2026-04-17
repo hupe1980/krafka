@@ -15,7 +15,7 @@ Complete reference for all Krafka configuration options.
 |--------|------|---------|-------------|
 | `bootstrap_servers` | String | Required | Comma-separated list of host:port pairs |
 | `client_id` | String | `"krafka"` | Client identifier sent with requests |
-| `acks` | Acks | `Leader` | Acknowledgment level for durability |
+| `acks` | Acks | `All` | Acknowledgment level for durability (default changed to All for idempotent) |
 | `compression` | Compression | `None` | Compression codec for messages |
 | `batch_size` | usize | `16384` | Maximum bytes per batch (must be >= 1) |
 | `linger` | Duration | `0ms` | Time to wait for batching |
@@ -24,7 +24,9 @@ Complete reference for all Krafka configuration options.
 | `retry_backoff` | Duration | `100ms` | Wait between retries |
 | `max_in_flight` | usize | `5` | Max concurrent in-flight requests per connection |
 | `metadata_max_age` | Duration | `5m` | Max age before metadata refresh |
-| `enable_idempotence` | bool | `false` | Enable exactly-once semantics |
+| `idempotent` | bool | `true` | Enable idempotent production (KIP-679, requires acks=All) |
+| `metadata_recovery_strategy` | MetadataRecoveryStrategy | `None` | Recovery strategy when metadata refresh fails (KIP-899) |
+| `metadata_recovery_rebootstrap_trigger` | Duration | `5m` | Duration after which failing refreshes trigger a rebootstrap |
 
 ### Acks Values
 
@@ -38,14 +40,18 @@ Acks::All     // -1: Wait for all in-sync replicas
 
 ### Compression Values
 
+Each codec requires its corresponding Cargo feature (`gzip`, `snappy`, `lz4`, `zstd`).
+All are enabled by default via the `compression` feature.
+Use [`Compression::is_available()`] to check at runtime.
+
 ```rust
 use krafka::protocol::Compression;
 
-Compression::None    // No compression
-Compression::Gzip    // Gzip compression
-Compression::Snappy  // Snappy compression
-Compression::Lz4     // LZ4 compression
-Compression::Zstd    // Zstandard compression
+Compression::None    // No compression (always available)
+Compression::Gzip    // Gzip compression (feature = "gzip")
+Compression::Snappy  // Snappy compression (feature = "snappy")
+Compression::Lz4     // LZ4 compression (feature = "lz4")
+Compression::Zstd    // Zstandard compression (feature = "zstd")
 ```
 
 ### Producer Builder Example
@@ -58,14 +64,12 @@ use std::time::Duration;
 let producer = Producer::builder()
     .bootstrap_servers("kafka1:9092,kafka2:9092")
     .client_id("my-producer")
-    .acks(Acks::All)
     .compression(Compression::Lz4)
     .batch_size(65536)
     .linger(Duration::from_millis(5))
     .request_timeout(Duration::from_secs(30))
     .retries(5)
     .retry_backoff(Duration::from_millis(200))
-    .enable_idempotence(true)
     .build()
     .await?;
 ```
@@ -93,6 +97,8 @@ let producer = Producer::builder()
 | `group_protocol` | GroupProtocol | `Classic` | Group protocol: `Classic` or `Consumer` (KIP-848) |
 | `request_timeout` | Duration | `30s` | Timeout for broker requests |
 | `metadata_max_age` | Duration | `5m` | Max age before metadata refresh |
+| `metadata_recovery_strategy` | MetadataRecoveryStrategy | `None` | Recovery strategy when metadata refresh fails (KIP-899) |
+| `metadata_recovery_rebootstrap_trigger` | Duration | `5m` | Duration after which failing refreshes trigger a rebootstrap |
 
 ### AutoOffsetReset Values
 
@@ -145,6 +151,8 @@ let consumer = Consumer::builder()
 | `bootstrap_servers` | String | Required | Comma-separated list of host:port pairs |
 | `client_id` | String | `"krafka-admin"` | Client identifier |
 | `request_timeout` | Duration | `30s` | Timeout for admin operations |
+| `metadata_recovery_strategy` | MetadataRecoveryStrategy | `None` | Recovery strategy when metadata refresh fails (KIP-899) |
+| `metadata_recovery_rebootstrap_trigger` | Duration | `5m` | Duration after which failing refreshes trigger a rebootstrap |
 
 ### Admin Client Builder Example
 
@@ -170,6 +178,67 @@ Internal connection settings (advanced):
 | `request_timeout` | Duration | `30s` | Request timeout |
 | `max_message_size` | usize | `10MB` | Maximum message size |
 | `max_response_size` | usize | `100MB` | Maximum response size from broker |
+
+## SOCKS5 Proxy
+
+Route all broker connections through a SOCKS5 proxy. This is useful for
+VPN/bastion setups where brokers are not directly reachable. The proxy handles
+DNS resolution, so broker hostnames are sent as-is (not pre-resolved).
+
+Enable the `socks5` feature:
+
+```toml
+krafka = { version = "0.4", features = ["socks5"] }
+```
+
+### Proxy Without Authentication
+
+```rust
+use krafka::network::ProxyConfig;
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("kafka.internal:9092")
+    .group_id("my-group")
+    .proxy(ProxyConfig::new("socks5-proxy.corp:1080"))
+    .build()
+    .await?;
+```
+
+### Proxy With Authentication
+
+```rust
+use krafka::network::ProxyConfig;
+
+let producer = Producer::builder()
+    .bootstrap_servers("kafka.internal:9092")
+    .proxy(ProxyConfig::with_credentials(
+        "socks5-proxy.corp:1080",
+        "proxy-user",
+        "proxy-password",
+    ))
+    .build()
+    .await?;
+```
+
+Proxy credentials are zeroized from memory on drop and redacted in `Debug` output.
+
+### Proxy With TLS/SASL
+
+Proxy and authentication can be combined — the SOCKS5 tunnel is established first,
+then TLS and/or SASL negotiation proceeds over the tunneled connection:
+
+```rust
+use krafka::auth::AuthConfig;
+use krafka::network::ProxyConfig;
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("kafka.secure.internal:9093")
+    .group_id("secure-group")
+    .auth(AuthConfig::tls())
+    .proxy(ProxyConfig::new("bastion:1080"))
+    .build()
+    .await?;
+```
 
 ## Topic Configuration
 

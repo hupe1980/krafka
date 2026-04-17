@@ -116,13 +116,21 @@ let producer = Producer::builder()
     .await?;
 ```
 
-| Codec | Speed | Ratio | Use Case |
-|-------|-------|-------|----------|
-| None | N/A | 1:1 | Low CPU, high bandwidth |
-| Gzip | Slow | Best | Archival, infrequent writes |
-| Snappy | Fast | Good | General purpose |
-| LZ4 | Fastest | Good | High-throughput, real-time |
-| Zstd | Medium | Best | Best balance of speed/ratio |
+| Codec | Cargo Feature | Speed | Ratio | Use Case |
+|-------|---------------|-------|-------|----------|
+| None | — | N/A | 1:1 | Low CPU, high bandwidth |
+| Gzip | `gzip` | Slow | Best | Archival, infrequent writes |
+| Snappy | `snappy` | Fast | Good | General purpose |
+| LZ4 | `lz4` | Fastest | Good | High-throughput, real-time |
+| Zstd | `zstd` | Medium | Best | Best balance of speed/ratio |
+
+All codecs are enabled by default via the `compression` convenience feature.
+To trim binary size or avoid the C toolchain (needed by `zstd`), disable defaults
+and select only the codecs you need:
+
+```toml
+krafka = { version = "0.4", default-features = false, features = ["lz4"] }
+```
 
 ### Batching
 
@@ -197,7 +205,7 @@ When batching/accumulation is enabled (i.e., `linger > 0`) and the buffer memory
 
 ## Flushing
 
-When using linger-based batching, call `flush()` to ensure all pending records are sent:
+Call `flush()` whenever you need a durability barrier over records that have already been handed to the producer. This now covers both linger-based batching and direct-send mode (`linger = 0`):
 
 ```rust
 // Send multiple records
@@ -314,6 +322,27 @@ let producer = Producer::builder()
 // send() automatically retries on transient failures
 producer.send("topic", None, b"value").await?;
 ```
+
+### Delivery Timeout
+
+The `delivery_timeout` setting (analogous to the Java client's `delivery.timeout.ms`) caps the total time from when a record enters the producer to when it must be acknowledged. This includes time spent in the accumulator's linger window, backpressure waits, and all retry attempts.
+
+```rust
+use krafka::producer::Producer;
+use std::time::Duration;
+
+let producer = Producer::builder()
+    .bootstrap_servers("localhost:9092")
+    .delivery_timeout(Duration::from_secs(120))  // Total delivery budget
+    .linger(Duration::from_millis(5))             // Batching window
+    .retries(u32::MAX)                            // Retry until timeout
+    .build()
+    .await?;
+```
+
+When `delivery_timeout` is set, backoff durations are clamped to the remaining budget so the producer does not overshoot. If the budget is exhausted, the send fails immediately regardless of the remaining retry count.
+
+> **Note:** By default `linger` is `0` (no batching delay), so the delivery timeout is nearly equivalent to network time + retry time. With `linger > 0`, add the maximum linger window to your delivery timeout budget.
 
 ### Manual Retry
 
@@ -438,16 +467,27 @@ use std::time::Duration;
 
 let producer = Producer::builder()
     .bootstrap_servers("localhost:9092")
-    .acks(Acks::All)                         // Wait for all ISR
     .retries(10)                             // Retry on failure
     .build()
     .await?;
 ```
 
-> **Note:** For idempotent/exactly-once semantics, use `TransactionalProducer` instead.
-> The `enable_idempotence()` method on the regular `Producer` is deprecated since v0.2.0.
-> `TransactionalProducer` handles PID/epoch allocation, sequence numbers, and
-> transactional batch marking automatically via `init_transactions()`.
+> **Idempotent by default (KIP-679):** Since Kafka 3.0, idempotent production is the default.
+> The regular `Producer` now obtains a Producer ID via `InitProducerId` at startup,
+> tracks sequence numbers per partition, and de-duplicates retries automatically.
+> `acks = All` and `max_in_flight <= 5` are enforced when idempotent is enabled.
+> The `InitProducerId` call retries on retriable errors (e.g. `CoordinatorLoadInProgress`)
+> with exponential backoff, rotating through available brokers on each attempt.
+>
+> **Error handling:**
+> - `OutOfOrderSequenceNumber` triggers a sequence reset and batch rebuild before retrying.
+> - `DuplicateSequenceNumber` is treated as success (broker already committed the batch;
+>   idempotent dedup worked). The returned offset is `-1` since the broker does not echo
+>   the original offset for duplicates.
+> - Multi-record batches acknowledge the *last* sequence (`base + count − 1`), matching
+>   the Kafka Java client's `ProducerBatch.lastSequence()` semantics.
+>
+> For cross-session exactly-once semantics (transactions), use `TransactionalProducer`.
 
 ### Concurrency Control
 
@@ -467,7 +507,7 @@ let producer = Producer::builder()
 
 ## Graceful Shutdown
 
-Always close producers properly to flush pending messages. The `close()` method guarantees that all pending batches in the accumulator are flushed to brokers before connections are torn down. Calling `close()` more than once is a no-op:
+Always close producers properly to flush pending messages. The `close()` method is a barrier over all started sends, not just batches still resident in the accumulator. It blocks new sends, waits for buffered and already-in-flight work to finish, then tears down connections. Calling `close()` more than once is a no-op:
 
 ```rust
 use krafka::producer::Producer;
@@ -482,6 +522,14 @@ let producer = Producer::builder()
 // Flush and close — waits for all in-flight batches to complete
 producer.flush().await?;
 producer.close().await;
+```
+
+If you need a bounded shutdown window, use `close_with_timeout()` instead. On timeout, Krafka tears down the connection pool and returns a timeout error, causing any remaining in-flight work to fail fast instead of hanging shutdown indefinitely:
+
+```rust
+use std::time::Duration;
+
+producer.close_with_timeout(Duration::from_secs(10)).await?;
 ```
 
 ## Transactional Producer
@@ -600,6 +648,7 @@ producer.close().await;
 ### Graceful Shutdown (Transactional)
 
 Always close transactional producers properly. The `close()` method:
+- Blocks new sends and waits for already-started transactional produce requests to finish
 - Aborts any active transaction to avoid dangling open transactions on the broker
 - Transitions the producer to `FatalError` state, preventing further use
 - Closes the underlying connection pool
@@ -611,6 +660,14 @@ producer.close().await;
 // Producer is no longer usable after close()
 ```
 
+For bounded shutdown windows, `close_with_timeout()` provides the same semantics with an explicit deadline:
+
+```rust
+use std::time::Duration;
+
+producer.close_with_timeout(Duration::from_secs(10)).await?;
+```
+
 ### Built-in Retry Logic
 
 The transactional producer automatically retries sends on transient failures:
@@ -619,6 +676,20 @@ The transactional producer automatically retries sends on transient failures:
 - `OutOfOrderSequenceNumber` errors trigger a sequence number reset and batch rebuild with a fresh sequence before retrying
 - Sequence numbers and the batch are allocated once and reused across normal retries to maintain idempotent semantics
 - Non-retriable errors (auth failures, invalid topics) fail immediately
+
+### Coordinator Re-discovery
+
+All coordinator RPCs (`InitProducerId`, `AddPartitionsToTxn`, `AddOffsetsToTxn`, `EndTxn`)
+automatically handle coordinator failover:
+
+- On `NotCoordinator`, `CoordinatorNotAvailable`, or `CoordinatorLoadInProgress` the cached
+  coordinator is invalidated and a fresh `FindCoordinator` is issued before retrying.
+- Network and timeout errors to the coordinator trigger the same invalidation + re-discovery flow.
+- The retry uses the producer's `RetryPolicy` for exponential backoff between attempts.
+- Fatal errors (`TransactionCoordinatorFenced`, `ProducerFenced`, `InvalidProducerEpoch`,
+  `InvalidTxnState`) are never retried.
+- If no coordinator is cached (e.g. after invalidation), `coordinator_connection()` auto-discovers
+  one transparently before returning the connection.
 
 ### Timestamps
 
@@ -682,7 +753,7 @@ observe the acknowledgement (or error) after a send completes.
 See the [Interceptors Guide](interceptors.md) for full details.
 
 ```rust
-use krafka::interceptor::ProducerInterceptor;
+use krafka::interceptor::{InterceptorResult, ProducerInterceptor};
 use krafka::producer::{Producer, ProducerRecord, RecordMetadata};
 use krafka::error::KrafkaError;
 use std::sync::Arc;
@@ -691,17 +762,19 @@ use std::sync::Arc;
 struct AuditInterceptor;
 
 impl ProducerInterceptor for AuditInterceptor {
-    fn on_send(&self, record: &mut ProducerRecord) {
+    fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
         // Add a tracing header to every record
         record.headers.push(("x-trace-id".to_string(), b"abc123".to_vec()));
+        Ok(())
     }
 
-    fn on_acknowledgement(&self, metadata: &RecordMetadata, error: Option<&KrafkaError>) {
+    fn on_acknowledgement(&self, metadata: &RecordMetadata, error: Option<&KrafkaError>) -> InterceptorResult {
         if let Some(err) = error {
             eprintln!("Send failed: {}", err);
         } else {
             println!("Sent to {}:{}", metadata.topic, metadata.partition);
         }
+        Ok(())
     }
 }
 

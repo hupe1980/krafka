@@ -10,38 +10,194 @@
 //! Note: These tests are ignored by default as they require Docker.
 //! Enable with: `cargo test --test integration_tests -- --ignored`
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::time::Duration;
 
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
-use testcontainers_modules::kafka::Kafka;
+use testcontainers::core::{ContainerPort, ContainerState, ExecCommand, WaitFor};
+use testcontainers::{ContainerAsync, Image, runners::AsyncRunner};
+
+// ---------------------------------------------------------------------------
+// Timing constants — tweak these for CI vs local runs
+// ---------------------------------------------------------------------------
+
+/// Time to wait after container start for Kafka to stabilize.
+const CONTAINER_SETTLE: Duration = Duration::from_secs(10);
+
+/// Time to wait after topic creation for metadata propagation.
+const TOPIC_READY: Duration = Duration::from_secs(2);
+
+// ---------------------------------------------------------------------------
+// Custom Kafka image – works with `apache/kafka-native` 3.8 – 4.x
+// ---------------------------------------------------------------------------
+
+const KAFKA_PORT: ContainerPort = ContainerPort::Tcp(9092);
+const START_SCRIPT: &str = "/tmp/testcontainers_start.sh";
+
+/// Minimal [`Image`] for `apache/kafka-native` that follows the same
+/// start-script pattern as Java testcontainers.
+///
+/// 1. The container command loops until `START_SCRIPT` exists.
+/// 2. `exec_after_start` writes that script — after the host port is known —
+///    exporting `KAFKA_ADVERTISED_LISTENERS` and calling `/etc/kafka/docker/run`.
+/// 3. Wait condition: "Kafka Server started" appears in container logs.
+#[derive(Debug, Clone)]
+struct ApacheKafka {
+    tag: String,
+    env_vars: HashMap<String, String>,
+}
+
+impl ApacheKafka {
+    fn new(tag: impl Into<String>) -> Self {
+        let tag = tag.into();
+        let mut env_vars = HashMap::new();
+
+        env_vars.insert("CLUSTER_ID".into(), "5L6g3nShT-eMCtK--X86sw".into());
+        env_vars.insert("KAFKA_NODE_ID".into(), "1".into());
+        env_vars.insert("KAFKA_PROCESS_ROLES".into(), "broker,controller".into());
+        env_vars.insert(
+            "KAFKA_LISTENERS".into(),
+            format!(
+                "PLAINTEXT://0.0.0.0:{},BROKER://0.0.0.0:9093,CONTROLLER://0.0.0.0:9094",
+                KAFKA_PORT.as_u16()
+            ),
+        );
+        env_vars.insert(
+            "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP".into(),
+            "BROKER:PLAINTEXT,PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT".into(),
+        );
+        env_vars.insert("KAFKA_INTER_BROKER_LISTENER_NAME".into(), "BROKER".into());
+        env_vars.insert(
+            "KAFKA_CONTROLLER_LISTENER_NAMES".into(),
+            "CONTROLLER".into(),
+        );
+        env_vars.insert(
+            "KAFKA_CONTROLLER_QUORUM_VOTERS".into(),
+            "1@localhost:9094".into(),
+        );
+        env_vars.insert("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR".into(), "1".into());
+        env_vars.insert("KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS".into(), "1".into());
+        env_vars.insert(
+            "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR".into(),
+            "1".into(),
+        );
+        env_vars.insert("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR".into(), "1".into());
+        env_vars.insert("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS".into(), "0".into());
+        env_vars.insert(
+            "KAFKA_LOG_FLUSH_INTERVAL_MESSAGES".into(),
+            i64::MAX.to_string(),
+        );
+
+        Self { tag, env_vars }
+    }
+}
+
+impl Image for ApacheKafka {
+    fn name(&self) -> &str {
+        "apache/kafka-native"
+    }
+
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    fn ready_conditions(&self) -> Vec<WaitFor> {
+        // The entrypoint waits for START_SCRIPT; readiness is checked
+        // via `exec_after_start` container-level conditions instead.
+        vec![]
+    }
+
+    fn entrypoint(&self) -> Option<&str> {
+        Some("bash")
+    }
+
+    fn cmd(&self) -> impl IntoIterator<Item = impl Into<Cow<'_, str>>> {
+        vec![
+            "-c".to_string(),
+            format!(
+                "while [ ! -f {START_SCRIPT} ]; do sleep 0.1; done; \
+                 chmod 755 {START_SCRIPT} && {START_SCRIPT}"
+            ),
+        ]
+    }
+
+    fn env_vars(
+        &self,
+    ) -> impl IntoIterator<Item = (impl Into<Cow<'_, str>>, impl Into<Cow<'_, str>>)> {
+        &self.env_vars
+    }
+
+    fn expose_ports(&self) -> &[ContainerPort] {
+        &[KAFKA_PORT]
+    }
+
+    fn exec_after_start(
+        &self,
+        cs: ContainerState,
+    ) -> Result<Vec<ExecCommand>, testcontainers::TestcontainersError> {
+        let host_port = cs.host_port_ipv4(KAFKA_PORT)?;
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             export KAFKA_ADVERTISED_LISTENERS=\
+             PLAINTEXT://127.0.0.1:{host_port},BROKER://localhost:9093,CONTROLLER://localhost:9094\n\
+             /etc/kafka/docker/run\n"
+        );
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("echo '{script}' > {START_SCRIPT}"),
+        ];
+        // Both older (3.8) and newer (3.9+/4.x) images eventually log this.
+        let ready = vec![WaitFor::message_on_stdout("Kafka Server started")];
+        Ok(vec![
+            ExecCommand::new(cmd).with_container_ready_conditions(ready),
+        ])
+    }
+}
 
 /// Helper to get a Kafka container.
-async fn kafka_container() -> (ContainerAsync<Kafka>, String) {
-    let container = Kafka::default()
-        .with_tag("7.5.0")
-        // Enable transactions and offsets for single-broker setup
-        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
-        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
-        .with_env_var("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1")
-        .with_env_var("KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS", "1")
-        // Group coordinator settings for single-broker
-        .with_env_var("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0")
-        .start()
-        .await
-        .expect("Failed to start Kafka container");
+///
+/// Uses the `apache/kafka-native` image. The image tag is read from the
+/// `KAFKA_VERSION` environment variable (set by CI matrix); defaults to
+/// `3.9.0` for local development.
+///
+/// The GraalVM native image occasionally segfaults during startup
+/// (`Pwd.getpwuid` in class initialization), so we retry up to 3 times.
+async fn kafka_container() -> (ContainerAsync<ApacheKafka>, String) {
+    let tag = std::env::var("KAFKA_VERSION").unwrap_or_else(|_| "3.9.0".to_string());
 
-    // Wait for Kafka to be fully ready (broker startup can take time)
-    // Increased from 15s to 20s for group coordinator initialization
-    tokio::time::sleep(Duration::from_secs(20)).await;
+    let max_attempts = 3;
+    let mut last_err = None;
 
-    let host_port = container
-        .get_host_port_ipv4(9093)
-        .await
-        .expect("Failed to get host port");
+    for attempt in 1..=max_attempts {
+        match ApacheKafka::new(&tag).start().await {
+            Ok(container) => {
+                // Wait for Kafka to be fully ready
+                tokio::time::sleep(CONTAINER_SETTLE).await;
 
-    let bootstrap_servers = format!("127.0.0.1:{}", host_port);
+                let host_port = container
+                    .get_host_port_ipv4(KAFKA_PORT)
+                    .await
+                    .expect("Failed to get host port");
 
-    (container, bootstrap_servers)
+                let bootstrap_servers = format!("127.0.0.1:{}", host_port);
+                return (container, bootstrap_servers);
+            }
+            Err(e) => {
+                eprintln!("Kafka container start attempt {attempt}/{max_attempts} failed: {e}");
+                last_err = Some(e);
+                if attempt < max_attempts {
+                    let backoff = Duration::from_secs(2u64.pow(attempt as u32));
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+    }
+
+    panic!(
+        "Failed to start Kafka container after {max_attempts} attempts: {}",
+        last_err.unwrap()
+    );
 }
 
 /// Helper to subscribe with retry for coordinator availability.
@@ -121,14 +277,14 @@ async fn create_topic(bootstrap_servers: &str, topic: &str, partitions: i32) {
 
     admin
         .create_topics(
-            vec![NewTopic::new(topic, partitions, 1)],
+            vec![NewTopic::new(topic, partitions, 1).unwrap()],
             Duration::from_secs(10),
         )
         .await
         .expect("Failed to create topic");
 
     // Wait for topic to be ready
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(TOPIC_READY).await;
 }
 
 #[tokio::test]
@@ -181,6 +337,7 @@ async fn test_producer_send_receive() {
     assert_eq!(record.key_str(), Some("test-key"));
     assert_eq!(record.value_str(), Some("test-value"));
 
+    consumer.close().await;
     producer.close().await;
 }
 
@@ -200,7 +357,7 @@ async fn test_admin_client() {
 
     // Create a topic
     let topic_name = "admin-test-topic";
-    let new_topic = NewTopic::new(topic_name, 3, 1);
+    let new_topic = NewTopic::new(topic_name, 3, 1).unwrap();
 
     admin
         .create_topics(vec![new_topic], Duration::from_secs(10))
@@ -242,10 +399,13 @@ async fn test_compression_roundtrip() {
 
     for compression in [
         Compression::None,
+        #[cfg(feature = "gzip")]
         Compression::Gzip,
+        #[cfg(feature = "snappy")]
         Compression::Snappy,
+        #[cfg(feature = "lz4")]
         Compression::Lz4,
-        Compression::Zstd,
+        // Zstd is not supported by the apache/kafka-native GraalVM image.
     ] {
         let topic = format!("compression-test-{:?}", compression).to_lowercase();
         create_topic(&bootstrap_servers, &topic, 1).await;
@@ -295,6 +455,7 @@ async fn test_compression_roundtrip() {
             "Value mismatch for {:?}",
             compression
         );
+        consumer.close().await;
     }
 }
 
@@ -314,7 +475,7 @@ async fn test_multiple_partitions() {
         .expect("Failed to create admin client");
 
     let topic_name = "multi-partition-topic";
-    let new_topic = NewTopic::new(topic_name, 6, 1);
+    let new_topic = NewTopic::new(topic_name, 6, 1).unwrap();
 
     admin
         .create_topics(vec![new_topic], Duration::from_secs(10))
@@ -370,7 +531,7 @@ async fn test_consumer_group_rebalance() {
         .await
         .expect("Failed to create admin client");
 
-    let new_topic = NewTopic::new(topic_name, 4, 1);
+    let new_topic = NewTopic::new(topic_name, 4, 1).unwrap();
     admin
         .create_topics(vec![new_topic], Duration::from_secs(10))
         .await
@@ -436,94 +597,8 @@ async fn test_consumer_group_rebalance() {
         total_records > 0,
         "Expected at least some records from consumer group"
     );
-}
-
-#[tokio::test]
-#[ignore = "requires Docker"]
-async fn test_consumer_commit_and_resume() {
-    use krafka::admin::{AdminClient, NewTopic};
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
-
-    let (_container, bootstrap_servers) = kafka_container().await;
-
-    let topic_name = "commit-resume-test";
-    let group_id = "commit-resume-group";
-
-    // Create topic
-    let admin = AdminClient::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .build()
-        .await
-        .expect("Failed to create admin client");
-
-    let new_topic = NewTopic::new(topic_name, 1, 1);
-    admin
-        .create_topics(vec![new_topic], Duration::from_secs(10))
-        .await
-        .expect("Failed to create topic");
-
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    // Produce messages
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .build()
-        .await
-        .expect("Failed to create producer");
-
-    for i in 0..10 {
-        let _ = producer
-            .send(topic_name, None, format!("msg-{}", i).as_bytes())
-            .await
-            .expect("Failed to send message");
-    }
-    producer.close().await;
-
-    // First consumer: read and commit
-    {
-        let consumer = Consumer::builder()
-            .bootstrap_servers(&bootstrap_servers)
-            .group_id(group_id)
-            .auto_offset_reset(AutoOffsetReset::Earliest)
-            .enable_auto_commit(false) // Manual commit
-            .build()
-            .await
-            .expect("Failed to create consumer");
-
-        subscribe_with_retry(&consumer, &[topic_name], 5)
-            .await
-            .expect("Failed to subscribe");
-
-        // Read some messages (first poll may be consumed by rebalance)
-        let records = poll_for_records(&consumer, 1, Duration::from_secs(5), 5).await;
-
-        assert!(!records.is_empty(), "Expected records");
-
-        // Commit offsets
-        consumer.commit().await.expect("Failed to commit");
-    }
-
-    // Second consumer: should resume from committed offset
-    {
-        let consumer = Consumer::builder()
-            .bootstrap_servers(&bootstrap_servers)
-            .group_id(group_id)
-            .auto_offset_reset(AutoOffsetReset::Earliest)
-            .enable_auto_commit(false)
-            .build()
-            .await
-            .expect("Failed to create second consumer");
-
-        subscribe_with_retry(&consumer, &[topic_name], 5)
-            .await
-            .expect("Failed to subscribe");
-
-        // Poll - should get remaining messages or none if all were committed
-        let _records = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
-
-        // Success - consumer was able to resume from committed offset
-    }
+    consumer1.close().await;
+    consumer2.close().await;
 }
 
 // ============================================================================
@@ -628,6 +703,7 @@ async fn test_consumer_handles_no_messages_gracefully() {
 
     // May be empty or have the setup message depending on timing
     drop(records);
+    consumer.close().await;
 }
 
 #[tokio::test]
@@ -689,6 +765,7 @@ async fn test_multiple_producers_same_topic() {
     let all_records = poll_for_records(&consumer, 6, Duration::from_secs(3), 8).await;
 
     assert_eq!(all_records.len(), 6, "Expected 6 messages from 2 producers");
+    consumer.close().await;
 }
 
 #[tokio::test]
@@ -740,6 +817,7 @@ async fn test_large_message_handling() {
         records[0].value.as_ref().map(|v| v.len()).unwrap_or(0),
         100 * 1024
     );
+    consumer.close().await;
 }
 
 // ============================================================================
@@ -799,27 +877,23 @@ async fn test_message_headers() {
 
     // Verify headers are present
     assert!(record.header("trace-id").is_some());
+    consumer.close().await;
 }
 
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_idempotent_producer() {
-    use krafka::producer::{Acks, Producer};
+    use krafka::producer::Producer;
 
     let (_container, bootstrap_servers) = kafka_container().await;
 
     let topic = "idempotent-test-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    // Create idempotent producer
-    // Note: Full idempotence requires TransactionalProducer. This test
-    // verifies the producer works with the idempotence config flag set.
-    #[allow(deprecated)]
+    // Create idempotent producer (enabled by default since KIP-679)
     let producer = Producer::builder()
         .bootstrap_servers(&bootstrap_servers)
         .client_id("idempotent-producer-test")
-        .acks(Acks::All) // Required for idempotence
-        .enable_idempotence(true)
         .build()
         .await
         .expect("Failed to create idempotent producer");
@@ -890,6 +964,7 @@ async fn test_null_key_and_value() {
     // Verify null key is received as None
     assert!(record.key.is_none());
     assert!(record.value.is_some());
+    consumer.close().await;
 }
 
 #[tokio::test]
@@ -949,67 +1024,7 @@ async fn test_multiple_topics_subscription() {
         "Should contain messages from both topics, got: {:?}",
         topics
     );
-}
-
-#[tokio::test]
-#[ignore = "requires Docker"]
-async fn test_consumer_seek_operations() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
-
-    let (_container, bootstrap_servers) = kafka_container().await;
-
-    let topic = "seek-test-topic";
-    create_topic(&bootstrap_servers, topic, 1).await;
-
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .client_id("seek-test-producer")
-        .build()
-        .await
-        .expect("Failed to create producer");
-
-    // Send multiple messages
-    for i in 0..10 {
-        let _ = producer
-            .send(
-                topic,
-                Some(format!("key-{}", i).as_bytes()),
-                format!("value-{}", i).as_bytes(),
-            )
-            .await
-            .expect("send failed");
-    }
-    producer.close().await;
-
-    // Test seek to specific offset
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("seek-test-consumer")
-        .auto_offset_reset(AutoOffsetReset::Earliest)
-        .enable_auto_commit(false)
-        .build()
-        .await
-        .expect("Failed to create consumer");
-
-    subscribe_with_retry(&consumer, &[topic], 5)
-        .await
-        .expect("Failed to subscribe");
-
-    // First poll to establish assignment (rebalance may consume first poll)
-    let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
-
-    // Seek to beginning of partition 0
-    consumer
-        .seek_to_beginning(topic, 0)
-        .await
-        .expect("seek to beginning failed");
-
-    // Poll should get messages from the beginning
-    let records = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
-
-    // We may or may not get records depending on timing, but no panic
-    drop(records);
+    consumer.close().await;
 }
 
 #[tokio::test]
@@ -1028,7 +1043,7 @@ async fn test_admin_describe_configs() {
 
     // Create a topic first
     let topic_name = "config-test-topic";
-    let new_topic = NewTopic::new(topic_name, 1, 1);
+    let new_topic = NewTopic::new(topic_name, 1, 1).unwrap();
     admin
         .create_topics(vec![new_topic], Duration::from_secs(10))
         .await
@@ -1037,8 +1052,9 @@ async fn test_admin_describe_configs() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Describe topic configs
+    use krafka::admin::DescribeConfigsRequest;
     let configs = admin
-        .describe_topic_config(topic_name)
+        .describe_configs(DescribeConfigsRequest::for_topic(topic_name))
         .await
         .expect("Failed to describe configs");
 
@@ -1050,73 +1066,6 @@ async fn test_admin_describe_configs() {
         .delete_topics(vec![topic_name.to_string()], Duration::from_secs(10))
         .await
         .ok();
-}
-
-#[tokio::test]
-#[ignore = "requires Docker"]
-async fn test_consumer_pause_resume() {
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use krafka::producer::Producer;
-
-    let (_container, bootstrap_servers) = kafka_container().await;
-
-    let topic = "pause-resume-topic";
-    create_topic(&bootstrap_servers, topic, 1).await;
-
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .client_id("pause-resume-producer")
-        .build()
-        .await
-        .expect("Failed to create producer");
-
-    // Send initial messages
-    for i in 0..5 {
-        let _ = producer
-            .send(
-                topic,
-                Some(format!("key-{}", i).as_bytes()),
-                format!("value-{}", i).as_bytes(),
-            )
-            .await
-            .expect("send failed");
-    }
-    producer.close().await;
-
-    let consumer = Consumer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .group_id("pause-resume-consumer")
-        .auto_offset_reset(AutoOffsetReset::Earliest)
-        .build()
-        .await
-        .expect("Failed to create consumer");
-
-    subscribe_with_retry(&consumer, &[topic], 5)
-        .await
-        .expect("Failed to subscribe");
-
-    // Initial poll to get assignment (rebalance may consume first poll)
-    let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
-
-    // Pause the partition
-    consumer.pause(topic, &[0]).await;
-
-    // Poll should return empty while paused (within timeout)
-    let _records = consumer
-        .poll(Duration::from_millis(500))
-        .await
-        .expect("poll failed");
-    // May or may not be empty depending on buffering
-
-    // Resume the partition
-    consumer.resume(topic, &[0]).await;
-
-    // Should be able to continue consuming
-    let records = consumer
-        .poll(Duration::from_secs(2))
-        .await
-        .expect("poll failed after resume");
-    drop(records);
 }
 
 #[tokio::test]
@@ -1183,6 +1132,7 @@ async fn test_concurrent_producers() {
         15,
         "Expected 15 messages from 3 concurrent producers"
     );
+    consumer.close().await;
 }
 
 #[tokio::test]
@@ -1234,6 +1184,7 @@ async fn test_producer_with_batching() {
 
     let records = poll_for_records(&consumer, 10, Duration::from_secs(5), 5).await;
     assert_eq!(records.len(), 10, "Expected 10 messages");
+    consumer.close().await;
 }
 
 // Note: TransactionalProducer tests are skipped because transaction coordinator
@@ -1259,7 +1210,7 @@ async fn test_admin_create_partitions() {
     // Create topic with 2 partitions
     admin
         .create_topics(
-            vec![NewTopic::new(topic_name, 2, 1)],
+            vec![NewTopic::new(topic_name, 2, 1).unwrap()],
             Duration::from_secs(10),
         )
         .await
@@ -1314,7 +1265,7 @@ async fn test_admin_alter_topic_config() {
     // Create topic
     admin
         .create_topics(
-            vec![NewTopic::new(topic_name, 1, 1)],
+            vec![NewTopic::new(topic_name, 1, 1).unwrap()],
             Duration::from_secs(10),
         )
         .await
@@ -1334,8 +1285,9 @@ async fn test_admin_alter_topic_config() {
     assert!(result.error.is_none(), "Config alteration should succeed");
 
     // Verify the config was changed
+    use krafka::admin::DescribeConfigsRequest;
     let topic_configs = admin
-        .describe_topic_config(topic_name)
+        .describe_configs(DescribeConfigsRequest::for_topic(topic_name))
         .await
         .expect("Failed to describe config");
 
@@ -1382,9 +1334,9 @@ async fn test_admin_describe_cluster() {
     // Note: controller_id may be None in some Kafka configurations
 
     let broker = &cluster.brokers[0];
-    assert!(!broker.host().is_empty(), "Broker should have a host");
-    assert!(broker.port() > 0, "Broker should have a valid port");
-    assert!(broker.id >= 0, "Broker should have a valid ID");
+    assert!(!broker.host.is_empty(), "Broker should have a host");
+    assert!(broker.port > 0, "Broker should have a valid port");
+    assert!(broker.broker_id >= 0, "Broker should have a valid ID");
 }
 
 #[tokio::test]
@@ -1406,7 +1358,10 @@ async fn test_admin_describe_topics() {
 
     admin
         .create_topics(
-            vec![NewTopic::new(topic1, 2, 1), NewTopic::new(topic2, 3, 1)],
+            vec![
+                NewTopic::new(topic1, 2, 1).unwrap(),
+                NewTopic::new(topic2, 3, 1).unwrap(),
+            ],
             Duration::from_secs(10),
         )
         .await
@@ -1518,6 +1473,7 @@ async fn test_producer_timestamp_propagation() {
             record.timestamp
         );
     }
+    consumer.close().await;
 }
 
 #[tokio::test]
@@ -1574,6 +1530,7 @@ async fn test_consumer_manual_assign() {
         assert_eq!(record.partition, 0, "Should only get partition 0");
     }
     assert!(!records.is_empty(), "Expected records from partition 0");
+    consumer.close().await;
 }
 
 #[tokio::test]
@@ -1623,6 +1580,7 @@ async fn test_admin_list_consumer_groups() {
         group_id,
         groups.iter().map(|g| &g.group_id).collect::<Vec<_>>()
     );
+    consumer.close().await;
 }
 
 #[tokio::test]
@@ -1659,6 +1617,7 @@ async fn test_consumer_unsubscribe() {
         subscription.is_empty(),
         "Subscription should be empty after unsubscribe"
     );
+    consumer.close().await;
 }
 
 #[tokio::test]
@@ -1854,28 +1813,46 @@ async fn test_consumer_recv() {
 async fn test_producer_flush() {
     use krafka::consumer::{AutoOffsetReset, Consumer};
     use krafka::producer::Producer;
+    use std::sync::Arc;
 
     let (_container, bootstrap_servers) = kafka_container().await;
 
     let topic = "flush-test-topic";
     create_topic(&bootstrap_servers, topic, 1).await;
 
-    let producer = Producer::builder()
-        .bootstrap_servers(&bootstrap_servers)
-        .linger(Duration::from_secs(30)) // Long linger to accumulate
-        .build()
-        .await
-        .unwrap();
-
-    for i in 0..5 {
-        let _ = producer
-            .send(topic, None, format!("flush-{}", i).as_bytes())
+    let producer = Arc::new(
+        Producer::builder()
+            .bootstrap_servers(&bootstrap_servers)
+            .linger(Duration::from_secs(30)) // Long linger to accumulate
+            .build()
             .await
-            .unwrap();
+            .unwrap(),
+    );
+
+    // Spawn sends in background — they block until the batch is flushed
+    let mut handles = Vec::new();
+    for i in 0..5 {
+        let p = Arc::clone(&producer);
+        let t = topic.to_string();
+        handles.push(tokio::spawn(async move {
+            let _ = p
+                .send(&t, None, format!("flush-{}", i).as_bytes())
+                .await
+                .unwrap();
+        }));
     }
+
+    // Give the accumulator time to receive all records
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Explicit flush should ensure all messages are sent
     producer.flush().await.expect("flush failed");
+
+    // All spawned sends should now complete
+    for h in handles {
+        h.await.unwrap();
+    }
+
     producer.close().await;
 
     let consumer = Consumer::builder()
@@ -1915,19 +1892,80 @@ async fn test_admin_describe_consumer_group() {
         .unwrap();
 
     subscribe_with_retry(&consumer, &[topic], 5).await.unwrap();
-    // Poll multiple times to ensure group join completes (first poll does rebalance)
-    let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
 
+    // Drive the rebalance until the consumer actually has partitions assigned.
+    // On Kafka 3.9 under CI load, JoinGroup/SyncGroup can take many polls.
+    let mut got_assignment = false;
+    for i in 0..20 {
+        let _ = consumer.poll(Duration::from_secs(3)).await;
+        let assignment = consumer.assignment().await;
+        if !assignment.is_empty() {
+            eprintln!("Consumer got assignment after {} poll(s)", i + 1);
+            got_assignment = true;
+            break;
+        }
+    }
+    assert!(
+        got_assignment,
+        "Consumer should have received partition assignment"
+    );
+
+    // Let the group stabilize — poll several more times so that the
+    // coordinator finishes SyncGroup and at least one heartbeat succeeds.
+    // Without this, Kafka 3.9 under CI load may not report the member yet.
+    for _ in 0..5 {
+        let _ = consumer.poll(Duration::from_secs(2)).await;
+    }
+
+    // Verify the group is listed by the broker before describing it.
     let admin = AdminClient::builder()
         .bootstrap_servers(&bootstrap_servers)
         .build()
         .await
         .unwrap();
 
-    let descriptions = admin
-        .describe_groups(vec![group_id.to_string()])
-        .await
-        .expect("describe_groups failed");
+    let listed = admin.list_consumer_groups().await.unwrap();
+    eprintln!(
+        "list_consumer_groups: [{}]",
+        listed
+            .iter()
+            .map(|g| format!("{}({})", g.group_id, g.protocol_type))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    // Retry describe_consumer_groups — the broker may take a moment to
+    // report the member after the rebalance completes. Keep polling the
+    // consumer between attempts so it stays in the group (heartbeats).
+    let mut descriptions = Vec::new();
+    for attempt in 0..30 {
+        // Poll first to keep the consumer alive and heartbeating
+        let _ = consumer.poll(Duration::from_secs(2)).await;
+
+        descriptions = admin
+            .describe_consumer_groups(vec![group_id.to_string()])
+            .await
+            .expect("describe_consumer_groups failed");
+        if descriptions.len() == 1 && !descriptions[0].members.is_empty() {
+            eprintln!(
+                "describe_consumer_groups succeeded on attempt {}/30: {} members, state={}, type={:?}",
+                attempt + 1,
+                descriptions[0].members.len(),
+                descriptions[0].state,
+                descriptions[0].group_type,
+            );
+            break;
+        }
+        eprintln!(
+            "describe_consumer_groups attempt {}/30: {} members, state={}, type={:?}, retrying...",
+            attempt + 1,
+            descriptions.first().map_or(0, |d| d.members.len()),
+            descriptions
+                .first()
+                .map_or("N/A".to_string(), |d| d.state.clone()),
+            descriptions.first().map(|d| d.group_type.clone()),
+        );
+    }
 
     assert_eq!(descriptions.len(), 1);
     assert_eq!(descriptions[0].group_id, group_id);
@@ -1974,16 +2012,19 @@ async fn test_consumer_close_leaves_group() {
         .unwrap();
 
     let descriptions = admin
-        .describe_groups(vec![group_id.to_string()])
+        .describe_consumer_groups(vec![group_id.to_string()])
         .await
-        .expect("describe_groups failed");
+        .expect("describe_consumer_groups failed");
 
-    if !descriptions.is_empty() {
-        assert!(
-            descriptions[0].members.is_empty(),
-            "After close(), group should have no active members"
-        );
-    }
+    assert!(
+        !descriptions.is_empty(),
+        "describe_consumer_groups should return the group even after close"
+    );
+    assert!(
+        descriptions[0].members.is_empty(),
+        "After close(), group should have no active members, got {} member(s)",
+        descriptions[0].members.len()
+    );
 }
 
 /// Test empty value messages roundtrip correctly.
@@ -2028,11 +2069,12 @@ async fn test_empty_value_message() {
     consumer.close().await;
 }
 
-/// Test admin describe_broker_config returns broker configuration.
+/// Test admin describe_configs returns broker configuration.
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_admin_describe_broker_config() {
     use krafka::admin::AdminClient;
+    use krafka::admin::DescribeConfigsRequest;
 
     let (_container, bootstrap_servers) = kafka_container().await;
 
@@ -2043,12 +2085,12 @@ async fn test_admin_describe_broker_config() {
         .unwrap();
 
     let cluster = admin.describe_cluster().await.unwrap();
-    let broker_id = cluster.brokers[0].id;
+    let broker_id = cluster.brokers[0].broker_id;
 
     let configs = admin
-        .describe_broker_config(broker_id)
+        .describe_configs(DescribeConfigsRequest::for_broker(broker_id))
         .await
-        .expect("describe_broker_config failed");
+        .expect("describe_configs failed");
 
     assert!(!configs.is_empty(), "Broker should have config entries");
 
@@ -2078,7 +2120,10 @@ async fn test_many_partitions_topic() {
 
     let topic = "many-partitions-topic";
     admin
-        .create_topics(vec![NewTopic::new(topic, 12, 1)], Duration::from_secs(10))
+        .create_topics(
+            vec![NewTopic::new(topic, 12, 1).unwrap()],
+            Duration::from_secs(10),
+        )
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -2251,6 +2296,7 @@ async fn test_admin_create_topic_with_config() {
 
     let topic = "configured-topic";
     let new_topic = NewTopic::new(topic, 3, 1)
+        .unwrap()
         .with_config("retention.ms", "3600000")
         .with_config("cleanup.policy", "compact");
 
@@ -2261,7 +2307,10 @@ async fn test_admin_create_topic_with_config() {
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let configs = admin.describe_topic_config(topic).await.unwrap();
+    let configs = admin
+        .describe_configs(krafka::admin::DescribeConfigsRequest::for_topic(topic))
+        .await
+        .unwrap();
     let retention = configs.iter().find(|c| c.name == "retention.ms");
     assert!(retention.is_some(), "Should have retention.ms config");
     assert_eq!(

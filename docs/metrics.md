@@ -19,12 +19,43 @@ Krafka provides built-in metrics collection that is automatically wired into all
 
 All metrics are lock-free using atomic operations for minimal performance impact. Access metrics via `producer.metrics_handle()` or `consumer.metrics()`.
 
+## Pluggable Export
+
+Krafka uses a trait-based export system. Implement `MetricsExporter` to add any
+backend. Built-in exporters:
+
+| Exporter | Format | Dependency |
+|----------|--------|------------|
+| `PrometheusExporter` | Prometheus text exposition | None |
+| `JsonExporter` | JSON array of metric objects | None |
+| `OtlpExporter` | OTLP MetricsData v1 protobuf | `telemetry` feature |
+
+### Custom Exporter
+
+```rust
+use krafka::metrics::{MetricsExporter, LatencySnapshot};
+
+struct StatsDExporter { /* ... */ }
+
+impl MetricsExporter for StatsDExporter {
+    fn export_counter(&mut self, name: &str, _help: &str, value: u64) {
+        // send_udp(format!("{name}:{value}|c"));
+    }
+    fn export_gauge(&mut self, name: &str, _help: &str, value: u64) {
+        // send_udp(format!("{name}:{value}|g"));
+    }
+    fn export_latency(&mut self, name: &str, _help: &str, snapshot: &LatencySnapshot) {
+        // send_udp(format!("{name}.count:{0}|g", snapshot.count));
+    }
+}
+```
+
 ## Basic Usage
 
 Each client type has its own metrics:
 
 ```rust
-use krafka::metrics::{ProducerMetrics, ConsumerMetrics, ConnectionMetrics};
+use krafka::metrics::{ProducerMetrics, ConsumerMetrics, ConnectionMetrics, MetricsVisitable};
 
 let producer_metrics = ProducerMetrics::new();
 let consumer_metrics = ConsumerMetrics::new();
@@ -42,36 +73,41 @@ println!("Bytes sent: {}", snapshot.bytes_sent);
 
 ## Prometheus Export
 
-Krafka provides built-in Prometheus text format export without external dependencies:
-
 ```rust
-use krafka::metrics::{ProducerMetrics, MetricsExport};
+use krafka::metrics::{ProducerMetrics, MetricsVisitable};
 
 let metrics = ProducerMetrics::new();
 metrics.record_send(100);
 metrics.record_batch(5);
 
-// Export in Prometheus text format
+// Export in Prometheus text format (convenience method)
 let prometheus_output = metrics.to_prometheus_text("krafka_producer");
 println!("{}", prometheus_output);
 ```
 
-Example output:
+Or use the exporter directly:
 
-```text
-# HELP krafka_producer_records_sent_total Total number of records sent
-# TYPE krafka_producer_records_sent_total counter
-krafka_producer_records_sent_total 6
-# HELP krafka_producer_bytes_sent_total Total bytes sent
-# TYPE krafka_producer_bytes_sent_total counter
-krafka_producer_bytes_sent_total 100
-# HELP krafka_producer_batches_sent_total Total batches sent
-# TYPE krafka_producer_batches_sent_total counter
-krafka_producer_batches_sent_total 1
-# HELP krafka_producer_send_latency_seconds Send latency
-# TYPE krafka_producer_send_latency_seconds summary
-krafka_producer_send_latency_seconds_count 0
-krafka_producer_send_latency_seconds_sum 0.000000000
+```rust
+use krafka::metrics::{ProducerMetrics, PrometheusExporter, MetricsVisitable};
+
+let metrics = ProducerMetrics::new();
+let mut exporter = PrometheusExporter::new();
+metrics.export_metrics("krafka_producer", &mut exporter);
+let output = exporter.finish();
+```
+
+## JSON Export
+
+```rust
+use krafka::metrics::{ProducerMetrics, JsonExporter, MetricsVisitable};
+
+let metrics = ProducerMetrics::new();
+metrics.record_send(100);
+
+let mut exporter = JsonExporter::new();
+metrics.export_metrics("krafka_producer", &mut exporter);
+let json = exporter.finish();
+// [{"name":"krafka_producer_records_sent","type":"counter","help":"Total records sent","value":1}, ...]
 ```
 
 ## Aggregated Metrics
@@ -96,6 +132,15 @@ consumer_metrics.record_poll(5);
 // Export all metrics in a single call
 let all_metrics = metrics.to_prometheus_text();
 println!("{}", all_metrics);
+
+// Export as JSON
+let json = metrics.to_json();
+
+// Use a custom exporter
+use krafka::metrics::PrometheusExporter;
+let mut exporter = PrometheusExporter::new();
+metrics.export_all(&mut exporter);
+let output = exporter.finish();
 
 // Reset all metrics (e.g., after scrape)
 metrics.reset();
@@ -172,6 +217,7 @@ async fn main() {
 | `lag_max` | Gauge | Maximum per-partition consumer lag |
 | `assigned_partitions` | Gauge | Currently assigned partitions |
 | `paused_partitions` | Gauge | Currently paused partitions |
+| `buffered_records` | Gauge | Currently buffered records in recv() buffer |
 | `poll_latency_seconds` | Summary | Poll latency statistics |
 | `fetch_latency_seconds` | Summary | Fetch latency statistics |
 
@@ -218,8 +264,57 @@ let snapshot = tracker.snapshot();
 
 ## Integration with OpenTelemetry
 
-While Krafka doesn't have a built-in OpenTelemetry integration, you can use the Prometheus
-exporter with OpenTelemetry's Prometheus receiver, or export snapshots directly:
+### Built-in OTLP Export (feature `telemetry`)
+
+Enable the `telemetry` feature for native OTLP protobuf export and KIP-714 broker telemetry:
+
+```toml
+[dependencies]
+krafka = { version = "...", features = ["telemetry"] }
+```
+
+Export metrics as OTLP protobuf bytes for ingestion by any OTLP-compatible backend:
+
+```rust
+use krafka::telemetry::otlp::OtlpExporter;
+use krafka::metrics::{KrafkaMetrics, MetricsVisitable};
+
+let metrics = KrafkaMetrics::new();
+// ... record metrics ...
+
+let mut exporter = OtlpExporter::new(true, 0); // delta temporality
+exporter.add_resource_attribute("service.name", "my-service");
+metrics.export_all(&mut exporter);
+let otlp_bytes: Vec<u8> = exporter.finish();
+// Send otlp_bytes to your OTLP receiver via gRPC or HTTP
+```
+
+### KIP-714 Automatic Telemetry
+
+The `TelemetryReporter` implements KIP-714 client telemetry — it subscribes to the
+broker's telemetry endpoint and pushes metric snapshots on the broker-specified interval:
+
+```rust
+use krafka::telemetry::reporter::{TelemetryReporter, TelemetryConfig};
+
+let config = TelemetryConfig {
+    enabled: true,
+    metrics_prefix: "krafka".into(),
+    resource_attributes: vec![
+        ("service.name".into(), "my-app".into()),
+    ],
+};
+
+let reporter = TelemetryReporter::new(connection, krafka_metrics, config, shutdown_rx);
+tokio::spawn(reporter.run());
+```
+
+The reporter handles subscription polling, push interval jitter, re-subscription on
+`UNKNOWN_SUBSCRIPTION_ID`, and a graceful terminating push on shutdown — all per KIP-714.
+
+### Manual Bridge to External OTel SDKs
+
+You can also bridge metrics to an external OpenTelemetry SDK using snapshots or a custom exporter:
 
 ```rust
 use krafka::metrics::{KrafkaMetrics, ProducerMetricsSnapshot};
@@ -227,7 +322,6 @@ use krafka::metrics::{KrafkaMetrics, ProducerMetricsSnapshot};
 fn export_to_otel(snapshot: &ProducerMetricsSnapshot) {
     // Use your OpenTelemetry SDK to record metrics
     // meter.create_counter("krafka.records_sent").add(snapshot.records_sent);
-    // etc.
 }
 ```
 
@@ -238,7 +332,9 @@ fn export_to_otel(snapshot: &ProducerMetricsSnapshot) {
 - Latency tracking uses compare-and-swap for min/max updates
 - Gauge updates are immediate (no aggregation)
 - Gauge `dec()` saturates at zero (will not underflow below 0), ensuring correctness for connection and partition counting
-- Prometheus export only happens on request (pull-based)
+- Prometheus and JSON export only happen on request (pull-based)
+- OTLP protobuf encoding is zero-copy where possible; no external protobuf dependency
+- KIP-714 telemetry push runs on a background task with broker-controlled intervals
 
 ## Next Steps
 

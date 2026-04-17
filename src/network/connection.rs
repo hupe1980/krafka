@@ -9,19 +9,150 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
+use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(feature = "socks5")]
 use tokio::net::TcpSocket;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::timeout;
+#[cfg(feature = "socks5")]
+use tokio::time::timeout_at;
+use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::CorrelationId;
-use crate::auth::{AuthConfig, SaslMechanism, SecurityProtocol, connect_tls};
+use crate::auth::tls::build_tls_connector;
+use crate::auth::{
+    AuthConfig, ChannelBinding, SaslMechanism, SecurityProtocol, connect_tls,
+    extract_tls_server_end_point,
+};
 use crate::error::{KrafkaError, Result};
+
+/// SOCKS5 proxy configuration for connecting to brokers through a proxy.
+///
+/// When set on a [`ConnectionConfig`], all TCP connections to Kafka brokers
+/// are tunneled through the specified SOCKS5 proxy. The proxy performs DNS
+/// resolution of the broker address, which is essential for VPN/bastion
+/// setups where broker hostnames are not resolvable from the client network.
+///
+/// TLS and SASL authentication are layered on top of the proxied connection
+/// transparently — no additional configuration is needed.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use krafka::network::{ConnectionConfig, ProxyConfig};
+///
+/// let proxy = ProxyConfig::new("socks5-proxy:1080");
+/// let config = ConnectionConfig::builder()
+///     .proxy(proxy)
+///     .build();
+/// ```
+#[cfg(feature = "socks5")]
+#[derive(Clone)]
+pub struct ProxyConfig {
+    /// SOCKS5 proxy address (`host:port`).
+    address: String,
+    /// Optional proxy authentication credentials.
+    credentials: Option<ProxyCredentials>,
+}
+
+#[cfg(feature = "socks5")]
+impl ProxyConfig {
+    /// Create a new SOCKS5 proxy configuration.
+    pub fn new(address: impl Into<String>) -> Self {
+        Self {
+            address: address.into(),
+            credentials: None,
+        }
+    }
+
+    /// Create a SOCKS5 proxy configuration with username/password authentication.
+    pub fn with_credentials(
+        address: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        Self {
+            address: address.into(),
+            credentials: Some(ProxyCredentials {
+                username: username.into(),
+                password: password.into(),
+            }),
+        }
+    }
+
+    /// Returns the proxy address.
+    #[inline]
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    /// Returns the proxy credentials, if set.
+    #[inline]
+    pub fn credentials(&self) -> Option<&ProxyCredentials> {
+        self.credentials.as_ref()
+    }
+}
+
+#[cfg(feature = "socks5")]
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("address", &self.address)
+            .field(
+                "credentials",
+                if self.credentials.is_some() {
+                    &"[REDACTED]"
+                } else {
+                    &"None"
+                },
+            )
+            .finish()
+    }
+}
+
+/// Credentials for SOCKS5 proxy authentication.
+///
+/// Implements [`Zeroize`](zeroize::Zeroize) to ensure the password is scrubbed
+/// from memory on drop.
+#[cfg(feature = "socks5")]
+#[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+pub struct ProxyCredentials {
+    /// Proxy username.
+    username: String,
+    /// Proxy password.
+    password: String,
+}
+
+#[cfg(feature = "socks5")]
+impl ProxyCredentials {
+    /// Returns the proxy username.
+    #[inline]
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    /// Returns the proxy password.
+    #[inline]
+    pub fn password(&self) -> &str {
+        &self.password
+    }
+}
+
+#[cfg(feature = "socks5")]
+impl std::fmt::Debug for ProxyCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyCredentials")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
 use crate::protocol::{
     ApiKey, ApiVersionRange, ApiVersionsRequest, ApiVersionsResponse, Decoder, Encoder,
     RequestHeader, ResponseHeader, SaslAuthenticateRequest, SaslAuthenticateResponse,
@@ -30,7 +161,7 @@ use crate::protocol::{
 use crate::util::CorrelationIdGenerator;
 use crate::util::extract_sni_hostname;
 
-use super::secure::SaslAuthenticator;
+use super::secure::{ChallengeResponse, SaslAuthenticator};
 
 /// Request priority level.
 ///
@@ -73,7 +204,10 @@ impl RequestPriority {
 /// Configuration for broker connections.
 ///
 /// Use [`ConnectionConfig::builder()`] or [`Default::default()`] to construct.
-#[derive(Debug, Clone)]
+/// Call [`init_tls()`](ConnectionConfig::init_tls) after building when TLS is
+/// configured to pre-build and cache the TLS connector, avoiding repeated disk
+/// I/O for certificates on every reconnection.
+#[derive(Clone)]
 pub struct ConnectionConfig {
     /// Connection timeout.
     pub(crate) connect_timeout: Duration,
@@ -103,11 +237,90 @@ pub struct ConnectionConfig {
     /// Responses larger than this are rejected to prevent excessive memory allocation.
     /// Default: 100 MB (matching `MAX_MESSAGE_SIZE`).
     pub(crate) max_response_size: usize,
+    /// Maximum number of in-flight requests per connection.
+    ///
+    /// When this limit is reached, new requests are rejected with an error
+    /// until existing requests complete or time out. This prevents unbounded
+    /// memory growth from a stalled broker or runaway producer.
+    ///
+    /// Default: 256. Use 5 for idempotent producers to match Kafka's
+    /// `max.in.flight.requests.per.connection` guarantee.
+    pub(crate) max_in_flight_requests: usize,
     /// Authentication configuration (optional).
     ///
     /// When set, the connection will perform TLS upgrade and/or SASL
     /// authentication handshake during establishment.
     pub(crate) auth: Option<AuthConfig>,
+    /// Cached TLS connector built from [`AuthConfig::tls_config`].
+    ///
+    /// Populated by [`init_tls()`](ConnectionConfig::init_tls). When present,
+    /// connections reuse this connector instead of reading certificate files
+    /// from disk on every connection attempt.
+    ///
+    /// Wrapped in `Arc<ArcSwap<…>>` so that all clones of this config share
+    /// the same connector and [`refresh_tls()`](ConnectionConfig::refresh_tls)
+    /// atomically updates it for every future connection.
+    pub(crate) tls_connector: Arc<ArcSwap<Option<TlsConnector>>>,
+    /// TCP keepalive interval.
+    ///
+    /// When set, enables TCP keepalive on all broker connections with the
+    /// given interval. This prevents idle connections from being silently
+    /// dropped by firewalls and load balancers.
+    pub(crate) tcp_keepalive: Option<Duration>,
+    /// Happy Eyeballs connection attempt delay (RFC 8305 §5).
+    ///
+    /// The delay between staggered connection attempts when racing multiple
+    /// addresses. Clamped to 100 ms – 2 s at connect time (RFC 8305 §5).
+    /// Default: 250 ms.
+    pub(crate) connection_attempt_delay: Duration,
+    /// Shared clock offset for MSK IAM signing (seconds).
+    ///
+    /// When SASL/MSK_IAM authentication fails with a signature-mismatch
+    /// that looks like clock skew, the connection layer stores the estimated
+    /// offset here.  Subsequent reconnection attempts apply this offset to
+    /// `SystemTime::now()` so the SigV4 timestamp matches the broker's
+    /// clock.  Default: 0 (no adjustment).
+    pub(crate) msk_iam_clock_offset_secs: Arc<AtomicI64>,
+    /// SOCKS5 proxy configuration (optional).
+    ///
+    /// When set, all connections are tunneled through the proxy.
+    /// Requires the `socks5` feature.
+    #[cfg(feature = "socks5")]
+    pub(crate) proxy: Option<ProxyConfig>,
+}
+
+impl std::fmt::Debug for ConnectionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("ConnectionConfig");
+        s.field("connect_timeout", &self.connect_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .field("send_buffer_size", &self.send_buffer_size)
+            .field("recv_buffer_size", &self.recv_buffer_size)
+            .field("nodelay", &self.nodelay)
+            .field("client_id", &self.client_id)
+            .field("connections_per_broker", &self.connections_per_broker)
+            .field(
+                "high_priority_channel_capacity",
+                &self.high_priority_channel_capacity,
+            )
+            .field(
+                "normal_priority_channel_capacity",
+                &self.normal_priority_channel_capacity,
+            )
+            .field("max_response_size", &self.max_response_size)
+            .field("max_in_flight_requests", &self.max_in_flight_requests)
+            .field("auth", &self.auth)
+            .field("tls_connector", &self.tls_connector.load().is_some())
+            .field("tcp_keepalive", &self.tcp_keepalive)
+            .field("connection_attempt_delay", &self.connection_attempt_delay)
+            .field(
+                "msk_iam_clock_offset_secs",
+                &self.msk_iam_clock_offset_secs.load(Ordering::Relaxed),
+            );
+        #[cfg(feature = "socks5")]
+        s.field("proxy", &self.proxy);
+        s.finish()
+    }
 }
 
 impl Default for ConnectionConfig {
@@ -123,7 +336,14 @@ impl Default for ConnectionConfig {
             high_priority_channel_capacity: 64,
             normal_priority_channel_capacity: 256,
             max_response_size: crate::protocol::MAX_MESSAGE_SIZE,
+            max_in_flight_requests: 256,
             auth: None,
+            tls_connector: Arc::new(ArcSwap::new(Arc::new(None))),
+            tcp_keepalive: Some(Duration::from_secs(60)),
+            connection_attempt_delay: Duration::from_millis(250),
+            msk_iam_clock_offset_secs: Arc::new(AtomicI64::new(0)),
+            #[cfg(feature = "socks5")]
+            proxy: None,
         }
     }
 }
@@ -132,6 +352,56 @@ impl ConnectionConfig {
     /// Create a new connection config builder.
     pub fn builder() -> ConnectionConfigBuilder {
         ConnectionConfigBuilder::default()
+    }
+
+    /// Pre-build and cache the TLS connector from the configured certificates.
+    ///
+    /// When TLS is configured, this reads the certificate and key files once
+    /// (via `spawn_blocking`) and stores the resulting [`TlsConnector`] for
+    /// reuse across all connections and reconnections. Without this call,
+    /// every connection attempt re-reads the files from disk.
+    ///
+    /// This is a no-op when no TLS configuration is present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if certificate or key files cannot be read or parsed.
+    pub async fn init_tls(&mut self) -> Result<()> {
+        if let Some(ref auth) = self.auth
+            && let Some(ref tls_config) = auth.tls_config
+        {
+            let connector = build_tls_connector(tls_config).await?;
+            self.tls_connector.store(Arc::new(Some(connector)));
+        }
+        Ok(())
+    }
+
+    /// Re-read certificate files from disk and atomically replace the cached
+    /// TLS connector.
+    ///
+    /// All future connections (including reconnections from the pool) will use
+    /// the new certificates. Existing TLS sessions are unaffected — they
+    /// continue using the connector that was active at handshake time.
+    ///
+    /// Call this after rotating certificates on disk, or on a periodic timer
+    /// (e.g. once per hour) to pick up renewed certificates without a client
+    /// restart.
+    ///
+    /// This is a no-op when no TLS configuration is present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the new certificate or key files cannot be read or
+    /// parsed. The existing (old) connector remains active on failure.
+    pub async fn refresh_tls(&self) -> Result<()> {
+        if let Some(ref auth) = self.auth
+            && let Some(ref tls_config) = auth.tls_config
+        {
+            let connector = build_tls_connector(tls_config).await?;
+            self.tls_connector.store(Arc::new(Some(connector)));
+            info!("TLS connector refreshed from disk");
+        }
+        Ok(())
     }
 
     /// Returns the connection timeout.
@@ -194,10 +464,31 @@ impl ConnectionConfig {
         self.max_response_size
     }
 
+    /// Returns the maximum number of in-flight requests per connection.
+    #[inline]
+    pub fn max_in_flight_requests(&self) -> usize {
+        self.max_in_flight_requests
+    }
+
     /// Returns the authentication configuration, if set.
     #[inline]
     pub fn auth(&self) -> Option<&AuthConfig> {
         self.auth.as_ref()
+    }
+
+    /// Returns the Happy Eyeballs connection attempt delay.
+    #[inline]
+    pub fn connection_attempt_delay(&self) -> Duration {
+        self.connection_attempt_delay
+    }
+
+    /// Returns the SOCKS5 proxy configuration, if set.
+    ///
+    /// Requires the `socks5` feature.
+    #[cfg(feature = "socks5")]
+    #[inline]
+    pub fn proxy(&self) -> Option<&ProxyConfig> {
+        self.proxy.as_ref()
     }
 }
 
@@ -264,12 +555,53 @@ impl ConnectionConfigBuilder {
         self
     }
 
+    /// Set the maximum number of in-flight requests per connection.
+    ///
+    /// Limits the number of requests waiting for a response on a single
+    /// connection. Default: 256. Use 5 for idempotent producers.
+    pub fn max_in_flight_requests(mut self, max: usize) -> Self {
+        self.0.max_in_flight_requests = max.max(1);
+        self
+    }
+
     /// Set authentication configuration.
     ///
     /// When set, the connection will perform TLS upgrade and/or SASL
     /// authentication handshake during establishment.
     pub fn auth(mut self, auth: AuthConfig) -> Self {
         self.0.auth = Some(auth);
+        self
+    }
+
+    /// Set the TCP keepalive interval.
+    ///
+    /// When set, enables TCP keepalive on all broker connections.
+    /// Pass `None` to disable keepalive. Default: 60 seconds.
+    pub fn tcp_keepalive(mut self, interval: Option<Duration>) -> Self {
+        self.0.tcp_keepalive = interval;
+        self
+    }
+
+    /// Set the Happy Eyeballs connection attempt delay (RFC 8305 §5).
+    ///
+    /// This controls the stagger interval between parallel connection
+    /// attempts. Clamped to 100 ms – 2 s at connect time.
+    /// Default: 250 ms.
+    pub fn connection_attempt_delay(mut self, delay: Duration) -> Self {
+        self.0.connection_attempt_delay = delay;
+        self
+    }
+
+    /// Set SOCKS5 proxy configuration.
+    ///
+    /// When set, all connections are tunneled through the specified SOCKS5
+    /// proxy. The proxy performs DNS resolution, which is essential for
+    /// VPN/bastion setups where broker hostnames are not directly resolvable.
+    ///
+    /// Requires the `socks5` feature.
+    #[cfg(feature = "socks5")]
+    pub fn proxy(mut self, proxy: ProxyConfig) -> Self {
+        self.0.proxy = Some(proxy);
         self
     }
 
@@ -327,12 +659,21 @@ pub struct BrokerConnection {
     api_versions: Arc<Mutex<HashMap<ApiKey, ApiVersionRange>>>,
     /// Whether the connection is alive.
     alive: Arc<std::sync::atomic::AtomicBool>,
+    /// When the SASL session expires (KIP-368).
+    ///
+    /// `None` when authentication is not used or the broker reported a
+    /// session lifetime of zero (no expiry).
+    session_expiry: Option<Instant>,
     /// Statistics for monitoring.
     stats: Arc<ConnectionStats>,
+    /// KIP-219: deadline until which normal-priority requests should be
+    /// delayed because the broker signalled quota throttling.
+    throttle_until: Arc<parking_lot::Mutex<Instant>>,
 }
 
 /// Connection statistics for monitoring.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct ConnectionStats {
     /// Total high-priority requests sent.
     pub high_priority_requests: AtomicU64,
@@ -371,43 +712,8 @@ impl BrokerConnection {
     /// 3. Perform SASL authentication handshake if required
     /// 4. Fetch API versions
     pub async fn connect(address: &str, config: ConnectionConfig) -> Result<Self> {
-        // Use tokio::net::lookup_host to support both IP:port and hostname:port
-        // (e.g. "kafka:9092" when brokers run inside containers).
-        // Bound DNS resolution by the connect timeout so a slow resolver cannot
-        // make connect() block indefinitely.
-        let mut addrs = timeout(config.connect_timeout, tokio::net::lookup_host(address))
-            .await
-            .map_err(|_| KrafkaError::timeout("DNS resolution"))?
-            .map_err(KrafkaError::Network)?;
-        let first_addr = addrs.next().ok_or_else(|| {
-            KrafkaError::invalid_state(format!("no addresses resolved for '{address}'"))
-        })?;
-        // Prefer IPv4 when available — IPv6 may be resolved first but not routable.
-        let addr = addrs.find(|a| a.is_ipv4()).unwrap_or(first_addr);
-
-        let socket = if addr.is_ipv6() {
-            TcpSocket::new_v6()
-        } else {
-            TcpSocket::new_v4()
-        }
-        .map_err(KrafkaError::Network)?;
-
-        // Apply socket buffer sizes before connecting
-        if let Some(size) = config.send_buffer_size {
-            socket
-                .set_send_buffer_size(size as u32)
-                .map_err(KrafkaError::Network)?;
-        }
-        if let Some(size) = config.recv_buffer_size {
-            socket
-                .set_recv_buffer_size(size as u32)
-                .map_err(KrafkaError::Network)?;
-        }
-
-        let stream = timeout(config.connect_timeout, socket.connect(addr))
-            .await
-            .map_err(|_| KrafkaError::timeout("connection"))?
-            .map_err(KrafkaError::Network)?;
+        // Establish TCP stream — either direct or through a SOCKS5 proxy.
+        let stream = Self::establish_tcp(address, &config).await?;
 
         stream.set_nodelay(config.nodelay)?;
 
@@ -424,7 +730,7 @@ impl BrokerConnection {
         let stats = Arc::new(ConnectionStats::default());
         let stats_clone = stats.clone();
 
-        let connection = Self {
+        let mut connection = Self {
             address: address.to_string(),
             config: config.clone(),
             correlation_id_gen: Arc::new(CorrelationIdGenerator::new()),
@@ -432,7 +738,9 @@ impl BrokerConnection {
             normal_priority_tx,
             api_versions: Arc::new(Mutex::new(HashMap::new())),
             alive,
+            session_expiry: None,
             stats,
+            throttle_until: Arc::new(parking_lot::Mutex::new(Instant::now())),
         };
 
         let request_timeout = config.request_timeout;
@@ -443,31 +751,59 @@ impl BrokerConnection {
 
         if needs_tls {
             // TLS path: upgrade stream then optionally do SASL
+            // SAFETY: needs_tls is true only when config.auth.is_some_and(requires_tls)
             let auth = config.auth.as_ref().unwrap();
             let tls_config = auth
                 .tls_config
                 .as_ref()
                 .ok_or_else(|| KrafkaError::config("TLS required but no TLS config provided"))?;
 
+            // Use cached TLS connector or build one from config. Calling
+            // `init_tls()` before first use avoids this fallback and the
+            // repeated disk I/O it entails.
+            let connector = match &**config.tls_connector.load() {
+                Some(c) => c.clone(),
+                None => build_tls_connector(tls_config).await?,
+            };
+
             // Extract hostname (without port) for TLS SNI.
             // Handle IPv6 bracket notation like [::1]:9092.
             let hostname = extract_sni_hostname(address)?;
-            let tls_stream = connect_tls(stream, hostname, tls_config).await?;
+            let tls_stream = connect_tls(
+                stream,
+                hostname,
+                tls_config.sni_hostname.as_deref(),
+                &connector,
+            )
+            .await?;
 
             info!("TLS handshake completed for {address}");
 
             if needs_sasl {
                 // TLS + SASL: authenticate on the TLS stream, then run event loop
                 let mut tls_stream = tls_stream;
-                Self::perform_sasl_handshake(
+
+                // Extract tls-server-end-point channel binding data (RFC 5929 §4.1)
+                // before the stream is consumed. This binds the SCRAM exchange to
+                // this specific TLS session.
+                let channel_binding = extract_tls_server_end_point(&tls_stream)
+                    .map(ChannelBinding::TlsServerEndPoint)
+                    .unwrap_or(ChannelBinding::None);
+
+                let session_lifetime_ms = Self::perform_sasl_handshake(
                     &mut tls_stream,
                     auth,
                     address,
                     &config.client_id,
                     config.max_response_size,
                     request_timeout,
+                    channel_binding,
+                    &config.msk_iam_clock_offset_secs,
                 )
                 .await?;
+
+                connection.session_expiry =
+                    Self::effective_session_expiry(session_lifetime_ms, auth);
 
                 // Spawn the connection task with TLS stream
                 let (reader, writer) = tokio::io::split(tls_stream);
@@ -479,6 +815,8 @@ impl BrokerConnection {
                         normal_priority_rx,
                         request_timeout,
                         stats_clone,
+                        config.max_response_size,
+                        config.max_in_flight_requests,
                     )
                     .await
                     {
@@ -497,6 +835,8 @@ impl BrokerConnection {
                         normal_priority_rx,
                         request_timeout,
                         stats_clone,
+                        config.max_response_size,
+                        config.max_in_flight_requests,
                     )
                     .await
                     {
@@ -507,17 +847,22 @@ impl BrokerConnection {
             }
         } else if needs_sasl {
             // SASL without TLS
+            // SAFETY: needs_sasl is true only when config.auth.is_some_and(requires_sasl)
             let auth = config.auth.as_ref().unwrap();
             let mut stream = stream;
-            Self::perform_sasl_handshake(
+            let session_lifetime_ms = Self::perform_sasl_handshake(
                 &mut stream,
                 auth,
                 address,
                 &config.client_id,
                 config.max_response_size,
                 request_timeout,
+                ChannelBinding::None,
+                &config.msk_iam_clock_offset_secs,
             )
             .await?;
+
+            connection.session_expiry = Self::effective_session_expiry(session_lifetime_ms, auth);
 
             let (reader, writer) = stream.into_split();
             tokio::spawn(async move {
@@ -528,6 +873,8 @@ impl BrokerConnection {
                     normal_priority_rx,
                     request_timeout,
                     stats_clone,
+                    config.max_response_size,
+                    config.max_in_flight_requests,
                 )
                 .await
                 {
@@ -546,6 +893,8 @@ impl BrokerConnection {
                     normal_priority_rx,
                     request_timeout,
                     stats_clone,
+                    config.max_response_size,
+                    config.max_in_flight_requests,
                 )
                 .await
                 {
@@ -561,6 +910,113 @@ impl BrokerConnection {
         Ok(connection)
     }
 
+    /// Establish a TCP connection — direct or through a SOCKS5 proxy.
+    async fn establish_tcp(
+        address: &str,
+        config: &ConnectionConfig,
+    ) -> Result<tokio::net::TcpStream> {
+        #[cfg(feature = "socks5")]
+        if let Some(ref proxy) = config.proxy {
+            return Self::connect_via_proxy(address, proxy, config).await;
+        }
+
+        Self::connect_direct(address, config).await
+    }
+
+    /// Direct TCP connection using Happy Eyeballs v2 (RFC 8305).
+    ///
+    /// Resolves DNS, interleaves IPv6/IPv4 addresses, and races staggered
+    /// connection attempts — returning the first successful socket.
+    async fn connect_direct(
+        address: &str,
+        config: &ConnectionConfig,
+    ) -> Result<tokio::net::TcpStream> {
+        super::happy_eyeballs::connect_happy_eyeballs(address, config).await
+    }
+
+    /// Connect through a SOCKS5 proxy.
+    ///
+    /// The proxy performs DNS resolution of the broker address, which is
+    /// essential for VPN/bastion setups where broker hostnames are not
+    /// resolvable from the client network.
+    #[cfg(feature = "socks5")]
+    async fn connect_via_proxy(
+        address: &str,
+        proxy: &ProxyConfig,
+        config: &ConnectionConfig,
+    ) -> Result<tokio::net::TcpStream> {
+        use tokio_socks::tcp::Socks5Stream;
+
+        debug!("Connecting to {address} via SOCKS5 proxy {}", proxy.address);
+
+        // Use a single deadline for the entire proxy connect path (DNS + TCP + SOCKS5)
+        // so the overall wall-clock time never exceeds connect_timeout.
+        let deadline = tokio::time::Instant::now() + config.connect_timeout;
+
+        // Resolve proxy address and create a socket with buffer sizes applied.
+        let addrs: Vec<std::net::SocketAddr> =
+            timeout_at(deadline, tokio::net::lookup_host(&proxy.address))
+                .await
+                .map_err(|_| KrafkaError::timeout("SOCKS5 proxy DNS resolution"))?
+                .map_err(KrafkaError::network)?
+                .collect();
+
+        if addrs.is_empty() {
+            return Err(KrafkaError::invalid_state(format!(
+                "no addresses resolved for SOCKS5 proxy '{}'",
+                proxy.address
+            )));
+        }
+
+        // Try proxy addresses in resolver order.
+        let proxy_addr = addrs[0];
+
+        let socket = Self::create_socket(proxy_addr, config)?;
+
+        // Connect to the proxy and perform the SOCKS5 handshake, bounded by
+        // the remaining budget from the same deadline.
+        let proxy_stream = timeout_at(deadline, async {
+            let tcp = socket
+                .connect(proxy_addr)
+                .await
+                .map_err(KrafkaError::network)?;
+
+            // SOCKS5 handshake — pass the broker address as a string so the
+            // proxy performs DNS resolution (remote resolution).
+            let socks = if let Some(ref creds) = proxy.credentials {
+                Socks5Stream::connect_with_password_and_socket(
+                    tcp,
+                    address,
+                    creds.username(),
+                    creds.password(),
+                )
+                .await
+            } else {
+                Socks5Stream::connect_with_socket(tcp, address).await
+            }
+            .map_err(|e| {
+                KrafkaError::network(std::io::Error::other(format!("SOCKS5 proxy error: {e}")))
+            })?;
+
+            Ok::<_, KrafkaError>(socks.into_inner())
+        })
+        .await
+        .map_err(|_| KrafkaError::timeout("SOCKS5 proxy connection"))??;
+
+        info!(
+            "SOCKS5 tunnel established to {address} via {}",
+            proxy.address
+        );
+
+        Ok(proxy_stream)
+    }
+
+    /// Create a TCP socket for the given address with buffer sizes and keepalive applied.
+    #[cfg(feature = "socks5")]
+    fn create_socket(addr: std::net::SocketAddr, config: &ConnectionConfig) -> Result<TcpSocket> {
+        super::happy_eyeballs::create_socket(addr, config)
+    }
+
     /// Perform the SASL handshake and authentication on a stream.
     ///
     /// This sends:
@@ -569,6 +1025,16 @@ impl BrokerConnection {
     ///
     /// For multi-step mechanisms (SCRAM-SHA-*), the challenge-response
     /// loop is handled automatically.
+    ///
+    /// The `channel_binding` parameter is forwarded to the SCRAM client when
+    /// the mechanism is SCRAM-SHA-*. Pass [`ChannelBinding::TlsServerEndPoint`]
+    /// when the underlying transport is TLS, or [`ChannelBinding::None`] for
+    /// plaintext SASL.
+    ///
+    /// Returns the session lifetime in milliseconds reported by the broker
+    /// (KIP-368). A value of `0` means the broker does not enforce
+    /// session expiry.
+    #[allow(clippy::too_many_arguments)]
     async fn perform_sasl_handshake<S>(
         stream: &mut S,
         auth: &AuthConfig,
@@ -576,10 +1042,26 @@ impl BrokerConnection {
         client_id: &str,
         max_response_size: usize,
         request_timeout: Duration,
-    ) -> Result<()>
+        channel_binding: ChannelBinding,
+        msk_iam_clock_offset_secs: &Arc<AtomicI64>,
+    ) -> Result<i64>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        // For MSK IAM with a credential provider, resolve fresh credentials
+        // before creating the authenticator.
+        let resolved_msk_iam;
+        let auth = if let Some(resolved) = timeout(request_timeout, auth.resolve_msk_iam_provider())
+            .await
+            .map_err(|_| KrafkaError::timeout("MSK IAM credential provider"))??
+        {
+            debug!("Resolved MSK IAM credentials from provider for {address}");
+            resolved_msk_iam = resolved;
+            &resolved_msk_iam
+        } else {
+            auth
+        };
+
         // For OAUTHBEARER with a provider, resolve a fresh token before
         // creating the authenticator (which is synchronous).
         // Apply the request timeout so a hung provider cannot stall reconnect loops.
@@ -596,7 +1078,7 @@ impl BrokerConnection {
             auth
         };
 
-        let mut authenticator = SaslAuthenticator::new(auth)
+        let mut authenticator = SaslAuthenticator::new(auth, channel_binding)
             .ok_or_else(|| KrafkaError::auth("Failed to create SASL authenticator"))?;
 
         // Warn about SASL PLAIN over cleartext — credentials sent unencrypted
@@ -610,9 +1092,10 @@ impl BrokerConnection {
             );
         }
 
-        // For MSK IAM, set the broker host
-        let hostname = address.split(':').next().unwrap_or(address);
-        authenticator.set_msk_host(auth, hostname);
+        // For MSK IAM, set the broker host (handles IPv6 brackets like [::1]:9092)
+        let hostname = extract_sni_hostname(address)?;
+        let clock_offset = msk_iam_clock_offset_secs.load(Ordering::Relaxed);
+        authenticator.set_msk_host(auth, hostname, clock_offset)?;
 
         let mechanism_name = authenticator.mechanism_name().to_string();
 
@@ -630,12 +1113,11 @@ impl BrokerConnection {
         stream
             .write_all(&encoder.take())
             .await
-            .map_err(KrafkaError::Network)?;
-        stream.flush().await.map_err(KrafkaError::Network)?;
+            .map_err(KrafkaError::network)?;
+        stream.flush().await.map_err(KrafkaError::network)?;
 
         // Read handshake response
-        let response_bytes = Self::read_framed_response(stream, max_response_size).await?;
-        let mut response_buf = response_bytes.clone();
+        let mut response_buf = Self::read_framed_response(stream, max_response_size).await?;
         let _header = ResponseHeader::decode(&mut response_buf, ApiKey::SaslHandshake, 1)?;
 
         let handshake_response = SaslHandshakeResponse::decode_v0(&mut response_buf)?;
@@ -652,46 +1134,121 @@ impl BrokerConnection {
         );
 
         // Step 2: SaslAuthenticate - initial response
-        let initial_bytes = authenticator.initial_response();
+        let initial_bytes = authenticator.initial_response()?;
         Self::send_sasl_authenticate(stream, &initial_bytes, client_id).await?;
 
         let auth_response =
             Self::read_sasl_authenticate_response(stream, max_response_size).await?;
         if !auth_response.error_code.is_ok() {
+            let err_msg = auth_response.error_message.unwrap_or_default();
+            // Best-effort clock skew detection for MSK IAM (C4).
+            // AWS SigV4 errors for clock skew typically contain
+            // phrases like "Signature expired" or "request time
+            // too skewed".  When detected, apply a ±5 min offset
+            // so the next reconnection attempt uses a corrected
+            // timestamp.  This is a single-shot heuristic; more
+            // sophisticated NTP-style correction is out of scope.
+            if mechanism_name == "AWS_MSK_IAM" {
+                let lower = err_msg.to_ascii_lowercase();
+                if lower.contains("signature expired")
+                    || lower.contains("signature not yet current")
+                    || lower.contains("request time too")
+                    || lower.contains("clock")
+                    || lower.contains("time skew")
+                {
+                    // Try to extract an ISO-8601 timestamp from the error to
+                    // compute the exact offset; fall back to a ±5 min nudge.
+                    let skew = Self::extract_clock_skew_secs(&err_msg);
+                    let prev = msk_iam_clock_offset_secs.load(Ordering::Relaxed);
+                    let nudge = if skew != 0 {
+                        skew
+                    } else if lower.contains("expired") || lower.contains("past") {
+                        // Signature expired → local clock is behind broker.
+                        300
+                    } else {
+                        // Not yet current → local clock is ahead of broker.
+                        -300
+                    };
+                    msk_iam_clock_offset_secs.store(prev + nudge, Ordering::Relaxed);
+                    warn!(
+                        "MSK IAM auth failed with possible clock skew ({}); \
+                         adjusted clock offset to {}s for next attempt",
+                        err_msg,
+                        prev + nudge,
+                    );
+                }
+            }
             return Err(KrafkaError::auth(format!(
                 "SASL authentication failed: {:?} - {}",
-                auth_response.error_code,
-                auth_response.error_message.unwrap_or_default()
+                auth_response.error_code, err_msg
             )));
         }
 
+        let mut session_lifetime_ms = auth_response.session_lifetime_ms;
+
         // Step 3: Challenge-response loop (for SCRAM-SHA-*)
+        // Capped at MAX_SASL_ROUNDS to guard against malicious brokers.
+        const MAX_SASL_ROUNDS: usize = 10;
+
         if !authenticator.is_complete() {
             let mut challenge = auth_response.auth_bytes;
+            let mut rounds = 0;
 
-            while let Some(response_bytes) = authenticator.process_challenge(&challenge)? {
-                Self::send_sasl_authenticate(stream, &response_bytes, client_id).await?;
-                let resp = Self::read_sasl_authenticate_response(stream, max_response_size).await?;
-                if !resp.error_code.is_ok() {
-                    return Err(KrafkaError::auth(format!(
-                        "SASL authentication step failed: {:?} - {}",
-                        resp.error_code,
-                        resp.error_message.unwrap_or_default()
-                    )));
-                }
-                challenge = resp.auth_bytes;
+            loop {
+                match authenticator.process_challenge(&challenge)? {
+                    ChallengeResponse::Done => break,
+                    ChallengeResponse::AckThenFail { ack, error } => {
+                        // Send the protocol-required ack (e.g., OAuthBearer \x01)
+                        // then surface the auth error without reading a response —
+                        // the server may close the connection immediately.
+                        let _ = Self::send_sasl_authenticate(stream, &ack, client_id).await;
+                        return Err(error);
+                    }
+                    ChallengeResponse::Continue(response_bytes) => {
+                        rounds += 1;
+                        if rounds > MAX_SASL_ROUNDS {
+                            return Err(KrafkaError::auth(format!(
+                                "SASL challenge-response exceeded {MAX_SASL_ROUNDS} rounds"
+                            )));
+                        }
 
-                if authenticator.is_complete() {
-                    break;
+                        Self::send_sasl_authenticate(stream, &response_bytes, client_id).await?;
+
+                        let resp = Self::read_sasl_authenticate_response(stream, max_response_size)
+                            .await?;
+                        if !resp.error_code.is_ok() {
+                            return Err(KrafkaError::auth(format!(
+                                "SASL authentication step failed: {:?} - {}",
+                                resp.error_code,
+                                resp.error_message.unwrap_or_default()
+                            )));
+                        }
+
+                        // The last successful response carries the session lifetime.
+                        session_lifetime_ms = resp.session_lifetime_ms;
+                        challenge = resp.auth_bytes;
+
+                        if authenticator.is_complete() {
+                            break;
+                        }
+                    }
                 }
             }
         }
 
         info!("SASL authentication completed ({mechanism_name}) for {address}");
-        Ok(())
+
+        if session_lifetime_ms > 0 {
+            debug!("Broker reported session lifetime of {session_lifetime_ms}ms for {address}");
+        }
+
+        Ok(session_lifetime_ms)
     }
 
-    /// Send a SaslAuthenticate request on a raw stream.
+    /// Send a SaslAuthenticate v1 request on a raw stream.
+    ///
+    /// Uses API version 1 so the broker returns `session_lifetime_ms`
+    /// in the response (KIP-368).
     async fn send_sasl_authenticate<S>(
         stream: &mut S,
         auth_bytes: &[u8],
@@ -703,20 +1260,22 @@ impl BrokerConnection {
         let request = SaslAuthenticateRequest::new(auth_bytes.to_vec());
         let mut encoder = Encoder::new();
         let pos = encoder.start_message();
-        let header = RequestHeader::new(ApiKey::SaslAuthenticate, 0, 1).with_client_id(client_id);
+        let header = RequestHeader::new(ApiKey::SaslAuthenticate, 1, 1).with_client_id(client_id);
         header.encode(encoder.buffer_mut())?;
-        request.encode_v0(encoder.buffer_mut())?;
+        request.encode_v1(encoder.buffer_mut())?;
         encoder.finish_message(pos)?;
 
         stream
             .write_all(&encoder.take())
             .await
-            .map_err(KrafkaError::Network)?;
-        stream.flush().await.map_err(KrafkaError::Network)?;
+            .map_err(KrafkaError::network)?;
+        stream.flush().await.map_err(KrafkaError::network)?;
         Ok(())
     }
 
-    /// Read a SaslAuthenticate response from a raw stream.
+    /// Read a SaslAuthenticate v1 response from a raw stream.
+    ///
+    /// Decodes using v1 to obtain the `session_lifetime_ms` field (KIP-368).
     async fn read_sasl_authenticate_response<S>(
         stream: &mut S,
         max_response_size: usize,
@@ -724,10 +1283,9 @@ impl BrokerConnection {
     where
         S: AsyncRead + Unpin,
     {
-        let response_bytes = Self::read_framed_response(stream, max_response_size).await?;
-        let mut buf = response_bytes.clone();
-        let _header = ResponseHeader::decode(&mut buf, ApiKey::SaslAuthenticate, 0)?;
-        SaslAuthenticateResponse::decode_v0(&mut buf)
+        let mut buf = Self::read_framed_response(stream, max_response_size).await?;
+        let _header = ResponseHeader::decode(&mut buf, ApiKey::SaslAuthenticate, 1)?;
+        SaslAuthenticateResponse::decode_v1(&mut buf)
     }
 
     /// Read a length-prefixed Kafka response from a stream.
@@ -740,7 +1298,7 @@ impl BrokerConnection {
         stream
             .read_exact(&mut len_buf)
             .await
-            .map_err(KrafkaError::Network)?;
+            .map_err(KrafkaError::network)?;
         let len_i32 = i32::from_be_bytes(len_buf);
 
         if len_i32 <= 0 || (len_i32 as usize) > max_response_size {
@@ -756,9 +1314,76 @@ impl BrokerConnection {
         stream
             .read_exact(&mut body)
             .await
-            .map_err(KrafkaError::Network)?;
+            .map_err(KrafkaError::network)?;
 
         Ok(Bytes::from(body))
+    }
+
+    /// Try to extract a clock skew (in seconds) from an AWS SigV4 error message.
+    ///
+    /// AWS error messages for clock skew often embed an ISO-8601 timestamp
+    /// (e.g. `20250413T120000Z`). If we can parse such a timestamp, we
+    /// compare it to `SystemTime::now()` and return the difference in
+    /// seconds.  Returns `0` if no parseable timestamp is found.
+    fn extract_clock_skew_secs(error_msg: &str) -> i64 {
+        // Look for an ISO-8601 basic-format timestamp: YYYYMMDDTHHMMSSz
+        // These show up in AWS error messages as the server's view of "now".
+        let Some(pos) = error_msg.find('T') else {
+            return 0;
+        };
+        // Need at least 8 chars before T (date) and 7 after (HHMMSSZ)
+        if pos < 8 || pos + 7 > error_msg.len() {
+            return 0;
+        }
+        let candidate = &error_msg[pos - 8..pos + 7];
+        // Validate format: digits, T, digits, Z
+        if candidate.len() != 15
+            || !candidate[..8].chars().all(|c| c.is_ascii_digit())
+            || candidate.as_bytes()[8] != b'T'
+            || !candidate[9..15].chars().all(|c| c.is_ascii_digit())
+        {
+            return 0;
+        }
+        // Check for trailing Z
+        let has_z = error_msg.len() > pos + 7 && error_msg.as_bytes()[pos + 7] == b'Z';
+        if !has_z {
+            return 0;
+        }
+        // Parse components
+        let year: i64 = candidate[..4].parse().unwrap_or(0);
+        let month: i64 = candidate[4..6].parse().unwrap_or(0);
+        let day: i64 = candidate[6..8].parse().unwrap_or(0);
+        let hour: i64 = candidate[9..11].parse().unwrap_or(0);
+        let min: i64 = candidate[11..13].parse().unwrap_or(0);
+        let sec: i64 = candidate[13..15].parse().unwrap_or(0);
+
+        if !(1..=12).contains(&month)
+            || !(1..=31).contains(&day)
+            || hour > 23
+            || min > 59
+            || sec > 59
+        {
+            return 0;
+        }
+        // Rough conversion to Unix epoch seconds (ignoring leap seconds).
+        // Good enough for computing a skew offset; we don't need sub-second
+        // precision.
+        let days_since_epoch = (year - 1970) * 365 + (year - 1969) / 4 - (year - 1901) / 100
+            + (year - 1601) / 400
+            + [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334][(month - 1) as usize]
+            + day
+            - 1
+            + if month > 2 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) {
+                1
+            } else {
+                0
+            };
+        let server_unix = days_since_epoch * 86400 + hour * 3600 + min * 60 + sec;
+        let local_unix = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        server_unix - local_unix
     }
 
     /// Run the connection event loop with priority handling.
@@ -766,6 +1391,7 @@ impl BrokerConnection {
     /// This is generic over the stream type, supporting both plain TCP and TLS.
     /// High-priority requests are always checked first using try_recv,
     /// ensuring heartbeats are never starved by backpressure on data requests.
+    #[allow(clippy::too_many_arguments)]
     async fn run_connection_loop<R, W>(
         mut reader: R,
         mut writer: W,
@@ -773,6 +1399,8 @@ impl BrokerConnection {
         mut normal_priority_rx: mpsc::Receiver<ConnectionCommand>,
         request_timeout: Duration,
         stats: Arc<ConnectionStats>,
+        max_response_size: usize,
+        max_in_flight_requests: usize,
     ) -> Result<()>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -790,12 +1418,24 @@ impl BrokerConnection {
             loop {
                 interval.tick().await;
                 let now = Instant::now();
+
+                // Phase 1: identify timed-out IDs under lock (no channel sends).
+                let timed_out: Vec<CorrelationId> = {
+                    let pending_map = pending_for_timeout.lock().await;
+                    pending_map
+                        .iter()
+                        .filter(|(_, req)| now.duration_since(req.sent_at) > request_timeout)
+                        .map(|(&id, _)| id)
+                        .collect()
+                };
+
+                if timed_out.is_empty() {
+                    continue;
+                }
+
+                // Phase 2: remove and notify outside the hot path — reacquire
+                // lock only when there is actual work to do.
                 let mut pending_map = pending_for_timeout.lock().await;
-                let timed_out: Vec<CorrelationId> = pending_map
-                    .iter()
-                    .filter(|(_, req)| now.duration_since(req.sent_at) > request_timeout)
-                    .map(|(&id, _)| id)
-                    .collect();
                 for id in timed_out {
                     if let Some(req) = pending_map.remove(&id) {
                         warn!(
@@ -811,41 +1451,51 @@ impl BrokerConnection {
             }
         });
 
+        let (reader_result_tx, mut reader_result_rx) = oneshot::channel();
+
         // Spawn reader task
         let reader_handle = tokio::spawn(async move {
-            let mut decoder = Decoder::new();
-            let mut buf = vec![0u8; 65536];
+            let result = async move {
+                let mut decoder = Decoder::with_max_size(max_response_size);
+                let mut buf = vec![0u8; 65536];
 
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => {
-                        debug!("Connection closed by peer");
-                        break;
-                    }
-                    Ok(n) => {
-                        decoder.extend(&buf[..n]);
+                loop {
+                    match reader.read(&mut buf).await {
+                        Ok(0) => {
+                            debug!("Connection closed by peer");
+                            break;
+                        }
+                        Ok(n) => {
+                            decoder.extend(&buf[..n]);
 
-                        // Process all complete messages
-                        while let Some(response) = decoder.decode()? {
-                            Self::handle_response(&pending_clone, response).await?;
+                            // Process all complete messages
+                            while let Some(response) = decoder.decode()? {
+                                Self::handle_response(&pending_clone, response).await?;
+                            }
+                        }
+                        Err(e) => {
+                            error!("Read error: {}", e);
+                            return Err(KrafkaError::network(e));
                         }
                     }
-                    Err(e) => {
-                        error!("Read error: {}", e);
-                        return Err(KrafkaError::Network(e));
-                    }
                 }
-            }
 
-            Ok::<_, KrafkaError>(())
+                Ok::<_, KrafkaError>(())
+            }
+            .await;
+
+            let _ = reader_result_tx.send(result.clone());
+            result
         });
+
+        let mut terminal_error: Option<KrafkaError> = None;
 
         // Process commands with priority
         loop {
             // Try high-priority first (non-blocking)
             if let Ok(cmd) = high_priority_rx.try_recv() {
                 stats.high_priority_bypasses.fetch_add(1, Ordering::Relaxed);
-                if Self::handle_command(&mut writer, &pending, cmd).await? {
+                if Self::handle_command(&mut writer, &pending, cmd, max_in_flight_requests).await? {
                     break;
                 }
                 continue;
@@ -856,10 +1506,19 @@ impl BrokerConnection {
                 // Bias towards high-priority
                 biased;
 
+                reader_result = &mut reader_result_rx => {
+                    terminal_error = match reader_result {
+                        Ok(Ok(())) => None,
+                        Ok(Err(err)) => Some(err),
+                        Err(_) => Some(KrafkaError::invalid_state("reader task result dropped")),
+                    };
+                    break;
+                }
+
                 cmd = high_priority_rx.recv() => {
                     match cmd {
                         Some(cmd) => {
-                            if Self::handle_command(&mut writer, &pending, cmd).await? {
+                            if Self::handle_command(&mut writer, &pending, cmd, max_in_flight_requests).await? {
                                 break;
                             }
                         }
@@ -869,7 +1528,7 @@ impl BrokerConnection {
                 cmd = normal_priority_rx.recv() => {
                     match cmd {
                         Some(cmd) => {
-                            if Self::handle_command(&mut writer, &pending, cmd).await? {
+                            if Self::handle_command(&mut writer, &pending, cmd, max_in_flight_requests).await? {
                                 break;
                             }
                         }
@@ -882,16 +1541,36 @@ impl BrokerConnection {
         // Wait for reader to finish
         drop(writer);
         timeout_sweep_handle.abort();
-        let _ = reader_handle.await;
+
+        match reader_handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                if terminal_error.is_none() {
+                    terminal_error = Some(err);
+                }
+            }
+            Err(join_err) => {
+                if terminal_error.is_none() {
+                    terminal_error = Some(KrafkaError::invalid_state(format!(
+                        "reader task failed: {join_err}"
+                    )));
+                }
+            }
+        }
 
         // Drain pending requests and notify callers that the connection is closed
         {
             let mut pending_map = pending.lock().await;
+            let pending_error = terminal_error
+                .clone()
+                .unwrap_or_else(|| KrafkaError::invalid_state("connection closed"));
             for (_, req) in pending_map.drain() {
-                let _ = req
-                    .response_tx
-                    .send(Err(KrafkaError::invalid_state("connection closed")));
+                let _ = req.response_tx.send(Err(pending_error.clone()));
             }
+        }
+
+        if let Some(err) = terminal_error {
+            return Err(err);
         }
 
         Ok(())
@@ -904,6 +1583,7 @@ impl BrokerConnection {
         writer: &mut W,
         pending: &Mutex<HashMap<CorrelationId, PendingRequest>>,
         cmd: ConnectionCommand,
+        max_in_flight_requests: usize,
     ) -> Result<bool> {
         match cmd {
             ConnectionCommand::Request {
@@ -913,6 +1593,22 @@ impl BrokerConnection {
                 api_version,
                 response_tx,
             } => {
+                // Reject if at capacity to prevent unbounded memory growth
+                {
+                    let pending_map = pending.lock().await;
+                    if pending_map.len() >= max_in_flight_requests {
+                        warn!(
+                            pending = pending_map.len(),
+                            max = max_in_flight_requests,
+                            "Rejecting request: max in-flight requests reached"
+                        );
+                        let _ = response_tx.send(Err(KrafkaError::invalid_state(format!(
+                            "max in-flight requests ({max_in_flight_requests}) reached"
+                        ))));
+                        return Ok(false);
+                    }
+                }
+
                 // Store pending request
                 {
                     let mut pending = pending.lock().await;
@@ -932,7 +1628,7 @@ impl BrokerConnection {
                     error!("Write error: {}", e);
                     let mut pending = pending.lock().await;
                     if let Some(req) = pending.remove(&correlation_id) {
-                        let _ = req.response_tx.send(Err(KrafkaError::Network(e)));
+                        let _ = req.response_tx.send(Err(KrafkaError::network(e)));
                     }
                     return Ok(false);
                 }
@@ -943,7 +1639,7 @@ impl BrokerConnection {
                     // doesn't hang waiting for a response that will never arrive.
                     let mut pending = pending.lock().await;
                     if let Some(req) = pending.remove(&correlation_id) {
-                        let _ = req.response_tx.send(Err(KrafkaError::Network(e)));
+                        let _ = req.response_tx.send(Err(KrafkaError::network(e)));
                     }
                     return Ok(false);
                 }
@@ -982,20 +1678,37 @@ impl BrokerConnection {
         if let Some(req) = pending.remove(&correlation_id) {
             trace!("Received response for correlation_id={}", correlation_id);
 
-            // Decode response header
+            // Decode response header — send any decode error to the caller
+            // instead of tearing down the entire connection.
             let mut response_buf = response.slice(..);
-            let _header = ResponseHeader::decode(&mut response_buf, req.api_key, req.api_version)?;
-
-            // Return the remaining bytes as the response body
-            let header_size = response.len() - response_buf.len();
-            let body = response.slice(header_size..);
-
-            let _ = req.response_tx.send(Ok(body));
+            match ResponseHeader::decode(&mut response_buf, req.api_key, req.api_version) {
+                Ok(_header) => {
+                    let header_size = response.len() - response_buf.len();
+                    let body = response.slice(header_size..);
+                    let _ = req.response_tx.send(Ok(body));
+                }
+                Err(e) => {
+                    // A header decode failure means the stream is desynchronized
+                    // — the remaining bytes are corrupt. Notify the caller and
+                    // close the connection to prevent further damage.
+                    warn!(
+                        "Failed to decode response header for correlation_id={}, closing connection: {}",
+                        correlation_id, e
+                    );
+                    let _ = req.response_tx.send(Err(KrafkaError::protocol(format!(
+                        "response header decode failed for correlation_id={correlation_id}: {e}"
+                    ))));
+                    return Err(KrafkaError::protocol(
+                        "response header decode failure — stream desynchronized",
+                    ));
+                }
+            }
         } else {
-            warn!(
-                "Received response for unknown correlation_id={}",
-                correlation_id
-            );
+            // Unknown correlation ID indicates a protocol desync — the
+            // connection is no longer reliable. Return an error to close it.
+            return Err(KrafkaError::protocol(format!(
+                "Received response for unknown correlation_id={correlation_id}, closing connection"
+            )));
         }
 
         Ok(())
@@ -1070,6 +1783,27 @@ impl BrokerConnection {
         }
     }
 
+    /// Record a broker-reported throttle time (KIP-219).
+    ///
+    /// When the broker returns `throttle_time_ms > 0` in a response, the
+    /// client should voluntarily delay subsequent normal-priority requests
+    /// by that amount. High-priority requests (heartbeats, metadata) are
+    /// never delayed.
+    pub fn notify_throttle(&self, throttle_time_ms: i32) {
+        if throttle_time_ms > 0 {
+            let new_deadline = Instant::now() + Duration::from_millis(throttle_time_ms as u64);
+            let mut deadline = self.throttle_until.lock();
+            if new_deadline > *deadline {
+                debug!(
+                    throttle_ms = throttle_time_ms,
+                    broker = %self.address,
+                    "Broker throttle applied (KIP-219)"
+                );
+                *deadline = new_deadline;
+            }
+        }
+    }
+
     /// Send a request with automatic priority based on API key.
     ///
     /// Priority is determined automatically:
@@ -1089,6 +1823,8 @@ impl BrokerConnection {
     /// Send a request with explicit priority.
     ///
     /// Use this when you need to override the automatic priority selection.
+    /// Normal-priority requests are delayed when the broker has signalled
+    /// quota throttling (KIP-219).
     pub async fn send_request_with_priority(
         &self,
         api_key: ApiKey,
@@ -1096,6 +1832,22 @@ impl BrokerConnection {
         priority: RequestPriority,
         request_body: impl FnOnce(&mut BytesMut) -> Result<()>,
     ) -> Result<Bytes> {
+        // KIP-219: honour broker throttle for normal-priority requests.
+        if priority == RequestPriority::Normal {
+            let remaining = {
+                let deadline = self.throttle_until.lock();
+                deadline.checked_duration_since(Instant::now())
+            };
+            if let Some(delay) = remaining {
+                debug!(
+                    delay_ms = delay.as_millis() as u64,
+                    broker = %self.address,
+                    "Delaying request due to broker throttle (KIP-219)"
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+
         let correlation_id = self.correlation_id_gen.next();
         let mut encoder = Encoder::new();
 
@@ -1227,10 +1979,94 @@ impl BrokerConnection {
         self.negotiate_api_version(api_key, client_max, 0).await
     }
 
+    /// Compute the session expiry instant from a broker-reported lifetime.
+    ///
+    /// Returns `None` when `session_lifetime_ms` is zero or negative (no expiry).
+    /// Otherwise picks a random reauthentication point between 85 % and 95 %
+    /// of the session lifetime.  The jitter avoids a thundering-herd where
+    /// many connections to the same broker all need replacement at the same
+    /// instant.  This matches the approach taken by the Java Kafka client.
+    fn compute_session_expiry(session_lifetime_ms: i64) -> Option<Instant> {
+        if session_lifetime_ms <= 0 {
+            return None;
+        }
+        // Randomised window: 85 % base + up to 10 % jitter = 85-95 % of lifetime.
+        // Mirrors Java client's pctWindowFactor (0.85) + jitter (0.10).
+        const MIN_REAUTH_MS: u64 = 100;
+        let base_factor: f64 = 0.85;
+        let jitter_range: f64 = 0.10;
+        let jitter: f64 = rand::random::<f64>() * jitter_range;
+        let factor = base_factor + jitter;
+        let computed_reauth_ms = (session_lifetime_ms as f64 * factor) as u64;
+        let reauth_ms = computed_reauth_ms.max(MIN_REAUTH_MS);
+        if computed_reauth_ms < MIN_REAUTH_MS {
+            warn!(
+                session_lifetime_ms,
+                computed_reauth_ms,
+                reauth_ms,
+                "broker reported unusually small SASL session lifetime; clamping reauthentication delay"
+            );
+        }
+        Some(Instant::now() + Duration::from_millis(reauth_ms))
+    }
+
+    /// Compute session expiry, falling back to an OAuthBearer token lifetime
+    /// when the broker does not report `session_lifetime_ms` (KIP-368).
+    ///
+    /// The token's `lifetime_ms` is an epoch-millisecond timestamp. We convert
+    /// it to a remaining duration before passing it through the standard
+    /// jittered-window logic.
+    fn effective_session_expiry(session_lifetime_ms: i64, auth: &AuthConfig) -> Option<Instant> {
+        if session_lifetime_ms > 0 {
+            return Self::compute_session_expiry(session_lifetime_ms);
+        }
+
+        // Fall back to OAuthBearer token lifetime if available.
+        if let Some(token) = auth.oauthbearer_token.as_ref()
+            && let Some(expiry_epoch_ms) = token.lifetime_ms()
+        {
+            let now_epoch_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let remaining_ms = expiry_epoch_ms.saturating_sub(now_epoch_ms);
+            if remaining_ms > 0 {
+                return Self::compute_session_expiry(remaining_ms);
+            }
+        }
+
+        None
+    }
+
+    /// Whether the SASL session is approaching expiry and the connection
+    /// should be replaced (KIP-368).
+    ///
+    /// Returns `false` when no session lifetime was reported by the broker.
+    #[inline]
+    pub fn needs_reauthentication(&self) -> bool {
+        self.session_expiry
+            .is_some_and(|expiry| Instant::now() >= expiry)
+    }
+
+    /// The instant at which the client should start reauthentication, if any.
+    #[inline]
+    pub fn session_expiry(&self) -> Option<Instant> {
+        self.session_expiry
+    }
+
     /// Check if the connection is alive.
     #[inline]
     pub fn is_alive(&self) -> bool {
         self.alive.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether the connection is alive and its SASL session has not expired.
+    ///
+    /// This is the primary check used by the connection pool to decide if an
+    /// existing connection can be reused or must be replaced.
+    #[inline]
+    pub fn is_usable(&self) -> bool {
+        self.is_alive() && !self.needs_reauthentication()
     }
 
     /// Get the broker address.
@@ -1302,7 +2138,7 @@ mod tests {
         use crate::auth::AuthConfig;
         let config = ConnectionConfig::builder()
             .client_id("test")
-            .auth(AuthConfig::sasl_plain("user", "pass"))
+            .auth(AuthConfig::sasl_plain("user", "pass").unwrap())
             .build();
 
         assert_eq!(config.client_id, "test");
@@ -1403,8 +2239,24 @@ mod tests {
     ///
     /// Accepts a connection, reads SaslHandshakeRequest, SaslAuthenticateRequest,
     /// and ApiVersionsRequest, responding to each with valid responses.
+    /// The `session_lifetime_ms` value is included in the SaslAuthenticate v1
+    /// response (KIP-368). The broker stays open until the test signals
+    /// shutdown so the connection remains usable after the initial handshake.
     /// Returns the captured auth bytes from SaslAuthenticate for verification.
-    async fn run_mock_sasl_broker(listener: tokio::net::TcpListener) -> (String, Vec<u8>) {
+    async fn run_mock_sasl_broker(
+        listener: tokio::net::TcpListener,
+        shutdown_rx: oneshot::Receiver<()>,
+    ) -> (String, Vec<u8>) {
+        run_mock_sasl_broker_with_lifetime(listener, 0, shutdown_rx).await
+    }
+
+    /// Like [`run_mock_sasl_broker`] but lets the caller set the session
+    /// lifetime reported in the SaslAuthenticateResponse (KIP-368).
+    async fn run_mock_sasl_broker_with_lifetime(
+        listener: tokio::net::TcpListener,
+        session_lifetime_ms: i64,
+        shutdown_rx: oneshot::Receiver<()>,
+    ) -> (String, Vec<u8>) {
         use bytes::BufMut;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1469,12 +2321,13 @@ mod tests {
             i32::from_be_bytes(req[auth_offset..auth_offset + 4].try_into().unwrap()) as usize;
         let auth_bytes = req[auth_offset + 4..auth_offset + 4 + auth_bytes_len].to_vec();
 
-        // Send SaslAuthenticateResponse: correlation_id + error_code(0) + null message + empty bytes
+        // Send SaslAuthenticateResponse v1: correlation_id + error_code(0) + null message + empty bytes + session_lifetime_ms
         let mut resp = BytesMut::new();
         resp.put_i32(correlation_id);
         resp.put_i16(0); // error_code = NONE
         resp.put_i16(-1_i16); // error_message = null (KafkaString)
         resp.put_i32(0); // auth_bytes = empty (KafkaBytes, 0 length)
+        resp.put_i64(session_lifetime_ms); // session_lifetime_ms (v1)
         write_frame(&mut stream, &resp).await;
 
         // 3. Read ApiVersionsRequest
@@ -1488,6 +2341,8 @@ mod tests {
         resp.put_i32(0); // 0 api keys
         write_frame(&mut stream, &resp).await;
 
+        let _ = shutdown_rx.await;
+
         (mechanism, auth_bytes)
     }
 
@@ -1499,15 +2354,13 @@ mod tests {
         let addr_str = addr.to_string();
 
         // Run mock broker in background
-        let mock_handle = tokio::spawn(run_mock_sasl_broker(listener));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mock_handle = tokio::spawn(run_mock_sasl_broker(listener, shutdown_rx));
 
         // Connect with SASL/PLAIN auth
         let config = ConnectionConfig::builder()
             .client_id("test-client")
-            .auth(crate::auth::AuthConfig::sasl_plain(
-                "testuser",
-                "testpassword",
-            ))
+            .auth(crate::auth::AuthConfig::sasl_plain("testuser", "testpassword").unwrap())
             .build();
 
         let conn = BrokerConnection::connect(&addr_str, config).await;
@@ -1520,14 +2373,15 @@ mod tests {
         let conn = conn.unwrap();
         assert!(conn.is_alive());
 
+        conn.close().await;
+        let _ = shutdown_tx.send(());
+
         // Verify the mock received the correct handshake
         let (mechanism, auth_bytes) = mock_handle.await.unwrap();
         assert_eq!(mechanism, "PLAIN");
 
         // SASL PLAIN format: \0username\0password
         assert_eq!(auth_bytes, b"\0testuser\0testpassword");
-
-        conn.close().await;
     }
 
     #[tokio::test]
@@ -1540,7 +2394,8 @@ mod tests {
         let addr_str = addr.to_string();
 
         // Run mock broker in background
-        let mock_handle = tokio::spawn(run_mock_sasl_broker(listener));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mock_handle = tokio::spawn(run_mock_sasl_broker(listener, shutdown_rx));
 
         // Connect with OAUTHBEARER provider (not a static token)
         let config = ConnectionConfig::builder()
@@ -1560,6 +2415,9 @@ mod tests {
         let conn = conn.unwrap();
         assert!(conn.is_alive());
 
+        conn.close().await;
+        let _ = shutdown_tx.send(());
+
         // Verify the mock received the correct OAUTHBEARER handshake
         let (mechanism, auth_bytes) = mock_handle.await.unwrap();
         assert_eq!(mechanism, "OAUTHBEARER");
@@ -1567,8 +2425,6 @@ mod tests {
         // GS2 format: n,,\x01auth=Bearer <token>\x01\x01
         let expected = OAuthBearerToken::new("provider-jwt-token").to_gs2_initial_response();
         assert_eq!(auth_bytes, expected);
-
-        conn.close().await;
     }
 
     #[tokio::test]
@@ -1702,7 +2558,7 @@ mod tests {
 
         let config = ConnectionConfig::builder()
             .client_id("test-client")
-            .auth(crate::auth::AuthConfig::sasl_plain("user", "pass"))
+            .auth(crate::auth::AuthConfig::sasl_plain("user", "pass").unwrap())
             .build();
 
         let result = BrokerConnection::connect(&addr_str, config).await;
@@ -1758,7 +2614,7 @@ mod tests {
             stream.write_all(&resp).await.unwrap();
             stream.flush().await.unwrap();
 
-            // 2. SaslAuthenticate — reject with auth error
+            // 2. SaslAuthenticate — reject with auth error (v1 format)
             let req = read_frame(&mut stream).await;
             let correlation_id = i32::from_be_bytes(req[4..8].try_into().unwrap());
             let mut resp = BytesMut::new();
@@ -1769,6 +2625,7 @@ mod tests {
             resp.put_i16(msg.len() as i16);
             resp.put_slice(msg);
             resp.put_i32(0); // empty auth_bytes
+            resp.put_i64(0); // session_lifetime_ms (v1)
             let len = resp.len() as i32;
             stream.write_all(&len.to_be_bytes()).await.unwrap();
             stream.write_all(&resp).await.unwrap();
@@ -1777,7 +2634,7 @@ mod tests {
 
         let config = ConnectionConfig::builder()
             .client_id("test-client")
-            .auth(crate::auth::AuthConfig::sasl_plain("user", "wrongpass"))
+            .auth(crate::auth::AuthConfig::sasl_plain("user", "wrongpass").unwrap())
             .build();
 
         let result = BrokerConnection::connect(&addr_str, config).await;
@@ -1840,6 +2697,61 @@ mod tests {
             BrokerConnection::read_framed_response(&mut cursor, crate::protocol::MAX_MESSAGE_SIZE)
                 .await;
         assert!(result.is_err(), "zero frame length should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_connection_loop_enforces_configured_max_response_size() {
+        let (client, mut server) = tokio::io::duplex(256);
+        let (reader, writer) = tokio::io::split(client);
+        let (_high_tx, high_rx) = mpsc::channel(4);
+        let (normal_tx, normal_rx) = mpsc::channel(4);
+        let stats = Arc::new(ConnectionStats::default());
+
+        let loop_task = tokio::spawn(BrokerConnection::run_connection_loop(
+            reader,
+            writer,
+            high_rx,
+            normal_rx,
+            Duration::from_secs(30),
+            stats,
+            16,
+            256,
+        ));
+
+        let (response_tx, response_rx) = oneshot::channel();
+        normal_tx
+            .send(ConnectionCommand::Request {
+                data: Bytes::from_static(b"ping"),
+                correlation_id: 7,
+                api_key: ApiKey::Metadata,
+                api_version: 0,
+                response_tx,
+            })
+            .await
+            .unwrap();
+
+        let mut request = [0u8; 4];
+        server.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"ping");
+
+        server.write_all(&(32i32).to_be_bytes()).await.unwrap();
+        server.write_all(&[0u8; 32]).await.unwrap();
+        server.flush().await.unwrap();
+
+        let err = response_rx.await.unwrap().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("message size 32 exceeds maximum 16"),
+            "pending request should receive the configured frame-limit error: {err}"
+        );
+
+        let loop_err = loop_task.await.unwrap().unwrap_err();
+        assert!(
+            loop_err
+                .to_string()
+                .contains("message size 32 exceeds maximum 16"),
+            "connection loop should stop on oversized steady-state frames: {loop_err}"
+        );
     }
 
     #[test]
@@ -1931,5 +2843,294 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(feature = "socks5")]
+    #[test]
+    fn test_proxy_config_new() {
+        let proxy = ProxyConfig::new("proxy.example.com:1080");
+        assert_eq!(proxy.address(), "proxy.example.com:1080");
+        assert!(proxy.credentials().is_none());
+    }
+
+    #[cfg(feature = "socks5")]
+    #[test]
+    fn test_proxy_config_with_credentials() {
+        let proxy = ProxyConfig::with_credentials("proxy.example.com:1080", "user", "s3cret");
+        assert_eq!(proxy.address(), "proxy.example.com:1080");
+        let creds = proxy.credentials().expect("should have credentials");
+        assert_eq!(creds.username(), "user");
+        assert_eq!(creds.password(), "s3cret");
+    }
+
+    #[cfg(feature = "socks5")]
+    #[test]
+    fn test_proxy_config_debug_redacts_credentials() {
+        let proxy = ProxyConfig::with_credentials("proxy.example.com:1080", "admin", "hunter2");
+        let debug_str = format!("{proxy:?}");
+        assert!(
+            debug_str.contains("proxy.example.com:1080"),
+            "Debug should contain the address"
+        );
+        assert!(
+            !debug_str.contains("hunter2"),
+            "Debug must NOT contain the password"
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "Debug should show [REDACTED] for credentials"
+        );
+    }
+
+    #[cfg(feature = "socks5")]
+    #[test]
+    fn test_proxy_credentials_debug_redacts() {
+        let proxy = ProxyConfig::with_credentials("proxy.example.com:1080", "user", "password123");
+        let creds = proxy.credentials().expect("should have credentials");
+        let debug_str = format!("{creds:?}");
+        assert!(
+            !debug_str.contains("password123"),
+            "Debug must NOT contain the password"
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "Debug should show [REDACTED]"
+        );
+    }
+
+    #[cfg(feature = "socks5")]
+    #[test]
+    fn test_connection_config_builder_with_proxy() {
+        let proxy = ProxyConfig::new("socks5.internal:1080");
+        let config = ConnectionConfig::builder()
+            .client_id("proxy-test")
+            .proxy(proxy)
+            .build();
+
+        assert!(config.proxy.is_some());
+        assert_eq!(
+            config.proxy.as_ref().unwrap().address(),
+            "socks5.internal:1080"
+        );
+    }
+
+    #[cfg(feature = "socks5")]
+    #[tokio::test]
+    async fn test_connect_via_proxy_dns_failure_is_retriable() {
+        let proxy = ProxyConfig::new("this-proxy-does-not-exist.invalid:1080");
+        let config = ConnectionConfig::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .proxy(proxy)
+            .build();
+        let result = BrokerConnection::connect("broker:9092", config).await;
+        match result {
+            Ok(_) => panic!("connect through non-existent proxy should fail"),
+            Err(err) => {
+                assert!(
+                    err.is_retriable(),
+                    "proxy DNS failure should be retriable (Network or Timeout), got: {err}"
+                );
+            }
+        }
+    }
+
+    // ========================================================================
+    // KIP-368: Session lifetime / reauthentication
+    // ========================================================================
+
+    #[test]
+    fn test_compute_session_expiry_zero_means_no_expiry() {
+        assert!(
+            BrokerConnection::compute_session_expiry(0).is_none(),
+            "session_lifetime_ms = 0 should mean no expiry"
+        );
+    }
+
+    #[test]
+    fn test_compute_session_expiry_negative_means_no_expiry() {
+        assert!(
+            BrokerConnection::compute_session_expiry(-1).is_none(),
+            "negative session_lifetime_ms should mean no expiry"
+        );
+    }
+
+    #[test]
+    fn test_compute_session_expiry_applies_jittered_margin() {
+        let before = Instant::now();
+        let expiry = BrokerConnection::compute_session_expiry(10_000).unwrap();
+        let after = Instant::now();
+
+        // Randomised window: 85-95% of 10_000ms = 8_500-9_500ms
+        let expected_low = before + Duration::from_millis(8_500);
+        let expected_high = after + Duration::from_millis(9_500);
+
+        assert!(
+            expiry >= expected_low && expiry <= expected_high,
+            "expiry should be between 8.5s and 9.5s from now (85-95% of 10s)"
+        );
+    }
+
+    #[test]
+    fn test_compute_session_expiry_jitter_varies() {
+        // Call multiple times and verify we don't always get the exact same value.
+        // With 10% jitter on a 100s lifetime, outcomes should vary.
+        let results: Vec<Instant> = (0..20)
+            .map(|_| BrokerConnection::compute_session_expiry(100_000).unwrap())
+            .collect();
+        let first = results[0];
+        let any_different = results.iter().any(|r| *r != first);
+        assert!(
+            any_different,
+            "20 calls should produce at least one different expiry (randomised jitter)"
+        );
+    }
+
+    #[test]
+    fn test_compute_session_expiry_small_lifetime() {
+        // Even very short lifetimes should produce a valid expiry
+        let expiry = BrokerConnection::compute_session_expiry(100);
+        assert!(expiry.is_some(), "100ms lifetime should produce an expiry");
+    }
+
+    #[tokio::test]
+    async fn test_session_lifetime_tracked_from_broker() {
+        // Mock broker that reports a 60-second session lifetime
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mock_handle = tokio::spawn(run_mock_sasl_broker_with_lifetime(
+            listener,
+            60_000,
+            shutdown_rx,
+        ));
+
+        let config = ConnectionConfig::builder()
+            .client_id("test-client")
+            .auth(crate::auth::AuthConfig::sasl_plain("user", "pass").unwrap())
+            .build();
+
+        let conn = BrokerConnection::connect(&addr, config).await.unwrap();
+
+        // The connection should have a session expiry set
+        assert!(
+            conn.session_expiry().is_some(),
+            "session_expiry should be set when broker reports a lifetime"
+        );
+
+        // The expiry should be roughly 51-57s from now (85-95% of 60s, randomised)
+        let remaining = conn.session_expiry().unwrap() - Instant::now();
+        assert!(
+            remaining > Duration::from_secs(49) && remaining < Duration::from_secs(58),
+            "session expiry should be ~51-57s from now (85-95% of 60s), got {:?}",
+            remaining
+        );
+
+        // Should not need reauthentication immediately
+        assert!(
+            !conn.needs_reauthentication(),
+            "fresh connection should not need reauthentication"
+        );
+
+        // is_usable should be true
+        assert!(conn.is_usable(), "fresh connection should be usable");
+
+        conn.close().await;
+        let _ = shutdown_tx.send(());
+        mock_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_no_session_expiry_when_lifetime_zero() {
+        // Mock broker that reports 0 session lifetime (no expiry)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mock_handle =
+            tokio::spawn(run_mock_sasl_broker_with_lifetime(listener, 0, shutdown_rx));
+
+        let config = ConnectionConfig::builder()
+            .client_id("test-client")
+            .auth(crate::auth::AuthConfig::sasl_plain("user", "pass").unwrap())
+            .build();
+
+        let conn = BrokerConnection::connect(&addr, config).await.unwrap();
+
+        assert!(
+            conn.session_expiry().is_none(),
+            "session_expiry should be None when broker reports 0"
+        );
+        assert!(
+            !conn.needs_reauthentication(),
+            "should never need reauth with no session lifetime"
+        );
+        assert!(conn.is_usable());
+
+        conn.close().await;
+        let _ = shutdown_tx.send(());
+        mock_handle.await.unwrap();
+    }
+
+    // ========================================================================
+    // KIP-219: Broker throttle compliance
+    // ========================================================================
+
+    #[test]
+    fn test_throttle_initial_state_is_past() {
+        // The throttle_until starts at Instant::now() which is immediately
+        // in the past (or at most the current instant), meaning no delay.
+        let deadline = Instant::now();
+        let throttle = parking_lot::Mutex::new(deadline);
+        let guard = throttle.lock();
+        assert!(guard.checked_duration_since(Instant::now()).is_none());
+    }
+
+    #[test]
+    fn test_throttle_future_deadline_yields_delay() {
+        let future = Instant::now() + Duration::from_secs(10);
+        let throttle = parking_lot::Mutex::new(future);
+        let guard = throttle.lock();
+        let remaining = guard.checked_duration_since(Instant::now());
+        assert!(remaining.is_some());
+        assert!(remaining.unwrap() > Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_throttle_past_deadline_yields_no_delay() {
+        // A deadline 1ms in the past means no delay.
+        let past = Instant::now() - Duration::from_millis(1);
+        let throttle = parking_lot::Mutex::new(past);
+        let guard = throttle.lock();
+        assert!(guard.checked_duration_since(Instant::now()).is_none());
+    }
+
+    #[test]
+    fn test_extract_clock_skew_secs_valid_timestamp() {
+        // Simulate an AWS error containing a server timestamp.
+        // The exact skew depends on when the test runs, but the function
+        // should return a non-zero value for a timestamp far from now.
+        let msg = "Signature expired: 20200101T000000Z is now past";
+        let skew = BrokerConnection::extract_clock_skew_secs(msg);
+        // 2020-01-01 is in the past, so skew should be negative.
+        assert!(skew < 0, "expected negative skew, got {skew}");
+    }
+
+    #[test]
+    fn test_extract_clock_skew_secs_no_timestamp() {
+        let msg = "some random error message";
+        assert_eq!(BrokerConnection::extract_clock_skew_secs(msg), 0);
+    }
+
+    #[test]
+    fn test_extract_clock_skew_secs_malformed_timestamp() {
+        let msg = "Signature expired: 2020XXYYT000000Z";
+        assert_eq!(BrokerConnection::extract_clock_skew_secs(msg), 0);
+    }
+
+    #[test]
+    fn test_msk_iam_clock_offset_default() {
+        let config = ConnectionConfig::default();
+        assert_eq!(config.msk_iam_clock_offset_secs.load(Ordering::Relaxed), 0);
     }
 }

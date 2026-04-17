@@ -30,7 +30,10 @@ use crate::protocol::{
     OffsetFetchResponse, SyncGroupRequest, SyncGroupRequestAssignment, SyncGroupResponse,
     VersionedDecode, VersionedEncode,
     versions::{
-        CONSUMER_GROUP_HEARTBEAT_MAX, FIND_COORDINATOR_MAX, OFFSET_COMMIT_MAX, OFFSET_FETCH_MAX,
+        CONSUMER_GROUP_HEARTBEAT_MAX, CONSUMER_GROUP_HEARTBEAT_MIN, FIND_COORDINATOR_MAX,
+        FIND_COORDINATOR_MIN, HEARTBEAT_MAX, HEARTBEAT_MIN, JOIN_GROUP_MAX, JOIN_GROUP_MIN,
+        LEAVE_GROUP_MAX, LEAVE_GROUP_MIN, LIST_OFFSETS_MAX, LIST_OFFSETS_MIN, OFFSET_COMMIT_MAX,
+        OFFSET_COMMIT_MIN, OFFSET_FETCH_MAX, OFFSET_FETCH_MIN, SYNC_GROUP_MAX, SYNC_GROUP_MIN,
     },
 };
 
@@ -38,6 +41,26 @@ use crate::protocol::{
 ///
 /// Implement this trait to receive notifications when the consumer's
 /// partition assignment changes during a rebalance.
+///
+/// # Synchronous execution contract
+///
+/// All methods are **synchronous** and are invoked on the consumer's
+/// poll/rebalance task.  The consumer **blocks** until the callback
+/// returns, so:
+///
+/// - Do **not** spawn detached async tasks that race with the
+///   rebalance (e.g., committing offsets in a `tokio::spawn`).  The
+///   consumer will continue reassigning partitions immediately after
+///   the callback returns, and the spawned task may see stale state.
+/// - Blocking I/O (e.g., offset commits) is safe to issue here when
+///   wrapped in `tokio::task::block_in_place` or by using a
+///   synchronous Kafka commit helper.
+/// - Keep callbacks fast.  Long-running work should be deferred to a
+///   separate channel that the application drains at its own pace.
+///
+/// If you need **async** work inside a callback, block on it inside
+/// the callback (e.g., `Handle::current().block_on(my_future)`) so
+/// it completes before the callback returns.
 ///
 /// # Example
 ///
@@ -64,6 +87,9 @@ pub trait ConsumerRebalanceListener: Send + Sync {
     /// owned by this consumer after the rebalance — not just newly added ones.
     /// It may include partitions that were already assigned before the rebalance.
     ///
+    /// **Must complete synchronously** — see the [trait-level docs](ConsumerRebalanceListener)
+    /// for the execution contract.
+    ///
     /// > **Note:** The Java `ConsumerRebalanceListener.onPartitionsAssigned`
     /// > passes only *newly added* partitions for cooperative rebalances.
     /// > This crate always passes the full set for simplicity and to avoid
@@ -75,6 +101,9 @@ pub trait ConsumerRebalanceListener: Send + Sync {
     /// This is triggered during a rebalance before the consumer loses
     /// its current partitions. Use this to commit offsets synchronously
     /// if needed.
+    ///
+    /// **Must complete synchronously** — see the [trait-level docs](ConsumerRebalanceListener)
+    /// for the execution contract.
     fn on_partitions_revoked(&self, partitions: &[crate::consumer::TopicPartition]);
 
     /// Called when partitions are lost due to an unclean shutdown.
@@ -82,6 +111,9 @@ pub trait ConsumerRebalanceListener: Send + Sync {
     /// This is called when the consumer unexpectedly loses its partition
     /// assignment (e.g., session timeout). Unlike `on_partitions_revoked`,
     /// offsets may already be committed by another consumer.
+    ///
+    /// **Must complete synchronously** — see the [trait-level docs](ConsumerRebalanceListener)
+    /// for the execution contract.
     fn on_partitions_lost(&self, partitions: &[crate::consumer::TopicPartition]) {
         // Default implementation delegates to revoked
         self.on_partitions_revoked(partitions);
@@ -573,7 +605,8 @@ impl PartitionAssignor for CooperativeStickyAssignor {
 
         // First pass: honor previous assignments (stickiness)
         for member in members {
-            member_partition_counts.insert(member.member_id.clone(), 0);
+            let mid = member.member_id.clone();
+            member_partition_counts.entry(mid.clone()).or_insert(0);
 
             if let Some(prev) = prev_assignments.get(&member.member_id) {
                 for (topic, prev_parts) in prev {
@@ -585,10 +618,10 @@ impl PartitionAssignor for CooperativeStickyAssignor {
                                 if let std::collections::hash_map::Entry::Vacant(e) =
                                     sticky_assignments.entry(key)
                                 {
-                                    e.insert(member.member_id.clone());
-                                    *member_partition_counts
-                                        .entry(member.member_id.clone())
-                                        .or_insert(0) += 1;
+                                    e.insert(mid.clone());
+                                    // SAFETY: member_partition_counts was populated for all
+                                    // members in the first pass.
+                                    *member_partition_counts.get_mut(&mid).unwrap() += 1;
                                 }
                             }
                         }
@@ -636,10 +669,9 @@ impl PartitionAssignor for CooperativeStickyAssignor {
             }
 
             if let Some(member_id) = best_member {
+                // SAFETY: member_partition_counts was populated for all members in the first pass.
+                *member_partition_counts.get_mut(member_id).unwrap() += 1;
                 sticky_assignments.insert(key, member_id.to_string());
-                *member_partition_counts
-                    .entry(member_id.to_string())
-                    .or_insert(0) += 1;
             }
         }
 
@@ -681,9 +713,9 @@ impl PartitionAssignor for CooperativeStickyAssignor {
                             if let Some(count) = member_partition_counts.get_mut(over_member) {
                                 *count = count.saturating_sub(1);
                             }
-                            *member_partition_counts
-                                .entry(under_member.clone())
-                                .or_insert(0) += 1;
+                            // SAFETY: member_partition_counts was populated for all members
+                            // in the first pass.
+                            *member_partition_counts.get_mut(under_member).unwrap() += 1;
                             moved = true;
                             break 'outer;
                         }
@@ -908,11 +940,15 @@ impl HeartbeatStatus {
 
 /// Commands for the heartbeat background task.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum HeartbeatCommand {
     /// Stop the heartbeat task.
     Stop,
     /// Trigger a rejoin.
     Rejoin,
+    /// Send an immediate heartbeat with current owned partitions to
+    /// acknowledge a revocation (KIP-848 §revocation-ack).
+    AcknowledgeRevocation,
 }
 
 /// Group coordinator that manages group membership, heartbeats, and offset commits.
@@ -1174,9 +1210,18 @@ impl GroupCoordinator {
         // for group coordinator lookup and compatible with all brokers.
         let request = FindCoordinatorRequest::for_group(&self.group_id);
         let fc_version = conn
-            .negotiate_api_version_max(ApiKey::FindCoordinator, FIND_COORDINATOR_MAX)
+            .negotiate_api_version(
+                ApiKey::FindCoordinator,
+                FIND_COORDINATOR_MAX,
+                FIND_COORDINATOR_MIN,
+            )
             .await
-            .unwrap_or(0);
+            .ok_or_else(|| {
+                KrafkaError::protocol(format!(
+                    "broker does not support FindCoordinator v{}-v{}",
+                    FIND_COORDINATOR_MIN, FIND_COORDINATOR_MAX,
+                ))
+            })?;
         let response = conn
             .send_request(ApiKey::FindCoordinator, fc_version, |buf| {
                 request.encode_versioned(fc_version, buf)
@@ -1212,18 +1257,18 @@ impl GroupCoordinator {
     }
 
     /// Get the coordinator connection, finding it if necessary.
-    /// Checks liveness of cached connections and re-discovers if dead.
+    /// Checks liveness and SASL session expiry of cached connections and re-discovers if unusable.
     async fn get_coordinator_connection(&self) -> Result<Arc<BrokerConnection>> {
         {
             let conn = self.coordinator_conn.read().await;
             if let Some(ref c) = *conn {
-                if c.is_alive() {
+                if c.is_usable() {
                     return Ok(c.clone());
                 }
-                // Connection is dead, clear it and re-discover
+                // Connection is dead or SASL session expired, clear it and re-discover
                 drop(conn);
                 *self.coordinator_conn.write().await = None;
-                debug!("Coordinator connection is dead, re-discovering");
+                debug!("Coordinator connection is unusable, re-discovering");
             }
         }
 
@@ -1245,7 +1290,7 @@ impl GroupCoordinator {
         }
 
         // Fall back to bootstrap servers
-        for server in self.metadata.bootstrap_servers() {
+        for server in &self.metadata.bootstrap_servers() {
             if let Ok(conn) = self.pool.get_connection(server).await {
                 return Ok(conn);
             }
@@ -1287,6 +1332,7 @@ impl GroupCoordinator {
                 name: self.assignor_name.clone(),
                 metadata: metadata.freeze(),
             }],
+            reason: None,
         };
 
         debug!(
@@ -1296,21 +1342,59 @@ impl GroupCoordinator {
 
         *self.state.write().await = GroupState::Joining;
 
-        // Use v5 for static membership (KIP-345), v0 otherwise
-        let response = if self.group_instance_id.is_some() {
-            conn.send_request(ApiKey::JoinGroup, 5, |buf| request.encode_v5(buf))
-                .await?
+        // Negotiate JoinGroup version. Static membership (group_instance_id)
+        // requires v5+ where the GroupInstanceId field is available.
+        let join_group_min = if self.group_instance_id.is_some() {
+            5
         } else {
-            conn.send_request(ApiKey::JoinGroup, 0, |buf| request.encode_v0(buf))
-                .await?
+            JOIN_GROUP_MIN
         };
+        let jg_version = conn
+            .negotiate_api_version(ApiKey::JoinGroup, JOIN_GROUP_MAX, join_group_min)
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol(format!(
+                    "broker does not support JoinGroup v{}-v{}",
+                    join_group_min, JOIN_GROUP_MAX,
+                ))
+            })?;
+
+        let response = conn
+            .send_request(ApiKey::JoinGroup, jg_version, |buf| {
+                request.encode_versioned(jg_version, buf)
+            })
+            .await?;
 
         let mut buf = response;
-        let join_response = if self.group_instance_id.is_some() {
-            JoinGroupResponse::decode_v5(&mut buf)?
-        } else {
-            JoinGroupResponse::decode_v0(&mut buf)?
-        };
+        let mut join_response = JoinGroupResponse::decode_versioned(jg_version, &mut buf)?;
+
+        // KIP-394 (v4+): broker returns MemberIdRequired with a newly
+        // assigned member_id.  Save the id and retry the JoinGroup request
+        // exactly once, which is the expected two-step join handshake.
+        if join_response.error_code == ErrorCode::MemberIdRequired {
+            debug!(
+                "Received MemberIdRequired for group '{}', retrying with assigned member_id '{}'",
+                self.group_id, join_response.member_id
+            );
+
+            // Persist the broker-assigned member_id.
+            *self.member_id.write().await = join_response.member_id.clone();
+
+            // Rebuild the request with the assigned member_id.
+            let retry_request = JoinGroupRequest {
+                member_id: join_response.member_id.clone(),
+                ..request.clone()
+            };
+
+            let retry_response = conn
+                .send_request(ApiKey::JoinGroup, jg_version, |buf| {
+                    retry_request.encode_versioned(jg_version, buf)
+                })
+                .await?;
+
+            let mut retry_buf = retry_response;
+            join_response = JoinGroupResponse::decode_versioned(jg_version, &mut retry_buf)?;
+        }
 
         if !join_response.error_code.is_ok() {
             // Reset member identity on session-invalidating errors so the
@@ -1388,23 +1472,25 @@ impl GroupCoordinator {
             join_response.is_leader()
         );
 
-        // Use v3 for static membership (KIP-345), v0 otherwise.
-        // v3 includes group_instance_id; v0 silently discards it.
-        let response = if self.group_instance_id.is_some() {
-            conn.send_request(ApiKey::SyncGroup, 3, |buf| request.encode_v3(buf))
-                .await?
-        } else {
-            conn.send_request(ApiKey::SyncGroup, 0, |buf| request.encode_v0(buf))
-                .await?
-        };
+        // Negotiate SyncGroup version — v3+ required (KIP-345 static membership).
+        let sg_version = conn
+            .negotiate_api_version(ApiKey::SyncGroup, SYNC_GROUP_MAX, SYNC_GROUP_MIN)
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol(format!(
+                    "broker does not support SyncGroup v{}-v{}",
+                    SYNC_GROUP_MIN, SYNC_GROUP_MAX,
+                ))
+            })?;
+
+        let response = conn
+            .send_request(ApiKey::SyncGroup, sg_version, |buf| {
+                request.encode_versioned(sg_version, buf)
+            })
+            .await?;
 
         let mut buf = response;
-        // v1+ adds throttle_time_ms; v0 omits it
-        let sync_response = if self.group_instance_id.is_some() {
-            SyncGroupResponse::decode_v1(&mut buf)?
-        } else {
-            SyncGroupResponse::decode_v0(&mut buf)?
-        };
+        let sync_response = SyncGroupResponse::decode_versioned(sg_version, &mut buf)?;
 
         if !sync_response.error_code.is_ok() {
             // Reset member identity on session-invalidating errors.
@@ -1472,6 +1558,7 @@ impl GroupCoordinator {
         // Classic protocol: JoinGroup/SyncGroup/Heartbeat
         // Detect topic changes: if the subscription changed while Stable,
         // force a rejoin so the broker learns the new subscription.
+        let new_topics = topics.to_vec();
         {
             let state = *self.state.read().await;
             if state == GroupState::Stable {
@@ -1479,7 +1566,7 @@ impl GroupCoordinator {
                 let mut old_sorted = old_topics.clone();
                 drop(old_topics);
                 old_sorted.sort();
-                let mut new_sorted = topics.to_vec();
+                let mut new_sorted = new_topics.clone();
                 new_sorted.sort();
                 if old_sorted != new_sorted {
                     // Topics changed — must rejoin to update broker subscription.
@@ -1492,19 +1579,16 @@ impl GroupCoordinator {
         }
 
         // Update subscribed topics
-        self.set_subscribed_topics(topics.to_vec()).await;
+        self.set_subscribed_topics(new_topics).await;
 
         let state = *self.state.read().await;
-        match state {
-            GroupState::Stable => {
-                // Already stable with same topics, return current assignment
-                Ok((self.assignment.read().await.clone(), false))
-            }
-            _ => {
-                // Need to join/rejoin
-                let assignment = self.perform_join_and_sync().await?;
-                Ok((assignment, true))
-            }
+        if state == GroupState::Stable {
+            // Already stable with same topics, return current assignment
+            Ok((self.assignment.read().await.clone(), false))
+        } else {
+            // Need to join/rejoin
+            let assignment = self.perform_join_and_sync().await?;
+            Ok((assignment, true))
         }
     }
 
@@ -1612,6 +1696,13 @@ impl GroupCoordinator {
             let mut interval = tokio::time::interval(heartbeat_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+            // Cache the negotiated heartbeat version per coordinator connection.
+            // The version is stable for a given connection (API versions don't
+            // change until reconnect), so we only re-negotiate when the
+            // connection identity changes.
+            let mut cached_hb_version: Option<i16> = None;
+            let mut cached_conn_id: Option<usize> = None;
+
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
@@ -1626,35 +1717,56 @@ impl GroupCoordinator {
 
                         // Send heartbeat
                         if let Some(ref conn) = coordinator_conn {
+                            // Re-negotiate only when the coordinator connection changes.
+                            let conn_id = std::sync::Arc::as_ptr(conn) as usize;
+                            let hb_version = if cached_conn_id == Some(conn_id) {
+                                // Safe to unwrap: cached_hb_version is always set
+                                // together with cached_conn_id.
+                                cached_hb_version.unwrap()
+                            } else {
+                                match conn
+                                    .negotiate_api_version(
+                                        ApiKey::Heartbeat,
+                                        HEARTBEAT_MAX,
+                                        HEARTBEAT_MIN,
+                                    )
+                                    .await
+                                {
+                                    Some(v) => {
+                                        cached_conn_id = Some(conn_id);
+                                        cached_hb_version = Some(v);
+                                        v
+                                    }
+                                    None => {
+                                        warn!(
+                                            "Broker does not support Heartbeat v{}-v{} for group '{}', triggering rebalance",
+                                            HEARTBEAT_MIN, HEARTBEAT_MAX, group_id
+                                        );
+                                        *coordinator_conn_ref.write().await = None;
+                                        heartbeat_controller.signal_rebalance();
+                                        heartbeat_controller.stop();
+                                        break;
+                                    }
+                                }
+                            };
+
                             let request = HeartbeatRequest {
                                 group_id: group_id.clone(),
                                 generation_id,
                                 member_id: member_id.clone(),
                                 group_instance_id: group_instance_id.clone(),
                             };
-
-                            // Use v3 for static membership (KIP-345), v0 otherwise
-                            let send_result = if group_instance_id.is_some() {
-                                conn.send_request(ApiKey::Heartbeat, 3, |buf| {
-                                    request.encode_v3(buf)
+                            let send_result = conn
+                                .send_request(ApiKey::Heartbeat, hb_version, |buf| {
+                                    request.encode_versioned(hb_version, buf)
                                 })
-                                .await
-                            } else {
-                                conn.send_request(ApiKey::Heartbeat, 0, |buf| {
-                                    request.encode_v0(buf)
-                                })
-                                .await
-                            };
+                                .await;
 
                             match send_result
                             {
                                 Ok(response) => {
                                     let mut buf = response;
-                                    let decode_result = if group_instance_id.is_some() {
-                                        HeartbeatResponse::decode_v1(&mut buf)
-                                    } else {
-                                        HeartbeatResponse::decode_v0(&mut buf)
-                                    };
+                                    let decode_result = HeartbeatResponse::decode_versioned(hb_version, &mut buf);
                                     if let Ok(hb_response) = decode_result {
                                         let status = HeartbeatStatus::from_error_code(hb_response.error_code);
                                         match status {
@@ -1717,6 +1829,9 @@ impl GroupCoordinator {
                                 heartbeat_controller.stop();
                                 break;
                             }
+                            Some(HeartbeatCommand::AcknowledgeRevocation) => {
+                                // Not applicable to the classic protocol — ignore.
+                            }
                         }
                     }
                 }
@@ -1741,6 +1856,15 @@ impl GroupCoordinator {
         let tx = self.heartbeat_cmd_tx.read().await.clone();
         if let Some(tx) = tx {
             let _ = tx.send(HeartbeatCommand::Rejoin).await;
+        }
+    }
+
+    /// Signal the heartbeat task to send an immediate full heartbeat with
+    /// the current owned partitions, acknowledging a revocation (KIP-848).
+    pub async fn acknowledge_revocation(&self) {
+        let tx = self.heartbeat_cmd_tx.read().await.clone();
+        if let Some(tx) = tx {
+            let _ = tx.send(HeartbeatCommand::AcknowledgeRevocation).await;
         }
     }
 
@@ -1777,6 +1901,17 @@ impl GroupCoordinator {
         topic_partitions: Option<Vec<ConsumerGroupTopicPartitions>>,
     ) -> Result<ConsumerGroupHeartbeatResponse> {
         let conn = self.get_coordinator_connection().await?;
+
+        // KIP-1082 (v1+): member ID must be client-generated. Generate a
+        // UUID on the first heartbeat and persist it for the member lifetime.
+        // Use a single write lock to avoid a TOCTOU race where two concurrent
+        // callers could both see an empty ID and both generate a UUID.
+        {
+            let mut id = self.member_id.write().await;
+            if id.is_empty() {
+                *id = crate::util::random_uuid_v4();
+            }
+        }
         let member_id = self.member_id.read().await.clone();
         let member_epoch = *self.member_epoch.read().await;
 
@@ -1799,7 +1934,11 @@ impl GroupCoordinator {
         );
 
         let Some(hb_version) = conn
-            .negotiate_api_version_max(ApiKey::ConsumerGroupHeartbeat, CONSUMER_GROUP_HEARTBEAT_MAX)
+            .negotiate_api_version(
+                ApiKey::ConsumerGroupHeartbeat,
+                CONSUMER_GROUP_HEARTBEAT_MAX,
+                CONSUMER_GROUP_HEARTBEAT_MIN,
+            )
             .await
         else {
             return Err(KrafkaError::protocol(
@@ -1904,8 +2043,8 @@ impl GroupCoordinator {
                 }
                 // Re-resolve after refresh. If topic UUIDs are still
                 // unresolved, KIP-848 cannot operate because UUID→name
-                // mappings require Metadata v10+ which is not yet active
-                // (METADATA_MAX = 8). Fail fast with a clear error rather
+                // mappings require Metadata v10+.
+                // Fail fast with a clear error rather
                 // than silently keeping an empty/partial assignment.
                 let target = self.target_assignment.read().await.clone();
                 let (resolved, still_unresolved) =
@@ -1985,25 +2124,25 @@ impl GroupCoordinator {
     ) -> Result<(MemberAssignment, bool)> {
         let state = *self.state.read().await;
 
+        let new_topics = topics.to_vec();
         match state {
             GroupState::Stable => {
                 // Already stable — check if topics changed
                 let old_topics = self.subscribed_topics.read().await.clone();
                 let mut old_sorted = old_topics;
                 old_sorted.sort();
-                let mut new_sorted = topics.to_vec();
+                let mut new_sorted = new_topics.clone();
                 new_sorted.sort();
                 if old_sorted == new_sorted {
                     return Ok((self.assignment.read().await.clone(), false));
                 }
                 // Topics changed — send heartbeat with new subscription
             }
-            GroupState::Unjoined => {
+            GroupState::Unjoined if self.coordinator_conn.read().await.is_none() => {
                 // Need to find coordinator first
-                if self.coordinator_conn.read().await.is_none() {
-                    self.find_coordinator().await?;
-                }
+                self.find_coordinator().await?;
             }
+            GroupState::Unjoined => {}
             GroupState::Leaving | GroupState::Dead => {
                 return Err(KrafkaError::invalid_state(format!(
                     "Cannot send consumer heartbeat: group state is {state:?}"
@@ -2015,9 +2154,9 @@ impl GroupCoordinator {
             _ => {}
         }
 
-        self.set_subscribed_topics(topics.to_vec()).await;
+        let subscribed = Some(new_topics.clone());
+        self.set_subscribed_topics(new_topics).await;
 
-        let subscribed = Some(topics.to_vec());
         let resp = self.consumer_group_heartbeat(subscribed, None).await?;
 
         // Start heartbeat task for KIP-848
@@ -2054,6 +2193,8 @@ impl GroupCoordinator {
         let metadata_ref = self.metadata.clone();
         let target_assignment_ref = self.target_assignment.clone();
         let topic_names_cache_ref = self.topic_names_cache.clone();
+        let subscribed_topics_snapshot = self.subscribed_topics.read().await.clone();
+        let rebalance_timeout = self.rebalance_timeout;
 
         tokio::spawn(async move {
             debug!(
@@ -2068,9 +2209,10 @@ impl GroupCoordinator {
                 let coordinator_conn = coordinator_conn_ref.read().await.clone();
                 if let Some(ref conn) = coordinator_conn {
                     match conn
-                        .negotiate_api_version_max(
+                        .negotiate_api_version(
                             ApiKey::ConsumerGroupHeartbeat,
                             CONSUMER_GROUP_HEARTBEAT_MAX,
+                            CONSUMER_GROUP_HEARTBEAT_MIN,
                         )
                         .await
                     {
@@ -2098,6 +2240,10 @@ impl GroupCoordinator {
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut current_interval_ms = interval.as_millis() as i32;
+            // KIP-848 spec: "The member must set all (top-level) fields when
+            // it joins for the first time or when an error/timeout occurs."
+            // Start `true` so the very first tick sends a full heartbeat.
+            let mut send_full_heartbeat = true;
 
             loop {
                 tokio::select! {
@@ -2111,17 +2257,34 @@ impl GroupCoordinator {
                         let epoch = *member_epoch_ref.read().await;
 
                         if let Some(ref conn) = coordinator_conn {
+                            // Build owned-partition snapshot from target
+                            // assignment for revocation acknowledgment.
+                            let owned_partitions = {
+                                let ta = target_assignment_ref.read().await;
+                                if ta.is_empty() { None } else { Some(ta.clone()) }
+                            };
+
+                            let (sub_names, rebal_timeout_ms, topic_parts) = if send_full_heartbeat {
+                                (
+                                    Some(subscribed_topics_snapshot.clone()),
+                                    crate::util::duration_to_millis_i32(rebalance_timeout),
+                                    owned_partitions,
+                                )
+                            } else {
+                                (None, -1, None)
+                            };
+
                             let request = ConsumerGroupHeartbeatRequest {
                                 group_id: group_id.clone(),
                                 member_id,
                                 member_epoch: epoch,
                                 instance_id: group_instance_id.clone(),
                                 rack_id: None,
-                                rebalance_timeout_ms: -1,
-                                subscribed_topic_names: None,
+                                rebalance_timeout_ms: rebal_timeout_ms,
+                                subscribed_topic_names: sub_names,
                                 subscribed_topic_regex: None,
                                 server_assignor: None,
-                                topic_partitions: None,
+                                topic_partitions: topic_parts,
                             };
 
                             match conn.send_request(
@@ -2181,7 +2344,7 @@ impl GroupCoordinator {
                                                             warn!(
                                                                 "KIP-848 topic UUIDs still unresolved after metadata refresh \
                                                                  for group '{}'. Metadata v10+ is required to map topic IDs \
-                                                                 to names — current METADATA_MAX does not support this.",
+                                                                 to names.",
                                                                 group_id
                                                             );
                                                         }
@@ -2212,6 +2375,7 @@ impl GroupCoordinator {
                                                 }
 
                                                 heartbeat_controller.heartbeat_success().await;
+                                                send_full_heartbeat = false;
 
                                                 // Update interval if the coordinator changed it.
                                                 let new_ms = resp.heartbeat_interval_ms.max(1000);
@@ -2230,6 +2394,7 @@ impl GroupCoordinator {
                                                     tick.tick().await;
                                                 }
                                             } else if resp.error_code == ErrorCode::RebalanceInProgress {
+                                                send_full_heartbeat = true;
                                                 heartbeat_controller.signal_rebalance();
                                             } else if resp.error_code == ErrorCode::StaleMemberEpoch {
                                                 // Stale epoch: our epoch is behind.
@@ -2244,6 +2409,7 @@ impl GroupCoordinator {
                                                      updated epoch to {}, will retry on next heartbeat",
                                                     group_id, resp.member_epoch
                                                 );
+                                                send_full_heartbeat = true;
                                                 heartbeat_controller.heartbeat_success().await;
                                             } else if resp.error_code == ErrorCode::UnknownMemberId
                                                 || resp.error_code == ErrorCode::FencedMemberEpoch
@@ -2267,6 +2433,7 @@ impl GroupCoordinator {
                                                     "KIP-848 unsupported assignor for '{}': {:?}",
                                                     group_id, resp.error_message
                                                 );
+                                                send_full_heartbeat = true;
                                                 heartbeat_controller.signal_rebalance();
                                             } else if resp.error_code
                                                 == ErrorCode::InvalidRegularExpression
@@ -2301,11 +2468,13 @@ impl GroupCoordinator {
                                                 // Transient: coordinator is loading state.
                                                 // Keep the connection and retry on the
                                                 // next heartbeat tick.
+                                                send_full_heartbeat = true;
                                                 debug!(
                                                     "KIP-848 coordinator loading for '{}', will retry",
                                                     group_id
                                                 );
                                             } else {
+                                                send_full_heartbeat = true;
                                                 warn!(
                                                     "KIP-848 heartbeat error for '{}': {:?}",
                                                     group_id, resp.error_code
@@ -2313,6 +2482,7 @@ impl GroupCoordinator {
                                             }
                                         }
                                         Err(e) => {
+                                            send_full_heartbeat = true;
                                             warn!(
                                                 "Failed to decode KIP-848 heartbeat response for '{}': {}",
                                                 group_id, e
@@ -2341,6 +2511,17 @@ impl GroupCoordinator {
                         match cmd {
                             Some(HeartbeatCommand::Stop) | None => break,
                             Some(HeartbeatCommand::Rejoin) => break,
+                            Some(HeartbeatCommand::AcknowledgeRevocation) => {
+                                // KIP-848 §revocation-ack: after the consumer
+                                // layer processes revocations, send an immediate
+                                // heartbeat with the updated owned partitions so
+                                // the coordinator can proceed.
+                                send_full_heartbeat = true;
+                                tick.reset();
+                                // The next tick fires immediately because we
+                                // just reset the interval, which means the
+                                // loop will go around and send the full HB.
+                            }
                         }
                     }
                 }
@@ -2364,21 +2545,24 @@ impl GroupCoordinator {
             group_instance_id: self.group_instance_id.clone(),
         };
 
-        // Use v3 for static membership (KIP-345), v0 otherwise
-        let response = if self.group_instance_id.is_some() {
-            conn.send_request(ApiKey::Heartbeat, 3, |buf| request.encode_v3(buf))
-                .await?
-        } else {
-            conn.send_request(ApiKey::Heartbeat, 0, |buf| request.encode_v0(buf))
-                .await?
-        };
+        // Negotiate heartbeat version with broker (MIN=3, KIP-345 static membership).
+        let hb_version = conn
+            .negotiate_api_version(ApiKey::Heartbeat, HEARTBEAT_MAX, HEARTBEAT_MIN)
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol(format!(
+                    "broker does not support Heartbeat v{}-v{}",
+                    HEARTBEAT_MIN, HEARTBEAT_MAX,
+                ))
+            })?;
+        let response = conn
+            .send_request(ApiKey::Heartbeat, hb_version, |buf| {
+                request.encode_versioned(hb_version, buf)
+            })
+            .await?;
 
         let mut buf = response;
-        let hb_response = if self.group_instance_id.is_some() {
-            HeartbeatResponse::decode_v1(&mut buf)?
-        } else {
-            HeartbeatResponse::decode_v0(&mut buf)?
-        };
+        let hb_response = HeartbeatResponse::decode_versioned(hb_version, &mut buf)?;
 
         let status = HeartbeatStatus::from_error_code(hb_response.error_code);
         if status == HeartbeatStatus::Ok {
@@ -2426,9 +2610,14 @@ impl GroupCoordinator {
         let conn = self.get_coordinator_connection().await?;
 
         let oc_version = conn
-            .negotiate_api_version_max(ApiKey::OffsetCommit, OFFSET_COMMIT_MAX)
+            .negotiate_api_version(ApiKey::OffsetCommit, OFFSET_COMMIT_MAX, OFFSET_COMMIT_MIN)
             .await
-            .unwrap_or(2);
+            .ok_or_else(|| {
+                KrafkaError::protocol(format!(
+                    "broker does not support OffsetCommit v{}-v{}",
+                    OFFSET_COMMIT_MIN, OFFSET_COMMIT_MAX,
+                ))
+            })?;
 
         let member_id = self.member_id.read().await.clone();
         // For KIP-848 (consumer protocol), the "generation ID" wire field
@@ -2436,9 +2625,6 @@ impl GroupCoordinator {
         // This semantic overload is only valid from v9+ — at earlier versions
         // the broker strictly validates against the classic group generation,
         // so we fall back to the classic generation_id.
-        //
-        // NOTE: Currently inactive — OFFSET_COMMIT_MAX caps negotiation
-        // below v9.  This branch activates once the MAX is bumped.
         let generation_id = if self.is_consumer_protocol() && oc_version >= 9 {
             *self.member_epoch.read().await
         } else {
@@ -2462,7 +2648,11 @@ impl GroupCoordinator {
 
         let topics: Vec<OffsetCommitRequestTopic> = topics_map
             .into_iter()
-            .map(|(name, partitions)| OffsetCommitRequestTopic { name, partitions })
+            .map(|(name, partitions)| OffsetCommitRequestTopic {
+                name,
+                topic_id: None,
+                partitions,
+            })
             .collect();
 
         let request = OffsetCommitRequest {
@@ -2566,6 +2756,7 @@ impl GroupCoordinator {
             .iter()
             .map(|(topic, parts)| OffsetFetchRequestTopic {
                 name: topic.clone(),
+                topic_id: None,
                 partition_indexes: parts.clone(),
             })
             .collect();
@@ -2575,18 +2766,19 @@ impl GroupCoordinator {
         // encoding, v8+ uses the batched Groups format (KIP-709), and v9
         // adds MemberId/MemberEpoch for KIP-848 epoch validation.
         let of_version = conn
-            .negotiate_api_version_max(ApiKey::OffsetFetch, OFFSET_FETCH_MAX)
+            .negotiate_api_version(ApiKey::OffsetFetch, OFFSET_FETCH_MAX, OFFSET_FETCH_MIN)
             .await
-            .unwrap_or(1)
-            .max(1);
+            .ok_or_else(|| {
+                KrafkaError::protocol(format!(
+                    "broker does not support OffsetFetch v{}-v{}",
+                    OFFSET_FETCH_MIN, OFFSET_FETCH_MAX,
+                ))
+            })?;
 
         // For KIP-848, populate MemberId/MemberEpoch so the broker can validate
         // membership and surface STALE_MEMBER_EPOCH when appropriate.
         // These fields only exist on the wire from v9+; at earlier versions
         // the encode path ignores them, so we leave defaults.
-        //
-        // NOTE: Currently inactive — OFFSET_FETCH_MAX caps negotiation
-        // below v9.  This branch activates once the MAX is bumped.
         let (offset_fetch_member_id, offset_fetch_member_epoch) =
             if self.is_consumer_protocol() && of_version >= 9 {
                 (
@@ -2748,17 +2940,29 @@ impl GroupCoordinator {
                 replica_id: -1,
                 isolation_level: self.isolation_level,
                 topics,
+                timeout_ms: None,
             };
 
             // Get connection to this leader directly by ID
             let conn = self.metadata.get_broker_connection(*leader_id).await?;
 
+            let lo_version = conn
+                .negotiate_api_version(ApiKey::ListOffsets, LIST_OFFSETS_MAX, LIST_OFFSETS_MIN)
+                .await
+                .ok_or_else(|| {
+                    KrafkaError::protocol(format!(
+                        "broker does not support ListOffsets v{}-v{}",
+                        LIST_OFFSETS_MIN, LIST_OFFSETS_MAX,
+                    ))
+                })?;
             let response = conn
-                .send_request(ApiKey::ListOffsets, 2, |buf| request.encode_v2(buf))
+                .send_request(ApiKey::ListOffsets, lo_version, |buf| {
+                    request.encode_versioned(lo_version, buf)
+                })
                 .await?;
 
             let mut buf = response;
-            let list_response = ListOffsetsResponse::decode_v2(&mut buf)?;
+            let list_response = ListOffsetsResponse::decode_versioned(lo_version, &mut buf)?;
 
             for topic_resp in &list_response.topics {
                 for part_resp in &topic_resp.partitions {
@@ -2789,18 +2993,20 @@ impl GroupCoordinator {
             return Ok(());
         }
 
-        // Stop heartbeat task
-        self.stop_heartbeat_task().await;
-
-        // KIP-848: leave by sending heartbeat with epoch -1
+        // KIP-848: stop heartbeat first (prevent normal heartbeat from
+        // racing with the leave-epoch heartbeat), then send the leave.
         if self.is_consumer_protocol() {
+            self.stop_heartbeat_task().await;
             return self.leave_group_consumer().await;
         }
 
+        // Classic protocol: send LeaveGroup while heartbeat still keeps the
+        // member alive on the broker, then stop heartbeat afterward.
         let conn = match self.get_coordinator_connection().await {
             Ok(c) => c,
             Err(_) => {
-                // If we can't get a connection, just reset state
+                // If we can't get a connection, just stop heartbeat and reset state
+                self.stop_heartbeat_task().await;
                 self.reset().await;
                 return Ok(());
             }
@@ -2810,17 +3016,16 @@ impl GroupCoordinator {
 
         *self.state.write().await = GroupState::Leaving;
 
+        // v3+ uses only the `members` array; the top-level `member_id`
+        // must be empty to avoid ambiguous single-vs-batch leave semantics.
         let request = LeaveGroupRequest {
             group_id: self.group_id.clone(),
-            member_id: member_id.clone(),
-            members: if self.group_instance_id.is_some() {
-                vec![LeaveGroupMember {
-                    member_id: member_id.clone(),
-                    group_instance_id: self.group_instance_id.clone(),
-                }]
-            } else {
-                vec![]
-            },
+            member_id: String::new(),
+            members: vec![LeaveGroupMember {
+                member_id: member_id.clone(),
+                group_instance_id: self.group_instance_id.clone(),
+                reason: None,
+            }],
         };
 
         debug!(
@@ -2829,30 +3034,29 @@ impl GroupCoordinator {
         );
 
         // Send leave group request (don't wait too long)
-        // Use v3 for static membership (KIP-345), v0 otherwise
-        let result = if self.group_instance_id.is_some() {
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                conn.send_request(ApiKey::LeaveGroup, 3, |buf| request.encode_v3(buf)),
-            )
+        // Negotiate version with broker (MIN=3, KIP-345 batch leave).
+        let lg_version = conn
+            .negotiate_api_version(ApiKey::LeaveGroup, LEAVE_GROUP_MAX, LEAVE_GROUP_MIN)
             .await
-        } else {
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                conn.send_request(ApiKey::LeaveGroup, 0, |buf| request.encode_v0(buf)),
-            )
-            .await
-        };
+            .ok_or_else(|| {
+                KrafkaError::protocol(format!(
+                    "broker does not support LeaveGroup v{}-v{}",
+                    LEAVE_GROUP_MIN, LEAVE_GROUP_MAX,
+                ))
+            })?;
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            conn.send_request(ApiKey::LeaveGroup, lg_version, |buf| {
+                request.encode_versioned(lg_version, buf)
+            }),
+        )
+        .await;
 
         // Decode the response and check for errors
         match result {
             Ok(Ok(response_bytes)) => {
                 let mut buf = response_bytes;
-                let decode_result = if self.group_instance_id.is_some() {
-                    LeaveGroupResponse::decode_v3(&mut buf)
-                } else {
-                    LeaveGroupResponse::decode_v0(&mut buf)
-                };
+                let decode_result = LeaveGroupResponse::decode_versioned(lg_version, &mut buf);
                 match decode_result {
                     Ok(r) if r.error_code.is_ok() => {
                         // Check per-member errors (v3 batch leave)
@@ -2891,6 +3095,7 @@ impl GroupCoordinator {
             }
         }
 
+        self.stop_heartbeat_task().await;
         self.reset().await;
         Ok(())
     }
@@ -2940,7 +3145,11 @@ impl GroupCoordinator {
         );
 
         let Some(hb_version) = conn
-            .negotiate_api_version_max(ApiKey::ConsumerGroupHeartbeat, CONSUMER_GROUP_HEARTBEAT_MAX)
+            .negotiate_api_version(
+                ApiKey::ConsumerGroupHeartbeat,
+                CONSUMER_GROUP_HEARTBEAT_MAX,
+                CONSUMER_GROUP_HEARTBEAT_MIN,
+            )
             .await
         else {
             warn!(
@@ -3136,7 +3345,7 @@ impl GroupCoordinator {
                 if len < 0 || buf.remaining() < len as usize {
                     return (topics, HashMap::new());
                 }
-                topics.push(String::from_utf8_lossy(&buf.copy_to_bytes(len as usize)).to_string());
+                topics.push(String::from_utf8_lossy(&buf.copy_to_bytes(len as usize)).into_owned());
             }
         }
 
@@ -3172,7 +3381,7 @@ impl GroupCoordinator {
                 if len < 0 || buf.remaining() < len as usize {
                     return (topics, owned);
                 }
-                let topic = String::from_utf8_lossy(&buf.copy_to_bytes(len as usize)).to_string();
+                let topic = String::from_utf8_lossy(&buf.copy_to_bytes(len as usize)).into_owned();
                 if buf.remaining() < 4 {
                     return (topics, owned);
                 }
@@ -3247,7 +3456,7 @@ impl GroupCoordinator {
             if buf.remaining() < topic_len {
                 break;
             }
-            let topic = String::from_utf8_lossy(&buf.copy_to_bytes(topic_len)).to_string();
+            let topic = String::from_utf8_lossy(&buf.copy_to_bytes(topic_len)).into_owned();
 
             if buf.remaining() < 4 {
                 break;

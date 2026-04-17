@@ -77,6 +77,9 @@ fn default_avro_type() -> String {
 // ── Auth ─────────────────────────────────────────────────────────────────
 
 /// Authentication method for the schema registry.
+///
+/// Credentials are zeroized on drop to reduce the window during which
+/// plaintext secrets remain in process memory.
 #[derive(Clone, Default)]
 enum RegistryAuth {
     #[default]
@@ -88,6 +91,22 @@ enum RegistryAuth {
     Bearer {
         token: String,
     },
+}
+
+impl Drop for RegistryAuth {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        match self {
+            Self::Basic { username, password } => {
+                username.zeroize();
+                password.zeroize();
+            }
+            Self::Bearer { token } => {
+                token.zeroize();
+            }
+            Self::None => {}
+        }
+    }
 }
 
 // ── Client ───────────────────────────────────────────────────────────────
@@ -524,12 +543,20 @@ impl ConfluentSchemaRegistryBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the URL is not set or the HTTP client cannot be
+    /// Returns an error if the URL is not set, basic auth is used over
+    /// plain HTTP (credential exposure risk), or the HTTP client cannot be
     /// constructed.
     pub fn build(self) -> Result<ConfluentSchemaRegistry> {
         let url = self
             .url
             .ok_or_else(|| KrafkaError::config("schema registry URL is required"))?;
+
+        // Reject basic auth over plain HTTP to prevent credential exposure.
+        if matches!(self.auth, RegistryAuth::Basic { .. }) && url.starts_with("http://") {
+            return Err(KrafkaError::config(
+                "basic auth requires HTTPS — credentials would be sent in cleartext over HTTP",
+            ));
+        }
 
         let mut http_builder = reqwest::Client::builder();
         if let Some(timeout) = self.request_timeout {
@@ -588,7 +615,7 @@ mod tests {
     #[test]
     fn test_debug_redacts_basic_auth() {
         let client = ConfluentSchemaRegistryBuilder::default()
-            .url("http://localhost:8081")
+            .url("https://localhost:8081")
             .basic_auth("admin", "s3cret")
             .build()
             .unwrap();

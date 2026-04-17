@@ -1,11 +1,12 @@
 //! TLS support for Kafka connections.
 //!
-//! This module provides TLS encryption using rustls.
+//! This module provides TLS encryption using rustls. All public functions are
+//! async and use `spawn_blocking` internally so that file I/O for certificates
+//! and keys never blocks the Tokio runtime.
 //!
-//! # File Loading
-//!
-//! Certificate and key loading uses async-compatible I/O via `spawn_blocking`
-//! to avoid blocking the async runtime on file system operations.
+//! The private implementation functions are synchronous — they are the single
+//! source of truth for TLS configuration logic and are wrapped by the public
+//! async API in a single `spawn_blocking` call per operation.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -23,6 +24,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ConfigBuilder, RootCertStore};
 #[cfg(feature = "danger-insecure-tls")]
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
+#[cfg(feature = "native-tls-roots")]
+use rustls_native_certs::load_native_certs;
 use rustls_pemfile::{certs, private_key};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -92,7 +95,15 @@ impl AsyncWrite for MaybeSecureStream {
     }
 }
 
-/// Build a rustls ClientConfig from TlsConfig.
+// ---------------------------------------------------------------------------
+// Public async API — each function wraps the sync implementation in a single
+// `spawn_blocking` call so that file I/O never blocks the Tokio runtime.
+// ---------------------------------------------------------------------------
+
+/// Build a rustls [`ClientConfig`] from [`TlsConfig`].
+///
+/// All file I/O (certificates, keys, native root store) runs inside
+/// `spawn_blocking` so it never blocks the async runtime.
 ///
 /// When `verify_server_cert` is `false`, certificate verification is skipped
 /// entirely. This is useful for local development with self-signed certificates
@@ -102,14 +113,93 @@ impl AsyncWrite for MaybeSecureStream {
 /// # Errors
 ///
 /// Returns an error if certificate/key files cannot be read or parsed.
-pub fn build_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
+pub async fn build_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || build_tls_config_sync(&config))
+        .await
+        .map_err(|e| KrafkaError::config(format!("Failed to spawn blocking task: {e}")))?
+}
+
+/// Build a [`TlsConnector`] from [`TlsConfig`].
+///
+/// Convenience wrapper around [`build_tls_config`] that produces a ready-to-use
+/// connector for [`connect_tls`].
+///
+/// # Errors
+///
+/// Returns an error if certificate/key files cannot be read or parsed.
+pub async fn build_tls_connector(config: &TlsConfig) -> Result<TlsConnector> {
+    let client_config = build_tls_config(config).await?;
+    Ok(TlsConnector::from(Arc::new(client_config)))
+}
+
+/// Connect with TLS using a pre-built connector.
+///
+/// Performs the TLS handshake on the provided TCP stream using the given
+/// [`TlsConnector`]. When `sni_hostname` is `Some`, it overrides the
+/// connection `hostname` for SNI (Server Name Indication).
+pub async fn connect_tls(
+    stream: TcpStream,
+    hostname: &str,
+    sni_hostname: Option<&str>,
+    connector: &TlsConnector,
+) -> Result<TlsStream<TcpStream>> {
+    // Use explicit SNI hostname override if provided, otherwise connection hostname
+    let sni_hostname = sni_hostname.unwrap_or(hostname);
+
+    // Extract the bare hostname (no port, no brackets) using the shared helper
+    let host = crate::util::extract_sni_hostname(sni_hostname)?.to_string();
+
+    let server_name = ServerName::try_from(host)
+        .map_err(|e| KrafkaError::config(format!("Invalid server name: {e}")))?;
+
+    connector
+        .connect(server_name, stream)
+        .await
+        .map_err(|e| KrafkaError::auth(format!("TLS handshake failed: {e}")))
+}
+
+/// Extract `tls-server-end-point` channel binding data from a TLS stream (RFC 5929 §4.1).
+///
+/// Returns the SHA-256 hash of the server's DER-encoded end-entity certificate.
+/// This binding type works with both TLS 1.2 and TLS 1.3.
+///
+/// Returns `None` if the server did not present any certificates (should not
+/// happen after a successful handshake with certificate verification enabled).
+pub fn extract_tls_server_end_point(stream: &TlsStream<TcpStream>) -> Option<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+
+    let (_, conn) = stream.get_ref();
+    let certs = conn.peer_certificates()?;
+    let end_entity = certs.first()?;
+
+    // RFC 5929 §4.1: for certificates using a signature algorithm with
+    // SHA-256 or stronger, the binding data is SHA-256(cert).  Since
+    // MD5/SHA-1 certs are rejected by rustls, SHA-256 is always correct.
+    Some(Sha256::digest(end_entity.as_ref()).to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// Private sync implementation — single source of truth for all TLS
+// configuration logic. Wrapped by the public async API above.
+// ---------------------------------------------------------------------------
+
+/// Build a rustls [`ClientConfig`] synchronously.
+///
+/// This is the core implementation. The public [`build_tls_config`] wraps this
+/// in `spawn_blocking`.
+fn build_tls_config_sync(config: &TlsConfig) -> Result<ClientConfig> {
     if !config.verify_server_cert {
         #[cfg(feature = "danger-insecure-tls")]
         {
-            warn!(
-                "TLS certificate verification is disabled (verify_server_cert=false). \
-                 This is insecure and should only be used for local development."
-            );
+            use std::sync::Once;
+            static WARN_ONCE: Once = Once::new();
+            WARN_ONCE.call_once(|| {
+                warn!(
+                    "TLS certificate verification is disabled (verify_server_cert=false). \
+                     This is insecure and should only be used for local development."
+                );
+            });
             return build_insecure_tls_config(config);
         }
         #[cfg(not(feature = "danger-insecure-tls"))]
@@ -125,132 +215,14 @@ pub fn build_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
     let root_store = load_root_store(config)?;
     let builder = ClientConfig::builder().with_root_certificates(root_store);
     let client_auth = load_client_auth(config)?;
-    finish_with_client_auth(builder, client_auth)
-}
+    let mut tls_config = finish_with_client_auth(builder, client_auth)?;
 
-/// Create a TLS connector from TlsConfig.
-pub fn create_tls_connector(config: &TlsConfig) -> Result<TlsConnector> {
-    let client_config = build_tls_config(config)?;
-    Ok(TlsConnector::from(Arc::new(client_config)))
-}
-
-/// Connect with TLS.
-///
-/// Uses async file I/O via `build_tls_config_async` to avoid blocking the
-/// Tokio runtime when loading certificate/key files.
-pub async fn connect_tls(
-    stream: TcpStream,
-    hostname: &str,
-    tls_config: &TlsConfig,
-) -> Result<TlsStream<TcpStream>> {
-    // Use async config builder to avoid blocking file I/O on the runtime
-    let client_config = build_tls_config_async(tls_config).await?;
-    let connector = TlsConnector::from(Arc::new(client_config));
-
-    // Use SNI hostname if specified, otherwise use the connection hostname
-    let sni_hostname = tls_config.sni_hostname.as_deref().unwrap_or(hostname);
-
-    // Extract the bare hostname (no port, no brackets) using the shared helper
-    let host = crate::util::extract_sni_hostname(sni_hostname)?.to_string();
-
-    let server_name = ServerName::try_from(host)
-        .map_err(|e| KrafkaError::config(format!("Invalid server name: {e}")))?;
-
-    connector
-        .connect(server_name, stream)
-        .await
-        .map_err(|e| KrafkaError::auth(format!("TLS handshake failed: {e}")))
-}
-
-/// Load certificates from a PEM file synchronously.
-///
-/// Note: This function performs blocking file I/O. For async contexts,
-/// use [`load_certs_async`] instead.
-fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let file = File::open(Path::new(path))
-        .map_err(|e| KrafkaError::config(format!("Failed to open cert file {path}: {e}")))?;
-    let mut reader = BufReader::new(file);
-
-    certs(&mut reader)
-        .map(|c| c.map_err(|e| KrafkaError::config(format!("Failed to parse cert: {e}"))))
-        .collect()
-}
-
-/// Load certificates from a PEM file asynchronously.
-///
-/// Uses `spawn_blocking` to avoid blocking the async runtime.
-pub async fn load_certs_async(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let path = path.to_string();
-    tokio::task::spawn_blocking(move || load_certs(&path))
-        .await
-        .map_err(|e| KrafkaError::config(format!("Failed to spawn blocking task: {e}")))?
-}
-
-/// Load a private key from a PEM file synchronously.
-///
-/// Note: This function performs blocking file I/O. For async contexts,
-/// use [`load_private_key_async`] instead.
-fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
-    let file = File::open(Path::new(path))
-        .map_err(|e| KrafkaError::config(format!("Failed to open key file {path}: {e}")))?;
-    let mut reader = BufReader::new(file);
-
-    private_key(&mut reader)
-        .map_err(|e| KrafkaError::config(format!("Failed to read private key: {e}")))?
-        .ok_or_else(|| KrafkaError::config("No private key found in file"))
-}
-
-/// Load a private key from a PEM file asynchronously.
-///
-/// Uses `spawn_blocking` to avoid blocking the async runtime.
-pub async fn load_private_key_async(path: &str) -> Result<PrivateKeyDer<'static>> {
-    let path = path.to_string();
-    tokio::task::spawn_blocking(move || load_private_key(&path))
-        .await
-        .map_err(|e| KrafkaError::config(format!("Failed to spawn blocking task: {e}")))?
-}
-
-/// Build a rustls ClientConfig asynchronously.
-///
-/// Uses `spawn_blocking` for file I/O operations to avoid blocking the async runtime.
-/// This is the recommended method for async applications.
-///
-/// When `verify_server_cert` is `false`, certificate verification is skipped.
-/// See [`build_tls_config`] for security implications.
-///
-/// # Errors
-///
-/// Returns an error if certificate or key files cannot be read or parsed.
-pub async fn build_tls_config_async(config: &TlsConfig) -> Result<ClientConfig> {
-    if !config.verify_server_cert {
-        #[cfg(feature = "danger-insecure-tls")]
-        {
-            warn!(
-                "TLS certificate verification is disabled (verify_server_cert=false). \
-                 This is insecure and should only be used for local development."
-            );
-            return build_insecure_tls_config_async(config).await;
-        }
-        #[cfg(not(feature = "danger-insecure-tls"))]
-        {
-            return Err(KrafkaError::config(
-                "Insecure TLS mode (verify_server_cert=false) requires the \
-                 'danger-insecure-tls' crate feature. If you need self-signed certificates, \
-                 provide the CA certificate via TlsConfig::with_ca_cert() instead.",
-            ));
-        }
+    if !config.alpn_protocols.is_empty() {
+        tls_config.alpn_protocols.clone_from(&config.alpn_protocols);
     }
 
-    let root_store = load_root_store_async(config).await?;
-    let builder = ClientConfig::builder().with_root_certificates(root_store);
-    let client_auth = load_client_auth_async(config).await?;
-    finish_with_client_auth(builder, client_auth)
+    Ok(tls_config)
 }
-
-// ---------------------------------------------------------------------------
-// Shared helpers — centralise logic that would otherwise be duplicated across
-// the sync/async × secure/insecure builder matrix.
-// ---------------------------------------------------------------------------
 
 /// Attach optional client‐certificate authentication to a builder that is
 /// waiting for a client‐auth decision, producing the final [`ClientConfig`].
@@ -267,60 +239,129 @@ fn finish_with_client_auth(
     }
 }
 
-/// Load root certificate store synchronously.
+/// Load certificates from a PEM file.
+fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let file = File::open(Path::new(path))
+        .map_err(|e| KrafkaError::config(format!("Failed to open cert file {path}: {e}")))?;
+    let mut reader = BufReader::new(file);
+
+    certs(&mut reader)
+        .map(|c| c.map_err(|e| KrafkaError::config(format!("Failed to parse cert: {e}"))))
+        .collect()
+}
+
+/// Load a private key from a PEM file.
+///
+/// On Unix, warns if the file is world-readable (permissions `& 0o077 != 0`).
+fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
+    let file = File::open(Path::new(path))
+        .map_err(|e| KrafkaError::config(format!("Failed to open key file {path}: {e}")))?;
+
+    // Warn on overly permissive file permissions (Unix only).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = file.metadata() {
+            let mode = meta.mode();
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    "Private key file {path} has world/group-readable permissions \
+                     (mode {mode:#o}). Consider restricting to owner-only (chmod 600)."
+                );
+            }
+        }
+    }
+
+    let mut reader = BufReader::new(file);
+
+    private_key(&mut reader)
+        .map_err(|e| KrafkaError::config(format!("Failed to read private key: {e}")))?
+        .ok_or_else(|| KrafkaError::config("No private key found in file"))
+}
+
+/// Load root certificate store.
+///
+/// Trust store construction follows the Kafka ecosystem convention (pinning):
+///
+/// | Configuration                         | Trust store contents                    |
+/// |---------------------------------------|-----------------------------------------|
+/// | Neither                               | webpki (Mozilla) roots — the default    |
+/// | `with_ca_cert()` only                 | **CA certs only** (pinning)             |
+/// | `with_native_roots()` only            | Platform roots only                     |
+/// | `with_native_roots()` + `with_ca_cert()` | Platform roots + CA certs (additive) |
+///
+/// Pinning is the industry-standard behaviour for TLS clients (Java Kafka
+/// client, librdkafka, Go `tls.Config`): when the caller explicitly provides
+/// a CA, only that CA is trusted — default/native roots are **not** loaded
+/// unless the caller also opts into them via `with_native_roots()`.
 fn load_root_store(config: &TlsConfig) -> Result<RootCertStore> {
     let mut root_store = RootCertStore::empty();
+
     if let Some(ca_path) = &config.ca_cert_path {
+        // When native roots are also requested, load them first so the
+        // explicit CA certs are added on top (additive mode).
+        if config.use_native_roots {
+            load_default_roots(&mut root_store, config)?;
+        }
+
+        // Pinning: only the provided CA bundle is trusted (unless
+        // `use_native_roots` was set above).
         for cert in load_certs(ca_path)? {
             root_store
                 .add(cert)
                 .map_err(|e| KrafkaError::config(format!("Failed to add CA cert: {e}")))?;
         }
     } else {
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        // No explicit CA: fall back to webpki or native roots.
+        load_default_roots(&mut root_store, config)?;
     }
+
     Ok(root_store)
 }
 
-/// Load root certificate store asynchronously.
-async fn load_root_store_async(config: &TlsConfig) -> Result<RootCertStore> {
-    let mut root_store = RootCertStore::empty();
-    if let Some(ca_path) = &config.ca_cert_path {
-        for cert in load_certs_async(ca_path).await? {
-            root_store
-                .add(cert)
-                .map_err(|e| KrafkaError::config(format!("Failed to add CA cert: {e}")))?;
+fn load_default_roots(root_store: &mut RootCertStore, config: &TlsConfig) -> Result<()> {
+    if config.use_native_roots {
+        #[cfg(feature = "native-tls-roots")]
+        {
+            let result = load_native_certs();
+            if !result.errors.is_empty() {
+                warn!(
+                    error_count = result.errors.len(),
+                    "Some native TLS root certificates could not be loaded"
+                );
+            }
+            if result.certs.is_empty() {
+                return Err(KrafkaError::config(
+                    "No native TLS root certificates could be loaded",
+                ));
+            }
+            for cert in result.certs {
+                root_store.add(cert).map_err(|e| {
+                    KrafkaError::config(format!("Failed to add native TLS root certificate: {e}"))
+                })?;
+            }
+            return Ok(());
         }
-    } else {
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        #[cfg(not(feature = "native-tls-roots"))]
+        {
+            return Err(KrafkaError::config(
+                "TlsConfig::with_native_roots() requires the 'native-tls-roots' crate feature",
+            ));
+        }
     }
-    Ok(root_store)
+
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    Ok(())
 }
 
-/// Load client certificate + private key synchronously, if configured.
+/// Load client certificate + private key, if configured.
 fn load_client_auth(
     config: &TlsConfig,
 ) -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
     if let (Some(cert_path), Some(key_path)) = (&config.client_cert_path, &config.client_key_path) {
         let certs = load_certs(cert_path)?;
         let key = load_private_key(key_path)?;
-        Ok(Some((certs, key)))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Load client certificate + private key asynchronously, if configured.
-///
-/// Certificate and key files are loaded concurrently via `tokio::try_join!`.
-async fn load_client_auth_async(
-    config: &TlsConfig,
-) -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
-    if let (Some(cert_path), Some(key_path)) = (&config.client_cert_path, &config.client_key_path) {
-        let (certs, key) = tokio::try_join!(
-            load_certs_async(cert_path),
-            load_private_key_async(key_path)
-        )?;
         Ok(Some((certs, key)))
     } else {
         Ok(None)
@@ -353,23 +394,17 @@ fn insecure_builder(
 ///
 /// **Warning:** This disables TLS security and must only be used for local
 /// development or testing. A `warn!` log is emitted by callers.
-///
-/// Uses synchronous file I/O for client certificates. For async contexts,
-/// use [`build_insecure_tls_config_async`] instead.
 #[cfg(feature = "danger-insecure-tls")]
 fn build_insecure_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
     let builder = insecure_builder(resolve_crypto_provider())?;
     let client_auth = load_client_auth(config)?;
-    finish_with_client_auth(builder, client_auth)
-}
+    let mut tls_config = finish_with_client_auth(builder, client_auth)?;
 
-/// Async variant of [`build_insecure_tls_config`] that uses non-blocking file I/O
-/// for client certificate loading.
-#[cfg(feature = "danger-insecure-tls")]
-async fn build_insecure_tls_config_async(config: &TlsConfig) -> Result<ClientConfig> {
-    let builder = insecure_builder(resolve_crypto_provider())?;
-    let client_auth = load_client_auth_async(config).await?;
-    finish_with_client_auth(builder, client_auth)
+    if !config.alpn_protocols.is_empty() {
+        tls_config.alpn_protocols.clone_from(&config.alpn_protocols);
+    }
+
+    Ok(tls_config)
 }
 
 /// A certificate verifier that accepts any server certificate without validation.
@@ -428,14 +463,6 @@ impl ServerCertVerifier for NoServerCertVerifier {
     }
 }
 
-/// Create a TLS connector asynchronously.
-///
-/// Uses async file I/O for loading certificates and keys.
-pub async fn create_tls_connector_async(config: &TlsConfig) -> Result<TlsConnector> {
-    let client_config = build_tls_config_async(config).await?;
-    Ok(TlsConnector::from(Arc::new(client_config)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,8 +476,23 @@ mod tests {
     fn test_build_tls_config_defaults() {
         setup_crypto_provider();
         let config = TlsConfig::new();
-        let result = build_tls_config(&config);
+        let result = build_tls_config_sync(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    #[cfg(not(feature = "native-tls-roots"))]
+    fn test_build_tls_config_native_roots_requires_feature() {
+        setup_crypto_provider();
+        // `with_native_roots()` is feature-gated, so set the field directly
+        // to exercise the runtime fallback in `load_default_roots`.
+        let mut config = TlsConfig::new();
+        config.use_native_roots = true;
+        let err = build_tls_config_sync(&config).unwrap_err();
+        assert!(
+            err.to_string().contains("native-tls-roots"),
+            "expected native root feature error, got: {err}"
+        );
     }
 
     #[test]
@@ -458,7 +500,7 @@ mod tests {
     fn test_build_tls_config_insecure_succeeds() {
         setup_crypto_provider();
         let config = TlsConfig::insecure();
-        let result = build_tls_config(&config);
+        let result = build_tls_config_sync(&config);
         assert!(
             result.is_ok(),
             "insecure TLS config should succeed: {result:?}"
@@ -478,10 +520,37 @@ mod tests {
     }
 
     #[test]
-    fn test_create_tls_connector() {
+    fn test_build_tls_connector() {
         setup_crypto_provider();
         let config = TlsConfig::new();
-        let result = create_tls_connector(&config);
+        let result = build_tls_config_sync(&config).map(|c| TlsConnector::from(Arc::new(c)));
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_alpn_protocols_set() {
+        setup_crypto_provider();
+        let config = TlsConfig::new().with_kafka_alpn();
+        let tls_config = build_tls_config_sync(&config).unwrap();
+        assert_eq!(tls_config.alpn_protocols, vec![b"kafka".to_vec()]);
+    }
+
+    #[test]
+    fn test_alpn_protocols_empty_by_default() {
+        setup_crypto_provider();
+        let config = TlsConfig::new();
+        let tls_config = build_tls_config_sync(&config).unwrap();
+        assert!(tls_config.alpn_protocols.is_empty());
+    }
+
+    #[test]
+    fn test_alpn_custom_protocols() {
+        setup_crypto_provider();
+        let config = TlsConfig::new().with_alpn_protocols(vec![b"kafka".to_vec(), b"h2".to_vec()]);
+        let tls_config = build_tls_config_sync(&config).unwrap();
+        assert_eq!(
+            tls_config.alpn_protocols,
+            vec![b"kafka".to_vec(), b"h2".to_vec()]
+        );
     }
 }

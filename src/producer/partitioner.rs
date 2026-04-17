@@ -62,13 +62,22 @@ pub fn murmur2(data: &[u8]) -> u32 {
 }
 
 /// Trait for partitioning records across topic partitions.
+///
+/// # Determinism contract
+///
+/// Implementations **must** be deterministic for keyed records: the same
+/// `(topic, key)` pair must always map to the same partition (given a
+/// fixed `partition_count`). This is required for per-key ordering
+/// guarantees. Unkeyed records (`key = None`) may use any strategy
+/// (round-robin, random, sticky, etc.).
 pub trait Partitioner: Send + Sync {
     /// Determine the partition for a record.
     ///
     /// # Arguments
     ///
     /// * `topic` - The topic name
-    /// * `key` - The record key (optional)
+    /// * `key` - The record key (optional). When `Some`, the same key must
+    ///   always map to the same partition for a given `partition_count`.
     /// * `partition_count` - Number of partitions for the topic
     ///
     /// # Returns

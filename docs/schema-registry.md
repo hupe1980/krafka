@@ -147,7 +147,7 @@ impl SchemaRegistryClient for MyRegistry {
 
 ## Caching
 
-`CachedSchemaRegistry` wraps any `SchemaRegistryClient` with an in-memory ID-to-schema cache. Schema IDs are immutable in the registry, so cached entries never expire:
+`CachedSchemaRegistry` wraps any `SchemaRegistryClient` with an in-memory ID-to-schema cache. Schema IDs are immutable in the registry, so cached entries never expire unless you opt into bounded eviction with `with_max_entries()`. Concurrent cold misses for the same schema ID are also coalesced, so only one upstream request runs per ID at a time:
 
 ```rust
 use krafka::schema_registry::CachedSchemaRegistry;
@@ -167,7 +167,12 @@ let by_id = cached.get_schema_by_id(latest.id).await?; // cache hit
 // Inspect or clear the cache
 println!("Cached schemas: {}", cached.cache_len());
 cached.clear_cache();
+
+// Optional: bound cache growth by evicting the oldest inserted IDs
+let bounded = CachedSchemaRegistry::with_max_entries(other_registry, 1024);
 ```
+
+`CachedGlueSchemaRegistry` follows the same rules for AWS Glue schema version IDs: immutable-ID caching, concurrent miss coalescing, and optional bounded eviction via `with_max_entries()`.
 
 ## Confluent Schema Registry HTTP Client
 
@@ -175,7 +180,7 @@ Enable the `schema-registry` feature to use the built-in HTTP client:
 
 ```toml
 [dependencies]
-krafka = { version = "0.3", features = ["schema-registry"] }
+krafka = { version = "0.4", features = ["schema-registry"] }
 ```
 
 ### Basic Usage
@@ -389,7 +394,7 @@ Enable the `aws-glue-schema-registry` feature to use the built-in SDK client:
 
 ```toml
 [dependencies]
-krafka = { version = "0.3", features = ["aws-glue-schema-registry"] }
+krafka = { version = "0.4", features = ["aws-glue-schema-registry"] }
 ```
 
 ```rust

@@ -25,7 +25,44 @@ pub fn duration_to_millis_i64(d: Duration) -> i64 {
     d.as_millis().min(i64::MAX as u128) as i64
 }
 
+/// Generate a random UUID v4 string (KIP-1082 client-generated member ID).
+///
+/// Format: `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx` where `y` is one of
+/// `{8, 9, a, b}`. Uses `rand::random` (non-cryptographic PRNG) for the
+/// 122 random bits. This is suitable for uniqueness (member IDs, client
+/// IDs) but **not** for security-sensitive tokens.
+pub fn random_uuid_v4() -> String {
+    let bytes: [u8; 16] = rand::random();
+    // Set version (4) and variant (RFC 4122).
+    let b6 = (bytes[6] & 0x0F) | 0x40;
+    let b8 = (bytes[8] & 0x3F) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        b6,
+        bytes[7],
+        b8,
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    )
+}
+
 /// Thread-safe correlation ID generator.
+///
+/// The counter wraps around from `i32::MAX` to `i32::MIN` (roughly every
+/// 2.1 billion IDs). With a bounded in-flight window (default 256),
+/// collision between a recycled ID and a still-pending request is
+/// extremely unlikely.
 pub struct CorrelationIdGenerator {
     counter: AtomicI32,
 }
@@ -39,6 +76,9 @@ impl CorrelationIdGenerator {
     }
 
     /// Generate the next correlation ID.
+    ///
+    /// IDs are unique modulo `i32` wraparound. Negative values are valid
+    /// Kafka correlation IDs.
     #[inline]
     pub fn next(&self) -> i32 {
         self.counter.fetch_add(1, Ordering::Relaxed)
@@ -262,6 +302,47 @@ mod tests {
         // Duration exactly at i64::MAX millis
         let exact = Duration::from_millis(i64::MAX as u64);
         assert_eq!(duration_to_millis_i64(exact), i64::MAX);
+    }
+
+    #[test]
+    fn test_random_uuid_v4_format() {
+        let uuid = random_uuid_v4();
+        // 8-4-4-4-12 hex format = 36 chars
+        assert_eq!(uuid.len(), 36);
+        let parts: Vec<&str> = uuid.split('-').collect();
+        assert_eq!(parts.len(), 5);
+        assert_eq!(parts[0].len(), 8);
+        assert_eq!(parts[1].len(), 4);
+        assert_eq!(parts[2].len(), 4);
+        assert_eq!(parts[3].len(), 4);
+        assert_eq!(parts[4].len(), 12);
+        // All chars are hex digits or hyphens
+        assert!(uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+    }
+
+    #[test]
+    fn test_random_uuid_v4_version_and_variant() {
+        let uuid = random_uuid_v4();
+        let parts: Vec<&str> = uuid.split('-').collect();
+        // Version nibble: first char of third group must be '4'
+        assert_eq!(
+            parts[2].chars().next().unwrap(),
+            '4',
+            "UUID version nibble must be 4"
+        );
+        // Variant: first char of fourth group must be 8, 9, a, or b
+        let variant = parts[3].chars().next().unwrap();
+        assert!(
+            matches!(variant, '8' | '9' | 'a' | 'b'),
+            "UUID variant nibble must be 8/9/a/b, got '{variant}'"
+        );
+    }
+
+    #[test]
+    fn test_random_uuid_v4_uniqueness() {
+        let a = random_uuid_v4();
+        let b = random_uuid_v4();
+        assert_ne!(a, b, "Two UUIDs should not be identical");
     }
 }
 

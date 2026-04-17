@@ -13,9 +13,9 @@
 //! # Example
 //!
 //! ```ignore
-//! use krafka::auth::scram::{ScramClient, ScramMechanism};
+//! use krafka::auth::scram::{ChannelBinding, ScramClient, ScramMechanism};
 //!
-//! let mut client = ScramClient::new("username", "password", ScramMechanism::Sha256);
+//! let mut client = ScramClient::new("username", "password", ScramMechanism::Sha256, ChannelBinding::None);
 //! let client_first = client.client_first_message();
 //! // ... send to server, receive server_first ...
 //! let client_final = client.client_final_message(&server_first)?;
@@ -35,9 +35,29 @@ use zeroize::Zeroize;
 use crate::error::{KrafkaError, Result};
 
 /// Minimum allowed PBKDF2 iteration count to prevent downgrade attacks.
-const MIN_PBKDF2_ITERATIONS: u32 = 4096;
+pub const MIN_PBKDF2_ITERATIONS: u32 = 4096;
 /// Maximum allowed PBKDF2 iteration count to prevent DoS via excessive CPU usage.
-const MAX_PBKDF2_ITERATIONS: u32 = 1_000_000;
+pub const MAX_PBKDF2_ITERATIONS: u32 = 1_000_000;
+
+/// Channel binding mode for SCRAM authentication.
+///
+/// When SCRAM is used over TLS (SASL_SSL), channel binding ties the SCRAM
+/// exchange to the specific TLS session, preventing man-in-the-middle attacks
+/// even if the password is compromised.
+///
+/// See RFC 5802 §6 and RFC 5929 §4 for details.
+#[derive(Debug, Clone)]
+pub enum ChannelBinding {
+    /// No channel binding (`n,,` GS2 header).
+    ///
+    /// Used when the connection is not over TLS (SASL_PLAINTEXT).
+    None,
+    /// `tls-server-end-point` channel binding (RFC 5929 §4.1).
+    ///
+    /// The binding data is the SHA-256 hash of the server's DER-encoded
+    /// end-entity certificate. This works with both TLS 1.2 and TLS 1.3.
+    TlsServerEndPoint(Vec<u8>),
+}
 
 /// SCRAM mechanism variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +84,32 @@ impl ScramMechanism {
         match self {
             ScramMechanism::Sha256 => 32,
             ScramMechanism::Sha512 => 64,
+        }
+    }
+
+    /// Convert to the Kafka wire-format byte value.
+    ///
+    /// Kafka uses `1` for SCRAM-SHA-256 and `2` for SCRAM-SHA-512
+    /// (as defined in KIP-554).
+    #[inline]
+    pub fn to_wire_byte(self) -> i8 {
+        match self {
+            ScramMechanism::Sha256 => 1,
+            ScramMechanism::Sha512 => 2,
+        }
+    }
+
+    /// Construct from the Kafka wire-format byte value.
+    ///
+    /// Returns an error for unknown mechanism codes.
+    #[inline]
+    pub fn from_wire_byte(b: i8) -> Result<Self> {
+        match b {
+            1 => Ok(ScramMechanism::Sha256),
+            2 => Ok(ScramMechanism::Sha512),
+            other => Err(KrafkaError::protocol(format!(
+                "unknown SCRAM mechanism code: {other}"
+            ))),
         }
     }
 }
@@ -99,6 +145,8 @@ pub struct ScramClient {
     password: String,
     /// SCRAM mechanism.
     mechanism: ScramMechanism,
+    /// Channel binding configuration.
+    channel_binding: ChannelBinding,
     /// Client nonce.
     client_nonce: String,
     /// Current state.
@@ -132,12 +180,26 @@ impl Drop for ScramClient {
 
 impl ScramClient {
     /// Create a new SCRAM client.
-    pub fn new(username: &str, password: &str, mechanism: ScramMechanism) -> Self {
+    ///
+    /// # Arguments
+    ///
+    /// * `username` - The SASL username
+    /// * `password` - The SASL password (zeroized on drop)
+    /// * `mechanism` - SCRAM-SHA-256 or SCRAM-SHA-512
+    /// * `channel_binding` - Channel binding mode; use [`ChannelBinding::TlsServerEndPoint`]
+    ///   when authenticating over TLS to bind the SCRAM exchange to the TLS session
+    pub fn new(
+        username: &str,
+        password: &str,
+        mechanism: ScramMechanism,
+        channel_binding: ChannelBinding,
+    ) -> Self {
         let client_nonce = generate_nonce();
         Self {
             username: username.to_string(),
             password: password.to_string(),
             mechanism,
+            channel_binding,
             client_nonce,
             state: ScramState::Initial,
             client_first_bare: String::new(),
@@ -163,10 +225,18 @@ impl ScramClient {
 
     /// Generate the client-first message.
     ///
+    /// The GS2 header is set according to the channel binding mode:
+    /// - [`ChannelBinding::None`]: `n,,` — client does not support channel binding
+    /// - [`ChannelBinding::TlsServerEndPoint`]: `p=tls-server-end-point,,` — client requires
+    ///   channel binding using the server certificate hash (RFC 5929 §4.1)
+    ///
     /// Returns the raw bytes to send in the SASL authenticate request.
     pub fn client_first_message(&mut self) -> Vec<u8> {
-        // GS2 header: no channel binding
-        let gs2_header = "n,,";
+        // GS2 header per RFC 5802 §7
+        let gs2_header = match &self.channel_binding {
+            ChannelBinding::None => "n,,".to_string(),
+            ChannelBinding::TlsServerEndPoint(_) => "p=tls-server-end-point,,".to_string(),
+        };
 
         // Escape username per RFC 5802
         let escaped_username = escape_username(&self.username);
@@ -233,15 +303,13 @@ impl ScramClient {
         if iteration_count < MIN_PBKDF2_ITERATIONS {
             self.state = ScramState::Failed;
             return Err(KrafkaError::auth(format!(
-                "PBKDF2 iteration count {} is below minimum {}",
-                iteration_count, MIN_PBKDF2_ITERATIONS
+                "PBKDF2 iteration count {iteration_count} is below minimum {MIN_PBKDF2_ITERATIONS}"
             )));
         }
         if iteration_count > MAX_PBKDF2_ITERATIONS {
             self.state = ScramState::Failed;
             return Err(KrafkaError::auth(format!(
-                "PBKDF2 iteration count {} exceeds maximum {}",
-                iteration_count, MAX_PBKDF2_ITERATIONS
+                "PBKDF2 iteration count {iteration_count} exceeds maximum {MAX_PBKDF2_ITERATIONS}"
             )));
         }
 
@@ -265,8 +333,17 @@ impl ScramClient {
         let client_key = self.compute_client_key(&salted_password);
         let stored_key = self.hash(&client_key);
 
-        // channel-binding = GS2 header base64 encoded
-        let channel_binding = BASE64.encode("n,,");
+        // channel-binding = base64(gs2-header [+ cbind-data])
+        // Per RFC 5802 §7, the c= field contains the base64 encoding of the
+        // GS2 header concatenated with the channel binding data (if any).
+        let channel_binding = match &self.channel_binding {
+            ChannelBinding::None => BASE64.encode("n,,"),
+            ChannelBinding::TlsServerEndPoint(cb_data) => {
+                let mut buf = b"p=tls-server-end-point,,".to_vec();
+                buf.extend_from_slice(cb_data);
+                BASE64.encode(&buf)
+            }
+        };
 
         // client-final-message-without-proof
         let client_final_without_proof = format!("c={},r={}", channel_binding, server_nonce);
@@ -432,9 +509,13 @@ fn xor_bytes(a: &[u8], b: &[u8]) -> Vec<u8> {
 
 /// Constant-time comparison to prevent timing attacks.
 ///
-/// Uses the `subtle` crate's `ConstantTimeEq` for formally verified
-/// constant-time comparison, avoiding the risk of compiler optimizations
-/// breaking a hand-rolled implementation.
+/// Uses the `subtle` crate's `ConstantTimeEq`. Returns `false` early
+/// when lengths differ — this is intentional: it reveals only that the
+/// lengths differ, not any content. This matches Go's
+/// `subtle.ConstantTimeCompare` and libsodium's `crypto_verify`.
+///
+/// For SCRAM, both inputs are fixed-length HMAC outputs, so the
+/// early-return path is never taken in practice.
 fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -483,14 +564,24 @@ mod tests {
 
     #[test]
     fn test_scram_client_initial_state() {
-        let client = ScramClient::new("user", "password", ScramMechanism::Sha256);
+        let client = ScramClient::new(
+            "user",
+            "password",
+            ScramMechanism::Sha256,
+            ChannelBinding::None,
+        );
         assert_eq!(client.state(), &ScramState::Initial);
         assert_eq!(client.mechanism(), ScramMechanism::Sha256);
     }
 
     #[test]
     fn test_scram_client_first_message() {
-        let mut client = ScramClient::new("user", "password", ScramMechanism::Sha256);
+        let mut client = ScramClient::new(
+            "user",
+            "password",
+            ScramMechanism::Sha256,
+            ChannelBinding::None,
+        );
         let msg = client.client_first_message();
 
         let msg_str = String::from_utf8(msg).unwrap();
@@ -500,7 +591,12 @@ mod tests {
 
     #[test]
     fn test_scram_client_first_message_escaped() {
-        let mut client = ScramClient::new("user=name", "password", ScramMechanism::Sha256);
+        let mut client = ScramClient::new(
+            "user=name",
+            "password",
+            ScramMechanism::Sha256,
+            ChannelBinding::None,
+        );
         let msg = client.client_first_message();
 
         let msg_str = String::from_utf8(msg).unwrap();
@@ -509,7 +605,12 @@ mod tests {
 
     #[test]
     fn test_scram_client_invalid_server_first() {
-        let mut client = ScramClient::new("user", "password", ScramMechanism::Sha256);
+        let mut client = ScramClient::new(
+            "user",
+            "password",
+            ScramMechanism::Sha256,
+            ChannelBinding::None,
+        );
         client.client_first_message();
 
         // Missing fields
@@ -519,7 +620,12 @@ mod tests {
 
     #[test]
     fn test_scram_client_wrong_nonce() {
-        let mut client = ScramClient::new("user", "password", ScramMechanism::Sha256);
+        let mut client = ScramClient::new(
+            "user",
+            "password",
+            ScramMechanism::Sha256,
+            ChannelBinding::None,
+        );
         client.client_first_message();
 
         // Server nonce doesn't start with client nonce
@@ -544,7 +650,12 @@ mod tests {
     #[test]
     fn test_scram_sha256_full_flow() {
         // This test simulates a full SCRAM-SHA-256 flow with known values
-        let mut client = ScramClient::new("user", "pencil", ScramMechanism::Sha256);
+        let mut client = ScramClient::new(
+            "user",
+            "pencil",
+            ScramMechanism::Sha256,
+            ChannelBinding::None,
+        );
 
         // Override the client nonce for reproducible test
         client.client_nonce = "rOprNGfwEbeRWgbNEkqO".to_string();
@@ -556,7 +667,12 @@ mod tests {
 
     #[test]
     fn test_scram_sha512_client() {
-        let mut client = ScramClient::new("user", "password", ScramMechanism::Sha512);
+        let mut client = ScramClient::new(
+            "user",
+            "password",
+            ScramMechanism::Sha512,
+            ChannelBinding::None,
+        );
         let first = client.client_first_message();
 
         let first_str = String::from_utf8(first).unwrap();
@@ -568,7 +684,12 @@ mod tests {
 
     #[test]
     fn test_pbkdf2_iteration_too_low() {
-        let mut client = ScramClient::new("user", "password", ScramMechanism::Sha256);
+        let mut client = ScramClient::new(
+            "user",
+            "password",
+            ScramMechanism::Sha256,
+            ChannelBinding::None,
+        );
         client.client_first_message();
 
         // Server sends iteration count below minimum (4096)
@@ -585,7 +706,12 @@ mod tests {
 
     #[test]
     fn test_pbkdf2_iteration_too_high() {
-        let mut client = ScramClient::new("user", "password", ScramMechanism::Sha256);
+        let mut client = ScramClient::new(
+            "user",
+            "password",
+            ScramMechanism::Sha256,
+            ChannelBinding::None,
+        );
         client.client_first_message();
 
         // Server sends iteration count above maximum (1_000_000)
@@ -603,14 +729,24 @@ mod tests {
     #[test]
     fn test_pbkdf2_iteration_at_boundaries() {
         // Minimum allowed (4096) should succeed
-        let mut client = ScramClient::new("user", "password", ScramMechanism::Sha256);
+        let mut client = ScramClient::new(
+            "user",
+            "password",
+            ScramMechanism::Sha256,
+            ChannelBinding::None,
+        );
         client.client_first_message();
         let server_first = format!("r={}extra,s=c2FsdA==,i=4096", client.client_nonce);
         let result = client.process_server_first(server_first.as_bytes());
         assert!(result.is_ok());
 
         // Maximum allowed (1_000_000) should succeed
-        let mut client = ScramClient::new("user", "password", ScramMechanism::Sha256);
+        let mut client = ScramClient::new(
+            "user",
+            "password",
+            ScramMechanism::Sha256,
+            ChannelBinding::None,
+        );
         client.client_first_message();
         let server_first = format!("r={}extra,s=c2FsdA==,i=1000000", client.client_nonce);
         let result = client.process_server_first(server_first.as_bytes());
@@ -619,7 +755,12 @@ mod tests {
 
     #[test]
     fn test_scram_debug_redacts_password() {
-        let client = ScramClient::new("user", "secret_password", ScramMechanism::Sha256);
+        let client = ScramClient::new(
+            "user",
+            "secret_password",
+            ScramMechanism::Sha256,
+            ChannelBinding::None,
+        );
         let debug_output = format!("{:?}", client);
         assert!(
             !debug_output.contains("secret_password"),
@@ -632,11 +773,119 @@ mod tests {
     fn test_scram_zeroize_on_drop() {
         // Create a client, do partial auth, then drop it
         // Verifies that Drop is implemented (no panic)
-        let mut client = ScramClient::new("user", "password", ScramMechanism::Sha256);
+        let mut client = ScramClient::new(
+            "user",
+            "password",
+            ScramMechanism::Sha256,
+            ChannelBinding::None,
+        );
         client.client_first_message();
         let server_first = format!("r={}extra,s=c2FsdA==,i=4096", client.client_nonce);
         let _ = client.process_server_first(server_first.as_bytes());
         // Drop should zeroize password and salted_password
         drop(client);
+    }
+
+    // ── Channel binding tests ──
+
+    #[test]
+    fn test_channel_binding_none_gs2_header() {
+        let mut client = ScramClient::new(
+            "user",
+            "password",
+            ScramMechanism::Sha256,
+            ChannelBinding::None,
+        );
+        let msg = client.client_first_message();
+        let msg_str = String::from_utf8(msg).unwrap();
+        assert!(
+            msg_str.starts_with("n,,"),
+            "Expected 'n,,' GS2 header, got: {msg_str}"
+        );
+    }
+
+    #[test]
+    fn test_channel_binding_tls_server_end_point_gs2_header() {
+        let cb_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let mut client = ScramClient::new(
+            "user",
+            "password",
+            ScramMechanism::Sha256,
+            ChannelBinding::TlsServerEndPoint(cb_data),
+        );
+        let msg = client.client_first_message();
+        let msg_str = String::from_utf8(msg).unwrap();
+        assert!(
+            msg_str.starts_with("p=tls-server-end-point,,"),
+            "Expected 'p=tls-server-end-point,,' GS2 header, got: {msg_str}"
+        );
+    }
+
+    #[test]
+    fn test_channel_binding_tls_server_end_point_c_field() {
+        // Verify the c= field in client-final includes the GS2 header + binding data
+        let cb_data = vec![0x01, 0x02, 0x03, 0x04];
+        let mut client = ScramClient::new(
+            "user",
+            "password",
+            ScramMechanism::Sha256,
+            ChannelBinding::TlsServerEndPoint(cb_data.clone()),
+        );
+        client.client_first_message();
+
+        let server_first = format!("r={}extra,s=c2FsdA==,i=4096", client.client_nonce);
+        let client_final = client
+            .process_server_first(server_first.as_bytes())
+            .unwrap();
+        let client_final_str = String::from_utf8(client_final).unwrap();
+
+        // Extract c= field value
+        let c_value = client_final_str
+            .split(',')
+            .find(|p| p.starts_with("c="))
+            .unwrap()
+            .strip_prefix("c=")
+            .unwrap();
+
+        // Decode and verify: should be gs2-header + cb-data
+        let decoded = BASE64.decode(c_value).unwrap();
+        let expected_prefix = b"p=tls-server-end-point,,";
+        assert!(
+            decoded.starts_with(expected_prefix),
+            "c= field should start with GS2 header"
+        );
+        assert_eq!(
+            &decoded[expected_prefix.len()..],
+            &cb_data,
+            "c= field should end with channel binding data"
+        );
+    }
+
+    #[test]
+    fn test_channel_binding_none_c_field() {
+        // Verify the c= field without channel binding is just base64("n,,")
+        let mut client = ScramClient::new(
+            "user",
+            "password",
+            ScramMechanism::Sha256,
+            ChannelBinding::None,
+        );
+        client.client_first_message();
+
+        let server_first = format!("r={}extra,s=c2FsdA==,i=4096", client.client_nonce);
+        let client_final = client
+            .process_server_first(server_first.as_bytes())
+            .unwrap();
+        let client_final_str = String::from_utf8(client_final).unwrap();
+
+        let c_value = client_final_str
+            .split(',')
+            .find(|p| p.starts_with("c="))
+            .unwrap()
+            .strip_prefix("c=")
+            .unwrap();
+
+        let decoded = BASE64.decode(c_value).unwrap();
+        assert_eq!(decoded, b"n,,");
     }
 }

@@ -29,62 +29,89 @@ This enables dynamic version negotiation for optimal compatibility and feature u
 2. Client sends `ApiVersions` request
 3. Broker responds with supported API version ranges
 4. Client stores version ranges for future requests
-5. Each request can negotiate the best version
+5. Each request negotiates the best version within the client's `[MIN, MAX]` range
 
 ### Using Version Negotiation
 
 ```rust
 use krafka::protocol::ApiKey;
 
-// Prefer Fetch v7..=v11; fall back to v4 if the broker doesn't support v7+.
-let fetch_version = match conn.negotiate_api_version(ApiKey::Fetch, 11, 7).await {
-    Some(v) => v,
-    None => conn.negotiate_api_version(ApiKey::Fetch, 4, 4).await
-        .expect("broker does not support any usable Fetch version"),
-};
+// negotiate_api_version(api_key, max, min) clamps to client MIN..MAX and broker range.
+let fetch_version = conn
+    .negotiate_api_version(ApiKey::Fetch, 12, 4)
+    .await
+    .expect("broker does not support any usable Fetch version");
 println!("Using Fetch v{}", fetch_version);
-
-// Convenience method with min=0
-let version = conn.negotiate_api_version_max(ApiKey::Produce, 3).await;
 ```
+
+### Minimum Broker Version
+
+Krafka **requires Apache Kafka 3.9 or later**. The MIN constants for all APIs
+are set so that pre-3.9 protocol features (e.g., Metadata v0, Produce v0-v2,
+Fetch v0-v3) are no longer supported. Connecting to an older broker will fail
+version negotiation for most APIs.
 
 ### Client Supported Versions
 
-Krafka supports the following API version ranges (clamped to match actual encode/decode implementations):
+Every API has a `MIN` and `MAX` constant in `krafka::protocol::versions`.
+The client only encodes/decodes versions within `[MIN, MAX]`; versions outside
+this range are rejected with a protocol error.
 
 | API | Min | Max | Key Features |
 |-----|-----|-----|--------------|
-| Produce | 0 | 3 | v3+ for transactions |
-| Fetch | 0 | 11 | v4 isolation level, v5–v6 log_start_offset, v7 fetch sessions (KIP-227), v9 leader epoch fencing (KIP-320), v11 closest-replica fetching (KIP-392) |
-| ListOffsets | 0 | 2 | v2 isolation level |
-| Metadata | 0 | 8 | v1 controller + rack, v2 cluster_id, v3 throttle, v5 offline replicas, v7 leader epoch, v8 authorized-ops (v9-v13 implemented, not yet activated) |
-| OffsetCommit | 0 | 2 | v2+ for retention (v3-v9 implemented, not yet activated) |
-| OffsetFetch | 0 | 1 | v1+ for group coordinator (v2-v9 implemented, not yet activated) |
-| FindCoordinator | 0 | 1 | Group/txn coordinator lookup (v2-v4 implemented, not yet activated) |
-| JoinGroup | 0 | 5 | v5 group instance id |
-| Heartbeat | 0 | 3 | v3 group instance id (KIP-345) |
-| SyncGroup | 0 | 3 | v3 group instance id |
-| LeaveGroup | 0 | 3 | v3 batch leave (KIP-345) |
-| CreateTopics | 0 | 2 | Topic creation |
-| DeleteTopics | 0 | 1 | Topic deletion |
-| CreatePartitions | 0 | 0 | Partition management |
-| DescribeConfigs | 0 | 0 | Config reading |
-| AlterConfigs | 0 | 0 | Config updates |
-| DescribeAcls | 0 | 1 | ACL queries |
-| CreateAcls | 0 | 1 | ACL creation |
-| DeleteAcls | 0 | 1 | ACL deletion |
-| DescribeGroups | 0 | 1 | Consumer group inspection |
-| ListGroups | 0 | 1 | Consumer group listing |
-| DeleteRecords | 0 | 0 | Log truncation |
-| OffsetForLeaderEpoch | 0 | 3 | Leader epoch validation |
-| InitProducerId | 0 | 0 | Idempotent/transactional |
-| CreateDelegationToken | 0 | 1 | Delegation token creation |
-| RenewDelegationToken | 0 | 1 | Delegation token renewal |
-| ExpireDelegationToken | 0 | 1 | Delegation token expiry |
-| DescribeDelegationToken | 0 | 1 | Delegation token listing |
-| DescribeClientQuotas | 0 | 0 | Client quota queries |
-| AlterClientQuotas | 0 | 0 | Client quota updates |
-| ConsumerGroupHeartbeat | 0 | 0 | KIP-848 consumer group protocol (v1 encode/decode exists but is not negotiated yet) |
+| Produce | 3 | 11 | v3 transactions, v9 flexible encoding, v11 ZStd compression |
+| Fetch | 4 | 12 | v4 isolation level, v7 fetch sessions (KIP-227), v9 leader epoch (KIP-320), v11 closest-replica (KIP-392), v12 flexible |
+| ListOffsets | 1 | 8 | v1 timestamp queries, v2 isolation level, v4 leader epoch, v6 flexible, v7 max_timestamp, v8 tiered-storage |
+| Metadata | 1 | 13 | v1 controller + rack, v7 leader epoch, v8 authorized-ops, v9 flexible, v10 topic UUIDs, v12 topic-ID lookup, v13 top-level error_code |
+| OffsetCommit | 2 | 9 | v2 retention, v5 drops retention_time, v6 leader epoch, v8 flexible, v9 KIP-848 |
+| OffsetFetch | 1 | 9 | v1 group coordinator, v2 top-level error, v6 flexible, v8 batched groups, v9 KIP-848 |
+| FindCoordinator | 1 | 6 | v1 key_type, v3 flexible, v4 batched keys (KIP-699), v6 share groups (KIP-932) |
+| JoinGroup | 4 | 9 | v4 group_instance_id (KIP-345), v6 flexible, v8 reason (KIP-800) |
+| Heartbeat | 3 | 4 | v3 group_instance_id (KIP-345), v4 flexible |
+| SyncGroup | 3 | 5 | v3 group_instance_id, v4 flexible, v5 protocol_type/name (KIP-559) |
+| LeaveGroup | 3 | 5 | v3 batch leave (KIP-345), v4 flexible, v5 reason (KIP-800) |
+| CreateTopics | 2 | 7 | v2 topic validation, v5 flexible, v7 topic_id (KIP-464, KIP-525) |
+| DeleteTopics | 1 | 6 | v1 baseline, v4 flexible, v6 topic-ID-based deletion |
+| CreatePartitions | 0 | 3 | v0 baseline, v2 flexible, v3 KIP-599 |
+| DescribeConfigs | 0 | 4 | v1 synonyms, v3 config_type + documentation, v4 flexible |
+| IncrementalAlterConfigs | 0 | 1 | v0 non-flexible, v1 flexible encoding |
+| DescribeAcls | 1 | 3 | v1 prefixed ACLs, v2 flexible, v3 user resource type |
+| CreateAcls | 1 | 3 | v1 prefixed ACLs, v2 flexible, v3 user resource type |
+| DeleteAcls | 1 | 3 | v1 prefixed ACLs, v2 flexible, v3 user resource type |
+| DescribeGroups | 1 | 6 | v3 authorized_operations, v4 static members, v5 flexible, v6 KIP-1043 |
+| ListGroups | 1 | 5 | v3 flexible, v4 state filter (KIP-518), v5 type filter (KIP-848) |
+| DeleteRecords | 0 | 2 | v0 baseline, v2 flexible encoding |
+| OffsetForLeaderEpoch | 2 | 4 | v2 leader epoch validation, v3 replica_id, v4 flexible |
+| InitProducerId | 0 | 4 | v0 idempotent, v2 flexible, v3 epoch recovery, v4 latest stable |
+| AddPartitionsToTxn | 0 | 3 | v0 baseline, v3 flexible encoding |
+| AddOffsetsToTxn | 0 | 3 | v0 baseline, v3 flexible encoding |
+| EndTxn | 0 | 3 | v0 baseline, v3 flexible encoding |
+| TxnOffsetCommit | 0 | 3 | v0 baseline, v2 leader epoch, v3 flexible + consumer fields |
+| CreateDelegationToken | 1 | 3 | v2 flexible, v3 owner override |
+| RenewDelegationToken | 1 | 2 | v2 flexible encoding |
+| ExpireDelegationToken | 1 | 2 | v2 flexible encoding |
+| DescribeDelegationToken | 1 | 3 | v2 flexible, v3 token requester |
+| DescribeClientQuotas | 0 | 1 | v1 flexible encoding |
+| AlterClientQuotas | 0 | 1 | v1 flexible encoding |
+| DeleteGroups | 0 | 2 | Consumer group deletion |
+| DescribeCluster | 0 | 2 | Cluster metadata |
+| ApiVersions | 0 | 4 (5¹) | API version negotiation |
+| ConsumerGroupHeartbeat | 0 | 1 | KIP-848 consumer group protocol, v1 KIP-1082 regex |
+| ConsumerGroupDescribe | 0 | 1 | KIP-848 group description |
+| DescribeTopicPartitions | 0 | 0 | Topic partition metadata (KIP-966) |
+| UpdateFeatures | 0 | 1 | Cluster feature versioning (KIP-584), v1 UpgradeType + ValidateOnly |
+| GetTelemetrySubscriptions² | 0 | 0 | KIP-714 client telemetry subscription discovery |
+| PushTelemetry² | 0 | 0 | KIP-714 client telemetry push |
+| ShareGroupHeartbeat¹ | 1 | 1 | KIP-932 share group heartbeat |
+| ShareGroupDescribe¹ | 1 | 1 | KIP-932 share group description |
+| ShareFetch¹ | 1 | 2 | KIP-932 share fetch, v2 acquire mode (KIP-1206) + renew ack (KIP-1222) |
+| ShareAcknowledge¹ | 1 | 2 | KIP-932 share acknowledge, v2 renew ack (KIP-1222) |
+
+> ¹ Requires `unstable-protocol` feature flag. Max shown in parentheses is the feature-gated max.
+>
+> ² Requires `telemetry` feature flag.
+>
+> **Note:** Encode/decode implementations exist for even higher versions of some APIs (e.g., Produce up to v13, Fetch up to v18) but the negotiated MAX is set conservatively for topic-UUID-based paths until those have been integration-tested against a real broker.
 
 ### Version Constants
 
@@ -93,10 +120,12 @@ Client-supported versions are defined in `krafka::protocol::versions`:
 ```rust
 use krafka::protocol::versions;
 
-// Maximum versions the client supports
-let max_fetch = versions::FETCH_MAX;        // 11 (v0-v11, KIP-392)
-let max_produce = versions::PRODUCE_MAX;    // 3  (v3+ transactions)
-let max_metadata = versions::METADATA_MAX;  // 8  (v8 KRaft-aware metadata)
+// Each API has both MIN and MAX constants
+let min_fetch = versions::FETCH_MIN;        // 4  (Kafka 3.9+ baseline)
+let max_fetch = versions::FETCH_MAX;        // 12 (v12 flexible encoding)
+let min_produce = versions::PRODUCE_MIN;    // 3  (v3+ transactions)
+let max_produce = versions::PRODUCE_MAX;    // 11 (v11 ZStd compression)
+let max_metadata = versions::METADATA_MAX;  // 13 (v13 top-level error_code)
 ```
 
 ## Record Batches
@@ -170,14 +199,14 @@ let batch = RecordBatchBuilder::new()
 | LZ4 | Always | Very fast, good compression |
 | Zstd | Always | Best compression, fast |
 
-> **Note:** Decompression output is capped at 128 MiB to protect against compression bombs. Compressed payloads that expand beyond this limit will return a `KrafkaError::compression` error.
+> **Note:** Decompression output is capped at 128 MiB by default to protect against compression bombs. This limit is configurable via `ConsumerConfig::max_decompressed_size()`. Compressed payloads that expand beyond the limit will return a `KrafkaError::compression` error.
 
 ## Protocol Safety
 
 Krafka protects against malicious or corrupted broker responses:
 
 - **Decode array bounds**: Every array-length field decoded from the wire is validated against `MAX_DECODE_ARRAY_LEN` (100,000), typically via `check_decode_array_len()` and in some specialized decode paths (e.g., `KafkaArray::decode`, record batch counts) via equivalent local checks. These checks reject negative counts and oversized counts across all 63+ protocol-message decode sites, `KafkaArray` decode paths, and record batch/header counts. The validation runs *before* any `Vec::with_capacity()` allocation, preventing both OOM and runaway decode loops.
-- **Decompression limits**: Decompressed record data is limited to 128 MiB via streaming `.take()` limits and post-decompression size checks
+- **Decompression limits**: Decompressed record data is limited to 128 MiB (configurable) via streaming `.take()` limits and post-decompression size checks
 - **Record headers**: Record headers are preserved during batch building — no silent data loss
 - **Encode validation**: The `TryEncode` trait provides fallible encoding for protocol primitives (`KafkaString`, `KafkaBytes`, `KafkaArray<T>` where `T: TryEncode`, `TaggedFields`), returning errors instead of panicking on oversized data. `ProducerRecord::validate()` checks wire-format limits at the API boundary before encoding
 - **Fuzz testing**: The `fuzz/` directory provides [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) targets for `KafkaArray` decode, `RecordBatch` decode, and response message decode across multiple API versions. See `fuzz/README.md` for usage.

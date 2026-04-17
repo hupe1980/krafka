@@ -7,11 +7,15 @@ use bytes::{Buf, BufMut};
 use super::primitives::{Decode, Encode, KafkaArray, KafkaString, TaggedFields, TryEncode};
 use crate::error::Result;
 
+/// Maximum number of supported features we'll accept from a broker.
+const MAX_SUPPORTED_FEATURES: usize = 256;
+
 /// Kafka API keys.
 ///
 /// Each API key corresponds to a specific request/response pair in the Kafka protocol.
 /// Forward compatibility is provided by the `Unknown(i16)` variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 #[repr(i16)]
 pub enum ApiKey {
     /// Produce messages to topics.
@@ -152,6 +156,24 @@ pub enum ApiKey {
     AllocateProducerIds = 67,
     /// Consumer group heartbeat.
     ConsumerGroupHeartbeat = 68,
+    /// Consumer group describe (KIP-848).
+    ConsumerGroupDescribe = 69,
+    /// Get telemetry subscriptions (KIP-714).
+    GetTelemetrySubscriptions = 71,
+    /// Push telemetry (KIP-714).
+    PushTelemetry = 72,
+    /// List client metrics resources (KIP-714).
+    ListClientMetricsResources = 74,
+    /// Describe topic partitions (KIP-966).
+    DescribeTopicPartitions = 75,
+    /// Share group heartbeat (KIP-932).
+    ShareGroupHeartbeat = 76,
+    /// Share group describe (KIP-932).
+    ShareGroupDescribe = 77,
+    /// Share fetch (KIP-932).
+    ShareFetch = 78,
+    /// Share acknowledge (KIP-932).
+    ShareAcknowledge = 79,
     /// Unknown API key.
     Unknown(i16),
 }
@@ -230,6 +252,15 @@ impl ApiKey {
             66 => Self::ListTransactions,
             67 => Self::AllocateProducerIds,
             68 => Self::ConsumerGroupHeartbeat,
+            69 => Self::ConsumerGroupDescribe,
+            71 => Self::GetTelemetrySubscriptions,
+            72 => Self::PushTelemetry,
+            74 => Self::ListClientMetricsResources,
+            75 => Self::DescribeTopicPartitions,
+            76 => Self::ShareGroupHeartbeat,
+            77 => Self::ShareGroupDescribe,
+            78 => Self::ShareFetch,
+            79 => Self::ShareAcknowledge,
             other => Self::Unknown(other),
         }
     }
@@ -307,6 +338,15 @@ impl ApiKey {
             Self::ListTransactions => 66,
             Self::AllocateProducerIds => 67,
             Self::ConsumerGroupHeartbeat => 68,
+            Self::ConsumerGroupDescribe => 69,
+            Self::GetTelemetrySubscriptions => 71,
+            Self::PushTelemetry => 72,
+            Self::ListClientMetricsResources => 74,
+            Self::DescribeTopicPartitions => 75,
+            Self::ShareGroupHeartbeat => 76,
+            Self::ShareGroupDescribe => 77,
+            Self::ShareFetch => 78,
+            Self::ShareAcknowledge => 79,
             Self::Unknown(key) => key,
         }
     }
@@ -387,6 +427,15 @@ impl ApiKey {
             Self::ListTransactions => 0,
             Self::AllocateProducerIds => 0,
             Self::ConsumerGroupHeartbeat => 0,
+            Self::ConsumerGroupDescribe => 0,
+            Self::GetTelemetrySubscriptions => 0,
+            Self::PushTelemetry => 0,
+            Self::ListClientMetricsResources => 0,
+            Self::DescribeTopicPartitions => 0,
+            Self::ShareGroupHeartbeat => 0,
+            Self::ShareGroupDescribe => 0,
+            Self::ShareFetch => 0,
+            Self::ShareAcknowledge => 0,
             // Unknown APIs: assume never flexible (safest default).
             Self::Unknown(_) => i16::MAX,
         }
@@ -547,13 +596,53 @@ impl Decode for ApiVersionRange {
     }
 }
 
+/// A feature supported by the broker, returned in ApiVersions v3+ tagged fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupportedFeature {
+    /// Feature name.
+    pub name: String,
+    /// Minimum supported version for the feature.
+    pub min_version: i16,
+    /// Maximum supported version for the feature.
+    pub max_version: i16,
+}
+
+/// A cluster-wide finalized feature, returned in ApiVersions v3+ tagged fields (KIP-584).
+///
+/// Valid only when [`ApiVersionsResponse::finalized_features_epoch`] is ≥ 0.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizedFeature {
+    /// Feature name.
+    pub name: String,
+    /// Cluster-wide finalized maximum version level for the feature.
+    pub max_version_level: i16,
+    /// Cluster-wide finalized minimum version level for the feature.
+    pub min_version_level: i16,
+}
+
 /// Request for API versions (ApiVersions API key = 18).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ApiVersionsRequest {
     /// Client software name (v3+).
     pub client_software_name: Option<KafkaString>,
     /// Client software version (v3+).
     pub client_software_version: Option<KafkaString>,
+    /// Cluster ID the client intends to connect to (v5+, KIP-1242).
+    pub cluster_id: Option<KafkaString>,
+    /// Node ID the client intends to connect to (v5+, KIP-1242). -1 if unknown.
+    pub node_id: i32,
+}
+
+impl Default for ApiVersionsRequest {
+    fn default() -> Self {
+        Self {
+            client_software_name: None,
+            client_software_version: None,
+            cluster_id: None,
+            node_id: -1,
+        }
+    }
 }
 
 impl ApiVersionsRequest {
@@ -596,6 +685,28 @@ impl ApiVersionsRequest {
         TaggedFields::default().try_encode(buf)?;
         Ok(())
     }
+
+    /// Encode for version 5 (KIP-1242: ClusterId + NodeId).
+    pub fn encode_v5(&self, buf: &mut impl BufMut) -> Result<()> {
+        if let Some(ref name) = self.client_software_name {
+            name.try_encode_compact(buf)?;
+        } else {
+            KafkaString::null().try_encode_compact(buf)?;
+        }
+        if let Some(ref version) = self.client_software_version {
+            version.try_encode_compact(buf)?;
+        } else {
+            KafkaString::null().try_encode_compact(buf)?;
+        }
+        if let Some(ref cluster_id) = self.cluster_id {
+            cluster_id.try_encode_compact(buf)?;
+        } else {
+            KafkaString::null().try_encode_compact(buf)?;
+        }
+        self.node_id.encode(buf);
+        TaggedFields::default().try_encode(buf)?;
+        Ok(())
+    }
 }
 
 /// Response for API versions.
@@ -607,6 +718,15 @@ pub struct ApiVersionsResponse {
     pub api_keys: Vec<ApiVersionRange>,
     /// Throttle time in milliseconds.
     pub throttle_time_ms: i32,
+    /// Features supported by the broker (v3+ tagged field, tag 0).
+    pub supported_features: Vec<SupportedFeature>,
+    /// Monotonically increasing epoch for finalized features (v3+ tagged field, tag 1, KIP-584).
+    ///
+    /// A value of −1 means unknown/absent. [`finalized_features`](Self::finalized_features)
+    /// is only valid when this is ≥ 0.
+    pub finalized_features_epoch: i64,
+    /// Cluster-wide finalized features (v3+ tagged field, tag 2, KIP-584).
+    pub finalized_features: Vec<FinalizedFeature>,
 }
 
 impl ApiVersionsResponse {
@@ -620,6 +740,9 @@ impl ApiVersionsResponse {
             error_code,
             api_keys,
             throttle_time_ms: 0,
+            supported_features: Vec::new(),
+            finalized_features_epoch: -1,
+            finalized_features: Vec::new(),
         })
     }
 
@@ -634,28 +757,158 @@ impl ApiVersionsResponse {
             error_code,
             api_keys,
             throttle_time_ms,
+            supported_features: Vec::new(),
+            finalized_features_epoch: -1,
+            finalized_features: Vec::new(),
         })
     }
 
-    /// Decode from version 3+ (flexible).
+    /// Decode from version 3–5 (flexible).
+    ///
+    /// v4 (KAFKA-17011) fixes SupportedFeatures.MinVersion so it can be 0;
+    /// v5 (KIP-1242) adds ClusterId/NodeId to the *request* and
+    /// REBOOTSTRAP_REQUIRED to the error codes; the response wire format is
+    /// identical to v3.
     pub fn decode_v3(buf: &mut impl Buf) -> Result<Self> {
         let error_code = i16::decode(buf)?;
         let api_keys = KafkaArray::<ApiVersionRange>::decode_compact(buf)?
             .0
             .unwrap_or_default();
         let throttle_time_ms = i32::decode(buf)?;
-        // Skip tagged fields
-        let _ = TaggedFields::decode(buf)?;
+        let tagged = TaggedFields::decode(buf)?;
+        let supported_features = Self::parse_supported_features(&tagged)?;
+        let finalized_features_epoch = Self::parse_finalized_features_epoch(&tagged)?;
+        let finalized_features = if finalized_features_epoch >= 0 {
+            Self::parse_finalized_features(&tagged)?
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             error_code,
             api_keys,
             throttle_time_ms,
+            supported_features,
+            finalized_features_epoch,
+            finalized_features,
         })
+    }
+
+    /// Parse SupportedFeatures from tagged field tag 0.
+    ///
+    /// Wire format: compact-array of \[compact-string Name, i16 MinVersion, i16 MaxVersion\],
+    /// each entry followed by its own empty tagged fields.
+    fn parse_supported_features(tagged: &TaggedFields) -> Result<Vec<SupportedFeature>> {
+        let Some(field) = tagged.0.iter().find(|f| f.tag == 0) else {
+            return Ok(Vec::new());
+        };
+        let mut buf = &field.data[..];
+        let raw_count = crate::util::varint::decode_unsigned_varint(&mut buf)?;
+        let items = super::check_compact_array_len(raw_count)?;
+        if items > MAX_SUPPORTED_FEATURES {
+            return Err(crate::error::KrafkaError::protocol(format!(
+                "SupportedFeatures array length {items} exceeds limit {MAX_SUPPORTED_FEATURES}"
+            )));
+        }
+        let mut features = Vec::with_capacity(items);
+        for _ in 0..items {
+            let name = super::non_nullable_string(
+                "feature name",
+                KafkaString::decode_compact(&mut buf)?.0,
+            )?;
+            let min_version = i16::decode(&mut buf)?;
+            let max_version = i16::decode(&mut buf)?;
+            // skip per-entry tagged fields
+            let _ = TaggedFields::decode(&mut buf)?;
+            features.push(SupportedFeature {
+                name,
+                min_version,
+                max_version,
+            });
+        }
+        if buf.has_remaining() {
+            return Err(crate::error::KrafkaError::protocol(format!(
+                "SupportedFeatures: {} trailing bytes after parsing {items} entries",
+                buf.remaining()
+            )));
+        }
+        Ok(features)
+    }
+
+    /// Parse FinalizedFeaturesEpoch from tagged field tag 1.
+    ///
+    /// Wire format: raw i64 (8 bytes). Returns −1 (unknown) when absent.
+    /// Returns a protocol error if the field is present but has an invalid length.
+    fn parse_finalized_features_epoch(tagged: &TaggedFields) -> Result<i64> {
+        let Some(field) = tagged.0.iter().find(|f| f.tag == 1) else {
+            return Ok(-1);
+        };
+
+        if field.data.len() != 8 {
+            return Err(crate::error::KrafkaError::protocol(format!(
+                "FinalizedFeaturesEpoch (tag 1) has invalid length {}, expected 8",
+                field.data.len()
+            )));
+        }
+
+        // Length verified to be exactly 8 bytes above.
+        let bytes: [u8; 8] = field.data[..8].try_into().expect("length checked above");
+        Ok(i64::from_be_bytes(bytes))
+    }
+
+    /// Parse FinalizedFeatures from tagged field tag 2 (KIP-584).
+    ///
+    /// Wire format: compact-array of \[compact-string Name, i16 MaxVersionLevel,
+    /// i16 MinVersionLevel\], each followed by per-entry tagged fields.
+    fn parse_finalized_features(tagged: &TaggedFields) -> Result<Vec<FinalizedFeature>> {
+        let Some(field) = tagged.0.iter().find(|f| f.tag == 2) else {
+            return Ok(Vec::new());
+        };
+        let mut buf = &field.data[..];
+        let raw_count = crate::util::varint::decode_unsigned_varint(&mut buf)?;
+        let items = super::check_compact_array_len(raw_count)?;
+        if items > MAX_SUPPORTED_FEATURES {
+            return Err(crate::error::KrafkaError::protocol(format!(
+                "FinalizedFeatures array length {items} exceeds limit {MAX_SUPPORTED_FEATURES}"
+            )));
+        }
+        let mut features = Vec::with_capacity(items);
+        for _ in 0..items {
+            let name = super::non_nullable_string(
+                "finalized feature name",
+                KafkaString::decode_compact(&mut buf)?.0,
+            )?;
+            let max_version_level = i16::decode(&mut buf)?;
+            let min_version_level = i16::decode(&mut buf)?;
+            // skip per-entry tagged fields
+            let _ = TaggedFields::decode(&mut buf)?;
+            features.push(FinalizedFeature {
+                name,
+                max_version_level,
+                min_version_level,
+            });
+        }
+        if buf.has_remaining() {
+            return Err(crate::error::KrafkaError::protocol(format!(
+                "FinalizedFeatures: {} trailing bytes after parsing {items} entries",
+                buf.remaining()
+            )));
+        }
+        Ok(features)
     }
 
     /// Get the version range for a specific API key.
     pub fn get_api_version(&self, api_key: ApiKey) -> Option<&ApiVersionRange> {
         self.api_keys.iter().find(|v| v.api_key == api_key)
+    }
+
+    /// Get a supported feature by name.
+    pub fn get_supported_feature(&self, name: &str) -> Option<&SupportedFeature> {
+        self.supported_features.iter().find(|f| f.name == name)
+    }
+
+    /// Get a finalized feature by name (KIP-584).
+    pub fn get_finalized_feature(&self, name: &str) -> Option<&FinalizedFeature> {
+        self.finalized_features.iter().find(|f| f.name == name)
     }
 
     /// Check if an API is supported.
@@ -670,6 +923,7 @@ mod tests {
     use bytes::BytesMut;
 
     use super::*;
+    use crate::protocol::primitives::TaggedField;
 
     #[test]
     fn test_api_key_roundtrip() {
@@ -712,14 +966,15 @@ mod tests {
 
     #[test]
     fn test_api_versions_request() {
-        let request = ApiVersionsRequest::new().with_client_software("krafka", "0.3.1");
+        let request =
+            ApiVersionsRequest::new().with_client_software("krafka", env!("CARGO_PKG_VERSION"));
         assert_eq!(
             request.client_software_name.as_ref().unwrap().as_str(),
             Some("krafka")
         );
         assert_eq!(
             request.client_software_version.as_ref().unwrap().as_str(),
-            Some("0.3.1")
+            Some(env!("CARGO_PKG_VERSION"))
         );
     }
 
@@ -732,6 +987,9 @@ mod tests {
                 ApiVersionRange::new(ApiKey::Fetch, 0, 13),
             ],
             throttle_time_ms: 0,
+            supported_features: Vec::new(),
+            finalized_features_epoch: -1,
+            finalized_features: Vec::new(),
         };
 
         assert!(response.supports(ApiKey::Produce, 5));
@@ -769,5 +1027,366 @@ mod tests {
         assert_eq!(ApiKey::Produce.to_string(), "Produce");
         assert_eq!(ApiKey::Fetch.to_string(), "Fetch");
         assert_eq!(ApiKey::Unknown(999).to_string(), "Unknown(999)");
+    }
+
+    // ── ApiVersions v3/v4 round-trip and SupportedFeatures parsing ──
+
+    #[test]
+    fn test_api_versions_request_v3_round_trip() {
+        let request =
+            ApiVersionsRequest::new().with_client_software("krafka", env!("CARGO_PKG_VERSION"));
+        let mut buf = BytesMut::new();
+        request.encode_v3(&mut buf).unwrap();
+        // v3 and v4 share the same wire format; a second encode must produce identical bytes
+        let mut buf2 = BytesMut::new();
+        request.encode_v3(&mut buf2).unwrap();
+        assert_eq!(buf, buf2);
+    }
+
+    #[test]
+    fn test_api_versions_response_decode_v3_no_tagged_features() {
+        use crate::util::varint;
+        let mut buf = BytesMut::new();
+        buf.put_i16(0); // error_code
+        // compact api_keys array: varint(count+1) = 1 means 0 items
+        varint::encode_unsigned_varint(1, &mut buf);
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_u8(0); // empty tagged fields
+        let mut data = buf.freeze();
+        let resp = ApiVersionsResponse::decode_v3(&mut data).unwrap();
+        assert_eq!(resp.error_code, 0);
+        assert!(resp.api_keys.is_empty());
+        assert!(resp.supported_features.is_empty());
+    }
+
+    #[test]
+    fn test_api_versions_response_decode_v3_with_supported_features() {
+        use crate::util::varint;
+        let mut buf = BytesMut::new();
+        buf.put_i16(0); // error_code
+        // compact api_keys array: 1 item (varint(2))
+        varint::encode_unsigned_varint(2, &mut buf);
+        // ApiVersionRange: api_key(i16) + min_version(i16) + max_version(i16)
+        buf.put_i16(0); // api_key = Produce
+        buf.put_i16(0); // min_version
+        buf.put_i16(9); // max_version
+        // per-entry tagged fields for compact api key
+        buf.put_u8(0);
+        buf.put_i32(0); // throttle_time_ms
+
+        // Tagged fields: 1 field, tag 0 = SupportedFeatures
+        let mut tag_data = BytesMut::new();
+        // compact array of features: 2 items (varint(3) = 2+1)
+        varint::encode_unsigned_varint(3, &mut tag_data);
+        // Feature 1: "metadata.version" min=1 max=20
+        let name1 = b"metadata.version";
+        varint::encode_unsigned_varint(name1.len() as u32 + 1, &mut tag_data);
+        tag_data.put_slice(name1);
+        tag_data.put_i16(1); // min_version
+        tag_data.put_i16(20); // max_version
+        tag_data.put_u8(0); // per-entry tagged fields
+        // Feature 2: "kraft.version" min=0 max=1
+        let name2 = b"kraft.version";
+        varint::encode_unsigned_varint(name2.len() as u32 + 1, &mut tag_data);
+        tag_data.put_slice(name2);
+        tag_data.put_i16(0); // min_version
+        tag_data.put_i16(1); // max_version
+        tag_data.put_u8(0); // per-entry tagged fields
+
+        // Emit top-level tagged fields: 1 field
+        varint::encode_unsigned_varint(1, &mut buf); // 1 tagged field
+        varint::encode_unsigned_varint(0, &mut buf); // tag = 0
+        varint::encode_unsigned_varint(tag_data.len() as u32, &mut buf);
+        buf.extend_from_slice(&tag_data);
+
+        let mut data = buf.freeze();
+        let resp = ApiVersionsResponse::decode_v3(&mut data).unwrap();
+        assert_eq!(resp.supported_features.len(), 2);
+        assert_eq!(resp.supported_features[0].name, "metadata.version");
+        assert_eq!(resp.supported_features[0].min_version, 1);
+        assert_eq!(resp.supported_features[0].max_version, 20);
+        assert_eq!(resp.supported_features[1].name, "kraft.version");
+        assert_eq!(resp.supported_features[1].min_version, 0);
+        assert_eq!(resp.supported_features[1].max_version, 1);
+
+        // Test feature lookup
+        let feat = resp.get_supported_feature("kraft.version").unwrap();
+        assert_eq!(feat.min_version, 0);
+        assert_eq!(feat.max_version, 1);
+        assert!(resp.get_supported_feature("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_api_versions_response_decode_v0_no_features() {
+        let mut buf = BytesMut::new();
+        buf.put_i16(0); // error_code
+        buf.put_i32(0); // api_keys count = 0
+        let mut data = buf.freeze();
+        let resp = ApiVersionsResponse::decode_v0(&mut data).unwrap();
+        assert!(resp.supported_features.is_empty());
+        assert_eq!(resp.throttle_time_ms, 0);
+    }
+
+    #[test]
+    fn test_parse_supported_features_null_rejected() {
+        use crate::util::varint;
+        // raw varint 0 means null — non-nullable field must reject it
+        let mut tag_data = BytesMut::new();
+        varint::encode_unsigned_varint(0, &mut tag_data);
+        let tagged = TaggedFields(vec![TaggedField {
+            tag: 0,
+            data: tag_data.freeze(),
+        }]);
+        let err = ApiVersionsResponse::parse_supported_features(&tagged).unwrap_err();
+        assert!(
+            err.to_string().contains("null"),
+            "expected null rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_supported_features_exceeds_max() {
+        use crate::util::varint;
+        // 257 items exceeds MAX_SUPPORTED_FEATURES (256)
+        let mut tag_data = BytesMut::new();
+        varint::encode_unsigned_varint(258, &mut tag_data); // 257 + 1
+        // Append 257 minimal feature entries
+        for i in 0..257u16 {
+            let name = format!("f{i}");
+            varint::encode_unsigned_varint(name.len() as u32 + 1, &mut tag_data);
+            tag_data.put_slice(name.as_bytes());
+            tag_data.put_i16(0); // min_version
+            tag_data.put_i16(1); // max_version
+            tag_data.put_u8(0); // per-entry tagged fields
+        }
+        let tagged = TaggedFields(vec![TaggedField {
+            tag: 0,
+            data: tag_data.freeze(),
+        }]);
+        let err = ApiVersionsResponse::parse_supported_features(&tagged).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds limit"),
+            "expected limit error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_supported_features_trailing_bytes() {
+        use crate::util::varint;
+        let mut tag_data = BytesMut::new();
+        // 1 feature (varint(2) = 1+1)
+        varint::encode_unsigned_varint(2, &mut tag_data);
+        let name = b"test.feature";
+        varint::encode_unsigned_varint(name.len() as u32 + 1, &mut tag_data);
+        tag_data.put_slice(name);
+        tag_data.put_i16(0); // min_version
+        tag_data.put_i16(1); // max_version
+        tag_data.put_u8(0); // per-entry tagged fields
+        // Append garbage trailing byte
+        tag_data.put_u8(0xFF);
+        let tagged = TaggedFields(vec![TaggedField {
+            tag: 0,
+            data: tag_data.freeze(),
+        }]);
+        let err = ApiVersionsResponse::parse_supported_features(&tagged).unwrap_err();
+        assert!(
+            err.to_string().contains("trailing bytes"),
+            "expected trailing bytes error, got: {err}"
+        );
+    }
+
+    // ── KIP-584 FinalizedFeatures parsing ────────────────────────────────
+
+    #[test]
+    fn test_parse_finalized_features_epoch_present() {
+        let mut epoch_bytes = BytesMut::new();
+        epoch_bytes.put_i64(42);
+        let tagged = TaggedFields(vec![TaggedField {
+            tag: 1,
+            data: epoch_bytes.freeze(),
+        }]);
+        assert_eq!(
+            ApiVersionsResponse::parse_finalized_features_epoch(&tagged).unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn test_parse_finalized_features_epoch_absent() {
+        let tagged = TaggedFields(vec![]);
+        assert_eq!(
+            ApiVersionsResponse::parse_finalized_features_epoch(&tagged).unwrap(),
+            -1
+        );
+    }
+
+    #[test]
+    fn test_parse_finalized_features_epoch_short_data() {
+        // Less than 8 bytes → protocol error (not silently treated as absent)
+        let tagged = TaggedFields(vec![TaggedField {
+            tag: 1,
+            data: bytes::Bytes::from_static(&[0, 0, 0]),
+        }]);
+        let err = ApiVersionsResponse::parse_finalized_features_epoch(&tagged).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid length 3"),
+            "expected error mentioning invalid length, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_finalized_features_epoch_too_long() {
+        // More than 8 bytes → protocol error (trailing bytes not silently ignored)
+        let tagged = TaggedFields(vec![TaggedField {
+            tag: 1,
+            data: bytes::Bytes::from_static(&[0, 0, 0, 0, 0, 0, 0, 42, 0xFF]),
+        }]);
+        let err = ApiVersionsResponse::parse_finalized_features_epoch(&tagged).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid length 9"),
+            "expected error mentioning invalid length, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_finalized_features_present() {
+        use crate::util::varint;
+        let mut tag_data = BytesMut::new();
+        // 1 feature entry (varint(2) = 1+1)
+        varint::encode_unsigned_varint(2, &mut tag_data);
+        let name = b"metadata.version";
+        varint::encode_unsigned_varint(name.len() as u32 + 1, &mut tag_data);
+        tag_data.put_slice(name);
+        tag_data.put_i16(17); // max_version_level
+        tag_data.put_i16(1); // min_version_level
+        tag_data.put_u8(0); // per-entry tagged fields
+
+        let tagged = TaggedFields(vec![TaggedField {
+            tag: 2,
+            data: tag_data.freeze(),
+        }]);
+        let features = ApiVersionsResponse::parse_finalized_features(&tagged).unwrap();
+        assert_eq!(features.len(), 1);
+        assert_eq!(features[0].name, "metadata.version");
+        assert_eq!(features[0].max_version_level, 17);
+        assert_eq!(features[0].min_version_level, 1);
+    }
+
+    #[test]
+    fn test_parse_finalized_features_absent() {
+        let tagged = TaggedFields(vec![]);
+        let features = ApiVersionsResponse::parse_finalized_features(&tagged).unwrap();
+        assert!(features.is_empty());
+    }
+
+    #[test]
+    fn test_api_versions_response_v3_all_feature_tags() {
+        use crate::util::varint;
+        let mut buf = BytesMut::new();
+        buf.put_i16(0); // error_code
+        varint::encode_unsigned_varint(1, &mut buf); // 0 api_keys
+        buf.put_i32(0); // throttle_time_ms
+
+        // Build tag 0: SupportedFeatures (1 entry)
+        let mut tag0 = BytesMut::new();
+        varint::encode_unsigned_varint(2, &mut tag0); // 1 entry
+        let n0 = b"metadata.version";
+        varint::encode_unsigned_varint(n0.len() as u32 + 1, &mut tag0);
+        tag0.put_slice(n0);
+        tag0.put_i16(1);
+        tag0.put_i16(20);
+        tag0.put_u8(0);
+
+        // Build tag 1: FinalizedFeaturesEpoch
+        let mut tag1 = BytesMut::new();
+        tag1.put_i64(99);
+
+        // Build tag 2: FinalizedFeatures (1 entry)
+        let mut tag2 = BytesMut::new();
+        varint::encode_unsigned_varint(2, &mut tag2); // 1 entry
+        let n2 = b"metadata.version";
+        varint::encode_unsigned_varint(n2.len() as u32 + 1, &mut tag2);
+        tag2.put_slice(n2);
+        tag2.put_i16(17); // max_version_level
+        tag2.put_i16(1); // min_version_level
+        tag2.put_u8(0);
+
+        // Emit 3 tagged fields
+        varint::encode_unsigned_varint(3, &mut buf); // 3 tagged fields
+        // tag 0
+        varint::encode_unsigned_varint(0, &mut buf);
+        varint::encode_unsigned_varint(tag0.len() as u32, &mut buf);
+        buf.extend_from_slice(&tag0);
+        // tag 1
+        varint::encode_unsigned_varint(1, &mut buf);
+        varint::encode_unsigned_varint(tag1.len() as u32, &mut buf);
+        buf.extend_from_slice(&tag1);
+        // tag 2
+        varint::encode_unsigned_varint(2, &mut buf);
+        varint::encode_unsigned_varint(tag2.len() as u32, &mut buf);
+        buf.extend_from_slice(&tag2);
+
+        let mut data = buf.freeze();
+        let resp = ApiVersionsResponse::decode_v3(&mut data).unwrap();
+
+        // SupportedFeatures
+        assert_eq!(resp.supported_features.len(), 1);
+        assert_eq!(resp.supported_features[0].name, "metadata.version");
+        assert_eq!(resp.supported_features[0].max_version, 20);
+
+        // FinalizedFeaturesEpoch
+        assert_eq!(resp.finalized_features_epoch, 99);
+
+        // FinalizedFeatures
+        assert_eq!(resp.finalized_features.len(), 1);
+        let ff = resp.get_finalized_feature("metadata.version").unwrap();
+        assert_eq!(ff.max_version_level, 17);
+        assert_eq!(ff.min_version_level, 1);
+        assert!(resp.get_finalized_feature("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_api_versions_response_v0_defaults_finalized() {
+        let mut buf = BytesMut::new();
+        buf.put_i16(0); // error_code
+        buf.put_i32(0); // 0 api_keys
+        let mut data = buf.freeze();
+        let resp = ApiVersionsResponse::decode_v0(&mut data).unwrap();
+        assert_eq!(resp.finalized_features_epoch, -1);
+        assert!(resp.finalized_features.is_empty());
+    }
+
+    #[test]
+    fn test_api_versions_response_v3_finalized_features_ignored_when_epoch_absent() {
+        // Tag 2 (FinalizedFeatures) present but tag 1 (epoch) absent → epoch defaults
+        // to -1, so decode_v3 must NOT parse tag 2 (the struct doc says finalized_features
+        // is valid only when epoch ≥ 0).
+        use crate::util::varint;
+        let mut buf = BytesMut::new();
+        buf.put_i16(0); // error_code
+        varint::encode_unsigned_varint(1, &mut buf); // 0 api_keys
+        buf.put_i32(0); // throttle_time_ms
+
+        // Build tag 2 only (no tag 1)
+        let mut tag2 = BytesMut::new();
+        varint::encode_unsigned_varint(2, &mut tag2); // 1 entry
+        let name = b"metadata.version";
+        varint::encode_unsigned_varint(name.len() as u32 + 1, &mut tag2);
+        tag2.put_slice(name);
+        tag2.put_i16(17); // max_version_level
+        tag2.put_i16(1); // min_version_level
+        tag2.put_u8(0); // per-entry tagged fields
+
+        // Emit 1 tagged field (tag 2 only, no tag 1)
+        varint::encode_unsigned_varint(1, &mut buf);
+        varint::encode_unsigned_varint(2, &mut buf); // tag id = 2
+        varint::encode_unsigned_varint(tag2.len() as u32, &mut buf);
+        buf.extend_from_slice(&tag2);
+
+        let mut data = buf.freeze();
+        let resp = ApiVersionsResponse::decode_v3(&mut data).unwrap();
+        assert_eq!(resp.finalized_features_epoch, -1);
+        // Tag 2 data is present in the wire but must be ignored since epoch < 0
+        assert!(resp.finalized_features.is_empty());
     }
 }

@@ -179,16 +179,7 @@ fn bench_request_header(c: &mut Criterion) {
 
     let header = RequestHeader::new(ApiKey::Produce, 3, 12345).with_client_id("krafka-benchmark");
 
-    // v0 header (minimal)
-    group.bench_function("encode_v0", |b| {
-        b.iter(|| {
-            let mut buf = BytesMut::with_capacity(32);
-            header.encode_v0(&mut buf).unwrap();
-            black_box(buf)
-        });
-    });
-
-    // v1 header (with client_id)
+    // v1 header (non-flexible, with client_id)
     group.bench_function("encode_v1", |b| {
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(64);

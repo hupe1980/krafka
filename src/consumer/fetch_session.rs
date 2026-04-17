@@ -33,7 +33,11 @@ struct PartitionState {
 /// Per-broker fetch session state.
 #[derive(Debug)]
 pub struct FetchSessionState {
-    /// Broker ID this session belongs to (used in Debug output).
+    /// Broker ID this session belongs to.
+    ///
+    /// Not read in production code but included in `Debug` output for
+    /// diagnostics (the compiler intentionally ignores derive usage for
+    /// dead-code analysis).
     #[allow(dead_code)]
     broker_id: BrokerId,
     /// Session ID returned by the broker (0 = no session).
@@ -165,6 +169,7 @@ impl FetchSessionState {
             .into_iter()
             .map(|(topic, partitions)| FetchTopicRequest {
                 topic: topic.to_string(),
+                topic_id: None,
                 partitions,
             })
             .collect();
@@ -173,6 +178,7 @@ impl FetchSessionState {
             .into_iter()
             .map(|(topic, partitions)| FetchForgottenTopic {
                 topic: topic.to_string(),
+                topic_id: None,
                 partitions,
             })
             .collect();
@@ -293,6 +299,7 @@ mod tests {
     fn make_topic_request(topic: &str, partitions: &[(i32, i64, i32)]) -> FetchTopicRequest {
         FetchTopicRequest {
             topic: topic.to_string(),
+            topic_id: None,
             partitions: partitions
                 .iter()
                 .map(|&(partition, offset, max_bytes)| FetchPartitionRequest {
@@ -302,6 +309,8 @@ mod tests {
                     last_fetched_epoch: -1,
                     log_start_offset: -1,
                     partition_max_bytes: max_bytes,
+                    replica_directory_id: None,
+                    high_watermark: None,
                 })
                 .collect(),
         }
@@ -313,6 +322,7 @@ mod tests {
     ) -> FetchTopicRequest {
         FetchTopicRequest {
             topic: topic.to_string(),
+            topic_id: None,
             partitions: partitions
                 .iter()
                 .map(
@@ -323,6 +333,8 @@ mod tests {
                         last_fetched_epoch: -1,
                         log_start_offset: -1,
                         partition_max_bytes: max_bytes,
+                        replica_directory_id: None,
+                        high_watermark: None,
                     },
                 )
                 .collect(),

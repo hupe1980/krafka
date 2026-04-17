@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::auth::AuthConfig;
+use crate::metadata::MetadataRecoveryStrategy;
 
 /// Auto offset reset behavior.
 #[non_exhaustive]
@@ -111,7 +112,20 @@ pub struct ConsumerConfig {
     pub(crate) client_id: String,
     /// Auto offset reset behavior.
     pub(crate) auto_offset_reset: AutoOffsetReset,
-    /// Enable auto commit.
+    /// Enable automatic offset commit.
+    ///
+    /// When `true` (the default), offsets are committed periodically in
+    /// the background at the interval specified by
+    /// [`auto_commit_interval`](Self::auto_commit_interval) (default: 5 s).
+    /// Commits also occur during cooperative revocation and consumer close.
+    ///
+    /// **Important**: auto-commit commits the offset of the last record
+    /// *returned* by [`poll()`](super::Consumer::poll), not the last record
+    /// *processed* by the application. If the application crashes after
+    /// `poll()` returns but before processing completes, some records may
+    /// be skipped on restart. For at-least-once processing guarantees,
+    /// disable auto-commit and call
+    /// [`commit()`](super::Consumer::commit) after processing.
     pub(crate) enable_auto_commit: bool,
     /// Auto commit interval.
     pub(crate) auto_commit_interval: Duration,
@@ -123,6 +137,22 @@ pub struct ConsumerConfig {
     pub(crate) max_partition_fetch_bytes: i32,
     /// Maximum poll records.
     pub(crate) max_poll_records: i32,
+    /// Maximum records buffered internally by [`recv()`](super::Consumer::recv).
+    ///
+    /// When the internal buffer reaches this limit, [`poll()`](super::Consumer::poll)
+    /// skips fetching new data until the buffer drains below the threshold.
+    /// This prevents unbounded memory growth when the consumer reads faster
+    /// than the application processes records.
+    ///
+    /// For `recv()`-only callers the buffer is naturally bounded by
+    /// [`max_poll_records`](Self::max_poll_records) (one `poll()` batch);
+    /// this cap adds an additional guard for mixed `poll()`/`recv()` usage
+    /// and concurrent `recv()` callers.
+    ///
+    /// Set to 0 to disable the buffer cap (unlimited). Defaults to 500.
+    /// Comparable to librdkafka's `queued.max.messages.kbytes` (count-based
+    /// rather than size-based).
+    pub(crate) max_buffered_records: i32,
     /// Maximum poll interval.
     pub(crate) max_poll_interval: Duration,
     /// Request timeout.
@@ -151,8 +181,28 @@ pub struct ConsumerConfig {
     /// reducing cross-rack traffic. The value should match the `broker.rack`
     /// configuration on the brokers.
     pub(crate) client_rack: Option<String>,
+    /// Metadata recovery strategy (KIP-899).
+    ///
+    /// When set to [`MetadataRecoveryStrategy::Rebootstrap`], the consumer
+    /// falls back to bootstrap servers if metadata refresh fails for longer
+    /// than [`metadata_recovery_rebootstrap_trigger`](Self::metadata_recovery_rebootstrap_trigger).
+    pub(crate) metadata_recovery_strategy: MetadataRecoveryStrategy,
+    /// Duration after which failing metadata refreshes trigger a rebootstrap
+    /// (KIP-899). Only effective with
+    /// [`MetadataRecoveryStrategy::Rebootstrap`]. Default: 300 s.
+    pub(crate) metadata_recovery_rebootstrap_trigger: Duration,
+    /// Maximum age of cached topic entries during partial metadata refreshes.
+    /// When set, topics not refreshed within this duration are evicted to
+    /// prevent unbounded cache growth. `None` disables TTL eviction (default).
+    pub(crate) metadata_topic_cache_ttl: Option<Duration>,
     /// Authentication configuration (optional).
     pub(crate) auth: Option<AuthConfig>,
+    /// Maximum decompressed size for record batches (compression bomb protection).
+    /// Defaults to [`RecordBatch::MAX_DECOMPRESSED_SIZE`](crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE) (128 MiB).
+    pub(crate) max_decompressed_size: usize,
+    /// SOCKS5 proxy configuration (optional).
+    #[cfg(feature = "socks5")]
+    pub(crate) proxy: Option<crate::network::ProxyConfig>,
 }
 
 impl Default for ConsumerConfig {
@@ -168,6 +218,7 @@ impl Default for ConsumerConfig {
             fetch_max_bytes: 52428800,          // 50 MB
             max_partition_fetch_bytes: 1048576, // 1 MB
             max_poll_records: 500,
+            max_buffered_records: 500,
             max_poll_interval: Duration::from_secs(300),
             request_timeout: Duration::from_secs(30),
             session_timeout: Duration::from_secs(10),
@@ -178,7 +229,13 @@ impl Default for ConsumerConfig {
             group_protocol: GroupProtocol::Classic,
             group_instance_id: None,
             client_rack: None,
+            metadata_recovery_strategy: MetadataRecoveryStrategy::None,
+            metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
+            metadata_topic_cache_ttl: None,
             auth: None,
+            max_decompressed_size: crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE,
+            #[cfg(feature = "socks5")]
+            proxy: None,
         }
     }
 }
@@ -249,6 +306,12 @@ impl ConsumerConfig {
         self.max_poll_records
     }
 
+    /// Returns the maximum buffered records.
+    #[inline]
+    pub fn max_buffered_records(&self) -> i32 {
+        self.max_buffered_records
+    }
+
     /// Returns the maximum poll interval.
     #[inline]
     pub fn max_poll_interval(&self) -> Duration {
@@ -309,10 +372,35 @@ impl ConsumerConfig {
         self.client_rack.as_deref()
     }
 
+    /// Returns the metadata recovery strategy (KIP-899).
+    #[inline]
+    pub fn metadata_recovery_strategy(&self) -> MetadataRecoveryStrategy {
+        self.metadata_recovery_strategy
+    }
+
+    /// Returns the rebootstrap trigger duration (KIP-899).
+    #[inline]
+    pub fn metadata_recovery_rebootstrap_trigger(&self) -> Duration {
+        self.metadata_recovery_rebootstrap_trigger
+    }
+
     /// Returns the authentication configuration, if set.
     #[inline]
     pub fn auth(&self) -> Option<&AuthConfig> {
         self.auth.as_ref()
+    }
+
+    /// Returns the maximum decompressed size for record batches.
+    #[inline]
+    pub fn max_decompressed_size(&self) -> usize {
+        self.max_decompressed_size
+    }
+
+    /// Returns the SOCKS5 proxy configuration, if set.
+    #[cfg(feature = "socks5")]
+    #[inline]
+    pub fn proxy(&self) -> Option<&crate::network::ProxyConfig> {
+        self.proxy.as_ref()
     }
 }
 
@@ -348,7 +436,9 @@ impl ConsumerConfigBuilder {
         self
     }
 
-    /// Enable auto commit.
+    /// Enable automatic offset commit.
+    ///
+    /// See [`ConsumerConfig::enable_auto_commit`] for semantics and caveats.
     pub fn enable_auto_commit(mut self, enable: bool) -> Self {
         self.config.enable_auto_commit = enable;
         self
@@ -371,6 +461,25 @@ impl ConsumerConfigBuilder {
     /// Enables TLS and/or SASL authentication for all connections.
     pub fn auth(mut self, auth: AuthConfig) -> Self {
         self.config.auth = Some(auth);
+        self
+    }
+
+    /// Set the maximum decompressed size for record batches.
+    ///
+    /// Compressed payloads that decompress beyond this limit are rejected as
+    /// potential compression bombs. Defaults to
+    /// [`RecordBatch::MAX_DECOMPRESSED_SIZE`](crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE) (128 MiB).
+    pub fn max_decompressed_size(mut self, size: usize) -> Self {
+        self.config.max_decompressed_size = size;
+        self
+    }
+
+    /// Set SOCKS5 proxy configuration.
+    ///
+    /// Routes all broker connections through the specified SOCKS5 proxy.
+    #[cfg(feature = "socks5")]
+    pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
+        self.config.proxy = Some(proxy);
         self
     }
 
@@ -423,6 +532,19 @@ impl ConsumerConfigBuilder {
         self
     }
 
+    /// Set maximum records buffered internally by `recv()`.
+    ///
+    /// When the internal buffer reaches this limit, `poll()` skips fetching
+    /// new data until the buffer drains below the threshold. For
+    /// `recv()`-only callers the buffer is naturally bounded by
+    /// `max_poll_records`; this cap guards against mixed `poll()`/`recv()`
+    /// usage and concurrent `recv()` callers.  Set to 0 to disable
+    /// (unlimited). Defaults to 500.
+    pub fn max_buffered_records(mut self, max: i32) -> Self {
+        self.config.max_buffered_records = max;
+        self
+    }
+
     /// Set maximum poll interval before the consumer is considered dead.
     pub fn max_poll_interval(mut self, interval: Duration) -> Self {
         self.config.max_poll_interval = interval;
@@ -459,9 +581,67 @@ impl ConsumerConfigBuilder {
         self
     }
 
+    /// Set the metadata recovery strategy (KIP-899).
+    pub fn metadata_recovery_strategy(mut self, strategy: MetadataRecoveryStrategy) -> Self {
+        self.config.metadata_recovery_strategy = strategy;
+        self
+    }
+
+    /// Set the rebootstrap trigger duration (KIP-899).
+    ///
+    /// Only effective when [`MetadataRecoveryStrategy::Rebootstrap`] is set.
+    pub fn metadata_recovery_rebootstrap_trigger(mut self, duration: Duration) -> Self {
+        self.config.metadata_recovery_rebootstrap_trigger = duration;
+        self
+    }
+
+    /// Set the topic cache TTL for partial metadata refreshes.
+    ///
+    /// During partial refreshes, cached topics that have not been refreshed
+    /// within this duration are evicted to prevent unbounded cache growth.
+    /// `None` disables TTL eviction (the default).
+    pub fn metadata_topic_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.config.metadata_topic_cache_ttl = Some(ttl);
+        self
+    }
+
+    /// Disable topic cache TTL eviction for partial metadata refreshes.
+    ///
+    /// This clears any previously configured TTL and restores the default
+    /// behavior where cached topics are not evicted based on age.
+    pub fn clear_metadata_topic_cache_ttl(mut self) -> Self {
+        self.config.metadata_topic_cache_ttl = None;
+        self
+    }
+
     /// Build the config.
-    pub fn build(self) -> ConsumerConfig {
-        self.config
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if timing or value constraints are violated:
+    /// - `heartbeat_interval` must be less than `session_timeout`
+    /// - `session_timeout` must be less than or equal to `max_poll_interval`
+    /// - `max_buffered_records` must be >= 0 (0 disables the cap)
+    pub fn build(self) -> crate::Result<ConsumerConfig> {
+        if self.config.heartbeat_interval >= self.config.session_timeout {
+            return Err(crate::error::KrafkaError::config(format!(
+                "heartbeat_interval ({:?}) must be less than session_timeout ({:?})",
+                self.config.heartbeat_interval, self.config.session_timeout,
+            )));
+        }
+        if self.config.session_timeout > self.config.max_poll_interval {
+            return Err(crate::error::KrafkaError::config(format!(
+                "session_timeout ({:?}) must be <= max_poll_interval ({:?})",
+                self.config.session_timeout, self.config.max_poll_interval,
+            )));
+        }
+        if self.config.max_buffered_records < 0 {
+            return Err(crate::error::KrafkaError::config(format!(
+                "max_buffered_records ({}) must be >= 0",
+                self.config.max_buffered_records,
+            )));
+        }
+        Ok(self.config)
     }
 }
 
@@ -504,7 +684,8 @@ mod tests {
             .enable_auto_commit(false)
             .isolation_level(IsolationLevel::ReadCommitted)
             .partition_assignment_strategy(PartitionAssignmentStrategy::CooperativeSticky)
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(config.bootstrap_servers, "localhost:9092");
         assert_eq!(config.group_id, Some("test-group".to_string()));
@@ -532,7 +713,10 @@ mod tests {
 
     #[test]
     fn test_config_builder_fetch_min_bytes() {
-        let config = ConsumerConfig::builder().fetch_min_bytes(1024).build();
+        let config = ConsumerConfig::builder()
+            .fetch_min_bytes(1024)
+            .build()
+            .unwrap();
         assert_eq!(
             config.fetch_min_bytes, 1024,
             "fetch_min_bytes should be set by builder"
@@ -543,7 +727,8 @@ mod tests {
     fn test_config_builder_fetch_max_bytes() {
         let config = ConsumerConfig::builder()
             .fetch_max_bytes(10 * 1024 * 1024)
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             config.fetch_max_bytes,
             10 * 1024 * 1024,
@@ -555,7 +740,8 @@ mod tests {
     fn test_config_builder_metadata_max_age() {
         let config = ConsumerConfig::builder()
             .metadata_max_age(Duration::from_secs(60))
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             config.metadata_max_age,
             Duration::from_secs(60),
@@ -577,7 +763,8 @@ mod tests {
         let config = ConsumerConfig::builder()
             .group_id("my-group")
             .group_instance_id("instance-1")
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             config.group_instance_id,
             Some("instance-1".to_string()),
@@ -596,7 +783,10 @@ mod tests {
 
     #[test]
     fn test_config_builder_client_rack() {
-        let config = ConsumerConfig::builder().client_rack("us-east-1a").build();
+        let config = ConsumerConfig::builder()
+            .client_rack("us-east-1a")
+            .build()
+            .unwrap();
         assert_eq!(
             config.client_rack,
             Some("us-east-1a".to_string()),
@@ -618,11 +808,75 @@ mod tests {
     fn test_config_builder_group_protocol_consumer() {
         let config = ConsumerConfig::builder()
             .group_protocol(GroupProtocol::Consumer)
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             config.group_protocol(),
             GroupProtocol::Consumer,
             "group_protocol should be Consumer when set"
         );
+    }
+
+    #[cfg(feature = "socks5")]
+    #[test]
+    fn test_config_builder_proxy_round_trip() {
+        let config = ConsumerConfig::builder()
+            .proxy(crate::network::ProxyConfig::new("proxy:1080"))
+            .build()
+            .unwrap();
+        let proxy = config.proxy().expect("proxy should be set");
+        assert_eq!(proxy.address(), "proxy:1080");
+    }
+
+    #[test]
+    fn test_config_default_recovery_strategy() {
+        let config = ConsumerConfig::default();
+        assert_eq!(
+            config.metadata_recovery_strategy,
+            MetadataRecoveryStrategy::None,
+        );
+        assert_eq!(
+            config.metadata_recovery_rebootstrap_trigger,
+            Duration::from_secs(300),
+        );
+    }
+
+    #[test]
+    fn test_config_builder_recovery_strategy() {
+        let config = ConsumerConfig::builder()
+            .metadata_recovery_strategy(MetadataRecoveryStrategy::Rebootstrap)
+            .metadata_recovery_rebootstrap_trigger(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        assert_eq!(
+            config.metadata_recovery_strategy(),
+            MetadataRecoveryStrategy::Rebootstrap,
+        );
+        assert_eq!(
+            config.metadata_recovery_rebootstrap_trigger(),
+            Duration::from_secs(60),
+        );
+    }
+
+    #[test]
+    fn test_config_builder_rejects_negative_max_buffered_records() {
+        let result = ConsumerConfig::builder().max_buffered_records(-1).build();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("max_buffered_records"),
+            "error message should mention max_buffered_records"
+        );
+    }
+
+    #[test]
+    fn test_config_builder_accepts_zero_max_buffered_records() {
+        let config = ConsumerConfig::builder()
+            .max_buffered_records(0)
+            .build()
+            .unwrap();
+        assert_eq!(config.max_buffered_records(), 0);
     }
 }

@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "krafka"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "base64",

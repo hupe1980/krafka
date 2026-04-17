@@ -16,7 +16,7 @@
 //! use krafka::auth::{MskIamAuthenticator, AwsMskIamCredentials};
 //!
 //! let credentials = AwsMskIamCredentials::new("AKID", "secret", "us-east-1");
-//! let authenticator = MskIamAuthenticator::new(&credentials, "broker.kafka.us-east-1.amazonaws.com");
+//! let authenticator = MskIamAuthenticator::new(&credentials, "broker.kafka.us-east-1.amazonaws.com")?;
 //! let payload = authenticator.create_auth_payload();
 //! ```
 //!
@@ -43,6 +43,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::auth::AwsMskIamCredentials;
 
@@ -57,8 +58,8 @@ const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 /// MSK IAM action for connect.
 const ACTION: &str = "kafka-cluster:Connect";
 
-/// User agent for MSK IAM.
-const USER_AGENT: &str = "krafka-rust-client";
+/// User agent for MSK IAM (includes crate version for diagnostics).
+const USER_AGENT: &str = concat!("krafka-rust-client/", env!("CARGO_PKG_VERSION"));
 
 /// MSK IAM authenticator using AWS Signature v4.
 pub struct MskIamAuthenticator {
@@ -72,6 +73,12 @@ pub struct MskIamAuthenticator {
     region: String,
     /// Broker host (without port).
     host: String,
+    /// Internal clock offset in seconds for automatic skew compensation.
+    ///
+    /// Set by the connection layer when MSK IAM authentication fails with a
+    /// clock-skew error. Not exposed publicly — SigV4 timestamps should
+    /// come from the system clock; skew is handled operationally via NTP.
+    clock_offset_secs: i64,
 }
 
 impl std::fmt::Debug for MskIamAuthenticator {
@@ -102,25 +109,65 @@ impl Drop for MskIamAuthenticator {
 
 impl MskIamAuthenticator {
     /// Create a new MSK IAM authenticator.
-    pub fn new(credentials: &AwsMskIamCredentials, host: impl Into<String>) -> Self {
+    ///
+    /// The `host` may include a port suffix (e.g. `broker:9098` or `[::1]:9092`);
+    /// IPv6 addresses in brackets are handled correctly.
+    pub fn new(credentials: &AwsMskIamCredentials, host: impl Into<String>) -> crate::Result<Self> {
         let host_str = host.into();
-        // Strip port from host if present
-        let host_without_port = host_str.split(':').next().unwrap_or(&host_str).to_string();
+        let host_without_port = crate::util::extract_sni_hostname(&host_str)?.to_string();
 
-        Self {
+        Ok(Self {
             access_key_id: credentials.access_key_id.clone(),
             secret_access_key: credentials.secret_access_key.clone(),
             session_token: credentials.session_token.clone(),
             region: credentials.region.clone(),
             host: host_without_port,
+            clock_offset_secs: 0,
+        })
+    }
+
+    /// Create a new MSK IAM authenticator with a clock offset.
+    ///
+    /// Used internally by the connection layer for automatic clock-skew
+    /// compensation when MSK IAM authentication fails with a signature
+    /// mismatch. Not part of the public API — SigV4 timestamps should
+    /// come from the system clock.
+    ///
+    /// The offset is clamped to ±86 400 s (24 hours). AWS SigV4 only
+    /// tolerates ±5 minutes, so larger offsets indicate a misconfigured
+    /// clock.
+    pub(crate) fn new_with_clock_offset(
+        credentials: &AwsMskIamCredentials,
+        host: impl Into<String>,
+        clock_offset_secs: i64,
+    ) -> crate::Result<Self> {
+        const MAX_OFFSET_SECS: i64 = 86_400;
+        if clock_offset_secs.abs() > MAX_OFFSET_SECS {
+            return Err(crate::error::KrafkaError::config(format!(
+                "clock_offset_secs ({clock_offset_secs}) exceeds ±{MAX_OFFSET_SECS}s; \
+                 AWS SigV4 only tolerates ±300s"
+            )));
         }
+        let mut auth = Self::new(credentials, host)?;
+        auth.clock_offset_secs = clock_offset_secs;
+        Ok(auth)
     }
 
     /// Create the authentication payload to send to MSK.
     ///
-    /// Returns JSON-formatted signed authentication payload.
+    /// Returns JSON-formatted signed authentication payload. If an internal
+    /// clock offset has been set (for automatic skew compensation), it is
+    /// applied to `SystemTime::now()` before signing.
     pub fn create_auth_payload(&self) -> Vec<u8> {
-        self.create_auth_payload_at(SystemTime::now())
+        let now = SystemTime::now();
+        let adjusted = if self.clock_offset_secs >= 0 {
+            let offset = std::time::Duration::from_secs(self.clock_offset_secs as u64);
+            now.checked_add(offset).unwrap_or(now)
+        } else {
+            let offset = std::time::Duration::from_secs(self.clock_offset_secs.unsigned_abs());
+            now.checked_sub(offset).unwrap_or(std::time::UNIX_EPOCH)
+        };
+        self.create_auth_payload_at(adjusted)
     }
 
     /// Create the authentication payload at a specific timestamp (for testing).
@@ -233,14 +280,21 @@ impl MskIamAuthenticator {
     }
 
     /// Derive the signing key using the AWS v4 key derivation.
-    fn derive_signing_key(&self, date_stamp: &str, region: &str, service: &str) -> Vec<u8> {
-        let k_date = hmac_sha256(
-            format!("AWS4{}", self.secret_access_key).as_bytes(),
-            date_stamp.as_bytes(),
-        );
-        let k_region = hmac_sha256(&k_date, region.as_bytes());
-        let k_service = hmac_sha256(&k_region, service.as_bytes());
-        hmac_sha256(&k_service, b"aws4_request")
+    ///
+    /// All intermediate HMAC keys are wrapped in [`Zeroizing`] to ensure
+    /// they are scrubbed from memory on drop, preventing credential
+    /// extraction from core dumps or swap files.
+    fn derive_signing_key(
+        &self,
+        date_stamp: &str,
+        region: &str,
+        service: &str,
+    ) -> Zeroizing<Vec<u8>> {
+        let secret = Zeroizing::new(format!("AWS4{}", self.secret_access_key));
+        let k_date = Zeroizing::new(hmac_sha256(secret.as_bytes(), date_stamp.as_bytes()));
+        let k_region = Zeroizing::new(hmac_sha256(&k_date, region.as_bytes()));
+        let k_service = Zeroizing::new(hmac_sha256(&k_region, service.as_bytes()));
+        Zeroizing::new(hmac_sha256(&k_service, b"aws4_request"))
     }
 }
 
@@ -339,7 +393,8 @@ mod tests {
     #[test]
     fn test_msk_iam_authenticator_creation() {
         let creds = test_credentials();
-        let auth = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com:9098");
+        let auth =
+            MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com:9098").unwrap();
         assert_eq!(auth.host, "broker.kafka.us-east-1.amazonaws.com");
         assert_eq!(auth.region, "us-east-1");
     }
@@ -347,7 +402,8 @@ mod tests {
     #[test]
     fn test_auth_payload_is_valid_json() {
         let creds = test_credentials();
-        let auth = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com");
+        let auth =
+            MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com").unwrap();
         let payload = auth.create_auth_payload();
 
         // Should be valid UTF-8
@@ -356,7 +412,7 @@ mod tests {
         // Should contain expected fields
         assert!(payload_str.contains("\"version\":\"2020_10_22\""));
         assert!(payload_str.contains("\"host\":\"broker.kafka.us-east-1.amazonaws.com\""));
-        assert!(payload_str.contains("\"user-agent\":\"krafka-rust-client\""));
+        assert!(payload_str.contains("\"user-agent\":\"krafka-rust-client/"));
         assert!(payload_str.contains("\"action\":\"kafka-cluster:Connect\""));
         assert!(payload_str.contains("\"x-amz-algorithm\":\"AWS4-HMAC-SHA256\""));
         assert!(payload_str.contains("\"x-amz-credential\":"));
@@ -377,7 +433,8 @@ mod tests {
             "FwoGZXIvYXdzEBYaDNZSNzRZzDJiLuQ8l==",
             "us-east-1",
         );
-        let auth = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com");
+        let auth =
+            MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com").unwrap();
         let payload = auth.create_auth_payload();
 
         let payload_str = String::from_utf8(payload).unwrap();
@@ -387,7 +444,8 @@ mod tests {
     #[test]
     fn test_deterministic_signature_at_same_time() {
         let creds = test_credentials();
-        let auth = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com");
+        let auth =
+            MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com").unwrap();
 
         // Use a fixed timestamp
         let fixed_time = UNIX_EPOCH + Duration::from_secs(1700000000); // Nov 14, 2023
@@ -420,7 +478,8 @@ mod tests {
     #[test]
     fn test_signing_key_derivation() {
         let creds = test_credentials();
-        let auth = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com");
+        let auth =
+            MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com").unwrap();
 
         // This tests the key derivation follows AWS v4 spec
         let key = auth.derive_signing_key("20231114", "us-east-1", "kafka-cluster");
@@ -430,7 +489,8 @@ mod tests {
     #[test]
     fn test_different_regions() {
         let creds = AwsMskIamCredentials::new("AKID", "secret", "eu-west-1");
-        let auth = MskIamAuthenticator::new(&creds, "broker.kafka.eu-west-1.amazonaws.com");
+        let auth =
+            MskIamAuthenticator::new(&creds, "broker.kafka.eu-west-1.amazonaws.com").unwrap();
 
         let payload_str = String::from_utf8(auth.create_auth_payload()).unwrap();
         assert!(payload_str.contains("eu-west-1"));
@@ -446,7 +506,8 @@ mod tests {
             "FwoGZXIvYXdzEBYaDNZSNzRZzDJiLuQ8l==",
             "us-east-1",
         );
-        let auth = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com");
+        let auth =
+            MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com").unwrap();
         let debug_output = format!("{:?}", auth);
 
         // Must NOT contain the actual secret key or session token
@@ -468,7 +529,48 @@ mod tests {
     fn test_msk_iam_zeroize_on_drop() {
         // Verify Drop does not panic
         let creds = test_credentials();
-        let auth = MskIamAuthenticator::new(&creds, "broker:9098");
+        let auth = MskIamAuthenticator::new(&creds, "broker:9098").unwrap();
         drop(auth);
+    }
+
+    #[test]
+    fn test_msk_iam_clock_offset_positive() {
+        let creds = test_credentials();
+        let auth_no_offset = MskIamAuthenticator::new(&creds, "broker:9098").unwrap();
+        let auth_offset =
+            MskIamAuthenticator::new_with_clock_offset(&creds, "broker:9098", 3600).unwrap();
+
+        let payload_no = String::from_utf8(auth_no_offset.create_auth_payload()).unwrap();
+        let payload_off = String::from_utf8(auth_offset.create_auth_payload()).unwrap();
+
+        // Both should be valid JSON, but the x-amz-date values should differ
+        // because one is shifted by 1 hour.
+        assert!(payload_no.contains("\"x-amz-date\":"));
+        assert!(payload_off.contains("\"x-amz-date\":"));
+
+        // Extract dates to compare
+        let date_no = extract_amz_date(&payload_no);
+        let date_off = extract_amz_date(&payload_off);
+        assert_ne!(
+            date_no, date_off,
+            "clock offset should produce different timestamps"
+        );
+    }
+
+    #[test]
+    fn test_msk_iam_clock_offset_negative() {
+        let creds = test_credentials();
+        let auth =
+            MskIamAuthenticator::new_with_clock_offset(&creds, "broker:9098", -3600).unwrap();
+        let payload = String::from_utf8(auth.create_auth_payload()).unwrap();
+        assert!(payload.contains("\"x-amz-date\":"));
+    }
+
+    /// Helper to extract `x-amz-date` value from the JSON payload.
+    fn extract_amz_date(json: &str) -> String {
+        let key = "\"x-amz-date\":\"";
+        let start = json.find(key).unwrap() + key.len();
+        let end = json[start..].find('"').unwrap() + start;
+        json[start..end].to_string()
     }
 }

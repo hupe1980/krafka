@@ -52,11 +52,11 @@ Simple username/password authentication. **Always use with TLS in production!**
 use krafka::auth::AuthConfig;
 
 // Without TLS (development only!)
-let config = AuthConfig::sasl_plain("username", "password");
+let config = AuthConfig::sasl_plain("username", "password")?;
 
 // With TLS (recommended for production)
 use krafka::auth::TlsConfig;
-let config = AuthConfig::sasl_plain_ssl("username", "password", TlsConfig::new());
+let config = AuthConfig::sasl_plain_ssl("username", "password", TlsConfig::new())?;
 ```
 
 ### SASL/SCRAM-SHA-256
@@ -91,15 +91,21 @@ The SCRAM client implements RFC 5802 with:
 - Debug output redacts the password as `[REDACTED]`
 
 ```rust
-use krafka::auth::{ScramClient, ScramMechanism, ScramState};
+use krafka::auth::{ChannelBinding, ScramClient, ScramMechanism, ScramState};
 
-// Create SCRAM client
-let mut scram = ScramClient::new("alice", "secret", ScramMechanism::Sha256);
+// Create SCRAM client (no channel binding for SASL_PLAINTEXT)
+let mut scram = ScramClient::new("alice", "secret", ScramMechanism::Sha256, ChannelBinding::None);
 assert_eq!(scram.state(), ScramState::Initial);
 
 // Generate client-first message
 let client_first = scram.client_first_message();
 // -> "n,,n=alice,r=<nonce>"
+
+// When using SASL_SSL, pass channel binding data to tie SCRAM to the TLS session:
+// let cb_data = extract_tls_server_end_point(&tls_stream).unwrap();
+// let mut scram = ScramClient::new("alice", "secret", ScramMechanism::Sha256,
+//     ChannelBinding::TlsServerEndPoint(cb_data));
+// -> client-first: "p=tls-server-end-point,,n=alice,r=<nonce>"
 
 // Process server-first message
 // scram.process_server_first(server_response)?;
@@ -305,6 +311,26 @@ let tls_config = TlsConfig::new()
     .with_ca_cert("/path/to/ca.pem");
 ```
 
+`with_ca_cert()` **pins** the trust store to the provided CA bundle — the default WebPKI (Mozilla) roots are **not** loaded. This matches the Java Kafka client (`ssl.truststore.location`) and librdkafka (`ssl.ca.location`).
+
+### Native Platform Trust Stores
+
+By default, Krafka uses compiled-in `webpki-roots`. To use the operating system trust store on macOS, Windows, or Linux, enable the `native-tls-roots` feature and opt in explicitly:
+
+```toml
+[dependencies]
+krafka = { version = "0.4", features = ["native-tls-roots"] }
+```
+
+```rust
+use krafka::auth::TlsConfig;
+
+let tls_config = TlsConfig::new()
+    .with_native_roots();
+```
+
+You can combine `with_native_roots()` and `with_ca_cert()` to trust both platform roots and an additional private CA bundle.
+
 ### Mutual TLS (mTLS)
 
 Client certificate authentication:
@@ -372,7 +398,7 @@ For production deployments on EC2, ECS, Lambda, or EKS, use the AWS SDK default 
 use krafka::auth::{AuthConfig, AwsMskIamCredentials};
 
 // Requires the `aws-msk` feature in Cargo.toml:
-// krafka = { version = "0.2", features = ["aws-msk"] }
+// krafka = { version = "0.4", features = ["aws-msk"] }
 
 // Loads from (in order):
 // 1. Environment variables
@@ -419,6 +445,50 @@ let config = SecureConnectionConfig::builder()
     .build();
 ```
 
+### Automatic Credential Refresh (Recommended)
+
+For production workloads using temporary credentials (STS, IRSA, ECS task role, EC2 instance profile), use a credential provider so that credentials are automatically refreshed on every broker reconnection:
+
+```rust
+use krafka::auth::{AuthConfig, AwsMskIamCredentials};
+
+// With a closure (requires `aws-msk` feature for from_default_chain)
+let config = AuthConfig::aws_msk_iam_provider(|| async {
+    AwsMskIamCredentials::from_default_chain("us-east-1").await
+});
+
+// Or implement AwsMskIamCredentialProvider for custom logic
+use krafka::auth::AwsMskIamCredentialProvider;
+
+struct MyCredentialProvider;
+impl AwsMskIamCredentialProvider for MyCredentialProvider {
+    fn provide_credentials(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = krafka::error::Result<AwsMskIamCredentials>> + Send + '_>> {
+        Box::pin(async {
+            // Custom credential loading logic
+            AwsMskIamCredentials::from_env()
+        })
+    }
+}
+
+let config = AuthConfig::aws_msk_iam_provider(MyCredentialProvider);
+```
+
+The provider pattern mirrors OAUTHBEARER's `sasl_oauthbearer_provider()`. The `SecureConnectionConfig` builder also supports it:
+
+```rust
+use krafka::network::SecureConnectionConfig;
+use krafka::auth::AwsMskIamCredentials;
+
+let config = SecureConnectionConfig::builder()
+    .client_id("msk-client")
+    .aws_msk_iam_provider(|| async {
+        AwsMskIamCredentials::from_default_chain("us-east-1").await
+    })
+    .build();
+```
+
 ### Direct MskIamAuthenticator Usage
 
 For low-level control over the authentication process:
@@ -427,7 +497,7 @@ For low-level control over the authentication process:
 use krafka::auth::{AwsMskIamCredentials, MskIamAuthenticator};
 
 let creds = AwsMskIamCredentials::new("AKID", "secret", "us-east-1");
-let authenticator = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com");
+let authenticator = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com")?;
 
 // Generate signed authentication payload
 let payload = authenticator.create_auth_payload();
@@ -453,8 +523,24 @@ The implementation uses AWS Signature v4 signing:
 | `ca_cert_path` | `Option<String>` | Path to CA certificate PEM file |
 | `client_cert_path` | `Option<String>` | Path to client certificate PEM file |
 | `client_key_path` | `Option<String>` | Path to client private key PEM file |
+| `use_native_roots` | `bool` | Whether to load root certificates from the platform trust store |
 | `verify_server_cert` | `bool` | Whether to verify server certificates (default: true) |
 | `sni_hostname` | `Option<String>` | SNI hostname for TLS handshake |
+| `alpn_protocols` | `Vec<Vec<u8>>` | ALPN protocol names to advertise (default: empty) |
+
+#### ALPN Protocol Negotiation
+
+Some environments (service meshes, load balancers like Envoy or AWS ALB) require ALPN for protocol multiplexing. Use `with_kafka_alpn()` as a convenience or `with_alpn_protocols()` for custom protocols:
+
+```rust
+use krafka::auth::TlsConfig;
+
+// Advertise "kafka" ALPN protocol
+let tls = TlsConfig::new().with_kafka_alpn();
+
+// Or custom protocols
+let tls = TlsConfig::new().with_alpn_protocols(vec![b"kafka".to_vec()]);
+```
 
 ### AuthConfig
 
@@ -629,6 +715,19 @@ let consumer = Consumer::builder()
     .await?;
 ```
 
+## Session Reauthentication (KIP-368)
+
+Krafka supports [KIP-368](https://cwiki.apache.org/confluence/display/KAFKA/KIP-368%3A+Allow+SASL+Connections+to+Periodically+Re-Authenticate) session lifetime tracking. When a broker reports a session lifetime via `SaslAuthenticateResponse` v1, krafka tracks the expiry and proactively replaces the connection before the session expires.
+
+### How It Works
+
+1. During SASL handshake, the broker may include a `session_lifetime_ms` value in its v1 response.
+2. If non-zero, krafka calculates a reauthentication deadline at a **randomised** point between 85% and 95% of the lifetime. The jitter prevents a thundering-herd where many connections to the same broker all expire simultaneously.
+3. When the connection pool serves a connection request, it checks `is_usable()` — which verifies the connection is both alive **and** not past its reauthentication deadline.
+4. Expired-session connections are transparently replaced with a fresh connection that performs a new SASL handshake.
+
+This behaviour matches the Java Kafka client and is fully automatic — no client configuration is required. It works with all SASL mechanisms and is especially important for OAUTHBEARER, where tokens have a natural expiry.
+
 ## Security Best Practices
 
 1. **Always use TLS in production** - Use `SASL_SSL` instead of `SASL_PLAINTEXT`
@@ -664,16 +763,16 @@ For handling SASL handshakes, use `SaslAuthenticator`:
 
 ```rust
 use krafka::network::SaslAuthenticator;
-use krafka::auth::AuthConfig;
+use krafka::auth::{AuthConfig, ChannelBinding};
 
 let auth = AuthConfig::sasl_scram_sha256("user", "pass");
-let mut authenticator = SaslAuthenticator::new(&auth).unwrap();
+let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None).unwrap();
 
 // Get mechanism name for SASL handshake
 let mechanism = authenticator.mechanism_name(); // "SCRAM-SHA-256"
 
 // Get initial authentication bytes
-let initial = authenticator.initial_response();
+let initial = authenticator.initial_response()?;
 
 // Process server challenges
 // let response = authenticator.process_challenge(&server_bytes)?;
@@ -698,7 +797,7 @@ let auth = AuthConfig::sasl_oauthbearer_provider(|| async {
 // Resolve the provider to get a config with the token set
 let resolved = auth.resolve_provider_to_token().await?;
 let auth = resolved.as_ref().unwrap_or(&auth);
-let mut authenticator = SaslAuthenticator::new(auth).unwrap();
+let mut authenticator = SaslAuthenticator::new(auth, ChannelBinding::None).unwrap();
 ```
 
 ## Example: Production Configuration

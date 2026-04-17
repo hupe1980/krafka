@@ -3,6 +3,7 @@
 //! This module provides structured error types for all Krafka operations.
 
 use std::io;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -11,8 +12,11 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum KrafkaError {
     /// Network-related errors (connection, I/O).
+    ///
+    /// Wrapped in `Arc` so that cloning preserves the full error chain
+    /// (including `raw_os_error()` and `source()`).
     #[error("network error: {0}")]
-    Network(#[from] io::Error),
+    Network(#[source] Arc<io::Error>),
 
     /// Protocol encoding/decoding errors.
     #[error("protocol error: {message}")]
@@ -80,7 +84,55 @@ pub enum KrafkaError {
     },
 }
 
+impl Clone for KrafkaError {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Network(err) => Self::Network(Arc::clone(err)),
+            Self::Protocol { message } => Self::Protocol {
+                message: message.clone(),
+            },
+            Self::Auth { message } => Self::Auth {
+                message: message.clone(),
+            },
+            Self::Timeout { operation } => Self::Timeout {
+                operation: operation.clone(),
+            },
+            Self::Broker { code, message } => Self::Broker {
+                code: *code,
+                message: message.clone(),
+            },
+            Self::Config { message } => Self::Config {
+                message: message.clone(),
+            },
+            Self::Compression { message } => Self::Compression {
+                message: message.clone(),
+            },
+            Self::InvalidState { message } => Self::InvalidState {
+                message: message.clone(),
+            },
+            Self::Serialization { message } => Self::Serialization {
+                message: message.clone(),
+            },
+            Self::SchemaRegistry { message } => Self::SchemaRegistry {
+                message: message.clone(),
+            },
+        }
+    }
+}
+
+impl From<io::Error> for KrafkaError {
+    fn from(err: io::Error) -> Self {
+        Self::Network(Arc::new(err))
+    }
+}
+
 impl KrafkaError {
+    /// Create a new network error from an I/O error.
+    #[cold]
+    pub fn network(err: io::Error) -> Self {
+        Self::Network(Arc::new(err))
+    }
+
     /// Create a new protocol error.
     #[cold]
     pub fn protocol(message: impl Into<String>) -> Self {
@@ -169,6 +221,10 @@ impl KrafkaError {
 ///
 /// These are the standard error codes defined in the Kafka protocol.
 /// Forward compatibility is provided by the `Unknown(i16)` variant.
+///
+/// This enum is `#[non_exhaustive]` — new Kafka error codes may be added as
+/// named variants in future releases without a semver-major bump.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(i16)]
 pub enum ErrorCode {
@@ -353,6 +409,48 @@ pub enum ErrorCode {
     InvalidRecord = 87,
     /// Unstable offset commit.
     UnstableOffsetCommit = 88,
+    /// The throttling quota has been exceeded.
+    ThrottlingQuotaExceeded = 89,
+    /// There is a newer producer with the same transactionalId which fences the current one.
+    ProducerFenced = 90,
+    /// A request illegally referred to a resource that does not exist.
+    ResourceNotFound = 91,
+    /// A request illegally referred to the same resource twice.
+    DuplicateResource = 92,
+    /// Requested credential would not meet criteria for acceptability.
+    UnacceptableCredential = 93,
+    /// Either the sender or recipient of a voter-only request is not one of the expected voters.
+    InconsistentVoterSet = 94,
+    /// The given update version was invalid.
+    InvalidUpdateVersion = 95,
+    /// Unable to update finalized features due to an unexpected server error.
+    FeatureUpdateFailed = 96,
+    /// Request principal deserialization failed during forwarding.
+    PrincipalDeserializationFailure = 97,
+    /// Requested snapshot was not found.
+    SnapshotNotFound = 98,
+    /// Requested position is not greater than or equal to zero, and less than the size of the snapshot.
+    PositionOutOfRange = 99,
+    /// This server does not host this topic ID.
+    UnknownTopicId = 100,
+    /// This broker ID is already in use.
+    DuplicateBrokerRegistration = 101,
+    /// The given broker ID was not registered.
+    BrokerIdNotRegistered = 102,
+    /// The log's topic ID did not match the topic ID in the request.
+    InconsistentTopicId = 103,
+    /// The clusterId in the request does not match that found on the server.
+    InconsistentClusterId = 104,
+    /// The transactionalId could not be found.
+    TransactionalIdNotFound = 105,
+    /// The fetch session encountered inconsistent topic ID usage.
+    FetchSessionTopicIdError = 106,
+    /// The new ISR contains at least one ineligible replica.
+    IneligibleReplica = 107,
+    /// The AlterPartition request successfully updated the partition state but the leader has changed.
+    NewLeaderElected = 108,
+    /// The requested offset is moved to tiered storage.
+    OffsetMovedToTieredStorage = 109,
     /// Fenced member epoch (KIP-848).
     FencedMemberEpoch = 110,
     /// The instance ID is still used by another member in the consumer group (KIP-848).
@@ -361,6 +459,22 @@ pub enum ErrorCode {
     UnsupportedAssignor = 112,
     /// The member epoch is stale; retry after receiving an updated epoch via ConsumerGroupHeartbeat (KIP-848).
     StaleMemberEpoch = 113,
+    /// The request was sent to an endpoint of the wrong type.
+    MismatchedEndpointType = 114,
+    /// This endpoint type is not supported yet.
+    UnsupportedEndpointType = 115,
+    /// This controller ID is not known.
+    UnknownControllerId = 116,
+    /// Client sent a push telemetry request with an invalid or outdated subscription ID.
+    UnknownSubscriptionId = 117,
+    /// Client sent a push telemetry request larger than the maximum size the broker will accept.
+    TelemetryTooLarge = 118,
+    /// The controller has considered the broker registration to be invalid.
+    InvalidRegistration = 119,
+    /// The server encountered an error with the transaction. The client can abort the transaction to continue (KIP-890).
+    TransactionAbortable = 120,
+    /// The client should rebootstrap to connect to the appropriate seed broker (KIP-899).
+    RebootstrapRequired = 124,
     /// The regular expression is not valid (KIP-848 v1+).
     InvalidRegularExpression = 128,
     /// Unknown error code.
@@ -462,10 +576,39 @@ impl ErrorCode {
             86 => Self::GroupSubscribedToTopic,
             87 => Self::InvalidRecord,
             88 => Self::UnstableOffsetCommit,
+            89 => Self::ThrottlingQuotaExceeded,
+            90 => Self::ProducerFenced,
+            91 => Self::ResourceNotFound,
+            92 => Self::DuplicateResource,
+            93 => Self::UnacceptableCredential,
+            94 => Self::InconsistentVoterSet,
+            95 => Self::InvalidUpdateVersion,
+            96 => Self::FeatureUpdateFailed,
+            97 => Self::PrincipalDeserializationFailure,
+            98 => Self::SnapshotNotFound,
+            99 => Self::PositionOutOfRange,
+            100 => Self::UnknownTopicId,
+            101 => Self::DuplicateBrokerRegistration,
+            102 => Self::BrokerIdNotRegistered,
+            103 => Self::InconsistentTopicId,
+            104 => Self::InconsistentClusterId,
+            105 => Self::TransactionalIdNotFound,
+            106 => Self::FetchSessionTopicIdError,
+            107 => Self::IneligibleReplica,
+            108 => Self::NewLeaderElected,
+            109 => Self::OffsetMovedToTieredStorage,
             110 => Self::FencedMemberEpoch,
             111 => Self::UnreleasedInstanceId,
             112 => Self::UnsupportedAssignor,
             113 => Self::StaleMemberEpoch,
+            114 => Self::MismatchedEndpointType,
+            115 => Self::UnsupportedEndpointType,
+            116 => Self::UnknownControllerId,
+            117 => Self::UnknownSubscriptionId,
+            118 => Self::TelemetryTooLarge,
+            119 => Self::InvalidRegistration,
+            120 => Self::TransactionAbortable,
+            124 => Self::RebootstrapRequired,
             128 => Self::InvalidRegularExpression,
             other => Self::Unknown(other),
         }
@@ -565,10 +708,39 @@ impl ErrorCode {
             Self::GroupSubscribedToTopic => 86,
             Self::InvalidRecord => 87,
             Self::UnstableOffsetCommit => 88,
+            Self::ThrottlingQuotaExceeded => 89,
+            Self::ProducerFenced => 90,
+            Self::ResourceNotFound => 91,
+            Self::DuplicateResource => 92,
+            Self::UnacceptableCredential => 93,
+            Self::InconsistentVoterSet => 94,
+            Self::InvalidUpdateVersion => 95,
+            Self::FeatureUpdateFailed => 96,
+            Self::PrincipalDeserializationFailure => 97,
+            Self::SnapshotNotFound => 98,
+            Self::PositionOutOfRange => 99,
+            Self::UnknownTopicId => 100,
+            Self::DuplicateBrokerRegistration => 101,
+            Self::BrokerIdNotRegistered => 102,
+            Self::InconsistentTopicId => 103,
+            Self::InconsistentClusterId => 104,
+            Self::TransactionalIdNotFound => 105,
+            Self::FetchSessionTopicIdError => 106,
+            Self::IneligibleReplica => 107,
+            Self::NewLeaderElected => 108,
+            Self::OffsetMovedToTieredStorage => 109,
             Self::FencedMemberEpoch => 110,
             Self::UnreleasedInstanceId => 111,
             Self::UnsupportedAssignor => 112,
             Self::StaleMemberEpoch => 113,
+            Self::MismatchedEndpointType => 114,
+            Self::UnsupportedEndpointType => 115,
+            Self::UnknownControllerId => 116,
+            Self::UnknownSubscriptionId => 117,
+            Self::TelemetryTooLarge => 118,
+            Self::InvalidRegistration => 119,
+            Self::TransactionAbortable => 120,
+            Self::RebootstrapRequired => 124,
             Self::InvalidRegularExpression => 128,
             Self::Unknown(code) => code,
         }
@@ -605,6 +777,10 @@ impl ErrorCode {
                 | Self::PreferredLeaderNotAvailable
                 | Self::EligibleLeadersNotAvailable
                 | Self::UnstableOffsetCommit
+                | Self::ThrottlingQuotaExceeded
+                | Self::FencedMemberEpoch
+                | Self::StaleMemberEpoch
+                | Self::NewLeaderElected
         )
     }
 
@@ -678,6 +854,38 @@ mod tests {
         assert!(KrafkaError::timeout("test").is_retriable());
         assert!(KrafkaError::broker(ErrorCode::LeaderNotAvailable, "test").is_retriable());
         assert!(!KrafkaError::config("test").is_retriable());
+        assert!(
+            KrafkaError::network(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "refused",
+            ))
+            .is_retriable()
+        );
+    }
+
+    #[test]
+    fn test_network_error_source_preserved_through_arc() {
+        use std::error::Error;
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let krafka_err = KrafkaError::network(io_err);
+        // source() must return Some — the Arc<io::Error> is the source
+        let source = krafka_err.source().expect("source() must not be None");
+        assert!(source.to_string().contains("refused"));
+    }
+
+    #[test]
+    fn test_network_error_clone_preserves_source() {
+        use std::error::Error;
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let original = KrafkaError::network(io_err);
+        let cloned = original.clone();
+        // Both original and clone must have source()
+        assert!(original.source().is_some());
+        assert!(cloned.source().is_some());
+        assert_eq!(
+            original.source().unwrap().to_string(),
+            cloned.source().unwrap().to_string()
+        );
     }
 
     // ── R9.10: ErrorCode 56–88 from_i16 / to_i16 round-trip ──

@@ -31,6 +31,7 @@ A pure Rust, async-native Apache Kafka client designed for high performance, saf
 | 💯 **Transactions** | Exactly-once semantics |
 | ☁️ **Cloud-native** | AWS MSK support with IAM auth |
 | 🛡️ **Security hardened** | Secret zeroization, constant-time auth, decompression limits |
+| 🌐 **SOCKS5 proxy** | Route connections through SOCKS5 proxies (VPN/bastion) |
 
 ---
 
@@ -40,7 +41,7 @@ Add Krafka to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-krafka = "0.2"
+krafka = "0.4"
 tokio = { version = "1", features = ["full"] }
 ```
 

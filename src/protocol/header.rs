@@ -7,7 +7,7 @@ use bytes::{Buf, BufMut};
 
 use super::api::ApiKey;
 use super::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
-use crate::error::Result;
+use crate::error::{KrafkaError, Result};
 
 /// Request header for Kafka protocol.
 ///
@@ -45,15 +45,6 @@ impl RequestHeader {
         self
     }
 
-    /// Encode the header for header version 0.
-    #[inline]
-    pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
-        self.api_key.encode(buf);
-        self.api_version.encode(buf);
-        self.correlation_id.encode(buf);
-        Ok(())
-    }
-
     /// Encode the header for header version 1.
     #[inline]
     pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
@@ -68,14 +59,20 @@ impl RequestHeader {
     }
 
     /// Encode the header for header version 2 (flexible).
+    ///
+    /// Per the Kafka protocol spec, `ClientId` has `flexibleVersions: "none"`:
+    /// it is always serialized with the old-style two-byte length prefix, even
+    /// in header v2, so that older brokers can still parse ApiVersionsRequest
+    /// headers from newer clients.
     #[inline]
     pub fn encode_v2(&self, buf: &mut impl BufMut) -> Result<()> {
         self.api_key.encode(buf);
         self.api_version.encode(buf);
         self.correlation_id.encode(buf);
+        // ClientId uses standard (non-compact) encoding — see doc comment.
         match &self.client_id {
-            Some(client_id) => client_id.try_encode_compact(buf)?,
-            None => KafkaString::null().try_encode_compact(buf)?,
+            Some(client_id) => client_id.try_encode(buf)?,
+            None => KafkaString::null().try_encode(buf)?,
         }
         TaggedFields::default().try_encode(buf)?;
         Ok(())
@@ -96,12 +93,19 @@ impl RequestHeader {
     }
 
     /// Encode the header using the appropriate version.
+    ///
+    /// `header_version()` returns 1 (non-flexible) or 2 (flexible);
+    /// v0 is unused because all APIs use client_id in requests.
     pub fn encode(&self, buf: &mut impl BufMut) -> Result<()> {
         let header_version = Self::header_version(self.api_key, self.api_version);
         match header_version {
-            0 => self.encode_v0(buf)?,
             1 => self.encode_v1(buf)?,
-            _ => self.encode_v2(buf)?,
+            2 => self.encode_v2(buf)?,
+            v => {
+                return Err(KrafkaError::protocol(format!(
+                    "unsupported request header version {v}"
+                )));
+            }
         }
         Ok(())
     }
@@ -165,7 +169,10 @@ impl ResponseHeader {
         let header_version = Self::header_version(api_key, api_version);
         match header_version {
             0 => Self::decode_v0(buf),
-            _ => Self::decode_v1(buf),
+            1 => Self::decode_v1(buf),
+            v => Err(KrafkaError::protocol(format!(
+                "unsupported response header version {v}"
+            ))),
         }
     }
 }
@@ -177,15 +184,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_request_header_v0() {
+    fn test_request_header_v1_without_client_id() {
+        // Header v1 without client_id encodes api_key, api_version,
+        // correlation_id, then a null string (2-byte length = -1).
         let header = RequestHeader::new(ApiKey::ApiVersions, 0, 1);
         let mut buf = BytesMut::new();
-        header.encode_v0(&mut buf).unwrap();
+        header.encode_v1(&mut buf).unwrap();
 
         let mut buf = buf.freeze();
         assert_eq!(i16::decode(&mut buf).unwrap(), 18); // ApiVersions = 18
         assert_eq!(i16::decode(&mut buf).unwrap(), 0); // version
         assert_eq!(i32::decode(&mut buf).unwrap(), 1); // correlation_id
+        let client_id = KafkaString::decode(&mut buf).unwrap();
+        assert!(client_id.is_null());
     }
 
     #[test]
@@ -200,6 +211,44 @@ mod tests {
         assert_eq!(i32::decode(&mut buf).unwrap(), 42); // correlation_id
         let client_id = KafkaString::decode(&mut buf).unwrap();
         assert_eq!(client_id.as_str(), Some("test-client"));
+    }
+
+    /// Header v2 must use standard (2-byte i16) encoding for ClientId,
+    /// NOT compact (varint), because `flexibleVersions: "none"` in the spec.
+    #[test]
+    fn test_request_header_v2_client_id_uses_standard_encoding() {
+        let header = RequestHeader::new(ApiKey::Metadata, 12, 99).with_client_id("krafka-client");
+        let mut buf = BytesMut::new();
+        header.encode_v2(&mut buf).unwrap();
+
+        let mut buf = buf.freeze();
+        assert_eq!(i16::decode(&mut buf).unwrap(), 3); // Metadata = 3
+        assert_eq!(i16::decode(&mut buf).unwrap(), 12); // version
+        assert_eq!(i32::decode(&mut buf).unwrap(), 99); // correlation_id
+        // ClientId: standard 2-byte i16 length prefix, NOT compact varint.
+        let client_id = KafkaString::decode(&mut buf).unwrap();
+        assert_eq!(client_id.as_str(), Some("krafka-client"));
+        // Trailing tagged fields (empty = single 0x00 byte).
+        let tf = TaggedFields::decode(&mut buf).unwrap();
+        assert!(tf.0.is_empty());
+        assert!(!buf.has_remaining(), "no trailing bytes");
+    }
+
+    #[test]
+    fn test_request_header_v2_without_client_id() {
+        let header = RequestHeader::new(ApiKey::Metadata, 12, 1);
+        let mut buf = BytesMut::new();
+        header.encode_v2(&mut buf).unwrap();
+
+        let mut buf = buf.freeze();
+        assert_eq!(i16::decode(&mut buf).unwrap(), 3);
+        assert_eq!(i16::decode(&mut buf).unwrap(), 12);
+        assert_eq!(i32::decode(&mut buf).unwrap(), 1);
+        // Null ClientId: standard encoding = i16(-1).
+        let client_id = KafkaString::decode(&mut buf).unwrap();
+        assert!(client_id.is_null());
+        let _ = TaggedFields::decode(&mut buf).unwrap();
+        assert!(!buf.has_remaining());
     }
 
     #[test]

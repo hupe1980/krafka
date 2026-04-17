@@ -3,6 +3,8 @@
 use std::time::Duration;
 
 use crate::auth::AuthConfig;
+use crate::error::{KrafkaError, Result};
+use crate::metadata::MetadataRecoveryStrategy;
 use crate::protocol::Compression;
 
 /// Required acknowledgments for produce requests.
@@ -12,9 +14,9 @@ pub enum Acks {
     /// Don't wait for any acknowledgment.
     None,
     /// Wait for leader acknowledgment.
-    #[default]
     Leader,
     /// Wait for all in-sync replicas.
+    #[default]
     All,
 }
 
@@ -73,15 +75,34 @@ pub struct ProducerConfig {
     /// Max in-flight requests per connection.
     pub(crate) max_in_flight: usize,
     /// Enable idempotent producer.
-    pub(crate) enable_idempotence: bool,
+    ///
+    /// When `true` (the default, matching KIP-679 / Kafka 3.0+), the producer
+    /// obtains a Producer ID from the broker and tracks sequence numbers per
+    /// partition to guarantee exactly-once delivery within a session.
+    ///
+    /// Requires `acks = All` and `max_in_flight <= 5`.
+    pub(crate) idempotent: bool,
     /// Max block time when buffer is full.
     pub(crate) max_block: Duration,
     /// Buffer memory size.
     pub(crate) buffer_memory: usize,
     /// Metadata max age.
     pub(crate) metadata_max_age: Duration,
+    /// Metadata recovery strategy (KIP-899).
+    ///
+    /// When set to [`MetadataRecoveryStrategy::Rebootstrap`], the producer
+    /// falls back to bootstrap servers if metadata refresh fails for longer
+    /// than [`metadata_recovery_rebootstrap_trigger`](Self::metadata_recovery_rebootstrap_trigger).
+    pub(crate) metadata_recovery_strategy: MetadataRecoveryStrategy,
+    /// Duration after which failing metadata refreshes trigger a rebootstrap
+    /// (KIP-899). Only effective with
+    /// [`MetadataRecoveryStrategy::Rebootstrap`]. Default: 300 s.
+    pub(crate) metadata_recovery_rebootstrap_trigger: Duration,
     /// Authentication configuration (optional).
     pub(crate) auth: Option<AuthConfig>,
+    /// SOCKS5 proxy configuration (optional).
+    #[cfg(feature = "socks5")]
+    pub(crate) proxy: Option<crate::network::ProxyConfig>,
 }
 
 impl Default for ProducerConfig {
@@ -89,7 +110,7 @@ impl Default for ProducerConfig {
         Self {
             bootstrap_servers: String::new(),
             client_id: "krafka".to_string(),
-            acks: Acks::Leader,
+            acks: Acks::All,
             compression: Compression::None,
             batch_size: 16384,
             linger: Duration::from_millis(0),
@@ -97,11 +118,15 @@ impl Default for ProducerConfig {
             retries: 3,
             retry_backoff: Duration::from_millis(100),
             max_in_flight: 5,
-            enable_idempotence: false,
+            idempotent: true,
             max_block: Duration::from_secs(60),
             buffer_memory: 32 * 1024 * 1024, // 32 MB
             metadata_max_age: Duration::from_secs(300),
+            metadata_recovery_strategy: MetadataRecoveryStrategy::None,
+            metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             auth: None,
+            #[cfg(feature = "socks5")]
+            proxy: None,
         }
     }
 }
@@ -172,10 +197,10 @@ impl ProducerConfig {
         self.max_in_flight
     }
 
-    /// Returns whether idempotent producer is enabled.
+    /// Returns whether idempotent production is enabled.
     #[inline]
-    pub fn enable_idempotence(&self) -> bool {
-        self.enable_idempotence
+    pub fn idempotent(&self) -> bool {
+        self.idempotent
     }
 
     /// Returns the max block time when buffer is full.
@@ -196,10 +221,29 @@ impl ProducerConfig {
         self.metadata_max_age
     }
 
+    /// Returns the metadata recovery strategy (KIP-899).
+    #[inline]
+    pub fn metadata_recovery_strategy(&self) -> MetadataRecoveryStrategy {
+        self.metadata_recovery_strategy
+    }
+
+    /// Returns the rebootstrap trigger duration (KIP-899).
+    #[inline]
+    pub fn metadata_recovery_rebootstrap_trigger(&self) -> Duration {
+        self.metadata_recovery_rebootstrap_trigger
+    }
+
     /// Returns the authentication configuration, if set.
     #[inline]
     pub fn auth(&self) -> Option<&AuthConfig> {
         self.auth.as_ref()
+    }
+
+    /// Returns the SOCKS5 proxy configuration, if set.
+    #[cfg(feature = "socks5")]
+    #[inline]
+    pub fn proxy(&self) -> Option<&crate::network::ProxyConfig> {
+        self.proxy.as_ref()
     }
 }
 
@@ -255,6 +299,15 @@ impl ProducerConfigBuilder {
         self
     }
 
+    /// Set SOCKS5 proxy configuration.
+    ///
+    /// Routes all broker connections through the specified SOCKS5 proxy.
+    #[cfg(feature = "socks5")]
+    pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
+        self.config.proxy = Some(proxy);
+        self
+    }
+
     /// Set request timeout.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.config.request_timeout = timeout;
@@ -279,13 +332,16 @@ impl ProducerConfigBuilder {
         self
     }
 
-    /// Set whether to enable idempotent producer.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Use TransactionalProducer for idempotent/exactly-once semantics"
-    )]
-    pub fn enable_idempotence(mut self, enable: bool) -> Self {
-        self.config.enable_idempotence = enable;
+    /// Enable or disable idempotent production.
+    ///
+    /// Idempotent production is enabled by default (matching KIP-679 / Kafka 3.0+).
+    /// When enabled, the producer obtains a Producer ID from the broker and
+    /// attaches sequence numbers to every batch, allowing the broker to
+    /// de-duplicate retries.
+    ///
+    /// Requires `acks = All` and `max_in_flight <= 5`.
+    pub fn idempotent(mut self, enable: bool) -> Self {
+        self.config.idempotent = enable;
         self
     }
 
@@ -307,9 +363,63 @@ impl ProducerConfigBuilder {
         self
     }
 
+    /// Set the metadata recovery strategy (KIP-899).
+    pub fn metadata_recovery_strategy(mut self, strategy: MetadataRecoveryStrategy) -> Self {
+        self.config.metadata_recovery_strategy = strategy;
+        self
+    }
+
+    /// Set the rebootstrap trigger duration (KIP-899).
+    ///
+    /// Only effective when [`MetadataRecoveryStrategy::Rebootstrap`] is set.
+    pub fn metadata_recovery_rebootstrap_trigger(mut self, duration: Duration) -> Self {
+        self.config.metadata_recovery_rebootstrap_trigger = duration;
+        self
+    }
+
     /// Build the config.
-    pub fn build(self) -> ProducerConfig {
-        self.config
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration is invalid:
+    /// - `batch_size` must be >= 1
+    /// - `max_in_flight` must be >= 1
+    /// - Idempotent mode requires `acks = All` and `max_in_flight <= 5`
+    /// - `batch_size` must not exceed `buffer_memory` (when `buffer_memory > 0`)
+    pub fn build(self) -> Result<ProducerConfig> {
+        if self.config.batch_size == 0 {
+            return Err(KrafkaError::config(format!(
+                "batch_size must be >= 1 (got {})",
+                self.config.batch_size
+            )));
+        }
+        if self.config.max_in_flight == 0 {
+            return Err(KrafkaError::config(format!(
+                "max_in_flight must be >= 1 (got {})",
+                self.config.max_in_flight
+            )));
+        }
+        if self.config.idempotent {
+            if self.config.acks != Acks::All {
+                return Err(KrafkaError::config(format!(
+                    "idempotent producer requires acks = All (got {:?})",
+                    self.config.acks
+                )));
+            }
+            if self.config.max_in_flight > 5 {
+                return Err(KrafkaError::config(format!(
+                    "idempotent producer requires max_in_flight <= 5 (got {})",
+                    self.config.max_in_flight
+                )));
+            }
+        }
+        if self.config.buffer_memory > 0 && self.config.batch_size > self.config.buffer_memory {
+            return Err(KrafkaError::config(format!(
+                "batch_size must not exceed buffer_memory (got batch_size={}, buffer_memory={})",
+                self.config.batch_size, self.config.buffer_memory
+            )));
+        }
+        Ok(self.config)
     }
 }
 
@@ -334,7 +444,8 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = ProducerConfig::default();
-        assert_eq!(config.acks, Acks::Leader);
+        assert_eq!(config.acks, Acks::All);
+        assert!(config.idempotent);
         assert_eq!(config.compression, Compression::None);
         assert_eq!(config.batch_size, 16384);
         assert_eq!(config.retries, 3);
@@ -348,7 +459,8 @@ mod tests {
             .acks(Acks::All)
             .compression(Compression::Lz4)
             .batch_size(32768)
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(config.bootstrap_servers, "localhost:9092");
         assert_eq!(config.client_id, "test");
@@ -361,7 +473,8 @@ mod tests {
     fn test_config_builder_request_timeout() {
         let config = ProducerConfig::builder()
             .request_timeout(Duration::from_secs(60))
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             config.request_timeout,
             Duration::from_secs(60),
@@ -371,7 +484,12 @@ mod tests {
 
     #[test]
     fn test_config_builder_max_in_flight() {
-        let config = ProducerConfig::builder().max_in_flight(10).build();
+        // max_in_flight=10 requires idempotent=false
+        let config = ProducerConfig::builder()
+            .idempotent(false)
+            .max_in_flight(10)
+            .build()
+            .unwrap();
         assert_eq!(
             config.max_in_flight, 10,
             "max_in_flight should be set by builder"
@@ -382,7 +500,8 @@ mod tests {
     fn test_config_builder_metadata_max_age() {
         let config = ProducerConfig::builder()
             .metadata_max_age(Duration::from_secs(120))
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             config.metadata_max_age,
             Duration::from_secs(120),
@@ -412,5 +531,85 @@ mod tests {
         assert_eq!(Acks::from_i16(Acks::None.to_i16()), Acks::None);
         assert_eq!(Acks::from_i16(Acks::Leader.to_i16()), Acks::Leader);
         assert_eq!(Acks::from_i16(Acks::All.to_i16()), Acks::All);
+    }
+
+    #[cfg(feature = "socks5")]
+    #[test]
+    fn test_config_builder_proxy_round_trip() {
+        let config = ProducerConfig::builder()
+            .proxy(crate::network::ProxyConfig::new("proxy:1080"))
+            .build()
+            .unwrap();
+        let proxy = config.proxy().expect("proxy should be set");
+        assert_eq!(proxy.address(), "proxy:1080");
+    }
+
+    #[test]
+    fn test_config_default_recovery_strategy() {
+        let config = ProducerConfig::default();
+        assert_eq!(
+            config.metadata_recovery_strategy,
+            MetadataRecoveryStrategy::None,
+        );
+        assert_eq!(
+            config.metadata_recovery_rebootstrap_trigger,
+            Duration::from_secs(300),
+        );
+    }
+
+    #[test]
+    fn test_config_builder_recovery_strategy() {
+        let config = ProducerConfig::builder()
+            .metadata_recovery_strategy(MetadataRecoveryStrategy::Rebootstrap)
+            .metadata_recovery_rebootstrap_trigger(Duration::from_secs(120))
+            .build()
+            .unwrap();
+        assert_eq!(
+            config.metadata_recovery_strategy(),
+            MetadataRecoveryStrategy::Rebootstrap,
+        );
+        assert_eq!(
+            config.metadata_recovery_rebootstrap_trigger(),
+            Duration::from_secs(120),
+        );
+    }
+
+    #[test]
+    fn test_config_builder_rejects_zero_batch_size() {
+        let err = ProducerConfig::builder().batch_size(0).build();
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_config_builder_rejects_zero_max_in_flight() {
+        let err = ProducerConfig::builder().max_in_flight(0).build();
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_config_builder_rejects_idempotent_with_acks_leader() {
+        let err = ProducerConfig::builder()
+            .idempotent(true)
+            .acks(Acks::Leader)
+            .build();
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_config_builder_rejects_idempotent_with_high_in_flight() {
+        let err = ProducerConfig::builder()
+            .idempotent(true)
+            .max_in_flight(6)
+            .build();
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_config_builder_rejects_batch_exceeding_buffer() {
+        let err = ProducerConfig::builder()
+            .batch_size(1024)
+            .buffer_memory(512)
+            .build();
+        assert!(err.is_err());
     }
 }

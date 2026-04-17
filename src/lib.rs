@@ -37,7 +37,7 @@
 //! for i in 0..10 {
 //!     let producer = producer.clone();
 //!     tokio::spawn(async move {
-//!         producer.send("topic", None, b"message").await.ok();
+//!         let _ = producer.send("topic", None, b"message").await;
 //!     });
 //! }
 //! # Ok(())
@@ -82,10 +82,33 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! ## Cargo Features
+//!
+//! | Feature | Default | Description |
+//! |---------|---------|-------------|
+//! | `compression` | **yes** | Enables all compression codecs (`gzip` + `snappy` + `lz4` + `zstd`). |
+//! | `gzip` | via `compression` | Gzip record batch compression via `flate2`. |
+//! | `snappy` | via `compression` | Snappy compression via `snap`. |
+//! | `lz4` | via `compression` | LZ4 compression via `lz4_flex`. |
+//! | `zstd` | via `compression` | Zstd compression via `zstd` (requires C toolchain). |
+//! | `aws-msk` | no | AWS MSK IAM authentication with SDK credential chain. |
+//! | `schema-registry` | no | Confluent Schema Registry HTTP client. |
+//! | `aws-glue-schema-registry` | no | AWS Glue Schema Registry SDK client. |
+//! | `socks5` | no | SOCKS5 proxy support via `tokio-socks`. |
+//! | `danger-insecure-tls` | no | Allow disabling TLS certificate verification (MITM risk!). |
+//!
+//! To disable the default compression codecs and pick only what you need:
+//!
+//! ```toml
+//! [dependencies]
+//! krafka = { version = "0.4", default-features = false, features = ["lz4"] }
+//! ```
 
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 #![deny(unsafe_code)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod admin;
 pub mod auth;
@@ -98,10 +121,17 @@ pub mod network;
 pub mod producer;
 pub mod protocol;
 pub mod schema_registry;
+#[cfg(feature = "unstable-protocol")]
+#[cfg_attr(docsrs, doc(cfg(feature = "unstable-protocol")))]
+pub mod share_consumer;
+#[cfg(feature = "telemetry")]
+#[cfg_attr(docsrs, doc(cfg(feature = "telemetry")))]
+pub mod telemetry;
 pub mod tracing_ext;
 pub mod util;
 
 pub use error::{KrafkaError, Result};
+pub use metadata::MetadataRecoveryStrategy;
 
 /// Kafka protocol API version.
 pub type ApiVersion = i16;

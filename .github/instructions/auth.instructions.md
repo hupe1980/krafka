@@ -27,7 +27,7 @@ States: `Initial → WaitingServerFirst → WaitingClientFinal → WaitingServer
 
 - `rustls` only (no OpenSSL / native-tls).
 - Insecure mode (`verify_server_cert = false`) requires the `danger-insecure-tls` crate feature. Without the feature, it is **rejected at runtime**. With the feature, it emits a `warn!` log and uses `NoServerCertVerifier` via `dangerous()` builder — intended only for local development. For production, use `with_ca_cert()`.
-- File I/O for certs: use `load_certs_async()` / `spawn_blocking` in async contexts; sync variants only in tests.
+- File I/O for certs: use `build_tls_config()` (async, wraps sync impl in a single `spawn_blocking`). The sync `build_tls_config_sync` is private and used only in tests. `ConnectionConfig::init_tls()` caches the built `TlsConnector` so cert files are read once, not per-reconnection.
 - SNI hostname extraction must handle IPv6 brackets (`[::1]:9092`).
 
 ## General Auth Patterns

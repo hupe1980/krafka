@@ -3,7 +3,7 @@
 [![CI](https://github.com/hupe1980/krafka/actions/workflows/ci.yml/badge.svg)](https://github.com/hupe1980/krafka/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/krafka.svg)](https://crates.io/crates/krafka)
 [![Documentation](https://docs.rs/krafka/badge.svg)](https://docs.rs/krafka)
-[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](https://github.com/rust-lang/rust/releases/tag/1.85.0)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://github.com/rust-lang/rust/releases/tag/1.88.0)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A pure Rust, async-native Apache Kafka client designed for high performance, safety, and ease of use.
@@ -24,17 +24,19 @@ A pure Rust, async-native Apache Kafka client designed for high performance, saf
 - 🔄 **Built-in retry**: Exponential backoff with metadata refresh on leader changes
 - 📊 **Metrics**: Lock-free counters/gauges/latency wired into all hot paths
 - 🧪 **Fuzz tested**: cargo-fuzz targets for protocol arrays, record batches, and response decoders
+
+> **Minimum Broker Version:** Krafka requires **Apache Kafka 3.9+**. Protocol versions older than the Kafka 3.9 baseline have been removed.
 ## 🚀 Quick Start
 
 Add Krafka to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-krafka = "0.3"
+krafka = "0.4"
 tokio = { version = "1", features = ["full"] }
 
 # For AWS MSK IAM authentication with full SDK support:
-# krafka = { version = "0.3", features = ["aws-msk"] }
+# krafka = { version = "0.4", features = ["aws-msk"] }
 ```
 
 ### Producer
@@ -210,7 +212,7 @@ let admin = AdminClient::builder()
 
 ## 🗜️ Compression
 
-Krafka supports all Kafka compression codecs:
+Krafka supports all Kafka compression codecs, individually feature-gated:
 
 ```rust
 use krafka::producer::Producer;
@@ -223,12 +225,18 @@ let producer = Producer::builder()
     .await?;
 ```
 
-| Codec | Crate | Characteristics |
-|-------|-------|-----------------|
-| `Compression::Gzip` | flate2 | Best ratio, slower |
-| `Compression::Snappy` | snap | Good balance |
-| `Compression::Lz4` | lz4_flex | Fastest |
-| `Compression::Zstd` | zstd | Best modern choice |
+| Codec | Cargo Feature | Crate | Characteristics |
+|-------|---------------|-------|-----------------|
+| `Compression::Gzip` | `gzip` | flate2 | Best ratio, slower |
+| `Compression::Snappy` | `snappy` | snap | Good balance |
+| `Compression::Lz4` | `lz4` | lz4_flex | Fastest |
+| `Compression::Zstd` | `zstd` | zstd | Best modern choice (requires C toolchain) |
+
+All codecs are enabled by default via the `compression` feature. To select only what you need:
+
+```toml
+krafka = { version = "0.4", default-features = false, features = ["lz4", "snappy"] }
+```
 
 ## ⚡ Performance Tuning
 

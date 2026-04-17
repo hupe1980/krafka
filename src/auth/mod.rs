@@ -20,14 +20,101 @@ pub mod tls;
 
 pub use msk_iam::MskIamAuthenticator;
 pub use oauthbearer::{OAuthBearerToken, OAuthBearerTokenProvider, OAuthBearerTokenProviderHandle};
-pub use scram::{ScramClient, ScramMechanism, ScramState};
+pub use scram::{
+    ChannelBinding, MAX_PBKDF2_ITERATIONS, MIN_PBKDF2_ITERATIONS, ScramClient, ScramMechanism,
+    ScramState,
+};
 pub use tls::{
-    MaybeSecureStream, build_tls_config, build_tls_config_async, connect_tls, create_tls_connector,
-    create_tls_connector_async, load_certs_async, load_private_key_async,
+    MaybeSecureStream, build_tls_config, build_tls_connector, connect_tls,
+    extract_tls_server_end_point,
 };
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+/// Provider for dynamically fetching AWS MSK IAM credentials.
+///
+/// Implement this trait to enable automatic credential refresh for MSK IAM
+/// authentication. The provider is called on every new broker connection
+/// (including automatic reconnections), ensuring credentials are always fresh.
+///
+/// This is essential when using temporary credentials (STS, IRSA, ECS task
+/// role, EC2 instance profile) that expire and need periodic renewal.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use krafka::auth::{AwsMskIamCredentialProvider, AwsMskIamCredentials};
+/// use krafka::error::Result;
+/// use std::future::Future;
+/// use std::pin::Pin;
+///
+/// struct MyCredentialProvider {
+///     region: String,
+/// }
+///
+/// impl AwsMskIamCredentialProvider for MyCredentialProvider {
+///     fn provide_credentials(
+///         &self,
+///     ) -> Pin<Box<dyn Future<Output = Result<AwsMskIamCredentials>> + Send + '_>> {
+///         let region = self.region.clone();
+///         Box::pin(async move {
+///             AwsMskIamCredentials::from_default_chain(region).await
+///         })
+///     }
+/// }
+/// ```
+pub trait AwsMskIamCredentialProvider: Send + Sync {
+    /// Fetch fresh AWS credentials for MSK IAM authentication.
+    ///
+    /// Called on every new broker connection. Implementations should handle
+    /// caching and refresh internally if desired.
+    fn provide_credentials(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = crate::error::Result<AwsMskIamCredentials>> + Send + '_>>;
+}
+
+/// Blanket impl: any `Fn() -> Future<Output = Result<AwsMskIamCredentials>>` is a provider.
+impl<F, Fut> AwsMskIamCredentialProvider for F
+where
+    F: Fn() -> Fut + Send + Sync,
+    Fut: Future<Output = crate::error::Result<AwsMskIamCredentials>> + Send + 'static,
+{
+    fn provide_credentials(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = crate::error::Result<AwsMskIamCredentials>> + Send + '_>> {
+        Box::pin(self())
+    }
+}
+
+/// Handle wrapping an [`Arc<dyn AwsMskIamCredentialProvider>`].
+///
+/// Provides `Clone` and `Debug` so it can be stored in
+/// [`AuthConfig`] without requiring implementors to derive those traits.
+#[derive(Clone)]
+pub struct AwsMskIamCredentialProviderHandle(Arc<dyn AwsMskIamCredentialProvider>);
+
+impl AwsMskIamCredentialProviderHandle {
+    /// Create a new handle wrapping the given provider.
+    pub fn new(provider: impl AwsMskIamCredentialProvider + 'static) -> Self {
+        Self(Arc::new(provider))
+    }
+
+    /// Fetch fresh credentials from the wrapped provider.
+    pub async fn provide_credentials(&self) -> crate::error::Result<AwsMskIamCredentials> {
+        self.0.provide_credentials().await
+    }
+}
+
+impl fmt::Debug for AwsMskIamCredentialProviderHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[AwsMskIamCredentialProvider]")
+    }
+}
 
 /// Security protocol for Kafka connections.
 #[non_exhaustive]
@@ -99,11 +186,23 @@ pub struct PlainCredentials {
 
 impl PlainCredentials {
     /// Create new PLAIN credentials.
-    pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
-        Self {
-            username: username.into(),
-            password: password.into(),
+    ///
+    /// Returns an error if username or password contains a null byte (`\0`),
+    /// which is used as the delimiter in the SASL PLAIN wire format.
+    pub fn new(username: impl Into<String>, password: impl Into<String>) -> crate::Result<Self> {
+        let username = username.into();
+        let password = password.into();
+        if username.contains('\0') {
+            return Err(crate::error::KrafkaError::config(
+                "PLAIN username must not contain null bytes",
+            ));
         }
+        if password.contains('\0') {
+            return Err(crate::error::KrafkaError::config(
+                "PLAIN password must not contain null bytes",
+            ));
+        }
+        Ok(Self { username, password })
     }
 
     /// Build the SASL PLAIN authentication message.
@@ -317,10 +416,17 @@ pub struct TlsConfig {
     pub(crate) client_cert_path: Option<String>,
     /// Path to client private key file.
     pub(crate) client_key_path: Option<String>,
+    /// Whether to load root certificates from the platform trust store.
+    pub(crate) use_native_roots: bool,
     /// Whether to verify server certificates (defaults to `true`).
     pub(crate) verify_server_cert: bool,
     /// Server name indication (SNI) hostname.
     pub(crate) sni_hostname: Option<String>,
+    /// ALPN protocol names to advertise during the TLS handshake.
+    ///
+    /// Empty by default. Use [`with_alpn_protocols()`](Self::with_alpn_protocols)
+    /// or the convenience [`with_kafka_alpn()`](Self::with_kafka_alpn) to set.
+    pub(crate) alpn_protocols: Vec<Vec<u8>>,
 }
 
 impl Default for TlsConfig {
@@ -330,8 +436,10 @@ impl Default for TlsConfig {
             ca_cert_path: None,
             client_cert_path: None,
             client_key_path: None,
+            use_native_roots: false,
             verify_server_cert: true,
             sni_hostname: None,
+            alpn_protocols: Vec::new(),
         }
     }
 }
@@ -353,6 +461,7 @@ impl TlsConfig {
     ///
     /// Requires the `danger-insecure-tls` crate feature.
     #[cfg(feature = "danger-insecure-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "danger-insecure-tls")))]
     pub fn insecure() -> Self {
         Self {
             verify_server_cert: false,
@@ -360,9 +469,30 @@ impl TlsConfig {
         }
     }
 
-    /// Set the CA certificate path.
+    /// Set the CA certificate path (pinning).
+    ///
+    /// When set, **only** the PEM-encoded certificates at this path are
+    /// trusted — the compiled-in WebPKI (Mozilla) roots are **not** loaded.
+    /// This matches the pinning semantics of the Java Kafka client
+    /// (`ssl.truststore.location`) and librdkafka (`ssl.ca.location`).
+    ///
+    /// To trust both platform roots **and** the custom CA, combine with
+    /// [`with_native_roots()`](Self::with_native_roots).
     pub fn with_ca_cert(mut self, path: impl Into<String>) -> Self {
         self.ca_cert_path = Some(path.into());
+        self
+    }
+
+    /// Load root certificates from the platform trust store.
+    ///
+    /// Requires the `native-tls-roots` crate feature. When used alone, native
+    /// trust anchors replace the default WebPKI roots. When combined with
+    /// [`with_ca_cert()`](Self::with_ca_cert), native roots are loaded first
+    /// and the explicit CA certificates are added on top.
+    #[cfg(feature = "native-tls-roots")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls-roots")))]
+    pub fn with_native_roots(mut self) -> Self {
+        self.use_native_roots = true;
         self
     }
 
@@ -398,6 +528,11 @@ impl TlsConfig {
         self.client_key_path.as_deref()
     }
 
+    /// Returns whether platform-native root certificates are enabled.
+    pub fn use_native_roots(&self) -> bool {
+        self.use_native_roots
+    }
+
     /// Returns whether server certificates are verified.
     pub fn verify_server_cert(&self) -> bool {
         self.verify_server_cert
@@ -406,6 +541,27 @@ impl TlsConfig {
     /// Returns the SNI hostname, if set.
     pub fn sni_hostname(&self) -> Option<&str> {
         self.sni_hostname.as_deref()
+    }
+
+    /// Set ALPN protocol names to advertise during the TLS handshake.
+    ///
+    /// Some environments (e.g., service meshes, load balancers) require ALPN
+    /// for protocol multiplexing. Pass protocol names as byte slices.
+    pub fn with_alpn_protocols(mut self, protocols: Vec<Vec<u8>>) -> Self {
+        self.alpn_protocols = protocols;
+        self
+    }
+
+    /// Convenience method to advertise `"kafka"` as the ALPN protocol.
+    ///
+    /// Equivalent to `with_alpn_protocols(vec![b"kafka".to_vec()])`.
+    pub fn with_kafka_alpn(self) -> Self {
+        self.with_alpn_protocols(vec![b"kafka".to_vec()])
+    }
+
+    /// Returns the configured ALPN protocols.
+    pub fn alpn_protocols(&self) -> &[Vec<u8>] {
+        &self.alpn_protocols
     }
 }
 
@@ -425,6 +581,8 @@ pub struct AuthConfig {
     pub(crate) scram_credentials: Option<ScramCredentials>,
     /// AWS MSK IAM credentials.
     pub(crate) aws_msk_iam_credentials: Option<AwsMskIamCredentials>,
+    /// AWS MSK IAM credential provider for automatic credential refresh.
+    pub(crate) aws_msk_iam_credential_provider: Option<AwsMskIamCredentialProviderHandle>,
     /// OAUTHBEARER token.
     pub(crate) oauthbearer_token: Option<OAuthBearerToken>,
     /// OAUTHBEARER token provider for automatic token refresh.
@@ -452,13 +610,16 @@ impl AuthConfig {
     }
 
     /// Create a SASL/PLAIN configuration.
-    pub fn sasl_plain(username: impl Into<String>, password: impl Into<String>) -> Self {
-        Self {
+    pub fn sasl_plain(
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> crate::Result<Self> {
+        Ok(Self {
             security_protocol: SecurityProtocol::SaslPlaintext,
             sasl_mechanism: Some(SaslMechanism::Plain),
-            plain_credentials: Some(PlainCredentials::new(username, password)),
+            plain_credentials: Some(PlainCredentials::new(username, password)?),
             ..Default::default()
-        }
+        })
     }
 
     /// Create a SASL/PLAIN over TLS configuration.
@@ -466,14 +627,14 @@ impl AuthConfig {
         username: impl Into<String>,
         password: impl Into<String>,
         tls_config: TlsConfig,
-    ) -> Self {
-        Self {
+    ) -> crate::Result<Self> {
+        Ok(Self {
             security_protocol: SecurityProtocol::SaslSsl,
             sasl_mechanism: Some(SaslMechanism::Plain),
-            plain_credentials: Some(PlainCredentials::new(username, password)),
+            plain_credentials: Some(PlainCredentials::new(username, password)?),
             tls_config: Some(tls_config),
             ..Default::default()
-        }
+        })
     }
 
     /// Create a SASL/SCRAM-SHA-256 configuration.
@@ -524,6 +685,32 @@ impl AuthConfig {
             security_protocol: SecurityProtocol::SaslSsl,
             sasl_mechanism: Some(SaslMechanism::AwsMskIam),
             aws_msk_iam_credentials: Some(credentials),
+            tls_config: Some(TlsConfig::new()),
+            ..Default::default()
+        }
+    }
+
+    /// Create an AWS MSK IAM configuration with a credential provider.
+    ///
+    /// The provider is called on every new broker connection (including
+    /// reconnections), ensuring credentials are always fresh. This is the
+    /// recommended approach for temporary credentials (STS, IRSA, ECS task
+    /// role, EC2 instance profile).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use krafka::auth::{AuthConfig, AwsMskIamCredentials};
+    ///
+    /// let config = AuthConfig::aws_msk_iam_provider(|| async {
+    ///     AwsMskIamCredentials::from_default_chain("us-east-1").await
+    /// });
+    /// ```
+    pub fn aws_msk_iam_provider(provider: impl AwsMskIamCredentialProvider + 'static) -> Self {
+        Self {
+            security_protocol: SecurityProtocol::SaslSsl,
+            sasl_mechanism: Some(SaslMechanism::AwsMskIam),
+            aws_msk_iam_credential_provider: Some(AwsMskIamCredentialProviderHandle::new(provider)),
             tls_config: Some(TlsConfig::new()),
             ..Default::default()
         }
@@ -658,6 +845,33 @@ impl AuthConfig {
         }
     }
 
+    /// If this config has an MSK IAM credential provider, resolve fresh
+    /// credentials and return a new `AuthConfig` with the credentials set
+    /// and the provider cleared. Returns `None` if no provider is configured
+    /// (the caller should use `self` as-is).
+    ///
+    /// This must be called before passing a provider-based config to
+    /// [`SaslAuthenticator::new_msk_iam()`](crate::network::SaslAuthenticator::new_msk_iam),
+    /// which requires resolved credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provider fails to fetch credentials.
+    pub async fn resolve_msk_iam_provider(&self) -> crate::error::Result<Option<AuthConfig>> {
+        if self.sasl_mechanism == Some(SaslMechanism::AwsMskIam)
+            && let Some(ref provider) = self.aws_msk_iam_credential_provider
+        {
+            let credentials = provider.provide_credentials().await?;
+            Ok(Some(AuthConfig {
+                aws_msk_iam_credentials: Some(credentials),
+                aws_msk_iam_credential_provider: None,
+                ..self.clone()
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Check if TLS is required.
     pub fn requires_tls(&self) -> bool {
         matches!(
@@ -697,6 +911,11 @@ impl AuthConfig {
     /// Returns the AWS MSK IAM credentials, if set.
     pub fn aws_msk_iam_credentials(&self) -> Option<&AwsMskIamCredentials> {
         self.aws_msk_iam_credentials.as_ref()
+    }
+
+    /// Returns the AWS MSK IAM credential provider handle, if set.
+    pub fn aws_msk_iam_credential_provider(&self) -> Option<&AwsMskIamCredentialProviderHandle> {
+        self.aws_msk_iam_credential_provider.as_ref()
     }
 
     /// Returns the OAUTHBEARER token, if set.
@@ -739,7 +958,7 @@ mod tests {
 
     #[test]
     fn test_plain_credentials() {
-        let creds = PlainCredentials::new("user", "pass");
+        let creds = PlainCredentials::new("user", "pass").unwrap();
         let auth_bytes = creds.to_auth_bytes();
         assert_eq!(&*auth_bytes, b"\0user\0pass");
     }
@@ -754,7 +973,7 @@ mod tests {
 
     #[test]
     fn test_auth_config_sasl_plain() {
-        let config = AuthConfig::sasl_plain("user", "pass");
+        let config = AuthConfig::sasl_plain("user", "pass").unwrap();
         assert_eq!(config.security_protocol, SecurityProtocol::SaslPlaintext);
         assert_eq!(config.sasl_mechanism, Some(SaslMechanism::Plain));
         assert!(config.plain_credentials.is_some());
@@ -773,12 +992,15 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native-tls-roots")]
     fn test_tls_config() {
         let config = TlsConfig::new()
             .with_ca_cert("/path/to/ca.pem")
-            .with_client_cert("/path/to/client.pem", "/path/to/client.key");
+            .with_client_cert("/path/to/client.pem", "/path/to/client.key")
+            .with_native_roots();
 
         assert!(config.verify_server_cert);
+        assert!(config.use_native_roots());
         assert_eq!(config.ca_cert_path, Some("/path/to/ca.pem".to_string()));
         assert_eq!(
             config.client_cert_path,
@@ -788,7 +1010,7 @@ mod tests {
 
     #[test]
     fn test_credentials_debug_redacts_password() {
-        let creds = PlainCredentials::new("user", "secret");
+        let creds = PlainCredentials::new("user", "secret").unwrap();
         let debug_str = format!("{creds:?}");
         assert!(debug_str.contains("user"));
         assert!(debug_str.contains("[REDACTED]"));
@@ -944,7 +1166,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_provider_to_token_returns_none_for_non_oauth() {
-        let config = AuthConfig::sasl_plain("user", "pass");
+        let config = AuthConfig::sasl_plain("user", "pass").unwrap();
         assert!(config.resolve_provider_to_token().await.unwrap().is_none());
     }
 
@@ -955,5 +1177,69 @@ mod tests {
         });
         let err = config.resolve_provider_to_token().await.unwrap_err();
         assert!(err.to_string().contains("oauth server down"));
+    }
+
+    #[test]
+    fn test_auth_config_aws_msk_iam_provider() {
+        let config = AuthConfig::aws_msk_iam_provider(|| async {
+            Ok(AwsMskIamCredentials::new("AKID", "secret", "us-east-1"))
+        });
+        assert_eq!(config.security_protocol, SecurityProtocol::SaslSsl);
+        assert_eq!(config.sasl_mechanism, Some(SaslMechanism::AwsMskIam));
+        assert!(config.aws_msk_iam_credential_provider.is_some());
+        assert!(config.aws_msk_iam_credentials.is_none());
+        assert!(config.tls_config.is_some());
+    }
+
+    #[test]
+    fn test_msk_iam_provider_debug_no_secrets() {
+        let config = AuthConfig::aws_msk_iam_provider(|| async {
+            Ok(AwsMskIamCredentials::new("AKID", "secret", "us-east-1"))
+        });
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("secret"));
+        assert!(debug.contains("[AwsMskIamCredentialProvider]"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_msk_iam_provider_calls_provider() {
+        let config = AuthConfig::aws_msk_iam_provider(|| async {
+            Ok(AwsMskIamCredentials::new("AKID", "secret", "us-east-1"))
+        });
+        let resolved = config.resolve_msk_iam_provider().await.unwrap().unwrap();
+
+        assert!(resolved.aws_msk_iam_credentials.is_some());
+        assert_eq!(
+            resolved.aws_msk_iam_credentials.as_ref().unwrap().region,
+            "us-east-1"
+        );
+        // Provider is cleared
+        assert!(resolved.aws_msk_iam_credential_provider.is_none());
+        // Mechanism and protocol are preserved
+        assert_eq!(resolved.sasl_mechanism, Some(SaslMechanism::AwsMskIam));
+        assert_eq!(resolved.security_protocol, SecurityProtocol::SaslSsl);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_msk_iam_provider_returns_none_for_static() {
+        let config = AuthConfig::aws_msk_iam("AKID", "secret", "us-east-1");
+        assert!(config.resolve_msk_iam_provider().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_msk_iam_provider_returns_none_for_non_msk() {
+        let config = AuthConfig::sasl_plain("user", "pass").unwrap();
+        assert!(config.resolve_msk_iam_provider().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_msk_iam_provider_propagates_error() {
+        let config = AuthConfig::aws_msk_iam_provider(|| async {
+            Err(crate::error::KrafkaError::auth(
+                "AWS credential fetch failed",
+            ))
+        });
+        let err = config.resolve_msk_iam_provider().await.unwrap_err();
+        assert!(err.to_string().contains("AWS credential fetch failed"));
     }
 }

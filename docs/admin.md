@@ -14,7 +14,8 @@ This guide covers administrative operations using the Krafka AdminClient.
 The AdminClient provides cluster administration capabilities:
 
 - Topic management (create, delete, describe, list)
-- Consumer group management (describe, list)
+- Consumer group management (describe, list, KIP-848 describe)
+- Topic partition details (paginated describe with ELR)
 - Record deletion (delete records before an offset)
 - Leader epoch queries (detect log truncation)
 - Cluster information
@@ -22,6 +23,13 @@ The AdminClient provides cluster administration capabilities:
 - ACL management
 - Delegation token management (create, describe, renew, expire)
 - Client quota management (describe, alter)
+- Cluster feature versioning (describe, update — KIP-584)
+- Log directory inspection (describe log dirs with volume capacity)
+- Move replicas between log directories
+- Delete consumer group committed offsets
+- SCRAM credential management (describe, alter — KIP-554)
+- Transaction debugging (describe producers, describe/list transactions — KIP-664)
+- Client metrics resource discovery (KIP-714)
 
 ### API Version Negotiation
 
@@ -217,10 +225,12 @@ match result.error {
 
 ## Configuration Management
 
-### Describing Topic Configuration
+### Describing Configuration
 
 ```rust
-let configs = admin.describe_topic_config("my-topic").await?;
+use krafka::admin::DescribeConfigsRequest;
+
+let configs = admin.describe_configs(DescribeConfigsRequest::for_topic("my-topic")).await?;
 
 println!("Topic configuration:");
 for config in configs {
@@ -238,7 +248,7 @@ for config in configs {
 ### Describing Broker Configuration
 
 ```rust
-let configs = admin.describe_broker_config(0).await?;
+let configs = admin.describe_configs(DescribeConfigsRequest::for_broker(0)).await?;
 
 println!("Broker 0 configuration:");
 for config in configs.iter().filter(|c| !c.is_default) {
@@ -271,14 +281,13 @@ match result.error {
 let cluster = admin.describe_cluster().await?;
 
 println!("Cluster info:");
-if let Some(controller) = cluster.controller_id {
-    println!("  Controller: {}", controller);
-}
+println!("  Cluster ID: {}", cluster.cluster_id);
+println!("  Controller: {}", cluster.controller_id);
 println!("  Brokers:");
 for broker in cluster.brokers {
     println!(
         "    - {} at {}:{} (rack: {:?})",
-        broker.id, broker.host(), broker.port(), broker.rack()
+        broker.broker_id, broker.host, broker.port, broker.rack
     );
 }
 ```
@@ -521,21 +530,29 @@ for (i, fr) in result.filter_results.iter().enumerate() {
 
 ### Describing Consumer Groups
 
-Get detailed information about one or more consumer groups, including their state, members, and assignment protocol. The request is automatically routed to each group's coordinator broker via FindCoordinator:
+Get detailed information about one or more consumer groups. The method
+automatically detects each group's type (classic or KIP-848 consumer protocol)
+and dispatches to the appropriate API (Key 15 or Key 69). The request is routed
+to each group's coordinator broker via FindCoordinator:
 
 ```rust
 let descriptions = admin
-    .describe_groups(vec!["my-group".to_string(), "other-group".to_string()])
+    .describe_consumer_groups(vec!["my-group".to_string(), "other-group".to_string()])
     .await?;
 
 for group in &descriptions {
-    println!("Group: {} (state: {})", group.group_id, group.state);
-    println!("  Protocol: {} / {}", group.protocol_type, group.protocol);
+    println!("Group: {} (type: {}, state: {})", group.group_id, group.group_type, group.state);
+    if let Some(assignor) = &group.assignor {
+        println!("  Assignor: {}", assignor);
+    }
+    if let Some(epoch) = group.group_epoch {
+        println!("  Epoch: {}", epoch);
+    }
     for member in &group.members {
         println!(
             "    Member: {} (client: {}, host: {}, instance: {:?})",
             member.member_id, member.client_id, member.client_host,
-            member.group_instance_id
+            member.instance_id
         );
     }
     if let Some(error) = &group.error {
@@ -543,6 +560,11 @@ for group in &descriptions {
     }
 }
 ```
+
+> **Note:** Classic-protocol groups return `protocol_type` and `assignor` but
+> no epoch or assignment details. KIP-848 groups return `group_epoch`,
+> `assignment_epoch`, per-member subscriptions, and topic-UUID-based
+> current/target assignments.
 
 ### Listing Consumer Groups
 
@@ -553,11 +575,53 @@ let groups = admin.list_consumer_groups().await?;
 
 println!("Consumer groups:");
 for group in &groups {
-    println!("  {} (protocol: {})", group.group_id, group.protocol_type);
+    println!("  {} (type: {:?}, protocol: {})", group.group_id, group.group_type, group.protocol_type);
 }
 ```
 
 > **Note:** `list_consumer_groups()` queries all brokers in the cluster and deduplicates results, since consumer groups are managed by their respective group coordinators.
+
+## Topic Partition Details
+
+### Describing Topic Partitions
+
+Use `describe_topic_partitions()` for paginated, detailed partition information
+including ELR (eligible leader replicas) from KIP-966:
+
+```rust
+let result = admin
+    .describe_topic_partitions(vec!["my-topic".to_string()])
+    .await?;
+
+for topic in &result.topics {
+    println!(
+        "Topic: {} (internal: {}, id: {:?})",
+        topic.name.as_deref().unwrap_or("?"),
+        topic.is_internal,
+        topic.topic_id
+    );
+    for p in &topic.partitions {
+        println!(
+            "  Partition {}: leader={}, epoch={}, replicas={:?}, isr={:?}",
+            p.partition_index, p.leader_id, p.leader_epoch,
+            p.replica_nodes, p.isr_nodes
+        );
+        if let Some(elr) = &p.eligible_leader_replicas {
+            println!("    ELR: {:?}", elr);
+        }
+        if let Some(last_elr) = &p.last_known_elr {
+            println!("    Last known ELR: {:?}", last_elr);
+        }
+        if !p.offline_replicas.is_empty() {
+            println!("    Offline: {:?}", p.offline_replicas);
+        }
+    }
+}
+```
+
+> **Note:** The DescribeTopicPartitions API (Key 75) is available on Kafka 4.0+.
+> It automatically handles pagination for topics with many partitions (default
+> limit 2000 partitions per page). All pages are collected into a single result.
 
 ## Record Deletion
 
@@ -718,6 +782,15 @@ let result = admin
     .await?;
 ```
 
+### Protocol Versions
+
+| API | Versions | Changes |
+|-----|----------|---------|
+| CreateDelegationToken | v1–v3 | v1 baseline (v0 removed in Kafka 4.0), v2 flexible encoding, v3 owner principal override |
+| RenewDelegationToken | v1–v2 | v1 baseline, v2 flexible encoding |
+| ExpireDelegationToken | v1–v2 | v1 baseline, v2 flexible encoding |
+| DescribeDelegationToken | v1–v3 | v1 baseline, v2 flexible encoding, v3 token requester fields |
+
 ## Client Quotas
 
 Client quotas control the resource usage of clients (producer/consumer byte
@@ -788,6 +861,488 @@ let results = admin
     )
     .await?;
 ```
+
+## Feature Versioning (KIP-584)
+
+Kafka 2.7+ supports cluster-wide feature flags that control the finalized
+version range for features like `metadata.version`. Use `describe_features` to
+discover what the cluster supports and `update_features` to upgrade, downgrade,
+or delete finalized feature levels.
+
+### Describing Features
+
+```rust
+let features = admin.describe_features().await?;
+println!("Epoch: {}", features.finalized_features_epoch);
+for f in &features.supported_features {
+    println!("supported: {} [{}, {}]", f.name, f.min_version, f.max_version);
+}
+for f in &features.finalized_features {
+    println!("finalized: {} [{}, {}]", f.name, f.min_version_level, f.max_version_level);
+}
+```
+
+### Updating Features
+
+```rust
+use krafka::protocol::messages::FeatureUpdateKey;
+
+// Upgrade metadata.version to level 17
+let results = admin
+    .update_features(
+        vec![FeatureUpdateKey::upgrade("metadata.version", 17)],
+        false, // validate_only
+    )
+    .await?;
+
+for r in &results.results {
+    match &r.error {
+        None => println!("{}: ok", r.feature),
+        Some(e) => println!("{}: {}", r.feature, e),
+    }
+}
+
+// Dry-run validation (validate_only = true, requires v1+)
+let results = admin
+    .update_features(
+        vec![FeatureUpdateKey::upgrade("metadata.version", 17)],
+        true,
+    )
+    .await?;
+```
+
+Upgrade types:
+- `FeatureUpdateKey::upgrade(name, level)` — raise to a higher level
+- `FeatureUpdateKey::safe_downgrade(name, level)` — lower the level safely
+- `FeatureUpdateKey::unsafe_downgrade(name, level)` — forceful downgrade (may lose data)
+- `FeatureUpdateKey::delete(name)` — remove the finalized feature entirely
+
+When the broker supports `UpdateFeatures` v1+, the request uses the typed
+`UpgradeType` field. On older v0 brokers, the client falls back to the boolean
+`AllowDowngrade` flag.
+
+## Log Directory Inspection
+
+`describe_log_dirs()` queries every broker and returns per-directory information
+including partition sizes, offset lag, future-replica status, and (v4+) volume
+capacity.
+
+### Describe All Log Directories
+
+```rust
+let dirs = admin.describe_log_dirs(None).await?;
+for dir in &dirs {
+    println!("broker {} — {} (total: {}, usable: {})",
+        dir.broker_id, dir.log_dir, dir.total_bytes, dir.usable_bytes);
+    if let Some(err) = &dir.error {
+        eprintln!("  error: {err}");
+    }
+    for topic in &dir.topics {
+        for p in &topic.partitions {
+            println!("  {}-{}: {} bytes, lag {}{}",
+                topic.name, p.partition_index, p.partition_size,
+                p.offset_lag, if p.is_future_key { " (future)" } else { "" });
+        }
+    }
+}
+```
+
+### Describe Specific Topics
+
+```rust
+use krafka::protocol::DescribableLogDirTopic;
+
+let filter = vec![DescribableLogDirTopic {
+    topic: "my-topic".into(),
+    partitions: vec![0, 1, 2],
+}];
+let dirs = admin.describe_log_dirs(Some(filter)).await?;
+```
+
+### Result Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `broker_id` | `i32` | Broker that owns the directory |
+| `log_dir` | `String` | Absolute path on the broker |
+| `error` | `Option<String>` | Per-directory error (e.g., `KAFKA_STORAGE_ERROR`) |
+| `total_bytes` | `i64` | Volume total bytes (-1 if unknown, v4+) |
+| `usable_bytes` | `i64` | Volume free bytes (-1 if unknown, v4+) |
+| `topics[].partitions[].partition_size` | `i64` | Log size in bytes |
+| `topics[].partitions[].offset_lag` | `i64` | Lag behind high watermark |
+| `topics[].partitions[].is_future_key` | `bool` | Future replica (reassignment) |
+
+### Protocol Versions
+
+| Version | Changes |
+|---------|--------|
+| v1 | Baseline (v0 removed in Kafka 4.0) |
+| v2 | Flexible encoding (compact strings + tagged fields) |
+| v3 | Top-level `ErrorCode` in response |
+| v4 | `TotalBytes` + `UsableBytes` per log directory |
+
+## Leader Election
+
+`elect_leaders()` triggers a leader election for the specified partitions.
+Supports preferred election (elect the preferred replica) and unclean election
+(elect the first live replica even without in-sync replicas).
+
+### Preferred Election for All Partitions
+
+```rust
+use krafka::protocol::ElectionType;
+
+let results = admin
+    .elect_leaders(ElectionType::Preferred, None, Duration::from_secs(60))
+    .await?;
+for topic in &results {
+    for p in &topic.partitions {
+        if let Some(err) = &p.error {
+            eprintln!("{}-{}: {err}", topic.topic, p.partition_id);
+        }
+    }
+}
+```
+
+### Unclean Election for Specific Partitions
+
+```rust
+use krafka::protocol::{ElectionType, ElectLeadersTopicPartitions};
+
+let results = admin
+    .elect_leaders(
+        ElectionType::Unclean,
+        Some(vec![ElectLeadersTopicPartitions {
+            topic: "my-topic".into(),
+            partitions: vec![0, 1],
+        }]),
+        Duration::from_secs(60),
+    )
+    .await?;
+```
+
+### Protocol Versions
+
+| Version | Changes |
+|---------|--------|
+| v0 | Baseline (preferred election only) |
+| v1 | Adds `ElectionType` for preferred/unclean (KIP-460); top-level error code |
+| v2 | Flexible encoding (compact strings + tagged fields) |
+
+## Partition Reassignment
+
+`alter_partition_reassignments()` initiates or cancels partition reassignments.
+`list_partition_reassignments()` lists all ongoing reassignments.
+
+> **Warning**: Reassigning partitions moves data between brokers and can
+> significantly impact cluster load.
+
+### Start a Reassignment
+
+```rust
+use krafka::protocol::{ReassignableTopic, ReassignablePartition};
+
+let result = admin.alter_partition_reassignments(
+    vec![ReassignableTopic {
+        name: "my-topic".into(),
+        partitions: vec![ReassignablePartition {
+            partition_index: 0,
+            replicas: Some(vec![1, 2, 3]),
+        }],
+    }],
+    Duration::from_secs(60),
+).await?;
+
+if let Some(err) = &result.error {
+    eprintln!("Top-level error: {err}");
+}
+for topic in &result.topics {
+    for p in &topic.partitions {
+        if let Some(err) = &p.error {
+            eprintln!("{}-{}: {err}", topic.name, p.partition_index);
+        }
+    }
+}
+```
+
+### Cancel a Pending Reassignment
+
+```rust
+use krafka::protocol::{ReassignableTopic, ReassignablePartition};
+
+// Set replicas to None to cancel
+let result = admin.alter_partition_reassignments(
+    vec![ReassignableTopic {
+        name: "my-topic".into(),
+        partitions: vec![ReassignablePartition {
+            partition_index: 0,
+            replicas: None,  // cancel pending reassignment
+        }],
+    }],
+    Duration::from_secs(60),
+).await?;
+```
+
+### List Ongoing Reassignments
+
+```rust
+let reassignments = admin
+    .list_partition_reassignments(None, Duration::from_secs(60))
+    .await?;
+for topic in &reassignments {
+    for p in &topic.partitions {
+        println!("{} p{}: replicas={:?} adding={:?} removing={:?}",
+            topic.name, p.partition_index, p.replicas,
+            p.adding_replicas, p.removing_replicas);
+    }
+}
+```
+
+### AlterPartitionReassignments Protocol Versions
+
+| Version | Changes |
+|---------|--------|
+| v0 | Baseline (flexible encoding from the start) |
+
+### ListPartitionReassignments Protocol Versions
+
+| Version | Changes |
+|---------|--------|
+| v0 | Baseline (flexible encoding from the start) |
+
+## SCRAM Credential Management
+
+Manage SASL/SCRAM credentials (KIP-554) for users.
+
+### Describe SCRAM Credentials
+
+```rust
+// Describe all users
+let result = admin.describe_user_scram_credentials(None).await?;
+for user in &result.users {
+    println!("{}: {:?}", user.name, user.credential_infos);
+}
+
+// Describe specific users
+let result = admin
+    .describe_user_scram_credentials(Some(vec!["alice".into(), "bob".into()]))
+    .await?;
+```
+
+### Alter SCRAM Credentials
+
+```rust
+use krafka::protocol::{ScramCredentialDeletion, ScramCredentialUpsertion};
+use krafka::auth::ScramMechanism;
+use zeroize::Zeroizing;
+
+let results = admin.alter_user_scram_credentials(
+    vec![ScramCredentialDeletion {
+        name: "alice".into(),
+        mechanism: ScramMechanism::Sha512,
+    }],
+    vec![ScramCredentialUpsertion {
+        name: "bob".into(),
+        mechanism: ScramMechanism::Sha256,
+        iterations: 8192,
+        salt: Zeroizing::new(vec![1, 2, 3]),
+        salted_password: Zeroizing::new(vec![4, 5, 6]),
+    }],
+).await?;
+```
+
+### SCRAM Credential Protocol Versions
+
+| Version | Changes |
+|---------|--------|
+| DescribeUserScramCredentials v0 | Baseline (KIP-554, flexible from v0) |
+| AlterUserScramCredentials v0 | Baseline (KIP-554, flexible from v0) |
+
+## Log Directory Management
+
+### Move Replicas Between Log Directories
+
+```rust
+use krafka::protocol::{AlterReplicaLogDir, AlterReplicaLogDirTopic};
+
+let results = admin.alter_replica_log_dirs(vec![
+    AlterReplicaLogDir {
+        path: "/data/kafka-logs-2".into(),
+        topics: vec![AlterReplicaLogDirTopic {
+            name: "my-topic".into(),
+            partitions: vec![0, 1],
+        }],
+    },
+]).await?;
+```
+
+### AlterReplicaLogDirs Protocol Versions
+
+| Version | Changes |
+|---------|--------|
+| v1 | Baseline (non-flexible encoding) |
+| v2 | Flexible encoding |
+
+## Offset Management
+
+### Delete Consumer Group Offsets
+
+```rust
+let result = admin.delete_offsets(
+    "my-group",
+    &[("my-topic", &[0, 1, 2])],
+).await?;
+if let Some(err) = &result.error {
+    eprintln!("Top-level error: {err}");
+}
+```
+
+### OffsetDelete Protocol Versions
+
+| Version | Changes |
+|---------|--------|
+| v0 | Baseline (non-flexible encoding) |
+
+## Transaction Debugging
+
+### Describe Producers
+
+Inspect active producers on partitions (useful for debugging stuck transactions).
+
+```rust
+let results = admin
+    .describe_producers(&[("my-topic", &[0, 1])])
+    .await?;
+for topic in &results {
+    for p in &topic.partitions {
+        for pr in &p.active_producers {
+            println!("p{}: producer_id={} epoch={} txn_offset={}",
+                p.partition_index, pr.producer_id,
+                pr.producer_epoch, pr.current_txn_start_offset);
+        }
+    }
+}
+```
+
+### Describe Transactions
+
+```rust
+let results = admin
+    .describe_transactions(&["txn-1", "txn-2"])
+    .await?;
+for txn in &results {
+    println!("{}: state={} producer_id={}", txn.transactional_id, txn.state, txn.producer_id);
+}
+```
+
+### List Transactions
+
+```rust
+// List all ongoing transactions
+let result = admin.list_transactions(&["Ongoing"], &[], -1).await?;
+for txn in &result.transactions {
+    println!("{}: state={} producer_id={}", txn.transactional_id, txn.state, txn.producer_id);
+}
+```
+
+### Transaction Debug Protocol Versions
+
+| Version | Changes |
+|---------|--------|
+| DescribeProducers v0 | Baseline (KIP-664, flexible from v0) |
+| DescribeTransactions v0 | Baseline (KIP-664, flexible from v0) |
+| ListTransactions v0 | Baseline (KIP-664, flexible from v0) |
+| ListTransactions v1 | Adds DurationFilter (KIP-994) |
+
+## Client Metrics Resources
+
+### List Client Metrics Subscriptions
+
+```rust
+let names = admin.list_client_metrics_resources().await?;
+for name in &names {
+    println!("subscription: {name}");
+}
+```
+
+### ListClientMetricsResources Protocol Versions
+
+| Version | Changes |
+|---------|--------|
+| v0 | Baseline (KIP-714, flexible from v0) |
+
+## Transaction Markers (WriteTxnMarkers)
+
+### Write Transaction Markers
+
+Write COMMIT or ABORT markers for transactions. Primarily useful for aborting
+stuck (hanging) transactions via the `abort_transaction` convenience method.
+
+```rust
+// Abort a stuck transaction
+admin.abort_transaction("my-transactional-id").await?;
+```
+
+For low-level control, use `write_txn_markers` directly:
+
+```rust
+use krafka::protocol::{WritableTxnMarker, WritableTxnMarkerTopic};
+
+let results = admin
+    .write_txn_markers(&[WritableTxnMarker {
+        producer_id: 42,
+        producer_epoch: 5,
+        transaction_result: false, // ABORT
+        topics: vec![WritableTxnMarkerTopic {
+            name: "my-topic".into(),
+            partition_indexes: vec![0, 1],
+        }],
+        coordinator_epoch: 10,
+    }])
+    .await?;
+```
+
+### WriteTxnMarkers Protocol Versions
+
+| Version | Changes |
+|---------|--------|
+| WriteTxnMarkers v1 | Baseline (flexible encoding, v0 removed in Kafka 4.0) |
+| WriteTxnMarkers v2 | Adds TransactionVersion field (KIP-1228) |
+
+## KRaft Quorum (DescribeQuorum)
+
+### Describe Quorum
+
+Inspect the KRaft quorum for cluster metadata partitions. Returns voter and
+observer replicas, leader info, and high watermark.
+
+```rust
+let result = admin
+    .describe_quorum(&[("__cluster_metadata", &[0])])
+    .await?;
+for topic in &result.topics {
+    for partition in &topic.partitions {
+        println!(
+            "partition {} leader={} epoch={} hw={}",
+            partition.partition_index,
+            partition.leader_id,
+            partition.leader_epoch,
+            partition.high_watermark
+        );
+        for voter in &partition.current_voters {
+            println!("  voter {} log_end_offset={}", voter.replica_id, voter.log_end_offset);
+        }
+    }
+}
+```
+
+### DescribeQuorum Protocol Versions
+
+| Version | Changes |
+|---------|--------|
+| DescribeQuorum v0 | Baseline (KIP-595, flexible from v0) |
+| DescribeQuorum v1 | Adds LastFetchTimestamp + LastCaughtUpTimestamp (KIP-836) |
+| DescribeQuorum v2 | Adds Nodes, ErrorMessage, ReplicaDirectoryId (KIP-853) |
 
 ## Next Steps
 

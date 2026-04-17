@@ -123,7 +123,9 @@ let consumer = Consumer::builder()
 
 ### Offset Commit
 
-Control how offsets are committed. When auto-commit is enabled (the default), Krafka automatically commits offsets during each `poll()` call when the commit interval has elapsed, and also during `close()`:
+Control how offsets are committed. When auto-commit is enabled (the default), Krafka automatically commits offsets during each `poll()` call when the commit interval has elapsed, during `close()`, and **before partition revocations** during rebalances (so the new partition owner sees up-to-date committed positions):
+
+> **Warning — at-least-once caveat:** Auto-commit commits the offset of the last record *returned* by `poll()`, not the last record *processed* by the application. If the application crashes after `poll()` returns but before processing completes, those records may be skipped on restart. For strict at-least-once guarantees, disable auto-commit and call `commit()` explicitly after processing each batch.
 
 ```rust
 use krafka::consumer::Consumer;
@@ -162,7 +164,29 @@ let consumer = Consumer::builder()
     .fetch_max_bytes(52428800)                   // Max bytes per fetch (50MB)
     .max_partition_fetch_bytes(1048576)          // Max bytes per partition (1MB)
     .max_poll_records(500)                       // Max records per poll
+    .max_buffered_records(500)                   // Buffer cap for recv()
     .fetch_max_wait(Duration::from_millis(500))  // Max wait time
+    .build()
+    .await?;
+```
+
+### Buffer Cap
+
+When using `recv()`, records from `poll()` that are not immediately returned are buffered internally. The `max_buffered_records` setting controls the maximum number of records held in this buffer. When the buffer reaches the limit, `poll()` skips fetching new data until the buffer drains below the threshold. Auto-commit and rebalance handling still run so the consumer remains healthy in the group.
+
+For single-caller `recv()` usage the buffer is naturally bounded by `max_poll_records` (one `poll()` batch minus the record returned to the caller). The cap adds an additional guard for:
+- Mixed `poll()` / `recv()` usage on the same consumer
+- Multiple tasks calling `recv()` concurrently
+
+Set to `0` to disable the buffer cap (unlimited). Defaults to `500`.
+
+```rust
+use krafka::consumer::Consumer;
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .max_buffered_records(1000) // Allow up to 1000 buffered records
     .build()
     .await?;
 ```
@@ -187,7 +211,7 @@ let consumer = Consumer::builder()
 | `ReadUncommitted` (default) | See all records, including uncommitted transactional records |
 | `ReadCommitted` | Only see committed records; uncommitted transactional records are filtered |
 
-> **Note:** `isolation_level` affects both data fetches and offset resolution (ListOffsets). Krafka uses ListOffsets v2 protocol to pass the isolation level to the broker.
+> **Note:** `isolation_level` affects both data fetches and offset resolution (ListOffsets). Krafka passes the isolation level to the broker via ListOffsets (v2+, up to v11).
 
 ## Consumer Groups
 
@@ -484,6 +508,8 @@ Paused partitions are skipped during `poll()` until resumed. This is useful for:
 - Prioritizing certain partitions
 - Implementing rate limiting
 
+> **Rebalance caveat:** During an eager rebalance (or unsubscribe), *all* pause state is cleared — even for partitions that are re-assigned to the same consumer. In cooperative rebalance mode, only revoked partitions lose their pause state; retained partitions stay paused. If your application relies on pause for backpressure, re-apply `pause()` in your `on_partitions_assigned` callback.
+
 ## Manual Partition Assignment
 
 For direct partition control (without consumer groups):
@@ -620,6 +646,34 @@ async fn consume_stream(consumer: &Consumer) -> Result<()> {
     Ok(())
 }
 ```
+
+### Async `Stream` API
+
+The `stream()` method returns a [`futures_core::Stream`](https://docs.rs/futures-core/latest/futures_core/stream/trait.Stream.html)
+of `Result<ConsumerRecord>`, enabling use with `tokio-stream` combinators
+(`.map()`, `.filter()`, `.take()`, `.buffer_unordered()`, etc.):
+
+```rust
+use krafka::consumer::Consumer;
+use krafka::error::Result;
+use tokio_stream::StreamExt; // requires tokio-stream dependency
+
+async fn consume_with_stream(consumer: &Consumer) -> Result<()> {
+    let mut stream = consumer.stream();
+    while let Some(result) = stream.next().await {
+        let record = result?;
+        println!(
+            "topic={}, partition={}, offset={}",
+            record.topic, record.partition, record.offset
+        );
+    }
+    Ok(())
+}
+```
+
+The stream terminates when the consumer is closed. Internally it delegates to
+`recv()`, so all features (auto-commit, rebalancing, fetch sessions, buffering)
+work identically.
 
 ### Graceful Shutdown
 
@@ -784,6 +838,7 @@ let consumer = Consumer::builder()
     .fetch_max_bytes(104857600)              // 100MB max fetch
     .max_partition_fetch_bytes(10485760)     // 10MB per partition
     .max_poll_records(10000)                 // Many records per poll
+    .max_buffered_records(10000)              // Match poll batch size
     .fetch_max_wait(Duration::from_millis(100))
     .build()
     .await?;
@@ -817,6 +872,7 @@ let consumer = Consumer::builder()
     .fetch_max_bytes(1048576)                // Limit to 1MB
     .max_partition_fetch_bytes(262144)       // 256KB per partition
     .max_poll_records(100)                   // Limit in-memory records
+    .max_buffered_records(200)               // Tight buffer cap
     .build()
     .await?;
 ```
@@ -883,17 +939,12 @@ let consumer = Consumer::builder()
 KIP-848 introduces a new consumer group protocol where the server performs
 partition assignment instead of the group leader. This eliminates the
 JoinGroup/SyncGroup round-trip and replaces it with a single
-`ConsumerGroupHeartbeat` API (key 68, version 0; v1 encode/decode exists but
-is not yet activated — see `CONSUMER_GROUP_HEARTBEAT_MAX`).
+`ConsumerGroupHeartbeat` API (key 68, v0–v1).
 
 ### Enabling KIP-848
 
-> **Not yet usable.** `Consumer::builder().group_protocol(GroupProtocol::Consumer).build()`
-> returns a configuration error because topic UUID resolution in heartbeat
-> assignments requires Metadata v10+, but the client currently negotiates
-> only up to v8 (`METADATA_MAX`).  Once Metadata v10+ support is activated
-> (bump `METADATA_MAX` to ≥ 10 and integration-test), the guard will be
-> removed and the following snippet will work:
+Set `GroupProtocol::Consumer` on the builder to use the KIP-848 consumer
+protocol. Requires Kafka 3.7+ (KIP-848 GA in Kafka 4.0).
 
 ```rust
 use krafka::consumer::{Consumer, GroupProtocol};
@@ -939,9 +990,9 @@ The ConsumerGroupHeartbeat response uses 16-byte topic UUIDs in assignments.
 Krafka resolves these UUIDs to topic names with a two-level lookup order:
 
 1. **Cluster metadata lookup** — first consult `ClusterMetadata::topic_name_for_id`.
-   This path only produces results when Metadata API v10+ has been negotiated
-   and activated, because topic UUID → name mappings are not present in earlier
-   Metadata response versions.
+   In Metadata v10 and later, brokers can return topic UUID → name mappings
+   in metadata responses, and Krafka uses automatic API version negotiation
+   to take advantage of that when supported.
 2. **Local topic names cache** — if metadata does not contain the mapping,
    fall back to a local UUID → name cache built from previously resolved
    assignments.  This cache survives metadata cache flushes and mirrors the
@@ -949,15 +1000,7 @@ Krafka resolves these UUIDs to topic names with a two-level lookup order:
    learned.
 
 Successfully resolved names are cached locally. Unresolvable UUIDs still
-trigger an automatic metadata refresh, but the current client negotiates the
-Metadata API only up to v8 (`METADATA_MAX`), so metadata responses do not yet
-provide the topic UUID mapping introduced in Metadata v10+.
-
-> **Note:** External users cannot reach these code paths today —
-> `ConsumerBuilder::build()` rejects `GroupProtocol::Consumer` while
-> `METADATA_MAX < 10` (see [Enabling KIP-848](#enabling-kip-848)).
-> The error handling below exists as defense-in-depth and documents the
-> intended behaviour once the guard is lifted.
+trigger an automatic metadata refresh.
 
 If topic UUIDs
 remain unresolved after a metadata refresh during the initial heartbeat
@@ -984,6 +1027,8 @@ timer is reset to the new duration (with a minimum floor of 1 000 ms).
 
 - **v0** — Base version; compatible with Kafka 3.7+ (EA) and 4.0+ (GA)
 - **v1** — Adds `SubscribedTopicRegex` for regex-based topic subscription (KIP-848) and requires consumer-generated member IDs (KIP-1082); available on Kafka 4.0+
+
+Both v0 and v1 are supported (`CONSUMER_GROUP_HEARTBEAT_MIN = 0`, `CONSUMER_GROUP_HEARTBEAT_MAX = 1`).
 
 ### Error Handling
 
@@ -1025,15 +1070,16 @@ top-level fields) and starts a fresh heartbeat task.
 - Requires Kafka 4.0+ (or earlier brokers with `group.coordinator.new.enable=true`)
 - The broker must support API key 68 (`ConsumerGroupHeartbeat`)
 
+### Describing KIP-848 Groups
+
+To inspect a KIP-848 consumer group (state, epochs, member assignments), use
+the AdminClient's `describe_consumer_groups()` method which auto-detects the
+group type and dispatches to the appropriate API. See the
+[Admin Client Guide](admin.md#describing-consumer-groups) for details.
+
 ### Limitations
 
-Offset commit and fetch currently negotiate only the older protocol versions
-supported by the client (`OFFSET_COMMIT_MAX=2`, `OFFSET_FETCH_MAX=1`), so
-the flexible v8–v9 wire format with member-epoch validation and OffsetFetch
-v8+ multi-group batching are **not yet active**. Encode/decode for those
-versions exists and the version-gating code is in place — bumping the MAX
-constants will activate them once integration-tested against a v9-capable
-broker. Full transactional offset support (`TxnOffsetCommit`) is not yet
+Full transactional offset support (`TxnOffsetCommit`) is not yet
 implemented.
 
 ## Consumer Interceptors
@@ -1042,7 +1088,7 @@ Interceptors allow you to observe records after they are fetched and monitor off
 See the [Interceptors Guide](interceptors.md) for full details.
 
 ```rust
-use krafka::interceptor::ConsumerInterceptor;
+use krafka::interceptor::{ConsumerInterceptor, InterceptorResult};
 use krafka::consumer::{Consumer, ConsumerRecord};
 use std::sync::Arc;
 
@@ -1050,8 +1096,9 @@ use std::sync::Arc;
 struct MetricsInterceptor;
 
 impl ConsumerInterceptor for MetricsInterceptor {
-    fn on_consume(&self, records: &[ConsumerRecord]) {
+    fn on_consume(&self, records: &[ConsumerRecord]) -> InterceptorResult {
         println!("Consumed {} records", records.len());
+        Ok(())
     }
 }
 
@@ -1255,6 +1302,13 @@ Lag is also exposed via metrics (recomputed after every offset or high-watermark
 | `lag_max` | Maximum per-partition lag |
 
 High watermarks and log start offsets are automatically cleared when partitions are revoked or the consumer unsubscribes. Lag metrics are recomputed accordingly.
+
+> **Staleness caveat** — High watermarks are only updated when a fetch
+> response is received from the broker. If the consumer is paused, slow, or
+> not polling, the cached watermarks (and therefore `current_lag`,
+> `compute_aggregate_lag`, and the `lag`/`lag_max` metrics) can become stale
+> and undercount the true lag. Treat lag values as eventually consistent
+> rather than real-time.
 
 ## Next Steps
 

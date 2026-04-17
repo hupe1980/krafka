@@ -11,15 +11,33 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use parking_lot::Mutex as SyncMutex;
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-use crate::error::{KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, Result};
 use crate::network::{BrokerConnection, ConnectionPool};
 use crate::protocol::{
     ApiKey, MetadataRequest, MetadataResponse, VersionedDecode, VersionedEncode,
 };
 use crate::{BrokerId, PartitionId};
+
+/// Strategy for recovering when metadata refresh fails for too long.
+///
+/// Mirrors Java's `MetadataRecoveryStrategy` from KIP-899. When the client
+/// cannot reach any broker in its current metadata for longer than
+/// [`ClusterMetadata::with_rebootstrap_trigger`], it can automatically fall back
+/// to the bootstrap servers to re-discover the cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum MetadataRecoveryStrategy {
+    /// No automatic recovery — behave like pre-KIP-899 clients.
+    #[default]
+    None,
+    /// Reset to bootstrap servers and re-discover the cluster when metadata
+    /// refresh has not succeeded within the configured trigger duration.
+    Rebootstrap,
+}
 
 /// Information about a broker.
 #[non_exhaustive]
@@ -154,6 +172,12 @@ struct MetadataCache {
     /// topic includes a 16-byte topic_id. Used by the KIP-848 consumer
     /// protocol to resolve topic UUIDs in assignments.
     topic_ids: HashMap<[u8; 16], Arc<String>>,
+    /// Reverse index: topic name → topic UUID. Kept in sync with `topic_ids`
+    /// for O(1) lookups.
+    name_to_topic_id: HashMap<String, [u8; 16]>,
+    /// Per-topic timestamp of the last refresh that included this topic.
+    /// Used for TTL-based eviction during partial refreshes.
+    topic_last_refreshed: HashMap<String, Instant>,
     /// When the metadata was last updated.
     last_updated: Instant,
 }
@@ -166,6 +190,8 @@ impl MetadataCache {
             brokers: HashMap::new(),
             topics: HashMap::new(),
             topic_ids: HashMap::new(),
+            name_to_topic_id: HashMap::new(),
+            topic_last_refreshed: HashMap::new(),
             last_updated: Instant::now(),
         }
     }
@@ -177,8 +203,8 @@ impl MetadataCache {
 
 /// Cluster metadata manager.
 pub struct ClusterMetadata {
-    /// Bootstrap servers.
-    bootstrap_servers: Vec<String>,
+    /// Bootstrap servers (lock-free reads via `ArcSwap` for KIP-899 `update_seed_brokers`).
+    bootstrap_servers: ArcSwap<Vec<String>>,
     /// Connection pool.
     pool: Arc<ConnectionPool>,
     /// Cached metadata (lock-free reads via `ArcSwap`).
@@ -188,6 +214,22 @@ pub struct ClusterMetadata {
     /// Coalescing lock: prevents concurrent metadata refreshes.
     /// Multiple callers wait on the same in-flight refresh instead of stampeding.
     refresh_lock: Mutex<()>,
+    /// Recovery strategy when metadata refresh fails for too long (KIP-899).
+    recovery_strategy: MetadataRecoveryStrategy,
+    /// Duration after which a failing metadata refresh triggers a rebootstrap
+    /// (only when `recovery_strategy` is [`MetadataRecoveryStrategy::Rebootstrap`]).
+    /// Default: 300 s (5 minutes), matching the Java client.
+    rebootstrap_trigger: Duration,
+    /// Instant when the current streak of metadata-refresh failures started.
+    /// Reset to `None` on every successful refresh. After a rebootstrap
+    /// it is set to the *current* instant (matching Java) so the next cycle
+    /// starts timing immediately.
+    metadata_attempt_start: SyncMutex<Option<Instant>>,
+    /// Maximum age of a cached topic entry before it is evicted during partial
+    /// refresh. `None` disables TTL eviction (default). When set, topics not
+    /// refreshed within this duration are pruned on the next partial refresh,
+    /// preventing unbounded cache growth from topic churn.
+    topic_cache_ttl: Option<Duration>,
 }
 
 impl ClusterMetadata {
@@ -198,17 +240,54 @@ impl ClusterMetadata {
         max_age: Duration,
     ) -> Self {
         Self {
-            bootstrap_servers,
+            bootstrap_servers: ArcSwap::from_pointee(bootstrap_servers),
             pool,
             cache: ArcSwap::from_pointee(MetadataCache::new()),
             max_age,
             refresh_lock: Mutex::new(()),
+            recovery_strategy: MetadataRecoveryStrategy::None,
+            rebootstrap_trigger: Duration::from_secs(300),
+            metadata_attempt_start: SyncMutex::new(None),
+            topic_cache_ttl: None,
         }
     }
 
+    /// Set the metadata recovery strategy (KIP-899).
+    ///
+    /// When set to [`MetadataRecoveryStrategy::Rebootstrap`], the client will
+    /// automatically close all connections and fall back to bootstrap servers
+    /// when metadata refresh has not succeeded within
+    /// [`rebootstrap_trigger`](Self::with_rebootstrap_trigger).
+    #[must_use]
+    pub fn with_recovery_strategy(mut self, strategy: MetadataRecoveryStrategy) -> Self {
+        self.recovery_strategy = strategy;
+        self
+    }
+
+    /// Set the duration after which failed metadata refreshes trigger a
+    /// rebootstrap (KIP-899). Only effective when recovery strategy is
+    /// [`MetadataRecoveryStrategy::Rebootstrap`]. Default: 300 s.
+    #[must_use]
+    pub fn with_rebootstrap_trigger(mut self, duration: Duration) -> Self {
+        self.rebootstrap_trigger = duration;
+        self
+    }
+
+    /// Set the topic cache TTL for partial refreshes.
+    ///
+    /// During partial refreshes, cached topics that have not been refreshed
+    /// within this duration are evicted to prevent unbounded cache growth.
+    /// Full refreshes always rebuild from scratch regardless of this setting.
+    /// `None` disables TTL eviction (the default).
+    #[must_use]
+    pub fn with_topic_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.topic_cache_ttl = Some(ttl);
+        self
+    }
+
     /// Get the bootstrap servers.
-    pub fn bootstrap_servers(&self) -> &[String] {
-        &self.bootstrap_servers
+    pub fn bootstrap_servers(&self) -> Vec<String> {
+        (**self.bootstrap_servers.load()).clone()
     }
 
     /// Refresh metadata from the cluster.
@@ -221,74 +300,227 @@ impl ClusterMetadata {
     /// Uses a coalescing lock to prevent concurrent metadata stampedes.
     /// If a refresh is already in-flight, callers wait for it to complete.
     ///
-    /// The Metadata API version is negotiated with the broker (v0–v8).
+    /// The Metadata API version is negotiated with the broker (v1–v13).
     /// Versions are cumulative: rack v1, cluster_id v2, offline replicas v5,
-    /// leader_epoch v7, authorized-ops v8.
-    /// Encode/decode for v9–v13 (flexible encoding v9, topic UUIDs v10) exists
-    /// but is not yet activated — see `METADATA_MAX`.
-    /// Falls back to v0 if the broker doesn’t advertise Metadata support.
+    /// leader_epoch v7, authorized-ops v8, flexible encoding v9, topic UUIDs v10,
+    /// cluster_authorized_operations removed v11, topic_id works v12,
+    /// top-level error_code v13.
+    /// Falls back to METADATA_MIN (v1) if the broker doesn't advertise higher
+    /// Metadata support.
+    ///
+    /// When [`MetadataRecoveryStrategy::Rebootstrap`] is configured and no
+    /// broker is reachable for longer than [`rebootstrap_trigger`](Self::with_rebootstrap_trigger),
+    /// all connections are closed and the client falls back to bootstrap
+    /// servers (KIP-899).
     pub async fn refresh_for_topics(&self, topics: Option<&[&str]>) -> Result<()> {
         // Coalesce concurrent calls: only one refresh in-flight at a time
         let _guard = self.refresh_lock.lock().await;
 
-        // After acquiring the lock, check if metadata was just refreshed by another caller.
-        // If it was refreshed within the last 100ms, skip the redundant request — but only
-        // for partial refreshes where all requested topics are already present. Full refreshes
-        // are never skipped: a recent partial refresh does not guarantee a full-cluster snapshot.
+        // After acquiring the lock, check if the requested data is already fresh.
+        //
+        // For partial refreshes: skip if every requested topic is present in the
+        // cache and was refreshed within `max_age`. This deduplicates work when
+        // multiple callers ask for overlapping topic sets — the second caller
+        // finds the first caller's result still fresh and returns immediately.
+        //
+        // Full refreshes (`topics=None`) are never skipped: a recent partial
+        // refresh does not guarantee a full-cluster snapshot.
         let cache = self.cache.load();
-        if cache.last_updated.elapsed() < Duration::from_millis(100) && !cache.brokers.is_empty() {
-            let all_present = match topics {
+        if !cache.brokers.is_empty() {
+            let all_fresh = match topics {
                 None => false,
-                Some(names) => names.iter().all(|name| cache.topics.contains_key(*name)),
+                Some(names) => names.iter().all(|name| {
+                    cache.topics.contains_key(*name)
+                        && cache
+                            .topic_last_refreshed
+                            .get(*name)
+                            .is_some_and(|ts| ts.elapsed() <= self.max_age)
+                }),
             };
-            if all_present {
-                debug!("Metadata was recently refreshed, skipping redundant request");
+            if all_fresh {
+                debug!("All requested topics are fresh in cache, skipping redundant request");
                 return Ok(());
             }
         }
 
-        // Get a connection
-        let conn = self.get_any_connection().await?;
+        // Record the start of this refresh attempt for KIP-899 failure tracking.
+        // If there is already a recorded start (from a previous failing attempt),
+        // keep it — we only care about how long the *streak* has lasted.
+        {
+            let mut start = self.metadata_attempt_start.lock();
+            start.get_or_insert_with(Instant::now);
+        }
 
-        // Negotiate the highest mutually supported Metadata version up to the
-        // client's supported maximum (`METADATA_MAX`, currently v8).
-        // Cumulative fields available through v8: rack v1, cluster_id v2,
-        // offline replicas v5, leader_epoch v7, authorized-ops v8.
-        // Encode/decode for v9–v13 exists but is not yet activated — see
-        // `METADATA_MAX` in protocol/mod.rs.
-        // Falls back to v0 if the broker doesn’t advertise Metadata support
-        // (mirrors the Fetch negotiation pattern in consumer).
-        let metadata_version = conn
-            .negotiate_api_version_max(ApiKey::Metadata, crate::protocol::versions::METADATA_MAX)
-            .await
-            .unwrap_or_else(|| {
-                debug!("Metadata API version negotiation unavailable; falling back to v0");
-                0
-            });
+        // Allow at most one rebootstrap retry per refresh call.
+        let mut rebootstrapped = false;
 
-        // Build and send metadata request
-        let request = match topics {
-            Some(t) => MetadataRequest::for_topics(t.to_vec()),
-            None => MetadataRequest::all_topics(),
+        loop {
+            // Get a connection — on failure, check if rebootstrap is needed.
+            let conn = match self.get_any_connection().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    if !rebootstrapped && self.needs_rebootstrap() {
+                        self.rebootstrap().await;
+                        rebootstrapped = true;
+                        // Retry once after rebootstrap.
+                        self.get_any_connection().await?
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
+
+            // Negotiate the highest mutually supported Metadata version up to the
+            // client's supported maximum (`METADATA_MAX`).
+            // v1+ required, up to v13 (top-level error_code).
+            let metadata_version = conn
+                .negotiate_api_version(
+                    ApiKey::Metadata,
+                    crate::protocol::versions::METADATA_MAX,
+                    crate::protocol::versions::METADATA_MIN,
+                )
+                .await
+                .unwrap_or_else(|| {
+                    debug!("Metadata API version negotiation unavailable; falling back to MIN");
+                    crate::protocol::versions::METADATA_MIN
+                });
+
+            // Build and send metadata request
+            let request = match topics {
+                Some(t) => MetadataRequest::for_topics(t.to_vec()),
+                None => MetadataRequest::all_topics(),
+            };
+
+            let response = conn
+                .send_request(ApiKey::Metadata, metadata_version, |buf| {
+                    request.encode_versioned(metadata_version, buf)
+                })
+                .await?;
+
+            // Decode response
+            let mut buf = response;
+            let metadata = MetadataResponse::decode_versioned(metadata_version, &mut buf)?;
+
+            // v13+ includes a top-level error code. Check it before processing
+            // topics. Per-topic errors are still handled individually in update_cache.
+            if metadata.error_code == ErrorCode::RebootstrapRequired {
+                if rebootstrapped {
+                    // Already retried once — don't loop forever.
+                    return Err(KrafkaError::broker(
+                        metadata.error_code,
+                        "server requested rebootstrap but retry also returned REBOOTSTRAP_REQUIRED",
+                    ));
+                }
+                // Server-initiated rebootstrap (KIP-899): the cluster is telling
+                // us to re-discover via bootstrap servers.
+                info!("Server requested rebootstrap (REBOOTSTRAP_REQUIRED)");
+                self.rebootstrap().await;
+                rebootstrapped = true;
+                continue;
+            }
+            if !metadata.error_code.is_ok() {
+                return Err(KrafkaError::broker(
+                    metadata.error_code,
+                    "metadata request failed",
+                ));
+            }
+
+            // Success — clear the failure-tracking timestamp only on full
+            // refreshes. A partial refresh succeeding does not prove that all
+            // brokers are reachable, so keep the rebootstrap timer running.
+
+            // Update cache. A full refresh (topics=None) is authoritative — the
+            // response contains every topic currently in the cluster, so we rebuild
+            // from scratch. A partial refresh delta-merges into the existing cache.
+            let full_refresh = topics.is_none();
+
+            if full_refresh {
+                let mut start = self.metadata_attempt_start.lock();
+                *start = None;
+            }
+
+            self.update_cache(metadata, full_refresh);
+
+            return Ok(());
+        }
+    }
+
+    /// Replace the bootstrap server list at runtime (KIP-899).
+    ///
+    /// This does **not** trigger a rebootstrap or close existing connections.
+    /// The new addresses are used on the next metadata refresh that falls back
+    /// to bootstrap servers (e.g. after all cached brokers become unreachable).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `servers` is empty.
+    pub fn update_seed_brokers(&self, servers: Vec<String>) -> Result<()> {
+        if servers.is_empty() {
+            return Err(KrafkaError::config(
+                "update_seed_brokers: at least one server required",
+            ));
+        }
+        info!(count = servers.len(), "Updating seed brokers (KIP-899)");
+        self.bootstrap_servers.store(Arc::new(servers));
+        Ok(())
+    }
+
+    /// Force a rebootstrap: close all connections, clear the metadata cache,
+    /// and fall back to bootstrap servers (KIP-899).
+    ///
+    /// The next call to [`refresh`](Self::refresh) or
+    /// [`refresh_for_topics`](Self::refresh_for_topics) will re-discover the
+    /// cluster from the bootstrap addresses.
+    ///
+    /// After rebootstrap, the failure-tracking timer is set to **now** (not
+    /// cleared) so that the next refresh cycle starts timing immediately —
+    /// matching the Java client's `metadataAttemptStartMs = Optional.of(now)`.
+    pub async fn rebootstrap(&self) {
+        info!("Rebootstrapping: closing all connections and resetting metadata (KIP-899)");
+
+        // Close all pooled connections.
+        self.pool.close_all().await;
+
+        // Reset metadata cache to empty so `get_any_connection` goes straight
+        // to bootstrap servers.
+        self.cache.store(Arc::new(MetadataCache::new()));
+
+        // Set the failure tracker to *now* (not None) so the next cycle starts
+        // timing immediately — if the rebootstrap itself doesn't help, we'll
+        // know how long it's been since we last rebootstrapped.
+        {
+            let mut start = self.metadata_attempt_start.lock();
+            *start = Some(Instant::now());
+        }
+    }
+
+    /// Check whether the rebootstrap trigger duration has elapsed.
+    ///
+    /// This is a pure predicate — it does **not** perform the rebootstrap.
+    /// The caller is responsible for calling [`rebootstrap`](Self::rebootstrap)
+    /// if this returns `true`.
+    fn needs_rebootstrap(&self) -> bool {
+        if self.recovery_strategy != MetadataRecoveryStrategy::Rebootstrap {
+            return false;
+        }
+
+        let start = self.metadata_attempt_start.lock();
+        let Some(attempt_start) = *start else {
+            return false;
         };
 
-        let response = conn
-            .send_request(ApiKey::Metadata, metadata_version, |buf| {
-                request.encode_versioned(metadata_version, buf)
-            })
-            .await?;
+        let elapsed = attempt_start.elapsed();
+        if elapsed < self.rebootstrap_trigger {
+            return false;
+        }
 
-        // Decode response
-        let mut buf = response;
-        let metadata = MetadataResponse::decode_versioned(metadata_version, &mut buf)?;
+        warn!(
+            elapsed_ms = elapsed.as_millis(),
+            trigger_ms = self.rebootstrap_trigger.as_millis(),
+            "Metadata refresh failing too long, rebootstrap needed (KIP-899)"
+        );
 
-        // Update cache. A full refresh (topics=None) is authoritative — the
-        // response contains every topic currently in the cluster, so we rebuild
-        // from scratch. A partial refresh delta-merges into the existing cache.
-        let full_refresh = topics.is_none();
-        self.update_cache(metadata, full_refresh);
-
-        Ok(())
+        true
     }
 
     /// Get a connection to any available broker.
@@ -302,7 +534,8 @@ impl ClusterMetadata {
         }
 
         // Fall back to bootstrap servers
-        for server in &self.bootstrap_servers {
+        let servers = self.bootstrap_servers.load();
+        for server in servers.iter() {
             if let Ok(conn) = self.pool.get_connection(server).await {
                 return Ok(conn);
             }
@@ -324,6 +557,7 @@ impl ClusterMetadata {
     /// and broker entries referenced by preserved topics remain available.
     fn update_cache(&self, response: MetadataResponse, full_refresh: bool) {
         let old = self.cache.load();
+        let now = Instant::now();
 
         // Full refresh: response is authoritative — start empty.
         // Partial refresh: merge into the existing broker map so preserved
@@ -341,14 +575,32 @@ impl ClusterMetadata {
         }
 
         // Full refresh: response is authoritative — start empty.
-        // Partial refresh: delta-merge into existing topics and topic_ids.
+        // Partial refresh: delta-merge into existing topics and topic_ids,
+        // optionally evicting entries older than `topic_cache_ttl`.
         let mut topics = if full_refresh {
             HashMap::new()
+        } else if let Some(ttl) = self.topic_cache_ttl {
+            old.topics
+                .iter()
+                .filter(|(name, _)| {
+                    old.topic_last_refreshed
+                        .get(*name)
+                        .is_some_and(|ts| now.duration_since(*ts) <= ttl)
+                })
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect()
         } else {
             old.topics.clone()
         };
         let mut topic_ids = if full_refresh {
             HashMap::new()
+        } else if self.topic_cache_ttl.is_some() {
+            // Keep only topic_ids whose names survived TTL eviction.
+            old.topic_ids
+                .iter()
+                .filter(|(_, name)| topics.contains_key(name.as_str()))
+                .map(|(k, v)| (*k, Arc::clone(v)))
+                .collect()
         } else {
             old.topic_ids.clone()
         };
@@ -366,17 +618,28 @@ impl ClusterMetadata {
             };
 
             if !topic.error_code.is_ok() {
-                warn!("Topic {} has error: {:?}", topic_name, topic.error_code);
-                // Remove from both maps on error (topic may have been deleted).
-                if let Some(tid) = topic.topic_id {
-                    topic_ids.remove(&tid);
+                if topic.error_code.is_retriable() {
+                    // Transient errors (LeaderNotAvailable, RequestTimedOut, etc.)
+                    // — keep stale cache entry so callers don't see the topic as
+                    // "unknown" until the next successful refresh.
+                    debug!(
+                        "Topic {} has transient error: {:?}, keeping stale cache entry",
+                        topic_name, topic.error_code
+                    );
+                } else {
+                    // Permanent errors (UnknownTopicOrPartition, TopicAuthorizationFailed,
+                    // InvalidTopic, etc.) — remove from cache.
+                    warn!("Topic {} has error: {:?}", topic_name, topic.error_code);
+                    if let Some(tid) = topic.topic_id {
+                        topic_ids.remove(&tid);
+                    }
+                    // Also remove any stale UUID → name mapping by name, in case
+                    // the error response omitted topic_id or it was an all-zero UUID.
+                    if let Some(old_uuid) = name_to_uuid.remove(&topic_name) {
+                        topic_ids.remove(&old_uuid);
+                    }
+                    topics.remove(&topic_name);
                 }
-                // Also remove any stale UUID → name mapping by name, in case
-                // the error response omitted topic_id or it was an all-zero UUID.
-                if let Some(old_uuid) = name_to_uuid.remove(&topic_name) {
-                    topic_ids.remove(&old_uuid);
-                }
-                topics.remove(&topic_name);
                 continue;
             }
 
@@ -387,7 +650,8 @@ impl ClusterMetadata {
                 if let Some(old_uuid) = name_to_uuid.remove(&topic_name) {
                     topic_ids.remove(&old_uuid);
                 }
-                topic_ids.insert(tid, Arc::new(topic_name.clone()));
+                let topic_arc = Arc::new(topic_name.clone());
+                topic_ids.insert(tid, topic_arc);
                 name_to_uuid.insert(topic_name.clone(), tid);
             }
 
@@ -416,13 +680,35 @@ impl ClusterMetadata {
             );
         }
 
+        // Build topic_last_refreshed: carry forward surviving entries (those
+        // that survived TTL eviction), then stamp every topic in this response.
+        let mut topic_last_refreshed = if full_refresh {
+            HashMap::with_capacity(topics.len())
+        } else if let Some(ttl) = self.topic_cache_ttl {
+            old.topic_last_refreshed
+                .iter()
+                .filter(|(_name, ts)| now.duration_since(**ts) <= ttl)
+                .map(|(k, v)| (k.clone(), *v))
+                .collect()
+        } else {
+            old.topic_last_refreshed.clone()
+        };
+        // Mark every topic currently in the cache as refreshed now.
+        // On full refresh this stamps everything; on partial refresh this
+        // stamps the topics from the response (which were just inserted/updated).
+        for name in topics.keys() {
+            topic_last_refreshed.insert(name.clone(), now);
+        }
+
         let new_cache = MetadataCache {
             cluster_id: response.cluster_id,
             controller_id: response.controller_id,
             brokers,
             topics,
             topic_ids,
-            last_updated: Instant::now(),
+            name_to_topic_id: name_to_uuid,
+            topic_last_refreshed,
+            last_updated: now,
         };
 
         debug!(
@@ -458,16 +744,21 @@ impl ClusterMetadata {
     /// The mapping is populated from metadata v10+ responses where each topic
     /// includes a `topic_id`. Returns `None` if the UUID is unknown — the
     /// caller should trigger a metadata refresh and retry.
-    ///
-    /// Currently `pub(crate)` because `METADATA_MAX` is capped at v8, so
-    /// `topic_ids` is never populated. Will be promoted to `pub` once
-    /// Metadata v10+ negotiation is activated.
-    pub(crate) fn topic_name_for_id(&self, topic_id: &[u8; 16]) -> Option<String> {
+    pub fn topic_name_for_id(&self, topic_id: &[u8; 16]) -> Option<String> {
         self.cache
             .load()
             .topic_ids
             .get(topic_id)
             .map(|name| (**name).clone())
+    }
+
+    /// Resolve a topic name to its 16-byte UUID.
+    ///
+    /// The mapping is populated from metadata v10+ responses. Returns `None`
+    /// if the topic is unknown or the broker did not return a topic ID — the
+    /// caller should trigger a metadata refresh and retry.
+    pub fn topic_id_for_name(&self, name: &str) -> Option<[u8; 16]> {
+        self.cache.load().name_to_topic_id.get(name).copied()
     }
 
     /// Get all topics.
@@ -669,5 +960,171 @@ mod tests {
     fn test_metadata_cache_new_has_empty_topic_ids() {
         let cache = MetadataCache::new();
         assert!(cache.topic_ids.is_empty());
+    }
+
+    #[test]
+    fn test_metadata_recovery_strategy_default() {
+        assert_eq!(
+            MetadataRecoveryStrategy::default(),
+            MetadataRecoveryStrategy::None,
+        );
+    }
+
+    #[test]
+    fn test_cluster_metadata_with_recovery_strategy() {
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        let meta = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        )
+        .with_recovery_strategy(MetadataRecoveryStrategy::Rebootstrap)
+        .with_rebootstrap_trigger(Duration::from_secs(60));
+
+        assert_eq!(
+            meta.recovery_strategy,
+            MetadataRecoveryStrategy::Rebootstrap
+        );
+        assert_eq!(meta.rebootstrap_trigger, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_update_seed_brokers() {
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        let meta = ClusterMetadata::new(
+            vec!["broker1:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        );
+
+        assert_eq!(meta.bootstrap_servers(), vec!["broker1:9092"]);
+
+        meta.update_seed_brokers(vec!["broker2:9092".to_string(), "broker3:9092".to_string()])
+            .unwrap();
+        assert_eq!(
+            meta.bootstrap_servers(),
+            vec!["broker2:9092", "broker3:9092"]
+        );
+    }
+
+    #[test]
+    fn test_update_seed_brokers_rejects_empty() {
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        let meta = ClusterMetadata::new(
+            vec!["broker1:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        );
+
+        let result = meta.update_seed_brokers(vec![]);
+        assert!(result.is_err());
+        // Original servers unchanged.
+        assert_eq!(meta.bootstrap_servers(), vec!["broker1:9092"]);
+    }
+
+    #[test]
+    fn test_needs_rebootstrap_disabled_by_default() {
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        let meta = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        );
+
+        // Default strategy is None — should never trigger rebootstrap.
+        assert!(!meta.needs_rebootstrap());
+    }
+
+    #[test]
+    fn test_needs_rebootstrap_not_yet_triggered() {
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        let meta = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        )
+        .with_recovery_strategy(MetadataRecoveryStrategy::Rebootstrap)
+        .with_rebootstrap_trigger(Duration::from_secs(300));
+
+        // No attempt recorded yet — needs_rebootstrap should return false.
+        assert!(!meta.needs_rebootstrap());
+
+        // Simulate that a refresh attempt has started.
+        {
+            let mut start = meta.metadata_attempt_start.lock();
+            *start = Some(Instant::now());
+        }
+
+        // Still shouldn't trigger — trigger is 300s, elapsed is ~0.
+        assert!(!meta.needs_rebootstrap());
+        // Timestamp should still be recorded.
+        assert!(meta.metadata_attempt_start.lock().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_needs_rebootstrap_triggers_after_timeout() {
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        let meta = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        )
+        .with_recovery_strategy(MetadataRecoveryStrategy::Rebootstrap)
+        .with_rebootstrap_trigger(Duration::ZERO); // Zero trigger = immediate
+
+        // Simulate that a refresh attempt has started.
+        {
+            let mut start = meta.metadata_attempt_start.lock();
+            *start = Some(Instant::now());
+        }
+
+        // With a zero trigger, needs_rebootstrap should return true.
+        assert!(meta.needs_rebootstrap());
+
+        // Perform the actual rebootstrap.
+        meta.rebootstrap().await;
+
+        // After rebootstrap, the attempt start should be set to Some(now) — not None.
+        assert!(meta.metadata_attempt_start.lock().is_some());
+        // Cache should be reset.
+        assert!(meta.cache.load().brokers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_rebootstrap_clears_cache() {
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        let meta = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        );
+
+        // Manually inject some data into the cache.
+        let mut cache = MetadataCache::new();
+        cache
+            .brokers
+            .insert(1, BrokerInfo::new(1, "host".to_string(), 9092, None));
+        meta.cache.store(Arc::new(cache));
+        assert!(!meta.cache.load().brokers.is_empty());
+
+        meta.rebootstrap().await;
+
+        assert!(meta.cache.load().brokers.is_empty());
+        // After rebootstrap, timer is set to Some(now) — not cleared.
+        assert!(meta.metadata_attempt_start.lock().is_some());
     }
 }

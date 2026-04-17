@@ -306,9 +306,10 @@ impl CompactedTable {
                 .as_ref()
                 .expect("non-tombstone compacted record must have a value")
                 .clone();
-            let old_value = self.entries.insert(key.clone(), value.clone());
+            let key_owned = key.clone();
+            let old_value = self.entries.insert(key_owned.clone(), value.clone());
             TableChange {
-                key: key.clone(),
+                key: key_owned,
                 old_value,
                 new_value: Some(value),
                 partition: record.partition,
@@ -675,6 +676,8 @@ pub struct CompactedTopicConsumerBuilder {
     max_partition_fetch_bytes: Option<i32>,
     max_poll_records: Option<i32>,
     auth: Option<AuthConfig>,
+    #[cfg(feature = "socks5")]
+    proxy: Option<crate::network::ProxyConfig>,
 }
 
 impl CompactedTopicConsumerBuilder {
@@ -726,6 +729,15 @@ impl CompactedTopicConsumerBuilder {
         self
     }
 
+    /// Set SOCKS5 proxy configuration.
+    ///
+    /// Routes all broker connections through the specified SOCKS5 proxy.
+    #[cfg(feature = "socks5")]
+    pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
+        self.proxy = Some(proxy);
+        self
+    }
+
     /// Build the [`CompactedTopicConsumer`].
     ///
     /// Creates an internal [`Consumer`] in standalone mode (no consumer group),
@@ -767,6 +779,10 @@ impl CompactedTopicConsumerBuilder {
         }
         if let Some(auth) = self.auth {
             consumer_builder = consumer_builder.auth(auth);
+        }
+        #[cfg(feature = "socks5")]
+        if let Some(proxy) = self.proxy {
+            consumer_builder = consumer_builder.proxy(proxy);
         }
 
         let consumer = consumer_builder.build().await?;
@@ -822,6 +838,7 @@ mod tests {
             value: value.map(|v| Bytes::from(v.to_string())),
             headers: Vec::new(),
             leader_epoch: None,
+            delivery_count: None,
         }
     }
 

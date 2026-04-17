@@ -28,11 +28,17 @@
 //! ```
 
 mod connection;
+mod happy_eyeballs;
 mod pool;
 mod secure;
 
 pub use connection::{
     BrokerConnection, ConnectionConfig, ConnectionConfigBuilder, ConnectionStats, RequestPriority,
 };
+#[cfg(feature = "socks5")]
+#[cfg_attr(docsrs, doc(cfg(feature = "socks5")))]
+pub use connection::{ProxyConfig, ProxyCredentials};
 pub use pool::{BrokerConnectionBundle, ConnectionPool, ConnectionRetryConfig};
-pub use secure::{SaslAuthenticator, SecureConnectionConfig, SecureConnectionConfigBuilder};
+pub use secure::{
+    ChallengeResponse, SaslAuthenticator, SecureConnectionConfig, SecureConnectionConfigBuilder,
+};
