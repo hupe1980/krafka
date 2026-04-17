@@ -566,9 +566,9 @@ impl ConnectionPool {
 
         // Double-check before acquiring the coalescing lock: another task
         // may have finished reconnecting between our fast-path miss and now.
-        // Done *outside* the `connecting` critical section to enforce a
-        // consistent lock order (connections_by_addr before connecting) and
-        // prevent deadlocking with the reconnector completion path.
+        // This read is done *outside* the `connecting` critical section so
+        // the two locks are never held simultaneously (see the no-nested-lock
+        // invariant documented in the reconnector completion path below).
         let existing = {
             let conns = self.connections_by_addr.read();
             conns.get(address).filter(|c| c.is_usable()).cloned()
@@ -614,10 +614,12 @@ impl ConnectionPool {
         let result = self.reconnect_with_backoff(address).await;
 
         // Notify waiting tasks and store the connection.
-        // Lock order: `connecting` before `connections_by_addr` (consistent
-        // with `get_or_reconnect` which reads `connections_by_addr` before
-        // locking `connecting`; a concurrent reader finishing its read before
-        // we write is safe — no nested hold in either direction).
+        // Safety invariant: this path must not hold `connecting` and
+        // `connections_by_addr` at the same time.  We remove the waiters
+        // from `connecting`, drop that lock immediately, and only then
+        // update `connections_by_addr`.  Future changes must preserve this
+        // no-nested-lock invariant; if code ever needs to hold both locks
+        // simultaneously, it must define and follow a single global order.
         let waiters = self.connecting.lock().remove(address).unwrap_or_default();
 
         if let Ok(conn) = &result {

@@ -37,9 +37,18 @@ impl InFlightBarrier {
 
         self.started.fetch_add(1, Ordering::SeqCst);
 
-        // SeqCst on both `started` and `closing` prevents the store-buffering
-        // hazard: either `begin_close` observes our incremented `started`,
-        // or we observe `closing = true` below — at least one must hold.
+        // Why SeqCst and not AcqRel:
+        //
+        // This is the store-buffering (SB) litmus test.  Thread A writes
+        // `started` then reads `closing`; thread B (begin_close) writes
+        // `closing` then reads `started`.  Under AcqRel both reads may
+        // return the pre-write values (each thread's store is only
+        // visible when the *other* thread performs an acquire load of
+        // the *same* variable).  Only SeqCst establishes a total order
+        // that guarantees at least one thread sees the other's write.
+        //
+        // This cannot be safely weakened to AcqRel without adding a
+        // separate fence or restructuring the algorithm.
 
         if self.closing.load(Ordering::SeqCst) {
             self.complete_one();
@@ -63,8 +72,9 @@ impl InFlightBarrier {
             return None;
         }
 
-        // SeqCst on `closing` and `started` pairs with `start()` to prevent
-        // store-buffering; see comment there.
+        // SeqCst pairs with `start()` — see the SB litmus-test comment
+        // there.  Cannot be weakened without breaking the invariant that
+        // at least one side observes the other's write.
         Some(self.started.load(Ordering::SeqCst))
     }
 
