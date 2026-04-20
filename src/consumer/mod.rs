@@ -69,7 +69,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::auth::AuthConfig;
 use crate::error::{KrafkaError, Result};
-use crate::metadata::ClusterMetadata;
+use crate::metadata::{BrokerInfo, ClusterMetadata, TopicInfo};
 use crate::metrics::ConsumerMetrics;
 use crate::network::{ConnectionConfig, ConnectionPool};
 use crate::protocol::{
@@ -85,6 +85,17 @@ use crate::{Offset, PartitionId};
 const MAX_COOPERATIVE_ROUNDS: usize = 5;
 
 use fetch_session::FetchSessionCache;
+
+/// Cluster metadata snapshot returned by [`Consumer::fetch_metadata`].
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct FetchMetadataResult {
+    /// All brokers known to the cluster.
+    pub brokers: Vec<BrokerInfo>,
+    /// Topics requested by the caller. Empty if the requested topic was not
+    /// found in the cluster.
+    pub topics: Vec<TopicInfo>,
+}
 
 /// A Kafka consumer.
 pub struct Consumer {
@@ -1449,6 +1460,115 @@ impl Consumer {
         self.seek(topic, partition, offset).await
     }
 
+    /// Look up the earliest offset whose message timestamp is greater than or
+    /// equal to the given timestamp, for each listed `(topic, partition)`.
+    ///
+    /// Uses the ListOffsets API. Requests are batched by leader broker so each
+    /// broker receives at most one RPC. If a partition has no message at or
+    /// after the timestamp, the broker returns `-1` for that partition.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let offsets = consumer
+    ///     .offsets_for_times(&[("orders", 0), ("orders", 1)], 1_700_000_000_000)
+    ///     .await?;
+    /// ```
+    pub async fn offsets_for_times(
+        &self,
+        partitions: &[(&str, PartitionId)],
+        timestamp: i64,
+    ) -> Result<HashMap<(String, PartitionId), Offset>> {
+        let mut grouped: HashMap<String, Vec<PartitionId>> = HashMap::new();
+        for (topic, partition) in partitions {
+            grouped
+                .entry((*topic).to_string())
+                .or_default()
+                .push(*partition);
+        }
+        self.resolve_list_offsets(&grouped, timestamp).await
+    }
+
+    /// Look up the earliest offset whose message timestamp is greater than or
+    /// equal to the given timestamp, for every partition of a single topic.
+    ///
+    /// Convenience wrapper around [`Consumer::offsets_for_times`] that resolves
+    /// the topic's partitions from metadata so callers don't have to list
+    /// them. Triggers a metadata refresh if the topic isn't cached yet.
+    ///
+    /// Returns a map from `PartitionId` to the resolved offset. A partition
+    /// with no message at or after the timestamp maps to `-1`.
+    pub async fn offsets_for_times_for_topic(
+        &self,
+        topic: &str,
+        timestamp: i64,
+    ) -> Result<HashMap<PartitionId, Offset>> {
+        let info = match self.metadata.topic(topic) {
+            Some(info) => info,
+            None => {
+                self.metadata.refresh_for_topics(Some(&[topic])).await?;
+                self.metadata.topic(topic).ok_or_else(|| {
+                    KrafkaError::invalid_state(format!("topic not found: {topic}"))
+                })?
+            }
+        };
+
+        let pairs: Vec<(&str, PartitionId)> = info
+            .partitions
+            .iter()
+            .map(|p| (topic, p.partition))
+            .collect();
+        let results = self.offsets_for_times(&pairs, timestamp).await?;
+
+        Ok(results
+            .into_iter()
+            .map(|((_, p), offset)| (p, offset))
+            .collect())
+    }
+
+    /// Fetch the low (log start) and high (latest) watermarks for a partition.
+    ///
+    /// Issues two ListOffsets RPCs to the partition leader — one for the
+    /// earliest offset (`timestamp = -2`) and one for the latest
+    /// (`timestamp = -1`) — and returns `(low, high)`.
+    pub async fn fetch_watermarks(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+    ) -> Result<(Offset, Offset)> {
+        let low = self.resolve_list_offset(topic, partition, -2).await?;
+        let high = self.resolve_list_offset(topic, partition, -1).await?;
+        Ok((low, high))
+    }
+
+    /// Return a snapshot of cluster metadata (brokers and topics).
+    ///
+    /// If `topic` is `Some`, only that topic is returned. If `None`, all
+    /// topics known to the cluster are returned.
+    ///
+    /// This reads from the consumer's cached cluster metadata. If the
+    /// requested topic is not yet in the cache, a metadata refresh is
+    /// triggered first.
+    pub async fn fetch_metadata(&self, topic: Option<&str>) -> Result<FetchMetadataResult> {
+        if let Some(name) = topic
+            && self.metadata.topic(name).is_none()
+        {
+            self.metadata.refresh_for_topics(Some(&[name])).await?;
+        }
+
+        let brokers = self.metadata.brokers();
+        let topics = match topic {
+            Some(name) => self
+                .metadata
+                .topic(name)
+                .map(|t| vec![t])
+                .unwrap_or_default(),
+            None => self.metadata.topics(),
+        };
+
+        Ok(FetchMetadataResult { brokers, topics })
+    }
+
     /// Resolve an offset timestamp via the ListOffsets API.
     ///
     /// `timestamp` should be:
@@ -2519,10 +2639,10 @@ impl Consumer {
         topic: &str,
         partition: PartitionId,
     ) -> Result<()> {
-        use crate::protocol::{
-            OffsetForLeaderEpochPartition, OffsetForLeaderEpochRequest,
-            OffsetForLeaderEpochResponse, OffsetForLeaderEpochTopic,
-        };
+        use crate::protocol::OffsetForLeaderEpochPartition;
+        use crate::protocol::OffsetForLeaderEpochRequest;
+        use crate::protocol::OffsetForLeaderEpochResponse;
+        use crate::protocol::OffsetForLeaderEpochTopic;
 
         // Refresh metadata first to get updated leader info
         if let Err(e) = self.metadata.refresh_for_topics(Some(&[topic])).await {
@@ -3717,7 +3837,8 @@ mod tests {
 
     #[test]
     fn test_consumer_builder_with_rebalance_listener() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
 
         struct TestListener {
             assigned: AtomicBool,
@@ -3929,7 +4050,8 @@ mod tests {
 
     #[test]
     fn test_consumer_builder_interceptor() {
-        use crate::interceptor::{ConsumerInterceptor, InterceptorResult};
+        use crate::interceptor::ConsumerInterceptor;
+        use crate::interceptor::InterceptorResult;
 
         #[derive(Debug)]
         struct TestInterceptor;
@@ -4300,7 +4422,8 @@ mod tests {
     #[test]
     fn test_list_offsets_response_result_extraction() {
         use crate::error::ErrorCode;
-        use crate::protocol::{ListOffsetsResponsePartition, ListOffsetsResponseTopic};
+        use crate::protocol::ListOffsetsResponsePartition;
+        use crate::protocol::ListOffsetsResponseTopic;
 
         let response = ListOffsetsResponse {
             topics: vec![
@@ -4360,7 +4483,8 @@ mod tests {
     #[test]
     fn test_list_offsets_partial_failure_keeps_successes() {
         use crate::error::ErrorCode;
-        use crate::protocol::{ListOffsetsResponsePartition, ListOffsetsResponseTopic};
+        use crate::protocol::ListOffsetsResponsePartition;
+        use crate::protocol::ListOffsetsResponseTopic;
 
         let response = ListOffsetsResponse {
             topics: vec![ListOffsetsResponseTopic {
@@ -4429,7 +4553,8 @@ mod tests {
     #[test]
     fn test_list_offsets_all_failed_returns_error() {
         use crate::error::ErrorCode;
-        use crate::protocol::{ListOffsetsResponsePartition, ListOffsetsResponseTopic};
+        use crate::protocol::ListOffsetsResponsePartition;
+        use crate::protocol::ListOffsetsResponseTopic;
 
         let response = ListOffsetsResponse {
             topics: vec![ListOffsetsResponseTopic {
@@ -4776,7 +4901,8 @@ mod tests {
     /// on_partitions_revoked fires before on_partitions_assigned.
     #[test]
     fn test_cooperative_callback_ordering() {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
 
         struct OrderTracker {
             revoke_seq: AtomicU64,
@@ -4828,7 +4954,8 @@ mod tests {
     /// (more consumers than partitions).
     #[test]
     fn test_cooperative_on_assigned_fires_on_empty() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
 
         struct EmptyTracker {
             assigned_called: AtomicBool,
@@ -5072,5 +5199,27 @@ mod tests {
         // ConsumerStream must be Send so it can be used across .await in
         // spawned tasks (e.g., tokio::spawn with an Arc<Consumer>).
         assert_send::<ConsumerStream<'_>>();
+    }
+
+    /// The flat `&[(&str, PartitionId)]` input to `offsets_for_times` is
+    /// grouped by topic before hitting the internal helper. Verify that the
+    /// grouping preserves all pairs, deduplicates topic keys, and keeps
+    /// partitions in insertion order.
+    #[test]
+    fn test_offsets_for_times_grouping() {
+        let partitions: &[(&str, PartitionId)] =
+            &[("topic1", 0), ("topic1", 2), ("topic2", 1), ("topic1", 5)];
+
+        let mut grouped: HashMap<String, Vec<PartitionId>> = HashMap::new();
+        for (topic, partition) in partitions {
+            grouped
+                .entry((*topic).to_string())
+                .or_default()
+                .push(*partition);
+        }
+
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped["topic1"], vec![0, 2, 5]);
+        assert_eq!(grouped["topic2"], vec![1]);
     }
 }
