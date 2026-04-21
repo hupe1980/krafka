@@ -1417,10 +1417,14 @@ impl BrokerConnection {
         // Maps correlation_id → queue key for O(1) cancellation on response receipt.
         let mut delay_keys: HashMap<CorrelationId, delay_queue::Key> = HashMap::new();
 
-        // Reader task sends decoded response frames to this loop via an unbounded
-        // channel.  Unbounded is safe here: the reader is rate-limited by the TCP
-        // receive window; no additional back-pressure mechanism is required.
-        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Result<Bytes>>();
+        // Reader task sends decoded response frames to this loop via a bounded
+        // channel.  The capacity matches max_in_flight_requests: the broker
+        // can only send responses for outstanding requests, so this cap is
+        // an exact fit.  It also provides back-pressure — if the main loop
+        // is momentarily stalled (e.g., on a write), the reader suspends
+        // instead of buffering unboundedly.
+        let (frame_tx, mut frame_rx) =
+            mpsc::channel::<Result<Bytes>>(max_in_flight_requests.max(1));
 
         let reader_handle = tokio::spawn(async move {
             let mut decoder = Decoder::with_max_size(max_response_size);
@@ -1437,20 +1441,20 @@ impl BrokerConnection {
                             match decoder.decode() {
                                 Ok(Some(frame)) => {
                                     // Exit silently when the main loop has already gone away.
-                                    if frame_tx.send(Ok(frame)).is_err() {
+                                    if frame_tx.send(Ok(frame)).await.is_err() {
                                         return Ok::<_, KrafkaError>(());
                                     }
                                 }
                                 Ok(None) => break,
                                 Err(e) => {
-                                    let _ = frame_tx.send(Err(e));
+                                    let _ = frame_tx.send(Err(e)).await;
                                     return Ok(());
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        let _ = frame_tx.send(Err(KrafkaError::network(e)));
+                        let _ = frame_tx.send(Err(KrafkaError::network(e))).await;
                         return Ok(());
                     }
                 }
@@ -1638,15 +1642,30 @@ impl BrokerConnection {
 
                 // Write to the wire.  Register in pending only after a successful
                 // write so we never create a leaked entry for an undelivered request.
-                if let Err(e) = writer.write_all(&data).await {
-                    error!("Write error: {}", e);
-                    let _ = response_tx.send(Err(KrafkaError::network(e)));
-                    return Ok(false);
-                }
-                if let Err(e) = writer.flush().await {
-                    error!("Flush error: {}", e);
-                    let _ = response_tx.send(Err(KrafkaError::network(e)));
-                    return Ok(false);
+                //
+                // A single timeout covers both write_all and flush so the total
+                // I/O budget for this request is exactly request_timeout.
+                // A stalled TCP write cannot freeze the event loop (and therefore
+                // block all in-flight timeout processing) for longer than that.
+                let write_result = tokio::time::timeout(request_timeout, async {
+                    writer.write_all(&data).await?;
+                    writer.flush().await
+                })
+                .await;
+                match write_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        error!("Write error: {}", e);
+                        let _ = response_tx.send(Err(KrafkaError::network(e)));
+                        return Ok(false);
+                    }
+                    Err(_) => {
+                        let msg = format!("write timed out after {request_timeout:?}");
+                        error!("{msg}");
+                        let _ = response_tx.send(Err(KrafkaError::timeout(msg.clone())));
+                        // The stream is in an indeterminate state — close the connection.
+                        return Err(KrafkaError::timeout(msg));
+                    }
                 }
 
                 // Register pending entry and arm the per-request timeout.
@@ -1667,11 +1686,23 @@ impl BrokerConnection {
                 Ok(true)
             }
             ConnectionCommand::FireAndForget { data } => {
-                if let Err(e) = writer.write_all(&data).await {
-                    error!("Fire-and-forget write error: {}", e);
-                }
-                if let Err(e) = writer.flush().await {
-                    error!("Fire-and-forget flush error: {}", e);
+                let write_result = tokio::time::timeout(request_timeout, async {
+                    writer.write_all(&data).await?;
+                    writer.flush().await
+                })
+                .await;
+                match write_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => error!("Fire-and-forget write error: {}", e),
+                    Err(_) => {
+                        error!(
+                            "Fire-and-forget write timed out after {:?}",
+                            request_timeout
+                        );
+                        return Err(KrafkaError::timeout(format!(
+                            "fire-and-forget write timed out after {request_timeout:?}"
+                        )));
+                    }
                 }
                 Ok(false)
             }
@@ -3157,5 +3188,108 @@ mod tests {
     fn test_msk_iam_clock_offset_default() {
         let config = ConnectionConfig::default();
         assert_eq!(config.msk_iam_clock_offset_secs.load(Ordering::Relaxed), 0);
+    }
+
+    /// An in-flight request must be failed with a timeout error when no
+    /// response arrives within `request_timeout`.  This tests the
+    /// `DelayQueue`-driven per-request timeout path introduced in the H2 fix.
+    #[tokio::test]
+    async fn test_request_times_out_when_no_response() {
+        let (client, _server) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(client);
+        let (_high_tx, high_rx) = mpsc::channel(4);
+        let (normal_tx, normal_rx) = mpsc::channel(4);
+        let stats = Arc::new(ConnectionStats::default());
+
+        // Very short timeout so the test completes quickly.
+        let request_timeout = Duration::from_millis(50);
+
+        tokio::spawn(BrokerConnection::run_connection_loop(
+            reader,
+            writer,
+            high_rx,
+            normal_rx,
+            request_timeout,
+            stats,
+            crate::protocol::MAX_MESSAGE_SIZE,
+            256,
+        ));
+
+        let (response_tx, response_rx) = oneshot::channel();
+        normal_tx
+            .send(ConnectionCommand::Request {
+                // Minimal 4-byte payload; the server side (_server) never replies.
+                data: Bytes::from_static(b"test"),
+                correlation_id: 42,
+                api_key: ApiKey::Produce,
+                api_version: 0,
+                response_tx,
+            })
+            .await
+            .unwrap();
+
+        let err = response_rx.await.unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected timeout error, got: {err}"
+        );
+    }
+
+    /// A response that arrives before the deadline must cancel the timer so
+    /// no spurious timeout error is delivered after the successful response.
+    #[tokio::test]
+    async fn test_response_cancels_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(client);
+        let (_high_tx, high_rx) = mpsc::channel(4);
+        let (normal_tx, normal_rx) = mpsc::channel(4);
+        let stats = Arc::new(ConnectionStats::default());
+
+        // Long enough to not fire during the test.
+        let request_timeout = Duration::from_secs(5);
+        let correlation_id: i32 = 99;
+
+        tokio::spawn(BrokerConnection::run_connection_loop(
+            reader,
+            writer,
+            high_rx,
+            normal_rx,
+            request_timeout,
+            stats,
+            crate::protocol::MAX_MESSAGE_SIZE,
+            256,
+        ));
+
+        let (response_tx, response_rx) = oneshot::channel();
+        normal_tx
+            .send(ConnectionCommand::Request {
+                data: Bytes::from_static(b"test"),
+                correlation_id,
+                api_key: ApiKey::Produce,
+                api_version: 0,
+                response_tx,
+            })
+            .await
+            .unwrap();
+
+        // Drain the request bytes the loop wrote to the wire.
+        let mut buf = [0u8; 4];
+        server.read_exact(&mut buf).await.unwrap();
+
+        // Send a valid response: 4-byte length prefix + 4-byte correlation_id.
+        // For Produce v0, ResponseHeader v0 = correlation_id only (4 bytes).
+        let body = correlation_id.to_be_bytes();
+        server.write_all(&(4i32).to_be_bytes()).await.unwrap();
+        server.write_all(&body).await.unwrap();
+        server.flush().await.unwrap();
+
+        let result = response_rx.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "expected successful response before timeout, got: {:?}",
+            result.unwrap_err()
+        );
     }
 }
