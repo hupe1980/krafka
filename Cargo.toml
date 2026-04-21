@@ -15,7 +15,7 @@ categories = ["network-programming", "asynchronous"]
 [dependencies]
 # Async runtime
 tokio = { version = "1.26", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
-tokio-util = { version = "0.7", default-features = false }
+tokio-util = { version = "0.7", default-features = false, features = ["time"] }
 
 # Zero-copy buffers
 bytes = "1"

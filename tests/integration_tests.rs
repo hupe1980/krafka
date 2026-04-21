@@ -28,14 +28,14 @@ const CONTAINER_SETTLE: Duration = Duration::from_secs(10);
 const TOPIC_READY: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
-// Custom Kafka image – works with `apache/kafka-native` 3.8 – 4.x
+// Custom Kafka image – works with `apache/kafka-native` and `apache/kafka` 3.8 – 4.x
 // ---------------------------------------------------------------------------
 
 const KAFKA_PORT: ContainerPort = ContainerPort::Tcp(9092);
 const START_SCRIPT: &str = "/tmp/testcontainers_start.sh";
 
-/// Minimal [`Image`] for `apache/kafka-native` that follows the same
-/// start-script pattern as Java testcontainers.
+/// Minimal [`Image`] for `apache/kafka-native` (or `apache/kafka`) that follows
+/// the same start-script pattern as Java testcontainers.
 ///
 /// 1. The container command loops until `START_SCRIPT` exists.
 /// 2. `exec_after_start` writes that script — after the host port is known —
@@ -43,12 +43,14 @@ const START_SCRIPT: &str = "/tmp/testcontainers_start.sh";
 /// 3. Wait condition: "Kafka Server started" appears in container logs.
 #[derive(Debug, Clone)]
 struct ApacheKafka {
+    image: String,
     tag: String,
     env_vars: HashMap<String, String>,
 }
 
 impl ApacheKafka {
-    fn new(tag: impl Into<String>) -> Self {
+    fn new(image: impl Into<String>, tag: impl Into<String>) -> Self {
+        let image = image.into();
         let tag = tag.into();
         let mut env_vars = HashMap::new();
 
@@ -88,13 +90,17 @@ impl ApacheKafka {
             i64::MAX.to_string(),
         );
 
-        Self { tag, env_vars }
+        Self {
+            image,
+            tag,
+            env_vars,
+        }
     }
 }
 
 impl Image for ApacheKafka {
     fn name(&self) -> &str {
-        "apache/kafka-native"
+        &self.image
     }
 
     fn tag(&self) -> &str {
@@ -157,20 +163,20 @@ impl Image for ApacheKafka {
 
 /// Helper to get a Kafka container.
 ///
-/// Uses the `apache/kafka-native` image. The image tag is read from the
-/// `KAFKA_VERSION` environment variable (set by CI matrix); defaults to
-/// `3.9.0` for local development.
+/// Image name is read from `KAFKA_IMAGE` (default: `apache/kafka-native`).
+/// Image tag is read from `KAFKA_VERSION` (default: `3.9.0`).
 ///
-/// The GraalVM native image occasionally segfaults during startup
-/// (`Pwd.getpwuid` in class initialization), so we retry up to 3 times.
+/// `apache/kafka-native` (GraalVM) segfaults on `Pwd.getpwuid` in some CI
+/// environments; set `KAFKA_IMAGE=apache/kafka` to use the JVM image instead.
 async fn kafka_container() -> (ContainerAsync<ApacheKafka>, String) {
+    let image = std::env::var("KAFKA_IMAGE").unwrap_or_else(|_| "apache/kafka-native".to_string());
     let tag = std::env::var("KAFKA_VERSION").unwrap_or_else(|_| "3.9.0".to_string());
 
     let max_attempts = 3;
     let mut last_err = None;
 
     for attempt in 1..=max_attempts {
-        match ApacheKafka::new(&tag).start().await {
+        match ApacheKafka::new(&image, &tag).start().await {
             Ok(container) => {
                 // Wait for Kafka to be fully ready
                 tokio::time::sleep(CONTAINER_SETTLE).await;
