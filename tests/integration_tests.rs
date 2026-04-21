@@ -90,7 +90,11 @@ impl ApacheKafka {
             i64::MAX.to_string(),
         );
 
-        Self { image, tag, env_vars }
+        Self {
+            image,
+            tag,
+            env_vars,
+        }
     }
 }
 
@@ -165,8 +169,7 @@ impl Image for ApacheKafka {
 /// `apache/kafka-native` (GraalVM) segfaults on `Pwd.getpwuid` in some CI
 /// environments; set `KAFKA_IMAGE=apache/kafka` to use the JVM image instead.
 async fn kafka_container() -> (ContainerAsync<ApacheKafka>, String) {
-    let image =
-        std::env::var("KAFKA_IMAGE").unwrap_or_else(|_| "apache/kafka-native".to_string());
+    let image = std::env::var("KAFKA_IMAGE").unwrap_or_else(|_| "apache/kafka-native".to_string());
     let tag = std::env::var("KAFKA_VERSION").unwrap_or_else(|_| "3.9.0".to_string());
 
     let max_attempts = 3;
