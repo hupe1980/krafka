@@ -1640,14 +1640,20 @@ impl BrokerConnection {
                     return Ok(false);
                 }
 
+                // Snapshot the deadline before touching the wire so that the
+                // end-to-end budget (write + network round-trip) is exactly
+                // request_timeout, not up to 2× request_timeout.
+                let deadline = tokio::time::Instant::now() + request_timeout;
+
                 // Write to the wire.  Register in pending only after a successful
                 // write so we never create a leaked entry for an undelivered request.
                 //
-                // A single timeout covers both write_all and flush so the total
-                // I/O budget for this request is exactly request_timeout.
-                // A stalled TCP write cannot freeze the event loop (and therefore
-                // block all in-flight timeout processing) for longer than that.
-                let write_result = tokio::time::timeout(request_timeout, async {
+                // Uses the same absolute deadline as the DelayQueue entry below so
+                // write + response wait together consume exactly one request_timeout
+                // budget.  A stalled TCP write cannot freeze the event loop (and
+                // therefore block all in-flight timeout processing) for longer than
+                // the remaining budget.
+                let write_result = tokio::time::timeout_at(deadline, async {
                     writer.write_all(&data).await?;
                     writer.flush().await
                 })
@@ -1668,8 +1674,10 @@ impl BrokerConnection {
                     }
                 }
 
-                // Register pending entry and arm the per-request timeout.
-                let key = delay_queue.insert(correlation_id, request_timeout);
+                // Register pending entry and arm the per-request timeout at the
+                // same absolute deadline used for the write, so the whole
+                // request (write + response wait) is bounded by request_timeout.
+                let key = delay_queue.insert_at(correlation_id, deadline);
                 delay_keys.insert(correlation_id, key);
                 pending.insert(
                     correlation_id,
@@ -1686,6 +1694,8 @@ impl BrokerConnection {
                 Ok(true)
             }
             ConnectionCommand::FireAndForget { data } => {
+                // No response is expected, so a relative timeout is sufficient —
+                // there is no second phase to share a deadline with.
                 let write_result = tokio::time::timeout(request_timeout, async {
                     writer.write_all(&data).await?;
                     writer.flush().await
