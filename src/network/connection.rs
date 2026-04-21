@@ -17,11 +17,12 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(feature = "socks5")]
 use tokio::net::TcpSocket;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 #[cfg(feature = "socks5")]
 use tokio::time::timeout_at;
 use tokio_rustls::TlsConnector;
+use tokio_util::time::{DelayQueue, delay_queue};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::CorrelationId;
@@ -616,8 +617,6 @@ struct PendingRequest {
     response_tx: oneshot::Sender<Result<Bytes>>,
     api_key: ApiKey,
     api_version: i16,
-    /// When this request was sent, for per-request timeout enforcement.
-    sent_at: Instant,
 }
 
 /// Command sent to the connection task.
@@ -656,7 +655,7 @@ pub struct BrokerConnection {
     /// Normal-priority command sender (produce, fetch).
     normal_priority_tx: mpsc::Sender<ConnectionCommand>,
     /// API versions supported by the broker.
-    api_versions: Arc<Mutex<HashMap<ApiKey, ApiVersionRange>>>,
+    api_versions: Arc<parking_lot::Mutex<HashMap<ApiKey, ApiVersionRange>>>,
     /// Whether the connection is alive.
     alive: Arc<std::sync::atomic::AtomicBool>,
     /// When the SASL session expires (KIP-368).
@@ -736,7 +735,7 @@ impl BrokerConnection {
             correlation_id_gen: Arc::new(CorrelationIdGenerator::new()),
             high_priority_tx,
             normal_priority_tx,
-            api_versions: Arc::new(Mutex::new(HashMap::new())),
+            api_versions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             alive,
             session_expiry: None,
             stats,
@@ -1406,167 +1405,190 @@ impl BrokerConnection {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let pending: Arc<Mutex<HashMap<CorrelationId, PendingRequest>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let pending_clone = pending.clone();
+        // All pending request state is owned exclusively by this task.
+        // No Arc<Mutex> needed — all access is single-threaded on this event loop.
+        let mut pending: HashMap<CorrelationId, PendingRequest> = HashMap::new();
 
-        // Per-request timeout sweep: check every 1s for timed-out in-flight requests
-        let pending_for_timeout = pending.clone();
-        let timeout_sweep_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let now = Instant::now();
+        // Per-request timeout via timer-wheel (tokio_util::time::DelayQueue).
+        // Cost: O(log n) per insertion/expiration vs O(n × connections) for the
+        // old 1-second polling task.  Each entry fires exactly once at
+        // `enqueue_time + request_timeout`.
+        let mut delay_queue: DelayQueue<CorrelationId> = DelayQueue::new();
+        // Maps correlation_id → queue key for O(1) cancellation on response receipt.
+        let mut delay_keys: HashMap<CorrelationId, delay_queue::Key> = HashMap::new();
 
-                // Phase 1: identify timed-out IDs under lock (no channel sends).
-                let timed_out: Vec<CorrelationId> = {
-                    let pending_map = pending_for_timeout.lock().await;
-                    pending_map
-                        .iter()
-                        .filter(|(_, req)| now.duration_since(req.sent_at) > request_timeout)
-                        .map(|(&id, _)| id)
-                        .collect()
-                };
+        // Reader task sends decoded response frames to this loop via an unbounded
+        // channel.  Unbounded is safe here: the reader is rate-limited by the TCP
+        // receive window; no additional back-pressure mechanism is required.
+        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Result<Bytes>>();
 
-                if timed_out.is_empty() {
-                    continue;
-                }
-
-                // Phase 2: remove and notify outside the hot path — reacquire
-                // lock only when there is actual work to do.
-                let mut pending_map = pending_for_timeout.lock().await;
-                for id in timed_out {
-                    if let Some(req) = pending_map.remove(&id) {
-                        warn!(
-                            correlation_id = id,
-                            "Request timed out after {:?}", request_timeout
-                        );
-                        let _ = req.response_tx.send(Err(KrafkaError::timeout(format!(
-                            "request {} timed out after {:?}",
-                            id, request_timeout
-                        ))));
-                    }
-                }
-            }
-        });
-
-        let (reader_result_tx, mut reader_result_rx) = oneshot::channel();
-
-        // Spawn reader task
         let reader_handle = tokio::spawn(async move {
-            let result = async move {
-                let mut decoder = Decoder::with_max_size(max_response_size);
-                let mut buf = vec![0u8; 65536];
-
-                loop {
-                    match reader.read(&mut buf).await {
-                        Ok(0) => {
-                            debug!("Connection closed by peer");
-                            break;
-                        }
-                        Ok(n) => {
-                            decoder.extend(&buf[..n]);
-
-                            // Process all complete messages
-                            while let Some(response) = decoder.decode()? {
-                                Self::handle_response(&pending_clone, response).await?;
+            let mut decoder = Decoder::with_max_size(max_response_size);
+            let mut buf = vec![0u8; 65536];
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) => {
+                        debug!("Connection closed by peer");
+                        break;
+                    }
+                    Ok(n) => {
+                        decoder.extend(&buf[..n]);
+                        loop {
+                            match decoder.decode() {
+                                Ok(Some(frame)) => {
+                                    // Exit silently when the main loop has already gone away.
+                                    if frame_tx.send(Ok(frame)).is_err() {
+                                        return Ok::<_, KrafkaError>(());
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    let _ = frame_tx.send(Err(e));
+                                    return Ok(());
+                                }
                             }
                         }
-                        Err(e) => {
-                            error!("Read error: {}", e);
-                            return Err(KrafkaError::network(e));
-                        }
+                    }
+                    Err(e) => {
+                        let _ = frame_tx.send(Err(KrafkaError::network(e)));
+                        return Ok(());
                     }
                 }
-
-                Ok::<_, KrafkaError>(())
             }
-            .await;
-
-            let _ = reader_result_tx.send(result.clone());
-            result
+            Ok(())
         });
 
         let mut terminal_error: Option<KrafkaError> = None;
 
-        // Process commands with priority
+        // Main event loop — lock-free on the hot path.
         loop {
-            // Try high-priority first (non-blocking)
+            // Fast path: drain the high-priority channel without yielding to the
+            // scheduler.  Heartbeats are the most latency-sensitive request type.
             if let Ok(cmd) = high_priority_rx.try_recv() {
                 stats.high_priority_bypasses.fetch_add(1, Ordering::Relaxed);
-                if Self::handle_command(&mut writer, &pending, cmd, max_in_flight_requests).await? {
+                if Self::handle_command_direct(
+                    &mut writer,
+                    &mut pending,
+                    &mut delay_queue,
+                    &mut delay_keys,
+                    cmd,
+                    max_in_flight_requests,
+                    request_timeout,
+                )
+                .await?
+                {
                     break;
                 }
                 continue;
             }
 
-            // Wait for either channel
             tokio::select! {
-                // Bias towards high-priority
                 biased;
 
-                reader_result = &mut reader_result_rx => {
-                    terminal_error = match reader_result {
-                        Ok(Ok(())) => None,
-                        Ok(Err(err)) => Some(err),
-                        Err(_) => Some(KrafkaError::invalid_state("reader task result dropped")),
-                    };
-                    break;
+                // Response frames from the reader task — dispatch immediately so
+                // callers receive results as soon as the bytes arrive.
+                frame_result = frame_rx.recv() => {
+                    match frame_result {
+                        Some(Ok(frame)) => {
+                            if let Err(e) = Self::dispatch_response(
+                                &mut pending,
+                                &mut delay_queue,
+                                &mut delay_keys,
+                                frame,
+                            ) {
+                                // Protocol desynchronisation — close the connection.
+                                terminal_error = Some(e);
+                                break;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            terminal_error = Some(e);
+                            break;
+                        }
+                        None => {
+                            // Reader task exited (peer closed the connection).
+                            break;
+                        }
+                    }
                 }
 
+                // Timer-wheel: fires exactly when a per-request deadline expires.
+                // O(log n) cost vs O(n × connections) for the old 1-second sweep.
+                Some(expired) = std::future::poll_fn(|cx| {
+                    use futures_core::Stream;
+                    std::pin::Pin::new(&mut delay_queue).poll_next(cx)
+                }) => {
+                    let id = expired.into_inner();
+                    if let Some(req) = pending.remove(&id) {
+                        delay_keys.remove(&id);
+                        warn!(
+                            correlation_id = id,
+                            "Request timed out after {:?}", request_timeout
+                        );
+                        let _ = req.response_tx.send(Err(KrafkaError::timeout(format!(
+                            "request {id} timed out after {request_timeout:?}"
+                        ))));
+                    }
+                }
+
+                // High-priority commands (heartbeats, metadata, coordinator lookups).
                 cmd = high_priority_rx.recv() => {
                     match cmd {
                         Some(cmd) => {
-                            if Self::handle_command(&mut writer, &pending, cmd, max_in_flight_requests).await? {
+                            if Self::handle_command_direct(
+                                &mut writer,
+                                &mut pending,
+                                &mut delay_queue,
+                                &mut delay_keys,
+                                cmd,
+                                max_in_flight_requests,
+                                request_timeout,
+                            )
+                            .await?
+                            {
                                 break;
                             }
                         }
-                        None => break, // Channel closed
+                        None => break,
                     }
                 }
+
+                // Normal-priority commands (produce, fetch, and all others).
                 cmd = normal_priority_rx.recv() => {
                     match cmd {
                         Some(cmd) => {
-                            if Self::handle_command(&mut writer, &pending, cmd, max_in_flight_requests).await? {
+                            if Self::handle_command_direct(
+                                &mut writer,
+                                &mut pending,
+                                &mut delay_queue,
+                                &mut delay_keys,
+                                cmd,
+                                max_in_flight_requests,
+                                request_timeout,
+                            )
+                            .await?
+                            {
                                 break;
                             }
                         }
-                        None => break, // Channel closed
+                        None => break,
                     }
                 }
             }
         }
 
-        // Wait for reader to finish
+        // Drop the writer half to signal EOF to the broker, then abort the
+        // reader task — we no longer need its output.
         drop(writer);
-        timeout_sweep_handle.abort();
+        reader_handle.abort();
 
-        match reader_handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                if terminal_error.is_none() {
-                    terminal_error = Some(err);
-                }
-            }
-            Err(join_err) => {
-                if terminal_error.is_none() {
-                    terminal_error = Some(KrafkaError::invalid_state(format!(
-                        "reader task failed: {join_err}"
-                    )));
-                }
-            }
-        }
-
-        // Drain pending requests and notify callers that the connection is closed
-        {
-            let mut pending_map = pending.lock().await;
-            let pending_error = terminal_error
-                .clone()
-                .unwrap_or_else(|| KrafkaError::invalid_state("connection closed"));
-            for (_, req) in pending_map.drain() {
-                let _ = req.response_tx.send(Err(pending_error.clone()));
-            }
+        // Drain all in-flight requests and notify callers that the connection
+        // is gone.
+        let pending_error = terminal_error
+            .clone()
+            .unwrap_or_else(|| KrafkaError::invalid_state("connection closed"));
+        for (_, req) in pending.drain() {
+            let _ = req.response_tx.send(Err(pending_error.clone()));
         }
 
         if let Some(err) = terminal_error {
@@ -1579,11 +1601,19 @@ impl BrokerConnection {
     /// Handle a single connection command.
     ///
     /// Returns `true` if the connection should close.
-    async fn handle_command<W: AsyncWrite + Unpin>(
+    ///
+    /// # Lock-free hot path
+    ///
+    /// The pending map is owned by the single event-loop task — all insertions
+    /// and removals are O(1) HashMap operations with no synchronization overhead.
+    async fn handle_command_direct<W: AsyncWrite + Unpin>(
         writer: &mut W,
-        pending: &Mutex<HashMap<CorrelationId, PendingRequest>>,
+        pending: &mut HashMap<CorrelationId, PendingRequest>,
+        delay_queue: &mut DelayQueue<CorrelationId>,
+        delay_keys: &mut HashMap<CorrelationId, delay_queue::Key>,
         cmd: ConnectionCommand,
         max_in_flight_requests: usize,
+        request_timeout: Duration,
     ) -> Result<bool> {
         match cmd {
             ConnectionCommand::Request {
@@ -1593,56 +1623,43 @@ impl BrokerConnection {
                 api_version,
                 response_tx,
             } => {
-                // Reject if at capacity to prevent unbounded memory growth
-                {
-                    let pending_map = pending.lock().await;
-                    if pending_map.len() >= max_in_flight_requests {
-                        warn!(
-                            pending = pending_map.len(),
-                            max = max_in_flight_requests,
-                            "Rejecting request: max in-flight requests reached"
-                        );
-                        let _ = response_tx.send(Err(KrafkaError::invalid_state(format!(
-                            "max in-flight requests ({max_in_flight_requests}) reached"
-                        ))));
-                        return Ok(false);
-                    }
-                }
-
-                // Store pending request
-                {
-                    let mut pending = pending.lock().await;
-                    pending.insert(
-                        correlation_id,
-                        PendingRequest {
-                            response_tx,
-                            api_key,
-                            api_version,
-                            sent_at: Instant::now(),
-                        },
+                // Reject when at capacity to prevent unbounded memory growth.
+                if pending.len() >= max_in_flight_requests {
+                    warn!(
+                        pending = pending.len(),
+                        max = max_in_flight_requests,
+                        "Rejecting request: max in-flight requests reached"
                     );
+                    let _ = response_tx.send(Err(KrafkaError::invalid_state(format!(
+                        "max in-flight requests ({max_in_flight_requests}) reached"
+                    ))));
+                    return Ok(false);
                 }
 
-                // Send request
+                // Write to the wire.  Register in pending only after a successful
+                // write so we never create a leaked entry for an undelivered request.
                 if let Err(e) = writer.write_all(&data).await {
                     error!("Write error: {}", e);
-                    let mut pending = pending.lock().await;
-                    if let Some(req) = pending.remove(&correlation_id) {
-                        let _ = req.response_tx.send(Err(KrafkaError::network(e)));
-                    }
+                    let _ = response_tx.send(Err(KrafkaError::network(e)));
                     return Ok(false);
                 }
-                // Ensure data is sent immediately
                 if let Err(e) = writer.flush().await {
                     error!("Flush error: {}", e);
-                    // Propagate flush failure to the pending request so the caller
-                    // doesn't hang waiting for a response that will never arrive.
-                    let mut pending = pending.lock().await;
-                    if let Some(req) = pending.remove(&correlation_id) {
-                        let _ = req.response_tx.send(Err(KrafkaError::network(e)));
-                    }
+                    let _ = response_tx.send(Err(KrafkaError::network(e)));
                     return Ok(false);
                 }
+
+                // Register pending entry and arm the per-request timeout.
+                let key = delay_queue.insert(correlation_id, request_timeout);
+                delay_keys.insert(correlation_id, key);
+                pending.insert(
+                    correlation_id,
+                    PendingRequest {
+                        response_tx,
+                        api_key,
+                        api_version,
+                    },
+                );
                 Ok(false)
             }
             ConnectionCommand::Close => {
@@ -1661,12 +1678,20 @@ impl BrokerConnection {
         }
     }
 
-    /// Handle an incoming response.
-    async fn handle_response(
-        pending: &Mutex<HashMap<CorrelationId, PendingRequest>>,
+    /// Dispatch an incoming response frame to the waiting caller.
+    ///
+    /// Looks up the correlation ID in the pending map, cancels the associated
+    /// timeout, decodes the response header, and delivers the body.
+    ///
+    /// Returns `Err` only on protocol-level desynchronisation (unknown
+    /// correlation ID or undecodable response header) — both indicate a corrupt
+    /// stream and require the connection to be closed.
+    fn dispatch_response(
+        pending: &mut HashMap<CorrelationId, PendingRequest>,
+        delay_queue: &mut DelayQueue<CorrelationId>,
+        delay_keys: &mut HashMap<CorrelationId, delay_queue::Key>,
         response: Bytes,
     ) -> Result<()> {
-        // Read correlation ID from response
         if response.len() < 4 {
             return Err(KrafkaError::protocol("response too short"));
         }
@@ -1674,12 +1699,14 @@ impl BrokerConnection {
         let correlation_id =
             i32::from_be_bytes([response[0], response[1], response[2], response[3]]);
 
-        let mut pending = pending.lock().await;
         if let Some(req) = pending.remove(&correlation_id) {
+            // Cancel the timeout — the response arrived before the deadline.
+            if let Some(key) = delay_keys.remove(&correlation_id) {
+                delay_queue.remove(&key);
+            }
+
             trace!("Received response for correlation_id={}", correlation_id);
 
-            // Decode response header — send any decode error to the caller
-            // instead of tearing down the entire connection.
             let mut response_buf = response.slice(..);
             match ResponseHeader::decode(&mut response_buf, req.api_key, req.api_version) {
                 Ok(_header) => {
@@ -1688,9 +1715,8 @@ impl BrokerConnection {
                     let _ = req.response_tx.send(Ok(body));
                 }
                 Err(e) => {
-                    // A header decode failure means the stream is desynchronized
-                    // — the remaining bytes are corrupt. Notify the caller and
-                    // close the connection to prevent further damage.
+                    // Header decode failure means the stream is desynchronised
+                    // — notify the caller and tear down the connection.
                     warn!(
                         "Failed to decode response header for correlation_id={}, closing connection: {}",
                         correlation_id, e
@@ -1704,8 +1730,7 @@ impl BrokerConnection {
                 }
             }
         } else {
-            // Unknown correlation ID indicates a protocol desync — the
-            // connection is no longer reliable. Return an error to close it.
+            // Unknown correlation ID indicates a protocol desync.
             return Err(KrafkaError::protocol(format!(
                 "Received response for unknown correlation_id={correlation_id}, closing connection"
             )));
@@ -1765,7 +1790,7 @@ impl BrokerConnection {
         }
 
         // Store API versions
-        let mut versions = self.api_versions.lock().await;
+        let mut versions = self.api_versions.lock();
         for range in api_versions_response.api_keys {
             versions.insert(range.api_key, range);
         }
@@ -1936,7 +1961,7 @@ impl BrokerConnection {
 
     /// Get the supported API version for a specific API.
     pub async fn get_api_version(&self, api_key: ApiKey) -> Option<ApiVersionRange> {
-        let versions = self.api_versions.lock().await;
+        let versions = self.api_versions.lock();
         versions.get(&api_key).copied()
     }
 
@@ -1968,7 +1993,7 @@ impl BrokerConnection {
         client_max: i16,
         client_min: i16,
     ) -> Option<i16> {
-        let versions = self.api_versions.lock().await;
+        let versions = self.api_versions.lock();
         versions
             .get(&api_key)
             .and_then(|range| range.negotiate(client_max, client_min))

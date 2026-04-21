@@ -619,9 +619,7 @@ impl PartitionAssignor for CooperativeStickyAssignor {
                                     sticky_assignments.entry(key)
                                 {
                                     e.insert(mid.clone());
-                                    // SAFETY: member_partition_counts was populated for all
-                                    // members in the first pass.
-                                    *member_partition_counts.get_mut(&mid).unwrap() += 1;
+                                    *member_partition_counts.entry(mid.clone()).or_insert(0) += 1;
                                 }
                             }
                         }
@@ -669,9 +667,11 @@ impl PartitionAssignor for CooperativeStickyAssignor {
             }
 
             if let Some(member_id) = best_member {
-                // SAFETY: member_partition_counts was populated for all members in the first pass.
-                *member_partition_counts.get_mut(member_id).unwrap() += 1;
-                sticky_assignments.insert(key, member_id.to_string());
+                let member_id = member_id.to_string();
+                *member_partition_counts
+                    .entry(member_id.clone())
+                    .or_insert(0) += 1;
+                sticky_assignments.insert(key, member_id);
             }
         }
 
@@ -713,9 +713,9 @@ impl PartitionAssignor for CooperativeStickyAssignor {
                             if let Some(count) = member_partition_counts.get_mut(over_member) {
                                 *count = count.saturating_sub(1);
                             }
-                            // SAFETY: member_partition_counts was populated for all members
-                            // in the first pass.
-                            *member_partition_counts.get_mut(under_member).unwrap() += 1;
+                            *member_partition_counts
+                                .entry(under_member.clone())
+                                .or_insert(0) += 1;
                             moved = true;
                             break 'outer;
                         }
