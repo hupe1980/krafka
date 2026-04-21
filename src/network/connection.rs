@@ -1470,7 +1470,7 @@ impl BrokerConnection {
             // scheduler.  Heartbeats are the most latency-sensitive request type.
             if let Ok(cmd) = high_priority_rx.try_recv() {
                 stats.high_priority_bypasses.fetch_add(1, Ordering::Relaxed);
-                if Self::handle_command_direct(
+                match Self::handle_command_direct(
                     &mut writer,
                     &mut pending,
                     &mut delay_queue,
@@ -1479,11 +1479,15 @@ impl BrokerConnection {
                     max_in_flight_requests,
                     request_timeout,
                 )
-                .await?
+                .await
                 {
-                    break;
+                    Ok(true) => break,
+                    Ok(false) => continue,
+                    Err(e) => {
+                        terminal_error = Some(e);
+                        break;
+                    }
                 }
-                continue;
             }
 
             tokio::select! {
@@ -1539,7 +1543,7 @@ impl BrokerConnection {
                 cmd = high_priority_rx.recv() => {
                     match cmd {
                         Some(cmd) => {
-                            if Self::handle_command_direct(
+                            match Self::handle_command_direct(
                                 &mut writer,
                                 &mut pending,
                                 &mut delay_queue,
@@ -1548,9 +1552,14 @@ impl BrokerConnection {
                                 max_in_flight_requests,
                                 request_timeout,
                             )
-                            .await?
+                            .await
                             {
-                                break;
+                                Ok(true) => break,
+                                Ok(false) => {}
+                                Err(e) => {
+                                    terminal_error = Some(e);
+                                    break;
+                                }
                             }
                         }
                         None => break,
@@ -1561,7 +1570,7 @@ impl BrokerConnection {
                 cmd = normal_priority_rx.recv() => {
                     match cmd {
                         Some(cmd) => {
-                            if Self::handle_command_direct(
+                            match Self::handle_command_direct(
                                 &mut writer,
                                 &mut pending,
                                 &mut delay_queue,
@@ -1570,9 +1579,14 @@ impl BrokerConnection {
                                 max_in_flight_requests,
                                 request_timeout,
                             )
-                            .await?
+                            .await
                             {
-                                break;
+                                Ok(true) => break,
+                                Ok(false) => {}
+                                Err(e) => {
+                                    terminal_error = Some(e);
+                                    break;
+                                }
                             }
                         }
                         None => break,
