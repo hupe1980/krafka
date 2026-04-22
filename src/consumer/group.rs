@@ -1699,9 +1699,9 @@ impl GroupCoordinator {
             // Cache the negotiated heartbeat version per coordinator connection.
             // The version is stable for a given connection (API versions don't
             // change until reconnect), so we only re-negotiate when the
-            // connection identity changes.
-            let mut cached_hb_version: Option<i16> = None;
-            let mut cached_conn_id: Option<usize> = None;
+            // connection identity changes.  Storing both fields as a single
+            // Option ensures they are always set and cleared atomically.
+            let mut cached_hb: Option<(usize, i16)> = None;
 
             loop {
                 tokio::select! {
@@ -1719,14 +1719,9 @@ impl GroupCoordinator {
                         if let Some(ref conn) = coordinator_conn {
                             // Re-negotiate only when the coordinator connection changes.
                             let conn_id = std::sync::Arc::as_ptr(conn) as usize;
-                            let hb_version = if cached_conn_id == Some(conn_id) {
-                                // cached_hb_version is always set together with cached_conn_id.
-                                let Some(v) = cached_hb_version else {
-                                    unreachable!("cached_hb_version is set whenever cached_conn_id is");
-                                };
-                                v
-                            } else {
-                                match conn
+                            let hb_version = match cached_hb {
+                                Some((id, v)) if id == conn_id => v,
+                                _ => match conn
                                     .negotiate_api_version(
                                         ApiKey::Heartbeat,
                                         HEARTBEAT_MAX,
@@ -1735,8 +1730,7 @@ impl GroupCoordinator {
                                     .await
                                 {
                                     Some(v) => {
-                                        cached_conn_id = Some(conn_id);
-                                        cached_hb_version = Some(v);
+                                        cached_hb = Some((conn_id, v));
                                         v
                                     }
                                     None => {
@@ -1749,7 +1743,7 @@ impl GroupCoordinator {
                                         heartbeat_controller.stop();
                                         break;
                                     }
-                                }
+                                },
                             };
 
                             let request = HeartbeatRequest {

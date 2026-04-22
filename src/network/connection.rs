@@ -744,15 +744,11 @@ impl BrokerConnection {
 
         let request_timeout = config.request_timeout;
 
-        // Determine if we need TLS and/or SASL
-        let needs_tls = config.auth.as_ref().is_some_and(|a| a.requires_tls());
-        let needs_sasl = config.auth.as_ref().is_some_and(|a| a.requires_sasl());
-
-        if needs_tls {
+        // Determine auth requirements and dispatch to the appropriate path.
+        // Using `filter` means `auth` is already in scope — no secondary
+        // unreachable guard needed to re-establish the invariant.
+        if let Some(auth) = config.auth.as_ref().filter(|a| a.requires_tls()) {
             // TLS path: upgrade stream then optionally do SASL
-            let Some(auth) = config.auth.as_ref() else {
-                unreachable!("needs_tls is true only when config.auth.is_some_and(requires_tls)");
-            };
             let tls_config = auth
                 .tls_config
                 .as_ref()
@@ -779,7 +775,7 @@ impl BrokerConnection {
 
             info!("TLS handshake completed for {address}");
 
-            if needs_sasl {
+            if auth.requires_sasl() {
                 // TLS + SASL: authenticate on the TLS stream, then run event loop
                 let mut tls_stream = tls_stream;
 
@@ -845,11 +841,8 @@ impl BrokerConnection {
                     alive_clone.store(false, std::sync::atomic::Ordering::SeqCst);
                 });
             }
-        } else if needs_sasl {
+        } else if let Some(auth) = config.auth.as_ref().filter(|a| a.requires_sasl()) {
             // SASL without TLS
-            let Some(auth) = config.auth.as_ref() else {
-                unreachable!("needs_sasl is true only when config.auth.is_some_and(requires_sasl)");
-            };
             let mut stream = stream;
             let session_lifetime_ms = Self::perform_sasl_handshake(
                 &mut stream,
