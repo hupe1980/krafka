@@ -319,7 +319,7 @@ By default, Krafka uses compiled-in `webpki-roots`. To use the operating system 
 
 ```toml
 [dependencies]
-krafka = { version = "0.4", features = ["native-tls-roots"] }
+krafka = { version = "0.5", features = ["native-tls-roots"] }
 ```
 
 ```rust
@@ -398,7 +398,7 @@ For production deployments on EC2, ECS, Lambda, or EKS, use the AWS SDK default 
 use krafka::auth::{AuthConfig, AwsMskIamCredentials};
 
 // Requires the `aws-msk` feature in Cargo.toml:
-// krafka = { version = "0.4", features = ["aws-msk"] }
+// krafka = { version = "0.5", features = ["aws-msk"] }
 
 // Loads from (in order):
 // 1. Environment variables
