@@ -20,8 +20,9 @@ pub enum KrafkaError {
 
     /// Protocol encoding/decoding errors.
     ///
-    /// The `kind` field carries a structured classification that callers can
-    /// match on to drive retry policy without substring-matching the message.
+    /// The structured classification is available via
+    /// [`KrafkaError::protocol_error_kind`], allowing callers to drive retry
+    /// policy without substring-matching the message.
     #[error("protocol error ({kind:?}): {message}")]
     Protocol {
         /// Structured classification of the protocol error.
@@ -233,6 +234,19 @@ impl KrafkaError {
             Self::Broker { code, .. } => code.is_retriable(),
             Self::Protocol { kind, .. } => kind.is_retriable(),
             _ => false,
+        }
+    }
+
+    /// Returns the structured classification for a protocol error.
+    ///
+    /// This is intended for callers that need to distinguish protocol
+    /// failures programmatically without matching on the human-readable
+    /// message text.
+    #[must_use]
+    pub fn protocol_error_kind(&self) -> Option<ProtocolErrorKind> {
+        match self {
+            Self::Protocol { kind, .. } => Some(*kind),
+            _ => None,
         }
     }
 }
@@ -1338,6 +1352,18 @@ mod tests {
         assert!(KrafkaError::protocol("not enough bytes for header").is_retriable());
         assert!(!KrafkaError::protocol("no mutually supported Produce API version").is_retriable());
         assert!(!KrafkaError::protocol("invalid UTF-8 string").is_retriable());
+    }
+
+    #[test]
+    fn test_krafka_error_protocol_error_kind_accessor() {
+        let protocol = KrafkaError::protocol_kind(ProtocolErrorKind::CrcMismatch, "details");
+        let timeout = KrafkaError::timeout("fetch");
+
+        assert_eq!(
+            protocol.protocol_error_kind(),
+            Some(ProtocolErrorKind::CrcMismatch)
+        );
+        assert_eq!(timeout.protocol_error_kind(), None);
     }
 
     #[test]

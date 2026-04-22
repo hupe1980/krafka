@@ -7,13 +7,15 @@
 //! cargo run --example authentication
 //! ```
 
+use std::io;
+
 use krafka::auth::{
     AuthConfig, AwsMskIamCredentials, ChannelBinding, MskIamAuthenticator, ScramClient,
     ScramMechanism, TlsConfig,
 };
 use krafka::network::{SaslAuthenticator, SecureConnectionConfig};
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Krafka Authentication Examples ===\n");
 
     // Example 1: Plaintext (no authentication)
@@ -32,7 +34,7 @@ fn main() {
 
     // Example 3: SASL/PLAIN authentication
     println!("3. SASL/PLAIN Authentication");
-    let config = AuthConfig::sasl_plain("username", "password").unwrap();
+    let config = AuthConfig::sasl_plain("username", "password")?;
     println!("   Security: SASL_PLAINTEXT");
     println!("   Mechanism: {:?}", config.sasl_mechanism());
     println!("   Requires SASL: {}", config.requires_sasl());
@@ -41,7 +43,7 @@ fn main() {
     // Example 4: SASL/PLAIN over TLS
     println!("4. SASL/PLAIN over TLS");
     let tls_config = TlsConfig::new();
-    let config = AuthConfig::sasl_plain_ssl("username", "password", tls_config).unwrap();
+    let config = AuthConfig::sasl_plain_ssl("username", "password", tls_config)?;
     println!("   Security: SASL_SSL");
     println!("   Mechanism: {:?}", config.sasl_mechanism());
     println!("   Requires TLS: {}", config.requires_tls());
@@ -155,7 +157,7 @@ fn main() {
     // Example 10: MSK IAM Authenticator Direct Usage
     println!("\n=== AWS MSK IAM Authenticator Demo ===\n");
     let creds = AwsMskIamCredentials::new("AKIAEXAMPLE", "secretkey", "us-east-1");
-    let auth = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com").unwrap();
+    let auth = MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com")?;
     let payload = auth.create_auth_payload();
     let payload_str = String::from_utf8_lossy(&payload);
     println!("Signed payload (truncated):");
@@ -175,11 +177,10 @@ fn main() {
     // Example 12: SaslAuthenticator
     println!("\n=== SaslAuthenticator Demo ===\n");
     let auth_config = AuthConfig::sasl_scram_sha256("alice", "secret");
-    let mut authenticator = SaslAuthenticator::new(&auth_config, ChannelBinding::None).unwrap();
+    let mut authenticator = SaslAuthenticator::new(&auth_config, ChannelBinding::None)
+        .ok_or_else(|| io::Error::other("SCRAM auth config did not produce a SASL authenticator"))?;
     println!("Mechanism: {}", authenticator.mechanism_name());
-    let initial = authenticator
-        .initial_response()
-        .expect("initial_response failed");
+    let initial = authenticator.initial_response()?;
     println!(
         "Initial response (client-first): {:?}...",
         String::from_utf8_lossy(&initial[..40.min(initial.len())])
@@ -187,4 +188,5 @@ fn main() {
     println!("Is complete: {}", authenticator.is_complete());
 
     println!("\nAuthentication example complete!");
+    Ok(())
 }

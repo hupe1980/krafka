@@ -693,13 +693,34 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use tokio::sync::Notify;
 
+    fn ok<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(err) => unreachable!("expected Ok(..), got Err({err})"),
+        }
+    }
+
+    fn err<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> E {
+        match result {
+            Err(err) => err,
+            Ok(_) => unreachable!("expected Err(..), got Ok(..)"),
+        }
+    }
+
+    fn join_ok<T>(result: std::result::Result<T, tokio::task::JoinError>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(err) => unreachable!("spawned task failed unexpectedly: {err}"),
+        }
+    }
+
     // ── Wire format ──────────────────────────────────────────────────────
 
     #[test]
     fn test_wire_format_roundtrip() {
         let payload = b"hello world";
         let encoded = encode_wire_format(42, payload);
-        let (id, decoded) = decode_wire_format(&encoded).unwrap();
+        let (id, decoded) = ok(decode_wire_format(&encoded));
         assert_eq!(id, 42);
         assert_eq!(decoded, payload);
     }
@@ -708,7 +729,7 @@ mod tests {
     fn test_wire_format_empty_payload() {
         let encoded = encode_wire_format(1, b"");
         assert_eq!(encoded.len(), HEADER_SIZE);
-        let (id, payload) = decode_wire_format(&encoded).unwrap();
+        let (id, payload) = ok(decode_wire_format(&encoded));
         assert_eq!(id, 1);
         assert!(payload.is_empty());
     }
@@ -716,7 +737,7 @@ mod tests {
     #[test]
     fn test_wire_format_max_schema_id() {
         let encoded = encode_wire_format(u32::MAX, b"data");
-        let (id, _) = decode_wire_format(&encoded).unwrap();
+        let (id, _) = ok(decode_wire_format(&encoded));
         assert_eq!(id, u32::MAX);
     }
 
@@ -733,14 +754,14 @@ mod tests {
         let data = [0x01, 0, 0, 0, 1, 0x42];
         let result = decode_wire_format(&data);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("magic byte"));
+        assert!(err(result).to_string().contains("magic byte"));
     }
 
     #[test]
     fn test_wire_format_too_short() {
         let result = decode_wire_format(&[0x00, 0, 0]);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("too short"));
+        assert!(err(result).to_string().contains("too short"));
     }
 
     #[test]
@@ -761,25 +782,23 @@ mod tests {
 
     #[test]
     fn test_subject_topic_name_key() {
-        let s = SubjectNameStrategy::TopicName
-            .subject_name("orders", None, true)
-            .unwrap();
+        let s = ok(SubjectNameStrategy::TopicName.subject_name("orders", None, true));
         assert_eq!(s, "orders-key");
     }
 
     #[test]
     fn test_subject_topic_name_value() {
-        let s = SubjectNameStrategy::TopicName
-            .subject_name("orders", None, false)
-            .unwrap();
+        let s = ok(SubjectNameStrategy::TopicName.subject_name("orders", None, false));
         assert_eq!(s, "orders-value");
     }
 
     #[test]
     fn test_subject_record_name() {
-        let s = SubjectNameStrategy::RecordName
-            .subject_name("orders", Some("com.example.Order"), false)
-            .unwrap();
+        let s = ok(SubjectNameStrategy::RecordName.subject_name(
+            "orders",
+            Some("com.example.Order"),
+            false,
+        ));
         assert_eq!(s, "com.example.Order");
     }
 
@@ -791,9 +810,8 @@ mod tests {
 
     #[test]
     fn test_subject_topic_record_name() {
-        let s = SubjectNameStrategy::TopicRecordName
-            .subject_name("orders", Some("Order"), true)
-            .unwrap();
+        let s =
+            ok(SubjectNameStrategy::TopicRecordName.subject_name("orders", Some("Order"), true));
         assert_eq!(s, "orders-Order");
     }
 
@@ -814,19 +832,16 @@ mod tests {
 
     #[test]
     fn test_schema_type_from_str() {
-        assert_eq!("AVRO".parse::<SchemaType>().unwrap(), SchemaType::Avro);
-        assert_eq!(
-            "PROTOBUF".parse::<SchemaType>().unwrap(),
-            SchemaType::Protobuf
-        );
-        assert_eq!("JSON".parse::<SchemaType>().unwrap(), SchemaType::Json);
+        assert_eq!(ok("AVRO".parse::<SchemaType>()), SchemaType::Avro);
+        assert_eq!(ok("PROTOBUF".parse::<SchemaType>()), SchemaType::Protobuf);
+        assert_eq!(ok("JSON".parse::<SchemaType>()), SchemaType::Json);
     }
 
     #[test]
     fn test_schema_type_from_str_unknown() {
         let result = "XML".parse::<SchemaType>();
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("XML"));
+        assert!(err(result).to_string().contains("XML"));
     }
 
     // ── Schema constructors ──────────────────────────────────────────────
@@ -1007,12 +1022,12 @@ mod tests {
         let cached = CachedSchemaRegistry::new(mock);
 
         // First call: cache miss → hits mock
-        let s1 = cached.get_schema_by_id(1).await.unwrap();
+        let s1 = ok(cached.get_schema_by_id(1).await);
         assert_eq!(cached.inner().get_by_id_call_count(), 1);
         assert_eq!(cached.cache_len(), 1);
 
         // Second call: cache hit → does NOT hit mock
-        let s2 = cached.get_schema_by_id(1).await.unwrap();
+        let s2 = ok(cached.get_schema_by_id(1).await);
         assert_eq!(cached.inner().get_by_id_call_count(), 1);
 
         assert_eq!(s1, s2);
@@ -1023,14 +1038,14 @@ mod tests {
         let mock = MockRegistry::new();
         let cached = CachedSchemaRegistry::new(mock);
 
-        cached.get_schema_by_id(1).await.unwrap();
-        cached.get_schema_by_id(2).await.unwrap();
+        ok(cached.get_schema_by_id(1).await);
+        ok(cached.get_schema_by_id(2).await);
         assert_eq!(cached.inner().get_by_id_call_count(), 2);
         assert_eq!(cached.cache_len(), 2);
 
         // Both cached now
-        cached.get_schema_by_id(1).await.unwrap();
-        cached.get_schema_by_id(2).await.unwrap();
+        ok(cached.get_schema_by_id(1).await);
+        ok(cached.get_schema_by_id(2).await);
         assert_eq!(cached.inner().get_by_id_call_count(), 2);
     }
 
@@ -1039,14 +1054,14 @@ mod tests {
         let mock = MockRegistry::new();
         let cached = CachedSchemaRegistry::new(mock);
 
-        cached.get_schema_by_id(1).await.unwrap();
+        ok(cached.get_schema_by_id(1).await);
         assert_eq!(cached.cache_len(), 1);
 
         cached.clear_cache();
         assert_eq!(cached.cache_len(), 0);
 
         // After clear, next call hits mock again
-        cached.get_schema_by_id(1).await.unwrap();
+        ok(cached.get_schema_by_id(1).await);
         assert_eq!(cached.inner().get_by_id_call_count(), 2);
     }
 
@@ -1056,21 +1071,21 @@ mod tests {
 
         let first = {
             let cached = cached.clone();
-            tokio::spawn(async move { cached.get_schema_by_id(7).await.unwrap() })
+            tokio::spawn(async move { ok(cached.get_schema_by_id(7).await) })
         };
 
         cached.inner().wait_started().await;
 
         let second = {
             let cached = cached.clone();
-            tokio::spawn(async move { cached.get_schema_by_id(7).await.unwrap() })
+            tokio::spawn(async move { ok(cached.get_schema_by_id(7).await) })
         };
 
         tokio::task::yield_now().await;
         cached.inner().release();
 
-        let first_schema = first.await.unwrap();
-        let second_schema = second.await.unwrap();
+        let first_schema = join_ok(first.await);
+        let second_schema = join_ok(second.await);
 
         assert_eq!(first_schema, second_schema);
         assert_eq!(cached.inner().get_by_id_call_count(), 1);
@@ -1082,11 +1097,11 @@ mod tests {
         let cached = CachedSchemaRegistry::new(mock);
 
         // get_latest_schema always forwards but caches by ID
-        let schema = cached.get_latest_schema("test-value").await.unwrap();
+        let schema = ok(cached.get_latest_schema("test-value").await);
         assert_eq!(cached.cache_len(), 1);
 
         // Subsequent get_schema_by_id should be cached
-        let by_id = cached.get_schema_by_id(schema.id).await.unwrap();
+        let by_id = ok(cached.get_schema_by_id(schema.id).await);
         // Mock was never called via get_schema_by_id
         assert_eq!(cached.inner().get_by_id_call_count(), 0);
         assert_eq!(by_id.id, schema.id);
@@ -1097,10 +1112,10 @@ mod tests {
         let mock = MockRegistry::new();
         let cached = CachedSchemaRegistry::new(mock);
 
-        let schema = cached.get_schema_by_version("test-value", 1).await.unwrap();
+        let schema = ok(cached.get_schema_by_version("test-value", 1).await);
         assert_eq!(cached.cache_len(), 1);
 
-        let by_id = cached.get_schema_by_id(schema.id).await.unwrap();
+        let by_id = ok(cached.get_schema_by_id(schema.id).await);
         assert_eq!(cached.inner().get_by_id_call_count(), 0);
         assert_eq!(by_id.id, schema.id);
     }
@@ -1112,8 +1127,8 @@ mod tests {
 
         let id = cached
             .register_schema("test-value", "{}", SchemaType::Avro, &[])
-            .await
-            .unwrap();
+            .await;
+        let id = ok(id);
         assert_eq!(id, 42);
     }
 
@@ -1148,7 +1163,7 @@ mod tests {
     fn test_wire_format_bytes_roundtrip() {
         let payload = b"hello world";
         let encoded = encode_wire_format(42, payload);
-        let (id, decoded) = decode_wire_format_bytes(&encoded).unwrap();
+        let (id, decoded) = ok(decode_wire_format_bytes(&encoded));
         assert_eq!(id, 42);
         assert_eq!(&decoded[..], payload);
     }
@@ -1156,7 +1171,7 @@ mod tests {
     #[test]
     fn test_wire_format_bytes_empty_payload() {
         let encoded = encode_wire_format(1, b"");
-        let (id, payload) = decode_wire_format_bytes(&encoded).unwrap();
+        let (id, payload) = ok(decode_wire_format_bytes(&encoded));
         assert_eq!(id, 1);
         assert!(payload.is_empty());
     }
@@ -1166,7 +1181,7 @@ mod tests {
         let data = Bytes::from_static(&[0x01, 0, 0, 0, 1, 0x42]);
         let result = decode_wire_format_bytes(&data);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("magic byte"));
+        assert!(err(result).to_string().contains("magic byte"));
     }
 
     #[test]
@@ -1174,14 +1189,14 @@ mod tests {
         let data = Bytes::from_static(&[0x00, 0, 0]);
         let result = decode_wire_format_bytes(&data);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("too short"));
+        assert!(err(result).to_string().contains("too short"));
     }
 
     #[test]
     fn test_wire_format_bytes_zero_copy() {
         // The returned Bytes should share the same allocation as the input.
         let encoded = encode_wire_format(99, b"shared");
-        let (_, payload) = decode_wire_format_bytes(&encoded).unwrap();
+        let (_, payload) = ok(decode_wire_format_bytes(&encoded));
         // Bytes::slice shares the backing allocation, so ptr should be
         // within the original allocation.
         assert_eq!(&payload[..], b"shared");
@@ -1191,22 +1206,16 @@ mod tests {
 
     #[test]
     fn test_schema_type_from_str_lowercase() {
-        assert_eq!("avro".parse::<SchemaType>().unwrap(), SchemaType::Avro);
-        assert_eq!(
-            "protobuf".parse::<SchemaType>().unwrap(),
-            SchemaType::Protobuf
-        );
-        assert_eq!("json".parse::<SchemaType>().unwrap(), SchemaType::Json);
+        assert_eq!(ok("avro".parse::<SchemaType>()), SchemaType::Avro);
+        assert_eq!(ok("protobuf".parse::<SchemaType>()), SchemaType::Protobuf);
+        assert_eq!(ok("json".parse::<SchemaType>()), SchemaType::Json);
     }
 
     #[test]
     fn test_schema_type_from_str_mixed_case() {
-        assert_eq!("Avro".parse::<SchemaType>().unwrap(), SchemaType::Avro);
-        assert_eq!(
-            "ProtobuF".parse::<SchemaType>().unwrap(),
-            SchemaType::Protobuf
-        );
-        assert_eq!("Json".parse::<SchemaType>().unwrap(), SchemaType::Json);
+        assert_eq!(ok("Avro".parse::<SchemaType>()), SchemaType::Avro);
+        assert_eq!(ok("ProtobuF".parse::<SchemaType>()), SchemaType::Protobuf);
+        assert_eq!(ok("Json".parse::<SchemaType>()), SchemaType::Json);
     }
 
     // ── CachedSchemaRegistry::with_capacity ──────────────────────────────
@@ -1217,7 +1226,7 @@ mod tests {
         let cached = CachedSchemaRegistry::with_capacity(mock, 100);
         assert_eq!(cached.cache_len(), 0);
 
-        cached.get_schema_by_id(1).await.unwrap();
+        ok(cached.get_schema_by_id(1).await);
         assert_eq!(cached.cache_len(), 1);
     }
 
@@ -1226,13 +1235,13 @@ mod tests {
         let mock = MockRegistry::new();
         let cached = CachedSchemaRegistry::with_max_entries(mock, 1);
 
-        cached.get_schema_by_id(1).await.unwrap();
-        cached.get_schema_by_id(2).await.unwrap();
+        ok(cached.get_schema_by_id(1).await);
+        ok(cached.get_schema_by_id(2).await);
 
         assert_eq!(cached.cache_len(), 1);
         assert_eq!(cached.inner().get_by_id_call_count(), 2);
 
-        cached.get_schema_by_id(1).await.unwrap();
+        ok(cached.get_schema_by_id(1).await);
         assert_eq!(cached.inner().get_by_id_call_count(), 3);
     }
 }

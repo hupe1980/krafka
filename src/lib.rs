@@ -106,6 +106,7 @@
 //! ```
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod admin;
 pub mod auth;
@@ -127,7 +128,7 @@ pub mod telemetry;
 pub mod tracing_ext;
 pub mod util;
 
-pub use error::{KrafkaError, Result};
+pub use error::{KrafkaError, ProtocolErrorKind, Result};
 pub use metadata::MetadataRecoveryStrategy;
 
 /// Kafka protocol API version.

@@ -10,6 +10,8 @@
 //!
 //! Note: These tests are ignored by default as they require Docker.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::Duration;
