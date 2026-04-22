@@ -1418,18 +1418,6 @@ impl ShareConsumerBuilder {
         self
     }
 
-    /// Deprecated: use [`Self::disable_metadata_topic_cache_ttl`].
-    ///
-    /// This method was renamed because "clear" reads like "reset to default"
-    /// when the default is TTL-enabled; "disable" makes the intent explicit.
-    #[deprecated(
-        since = "0.5.0",
-        note = "use `disable_metadata_topic_cache_ttl` instead"
-    )]
-    pub fn clear_metadata_topic_cache_ttl(self) -> Self {
-        self.disable_metadata_topic_cache_ttl()
-    }
-
     /// Set SOCKS5 proxy configuration.
     #[cfg(feature = "socks5")]
     pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {

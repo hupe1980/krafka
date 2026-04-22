@@ -677,6 +677,15 @@ impl ClusterMetadata {
                         // before the response loop, but the broker still
                         // acknowledges it (even transiently).
                         topics.insert(topic_name.clone(), Arc::clone(old_info));
+                        // Also restore the UUID mapping so that
+                        // `topic_id_for_name()` keeps working (e.g. for
+                        // ShareConsumer fetch routing that requires topic IDs).
+                        if let Some(&old_uuid) = old.name_to_topic_id.get(&topic_name)
+                            && let Some(name_arc) = old.topic_ids.get(&old_uuid)
+                        {
+                            topic_ids.insert(old_uuid, Arc::clone(name_arc));
+                            name_to_uuid.insert(topic_name.clone(), old_uuid);
+                        }
                     }
                     // Only stamp TTL for topics that are actually in the cache
                     // (survived eviction or just restored from old).  Topics
@@ -1552,6 +1561,111 @@ mod tests {
         assert!(
             !cache.topic_last_refreshed.contains_key("unknown-topic"),
             "unknown-topic must not be stamped in topic_last_refreshed when it is not in topics"
+        );
+    }
+
+    /// Regression test: when a TTL-evicted topic is restored via the
+    /// transient-error path, its UUID mapping must also be restored so that
+    /// `topic_id_for_name()` continues to return `Some(uuid)`.
+    ///
+    /// Without the fix, `topic_ids` / `name_to_topic_id` were pruned during
+    /// TTL eviction and never repopulated in the transient-error branch,
+    /// causing ShareConsumer fetch routing to break.
+    #[test]
+    fn test_transient_error_restores_uuid_mapping_for_evicted_topic() {
+        use crate::protocol::{MetadataBroker, MetadataPartitionResponse, MetadataTopicResponse};
+
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        let meta = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        )
+        .with_topic_cache_ttl(Duration::from_nanos(1));
+
+        // The UUID used for "topic-b" in the seed response.
+        let uuid: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ];
+
+        // Seed the cache with "topic-b" carrying a topic UUID.
+        meta.update_cache(
+            MetadataResponse {
+                throttle_time_ms: 0,
+                brokers: vec![MetadataBroker {
+                    node_id: 1,
+                    host: "localhost".to_string(),
+                    port: 9092,
+                    rack: None,
+                }],
+                cluster_id: None,
+                controller_id: 1,
+                error_code: ErrorCode::None,
+                topics: vec![MetadataTopicResponse {
+                    error_code: ErrorCode::None,
+                    name: Some("topic-b".to_string()),
+                    topic_id: Some(uuid),
+                    is_internal: false,
+                    partitions: vec![MetadataPartitionResponse {
+                        error_code: ErrorCode::None,
+                        partition_index: 0,
+                        leader_id: 1,
+                        leader_epoch: 0,
+                        replica_nodes: vec![1],
+                        isr_nodes: vec![1],
+                        offline_replicas: vec![],
+                    }],
+                }],
+            },
+            false,
+        );
+        assert!(
+            meta.cache.load().name_to_topic_id.contains_key("topic-b"),
+            "pre-condition: UUID mapping seeded"
+        );
+
+        // Partial refresh — 1 ns TTL guarantees eviction of "topic-b" before
+        // the response loop.  Transient error must restore both the topic entry
+        // and its UUID mapping.
+        meta.update_cache(
+            MetadataResponse {
+                throttle_time_ms: 0,
+                brokers: vec![MetadataBroker {
+                    node_id: 1,
+                    host: "localhost".to_string(),
+                    port: 9092,
+                    rack: None,
+                }],
+                cluster_id: None,
+                controller_id: 1,
+                error_code: ErrorCode::None,
+                topics: vec![MetadataTopicResponse {
+                    error_code: ErrorCode::LeaderNotAvailable,
+                    name: Some("topic-b".to_string()),
+                    topic_id: Some(uuid),
+                    is_internal: false,
+                    partitions: vec![],
+                }],
+            },
+            false,
+        );
+
+        let cache = meta.cache.load();
+        assert!(
+            cache.topics.contains_key("topic-b"),
+            "topic-b must be restored in topics"
+        );
+        assert_eq!(
+            cache.name_to_topic_id.get("topic-b"),
+            Some(&uuid),
+            "UUID mapping for topic-b must be restored in name_to_topic_id"
+        );
+        assert!(
+            cache.topic_ids.contains_key(&uuid),
+            "UUID must be present in topic_ids"
         );
     }
 }
