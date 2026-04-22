@@ -342,6 +342,7 @@ impl ProtocolErrorKind {
         if ml.contains("not enough bytes")
             || ml.contains("unexpected end of")
             || ml.contains("response too short")
+            || ml.contains("short buf")
         {
             return Self::TruncatedFrame;
         }
@@ -372,6 +373,7 @@ impl ProtocolErrorKind {
             || ml.contains("no offset returned")
             || ml.contains("no transaction description")
             || ml.contains("missing ")
+            || ml.contains("must not be null")
         {
             return Self::Malformed;
         }
@@ -1212,6 +1214,7 @@ mod tests {
             "not enough bytes for record batch",
             "unexpected end of varint",
             "response too short",
+            "short buf for topic_id",
         ] {
             assert_eq!(
                 ProtocolErrorKind::from_message(msg),
@@ -1298,6 +1301,8 @@ mod tests {
             "partition not found in response",
             "no offset returned for topic-0",
             "missing record attributes",
+            "coordinator host must not be null",
+            "coordinator key must not be null",
         ] {
             assert_eq!(
                 ProtocolErrorKind::from_message(msg),

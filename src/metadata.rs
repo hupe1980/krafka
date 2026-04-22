@@ -640,6 +640,13 @@ impl ClusterMetadata {
             .map(|(uuid, name)| (name.as_ref().clone(), *uuid))
             .collect();
 
+        // Track which topic names are actually provided by this response so
+        // that only those entries get their `topic_last_refreshed` timestamp
+        // advanced to `now`.  Retained-from-cache topics must keep their
+        // original timestamps; resetting them would make them perpetually
+        // "fresh" and defeat TTL eviction.
+        let mut response_topic_names: Vec<String> = Vec::new();
+
         for topic in response.topics {
             let Some(topic_name) = topic.name else {
                 continue;
@@ -698,6 +705,7 @@ impl ClusterMetadata {
                 })
                 .collect();
 
+            response_topic_names.push(topic_name.clone());
             topics.insert(
                 topic_name.clone(),
                 Arc::new(TopicInfo {
@@ -708,10 +716,17 @@ impl ClusterMetadata {
             );
         }
 
-        // Build topic_last_refreshed: carry forward surviving entries (those
-        // that survived TTL eviction), then stamp every topic in this response.
+        // Build topic_last_refreshed:
+        // - Full refresh: start empty; every topic comes from this response.
+        // - Partial refresh with TTL: carry forward only entries that survived
+        //   TTL eviction (with their *original* timestamps so their age is
+        //   preserved); retained topics must NOT have their clock reset.
+        // - Partial refresh without TTL: carry forward all existing entries.
+        // In all cases, only topics that appear in the current response are
+        // stamped with `now`; retained-from-cache topics keep their existing
+        // timestamps so TTL eviction can fire correctly on the next refresh.
         let mut topic_last_refreshed = if full_refresh {
-            HashMap::with_capacity(topics.len())
+            HashMap::with_capacity(response_topic_names.len())
         } else if let Some(ttl) = self.topic_cache_ttl {
             old.topic_last_refreshed
                 .iter()
@@ -721,11 +736,12 @@ impl ClusterMetadata {
         } else {
             old.topic_last_refreshed.clone()
         };
-        // Mark every topic currently in the cache as refreshed now.
-        // On full refresh this stamps everything; on partial refresh this
-        // stamps the topics from the response (which were just inserted/updated).
-        for name in topics.keys() {
-            topic_last_refreshed.insert(name.clone(), now);
+        // Stamp only topics included in this response with `now`.
+        // For a full refresh `response_topic_names` covers all topics (the map
+        // started empty).  For a partial refresh this correctly skips
+        // retained-only entries, preserving their original timestamps.
+        for name in response_topic_names {
+            topic_last_refreshed.insert(name, now);
         }
 
         let new_cache = MetadataCache {
@@ -1184,5 +1200,91 @@ mod tests {
         )
         .with_topic_cache_ttl_disabled();
         assert_eq!(meta.topic_cache_ttl, None);
+    }
+
+    /// Regression test: a partial refresh must not reset `topic_last_refreshed`
+    /// for topics that were only retained from the cache (not present in the
+    /// response).  Resetting retained timestamps makes them perpetually "fresh"
+    /// so TTL eviction never fires.
+    #[test]
+    fn test_partial_refresh_preserves_retained_topic_timestamps() {
+        use crate::protocol::{MetadataBroker, MetadataPartitionResponse, MetadataTopicResponse};
+
+        fn make_response(topic_names: &[&str]) -> MetadataResponse {
+            MetadataResponse {
+                throttle_time_ms: 0,
+                brokers: vec![MetadataBroker {
+                    node_id: 1,
+                    host: "localhost".to_string(),
+                    port: 9092,
+                    rack: None,
+                }],
+                cluster_id: None,
+                controller_id: 1,
+                error_code: ErrorCode::None,
+                topics: topic_names
+                    .iter()
+                    .map(|name| MetadataTopicResponse {
+                        error_code: ErrorCode::None,
+                        name: Some(name.to_string()),
+                        topic_id: None,
+                        is_internal: false,
+                        partitions: vec![MetadataPartitionResponse {
+                            error_code: ErrorCode::None,
+                            partition_index: 0,
+                            leader_id: 1,
+                            leader_epoch: 0,
+                            replica_nodes: vec![1],
+                            isr_nodes: vec![1],
+                            offline_replicas: vec![],
+                        }],
+                    })
+                    .collect(),
+            }
+        }
+
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        // Use a long TTL so "topic-a" is not evicted.
+        let meta = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        );
+
+        // First partial update: populate cache with "topic-a".
+        meta.update_cache(make_response(&["topic-a"]), false);
+        let ts_a = meta
+            .cache
+            .load()
+            .topic_last_refreshed
+            .get("topic-a")
+            .copied()
+            .unwrap();
+
+        // Second partial update: only "topic-b" is in the response.
+        // "topic-a" is retained from the cache but must keep its original timestamp.
+        meta.update_cache(make_response(&["topic-b"]), false);
+        let cache = meta.cache.load();
+
+        assert!(
+            cache.topics.contains_key("topic-a"),
+            "topic-a should still be in the cache (TTL not yet expired)"
+        );
+        assert!(
+            cache.topics.contains_key("topic-b"),
+            "topic-b should appear after the second update"
+        );
+
+        let ts_a_after = cache.topic_last_refreshed.get("topic-a").copied().unwrap();
+        assert_eq!(
+            ts_a, ts_a_after,
+            "retained topic-a's timestamp must not be advanced by a partial refresh"
+        );
+        assert!(
+            cache.topic_last_refreshed.contains_key("topic-b"),
+            "freshly refreshed topic-b must have a timestamp"
+        );
     }
 }
