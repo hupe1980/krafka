@@ -364,16 +364,22 @@ impl ProtocolErrorKind {
         {
             return Self::InvalidLength;
         }
-        if ml.contains("invalid") || ml.contains("unknown") || ml.contains("unexpected") {
-            return Self::InvalidValue;
-        }
         if ml.contains("not found")
             || ml.contains("no offset returned")
             || ml.contains("no transaction description")
+            || ml.contains("no brokers available")
             || ml.contains("missing ")
             || ml.contains("must not be null")
+            || ml.contains("non-null")
+            || ml.contains("non-nullable")
+            || ml.contains("unexpected partition")
+            || ml.contains("unexpected topic")
+            || ml.contains("unexpected broker")
         {
             return Self::Malformed;
+        }
+        if ml.contains("invalid") || ml.contains("unknown") || ml.contains("unexpected") {
+            return Self::InvalidValue;
         }
         Self::Other
     }
@@ -971,6 +977,7 @@ impl From<ErrorCode> for i16 {
 pub type Result<T> = std::result::Result<T, KrafkaError>;
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -1300,6 +1307,18 @@ mod tests {
             "missing record attributes",
             "coordinator host must not be null",
             "coordinator key must not be null",
+            // These contain "unexpected" but must still be Malformed (retriable),
+            // not InvalidValue, because Malformed is checked first.
+            "unexpected partition in response",
+            "unexpected topic in metadata response",
+            "unexpected broker id in response",
+            // Null-in-required-field messages must be Malformed (retriable server error).
+            "metadata broker host must be a non-null string",
+            "metadata broker host must be a non-null compact string",
+            "compact string length 0 is null but field is non-nullable",
+            "compact array raw value 0 (null) is invalid for a non-nullable field",
+            // "no brokers available" must be Malformed so retry loops can retry it.
+            "no brokers available",
         ] {
             assert_eq!(
                 ProtocolErrorKind::from_message(msg),

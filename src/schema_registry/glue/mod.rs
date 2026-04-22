@@ -720,6 +720,7 @@ impl<C: GlueSchemaRegistryClient> GlueSchemaRegistryClient for CachedGlueSchemaR
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::sync::Arc;

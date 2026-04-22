@@ -296,12 +296,17 @@ impl Record {
                 format!("invalid record length: {length}"),
             ));
         }
-        if buf.remaining() < length as usize {
+        let length = usize::try_from(length).map_err(|_| {
+            KrafkaError::protocol_kind(
+                crate::error::ProtocolErrorKind::InvalidLength,
+                format!("record length {length} overflows usize on this target"),
+            )
+        })?;
+        if buf.remaining() < length {
             return Err(KrafkaError::protocol_kind(
                 crate::error::ProtocolErrorKind::TruncatedFrame,
                 format!(
-                    "record body truncated: need {} bytes, have {}",
-                    length,
+                    "record body truncated: need {length} bytes, have {}",
                     buf.remaining()
                 ),
             ));
@@ -1190,6 +1195,7 @@ impl Iterator for LazyRecordIterator {
 impl ExactSizeIterator for LazyRecordIterator {}
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

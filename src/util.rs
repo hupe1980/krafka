@@ -207,6 +207,7 @@ pub mod varint {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use bytes::BytesMut;
 
@@ -437,6 +438,7 @@ pub fn extract_sni_hostname(address: &str) -> Result<&str> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod bootstrap_tests {
     use super::*;
 
@@ -470,6 +472,7 @@ mod bootstrap_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod sni_tests {
     use super::*;
 

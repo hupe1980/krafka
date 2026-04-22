@@ -152,7 +152,7 @@ fn handle_error(error: KrafkaError) {
 
 `KrafkaError` exposes a built-in `.is_retriable()` method so callers don't need
 to duplicate retry-classification logic. Protocol errors are further classified
-by `ProtocolErrorKind` (see [below](#protokollerrorkind)) so you can distinguish
+by `ProtocolErrorKind` (see [below](#protocolerrorkind)) so you can distinguish
 a transient truncated frame from a permanent API-version mismatch.
 
 ```rust
