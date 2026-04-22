@@ -851,7 +851,9 @@ impl ApiVersionsResponse {
         }
 
         // Length verified to be exactly 8 bytes above.
-        let bytes: [u8; 8] = field.data[..8].try_into().expect("length checked above");
+        let Ok(bytes) = <[u8; 8]>::try_from(&field.data[..8]) else {
+            unreachable!("length verified to be exactly 8 above");
+        };
         Ok(i64::from_be_bytes(bytes))
     }
 

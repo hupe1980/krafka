@@ -905,6 +905,20 @@ pub struct AdminClient {
     closed: std::sync::atomic::AtomicBool,
 }
 
+impl Drop for AdminClient {
+    fn drop(&mut self) {
+        // Warn when the client is dropped without an explicit `close()`:
+        // in-flight RPCs are terminated abruptly and connections are not
+        // cleanly shut down. Skip during panic unwinding.
+        if !self.closed.load(std::sync::atomic::Ordering::SeqCst) && !std::thread::panicking() {
+            warn!(
+                "AdminClient dropped without close(); in-flight RPCs may fail abruptly. \
+                 Call `AdminClient::close()` before drop."
+            );
+        }
+    }
+}
+
 impl AdminClient {
     /// Create a new admin client builder.
     pub fn builder() -> AdminClientBuilder {

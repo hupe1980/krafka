@@ -270,6 +270,8 @@ impl Consumer {
                     .with_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger);
             if let Some(ttl) = config.metadata_topic_cache_ttl {
                 meta = meta.with_topic_cache_ttl(ttl);
+            } else {
+                meta = meta.with_topic_cache_ttl_disabled();
             }
             meta
         });
@@ -2653,9 +2655,9 @@ impl Consumer {
                 Ok(records) if !records.is_empty() => {
                     let mut iter = records.into_iter();
                     // Infallible: `!records.is_empty()` guard above guarantees ≥1 element.
-                    let first = iter
-                        .next()
-                        .expect("non-empty ConsumerRecords yields at least one element");
+                    let Some(first) = iter.next() else {
+                        unreachable!("non-empty ConsumerRecords yields at least one element");
+                    };
                     // Buffer any remaining records for subsequent recv() calls
                     if iter.len() > 0 {
                         let mut buffer = self.recv_buffer.write().await;
@@ -3237,6 +3239,22 @@ impl Consumer {
     }
 }
 
+impl Drop for Consumer {
+    fn drop(&mut self) {
+        // Warn when a consumer is dropped without an explicit `close()`.
+        // Skipping `close()` means the broker will not see a `LeaveGroup`
+        // and the partitions will only be reassigned after
+        // `session.timeout.ms` expires, stalling the rest of the group.
+        // Skip during panic unwinding.
+        if !self.closed.load(std::sync::atomic::Ordering::SeqCst) && !std::thread::panicking() {
+            warn!(
+                "Consumer dropped without close(); group rebalance will be delayed \
+                 until session.timeout.ms. Call `Consumer::close()` before drop."
+            );
+        }
+    }
+}
+
 /// Builder for creating consumers.
 #[derive(Default)]
 #[must_use = "builders do nothing until .build() is called"]
@@ -3538,8 +3556,11 @@ impl ConsumerBuilder {
         }
         if !self.interceptors.is_empty() {
             consumer.interceptor = if self.interceptors.len() == 1 {
-                // infallible: len == 1 guaranteed above
-                self.interceptors.into_iter().next().unwrap()
+                // infallible: len == 1 guaranteed by the surrounding if
+                let Some(single) = self.interceptors.into_iter().next() else {
+                    unreachable!("len == 1 verified above");
+                };
+                single
             } else {
                 Arc::new(crate::interceptor::ConsumerInterceptorChain::new(
                     self.interceptors,

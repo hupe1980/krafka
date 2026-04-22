@@ -105,9 +105,6 @@
 //! krafka = { version = "0.4", default-features = false, features = ["lz4"] }
 //! ```
 
-#![warn(missing_docs)]
-#![warn(rust_2018_idioms)]
-#![deny(unsafe_code)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod admin;

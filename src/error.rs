@@ -19,9 +19,14 @@ pub enum KrafkaError {
     Network(#[source] Arc<io::Error>),
 
     /// Protocol encoding/decoding errors.
-    #[error("protocol error: {message}")]
+    ///
+    /// The `kind` field carries a structured classification that callers can
+    /// match on to drive retry policy without substring-matching the message.
+    #[error("protocol error ({kind:?}): {message}")]
     Protocol {
-        /// Error message describing the protocol error.
+        /// Structured classification of the protocol error.
+        kind: ProtocolErrorKind,
+        /// Human-readable error message with specific details.
         message: String,
     },
 
@@ -88,7 +93,8 @@ impl Clone for KrafkaError {
     fn clone(&self) -> Self {
         match self {
             Self::Network(err) => Self::Network(Arc::clone(err)),
-            Self::Protocol { message } => Self::Protocol {
+            Self::Protocol { kind, message } => Self::Protocol {
+                kind: *kind,
                 message: message.clone(),
             },
             Self::Auth { message } => Self::Auth {
@@ -134,9 +140,22 @@ impl KrafkaError {
     }
 
     /// Create a new protocol error.
+    ///
+    /// The [`ProtocolErrorKind`] is inferred from the message via
+    /// [`ProtocolErrorKind::from_message`]. Use [`KrafkaError::protocol_kind`]
+    /// when the kind is known at the call site.
     #[cold]
     pub fn protocol(message: impl Into<String>) -> Self {
+        let message = message.into();
+        let kind = ProtocolErrorKind::from_message(&message);
+        Self::Protocol { kind, message }
+    }
+
+    /// Create a new protocol error with an explicit [`ProtocolErrorKind`].
+    #[cold]
+    pub fn protocol_kind(kind: ProtocolErrorKind, message: impl Into<String>) -> Self {
         Self::Protocol {
+            kind,
             message: message.into(),
         }
     }
@@ -212,8 +231,137 @@ impl KrafkaError {
             Self::Network(_) => true,
             Self::Timeout { .. } => true,
             Self::Broker { code, .. } => code.is_retriable(),
+            Self::Protocol { kind, .. } => kind.is_retriable(),
             _ => false,
         }
+    }
+}
+
+/// Structured classification of [`KrafkaError::Protocol`] errors.
+///
+/// The Kafka wire protocol surfaces many distinct failure modes (truncated
+/// frames, CRC mismatches, version negotiation failures, oversized arrays,
+/// etc.) that callers may want to distinguish without substring-matching the
+/// error message. `ProtocolErrorKind` exposes the classification as a typed
+/// enum while keeping the human-readable detail on the accompanying message.
+///
+/// Kinds are coarse on purpose — they reflect *retry/fail* decisions rather
+/// than every possible broker-returned condition. Retriability is exposed via
+/// [`ProtocolErrorKind::is_retriable`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProtocolErrorKind {
+    /// Buffer exhausted before a complete frame, field, or record could be read.
+    ///
+    /// Usually indicates a short read on the wire or a truncated response body.
+    /// Retriable: the request may succeed on a fresh connection.
+    TruncatedFrame,
+    /// Record batch CRC32C did not match the computed checksum.
+    ///
+    /// Indicates on-wire corruption. Retriable.
+    CrcMismatch,
+    /// No mutually supported API version, or the broker does not advertise
+    /// the required API at all.
+    ///
+    /// Not retriable — reflects a permanent client/broker version mismatch.
+    UnknownApiVersion,
+    /// An encoded length exceeds the protocol maximum (`i32::MAX`, `u32::MAX`,
+    /// `i16::MAX` for `KafkaString`, etc.) or the configured safety cap
+    /// (`MAX_DECODE_ARRAY_LEN`, `MAX_RECORD_HEADERS`).
+    ///
+    /// Not retriable — indicates a malformed response or a misconfigured cap.
+    InvalidLength,
+    /// Bytes decoded as a UTF-8 string were not valid UTF-8.
+    ///
+    /// Not retriable.
+    InvalidUtf8,
+    /// Record batch magic byte is not a supported version (only `2` is
+    /// accepted today).
+    ///
+    /// Not retriable.
+    UnsupportedMagic,
+    /// A field value was outside its allowed range or encoded incorrectly
+    /// (negative record count, bad enum discriminant, unknown header version,
+    /// malformed varint, etc.).
+    ///
+    /// Not retriable.
+    InvalidValue,
+    /// The response was structurally malformed in a way that does not fit the
+    /// other variants (unexpected partition in a response, missing required
+    /// field, etc.).
+    ///
+    /// Retriable — often transient and resolves after a metadata refresh or
+    /// reconnection.
+    Malformed,
+    /// Catch-all for protocol errors not otherwise classified.
+    ///
+    /// Not retriable by default; callers should inspect the message.
+    Other,
+}
+
+impl ProtocolErrorKind {
+    /// Returns true if this protocol error kind is typically transient and
+    /// safe to retry after a reconnect or metadata refresh.
+    pub fn is_retriable(self) -> bool {
+        matches!(
+            self,
+            Self::TruncatedFrame | Self::CrcMismatch | Self::Malformed
+        )
+    }
+
+    /// Classify an error message into a [`ProtocolErrorKind`] by inspecting
+    /// well-known substrings.
+    ///
+    /// This is the central point where internal call sites using the generic
+    /// [`KrafkaError::protocol`] constructor gain structural information.
+    /// Prefer [`KrafkaError::protocol_kind`] when the kind is known at the
+    /// call site.
+    pub fn from_message(message: &str) -> Self {
+        // Match on ASCII-lowercase to be tolerant of capitalization drift.
+        // The patterns are keyed on stable substrings emitted by the
+        // crate's own `KrafkaError::protocol(...)` call sites — see
+        // `src/protocol/**`, `src/consumer/**`, `src/producer/**`,
+        // `src/admin.rs` for the vocabulary.
+        let m = message;
+        let ml = m.to_ascii_lowercase();
+
+        if ml.contains("not enough bytes")
+            || ml.contains("unexpected end of")
+            || ml.contains("response too short")
+        {
+            return Self::TruncatedFrame;
+        }
+        if ml.contains("crc mismatch") {
+            return Self::CrcMismatch;
+        }
+        if ml.contains("no mutually supported") || ml.contains("broker does not support") {
+            return Self::UnknownApiVersion;
+        }
+        if ml.contains("unsupported record batch magic") {
+            return Self::UnsupportedMagic;
+        }
+        if ml.contains("invalid utf-8") {
+            return Self::InvalidUtf8;
+        }
+        if ml.contains("too large")
+            || ml.contains("too long")
+            || ml.contains("exceeds")
+            || ml.contains("overflow")
+            || ml.contains("length")
+        {
+            return Self::InvalidLength;
+        }
+        if ml.contains("invalid") || ml.contains("unknown") || ml.contains("unexpected") {
+            return Self::InvalidValue;
+        }
+        if ml.contains("not found")
+            || ml.contains("no offset returned")
+            || ml.contains("no transaction description")
+            || ml.contains("missing ")
+        {
+            return Self::Malformed;
+        }
+        Self::Other
     }
 }
 
@@ -1039,5 +1187,164 @@ mod tests {
             let back: i16 = ec.into();
             assert_eq!(back, code, "round-trip failed for code {}", code);
         }
+    }
+
+    // ── L10: ProtocolErrorKind classification and retry policy ──
+
+    #[test]
+    fn test_protocol_error_kind_classifies_truncated_frame() {
+        for msg in [
+            "not enough bytes for i32",
+            "not enough bytes for record batch",
+            "unexpected end of varint",
+            "response too short",
+        ] {
+            assert_eq!(
+                ProtocolErrorKind::from_message(msg),
+                ProtocolErrorKind::TruncatedFrame,
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_protocol_error_kind_classifies_crc_mismatch() {
+        assert_eq!(
+            ProtocolErrorKind::from_message("CRC mismatch: expected deadbeef, got cafebabe"),
+            ProtocolErrorKind::CrcMismatch,
+        );
+    }
+
+    #[test]
+    fn test_protocol_error_kind_classifies_unknown_api_version() {
+        for msg in [
+            "no mutually supported Produce API version",
+            "no mutually supported CreateTopics API version",
+            "broker does not support ShareFetch",
+        ] {
+            assert_eq!(
+                ProtocolErrorKind::from_message(msg),
+                ProtocolErrorKind::UnknownApiVersion,
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_protocol_error_kind_classifies_invalid_length() {
+        for msg in [
+            "record header key too large for i32 length",
+            "varint too long",
+            "message size exceeds i32::MAX",
+            "compact bytes length overflow",
+            "array length 200000 exceeds i32::MAX",
+            "invalid record length",
+        ] {
+            assert_eq!(
+                ProtocolErrorKind::from_message(msg),
+                ProtocolErrorKind::InvalidLength,
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_protocol_error_kind_classifies_invalid_utf8() {
+        assert_eq!(
+            ProtocolErrorKind::from_message("invalid UTF-8 string: bad byte"),
+            ProtocolErrorKind::InvalidUtf8,
+        );
+    }
+
+    #[test]
+    fn test_protocol_error_kind_classifies_unsupported_magic() {
+        assert_eq!(
+            ProtocolErrorKind::from_message("unsupported record batch magic: 1"),
+            ProtocolErrorKind::UnsupportedMagic,
+        );
+    }
+
+    #[test]
+    fn test_protocol_error_kind_classifies_invalid_value() {
+        for msg in [
+            "invalid negative records count: -1",
+            "unknown header version: 3",
+        ] {
+            assert_eq!(
+                ProtocolErrorKind::from_message(msg),
+                ProtocolErrorKind::InvalidValue,
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_protocol_error_kind_classifies_malformed() {
+        for msg in [
+            "partition not found in response",
+            "no offset returned for topic-0",
+            "missing record attributes",
+        ] {
+            assert_eq!(
+                ProtocolErrorKind::from_message(msg),
+                ProtocolErrorKind::Malformed,
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_protocol_error_kind_is_retriable() {
+        assert!(ProtocolErrorKind::TruncatedFrame.is_retriable());
+        assert!(ProtocolErrorKind::CrcMismatch.is_retriable());
+        assert!(ProtocolErrorKind::Malformed.is_retriable());
+        assert!(!ProtocolErrorKind::UnknownApiVersion.is_retriable());
+        assert!(!ProtocolErrorKind::InvalidLength.is_retriable());
+        assert!(!ProtocolErrorKind::InvalidUtf8.is_retriable());
+        assert!(!ProtocolErrorKind::UnsupportedMagic.is_retriable());
+        assert!(!ProtocolErrorKind::InvalidValue.is_retriable());
+        assert!(!ProtocolErrorKind::Other.is_retriable());
+    }
+
+    #[test]
+    fn test_krafka_error_protocol_constructor_classifies_message() {
+        let err = KrafkaError::protocol("not enough bytes for i32");
+        match err {
+            KrafkaError::Protocol { kind, .. } => {
+                assert_eq!(kind, ProtocolErrorKind::TruncatedFrame);
+            }
+            _ => panic!("expected Protocol variant"),
+        }
+    }
+
+    #[test]
+    fn test_krafka_error_protocol_kind_explicit() {
+        let err = KrafkaError::protocol_kind(
+            ProtocolErrorKind::CrcMismatch,
+            "record batch CRC check failed",
+        );
+        match err {
+            KrafkaError::Protocol { kind, message } => {
+                assert_eq!(kind, ProtocolErrorKind::CrcMismatch);
+                assert_eq!(message, "record batch CRC check failed");
+            }
+            _ => panic!("expected Protocol variant"),
+        }
+    }
+
+    #[test]
+    fn test_krafka_error_protocol_retriable_via_kind() {
+        assert!(KrafkaError::protocol("CRC mismatch: a vs b").is_retriable());
+        assert!(KrafkaError::protocol("not enough bytes for header").is_retriable());
+        assert!(!KrafkaError::protocol("no mutually supported Produce API version").is_retriable());
+        assert!(!KrafkaError::protocol("invalid UTF-8 string").is_retriable());
+    }
+
+    #[test]
+    fn test_krafka_error_protocol_display_includes_kind() {
+        let err = KrafkaError::protocol_kind(ProtocolErrorKind::CrcMismatch, "details");
+        let s = err.to_string();
+        assert!(s.contains("CrcMismatch"), "got: {s}");
+        assert!(s.contains("details"), "got: {s}");
     }
 }

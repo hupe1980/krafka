@@ -446,14 +446,17 @@ impl ScramClient {
     fn compute_hmac(&self, key: &[u8], data: &[u8]) -> Vec<u8> {
         match self.mechanism {
             ScramMechanism::Sha256 => {
-                let mut mac =
-                    Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take key of any size");
+                // new_from_slice accepts any key length per RFC 2104.
+                let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(key) else {
+                    unreachable!("HMAC accepts any key length per RFC 2104");
+                };
                 mac.update(data);
                 mac.finalize().into_bytes().to_vec()
             }
             ScramMechanism::Sha512 => {
-                let mut mac =
-                    Hmac::<Sha512>::new_from_slice(key).expect("HMAC can take key of any size");
+                let Ok(mut mac) = Hmac::<Sha512>::new_from_slice(key) else {
+                    unreachable!("HMAC accepts any key length per RFC 2104");
+                };
                 mac.update(data);
                 mac.finalize().into_bytes().to_vec()
             }

@@ -226,9 +226,10 @@ pub struct ClusterMetadata {
     /// starts timing immediately.
     metadata_attempt_start: SyncMutex<Option<Instant>>,
     /// Maximum age of a cached topic entry before it is evicted during partial
-    /// refresh. `None` disables TTL eviction (default). When set, topics not
-    /// refreshed within this duration are pruned on the next partial refresh,
-    /// preventing unbounded cache growth from topic churn.
+    /// refresh. Defaults to 5 minutes, matching the Java client's
+    /// `metadata.max.idle.ms`. `None` disables TTL eviction. When set, topics
+    /// not refreshed within this duration are pruned on the next partial
+    /// refresh, preventing unbounded cache growth from topic churn.
     topic_cache_ttl: Option<Duration>,
 }
 
@@ -248,7 +249,11 @@ impl ClusterMetadata {
             recovery_strategy: MetadataRecoveryStrategy::None,
             rebootstrap_trigger: Duration::from_secs(300),
             metadata_attempt_start: SyncMutex::new(None),
-            topic_cache_ttl: None,
+            // Default to 5 minutes, matching Java's `metadata.max.idle.ms`.
+            // Prevents unbounded cache growth on topic churn; callers that
+            // want the old unbounded behaviour can opt out via
+            // `with_topic_cache_ttl_disabled()`.
+            topic_cache_ttl: Some(Duration::from_secs(300)),
         }
     }
 
@@ -278,10 +283,23 @@ impl ClusterMetadata {
     /// During partial refreshes, cached topics that have not been refreshed
     /// within this duration are evicted to prevent unbounded cache growth.
     /// Full refreshes always rebuild from scratch regardless of this setting.
-    /// `None` disables TTL eviction (the default).
+    ///
+    /// Default: 5 minutes (matching Java's `metadata.max.idle.ms`).
     #[must_use]
     pub fn with_topic_cache_ttl(mut self, ttl: Duration) -> Self {
         self.topic_cache_ttl = Some(ttl);
+        self
+    }
+
+    /// Disable topic cache TTL eviction.
+    ///
+    /// Partial refreshes will retain cached topic entries indefinitely.
+    /// Prefer the default TTL for long-lived clients that discover topics
+    /// dynamically (CDC, multi-tenant gateways); disabling TTL eviction can
+    /// cause unbounded cache growth on topic churn.
+    #[must_use]
+    pub fn with_topic_cache_ttl_disabled(mut self) -> Self {
+        self.topic_cache_ttl = None;
         self
     }
 
@@ -580,7 +598,8 @@ impl ClusterMetadata {
         let mut topics = if full_refresh {
             HashMap::new()
         } else if let Some(ttl) = self.topic_cache_ttl {
-            old.topics
+            let retained: HashMap<_, _> = old
+                .topics
                 .iter()
                 .filter(|(name, _)| {
                     old.topic_last_refreshed
@@ -588,7 +607,16 @@ impl ClusterMetadata {
                         .is_some_and(|ts| now.duration_since(*ts) <= ttl)
                 })
                 .map(|(k, v)| (k.clone(), Arc::clone(v)))
-                .collect()
+                .collect();
+            let evicted = old.topics.len().saturating_sub(retained.len());
+            if evicted > 0 {
+                debug!(
+                    evicted,
+                    ttl_secs = ttl.as_secs(),
+                    "evicted stale topics from metadata cache"
+                );
+            }
+            retained
         } else {
             old.topics.clone()
         };
@@ -1126,5 +1154,35 @@ mod tests {
         assert!(meta.cache.load().brokers.is_empty());
         // After rebootstrap, timer is set to Some(now) — not cleared.
         assert!(meta.metadata_attempt_start.lock().is_some());
+    }
+
+    #[test]
+    fn test_topic_cache_ttl_default_is_five_minutes() {
+        // Locks in the M2 default: topic cache TTL must be 5 min (matching
+        // Java's `metadata.max.idle.ms`) to prevent unbounded metadata growth
+        // on topic churn. See FINDINGS.md M2.
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        let meta = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        );
+        assert_eq!(meta.topic_cache_ttl, Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn test_topic_cache_ttl_disabled_opt_out() {
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        let meta = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        )
+        .with_topic_cache_ttl_disabled();
+        assert_eq!(meta.topic_cache_ttl, None);
     }
 }

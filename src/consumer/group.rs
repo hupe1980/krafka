@@ -471,9 +471,9 @@ impl PartitionAssignor for RoundRobinAssignor {
         // Round-robin assign
         for (idx, (topic, partition)) in all_partitions.into_iter().enumerate() {
             let member = &members[idx % members.len()];
-            let member_topics = member_topic_partitions
-                .get_mut(&member.member_id)
-                .expect("member must exist in pre-populated map");
+            let Some(member_topics) = member_topic_partitions.get_mut(&member.member_id) else {
+                unreachable!("member must exist in pre-populated map");
+            };
             member_topics.entry(topic).or_default().push(partition);
         }
 
@@ -1720,9 +1720,11 @@ impl GroupCoordinator {
                             // Re-negotiate only when the coordinator connection changes.
                             let conn_id = std::sync::Arc::as_ptr(conn) as usize;
                             let hb_version = if cached_conn_id == Some(conn_id) {
-                                // Safe to unwrap: cached_hb_version is always set
-                                // together with cached_conn_id.
-                                cached_hb_version.unwrap()
+                                // cached_hb_version is always set together with cached_conn_id.
+                                let Some(v) = cached_hb_version else {
+                                    unreachable!("cached_hb_version is set whenever cached_conn_id is");
+                                };
+                                v
                             } else {
                                 match conn
                                     .negotiate_api_version(
