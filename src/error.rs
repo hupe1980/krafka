@@ -142,9 +142,8 @@ impl KrafkaError {
 
     /// Create a new protocol error.
     ///
-    /// The [`ProtocolErrorKind`] is inferred from the message via
-    /// [`ProtocolErrorKind::from_message`]. Use [`KrafkaError::protocol_kind`]
-    /// when the kind is known at the call site.
+    /// The [`ProtocolErrorKind`] is inferred automatically from the message.
+    /// Use [`KrafkaError::protocol_kind`] when the kind is known at the call site.
     #[cold]
     pub fn protocol(message: impl Into<String>) -> Self {
         let message = message.into();
@@ -330,7 +329,12 @@ impl ProtocolErrorKind {
     /// [`KrafkaError::protocol`] constructor gain structural information.
     /// Prefer [`KrafkaError::protocol_kind`] when the kind is known at the
     /// call site.
-    pub fn from_message(message: &str) -> Self {
+    ///
+    /// This method is intentionally `pub(crate)`: the patterns are keyed on
+    /// substrings emitted by krafka's own internal `protocol(...)` call sites
+    /// and are not a stable public contract.  External callers should use
+    /// [`KrafkaError::protocol_error_kind`] on errors they receive.
+    pub(crate) fn from_message(message: &str) -> Self {
         // Match on ASCII-lowercase to be tolerant of capitalization drift.
         // The patterns are keyed on stable substrings emitted by the
         // crate's own `KrafkaError::protocol(...)` call sites — see

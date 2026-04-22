@@ -1478,9 +1478,12 @@ mod tests {
             "pre-condition: topic-a seeded"
         );
 
+        // Sleep long enough that Instant::elapsed() strictly exceeds the 1 ns TTL
+        // on every platform, including those with coarse clock resolution
+        // (e.g. Windows default timer granularity is ~15 ms).
+        std::thread::sleep(Duration::from_millis(20));
+
         // Partial refresh with a transient error for "topic-a".
-        // The 1 ns TTL guarantees eviction of topic-a in the eviction pass
-        // before the response loop.  The transient-error path must restore it.
         meta.update_cache(
             MetadataResponse {
                 throttle_time_ms: 0,
@@ -1626,6 +1629,11 @@ mod tests {
             meta.cache.load().name_to_topic_id.contains_key("topic-b"),
             "pre-condition: UUID mapping seeded"
         );
+
+        // Sleep long enough that Instant::elapsed() strictly exceeds the 1 ns TTL
+        // on every platform, including those with coarse clock resolution
+        // (e.g. Windows default timer granularity is ~15 ms).
+        std::thread::sleep(Duration::from_millis(20));
 
         // Partial refresh — 1 ns TTL guarantees eviction of "topic-b" before
         // the response loop.  Transient error must restore both the topic entry
