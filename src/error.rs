@@ -361,7 +361,6 @@ impl ProtocolErrorKind {
             || ml.contains("too long")
             || ml.contains("exceeds")
             || ml.contains("overflow")
-            || ml.contains("length")
         {
             return Self::InvalidLength;
         }
@@ -1254,7 +1253,6 @@ mod tests {
             "message size exceeds i32::MAX",
             "compact bytes length overflow",
             "array length 200000 exceeds i32::MAX",
-            "invalid record length",
         ] {
             assert_eq!(
                 ProtocolErrorKind::from_message(msg),

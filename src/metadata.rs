@@ -678,7 +678,14 @@ impl ClusterMetadata {
                         // acknowledges it (even transiently).
                         topics.insert(topic_name.clone(), Arc::clone(old_info));
                     }
-                    response_topic_names.push(topic_name);
+                    // Only stamp TTL for topics that are actually in the cache
+                    // (survived eviction or just restored from old).  Topics
+                    // with a transient error but no prior cache entry are
+                    // skipped, preventing orphaned entries in
+                    // `topic_last_refreshed` with no corresponding `topics` key.
+                    if topics.contains_key(&topic_name) {
+                        response_topic_names.push(topic_name);
+                    }
                 } else {
                     // Permanent errors (UnknownTopicOrPartition, TopicAuthorizationFailed,
                     // InvalidTopic, etc.) — remove from cache.
@@ -1490,6 +1497,60 @@ mod tests {
         assert!(
             meta.cache.load().topics.contains_key("topic-a"),
             "topic-a must be restored from old cache after TTL eviction + transient error"
+        );
+    }
+
+    /// Regression test: a brand-new topic that appears in a partial refresh
+    /// only with a transient error (and has no prior cache entry) must NOT
+    /// create an orphaned entry in `topic_last_refreshed` with no corresponding
+    /// key in `topics`.
+    #[test]
+    fn test_transient_error_never_cached_topic_not_stamped() {
+        use crate::protocol::{MetadataBroker, MetadataTopicResponse};
+
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        let meta = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        );
+
+        // Empty cache — "unknown-topic" has never been seen before.
+        // A partial refresh returns a retriable error for it.
+        meta.update_cache(
+            MetadataResponse {
+                throttle_time_ms: 0,
+                brokers: vec![MetadataBroker {
+                    node_id: 1,
+                    host: "localhost".to_string(),
+                    port: 9092,
+                    rack: None,
+                }],
+                cluster_id: None,
+                controller_id: 1,
+                error_code: ErrorCode::None,
+                topics: vec![MetadataTopicResponse {
+                    error_code: ErrorCode::LeaderNotAvailable,
+                    name: Some("unknown-topic".to_string()),
+                    topic_id: None,
+                    is_internal: false,
+                    partitions: vec![],
+                }],
+            },
+            false,
+        );
+
+        let cache = meta.cache.load();
+        assert!(
+            !cache.topics.contains_key("unknown-topic"),
+            "unknown-topic must not appear in topics when only a transient error was received \
+             and there is no prior cache entry"
+        );
+        assert!(
+            !cache.topic_last_refreshed.contains_key("unknown-topic"),
+            "unknown-topic must not be stamped in topic_last_refreshed when it is not in topics"
         );
     }
 }
