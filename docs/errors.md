@@ -19,7 +19,8 @@ pub enum KrafkaError {
     Network(Arc<io::Error>),
 
     /// Protocol encoding/decoding errors
-    Protocol { message: String },
+    /// Display: "protocol error ({kind:?}): {message}"
+    Protocol { kind: ProtocolErrorKind, message: String },
 
     /// Authentication failures
     Auth { message: String },
@@ -149,29 +150,14 @@ fn handle_error(error: KrafkaError) {
 
 ### Retry Logic
 
-```rust
-use krafka::error::{KrafkaError, ErrorCode};
-use std::time::Duration;
+`KrafkaError` exposes a built-in `.is_retriable()` method so callers don't need
+to duplicate retry-classification logic. Protocol errors are further classified
+by `ProtocolErrorKind` (see [below](#protokollerrorkind)) so you can distinguish
+a transient truncated frame from a permanent API-version mismatch.
 
-fn is_retriable(error: &KrafkaError) -> bool {
-    match error {
-        KrafkaError::Timeout { .. } => true,
-        KrafkaError::Broker { code, .. } => matches!(
-            code,
-            ErrorCode::NotLeaderForPartition
-            | ErrorCode::LeaderNotAvailable
-            | ErrorCode::RequestTimedOut
-            | ErrorCode::ReplicaNotAvailable
-            | ErrorCode::NetworkException
-            | ErrorCode::CorruptMessage
-            | ErrorCode::UnknownTopicOrPartition
-            | ErrorCode::OutOfOrderSequenceNumber
-            | ErrorCode::ConcurrentTransactions
-            | ErrorCode::OperationNotAttempted
-        ),
-        _ => false,
-    }
-}
+```rust
+use krafka::error::KrafkaError;
+use std::time::Duration;
 
 async fn send_with_retry<F, T>(
     mut operation: F,
@@ -182,11 +168,11 @@ where
     F: FnMut() -> futures::future::BoxFuture<'static, Result<T, KrafkaError>>,
 {
     let mut attempts = 0;
-    
+
     loop {
         match operation().await {
             Ok(result) => return Ok(result),
-            Err(e) if is_retriable(&e) && attempts < max_retries => {
+            Err(e) if e.is_retriable() && attempts < max_retries => {
                 attempts += 1;
                 let delay = backoff * attempts;
                 eprintln!(
@@ -200,6 +186,57 @@ where
     }
 }
 ```
+
+## ProtocolErrorKind
+
+`KrafkaError::Protocol` carries a structured [`ProtocolErrorKind`] classification
+alongside the human-readable message. This lets callers make retry decisions
+without substring-matching the message text.
+
+```rust
+use krafka::{KrafkaError, ProtocolErrorKind};
+
+fn handle_protocol_error(err: &KrafkaError) {
+    match err.protocol_error_kind() {
+        Some(ProtocolErrorKind::TruncatedFrame) => {
+            // Retriable — transient short read, reconnect and retry.
+        }
+        Some(ProtocolErrorKind::CrcMismatch) => {
+            // Retriable — on-wire corruption, reconnect and retry.
+        }
+        Some(ProtocolErrorKind::UnknownApiVersion) => {
+            // Not retriable — permanent client/broker version mismatch.
+        }
+        Some(ProtocolErrorKind::InvalidLength) => {
+            // Not retriable — malformed response or misconfigured safety cap.
+        }
+        Some(kind) => {
+            eprintln!("Protocol error ({kind:?}): {err}");
+        }
+        None => { /* not a Protocol variant */ }
+    }
+}
+```
+
+The display format for `KrafkaError::Protocol` is:
+
+```
+protocol error (CrcMismatch): record batch CRC check failed
+```
+
+### ProtocolErrorKind variants
+
+| Variant | Retriable | Meaning |
+|---|---|---|
+| `TruncatedFrame` | ✓ | Buffer exhausted before a complete frame could be read |
+| `CrcMismatch` | ✓ | Record batch CRC32C mismatch — on-wire corruption |
+| `Malformed` | ✓ | Structurally malformed response (often transient) |
+| `UnknownApiVersion` | ✗ | No mutually supported API version — permanent mismatch |
+| `InvalidLength` | ✗ | Encoded length exceeds protocol maximum or safety cap |
+| `InvalidUtf8` | ✗ | Bytes decoded as UTF-8 string were not valid UTF-8 |
+| `UnsupportedMagic` | ✗ | Record batch magic byte is not version 2 |
+| `InvalidValue` | ✗ | Field value outside allowed range or malformed varint |
+| `Other` | ✗ | Catch-all; inspect the message for details |
 
 ### Error Context
 
@@ -328,7 +365,7 @@ async fn send_critical_message(
                 // Not retriable - message is too large
                 return Err(KrafkaError::config("Message exceeds max size"));
             }
-            Err(e) if is_retriable(&e) && attempt < MAX_RETRIES => {
+            Err(e) if e.is_retriable() && attempt < MAX_RETRIES => {
                 eprintln!("Send failed (attempt {}): {}. Retrying...", attempt, e);
                 tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
             }
@@ -410,7 +447,7 @@ let mut attempts = 0;
 while attempts < 3 {
     match producer.send(...).await {
         Ok(_) => break,
-        Err(e) if is_retriable(&e) => {
+        Err(e) if e.is_retriable() => {
             attempts += 1;
             tokio::time::sleep(Duration::from_millis(100 << attempts)).await;
         }

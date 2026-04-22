@@ -5,7 +5,7 @@
 //! These benchmarks measure the performance of protocol primitives,
 //! header encoding/decoding, and metadata lookups - all critical hot paths.
 
-#![allow(missing_docs)]
+#![allow(missing_docs, clippy::panic)]
 
 use bytes::BytesMut;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};

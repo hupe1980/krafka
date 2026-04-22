@@ -472,7 +472,7 @@ All protocol decoding paths cap `Vec::with_capacity(len.min(10_000))` to prevent
 
 ```rust
 pub enum KrafkaError {
-    Protocol { message: String },           // Wire protocol errors
+    Protocol { kind: ProtocolErrorKind, message: String }, // Wire protocol errors; kind drives retry policy
     Broker { code: ErrorCode, message },    // Kafka error codes
     Auth { message: String },               // Authentication failures
     Timeout { operation: String },          // Operation timeouts

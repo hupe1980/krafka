@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo bench --bench consumer
 
-#![allow(missing_docs)]
+#![allow(missing_docs, clippy::panic)]
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 

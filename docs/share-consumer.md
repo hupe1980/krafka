@@ -145,6 +145,7 @@ while let Some(record) = stream.next().await {
 | `session_timeout` | `45s` | Session timeout for group membership |
 | `heartbeat_interval` | `5s` | Heartbeat interval (must be < session_timeout) |
 | `metadata_max_age` | `5min` | Metadata cache TTL |
+| `metadata_topic_cache_ttl` | `Some(5min)` | TTL for topic entries in the partial-refresh cache. `None` disables eviction. Use `disable_metadata_topic_cache_ttl()` to opt out. |
 | `client_rack` | `None` | Rack ID for rack-aware fetching |
 
 ## Session Management
