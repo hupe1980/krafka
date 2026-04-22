@@ -336,8 +336,7 @@ impl ProtocolErrorKind {
         // crate's own `KrafkaError::protocol(...)` call sites — see
         // `src/protocol/**`, `src/consumer/**`, `src/producer/**`,
         // `src/admin.rs` for the vocabulary.
-        let m = message;
-        let ml = m.to_ascii_lowercase();
+        let ml = message.to_ascii_lowercase();
 
         if ml.contains("not enough bytes")
             || ml.contains("unexpected end of")
