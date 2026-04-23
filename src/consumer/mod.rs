@@ -2522,8 +2522,23 @@ impl Consumer {
                 partition_state.entry(key).or_default().log_start_offset = Some(offset);
             }
             for (key, value) in pref_updates {
-                let entry = partition_state.entry(key).or_default();
-                entry.preferred_replica = value.map(|replica_id| (replica_id, expiry));
+                match value {
+                    // Setting a preferred replica: insert/update the entry.
+                    Some(replica_id) => {
+                        partition_state.entry(key).or_default().preferred_replica =
+                            Some((replica_id, expiry));
+                    }
+                    // Clearing: only mutate an existing entry. Skipping
+                    // absent entries avoids inserting empty `PartitionState`
+                    // values on every fetch response that reports
+                    // `preferred_read_replica = -1` (the common case), which
+                    // would otherwise write-amplify this hot path.
+                    None => {
+                        if let Some(state) = partition_state.get_mut(&key) {
+                            state.preferred_replica = None;
+                        }
+                    }
+                }
             }
         }
 
