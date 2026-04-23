@@ -120,13 +120,16 @@ impl NewTopic {
     ///
     /// # Arguments
     ///
+    /// * `name` — Topic name. Must be non-empty and no longer than `i16::MAX`
+    ///   bytes (the Kafka wire-format limit).
     /// * `num_partitions` — Must be positive or -1 (use broker default).
     /// * `replication_factor` — Must be positive or -1 (use broker default).
     ///
     /// # Errors
     ///
-    /// Returns an error if `num_partitions` or `replication_factor` is zero or
-    /// less than -1.
+    /// Returns an error if:
+    /// - `name` is empty or exceeds the `i16::MAX`-byte wire-format limit, or
+    /// - `num_partitions` or `replication_factor` is zero or less than -1.
     pub fn new(
         name: impl Into<String>,
         num_partitions: i32,

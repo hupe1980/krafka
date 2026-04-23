@@ -744,8 +744,11 @@ impl ConnectionPool {
     /// released, which correctly defers teardown if another caller is
     /// still holding the connection (e.g. mid-request).
     ///
-    /// Returns the number of connections evicted. No-op when `max_idle` is
-    /// `None`.
+    /// Returns the number of *unique* connections evicted. A single socket
+    /// registered under both a broker ID and a bootstrap address counts
+    /// once: the collected `Arc`s are deduplicated by pointer identity
+    /// before the count is returned, so the `debug!` log and the return
+    /// value reflect distinct sockets. No-op when `max_idle` is `None`.
     ///
     /// Safe to call concurrently with `get_connection_by_id` /
     /// `get_bootstrap_connection`: any connection re-inserted between the
@@ -812,6 +815,13 @@ impl ConnectionPool {
             }
         }
 
+        // A single connection typically lives in both maps (same `Arc`
+        // registered under broker id and bootstrap address). Dedup by
+        // `Arc::as_ptr` so the eviction count reflects unique sockets
+        // and `Drop` runs once per connection without inflation.
+        removed.sort_by_key(|c| Arc::as_ptr(c) as usize);
+        removed.dedup_by(|a, b| Arc::ptr_eq(a, b));
+
         let count = removed.len();
         if count > 0 {
             debug!(
@@ -827,11 +837,11 @@ impl ConnectionPool {
         count
     }
 
-    /// Spawn a background task that periodically calls [`evict_idle`].
+    /// Spawn a background task that periodically calls [`Self::evict_idle`].
     ///
     /// Idempotent: a second call while a previous evictor is still running
     /// aborts the previous handle before installing the new one. The task
-    /// is automatically aborted by [`close_all`].
+    /// is automatically aborted by [`Self::close_all`].
     ///
     /// The sweep interval is `max_idle / 9`, clamped to a minimum of 1 s
     /// and a maximum of 60 s. This matches the Java client's approach: a
@@ -839,12 +849,23 @@ impl ConnectionPool {
     /// removal, so a fractional-sweep keeps actual idle time close to
     /// the configured bound.
     ///
-    /// Requires a Tokio runtime context (uses `tokio::spawn`). No-op when
-    /// `max_idle` is `None`.
+    /// No-op when `max_idle` is `None` or when called outside a Tokio
+    /// runtime context. The runtime guard keeps the library panic-free
+    /// for integrations that construct a pool without `tokio::spawn`
+    /// being available (e.g. ad-hoc tests or synchronous tooling); such
+    /// callers simply lose the background sweep and can call
+    /// [`Self::evict_idle`] explicitly instead.
     pub fn start_idle_evictor(self: &Arc<Self>) {
         let Some(max_idle) = self.max_idle else {
             return;
         };
+        // Guard against being called outside a Tokio runtime so that
+        // `tokio::spawn` never panics. This mirrors the `BrokerConnection`
+        // Drop path, which also checks for a live runtime before spawning.
+        if tokio::runtime::Handle::try_current().is_err() {
+            warn!("start_idle_evictor called outside a Tokio runtime; idle eviction disabled");
+            return;
+        }
         // Sweep about 9× during one idle window, clamped to sensible bounds.
         // 9 is the same divisor the Java client uses.
         let interval = (max_idle / 9)
@@ -1082,5 +1103,18 @@ mod tests {
         let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()).with_max_idle(None));
         pool.start_idle_evictor();
         assert!(pool.evictor_handle.lock().is_none());
+    }
+
+    #[test]
+    fn test_start_idle_evictor_noop_outside_tokio_runtime() {
+        // No `#[tokio::test]`: this synchronous test runs without a runtime,
+        // so `start_idle_evictor` must take the `Handle::try_current()` early
+        // return rather than panic inside `tokio::spawn`.
+        let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
+        pool.start_idle_evictor();
+        assert!(
+            pool.evictor_handle.lock().is_none(),
+            "evictor must not be installed without a Tokio runtime"
+        );
     }
 }
