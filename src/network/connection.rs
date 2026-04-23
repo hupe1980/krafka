@@ -2179,6 +2179,7 @@ impl BrokerConnection {
     /// - is marked `alive = true` so `is_alive()` reports consistently;
     /// - has `last_used_nanos = 0` so idle time equals full age.
     #[cfg(test)]
+    #[allow(clippy::expect_used)]
     pub(crate) fn test_stub_idle_for(address: &str, idle_for: Duration) -> Self {
         let (high_priority_tx, _) = mpsc::channel(1);
         let (normal_priority_tx, _) = mpsc::channel(1);
@@ -2195,7 +2196,11 @@ impl BrokerConnection {
             throttle_until: Arc::new(parking_lot::Mutex::new(Instant::now())),
             created_at: Instant::now()
                 .checked_sub(idle_for)
-                .unwrap_or_else(Instant::now),
+                // `unwrap`: test idle_for values are always small (≤ 10s) and
+                // any system uptime on which tests run exceeds that easily;
+                // failing loudly here is better than silently yielding a fresh
+                // timestamp that makes eviction tests vacuously pass.
+                .expect("idle_for exceeds system uptime; cannot backdate Instant"),
             last_used_nanos: AtomicU64::new(0),
         }
     }
