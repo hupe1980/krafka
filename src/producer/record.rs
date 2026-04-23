@@ -3,7 +3,7 @@
 use bytes::Bytes;
 
 use crate::error::{KrafkaError, Result};
-use crate::protocol::MAX_RECORD_HEADERS;
+use crate::protocol::{MAX_RECORD_HEADERS, validate_topic_name};
 use crate::{PartitionId, Timestamp};
 
 /// A record to be sent to Kafka.
@@ -108,19 +108,10 @@ impl ProducerRecord {
     /// - Each header value fits in `i32`
     /// - Topic name fits in `i16` (Kafka string encoding limit of 32 KiB)
     pub fn validate(&self) -> Result<()> {
-        // Topic names cannot be empty
-        if self.topic.is_empty() {
-            return Err(KrafkaError::protocol("topic name cannot be empty"));
-        }
-
-        // Topic names are encoded as KafkaString (i16 length prefix)
-        if self.topic.len() > i16::MAX as usize {
-            return Err(KrafkaError::protocol(format!(
-                "topic name length {} exceeds protocol limit of {}",
-                self.topic.len(),
-                i16::MAX
-            )));
-        }
+        // Topic name must be non-empty and fit the KafkaString (i16) length prefix.
+        // Shared with admin-path ingress so the error message is stable across
+        // the client.
+        validate_topic_name(&self.topic)?;
 
         // Key is encoded as KafkaBytes (i32 length prefix)
         if let Some(ref key) = self.key

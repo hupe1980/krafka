@@ -91,7 +91,8 @@ use crate::protocol::{
     ReassignableTopic, RenewDelegationTokenRequest, RenewDelegationTokenResponse,
     ScramCredentialDeletion, ScramCredentialUpsertion, SupportedFeature, UpdateFeaturesRequest,
     UpdateFeaturesResponse, VersionedDecode, VersionedEncode, WritableTxnMarker,
-    WritableTxnMarkerTopic, WriteTxnMarkersRequest, WriteTxnMarkersResponse, versions,
+    WritableTxnMarkerTopic, WriteTxnMarkersRequest, WriteTxnMarkersResponse, validate_topic_name,
+    validate_topic_names, versions,
 };
 
 // Re-export for use by callers of `describe_configs`.
@@ -131,6 +132,8 @@ impl NewTopic {
         num_partitions: i32,
         replication_factor: i16,
     ) -> Result<Self> {
+        let name = name.into();
+        validate_topic_name(&name)?;
         if num_partitions == 0 || num_partitions < -1 {
             return Err(KrafkaError::config(format!(
                 "num_partitions must be positive or -1, got {num_partitions}"
@@ -142,7 +145,7 @@ impl NewTopic {
             )));
         }
         Ok(Self {
-            name: name.into(),
+            name,
             num_partitions,
             replication_factor,
             configs: HashMap::new(),
@@ -1038,6 +1041,9 @@ impl AdminClient {
         topics: Vec<String>,
         timeout: Duration,
     ) -> Result<Vec<DeleteTopicResult>> {
+        // H6: reject oversize topic names at ingress so we never reach the
+        // panicking `KafkaString::encode` path.
+        validate_topic_names(topics.iter().map(String::as_str))?;
         let conn = self.get_any_broker_connection().await?;
 
         // Build request — populate both fields so the correct one is used
@@ -1110,6 +1116,9 @@ impl AdminClient {
         timeout: Duration,
     ) -> Result<CreatePartitionsResult> {
         let topic_name = topic.into();
+        // H6: reject oversize topic names at ingress so we never reach the
+        // panicking `KafkaString::encode` path.
+        validate_topic_name(&topic_name)?;
         let conn = self.get_any_broker_connection().await?;
 
         // Build request
@@ -2073,6 +2082,10 @@ impl AdminClient {
         timeout: Duration,
     ) -> Result<Vec<DeleteRecordResult>> {
         self.check_not_closed()?;
+        // H6: reject oversize topic names before any encoder reaches them.
+        for (topic, _) in offsets.keys() {
+            validate_topic_name(topic)?;
+        }
 
         for attempt in 0u8..2 {
             if attempt == 1 {
@@ -2207,6 +2220,10 @@ impl AdminClient {
         partitions: Vec<(String, i32, i32)>,
     ) -> Result<Vec<LeaderEpochResult>> {
         self.check_not_closed()?;
+        // H6: reject oversize topic names at ingress.
+        for (topic, _, _) in &partitions {
+            validate_topic_name(topic)?;
+        }
 
         for attempt in 0u8..2 {
             if attempt == 1 {
@@ -2876,6 +2893,8 @@ impl AdminClient {
         topics: Vec<String>,
     ) -> Result<DescribeTopicPartitionsResult> {
         self.check_not_closed()?;
+        // H6: reject oversize topic names at ingress.
+        validate_topic_names(topics.iter().map(String::as_str))?;
         let conn = self.get_any_broker_connection().await?;
 
         let version = conn
@@ -3203,6 +3222,12 @@ impl AdminClient {
         topics: Option<Vec<DescribableLogDirTopic>>,
     ) -> Result<Vec<LogDirInfo>> {
         self.check_not_closed()?;
+        // H6: reject oversize topic names at ingress.
+        if let Some(ref ts) = topics {
+            for t in ts {
+                validate_topic_name(&t.topic)?;
+            }
+        }
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -3353,6 +3378,12 @@ impl AdminClient {
         topic_partitions: Option<Vec<ElectLeadersTopicPartitions>>,
         timeout: Duration,
     ) -> Result<Vec<ElectLeadersResult>> {
+        // H6: reject oversize topic names at ingress.
+        if let Some(ref tps) = topic_partitions {
+            for tp in tps {
+                validate_topic_name(&tp.topic)?;
+            }
+        }
         let conn = self.get_any_broker_connection().await?;
 
         let request = ElectLeadersRequest {
@@ -3445,6 +3476,10 @@ impl AdminClient {
         topics: Vec<ReassignableTopic>,
         timeout: Duration,
     ) -> Result<AlterReassignmentsResult> {
+        // H6: reject oversize topic names at ingress.
+        for t in &topics {
+            validate_topic_name(&t.name)?;
+        }
         let conn = self.get_any_broker_connection().await?;
 
         let request = AlterPartitionReassignmentsRequest {
@@ -3548,6 +3583,12 @@ impl AdminClient {
         topics: Option<Vec<ListPartitionReassignmentsTopic>>,
         timeout: Duration,
     ) -> Result<Vec<PartitionReassignmentInfo>> {
+        // H6: reject oversize topic names at ingress.
+        if let Some(ref ts) = topics {
+            for t in ts {
+                validate_topic_name(&t.name)?;
+            }
+        }
         let conn = self.get_any_broker_connection().await?;
 
         let request = ListPartitionReassignmentsRequest {
@@ -3646,6 +3687,12 @@ impl AdminClient {
         dirs: Vec<AlterReplicaLogDir>,
     ) -> Result<Vec<AlterReplicaLogDirsResult>> {
         self.check_not_closed()?;
+        // H6: reject oversize topic names at ingress.
+        for d in &dirs {
+            for t in &d.topics {
+                validate_topic_name(&t.name)?;
+            }
+        }
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -5388,6 +5435,7 @@ impl AdminClientBuilder {
         conn_config.init_tls().await?;
 
         let pool = Arc::new(ConnectionPool::new(conn_config));
+        pool.start_idle_evictor();
         let metadata = Arc::new(
             ClusterMetadata::new(bootstrap_servers, pool.clone(), Duration::from_secs(300))
                 .with_recovery_strategy(self.config.metadata_recovery_strategy)
@@ -5440,6 +5488,29 @@ mod tests {
         assert!(NewTopic::new("t", -2, 1).is_err());
         assert!(NewTopic::new("t", 1, 0).is_err());
         assert!(NewTopic::new("t", 1, -2).is_err());
+    }
+
+    /// H6: empty / oversize topic names must be rejected at `NewTopic::new`
+    /// so the panicking `KafkaString::encode` path is unreachable from the
+    /// public API.
+    #[test]
+    fn test_new_topic_name_validation_rejects_empty_and_oversize() {
+        let empty = NewTopic::new("", 1, 1).unwrap_err().to_string();
+        assert!(
+            empty.contains("topic name cannot be empty"),
+            "expected empty-name error, got: {empty}"
+        );
+
+        let oversize = "x".repeat(i16::MAX as usize + 1);
+        let err = NewTopic::new(oversize, 1, 1).unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds protocol limit"),
+            "expected protocol-limit error, got: {err}"
+        );
+
+        // Boundary: exactly i16::MAX bytes is accepted.
+        let max_ok = "x".repeat(i16::MAX as usize);
+        assert!(NewTopic::new(max_ok, 1, 1).is_ok());
     }
 
     #[test]

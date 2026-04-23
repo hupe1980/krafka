@@ -38,7 +38,7 @@ pub use connection::{
 #[cfg(feature = "socks5")]
 #[cfg_attr(docsrs, doc(cfg(feature = "socks5")))]
 pub use connection::{ProxyConfig, ProxyCredentials};
-pub use pool::{BrokerConnectionBundle, ConnectionPool, ConnectionRetryConfig};
+pub use pool::{BrokerConnectionBundle, ConnectionPool, ConnectionRetryConfig, DEFAULT_MAX_IDLE};
 pub use secure::{
     ChallengeResponse, SaslAuthenticator, SecureConnectionConfig, SecureConnectionConfigBuilder,
 };
