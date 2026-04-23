@@ -140,11 +140,15 @@ struct PermitReservation {
 }
 
 impl PermitReservation {
-    /// Surrender the release obligation; the caller is now responsible for
-    /// calling `add_permits(bytes)` on the same semaphore (typically via
+    /// Surrender the release obligation without leaking any allocation.
+    ///
+    /// Sets `bytes` to zero so that `Drop` calls `add_permits(0)`, which is
+    /// a no-op in Tokio. The `Arc<Semaphore>` is dropped normally at end of
+    /// scope. The caller is now responsible for eventually calling
+    /// `add_permits(original_bytes)` on the same semaphore (typically via
     /// `InFlightGuard::drop`).
-    fn forget(self) {
-        std::mem::forget(self);
+    fn forget(mut self) {
+        self.bytes = 0;
     }
 }
 
