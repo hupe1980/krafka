@@ -34,21 +34,55 @@ use crate::protocol::{
     RecordBatchBuilder, VersionedDecode, VersionedEncode, versions,
 };
 
-/// Maximum number of concurrent `send_extracted_batch` tasks in any single
-/// drain: `flush_all_ready`, `check_linger_expiry`, `flush_all`, and
-/// `flush_batch` all route through `spawn_batches_bounded`, so this cap
-/// applies uniformly to linger-triggered sends, user-initiated `flush()`,
-/// and shutdown `close()`.
+/// Maximum number of concurrent `send_extracted_batch` tasks in a single
+/// bounded drain wave.
+///
+/// `flush_all` (Flush/Shutdown commands) awaits `spawn_batches_bounded`
+/// directly so completion is confirmed before the caller is unblocked.
+/// Linger-triggered paths (`check_linger_expiry`, `flush_all_ready`) and
+/// single-batch flushes (`flush_batch`) detach their send work via
+/// `spawn_batches_detached` so the accumulator run loop is never held
+/// waiting for network I/O. `spawn_batches_bounded` enforces this cap
+/// inside each detached wave; `InFlightGuard` limits per-broker parallelism
+/// across concurrent waves.
 ///
 /// Fix for H3: prior implementations spawned one task per batch with no
 /// cap, meaning 10k partitions at `linger.ms=5` produced a 10k-task burst
 /// every linger tick. This number is deliberately modest — batch sends are
 /// I/O-bound and the per-broker connection pipeline already serializes
 /// requests, so extra parallelism beyond a few dozen tasks does not
-/// translate to throughput and only adds scheduler pressure. Keep this
-/// in sync with the rationale in [FINDINGS H3] and the Java client's
-/// single `Sender` thread topology.
+/// translate to throughput and only adds scheduler pressure.
 const MAX_CONCURRENT_BATCH_SENDS: usize = 64;
+
+/// Validate that `record_size` bytes can be admitted into the memory pool.
+///
+/// Returns an error immediately if the record would permanently block
+/// `acquire_many` — either because it exceeds `u32::MAX` (the hard limit of
+/// `Semaphore::acquire_many`) or because it exceeds the configured
+/// `buffer_memory` budget (permits can never accumulate to that level).
+///
+/// The u32 check comes first so the error message is always accurate:
+/// a record larger than both limits is a semaphore-API violation, not a
+/// tunable configuration problem.
+fn check_record_admission(record_size: usize, memory_capacity: usize) -> Result<()> {
+    if record_size > u32::MAX as usize {
+        return Err(KrafkaError::config(format!(
+            "record size {record_size} B exceeds the semaphore \
+             permit-count limit ({} B, u32::MAX); Kafka records must \
+             be smaller",
+            u32::MAX
+        )));
+    }
+    if record_size > memory_capacity {
+        return Err(KrafkaError::config(format!(
+            "record size {record_size} B exceeds producer buffer_memory \
+             capacity ({} B); raise ProducerConfig::buffer_memory or \
+             shrink the record",
+            memory_capacity
+        )));
+    }
+    Ok(())
+}
 
 /// Response from the accumulator for an append attempt.
 ///
@@ -177,31 +211,11 @@ impl RecordAccumulatorHandle {
         let deadline = tokio::time::Instant::now() + self.max_block_ms;
         let record_size = record.estimated_size();
 
-        // Reject records that cannot physically be admitted:
-        //   (a) larger than the configured `buffer_memory` budget —
-        //       `acquire_many` would block forever waiting for a release
-        //       that can never come; or
-        //   (b) larger than `u32::MAX`, the permit-count limit of
-        //       `Semaphore::acquire_many`. Kafka brokers cap records far
-        //       below this in practice (~16 MiB by default).
-        // Surface the specific failure so the caller knows whether to
-        // raise `buffer_memory` or shrink the record.
-        if record_size > u32::MAX as usize {
-            return Err(KrafkaError::config(format!(
-                "record size {record_size} B exceeds the semaphore \
-                 permit-count limit ({} B, u32::MAX); Kafka records must \
-                 be smaller",
-                u32::MAX
-            )));
-        }
-        if record_size > self.memory_capacity {
-            return Err(KrafkaError::config(format!(
-                "record size {record_size} B exceeds producer buffer_memory \
-                 capacity ({} B); raise ProducerConfig::buffer_memory or \
-                 shrink the record",
-                self.memory_capacity
-            )));
-        }
+        // Reject records that cannot physically be admitted (exceeds the
+        // semaphore permit limit or the configured buffer_memory budget).
+        // Uses the module-level helper so both branches are unit-testable
+        // without allocating large buffers.
+        check_record_admission(record_size, self.memory_capacity)?;
 
         // FIFO-fair reservation of `record_size` bytes from the shared pool.
         // On timeout or closed semaphore (accumulator panicked), the permit
@@ -592,7 +606,7 @@ impl RecordAccumulator {
                     }
                 }
                 _ = linger_timer.tick() => {
-                    self.check_linger_expiry().await;
+                    self.check_linger_expiry();
                 }
             }
         }
@@ -650,16 +664,16 @@ impl RecordAccumulator {
             // Check if batch is full
             if accumulator_batch.batch.is_full() {
                 trace!("Batch full for {}-{}, flushing", key.0, partition);
-                self.flush_batch(&key).await;
+                self.flush_batch(&key);
             } else if self.config.linger.is_zero() {
                 // linger=0 means send immediately without waiting
                 // for the next linger timer tick (up to 1ms delay otherwise).
                 trace!("Linger=0 for {}-{}, flushing immediately", key.0, partition);
-                self.flush_batch(&key).await;
+                self.flush_batch(&key);
             }
         } else {
             // Batch is full, flush it first and then add to new batch
-            self.flush_batch(&key).await;
+            self.flush_batch(&key);
 
             // Create new batch and add record
             let mut new_batch =
@@ -689,10 +703,15 @@ impl RecordAccumulator {
         }
     }
 
-    /// Check for batches that have exceeded linger time (concurrent flush).
-    async fn check_linger_expiry(&mut self) {
+    /// Check for batches that have exceeded their linger time and detach sends.
+    ///
+    /// Extracts expired batches synchronously, then dispatches them via
+    /// `spawn_batches_detached` so the accumulator's run loop is never held
+    /// waiting for network I/O. When `linger` is zero, delegates to
+    /// `flush_all_ready`.
+    fn check_linger_expiry(&mut self) {
         if self.config.linger.is_zero() {
-            self.flush_all_ready().await;
+            self.flush_all_ready();
             return;
         }
 
@@ -715,18 +734,22 @@ impl RecordAccumulator {
             }
         }
 
-        Self::spawn_batches_bounded(
+        Self::spawn_batches_detached(
             extracted,
             &self.metadata,
             &self.config,
             &self.retry_policy,
             &self.metrics,
-        )
-        .await;
+        );
     }
 
-    /// Flush all ready batches concurrently (non-empty with linger=0).
-    async fn flush_all_ready(&mut self) {
+    /// Flush all ready batches by detaching send tasks.
+    ///
+    /// Extracts all non-empty batches synchronously, then hands them off to
+    /// `spawn_batches_detached` so the run loop is never blocked by network
+    /// I/O. The send cap (`MAX_CONCURRENT_BATCH_SENDS`) is enforced inside
+    /// the detached wave.
+    fn flush_all_ready(&mut self) {
         let keys_to_flush: Vec<_> = self
             .batches
             .iter()
@@ -745,14 +768,13 @@ impl RecordAccumulator {
             }
         }
 
-        Self::spawn_batches_bounded(
+        Self::spawn_batches_detached(
             extracted,
             &self.metadata,
             &self.config,
             &self.retry_policy,
             &self.metrics,
-        )
-        .await;
+        );
     }
 
     /// Spawn at most `MAX_CONCURRENT_BATCH_SENDS` send tasks at a time.
@@ -777,11 +799,14 @@ impl RecordAccumulator {
         let mut join_set = tokio::task::JoinSet::new();
         for ((topic, partition), (batch, guard)) in extracted {
             if join_set.len() >= MAX_CONCURRENT_BATCH_SENDS {
-                // Wait for at least one in-flight spawn to complete before
-                // admitting the next. `join_next` returning `None` means the
-                // set is empty, which cannot happen here because
-                // `len() >= cap >= 1`; ignore the return value.
-                let _ = join_set.join_next().await;
+                // Drain one slot before admitting the next task.
+                // `join_next` returning `None` cannot happen here because
+                // `len() >= cap >= 1`.
+                if let Some(Err(e)) = join_set.join_next().await
+                    && e.is_panic()
+                {
+                    warn!("send_extracted_batch task panicked: {e}");
+                }
             }
             join_set.spawn(Self::send_extracted_batch(
                 topic,
@@ -795,7 +820,46 @@ impl RecordAccumulator {
                 metrics.clone(),
             ));
         }
-        while join_set.join_next().await.is_some() {}
+        while let Some(result) = join_set.join_next().await {
+            if let Err(e) = result
+                && e.is_panic()
+            {
+                warn!("send_extracted_batch task panicked: {e}");
+            }
+        }
+    }
+
+    /// Detach a bounded batch-send wave so the accumulator run loop is not
+    /// blocked by in-flight network I/O.
+    ///
+    /// Clones the shared handles, spawns a single Tokio task, and returns
+    /// immediately. Inside the task, `spawn_batches_bounded` enforces the
+    /// `MAX_CONCURRENT_BATCH_SENDS` cap so at most that many
+    /// `send_extracted_batch` tasks run concurrently within each wave.
+    /// Cross-wave parallelism is bounded by the `InFlightGuard` semaphore
+    /// inside `send_extracted_batch`.
+    fn spawn_batches_detached(
+        extracted: Vec<((String, PartitionId), (AccumulatorBatch, InFlightGuard))>,
+        metadata: &Arc<ClusterMetadata>,
+        config: &AccumulatorConfig,
+        retry_policy: &RetryPolicy,
+        metrics: &Arc<ProducerMetrics>,
+    ) {
+        if extracted.is_empty() {
+            return;
+        }
+        let metadata = metadata.clone();
+        let config = config.clone();
+        let retry_policy = retry_policy.clone();
+        let metrics = metrics.clone();
+        // Fire-and-forget: dropping the JoinHandle detaches the task;
+        // it continues running independently. The task is self-contained
+        // (InFlightGuard ensures memory permits are reclaimed on completion
+        // or panic) so we do not need to track it.
+        let _wave = tokio::spawn(async move {
+            Self::spawn_batches_bounded(extracted, &metadata, &config, &retry_policy, &metrics)
+                .await;
+        });
     }
 
     /// Extract a batch from the accumulator and account its byte count
@@ -825,23 +889,32 @@ impl RecordAccumulator {
         Some((batch, guard))
     }
 
-    /// Flush a specific batch, respecting the global send-task cap.
+    /// Flush a specific batch by spawning a detached send task.
     ///
-    /// Routes through `spawn_batches_bounded` (with a single-element vec) so
-    /// this path shares the same `MAX_CONCURRENT_BATCH_SENDS` ceiling as
-    /// `check_linger_expiry` and `flush_all`. Even though a single flush
-    /// creates only one task, using the shared helper keeps all spawn paths
-    /// consistently bounded.
-    async fn flush_batch(&mut self, key: &(String, PartitionId)) {
-        if let Some(item) = self.extract_batch(key) {
-            Self::spawn_batches_bounded(
-                vec![(key.clone(), item)],
-                &self.metadata,
-                &self.config,
-                &self.retry_policy,
-                &self.metrics,
-            )
-            .await;
+    /// Spawns exactly one `send_extracted_batch` task and returns immediately
+    /// so the accumulator run loop is never blocked on the linger=0 hot path
+    /// or when a full batch is encountered during an append. `InFlightGuard`
+    /// limits per-broker parallelism; `send_extracted_batch` handles all
+    /// retry and backpressure internally.
+    fn flush_batch(&mut self, key: &(String, PartitionId)) {
+        if let Some((batch, guard)) = self.extract_batch(key) {
+            let topic = key.0.clone();
+            let partition = key.1;
+            let metadata = self.metadata.clone();
+            let config = self.config.clone();
+            let retry_policy = self.retry_policy.clone();
+            let metrics = self.metrics.clone();
+            tokio::spawn(Self::send_extracted_batch(
+                topic,
+                partition,
+                batch.pending,
+                batch.created_at,
+                guard,
+                metadata,
+                config,
+                retry_policy,
+                metrics,
+            ));
         }
     }
 
@@ -1227,6 +1300,10 @@ impl RecordAccumulator {
     /// `flush()` or `close()` with many partitions does not create an
     /// unbounded task burst — the same `MAX_CONCURRENT_BATCH_SENDS` ceiling
     /// that governs linger-triggered sends applies here too.
+    ///
+    /// Always returns `Ok(())`: individual send errors are delivered through
+    /// each record's `response_tx` inside `send_extracted_batch`; there is
+    /// no aggregate failure to surface at this level.
     async fn flush_all(&mut self) -> Result<()> {
         let keys: Vec<_> = self
             .batches
@@ -1498,39 +1575,42 @@ mod tests {
         );
     }
 
-    /// The oversize-record guard distinguishes the two failure modes so
-    /// users know whether to raise `buffer_memory` or shrink the record.
-    #[tokio::test]
-    async fn test_oversize_error_distinguishes_buffer_vs_u32_limit() {
-        // Case A: record exceeds configured buffer_memory.
-        let (sender, _receiver) = mpsc::channel::<AccumulatorMessage>(16);
-        let handle_a = RecordAccumulatorHandle {
-            sender,
-            memory_permits: Arc::new(Semaphore::new(16)),
-            memory_capacity: 16,
-            max_block_ms: Duration::from_secs(60),
-            in_flight_barrier: Arc::new(InFlightBarrier::new()),
-        };
-        let err_a = handle_a
-            .append(ProducerRecord::new("t", vec![0u8; 1024]), 0)
-            .await
-            .expect_err("must reject");
-        let msg_a = err_a.to_string();
+    /// `check_record_admission` rejects records that exceed `buffer_memory`.
+    ///
+    /// Tests the `buffer_memory` branch independently via the extracted
+    /// helper so both admission failure modes are regression-proof without
+    /// needing to allocate large buffers.
+    #[test]
+    fn test_check_record_admission_rejects_oversized_for_buffer() {
+        let err = check_record_admission(1024, 16).expect_err("must reject");
+        let msg = err.to_string();
         assert!(
-            msg_a.contains("buffer_memory"),
-            "case A error must cite buffer_memory, got: {msg_a}"
+            msg.contains("buffer_memory"),
+            "error must cite buffer_memory, got: {msg}"
         );
         assert!(
-            !msg_a.contains("u32::MAX"),
-            "case A error must not cite u32::MAX, got: {msg_a}"
+            !msg.contains("u32::MAX"),
+            "must not cite u32::MAX for a buffer_memory rejection, got: {msg}"
         );
+    }
 
-        // We cannot construct a `Vec<u8>` of `u32::MAX + 1` bytes in a
-        // test, so case B is verified by inspecting the error message
-        // format directly: the guard's ordering means the `u32::MAX`
-        // check fires before the `memory_capacity` check when both
-        // would trigger. A code reader (and rustc via the test above)
-        // can see the guard now emits two distinct messages; no further
-        // runtime assertion is needed for the B branch.
+    /// `check_record_admission` rejects records that exceed `u32::MAX`.
+    ///
+    /// Tests the `u32::MAX` branch directly via the extracted helper —
+    /// no >4 GiB allocation needed.
+    #[test]
+    fn test_check_record_admission_rejects_oversized_for_u32_max() {
+        // Synthetic size just above u32::MAX — no allocation required.
+        let oversized = u32::MAX as usize + 1;
+        let err = check_record_admission(oversized, usize::MAX).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("u32::MAX"),
+            "error must cite u32::MAX, got: {msg}"
+        );
+        assert!(
+            !msg.contains("buffer_memory"),
+            "must not cite buffer_memory for a u32::MAX rejection, got: {msg}"
+        );
     }
 }

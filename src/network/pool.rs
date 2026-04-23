@@ -487,6 +487,25 @@ impl ConnectionPool {
         }
     }
 
+    /// Create a new connection pool, wrap it in an `Arc`, and start the
+    /// background idle-evictor immediately.
+    ///
+    /// This is the recommended constructor for production use: the evictor
+    /// is activated automatically if a Tokio runtime is available (the same
+    /// runtime-availability guard as [`Self::start_idle_evictor`] applies —
+    /// if no runtime is detected the pool is returned without eviction and
+    /// a `warn!` is emitted).
+    ///
+    /// Use [`Self::new`] + [`Self::with_max_idle`] + manual
+    /// [`Self::start_idle_evictor`] when you need to configure the pool
+    /// before starting eviction, or when you need the raw `Self` rather
+    /// than an `Arc`.
+    pub fn start(config: ConnectionConfig) -> Arc<Self> {
+        let pool = Arc::new(Self::new(config));
+        pool.start_idle_evictor();
+        pool
+    }
+
     /// Override the idle-eviction timeout.
     ///
     /// Connections that have submitted no requests for longer than this
