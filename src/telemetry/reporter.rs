@@ -696,6 +696,7 @@ impl MetricsExporter for PrefixFilterExporter<'_> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

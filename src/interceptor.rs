@@ -563,6 +563,7 @@ pub(crate) fn safe_consumer_close(interceptor: &dyn ConsumerInterceptor) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

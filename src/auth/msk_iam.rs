@@ -39,6 +39,7 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
@@ -190,23 +191,38 @@ impl MskIamAuthenticator {
         let signature =
             self.calculate_signature(&date_stamp, &self.region, SERVICE_NAME, &string_to_sign);
 
-        // Build the authentication payload
+        // Build the authentication payload.
+        // All user-controlled string fields (host, access_key_id, region via
+        // credential_scope, session_token) are JSON-escaped per RFC 8259 §7 to
+        // prevent injection if a custom credential provider ever returns
+        // characters with JSON significance (`"`, `\`, control chars).
+        // Fixed fields (user-agent, action, algorithm) are compile-time
+        // constants; hex/ASCII fields (signature, amz_date, signed_headers)
+        // come from SigV4 internals and contain no JSON metacharacters.
+        let host_esc = json_escape_string(&self.host);
+        let akid_esc = json_escape_string(&self.access_key_id);
+        let scope_esc = json_escape_string(&credential_scope);
+
         let mut payload = format!(
             r#"{{"version":"2020_10_22","host":"{}","user-agent":"{}","action":"{}","x-amz-algorithm":"{}","x-amz-credential":"{}/{}","x-amz-date":"{}","x-amz-signedheaders":"{}","x-amz-signature":"{}""#,
-            self.host,
+            host_esc,
             USER_AGENT,
             ACTION,
             ALGORITHM,
-            self.access_key_id,
-            credential_scope,
+            akid_esc,
+            scope_esc,
             amz_date,
             signed_headers,
             signature
         );
 
         // Add session token if present
-        if let Some(ref token) = self.session_token {
-            payload.push_str(&format!(r#","x-amz-security-token":"{}""#, token));
+        if let Some(token) = &self.session_token {
+            let token_esc = json_escape_string(token);
+            // write! to String is infallible.
+            let Ok(()) = write!(payload, r#","x-amz-security-token":"{}""#, token_esc) else {
+                unreachable!("write! to String never fails");
+            };
         }
 
         payload.push('}');
@@ -350,9 +366,40 @@ fn sha256(data: &[u8]) -> Vec<u8> {
 /// Compute HMAC-SHA256.
 #[inline]
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
+    // new_from_slice accepts any key length per RFC 2104; the error variant is unreachable.
+    let Ok(mut mac) = HmacSha256::new_from_slice(key) else {
+        unreachable!("HMAC accepts any key length per RFC 2104");
+    };
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
+}
+
+/// JSON-escape a string per RFC 8259 §7.
+///
+/// Escapes `"`, `\`, and ASCII control characters (U+0000–U+001F).
+/// The result is safe for interpolation inside a JSON string literal
+/// (between the enclosing double-quote characters).
+fn json_escape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\x08' => out.push_str("\\b"),
+            '\x09' => out.push_str("\\t"),
+            '\x0A' => out.push_str("\\n"),
+            '\x0C' => out.push_str("\\f"),
+            '\x0D' => out.push_str("\\r"),
+            c if u32::from(c) < 0x20 => {
+                // write! to String is infallible; fmt::Error is never returned.
+                let Ok(()) = write!(out, "\\u{:04X}", u32::from(c)) else {
+                    unreachable!("write! to String never fails");
+                };
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// URL-encode a string per RFC 3986.
@@ -378,6 +425,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -473,6 +521,84 @@ mod tests {
             url_encode("kafka-cluster:Connect"),
             "kafka-cluster%3AConnect"
         );
+    }
+
+    #[test]
+    fn test_json_escape_string() {
+        // Baseline — safe characters pass through unchanged
+        assert_eq!(json_escape_string("hello"), "hello");
+        assert_eq!(json_escape_string("us-east-1"), "us-east-1");
+
+        // RFC 8259 §7 mandatory escapes
+        assert_eq!(json_escape_string("say \"hi\""), r#"say \"hi\""#);
+        assert_eq!(json_escape_string(r"back\slash"), r"back\\slash");
+        assert_eq!(json_escape_string("\x08here"), r"\bhere");
+        assert_eq!(json_escape_string("tab\there"), r"tab\there");
+        assert_eq!(json_escape_string("new\nline"), r"new\nline");
+        assert_eq!(json_escape_string("\x0Cpage"), r"\fpage");
+        assert_eq!(json_escape_string("cr\rhere"), r"cr\rhere");
+
+        // Other control characters use \uXXXX
+        assert_eq!(json_escape_string("\x00"), r"\u0000"); // null
+        assert_eq!(json_escape_string("\x0B"), r"\u000B"); // vertical tab — no RFC 8259 named escape
+        assert_eq!(json_escape_string("\x01\x1f"), r"\u0001\u001F");
+    }
+
+    #[test]
+    fn test_payload_json_injection_safety() {
+        // Directly construct an authenticator with JSON metacharacters in every
+        // user-supplied field that flows into the payload. This cannot happen via
+        // the public `new()` constructor (the hostname parser rejects it), but a
+        // future code path might. The test verifies the escaping layer holds.
+        let auth = MskIamAuthenticator {
+            access_key_id: r#"AK"ID\injected"#.to_string(),
+            secret_access_key: "secret".to_string(),
+            session_token: Some(r#"tok\"en"#.to_string()),
+            // region flows into credential_scope; inject a quote there too
+            region: r#"us-east-"1"#.to_string(),
+            host: r#"host"with"quotes.example.com"#.to_string(),
+            clock_offset_secs: 0,
+        };
+        let fixed_time = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let payload_str = String::from_utf8(auth.create_auth_payload_at(fixed_time)).unwrap();
+
+        // Unescaped metacharacters must not appear mid-value
+        assert!(
+            !payload_str.contains(r#","AK"ID"#),
+            "unescaped quote in access_key_id"
+        );
+        assert!(
+            !payload_str.contains(r#","host":"host"with"#),
+            "unescaped quote in host"
+        );
+
+        // Escaped forms must be present
+        assert!(
+            payload_str.contains(r#"AK\"ID\\injected"#),
+            "access_key_id not escaped"
+        );
+        assert!(
+            payload_str.contains(r#"host\"with\"quotes"#),
+            "host not escaped"
+        );
+        assert!(
+            payload_str.contains(r#"tok\\\"en"#),
+            "session_token not escaped"
+        );
+
+        // region flows into x-amz-credential via credential_scope — must be escaped there too
+        assert!(
+            !payload_str.contains(r#"us-east-"1"#),
+            "unescaped quote in region (via credential_scope)"
+        );
+        assert!(
+            payload_str.contains(r#"us-east-\"1"#),
+            "region not escaped in credential_scope"
+        );
+
+        // Output must still be well-formed (braces match)
+        assert!(payload_str.starts_with('{'));
+        assert!(payload_str.ends_with('}'));
     }
 
     #[test]

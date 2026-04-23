@@ -744,14 +744,11 @@ impl BrokerConnection {
 
         let request_timeout = config.request_timeout;
 
-        // Determine if we need TLS and/or SASL
-        let needs_tls = config.auth.as_ref().is_some_and(|a| a.requires_tls());
-        let needs_sasl = config.auth.as_ref().is_some_and(|a| a.requires_sasl());
-
-        if needs_tls {
+        // Determine auth requirements and dispatch to the appropriate path.
+        // Using `filter` means `auth` is already in scope — no secondary
+        // unreachable guard needed to re-establish the invariant.
+        if let Some(auth) = config.auth.as_ref().filter(|a| a.requires_tls()) {
             // TLS path: upgrade stream then optionally do SASL
-            // SAFETY: needs_tls is true only when config.auth.is_some_and(requires_tls)
-            let auth = config.auth.as_ref().unwrap();
             let tls_config = auth
                 .tls_config
                 .as_ref()
@@ -778,7 +775,7 @@ impl BrokerConnection {
 
             info!("TLS handshake completed for {address}");
 
-            if needs_sasl {
+            if auth.requires_sasl() {
                 // TLS + SASL: authenticate on the TLS stream, then run event loop
                 let mut tls_stream = tls_stream;
 
@@ -844,10 +841,8 @@ impl BrokerConnection {
                     alive_clone.store(false, std::sync::atomic::Ordering::SeqCst);
                 });
             }
-        } else if needs_sasl {
+        } else if let Some(auth) = config.auth.as_ref().filter(|a| a.requires_sasl()) {
             // SASL without TLS
-            // SAFETY: needs_sasl is true only when config.auth.is_some_and(requires_sasl)
-            let auth = config.auth.as_ref().unwrap();
             let mut stream = stream;
             let session_lifetime_ms = Self::perform_sasl_handshake(
                 &mut stream,
@@ -1320,69 +1315,46 @@ impl BrokerConnection {
 
     /// Try to extract a clock skew (in seconds) from an AWS SigV4 error message.
     ///
-    /// AWS error messages for clock skew often embed an ISO-8601 timestamp
-    /// (e.g. `20250413T120000Z`). If we can parse such a timestamp, we
-    /// compare it to `SystemTime::now()` and return the difference in
-    /// seconds.  Returns `0` if no parseable timestamp is found.
+    /// AWS error messages for clock skew embed an ISO-8601 basic-format timestamp
+    /// (e.g. `20250413T120000Z`) that represents the server's view of "now".
+    /// If such a timestamp is found, returns `server_unix - local_unix` in seconds.
+    /// Returns `0` if no parseable timestamp is present.
     fn extract_clock_skew_secs(error_msg: &str) -> i64 {
-        // Look for an ISO-8601 basic-format timestamp: YYYYMMDDTHHMMSSz
-        // These show up in AWS error messages as the server's view of "now".
-        let Some(pos) = error_msg.find('T') else {
-            return 0;
-        };
-        // Need at least 8 chars before T (date) and 7 after (HHMMSSZ)
-        if pos < 8 || pos + 7 > error_msg.len() {
-            return 0;
-        }
-        let candidate = &error_msg[pos - 8..pos + 7];
-        // Validate format: digits, T, digits, Z
-        if candidate.len() != 15
-            || !candidate[..8].chars().all(|c| c.is_ascii_digit())
-            || candidate.as_bytes()[8] != b'T'
-            || !candidate[9..15].chars().all(|c| c.is_ascii_digit())
-        {
-            return 0;
-        }
-        // Check for trailing Z
-        let has_z = error_msg.len() > pos + 7 && error_msg.as_bytes()[pos + 7] == b'Z';
-        if !has_z {
-            return 0;
-        }
-        // Parse components
-        let year: i64 = candidate[..4].parse().unwrap_or(0);
-        let month: i64 = candidate[4..6].parse().unwrap_or(0);
-        let day: i64 = candidate[6..8].parse().unwrap_or(0);
-        let hour: i64 = candidate[9..11].parse().unwrap_or(0);
-        let min: i64 = candidate[11..13].parse().unwrap_or(0);
-        let sec: i64 = candidate[13..15].parse().unwrap_or(0);
+        use time::PrimitiveDateTime;
+        use time::format_description::BorrowedFormatItem;
+        use time::macros::format_description;
 
-        if !(1..=12).contains(&month)
-            || !(1..=31).contains(&day)
-            || hour > 23
-            || min > 59
-            || sec > 59
-        {
+        // AWS SigV4 basic-format: YYYYMMDDTHHMMSSZ (16 bytes, ASCII-only).
+        const AWS_TS_FMT: &[BorrowedFormatItem<'_>] =
+            format_description!("[year][month][day]T[hour][minute][second]Z");
+        const AWS_TS_LEN: usize = 16;
+
+        let bytes = error_msg.as_bytes();
+        if bytes.len() < AWS_TS_LEN {
             return 0;
         }
-        // Rough conversion to Unix epoch seconds (ignoring leap seconds).
-        // Good enough for computing a skew offset; we don't need sub-second
-        // precision.
-        let days_since_epoch = (year - 1970) * 365 + (year - 1969) / 4 - (year - 1901) / 100
-            + (year - 1601) / 400
-            + [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334][(month - 1) as usize]
-            + day
-            - 1
-            + if month > 2 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) {
-                1
-            } else {
-                0
+        // Scan every byte-aligned window of AWS_TS_LEN bytes. The grammar is
+        // ASCII-only, so indexing into `error_msg` at these offsets is safe
+        // (no UTF-8 split risk — a successful parse guarantees ASCII content).
+        for i in 0..=bytes.len() - AWS_TS_LEN {
+            // Cheap pre-filter: byte 8 must be 'T', byte 15 must be 'Z'.
+            if bytes[i + 8] != b'T' || bytes[i + 15] != b'Z' {
+                continue;
+            }
+            let Ok(candidate) = std::str::from_utf8(&bytes[i..i + AWS_TS_LEN]) else {
+                continue;
             };
-        let server_unix = days_since_epoch * 86400 + hour * 3600 + min * 60 + sec;
-        let local_unix = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        server_unix - local_unix
+            let Ok(dt) = PrimitiveDateTime::parse(candidate, AWS_TS_FMT) else {
+                continue;
+            };
+            let server_unix = dt.assume_utc().unix_timestamp();
+            let local_unix = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            return server_unix - local_unix;
+        }
+        0
     }
 
     /// Run the connection event loop with priority handling.
@@ -2182,6 +2154,7 @@ impl Drop for BrokerConnection {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -3206,6 +3179,45 @@ mod tests {
     fn test_extract_clock_skew_secs_malformed_timestamp() {
         let msg = "Signature expired: 2020XXYYT000000Z";
         assert_eq!(BrokerConnection::extract_clock_skew_secs(msg), 0);
+    }
+
+    #[test]
+    fn test_extract_clock_skew_secs_invalid_calendar_date() {
+        // Month 13 / day 32 / hour 25 — the hand-rolled parser accepted these
+        // with range checks; `time` rejects them at parse time.
+        assert_eq!(
+            BrokerConnection::extract_clock_skew_secs("foo 20201301T000000Z bar"),
+            0
+        );
+        assert_eq!(
+            BrokerConnection::extract_clock_skew_secs("foo 20200132T000000Z bar"),
+            0
+        );
+        assert_eq!(
+            BrokerConnection::extract_clock_skew_secs("foo 20200101T250000Z bar"),
+            0
+        );
+    }
+
+    #[test]
+    fn test_extract_clock_skew_secs_leap_day() {
+        // Feb 29 2020 is valid (leap year); Feb 29 2021 is not.
+        assert_ne!(
+            BrokerConnection::extract_clock_skew_secs("stamp=20200229T120000Z"),
+            0
+        );
+        assert_eq!(
+            BrokerConnection::extract_clock_skew_secs("stamp=20210229T120000Z"),
+            0
+        );
+    }
+
+    #[test]
+    fn test_extract_clock_skew_secs_embedded_in_longer_message() {
+        // Multiple 'T' chars earlier in the message should not fool the scanner.
+        let msg = "RequestTime=THIS IS TEXT; expired; server 20200101T000000Z -- request rejected";
+        let skew = BrokerConnection::extract_clock_skew_secs(msg);
+        assert!(skew < 0);
     }
 
     #[test]

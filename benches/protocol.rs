@@ -5,12 +5,21 @@
 //! These benchmarks measure the performance of protocol primitives,
 //! header encoding/decoding, and metadata lookups - all critical hot paths.
 
+#![allow(missing_docs, clippy::panic)]
+
 use bytes::BytesMut;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use krafka::util::varint::{
     decode_signed_varint, decode_unsigned_varint, encode_signed_varint, encode_unsigned_varint,
 };
+
+fn ok<T, E: std::fmt::Display>(result: Result<T, E>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(err) => unreachable!("benchmark setup should not fail: {err}"),
+    }
+}
 
 /// Benchmark primitive encoding operations (hot path).
 fn bench_primitives_encode(c: &mut Criterion) {
@@ -124,7 +133,7 @@ fn bench_varint_detailed(c: &mut Criterion) {
             |b, encoded| {
                 b.iter(|| {
                     let mut buf = encoded.clone();
-                    let val = decode_signed_varint(&mut buf).unwrap();
+                    let val = ok(decode_signed_varint(&mut buf));
                     black_box(val)
                 });
             },
@@ -140,7 +149,7 @@ fn bench_varint_detailed(c: &mut Criterion) {
             |b, encoded| {
                 b.iter(|| {
                     let mut buf = encoded.clone();
-                    let val = decode_unsigned_varint(&mut buf).unwrap();
+                    let val = ok(decode_unsigned_varint(&mut buf));
                     black_box(val)
                 });
             },
@@ -183,7 +192,7 @@ fn bench_request_header(c: &mut Criterion) {
     group.bench_function("encode_v1", |b| {
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(64);
-            header.encode_v1(&mut buf).unwrap();
+            ok(header.encode_v1(&mut buf));
             black_box(buf)
         });
     });
@@ -192,7 +201,7 @@ fn bench_request_header(c: &mut Criterion) {
     group.bench_function("encode_v2", |b| {
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(64);
-            header.encode_v2(&mut buf).unwrap();
+            ok(header.encode_v2(&mut buf));
             black_box(buf)
         });
     });

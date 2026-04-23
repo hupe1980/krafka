@@ -41,7 +41,7 @@ Add Krafka to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-krafka = "0.4"
+krafka = "0.5"
 tokio = { version = "1", features = ["full"] }
 ```
 

@@ -192,8 +192,9 @@ pub struct ConsumerConfig {
     /// [`MetadataRecoveryStrategy::Rebootstrap`]. Default: 300 s.
     pub(crate) metadata_recovery_rebootstrap_trigger: Duration,
     /// Maximum age of cached topic entries during partial metadata refreshes.
-    /// When set, topics not refreshed within this duration are evicted to
-    /// prevent unbounded cache growth. `None` disables TTL eviction (default).
+    /// Topics not refreshed within this duration are evicted to prevent
+    /// unbounded cache growth. Defaults to 5 minutes, matching the Java
+    /// client's `metadata.max.idle.ms`. `None` disables TTL eviction.
     pub(crate) metadata_topic_cache_ttl: Option<Duration>,
     /// Authentication configuration (optional).
     pub(crate) auth: Option<AuthConfig>,
@@ -231,7 +232,7 @@ impl Default for ConsumerConfig {
             client_rack: None,
             metadata_recovery_strategy: MetadataRecoveryStrategy::None,
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
-            metadata_topic_cache_ttl: None,
+            metadata_topic_cache_ttl: Some(Duration::from_secs(300)),
             auth: None,
             max_decompressed_size: crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE,
             #[cfg(feature = "socks5")]
@@ -599,7 +600,8 @@ impl ConsumerConfigBuilder {
     ///
     /// During partial refreshes, cached topics that have not been refreshed
     /// within this duration are evicted to prevent unbounded cache growth.
-    /// `None` disables TTL eviction (the default).
+    ///
+    /// Default: 5 minutes (matching Java's `metadata.max.idle.ms`).
     pub fn metadata_topic_cache_ttl(mut self, ttl: Duration) -> Self {
         self.config.metadata_topic_cache_ttl = Some(ttl);
         self
@@ -607,9 +609,10 @@ impl ConsumerConfigBuilder {
 
     /// Disable topic cache TTL eviction for partial metadata refreshes.
     ///
-    /// This clears any previously configured TTL and restores the default
-    /// behavior where cached topics are not evicted based on age.
-    pub fn clear_metadata_topic_cache_ttl(mut self) -> Self {
+    /// By default, cached topics are evicted after 5 minutes to prevent
+    /// unbounded growth on topic churn. Call this to opt out of TTL eviction;
+    /// entries will then persist across partial refreshes indefinitely.
+    pub fn disable_metadata_topic_cache_ttl(mut self) -> Self {
         self.config.metadata_topic_cache_ttl = None;
         self
     }
@@ -646,6 +649,7 @@ impl ConsumerConfigBuilder {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

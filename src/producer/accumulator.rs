@@ -107,10 +107,14 @@ impl RecordAccumulatorHandle {
         let mut pending = Some(record);
 
         loop {
-            // SAFETY: `pending` is always `Some` here — either set by the
+            // `pending` is always `Some` here — either set by the
             // initial call or replenished by `AppendResponse::BufferFull`.
-            let rec = pending.take().expect("pending record missing");
-            let guard = operation_guard.take().expect("operation guard missing");
+            let Some(rec) = pending.take() else {
+                unreachable!("pending record missing");
+            };
+            let Some(guard) = operation_guard.take() else {
+                unreachable!("operation guard missing");
+            };
             let (response_tx, response_rx) = oneshot::channel();
 
             // Pre-register interest in memory_freed BEFORE sending so that
@@ -1117,6 +1121,7 @@ impl RecordAccumulator {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

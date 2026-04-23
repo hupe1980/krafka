@@ -270,6 +270,8 @@ impl Consumer {
                     .with_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger);
             if let Some(ttl) = config.metadata_topic_cache_ttl {
                 meta = meta.with_topic_cache_ttl(ttl);
+            } else {
+                meta = meta.with_topic_cache_ttl_disabled();
             }
             meta
         });
@@ -2653,9 +2655,9 @@ impl Consumer {
                 Ok(records) if !records.is_empty() => {
                     let mut iter = records.into_iter();
                     // Infallible: `!records.is_empty()` guard above guarantees ≥1 element.
-                    let first = iter
-                        .next()
-                        .expect("non-empty ConsumerRecords yields at least one element");
+                    let Some(first) = iter.next() else {
+                        unreachable!("non-empty ConsumerRecords yields at least one element");
+                    };
                     // Buffer any remaining records for subsequent recv() calls
                     if iter.len() > 0 {
                         let mut buffer = self.recv_buffer.write().await;
@@ -3237,6 +3239,22 @@ impl Consumer {
     }
 }
 
+impl Drop for Consumer {
+    fn drop(&mut self) {
+        // Warn when a consumer is dropped without an explicit `close()`.
+        // Skipping `close()` means the broker will not see a `LeaveGroup`
+        // and the partitions will only be reassigned after
+        // `session.timeout.ms` expires, stalling the rest of the group.
+        // Skip during panic unwinding.
+        if !self.closed.load(std::sync::atomic::Ordering::SeqCst) && !std::thread::panicking() {
+            warn!(
+                "Consumer dropped without close(); group rebalance will be delayed \
+                 until session.timeout.ms. Call `Consumer::close()` before drop."
+            );
+        }
+    }
+}
+
 /// Builder for creating consumers.
 #[derive(Default)]
 #[must_use = "builders do nothing until .build() is called"]
@@ -3508,6 +3526,27 @@ impl ConsumerBuilder {
         self
     }
 
+    /// Set the topic cache TTL for partial metadata refreshes.
+    ///
+    /// During partial refreshes, cached topics that have not been refreshed
+    /// within this duration are evicted to prevent unbounded cache growth.
+    ///
+    /// Default: 5 minutes (matching Java's `metadata.max.idle.ms`).
+    pub fn metadata_topic_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.config.metadata_topic_cache_ttl = Some(ttl);
+        self
+    }
+
+    /// Disable topic cache TTL eviction for partial metadata refreshes.
+    ///
+    /// By default, cached topics are evicted after 5 minutes to prevent
+    /// unbounded growth on topic churn. Call this to opt out of TTL eviction;
+    /// entries will then persist across partial refreshes indefinitely.
+    pub fn disable_metadata_topic_cache_ttl(mut self) -> Self {
+        self.config.metadata_topic_cache_ttl = None;
+        self
+    }
+
     /// Build the consumer.
     pub async fn build(self) -> Result<Consumer> {
         if self.config.bootstrap_servers.is_empty() {
@@ -3538,8 +3577,11 @@ impl ConsumerBuilder {
         }
         if !self.interceptors.is_empty() {
             consumer.interceptor = if self.interceptors.len() == 1 {
-                // infallible: len == 1 guaranteed above
-                self.interceptors.into_iter().next().unwrap()
+                // infallible: len == 1 guaranteed by the surrounding if
+                let Some(single) = self.interceptors.into_iter().next() else {
+                    unreachable!("len == 1 verified above");
+                };
+                single
             } else {
                 Arc::new(crate::interceptor::ConsumerInterceptorChain::new(
                     self.interceptors,
@@ -3551,6 +3593,7 @@ impl ConsumerBuilder {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

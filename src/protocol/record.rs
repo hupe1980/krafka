@@ -290,8 +290,26 @@ impl Record {
     #[inline]
     pub fn decode(buf: &mut impl Buf) -> Result<Self> {
         let length = varint::decode_signed_varint(buf)?;
-        if length < 0 || buf.remaining() < length as usize {
-            return Err(KrafkaError::protocol("invalid record length"));
+        if length < 0 {
+            return Err(KrafkaError::protocol_kind(
+                crate::error::ProtocolErrorKind::InvalidValue,
+                format!("invalid record length: {length}"),
+            ));
+        }
+        let length = usize::try_from(length).map_err(|_| {
+            KrafkaError::protocol_kind(
+                crate::error::ProtocolErrorKind::InvalidLength,
+                format!("record length {length} overflows usize on this target"),
+            )
+        })?;
+        if buf.remaining() < length {
+            return Err(KrafkaError::protocol_kind(
+                crate::error::ProtocolErrorKind::TruncatedFrame,
+                format!(
+                    "record body truncated: need {length} bytes, have {}",
+                    buf.remaining()
+                ),
+            ));
         }
 
         let attributes = if buf.has_remaining() {
@@ -1177,6 +1195,7 @@ impl Iterator for LazyRecordIterator {
 impl ExactSizeIterator for LazyRecordIterator {}
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

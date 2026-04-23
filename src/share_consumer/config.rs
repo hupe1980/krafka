@@ -88,8 +88,9 @@ pub struct ShareConsumerConfig {
     /// Rebootstrap trigger duration (KIP-899).
     pub(crate) metadata_recovery_rebootstrap_trigger: Duration,
     /// Maximum age of cached topic entries during partial metadata refreshes.
-    /// When set, topics not refreshed within this duration are evicted to
-    /// prevent unbounded cache growth. `None` disables TTL eviction (default).
+    /// Topics not refreshed within this duration are evicted to prevent
+    /// unbounded cache growth. Defaults to 5 minutes, matching the Java
+    /// client's `metadata.max.idle.ms`. `None` disables TTL eviction.
     pub(crate) metadata_topic_cache_ttl: Option<Duration>,
     /// Authentication configuration.
     pub(crate) auth: Option<AuthConfig>,
@@ -121,7 +122,7 @@ impl Default for ShareConsumerConfig {
             metadata_max_age: Duration::from_secs(300),
             metadata_recovery_strategy: MetadataRecoveryStrategy::None,
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
-            metadata_topic_cache_ttl: None,
+            metadata_topic_cache_ttl: Some(Duration::from_secs(300)),
             auth: None,
             max_decompressed_size: crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE,
             #[cfg(feature = "socks5")]

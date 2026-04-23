@@ -129,7 +129,7 @@ To trim binary size or avoid the C toolchain (needed by `zstd`), disable default
 and select only the codecs you need:
 
 ```toml
-krafka = { version = "0.4", default-features = false, features = ["lz4"] }
+krafka = { version = "0.5", default-features = false, features = ["lz4"] }
 ```
 
 ### Batching
