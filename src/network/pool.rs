@@ -452,9 +452,10 @@ impl ConnectionPool {
     /// Create a new connection pool.
     ///
     /// Idle eviction is **not** started automatically. After wrapping the pool
-    /// in an `Arc`, call [`Self::start_idle_evictor`] to start the background
-    /// sweep task. Without that call, connections are never evicted regardless
-    /// of [`Self::with_max_idle`].
+    /// in an `Arc`, call [`Self::start_idle_evictor`] to activate the
+    /// background sweep task. Without that call, connections are never evicted
+    /// **automatically** (though [`Self::evict_idle`] can still be called
+    /// manually, regardless of [`Self::with_max_idle`]).
     pub fn new(config: ConnectionConfig) -> Self {
         Self {
             connections: RwLock::new(HashMap::new()),
@@ -471,7 +472,7 @@ impl ConnectionPool {
     ///
     /// As with [`Self::new`], idle eviction is **not** started automatically.
     /// Call [`Self::start_idle_evictor`] on the resulting `Arc<Self>` to
-    /// activate the background sweep.
+    /// activate the background sweep, or call [`Self::evict_idle`] manually.
     pub fn with_retry_config(
         config: ConnectionConfig,
         retry_config: ConnectionRetryConfig,
