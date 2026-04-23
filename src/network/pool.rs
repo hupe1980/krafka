@@ -767,11 +767,14 @@ impl ConnectionPool {
     /// Remove connections that have sat idle for at least `max_idle`.
     ///
     /// Entries are removed from both `connections` (by broker ID) and
-    /// `connections_by_addr` (bootstrap map); the underlying
-    /// [`BrokerConnection`] is not explicitly `close()`-ed — its own `Drop`
-    /// impl dispatches a close command when the last `Arc` reference is
-    /// released, which correctly defers teardown if another caller is
-    /// still holding the connection (e.g. mid-request).
+    /// `connections_by_addr` (bootstrap map). Each uniquely-evicted
+    /// connection is then explicitly closed by spawning `conn.close()`,
+    /// which signals the connection's internal task via the high-priority
+    /// channel. This ensures the underlying socket is torn down promptly
+    /// even if other `Arc` clones of the connection exist (e.g. in-flight
+    /// requests or coordinator caches). If no Tokio runtime is available
+    /// (e.g. in tests without a runtime), teardown falls back to
+    /// `BrokerConnection::Drop`.
     ///
     /// Returns the number of *unique* connections evicted. A single socket
     /// registered under both a broker ID and a bootstrap address counts
@@ -859,10 +862,19 @@ impl ConnectionPool {
                 "Evicted idle connections"
             );
         }
-        // Drop `removed` here: `BrokerConnection::Drop` dispatches the
-        // close via a spawned task iff a runtime is active, and only when
-        // the last `Arc` reference is released.
-        drop(removed);
+        // Explicitly close each evicted connection by signalling its internal
+        // task via the high-priority channel. This is important when other
+        // `Arc` clones are held elsewhere (e.g. in-flight requests, coordinator
+        // references): merely dropping the pool's `Arc` would leave the socket
+        // open until those callers also drop their clone. Spawning the close
+        // mirrors the pattern used in `close_all` and in `BrokerConnection::Drop`.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            for conn in removed {
+                tokio::spawn(async move { conn.close().await });
+            }
+        }
+        // If no runtime is available (tests, process exit) fall back to Drop-
+        // based teardown — the same guard used by BrokerConnection::Drop.
         count
     }
 

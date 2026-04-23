@@ -163,9 +163,10 @@ pub fn validate_topic_name(name: &str) -> Result<()> {
 
 /// Validate every topic name in `names` via [`validate_topic_name`].
 ///
-/// Short-circuits on the first invalid name, so the surfaced error is
-/// deterministic and matches the single-name helper's message exactly.
-/// Preferred over `for name in names { validate_topic_name(name)? }`
+/// Short-circuits on the first invalid name encountered in iteration order.
+/// For inputs with deterministic iteration order (e.g. slices or `Vec`s) the
+/// surfaced error is also deterministic and matches the single-name helper's
+/// message exactly. Preferred over `for name in names { validate_topic_name(name)? }`
 /// sprinkled across call sites, because the shared implementation keeps
 /// the H6 coverage surface easy to audit.
 #[inline]
