@@ -34,8 +34,11 @@ use crate::protocol::{
     RecordBatchBuilder, VersionedDecode, VersionedEncode, versions,
 };
 
-/// Maximum number of concurrent `send_extracted_batch` tasks during a single
-/// `flush_all_ready` / `check_linger_expiry` drain.
+/// Maximum number of concurrent `send_extracted_batch` tasks in any single
+/// drain: `flush_all_ready`, `check_linger_expiry`, `flush_all`, and
+/// `flush_batch` all route through `spawn_batches_bounded`, so this cap
+/// applies uniformly to linger-triggered sends, user-initiated `flush()`,
+/// and shutdown `close()`.
 ///
 /// Fix for H3: prior implementations spawned one task per batch with no
 /// cap, meaning 10k partitions at `linger.ms=5` produced a 10k-task burst
@@ -822,30 +825,23 @@ impl RecordAccumulator {
         Some((batch, guard))
     }
 
-    /// Flush a specific batch by spawning a background task.
+    /// Flush a specific batch, respecting the global send-task cap.
     ///
-    /// Previously, this method awaited the network I/O inline, blocking the
-    /// entire accumulator task. Now it spawns the send as a background task
-    /// matching the concurrent flush pattern used by `check_linger_expiry`.
+    /// Routes through `spawn_batches_bounded` (with a single-element vec) so
+    /// this path shares the same `MAX_CONCURRENT_BATCH_SENDS` ceiling as
+    /// `check_linger_expiry` and `flush_all`. Even though a single flush
+    /// creates only one task, using the shared helper keeps all spawn paths
+    /// consistently bounded.
     async fn flush_batch(&mut self, key: &(String, PartitionId)) {
-        if let Some((batch, guard)) = self.extract_batch(key) {
-            let topic = key.0.clone();
-            let partition = key.1;
-            let metadata = self.metadata.clone();
-            let config = self.config.clone();
-            let retry_policy = self.retry_policy.clone();
-            let metrics = self.metrics.clone();
-            tokio::spawn(Self::send_extracted_batch(
-                topic,
-                partition,
-                batch.pending,
-                batch.created_at,
-                guard,
-                metadata,
-                config,
-                retry_policy,
-                metrics,
-            ));
+        if let Some(item) = self.extract_batch(key) {
+            Self::spawn_batches_bounded(
+                vec![(key.clone(), item)],
+                &self.metadata,
+                &self.config,
+                &self.retry_policy,
+                &self.metrics,
+            )
+            .await;
         }
     }
 
@@ -1225,7 +1221,12 @@ impl RecordAccumulator {
         }
     }
 
-    /// Flush all batches concurrently.
+    /// Flush all batches, respecting the global send-task cap.
+    ///
+    /// Routes through `spawn_batches_bounded` so that a user-triggered
+    /// `flush()` or `close()` with many partitions does not create an
+    /// unbounded task burst — the same `MAX_CONCURRENT_BATCH_SENDS` ceiling
+    /// that governs linger-triggered sends applies here too.
     async fn flush_all(&mut self) -> Result<()> {
         let keys: Vec<_> = self
             .batches
@@ -1241,26 +1242,14 @@ impl RecordAccumulator {
             }
         }
 
-        // Send all batches concurrently
-        let mut join_set = tokio::task::JoinSet::new();
-        for ((topic, partition), (batch, guard)) in extracted {
-            let metadata = self.metadata.clone();
-            let config = self.config.clone();
-            let retry_policy = self.retry_policy.clone();
-            let metrics = self.metrics.clone();
-            join_set.spawn(Self::send_extracted_batch(
-                topic,
-                partition,
-                batch.pending,
-                batch.created_at,
-                guard,
-                metadata,
-                config,
-                retry_policy,
-                metrics,
-            ));
-        }
-        while join_set.join_next().await.is_some() {}
+        Self::spawn_batches_bounded(
+            extracted,
+            &self.metadata,
+            &self.config,
+            &self.retry_policy,
+            &self.metrics,
+        )
+        .await;
         Ok(())
     }
 }
