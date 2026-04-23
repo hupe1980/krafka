@@ -1473,7 +1473,7 @@ mod tests {
     /// pool. A leak here would permanently reduce `buffer_memory`.
     #[tokio::test]
     async fn test_permits_released_when_append_message_dropped() {
-        let (sender, receiver) = mpsc::channel::<AccumulatorMessage>(16);
+        let (sender, mut receiver) = mpsc::channel::<AccumulatorMessage>(16);
         let sem = Arc::new(Semaphore::new(1024));
         let handle = RecordAccumulatorHandle {
             sender,
@@ -1483,26 +1483,22 @@ mod tests {
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
         };
 
-        // Use a oneshot to synchronise: wait until the append task has
-        // acquired its permits and posted to the channel before dropping
-        // the receiver, so the test exercises the "message in buffer then
-        // receiver dropped" path rather than the "send failed" path.
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
         let record = ProducerRecord::new("topic", vec![0u8; 256]);
-        let append_fut = tokio::spawn(async move {
-            // Signal once the append completes (either direction), then
-            // let the caller inspect permit counts.
-            let result = handle.append(record, 0).await;
-            let _ = ready_tx.send(());
-            result
-        });
+        let append_fut = tokio::spawn(async move { handle.append(record, 0).await });
 
-        // Wait for the append task to take permits and post the message.
-        // Drop the receiver to simulate the accumulator exiting mid-flight.
-        let _ = tokio::time::timeout(Duration::from_secs(2), ready_rx).await;
+        // Receive the Append message and immediately drop it without responding.
+        // Dropping the message triggers `PermitReservation::drop`, which returns
+        // the permits to the semaphore. This is deterministic — no sleep or
+        // timer needed, and the test is fully reproducible under load.
+        let msg = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("timed out waiting for Append message to arrive in channel")
+            .expect("channel closed before message arrived");
+        drop(msg);
         drop(receiver);
 
-        // The append task returns an error once its response channel drops.
+        // The response_tx inside the message was dropped above; response_rx
+        // returns RecvError, which surfaces as an InvalidState error.
         let _ = append_fut.await;
 
         // All 1024 permits must be available again — no leak.
