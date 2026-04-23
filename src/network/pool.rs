@@ -855,7 +855,7 @@ impl ConnectionPool {
         if count > 0 {
             debug!(
                 evicted = count,
-                max_idle_ms = max_idle.as_millis() as u64,
+                max_idle_ms = max_idle.as_millis(),
                 "Evicted idle connections"
             );
         }
