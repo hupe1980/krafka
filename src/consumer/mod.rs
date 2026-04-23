@@ -111,11 +111,13 @@ use fetch_session::FetchSessionCache;
 //                               ALWAYS release before fetch RPC send/recv)
 //   8. `last_auto_commit`      (sync — `parking_lot::Mutex<Instant>`)
 //
-// The sync (`parking_lot`) primitives are chosen where every critical section
-// is a straight-line mutation with NO `.await` inside. They are ~10× faster
-// than `tokio::sync` locks uncontended and cannot stall the executor because
-// the sections complete in tens of nanoseconds. Do not convert any async lock
-// above without first auditing every call site for `.await` under the lock.
+// The sync (`parking_lot`) primitives are chosen only for critical sections
+// with NO `.await` inside. They can still block a Tokio worker thread if
+// contended, and some sections are O(n) (e.g. `recv_buffer.retain`), so do
+// not assume they are always nanosecond-scale. Keep them short, avoid
+// contention, and always release them before async work, network I/O, or
+// callbacks back into `Consumer`. Do not convert any async lock above
+// without first auditing every call site for `.await` under the lock.
 //
 // Per-partition caches (`high_watermark`, `log_start_offset`,
 // `preferred_replica`, `offset_retry_backoff`) were previously four separate
@@ -137,10 +139,14 @@ use fetch_session::FetchSessionCache;
 #[derive(Default)]
 struct PartitionState {
     /// Latest known high watermark (log-end offset), from `FetchResponse`.
-    /// `None` until the first successful fetch for this partition.
+    /// `None` until first observed in a fetch response for this partition
+    /// (the broker reports it on every response with `high_watermark >= 0`,
+    /// including empty and error responses).
     high_watermark: Option<Offset>,
     /// Latest known log start offset, from `FetchResponse`.
-    /// `None` until the first successful fetch for this partition.
+    /// `None` until first observed in a fetch response for this partition
+    /// (reported in Fetch v5+ whenever `log_start_offset >= 0`, including
+    /// empty and error responses).
     log_start_offset: Option<Offset>,
     /// KIP-392 preferred read replica and its expiry time.
     ///
@@ -217,11 +223,13 @@ pub struct Consumer {
 /// partitions (using `saturating_add`) and `max_lag` is the per-partition
 /// maximum. Only partitions present in both maps contribute.
 ///
-/// **Staleness caveat**: high watermarks are updated only when a fetch
-/// response contains records. If no new data arrives on a partition, the
-/// cached watermark stales and the reported lag becomes increasingly
-/// inaccurate. Lag should be treated as *eventually consistent*. For
-/// precise lag values, issue a `ListOffsets` RPC externally.
+/// **Staleness caveat**: high watermarks are refreshed from each fetch
+/// response (including empty and error responses) for partitions the
+/// consumer polls. Partitions that are not being polled — or whose broker
+/// is unreachable — will retain a stale watermark, so the reported lag
+/// becomes increasingly inaccurate the longer fetches are skipped. Lag
+/// should be treated as *eventually consistent*. For precise lag values,
+/// issue a `ListOffsets` RPC externally.
 fn compute_aggregate_lag(
     offsets: &HashMap<(String, PartitionId), Offset>,
     partition_state: &HashMap<(String, PartitionId), PartitionState>,
