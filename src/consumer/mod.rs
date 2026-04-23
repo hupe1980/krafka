@@ -64,6 +64,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex as SyncMutex;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -85,6 +86,81 @@ use crate::{Offset, PartitionId};
 const MAX_COOPERATIVE_ROUNDS: usize = 5;
 
 use fetch_session::FetchSessionCache;
+
+// ── LOCK ORDER ──────────────────────────────────────────────────────────────
+//
+// `Consumer` holds several synchronization primitives. Two rules prevent
+// deadlocks and executor stalls:
+//
+//   1. Acquire locks in the order listed below. Never acquire an
+//      earlier-numbered lock while holding a later-numbered one.
+//   2. If you hold an **async** lock (`tokio::sync::{RwLock, Mutex}`) across
+//      an `.await`, the awaited operation must not (transitively) acquire
+//      any lock numbered **lower** than the one held. In practice: do not
+//      call back into `Consumer` methods while holding a lock. Release with
+//      `drop(...)` or a scoped `{ … }` block first.
+//
+// Order:
+//   1. `subscriptions`         (async — read across `poll()` network paths)
+//   2. `assignments`           (async — read across `poll()` network paths)
+//   3. `offsets`               (async — read across commit/fetch RPC paths)
+//   4. `paused`                (async — read across `poll()` network paths)
+//   5. `partition_state`       (async — per-partition fetch-derived caches)
+//   6. `recv_buffer`           (sync — `parking_lot::Mutex`, pure mutation)
+//   7. `fetch_sessions`        (sync — `parking_lot::Mutex`, pure mutation;
+//                               ALWAYS release before fetch RPC send/recv)
+//   8. `last_auto_commit`      (sync — `parking_lot::Mutex<Instant>`)
+//
+// The sync (`parking_lot`) primitives are chosen only for critical sections
+// with NO `.await` inside. They can still block a Tokio worker thread if
+// contended, and some sections are O(n) (e.g. `recv_buffer.retain`), so do
+// not assume they are always nanosecond-scale. Keep them short, avoid
+// contention, and always release them before async work, network I/O, or
+// callbacks back into `Consumer`. Do not convert any async lock above
+// without first auditing every call site for `.await` under the lock.
+//
+// Per-partition caches (`high_watermark`, `log_start_offset`,
+// `preferred_replica`, `offset_retry_backoff`) were previously four separate
+// `RwLock<HashMap<_, _>>` fields. They are consolidated into a single
+// `partition_state` map so that revocation / reset / close paths cannot leave
+// a partition partially populated. Adding a new per-partition cache? Add a
+// field to `PartitionState`; do not introduce another `RwLock`.
+
+/// Per-topic-partition state cached locally by the consumer.
+///
+/// All fields are populated from fetch responses or consumer-protocol
+/// feedback. Grouping them under a single lock (`Consumer::partition_state`)
+/// guarantees that revocation and reset paths cannot leave a partition in a
+/// partially-populated state — a silent bug class that existed when each
+/// cache lived under its own `RwLock`.
+///
+/// `Default` returns an all-`None` state, suitable for `entry().or_default()`
+/// on first insert.
+#[derive(Default)]
+struct PartitionState {
+    /// Latest known high watermark (log-end offset), from `FetchResponse`.
+    /// `None` until first observed in a fetch response for this partition
+    /// (the broker reports it on every response with `high_watermark >= 0`,
+    /// including empty and error responses).
+    high_watermark: Option<Offset>,
+    /// Latest known log start offset, from `FetchResponse`.
+    /// `None` until first observed in a fetch response for this partition
+    /// (reported in Fetch v5+ whenever `log_start_offset >= 0`, including
+    /// empty and error responses).
+    log_start_offset: Option<Offset>,
+    /// KIP-392 preferred read replica and its expiry time.
+    ///
+    /// When a broker returns a `preferred_read_replica` in a fetch response,
+    /// subsequent fetches for that partition are routed to the indicated
+    /// replica until the entry expires (after `metadata_max_age`).
+    /// `None` means the leader should be used (the default).
+    preferred_replica: Option<(crate::BrokerId, Instant)>,
+    /// Next allowed retry time and current exponential backoff interval for
+    /// offset-resolution failures. `None` once the partition is successfully
+    /// resolved or was never retried. Prevents retry storms when offset
+    /// resolution fails persistently (e.g. broker unavailable).
+    offset_retry_backoff: Option<(Instant, Duration)>,
+}
 
 /// A Kafka consumer.
 pub struct Consumer {
@@ -113,30 +189,32 @@ pub struct Consumer {
     /// Consumer interceptor.
     interceptor: Arc<dyn crate::interceptor::ConsumerInterceptor>,
     /// Last auto-commit time (for auto-commit timer).
-    last_auto_commit: RwLock<Instant>,
+    ///
+    /// Held only for a single read/write of an `Instant` — no `.await` under
+    /// the lock — so a sync `parking_lot::Mutex` is the correct primitive.
+    last_auto_commit: SyncMutex<Instant>,
     /// Buffer for records returned by `recv()`.
     /// `poll()` may return multiple records; `recv()` buffers the rest here.
-    recv_buffer: RwLock<std::collections::VecDeque<ConsumerRecord>>,
-    /// Per-broker fetch session cache (KIP-227).
-    fetch_sessions: tokio::sync::Mutex<FetchSessionCache>,
-    /// Per-partition backoff state for offset resolution retries.
-    /// Stores the next allowed retry time and current backoff duration.
-    /// Prevents retry storms when offset resolution fails persistently
-    /// (e.g., broker unavailable).
-    offset_retry_backoff: RwLock<HashMap<(String, PartitionId), (Instant, Duration)>>,
-    /// Per-partition high watermark from the latest fetch response.
-    /// Used to compute consumer lag without additional network calls.
-    high_watermarks: RwLock<HashMap<(String, PartitionId), Offset>>,
-    /// Per-partition log start offset from the latest fetch response.
-    /// Caches the earliest available offset so `cached_beginning_offset()` can
-    /// return immediately without a network round-trip.
-    log_start_offsets: RwLock<HashMap<(String, PartitionId), Offset>>,
-    /// Preferred read replica per partition with expiry (KIP-392).
     ///
-    /// When a broker returns a preferred_read_replica in a fetch response,
-    /// subsequent fetches for that partition are routed to the indicated
-    /// replica until the entry expires (after `metadata_max_age`).
-    preferred_replicas: RwLock<HashMap<(String, PartitionId), (crate::BrokerId, Instant)>>,
+    /// All call sites mutate (`pop_front` / `extend` / `clear`) or read
+    /// `len()` without crossing an `.await`, so a sync `parking_lot::Mutex`
+    /// is used instead of a tokio async lock. The old `RwLock` had no
+    /// concurrent readers in practice — every access took the write side.
+    recv_buffer: SyncMutex<std::collections::VecDeque<ConsumerRecord>>,
+    /// Per-broker fetch session cache (KIP-227).
+    ///
+    /// Every critical section is pure sync (session bookkeeping: build
+    /// request, update from response, reset on error). The actual fetch
+    /// RPC `send_request().await` is always performed **after** the lock is
+    /// released — never while it is held — so a sync `parking_lot::Mutex`
+    /// is the correct primitive. If you add a new use site, keep the
+    /// critical section straight-line-sync.
+    fetch_sessions: SyncMutex<FetchSessionCache>,
+    /// Consolidated per-partition state: high watermark, log start offset,
+    /// preferred replica (KIP-392), and offset-retry backoff. A single lock
+    /// replaces what was previously four separate `RwLock<HashMap>` fields;
+    /// see the `LOCK ORDER` comment above and [`PartitionState`] for details.
+    partition_state: RwLock<HashMap<(String, PartitionId), PartitionState>>,
 }
 
 /// Compute aggregate lag from offset and high-watermark caches.
@@ -145,19 +223,21 @@ pub struct Consumer {
 /// partitions (using `saturating_add`) and `max_lag` is the per-partition
 /// maximum. Only partitions present in both maps contribute.
 ///
-/// **Staleness caveat**: high watermarks are updated only when a fetch
-/// response contains records. If no new data arrives on a partition, the
-/// cached watermark stales and the reported lag becomes increasingly
-/// inaccurate. Lag should be treated as *eventually consistent*. For
-/// precise lag values, issue a `ListOffsets` RPC externally.
+/// **Staleness caveat**: high watermarks are refreshed from each fetch
+/// response (including empty and error responses) for partitions the
+/// consumer polls. Partitions that are not being polled — or whose broker
+/// is unreachable — will retain a stale watermark, so the reported lag
+/// becomes increasingly inaccurate the longer fetches are skipped. Lag
+/// should be treated as *eventually consistent*. For precise lag values,
+/// issue a `ListOffsets` RPC externally.
 fn compute_aggregate_lag(
     offsets: &HashMap<(String, PartitionId), Offset>,
-    high_watermarks: &HashMap<(String, PartitionId), Offset>,
+    partition_state: &HashMap<(String, PartitionId), PartitionState>,
 ) -> (u64, u64) {
     let mut total_lag: u64 = 0;
     let mut max_lag: u64 = 0;
-    for (key, &watermark) in high_watermarks {
-        if let Some(&position) = offsets.get(key) {
+    for (key, state) in partition_state {
+        if let (Some(watermark), Some(&position)) = (state.high_watermark, offsets.get(key)) {
             let partition_lag = (watermark - position).max(0) as u64;
             total_lag = total_lag.saturating_add(partition_lag);
             max_lag = max_lag.max(partition_lag);
@@ -191,7 +271,7 @@ struct FetchRoutingPlan {
 /// routing logic can be unit-tested without a live broker.
 fn build_fetch_routing_plan(
     non_paused_keys: Vec<(String, PartitionId)>,
-    preferred_replicas: &HashMap<(String, PartitionId), (crate::BrokerId, Instant)>,
+    partition_state: &HashMap<(String, PartitionId), PartitionState>,
     leaders: &HashMap<(String, PartitionId), crate::BrokerId>,
     now: Instant,
 ) -> FetchRoutingPlan {
@@ -202,15 +282,13 @@ fn build_fetch_routing_plan(
 
     for key in non_paused_keys {
         // Check for a valid (non-expired) preferred replica
-        let target_broker = if let Some(&(replica_id, expiry)) = preferred_replicas.get(&key) {
-            if now < expiry {
-                Some(replica_id)
-            } else {
+        let target_broker = match partition_state.get(&key).and_then(|s| s.preferred_replica) {
+            Some((replica_id, expiry)) if now < expiry => Some(replica_id),
+            Some(_) => {
                 expired_preferred.push(key.clone());
                 None
             }
-        } else {
-            None
+            None => None,
         };
 
         let broker_id = match target_broker {
@@ -324,13 +402,10 @@ impl Consumer {
             metrics,
             rebalance_listener: Arc::new(NoOpRebalanceListener),
             interceptor: Arc::new(crate::interceptor::NoOpConsumerInterceptor),
-            last_auto_commit: RwLock::new(Instant::now()),
-            recv_buffer: RwLock::new(std::collections::VecDeque::new()),
-            fetch_sessions: tokio::sync::Mutex::new(FetchSessionCache::new()),
-            offset_retry_backoff: RwLock::new(HashMap::new()),
-            high_watermarks: RwLock::new(HashMap::new()),
-            log_start_offsets: RwLock::new(HashMap::new()),
-            preferred_replicas: RwLock::new(HashMap::new()),
+            last_auto_commit: SyncMutex::new(Instant::now()),
+            recv_buffer: SyncMutex::new(std::collections::VecDeque::new()),
+            fetch_sessions: SyncMutex::new(FetchSessionCache::new()),
+            partition_state: RwLock::new(HashMap::new()),
         })
     }
 
@@ -487,10 +562,13 @@ impl Consumer {
 
     /// Apply per-partition cleanup for revoked partitions.
     ///
-    /// Removes revoked entries from assignments, offsets, backoff, paused, and recv_buffer.
-    /// Fetch sessions are NOT reset here — `build_request()` automatically computes
-    /// `forgotten_topics` diffs from the updated assignment, preserving KIP-227
-    /// incremental fetch benefits. Called by all cooperative revocation paths.
+    /// Removes revoked entries from `assignments`, `offsets`, `paused`,
+    /// `recv_buffer`, and `partition_state` (the consolidated cache that
+    /// holds high watermark, log start offset, preferred replica, and
+    /// offset-retry backoff). Fetch sessions are NOT reset here —
+    /// `build_request()` automatically computes `forgotten_topics` diffs
+    /// from the updated assignment, preserving KIP-227 incremental fetch
+    /// benefits. Called by all cooperative revocation paths.
     async fn apply_partition_revocations(&self, revoked: &[(String, PartitionId)]) {
         // Build per-topic set of revoked partition IDs for O(T * P) removal
         // instead of O(R * P) when many partitions of the same topic are revoked.
@@ -526,18 +604,11 @@ impl Consumer {
                 offsets.remove(key);
             }
         }
-        // Remove offset retry backoff entries
-        {
-            let mut backoff = self.offset_retry_backoff.write().await;
-            for key in &revoked_keys {
-                backoff.remove(key);
-            }
-        }
         // Discard buffered records from revoked partitions
         {
             let revoked_set: HashSet<(&str, PartitionId)> =
                 revoked_keys.iter().map(|(t, p)| (t.as_str(), *p)).collect();
-            let mut buf = self.recv_buffer.write().await;
+            let mut buf = self.recv_buffer.lock();
             buf.retain(|r| !revoked_set.contains(&(r.topic.as_str(), r.partition)));
             self.metrics.buffered_records.set(buf.len() as u64);
         }
@@ -549,25 +620,14 @@ impl Consumer {
             }
             self.metrics.paused_partitions.set(paused.len() as u64);
         }
-        // Clear cached high watermarks for revoked partitions
+        // Clear all per-partition fetch-derived state (high watermark, log
+        // start offset, preferred replica, offset-retry backoff) in a single
+        // lock acquisition. This replaces four independent `RwLock` writes
+        // that previously had to be kept in sync by hand.
         {
-            let mut hw = self.high_watermarks.write().await;
+            let mut partition_state = self.partition_state.write().await;
             for key in &revoked_keys {
-                hw.remove(key);
-            }
-        }
-        // Clear cached log start offsets for revoked partitions
-        {
-            let mut lso = self.log_start_offsets.write().await;
-            for key in &revoked_keys {
-                lso.remove(key);
-            }
-        }
-        // Clear preferred replica mappings for revoked partitions
-        {
-            let mut pref = self.preferred_replicas.write().await;
-            for key in &revoked_keys {
-                pref.remove(key);
+                partition_state.remove(key);
             }
         }
         // Recompute lag metrics from remaining caches so revoked
@@ -642,18 +702,15 @@ impl Consumer {
 
     /// Clear all per-partition state after an eager revocation or unsubscribe/close.
     ///
-    /// Resets fetch sessions, offsets, retry backoff, buffered records, paused set,
-    /// high watermark and log start offset caches, preferred replica mappings, and
-    /// lag metrics.
+    /// Resets fetch sessions, offsets, buffered records, paused set, and the
+    /// consolidated [`PartitionState`] map (high watermark, log start offset,
+    /// preferred replica, offset-retry backoff), then zeros the lag metrics.
     async fn clear_partition_state(&self) {
-        self.fetch_sessions.lock().await.reset_all();
+        self.fetch_sessions.lock().reset_all();
         self.offsets.write().await.clear();
-        self.offset_retry_backoff.write().await.clear();
-        self.recv_buffer.write().await.clear();
+        self.recv_buffer.lock().clear();
         self.paused.write().await.clear();
-        self.high_watermarks.write().await.clear();
-        self.log_start_offsets.write().await.clear();
-        self.preferred_replicas.write().await.clear();
+        self.partition_state.write().await.clear();
         self.metrics.buffered_records.set(0);
         self.metrics.paused_partitions.set(0);
         self.metrics.lag.set(0);
@@ -705,9 +762,10 @@ impl Consumer {
 
     /// Recompute lag and lag_max gauges from cached offsets and high watermarks.
     ///
-    /// Call after any mutation of `self.offsets` or `self.high_watermarks` so
-    /// the exported metrics always reflect the current consumer position.
-    /// Acquires read locks in documented order: offsets → high_watermarks.
+    /// Call after any mutation of `self.offsets` or the `high_watermark` field
+    /// of `self.partition_state` so the exported metrics always reflect the
+    /// current consumer position. Acquires read locks in documented order:
+    /// offsets → partition_state.
     ///
     /// This performs an O(partitions) full scan via [`compute_aggregate_lag`].
     /// An incremental (delta-based) approach was considered but rejected:
@@ -717,8 +775,8 @@ impl Consumer {
     /// path (e.g. `poll()`) already guard calls behind a change-detection flag.
     async fn recompute_lag_metrics(&self) {
         let offsets = self.offsets.read().await;
-        let hw = self.high_watermarks.read().await;
-        let (total_lag, max_lag) = compute_aggregate_lag(&offsets, &hw);
+        let partition_state = self.partition_state.read().await;
+        let (total_lag, max_lag) = compute_aggregate_lag(&offsets, &partition_state);
         self.metrics.lag.set(total_lag);
         self.metrics.lag_max.set(max_lag);
     }
@@ -1717,13 +1775,13 @@ impl Consumer {
         // Auto-commit timer: commit if interval has elapsed
         if self.config.enable_auto_commit && self.group_coordinator.is_some() {
             let should_commit = {
-                let last = self.last_auto_commit.read().await;
+                let last = self.last_auto_commit.lock();
                 last.elapsed() >= self.config.auto_commit_interval
             };
             if should_commit {
                 match self.commit().await {
                     Ok(()) => {
-                        *self.last_auto_commit.write().await = Instant::now();
+                        *self.last_auto_commit.lock() = Instant::now();
                     }
                     Err(e) => {
                         warn!("Auto-commit failed: {}", e);
@@ -1747,7 +1805,7 @@ impl Consumer {
         // too many unconsumed records.  Auto-commit and rebalance handling
         // above still run so the consumer remains healthy in the group.
         if self.config.max_buffered_records > 0 {
-            let buffered = self.recv_buffer.read().await.len();
+            let buffered = self.recv_buffer.lock().len();
             if buffered >= self.config.max_buffered_records as usize {
                 debug!(
                     buffered = buffered,
@@ -1768,7 +1826,7 @@ impl Consumer {
             let now = Instant::now();
             let missing: Vec<(String, PartitionId)> = {
                 let offsets = self.offsets.read().await;
-                let backoff = self.offset_retry_backoff.read().await;
+                let partition_state = self.partition_state.read().await;
                 assignments
                     .iter()
                     .flat_map(|(topic, partitions)| {
@@ -1780,9 +1838,12 @@ impl Consumer {
                             }
 
                             // Only include if backoff period has elapsed
-                            match backoff.get(&key) {
+                            match partition_state
+                                .get(&key)
+                                .and_then(|s| s.offset_retry_backoff)
+                            {
                                 None => Some(key),
-                                Some(&(next_retry, _)) if now >= next_retry => Some(key),
+                                Some((next_retry, _)) if now >= next_retry => Some(key),
                                 _ => None,
                             }
                         })
@@ -1858,22 +1919,27 @@ impl Consumer {
                 // partitions that were successfully resolved.
                 {
                     let offsets = self.offsets.read().await;
-                    let mut backoff = self.offset_retry_backoff.write().await;
+                    let mut partition_state = self.partition_state.write().await;
                     for (topic, partition) in &missing {
                         let key = (topic.clone(), *partition);
                         if offsets.contains_key(&key) {
-                            // Successfully resolved — remove backoff entry.
-                            backoff.remove(&key);
+                            // Successfully resolved — clear backoff.
+                            if let Some(state) = partition_state.get_mut(&key) {
+                                state.offset_retry_backoff = None;
+                            }
                         } else {
                             // Still unresolved — compute next backoff interval.
                             // Start at 100ms, double each time, cap at 30s.
                             let base = Duration::from_millis(100);
                             let max = Duration::from_secs(30);
-                            let prev_wait =
-                                backoff.get(&key).map(|&(_, d)| d).unwrap_or(Duration::ZERO);
+                            let entry = partition_state.entry(key).or_default();
+                            let prev_wait = entry
+                                .offset_retry_backoff
+                                .map(|(_, d)| d)
+                                .unwrap_or(Duration::ZERO);
                             let next_wait = (prev_wait * 2).max(base).min(max);
-                            let backoff_now = Instant::now();
-                            backoff.insert(key, (backoff_now + next_wait, next_wait));
+                            entry.offset_retry_backoff =
+                                Some((Instant::now() + next_wait, next_wait));
                         }
                     }
                 }
@@ -1901,12 +1967,12 @@ impl Consumer {
         }
 
         let now = Instant::now();
-        let preferred = self.preferred_replicas.read().await;
+        let partition_state_read = self.partition_state.read().await;
 
-        let plan = build_fetch_routing_plan(non_paused_keys, &preferred, &leaders, now);
+        let plan = build_fetch_routing_plan(non_paused_keys, &partition_state_read, &leaders, now);
 
         // Release read lock before potentially acquiring write lock
-        drop(preferred);
+        drop(partition_state_read);
 
         // Warn only for partitions that are truly skipped (no leader AND no
         // valid preferred replica). This avoids log spam during transient
@@ -1917,11 +1983,15 @@ impl Consumer {
             );
         }
 
-        // Remove expired preferred replica entries so they don't accumulate
+        // Clear expired preferred-replica entries so they don't accumulate.
+        // Only the `preferred_replica` field is cleared — other per-partition
+        // caches (high watermark, log start offset, retry backoff) are kept.
         if !plan.expired_preferred.is_empty() {
-            let mut pref = self.preferred_replicas.write().await;
+            let mut partition_state = self.partition_state.write().await;
             for key in &plan.expired_preferred {
-                pref.remove(key);
+                if let Some(state) = partition_state.get_mut(key) {
+                    state.preferred_replica = None;
+                }
             }
         }
 
@@ -1951,9 +2021,11 @@ impl Consumer {
                     // actually the leader the entries won't exist (no-op), but
                     // if it was a preferred replica this avoids routing to a
                     // dead broker for up to metadata_max_age.
-                    let mut pref = self.preferred_replicas.write().await;
+                    let mut partition_state = self.partition_state.write().await;
                     for tp in &topic_partitions {
-                        pref.remove(tp);
+                        if let Some(state) = partition_state.get_mut(tp) {
+                            state.preferred_replica = None;
+                        }
                     }
                 }
             }
@@ -1997,9 +2069,9 @@ impl Consumer {
         // Update high watermarks
         let hw_changed = !all_hw_updates.is_empty();
         if hw_changed {
-            let mut hw = self.high_watermarks.write().await;
+            let mut partition_state = self.partition_state.write().await;
             for (key, watermark) in all_hw_updates {
-                hw.insert(key, watermark);
+                partition_state.entry(key).or_default().high_watermark = Some(watermark);
             }
         }
 
@@ -2138,7 +2210,7 @@ impl Consumer {
         // Build the fetch request. For v7, compute an incremental session diff
         // from fetch_topics without cloning the full topic list into the base request.
         let (session_id, session_epoch, request_topics, forgotten_topics) = if fetch_version >= 7 {
-            let mut sessions = self.fetch_sessions.lock().await;
+            let mut sessions = self.fetch_sessions.lock();
             let session = sessions.get_or_create(broker_id);
             let session_req = session.build_request(&fetch_topics);
             if session_req.is_full_fetch {
@@ -2194,7 +2266,7 @@ impl Consumer {
             Ok(r) => r,
             Err(e) => {
                 if fetch_version >= 7 {
-                    let mut sessions = self.fetch_sessions.lock().await;
+                    let mut sessions = self.fetch_sessions.lock();
                     sessions.reset_broker(broker_id);
                 }
                 return Err(e);
@@ -2207,7 +2279,7 @@ impl Consumer {
             Ok(r) => r,
             Err(e) => {
                 if fetch_version >= 7 {
-                    let mut sessions = self.fetch_sessions.lock().await;
+                    let mut sessions = self.fetch_sessions.lock();
                     sessions.reset_broker(broker_id);
                 }
                 return Err(e);
@@ -2227,13 +2299,13 @@ impl Consumer {
                     "Fetch session error for broker {}: {:?}, resetting session",
                     broker_id, fetch_response.error_code
                 );
-                let mut sessions = self.fetch_sessions.lock().await;
+                let mut sessions = self.fetch_sessions.lock();
                 sessions.reset_broker(broker_id);
                 return Ok((Vec::new(), Vec::new(), Vec::new()));
             }
 
             // Update session state from response
-            let mut sessions = self.fetch_sessions.lock().await;
+            let mut sessions = self.fetch_sessions.lock();
             let session = sessions.get_or_create(broker_id);
             session.update_from_response(fetch_response.session_id, &fetch_topics);
         }
@@ -2437,27 +2509,35 @@ impl Consumer {
         // We return offset_updates and high watermarks alongside records so
         // the caller can apply them and compute lag.
 
-        // Apply log_start_offset updates directly (not affected by
-        // max_poll_records truncation — they reflect broker state).
-        if !lso_updates.is_empty() {
-            let mut lso = self.log_start_offsets.write().await;
-            for (key, offset) in lso_updates {
-                lso.insert(key, offset);
-            }
-        }
-
-        // Apply preferred replica updates in a single write lock (KIP-392).
-        // Last-write-wins: if a partition appears multiple times (e.g. set by
+        // Apply log_start_offset and preferred-replica updates in a single
+        // write lock acquisition. Log-start updates reflect broker state and
+        // are not affected by max_poll_records truncation. Preferred-replica
+        // last-write-wins: if a partition appears multiple times (e.g. set by
         // the response then cleared by error handling), the final entry takes
         // effect.
-        if !pref_updates.is_empty() {
+        if !lso_updates.is_empty() || !pref_updates.is_empty() {
             let expiry = Instant::now() + self.config.metadata_max_age;
-            let mut pref = self.preferred_replicas.write().await;
+            let mut partition_state = self.partition_state.write().await;
+            for (key, offset) in lso_updates {
+                partition_state.entry(key).or_default().log_start_offset = Some(offset);
+            }
             for (key, value) in pref_updates {
-                if let Some(replica_id) = value {
-                    pref.insert(key, (replica_id, expiry));
-                } else {
-                    pref.remove(&key);
+                match value {
+                    // Setting a preferred replica: insert/update the entry.
+                    Some(replica_id) => {
+                        partition_state.entry(key).or_default().preferred_replica =
+                            Some((replica_id, expiry));
+                    }
+                    // Clearing: only mutate an existing entry. Skipping
+                    // absent entries avoids inserting empty `PartitionState`
+                    // values on every fetch response that reports
+                    // `preferred_read_replica = -1` (the common case), which
+                    // would otherwise write-amplify this hot path.
+                    None => {
+                        if let Some(state) = partition_state.get_mut(&key) {
+                            state.preferred_replica = None;
+                        }
+                    }
                 }
             }
         }
@@ -2640,7 +2720,7 @@ impl Consumer {
         loop {
             // Return buffered records first
             {
-                let mut buffer = self.recv_buffer.write().await;
+                let mut buffer = self.recv_buffer.lock();
                 if let Some(record) = buffer.pop_front() {
                     self.metrics.buffered_records.set(buffer.len() as u64);
                     return Ok(Some(record));
@@ -2660,7 +2740,7 @@ impl Consumer {
                     };
                     // Buffer any remaining records for subsequent recv() calls
                     if iter.len() > 0 {
-                        let mut buffer = self.recv_buffer.write().await;
+                        let mut buffer = self.recv_buffer.lock();
                         buffer.extend(iter);
                         self.metrics.buffered_records.set(buffer.len() as u64);
                     }
@@ -3040,12 +3120,12 @@ impl Consumer {
     /// no additional network calls are made.
     pub async fn current_lag(&self, topic: &str, partition: PartitionId) -> Option<u64> {
         let key = (topic.to_string(), partition);
-        // Acquire offsets before high_watermarks to match the documented
-        // lock ordering: assignments → offsets → high_watermarks.
+        // Acquire offsets before partition_state to match the documented
+        // lock ordering: assignments → offsets → partition_state.
         let offsets = self.offsets.read().await;
         let position = offsets.get(&key).copied()?;
-        let hw = self.high_watermarks.read().await;
-        let watermark = hw.get(&key).copied()?;
+        let partition_state = self.partition_state.read().await;
+        let watermark = partition_state.get(&key).and_then(|s| s.high_watermark)?;
         Some((watermark - position).max(0) as u64)
     }
 
@@ -3055,13 +3135,13 @@ impl Consumer {
     /// both the high watermark and current position are known. Partitions that
     /// haven't been fetched yet are omitted.
     pub async fn lag(&self) -> HashMap<(String, PartitionId), u64> {
-        // Acquire offsets before high_watermarks to match the documented
-        // lock ordering: assignments → offsets → high_watermarks.
+        // Acquire offsets before partition_state to match the documented
+        // lock ordering: assignments → offsets → partition_state.
         let offsets = self.offsets.read().await;
-        let hw = self.high_watermarks.read().await;
-        let mut result = HashMap::with_capacity(hw.len());
-        for (key, &watermark) in hw.iter() {
-            if let Some(&position) = offsets.get(key) {
+        let partition_state = self.partition_state.read().await;
+        let mut result = HashMap::with_capacity(partition_state.len());
+        for (key, state) in partition_state.iter() {
+            if let (Some(watermark), Some(&position)) = (state.high_watermark, offsets.get(key)) {
                 result.insert(key.clone(), (watermark - position).max(0) as u64);
             }
         }
@@ -3079,7 +3159,11 @@ impl Consumer {
         partition: PartitionId,
     ) -> Option<Offset> {
         let key = (topic.to_string(), partition);
-        self.log_start_offsets.read().await.get(&key).copied()
+        self.partition_state
+            .read()
+            .await
+            .get(&key)
+            .and_then(|s| s.log_start_offset)
     }
 
     /// Get the cached end (high watermark) offset for a partition.
@@ -3089,7 +3173,11 @@ impl Consumer {
     /// No network calls are made.
     pub async fn cached_end_offset(&self, topic: &str, partition: PartitionId) -> Option<Offset> {
         let key = (topic.to_string(), partition);
-        self.high_watermarks.read().await.get(&key).copied()
+        self.partition_state
+            .read()
+            .await
+            .get(&key)
+            .and_then(|s| s.high_watermark)
     }
 
     /// Unsubscribe from all topics.
@@ -4891,26 +4979,35 @@ mod tests {
         assert!(tracker.assigned_called.load(Ordering::SeqCst));
     }
 
+    /// Build a `PartitionState` map entry with only the high watermark set.
+    /// Used by the lag-computation tests below.
+    fn ps_with_hw(watermark: Offset) -> PartitionState {
+        PartitionState {
+            high_watermark: Some(watermark),
+            ..Default::default()
+        }
+    }
+
     /// Test the lag computation logic via the extracted `compute_aggregate_lag`
     /// helper — the same function used by `recompute_lag_metrics()` in
     /// production.
     #[test]
     fn test_lag_computation_logic() {
         let mut offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
-        let mut high_watermarks: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let mut partition_state: HashMap<(String, PartitionId), PartitionState> = HashMap::new();
 
         // No data → lag is 0
-        let (total_lag, max_lag) = compute_aggregate_lag(&offsets, &high_watermarks);
+        let (total_lag, max_lag) = compute_aggregate_lag(&offsets, &partition_state);
         assert_eq!(total_lag, 0);
         assert_eq!(max_lag, 0);
 
         // Populate two partitions
         offsets.insert(("t".into(), 0), 50);
         offsets.insert(("t".into(), 1), 100);
-        high_watermarks.insert(("t".into(), 0), 80);
-        high_watermarks.insert(("t".into(), 1), 120);
+        partition_state.insert(("t".into(), 0), ps_with_hw(80));
+        partition_state.insert(("t".into(), 1), ps_with_hw(120));
 
-        let (total_lag, max_lag) = compute_aggregate_lag(&offsets, &high_watermarks);
+        let (total_lag, max_lag) = compute_aggregate_lag(&offsets, &partition_state);
 
         assert_eq!(total_lag, 50); // (80-50) + (120-100)
         assert_eq!(max_lag, 30); // max(30, 20)
@@ -4920,12 +5017,12 @@ mod tests {
     fn test_lag_negative_clamped_to_zero() {
         // Position ahead of high watermark (can happen briefly after a reset)
         let mut offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
-        let mut high_watermarks: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let mut partition_state: HashMap<(String, PartitionId), PartitionState> = HashMap::new();
 
         offsets.insert(("t".into(), 0), 100);
-        high_watermarks.insert(("t".into(), 0), 80);
+        partition_state.insert(("t".into(), 0), ps_with_hw(80));
 
-        let (total_lag, _) = compute_aggregate_lag(&offsets, &high_watermarks);
+        let (total_lag, _) = compute_aggregate_lag(&offsets, &partition_state);
         assert_eq!(total_lag, 0);
     }
 
@@ -4933,14 +5030,14 @@ mod tests {
     fn test_lag_partial_watermarks() {
         // High watermark known for only one of two partitions
         let mut offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
-        let mut high_watermarks: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let mut partition_state: HashMap<(String, PartitionId), PartitionState> = HashMap::new();
 
         offsets.insert(("t".into(), 0), 50);
         offsets.insert(("t".into(), 1), 100);
-        high_watermarks.insert(("t".into(), 0), 80);
+        partition_state.insert(("t".into(), 0), ps_with_hw(80));
         // Partition 1 has no high watermark
 
-        let (total_lag, _) = compute_aggregate_lag(&offsets, &high_watermarks);
+        let (total_lag, _) = compute_aggregate_lag(&offsets, &partition_state);
         assert_eq!(total_lag, 30); // Only partition 0 contributes
     }
 
@@ -4948,26 +5045,26 @@ mod tests {
     fn test_lag_after_revocation() {
         // Simulate clearing revoked partitions and recomputing lag metrics
         let mut offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
-        let mut high_watermarks: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let mut partition_state: HashMap<(String, PartitionId), PartitionState> = HashMap::new();
 
         offsets.insert(("t".into(), 0), 50);
         offsets.insert(("t".into(), 1), 100);
-        high_watermarks.insert(("t".into(), 0), 100); // lag = 50
-        high_watermarks.insert(("t".into(), 1), 200); // lag = 100
+        partition_state.insert(("t".into(), 0), ps_with_hw(100)); // lag = 50
+        partition_state.insert(("t".into(), 1), ps_with_hw(200)); // lag = 100
 
         // Revoke partition 0
         let revoked = vec![TopicPartition::new("t", 0)];
         for tp in &revoked {
             let key = (tp.topic.clone(), tp.partition);
             offsets.remove(&key);
-            high_watermarks.remove(&key);
+            partition_state.remove(&key);
         }
 
-        assert!(!high_watermarks.contains_key(&("t".into(), 0)));
-        assert!(high_watermarks.contains_key(&("t".into(), 1)));
+        assert!(!partition_state.contains_key(&("t".into(), 0)));
+        assert!(partition_state.contains_key(&("t".into(), 1)));
 
         // Recompute lag from remaining caches (same logic as apply_partition_revocations)
-        let (total_lag, max_lag) = compute_aggregate_lag(&offsets, &high_watermarks);
+        let (total_lag, max_lag) = compute_aggregate_lag(&offsets, &partition_state);
 
         // Only partition 1 remains: lag = 200 - 100 = 100
         assert_eq!(total_lag, 100);
@@ -4978,20 +5075,64 @@ mod tests {
     fn test_lag_clear_resets_to_zero() {
         // After clear_partition_state, all caches are empty → lag must be 0
         let mut offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
-        let mut high_watermarks: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let mut partition_state: HashMap<(String, PartitionId), PartitionState> = HashMap::new();
 
         offsets.insert(("t".into(), 0), 50);
-        high_watermarks.insert(("t".into(), 0), 100);
+        partition_state.insert(("t".into(), 0), ps_with_hw(100));
 
         // Simulate clear_partition_state
         offsets.clear();
-        high_watermarks.clear();
+        partition_state.clear();
 
-        let (total_lag, _) = compute_aggregate_lag(&offsets, &high_watermarks);
+        let (total_lag, _) = compute_aggregate_lag(&offsets, &partition_state);
         assert_eq!(total_lag, 0);
     }
 
+    /// Revoking a partition must clear **every** per-partition cache
+    /// (high watermark, log start offset, preferred replica, offset-retry
+    /// backoff) atomically. Before the `PartitionState` consolidation this
+    /// was "four separate `HashMap::remove` calls under four separate locks",
+    /// which was the exact bug class the refactor eliminated. This test pins
+    /// the invariant: a single `HashMap::remove` of a `PartitionState` value
+    /// drops all four caches together, so no future field added to
+    /// `PartitionState` can be accidentally skipped by the revocation path.
+    #[test]
+    fn test_partition_state_revocation_is_atomic() {
+        let key = ("t".to_string(), 0_i32);
+        let mut partition_state: HashMap<(String, PartitionId), PartitionState> = HashMap::new();
+        partition_state.insert(
+            key.clone(),
+            PartitionState {
+                high_watermark: Some(100),
+                log_start_offset: Some(0),
+                preferred_replica: Some((3_i32, Instant::now() + Duration::from_secs(60))),
+                offset_retry_backoff: Some((Instant::now(), Duration::from_millis(100))),
+            },
+        );
+
+        // Sanity: the entry has all four facets populated.
+        let state = &partition_state[&key];
+        assert!(state.high_watermark.is_some());
+        assert!(state.log_start_offset.is_some());
+        assert!(state.preferred_replica.is_some());
+        assert!(state.offset_retry_backoff.is_some());
+
+        // Revoke — a single remove wipes all four facets at once.
+        partition_state.remove(&key);
+
+        assert!(!partition_state.contains_key(&key));
+    }
+
     // --- Fetch routing plan tests (KIP-392) ---
+
+    /// Build a `PartitionState` map entry with only the preferred replica set.
+    /// Used by the routing-plan tests below.
+    fn ps_with_preferred(replica_id: crate::BrokerId, expiry: Instant) -> PartitionState {
+        PartitionState {
+            preferred_replica: Some((replica_id, expiry)),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn test_routing_plan_uses_leader_when_no_preferred() {
@@ -5011,12 +5152,12 @@ mod tests {
         let keys = vec![("t".into(), 0)];
 
         let leaders = HashMap::from([(("t".into(), 0), 1)]);
-        let preferred = HashMap::from([(
+        let partition_state = HashMap::from([(
             ("t".into(), 0),
-            (3_i32, Instant::now() + Duration::from_secs(60)),
+            ps_with_preferred(3_i32, Instant::now() + Duration::from_secs(60)),
         )]);
 
-        let plan = build_fetch_routing_plan(keys, &preferred, &leaders, Instant::now());
+        let plan = build_fetch_routing_plan(keys, &partition_state, &leaders, Instant::now());
 
         assert!(plan.expired_preferred.is_empty());
         // Should route to preferred replica (broker 3), not leader (broker 1)
@@ -5030,12 +5171,12 @@ mod tests {
 
         let leaders = HashMap::from([(("t".into(), 0), 1)]);
         // Preferred replica that expired 10 seconds ago
-        let preferred = HashMap::from([(
+        let partition_state = HashMap::from([(
             ("t".into(), 0),
-            (3_i32, Instant::now() - Duration::from_secs(10)),
+            ps_with_preferred(3_i32, Instant::now() - Duration::from_secs(10)),
         )]);
 
-        let plan = build_fetch_routing_plan(keys, &preferred, &leaders, Instant::now());
+        let plan = build_fetch_routing_plan(keys, &partition_state, &leaders, Instant::now());
 
         // Should fall back to leader (broker 1)
         assert_eq!(plan.partitions_by_broker[&1], vec![("t".into(), 0)]);
@@ -5083,18 +5224,18 @@ mod tests {
             (("t".into(), 2), 2),
         ]);
         let future = Instant::now() + Duration::from_secs(300);
-        let preferred = HashMap::from([
+        let partition_state = HashMap::from([
             // p0 has a valid preferred replica
-            (("t".into(), 0), (3_i32, future)),
+            (("t".into(), 0), ps_with_preferred(3_i32, future)),
             // p1 has an expired preferred replica
             (
                 ("t".into(), 1),
-                (3_i32, Instant::now() - Duration::from_secs(1)),
+                ps_with_preferred(3_i32, Instant::now() - Duration::from_secs(1)),
             ),
             // p2 has no preferred replica
         ]);
 
-        let plan = build_fetch_routing_plan(keys, &preferred, &leaders, Instant::now());
+        let plan = build_fetch_routing_plan(keys, &partition_state, &leaders, Instant::now());
 
         // p0 → broker 3 (preferred), p1 → broker 1 (leader, expired), p2 → broker 2 (leader)
         assert!(plan.partitions_by_broker[&3].contains(&("t".into(), 0)));
