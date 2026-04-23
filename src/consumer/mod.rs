@@ -76,7 +76,8 @@ use crate::network::{ConnectionConfig, ConnectionPool};
 use crate::protocol::{
     ApiKey, FetchPartitionRequest, FetchRequest, FetchResponse, FetchTopicRequest,
     ListOffsetsRequest, ListOffsetsRequestPartition, ListOffsetsRequestTopic, ListOffsetsResponse,
-    RecordBatch, VersionedDecode, VersionedEncode, versions,
+    RecordBatch, VersionedDecode, VersionedEncode, validate_topic_name, validate_topic_names,
+    versions,
 };
 use crate::{Offset, PartitionId};
 
@@ -338,6 +339,7 @@ impl Consumer {
         pool_config.init_tls().await?;
 
         let pool = Arc::new(ConnectionPool::new(pool_config));
+        pool.start_idle_evictor();
 
         let bootstrap_servers = crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
 
@@ -414,6 +416,11 @@ impl Consumer {
     /// Replaces the current subscription with the given topics (matching
     /// the Kafka Java client's replace semantics).
     pub async fn subscribe(&self, topics: &[&str]) -> Result<()> {
+        // H6: reject empty / oversize topic names at ingress so they cannot
+        // reach the panicking `KafkaString::encode` path via the MetadataRequest
+        // / Heartbeat / subscription payload.
+        validate_topic_names(topics.iter().copied())?;
+
         // Scope the write lock so it is dropped before network I/O
         {
             let mut subscriptions = self.subscriptions.write().await;
@@ -1373,6 +1380,11 @@ impl Consumer {
     /// Manual assignment and group subscription are mutually exclusive.
     /// This method returns an error if a group coordinator is active.
     pub async fn assign(&self, topic: &str, partitions: Vec<PartitionId>) -> Result<()> {
+        // H6: reject empty / oversize topic names at ingress so they cannot
+        // reach the panicking `KafkaString::encode` path via MetadataRequest /
+        // FetchRequest / OffsetFetchRequest.
+        validate_topic_name(topic)?;
+
         if self.group_coordinator.is_some() {
             return Err(KrafkaError::invalid_state(
                 "cannot use manual partition assignment with consumer group subscription",

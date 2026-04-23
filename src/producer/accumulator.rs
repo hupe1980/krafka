@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::interval;
 use tracing::{debug, trace, warn};
 
@@ -34,28 +34,87 @@ use crate::protocol::{
     RecordBatchBuilder, VersionedDecode, VersionedEncode, versions,
 };
 
+/// Maximum number of concurrent `send_extracted_batch` tasks in a single
+/// bounded drain wave.
+///
+/// `flush_all` (Flush/Shutdown commands) awaits `spawn_batches_bounded`
+/// directly so completion is confirmed before the caller is unblocked.
+/// Linger-triggered paths (`check_linger_expiry`, `flush_all_ready`) and
+/// single-batch flushes (`flush_batch`) detach their send work via
+/// `spawn_batches_detached` so the accumulator run loop is never held
+/// waiting for network I/O. `spawn_batches_bounded` enforces this cap
+/// inside each detached wave; `InFlightGuard` limits per-broker parallelism
+/// across concurrent waves.
+///
+/// Fix for H3: prior implementations spawned one task per batch with no
+/// cap, meaning 10k partitions at `linger.ms=5` produced a 10k-task burst
+/// every linger tick. This number is deliberately modest — batch sends are
+/// I/O-bound and the per-broker connection pipeline already serializes
+/// requests, so extra parallelism beyond a few dozen tasks does not
+/// translate to throughput and only adds scheduler pressure.
+const MAX_CONCURRENT_BATCH_SENDS: usize = 64;
+
+/// Validate that `record_size` bytes can be admitted into the memory pool.
+///
+/// Returns an error immediately if the record would permanently block
+/// `acquire_many` — either because it exceeds `u32::MAX` (the hard limit of
+/// `Semaphore::acquire_many`) or because it exceeds the configured
+/// `buffer_memory` budget (permits can never accumulate to that level).
+///
+/// The u32 check comes first so the error message is always accurate:
+/// a record larger than both limits is a semaphore-API violation, not a
+/// tunable configuration problem.
+fn check_record_admission(record_size: usize, memory_capacity: usize) -> Result<()> {
+    if record_size > u32::MAX as usize {
+        return Err(KrafkaError::config(format!(
+            "record size {record_size} B exceeds the semaphore \
+             permit-count limit ({} B, u32::MAX); Kafka records must \
+             be smaller",
+            u32::MAX
+        )));
+    }
+    if record_size > memory_capacity {
+        return Err(KrafkaError::config(format!(
+            "record size {record_size} B exceeds producer buffer_memory \
+             capacity ({} B); raise ProducerConfig::buffer_memory or \
+             shrink the record",
+            memory_capacity
+        )));
+    }
+    Ok(())
+}
+
 /// Response from the accumulator for an append attempt.
+///
+/// Backpressure (buffer-memory exhaustion) is handled entirely in the handle
+/// via `memory_permits.acquire_many(record_size)` before the message is sent,
+/// so the accumulator never returns a "buffer full" signal — by the time a
+/// message arrives, its bytes are already reserved.
 #[derive(Debug)]
 enum AppendResponse {
     /// Record accepted — metadata will arrive via the inner Result.
     Done(Result<RecordMetadata>),
-    /// Buffer is full — the record is returned so the caller can retry
-    /// without cloning.
-    BufferFull {
-        record: ProducerRecord,
-        operation_guard: InFlightOpGuard,
-    },
 }
 
 /// Message sent to the accumulator background task.
 #[derive(Debug)]
 enum AccumulatorMessage {
     /// Add a record to the accumulator.
+    ///
+    /// `record_size` duplicates `permit_reservation.bytes` for easy access
+    /// on the hot path; the RAII `PermitReservation` owns the release
+    /// obligation. Successful paths call `permit_reservation.forget()` once
+    /// an `InFlightGuard` takes over. Any path that drops this message
+    /// without explicit handling (accumulator task panics, channel send
+    /// race during shutdown, etc.) releases the permits via `Drop` so
+    /// `buffer_memory` is never leaked.
     Append {
         record: ProducerRecord,
         partition: PartitionId,
+        record_size: usize,
         response_tx: oneshot::Sender<AppendResponse>,
         operation_guard: InFlightOpGuard,
+        permit_reservation: PermitReservation,
     },
     /// Flush all batches.
     Flush {
@@ -65,12 +124,66 @@ enum AccumulatorMessage {
     Shutdown { response_tx: oneshot::Sender<()> },
 }
 
+/// RAII reservation of `bytes` permits on `memory_permits`.
+///
+/// Created in `append_with_guard` once the handle has successfully
+/// `acquire_many`-ed. Travels with the `AccumulatorMessage::Append` into
+/// the accumulator task; on the success path the accumulator calls
+/// `forget()` to transfer ownership to an `InFlightGuard` (which will
+/// eventually `add_permits` when the batch completes). On any other path
+/// — explicit rejection, task panic, message dropped during shutdown —
+/// `Drop` returns the bytes to the semaphore so `buffer_memory` is
+/// never permanently stranded.
+struct PermitReservation {
+    bytes: usize,
+    memory_permits: Arc<Semaphore>,
+}
+
+impl PermitReservation {
+    /// Surrender the release obligation without leaking any allocation.
+    ///
+    /// Sets `bytes` to zero so that `Drop` calls `add_permits(0)`, which is
+    /// a no-op in Tokio. The `Arc<Semaphore>` is dropped normally at end of
+    /// scope. The caller is now responsible for eventually calling
+    /// `add_permits(original_bytes)` on the same semaphore (typically via
+    /// `InFlightGuard::drop`).
+    fn forget(mut self) {
+        self.bytes = 0;
+    }
+}
+
+impl Drop for PermitReservation {
+    fn drop(&mut self) {
+        self.memory_permits.add_permits(self.bytes);
+    }
+}
+
+impl std::fmt::Debug for PermitReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PermitReservation")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
 /// Handle to the record accumulator.
 #[derive(Clone)]
 pub struct RecordAccumulatorHandle {
     sender: mpsc::Sender<AccumulatorMessage>,
-    /// Notified when buffer memory is freed (backpressure).
-    memory_freed: Arc<Notify>,
+    /// Byte-granular FIFO semaphore gating `buffer_memory`.
+    ///
+    /// Each producer `append()` reserves `record.estimated_size()` permits
+    /// via `acquire_many` before sending to the accumulator, and the
+    /// matching `InFlightGuard` releases the same count via `add_permits`
+    /// when the batch completes. Tokio's `Semaphore` queues waiters FIFO
+    /// and wakes exactly the front waiter that can satisfy its request,
+    /// eliminating the thundering-herd and fairness problems of the
+    /// previous `Notify::notify_waiters()` design.
+    memory_permits: Arc<Semaphore>,
+    /// Initial semaphore capacity (= `buffer_memory`, or `MAX_PERMITS` when
+    /// unlimited). Used to reject records larger than the entire budget
+    /// with a structured error instead of blocking forever on `acquire_many`.
+    memory_capacity: usize,
     /// Maximum time to block waiting for buffer memory.
     max_block_ms: Duration,
     /// Barrier over all producer sends, including detached batch tasks.
@@ -100,83 +213,80 @@ impl RecordAccumulatorHandle {
         operation_guard: InFlightOpGuard,
     ) -> Result<RecordMetadata> {
         let deadline = tokio::time::Instant::now() + self.max_block_ms;
-        let mut operation_guard = Some(operation_guard);
-        // Hold the record in an Option so the first send moves it into the
-        // channel without cloning. On BufferFull the accumulator returns it,
-        // so retries are also zero-copy.
-        let mut pending = Some(record);
+        let record_size = record.estimated_size();
 
-        loop {
-            // `pending` is always `Some` here — either set by the
-            // initial call or replenished by `AppendResponse::BufferFull`.
-            let Some(rec) = pending.take() else {
-                unreachable!("pending record missing");
-            };
-            let Some(guard) = operation_guard.take() else {
-                unreachable!("operation guard missing");
-            };
-            let (response_tx, response_rx) = oneshot::channel();
+        // Reject records that cannot physically be admitted (exceeds the
+        // semaphore permit limit or the configured buffer_memory budget).
+        // Uses the module-level helper so both branches are unit-testable
+        // without allocating large buffers.
+        check_record_admission(record_size, self.memory_capacity)?;
 
-            // Pre-register interest in memory_freed BEFORE sending so that
-            // a notify_waiters() from extract_batch/flush_all between the
-            // send and the await cannot be missed.
-            let notified = self.memory_freed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            // Respect max_block_ms for the channel send too, in case the
-            // accumulator channel is backed up.
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            tokio::time::timeout(
-                remaining,
-                self.sender.send(AccumulatorMessage::Append {
-                    record: rec,
-                    partition,
-                    response_tx,
-                    operation_guard: guard,
-                }),
-            )
-            .await
-            .map_err(|_| {
-                KrafkaError::timeout(
-                    "producer append: max_block exceeded while sending to accumulator",
-                )
-            })?
-            .map_err(|_| KrafkaError::invalid_state("accumulator closed"))?;
-
-            let response = response_rx
-                .await
-                .map_err(|_| KrafkaError::invalid_state("accumulator response dropped"))?;
-
-            match response {
-                AppendResponse::BufferFull {
-                    record: returned_record,
-                    operation_guard: guard,
-                } => {
-                    // The accumulator returned the record without touching it.
-                    // Wait for memory to be freed, then retry with the same
-                    // record instance — zero clones on the retry path.
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if remaining.is_zero() {
-                        return Err(KrafkaError::timeout(
-                            "producer append: max_block exceeded while waiting \
-                             for buffer memory (ProducerConfig::max_block / \
-                             AccumulatorConfig::max_block_ms)",
-                        ));
-                    }
-                    if tokio::time::timeout(remaining, notified).await.is_err() {
-                        return Err(KrafkaError::timeout(
-                            "producer append: max_block exceeded while waiting \
-                             for buffer memory (ProducerConfig::max_block / \
-                             AccumulatorConfig::max_block_ms)",
-                        ));
-                    }
-                    // Replenish pending for the next iteration.
-                    pending = Some(returned_record);
-                    operation_guard = Some(guard);
-                }
-                AppendResponse::Done(result) => return result,
+        // FIFO-fair reservation of `record_size` bytes from the shared pool.
+        // On timeout or closed semaphore (accumulator panicked), the permit
+        // future cancels cleanly with no leaked reservation.
+        let permit = match tokio::time::timeout(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            self.memory_permits.acquire_many(record_size as u32),
+        )
+        .await
+        {
+            Ok(Ok(p)) => p,
+            Ok(Err(_)) => return Err(KrafkaError::invalid_state("accumulator closed")),
+            Err(_) => {
+                return Err(KrafkaError::timeout(
+                    "producer append: max_block exceeded while waiting for buffer \
+                     memory (ProducerConfig::max_block / AccumulatorConfig::max_block_ms)",
+                ));
             }
+        };
+
+        // Transfer from the `SemaphorePermit` future to the RAII
+        // `PermitReservation`. Construction happens BEFORE `permit.forget()` so
+        // there is no window where permits are orphaned if `Arc::clone` were
+        // ever to panic (it never does, but the ordering makes the intent
+        // explicit and keeps the two sides of the handoff adjacent).
+        let permit_reservation = PermitReservation {
+            bytes: record_size,
+            memory_permits: self.memory_permits.clone(),
+        };
+        // Discard the `SemaphorePermit` without releasing its permits;
+        // `permit_reservation` is now the sole release authority.
+        permit.forget();
+
+        let (response_tx, response_rx) = oneshot::channel();
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+
+        // Send the Append; on failure (timeout / closed channel),
+        // `permit_reservation` drops and returns the permits to the pool
+        // so another waiter can proceed. On success the accumulator now
+        // owns the release obligation via the message contents.
+        match tokio::time::timeout(
+            remaining,
+            self.sender.send(AccumulatorMessage::Append {
+                record,
+                partition,
+                record_size,
+                response_tx,
+                operation_guard,
+                permit_reservation,
+            }),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(KrafkaError::invalid_state("accumulator closed")),
+            Err(_) => {
+                return Err(KrafkaError::timeout(
+                    "producer append: max_block exceeded while sending to accumulator",
+                ));
+            }
+        }
+
+        match response_rx
+            .await
+            .map_err(|_| KrafkaError::invalid_state("accumulator response dropped"))?
+        {
+            AppendResponse::Done(result) => result,
         }
     }
 
@@ -302,22 +412,25 @@ struct PendingRecord {
     _operation_guard: InFlightOpGuard,
 }
 
-/// RAII guard that releases in-flight memory and notifies waiters on drop.
+/// RAII guard that releases `buffer_memory` permits and in-flight byte
+/// tracking on drop.
 ///
 /// Created by `extract_batch` and passed to `send_extracted_batch`.
 /// When the send task completes (or panics), the guard automatically
-/// decrements `in_flight_memory` and wakes blocked `append()` callers.
+/// decrements `in_flight_memory` for metrics and releases `bytes` permits
+/// back to `memory_permits`, waking the front FIFO waiter whose request
+/// can now be satisfied.
 struct InFlightGuard {
     bytes: usize,
     in_flight_memory: Arc<AtomicUsize>,
-    memory_freed: Arc<Notify>,
+    memory_permits: Arc<Semaphore>,
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.in_flight_memory
             .fetch_sub(self.bytes, Ordering::Relaxed);
-        self.memory_freed.notify_waiters();
+        self.memory_permits.add_permits(self.bytes);
     }
 }
 
@@ -355,16 +468,15 @@ pub struct RecordAccumulator {
     batches: HashMap<(String, PartitionId), AccumulatorBatch>,
     /// Cluster metadata for sending.
     metadata: Arc<ClusterMetadata>,
-    /// Current total memory usage in bytes (buffered, not yet extracted).
-    memory_used: usize,
     /// Memory held by in-flight send tasks (extracted but not yet completed).
+    /// Exposed for metrics only; backpressure is enforced by `memory_permits`.
     in_flight_memory: Arc<AtomicUsize>,
     /// Retry policy for transient failures.
     retry_policy: RetryPolicy,
     /// Shared metrics.
     metrics: Arc<ProducerMetrics>,
-    /// Notified when buffer memory is freed (backpressure).
-    memory_freed: Arc<Notify>,
+    /// Byte-granular FIFO semaphore gating `buffer_memory` (shared with handle).
+    memory_permits: Arc<Semaphore>,
 }
 
 impl RecordAccumulator {
@@ -377,9 +489,11 @@ impl RecordAccumulator {
         in_flight_barrier: Arc<InFlightBarrier>,
     ) -> RecordAccumulatorHandle {
         // Cap the channel at 256 to limit untracked memory sitting in the
-        // channel before the accumulator's memory-check runs.  When
-        // buffer_memory is configured, we shrink further so at most ~10% of
-        // the budget can be untracked.
+        // channel before the accumulator processes it. When buffer_memory
+        // is configured, we shrink further so at most ~10% of the budget
+        // can be untracked. (Strictly speaking permits are already held
+        // before send, so the channel sits on top of the permit layer;
+        // the cap is still useful to bound scheduler queueing.)
         let channel_capacity = if config.buffer_memory > 0 {
             let batch = config.batch_size.max(1);
             (config.buffer_memory / 10 / batch).clamp(1, 256)
@@ -387,7 +501,31 @@ impl RecordAccumulator {
             64
         };
         let (sender, receiver) = mpsc::channel(channel_capacity);
-        let memory_freed = Arc::new(Notify::new());
+
+        // Semaphore capacity: `buffer_memory` when bounded, or
+        // `Semaphore::MAX_PERMITS` (effectively unlimited) when `buffer_memory
+        // = 0`. A single `acquire_many` call still takes a `u32` request,
+        // so the per-record cap is `u32::MAX` regardless. If the caller
+        // configured `buffer_memory` above `Semaphore::MAX_PERMITS`
+        // (`usize::MAX >> 3`, only reachable on 32-bit targets in practice),
+        // we clamp and emit a single `warn!` so the effective cap is
+        // explicit rather than silent.
+        let memory_capacity = if config.buffer_memory > 0 {
+            if config.buffer_memory > Semaphore::MAX_PERMITS {
+                warn!(
+                    requested = config.buffer_memory,
+                    effective = Semaphore::MAX_PERMITS,
+                    "buffer_memory exceeds Semaphore::MAX_PERMITS; clamping effective \
+                     producer memory capacity"
+                );
+                Semaphore::MAX_PERMITS
+            } else {
+                config.buffer_memory
+            }
+        } else {
+            Semaphore::MAX_PERMITS
+        };
+        let memory_permits = Arc::new(Semaphore::new(memory_capacity));
         let in_flight_memory = Arc::new(AtomicUsize::new(0));
         let max_block_ms = config.max_block_ms;
 
@@ -402,14 +540,13 @@ impl RecordAccumulator {
             config,
             batches: HashMap::new(),
             metadata,
-            memory_used: 0,
             in_flight_memory,
             retry_policy,
             metrics,
-            memory_freed: memory_freed.clone(),
+            memory_permits: memory_permits.clone(),
         };
 
-        let memory_freed_panic = memory_freed.clone();
+        let memory_permits_panic = memory_permits.clone();
         tokio::spawn(async move {
             let join_handle = tokio::spawn(accumulator.run(receiver));
             if let Err(join_err) = join_handle.await {
@@ -418,15 +555,17 @@ impl RecordAccumulator {
                 } else {
                     tracing::error!("Accumulator task cancelled: {join_err}");
                 }
-                // Wake all blocked append() callers so they observe the
-                // closed channel and return an error instead of hanging.
-                memory_freed_panic.notify_waiters();
+                // Close the semaphore so all blocked `acquire_many` calls
+                // in `append_with_guard` return an error instead of hanging
+                // forever. New callers will also fail immediately.
+                memory_permits_panic.close();
             }
         });
 
         RecordAccumulatorHandle {
             sender,
-            memory_freed,
+            memory_permits,
+            memory_capacity,
             max_block_ms,
             in_flight_barrier,
         }
@@ -446,10 +585,12 @@ impl RecordAccumulator {
                         Some(AccumulatorMessage::Append {
                             record,
                             partition,
+                            record_size,
                             response_tx,
                             operation_guard,
+                            permit_reservation,
                         }) => {
-                            self.handle_append(record, partition, response_tx, operation_guard).await;
+                            self.handle_append(record, partition, record_size, response_tx, operation_guard, permit_reservation).await;
                         }
                         Some(AccumulatorMessage::Flush { response_tx }) => {
                             let result = self.flush_all().await;
@@ -469,7 +610,7 @@ impl RecordAccumulator {
                     }
                 }
                 _ = linger_timer.tick() => {
-                    self.check_linger_expiry().await;
+                    self.check_linger_expiry();
                 }
             }
         }
@@ -478,34 +619,30 @@ impl RecordAccumulator {
     }
 
     /// Handle appending a record.
+    ///
+    /// `record_size` duplicates `permit_reservation.bytes` for fast access;
+    /// the reservation owns the release obligation. Successful paths call
+    /// `permit_reservation.forget()` so the eventual `InFlightGuard` can
+    /// release the permits on batch completion; error paths let the
+    /// reservation drop naturally, returning the permits to the pool.
     async fn handle_append(
         &mut self,
         record: ProducerRecord,
         partition: PartitionId,
+        record_size: usize,
         response_tx: oneshot::Sender<AppendResponse>,
         operation_guard: InFlightOpGuard,
+        permit_reservation: PermitReservation,
     ) {
-        // Estimate record size for memory tracking and batch size-gating.
-        let record_size = record.estimated_size();
-        let topic = record.topic.clone();
-        let key = (topic, partition);
+        let key = (record.topic.clone(), partition);
 
-        // Check memory limit before appending (0 = unlimited).
-        // Include in-flight memory so extracted-but-unsent batches are counted.
-        let total_memory = self.memory_used + self.in_flight_memory.load(Ordering::Relaxed);
-        if self.config.buffer_memory > 0 && total_memory + record_size > self.config.buffer_memory {
-            // Return the record to the caller so it can retry without cloning.
-            let _ = response_tx.send(AppendResponse::BufferFull {
-                record,
-                operation_guard,
-            });
-            return;
-        }
+        // Backpressure is enforced in `append_with_guard` via
+        // `memory_permits.acquire_many(record_size)`; by the time we get
+        // here the bytes are already reserved, so no buffer-size check
+        // is needed.
 
-        // Track memory usage
-        self.memory_used += record_size;
-
-        // Get or create batch
+        // Get or create batch. `or_insert_with` closure needs an owned
+        // topic string; `key.0.clone()` happens only on the first insert.
         let batch_size = self.config.batch_size;
         let compression = self.config.compression;
         let accumulator_batch = self.batches.entry(key.clone()).or_insert_with(|| {
@@ -525,20 +662,22 @@ impl RecordAccumulator {
                 estimated_size: record_size,
                 _operation_guard: operation_guard,
             });
+            // Release is now owned by the eventual `InFlightGuard`.
+            permit_reservation.forget();
 
             // Check if batch is full
             if accumulator_batch.batch.is_full() {
                 trace!("Batch full for {}-{}, flushing", key.0, partition);
-                self.flush_batch(&key).await;
+                self.flush_batch(&key);
             } else if self.config.linger.is_zero() {
                 // linger=0 means send immediately without waiting
                 // for the next linger timer tick (up to 1ms delay otherwise).
                 trace!("Linger=0 for {}-{}, flushing immediately", key.0, partition);
-                self.flush_batch(&key).await;
+                self.flush_batch(&key);
             }
         } else {
             // Batch is full, flush it first and then add to new batch
-            self.flush_batch(&key).await;
+            self.flush_batch(&key);
 
             // Create new batch and add record
             let mut new_batch =
@@ -554,11 +693,13 @@ impl RecordAccumulator {
                     _operation_guard: operation_guard,
                 });
                 self.batches.insert(key, new_batch);
+                // Release is now owned by the eventual `InFlightGuard`.
+                permit_reservation.forget();
             } else {
-                // Record too large for batch - free the memory we reserved
-                self.memory_used = self.memory_used.saturating_sub(record_size);
-                // Wake any tasks waiting for buffer memory so they can make progress.
-                self.memory_freed.notify_waiters();
+                // Record too large for batch size — drop the reservation,
+                // which returns the permits to the pool so another
+                // producer can make progress, then surface the error.
+                drop(permit_reservation);
                 let _ = response_tx.send(AppendResponse::Done(Err(KrafkaError::config(
                     "record too large for batch size",
                 ))));
@@ -566,10 +707,15 @@ impl RecordAccumulator {
         }
     }
 
-    /// Check for batches that have exceeded linger time (concurrent flush).
-    async fn check_linger_expiry(&mut self) {
+    /// Check for batches that have exceeded their linger time and detach sends.
+    ///
+    /// Extracts expired batches synchronously, then dispatches them via
+    /// `spawn_batches_detached` so the accumulator's run loop is never held
+    /// waiting for network I/O. When `linger` is zero, delegates to
+    /// `flush_all_ready`.
+    fn check_linger_expiry(&mut self) {
         if self.config.linger.is_zero() {
-            self.flush_all_ready().await;
+            self.flush_all_ready();
             return;
         }
 
@@ -592,29 +738,22 @@ impl RecordAccumulator {
             }
         }
 
-        let mut join_set = tokio::task::JoinSet::new();
-        for ((topic, partition), (batch, guard)) in extracted {
-            let metadata = self.metadata.clone();
-            let config = self.config.clone();
-            let retry_policy = self.retry_policy.clone();
-            let metrics = self.metrics.clone();
-            join_set.spawn(Self::send_extracted_batch(
-                topic,
-                partition,
-                batch.pending,
-                batch.created_at,
-                guard,
-                metadata,
-                config,
-                retry_policy,
-                metrics,
-            ));
-        }
-        while join_set.join_next().await.is_some() {}
+        Self::spawn_batches_detached(
+            extracted,
+            &self.metadata,
+            &self.config,
+            &self.retry_policy,
+            &self.metrics,
+        );
     }
 
-    /// Flush all ready batches concurrently (non-empty with linger=0).
-    async fn flush_all_ready(&mut self) {
+    /// Flush all ready batches by detaching send tasks.
+    ///
+    /// Extracts all non-empty batches synchronously, then hands them off to
+    /// `spawn_batches_detached` so the run loop is never blocked by network
+    /// I/O. The send cap (`MAX_CONCURRENT_BATCH_SENDS`) is enforced inside
+    /// the detached wave.
+    fn flush_all_ready(&mut self) {
         let keys_to_flush: Vec<_> = self
             .batches
             .iter()
@@ -633,30 +772,108 @@ impl RecordAccumulator {
             }
         }
 
+        Self::spawn_batches_detached(
+            extracted,
+            &self.metadata,
+            &self.config,
+            &self.retry_policy,
+            &self.metrics,
+        );
+    }
+
+    /// Spawn at most `MAX_CONCURRENT_BATCH_SENDS` send tasks at a time.
+    ///
+    /// Fix for H3: the previous implementation did `join_set.spawn(...)` in
+    /// a tight loop with no cap, materializing every batch into a Tokio
+    /// task in a single linger tick. With 10k partitions at `linger.ms=5`
+    /// this meant 10k spawns per tick, flooding the global injection queue
+    /// and degrading tail latency for no throughput gain (the per-broker
+    /// connection already serializes). We now drain in a bounded fashion:
+    /// spawn up to the cap, then await one task before spawning the next.
+    /// The cap is deliberately fixed (`MAX_CONCURRENT_BATCH_SENDS`) rather
+    /// than derived from `num_cpus` — the send tasks are I/O bound and a
+    /// fixed ceiling caps scheduler pressure predictably.
+    async fn spawn_batches_bounded(
+        extracted: Vec<((String, PartitionId), (AccumulatorBatch, InFlightGuard))>,
+        metadata: &Arc<ClusterMetadata>,
+        config: &AccumulatorConfig,
+        retry_policy: &RetryPolicy,
+        metrics: &Arc<ProducerMetrics>,
+    ) {
         let mut join_set = tokio::task::JoinSet::new();
         for ((topic, partition), (batch, guard)) in extracted {
-            let metadata = self.metadata.clone();
-            let config = self.config.clone();
-            let retry_policy = self.retry_policy.clone();
-            let metrics = self.metrics.clone();
+            if join_set.len() >= MAX_CONCURRENT_BATCH_SENDS {
+                // Drain one slot before admitting the next task.
+                // `join_next` returning `None` cannot happen here because
+                // `len() >= cap >= 1`.
+                if let Some(Err(e)) = join_set.join_next().await
+                    && e.is_panic()
+                {
+                    warn!("send_extracted_batch task panicked: {e}");
+                }
+            }
             join_set.spawn(Self::send_extracted_batch(
                 topic,
                 partition,
                 batch.pending,
                 batch.created_at,
                 guard,
-                metadata,
-                config,
-                retry_policy,
-                metrics,
+                metadata.clone(),
+                config.clone(),
+                retry_policy.clone(),
+                metrics.clone(),
             ));
         }
-        while join_set.join_next().await.is_some() {}
+        while let Some(result) = join_set.join_next().await {
+            if let Err(e) = result
+                && e.is_panic()
+            {
+                warn!("send_extracted_batch task panicked: {e}");
+            }
+        }
     }
 
-    /// Extract a batch from the accumulator, transferring its memory to
-    /// the in-flight tracker. The actual free + notify happens when the
-    /// send task completes (see `send_extracted_batch`).
+    /// Detach a bounded batch-send wave so the accumulator run loop is not
+    /// blocked by in-flight network I/O.
+    ///
+    /// Clones the shared handles, spawns a single Tokio task, and returns
+    /// immediately. Inside the task, `spawn_batches_bounded` enforces the
+    /// `MAX_CONCURRENT_BATCH_SENDS` cap so at most that many
+    /// `send_extracted_batch` tasks run concurrently within each wave.
+    /// Cross-wave parallelism is bounded by the `InFlightGuard` semaphore
+    /// inside `send_extracted_batch`.
+    fn spawn_batches_detached(
+        extracted: Vec<((String, PartitionId), (AccumulatorBatch, InFlightGuard))>,
+        metadata: &Arc<ClusterMetadata>,
+        config: &AccumulatorConfig,
+        retry_policy: &RetryPolicy,
+        metrics: &Arc<ProducerMetrics>,
+    ) {
+        if extracted.is_empty() {
+            return;
+        }
+        let metadata = metadata.clone();
+        let config = config.clone();
+        let retry_policy = retry_policy.clone();
+        let metrics = metrics.clone();
+        // Fire-and-forget: drop the JoinHandle immediately to make the
+        // detached semantics explicit. The spawned task is self-contained —
+        // `InFlightGuard` reclaims memory permits on completion or panic —
+        // so there is nothing to join.
+        drop(tokio::spawn(async move {
+            Self::spawn_batches_bounded(extracted, &metadata, &config, &retry_policy, &metrics)
+                .await;
+        }));
+    }
+
+    /// Extract a batch from the accumulator and account its byte count
+    /// against the in-flight tracker.
+    ///
+    /// The permits for these bytes are already "forgotten" (ownership
+    /// transferred away from the handle's acquire future when the Append
+    /// message was sent); the returned `InFlightGuard` carries the
+    /// obligation to release an equivalent count via `add_permits` when
+    /// the send task completes or panics — see `send_extracted_batch`.
     fn extract_batch(
         &mut self,
         key: &(String, PartitionId),
@@ -666,41 +883,33 @@ impl RecordAccumulator {
             return None;
         }
         let batch_memory: usize = batch.pending.iter().map(|p| p.estimated_size).sum();
-        self.memory_used = self.memory_used.saturating_sub(batch_memory);
         self.in_flight_memory
             .fetch_add(batch_memory, Ordering::Relaxed);
         let guard = InFlightGuard {
             bytes: batch_memory,
             in_flight_memory: self.in_flight_memory.clone(),
-            memory_freed: self.memory_freed.clone(),
+            memory_permits: self.memory_permits.clone(),
         };
         Some((batch, guard))
     }
 
-    /// Flush a specific batch by spawning a background task.
+    /// Flush a specific batch by routing through `spawn_batches_detached`.
     ///
-    /// Previously, this method awaited the network I/O inline, blocking the
-    /// entire accumulator task. Now it spawns the send as a background task
-    /// matching the concurrent flush pattern used by `check_linger_expiry`.
-    async fn flush_batch(&mut self, key: &(String, PartitionId)) {
-        if let Some((batch, guard)) = self.extract_batch(key) {
-            let topic = key.0.clone();
-            let partition = key.1;
-            let metadata = self.metadata.clone();
-            let config = self.config.clone();
-            let retry_policy = self.retry_policy.clone();
-            let metrics = self.metrics.clone();
-            tokio::spawn(Self::send_extracted_batch(
-                topic,
-                partition,
-                batch.pending,
-                batch.created_at,
-                guard,
-                metadata,
-                config,
-                retry_policy,
-                metrics,
-            ));
+    /// All flush paths (`flush_batch`, `flush_all_ready`, `check_linger_expiry`)
+    /// funnel through `spawn_batches_detached` → `spawn_batches_bounded`,
+    /// ensuring the `MAX_CONCURRENT_BATCH_SENDS` ceiling is applied uniformly.
+    /// A single-entry vec exits the bounded loop before any backpressure
+    /// point, so this path adds no observable overhead beyond the outer
+    /// wrapper task that `spawn_batches_detached` spawns.
+    fn flush_batch(&mut self, key: &(String, PartitionId)) {
+        if let Some(item) = self.extract_batch(key) {
+            Self::spawn_batches_detached(
+                vec![(key.clone(), item)],
+                &self.metadata,
+                &self.config,
+                &self.retry_policy,
+                &self.metrics,
+            );
         }
     }
 
@@ -1080,7 +1289,16 @@ impl RecordAccumulator {
         }
     }
 
-    /// Flush all batches concurrently.
+    /// Flush all batches, respecting the global send-task cap.
+    ///
+    /// Routes through `spawn_batches_bounded` so that a user-triggered
+    /// `flush()` or `close()` with many partitions does not create an
+    /// unbounded task burst — the same `MAX_CONCURRENT_BATCH_SENDS` ceiling
+    /// that governs linger-triggered sends applies here too.
+    ///
+    /// Always returns `Ok(())`: individual send errors are delivered through
+    /// each record's `response_tx` inside `send_extracted_batch`; there is
+    /// no aggregate failure to surface at this level.
     async fn flush_all(&mut self) -> Result<()> {
         let keys: Vec<_> = self
             .batches
@@ -1096,26 +1314,14 @@ impl RecordAccumulator {
             }
         }
 
-        // Send all batches concurrently
-        let mut join_set = tokio::task::JoinSet::new();
-        for ((topic, partition), (batch, guard)) in extracted {
-            let metadata = self.metadata.clone();
-            let config = self.config.clone();
-            let retry_policy = self.retry_policy.clone();
-            let metrics = self.metrics.clone();
-            join_set.spawn(Self::send_extracted_batch(
-                topic,
-                partition,
-                batch.pending,
-                batch.created_at,
-                guard,
-                metadata,
-                config,
-                retry_policy,
-                metrics,
-            ));
-        }
-        while join_set.join_next().await.is_some() {}
+        Self::spawn_batches_bounded(
+            extracted,
+            &self.metadata,
+            &self.config,
+            &self.retry_policy,
+            &self.metrics,
+        )
+        .await;
         Ok(())
     }
 }
@@ -1201,8 +1407,12 @@ mod tests {
         assert!(config.linger.is_zero());
     }
 
-    /// Verify flush_batch signature enables spawning
-    /// (send_extracted_batch is 'static + Send, required for tokio::spawn).
+    /// Verify `send_extracted_batch` is `'static + Send`.
+    ///
+    /// All detached flush paths (`spawn_batches_detached`, `flush_batch`,
+    /// etc.) ultimately call `tokio::spawn(Self::send_extracted_batch(...))`;
+    /// this compile-time assertion ensures the future stays `Send` so
+    /// `tokio::spawn` can schedule it across threads.
     #[test]
     fn test_send_extracted_batch_is_send() {
         fn assert_send<T: Send>() {}
@@ -1213,34 +1423,19 @@ mod tests {
 
     // ── Backpressure tests ──────────────────────────────────────
 
+    /// A zero-capacity semaphore forces `acquire_many(record_size)` to
+    /// block until `max_block_ms` expires, which is the backpressure
+    /// timeout path we want to exercise.
     #[tokio::test]
     async fn test_backpressure_timeout_returns_timeout_error() {
-        let (sender, mut receiver) = mpsc::channel::<AccumulatorMessage>(16);
-        let memory_freed = Arc::new(tokio::sync::Notify::new());
+        let (sender, _receiver) = mpsc::channel::<AccumulatorMessage>(16);
         let handle = RecordAccumulatorHandle {
             sender,
-            memory_freed,
+            memory_permits: Arc::new(Semaphore::new(0)),
+            memory_capacity: 1024 * 1024, // larger than any test record
             max_block_ms: Duration::from_millis(50),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
         };
-
-        // Spawn a fake accumulator that always responds BufferFull
-        tokio::spawn(async move {
-            while let Some(msg) = receiver.recv().await {
-                if let AccumulatorMessage::Append {
-                    record,
-                    response_tx,
-                    operation_guard,
-                    ..
-                } = msg
-                {
-                    let _ = response_tx.send(AppendResponse::BufferFull {
-                        record,
-                        operation_guard,
-                    });
-                }
-            }
-        });
 
         let record = ProducerRecord::new("topic", b"value".to_vec());
         let result = handle.append(record, 0).await;
@@ -1257,15 +1452,164 @@ mod tests {
         );
     }
 
+    /// `Semaphore::add_permits` immediately wakes the front FIFO waiter,
+    /// which is the mechanism that replaces `Notify::notify_waiters()`
+    /// for backpressure release.
     #[tokio::test]
-    async fn test_backpressure_unblocks_on_notify() {
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let n = notify.clone();
+    async fn test_backpressure_unblocks_on_permit_release() {
+        let sem = Arc::new(Semaphore::new(0));
+        let s = sem.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            n.notify_waiters();
+            s.add_permits(128);
         });
-        let result = tokio::time::timeout(Duration::from_secs(2), notify.notified()).await;
-        assert!(result.is_ok(), "notify should have fired");
+        let result = tokio::time::timeout(Duration::from_secs(2), sem.acquire_many(64)).await;
+        assert!(result.is_ok(), "acquire_many should have completed");
+        assert!(
+            result.unwrap().is_ok(),
+            "acquire_many should have succeeded"
+        );
+    }
+
+    /// Records larger than `memory_capacity` must be rejected immediately
+    /// rather than blocking forever on `acquire_many` (which would never
+    /// succeed against a semaphore that cannot hold that many permits).
+    #[tokio::test]
+    async fn test_oversize_record_rejected_immediately() {
+        let (sender, _receiver) = mpsc::channel::<AccumulatorMessage>(16);
+        let handle = RecordAccumulatorHandle {
+            sender,
+            memory_permits: Arc::new(Semaphore::new(16)),
+            memory_capacity: 16, // deliberately tiny
+            max_block_ms: Duration::from_secs(60),
+            in_flight_barrier: Arc::new(InFlightBarrier::new()),
+        };
+
+        let record = ProducerRecord::new("topic", vec![0u8; 1024]);
+        let start = std::time::Instant::now();
+        let result = handle.append(record, 0).await;
+        // Must return synchronously without waiting for max_block_ms.
+        assert!(start.elapsed() < Duration::from_secs(1));
+        let err = result.expect_err("oversize record must be rejected");
+        assert!(
+            err.to_string().contains("buffer_memory"),
+            "expected buffer_memory error, got: {err}"
+        );
+    }
+
+    /// A closed semaphore (panic recovery path) must propagate to
+    /// in-flight `acquire_many` calls as an error, not hang them.
+    #[tokio::test]
+    async fn test_closed_semaphore_unblocks_waiters() {
+        let (sender, _receiver) = mpsc::channel::<AccumulatorMessage>(16);
+        let sem = Arc::new(Semaphore::new(0));
+        let handle = RecordAccumulatorHandle {
+            sender,
+            memory_permits: sem.clone(),
+            memory_capacity: 1024 * 1024,
+            max_block_ms: Duration::from_secs(60),
+            in_flight_barrier: Arc::new(InFlightBarrier::new()),
+        };
+
+        let sem_close = sem.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            sem_close.close();
+        });
+
+        let record = ProducerRecord::new("topic", b"value".to_vec());
+        let start = std::time::Instant::now();
+        let result = handle.append(record, 0).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "must unblock on close, not on max_block timeout"
+        );
+        let err = result.expect_err("closed semaphore must surface as error");
+        assert!(
+            matches!(err, KrafkaError::InvalidState { .. }),
+            "expected InvalidState variant, got: {err:?}"
+        );
+    }
+
+    /// Regression: if the `AccumulatorMessage::Append` is dropped before
+    /// the accumulator hands the permits off to an `InFlightGuard` (task
+    /// panic mid-handle, receiver dropped during shutdown, etc.), the
+    /// RAII `PermitReservation` must release the permits back to the
+    /// pool. A leak here would permanently reduce `buffer_memory`.
+    #[tokio::test]
+    async fn test_permits_released_when_append_message_dropped() {
+        let (sender, mut receiver) = mpsc::channel::<AccumulatorMessage>(16);
+        let sem = Arc::new(Semaphore::new(1024));
+        let handle = RecordAccumulatorHandle {
+            sender,
+            memory_permits: sem.clone(),
+            memory_capacity: 1024,
+            max_block_ms: Duration::from_millis(500),
+            in_flight_barrier: Arc::new(InFlightBarrier::new()),
+        };
+
+        let record = ProducerRecord::new("topic", vec![0u8; 256]);
+        let append_fut = tokio::spawn(async move { handle.append(record, 0).await });
+
+        // Receive the Append message and immediately drop it without responding.
+        // Dropping the message triggers `PermitReservation::drop`, which returns
+        // the permits to the semaphore. This is deterministic — no sleep or
+        // timer needed, and the test is fully reproducible under load.
+        let msg = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("timed out waiting for Append message to arrive in channel")
+            .expect("channel closed before message arrived");
+        drop(msg);
+        drop(receiver);
+
+        // The response_tx inside the message was dropped above; response_rx
+        // returns RecvError, which surfaces as an InvalidState error.
+        let _ = append_fut.await;
+
+        // All 1024 permits must be available again — no leak.
+        assert_eq!(
+            sem.available_permits(),
+            1024,
+            "permits leaked when the Append message was dropped"
+        );
+    }
+
+    /// `check_record_admission` rejects records that exceed `buffer_memory`.
+    ///
+    /// Tests the `buffer_memory` branch independently via the extracted
+    /// helper so both admission failure modes are regression-proof without
+    /// needing to allocate large buffers.
+    #[test]
+    fn test_check_record_admission_rejects_oversized_for_buffer() {
+        let err = check_record_admission(1024, 16).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("buffer_memory"),
+            "error must cite buffer_memory, got: {msg}"
+        );
+        assert!(
+            !msg.contains("u32::MAX"),
+            "must not cite u32::MAX for a buffer_memory rejection, got: {msg}"
+        );
+    }
+
+    /// `check_record_admission` rejects records that exceed `u32::MAX`.
+    ///
+    /// Tests the `u32::MAX` branch directly via the extracted helper —
+    /// no >4 GiB allocation needed.
+    #[test]
+    fn test_check_record_admission_rejects_oversized_for_u32_max() {
+        // Synthetic size just above u32::MAX — no allocation required.
+        let oversized = u32::MAX as usize + 1;
+        let err = check_record_admission(oversized, usize::MAX).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("u32::MAX"),
+            "error must cite u32::MAX, got: {msg}"
+        );
+        assert!(
+            !msg.contains("buffer_memory"),
+            "must not cite buffer_memory for a u32::MAX rejection, got: {msg}"
+        );
     }
 }

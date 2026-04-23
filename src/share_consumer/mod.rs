@@ -178,6 +178,7 @@ impl ShareConsumer {
         pool_config.init_tls().await?;
 
         let pool = Arc::new(ConnectionPool::new(pool_config));
+        pool.start_idle_evictor();
 
         let bootstrap_servers = crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
 

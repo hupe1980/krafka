@@ -668,6 +668,18 @@ pub struct BrokerConnection {
     /// KIP-219: deadline until which normal-priority requests should be
     /// delayed because the broker signalled quota throttling.
     throttle_until: Arc<parking_lot::Mutex<Instant>>,
+    /// Instant anchor used with `last_used_nanos` to compute idle duration
+    /// without locking. Set once at connect time; never mutated.
+    created_at: Instant,
+    /// Monotonic-nanoseconds since `created_at` of the last submitted
+    /// request. Updated on every `send_request_with_priority` and
+    /// `send_fire_and_forget` entry. Read by `ConnectionPool::evict_idle`
+    /// to decide whether a connection has been idle past
+    /// `connections.max.idle.ms`. An `AtomicU64` rather than a lock keeps
+    /// the network hot path free of contention; the only race is two
+    /// concurrent senders both storing a "recent" value, which is fine
+    /// because either observer still reads "recently used".
+    last_used_nanos: AtomicU64,
 }
 
 /// Connection statistics for monitoring.
@@ -740,6 +752,8 @@ impl BrokerConnection {
             session_expiry: None,
             stats,
             throttle_until: Arc::new(parking_lot::Mutex::new(Instant::now())),
+            created_at: Instant::now(),
+            last_used_nanos: AtomicU64::new(0),
         };
 
         let request_timeout = config.request_timeout;
@@ -1884,6 +1898,10 @@ impl BrokerConnection {
         priority: RequestPriority,
         request_body: impl FnOnce(&mut BytesMut) -> Result<()>,
     ) -> Result<Bytes> {
+        // M1: refresh the idle timestamp on every submission so the pool's
+        // idle-evictor does not close an actively used connection.
+        self.mark_used();
+
         // KIP-219: honour broker throttle for normal-priority requests.
         if priority == RequestPriority::Normal {
             let remaining = {
@@ -1959,6 +1977,9 @@ impl BrokerConnection {
         api_version: i16,
         request_body: impl FnOnce(&mut BytesMut) -> Result<()>,
     ) -> Result<()> {
+        // M1: refresh the idle timestamp on every submission.
+        self.mark_used();
+
         let correlation_id = self.correlation_id_gen.next();
         let mut encoder = Encoder::new();
 
@@ -2119,6 +2140,77 @@ impl BrokerConnection {
     #[inline]
     pub fn is_usable(&self) -> bool {
         self.is_alive() && !self.needs_reauthentication()
+    }
+
+    /// Record that the connection was just used for a request.
+    ///
+    /// Called from the submission paths (`send_request_with_priority`,
+    /// `send_fire_and_forget`). Stores monotonic nanos since `created_at`
+    /// into `last_used_nanos`; reads happen from [`idle_duration`].
+    #[inline]
+    fn mark_used(&self) {
+        let elapsed = self.created_at.elapsed().as_nanos();
+        // Saturate on the (astronomical) overflow boundary rather than panic.
+        let nanos = u64::try_from(elapsed).unwrap_or(u64::MAX);
+        self.last_used_nanos.store(nanos, Ordering::Relaxed);
+    }
+
+    /// Duration since the last submitted request on this connection.
+    ///
+    /// A freshly connected socket that has sent no requests reports its
+    /// full age (since `created_at`) as idle — identical to Java's
+    /// `connections.max.idle.ms` accounting.
+    #[inline]
+    pub fn idle_duration(&self) -> Duration {
+        let last = self.last_used_nanos.load(Ordering::Relaxed);
+        let now = self.created_at.elapsed();
+        now.saturating_sub(Duration::from_nanos(last))
+    }
+
+    /// Test-only: construct a minimal, non-I/O-capable `BrokerConnection`
+    /// with `created_at` backdated by `idle_for`, so `idle_duration()`
+    /// reports at least `idle_for`. Used by pool eviction tests that need
+    /// to exercise `evict_idle` without standing up a real broker.
+    ///
+    /// The returned connection:
+    /// - has dropped receivers for both priority channels (sending on it
+    ///   will fail; this is intentional — the stub is only consumed by
+    ///   the eviction scan, which never sends);
+    /// - is marked `alive = true` so `is_alive()` reports consistently;
+    /// - has `last_used_nanos = 0` so idle time equals full age.
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
+    pub(crate) fn test_stub_idle_for(address: &str, idle_for: Duration) -> Self {
+        let (high_priority_tx, _) = mpsc::channel(1);
+        let (normal_priority_tx, _) = mpsc::channel(1);
+        Self {
+            address: address.to_string(),
+            config: ConnectionConfig::default(),
+            correlation_id_gen: Arc::new(CorrelationIdGenerator::new()),
+            high_priority_tx,
+            normal_priority_tx,
+            api_versions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            session_expiry: None,
+            stats: Arc::new(ConnectionStats::default()),
+            throttle_until: Arc::new(parking_lot::Mutex::new(Instant::now())),
+            created_at: Instant::now()
+                .checked_sub(idle_for)
+                // `unwrap`: test idle_for values are always small (≤ 10s) and
+                // any system uptime on which tests run exceeds that easily;
+                // failing loudly here is better than silently yielding a fresh
+                // timestamp that makes eviction tests vacuously pass.
+                .expect("idle_for exceeds system uptime; cannot backdate Instant"),
+            last_used_nanos: AtomicU64::new(0),
+        }
+    }
+
+    /// Test-only: refresh `last_used_nanos` to "now" without going through
+    /// a send path. Used to verify the evictor's race re-check rescues a
+    /// connection that was refreshed between the snapshot and the write.
+    #[cfg(test)]
+    pub(crate) fn test_mark_fresh(&self) {
+        self.mark_used();
     }
 
     /// Get the broker address.

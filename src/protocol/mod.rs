@@ -124,6 +124,62 @@ pub const MAX_DECODE_ARRAY_LEN: usize = 100_000;
 /// bypassing `max_request_size` checks.
 pub const MAX_RECORD_HEADERS: usize = 10_000;
 
+/// Validate a topic name against the Kafka wire-format limit.
+///
+/// Fix for H6: the infallible [`Encode`] impl on [`KafkaString`] panics when
+/// a value exceeds `i16::MAX` bytes. Rather than refactoring every call site
+/// through the fallible [`TryEncode`] path, we validate at the public API
+/// boundary so the panic path is structurally unreachable in production —
+/// matching Kafka's Java client and `librdkafka`, which reject oversize
+/// inputs at ingress with `InvalidTopicException` / `RD_KAFKA_RESP_ERR__INVALID_ARG`.
+///
+/// This helper is **not** a full broker-side topic-name validator (Kafka's
+/// broker limit is 249 chars of a restricted charset); it enforces only the
+/// wire-format prerequisite for panic-free encoding. Brokers remain the
+/// authority on semantic validity.
+///
+/// Checks:
+/// - Non-empty.
+/// - Length fits in an `i16` length prefix (the `KafkaString` wire limit of
+///   32 767 bytes).
+///
+/// Use at every public ingress where a user-supplied topic name reaches a
+/// request encoder (see call sites in [`crate::admin`] and
+/// [`crate::producer::ProducerRecord::validate`]).
+#[inline]
+pub fn validate_topic_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(KrafkaError::protocol("topic name cannot be empty"));
+    }
+    if name.len() > i16::MAX as usize {
+        return Err(KrafkaError::protocol(format!(
+            "topic name length {} exceeds protocol limit of {}",
+            name.len(),
+            i16::MAX
+        )));
+    }
+    Ok(())
+}
+
+/// Validate every topic name in `names` via [`validate_topic_name`].
+///
+/// Short-circuits on the first invalid name encountered in iteration order.
+/// For inputs with deterministic iteration order (e.g. slices or `Vec`s) the
+/// surfaced error is also deterministic and matches the single-name helper's
+/// message exactly. Preferred over `for name in names { validate_topic_name(name)? }`
+/// sprinkled across call sites, because the shared implementation keeps
+/// the H6 coverage surface easy to audit.
+#[inline]
+pub fn validate_topic_names<'a, I>(names: I) -> Result<()>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    for name in names {
+        validate_topic_name(name)?;
+    }
+    Ok(())
+}
+
 /// Convert a collection length to i32, returning an error if it overflows.
 #[inline]
 pub(crate) fn array_len_i32(len: usize) -> Result<i32> {
@@ -705,6 +761,41 @@ mod tests {
         assert_eq!(check_decode_array_len(0).unwrap(), 0);
         assert_eq!(check_decode_array_len(1).unwrap(), 1);
         assert_eq!(check_decode_array_len(100_000).unwrap(), 100_000);
+    }
+
+    #[test]
+    fn validate_topic_name_accepts_valid() {
+        assert!(validate_topic_name("t").is_ok());
+        assert!(validate_topic_name("my.topic-0_1").is_ok());
+        // Boundary: exactly i16::MAX bytes is accepted.
+        let max_ok = "x".repeat(i16::MAX as usize);
+        assert!(validate_topic_name(&max_ok).is_ok());
+    }
+
+    #[test]
+    fn validate_topic_name_rejects_empty() {
+        let err = validate_topic_name("").unwrap_err().to_string();
+        assert!(err.contains("cannot be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_topic_name_rejects_oversize() {
+        let too_big = "x".repeat(i16::MAX as usize + 1);
+        let err = validate_topic_name(&too_big).unwrap_err().to_string();
+        assert!(err.contains("exceeds protocol limit"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_topic_names_short_circuits_on_first_error() {
+        // Plural helper rejects on the first invalid entry.
+        let names = ["ok", "", "also-ok"];
+        let err = validate_topic_names(names.iter().copied())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be empty"), "got: {err}");
+
+        // All-valid input passes.
+        assert!(validate_topic_names(["a", "b", "c"].iter().copied()).is_ok());
     }
 
     #[test]
