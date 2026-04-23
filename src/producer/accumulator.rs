@@ -417,9 +417,23 @@ impl RecordAccumulator {
         // Semaphore capacity: `buffer_memory` when bounded, or
         // `Semaphore::MAX_PERMITS` (effectively unlimited) when `buffer_memory
         // = 0`. A single `acquire_many` call still takes a `u32` request,
-        // so the per-record cap is `u32::MAX` regardless.
+        // so the per-record cap is `u32::MAX` regardless. If the caller
+        // configured `buffer_memory` above `Semaphore::MAX_PERMITS`
+        // (`usize::MAX >> 3`, only reachable on 32-bit targets in practice),
+        // we clamp and emit a single `warn!` so the effective cap is
+        // explicit rather than silent.
         let memory_capacity = if config.buffer_memory > 0 {
-            config.buffer_memory.min(Semaphore::MAX_PERMITS)
+            if config.buffer_memory > Semaphore::MAX_PERMITS {
+                warn!(
+                    requested = config.buffer_memory,
+                    effective = Semaphore::MAX_PERMITS,
+                    "buffer_memory exceeds Semaphore::MAX_PERMITS; clamping effective \
+                     producer memory capacity"
+                );
+                Semaphore::MAX_PERMITS
+            } else {
+                config.buffer_memory
+            }
         } else {
             Semaphore::MAX_PERMITS
         };

@@ -2167,6 +2167,47 @@ impl BrokerConnection {
         now.saturating_sub(Duration::from_nanos(last))
     }
 
+    /// Test-only: construct a minimal, non-I/O-capable `BrokerConnection`
+    /// with `created_at` backdated by `idle_for`, so `idle_duration()`
+    /// reports at least `idle_for`. Used by pool eviction tests that need
+    /// to exercise `evict_idle` without standing up a real broker.
+    ///
+    /// The returned connection:
+    /// - has dropped receivers for both priority channels (sending on it
+    ///   will fail; this is intentional — the stub is only consumed by
+    ///   the eviction scan, which never sends);
+    /// - is marked `alive = true` so `is_alive()` reports consistently;
+    /// - has `last_used_nanos = 0` so idle time equals full age.
+    #[cfg(test)]
+    pub(crate) fn test_stub_idle_for(address: &str, idle_for: Duration) -> Self {
+        let (high_priority_tx, _) = mpsc::channel(1);
+        let (normal_priority_tx, _) = mpsc::channel(1);
+        Self {
+            address: address.to_string(),
+            config: ConnectionConfig::default(),
+            correlation_id_gen: Arc::new(CorrelationIdGenerator::new()),
+            high_priority_tx,
+            normal_priority_tx,
+            api_versions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            session_expiry: None,
+            stats: Arc::new(ConnectionStats::default()),
+            throttle_until: Arc::new(parking_lot::Mutex::new(Instant::now())),
+            created_at: Instant::now()
+                .checked_sub(idle_for)
+                .unwrap_or_else(Instant::now),
+            last_used_nanos: AtomicU64::new(0),
+        }
+    }
+
+    /// Test-only: refresh `last_used_nanos` to "now" without going through
+    /// a send path. Used to verify the evictor's race re-check rescues a
+    /// connection that was refreshed between the snapshot and the write.
+    #[cfg(test)]
+    pub(crate) fn test_mark_fresh(&self) {
+        self.mark_used();
+    }
+
     /// Get the broker address.
     #[inline]
     pub fn address(&self) -> &str {

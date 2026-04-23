@@ -1117,4 +1117,70 @@ mod tests {
             "evictor must not be installed without a Tokio runtime"
         );
     }
+
+    #[test]
+    fn test_evict_idle_removes_stale_from_both_maps() {
+        // Stub connection is idle for 10 s; max_idle is 100 ms, so the
+        // entry is stale in both `connections` (by broker id) and
+        // `connections_by_addr` (bootstrap map).
+        let pool = ConnectionPool::new(ConnectionConfig::default())
+            .with_max_idle(Some(Duration::from_millis(100)));
+        let stale = Arc::new(BrokerConnection::test_stub_idle_for(
+            "b1:9092",
+            Duration::from_secs(10),
+        ));
+        pool.connections.write().insert(1, stale.clone());
+        pool.connections_by_addr
+            .write()
+            .insert("b1:9092".to_string(), stale);
+
+        // Same socket shared across both maps must dedup to a single
+        // eviction.
+        assert_eq!(pool.evict_idle(), 1);
+        assert!(pool.connections.read().is_empty());
+        assert!(pool.connections_by_addr.read().is_empty());
+    }
+
+    #[test]
+    fn test_evict_idle_retains_fresh_and_evicts_stale() {
+        let pool = ConnectionPool::new(ConnectionConfig::default())
+            .with_max_idle(Some(Duration::from_millis(100)));
+        let stale = Arc::new(BrokerConnection::test_stub_idle_for(
+            "b1:9092",
+            Duration::from_secs(10),
+        ));
+        let fresh = Arc::new(BrokerConnection::test_stub_idle_for(
+            "b2:9092",
+            Duration::from_millis(10),
+        ));
+        {
+            let mut w = pool.connections.write();
+            w.insert(1, stale);
+            w.insert(2, fresh);
+        }
+
+        assert_eq!(pool.evict_idle(), 1);
+        let kept = pool.connections.read();
+        assert!(!kept.contains_key(&1));
+        assert!(kept.contains_key(&2));
+    }
+
+    #[test]
+    fn test_evict_idle_rescued_after_refresh() {
+        // Pin the freshness side of the contract: a connection that has
+        // been marked used is not evicted even if its `created_at` is old.
+        // This covers the same code path the write-lock re-check uses
+        // (a refresh invalidates the stale decision).
+        let pool = ConnectionPool::new(ConnectionConfig::default())
+            .with_max_idle(Some(Duration::from_millis(100)));
+        let conn = Arc::new(BrokerConnection::test_stub_idle_for(
+            "b1:9092",
+            Duration::from_secs(10),
+        ));
+        conn.test_mark_fresh();
+        pool.connections.write().insert(1, conn);
+
+        assert_eq!(pool.evict_idle(), 0);
+        assert!(pool.connections.read().contains_key(&1));
+    }
 }
