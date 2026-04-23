@@ -856,14 +856,14 @@ impl RecordAccumulator {
         let config = config.clone();
         let retry_policy = retry_policy.clone();
         let metrics = metrics.clone();
-        // Fire-and-forget: dropping the JoinHandle detaches the task;
-        // it continues running independently. The task is self-contained
-        // (InFlightGuard ensures memory permits are reclaimed on completion
-        // or panic) so we do not need to track it.
-        let _wave = tokio::spawn(async move {
+        // Fire-and-forget: drop the JoinHandle immediately to make the
+        // detached semantics explicit. The spawned task is self-contained —
+        // `InFlightGuard` reclaims memory permits on completion or panic —
+        // so there is nothing to join.
+        drop(tokio::spawn(async move {
             Self::spawn_batches_bounded(extracted, &metadata, &config, &retry_policy, &metrics)
                 .await;
-        });
+        }));
     }
 
     /// Extract a batch from the accumulator and account its byte count
@@ -893,32 +893,23 @@ impl RecordAccumulator {
         Some((batch, guard))
     }
 
-    /// Flush a specific batch by spawning a detached send task.
+    /// Flush a specific batch by routing through `spawn_batches_detached`.
     ///
-    /// Spawns exactly one `send_extracted_batch` task and returns immediately
-    /// so the accumulator run loop is never blocked on the linger=0 hot path
-    /// or when a full batch is encountered during an append. `InFlightGuard`
-    /// limits per-broker parallelism; `send_extracted_batch` handles all
-    /// retry and backpressure internally.
+    /// All flush paths (`flush_batch`, `flush_all_ready`, `check_linger_expiry`)
+    /// funnel through `spawn_batches_detached` → `spawn_batches_bounded`,
+    /// ensuring the `MAX_CONCURRENT_BATCH_SENDS` ceiling is applied uniformly.
+    /// A single-entry vec exits the bounded loop before any backpressure
+    /// point, so this path adds no observable overhead beyond the outer
+    /// wrapper task that `spawn_batches_detached` spawns.
     fn flush_batch(&mut self, key: &(String, PartitionId)) {
-        if let Some((batch, guard)) = self.extract_batch(key) {
-            let topic = key.0.clone();
-            let partition = key.1;
-            let metadata = self.metadata.clone();
-            let config = self.config.clone();
-            let retry_policy = self.retry_policy.clone();
-            let metrics = self.metrics.clone();
-            tokio::spawn(Self::send_extracted_batch(
-                topic,
-                partition,
-                batch.pending,
-                batch.created_at,
-                guard,
-                metadata,
-                config,
-                retry_policy,
-                metrics,
-            ));
+        if let Some(item) = self.extract_batch(key) {
+            Self::spawn_batches_detached(
+                vec![(key.clone(), item)],
+                &self.metadata,
+                &self.config,
+                &self.retry_policy,
+                &self.metrics,
+            );
         }
     }
 
@@ -1416,8 +1407,12 @@ mod tests {
         assert!(config.linger.is_zero());
     }
 
-    /// Verify flush_batch signature enables spawning
-    /// (send_extracted_batch is 'static + Send, required for tokio::spawn).
+    /// Verify `send_extracted_batch` is `'static + Send`.
+    ///
+    /// All detached flush paths (`spawn_batches_detached`, `flush_batch`,
+    /// etc.) ultimately call `tokio::spawn(Self::send_extracted_batch(...))`;
+    /// this compile-time assertion ensures the future stays `Send` so
+    /// `tokio::spawn` can schedule it across threads.
     #[test]
     fn test_send_extracted_batch_is_send() {
         fn assert_send<T: Send>() {}
