@@ -337,13 +337,56 @@ fn build_fetch_routing_plan(
 /// and its unit test so that the test exercises the real logic.
 fn group_topic_partitions(partitions: &[(&str, PartitionId)]) -> HashMap<String, Vec<PartitionId>> {
     let mut grouped: HashMap<String, Vec<PartitionId>> = HashMap::new();
-    for (topic, partition) in partitions {
-        grouped
-            .entry((*topic).to_string())
-            .or_default()
-            .push(*partition);
+    for &(topic, partition) in partitions {
+        // Use get_mut to avoid allocating a String key on every lookup;
+        // only insert (and therefore allocate) when the topic is first seen.
+        if let Some(v) = grouped.get_mut(topic) {
+            v.push(partition);
+        } else {
+            grouped.insert(topic.to_string(), vec![partition]);
+        }
     }
     grouped
+}
+
+/// Apply a [`ListOffsetsResponse`] into a per-partition result map.
+///
+/// For each partition in the response:
+/// - `error_code == None` → inserts `Ok(offset)`.
+/// - any other error code → inserts `Err(KrafkaError::broker(...))` and logs
+///   a `warn!`.
+///
+/// Partitions not mentioned in the response are left unchanged, so the
+/// pre-populated `Err("no leader found …")` sentinel that `resolve_list_offsets`
+/// inserts before calling this function is preserved for any partition the
+/// broker did not report.
+fn apply_list_offsets_response(
+    response: &ListOffsetsResponse,
+    result: &mut HashMap<(String, PartitionId), Result<Offset>>,
+) {
+    for topic_resp in &response.topics {
+        for part_resp in &topic_resp.partitions {
+            let key = (topic_resp.name.clone(), part_resp.partition_index);
+            if part_resp.error_code.is_ok() {
+                result.insert(key, Ok(part_resp.offset));
+            } else {
+                warn!(
+                    "ListOffsets error for {}-{}: {:?}",
+                    topic_resp.name, part_resp.partition_index, part_resp.error_code
+                );
+                result.insert(
+                    key,
+                    Err(KrafkaError::broker(
+                        part_resp.error_code,
+                        format!(
+                            "ListOffsets error for {}-{}",
+                            topic_resp.name, part_resp.partition_index
+                        ),
+                    )),
+                );
+            }
+        }
+    }
 }
 
 impl Consumer {
@@ -1892,29 +1935,7 @@ impl Consumer {
                 }
             };
 
-            for topic_resp in &list_response.topics {
-                for part_resp in &topic_resp.partitions {
-                    let key = (topic_resp.name.clone(), part_resp.partition_index);
-                    if part_resp.error_code.is_ok() {
-                        result.insert(key, Ok(part_resp.offset));
-                    } else {
-                        warn!(
-                            "ListOffsets error for {}-{}: {:?}",
-                            topic_resp.name, part_resp.partition_index, part_resp.error_code
-                        );
-                        result.insert(
-                            key,
-                            Err(KrafkaError::broker(
-                                part_resp.error_code,
-                                format!(
-                                    "ListOffsets error for {}-{}",
-                                    topic_resp.name, part_resp.partition_index
-                                ),
-                            )),
-                        );
-                    }
-                }
-            }
+            apply_list_offsets_response(&list_response, &mut result);
         }
 
         result
@@ -4610,7 +4631,7 @@ mod tests {
         assert_eq!(t2.partitions[0].partition_index, 1);
     }
 
-    /// Test response result extraction — successful offsets are collected.
+    /// Test response result extraction — every partition maps to Ok(offset).
     #[test]
     fn test_list_offsets_response_result_extraction() {
         use crate::error::ErrorCode;
@@ -4651,27 +4672,17 @@ mod tests {
             ],
         };
 
-        // Simulate the result extraction logic from resolve_list_offsets
-        let mut result: HashMap<(String, PartitionId), Offset> = HashMap::new();
-        for topic_resp in &response.topics {
-            for part_resp in &topic_resp.partitions {
-                if part_resp.error_code.is_ok() {
-                    result.insert(
-                        (topic_resp.name.clone(), part_resp.partition_index),
-                        part_resp.offset,
-                    );
-                }
-            }
-        }
+        let mut result: HashMap<(String, PartitionId), Result<Offset>> = HashMap::new();
+        apply_list_offsets_response(&response, &mut result);
 
         assert_eq!(result.len(), 3);
-        assert_eq!(result[&("topic1".to_string(), 0)], 42);
-        assert_eq!(result[&("topic1".to_string(), 1)], 100);
-        assert_eq!(result[&("topic2".to_string(), 0)], 7);
+        assert_eq!(*result[&("topic1".to_string(), 0)].as_ref().unwrap(), 42);
+        assert_eq!(*result[&("topic1".to_string(), 1)].as_ref().unwrap(), 100);
+        assert_eq!(*result[&("topic2".to_string(), 0)].as_ref().unwrap(), 7);
     }
 
-    /// Test partial failure — some partitions succeed, some have error codes.
-    /// Successful results are kept; errors are recorded but don't block success.
+    /// Test partial failure — successful partitions map to Ok, failed partition
+    /// maps to Err. No partition is dropped from the result.
     #[test]
     fn test_list_offsets_partial_failure_keeps_successes() {
         use crate::error::ErrorCode;
@@ -4707,41 +4718,28 @@ mod tests {
             }],
         };
 
-        let mut result: HashMap<(String, PartitionId), Offset> = HashMap::new();
-        let mut last_error: Option<KrafkaError> = None;
+        let mut result: HashMap<(String, PartitionId), Result<Offset>> = HashMap::new();
+        apply_list_offsets_response(&response, &mut result);
 
-        for topic_resp in &response.topics {
-            for part_resp in &topic_resp.partitions {
-                if part_resp.error_code.is_ok() {
-                    result.insert(
-                        (topic_resp.name.clone(), part_resp.partition_index),
-                        part_resp.offset,
-                    );
-                } else {
-                    last_error = Some(KrafkaError::broker(
-                        part_resp.error_code,
-                        format!(
-                            "ListOffsets error for {}-{}",
-                            topic_resp.name, part_resp.partition_index
-                        ),
-                    ));
-                }
-            }
-        }
-
-        // Successful partitions are present
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[&("topic1".to_string(), 0)], 42);
-        assert_eq!(result[&("topic1".to_string(), 2)], 99);
-        // Failed partition is not present
-        assert!(!result.contains_key(&("topic1".to_string(), 1)));
-        // Error was recorded
-        assert!(last_error.is_some());
-        // But since we have results, the method would return Ok (not Err)
-        assert!(!result.is_empty());
+        // All three partitions are present in the map.
+        assert_eq!(result.len(), 3);
+        // Successful partitions carry Ok(offset).
+        assert_eq!(*result[&("topic1".to_string(), 0)].as_ref().unwrap(), 42);
+        assert_eq!(*result[&("topic1".to_string(), 2)].as_ref().unwrap(), 99);
+        // Failed partition is present with Err, not absent.
+        assert!(result[&("topic1".to_string(), 1)].is_err());
+        let err_msg = result[&("topic1".to_string(), 1)]
+            .as_ref()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_msg.contains("ListOffsets error"),
+            "unexpected: {err_msg}"
+        );
     }
 
-    /// Test that all-failed response with no results propagates the error.
+    /// Test that an all-failed response returns every partition as Err —
+    /// the function itself does not return a top-level error.
     #[test]
     fn test_list_offsets_all_failed_returns_error() {
         use crate::error::ErrorCode;
@@ -4761,33 +4759,20 @@ mod tests {
             }],
         };
 
-        let mut result: HashMap<(String, PartitionId), Offset> = HashMap::new();
-        let mut last_error: Option<KrafkaError> = None;
+        let mut result: HashMap<(String, PartitionId), Result<Offset>> = HashMap::new();
+        apply_list_offsets_response(&response, &mut result);
 
-        for topic_resp in &response.topics {
-            for part_resp in &topic_resp.partitions {
-                if part_resp.error_code.is_ok() {
-                    result.insert(
-                        (topic_resp.name.clone(), part_resp.partition_index),
-                        part_resp.offset,
-                    );
-                } else {
-                    last_error = Some(KrafkaError::broker(
-                        part_resp.error_code,
-                        format!(
-                            "ListOffsets error for {}-{}",
-                            topic_resp.name, part_resp.partition_index
-                        ),
-                    ));
-                }
-            }
-        }
-
-        // No results — method would return Err(last_error)
-        assert!(result.is_empty());
-        assert!(last_error.is_some());
-        let err = last_error.unwrap();
-        assert!(err.to_string().contains("ListOffsets error"));
+        // The partition is present in the map, mapped to Err.
+        assert_eq!(result.len(), 1);
+        assert!(result[&("topic1".to_string(), 0)].is_err());
+        let err_msg = result[&("topic1".to_string(), 0)]
+            .as_ref()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_msg.contains("ListOffsets error"),
+            "unexpected: {err_msg}"
+        );
     }
 
     /// Test ListOffsets request encoding for v1 and v2 produces expected sizes.
