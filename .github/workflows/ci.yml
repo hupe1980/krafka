@@ -67,7 +67,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kafka-version: ["3.9.0", "4.0.0"]
+        include:
+          # apache/kafka-native (GraalVM) is fast but segfaults on getpwuid in
+          # some CI environments; use it only where it is known to be stable.
+          - kafka-version: "3.9.0"
+            kafka-image: "apache/kafka-native"
+          # Kafka 4.0.0 native image consistently segfaults on GitHub Actions
+          # (GraalVM Pwd.getpwuid bug); use the JVM image instead.
+          - kafka-version: "4.0.0"
+            kafka-image: "apache/kafka"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -75,7 +83,7 @@ jobs:
       - name: Pre-pull Kafka image
         run: |
           for i in 1 2 3; do
-            docker pull apache/kafka-native:${{ matrix.kafka-version }} && break
+            docker pull ${{ matrix.kafka-image }}:${{ matrix.kafka-version }} && break
             echo "Retry $i failed, waiting..."
             sleep 10
           done
@@ -83,6 +91,7 @@ jobs:
         timeout-minutes: 45
         env:
           KAFKA_VERSION: ${{ matrix.kafka-version }}
+          KAFKA_IMAGE: ${{ matrix.kafka-image }}
 
   msrv:
     name: MSRV (1.88)

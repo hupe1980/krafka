@@ -213,6 +213,33 @@ let consumer = Consumer::builder()
 
 > **Note:** `isolation_level` affects both data fetches and offset resolution (ListOffsets). Krafka passes the isolation level to the broker via ListOffsets (v2+, up to v11).
 
+### Metadata Topic Cache TTL
+
+During a partial metadata refresh (where only the subscribed topics are re-fetched rather than the entire cluster), Krafka caches each topic's metadata between refreshes. By default, a topic entry is evicted from this cache after **5 minutes** of not being successfully refreshed — matching Java's `metadata.max.idle.ms` — to prevent unbounded growth when topics are deleted or subscriptions change.
+
+```rust
+use krafka::consumer::Consumer;
+use std::time::Duration;
+
+// Use a custom TTL (e.g. 10 minutes):
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .metadata_topic_cache_ttl(Duration::from_secs(600))
+    .build()
+    .await?;
+
+// Opt out of TTL eviction entirely (topics persist until the cache is flushed):
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .disable_metadata_topic_cache_ttl()
+    .build()
+    .await?;
+```
+
+> **Note:** TTL eviction only affects the partial-refresh cache. A full metadata refresh (triggered by `metadata_max_age` expiry or an explicit refresh) always replaces the cache unconditionally.
+
 ## Consumer Groups
 
 ### How Consumer Groups Work

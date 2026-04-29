@@ -471,9 +471,9 @@ impl PartitionAssignor for RoundRobinAssignor {
         // Round-robin assign
         for (idx, (topic, partition)) in all_partitions.into_iter().enumerate() {
             let member = &members[idx % members.len()];
-            let member_topics = member_topic_partitions
-                .get_mut(&member.member_id)
-                .expect("member must exist in pre-populated map");
+            let Some(member_topics) = member_topic_partitions.get_mut(&member.member_id) else {
+                unreachable!("member must exist in pre-populated map");
+            };
             member_topics.entry(topic).or_default().push(partition);
         }
 
@@ -619,9 +619,7 @@ impl PartitionAssignor for CooperativeStickyAssignor {
                                     sticky_assignments.entry(key)
                                 {
                                     e.insert(mid.clone());
-                                    // SAFETY: member_partition_counts was populated for all
-                                    // members in the first pass.
-                                    *member_partition_counts.get_mut(&mid).unwrap() += 1;
+                                    *member_partition_counts.entry(mid.clone()).or_insert(0) += 1;
                                 }
                             }
                         }
@@ -669,9 +667,11 @@ impl PartitionAssignor for CooperativeStickyAssignor {
             }
 
             if let Some(member_id) = best_member {
-                // SAFETY: member_partition_counts was populated for all members in the first pass.
-                *member_partition_counts.get_mut(member_id).unwrap() += 1;
-                sticky_assignments.insert(key, member_id.to_string());
+                let member_id = member_id.to_string();
+                *member_partition_counts
+                    .entry(member_id.clone())
+                    .or_insert(0) += 1;
+                sticky_assignments.insert(key, member_id);
             }
         }
 
@@ -713,9 +713,9 @@ impl PartitionAssignor for CooperativeStickyAssignor {
                             if let Some(count) = member_partition_counts.get_mut(over_member) {
                                 *count = count.saturating_sub(1);
                             }
-                            // SAFETY: member_partition_counts was populated for all members
-                            // in the first pass.
-                            *member_partition_counts.get_mut(under_member).unwrap() += 1;
+                            *member_partition_counts
+                                .entry(under_member.clone())
+                                .or_insert(0) += 1;
                             moved = true;
                             break 'outer;
                         }
@@ -1699,9 +1699,9 @@ impl GroupCoordinator {
             // Cache the negotiated heartbeat version per coordinator connection.
             // The version is stable for a given connection (API versions don't
             // change until reconnect), so we only re-negotiate when the
-            // connection identity changes.
-            let mut cached_hb_version: Option<i16> = None;
-            let mut cached_conn_id: Option<usize> = None;
+            // connection identity changes.  Storing both fields as a single
+            // Option ensures they are always set and cleared atomically.
+            let mut cached_hb: Option<(usize, i16)> = None;
 
             loop {
                 tokio::select! {
@@ -1719,12 +1719,9 @@ impl GroupCoordinator {
                         if let Some(ref conn) = coordinator_conn {
                             // Re-negotiate only when the coordinator connection changes.
                             let conn_id = std::sync::Arc::as_ptr(conn) as usize;
-                            let hb_version = if cached_conn_id == Some(conn_id) {
-                                // Safe to unwrap: cached_hb_version is always set
-                                // together with cached_conn_id.
-                                cached_hb_version.unwrap()
-                            } else {
-                                match conn
+                            let hb_version = match cached_hb {
+                                Some((id, v)) if id == conn_id => v,
+                                _ => match conn
                                     .negotiate_api_version(
                                         ApiKey::Heartbeat,
                                         HEARTBEAT_MAX,
@@ -1733,8 +1730,7 @@ impl GroupCoordinator {
                                     .await
                                 {
                                     Some(v) => {
-                                        cached_conn_id = Some(conn_id);
-                                        cached_hb_version = Some(v);
+                                        cached_hb = Some((conn_id, v));
                                         v
                                     }
                                     None => {
@@ -1747,7 +1743,7 @@ impl GroupCoordinator {
                                         heartbeat_controller.stop();
                                         break;
                                     }
-                                }
+                                },
                             };
 
                             let request = HeartbeatRequest {
@@ -3615,6 +3611,7 @@ impl std::fmt::Debug for GroupCoordinator {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

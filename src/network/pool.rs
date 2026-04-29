@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use super::connection::{BrokerConnection, ConnectionConfig};
@@ -358,6 +359,15 @@ impl BrokerConnectionBundle {
 // Connection Pool
 // ============================================================================
 
+/// Default idle-eviction timeout for a pooled connection.
+///
+/// Matches the Apache Kafka Java client's `connections.max.idle.ms = 540_000`
+/// (9 minutes). `librdkafka` defaults to 10 min and `franz-go` to 20 min; 9
+/// min is the most conservative of the reference clients and avoids
+/// accumulating sockets to rotated-out brokers on long-lived clients whose
+/// metadata churns (broker scale-up/down, topic drift).
+pub const DEFAULT_MAX_IDLE: Duration = Duration::from_secs(9 * 60);
+
 /// Waiters for coalesced reconnection attempts, keyed by address.
 type ConnectingWaiters = HashMap<String, Vec<oneshot::Sender<Result<Arc<BrokerConnection>>>>>;
 
@@ -426,10 +436,26 @@ pub struct ConnectionPool {
     config: ConnectionConfig,
     /// Retry configuration for reconnection attempts.
     retry_config: ConnectionRetryConfig,
+    /// Maximum time a connection may sit idle (no submitted requests)
+    /// before the idle-evictor removes it from the pool. `None` disables
+    /// eviction. Default: 9 min, matching the Java client's
+    /// `connections.max.idle.ms`.
+    max_idle: Option<Duration>,
+    /// Handle of the background idle-eviction task, if one was spawned.
+    /// Aborted by `close_all`. A `parking_lot::Mutex` is sufficient because
+    /// the handle is only taken/replaced in non-hot paths (startup,
+    /// shutdown).
+    evictor_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl ConnectionPool {
     /// Create a new connection pool.
+    ///
+    /// Idle eviction is **not** started automatically. After wrapping the pool
+    /// in an `Arc`, call [`Self::start_idle_evictor`] to activate the
+    /// background sweep task. Without that call, connections are never evicted
+    /// **automatically** (though [`Self::evict_idle`] can still be called
+    /// manually, regardless of [`Self::with_max_idle`]).
     pub fn new(config: ConnectionConfig) -> Self {
         Self {
             connections: RwLock::new(HashMap::new()),
@@ -437,10 +463,16 @@ impl ConnectionPool {
             connecting: Arc::new(Mutex::new(HashMap::new())),
             config,
             retry_config: ConnectionRetryConfig::default(),
+            max_idle: Some(DEFAULT_MAX_IDLE),
+            evictor_handle: Mutex::new(None),
         }
     }
 
     /// Create a new connection pool with custom retry configuration.
+    ///
+    /// As with [`Self::new`], idle eviction is **not** started automatically.
+    /// Call [`Self::start_idle_evictor`] on the resulting `Arc<Self>` to
+    /// activate the background sweep, or call [`Self::evict_idle`] manually.
     pub fn with_retry_config(
         config: ConnectionConfig,
         retry_config: ConnectionRetryConfig,
@@ -451,7 +483,49 @@ impl ConnectionPool {
             connecting: Arc::new(Mutex::new(HashMap::new())),
             config,
             retry_config,
+            max_idle: Some(DEFAULT_MAX_IDLE),
+            evictor_handle: Mutex::new(None),
         }
+    }
+
+    /// Create a new connection pool, wrap it in an `Arc`, and start the
+    /// background idle-evictor immediately.
+    ///
+    /// This is the recommended constructor for production use: the evictor
+    /// is activated automatically if a Tokio runtime is available (the same
+    /// runtime-availability guard as [`Self::start_idle_evictor`] applies —
+    /// if no runtime is detected the pool is returned without eviction and
+    /// a `warn!` is emitted).
+    ///
+    /// Use [`Self::new`] + [`Self::with_max_idle`] + manual
+    /// [`Self::start_idle_evictor`] when you need to configure the pool
+    /// before starting eviction, or when you need the raw `Self` rather
+    /// than an `Arc`.
+    pub fn start(config: ConnectionConfig) -> Arc<Self> {
+        let pool = Arc::new(Self::new(config));
+        pool.start_idle_evictor();
+        pool
+    }
+
+    /// Override the idle-eviction timeout.
+    ///
+    /// Connections that have submitted no requests for longer than this
+    /// are removed from the pool by the background evictor (see
+    /// [`ConnectionPool::start_idle_evictor`]). `None` disables eviction
+    /// entirely — matching the pre-0.5.0 behaviour.
+    ///
+    /// Default: 9 minutes (`connections.max.idle.ms = 540_000`), matching
+    /// the Apache Kafka Java client.
+    #[must_use]
+    pub fn with_max_idle(mut self, max_idle: Option<Duration>) -> Self {
+        self.max_idle = max_idle;
+        self
+    }
+
+    /// Returns the configured idle-eviction timeout.
+    #[inline]
+    pub fn max_idle(&self) -> Option<Duration> {
+        self.max_idle
     }
 
     /// Re-read TLS certificate files from disk and atomically update the
@@ -690,14 +764,192 @@ impl ConnectionPool {
         Ok(conn)
     }
 
+    /// Remove connections that have sat idle for at least `max_idle`.
+    ///
+    /// Entries are removed from both `connections` (by broker ID) and
+    /// `connections_by_addr` (bootstrap map). Each uniquely-evicted
+    /// connection is then explicitly closed by spawning `conn.close()`,
+    /// which signals the connection's internal task via the high-priority
+    /// channel. This ensures the underlying socket is torn down promptly
+    /// even if other `Arc` clones of the connection exist (e.g. in-flight
+    /// requests or coordinator caches). If no Tokio runtime is available
+    /// (e.g. in tests without a runtime), teardown falls back to
+    /// `BrokerConnection::Drop`.
+    ///
+    /// Returns the number of *unique* connections evicted. A single socket
+    /// registered under both a broker ID and a bootstrap address counts
+    /// once: the collected `Arc`s are deduplicated by pointer identity
+    /// before the count is returned, so the `debug!` log and the return
+    /// value reflect distinct sockets. No-op when `max_idle` is `None`.
+    ///
+    /// Safe to call concurrently with `get_connection_by_id` /
+    /// `get_bootstrap_connection`: any connection re-inserted between the
+    /// scan and the removal step is re-checked under the write lock, so
+    /// newly installed connections are never accidentally evicted.
+    pub fn evict_idle(&self) -> usize {
+        let Some(max_idle) = self.max_idle else {
+            return 0;
+        };
+
+        // Snapshot candidate keys under read locks; defer mutation so
+        // critical sections stay short.
+        let stale_ids: Vec<BrokerId> = {
+            let conns = self.connections.read();
+            conns
+                .iter()
+                .filter(|(_, c)| c.idle_duration() >= max_idle)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        let stale_addrs: Vec<String> = {
+            let conns = self.connections_by_addr.read();
+            conns
+                .iter()
+                .filter(|(_, c)| c.idle_duration() >= max_idle)
+                .map(|(addr, _)| addr.clone())
+                .collect()
+        };
+
+        if stale_ids.is_empty() && stale_addrs.is_empty() {
+            return 0;
+        }
+
+        let mut removed: Vec<Arc<BrokerConnection>> =
+            Vec::with_capacity(stale_ids.len() + stale_addrs.len());
+
+        if !stale_ids.is_empty() {
+            let mut conns = self.connections.write();
+            for id in &stale_ids {
+                // Re-check under the write lock: another task may have
+                // refreshed `last_used_nanos` (or replaced the entry)
+                // between the snapshot and here. `remove` + re-insert on
+                // miss avoids a second hashmap lookup on the hot path.
+                if let Some(c) = conns.remove(id) {
+                    if c.idle_duration() >= max_idle {
+                        removed.push(c);
+                    } else {
+                        conns.insert(*id, c);
+                    }
+                }
+            }
+        }
+
+        if !stale_addrs.is_empty() {
+            let mut conns = self.connections_by_addr.write();
+            for addr in &stale_addrs {
+                if let Some(c) = conns.remove(addr) {
+                    if c.idle_duration() >= max_idle {
+                        removed.push(c);
+                    } else {
+                        conns.insert(addr.clone(), c);
+                    }
+                }
+            }
+        }
+
+        // A single connection typically lives in both maps (same `Arc`
+        // registered under broker id and bootstrap address). Dedup by
+        // `Arc::as_ptr` so the eviction count reflects unique sockets
+        // and `Drop` runs once per connection without inflation.
+        removed.sort_by_key(|c| Arc::as_ptr(c) as usize);
+        removed.dedup_by(|a, b| Arc::ptr_eq(a, b));
+
+        let count = removed.len();
+        if count > 0 {
+            debug!(
+                evicted = count,
+                max_idle_ms = max_idle.as_millis(),
+                "Evicted idle connections"
+            );
+        }
+        // Explicitly close each evicted connection by signalling its internal
+        // task via the high-priority channel. This is important when other
+        // `Arc` clones are held elsewhere (e.g. in-flight requests, coordinator
+        // references): merely dropping the pool's `Arc` would leave the socket
+        // open until those callers also drop their clone. Spawning the close
+        // mirrors the pattern used in `close_all` and in `BrokerConnection::Drop`.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            for conn in removed {
+                tokio::spawn(async move { conn.close().await });
+            }
+        }
+        // If no runtime is available (tests, process exit) fall back to Drop-
+        // based teardown — the same guard used by BrokerConnection::Drop.
+        count
+    }
+
+    /// Spawn a background task that periodically calls [`Self::evict_idle`].
+    ///
+    /// Idempotent: a second call while a previous evictor is still running
+    /// aborts the previous handle before installing the new one. The task
+    /// is automatically aborted by [`Self::close_all`].
+    ///
+    /// The sweep interval is `max_idle / 9`, clamped to a minimum of 1 s
+    /// and a maximum of 60 s. This matches the Java client's approach: a
+    /// connection may sit idle for up to `max_idle + interval` before
+    /// removal, so a fractional-sweep keeps actual idle time close to
+    /// the configured bound.
+    ///
+    /// No-op when `max_idle` is `None` or when called outside a Tokio
+    /// runtime context. The runtime guard keeps the library panic-free
+    /// for integrations that construct a pool without `tokio::spawn`
+    /// being available (e.g. ad-hoc tests or synchronous tooling); such
+    /// callers simply lose the background sweep and can call
+    /// [`Self::evict_idle`] explicitly instead.
+    pub fn start_idle_evictor(self: &Arc<Self>) {
+        let Some(max_idle) = self.max_idle else {
+            return;
+        };
+        // Guard against being called outside a Tokio runtime so that
+        // `tokio::spawn` never panics. This mirrors the `BrokerConnection`
+        // Drop path, which also checks for a live runtime before spawning.
+        if tokio::runtime::Handle::try_current().is_err() {
+            warn!("start_idle_evictor called outside a Tokio runtime; idle eviction disabled");
+            return;
+        }
+        // Sweep about 9× during one idle window, clamped to sensible bounds.
+        // 9 is the same divisor the Java client uses.
+        let interval = (max_idle / 9)
+            .max(Duration::from_secs(1))
+            .min(Duration::from_secs(60));
+
+        // Dead-man-switch: if the pool is dropped the weak upgrade fails
+        // and the task exits cleanly on its next tick.
+        let weak = Arc::downgrade(self);
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // Skip the immediate fire; the first eviction happens after
+            // `interval`, not at startup.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let Some(pool) = weak.upgrade() else {
+                    break;
+                };
+                pool.evict_idle();
+            }
+        });
+        if let Some(prev) = self.evictor_handle.lock().replace(handle) {
+            prev.abort();
+        }
+    }
+
     /// Close all connections and drain both maps.
     ///
-    /// Drains the broker-ID and address maps under short write locks (one at
-    /// a time, never held simultaneously), deduplicates by `Arc` pointer,
-    /// then closes each unique connection outside any lock.  Any in-flight
-    /// reconnection waiters in the `connecting` map are notified with an
-    /// error so they do not hang during shutdown.
+    /// Stops the idle-evictor, drains the broker-ID and address maps under
+    /// short write locks (one at a time, never held simultaneously),
+    /// deduplicates by `Arc` pointer, then closes each unique connection
+    /// outside any lock. Any in-flight reconnection waiters in the
+    /// `connecting` map are notified with an error so they do not hang
+    /// during shutdown.
     pub async fn close_all(&self) {
+        // Stop the idle-evictor before tearing down state so it does not
+        // race with the drain below.
+        if let Some(handle) = self.evictor_handle.lock().take() {
+            handle.abort();
+        }
+
         // Drain both maps, acquiring each write lock independently.
         let by_id: Vec<Arc<BrokerConnection>> =
             self.connections.write().drain().map(|(_, c)| c).collect();
@@ -750,6 +1002,7 @@ impl ConnectionPool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -845,5 +1098,130 @@ mod tests {
         assert!(pool.connections_by_addr.read().is_empty());
         // close_all on empty pool should not panic
         pool.close_all().await;
+    }
+
+    #[test]
+    fn test_max_idle_default_matches_java_client() {
+        // 9 minutes = 540_000 ms, matching Apache Kafka Java client's
+        // default `connections.max.idle.ms`.
+        let pool = ConnectionPool::new(ConnectionConfig::default());
+        assert_eq!(pool.max_idle(), Some(Duration::from_millis(9 * 60 * 1000)));
+        assert_eq!(DEFAULT_MAX_IDLE, Duration::from_secs(540));
+    }
+
+    #[test]
+    fn test_with_max_idle_none_disables_eviction() {
+        let pool = ConnectionPool::new(ConnectionConfig::default()).with_max_idle(None);
+        assert_eq!(pool.max_idle(), None);
+        // `evict_idle` is a no-op when disabled.
+        assert_eq!(pool.evict_idle(), 0);
+    }
+
+    #[test]
+    fn test_evict_idle_on_empty_pool_is_noop() {
+        let pool = ConnectionPool::new(ConnectionConfig::default());
+        assert_eq!(pool.evict_idle(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_start_idle_evictor_installs_and_aborts_task() {
+        let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
+        assert!(pool.evictor_handle.lock().is_none());
+        pool.start_idle_evictor();
+        assert!(pool.evictor_handle.lock().is_some());
+
+        // Idempotent: second call replaces the handle.
+        pool.start_idle_evictor();
+        assert!(pool.evictor_handle.lock().is_some());
+
+        // close_all aborts.
+        pool.close_all().await;
+        assert!(pool.evictor_handle.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_start_idle_evictor_noop_when_max_idle_disabled() {
+        let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()).with_max_idle(None));
+        pool.start_idle_evictor();
+        assert!(pool.evictor_handle.lock().is_none());
+    }
+
+    #[test]
+    fn test_start_idle_evictor_noop_outside_tokio_runtime() {
+        // No `#[tokio::test]`: this synchronous test runs without a runtime,
+        // so `start_idle_evictor` must take the `Handle::try_current()` early
+        // return rather than panic inside `tokio::spawn`.
+        let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
+        pool.start_idle_evictor();
+        assert!(
+            pool.evictor_handle.lock().is_none(),
+            "evictor must not be installed without a Tokio runtime"
+        );
+    }
+
+    #[test]
+    fn test_evict_idle_removes_stale_from_both_maps() {
+        // Stub connection is idle for 10 s; max_idle is 100 ms, so the
+        // entry is stale in both `connections` (by broker id) and
+        // `connections_by_addr` (bootstrap map).
+        let pool = ConnectionPool::new(ConnectionConfig::default())
+            .with_max_idle(Some(Duration::from_millis(100)));
+        let stale = Arc::new(BrokerConnection::test_stub_idle_for(
+            "b1:9092",
+            Duration::from_secs(10),
+        ));
+        pool.connections.write().insert(1, stale.clone());
+        pool.connections_by_addr
+            .write()
+            .insert("b1:9092".to_string(), stale);
+
+        // Same socket shared across both maps must dedup to a single
+        // eviction.
+        assert_eq!(pool.evict_idle(), 1);
+        assert!(pool.connections.read().is_empty());
+        assert!(pool.connections_by_addr.read().is_empty());
+    }
+
+    #[test]
+    fn test_evict_idle_retains_fresh_and_evicts_stale() {
+        let pool = ConnectionPool::new(ConnectionConfig::default())
+            .with_max_idle(Some(Duration::from_millis(100)));
+        let stale = Arc::new(BrokerConnection::test_stub_idle_for(
+            "b1:9092",
+            Duration::from_secs(10),
+        ));
+        let fresh = Arc::new(BrokerConnection::test_stub_idle_for(
+            "b2:9092",
+            Duration::from_millis(10),
+        ));
+        {
+            let mut w = pool.connections.write();
+            w.insert(1, stale);
+            w.insert(2, fresh);
+        }
+
+        assert_eq!(pool.evict_idle(), 1);
+        let kept = pool.connections.read();
+        assert!(!kept.contains_key(&1));
+        assert!(kept.contains_key(&2));
+    }
+
+    #[test]
+    fn test_evict_idle_rescued_after_refresh() {
+        // Pin the freshness side of the contract: a connection that has
+        // been marked used is not evicted even if its `created_at` is old.
+        // This covers the same code path the write-lock re-check uses
+        // (a refresh invalidates the stale decision).
+        let pool = ConnectionPool::new(ConnectionConfig::default())
+            .with_max_idle(Some(Duration::from_millis(100)));
+        let conn = Arc::new(BrokerConnection::test_stub_idle_for(
+            "b1:9092",
+            Duration::from_secs(10),
+        ));
+        conn.test_mark_fresh();
+        pool.connections.write().insert(1, conn);
+
+        assert_eq!(pool.evict_idle(), 0);
+        assert!(pool.connections.read().contains_key(&1));
     }
 }

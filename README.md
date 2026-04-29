@@ -32,11 +32,11 @@ Add Krafka to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-krafka = "0.4"
+krafka = "0.5"
 tokio = { version = "1", features = ["full"] }
 
 # For AWS MSK IAM authentication with full SDK support:
-# krafka = { version = "0.4", features = ["aws-msk"] }
+# krafka = { version = "0.5", features = ["aws-msk"] }
 ```
 
 ### Producer
@@ -235,7 +235,7 @@ let producer = Producer::builder()
 All codecs are enabled by default via the `compression` feature. To select only what you need:
 
 ```toml
-krafka = { version = "0.4", default-features = false, features = ["lz4", "snappy"] }
+krafka = { version = "0.5", default-features = false, features = ["lz4", "snappy"] }
 ```
 
 ## ⚡ Performance Tuning

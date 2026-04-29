@@ -138,6 +138,21 @@ impl std::fmt::Debug for ShareConsumer {
     }
 }
 
+impl Drop for ShareConsumer {
+    fn drop(&mut self) {
+        // Warn when the consumer is dropped without an explicit `close()`.
+        // Without `close()` the coordinator will only reassign this
+        // member's partitions after its heartbeat lease expires, and any
+        // pending acknowledgements are discarded. Skip during panic unwinding.
+        if !self.closed.load(Ordering::SeqCst) && !std::thread::panicking() {
+            warn!(
+                "ShareConsumer dropped without close(); pending acks may be lost and \
+                 share-group rebalance will be delayed. Call `ShareConsumer::close()` before drop."
+            );
+        }
+    }
+}
+
 impl ShareConsumer {
     /// Create a new share consumer builder.
     pub fn builder() -> ShareConsumerBuilder {
@@ -163,6 +178,7 @@ impl ShareConsumer {
         pool_config.init_tls().await?;
 
         let pool = Arc::new(ConnectionPool::new(pool_config));
+        pool.start_idle_evictor();
 
         let bootstrap_servers = crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
 
@@ -173,6 +189,8 @@ impl ShareConsumer {
                     .with_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger);
             if let Some(ttl) = config.metadata_topic_cache_ttl {
                 meta = meta.with_topic_cache_ttl(ttl);
+            } else {
+                meta = meta.with_topic_cache_ttl_disabled();
             }
             meta
         });
@@ -1384,7 +1402,8 @@ impl ShareConsumerBuilder {
     ///
     /// During partial refreshes, cached topics that have not been refreshed
     /// within this duration are evicted to prevent unbounded cache growth.
-    /// `None` disables TTL eviction (the default).
+    ///
+    /// Default: 5 minutes (matching Java's `metadata.max.idle.ms`).
     pub fn metadata_topic_cache_ttl(mut self, ttl: Duration) -> Self {
         self.config.metadata_topic_cache_ttl = Some(ttl);
         self
@@ -1392,9 +1411,10 @@ impl ShareConsumerBuilder {
 
     /// Disable topic cache TTL eviction for partial metadata refreshes.
     ///
-    /// This clears any previously configured TTL and restores the default
-    /// behavior where cached topics are not evicted based on age.
-    pub fn clear_metadata_topic_cache_ttl(mut self) -> Self {
+    /// By default, cached topics are evicted after 5 minutes to prevent
+    /// unbounded growth on topic churn. Call this to opt out of TTL eviction;
+    /// entries will then persist across partial refreshes indefinitely.
+    pub fn disable_metadata_topic_cache_ttl(mut self) -> Self {
         self.config.metadata_topic_cache_ttl = None;
         self
     }
@@ -1437,6 +1457,7 @@ impl ShareConsumerBuilder {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

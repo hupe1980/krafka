@@ -301,11 +301,9 @@ impl CompactedTable {
             }
         } else {
             // value must be Some here because is_tombstone() returned false and key is Some
-            let value = record
-                .value
-                .as_ref()
-                .expect("non-tombstone compacted record must have a value")
-                .clone();
+            let Some(value) = record.value.clone() else {
+                unreachable!("non-tombstone compacted record must have a value");
+            };
             let key_owned = key.clone();
             let old_value = self.entries.insert(key_owned.clone(), value.clone());
             TableChange {
@@ -327,11 +325,9 @@ impl CompactedTable {
             self.entries.remove(key.as_ref());
         } else {
             // value must be Some here because is_tombstone() returned false and key is Some
-            let value = record
-                .value
-                .as_ref()
-                .expect("non-tombstone compacted record must have a value")
-                .clone();
+            let Some(value) = record.value.clone() else {
+                unreachable!("non-tombstone compacted record must have a value");
+            };
             self.entries.insert(key.clone(), value);
         }
     }
@@ -819,6 +815,7 @@ impl CompactedTopicConsumerBuilder {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

@@ -145,7 +145,35 @@ while let Some(record) = stream.next().await {
 | `session_timeout` | `45s` | Session timeout for group membership |
 | `heartbeat_interval` | `5s` | Heartbeat interval (must be < session_timeout) |
 | `metadata_max_age` | `5min` | Metadata cache TTL |
+| `metadata_topic_cache_ttl` | `Some(5min)` | TTL for topic entries in the partial-refresh cache. `None` disables eviction. Use `disable_metadata_topic_cache_ttl()` to opt out. |
 | `client_rack` | `None` | Rack ID for rack-aware fetching |
+
+### Metadata Topic Cache TTL
+
+During a partial metadata refresh (where only the subscribed topics are re-fetched rather than the entire cluster), Krafka caches each topic's metadata between refreshes. By default, a topic entry is evicted from this cache after **5 minutes** of not being successfully refreshed — matching Java's `metadata.max.idle.ms` — to prevent unbounded growth when topics are deleted or subscriptions change.
+
+```rust
+use krafka::share_consumer::ShareConsumer;
+use std::time::Duration;
+
+// Use a custom TTL (e.g. 10 minutes):
+let consumer = ShareConsumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-share-group")
+    .metadata_topic_cache_ttl(Duration::from_secs(600))
+    .build()
+    .await?;
+
+// Opt out of TTL eviction entirely (topics persist until the cache is flushed):
+let consumer = ShareConsumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-share-group")
+    .disable_metadata_topic_cache_ttl()
+    .build()
+    .await?;
+```
+
+> **Note:** TTL eviction only affects the partial-refresh cache. A full metadata refresh (triggered by `metadata_max_age` expiry or an explicit refresh) always replaces the cache unconditionally.
 
 ## Session Management
 

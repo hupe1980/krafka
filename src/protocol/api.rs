@@ -843,15 +843,19 @@ impl ApiVersionsResponse {
             return Ok(-1);
         };
 
-        if field.data.len() != 8 {
-            return Err(crate::error::KrafkaError::protocol(format!(
-                "FinalizedFeaturesEpoch (tag 1) has invalid length {}, expected 8",
-                field.data.len()
-            )));
-        }
-
-        // Length verified to be exactly 8 bytes above.
-        let bytes: [u8; 8] = field.data[..8].try_into().expect("length checked above");
+        // Decode untrusted wire bytes: a single `try_into` enforces the exact
+        // 8-byte length without a separate bounds check and without any
+        // panic path.  A malformed response becomes a protocol error rather
+        // than crashing the client.
+        let bytes: [u8; 8] = field.data[..].try_into().map_err(|_| {
+            crate::error::KrafkaError::protocol_kind(
+                crate::error::ProtocolErrorKind::InvalidLength,
+                format!(
+                    "FinalizedFeaturesEpoch (tag 1) has invalid length {}, expected 8",
+                    field.data.len()
+                ),
+            )
+        })?;
         Ok(i64::from_be_bytes(bytes))
     }
 
@@ -919,6 +923,7 @@ impl ApiVersionsResponse {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use bytes::BytesMut;
 

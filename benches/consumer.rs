@@ -2,9 +2,25 @@
 //!
 //! Run with: cargo bench --bench consumer
 
+#![allow(missing_docs, clippy::panic)]
+
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use krafka::protocol::{Compression, LazyRecordBatch, RecordBatch};
+
+fn ok<T, E: std::fmt::Display>(result: Result<T, E>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(err) => unreachable!("benchmark setup should not fail: {err}"),
+    }
+}
+
+fn some<T>(value: Option<T>) -> T {
+    match value {
+        Some(value) => value,
+        None => unreachable!("benchmark should contain at least one record"),
+    }
+}
 
 /// Benchmark record batch decoding with different batch sizes.
 fn bench_record_batch_decoding(c: &mut Criterion) {
@@ -24,7 +40,7 @@ fn bench_record_batch_decoding(c: &mut Criterion) {
             );
         }
         let batch = builder.build();
-        let encoded = batch.encode().expect("encode failed");
+        let encoded = ok(batch.encode());
 
         group.throughput(Throughput::Elements(batch_size as u64));
         group.bench_with_input(
@@ -33,7 +49,7 @@ fn bench_record_batch_decoding(c: &mut Criterion) {
             |b, encoded| {
                 b.iter(|| {
                     let mut buf = encoded.clone();
-                    let decoded = RecordBatch::decode(&mut buf).expect("decode failed");
+                    let decoded = ok(RecordBatch::decode(&mut buf));
                     black_box(decoded)
                 });
             },
@@ -77,7 +93,7 @@ fn bench_decompression(c: &mut Criterion) {
             );
         }
         let batch = builder.build();
-        let encoded = batch.encode().expect("encode failed");
+        let encoded = ok(batch.encode());
 
         group.throughput(Throughput::Elements(100));
         group.bench_with_input(
@@ -86,7 +102,7 @@ fn bench_decompression(c: &mut Criterion) {
             |b, encoded| {
                 b.iter(|| {
                     let mut buf = encoded.clone();
-                    let decoded = RecordBatch::decode(&mut buf).expect("decode failed");
+                    let decoded = ok(RecordBatch::decode(&mut buf));
                     black_box(decoded)
                 });
             },
@@ -113,7 +129,7 @@ fn bench_record_iteration(c: &mut Criterion) {
             );
         }
         let batch = builder.build();
-        let encoded = batch.encode().expect("encode failed");
+        let encoded = ok(batch.encode());
 
         group.throughput(Throughput::Elements(batch_size as u64));
         group.bench_with_input(
@@ -122,7 +138,7 @@ fn bench_record_iteration(c: &mut Criterion) {
             |b, encoded| {
                 b.iter(|| {
                     let mut buf = encoded.clone();
-                    let decoded = RecordBatch::decode(&mut buf).expect("decode failed");
+                    let decoded = ok(RecordBatch::decode(&mut buf));
                     let mut count = 0;
                     for record in &decoded.records {
                         black_box(&record.key);
@@ -160,7 +176,7 @@ fn bench_lazy_vs_eager_decoding(c: &mut Criterion) {
             );
         }
         let batch = builder.build();
-        let encoded = batch.encode().expect("encode failed");
+        let encoded = ok(batch.encode());
 
         // Eager: decode all records immediately
         group.bench_with_input(
@@ -169,7 +185,7 @@ fn bench_lazy_vs_eager_decoding(c: &mut Criterion) {
             |b, encoded| {
                 b.iter(|| {
                     let mut buf = encoded.clone();
-                    let decoded = RecordBatch::decode(&mut buf).expect("decode failed");
+                    let decoded = ok(RecordBatch::decode(&mut buf));
                     black_box(decoded.records.len())
                 });
             },
@@ -182,7 +198,7 @@ fn bench_lazy_vs_eager_decoding(c: &mut Criterion) {
             |b, encoded| {
                 b.iter(|| {
                     let mut buf = encoded.clone();
-                    let lazy = LazyRecordBatch::decode(&mut buf).expect("decode failed");
+                    let lazy = ok(LazyRecordBatch::decode(&mut buf));
                     black_box(lazy.len())
                 });
             },
@@ -195,8 +211,8 @@ fn bench_lazy_vs_eager_decoding(c: &mut Criterion) {
             |b, encoded| {
                 b.iter(|| {
                     let mut buf = encoded.clone();
-                    let lazy = LazyRecordBatch::decode(&mut buf).expect("decode failed");
-                    let first = lazy.records().next().unwrap().unwrap();
+                    let lazy = ok(LazyRecordBatch::decode(&mut buf));
+                    let first = ok(some(lazy.records().next()));
                     black_box(first.key)
                 });
             },

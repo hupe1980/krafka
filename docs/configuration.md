@@ -97,6 +97,7 @@ let producer = Producer::builder()
 | `group_protocol` | GroupProtocol | `Classic` | Group protocol: `Classic` or `Consumer` (KIP-848) |
 | `request_timeout` | Duration | `30s` | Timeout for broker requests |
 | `metadata_max_age` | Duration | `5m` | Max age before metadata refresh |
+| `metadata_topic_cache_ttl` | `Option<Duration>` | `Some(5m)` | TTL for topic entries in the partial-refresh cache. `None` disables eviction. |
 | `metadata_recovery_strategy` | MetadataRecoveryStrategy | `None` | Recovery strategy when metadata refresh fails (KIP-899) |
 | `metadata_recovery_rebootstrap_trigger` | Duration | `5m` | Duration after which failing refreshes trigger a rebootstrap |
 
@@ -188,7 +189,7 @@ DNS resolution, so broker hostnames are sent as-is (not pre-resolved).
 Enable the `socks5` feature:
 
 ```toml
-krafka = { version = "0.4", features = ["socks5"] }
+krafka = { version = "0.5", features = ["socks5"] }
 ```
 
 ### Proxy Without Authentication

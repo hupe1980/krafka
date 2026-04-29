@@ -110,6 +110,7 @@ impl Producer {
         pool_config.init_tls().await?;
 
         let pool = Arc::new(ConnectionPool::new(pool_config));
+        pool.start_idle_evictor();
 
         let bootstrap_servers = crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
 
@@ -812,6 +813,20 @@ impl Producer {
     }
 }
 
+impl Drop for Producer {
+    fn drop(&mut self) {
+        // Warn when a producer is dropped without an explicit `close()`:
+        // unacked batches sitting in the accumulator or retry backoff
+        // are discarded silently. Skip during panic unwinding.
+        if !self.in_flight_barrier.is_closing() && !std::thread::panicking() {
+            warn!(
+                "Producer dropped without close(); in-flight batches may be lost. \
+                 Call `Producer::close()` (or `close_with_timeout`) before drop to flush."
+            );
+        }
+    }
+}
+
 /// Producer metrics snapshot.
 #[derive(Debug, Clone)]
 pub struct ProducerMetricsSnapshot {
@@ -1087,8 +1102,11 @@ impl ProducerBuilder {
             if self.interceptors.is_empty() {
                 Arc::new(crate::interceptor::NoOpProducerInterceptor)
             } else if self.interceptors.len() == 1 {
-                // infallible: len == 1 guaranteed above
-                self.interceptors.into_iter().next().unwrap()
+                // infallible: len == 1 guaranteed by the surrounding else-if
+                let Some(single) = self.interceptors.into_iter().next() else {
+                    unreachable!("len == 1 verified above");
+                };
+                single
             } else {
                 Arc::new(crate::interceptor::ProducerInterceptorChain::new(
                     self.interceptors,
@@ -1100,6 +1118,7 @@ impl ProducerBuilder {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

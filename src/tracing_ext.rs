@@ -388,6 +388,7 @@ pub fn record_partition(partition: PartitionId) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

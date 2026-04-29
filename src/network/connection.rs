@@ -17,11 +17,12 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(feature = "socks5")]
 use tokio::net::TcpSocket;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 #[cfg(feature = "socks5")]
 use tokio::time::timeout_at;
 use tokio_rustls::TlsConnector;
+use tokio_util::time::{DelayQueue, delay_queue};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::CorrelationId;
@@ -616,8 +617,6 @@ struct PendingRequest {
     response_tx: oneshot::Sender<Result<Bytes>>,
     api_key: ApiKey,
     api_version: i16,
-    /// When this request was sent, for per-request timeout enforcement.
-    sent_at: Instant,
 }
 
 /// Command sent to the connection task.
@@ -656,7 +655,7 @@ pub struct BrokerConnection {
     /// Normal-priority command sender (produce, fetch).
     normal_priority_tx: mpsc::Sender<ConnectionCommand>,
     /// API versions supported by the broker.
-    api_versions: Arc<Mutex<HashMap<ApiKey, ApiVersionRange>>>,
+    api_versions: Arc<parking_lot::Mutex<HashMap<ApiKey, ApiVersionRange>>>,
     /// Whether the connection is alive.
     alive: Arc<std::sync::atomic::AtomicBool>,
     /// When the SASL session expires (KIP-368).
@@ -669,6 +668,18 @@ pub struct BrokerConnection {
     /// KIP-219: deadline until which normal-priority requests should be
     /// delayed because the broker signalled quota throttling.
     throttle_until: Arc<parking_lot::Mutex<Instant>>,
+    /// Instant anchor used with `last_used_nanos` to compute idle duration
+    /// without locking. Set once at connect time; never mutated.
+    created_at: Instant,
+    /// Monotonic-nanoseconds since `created_at` of the last submitted
+    /// request. Updated on every `send_request_with_priority` and
+    /// `send_fire_and_forget` entry. Read by `ConnectionPool::evict_idle`
+    /// to decide whether a connection has been idle past
+    /// `connections.max.idle.ms`. An `AtomicU64` rather than a lock keeps
+    /// the network hot path free of contention; the only race is two
+    /// concurrent senders both storing a "recent" value, which is fine
+    /// because either observer still reads "recently used".
+    last_used_nanos: AtomicU64,
 }
 
 /// Connection statistics for monitoring.
@@ -736,23 +747,22 @@ impl BrokerConnection {
             correlation_id_gen: Arc::new(CorrelationIdGenerator::new()),
             high_priority_tx,
             normal_priority_tx,
-            api_versions: Arc::new(Mutex::new(HashMap::new())),
+            api_versions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             alive,
             session_expiry: None,
             stats,
             throttle_until: Arc::new(parking_lot::Mutex::new(Instant::now())),
+            created_at: Instant::now(),
+            last_used_nanos: AtomicU64::new(0),
         };
 
         let request_timeout = config.request_timeout;
 
-        // Determine if we need TLS and/or SASL
-        let needs_tls = config.auth.as_ref().is_some_and(|a| a.requires_tls());
-        let needs_sasl = config.auth.as_ref().is_some_and(|a| a.requires_sasl());
-
-        if needs_tls {
+        // Determine auth requirements and dispatch to the appropriate path.
+        // Using `filter` means `auth` is already in scope — no secondary
+        // unreachable guard needed to re-establish the invariant.
+        if let Some(auth) = config.auth.as_ref().filter(|a| a.requires_tls()) {
             // TLS path: upgrade stream then optionally do SASL
-            // SAFETY: needs_tls is true only when config.auth.is_some_and(requires_tls)
-            let auth = config.auth.as_ref().unwrap();
             let tls_config = auth
                 .tls_config
                 .as_ref()
@@ -779,7 +789,7 @@ impl BrokerConnection {
 
             info!("TLS handshake completed for {address}");
 
-            if needs_sasl {
+            if auth.requires_sasl() {
                 // TLS + SASL: authenticate on the TLS stream, then run event loop
                 let mut tls_stream = tls_stream;
 
@@ -845,10 +855,8 @@ impl BrokerConnection {
                     alive_clone.store(false, std::sync::atomic::Ordering::SeqCst);
                 });
             }
-        } else if needs_sasl {
+        } else if let Some(auth) = config.auth.as_ref().filter(|a| a.requires_sasl()) {
             // SASL without TLS
-            // SAFETY: needs_sasl is true only when config.auth.is_some_and(requires_sasl)
-            let auth = config.auth.as_ref().unwrap();
             let mut stream = stream;
             let session_lifetime_ms = Self::perform_sasl_handshake(
                 &mut stream,
@@ -1321,69 +1329,46 @@ impl BrokerConnection {
 
     /// Try to extract a clock skew (in seconds) from an AWS SigV4 error message.
     ///
-    /// AWS error messages for clock skew often embed an ISO-8601 timestamp
-    /// (e.g. `20250413T120000Z`). If we can parse such a timestamp, we
-    /// compare it to `SystemTime::now()` and return the difference in
-    /// seconds.  Returns `0` if no parseable timestamp is found.
+    /// AWS error messages for clock skew embed an ISO-8601 basic-format timestamp
+    /// (e.g. `20250413T120000Z`) that represents the server's view of "now".
+    /// If such a timestamp is found, returns `server_unix - local_unix` in seconds.
+    /// Returns `0` if no parseable timestamp is present.
     fn extract_clock_skew_secs(error_msg: &str) -> i64 {
-        // Look for an ISO-8601 basic-format timestamp: YYYYMMDDTHHMMSSz
-        // These show up in AWS error messages as the server's view of "now".
-        let Some(pos) = error_msg.find('T') else {
-            return 0;
-        };
-        // Need at least 8 chars before T (date) and 7 after (HHMMSSZ)
-        if pos < 8 || pos + 7 > error_msg.len() {
-            return 0;
-        }
-        let candidate = &error_msg[pos - 8..pos + 7];
-        // Validate format: digits, T, digits, Z
-        if candidate.len() != 15
-            || !candidate[..8].chars().all(|c| c.is_ascii_digit())
-            || candidate.as_bytes()[8] != b'T'
-            || !candidate[9..15].chars().all(|c| c.is_ascii_digit())
-        {
-            return 0;
-        }
-        // Check for trailing Z
-        let has_z = error_msg.len() > pos + 7 && error_msg.as_bytes()[pos + 7] == b'Z';
-        if !has_z {
-            return 0;
-        }
-        // Parse components
-        let year: i64 = candidate[..4].parse().unwrap_or(0);
-        let month: i64 = candidate[4..6].parse().unwrap_or(0);
-        let day: i64 = candidate[6..8].parse().unwrap_or(0);
-        let hour: i64 = candidate[9..11].parse().unwrap_or(0);
-        let min: i64 = candidate[11..13].parse().unwrap_or(0);
-        let sec: i64 = candidate[13..15].parse().unwrap_or(0);
+        use time::PrimitiveDateTime;
+        use time::format_description::BorrowedFormatItem;
+        use time::macros::format_description;
 
-        if !(1..=12).contains(&month)
-            || !(1..=31).contains(&day)
-            || hour > 23
-            || min > 59
-            || sec > 59
-        {
+        // AWS SigV4 basic-format: YYYYMMDDTHHMMSSZ (16 bytes, ASCII-only).
+        const AWS_TS_FMT: &[BorrowedFormatItem<'_>] =
+            format_description!("[year][month][day]T[hour][minute][second]Z");
+        const AWS_TS_LEN: usize = 16;
+
+        let bytes = error_msg.as_bytes();
+        if bytes.len() < AWS_TS_LEN {
             return 0;
         }
-        // Rough conversion to Unix epoch seconds (ignoring leap seconds).
-        // Good enough for computing a skew offset; we don't need sub-second
-        // precision.
-        let days_since_epoch = (year - 1970) * 365 + (year - 1969) / 4 - (year - 1901) / 100
-            + (year - 1601) / 400
-            + [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334][(month - 1) as usize]
-            + day
-            - 1
-            + if month > 2 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) {
-                1
-            } else {
-                0
+        // Scan every byte-aligned window of AWS_TS_LEN bytes. The grammar is
+        // ASCII-only, so indexing into `error_msg` at these offsets is safe
+        // (no UTF-8 split risk — a successful parse guarantees ASCII content).
+        for i in 0..=bytes.len() - AWS_TS_LEN {
+            // Cheap pre-filter: byte 8 must be 'T', byte 15 must be 'Z'.
+            if bytes[i + 8] != b'T' || bytes[i + 15] != b'Z' {
+                continue;
+            }
+            let Ok(candidate) = std::str::from_utf8(&bytes[i..i + AWS_TS_LEN]) else {
+                continue;
             };
-        let server_unix = days_since_epoch * 86400 + hour * 3600 + min * 60 + sec;
-        let local_unix = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        server_unix - local_unix
+            let Ok(dt) = PrimitiveDateTime::parse(candidate, AWS_TS_FMT) else {
+                continue;
+            };
+            let server_unix = dt.assume_utc().unix_timestamp();
+            let local_unix = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            return server_unix - local_unix;
+        }
+        0
     }
 
     /// Run the connection event loop with priority handling.
@@ -1406,167 +1391,208 @@ impl BrokerConnection {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let pending: Arc<Mutex<HashMap<CorrelationId, PendingRequest>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let pending_clone = pending.clone();
+        // All pending request state is owned exclusively by this task.
+        // No Arc<Mutex> needed — all access is single-threaded on this event loop.
+        let mut pending: HashMap<CorrelationId, PendingRequest> = HashMap::new();
 
-        // Per-request timeout sweep: check every 1s for timed-out in-flight requests
-        let pending_for_timeout = pending.clone();
-        let timeout_sweep_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Per-request timeout via timer-wheel (tokio_util::time::DelayQueue).
+        // Cost: O(log n) per insertion/expiration vs O(n × connections) for the
+        // old 1-second polling task.  Each entry fires exactly once at
+        // `enqueue_time + request_timeout`.
+        let mut delay_queue: DelayQueue<CorrelationId> = DelayQueue::new();
+        // Maps correlation_id → queue key for O(1) cancellation on response receipt.
+        let mut delay_keys: HashMap<CorrelationId, delay_queue::Key> = HashMap::new();
+
+        // Reader task sends decoded response frames to this loop via a bounded
+        // channel.  The capacity matches max_in_flight_requests: the broker
+        // can only send responses for outstanding requests, so this cap is
+        // an exact fit.  It also provides back-pressure — if the main loop
+        // is momentarily stalled (e.g., on a write), the reader suspends
+        // instead of buffering unboundedly.
+        let (frame_tx, mut frame_rx) =
+            mpsc::channel::<Result<Bytes>>(max_in_flight_requests.max(1));
+
+        let reader_handle = tokio::spawn(async move {
+            let mut decoder = Decoder::with_max_size(max_response_size);
+            let mut buf = vec![0u8; 65536];
             loop {
-                interval.tick().await;
-                let now = Instant::now();
+                match reader.read(&mut buf).await {
+                    Ok(0) => {
+                        debug!("Connection closed by peer");
+                        break;
+                    }
+                    Ok(n) => {
+                        decoder.extend(&buf[..n]);
+                        loop {
+                            match decoder.decode() {
+                                Ok(Some(frame)) => {
+                                    // Exit silently when the main loop has already gone away.
+                                    if frame_tx.send(Ok(frame)).await.is_err() {
+                                        return Ok::<_, KrafkaError>(());
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    let _ = frame_tx.send(Err(e)).await;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = frame_tx.send(Err(KrafkaError::network(e))).await;
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(())
+        });
 
-                // Phase 1: identify timed-out IDs under lock (no channel sends).
-                let timed_out: Vec<CorrelationId> = {
-                    let pending_map = pending_for_timeout.lock().await;
-                    pending_map
-                        .iter()
-                        .filter(|(_, req)| now.duration_since(req.sent_at) > request_timeout)
-                        .map(|(&id, _)| id)
-                        .collect()
-                };
+        let mut terminal_error: Option<KrafkaError> = None;
 
-                if timed_out.is_empty() {
-                    continue;
+        // Main event loop — lock-free on the hot path.
+        loop {
+            // Fast path: drain the high-priority channel without yielding to the
+            // scheduler.  Heartbeats are the most latency-sensitive request type.
+            if let Ok(cmd) = high_priority_rx.try_recv() {
+                stats.high_priority_bypasses.fetch_add(1, Ordering::Relaxed);
+                match Self::handle_command_direct(
+                    &mut writer,
+                    &mut pending,
+                    &mut delay_queue,
+                    &mut delay_keys,
+                    cmd,
+                    max_in_flight_requests,
+                    request_timeout,
+                )
+                .await
+                {
+                    Ok(true) => break,
+                    Ok(false) => continue,
+                    Err(e) => {
+                        terminal_error = Some(e);
+                        break;
+                    }
+                }
+            }
+
+            tokio::select! {
+                biased;
+
+                // Response frames from the reader task — dispatch immediately so
+                // callers receive results as soon as the bytes arrive.
+                frame_result = frame_rx.recv() => {
+                    match frame_result {
+                        Some(Ok(frame)) => {
+                            if let Err(e) = Self::dispatch_response(
+                                &mut pending,
+                                &mut delay_queue,
+                                &mut delay_keys,
+                                frame,
+                            ) {
+                                // Protocol desynchronisation — close the connection.
+                                terminal_error = Some(e);
+                                break;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            terminal_error = Some(e);
+                            break;
+                        }
+                        None => {
+                            // Reader task exited (peer closed the connection).
+                            break;
+                        }
+                    }
                 }
 
-                // Phase 2: remove and notify outside the hot path — reacquire
-                // lock only when there is actual work to do.
-                let mut pending_map = pending_for_timeout.lock().await;
-                for id in timed_out {
-                    if let Some(req) = pending_map.remove(&id) {
+                // Timer-wheel: fires exactly when a per-request deadline expires.
+                // O(log n) cost vs O(n × connections) for the old 1-second sweep.
+                Some(expired) = std::future::poll_fn(|cx| {
+                    use futures_core::Stream;
+                    std::pin::Pin::new(&mut delay_queue).poll_next(cx)
+                }) => {
+                    let id = expired.into_inner();
+                    if let Some(req) = pending.remove(&id) {
+                        delay_keys.remove(&id);
                         warn!(
                             correlation_id = id,
                             "Request timed out after {:?}", request_timeout
                         );
                         let _ = req.response_tx.send(Err(KrafkaError::timeout(format!(
-                            "request {} timed out after {:?}",
-                            id, request_timeout
+                            "request {id} timed out after {request_timeout:?}"
                         ))));
                     }
                 }
-            }
-        });
 
-        let (reader_result_tx, mut reader_result_rx) = oneshot::channel();
-
-        // Spawn reader task
-        let reader_handle = tokio::spawn(async move {
-            let result = async move {
-                let mut decoder = Decoder::with_max_size(max_response_size);
-                let mut buf = vec![0u8; 65536];
-
-                loop {
-                    match reader.read(&mut buf).await {
-                        Ok(0) => {
-                            debug!("Connection closed by peer");
-                            break;
-                        }
-                        Ok(n) => {
-                            decoder.extend(&buf[..n]);
-
-                            // Process all complete messages
-                            while let Some(response) = decoder.decode()? {
-                                Self::handle_response(&pending_clone, response).await?;
-                            }
-                        }
-                        Err(e) => {
-                            error!("Read error: {}", e);
-                            return Err(KrafkaError::network(e));
-                        }
-                    }
-                }
-
-                Ok::<_, KrafkaError>(())
-            }
-            .await;
-
-            let _ = reader_result_tx.send(result.clone());
-            result
-        });
-
-        let mut terminal_error: Option<KrafkaError> = None;
-
-        // Process commands with priority
-        loop {
-            // Try high-priority first (non-blocking)
-            if let Ok(cmd) = high_priority_rx.try_recv() {
-                stats.high_priority_bypasses.fetch_add(1, Ordering::Relaxed);
-                if Self::handle_command(&mut writer, &pending, cmd, max_in_flight_requests).await? {
-                    break;
-                }
-                continue;
-            }
-
-            // Wait for either channel
-            tokio::select! {
-                // Bias towards high-priority
-                biased;
-
-                reader_result = &mut reader_result_rx => {
-                    terminal_error = match reader_result {
-                        Ok(Ok(())) => None,
-                        Ok(Err(err)) => Some(err),
-                        Err(_) => Some(KrafkaError::invalid_state("reader task result dropped")),
-                    };
-                    break;
-                }
-
+                // High-priority commands (heartbeats, metadata, coordinator lookups).
                 cmd = high_priority_rx.recv() => {
                     match cmd {
                         Some(cmd) => {
-                            if Self::handle_command(&mut writer, &pending, cmd, max_in_flight_requests).await? {
-                                break;
+                            match Self::handle_command_direct(
+                                &mut writer,
+                                &mut pending,
+                                &mut delay_queue,
+                                &mut delay_keys,
+                                cmd,
+                                max_in_flight_requests,
+                                request_timeout,
+                            )
+                            .await
+                            {
+                                Ok(true) => break,
+                                Ok(false) => {}
+                                Err(e) => {
+                                    terminal_error = Some(e);
+                                    break;
+                                }
                             }
                         }
-                        None => break, // Channel closed
+                        None => break,
                     }
                 }
+
+                // Normal-priority commands (produce, fetch, and all others).
                 cmd = normal_priority_rx.recv() => {
                     match cmd {
                         Some(cmd) => {
-                            if Self::handle_command(&mut writer, &pending, cmd, max_in_flight_requests).await? {
-                                break;
+                            match Self::handle_command_direct(
+                                &mut writer,
+                                &mut pending,
+                                &mut delay_queue,
+                                &mut delay_keys,
+                                cmd,
+                                max_in_flight_requests,
+                                request_timeout,
+                            )
+                            .await
+                            {
+                                Ok(true) => break,
+                                Ok(false) => {}
+                                Err(e) => {
+                                    terminal_error = Some(e);
+                                    break;
+                                }
                             }
                         }
-                        None => break, // Channel closed
+                        None => break,
                     }
                 }
             }
         }
 
-        // Wait for reader to finish
+        // Drop the writer half to signal EOF to the broker, then abort the
+        // reader task — we no longer need its output.
         drop(writer);
-        timeout_sweep_handle.abort();
+        reader_handle.abort();
 
-        match reader_handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                if terminal_error.is_none() {
-                    terminal_error = Some(err);
-                }
-            }
-            Err(join_err) => {
-                if terminal_error.is_none() {
-                    terminal_error = Some(KrafkaError::invalid_state(format!(
-                        "reader task failed: {join_err}"
-                    )));
-                }
-            }
-        }
-
-        // Drain pending requests and notify callers that the connection is closed
-        {
-            let mut pending_map = pending.lock().await;
-            let pending_error = terminal_error
-                .clone()
-                .unwrap_or_else(|| KrafkaError::invalid_state("connection closed"));
-            for (_, req) in pending_map.drain() {
-                let _ = req.response_tx.send(Err(pending_error.clone()));
-            }
+        // Drain all in-flight requests and notify callers that the connection
+        // is gone.
+        let pending_error = terminal_error
+            .clone()
+            .unwrap_or_else(|| KrafkaError::invalid_state("connection closed"));
+        for (_, req) in pending.drain() {
+            let _ = req.response_tx.send(Err(pending_error.clone()));
         }
 
         if let Some(err) = terminal_error {
@@ -1579,11 +1605,19 @@ impl BrokerConnection {
     /// Handle a single connection command.
     ///
     /// Returns `true` if the connection should close.
-    async fn handle_command<W: AsyncWrite + Unpin>(
+    ///
+    /// # Lock-free hot path
+    ///
+    /// The pending map is owned by the single event-loop task — all insertions
+    /// and removals are O(1) HashMap operations with no synchronization overhead.
+    async fn handle_command_direct<W: AsyncWrite + Unpin>(
         writer: &mut W,
-        pending: &Mutex<HashMap<CorrelationId, PendingRequest>>,
+        pending: &mut HashMap<CorrelationId, PendingRequest>,
+        delay_queue: &mut DelayQueue<CorrelationId>,
+        delay_keys: &mut HashMap<CorrelationId, delay_queue::Key>,
         cmd: ConnectionCommand,
         max_in_flight_requests: usize,
+        request_timeout: Duration,
     ) -> Result<bool> {
         match cmd {
             ConnectionCommand::Request {
@@ -1593,56 +1627,66 @@ impl BrokerConnection {
                 api_version,
                 response_tx,
             } => {
-                // Reject if at capacity to prevent unbounded memory growth
-                {
-                    let pending_map = pending.lock().await;
-                    if pending_map.len() >= max_in_flight_requests {
-                        warn!(
-                            pending = pending_map.len(),
-                            max = max_in_flight_requests,
-                            "Rejecting request: max in-flight requests reached"
-                        );
-                        let _ = response_tx.send(Err(KrafkaError::invalid_state(format!(
-                            "max in-flight requests ({max_in_flight_requests}) reached"
-                        ))));
+                // Reject when at capacity to prevent unbounded memory growth.
+                if pending.len() >= max_in_flight_requests {
+                    warn!(
+                        pending = pending.len(),
+                        max = max_in_flight_requests,
+                        "Rejecting request: max in-flight requests reached"
+                    );
+                    let _ = response_tx.send(Err(KrafkaError::invalid_state(format!(
+                        "max in-flight requests ({max_in_flight_requests}) reached"
+                    ))));
+                    return Ok(false);
+                }
+
+                // Snapshot the deadline before touching the wire so that the
+                // end-to-end budget (write + network round-trip) is exactly
+                // request_timeout, not up to 2× request_timeout.
+                let deadline = tokio::time::Instant::now() + request_timeout;
+
+                // Write to the wire.  Register in pending only after a successful
+                // write so we never create a leaked entry for an undelivered request.
+                //
+                // Uses the same absolute deadline as the DelayQueue entry below so
+                // write + response wait together consume exactly one request_timeout
+                // budget.  A stalled TCP write cannot freeze the event loop (and
+                // therefore block all in-flight timeout processing) for longer than
+                // the remaining budget.
+                let write_result = tokio::time::timeout_at(deadline, async {
+                    writer.write_all(&data).await?;
+                    writer.flush().await
+                })
+                .await;
+                match write_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        error!("Write error: {}", e);
+                        let _ = response_tx.send(Err(KrafkaError::network(e)));
                         return Ok(false);
                     }
+                    Err(_) => {
+                        let msg = format!("write timed out after {request_timeout:?}");
+                        error!("{msg}");
+                        let _ = response_tx.send(Err(KrafkaError::timeout(msg.clone())));
+                        // The stream is in an indeterminate state — close the connection.
+                        return Err(KrafkaError::timeout(msg));
+                    }
                 }
 
-                // Store pending request
-                {
-                    let mut pending = pending.lock().await;
-                    pending.insert(
-                        correlation_id,
-                        PendingRequest {
-                            response_tx,
-                            api_key,
-                            api_version,
-                            sent_at: Instant::now(),
-                        },
-                    );
-                }
-
-                // Send request
-                if let Err(e) = writer.write_all(&data).await {
-                    error!("Write error: {}", e);
-                    let mut pending = pending.lock().await;
-                    if let Some(req) = pending.remove(&correlation_id) {
-                        let _ = req.response_tx.send(Err(KrafkaError::network(e)));
-                    }
-                    return Ok(false);
-                }
-                // Ensure data is sent immediately
-                if let Err(e) = writer.flush().await {
-                    error!("Flush error: {}", e);
-                    // Propagate flush failure to the pending request so the caller
-                    // doesn't hang waiting for a response that will never arrive.
-                    let mut pending = pending.lock().await;
-                    if let Some(req) = pending.remove(&correlation_id) {
-                        let _ = req.response_tx.send(Err(KrafkaError::network(e)));
-                    }
-                    return Ok(false);
-                }
+                // Register pending entry and arm the per-request timeout at the
+                // same absolute deadline used for the write, so the whole
+                // request (write + response wait) is bounded by request_timeout.
+                let key = delay_queue.insert_at(correlation_id, deadline);
+                delay_keys.insert(correlation_id, key);
+                pending.insert(
+                    correlation_id,
+                    PendingRequest {
+                        response_tx,
+                        api_key,
+                        api_version,
+                    },
+                );
                 Ok(false)
             }
             ConnectionCommand::Close => {
@@ -1650,23 +1694,45 @@ impl BrokerConnection {
                 Ok(true)
             }
             ConnectionCommand::FireAndForget { data } => {
-                if let Err(e) = writer.write_all(&data).await {
-                    error!("Fire-and-forget write error: {}", e);
-                }
-                if let Err(e) = writer.flush().await {
-                    error!("Fire-and-forget flush error: {}", e);
+                // No response is expected, so a relative timeout is sufficient —
+                // there is no second phase to share a deadline with.
+                let write_result = tokio::time::timeout(request_timeout, async {
+                    writer.write_all(&data).await?;
+                    writer.flush().await
+                })
+                .await;
+                match write_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => error!("Fire-and-forget write error: {}", e),
+                    Err(_) => {
+                        error!(
+                            "Fire-and-forget write timed out after {:?}",
+                            request_timeout
+                        );
+                        return Err(KrafkaError::timeout(format!(
+                            "fire-and-forget write timed out after {request_timeout:?}"
+                        )));
+                    }
                 }
                 Ok(false)
             }
         }
     }
 
-    /// Handle an incoming response.
-    async fn handle_response(
-        pending: &Mutex<HashMap<CorrelationId, PendingRequest>>,
+    /// Dispatch an incoming response frame to the waiting caller.
+    ///
+    /// Looks up the correlation ID in the pending map, cancels the associated
+    /// timeout, decodes the response header, and delivers the body.
+    ///
+    /// Returns `Err` only on protocol-level desynchronisation (unknown
+    /// correlation ID or undecodable response header) — both indicate a corrupt
+    /// stream and require the connection to be closed.
+    fn dispatch_response(
+        pending: &mut HashMap<CorrelationId, PendingRequest>,
+        delay_queue: &mut DelayQueue<CorrelationId>,
+        delay_keys: &mut HashMap<CorrelationId, delay_queue::Key>,
         response: Bytes,
     ) -> Result<()> {
-        // Read correlation ID from response
         if response.len() < 4 {
             return Err(KrafkaError::protocol("response too short"));
         }
@@ -1674,12 +1740,14 @@ impl BrokerConnection {
         let correlation_id =
             i32::from_be_bytes([response[0], response[1], response[2], response[3]]);
 
-        let mut pending = pending.lock().await;
         if let Some(req) = pending.remove(&correlation_id) {
+            // Cancel the timeout — the response arrived before the deadline.
+            if let Some(key) = delay_keys.remove(&correlation_id) {
+                delay_queue.remove(&key);
+            }
+
             trace!("Received response for correlation_id={}", correlation_id);
 
-            // Decode response header — send any decode error to the caller
-            // instead of tearing down the entire connection.
             let mut response_buf = response.slice(..);
             match ResponseHeader::decode(&mut response_buf, req.api_key, req.api_version) {
                 Ok(_header) => {
@@ -1688,9 +1756,8 @@ impl BrokerConnection {
                     let _ = req.response_tx.send(Ok(body));
                 }
                 Err(e) => {
-                    // A header decode failure means the stream is desynchronized
-                    // — the remaining bytes are corrupt. Notify the caller and
-                    // close the connection to prevent further damage.
+                    // Header decode failure means the stream is desynchronised
+                    // — notify the caller and tear down the connection.
                     warn!(
                         "Failed to decode response header for correlation_id={}, closing connection: {}",
                         correlation_id, e
@@ -1704,8 +1771,7 @@ impl BrokerConnection {
                 }
             }
         } else {
-            // Unknown correlation ID indicates a protocol desync — the
-            // connection is no longer reliable. Return an error to close it.
+            // Unknown correlation ID indicates a protocol desync.
             return Err(KrafkaError::protocol(format!(
                 "Received response for unknown correlation_id={correlation_id}, closing connection"
             )));
@@ -1765,7 +1831,7 @@ impl BrokerConnection {
         }
 
         // Store API versions
-        let mut versions = self.api_versions.lock().await;
+        let mut versions = self.api_versions.lock();
         for range in api_versions_response.api_keys {
             versions.insert(range.api_key, range);
         }
@@ -1832,6 +1898,10 @@ impl BrokerConnection {
         priority: RequestPriority,
         request_body: impl FnOnce(&mut BytesMut) -> Result<()>,
     ) -> Result<Bytes> {
+        // M1: refresh the idle timestamp on every submission so the pool's
+        // idle-evictor does not close an actively used connection.
+        self.mark_used();
+
         // KIP-219: honour broker throttle for normal-priority requests.
         if priority == RequestPriority::Normal {
             let remaining = {
@@ -1907,6 +1977,9 @@ impl BrokerConnection {
         api_version: i16,
         request_body: impl FnOnce(&mut BytesMut) -> Result<()>,
     ) -> Result<()> {
+        // M1: refresh the idle timestamp on every submission.
+        self.mark_used();
+
         let correlation_id = self.correlation_id_gen.next();
         let mut encoder = Encoder::new();
 
@@ -1936,7 +2009,7 @@ impl BrokerConnection {
 
     /// Get the supported API version for a specific API.
     pub async fn get_api_version(&self, api_key: ApiKey) -> Option<ApiVersionRange> {
-        let versions = self.api_versions.lock().await;
+        let versions = self.api_versions.lock();
         versions.get(&api_key).copied()
     }
 
@@ -1968,7 +2041,7 @@ impl BrokerConnection {
         client_max: i16,
         client_min: i16,
     ) -> Option<i16> {
-        let versions = self.api_versions.lock().await;
+        let versions = self.api_versions.lock();
         versions
             .get(&api_key)
             .and_then(|range| range.negotiate(client_max, client_min))
@@ -2069,6 +2142,77 @@ impl BrokerConnection {
         self.is_alive() && !self.needs_reauthentication()
     }
 
+    /// Record that the connection was just used for a request.
+    ///
+    /// Called from the submission paths (`send_request_with_priority`,
+    /// `send_fire_and_forget`). Stores monotonic nanos since `created_at`
+    /// into `last_used_nanos`; reads happen from [`idle_duration`].
+    #[inline]
+    fn mark_used(&self) {
+        let elapsed = self.created_at.elapsed().as_nanos();
+        // Saturate on the (astronomical) overflow boundary rather than panic.
+        let nanos = u64::try_from(elapsed).unwrap_or(u64::MAX);
+        self.last_used_nanos.store(nanos, Ordering::Relaxed);
+    }
+
+    /// Duration since the last submitted request on this connection.
+    ///
+    /// A freshly connected socket that has sent no requests reports its
+    /// full age (since `created_at`) as idle — identical to Java's
+    /// `connections.max.idle.ms` accounting.
+    #[inline]
+    pub fn idle_duration(&self) -> Duration {
+        let last = self.last_used_nanos.load(Ordering::Relaxed);
+        let now = self.created_at.elapsed();
+        now.saturating_sub(Duration::from_nanos(last))
+    }
+
+    /// Test-only: construct a minimal, non-I/O-capable `BrokerConnection`
+    /// with `created_at` backdated by `idle_for`, so `idle_duration()`
+    /// reports at least `idle_for`. Used by pool eviction tests that need
+    /// to exercise `evict_idle` without standing up a real broker.
+    ///
+    /// The returned connection:
+    /// - has dropped receivers for both priority channels (sending on it
+    ///   will fail; this is intentional — the stub is only consumed by
+    ///   the eviction scan, which never sends);
+    /// - is marked `alive = true` so `is_alive()` reports consistently;
+    /// - has `last_used_nanos = 0` so idle time equals full age.
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
+    pub(crate) fn test_stub_idle_for(address: &str, idle_for: Duration) -> Self {
+        let (high_priority_tx, _) = mpsc::channel(1);
+        let (normal_priority_tx, _) = mpsc::channel(1);
+        Self {
+            address: address.to_string(),
+            config: ConnectionConfig::default(),
+            correlation_id_gen: Arc::new(CorrelationIdGenerator::new()),
+            high_priority_tx,
+            normal_priority_tx,
+            api_versions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            session_expiry: None,
+            stats: Arc::new(ConnectionStats::default()),
+            throttle_until: Arc::new(parking_lot::Mutex::new(Instant::now())),
+            created_at: Instant::now()
+                .checked_sub(idle_for)
+                // `unwrap`: test idle_for values are always small (≤ 10s) and
+                // any system uptime on which tests run exceeds that easily;
+                // failing loudly here is better than silently yielding a fresh
+                // timestamp that makes eviction tests vacuously pass.
+                .expect("idle_for exceeds system uptime; cannot backdate Instant"),
+            last_used_nanos: AtomicU64::new(0),
+        }
+    }
+
+    /// Test-only: refresh `last_used_nanos` to "now" without going through
+    /// a send path. Used to verify the evictor's race re-check rescues a
+    /// connection that was refreshed between the snapshot and the write.
+    #[cfg(test)]
+    pub(crate) fn test_mark_fresh(&self) {
+        self.mark_used();
+    }
+
     /// Get the broker address.
     #[inline]
     pub fn address(&self) -> &str {
@@ -2102,6 +2246,7 @@ impl Drop for BrokerConnection {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -3129,8 +3274,150 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_clock_skew_secs_invalid_calendar_date() {
+        // Month 13 / day 32 / hour 25 — the hand-rolled parser accepted these
+        // with range checks; `time` rejects them at parse time.
+        assert_eq!(
+            BrokerConnection::extract_clock_skew_secs("foo 20201301T000000Z bar"),
+            0
+        );
+        assert_eq!(
+            BrokerConnection::extract_clock_skew_secs("foo 20200132T000000Z bar"),
+            0
+        );
+        assert_eq!(
+            BrokerConnection::extract_clock_skew_secs("foo 20200101T250000Z bar"),
+            0
+        );
+    }
+
+    #[test]
+    fn test_extract_clock_skew_secs_leap_day() {
+        // Feb 29 2020 is valid (leap year); Feb 29 2021 is not.
+        assert_ne!(
+            BrokerConnection::extract_clock_skew_secs("stamp=20200229T120000Z"),
+            0
+        );
+        assert_eq!(
+            BrokerConnection::extract_clock_skew_secs("stamp=20210229T120000Z"),
+            0
+        );
+    }
+
+    #[test]
+    fn test_extract_clock_skew_secs_embedded_in_longer_message() {
+        // Multiple 'T' chars earlier in the message should not fool the scanner.
+        let msg = "RequestTime=THIS IS TEXT; expired; server 20200101T000000Z -- request rejected";
+        let skew = BrokerConnection::extract_clock_skew_secs(msg);
+        assert!(skew < 0);
+    }
+
+    #[test]
     fn test_msk_iam_clock_offset_default() {
         let config = ConnectionConfig::default();
         assert_eq!(config.msk_iam_clock_offset_secs.load(Ordering::Relaxed), 0);
+    }
+
+    /// An in-flight request must be failed with a timeout error when no
+    /// response arrives within `request_timeout`.  This tests the
+    /// `DelayQueue`-driven per-request timeout path introduced in the H2 fix.
+    #[tokio::test]
+    async fn test_request_times_out_when_no_response() {
+        let (client, _server) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(client);
+        let (_high_tx, high_rx) = mpsc::channel(4);
+        let (normal_tx, normal_rx) = mpsc::channel(4);
+        let stats = Arc::new(ConnectionStats::default());
+
+        // Very short timeout so the test completes quickly.
+        let request_timeout = Duration::from_millis(50);
+
+        tokio::spawn(BrokerConnection::run_connection_loop(
+            reader,
+            writer,
+            high_rx,
+            normal_rx,
+            request_timeout,
+            stats,
+            crate::protocol::MAX_MESSAGE_SIZE,
+            256,
+        ));
+
+        let (response_tx, response_rx) = oneshot::channel();
+        normal_tx
+            .send(ConnectionCommand::Request {
+                // Minimal 4-byte payload; the server side (_server) never replies.
+                data: Bytes::from_static(b"test"),
+                correlation_id: 42,
+                api_key: ApiKey::Produce,
+                api_version: 0,
+                response_tx,
+            })
+            .await
+            .unwrap();
+
+        let err = response_rx.await.unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected timeout error, got: {err}"
+        );
+    }
+
+    /// A response that arrives before the deadline must cancel the timer so
+    /// no spurious timeout error is delivered after the successful response.
+    #[tokio::test]
+    async fn test_response_cancels_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(client);
+        let (_high_tx, high_rx) = mpsc::channel(4);
+        let (normal_tx, normal_rx) = mpsc::channel(4);
+        let stats = Arc::new(ConnectionStats::default());
+
+        // Long enough to not fire during the test.
+        let request_timeout = Duration::from_secs(5);
+        let correlation_id: i32 = 99;
+
+        tokio::spawn(BrokerConnection::run_connection_loop(
+            reader,
+            writer,
+            high_rx,
+            normal_rx,
+            request_timeout,
+            stats,
+            crate::protocol::MAX_MESSAGE_SIZE,
+            256,
+        ));
+
+        let (response_tx, response_rx) = oneshot::channel();
+        normal_tx
+            .send(ConnectionCommand::Request {
+                data: Bytes::from_static(b"test"),
+                correlation_id,
+                api_key: ApiKey::Produce,
+                api_version: 0,
+                response_tx,
+            })
+            .await
+            .unwrap();
+
+        // Drain the request bytes the loop wrote to the wire.
+        let mut buf = [0u8; 4];
+        server.read_exact(&mut buf).await.unwrap();
+
+        // Send a valid response: 4-byte length prefix + 4-byte correlation_id.
+        // For Produce v0, ResponseHeader v0 = correlation_id only (4 bytes).
+        let body = correlation_id.to_be_bytes();
+        server.write_all(&(4i32).to_be_bytes()).await.unwrap();
+        server.write_all(&body).await.unwrap();
+        server.flush().await.unwrap();
+
+        let result = response_rx.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "expected successful response before timeout, got: {:?}",
+            result.unwrap_err()
+        );
     }
 }

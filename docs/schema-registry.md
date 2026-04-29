@@ -180,7 +180,7 @@ Enable the `schema-registry` feature to use the built-in HTTP client:
 
 ```toml
 [dependencies]
-krafka = { version = "0.4", features = ["schema-registry"] }
+krafka = { version = "0.5", features = ["schema-registry"] }
 ```
 
 ### Basic Usage
@@ -394,7 +394,7 @@ Enable the `aws-glue-schema-registry` feature to use the built-in SDK client:
 
 ```toml
 [dependencies]
-krafka = { version = "0.4", features = ["aws-glue-schema-registry"] }
+krafka = { version = "0.5", features = ["aws-glue-schema-registry"] }
 ```
 
 ```rust

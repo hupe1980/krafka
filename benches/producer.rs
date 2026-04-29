@@ -2,10 +2,19 @@
 //!
 //! Run with: cargo bench --bench producer
 
+#![allow(missing_docs, clippy::panic)]
+
 use bytes::BytesMut;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use krafka::protocol::{Compression, RecordBatch, RecordBatchBuilder};
+
+fn ok<T, E: std::fmt::Display>(result: Result<T, E>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(err) => unreachable!("benchmark setup should not fail: {err}"),
+    }
+}
 
 /// Benchmark record batch encoding with different sizes.
 fn bench_record_batch_encoding(c: &mut Criterion) {
@@ -165,11 +174,11 @@ fn bench_roundtrip_latency(c: &mut Criterion) {
                             Some(value.as_bytes().to_vec()),
                         )
                         .build();
-                    let encoded = batch.encode().expect("encode failed");
+                    let encoded = ok(batch.encode());
 
                     // Decode
                     let mut buf = encoded;
-                    let decoded = RecordBatch::decode(&mut buf).expect("decode failed");
+                    let decoded = ok(RecordBatch::decode(&mut buf));
                     black_box(decoded)
                 });
             },

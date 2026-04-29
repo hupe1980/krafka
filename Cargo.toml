@@ -1,6 +1,6 @@
 [package]
 name = "krafka"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["hupe1980"]
@@ -15,7 +15,7 @@ categories = ["network-programming", "asynchronous"]
 [dependencies]
 # Async runtime
 tokio = { version = "1.26", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
-tokio-util = { version = "0.7", default-features = false }
+tokio-util = { version = "0.7", default-features = false, features = ["time"] }
 
 # Zero-copy buffers
 bytes = "1"
@@ -46,6 +46,9 @@ parking_lot = "0.12"
 
 # TCP keepalive configuration
 socket2 = "0.5"
+
+# Date/time parsing for AWS SigV4 clock-skew extraction from broker errors.
+time = { version = "0.3", default-features = false, features = ["std", "parsing", "macros"] }
 
 # Cryptography for SASL/SCRAM
 sha2 = "0.10"
@@ -146,7 +149,16 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+undocumented_unsafe_blocks = "warn"
 
 [profile.release]
 lto = true

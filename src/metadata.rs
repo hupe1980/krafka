@@ -226,9 +226,10 @@ pub struct ClusterMetadata {
     /// starts timing immediately.
     metadata_attempt_start: SyncMutex<Option<Instant>>,
     /// Maximum age of a cached topic entry before it is evicted during partial
-    /// refresh. `None` disables TTL eviction (default). When set, topics not
-    /// refreshed within this duration are pruned on the next partial refresh,
-    /// preventing unbounded cache growth from topic churn.
+    /// refresh. Defaults to 5 minutes, matching the Java client's
+    /// `metadata.max.idle.ms`. `None` disables TTL eviction. When set, topics
+    /// not refreshed within this duration are pruned on the next partial
+    /// refresh, preventing unbounded cache growth from topic churn.
     topic_cache_ttl: Option<Duration>,
 }
 
@@ -248,7 +249,11 @@ impl ClusterMetadata {
             recovery_strategy: MetadataRecoveryStrategy::None,
             rebootstrap_trigger: Duration::from_secs(300),
             metadata_attempt_start: SyncMutex::new(None),
-            topic_cache_ttl: None,
+            // Default to 5 minutes, matching Java's `metadata.max.idle.ms`.
+            // Prevents unbounded cache growth on topic churn; callers that
+            // want the old unbounded behaviour can opt out via
+            // `with_topic_cache_ttl_disabled()`.
+            topic_cache_ttl: Some(Duration::from_secs(300)),
         }
     }
 
@@ -278,10 +283,23 @@ impl ClusterMetadata {
     /// During partial refreshes, cached topics that have not been refreshed
     /// within this duration are evicted to prevent unbounded cache growth.
     /// Full refreshes always rebuild from scratch regardless of this setting.
-    /// `None` disables TTL eviction (the default).
+    ///
+    /// Default: 5 minutes (matching Java's `metadata.max.idle.ms`).
     #[must_use]
     pub fn with_topic_cache_ttl(mut self, ttl: Duration) -> Self {
         self.topic_cache_ttl = Some(ttl);
+        self
+    }
+
+    /// Disable topic cache TTL eviction.
+    ///
+    /// Partial refreshes will retain cached topic entries indefinitely.
+    /// Prefer the default TTL for long-lived clients that discover topics
+    /// dynamically (CDC, multi-tenant gateways); disabling TTL eviction can
+    /// cause unbounded cache growth on topic churn.
+    #[must_use]
+    pub fn with_topic_cache_ttl_disabled(mut self) -> Self {
+        self.topic_cache_ttl = None;
         self
     }
 
@@ -580,7 +598,8 @@ impl ClusterMetadata {
         let mut topics = if full_refresh {
             HashMap::new()
         } else if let Some(ttl) = self.topic_cache_ttl {
-            old.topics
+            let retained: HashMap<_, _> = old
+                .topics
                 .iter()
                 .filter(|(name, _)| {
                     old.topic_last_refreshed
@@ -588,7 +607,16 @@ impl ClusterMetadata {
                         .is_some_and(|ts| now.duration_since(*ts) <= ttl)
                 })
                 .map(|(k, v)| (k.clone(), Arc::clone(v)))
-                .collect()
+                .collect();
+            let evicted = old.topics.len().saturating_sub(retained.len());
+            if evicted > 0 {
+                debug!(
+                    evicted,
+                    ttl_secs = ttl.as_secs(),
+                    "evicted stale topics from metadata cache"
+                );
+            }
+            retained
         } else {
             old.topics.clone()
         };
@@ -612,6 +640,13 @@ impl ClusterMetadata {
             .map(|(uuid, name)| (name.as_ref().clone(), *uuid))
             .collect();
 
+        // Track which topic names are actually provided by this response so
+        // that only those entries get their `topic_last_refreshed` timestamp
+        // advanced to `now`.  Retained-from-cache topics must keep their
+        // original timestamps; resetting them would make them perpetually
+        // "fresh" and defeat TTL eviction.
+        let mut response_topic_names: Vec<String> = Vec::new();
+
         for topic in response.topics {
             let Some(topic_name) = topic.name else {
                 continue;
@@ -620,12 +655,46 @@ impl ClusterMetadata {
             if !topic.error_code.is_ok() {
                 if topic.error_code.is_retriable() {
                     // Transient errors (LeaderNotAvailable, RequestTimedOut, etc.)
-                    // — keep stale cache entry so callers don't see the topic as
-                    // "unknown" until the next successful refresh.
+                    // — keep the stale cache entry so callers don't see the topic
+                    // as "unknown" until the next successful refresh.
+                    //
+                    // Also treat the transient response as a TTL refresh signal:
+                    // the broker knows about this topic, so we stamp it with `now`
+                    // to prevent premature TTL eviction.  Two sub-cases:
+                    //
+                    // 1. Topic survived TTL eviction above (still in `topics`):
+                    //    no entry change needed, just reset the timestamp.
+                    // 2. Topic was already TTL-evicted before the loop:
+                    //    restore it from `old.topics` so it is not silently lost.
                     debug!(
                         "Topic {} has transient error: {:?}, keeping stale cache entry",
                         topic_name, topic.error_code
                     );
+                    if !topics.contains_key(&topic_name)
+                        && let Some(old_info) = old.topics.get(&topic_name)
+                    {
+                        // Restore the stale entry: the topic was TTL-evicted
+                        // before the response loop, but the broker still
+                        // acknowledges it (even transiently).
+                        topics.insert(topic_name.clone(), Arc::clone(old_info));
+                        // Also restore the UUID mapping so that
+                        // `topic_id_for_name()` keeps working (e.g. for
+                        // ShareConsumer fetch routing that requires topic IDs).
+                        if let Some(&old_uuid) = old.name_to_topic_id.get(&topic_name)
+                            && let Some(name_arc) = old.topic_ids.get(&old_uuid)
+                        {
+                            topic_ids.insert(old_uuid, Arc::clone(name_arc));
+                            name_to_uuid.insert(topic_name.clone(), old_uuid);
+                        }
+                    }
+                    // Only stamp TTL for topics that are actually in the cache
+                    // (survived eviction or just restored from old).  Topics
+                    // with a transient error but no prior cache entry are
+                    // skipped, preventing orphaned entries in
+                    // `topic_last_refreshed` with no corresponding `topics` key.
+                    if topics.contains_key(&topic_name) {
+                        response_topic_names.push(topic_name);
+                    }
                 } else {
                     // Permanent errors (UnknownTopicOrPartition, TopicAuthorizationFailed,
                     // InvalidTopic, etc.) — remove from cache.
@@ -670,6 +739,7 @@ impl ClusterMetadata {
                 })
                 .collect();
 
+            response_topic_names.push(topic_name.clone());
             topics.insert(
                 topic_name.clone(),
                 Arc::new(TopicInfo {
@@ -680,10 +750,17 @@ impl ClusterMetadata {
             );
         }
 
-        // Build topic_last_refreshed: carry forward surviving entries (those
-        // that survived TTL eviction), then stamp every topic in this response.
+        // Build topic_last_refreshed:
+        // - Full refresh: start empty; every topic comes from this response.
+        // - Partial refresh with TTL: carry forward only entries that survived
+        //   TTL eviction (with their *original* timestamps so their age is
+        //   preserved); retained topics must NOT have their clock reset.
+        // - Partial refresh without TTL: carry forward all existing entries.
+        // In all cases, only topics that appear in the current response are
+        // stamped with `now`; retained-from-cache topics keep their existing
+        // timestamps so TTL eviction can fire correctly on the next refresh.
         let mut topic_last_refreshed = if full_refresh {
-            HashMap::with_capacity(topics.len())
+            HashMap::with_capacity(response_topic_names.len())
         } else if let Some(ttl) = self.topic_cache_ttl {
             old.topic_last_refreshed
                 .iter()
@@ -693,11 +770,12 @@ impl ClusterMetadata {
         } else {
             old.topic_last_refreshed.clone()
         };
-        // Mark every topic currently in the cache as refreshed now.
-        // On full refresh this stamps everything; on partial refresh this
-        // stamps the topics from the response (which were just inserted/updated).
-        for name in topics.keys() {
-            topic_last_refreshed.insert(name.clone(), now);
+        // Stamp only topics included in this response with `now`.
+        // For a full refresh `response_topic_names` covers all topics (the map
+        // started empty).  For a partial refresh this correctly skips
+        // retained-only entries, preserving their original timestamps.
+        for name in response_topic_names {
+            topic_last_refreshed.insert(name, now);
         }
 
         let new_cache = MetadataCache {
@@ -870,6 +948,7 @@ impl ClusterMetadata {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -1126,5 +1205,475 @@ mod tests {
         assert!(meta.cache.load().brokers.is_empty());
         // After rebootstrap, timer is set to Some(now) — not cleared.
         assert!(meta.metadata_attempt_start.lock().is_some());
+    }
+
+    #[test]
+    fn test_topic_cache_ttl_default_is_five_minutes() {
+        // Locks in the M2 default: topic cache TTL must be 5 min (matching
+        // Java's `metadata.max.idle.ms`) to prevent unbounded metadata growth
+        // on topic churn. See FINDINGS.md M2.
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        let meta = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        );
+        assert_eq!(meta.topic_cache_ttl, Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn test_topic_cache_ttl_disabled_opt_out() {
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        let meta = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        )
+        .with_topic_cache_ttl_disabled();
+        assert_eq!(meta.topic_cache_ttl, None);
+    }
+
+    /// Regression test: a partial refresh must not reset `topic_last_refreshed`
+    /// for topics that were only retained from the cache (not present in the
+    /// response).  Resetting retained timestamps makes them perpetually "fresh"
+    /// so TTL eviction never fires.
+    #[test]
+    fn test_partial_refresh_preserves_retained_topic_timestamps() {
+        use crate::protocol::{MetadataBroker, MetadataPartitionResponse, MetadataTopicResponse};
+
+        fn make_response(topic_names: &[&str]) -> MetadataResponse {
+            MetadataResponse {
+                throttle_time_ms: 0,
+                brokers: vec![MetadataBroker {
+                    node_id: 1,
+                    host: "localhost".to_string(),
+                    port: 9092,
+                    rack: None,
+                }],
+                cluster_id: None,
+                controller_id: 1,
+                error_code: ErrorCode::None,
+                topics: topic_names
+                    .iter()
+                    .map(|name| MetadataTopicResponse {
+                        error_code: ErrorCode::None,
+                        name: Some(name.to_string()),
+                        topic_id: None,
+                        is_internal: false,
+                        partitions: vec![MetadataPartitionResponse {
+                            error_code: ErrorCode::None,
+                            partition_index: 0,
+                            leader_id: 1,
+                            leader_epoch: 0,
+                            replica_nodes: vec![1],
+                            isr_nodes: vec![1],
+                            offline_replicas: vec![],
+                        }],
+                    })
+                    .collect(),
+            }
+        }
+
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        // Use a long TTL so "topic-a" is not evicted.
+        let meta = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        );
+
+        // First partial update: populate cache with "topic-a".
+        meta.update_cache(make_response(&["topic-a"]), false);
+        let ts_a = meta
+            .cache
+            .load()
+            .topic_last_refreshed
+            .get("topic-a")
+            .copied()
+            .unwrap();
+
+        // Second partial update: only "topic-b" is in the response.
+        // "topic-a" is retained from the cache but must keep its original timestamp.
+        meta.update_cache(make_response(&["topic-b"]), false);
+        let cache = meta.cache.load();
+
+        assert!(
+            cache.topics.contains_key("topic-a"),
+            "topic-a should still be in the cache (TTL not yet expired)"
+        );
+        assert!(
+            cache.topics.contains_key("topic-b"),
+            "topic-b should appear after the second update"
+        );
+
+        let ts_a_after = cache.topic_last_refreshed.get("topic-a").copied().unwrap();
+        assert_eq!(
+            ts_a, ts_a_after,
+            "retained topic-a's timestamp must not be advanced by a partial refresh"
+        );
+        assert!(
+            cache.topic_last_refreshed.contains_key("topic-b"),
+            "freshly refreshed topic-b must have a timestamp"
+        );
+    }
+
+    /// Regression test: a partial refresh where a topic comes back with a
+    /// transient error must reset its TTL timestamp so it is not evicted on
+    /// the next refresh, and the stale cache entry must be preserved.
+    #[test]
+    fn test_transient_error_topic_refreshes_ttl_timestamp() {
+        use crate::protocol::{MetadataBroker, MetadataPartitionResponse, MetadataTopicResponse};
+
+        fn make_ok_response(topic_names: &[&str]) -> MetadataResponse {
+            MetadataResponse {
+                throttle_time_ms: 0,
+                brokers: vec![MetadataBroker {
+                    node_id: 1,
+                    host: "localhost".to_string(),
+                    port: 9092,
+                    rack: None,
+                }],
+                cluster_id: None,
+                controller_id: 1,
+                error_code: ErrorCode::None,
+                topics: topic_names
+                    .iter()
+                    .map(|name| MetadataTopicResponse {
+                        error_code: ErrorCode::None,
+                        name: Some(name.to_string()),
+                        topic_id: None,
+                        is_internal: false,
+                        partitions: vec![MetadataPartitionResponse {
+                            error_code: ErrorCode::None,
+                            partition_index: 0,
+                            leader_id: 1,
+                            leader_epoch: 0,
+                            replica_nodes: vec![1],
+                            isr_nodes: vec![1],
+                            offline_replicas: vec![],
+                        }],
+                    })
+                    .collect(),
+            }
+        }
+
+        fn make_transient_error_response(topic_name: &str) -> MetadataResponse {
+            MetadataResponse {
+                throttle_time_ms: 0,
+                brokers: vec![MetadataBroker {
+                    node_id: 1,
+                    host: "localhost".to_string(),
+                    port: 9092,
+                    rack: None,
+                }],
+                cluster_id: None,
+                controller_id: 1,
+                error_code: ErrorCode::None,
+                topics: vec![MetadataTopicResponse {
+                    // LeaderNotAvailable is retriable
+                    error_code: ErrorCode::LeaderNotAvailable,
+                    name: Some(topic_name.to_string()),
+                    topic_id: None,
+                    is_internal: false,
+                    partitions: vec![],
+                }],
+            }
+        }
+
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        let meta = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        );
+
+        // Populate the cache with a successful refresh for "topic-a".
+        meta.update_cache(make_ok_response(&["topic-a"]), false);
+        let ts_before = meta
+            .cache
+            .load()
+            .topic_last_refreshed
+            .get("topic-a")
+            .copied()
+            .unwrap();
+
+        // A subsequent partial refresh returns a transient error for "topic-a".
+        // The stale entry must be preserved AND the timestamp must advance.
+        meta.update_cache(make_transient_error_response("topic-a"), false);
+        let cache = meta.cache.load();
+
+        assert!(
+            cache.topics.contains_key("topic-a"),
+            "topic-a must be retained when the response has a transient error"
+        );
+        let ts_after = cache.topic_last_refreshed.get("topic-a").copied().unwrap();
+        assert!(
+            ts_after >= ts_before,
+            "transient-error response must advance the TTL timestamp so the topic \
+             is not evicted on the next refresh"
+        );
+    }
+
+    /// Regression test: if a topic has already been TTL-evicted before the
+    /// response loop runs, a transient error in the response must restore the
+    /// stale entry rather than silently losing it.
+    #[test]
+    fn test_transient_error_restores_ttl_evicted_topic() {
+        use crate::protocol::{MetadataBroker, MetadataPartitionResponse, MetadataTopicResponse};
+
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        // 1 ns TTL — any nonzero time between two calls to update_cache
+        // will exceed it, so the eviction pass is guaranteed to remove
+        // the seeded entry before the response loop runs.
+        let meta = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        )
+        .with_topic_cache_ttl(Duration::from_nanos(1));
+
+        // Seed the cache with "topic-a".
+        meta.update_cache(
+            MetadataResponse {
+                throttle_time_ms: 0,
+                brokers: vec![MetadataBroker {
+                    node_id: 1,
+                    host: "localhost".to_string(),
+                    port: 9092,
+                    rack: None,
+                }],
+                cluster_id: None,
+                controller_id: 1,
+                error_code: ErrorCode::None,
+                topics: vec![MetadataTopicResponse {
+                    error_code: ErrorCode::None,
+                    name: Some("topic-a".to_string()),
+                    topic_id: None,
+                    is_internal: false,
+                    partitions: vec![MetadataPartitionResponse {
+                        error_code: ErrorCode::None,
+                        partition_index: 0,
+                        leader_id: 1,
+                        leader_epoch: 0,
+                        replica_nodes: vec![1],
+                        isr_nodes: vec![1],
+                        offline_replicas: vec![],
+                    }],
+                }],
+            },
+            false,
+        );
+        assert!(
+            meta.cache.load().topics.contains_key("topic-a"),
+            "pre-condition: topic-a seeded"
+        );
+
+        // Sleep long enough that Instant::elapsed() strictly exceeds the 1 ns TTL
+        // on every platform, including those with coarse clock resolution
+        // (e.g. Windows default timer granularity is ~15 ms).
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Partial refresh with a transient error for "topic-a".
+        meta.update_cache(
+            MetadataResponse {
+                throttle_time_ms: 0,
+                brokers: vec![MetadataBroker {
+                    node_id: 1,
+                    host: "localhost".to_string(),
+                    port: 9092,
+                    rack: None,
+                }],
+                cluster_id: None,
+                controller_id: 1,
+                error_code: ErrorCode::None,
+                topics: vec![MetadataTopicResponse {
+                    error_code: ErrorCode::LeaderNotAvailable,
+                    name: Some("topic-a".to_string()),
+                    topic_id: None,
+                    is_internal: false,
+                    partitions: vec![],
+                }],
+            },
+            false,
+        );
+
+        assert!(
+            meta.cache.load().topics.contains_key("topic-a"),
+            "topic-a must be restored from old cache after TTL eviction + transient error"
+        );
+    }
+
+    /// Regression test: a brand-new topic that appears in a partial refresh
+    /// only with a transient error (and has no prior cache entry) must NOT
+    /// create an orphaned entry in `topic_last_refreshed` with no corresponding
+    /// key in `topics`.
+    #[test]
+    fn test_transient_error_never_cached_topic_not_stamped() {
+        use crate::protocol::{MetadataBroker, MetadataTopicResponse};
+
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        let meta = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        );
+
+        // Empty cache — "unknown-topic" has never been seen before.
+        // A partial refresh returns a retriable error for it.
+        meta.update_cache(
+            MetadataResponse {
+                throttle_time_ms: 0,
+                brokers: vec![MetadataBroker {
+                    node_id: 1,
+                    host: "localhost".to_string(),
+                    port: 9092,
+                    rack: None,
+                }],
+                cluster_id: None,
+                controller_id: 1,
+                error_code: ErrorCode::None,
+                topics: vec![MetadataTopicResponse {
+                    error_code: ErrorCode::LeaderNotAvailable,
+                    name: Some("unknown-topic".to_string()),
+                    topic_id: None,
+                    is_internal: false,
+                    partitions: vec![],
+                }],
+            },
+            false,
+        );
+
+        let cache = meta.cache.load();
+        assert!(
+            !cache.topics.contains_key("unknown-topic"),
+            "unknown-topic must not appear in topics when only a transient error was received \
+             and there is no prior cache entry"
+        );
+        assert!(
+            !cache.topic_last_refreshed.contains_key("unknown-topic"),
+            "unknown-topic must not be stamped in topic_last_refreshed when it is not in topics"
+        );
+    }
+
+    /// Regression test: when a TTL-evicted topic is restored via the
+    /// transient-error path, its UUID mapping must also be restored so that
+    /// `topic_id_for_name()` continues to return `Some(uuid)`.
+    ///
+    /// Without the fix, `topic_ids` / `name_to_topic_id` were pruned during
+    /// TTL eviction and never repopulated in the transient-error branch,
+    /// causing ShareConsumer fetch routing to break.
+    #[test]
+    fn test_transient_error_restores_uuid_mapping_for_evicted_topic() {
+        use crate::protocol::{MetadataBroker, MetadataPartitionResponse, MetadataTopicResponse};
+
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        let meta = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        )
+        .with_topic_cache_ttl(Duration::from_nanos(1));
+
+        // The UUID used for "topic-b" in the seed response.
+        let uuid: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ];
+
+        // Seed the cache with "topic-b" carrying a topic UUID.
+        meta.update_cache(
+            MetadataResponse {
+                throttle_time_ms: 0,
+                brokers: vec![MetadataBroker {
+                    node_id: 1,
+                    host: "localhost".to_string(),
+                    port: 9092,
+                    rack: None,
+                }],
+                cluster_id: None,
+                controller_id: 1,
+                error_code: ErrorCode::None,
+                topics: vec![MetadataTopicResponse {
+                    error_code: ErrorCode::None,
+                    name: Some("topic-b".to_string()),
+                    topic_id: Some(uuid),
+                    is_internal: false,
+                    partitions: vec![MetadataPartitionResponse {
+                        error_code: ErrorCode::None,
+                        partition_index: 0,
+                        leader_id: 1,
+                        leader_epoch: 0,
+                        replica_nodes: vec![1],
+                        isr_nodes: vec![1],
+                        offline_replicas: vec![],
+                    }],
+                }],
+            },
+            false,
+        );
+        assert!(
+            meta.cache.load().name_to_topic_id.contains_key("topic-b"),
+            "pre-condition: UUID mapping seeded"
+        );
+
+        // Sleep long enough that Instant::elapsed() strictly exceeds the 1 ns TTL
+        // on every platform, including those with coarse clock resolution
+        // (e.g. Windows default timer granularity is ~15 ms).
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Partial refresh — 1 ns TTL guarantees eviction of "topic-b" before
+        // the response loop.  Transient error must restore both the topic entry
+        // and its UUID mapping.
+        meta.update_cache(
+            MetadataResponse {
+                throttle_time_ms: 0,
+                brokers: vec![MetadataBroker {
+                    node_id: 1,
+                    host: "localhost".to_string(),
+                    port: 9092,
+                    rack: None,
+                }],
+                cluster_id: None,
+                controller_id: 1,
+                error_code: ErrorCode::None,
+                topics: vec![MetadataTopicResponse {
+                    error_code: ErrorCode::LeaderNotAvailable,
+                    name: Some("topic-b".to_string()),
+                    topic_id: Some(uuid),
+                    is_internal: false,
+                    partitions: vec![],
+                }],
+            },
+            false,
+        );
+
+        let cache = meta.cache.load();
+        assert!(
+            cache.topics.contains_key("topic-b"),
+            "topic-b must be restored in topics"
+        );
+        assert_eq!(
+            cache.name_to_topic_id.get("topic-b"),
+            Some(&uuid),
+            "UUID mapping for topic-b must be restored in name_to_topic_id"
+        );
+        assert!(
+            cache.topic_ids.contains_key(&uuid),
+            "UUID must be present in topic_ids"
+        );
     }
 }

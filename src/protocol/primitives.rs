@@ -308,6 +308,7 @@ impl From<Option<String>> for KafkaString {
 // NOTE: Internal call sites use `TryEncode::try_encode()` instead.
 // This `Encode` impl exists for trait-bound compatibility.
 // PANIC: The `.expect()` triggers if `.encode()` is called on an oversized string.
+#[allow(clippy::expect_used)]
 impl Encode for KafkaString {
     fn encode(&self, buf: &mut impl BufMut) {
         self.try_encode(buf)
@@ -448,6 +449,7 @@ impl From<&[u8]> for KafkaBytes {
 // NOTE: Internal call sites use `TryEncode::try_encode()` instead.
 // This `Encode` impl exists for trait-bound compatibility.
 // PANIC: The `.expect()` triggers if `.encode()` is called on an oversized byte buffer.
+#[allow(clippy::expect_used)]
 impl Encode for KafkaBytes {
     fn encode(&self, buf: &mut impl BufMut) {
         self.try_encode(buf)
@@ -584,6 +586,7 @@ impl<T> From<Vec<T>> for KafkaArray<T> {
 // NOTE: Internal call sites use `TryEncode::try_encode()` instead.
 // This `Encode` impl exists for trait-bound compatibility.
 // PANIC: The `.expect()` triggers if `.encode()` is called on an oversized array.
+#[allow(clippy::expect_used)]
 impl<T: Encode> Encode for KafkaArray<T> {
     fn encode(&self, buf: &mut impl BufMut) {
         match &self.0 {
@@ -719,6 +722,7 @@ pub struct TaggedField {
 // NOTE: Internal call sites use `TryEncode::try_encode()` instead.
 // This `Encode` impl exists for trait-bound compatibility.
 // PANIC: The `.expect()` triggers if `.encode()` is called on oversized tagged fields.
+#[allow(clippy::expect_used)]
 impl Encode for TaggedFields {
     fn encode(&self, buf: &mut impl BufMut) {
         self.try_encode(buf)
@@ -776,6 +780,7 @@ impl Decode for TaggedFields {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use bytes::BytesMut;
 
