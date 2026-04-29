@@ -2463,7 +2463,8 @@ async fn test_offsets_for_times_and_watermarks_and_metadata() {
         .await
         .expect("offsets_for_times_for_topic failed");
     assert_eq!(offsets_at_zero.len(), 2);
-    for offset in offsets_at_zero.values() {
+    for result in offsets_at_zero.values() {
+        let offset = result.as_ref().expect("partition offset should be Ok");
         assert_eq!(*offset, 0, "expected offset 0 at timestamp 0");
     }
 
@@ -2474,7 +2475,8 @@ async fn test_offsets_for_times_and_watermarks_and_metadata() {
         .offsets_for_times_for_topic(topic, future_ts)
         .await
         .expect("offsets_for_times_for_topic (future) failed");
-    for offset in offsets_future.values() {
+    for result in offsets_future.values() {
+        let offset = result.as_ref().expect("partition offset should be Ok");
         assert_eq!(*offset, -1, "expected -1 for far-future timestamp");
     }
 
@@ -2484,14 +2486,11 @@ async fn test_offsets_for_times_and_watermarks_and_metadata() {
         .iter()
         .map(|p| (topic, p.partition))
         .collect();
-    let offsets_pairs = consumer
-        .offsets_for_times(&pairs, 0)
-        .await
-        .expect("offsets_for_times (pairs) failed");
+    let offsets_pairs = consumer.offsets_for_times(&pairs, 0).await;
     assert_eq!(offsets_pairs.len(), 2);
-    for ((t, _p), offset) in &offsets_pairs {
+    for ((t, _p), result) in &offsets_pairs {
         assert_eq!(t, topic);
-        assert_eq!(*offset, 0);
+        assert_eq!(*result.as_ref().expect("partition offset should be Ok"), 0);
     }
 
     consumer.close().await;

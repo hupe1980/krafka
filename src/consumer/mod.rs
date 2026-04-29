@@ -169,8 +169,12 @@ struct PartitionState {
 pub struct FetchMetadataResult {
     /// All brokers known to the cluster.
     pub brokers: Vec<BrokerInfo>,
-    /// Topics requested by the caller. Empty if the requested topic was not
-    /// found in the cluster.
+    /// Topics returned in the metadata snapshot.
+    ///
+    /// When [`Consumer::fetch_metadata`] is called with `None`, this contains
+    /// all cached topics. When called with `Some(topic)`, this contains the
+    /// matching topic if found, or is empty if that topic was not found in the
+    /// cluster.
     pub topics: Vec<TopicInfo>,
 }
 
@@ -323,6 +327,23 @@ fn build_fetch_routing_plan(
         expired_preferred,
         skipped,
     }
+}
+
+/// Group a flat `&[(&str, PartitionId)]` slice into a
+/// `HashMap<String, Vec<PartitionId>>` keyed by topic name, preserving
+/// insertion order within each topic's partition list.
+///
+/// This is the pure grouping step shared by [`Consumer::offsets_for_times`]
+/// and its unit test so that the test exercises the real logic.
+fn group_topic_partitions(partitions: &[(&str, PartitionId)]) -> HashMap<String, Vec<PartitionId>> {
+    let mut grouped: HashMap<String, Vec<PartitionId>> = HashMap::new();
+    for (topic, partition) in partitions {
+        grouped
+            .entry((*topic).to_string())
+            .or_default()
+            .push(*partition);
+    }
+    grouped
 }
 
 impl Consumer {
@@ -1453,33 +1474,22 @@ impl Consumer {
         }
 
         if let Some(timestamp) = self.config.auto_offset_reset.to_offset() {
-            // Group need_reset into HashMap<String, Vec<PartitionId>> for batched resolution
-            let mut batch: HashMap<String, Vec<PartitionId>> = HashMap::new();
-            for (topic, partition) in &need_reset {
-                batch.entry(topic.clone()).or_default().push(*partition);
-            }
+            let reset_pairs: Vec<(&str, PartitionId)> =
+                need_reset.iter().map(|(t, p)| (t.as_str(), *p)).collect();
+            let batch = group_topic_partitions(&reset_pairs);
 
-            let resolved = match self.resolve_list_offsets(&batch, timestamp).await {
-                Ok(resolved) => resolved,
-                Err(e) => {
-                    warn!(
-                        "Failed to resolve offsets via ListOffsets for {:?}: {}. \
-                         Will retry on next poll",
-                        batch.keys().collect::<Vec<_>>(),
-                        e
-                    );
-                    HashMap::new()
-                }
-            };
+            let resolved = self.resolve_list_offsets(&batch, timestamp).await;
             let mut offsets = self.offsets.write().await;
-            for (key, offset) in &resolved {
-                offsets.insert(key.clone(), *offset);
+            for (key, result) in &resolved {
+                if let Ok(offset) = result {
+                    offsets.insert(key.clone(), *offset);
+                }
             }
             drop(offsets);
 
-            // Log any partitions that weren't resolved (broker skipped or errored)
+            // Log any partitions that weren't resolved (no leader, broker error, etc.)
             for key in &need_reset {
-                if !resolved.contains_key(key) {
+                if resolved.get(key).is_none_or(|r| r.is_err()) {
                     warn!(
                         "Failed to resolve offset for {}-{}, will retry on next poll",
                         key.0, key.1
@@ -1536,28 +1546,33 @@ impl Consumer {
     /// equal to the given timestamp, for each listed `(topic, partition)`.
     ///
     /// Uses the ListOffsets API. Requests are batched by leader broker so each
-    /// broker receives at most one RPC. If a partition has no message at or
-    /// after the timestamp, the broker returns `-1` for that partition.
+    /// broker receives at most one RPC.
+    ///
+    /// Every input partition appears in the returned map:
+    /// - `Ok(offset)` — the broker returned a valid offset (`-1` means no
+    ///   message exists at or after the timestamp for that partition).
+    /// - `Err(e)` — a partition-level broker error (e.g. `NotLeaderForPartition`)
+    ///   or a transport failure prevented resolution for this partition.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let offsets = consumer
+    /// let results = consumer
     ///     .offsets_for_times(&[("orders", 0), ("orders", 1)], 1_700_000_000_000)
-    ///     .await?;
+    ///     .await;
+    /// for ((topic, partition), result) in &results {
+    ///     match result {
+    ///         Ok(offset) => println!("{topic}-{partition}: {offset}"),
+    ///         Err(e) => eprintln!("{topic}-{partition}: error {e}"),
+    ///     }
+    /// }
     /// ```
     pub async fn offsets_for_times(
         &self,
         partitions: &[(&str, PartitionId)],
         timestamp: i64,
-    ) -> Result<HashMap<(String, PartitionId), Offset>> {
-        let mut grouped: HashMap<String, Vec<PartitionId>> = HashMap::new();
-        for (topic, partition) in partitions {
-            grouped
-                .entry((*topic).to_string())
-                .or_default()
-                .push(*partition);
-        }
+    ) -> HashMap<(String, PartitionId), Result<Offset>> {
+        let grouped = group_topic_partitions(partitions);
         self.resolve_list_offsets(&grouped, timestamp).await
     }
 
@@ -1566,35 +1581,34 @@ impl Consumer {
     ///
     /// Convenience wrapper around [`Consumer::offsets_for_times`] that resolves
     /// the topic's partitions from metadata so callers don't have to list
-    /// them. Triggers a metadata refresh if the topic isn't cached yet.
+    /// them. Always refreshes topic metadata before deriving the partition
+    /// list so the results reflect the latest leader assignments (the refresh
+    /// is skipped by the metadata layer if cached metadata is still fresh).
     ///
-    /// Returns a map from `PartitionId` to the resolved offset. A partition
-    /// with no message at or after the timestamp maps to `-1`.
+    /// Returns `Err` if the topic cannot be found after the metadata refresh.
+    /// On success, each `PartitionId` maps to `Ok(offset)` or `Err(e)` —
+    /// see [`Consumer::offsets_for_times`] for per-partition semantics.
     pub async fn offsets_for_times_for_topic(
         &self,
         topic: &str,
         timestamp: i64,
-    ) -> Result<HashMap<PartitionId, Offset>> {
-        let info = match self.metadata.topic(topic) {
-            Some(info) => info,
-            None => {
-                self.metadata.refresh_for_topics(Some(&[topic])).await?;
-                self.metadata.topic(topic).ok_or_else(|| {
-                    KrafkaError::invalid_state(format!("topic not found: {topic}"))
-                })?
-            }
-        };
+    ) -> Result<HashMap<PartitionId, Result<Offset>>> {
+        self.metadata.refresh_for_topics(Some(&[topic])).await?;
+        let info = self
+            .metadata
+            .topic(topic)
+            .ok_or_else(|| KrafkaError::invalid_state(format!("topic not found: {topic}")))?;
 
         let pairs: Vec<(&str, PartitionId)> = info
             .partitions
             .iter()
             .map(|p| (topic, p.partition))
             .collect();
-        let results = self.offsets_for_times(&pairs, timestamp).await?;
+        let results = self.offsets_for_times(&pairs, timestamp).await;
 
         Ok(results
             .into_iter()
-            .map(|((_, p), offset)| (p, offset))
+            .map(|((_, p), result)| (p, result))
             .collect())
     }
 
@@ -1615,16 +1629,12 @@ impl Consumer {
 
     /// Return a snapshot of cluster metadata (brokers and topics).
     ///
-    /// If `topic` is `Some`, only that topic is returned. If `None`, all
-    /// topics known to the cluster are returned.
-    ///
-    /// This reads from the consumer's cached cluster metadata. If the
-    /// requested topic is not yet in the cache, a metadata refresh is
-    /// triggered first.
+    /// If `topic` is `Some`, only that topic is returned and the metadata
+    /// layer is asked to refresh that topic first (the network call is
+    /// skipped if cached metadata is still fresh). If `None`, all topics
+    /// known to the cluster are returned without triggering a refresh.
     pub async fn fetch_metadata(&self, topic: Option<&str>) -> Result<FetchMetadataResult> {
-        if let Some(name) = topic
-            && self.metadata.topic(name).is_none()
-        {
+        if let Some(name) = topic {
             self.metadata.refresh_for_topics(Some(&[name])).await?;
         }
 
@@ -1655,25 +1665,43 @@ impl Consumer {
         let mut partitions = HashMap::new();
         let topic_owned = topic.to_string();
         partitions.insert(topic_owned.clone(), vec![partition]);
-        let results = self.resolve_list_offsets(&partitions, timestamp).await?;
+        let mut results = self.resolve_list_offsets(&partitions, timestamp).await;
         results
-            .get(&(topic_owned, partition))
-            .copied()
-            .ok_or_else(|| {
-                KrafkaError::protocol(format!("no offset returned for {topic}-{partition}"))
+            .remove(&(topic_owned, partition))
+            .unwrap_or_else(|| {
+                Err(KrafkaError::protocol(format!(
+                    "no offset returned for {topic}-{partition}"
+                )))
             })
     }
 
     /// Resolve offsets for multiple partitions in batched ListOffsets RPCs,
     /// grouped by leader broker so each broker receives at most one request.
+    ///
+    /// Every requested partition appears in the returned map:
+    /// - `Ok(offset)` — broker returned a valid offset.
+    /// - `Err(e)` — the partition could not be resolved (no leader, connection
+    ///   failure, or a partition-level broker error).
     async fn resolve_list_offsets(
         &self,
         partitions: &HashMap<String, Vec<PartitionId>>,
         timestamp: i64,
-    ) -> Result<HashMap<(String, PartitionId), Offset>> {
+    ) -> HashMap<(String, PartitionId), Result<Offset>> {
         if partitions.is_empty() {
-            return Ok(HashMap::new());
+            return HashMap::new();
         }
+
+        // Pre-populate every partition with a default error; replaced on success.
+        let mut result: HashMap<(String, PartitionId), Result<Offset>> = partitions
+            .iter()
+            .flat_map(|(topic, parts)| {
+                let topic = topic.clone();
+                parts.iter().map(move |&p| {
+                    let msg = format!("no leader found for {topic}-{p}");
+                    ((topic.clone(), p), Err(KrafkaError::invalid_state(msg)))
+                })
+            })
+            .collect();
 
         // Group partitions by leader broker
         let mut by_leader: HashMap<crate::BrokerId, Vec<(String, PartitionId)>> = HashMap::new();
@@ -1711,15 +1739,13 @@ impl Consumer {
                         .push((topic, partition));
                 } else {
                     warn!(
-                        "No leader for {}-{} after metadata refresh, skipping",
+                        "No leader for {}-{} after metadata refresh",
                         topic, partition
                     );
+                    // result[(topic, partition)] retains its default Err
                 }
             }
         }
-
-        let mut result = HashMap::new();
-        let mut last_error: Option<KrafkaError> = None;
 
         for (&leader_id, leader_partitions) in &by_leader {
             // Group into ListOffsetsRequest topics
@@ -1751,15 +1777,18 @@ impl Consumer {
                 timeout_ms: None,
             };
 
-            // Get a connection to this broker by leader ID
+            // Get a connection to this broker by leader ID.
+            // On any broker-level failure, mark all its partitions as Err.
             let broker_info = match self.metadata.broker(leader_id) {
                 Some(b) => b,
                 None => {
                     warn!("Broker {} not found in metadata, skipping", leader_id);
-                    last_error = Some(KrafkaError::invalid_state(format!(
-                        "broker {} not found in metadata",
-                        leader_id
-                    )));
+                    let err = KrafkaError::invalid_state(format!(
+                        "broker {leader_id} not found in metadata"
+                    ));
+                    for (topic, partition) in leader_partitions {
+                        result.insert((topic.clone(), *partition), Err(err.clone()));
+                    }
                     continue;
                 }
             };
@@ -1771,7 +1800,9 @@ impl Consumer {
                 Ok(c) => c,
                 Err(e) => {
                     warn!("Failed to connect to broker {}: {}, skipping", leader_id, e);
-                    last_error = Some(e);
+                    for (topic, partition) in leader_partitions {
+                        result.insert((topic.clone(), *partition), Err(e.clone()));
+                    }
                     continue;
                 }
             };
@@ -1791,20 +1822,12 @@ impl Consumer {
                         "no mutually supported ListOffsets API version for broker {leader_id}"
                     ));
                     warn!("{err}");
-                    last_error = Some(err);
+                    for (topic, partition) in leader_partitions {
+                        result.insert((topic.clone(), *partition), Err(err.clone()));
+                    }
                     continue;
                 }
             };
-
-            if list_version < 1 {
-                let err = KrafkaError::protocol(format!(
-                    "broker {} only supports ListOffsets v{}, but v1+ is required",
-                    leader_id, list_version
-                ));
-                warn!("{}", err);
-                last_error = Some(err);
-                continue;
-            }
 
             let response = match conn
                 .send_request(ApiKey::ListOffsets, list_version, |buf| {
@@ -1818,7 +1841,9 @@ impl Consumer {
                         "ListOffsets v{} request failed for broker {}: {}, skipping",
                         list_version, leader_id, e
                     );
-                    last_error = Some(e);
+                    for (topic, partition) in leader_partitions {
+                        result.insert((topic.clone(), *partition), Err(e.clone()));
+                    }
                     continue;
                 }
             };
@@ -1832,43 +1857,42 @@ impl Consumer {
                         "Failed to decode ListOffsets v{} response from broker {}: {}, skipping",
                         list_version, leader_id, e
                     );
-                    last_error = Some(e);
+                    let err = KrafkaError::protocol(format!(
+                        "failed to decode ListOffsets response from broker {leader_id}: {e}"
+                    ));
+                    for (topic, partition) in leader_partitions {
+                        result.insert((topic.clone(), *partition), Err(err.clone()));
+                    }
                     continue;
                 }
             };
 
             for topic_resp in &list_response.topics {
                 for part_resp in &topic_resp.partitions {
+                    let key = (topic_resp.name.clone(), part_resp.partition_index);
                     if part_resp.error_code.is_ok() {
-                        result.insert(
-                            (topic_resp.name.clone(), part_resp.partition_index),
-                            part_resp.offset,
-                        );
+                        result.insert(key, Ok(part_resp.offset));
                     } else {
-                        let err = KrafkaError::broker(
-                            part_resp.error_code,
-                            format!(
-                                "ListOffsets error for {}-{}",
-                                topic_resp.name, part_resp.partition_index
-                            ),
-                        );
                         warn!(
                             "ListOffsets error for {}-{}: {:?}",
                             topic_resp.name, part_resp.partition_index, part_resp.error_code
                         );
-                        last_error = Some(err);
+                        result.insert(
+                            key,
+                            Err(KrafkaError::broker(
+                                part_resp.error_code,
+                                format!(
+                                    "ListOffsets error for {}-{}",
+                                    topic_resp.name, part_resp.partition_index
+                                ),
+                            )),
+                        );
                     }
                 }
             }
         }
 
-        if result.is_empty()
-            && let Some(e) = last_error
-        {
-            return Err(e);
-        }
-
-        Ok(result)
+        result
     }
 
     /// Poll for new records.
@@ -5398,21 +5422,15 @@ mod tests {
     }
 
     /// The flat `&[(&str, PartitionId)]` input to `offsets_for_times` is
-    /// grouped by topic before hitting the internal helper. Verify that the
-    /// grouping preserves all pairs, deduplicates topic keys, and keeps
-    /// partitions in insertion order.
+    /// grouped by topic via `group_topic_partitions`. Verify that the grouping
+    /// preserves all pairs, deduplicates topic keys, and keeps partitions in
+    /// insertion order.
     #[test]
     fn test_offsets_for_times_grouping() {
         let partitions: &[(&str, PartitionId)] =
             &[("topic1", 0), ("topic1", 2), ("topic2", 1), ("topic1", 5)];
 
-        let mut grouped: HashMap<String, Vec<PartitionId>> = HashMap::new();
-        for (topic, partition) in partitions {
-            grouped
-                .entry((*topic).to_string())
-                .or_default()
-                .push(*partition);
-        }
+        let grouped = group_topic_partitions(partitions);
 
         assert_eq!(grouped.len(), 2);
         assert_eq!(grouped["topic1"], vec![0, 2, 5]);
