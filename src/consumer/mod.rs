@@ -1572,8 +1572,23 @@ impl Consumer {
         partitions: &[(&str, PartitionId)],
         timestamp: i64,
     ) -> HashMap<(String, PartitionId), Result<Offset>> {
-        let grouped = group_topic_partitions(partitions);
-        self.resolve_list_offsets(&grouped, timestamp).await
+        // Validate all topic names up front; surface invalid ones as per-partition
+        // Err entries rather than letting them reach protocol encoding.
+        let mut result: HashMap<(String, PartitionId), Result<Offset>> = HashMap::new();
+        let mut valid: Vec<(&str, PartitionId)> = Vec::with_capacity(partitions.len());
+        for &(topic, partition) in partitions {
+            match validate_topic_name(topic) {
+                Ok(()) => valid.push((topic, partition)),
+                Err(e) => {
+                    result.insert((topic.to_string(), partition), Err(e));
+                }
+            }
+        }
+        if !valid.is_empty() {
+            let grouped = group_topic_partitions(&valid);
+            result.extend(self.resolve_list_offsets(&grouped, timestamp).await);
+        }
+        result
     }
 
     /// Look up the earliest offset whose message timestamp is greater than or
@@ -1593,18 +1608,22 @@ impl Consumer {
         topic: &str,
         timestamp: i64,
     ) -> Result<HashMap<PartitionId, Result<Offset>>> {
+        validate_topic_name(topic)?;
         self.metadata.refresh_for_topics(Some(&[topic])).await?;
         let info = self
             .metadata
             .topic(topic)
             .ok_or_else(|| KrafkaError::invalid_state(format!("topic not found: {topic}")))?;
 
-        let pairs: Vec<(&str, PartitionId)> = info
-            .partitions
-            .iter()
-            .map(|p| (topic, p.partition))
-            .collect();
-        let results = self.offsets_for_times(&pairs, timestamp).await;
+        // Build the grouped map directly — topic name is already validated and
+        // the partition list comes from trusted metadata, so bypass the
+        // per-entry validation loop inside `offsets_for_times`.
+        let mut grouped: HashMap<String, Vec<PartitionId>> = HashMap::new();
+        grouped.insert(
+            topic.to_string(),
+            info.partitions.iter().map(|p| p.partition).collect(),
+        );
+        let results = self.resolve_list_offsets(&grouped, timestamp).await;
 
         Ok(results
             .into_iter()
@@ -1616,25 +1635,31 @@ impl Consumer {
     ///
     /// Issues two ListOffsets RPCs to the partition leader — one for the
     /// earliest offset (`timestamp = -2`) and one for the latest
-    /// (`timestamp = -1`) — and returns `(low, high)`.
+    /// (`timestamp = -1`) — and returns `(low, high)`. Both RPCs are issued
+    /// concurrently.
     pub async fn fetch_watermarks(
         &self,
         topic: &str,
         partition: PartitionId,
     ) -> Result<(Offset, Offset)> {
-        let low = self.resolve_list_offset(topic, partition, -2).await?;
-        let high = self.resolve_list_offset(topic, partition, -1).await?;
-        Ok((low, high))
+        validate_topic_name(topic)?;
+        let (low, high) = tokio::join!(
+            self.resolve_list_offset(topic, partition, -2),
+            self.resolve_list_offset(topic, partition, -1),
+        );
+        Ok((low?, high?))
     }
 
     /// Return a snapshot of cluster metadata (brokers and topics).
     ///
     /// If `topic` is `Some`, only that topic is returned and the metadata
     /// layer is asked to refresh that topic first (the network call is
-    /// skipped if cached metadata is still fresh). If `None`, all topics
-    /// known to the cluster are returned without triggering a refresh.
+    /// skipped if cached metadata is still fresh). If `None`, a snapshot of
+    /// all currently cached topics is returned without triggering a refresh
+    /// (cached data may be partial or stale).
     pub async fn fetch_metadata(&self, topic: Option<&str>) -> Result<FetchMetadataResult> {
         if let Some(name) = topic {
+            validate_topic_name(name)?;
             self.metadata.refresh_for_topics(Some(&[name])).await?;
         }
 
