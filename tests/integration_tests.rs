@@ -2378,3 +2378,120 @@ async fn test_consumer_metrics() {
     );
     consumer.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_offsets_for_times_and_watermarks_and_metadata() {
+    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::producer::Producer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "offsets-times-topic";
+    create_topic(&bootstrap_servers, topic, 2).await;
+
+    let producer = Producer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .build()
+        .await
+        .expect("Failed to create producer");
+
+    // Send a few messages across both partitions using different keys.
+    const N: usize = 10;
+    for i in 0..N {
+        let key = format!("k-{}", i);
+        let _ = producer
+            .send(topic, Some(key.as_bytes()), format!("v-{}", i).as_bytes())
+            .await
+            .expect("Failed to send message");
+    }
+    producer.close().await;
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id("offsets-times-group")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .expect("Failed to create consumer");
+
+    // fetch_metadata(Some(topic)) should find the topic with 2 partitions.
+    let md = consumer
+        .fetch_metadata(Some(topic))
+        .await
+        .expect("fetch_metadata failed");
+    assert!(!md.brokers.is_empty(), "expected at least one broker");
+    let topic_info = md
+        .topics
+        .iter()
+        .find(|t| t.name == topic)
+        .expect("topic missing from fetch_metadata");
+    assert_eq!(topic_info.partition_count(), 2);
+
+    // fetch_metadata(None) should include the topic.
+    let all = consumer
+        .fetch_metadata(None)
+        .await
+        .expect("fetch_metadata(None) failed");
+    assert!(all.topics.iter().any(|t| t.name == topic));
+
+    // fetch_watermarks: low should be 0, high should be > 0 and the two
+    // partitions together should account for all N messages.
+    let mut total_high = 0i64;
+    for p in &topic_info.partitions {
+        let (low, high) = consumer
+            .fetch_watermarks(topic, p.partition)
+            .await
+            .expect("fetch_watermarks failed");
+        assert_eq!(
+            low, 0,
+            "low watermark should be 0 for partition {}",
+            p.partition
+        );
+        assert!(high >= 0, "high watermark should be non-negative");
+        total_high += high;
+    }
+    assert_eq!(
+        total_high, N as i64,
+        "watermarks should sum to message count"
+    );
+
+    // offsets_for_times with timestamp 0 should return offset 0 for every
+    // partition (all messages are at or after epoch).
+    let offsets_at_zero = consumer
+        .offsets_for_times_for_topic(topic, 0)
+        .await
+        .expect("offsets_for_times_for_topic failed");
+    assert_eq!(offsets_at_zero.len(), 2);
+    for result in offsets_at_zero.values() {
+        let offset = result.as_ref().expect("partition offset should be Ok");
+        assert_eq!(*offset, 0, "expected offset 0 at timestamp 0");
+    }
+
+    // offsets_for_times with a future timestamp should return -1 per
+    // partition (no message at or after).
+    let future_ts = i64::MAX / 2;
+    let offsets_future = consumer
+        .offsets_for_times_for_topic(topic, future_ts)
+        .await
+        .expect("offsets_for_times_for_topic (future) failed");
+    for result in offsets_future.values() {
+        let offset = result.as_ref().expect("partition offset should be Ok");
+        assert_eq!(*offset, -1, "expected -1 for far-future timestamp");
+    }
+
+    // Lower-level offsets_for_times with an explicit pair list.
+    let pairs: Vec<(&str, i32)> = topic_info
+        .partitions
+        .iter()
+        .map(|p| (topic, p.partition))
+        .collect();
+    let offsets_pairs = consumer.offsets_for_times(&pairs, 0).await;
+    assert_eq!(offsets_pairs.len(), 2);
+    for ((t, _p), result) in &offsets_pairs {
+        assert_eq!(t, topic);
+        assert_eq!(*result.as_ref().expect("partition offset should be Ok"), 0);
+    }
+
+    consumer.close().await;
+}

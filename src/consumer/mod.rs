@@ -70,7 +70,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::auth::AuthConfig;
 use crate::error::{KrafkaError, Result};
-use crate::metadata::ClusterMetadata;
+use crate::metadata::{BrokerInfo, ClusterMetadata, TopicInfo};
 use crate::metrics::ConsumerMetrics;
 use crate::network::{ConnectionConfig, ConnectionPool};
 use crate::protocol::{
@@ -161,6 +161,21 @@ struct PartitionState {
     /// resolved or was never retried. Prevents retry storms when offset
     /// resolution fails persistently (e.g. broker unavailable).
     offset_retry_backoff: Option<(Instant, Duration)>,
+}
+
+/// Cluster metadata snapshot returned by [`Consumer::fetch_metadata`].
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct FetchMetadataResult {
+    /// All brokers known to the cluster.
+    pub brokers: Vec<BrokerInfo>,
+    /// Topics returned in the metadata snapshot.
+    ///
+    /// When [`Consumer::fetch_metadata`] is called with `None`, this contains
+    /// all cached topics. When called with `Some(topic)`, this contains the
+    /// matching topic if found, or is empty if that topic was not found in the
+    /// cluster.
+    pub topics: Vec<TopicInfo>,
 }
 
 /// A Kafka consumer.
@@ -311,6 +326,66 @@ fn build_fetch_routing_plan(
         partitions_by_broker,
         expired_preferred,
         skipped,
+    }
+}
+
+/// Group a flat `&[(&str, PartitionId)]` slice into a
+/// `HashMap<String, Vec<PartitionId>>` keyed by topic name, preserving
+/// insertion order within each topic's partition list.
+///
+/// This is the pure grouping step shared by [`Consumer::offsets_for_times`]
+/// and its unit test so that the test exercises the real logic.
+fn group_topic_partitions(partitions: &[(&str, PartitionId)]) -> HashMap<String, Vec<PartitionId>> {
+    let mut grouped: HashMap<String, Vec<PartitionId>> = HashMap::new();
+    for &(topic, partition) in partitions {
+        // Use get_mut to avoid allocating a String key on every lookup;
+        // only insert (and therefore allocate) when the topic is first seen.
+        if let Some(v) = grouped.get_mut(topic) {
+            v.push(partition);
+        } else {
+            grouped.insert(topic.to_string(), vec![partition]);
+        }
+    }
+    grouped
+}
+
+/// Apply a [`ListOffsetsResponse`] into a per-partition result map.
+///
+/// For each partition in the response:
+/// - `error_code == None` → inserts `Ok(offset)`.
+/// - any other error code → inserts `Err(KrafkaError::broker(...))` and logs
+///   a `warn!`.
+///
+/// Partitions not mentioned in the response are left unchanged, so the
+/// pre-populated `Err("no leader found …")` sentinel that `resolve_list_offsets`
+/// inserts before calling this function is preserved for any partition the
+/// broker did not report.
+fn apply_list_offsets_response(
+    response: &ListOffsetsResponse,
+    result: &mut HashMap<(String, PartitionId), Result<Offset>>,
+) {
+    for topic_resp in &response.topics {
+        for part_resp in &topic_resp.partitions {
+            let key = (topic_resp.name.clone(), part_resp.partition_index);
+            if part_resp.error_code.is_ok() {
+                result.insert(key, Ok(part_resp.offset));
+            } else {
+                warn!(
+                    "ListOffsets error for {}-{}: {:?}",
+                    topic_resp.name, part_resp.partition_index, part_resp.error_code
+                );
+                result.insert(
+                    key,
+                    Err(KrafkaError::broker(
+                        part_resp.error_code,
+                        format!(
+                            "ListOffsets error for {}-{}",
+                            topic_resp.name, part_resp.partition_index
+                        ),
+                    )),
+                );
+            }
+        }
     }
 }
 
@@ -1442,33 +1517,22 @@ impl Consumer {
         }
 
         if let Some(timestamp) = self.config.auto_offset_reset.to_offset() {
-            // Group need_reset into HashMap<String, Vec<PartitionId>> for batched resolution
-            let mut batch: HashMap<String, Vec<PartitionId>> = HashMap::new();
-            for (topic, partition) in &need_reset {
-                batch.entry(topic.clone()).or_default().push(*partition);
-            }
+            let reset_pairs: Vec<(&str, PartitionId)> =
+                need_reset.iter().map(|(t, p)| (t.as_str(), *p)).collect();
+            let batch = group_topic_partitions(&reset_pairs);
 
-            let resolved = match self.resolve_list_offsets(&batch, timestamp).await {
-                Ok(resolved) => resolved,
-                Err(e) => {
-                    warn!(
-                        "Failed to resolve offsets via ListOffsets for {:?}: {}. \
-                         Will retry on next poll",
-                        batch.keys().collect::<Vec<_>>(),
-                        e
-                    );
-                    HashMap::new()
-                }
-            };
+            let resolved = self.resolve_list_offsets(&batch, timestamp).await;
             let mut offsets = self.offsets.write().await;
-            for (key, offset) in &resolved {
-                offsets.insert(key.clone(), *offset);
+            for (key, result) in &resolved {
+                if let Ok(offset) = result {
+                    offsets.insert(key.clone(), *offset);
+                }
             }
             drop(offsets);
 
-            // Log any partitions that weren't resolved (broker skipped or errored)
+            // Log any partitions that weren't resolved (no leader, broker error, etc.)
             for key in &need_reset {
-                if !resolved.contains_key(key) {
+                if resolved.get(key).is_none_or(|r| r.is_err()) {
                     warn!(
                         "Failed to resolve offset for {}-{}, will retry on next poll",
                         key.0, key.1
@@ -1521,6 +1585,140 @@ impl Consumer {
         self.seek(topic, partition, offset).await
     }
 
+    /// Look up the earliest offset whose message timestamp is greater than or
+    /// equal to the given timestamp, for each listed `(topic, partition)`.
+    ///
+    /// Uses the ListOffsets API. Requests are batched by leader broker so each
+    /// broker receives at most one RPC.
+    ///
+    /// Every input partition appears in the returned map:
+    /// - `Ok(offset)` — the broker returned a valid offset (`-1` means no
+    ///   message exists at or after the timestamp for that partition).
+    /// - `Err(e)` — a partition-level broker error (e.g. `NotLeaderForPartition`)
+    ///   or a transport failure prevented resolution for this partition.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let results = consumer
+    ///     .offsets_for_times(&[("orders", 0), ("orders", 1)], 1_700_000_000_000)
+    ///     .await;
+    /// for ((topic, partition), result) in &results {
+    ///     match result {
+    ///         Ok(offset) => println!("{topic}-{partition}: {offset}"),
+    ///         Err(e) => eprintln!("{topic}-{partition}: error {e}"),
+    ///     }
+    /// }
+    /// ```
+    pub async fn offsets_for_times(
+        &self,
+        partitions: &[(&str, PartitionId)],
+        timestamp: i64,
+    ) -> HashMap<(String, PartitionId), Result<Offset>> {
+        // Validate all topic names up front; surface invalid ones as per-partition
+        // Err entries rather than letting them reach protocol encoding.
+        let mut result: HashMap<(String, PartitionId), Result<Offset>> = HashMap::new();
+        let mut valid: Vec<(&str, PartitionId)> = Vec::with_capacity(partitions.len());
+        for &(topic, partition) in partitions {
+            match validate_topic_name(topic) {
+                Ok(()) => valid.push((topic, partition)),
+                Err(e) => {
+                    result.insert((topic.to_string(), partition), Err(e));
+                }
+            }
+        }
+        if !valid.is_empty() {
+            let grouped = group_topic_partitions(&valid);
+            result.extend(self.resolve_list_offsets(&grouped, timestamp).await);
+        }
+        result
+    }
+
+    /// Look up the earliest offset whose message timestamp is greater than or
+    /// equal to the given timestamp, for every partition of a single topic.
+    ///
+    /// Convenience wrapper around [`Consumer::offsets_for_times`] that resolves
+    /// the topic's partitions from metadata so callers don't have to list
+    /// them. Always refreshes topic metadata before deriving the partition
+    /// list so the results reflect the latest leader assignments (the refresh
+    /// is skipped by the metadata layer if cached metadata is still fresh).
+    ///
+    /// Returns `Err` if the topic cannot be found after the metadata refresh.
+    /// On success, each `PartitionId` maps to `Ok(offset)` or `Err(e)` —
+    /// see [`Consumer::offsets_for_times`] for per-partition semantics.
+    pub async fn offsets_for_times_for_topic(
+        &self,
+        topic: &str,
+        timestamp: i64,
+    ) -> Result<HashMap<PartitionId, Result<Offset>>> {
+        validate_topic_name(topic)?;
+        self.metadata.refresh_for_topics(Some(&[topic])).await?;
+        let info = self
+            .metadata
+            .topic(topic)
+            .ok_or_else(|| KrafkaError::invalid_state(format!("topic not found: {topic}")))?;
+
+        // Build the grouped map directly — topic name is already validated and
+        // the partition list comes from trusted metadata, so bypass the
+        // per-entry validation loop inside `offsets_for_times`.
+        let mut grouped: HashMap<String, Vec<PartitionId>> = HashMap::new();
+        grouped.insert(
+            topic.to_string(),
+            info.partitions.iter().map(|p| p.partition).collect(),
+        );
+        let results = self.resolve_list_offsets(&grouped, timestamp).await;
+
+        Ok(results
+            .into_iter()
+            .map(|((_, p), result)| (p, result))
+            .collect())
+    }
+
+    /// Fetch the low (log start) and high (latest) watermarks for a partition.
+    ///
+    /// Issues two ListOffsets RPCs to the partition leader — one for the
+    /// earliest offset (`timestamp = -2`) and one for the latest
+    /// (`timestamp = -1`) — and returns `(low, high)`. Both RPCs are issued
+    /// concurrently.
+    pub async fn fetch_watermarks(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+    ) -> Result<(Offset, Offset)> {
+        validate_topic_name(topic)?;
+        let (low, high) = tokio::join!(
+            self.resolve_list_offset(topic, partition, -2),
+            self.resolve_list_offset(topic, partition, -1),
+        );
+        Ok((low?, high?))
+    }
+
+    /// Return a snapshot of cluster metadata (brokers and topics).
+    ///
+    /// If `topic` is `Some`, only that topic is returned and the metadata
+    /// layer is asked to refresh that topic first (the network call is
+    /// skipped if cached metadata is still fresh). If `None`, a snapshot of
+    /// all currently cached topics is returned without triggering a refresh
+    /// (cached data may be partial or stale).
+    pub async fn fetch_metadata(&self, topic: Option<&str>) -> Result<FetchMetadataResult> {
+        if let Some(name) = topic {
+            validate_topic_name(name)?;
+            self.metadata.refresh_for_topics(Some(&[name])).await?;
+        }
+
+        let brokers = self.metadata.brokers();
+        let topics = match topic {
+            Some(name) => self
+                .metadata
+                .topic(name)
+                .map(|t| vec![t])
+                .unwrap_or_default(),
+            None => self.metadata.topics(),
+        };
+
+        Ok(FetchMetadataResult { brokers, topics })
+    }
+
     /// Resolve an offset timestamp via the ListOffsets API.
     ///
     /// `timestamp` should be:
@@ -1535,25 +1733,43 @@ impl Consumer {
         let mut partitions = HashMap::new();
         let topic_owned = topic.to_string();
         partitions.insert(topic_owned.clone(), vec![partition]);
-        let results = self.resolve_list_offsets(&partitions, timestamp).await?;
+        let mut results = self.resolve_list_offsets(&partitions, timestamp).await;
         results
-            .get(&(topic_owned, partition))
-            .copied()
-            .ok_or_else(|| {
-                KrafkaError::protocol(format!("no offset returned for {topic}-{partition}"))
+            .remove(&(topic_owned, partition))
+            .unwrap_or_else(|| {
+                Err(KrafkaError::protocol(format!(
+                    "no offset returned for {topic}-{partition}"
+                )))
             })
     }
 
     /// Resolve offsets for multiple partitions in batched ListOffsets RPCs,
     /// grouped by leader broker so each broker receives at most one request.
+    ///
+    /// Every requested partition appears in the returned map:
+    /// - `Ok(offset)` — broker returned a valid offset.
+    /// - `Err(e)` — the partition could not be resolved (no leader, connection
+    ///   failure, or a partition-level broker error).
     async fn resolve_list_offsets(
         &self,
         partitions: &HashMap<String, Vec<PartitionId>>,
         timestamp: i64,
-    ) -> Result<HashMap<(String, PartitionId), Offset>> {
+    ) -> HashMap<(String, PartitionId), Result<Offset>> {
         if partitions.is_empty() {
-            return Ok(HashMap::new());
+            return HashMap::new();
         }
+
+        // Pre-populate every partition with a default error; replaced on success.
+        let mut result: HashMap<(String, PartitionId), Result<Offset>> = partitions
+            .iter()
+            .flat_map(|(topic, parts)| {
+                let topic = topic.clone();
+                parts.iter().map(move |&p| {
+                    let msg = format!("no leader found for {topic}-{p}");
+                    ((topic.clone(), p), Err(KrafkaError::invalid_state(msg)))
+                })
+            })
+            .collect();
 
         // Group partitions by leader broker
         let mut by_leader: HashMap<crate::BrokerId, Vec<(String, PartitionId)>> = HashMap::new();
@@ -1591,15 +1807,13 @@ impl Consumer {
                         .push((topic, partition));
                 } else {
                     warn!(
-                        "No leader for {}-{} after metadata refresh, skipping",
+                        "No leader for {}-{} after metadata refresh",
                         topic, partition
                     );
+                    // result[(topic, partition)] retains its default Err
                 }
             }
         }
-
-        let mut result = HashMap::new();
-        let mut last_error: Option<KrafkaError> = None;
 
         for (&leader_id, leader_partitions) in &by_leader {
             // Group into ListOffsetsRequest topics
@@ -1631,15 +1845,18 @@ impl Consumer {
                 timeout_ms: None,
             };
 
-            // Get a connection to this broker by leader ID
+            // Get a connection to this broker by leader ID.
+            // On any broker-level failure, mark all its partitions as Err.
             let broker_info = match self.metadata.broker(leader_id) {
                 Some(b) => b,
                 None => {
                     warn!("Broker {} not found in metadata, skipping", leader_id);
-                    last_error = Some(KrafkaError::invalid_state(format!(
-                        "broker {} not found in metadata",
-                        leader_id
-                    )));
+                    let err = KrafkaError::invalid_state(format!(
+                        "broker {leader_id} not found in metadata"
+                    ));
+                    for (topic, partition) in leader_partitions {
+                        result.insert((topic.clone(), *partition), Err(err.clone()));
+                    }
                     continue;
                 }
             };
@@ -1651,7 +1868,9 @@ impl Consumer {
                 Ok(c) => c,
                 Err(e) => {
                     warn!("Failed to connect to broker {}: {}, skipping", leader_id, e);
-                    last_error = Some(e);
+                    for (topic, partition) in leader_partitions {
+                        result.insert((topic.clone(), *partition), Err(e.clone()));
+                    }
                     continue;
                 }
             };
@@ -1671,20 +1890,12 @@ impl Consumer {
                         "no mutually supported ListOffsets API version for broker {leader_id}"
                     ));
                     warn!("{err}");
-                    last_error = Some(err);
+                    for (topic, partition) in leader_partitions {
+                        result.insert((topic.clone(), *partition), Err(err.clone()));
+                    }
                     continue;
                 }
             };
-
-            if list_version < 1 {
-                let err = KrafkaError::protocol(format!(
-                    "broker {} only supports ListOffsets v{}, but v1+ is required",
-                    leader_id, list_version
-                ));
-                warn!("{}", err);
-                last_error = Some(err);
-                continue;
-            }
 
             let response = match conn
                 .send_request(ApiKey::ListOffsets, list_version, |buf| {
@@ -1698,7 +1909,9 @@ impl Consumer {
                         "ListOffsets v{} request failed for broker {}: {}, skipping",
                         list_version, leader_id, e
                     );
-                    last_error = Some(e);
+                    for (topic, partition) in leader_partitions {
+                        result.insert((topic.clone(), *partition), Err(e.clone()));
+                    }
                     continue;
                 }
             };
@@ -1712,43 +1925,20 @@ impl Consumer {
                         "Failed to decode ListOffsets v{} response from broker {}: {}, skipping",
                         list_version, leader_id, e
                     );
-                    last_error = Some(e);
+                    let err = KrafkaError::protocol(format!(
+                        "failed to decode ListOffsets response from broker {leader_id}: {e}"
+                    ));
+                    for (topic, partition) in leader_partitions {
+                        result.insert((topic.clone(), *partition), Err(err.clone()));
+                    }
                     continue;
                 }
             };
 
-            for topic_resp in &list_response.topics {
-                for part_resp in &topic_resp.partitions {
-                    if part_resp.error_code.is_ok() {
-                        result.insert(
-                            (topic_resp.name.clone(), part_resp.partition_index),
-                            part_resp.offset,
-                        );
-                    } else {
-                        let err = KrafkaError::broker(
-                            part_resp.error_code,
-                            format!(
-                                "ListOffsets error for {}-{}",
-                                topic_resp.name, part_resp.partition_index
-                            ),
-                        );
-                        warn!(
-                            "ListOffsets error for {}-{}: {:?}",
-                            topic_resp.name, part_resp.partition_index, part_resp.error_code
-                        );
-                        last_error = Some(err);
-                    }
-                }
-            }
+            apply_list_offsets_response(&list_response, &mut result);
         }
 
-        if result.is_empty()
-            && let Some(e) = last_error
-        {
-            return Err(e);
-        }
-
-        Ok(result)
+        result
     }
 
     /// Poll for new records.
@@ -2613,10 +2803,10 @@ impl Consumer {
         topic: &str,
         partition: PartitionId,
     ) -> Result<()> {
-        use crate::protocol::{
-            OffsetForLeaderEpochPartition, OffsetForLeaderEpochRequest,
-            OffsetForLeaderEpochResponse, OffsetForLeaderEpochTopic,
-        };
+        use crate::protocol::OffsetForLeaderEpochPartition;
+        use crate::protocol::OffsetForLeaderEpochRequest;
+        use crate::protocol::OffsetForLeaderEpochResponse;
+        use crate::protocol::OffsetForLeaderEpochTopic;
 
         // Refresh metadata first to get updated leader info
         if let Err(e) = self.metadata.refresh_for_topics(Some(&[topic])).await {
@@ -3860,7 +4050,8 @@ mod tests {
 
     #[test]
     fn test_consumer_builder_with_rebalance_listener() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
 
         struct TestListener {
             assigned: AtomicBool,
@@ -4072,7 +4263,8 @@ mod tests {
 
     #[test]
     fn test_consumer_builder_interceptor() {
-        use crate::interceptor::{ConsumerInterceptor, InterceptorResult};
+        use crate::interceptor::ConsumerInterceptor;
+        use crate::interceptor::InterceptorResult;
 
         #[derive(Debug)]
         struct TestInterceptor;
@@ -4439,11 +4631,12 @@ mod tests {
         assert_eq!(t2.partitions[0].partition_index, 1);
     }
 
-    /// Test response result extraction — successful offsets are collected.
+    /// Test response result extraction — every partition maps to Ok(offset).
     #[test]
     fn test_list_offsets_response_result_extraction() {
         use crate::error::ErrorCode;
-        use crate::protocol::{ListOffsetsResponsePartition, ListOffsetsResponseTopic};
+        use crate::protocol::ListOffsetsResponsePartition;
+        use crate::protocol::ListOffsetsResponseTopic;
 
         let response = ListOffsetsResponse {
             topics: vec![
@@ -4479,31 +4672,22 @@ mod tests {
             ],
         };
 
-        // Simulate the result extraction logic from resolve_list_offsets
-        let mut result: HashMap<(String, PartitionId), Offset> = HashMap::new();
-        for topic_resp in &response.topics {
-            for part_resp in &topic_resp.partitions {
-                if part_resp.error_code.is_ok() {
-                    result.insert(
-                        (topic_resp.name.clone(), part_resp.partition_index),
-                        part_resp.offset,
-                    );
-                }
-            }
-        }
+        let mut result: HashMap<(String, PartitionId), Result<Offset>> = HashMap::new();
+        apply_list_offsets_response(&response, &mut result);
 
         assert_eq!(result.len(), 3);
-        assert_eq!(result[&("topic1".to_string(), 0)], 42);
-        assert_eq!(result[&("topic1".to_string(), 1)], 100);
-        assert_eq!(result[&("topic2".to_string(), 0)], 7);
+        assert_eq!(*result[&("topic1".to_string(), 0)].as_ref().unwrap(), 42);
+        assert_eq!(*result[&("topic1".to_string(), 1)].as_ref().unwrap(), 100);
+        assert_eq!(*result[&("topic2".to_string(), 0)].as_ref().unwrap(), 7);
     }
 
-    /// Test partial failure — some partitions succeed, some have error codes.
-    /// Successful results are kept; errors are recorded but don't block success.
+    /// Test partial failure — successful partitions map to Ok, failed partition
+    /// maps to Err. No partition is dropped from the result.
     #[test]
     fn test_list_offsets_partial_failure_keeps_successes() {
         use crate::error::ErrorCode;
-        use crate::protocol::{ListOffsetsResponsePartition, ListOffsetsResponseTopic};
+        use crate::protocol::ListOffsetsResponsePartition;
+        use crate::protocol::ListOffsetsResponseTopic;
 
         let response = ListOffsetsResponse {
             topics: vec![ListOffsetsResponseTopic {
@@ -4534,45 +4718,33 @@ mod tests {
             }],
         };
 
-        let mut result: HashMap<(String, PartitionId), Offset> = HashMap::new();
-        let mut last_error: Option<KrafkaError> = None;
+        let mut result: HashMap<(String, PartitionId), Result<Offset>> = HashMap::new();
+        apply_list_offsets_response(&response, &mut result);
 
-        for topic_resp in &response.topics {
-            for part_resp in &topic_resp.partitions {
-                if part_resp.error_code.is_ok() {
-                    result.insert(
-                        (topic_resp.name.clone(), part_resp.partition_index),
-                        part_resp.offset,
-                    );
-                } else {
-                    last_error = Some(KrafkaError::broker(
-                        part_resp.error_code,
-                        format!(
-                            "ListOffsets error for {}-{}",
-                            topic_resp.name, part_resp.partition_index
-                        ),
-                    ));
-                }
-            }
-        }
-
-        // Successful partitions are present
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[&("topic1".to_string(), 0)], 42);
-        assert_eq!(result[&("topic1".to_string(), 2)], 99);
-        // Failed partition is not present
-        assert!(!result.contains_key(&("topic1".to_string(), 1)));
-        // Error was recorded
-        assert!(last_error.is_some());
-        // But since we have results, the method would return Ok (not Err)
-        assert!(!result.is_empty());
+        // All three partitions are present in the map.
+        assert_eq!(result.len(), 3);
+        // Successful partitions carry Ok(offset).
+        assert_eq!(*result[&("topic1".to_string(), 0)].as_ref().unwrap(), 42);
+        assert_eq!(*result[&("topic1".to_string(), 2)].as_ref().unwrap(), 99);
+        // Failed partition is present with Err, not absent.
+        assert!(result[&("topic1".to_string(), 1)].is_err());
+        let err_msg = result[&("topic1".to_string(), 1)]
+            .as_ref()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_msg.contains("ListOffsets error"),
+            "unexpected: {err_msg}"
+        );
     }
 
-    /// Test that all-failed response with no results propagates the error.
+    /// Test that an all-failed response returns every partition as Err —
+    /// the function itself does not return a top-level error.
     #[test]
     fn test_list_offsets_all_failed_returns_error() {
         use crate::error::ErrorCode;
-        use crate::protocol::{ListOffsetsResponsePartition, ListOffsetsResponseTopic};
+        use crate::protocol::ListOffsetsResponsePartition;
+        use crate::protocol::ListOffsetsResponseTopic;
 
         let response = ListOffsetsResponse {
             topics: vec![ListOffsetsResponseTopic {
@@ -4587,33 +4759,20 @@ mod tests {
             }],
         };
 
-        let mut result: HashMap<(String, PartitionId), Offset> = HashMap::new();
-        let mut last_error: Option<KrafkaError> = None;
+        let mut result: HashMap<(String, PartitionId), Result<Offset>> = HashMap::new();
+        apply_list_offsets_response(&response, &mut result);
 
-        for topic_resp in &response.topics {
-            for part_resp in &topic_resp.partitions {
-                if part_resp.error_code.is_ok() {
-                    result.insert(
-                        (topic_resp.name.clone(), part_resp.partition_index),
-                        part_resp.offset,
-                    );
-                } else {
-                    last_error = Some(KrafkaError::broker(
-                        part_resp.error_code,
-                        format!(
-                            "ListOffsets error for {}-{}",
-                            topic_resp.name, part_resp.partition_index
-                        ),
-                    ));
-                }
-            }
-        }
-
-        // No results — method would return Err(last_error)
-        assert!(result.is_empty());
-        assert!(last_error.is_some());
-        let err = last_error.unwrap();
-        assert!(err.to_string().contains("ListOffsets error"));
+        // The partition is present in the map, mapped to Err.
+        assert_eq!(result.len(), 1);
+        assert!(result[&("topic1".to_string(), 0)].is_err());
+        let err_msg = result[&("topic1".to_string(), 0)]
+            .as_ref()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_msg.contains("ListOffsets error"),
+            "unexpected: {err_msg}"
+        );
     }
 
     /// Test ListOffsets request encoding for v1 and v2 produces expected sizes.
@@ -4919,7 +5078,8 @@ mod tests {
     /// on_partitions_revoked fires before on_partitions_assigned.
     #[test]
     fn test_cooperative_callback_ordering() {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
 
         struct OrderTracker {
             revoke_seq: AtomicU64,
@@ -4971,7 +5131,8 @@ mod tests {
     /// (more consumers than partitions).
     #[test]
     fn test_cooperative_on_assigned_fires_on_empty() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
 
         struct EmptyTracker {
             assigned_called: AtomicBool,
@@ -5268,5 +5429,21 @@ mod tests {
         // ConsumerStream must be Send so it can be used across .await in
         // spawned tasks (e.g., tokio::spawn with an Arc<Consumer>).
         assert_send::<ConsumerStream<'_>>();
+    }
+
+    /// The flat `&[(&str, PartitionId)]` input to `offsets_for_times` is
+    /// grouped by topic via `group_topic_partitions`. Verify that the grouping
+    /// preserves all pairs, deduplicates topic keys, and keeps partitions in
+    /// insertion order.
+    #[test]
+    fn test_offsets_for_times_grouping() {
+        let partitions: &[(&str, PartitionId)] =
+            &[("topic1", 0), ("topic1", 2), ("topic2", 1), ("topic1", 5)];
+
+        let grouped = group_topic_partitions(partitions);
+
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped["topic1"], vec![0, 2, 5]);
+        assert_eq!(grouped["topic2"], vec![1]);
     }
 }
