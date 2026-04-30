@@ -97,7 +97,9 @@ pub fn kafka_producer_span(
         span.record(MESSAGING_KAFKA_PARTITION, p);
     }
 
-    if let Some(key_bytes) = key {
+    if let Some(key_bytes) = key
+        && !span.is_disabled()
+    {
         span.record(KRAFKA_MESSAGE_KEY_SIZE, key_bytes.len() as u64);
         let key_hash = sha256_hex(key_bytes);
         span.record(KRAFKA_MESSAGE_KEY_SHA256, key_hash.as_str());
