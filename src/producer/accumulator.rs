@@ -95,6 +95,17 @@ enum AppendResponse {
     Done(Result<RecordMetadata>),
 }
 
+#[derive(Debug)]
+struct AppendCommand {
+    topic: TopicHandle,
+    record: RoutedRecord,
+    partition: PartitionId,
+    record_size: usize,
+    response_tx: oneshot::Sender<AppendResponse>,
+    operation_guard: InFlightOpGuard,
+    permit_reservation: PermitReservation,
+}
+
 /// Message sent to the accumulator background task.
 #[derive(Debug)]
 enum AccumulatorMessage {
@@ -107,15 +118,7 @@ enum AccumulatorMessage {
     /// without explicit handling (accumulator task panics, channel send
     /// race during shutdown, etc.) releases the permits via `Drop` so
     /// `buffer_memory` is never leaked.
-    Append {
-        topic: TopicHandle,
-        record: RoutedRecord,
-        partition: PartitionId,
-        record_size: usize,
-        response_tx: oneshot::Sender<AppendResponse>,
-        operation_guard: InFlightOpGuard,
-        permit_reservation: PermitReservation,
-    },
+    Append(AppendCommand),
     /// Flush all batches.
     Flush {
         response_tx: oneshot::Sender<Result<()>>,
@@ -281,7 +284,7 @@ impl RecordAccumulatorHandle {
         // owns the release obligation via the message contents.
         match tokio::time::timeout(
             remaining,
-            self.sender.send(AccumulatorMessage::Append {
+            self.sender.send(AccumulatorMessage::Append(AppendCommand {
                 topic,
                 record,
                 partition,
@@ -289,7 +292,7 @@ impl RecordAccumulatorHandle {
                 response_tx,
                 operation_guard,
                 permit_reservation,
-            }),
+            })),
         )
         .await
         {
@@ -612,16 +615,8 @@ impl RecordAccumulator {
             tokio::select! {
                 msg = receiver.recv() => {
                     match msg {
-                        Some(AccumulatorMessage::Append {
-                            topic,
-                            record,
-                            partition,
-                            record_size,
-                            response_tx,
-                            operation_guard,
-                            permit_reservation,
-                        }) => {
-                            self.handle_append(topic, record, partition, record_size, response_tx, operation_guard, permit_reservation).await;
+                        Some(AccumulatorMessage::Append(append)) => {
+                            self.handle_append(append).await;
                         }
                         Some(AccumulatorMessage::Flush { response_tx }) => {
                             let result = self.flush_all().await;
@@ -656,16 +651,16 @@ impl RecordAccumulator {
     /// `permit_reservation.forget()` so the eventual `InFlightGuard` can
     /// release the permits on batch completion; error paths let the
     /// reservation drop naturally, returning the permits to the pool.
-    async fn handle_append(
-        &mut self,
-        topic: TopicHandle,
-        record: RoutedRecord,
-        partition: PartitionId,
-        record_size: usize,
-        response_tx: oneshot::Sender<AppendResponse>,
-        operation_guard: InFlightOpGuard,
-        permit_reservation: PermitReservation,
-    ) {
+    async fn handle_append(&mut self, append: AppendCommand) {
+        let AppendCommand {
+            topic,
+            record,
+            partition,
+            record_size,
+            response_tx,
+            operation_guard,
+            permit_reservation,
+        } = append;
         let key = (topic, partition);
 
         // Backpressure is enforced in `append_with_guard` via

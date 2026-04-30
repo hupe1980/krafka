@@ -479,7 +479,7 @@ impl Producer {
         // Runs after the interceptor since interceptors can mutate the record.
         record.validate()?;
 
-        let accumulator_record_size = self.accumulator.as_ref().map(|_| record.estimated_size());
+        let record_size = record.estimated_size();
         let routed = record.into_routed_parts();
         let topic = routed.topic;
         let record = routed.record;
@@ -500,13 +500,7 @@ impl Producer {
         // Use accumulator for batching if available (linger > 0)
         if let Some(ref accumulator) = self.accumulator {
             return accumulator
-                .append_routed_with_guard(
-                    topic,
-                    record,
-                    accumulator_record_size.expect("accumulator size computed when present"),
-                    partition,
-                    operation_guard,
-                )
+                .append_routed_with_guard(topic, record, record_size, partition, operation_guard)
                 .await;
         }
 

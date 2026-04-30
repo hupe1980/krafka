@@ -67,7 +67,7 @@ pub fn random_uuid_v4() -> String {
 ///
 /// The counter wraps around from `i32::MAX` to `i32::MIN` (roughly every
 /// 2.1 billion IDs), while skipping the reserved
-/// [`NO_RESPONSE_CORRELATION_ID`] sentinel used by fire-and-forget requests.
+/// `NO_RESPONSE_CORRELATION_ID` sentinel used by fire-and-forget requests.
 /// With a bounded in-flight window (default 256), collision between a
 /// recycled ID and a still-pending request is extremely unlikely.
 pub struct CorrelationIdGenerator {
@@ -85,7 +85,7 @@ impl CorrelationIdGenerator {
     /// Generate the next correlation ID.
     ///
     /// IDs are unique modulo `i32` wraparound, excluding the reserved
-    /// [`NO_RESPONSE_CORRELATION_ID`] sentinel. Negative values are valid
+    /// `NO_RESPONSE_CORRELATION_ID` sentinel. Negative values are valid
     /// Kafka correlation IDs.
     #[inline]
     pub fn next(&self) -> i32 {
