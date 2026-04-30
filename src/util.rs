@@ -5,6 +5,12 @@ use std::time::Duration;
 
 use crate::error::{KrafkaError, Result};
 
+/// Reserved correlation ID for requests that intentionally expect no response.
+///
+/// The normal request generator skips this value so fire-and-forget paths can
+/// avoid consuming the regular request/response ID space.
+pub(crate) const NO_RESPONSE_CORRELATION_ID: i32 = i32::MIN;
+
 /// Convert a `Duration` to milliseconds as `i32`, capping at `i32::MAX`.
 ///
 /// `Duration::as_millis()` returns `u128`, which would silently truncate
@@ -60,9 +66,10 @@ pub fn random_uuid_v4() -> String {
 /// Thread-safe correlation ID generator.
 ///
 /// The counter wraps around from `i32::MAX` to `i32::MIN` (roughly every
-/// 2.1 billion IDs). With a bounded in-flight window (default 256),
-/// collision between a recycled ID and a still-pending request is
-/// extremely unlikely.
+/// 2.1 billion IDs), while skipping the reserved
+/// [`NO_RESPONSE_CORRELATION_ID`] sentinel used by fire-and-forget requests.
+/// With a bounded in-flight window (default 256), collision between a
+/// recycled ID and a still-pending request is extremely unlikely.
 pub struct CorrelationIdGenerator {
     counter: AtomicI32,
 }
@@ -77,11 +84,17 @@ impl CorrelationIdGenerator {
 
     /// Generate the next correlation ID.
     ///
-    /// IDs are unique modulo `i32` wraparound. Negative values are valid
+    /// IDs are unique modulo `i32` wraparound, excluding the reserved
+    /// [`NO_RESPONSE_CORRELATION_ID`] sentinel. Negative values are valid
     /// Kafka correlation IDs.
     #[inline]
     pub fn next(&self) -> i32 {
-        self.counter.fetch_add(1, Ordering::Relaxed)
+        loop {
+            let correlation_id = self.counter.fetch_add(1, Ordering::Relaxed);
+            if correlation_id != NO_RESPONSE_CORRELATION_ID {
+                return correlation_id;
+            }
+        }
     }
 }
 
@@ -219,6 +232,16 @@ mod tests {
         assert_eq!(generator.next(), 1);
         assert_eq!(generator.next(), 2);
         assert_eq!(generator.next(), 3);
+    }
+
+    #[test]
+    fn test_correlation_id_generator_skips_reserved_no_response_id() {
+        let generator = CorrelationIdGenerator {
+            counter: AtomicI32::new(NO_RESPONSE_CORRELATION_ID),
+        };
+
+        assert_eq!(generator.next(), NO_RESPONSE_CORRELATION_ID + 1);
+        assert_eq!(generator.next(), NO_RESPONSE_CORRELATION_ID + 2);
     }
 
     #[test]
@@ -366,8 +389,6 @@ pub fn parse_bootstrap_servers(servers: &str) -> Result<Vec<String>> {
     Ok(addrs)
 }
 
-/// Extract the hostname from an address string for TLS SNI.
-///
 /// Handles bracketed IPv6 (`[::1]:port`), bare IPv6 (`2001:db8::1`),
 /// and IPv4/hostname with optional port (`host:port`). Returns the bare
 /// hostname without port or brackets.

@@ -149,6 +149,7 @@ pub async fn connect_tls(
 
     // Extract the bare hostname (no port, no brackets) using the shared helper
     let host = crate::util::extract_sni_hostname(sni_hostname)?.to_string();
+    validate_tls_server_name(&host, sni_hostname)?;
 
     let server_name = ServerName::try_from(host)
         .map_err(|e| KrafkaError::config(format!("Invalid server name: {e}")))?;
@@ -157,6 +158,15 @@ pub async fn connect_tls(
         .connect(server_name, stream)
         .await
         .map_err(|e| KrafkaError::auth(format!("TLS handshake failed: {e}")))
+}
+
+fn validate_tls_server_name(host: &str, original: &str) -> Result<()> {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Err(KrafkaError::config(format!(
+            "numeric IP addresses are not valid TLS SNI hostnames: {original}"
+        )));
+    }
+    Ok(())
 }
 
 /// Extract `tls-server-end-point` channel binding data from a TLS stream (RFC 5929 §4.1).
@@ -553,5 +563,16 @@ mod tests {
             tls_config.alpn_protocols,
             vec![b"kafka".to_vec(), b"h2".to_vec()]
         );
+    }
+
+    #[test]
+    fn test_validate_tls_server_name_rejects_numeric_ips() {
+        let ipv4 = validate_tls_server_name("127.0.0.1", "127.0.0.1:9092").unwrap_err();
+        assert!(ipv4.to_string().contains("numeric IP addresses"));
+
+        let ipv6 = validate_tls_server_name("::1", "[::1]:9092").unwrap_err();
+        assert!(ipv6.to_string().contains("numeric IP addresses"));
+
+        assert!(validate_tls_server_name("broker.example.com", "broker.example.com:9092").is_ok());
     }
 }

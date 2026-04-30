@@ -231,6 +231,7 @@ async fn main() {
 | `high_priority_requests_total` | Counter | High-priority requests sent |
 | `normal_priority_requests_total` | Counter | Normal-priority requests sent |
 | `high_priority_bypasses_total` | Counter | High-priority requests processed ahead of normal-priority work |
+| `high_priority_bypass_yields_total` | Counter | Forced normal-priority drain steps after exhausting the high-priority bypass budget |
 | `throttle_delays_total` | Counter | Normal-priority requests delayed due to broker throttling |
 | `throttle_delay_ms_total` | Counter | Total broker-throttle delay applied to normal-priority requests, in milliseconds |
 | `active_connections` | Gauge | Current active connections |

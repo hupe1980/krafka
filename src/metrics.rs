@@ -719,6 +719,11 @@ impl MetricsVisitable for ConnectionMetrics {
             self.high_priority_bypasses.get(),
         );
         exporter.export_counter(
+            &format!("{prefix}_high_priority_bypass_yields"),
+            "Forced normal-priority drain steps after exhausting the high-priority bypass budget",
+            self.high_priority_bypass_yields.get(),
+        );
+        exporter.export_counter(
             &format!("{prefix}_throttle_delays"),
             "Normal-priority requests delayed due to broker throttling",
             self.throttle_delays.get(),
@@ -894,6 +899,7 @@ impl KrafkaMetrics {
         self.connection.high_priority_requests.reset();
         self.connection.normal_priority_requests.reset();
         self.connection.high_priority_bypasses.reset();
+        self.connection.high_priority_bypass_yields.reset();
         self.connection.throttle_delays.reset();
         self.connection.throttle_delay_ms.reset();
         self.connection.active_connections.set(0);
@@ -1145,6 +1151,9 @@ pub struct ConnectionMetrics {
     pub normal_priority_requests: Counter,
     /// Number of high-priority requests processed ahead of normal-priority work.
     pub high_priority_bypasses: Counter,
+    /// Number of fairness yields that forced one normal-priority drain after the
+    /// high-priority bypass budget was exhausted.
+    pub high_priority_bypass_yields: Counter,
     /// Number of normal-priority requests delayed by broker throttling.
     pub throttle_delays: Counter,
     /// Total broker-throttle delay applied to normal-priority requests, in milliseconds.
@@ -1199,6 +1208,12 @@ impl ConnectionMetrics {
         self.high_priority_bypasses.inc();
     }
 
+    /// Record a fairness yield after exhausting the high-priority bypass budget.
+    #[inline]
+    pub fn record_high_priority_bypass_yield(&self) {
+        self.high_priority_bypass_yields.inc();
+    }
+
     /// Record a normal-priority delay caused by broker throttling.
     #[inline]
     pub fn record_throttle_delay(&self, delay: Duration) {
@@ -1216,6 +1231,7 @@ impl ConnectionMetrics {
             high_priority_requests: self.high_priority_requests.get(),
             normal_priority_requests: self.normal_priority_requests.get(),
             high_priority_bypasses: self.high_priority_bypasses.get(),
+            high_priority_bypass_yields: self.high_priority_bypass_yields.get(),
             throttle_delays: self.throttle_delays.get(),
             throttle_delay_ms: self.throttle_delay_ms.get(),
             active_connections: self.active_connections.get(),
@@ -1240,6 +1256,8 @@ pub struct ConnectionMetricsSnapshot {
     pub normal_priority_requests: u64,
     /// High-priority requests processed ahead of normal-priority work.
     pub high_priority_bypasses: u64,
+    /// Forced normal-priority drain steps after the high-priority bypass budget was exhausted.
+    pub high_priority_bypass_yields: u64,
     /// Normal-priority requests delayed by broker throttling.
     pub throttle_delays: u64,
     /// Total broker-throttle delay applied to normal-priority requests, in milliseconds.
@@ -1396,6 +1414,7 @@ mod tests {
         metrics.record_high_priority_request();
         metrics.record_normal_priority_request();
         metrics.record_high_priority_bypass();
+        metrics.record_high_priority_bypass_yield();
         metrics.record_throttle_delay(Duration::from_millis(25));
 
         let snapshot = metrics.snapshot();
@@ -1406,6 +1425,7 @@ mod tests {
         assert_eq!(snapshot.high_priority_requests, 1);
         assert_eq!(snapshot.normal_priority_requests, 1);
         assert_eq!(snapshot.high_priority_bypasses, 1);
+        assert_eq!(snapshot.high_priority_bypass_yields, 1);
         assert_eq!(snapshot.throttle_delays, 1);
         assert_eq!(snapshot.throttle_delay_ms, 25);
     }
@@ -1471,6 +1491,7 @@ mod tests {
         metrics.record_high_priority_request();
         metrics.record_normal_priority_request();
         metrics.record_high_priority_bypass();
+        metrics.record_high_priority_bypass_yield();
         metrics.record_throttle_delay(Duration::from_millis(75));
 
         let output = metrics.to_prometheus_text("krafka_connection");
@@ -1478,6 +1499,7 @@ mod tests {
         assert!(output.contains("krafka_connection_high_priority_requests_total 1"));
         assert!(output.contains("krafka_connection_normal_priority_requests_total 1"));
         assert!(output.contains("krafka_connection_high_priority_bypasses_total 1"));
+        assert!(output.contains("krafka_connection_high_priority_bypass_yields_total 1"));
         assert!(output.contains("krafka_connection_throttle_delays_total 1"));
         assert!(output.contains("krafka_connection_throttle_delay_ms_total 75"));
     }
@@ -1508,14 +1530,17 @@ mod tests {
 
         producer.record_send(100);
         connection.record_high_priority_request();
+        connection.record_high_priority_bypass_yield();
         connection.record_throttle_delay(Duration::from_millis(10));
         assert_eq!(producer.records_sent.get(), 1);
         assert_eq!(connection.high_priority_requests.get(), 1);
+        assert_eq!(connection.high_priority_bypass_yields.get(), 1);
         assert_eq!(connection.throttle_delay_ms.get(), 10);
 
         registry.reset();
         assert_eq!(producer.records_sent.get(), 0);
         assert_eq!(connection.high_priority_requests.get(), 0);
+        assert_eq!(connection.high_priority_bypass_yields.get(), 0);
         assert_eq!(connection.throttle_delay_ms.get(), 0);
     }
 

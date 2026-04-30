@@ -39,6 +39,21 @@ const MAX_RETRIES: u32 = 3;
 /// Base backoff duration for retries.
 const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
 
+/// Minimum telemetry push interval accepted from the broker.
+const MIN_PUSH_INTERVAL_MS: i32 = 100;
+
+/// Maximum telemetry push interval accepted from the broker.
+const MAX_PUSH_INTERVAL_MS: i32 = 60 * 60 * 1000;
+
+fn retry_backoff(attempt: u32) -> Duration {
+    debug_assert!(attempt > 0, "retry_backoff expects attempts starting at 1");
+    RETRY_BACKOFF_BASE * 2u32.saturating_pow(attempt.saturating_sub(1))
+}
+
+fn clamp_push_interval_ms(raw_ms: i32) -> i32 {
+    raw_ms.clamp(MIN_PUSH_INTERVAL_MS, MAX_PUSH_INTERVAL_MS)
+}
+
 /// Configuration for the telemetry reporter.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -274,7 +289,7 @@ impl TelemetryReporter {
     ) -> Option<Subscription> {
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
-                let backoff = RETRY_BACKOFF_BASE * 2u32.saturating_pow(attempt - 1);
+                let backoff = retry_backoff(attempt);
                 debug!(
                     attempt,
                     backoff_ms = backoff.as_millis(),
@@ -341,7 +356,15 @@ impl TelemetryReporter {
             };
         }
 
-        let push_interval = Duration::from_millis(resp.push_interval_ms.max(100) as u64);
+        let clamped_push_interval_ms = clamp_push_interval_ms(resp.push_interval_ms);
+        if clamped_push_interval_ms != resp.push_interval_ms {
+            debug!(
+                raw_push_interval_ms = resp.push_interval_ms,
+                clamped_push_interval_ms,
+                "Clamped broker telemetry push interval to supported bounds"
+            );
+        }
+        let push_interval = Duration::from_millis(clamped_push_interval_ms as u64);
 
         // KIP-714: the response only contains a non-null ClientInstanceId on
         // the initial handshake (request had null UUID). On subsequent requests
@@ -416,15 +439,17 @@ impl TelemetryReporter {
 
         let payload = exporter.finish();
 
-        // Warn if payload exceeds broker limit (but still send — broker enforces).
+        // Without splitting or truncation support, skip oversized pushes locally
+        // instead of knowingly sending a payload the broker will reject.
         if subscription.telemetry_max_bytes > 0
             && payload.len() > subscription.telemetry_max_bytes as usize
         {
             warn!(
                 payload_bytes = payload.len(),
                 max_bytes = subscription.telemetry_max_bytes,
-                "Telemetry payload exceeds broker TelemetryMaxBytes"
+                "Telemetry payload exceeds broker TelemetryMaxBytes; skipping push"
             );
+            return PushResult::Ok;
         }
 
         let req = PushTelemetryRequest {
@@ -510,6 +535,40 @@ impl TelemetryReporter {
         }
     }
 
+    /// Retry transient push failures with the same bounded exponential backoff
+    /// used for subscription acquisition.
+    async fn push_metrics_with_retry(
+        &mut self,
+        subscription: &Subscription,
+        window_start_nanos: u64,
+        terminating: bool,
+    ) -> PushResult {
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let backoff = retry_backoff(attempt);
+                debug!(
+                    attempt,
+                    backoff_ms = backoff.as_millis(),
+                    terminating,
+                    "Retrying PushTelemetry"
+                );
+                if self.wait_or_shutdown(backoff).await {
+                    return PushResult::Transient;
+                }
+            }
+
+            match self
+                .push_metrics(subscription, window_start_nanos, terminating)
+                .await
+            {
+                PushResult::Transient if attempt < MAX_RETRIES => continue,
+                result => return result,
+            }
+        }
+
+        PushResult::Transient
+    }
+
     /// Send a final push with `terminating = true`.
     ///
     /// Per KIP-714 § Client termination: if the push fails with
@@ -521,12 +580,17 @@ impl TelemetryReporter {
         }
 
         info!("Sending terminating telemetry push");
-        if let PushResult::ReSubscribe = self.push_metrics(subscription, window_start, true).await {
+        if let PushResult::ReSubscribe = self
+            .push_metrics_with_retry(subscription, window_start, true)
+            .await
+        {
             debug!("Terminating push returned re-subscribe; attempting one re-subscribe");
             if let SubscriptionResult::Ok(new_sub) =
                 self.get_subscription(subscription.client_instance_id).await
             {
-                let _ = self.push_metrics(&new_sub, window_start, true).await;
+                let _ = self
+                    .push_metrics_with_retry(&new_sub, window_start, true)
+                    .await;
             }
         }
     }
@@ -805,12 +869,9 @@ mod tests {
     }
 
     #[test]
-    fn test_subscription_push_interval_floored_at_100ms() {
-        // Verifies the push_interval_ms.max(100) floor in get_subscription's
-        // Subscription construction. Values below 100 (including negatives)
-        // should be clamped to 100ms.
+    fn test_subscription_push_interval_clamped_to_supported_bounds() {
         let check = |raw: i32, expected_ms: u64| {
-            let clamped = raw.max(100) as u64;
+            let clamped = clamp_push_interval_ms(raw) as u64;
             assert_eq!(clamped, expected_ms);
         };
         check(0, 100);
@@ -818,6 +879,15 @@ mod tests {
         check(50, 100);
         check(100, 100);
         check(300_000, 300_000);
+        check(MAX_PUSH_INTERVAL_MS + 1, MAX_PUSH_INTERVAL_MS as u64);
+        check(i32::MAX, MAX_PUSH_INTERVAL_MS as u64);
+    }
+
+    #[test]
+    fn test_retry_backoff_exponential() {
+        assert_eq!(retry_backoff(1), Duration::from_secs(1));
+        assert_eq!(retry_backoff(2), Duration::from_secs(2));
+        assert_eq!(retry_backoff(3), Duration::from_secs(4));
     }
 
     #[test]

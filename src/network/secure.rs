@@ -396,7 +396,7 @@ impl SaslAuthenticator {
     /// For PLAIN mechanism, the returned bytes are wrapped in `Zeroizing`
     /// to ensure the password is erased from memory after being sent on the wire.
     ///
-    /// Returns an error if the OAuthBearer token is known to be expired.
+    /// Returns an error if the OAuthBearer token is expired or too close to expiry.
     pub fn initial_response(&mut self) -> Result<Zeroizing<Vec<u8>>> {
         match self.mechanism {
             SaslMechanism::Plain => Ok(self
@@ -418,9 +418,9 @@ impl SaslAuthenticator {
             )),
             SaslMechanism::OAuthBearer => {
                 if let Some(token) = &self.oauthbearer_token {
-                    if token.is_expired() {
+                    if token.needs_refresh() {
                         return Err(KrafkaError::auth(
-                            "OAuthBearer token is expired; obtain a fresh token before connecting",
+                            "OAuthBearer token is expired or too close to expiry; obtain a fresh token before connecting",
                         ));
                     }
                     Ok(Zeroizing::new(token.to_gs2_initial_response()))
@@ -757,5 +757,28 @@ mod tests {
 
         let result = authenticator.initial_response();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_sasl_authenticator_oauthbearer_near_expiry_token_rejected() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let near_future_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + 10_000;
+        let token = OAuthBearerToken::new("near-expiry-jwt").with_lifetime_ms(near_future_ms);
+        let auth = AuthConfig::sasl_oauthbearer_token(token);
+        let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None).unwrap();
+
+        let result = authenticator.initial_response();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("too close to expiry")
+        );
     }
 }

@@ -273,6 +273,12 @@ approaching expiry. Provider resolution is bounded by the configured
 request timeout (default 30 s) to prevent hung providers from stalling
 reconnection loops.
 
+If `OAuthBearerToken::with_lifetime_ms()` is set, Krafka rejects tokens that
+are already expired or within 30 seconds of expiry before starting the SASL
+handshake. This avoids avoidable broker-side failures caused by client/broker
+clock skew. Provider implementations should return a token with comfortably
+more than 30 seconds of remaining lifetime.
+
 #### OAUTHBEARER Protocol Details
 
 The implementation follows RFC 7628 GS2 framing:
@@ -319,7 +325,7 @@ By default, Krafka uses compiled-in `webpki-roots`. To use the operating system 
 
 ```toml
 [dependencies]
-krafka = { version = "0.6", features = ["native-tls-roots"] }
+krafka = { version = "0.7.0", features = ["native-tls-roots"] }
 ```
 
 ```rust
@@ -398,7 +404,7 @@ For production deployments on EC2, ECS, Lambda, or EKS, use the AWS SDK default 
 use krafka::auth::{AuthConfig, AwsMskIamCredentials};
 
 // Requires the `aws-msk` feature in Cargo.toml:
-// krafka = { version = "0.6", features = ["aws-msk"] }
+// krafka = { version = "0.7.0", features = ["aws-msk"] }
 
 // Loads from (in order):
 // 1. Environment variables

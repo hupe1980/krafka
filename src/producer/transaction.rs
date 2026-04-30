@@ -52,7 +52,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -76,7 +76,7 @@ use super::barrier::InFlightBarrier;
 use super::config::Acks;
 use super::idempotent::ProducerIdentity;
 use super::partitioner::{DefaultPartitioner, Partitioner};
-use super::record::{ProducerRecord, RecordMetadata};
+use super::record::{ProducerRecord, RecordMetadata, RoutedRecord, TopicHandle};
 use super::retry::RetryPolicy;
 
 /// Transaction state machine states.
@@ -126,6 +126,8 @@ pub struct TransactionalProducerConfig {
     pub transaction_timeout_ms: i32,
     /// Request timeout.
     pub request_timeout: Duration,
+    /// Maximum encoded Kafka request frame size in bytes.
+    pub max_request_size: usize,
     /// Compression.
     pub compression: Compression,
     /// Metadata max age.
@@ -145,6 +147,7 @@ impl Default for TransactionalProducerConfig {
             transactional_id: String::new(),
             transaction_timeout_ms: 60000,
             request_timeout: Duration::from_secs(30),
+            max_request_size: crate::protocol::MAX_MESSAGE_SIZE,
             compression: Compression::None,
             metadata_max_age: Duration::from_secs(300),
             auth: None,
@@ -240,7 +243,7 @@ impl TransactionPartitions {
 /// from `Pending` to absent so that future callers aren't stuck waiting forever.
 struct PendingAddGuard {
     txn_partitions: Arc<RwLock<TransactionPartitions>>,
-    topic: String,
+    topic: TopicHandle,
     partition: PartitionId,
     notify: Arc<Notify>,
     /// Set to `true` when `confirm_add` or an explicit `cancel_add` is called,
@@ -310,6 +313,9 @@ pub struct TransactionalProducer {
     partitioner: Arc<dyn Partitioner>,
     /// Transaction state.
     state: AtomicU8,
+    /// Whether the current transaction hit an abortable error and must be
+    /// aborted before further send/commit operations are allowed.
+    abort_required: AtomicBool,
     /// Transaction coordinator broker ID.
     coordinator_id: RwLock<Option<i32>>,
     /// Partitions in current transaction.
@@ -332,6 +338,72 @@ impl TransactionalProducer {
     #[inline]
     pub fn state(&self) -> TransactionState {
         TransactionState::from_u8(self.state.load(Ordering::SeqCst))
+    }
+
+    /// Return the transactional producer identity, failing fast when
+    /// `init_transactions()` has not established a valid PID/epoch yet.
+    fn checked_transactional_identity(&self) -> Result<(i64, i16)> {
+        let producer_id = self.identity.producer_id();
+        let producer_epoch = self.identity.producer_epoch();
+
+        if producer_id < 0 || producer_epoch < 0 {
+            return Err(KrafkaError::invalid_state(
+                "transactional producer identity not initialized",
+            ));
+        }
+
+        debug_assert!(
+            producer_id >= 0 && producer_epoch >= 0,
+            "transactional producer identity must be initialized before sending"
+        );
+
+        Ok((producer_id, producer_epoch))
+    }
+
+    #[inline]
+    fn abort_required(&self) -> bool {
+        self.abort_required.load(Ordering::SeqCst)
+    }
+
+    fn ensure_transaction_can_continue(&self, operation: &str) -> Result<()> {
+        if self.abort_required() {
+            return Err(KrafkaError::broker(
+                ErrorCode::TransactionAbortable,
+                format!("cannot {operation}: abort_transaction() is required before continuing"),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn mark_unknown_producer_id_abort_required(&self, operation: &str) -> KrafkaError {
+        self.abort_required.store(true, Ordering::SeqCst);
+        KrafkaError::broker(
+            ErrorCode::TransactionAbortable,
+            format!(
+                "{operation} failed with UnknownProducerId; abort_transaction() is required before continuing"
+            ),
+        )
+    }
+
+    fn is_unknown_producer_id_error(error: &KrafkaError) -> bool {
+        matches!(
+            error,
+            KrafkaError::Broker {
+                code: ErrorCode::UnknownProducerId,
+                ..
+            }
+        )
+    }
+
+    fn is_abortable_transaction_error(error: &KrafkaError) -> bool {
+        matches!(
+            error,
+            KrafkaError::Broker {
+                code: ErrorCode::TransactionAbortable,
+                ..
+            }
+        )
     }
 
     /// Get a connection to the cached transaction coordinator.
@@ -414,6 +486,7 @@ impl TransactionalProducer {
 
             match &result {
                 Ok(()) => return Ok(()),
+                Err(e) if Self::is_unknown_producer_id_error(e) => return result,
                 Err(e) if Self::needs_coordinator_refresh(e) && attempt < max_retries => {
                     warn!(
                         attempt,
@@ -532,6 +605,7 @@ impl TransactionalProducer {
             self.identity
                 .initialize(response.producer_id, response.producer_epoch);
 
+            self.abort_required.store(false, Ordering::SeqCst);
             self.set_state(TransactionState::Ready);
             info!(
                 "Transactional producer initialized: PID={}, epoch={}",
@@ -642,21 +716,27 @@ impl TransactionalProducer {
             )));
         }
 
+        self.ensure_transaction_can_continue("send records")?;
+
         // Validate record fields against Kafka protocol wire-format limits.
         record.validate()?;
 
-        let topic = record.topic.clone();
+        let _identity = self.checked_transactional_identity()?;
+
+        let routed = record.into_routed_parts();
+        let topic = routed.topic;
+        let record = routed.record;
 
         // Determine partition
-        let partition = match record.partition {
+        let partition = match routed.partition {
             Some(p) => p,
             None => {
                 let partition_count = self
                     .metadata
-                    .partition_count(&topic)
+                    .partition_count(topic.as_ref())
                     .ok_or_else(|| KrafkaError::invalid_state(format!("unknown topic: {topic}")))?;
                 self.partitioner
-                    .partition(&topic, record.key.as_deref(), partition_count)
+                    .partition(topic.as_ref(), record.key_bytes(), partition_count)
             }
         };
 
@@ -665,7 +745,7 @@ impl TransactionalProducer {
         // skipping the RPC while an in-flight add has not yet completed.
         loop {
             let mut txn_partitions = self.txn_partitions.write().await;
-            match txn_partitions.begin_add(&topic, partition) {
+            match txn_partitions.begin_add(topic.as_ref(), partition) {
                 BeginAddResult::AlreadyAdded => break,
                 BeginAddResult::Wait(notify) => {
                     // Register interest in the Notify BEFORE releasing the
@@ -690,12 +770,12 @@ impl TransactionalProducer {
                         notify,
                         defused: false,
                     };
-                    match self.add_partition_to_txn(&topic, partition).await {
+                    match self.add_partition_to_txn(topic.as_ref(), partition).await {
                         Ok(()) => {
-                            guard.confirm(&topic, partition).await;
+                            guard.confirm(topic.as_ref(), partition).await;
                         }
                         Err(e) => {
-                            guard.cancel(&topic, partition).await;
+                            guard.cancel(topic.as_ref(), partition).await;
                             return Err(e);
                         }
                     }
@@ -705,7 +785,7 @@ impl TransactionalProducer {
         }
 
         // Send the record
-        self.send_to_partition(&topic, partition, record).await
+        self.send_to_partition(topic, partition, record).await
     }
 
     /// Add a partition to the current transaction.
@@ -713,11 +793,10 @@ impl TransactionalProducer {
     /// Retries on coordinator errors with exponential backoff, re-discovering
     /// the transaction coordinator between attempts.
     async fn add_partition_to_txn(&self, topic: &str, partition: PartitionId) -> Result<()> {
-        self.retry_with_coordinator("AddPartitionsToTxn", || async {
+        let result = self.retry_with_coordinator("AddPartitionsToTxn", || async {
             let (_coordinator_id, conn) = self.coordinator_connection().await?;
 
-            let producer_id = self.identity.producer_id();
-            let producer_epoch = self.identity.producer_epoch();
+            let (producer_id, producer_epoch) = self.checked_transactional_identity()?;
 
             let apt_version = conn
                 .negotiate_api_version(
@@ -768,7 +847,14 @@ impl TransactionalProducer {
             debug!("Added partition {}-{} to transaction", topic, partition);
             Ok(())
         })
-        .await
+        .await;
+
+        match result {
+            Err(error) if Self::is_unknown_producer_id_error(&error) => {
+                Err(self.mark_unknown_producer_id_abort_required("AddPartitionsToTxn"))
+            }
+            other => other,
+        }
     }
 
     /// Send a record to a specific partition.
@@ -778,25 +864,24 @@ impl TransactionalProducer {
     /// the batch with a fresh sequence before retrying.
     async fn send_to_partition(
         &self,
-        topic: &str,
+        topic: TopicHandle,
         partition: PartitionId,
-        record: ProducerRecord,
+        record: RoutedRecord,
     ) -> Result<RecordMetadata> {
         let retry_policy = &self.retry_policy;
-        let mut attempt: u32 = 0;
+        let max_retries = retry_policy.max_retries;
 
-        let producer_id = self.identity.producer_id();
-        let producer_epoch = self.identity.producer_epoch();
+        let (producer_id, producer_epoch) = self.checked_transactional_identity()?;
 
         // Allocate the sequence number once — retries must resend the same
         // sequence to maintain idempotent semantics.
-        let mut sequence = self.next_sequence(topic, partition).await?;
+        let mut sequence = self.next_sequence(topic.as_ref(), partition).await?;
 
         // Build the record batch and request once before entering the retry loop.
         // If encoding fails, roll back the sequence so the next send attempt
         // starts from the correct value rather than creating a gap.
         let mut request = match self.build_produce_request(
-            topic,
+            topic.as_ref(),
             partition,
             &record,
             producer_id,
@@ -805,17 +890,17 @@ impl TransactionalProducer {
         ) {
             Ok(req) => req,
             Err(e) => {
-                let _ = self.identity.rollback_sequence(topic, partition);
+                let _ = self.identity.rollback_sequence(topic.as_ref(), partition);
                 return Err(e);
             }
         };
 
-        loop {
+        for attempt in 0..=max_retries {
             // Re-acquire connection on each attempt (leader may have moved).
             let send_result: Result<RecordMetadata> = async {
                 let conn = self
                     .metadata
-                    .get_leader_connection(topic, partition)
+                    .get_leader_connection(topic.as_ref(), partition)
                     .await?;
 
                 // Transactions require Produce v3+ (transactional_id field).
@@ -832,6 +917,13 @@ impl TransactionalProducer {
                              transactional produce requires v3+",
                         )
                     })?;
+
+                super::validate_produce_request_size(
+                    &self.config.client_id,
+                    self.config.max_request_size,
+                    version,
+                    &request,
+                )?;
 
                 let response = conn
                     .send_request(ApiKey::Produce, version, |buf| {
@@ -855,7 +947,8 @@ impl TransactionalProducer {
                                 ));
                             }
 
-                            self.identity.acknowledge(topic, partition, sequence);
+                            self.identity
+                                .acknowledge(topic.as_ref(), partition, sequence);
                             return Ok(RecordMetadata {
                                 topic: topic.to_string(),
                                 partition,
@@ -873,26 +966,31 @@ impl TransactionalProducer {
             match send_result {
                 Ok(metadata) => return Ok(metadata),
                 Err(e) => {
+                    if Self::is_unknown_producer_id_error(&e) {
+                        return Err(
+                            self.mark_unknown_producer_id_abort_required("transactional produce")
+                        );
+                    }
+
                     // OutOfOrderSequenceNumber means the broker's expected
                     // sequence diverged from ours. Reset local state and
                     // rebuild the batch with a fresh sequence before retrying.
                     if let KrafkaError::Broker { code, .. } = &e
                         && *code == ErrorCode::OutOfOrderSequenceNumber
                     {
-                        if retry_policy.max_retries_reached(attempt) {
+                        if attempt >= max_retries {
                             return Err(e);
                         }
-                        attempt += 1;
 
                         warn!(
-                            topic = topic,
+                            topic = %topic,
                             partition = partition,
                             "OutOfOrderSequenceNumber, resetting sequence and rebuilding batch"
                         );
-                        self.identity.reset_sequence(topic, partition);
-                        sequence = self.next_sequence(topic, partition).await?;
+                        self.identity.reset_sequence(topic.as_ref(), partition);
+                        sequence = self.next_sequence(topic.as_ref(), partition).await?;
                         request = self.build_produce_request(
-                            topic,
+                            topic.as_ref(),
                             partition,
                             &record,
                             producer_id,
@@ -900,39 +998,39 @@ impl TransactionalProducer {
                             sequence,
                         )?;
 
-                        if let Err(refresh_err) =
-                            self.metadata.refresh_for_topics(Some(&[topic])).await
-                        {
-                            debug!(error = %refresh_err, "Metadata refresh failed during txn retry");
-                        }
-
-                        tokio::time::sleep(retry_policy.calculate_backoff(attempt)).await;
+                        tokio::time::sleep(retry_policy.calculate_backoff(attempt + 1)).await;
                         continue;
                     }
 
-                    if !retry_policy.should_retry(&e, attempt) {
+                    if !e.is_retriable() || attempt >= max_retries {
                         return Err(e);
                     }
 
-                    attempt += 1;
-
                     debug!(
-                        topic = topic,
+                        topic = %topic,
                         partition = partition,
-                        attempt = attempt,
+                        attempt = attempt + 1,
                         "Transient error in txn send, retrying: {}",
                         e
                     );
 
-                    if let Err(refresh_err) = self.metadata.refresh_for_topics(Some(&[topic])).await
+                    if should_refresh_metadata_after_txn_send_error(&e)
+                        && let Err(refresh_err) = self
+                            .metadata
+                            .refresh_for_topics(Some(&[topic.as_ref()]))
+                            .await
                     {
                         debug!(error = %refresh_err, "Metadata refresh failed during txn retry");
                     }
 
-                    tokio::time::sleep(retry_policy.calculate_backoff(attempt)).await;
+                    tokio::time::sleep(retry_policy.calculate_backoff(attempt + 1)).await;
                 }
             }
         }
+
+        Err(KrafkaError::protocol(format!(
+            "transactional produce retry loop exhausted after {max_retries} retries"
+        )))
     }
 
     /// Build a produce request for a single record to a partition.
@@ -940,7 +1038,7 @@ impl TransactionalProducer {
         &self,
         topic: &str,
         partition: PartitionId,
-        record: &ProducerRecord,
+        record: &RoutedRecord,
         producer_id: i64,
         producer_epoch: i16,
         sequence: i32,
@@ -954,20 +1052,7 @@ impl TransactionalProducer {
             batch_builder = batch_builder.base_timestamp(ts);
         }
 
-        if record.headers.is_empty() {
-            batch_builder =
-                batch_builder.add_record(record.key.clone(), Some(record.value.clone()));
-        } else {
-            batch_builder = batch_builder.add_record_with_headers(
-                record.key.clone(),
-                Some(record.value.clone()),
-                record
-                    .headers
-                    .iter()
-                    .map(|(k, v)| (k.clone(), Bytes::from(v.clone())))
-                    .collect(),
-            );
-        }
+        batch_builder = record.append_to_batch_builder(batch_builder);
 
         let batch = batch_builder.build();
         let batch_bytes = batch.encode()?;
@@ -1007,50 +1092,61 @@ impl TransactionalProducer {
             )));
         }
 
-        let producer_id = self.identity.producer_id();
-        let producer_epoch = self.identity.producer_epoch();
+        self.ensure_transaction_can_continue("send offsets")?;
+
+        let (producer_id, producer_epoch) = self.checked_transactional_identity()?;
 
         // Phase 1: AddOffsetsToTxn — sent to transaction coordinator, with retry.
-        self.retry_with_coordinator("AddOffsetsToTxn", || async {
-            let (_coordinator_id, conn) = self.coordinator_connection().await?;
+        let add_offsets_result = self
+            .retry_with_coordinator("AddOffsetsToTxn", || async {
+                let (_coordinator_id, conn) = self.coordinator_connection().await?;
 
-            let add_request = AddOffsetsToTxnRequest::new(
-                &self.config.transactional_id,
-                producer_id,
-                producer_epoch,
-                group_id,
-            );
+                let add_request = AddOffsetsToTxnRequest::new(
+                    &self.config.transactional_id,
+                    producer_id,
+                    producer_epoch,
+                    group_id,
+                );
 
-            let aot_version = conn
-                .negotiate_api_version(
-                    ApiKey::AddOffsetsToTxn,
-                    versions::ADD_OFFSETS_TO_TXN_MAX,
-                    versions::ADD_OFFSETS_TO_TXN_MIN,
-                )
-                .await
-                .ok_or_else(|| {
-                    KrafkaError::protocol("no mutually supported AddOffsetsToTxn API version")
-                })?;
+                let aot_version = conn
+                    .negotiate_api_version(
+                        ApiKey::AddOffsetsToTxn,
+                        versions::ADD_OFFSETS_TO_TXN_MAX,
+                        versions::ADD_OFFSETS_TO_TXN_MIN,
+                    )
+                    .await
+                    .ok_or_else(|| {
+                        KrafkaError::protocol("no mutually supported AddOffsetsToTxn API version")
+                    })?;
 
-            let response_bytes = conn
-                .send_request(ApiKey::AddOffsetsToTxn, aot_version, |buf| {
-                    add_request.encode_versioned(aot_version, buf)
-                })
-                .await?;
+                let response_bytes = conn
+                    .send_request(ApiKey::AddOffsetsToTxn, aot_version, |buf| {
+                        add_request.encode_versioned(aot_version, buf)
+                    })
+                    .await?;
 
-            let mut buf = response_bytes;
-            let add_response = AddOffsetsToTxnResponse::decode_versioned(aot_version, &mut buf)?;
+                let mut buf = response_bytes;
+                let add_response =
+                    AddOffsetsToTxnResponse::decode_versioned(aot_version, &mut buf)?;
 
-            if !add_response.is_ok() {
-                return Err(KrafkaError::broker(
-                    add_response.error_code,
-                    "failed to add offsets to transaction",
-                ));
+                if !add_response.is_ok() {
+                    return Err(KrafkaError::broker(
+                        add_response.error_code,
+                        "failed to add offsets to transaction",
+                    ));
+                }
+
+                Ok(())
+            })
+            .await;
+
+        match add_offsets_result {
+            Err(error) if Self::is_unknown_producer_id_error(&error) => {
+                return Err(self.mark_unknown_producer_id_abort_required("AddOffsetsToTxn"));
             }
-
-            Ok(())
-        })
-        .await?;
+            Err(error) => return Err(error),
+            Ok(()) => {}
+        }
 
         // Phase 2: TxnOffsetCommit — sent to the group coordinator, with retry.
         // The Java client re-discovers the group coordinator and re-enqueues
@@ -1129,6 +1225,12 @@ impl TransactionalProducer {
             }
             .await;
 
+            if let Err(error) = &result
+                && Self::is_unknown_producer_id_error(error)
+            {
+                return Err(self.mark_unknown_producer_id_abort_required("TxnOffsetCommit"));
+            }
+
             match &result {
                 Ok(()) => {
                     debug!("Added offsets to transaction for group {}", group_id);
@@ -1205,6 +1307,8 @@ impl TransactionalProducer {
 
     /// Commit the current transaction.
     pub async fn commit_transaction(&self) -> Result<()> {
+        self.ensure_transaction_can_continue("commit transaction")?;
+
         // Atomic CAS: InTransaction → Committing
         if let Err(actual) = self.try_transition(
             TransactionState::InTransaction,
@@ -1216,13 +1320,35 @@ impl TransactionalProducer {
             )));
         }
 
-        let result = self.end_transaction(true).await;
+        let result = match self.end_transaction(true).await {
+            Err(error) if Self::is_unknown_producer_id_error(&error) => {
+                Err(self.mark_unknown_producer_id_abort_required("commit_transaction"))
+            }
+            other => other,
+        };
 
         match &result {
             Ok(()) => {
                 self.set_state(TransactionState::Ready);
                 self.txn_partitions.write().await.clear();
                 info!("Transaction committed");
+            }
+            Err(e) if Self::is_abortable_transaction_error(e) => {
+                match self.try_transition(
+                    TransactionState::Committing,
+                    TransactionState::InTransaction,
+                ) {
+                    Ok(()) => {
+                        warn!("Transaction commit failed (abort required): {}", e);
+                    }
+                    Err(actual) => {
+                        warn!(
+                            "Transaction commit failed (abort required): {}; \
+                             state is now {:?} (concurrent abort may be in progress)",
+                            e, actual
+                        );
+                    }
+                }
             }
             Err(e) => {
                 if e.is_retriable() {
@@ -1271,7 +1397,21 @@ impl TransactionalProducer {
             )));
         }
 
-        let result = self.end_transaction(false).await;
+        let needs_reinitialize = self.abort_required.swap(false, Ordering::SeqCst);
+        let result = if needs_reinitialize {
+            match self.end_transaction(false).await {
+                Ok(()) => self.do_init_transactions().await,
+                Err(error) if Self::is_unknown_producer_id_error(&error) => {
+                    debug!(
+                        "Abort observed UnknownProducerId after transactional error; reinitializing producer identity"
+                    );
+                    self.do_init_transactions().await
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            self.end_transaction(false).await
+        };
 
         match &result {
             Ok(()) => {
@@ -1296,8 +1436,7 @@ impl TransactionalProducer {
         self.retry_with_coordinator("EndTxn", || async {
             let (_coordinator_id, conn) = self.coordinator_connection().await?;
 
-            let producer_id = self.identity.producer_id();
-            let producer_epoch = self.identity.producer_epoch();
+            let (producer_id, producer_epoch) = self.checked_transactional_identity()?;
 
             let et_version = conn
                 .negotiate_api_version(ApiKey::EndTxn, versions::END_TXN_MAX, versions::END_TXN_MIN)
@@ -1440,6 +1579,17 @@ fn is_fatal_transaction_error(error_code: ErrorCode) -> bool {
     )
 }
 
+fn should_refresh_metadata_after_txn_send_error(error: &KrafkaError) -> bool {
+    error.is_retriable()
+        && !matches!(
+            error,
+            KrafkaError::Broker {
+                code: ErrorCode::OutOfOrderSequenceNumber,
+                ..
+            }
+        )
+}
+
 /// Builder for TransactionalProducer.
 #[must_use = "builders do nothing until .build() is called"]
 #[derive(Default)]
@@ -1476,6 +1626,12 @@ impl TransactionalProducerBuilder {
     /// Set request timeout.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.config.request_timeout = timeout;
+        self
+    }
+
+    /// Set the maximum encoded Kafka request frame size in bytes.
+    pub fn max_request_size(mut self, bytes: usize) -> Self {
+        self.config.max_request_size = bytes;
         self
     }
 
@@ -1538,6 +1694,9 @@ impl TransactionalProducerBuilder {
         if self.config.transaction_timeout_ms <= 0 {
             return Err(KrafkaError::config("transaction_timeout_ms must be > 0"));
         }
+        if self.config.max_request_size == 0 {
+            return Err(KrafkaError::config("max_request_size must be >= 1"));
+        }
 
         let mut pool_config_builder = ConnectionConfig::builder()
             .client_id(&self.config.client_id)
@@ -1582,6 +1741,7 @@ impl TransactionalProducerBuilder {
                 .partitioner
                 .unwrap_or_else(|| Arc::new(DefaultPartitioner::new())),
             state: AtomicU8::new(TransactionState::Uninitialized as u8),
+            abort_required: AtomicBool::new(false),
             coordinator_id: RwLock::new(None),
             txn_partitions: Arc::new(RwLock::new(TransactionPartitions::default())),
             identity: ProducerIdentity::new(),
@@ -1595,6 +1755,9 @@ impl TransactionalProducerBuilder {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    use crate::metadata::ClusterMetadata;
+    use crate::network::ConnectionPool;
 
     #[test]
     fn test_transaction_state() {
@@ -1618,6 +1781,7 @@ mod tests {
         let config = TransactionalProducerConfig::default();
         assert_eq!(config.client_id, "krafka-txn-producer");
         assert_eq!(config.transaction_timeout_ms, 60000);
+        assert_eq!(config.max_request_size, crate::protocol::MAX_MESSAGE_SIZE);
     }
 
     #[test]
@@ -1712,6 +1876,22 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_should_refresh_metadata_after_txn_send_error() {
+        assert!(!should_refresh_metadata_after_txn_send_error(
+            &KrafkaError::broker(ErrorCode::OutOfOrderSequenceNumber, "sequence mismatch")
+        ));
+        assert!(should_refresh_metadata_after_txn_send_error(
+            &KrafkaError::broker(ErrorCode::LeaderNotAvailable, "leader moved")
+        ));
+        assert!(should_refresh_metadata_after_txn_send_error(
+            &KrafkaError::timeout("produce")
+        ));
+        assert!(!should_refresh_metadata_after_txn_send_error(
+            &KrafkaError::broker(ErrorCode::InvalidProducerEpoch, "fenced")
+        ));
+    }
+
     #[tokio::test]
     async fn test_builder_missing_bootstrap() {
         let result = TransactionalProducer::builder()
@@ -1722,12 +1902,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_send_record_requires_initialized_transactional_identity() {
+        let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
+        let metadata = Arc::new(ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool.clone(),
+            Duration::from_secs(300),
+        ));
+
+        let producer = TransactionalProducer {
+            config: TransactionalProducerConfig {
+                bootstrap_servers: "localhost:9092".to_string(),
+                transactional_id: "txn-test".to_string(),
+                ..TransactionalProducerConfig::default()
+            },
+            metadata,
+            pool,
+            partitioner: Arc::new(DefaultPartitioner::new()),
+            state: AtomicU8::new(TransactionState::InTransaction as u8),
+            abort_required: AtomicBool::new(false),
+            coordinator_id: RwLock::new(None),
+            txn_partitions: Arc::new(RwLock::new(TransactionPartitions::default())),
+            identity: ProducerIdentity::new(),
+            retry_policy: RetryPolicy::default(),
+            in_flight_barrier: Arc::new(InFlightBarrier::new()),
+        };
+
+        let record = ProducerRecord::new("topic", Bytes::from_static(b"value")).with_partition(0);
+
+        let err = producer.send_record(record).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("transactional producer identity not initialized"),
+            "expected invalid identity guard, got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_builder_missing_txn_id() {
         let result = TransactionalProducer::builder()
             .bootstrap_servers("localhost:9092")
             .build()
             .await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_mark_unknown_producer_id_requires_abort() {
+        let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
+        let metadata = Arc::new(ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool.clone(),
+            Duration::from_secs(300),
+        ));
+
+        let producer = TransactionalProducer {
+            config: TransactionalProducerConfig {
+                bootstrap_servers: "localhost:9092".to_string(),
+                transactional_id: "txn-test".to_string(),
+                ..TransactionalProducerConfig::default()
+            },
+            metadata,
+            pool,
+            partitioner: Arc::new(DefaultPartitioner::new()),
+            state: AtomicU8::new(TransactionState::InTransaction as u8),
+            abort_required: AtomicBool::new(false),
+            coordinator_id: RwLock::new(None),
+            txn_partitions: Arc::new(RwLock::new(TransactionPartitions::default())),
+            identity: ProducerIdentity::new(),
+            retry_policy: RetryPolicy::default(),
+            in_flight_barrier: Arc::new(InFlightBarrier::new()),
+        };
+
+        let error = producer.mark_unknown_producer_id_abort_required("transactional produce");
+        assert!(matches!(
+            error,
+            KrafkaError::Broker {
+                code: ErrorCode::TransactionAbortable,
+                ..
+            }
+        ));
+        assert!(producer.abort_required());
+
+        let gate_error = producer
+            .ensure_transaction_can_continue("commit transaction")
+            .unwrap_err();
+        assert!(matches!(
+            gate_error,
+            KrafkaError::Broker {
+                code: ErrorCode::TransactionAbortable,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_commit_transaction_rejects_abort_required() {
+        let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
+        let metadata = Arc::new(ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool.clone(),
+            Duration::from_secs(300),
+        ));
+
+        let producer = TransactionalProducer {
+            config: TransactionalProducerConfig {
+                bootstrap_servers: "localhost:9092".to_string(),
+                transactional_id: "txn-test".to_string(),
+                ..TransactionalProducerConfig::default()
+            },
+            metadata,
+            pool,
+            partitioner: Arc::new(DefaultPartitioner::new()),
+            state: AtomicU8::new(TransactionState::InTransaction as u8),
+            abort_required: AtomicBool::new(true),
+            coordinator_id: RwLock::new(None),
+            txn_partitions: Arc::new(RwLock::new(TransactionPartitions::default())),
+            identity: ProducerIdentity::new(),
+            retry_policy: RetryPolicy::default(),
+            in_flight_barrier: Arc::new(InFlightBarrier::new()),
+        };
+
+        let error = producer.commit_transaction().await.unwrap_err();
+        assert!(matches!(
+            error,
+            KrafkaError::Broker {
+                code: ErrorCode::TransactionAbortable,
+                ..
+            }
+        ));
+        assert_eq!(producer.state(), TransactionState::InTransaction);
     }
 
     #[test]
@@ -1770,6 +2074,16 @@ mod tests {
             .transactional_id("txn-1");
 
         assert!(builder.config.auth.is_none());
+    }
+
+    #[test]
+    fn test_txn_builder_sets_max_request_size() {
+        let builder = TransactionalProducer::builder()
+            .bootstrap_servers("broker:9092")
+            .transactional_id("txn-1")
+            .max_request_size(65_536);
+
+        assert_eq!(builder.config.max_request_size, 65_536);
     }
 
     #[test]
@@ -1854,6 +2168,21 @@ mod tests {
         match result {
             Err(e) => assert!(e.to_string().contains("transaction_timeout_ms")),
             Ok(_) => panic!("expected error for transaction_timeout_ms=0"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_txn_builder_rejects_zero_max_request_size() {
+        let result = TransactionalProducer::builder()
+            .bootstrap_servers("localhost:9092")
+            .transactional_id("txn-1")
+            .max_request_size(0)
+            .build()
+            .await;
+
+        match result {
+            Err(e) => assert!(e.to_string().contains("max_request_size")),
+            Ok(_) => panic!("expected error for max_request_size=0"),
         }
     }
 

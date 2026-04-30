@@ -76,6 +76,8 @@ pub struct ProducerConfig {
     pub(crate) retry_backoff: Duration,
     /// Max in-flight requests per connection.
     pub(crate) max_in_flight: usize,
+    /// Maximum encoded Kafka request frame size in bytes.
+    pub(crate) max_request_size: usize,
     /// Enable idempotent producer.
     ///
     /// When `true` (the default, matching KIP-679 / Kafka 3.0+), the producer
@@ -123,6 +125,7 @@ impl Default for ProducerConfig {
             retries: u32::MAX,
             retry_backoff: Duration::from_millis(100),
             max_in_flight: 5,
+            max_request_size: crate::protocol::MAX_MESSAGE_SIZE,
             idempotent: true,
             max_block: Duration::from_secs(60),
             buffer_memory: 32 * 1024 * 1024, // 32 MB
@@ -207,6 +210,12 @@ impl ProducerConfig {
     #[inline]
     pub fn max_in_flight(&self) -> usize {
         self.max_in_flight
+    }
+
+    /// Returns the maximum encoded request frame size in bytes.
+    #[inline]
+    pub fn max_request_size(&self) -> usize {
+        self.max_request_size
     }
 
     /// Returns whether idempotent production is enabled.
@@ -359,6 +368,12 @@ impl ProducerConfigBuilder {
         self
     }
 
+    /// Set the maximum encoded Kafka request frame size in bytes.
+    pub fn max_request_size(mut self, bytes: usize) -> Self {
+        self.config.max_request_size = bytes;
+        self
+    }
+
     /// Enable or disable idempotent production.
     ///
     /// Idempotent production is enabled by default (matching KIP-679 / Kafka 3.0+).
@@ -432,9 +447,11 @@ impl ProducerConfigBuilder {
     /// Returns an error if the configuration is invalid:
     /// - `batch_size` must be >= 1
     /// - `max_in_flight` must be >= 1
+    /// - `max_request_size` must be >= 1
     /// - `delivery_timeout` must be greater than zero
     /// - Idempotent mode requires `acks = All` and `max_in_flight <= 5`
     /// - `batch_size` must not exceed `buffer_memory` (when `buffer_memory > 0`)
+    /// - `batch_size` must not exceed `max_request_size`
     pub fn build(self) -> Result<ProducerConfig> {
         if self.config.batch_size == 0 {
             return Err(KrafkaError::config(format!(
@@ -447,6 +464,9 @@ impl ProducerConfigBuilder {
                 "max_in_flight must be >= 1 (got {})",
                 self.config.max_in_flight
             )));
+        }
+        if self.config.max_request_size == 0 {
+            return Err(KrafkaError::config("max_request_size must be >= 1"));
         }
         if self.config.delivery_timeout.is_zero() {
             return Err(KrafkaError::config(
@@ -476,6 +496,12 @@ impl ProducerConfigBuilder {
             return Err(KrafkaError::config(format!(
                 "batch_size must not exceed buffer_memory (got batch_size={}, buffer_memory={})",
                 self.config.batch_size, self.config.buffer_memory
+            )));
+        }
+        if self.config.batch_size > self.config.max_request_size {
+            return Err(KrafkaError::config(format!(
+                "batch_size must not exceed max_request_size (got batch_size={}, max_request_size={})",
+                self.config.batch_size, self.config.max_request_size
             )));
         }
         Ok(self.config)
@@ -508,6 +534,7 @@ mod tests {
         assert!(config.idempotent);
         assert_eq!(config.compression, Compression::None);
         assert_eq!(config.batch_size, 16384);
+        assert_eq!(config.max_request_size, crate::protocol::MAX_MESSAGE_SIZE);
         assert_eq!(config.delivery_timeout, Duration::from_secs(120));
         assert_eq!(config.retries, u32::MAX);
         assert_eq!(
@@ -524,6 +551,7 @@ mod tests {
             .acks(Acks::All)
             .compression(Compression::Lz4)
             .batch_size(32768)
+            .max_request_size(65536)
             .build()
             .unwrap();
 
@@ -532,6 +560,7 @@ mod tests {
         assert_eq!(config.acks, Acks::All);
         assert_eq!(config.compression, Compression::Lz4);
         assert_eq!(config.batch_size, 32768);
+        assert_eq!(config.max_request_size, 65536);
     }
 
     #[test]
@@ -682,6 +711,12 @@ mod tests {
     }
 
     #[test]
+    fn test_config_builder_rejects_zero_max_request_size() {
+        let err = ProducerConfig::builder().max_request_size(0).build();
+        assert!(err.is_err());
+    }
+
+    #[test]
     fn test_config_builder_rejects_zero_delivery_timeout() {
         let err = ProducerConfig::builder()
             .delivery_timeout(Duration::ZERO)
@@ -718,6 +753,15 @@ mod tests {
         let err = ProducerConfig::builder()
             .batch_size(1024)
             .buffer_memory(512)
+            .build();
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_config_builder_rejects_batch_exceeding_max_request_size() {
+        let err = ProducerConfig::builder()
+            .batch_size(1024)
+            .max_request_size(512)
             .build();
         assert!(err.is_err());
     }

@@ -352,6 +352,33 @@ impl ProducerIdentity {
             .unwrap_or(-1)
     }
 
+    /// Return whether an `UnknownProducerId` for this batch can be retried
+    /// safely after resetting producer state.
+    ///
+    /// Recovery is only safe when the failing batch is still the oldest
+    /// unresolved sequence range for the partition and no newer sequence range
+    /// has been allocated locally. That matches the local condition we can
+    /// verify before reinitializing the producer identity and rebuilding the
+    /// batch under a fresh PID/epoch.
+    pub(crate) fn can_retry_unknown_producer_id(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+        base_sequence: i32,
+        count: i32,
+    ) -> Result<bool> {
+        let last_sequence = last_sequence_of_batch(base_sequence, count)?;
+        let sequences = self.sequences.read();
+        let Some(state) = sequences.get(topic).and_then(|parts| parts.get(&partition)) else {
+            return Ok(false);
+        };
+
+        Ok(
+            base_sequence == next_sequence_after(state.last_acked_sequence)
+                && state.next_sequence == next_sequence_after(last_sequence),
+        )
+    }
+
     /// Create a snapshot of the current idempotent state.
     pub fn snapshot(&self) -> ProducerIdentitySnapshot {
         let partition_sequences = {
@@ -577,6 +604,35 @@ mod tests {
         assert_eq!(snapshot.producer_id, 100);
         assert_eq!(snapshot.producer_epoch, 1);
         assert_eq!(snapshot.partition_sequences.len(), 2);
+    }
+
+    #[test]
+    fn test_can_retry_unknown_producer_id_for_oldest_unacked_batch() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+
+        assert_eq!(identity.allocate_sequence("topic", 0, 2).unwrap(), 0);
+
+        assert!(
+            identity
+                .can_retry_unknown_producer_id("topic", 0, 0, 2)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_cannot_retry_unknown_producer_id_when_newer_batch_exists() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+
+        assert_eq!(identity.allocate_sequence("topic", 0, 2).unwrap(), 0);
+        assert_eq!(identity.allocate_sequence("topic", 0, 1).unwrap(), 2);
+
+        assert!(
+            !identity
+                .can_retry_unknown_producer_id("topic", 0, 0, 2)
+                .unwrap()
+        );
     }
 
     #[test]
