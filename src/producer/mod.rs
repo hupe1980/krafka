@@ -223,6 +223,12 @@ async fn ensure_idempotent_producer_id_initialized(
     metadata: &ClusterMetadata,
     retry_policy: &RetryPolicy,
 ) -> Result<()> {
+    if identity.is_poisoned() {
+        return Err(KrafkaError::invalid_state(
+            "producer identity is poisoned after an unrecoverable UnknownProducerId; recreate the producer",
+        ));
+    }
+
     if identity.is_initialized() {
         return Ok(());
     }
@@ -239,10 +245,16 @@ async fn recover_unknown_producer_id(
     base_sequence: i32,
     record_count: i32,
 ) -> Result<i32> {
+    if identity.is_poisoned() {
+        return Err(KrafkaError::invalid_state(
+            "producer identity is poisoned after an unrecoverable UnknownProducerId; recreate the producer",
+        ));
+    }
+
     if !identity.can_retry_unknown_producer_id(topic, partition, base_sequence, record_count)? {
-        identity.reset();
+        identity.poison();
         return Err(KrafkaError::invalid_state(format!(
-            "UnknownProducerId for {topic}-{partition} cannot be retried safely while newer batches are still in flight; producer identity reset"
+            "UnknownProducerId for {topic}-{partition} cannot be retried safely while newer batches are still in flight; producer identity poisoned, recreate the producer after in-flight work drains"
         )));
     }
 
@@ -251,37 +263,169 @@ async fn recover_unknown_producer_id(
     identity.allocate_sequence(topic, partition, record_count)
 }
 
+fn unsigned_varint_size(mut value: u32) -> usize {
+    let mut size = 1;
+    while value >= 0x80 {
+        size += 1;
+        value >>= 7;
+    }
+    size
+}
+
+fn kafka_string_size(value: Option<&str>) -> Result<usize> {
+    match value {
+        Some(value) => {
+            i16::try_from(value.len()).map_err(|_| {
+                KrafkaError::protocol(format!(
+                    "KafkaString length {} exceeds protocol limit of {}",
+                    value.len(),
+                    i16::MAX
+                ))
+            })?;
+            Ok(2 + value.len())
+        }
+        None => Ok(2),
+    }
+}
+
+fn compact_kafka_string_size(value: Option<&str>) -> Result<usize> {
+    match value {
+        Some(value) => {
+            let len_plus_one = u32::try_from(value.len().saturating_add(1)).map_err(|_| {
+                KrafkaError::protocol(format!(
+                    "compact KafkaString length {} exceeds u32 limit",
+                    value.len()
+                ))
+            })?;
+            Ok(unsigned_varint_size(len_plus_one) + value.len())
+        }
+        None => Ok(unsigned_varint_size(0)),
+    }
+}
+
+fn kafka_bytes_size(len: usize) -> Result<usize> {
+    i32::try_from(len).map_err(|_| {
+        KrafkaError::protocol(format!(
+            "KafkaBytes length {} exceeds protocol limit of {}",
+            len,
+            i32::MAX
+        ))
+    })?;
+    Ok(4 + len)
+}
+
+fn compact_kafka_bytes_size(len: usize) -> Result<usize> {
+    let len_plus_one = u32::try_from(len.saturating_add(1)).map_err(|_| {
+        KrafkaError::protocol(format!(
+            "compact KafkaBytes length {} exceeds u32 limit",
+            len
+        ))
+    })?;
+    Ok(unsigned_varint_size(len_plus_one) + len)
+}
+
+fn array_len_size(len: usize) -> Result<usize> {
+    i32::try_from(len).map_err(|_| {
+        KrafkaError::protocol(format!("Kafka array length {len} exceeds protocol limit"))
+    })?;
+    Ok(4)
+}
+
+fn compact_array_len_size(len: usize) -> Result<usize> {
+    let len_plus_one = u32::try_from(len.saturating_add(1)).map_err(|_| {
+        KrafkaError::protocol(format!(
+            "compact Kafka array length {len} exceeds u32 limit"
+        ))
+    })?;
+    Ok(unsigned_varint_size(len_plus_one))
+}
+
+fn request_header_size(api_key: ApiKey, api_version: i16, client_id: &str) -> Result<usize> {
+    let base = 2 + 2 + 4 + kafka_string_size(Some(client_id))?;
+    match crate::protocol::RequestHeader::header_version(api_key, api_version) {
+        1 => Ok(base),
+        2 => Ok(base + 1),
+        version => Err(KrafkaError::protocol(format!(
+            "unsupported request header version {version}"
+        ))),
+    }
+}
+
+fn produce_request_body_size(api_version: i16, request: &ProduceRequest) -> Result<usize> {
+    let mut size = match api_version {
+        3..=8 => kafka_string_size(request.transactional_id.as_deref())? + 2 + 4,
+        9..=13 => compact_kafka_string_size(request.transactional_id.as_deref())? + 2 + 4,
+        _ => {
+            return Err(KrafkaError::protocol(format!(
+                "unsupported ProduceRequest version {api_version}"
+            )));
+        }
+    };
+
+    match api_version {
+        3..=8 => {
+            size += array_len_size(request.topic_data.len())?;
+            for topic in &request.topic_data {
+                size += kafka_string_size(Some(&topic.name))?;
+                size += array_len_size(topic.partition_data.len())?;
+                for partition in &topic.partition_data {
+                    size += 4 + kafka_bytes_size(partition.records.len())?;
+                }
+            }
+        }
+        9..=12 => {
+            size += compact_array_len_size(request.topic_data.len())?;
+            for topic in &request.topic_data {
+                size += compact_kafka_string_size(Some(&topic.name))?;
+                size += compact_array_len_size(topic.partition_data.len())?;
+                for partition in &topic.partition_data {
+                    size += 4 + compact_kafka_bytes_size(partition.records.len())? + 1;
+                }
+                size += 1;
+            }
+            size += 1;
+        }
+        13 => {
+            size += compact_array_len_size(request.topic_data.len())?;
+            for topic in &request.topic_data {
+                if topic.topic_id.is_none() {
+                    return Err(KrafkaError::protocol(
+                        "topic_id is required for Produce v13+ (KIP-516)",
+                    ));
+                }
+                size += 16;
+                size += compact_array_len_size(topic.partition_data.len())?;
+                for partition in &topic.partition_data {
+                    size += 4 + compact_kafka_bytes_size(partition.records.len())? + 1;
+                }
+                size += 1;
+            }
+            size += 1;
+        }
+        _ => unreachable!("validated above"),
+    }
+
+    Ok(size)
+}
+
+fn produce_request_frame_size(
+    client_id: &str,
+    api_version: i16,
+    request: &ProduceRequest,
+) -> Result<usize> {
+    Ok(
+        4 + request_header_size(ApiKey::Produce, api_version, client_id)?
+            + produce_request_body_size(api_version, request)?,
+    )
+}
+
 fn validate_produce_request_size(
     client_id: &str,
     max_request_size: usize,
     api_version: i16,
     request: &ProduceRequest,
 ) -> Result<()> {
-    let approximate_upper_bound =
-        request
-            .topic_data
-            .iter()
-            .fold(4usize + client_id.len() + 256, |acc, topic_data| {
-                acc.saturating_add(topic_data.name.len()).saturating_add(
-                    topic_data
-                        .partition_data
-                        .iter()
-                        .map(|partition_data| partition_data.records.len())
-                        .sum::<usize>(),
-                )
-            });
-
-    if approximate_upper_bound <= max_request_size {
-        return Ok(());
-    }
-
-    let header = crate::protocol::RequestHeader::new(ApiKey::Produce, api_version, 0)
-        .with_client_id(client_id.to_string());
-    let mut encoded = Vec::new();
-    header.encode(&mut encoded)?;
-    request.encode_versioned(api_version, &mut encoded)?;
-
-    let frame_size = encoded.len().saturating_add(4);
+    let frame_size = produce_request_frame_size(client_id, api_version, request)?;
     if frame_size > max_request_size {
         return Err(KrafkaError::protocol(format!(
             "produce request size {frame_size} exceeds max_request_size {max_request_size}"
@@ -1363,6 +1507,9 @@ impl ProducerBuilder {
 mod tests {
     use super::*;
 
+    use crate::metadata::ClusterMetadata;
+    use crate::network::{ConnectionConfig, ConnectionPool};
+
     #[test]
     fn test_producer_builder() {
         let builder = Producer::builder()
@@ -1493,6 +1640,92 @@ mod tests {
             .expect_err("oversized frame should be rejected");
 
         assert!(error.to_string().contains("max_request_size"));
+    }
+
+    #[test]
+    fn test_validate_produce_request_size_uses_exact_flexible_encoding_size() {
+        let request = ProduceRequest {
+            transactional_id: Some("txn-123".to_string()),
+            acks: Acks::All.to_i16(),
+            timeout_ms: 30_000,
+            topic_data: vec![ProduceTopicData {
+                name: "topic".to_string(),
+                topic_id: None,
+                partition_data: vec![ProducePartitionData {
+                    index: 0,
+                    records: Bytes::from(vec![1; 32]),
+                }],
+            }],
+        };
+
+        let exact_size =
+            produce_request_frame_size("client", versions::PRODUCE_MAX, &request).unwrap();
+
+        validate_produce_request_size("client", exact_size, versions::PRODUCE_MAX, &request)
+            .unwrap();
+
+        let error = validate_produce_request_size(
+            "client",
+            exact_size.saturating_sub(1),
+            versions::PRODUCE_MAX,
+            &request,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("max_request_size"));
+    }
+
+    #[test]
+    fn test_validate_produce_request_size_v13_requires_topic_id() {
+        let request = ProduceRequest {
+            transactional_id: None,
+            acks: Acks::All.to_i16(),
+            timeout_ms: 30_000,
+            topic_data: vec![ProduceTopicData {
+                name: "topic".to_string(),
+                topic_id: None,
+                partition_data: vec![ProducePartitionData {
+                    index: 0,
+                    records: Bytes::from_static(b"payload"),
+                }],
+            }],
+        };
+
+        let error = validate_produce_request_size("client", 1024, 13, &request).unwrap_err();
+        assert!(error.to_string().contains("topic_id is required"));
+    }
+
+    #[tokio::test]
+    async fn test_recover_unknown_producer_id_poisoned_when_newer_batches_in_flight() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(7, 1);
+        assert_eq!(identity.allocate_sequence("topic", 0, 2).unwrap(), 0);
+        assert_eq!(identity.allocate_sequence("topic", 0, 1).unwrap(), 2);
+
+        let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
+        let metadata = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        );
+        let retry_policy = RetryPolicy::default();
+
+        let error =
+            recover_unknown_producer_id(&identity, &metadata, &retry_policy, "topic", 0, 0, 2)
+                .await
+                .unwrap_err();
+
+        assert!(error.to_string().contains("poisoned"));
+        assert!(identity.is_initialized());
+        assert!(identity.is_poisoned());
+        assert_eq!(identity.producer_id(), 7);
+        assert_eq!(identity.peek_sequence("topic", 0), 3);
+
+        let ensure_error =
+            ensure_idempotent_producer_id_initialized(&identity, &metadata, &retry_policy)
+                .await
+                .unwrap_err();
+        assert!(ensure_error.to_string().contains("poisoned"));
     }
 
     #[test]

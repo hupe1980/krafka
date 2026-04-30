@@ -482,15 +482,10 @@ impl SchemaRegistryClient for ConfluentSchemaRegistry {
 /// userinfo (`user:pass@`) to prevent credential leakage through `Debug`
 /// output or logs.
 ///
-/// If userinfo is detected, a warning is logged with a masked user hint and
-/// host, advising the caller to use `basic_auth()` instead.
-fn masked_userinfo_indicator(userinfo: &str) -> String {
-    match userinfo.split_once(':') {
-        Some((username, _)) if !username.is_empty() => format!("<{username}:***@>"),
-        Some(_) => "<***@>".to_string(),
-        None if !userinfo.is_empty() => format!("<{userinfo}@>"),
-        None => "<***@>".to_string(),
-    }
+/// If userinfo is detected, a warning is logged with a fully redacted marker
+/// and host, advising the caller to use `basic_auth()` instead.
+fn masked_userinfo_indicator(_userinfo: &str) -> &'static str {
+    "<***@>"
 }
 
 fn sanitize_url(mut url: String) -> String {
@@ -748,9 +743,10 @@ mod tests {
     }
 
     #[test]
-    fn test_masked_userinfo_indicator_redacts_password() {
-        assert_eq!(masked_userinfo_indicator("admin:s3cret"), "<admin:***@>");
-        assert_eq!(masked_userinfo_indicator("admin"), "<admin@>");
+    fn test_masked_userinfo_indicator_never_reveals_userinfo() {
+        assert_eq!(masked_userinfo_indicator("admin:s3cret"), "<***@>");
+        assert_eq!(masked_userinfo_indicator("admin"), "<***@>");
+        assert_eq!(masked_userinfo_indicator("opaque-token"), "<***@>");
         assert_eq!(masked_userinfo_indicator(":s3cret"), "<***@>");
     }
 

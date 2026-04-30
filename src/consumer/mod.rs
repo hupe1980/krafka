@@ -5018,7 +5018,7 @@ mod tests {
         let new: HashMap<String, Vec<PartitionId>> =
             [("topic1".to_string(), vec![1, 2])].into_iter().collect();
 
-        let revoked = cooperative_revocations(&old, &new);
+        let revoked = revoked_partitions_diff(&old, &new);
         let revoked_tuples: Vec<(String, PartitionId)> = revoked
             .into_iter()
             .map(|tp| (tp.topic, tp.partition))

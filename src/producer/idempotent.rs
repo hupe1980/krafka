@@ -49,7 +49,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 
 use parking_lot::RwLock;
 
@@ -66,6 +66,9 @@ pub struct ProducerIdentity {
     producer_id: AtomicI64,
     /// Producer epoch assigned by the broker (-1 if not initialized).
     producer_epoch: AtomicI32,
+    /// Set when an unrecoverable `UnknownProducerId` was observed while newer
+    /// in-flight batches still depended on the current sequence state.
+    poisoned: AtomicBool,
     /// Sequence numbers per topic-partition (two-level map avoids
     /// per-call `String` allocations on lookups).
     sequences: RwLock<HashMap<String, HashMap<PartitionId, SequenceState>>>,
@@ -146,6 +149,7 @@ impl ProducerIdentity {
         Self {
             producer_id: AtomicI64::new(-1),
             producer_epoch: AtomicI32::new(-1),
+            poisoned: AtomicBool::new(false),
             sequences: RwLock::new(HashMap::new()),
         }
     }
@@ -178,6 +182,7 @@ impl ProducerIdentity {
         self.producer_id.store(producer_id, Ordering::SeqCst);
         self.producer_epoch
             .store(producer_epoch as i32, Ordering::SeqCst);
+        self.poisoned.store(false, Ordering::SeqCst);
         sequences.clear();
     }
 
@@ -189,7 +194,18 @@ impl ProducerIdentity {
         let mut sequences = self.sequences.write();
         self.producer_id.store(-1, Ordering::SeqCst);
         self.producer_epoch.store(-1, Ordering::SeqCst);
+        self.poisoned.store(false, Ordering::SeqCst);
         sequences.clear();
+    }
+
+    #[inline]
+    pub(crate) fn poison(&self) {
+        self.poisoned.store(true, Ordering::SeqCst);
+    }
+
+    #[inline]
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::SeqCst)
     }
 
     /// Get the next sequence number for a topic-partition (single-record batch).
@@ -633,6 +649,21 @@ mod tests {
                 .can_retry_unknown_producer_id("topic", 0, 0, 2)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn test_poison_flag_clears_on_reset_and_reinitialize() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+        identity.poison();
+
+        assert!(identity.is_poisoned());
+
+        identity.reset();
+        assert!(!identity.is_poisoned());
+
+        identity.initialize(2, 1);
+        assert!(!identity.is_poisoned());
     }
 
     #[test]
