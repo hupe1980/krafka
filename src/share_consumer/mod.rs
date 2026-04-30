@@ -60,6 +60,7 @@ use crate::auth::AuthConfig;
 use crate::consumer::ConsumerRecord;
 use crate::error::{KrafkaError, Result};
 use crate::metadata::ClusterMetadata;
+use crate::metrics::ConnectionMetrics;
 use crate::network::{ConnectionConfig, ConnectionPool};
 use crate::protocol::{
     ApiKey, FindCoordinatorRequest, FindCoordinatorResponse, RecordBatch,
@@ -850,6 +851,12 @@ impl ShareConsumer {
     #[inline]
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Get the shared connection metrics handle used by this share consumer's broker pool.
+    #[inline]
+    pub fn connection_metrics(&self) -> Arc<ConnectionMetrics> {
+        self.pool.metrics()
     }
 
     // ── Internal helpers ────────────────────────────────────────────────

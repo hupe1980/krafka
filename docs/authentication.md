@@ -319,7 +319,7 @@ By default, Krafka uses compiled-in `webpki-roots`. To use the operating system 
 
 ```toml
 [dependencies]
-krafka = { version = "0.5", features = ["native-tls-roots"] }
+krafka = { version = "0.6", features = ["native-tls-roots"] }
 ```
 
 ```rust
@@ -398,7 +398,7 @@ For production deployments on EC2, ECS, Lambda, or EKS, use the AWS SDK default 
 use krafka::auth::{AuthConfig, AwsMskIamCredentials};
 
 // Requires the `aws-msk` feature in Cargo.toml:
-// krafka = { version = "0.5", features = ["aws-msk"] }
+// krafka = { version = "0.6", features = ["aws-msk"] }
 
 // Loads from (in order):
 // 1. Environment variables
@@ -513,6 +513,9 @@ The implementation uses AWS Signature v4 signing:
 - **Payload Format**: JSON with signed headers
 - **TLS Required**: Always uses SASL_SSL (TLS is mandatory)
 - **Region-Aware**: Credentials are scoped to AWS region
+- **Clock Skew**: Authentication uses the system clock. On recognized SigV4
+    clock-skew failures, reconnects apply a best-effort correction capped at
+    +/-300 seconds; larger drift should be fixed with NTP or host time sync.
 
 ## Configuration Options
 

@@ -71,7 +71,7 @@ use tracing::{debug, error, info, warn};
 use crate::auth::AuthConfig;
 use crate::error::{KrafkaError, Result};
 use crate::metadata::{BrokerInfo, ClusterMetadata, TopicInfo};
-use crate::metrics::ConsumerMetrics;
+use crate::metrics::{ConnectionMetrics, ConsumerMetrics};
 use crate::network::{ConnectionConfig, ConnectionPool};
 use crate::protocol::{
     ApiKey, FetchPartitionRequest, FetchRequest, FetchResponse, FetchTopicRequest,
@@ -3526,6 +3526,12 @@ impl Consumer {
     #[inline]
     pub fn metrics(&self) -> &Arc<ConsumerMetrics> {
         &self.metrics
+    }
+
+    /// Get the shared connection metrics handle used by this consumer's broker pool.
+    #[inline]
+    pub fn connection_metrics(&self) -> Arc<ConnectionMetrics> {
+        self.pool.metrics()
     }
 }
 

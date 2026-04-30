@@ -68,6 +68,8 @@ pub struct ProducerConfig {
     pub(crate) linger: Duration,
     /// Request timeout.
     pub(crate) request_timeout: Duration,
+    /// Total delivery timeout for a record, including retries and time spent queued.
+    pub(crate) delivery_timeout: Duration,
     /// Number of retries.
     pub(crate) retries: u32,
     /// Time between retries.
@@ -88,6 +90,8 @@ pub struct ProducerConfig {
     pub(crate) buffer_memory: usize,
     /// Metadata max age.
     pub(crate) metadata_max_age: Duration,
+    /// Topic cache TTL for partial metadata refreshes.
+    pub(crate) metadata_topic_cache_ttl: Option<Duration>,
     /// Metadata recovery strategy (KIP-899).
     ///
     /// When set to [`MetadataRecoveryStrategy::Rebootstrap`], the producer
@@ -115,14 +119,16 @@ impl Default for ProducerConfig {
             batch_size: 16384,
             linger: Duration::from_millis(0),
             request_timeout: Duration::from_secs(30),
-            retries: 3,
+            delivery_timeout: Duration::from_secs(120),
+            retries: u32::MAX,
             retry_backoff: Duration::from_millis(100),
             max_in_flight: 5,
             idempotent: true,
             max_block: Duration::from_secs(60),
             buffer_memory: 32 * 1024 * 1024, // 32 MB
             metadata_max_age: Duration::from_secs(300),
-            metadata_recovery_strategy: MetadataRecoveryStrategy::None,
+            metadata_topic_cache_ttl: Some(Duration::from_secs(300)),
+            metadata_recovery_strategy: MetadataRecoveryStrategy::Rebootstrap,
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             auth: None,
             #[cfg(feature = "socks5")]
@@ -179,6 +185,12 @@ impl ProducerConfig {
         self.request_timeout
     }
 
+    /// Returns the total delivery timeout.
+    #[inline]
+    pub fn delivery_timeout(&self) -> Duration {
+        self.delivery_timeout
+    }
+
     /// Returns the number of retries.
     #[inline]
     pub fn retries(&self) -> u32 {
@@ -219,6 +231,12 @@ impl ProducerConfig {
     #[inline]
     pub fn metadata_max_age(&self) -> Duration {
         self.metadata_max_age
+    }
+
+    /// Returns the topic cache TTL for partial metadata refreshes.
+    #[inline]
+    pub fn metadata_topic_cache_ttl(&self) -> Option<Duration> {
+        self.metadata_topic_cache_ttl
     }
 
     /// Returns the metadata recovery strategy (KIP-899).
@@ -314,6 +332,15 @@ impl ProducerConfigBuilder {
         self
     }
 
+    /// Set the total delivery timeout.
+    ///
+    /// This bounds the total time a record may spend queued and retried before
+    /// it is failed locally, similar to Kafka's `delivery.timeout.ms`.
+    pub fn delivery_timeout(mut self, timeout: Duration) -> Self {
+        self.config.delivery_timeout = timeout;
+        self
+    }
+
     /// Set number of retries.
     pub fn retries(mut self, retries: u32) -> Self {
         self.config.retries = retries;
@@ -363,6 +390,27 @@ impl ProducerConfigBuilder {
         self
     }
 
+    /// Set the topic cache TTL for partial metadata refreshes.
+    ///
+    /// During partial refreshes, cached topics that have not been refreshed
+    /// within this duration are evicted to prevent unbounded cache growth.
+    ///
+    /// Default: 5 minutes (matching Java's `metadata.max.idle.ms`).
+    pub fn metadata_topic_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.config.metadata_topic_cache_ttl = Some(ttl);
+        self
+    }
+
+    /// Disable topic cache TTL eviction for partial metadata refreshes.
+    ///
+    /// By default, cached topics are evicted after 5 minutes to prevent
+    /// unbounded growth on topic churn. Call this to opt out of TTL eviction;
+    /// entries will then persist across partial refreshes indefinitely.
+    pub fn disable_metadata_topic_cache_ttl(mut self) -> Self {
+        self.config.metadata_topic_cache_ttl = None;
+        self
+    }
+
     /// Set the metadata recovery strategy (KIP-899).
     pub fn metadata_recovery_strategy(mut self, strategy: MetadataRecoveryStrategy) -> Self {
         self.config.metadata_recovery_strategy = strategy;
@@ -384,6 +432,7 @@ impl ProducerConfigBuilder {
     /// Returns an error if the configuration is invalid:
     /// - `batch_size` must be >= 1
     /// - `max_in_flight` must be >= 1
+    /// - `delivery_timeout` must be greater than zero
     /// - Idempotent mode requires `acks = All` and `max_in_flight <= 5`
     /// - `batch_size` must not exceed `buffer_memory` (when `buffer_memory > 0`)
     pub fn build(self) -> Result<ProducerConfig> {
@@ -399,7 +448,17 @@ impl ProducerConfigBuilder {
                 self.config.max_in_flight
             )));
         }
+        if self.config.delivery_timeout.is_zero() {
+            return Err(KrafkaError::config(
+                "delivery_timeout must be greater than zero",
+            ));
+        }
         if self.config.idempotent {
+            if self.config.retries == 0 {
+                return Err(KrafkaError::config(
+                    "idempotent producer requires retries > 0",
+                ));
+            }
             if self.config.acks != Acks::All {
                 return Err(KrafkaError::config(format!(
                     "idempotent producer requires acks = All (got {:?})",
@@ -449,7 +508,12 @@ mod tests {
         assert!(config.idempotent);
         assert_eq!(config.compression, Compression::None);
         assert_eq!(config.batch_size, 16384);
-        assert_eq!(config.retries, 3);
+        assert_eq!(config.delivery_timeout, Duration::from_secs(120));
+        assert_eq!(config.retries, u32::MAX);
+        assert_eq!(
+            config.metadata_topic_cache_ttl,
+            Some(Duration::from_secs(300))
+        );
     }
 
     #[test]
@@ -484,6 +548,15 @@ mod tests {
     }
 
     #[test]
+    fn test_config_builder_delivery_timeout() {
+        let config = ProducerConfig::builder()
+            .delivery_timeout(Duration::from_secs(45))
+            .build()
+            .unwrap();
+        assert_eq!(config.delivery_timeout(), Duration::from_secs(45));
+    }
+
+    #[test]
     fn test_config_builder_max_in_flight() {
         // max_in_flight=10 requires idempotent=false
         let config = ProducerConfig::builder()
@@ -508,6 +581,27 @@ mod tests {
             Duration::from_secs(120),
             "metadata_max_age should be set by builder"
         );
+    }
+
+    #[test]
+    fn test_config_builder_metadata_topic_cache_ttl() {
+        let config = ProducerConfig::builder()
+            .metadata_topic_cache_ttl(Duration::from_secs(600))
+            .build()
+            .unwrap();
+        assert_eq!(
+            config.metadata_topic_cache_ttl(),
+            Some(Duration::from_secs(600))
+        );
+    }
+
+    #[test]
+    fn test_config_builder_disable_metadata_topic_cache_ttl() {
+        let config = ProducerConfig::builder()
+            .disable_metadata_topic_cache_ttl()
+            .build()
+            .unwrap();
+        assert_eq!(config.metadata_topic_cache_ttl(), None);
     }
 
     // ── R14: Acks::from_i16 known values ──
@@ -550,7 +644,7 @@ mod tests {
         let config = ProducerConfig::default();
         assert_eq!(
             config.metadata_recovery_strategy,
-            MetadataRecoveryStrategy::None,
+            MetadataRecoveryStrategy::Rebootstrap,
         );
         assert_eq!(
             config.metadata_recovery_rebootstrap_trigger,
@@ -584,6 +678,20 @@ mod tests {
     #[test]
     fn test_config_builder_rejects_zero_max_in_flight() {
         let err = ProducerConfig::builder().max_in_flight(0).build();
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_config_builder_rejects_zero_delivery_timeout() {
+        let err = ProducerConfig::builder()
+            .delivery_timeout(Duration::ZERO)
+            .build();
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_config_builder_rejects_idempotent_without_retries() {
+        let err = ProducerConfig::builder().retries(0).build();
         assert!(err.is_err());
     }
 

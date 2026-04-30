@@ -26,12 +26,14 @@ use tokio_util::time::{DelayQueue, delay_queue};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::CorrelationId;
+use crate::auth::msk_iam::MAX_SIGV4_CLOCK_SKEW_SECS;
 use crate::auth::tls::build_tls_connector;
 use crate::auth::{
     AuthConfig, ChannelBinding, SaslMechanism, SecurityProtocol, connect_tls,
     extract_tls_server_end_point,
 };
 use crate::error::{KrafkaError, Result};
+use crate::metrics::ConnectionMetrics;
 
 /// SOCKS5 proxy configuration for connecting to brokers through a proxy.
 ///
@@ -282,6 +284,8 @@ pub struct ConnectionConfig {
     /// `SystemTime::now()` so the SigV4 timestamp matches the broker's
     /// clock.  Default: 0 (no adjustment).
     pub(crate) msk_iam_clock_offset_secs: Arc<AtomicI64>,
+    /// Shared connection metrics recorded by broker connections created from this config.
+    pub(crate) connection_metrics: Arc<ConnectionMetrics>,
     /// SOCKS5 proxy configuration (optional).
     ///
     /// When set, all connections are tunneled through the proxy.
@@ -343,6 +347,7 @@ impl Default for ConnectionConfig {
             tcp_keepalive: Some(Duration::from_secs(60)),
             connection_attempt_delay: Duration::from_millis(250),
             msk_iam_clock_offset_secs: Arc::new(AtomicI64::new(0)),
+            connection_metrics: Arc::new(ConnectionMetrics::default()),
             #[cfg(feature = "socks5")]
             proxy: None,
         }
@@ -483,6 +488,12 @@ impl ConnectionConfig {
         self.connection_attempt_delay
     }
 
+    /// Returns the shared connection metrics handle.
+    #[inline]
+    pub fn connection_metrics(&self) -> Arc<ConnectionMetrics> {
+        self.connection_metrics.clone()
+    }
+
     /// Returns the SOCKS5 proxy configuration, if set.
     ///
     /// Requires the `socks5` feature.
@@ -590,6 +601,12 @@ impl ConnectionConfigBuilder {
     /// Default: 250 ms.
     pub fn connection_attempt_delay(mut self, delay: Duration) -> Self {
         self.0.connection_attempt_delay = delay;
+        self
+    }
+
+    /// Set the shared connection metrics handle.
+    pub fn connection_metrics(mut self, metrics: Arc<ConnectionMetrics>) -> Self {
+        self.0.connection_metrics = metrics;
         self
     }
 
@@ -817,41 +834,61 @@ impl BrokerConnection {
 
                 // Spawn the connection task with TLS stream
                 let (reader, writer) = tokio::io::split(tls_stream);
+                let loop_address = address.to_string();
+                let loop_metrics = config.connection_metrics.clone();
+                let close_metrics = loop_metrics.clone();
+                let max_response_size = config.max_response_size;
+                let max_in_flight_requests = config.max_in_flight_requests;
+                config.connection_metrics.record_connect();
                 tokio::spawn(async move {
                     if let Err(e) = Self::run_connection_loop(
+                        loop_address,
                         reader,
                         writer,
                         high_priority_rx,
                         normal_priority_rx,
                         request_timeout,
                         stats_clone,
-                        config.max_response_size,
-                        config.max_in_flight_requests,
+                        loop_metrics,
+                        max_response_size,
+                        max_in_flight_requests,
                     )
                     .await
                     {
+                        close_metrics.record_error();
                         error!("Connection error: {e}");
                     }
+                    close_metrics.record_close();
                     alive_clone.store(false, std::sync::atomic::Ordering::SeqCst);
                 });
             } else {
                 // TLS only, no SASL
                 let (reader, writer) = tokio::io::split(tls_stream);
+                let loop_address = address.to_string();
+                let loop_metrics = config.connection_metrics.clone();
+                let close_metrics = loop_metrics.clone();
+                let max_response_size = config.max_response_size;
+                let max_in_flight_requests = config.max_in_flight_requests;
+                config.connection_metrics.record_connect();
                 tokio::spawn(async move {
                     if let Err(e) = Self::run_connection_loop(
+                        loop_address,
                         reader,
                         writer,
                         high_priority_rx,
                         normal_priority_rx,
                         request_timeout,
                         stats_clone,
-                        config.max_response_size,
-                        config.max_in_flight_requests,
+                        loop_metrics,
+                        max_response_size,
+                        max_in_flight_requests,
                     )
                     .await
                     {
+                        close_metrics.record_error();
                         error!("Connection error: {e}");
                     }
+                    close_metrics.record_close();
                     alive_clone.store(false, std::sync::atomic::Ordering::SeqCst);
                 });
             }
@@ -873,41 +910,61 @@ impl BrokerConnection {
             connection.session_expiry = Self::effective_session_expiry(session_lifetime_ms, auth);
 
             let (reader, writer) = stream.into_split();
+            let loop_address = address.to_string();
+            let loop_metrics = config.connection_metrics.clone();
+            let close_metrics = loop_metrics.clone();
+            let max_response_size = config.max_response_size;
+            let max_in_flight_requests = config.max_in_flight_requests;
+            config.connection_metrics.record_connect();
             tokio::spawn(async move {
                 if let Err(e) = Self::run_connection_loop(
+                    loop_address,
                     reader,
                     writer,
                     high_priority_rx,
                     normal_priority_rx,
                     request_timeout,
                     stats_clone,
-                    config.max_response_size,
-                    config.max_in_flight_requests,
+                    loop_metrics,
+                    max_response_size,
+                    max_in_flight_requests,
                 )
                 .await
                 {
+                    close_metrics.record_error();
                     error!("Connection error: {e}");
                 }
+                close_metrics.record_close();
                 alive_clone.store(false, std::sync::atomic::Ordering::SeqCst);
             });
         } else {
             // Plain TCP — fast path (most common for local dev)
             let (reader, writer) = stream.into_split();
+            let loop_address = address.to_string();
+            let loop_metrics = config.connection_metrics.clone();
+            let close_metrics = loop_metrics.clone();
+            let max_response_size = config.max_response_size;
+            let max_in_flight_requests = config.max_in_flight_requests;
+            config.connection_metrics.record_connect();
             tokio::spawn(async move {
                 if let Err(e) = Self::run_connection_loop(
+                    loop_address,
                     reader,
                     writer,
                     high_priority_rx,
                     normal_priority_rx,
                     request_timeout,
                     stats_clone,
-                    config.max_response_size,
-                    config.max_in_flight_requests,
+                    loop_metrics,
+                    max_response_size,
+                    max_in_flight_requests,
                 )
                 .await
                 {
+                    close_metrics.record_error();
                     error!("Connection error: {e}");
                 }
+                close_metrics.record_close();
                 alive_clone.store(false, std::sync::atomic::Ordering::SeqCst);
             });
         }
@@ -1177,12 +1234,13 @@ impl BrokerConnection {
                         // Not yet current → local clock is ahead of broker.
                         -300
                     };
-                    msk_iam_clock_offset_secs.store(prev + nudge, Ordering::Relaxed);
+                    let adjusted =
+                        Self::clamp_msk_iam_clock_offset_secs(prev.saturating_add(nudge));
+                    msk_iam_clock_offset_secs.store(adjusted, Ordering::Relaxed);
                     warn!(
                         "MSK IAM auth failed with possible clock skew ({}); \
                          adjusted clock offset to {}s for next attempt",
-                        err_msg,
-                        prev + nudge,
+                        err_msg, adjusted,
                     );
                 }
             }
@@ -1371,6 +1429,10 @@ impl BrokerConnection {
         0
     }
 
+    fn clamp_msk_iam_clock_offset_secs(offset: i64) -> i64 {
+        offset.clamp(-MAX_SIGV4_CLOCK_SKEW_SECS, MAX_SIGV4_CLOCK_SKEW_SECS)
+    }
+
     /// Run the connection event loop with priority handling.
     ///
     /// This is generic over the stream type, supporting both plain TCP and TLS.
@@ -1378,12 +1440,14 @@ impl BrokerConnection {
     /// ensuring heartbeats are never starved by backpressure on data requests.
     #[allow(clippy::too_many_arguments)]
     async fn run_connection_loop<R, W>(
+        broker_address: String,
         mut reader: R,
         mut writer: W,
         mut high_priority_rx: mpsc::Receiver<ConnectionCommand>,
         mut normal_priority_rx: mpsc::Receiver<ConnectionCommand>,
         request_timeout: Duration,
         stats: Arc<ConnectionStats>,
+        metrics: Arc<ConnectionMetrics>,
         max_response_size: usize,
         max_in_flight_requests: usize,
     ) -> Result<()>
@@ -1456,6 +1520,7 @@ impl BrokerConnection {
             // scheduler.  Heartbeats are the most latency-sensitive request type.
             if let Ok(cmd) = high_priority_rx.try_recv() {
                 stats.high_priority_bypasses.fetch_add(1, Ordering::Relaxed);
+                metrics.record_high_priority_bypass();
                 match Self::handle_command_direct(
                     &mut writer,
                     &mut pending,
@@ -1489,6 +1554,7 @@ impl BrokerConnection {
                                 &mut delay_queue,
                                 &mut delay_keys,
                                 frame,
+                                &broker_address,
                             ) {
                                 // Protocol desynchronisation — close the connection.
                                 terminal_error = Some(e);
@@ -1732,14 +1798,19 @@ impl BrokerConnection {
         delay_queue: &mut DelayQueue<CorrelationId>,
         delay_keys: &mut HashMap<CorrelationId, delay_queue::Key>,
         response: Bytes,
+        broker_address: &str,
     ) -> Result<()> {
         if response.len() < 4 {
-            return Err(KrafkaError::protocol("response too short"));
+            return Err(KrafkaError::protocol(format!(
+                "response too short from broker {broker_address}: frame_bytes={}",
+                response.len()
+            )));
         }
 
         let correlation_id =
             i32::from_be_bytes([response[0], response[1], response[2], response[3]]);
 
+        let pending_before_remove = pending.len();
         if let Some(req) = pending.remove(&correlation_id) {
             // Cancel the timeout — the response arrived before the deadline.
             if let Some(key) = delay_keys.remove(&correlation_id) {
@@ -1758,22 +1829,39 @@ impl BrokerConnection {
                 Err(e) => {
                     // Header decode failure means the stream is desynchronised
                     // — notify the caller and tear down the connection.
-                    warn!(
-                        "Failed to decode response header for correlation_id={}, closing connection: {}",
-                        correlation_id, e
+                    let response_header_version =
+                        ResponseHeader::header_version(req.api_key, req.api_version);
+                    let context = format!(
+                        "response header decode failed: broker={broker_address}, api_key={:?}, api_version={}, response_header_version={}, correlation_id={correlation_id}, frame_bytes={}, pending_before_remove={pending_before_remove}, error={e}",
+                        req.api_key,
+                        req.api_version,
+                        response_header_version,
+                        response.len(),
                     );
-                    let _ = req.response_tx.send(Err(KrafkaError::protocol(format!(
-                        "response header decode failed for correlation_id={correlation_id}: {e}"
-                    ))));
-                    return Err(KrafkaError::protocol(
-                        "response header decode failure — stream desynchronized",
-                    ));
+                    warn!(
+                        broker = broker_address,
+                        api_key = ?req.api_key,
+                        api_version = req.api_version,
+                        response_header_version,
+                        correlation_id,
+                        frame_bytes = response.len(),
+                        pending_before_remove,
+                        error = %e,
+                        "Failed to decode response header; closing connection"
+                    );
+                    let _ = req
+                        .response_tx
+                        .send(Err(KrafkaError::protocol(context.clone())));
+                    return Err(KrafkaError::protocol(format!(
+                        "{context}; stream desynchronized"
+                    )));
                 }
             }
         } else {
             // Unknown correlation ID indicates a protocol desync.
             return Err(KrafkaError::protocol(format!(
-                "Received response for unknown correlation_id={correlation_id}, closing connection"
+                "Received response for unknown correlation_id={correlation_id} from broker {broker_address}; frame_bytes={}, pending_requests={pending_before_remove}; closing connection",
+                response.len()
             )));
         }
 
@@ -1812,6 +1900,9 @@ impl BrokerConnection {
         self.stats
             .high_priority_requests
             .fetch_add(1, Ordering::Relaxed);
+        self.config
+            .connection_metrics
+            .record_high_priority_request();
 
         // Wait for response
         let response = timeout(self.config.request_timeout, response_rx)
@@ -1914,6 +2005,7 @@ impl BrokerConnection {
                     broker = %self.address,
                     "Delaying request due to broker throttle (KIP-219)"
                 );
+                self.config.connection_metrics.record_throttle_delay(delay);
                 tokio::time::sleep(delay).await;
             }
         }
@@ -1949,11 +2041,17 @@ impl BrokerConnection {
                 self.stats
                     .high_priority_requests
                     .fetch_add(1, Ordering::Relaxed);
+                self.config
+                    .connection_metrics
+                    .record_high_priority_request();
             }
             RequestPriority::Normal => {
                 self.stats
                     .normal_priority_requests
                     .fetch_add(1, Ordering::Relaxed);
+                self.config
+                    .connection_metrics
+                    .record_normal_priority_request();
             }
         }
 
@@ -2003,6 +2101,9 @@ impl BrokerConnection {
         self.stats
             .normal_priority_requests
             .fetch_add(1, Ordering::Relaxed);
+        self.config
+            .connection_metrics
+            .record_normal_priority_request();
 
         Ok(())
     }
@@ -2279,6 +2380,18 @@ mod tests {
     }
 
     #[test]
+    fn test_connection_config_uses_shared_metrics_handle() {
+        let metrics = Arc::new(ConnectionMetrics::default());
+        let config = ConnectionConfig::builder()
+            .connection_metrics(metrics.clone())
+            .build();
+
+        config.connection_metrics.record_high_priority_request();
+        assert_eq!(metrics.high_priority_requests.get(), 1);
+        assert!(Arc::ptr_eq(&metrics, &config.connection_metrics()));
+    }
+
+    #[test]
     fn test_connection_config_with_auth() {
         use crate::auth::AuthConfig;
         let config = ConnectionConfig::builder()
@@ -2378,6 +2491,42 @@ mod tests {
         assert_eq!(stats.high_priority_count(), 5);
         assert_eq!(stats.normal_priority_count(), 10);
         assert_eq!(stats.bypass_count(), 2);
+    }
+
+    #[test]
+    fn test_dispatch_response_header_decode_error_includes_context() {
+        let correlation_id = 7;
+        let (response_tx, mut response_rx) = oneshot::channel();
+        let mut pending = HashMap::new();
+        pending.insert(
+            correlation_id,
+            PendingRequest {
+                response_tx,
+                api_key: ApiKey::Metadata,
+                api_version: 9,
+            },
+        );
+        let mut delay_queue = DelayQueue::new();
+        let mut delay_keys = HashMap::new();
+
+        let err = BrokerConnection::dispatch_response(
+            &mut pending,
+            &mut delay_queue,
+            &mut delay_keys,
+            Bytes::copy_from_slice(&correlation_id.to_be_bytes()),
+            "broker-1:9092",
+        )
+        .unwrap_err();
+        let caller_err = response_rx.try_recv().unwrap().unwrap_err();
+        let err_text = caller_err.to_string();
+
+        assert!(err.to_string().contains("stream desynchronized"));
+        assert!(err_text.contains("broker=broker-1:9092"));
+        assert!(err_text.contains("api_key=Metadata"));
+        assert!(err_text.contains("api_version=9"));
+        assert!(err_text.contains("response_header_version=1"));
+        assert!(err_text.contains("correlation_id=7"));
+        assert!(err_text.contains("frame_bytes=4"));
     }
 
     /// Mock Kafka broker that handles the SASL handshake protocol.
@@ -2851,14 +3000,17 @@ mod tests {
         let (_high_tx, high_rx) = mpsc::channel(4);
         let (normal_tx, normal_rx) = mpsc::channel(4);
         let stats = Arc::new(ConnectionStats::default());
+        let metrics = Arc::new(ConnectionMetrics::default());
 
         let loop_task = tokio::spawn(BrokerConnection::run_connection_loop(
+            "test-broker".to_string(),
             reader,
             writer,
             high_rx,
             normal_rx,
             Duration::from_secs(30),
             stats,
+            metrics,
             16,
             256,
         ));
@@ -3318,6 +3470,16 @@ mod tests {
         assert_eq!(config.msk_iam_clock_offset_secs.load(Ordering::Relaxed), 0);
     }
 
+    #[test]
+    fn test_msk_iam_clock_offset_clamps_to_sigv4_window() {
+        assert_eq!(BrokerConnection::clamp_msk_iam_clock_offset_secs(450), 300);
+        assert_eq!(
+            BrokerConnection::clamp_msk_iam_clock_offset_secs(-450),
+            -300
+        );
+        assert_eq!(BrokerConnection::clamp_msk_iam_clock_offset_secs(120), 120);
+    }
+
     /// An in-flight request must be failed with a timeout error when no
     /// response arrives within `request_timeout`.  This tests the
     /// `DelayQueue`-driven per-request timeout path introduced in the H2 fix.
@@ -3328,17 +3490,20 @@ mod tests {
         let (_high_tx, high_rx) = mpsc::channel(4);
         let (normal_tx, normal_rx) = mpsc::channel(4);
         let stats = Arc::new(ConnectionStats::default());
+        let metrics = Arc::new(ConnectionMetrics::default());
 
         // Very short timeout so the test completes quickly.
         let request_timeout = Duration::from_millis(50);
 
         tokio::spawn(BrokerConnection::run_connection_loop(
+            "test-broker".to_string(),
             reader,
             writer,
             high_rx,
             normal_rx,
             request_timeout,
             stats,
+            metrics,
             crate::protocol::MAX_MESSAGE_SIZE,
             256,
         ));
@@ -3374,18 +3539,21 @@ mod tests {
         let (_high_tx, high_rx) = mpsc::channel(4);
         let (normal_tx, normal_rx) = mpsc::channel(4);
         let stats = Arc::new(ConnectionStats::default());
+        let metrics = Arc::new(ConnectionMetrics::default());
 
         // Long enough to not fire during the test.
         let request_timeout = Duration::from_secs(5);
         let correlation_id: i32 = 99;
 
         tokio::spawn(BrokerConnection::run_connection_loop(
+            "test-broker".to_string(),
             reader,
             writer,
             high_rx,
             normal_rx,
             request_timeout,
             stats,
+            metrics,
             crate::protocol::MAX_MESSAGE_SIZE,
             256,
         ));

@@ -194,10 +194,10 @@ let batch = RecordBatchBuilder::new()
 | Codec | Feature | Notes |
 |-------|---------|-------|
 | None | Default | No compression |
-| Gzip | Always | Good compression, slower |
-| Snappy | Always | Fast, moderate compression |
-| LZ4 | Always | Very fast, good compression |
-| Zstd | Always | Best compression, fast |
+| Gzip | `gzip` via default `compression` | Good compression, slower |
+| Snappy | `snappy` via default `compression` | Fast, moderate compression |
+| LZ4 | `lz4` via default `compression` | Very fast, good compression |
+| Zstd | `zstd` or `compression-all` | Best compression, fast; requires a C toolchain via `zstd-sys` |
 
 > **Note:** Decompression output is capped at 128 MiB by default to protect against compression bombs. This limit is configurable via `ConsumerConfig::max_decompressed_size()`. Compressed payloads that expand beyond the limit will return a `KrafkaError::compression` error.
 

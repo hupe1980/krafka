@@ -24,6 +24,7 @@
 //! ```
 
 use crate::PartitionId;
+use sha2::{Digest, Sha256};
 use tracing::{Level, Span};
 
 /// OpenTelemetry semantic convention: messaging system.
@@ -40,6 +41,10 @@ pub const MESSAGING_KAFKA_OFFSET: &str = "messaging.kafka.message.offset";
 pub const MESSAGING_KAFKA_CONSUMER_GROUP: &str = "messaging.kafka.consumer.group";
 /// OpenTelemetry semantic convention: message key.
 pub const MESSAGING_MESSAGE_KEY: &str = "messaging.message.id";
+/// Krafka-specific: message key size in bytes.
+pub const KRAFKA_MESSAGE_KEY_SIZE: &str = "krafka.message.key.size";
+/// Krafka-specific: SHA-256 hash of the message key, hex encoded.
+pub const KRAFKA_MESSAGE_KEY_SHA256: &str = "krafka.message.key.sha256";
 /// OpenTelemetry semantic convention: message body size.
 pub const MESSAGING_MESSAGE_BODY_SIZE: &str = "messaging.message.body.size";
 /// OpenTelemetry semantic convention: batch message count.
@@ -59,7 +64,8 @@ pub const KRAFKA_ACKS: &str = "krafka.acks";
 ///
 /// * `topic` - The destination topic name
 /// * `partition` - Optional partition ID (if known before send)
-/// * `key` - Optional message key (for logging)
+/// * `key` - Optional message key. Raw key bytes are never recorded; spans
+///   include only key length and a SHA-256 hash.
 ///
 /// # Returns
 ///
@@ -77,7 +83,8 @@ pub fn kafka_producer_span(
         { MESSAGING_OPERATION } = tracing::field::Empty,
         { MESSAGING_DESTINATION } = tracing::field::Empty,
         { MESSAGING_KAFKA_PARTITION } = tracing::field::Empty,
-        { MESSAGING_MESSAGE_KEY } = tracing::field::Empty,
+        { KRAFKA_MESSAGE_KEY_SIZE } = tracing::field::Empty,
+        { KRAFKA_MESSAGE_KEY_SHA256 } = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
         error.message = tracing::field::Empty,
     );
@@ -90,13 +97,27 @@ pub fn kafka_producer_span(
         span.record(MESSAGING_KAFKA_PARTITION, p);
     }
 
-    if let Some(k) = key
-        && let Ok(key_str) = std::str::from_utf8(k)
+    if let Some(key_bytes) = key
+        && !span.is_disabled()
     {
-        span.record(MESSAGING_MESSAGE_KEY, key_str);
+        span.record(KRAFKA_MESSAGE_KEY_SIZE, key_bytes.len() as u64);
+        let key_hash = sha256_hex(key_bytes);
+        span.record(KRAFKA_MESSAGE_KEY_SHA256, key_hash.as_str());
     }
 
     span
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 /// Create a span for a Kafka consumer poll operation.
@@ -399,8 +420,18 @@ mod tests {
     #[test]
     fn test_kafka_producer_span() {
         let _span = kafka_producer_span("test-topic", Some(0), Some(b"key"));
+        let _binary_key_span =
+            kafka_producer_span("test-topic", Some(0), Some(&[0, 159, 146, 150]));
         // Also test without partition and key
         let _span2 = kafka_producer_span("test-topic", None, None);
+    }
+
+    #[test]
+    fn test_sha256_hex_for_message_key() {
+        assert_eq!(
+            sha256_hex(b"key"),
+            "2c70e12b7a0646f92279f427c7b38e7334d8e5389cff167a1dc30e73f826b683"
+        );
     }
 
     #[test]

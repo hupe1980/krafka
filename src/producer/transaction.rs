@@ -435,7 +435,9 @@ impl TransactionalProducer {
             }
         }
 
-        unreachable!()
+        Err(KrafkaError::protocol(format!(
+            "{op_name} retry loop exhausted after {max_retries} retries"
+        )))
     }
 
     fn set_state(&self, state: TransactionState) {
@@ -1150,7 +1152,9 @@ impl TransactionalProducer {
             }
         }
 
-        unreachable!()
+        Err(KrafkaError::protocol(format!(
+            "TxnOffsetCommit retry loop exhausted after {max_retries} retries"
+        )))
     }
 
     /// Find the group coordinator, returning (node_id, host, port).

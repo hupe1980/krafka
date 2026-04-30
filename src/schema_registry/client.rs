@@ -16,6 +16,8 @@ use crate::error::{KrafkaError, Result};
 
 /// Content type for the Confluent Schema Registry REST API.
 const SCHEMA_REGISTRY_CONTENT_TYPE: &str = "application/vnd.schemaregistry.v1+json";
+/// Maximum non-standard error body preview included in returned errors.
+const ERROR_BODY_PREVIEW_LIMIT: usize = 512;
 
 // ── API JSON types ───────────────────────────────────────────────────────
 
@@ -72,6 +74,36 @@ struct RegisterSchemaRequest<'a> {
 
 fn default_avro_type() -> String {
     "AVRO".to_string()
+}
+
+fn sanitized_error_body_preview(body: &str) -> String {
+    if body.is_empty() {
+        return "<empty>".to_string();
+    }
+
+    let mut preview = String::new();
+    let mut truncated = false;
+
+    for ch in body.chars() {
+        let replacement = match ch {
+            '\n' => "\\n".to_string(),
+            '\r' => "\\r".to_string(),
+            '\t' => "\\t".to_string(),
+            ch if ch.is_control() => "?".to_string(),
+            ch => ch.to_string(),
+        };
+
+        if preview.len() + replacement.len() > ERROR_BODY_PREVIEW_LIMIT {
+            truncated = true;
+            break;
+        }
+        preview.push_str(&replacement);
+    }
+
+    if truncated {
+        preview.push_str("...[truncated]");
+    }
+    preview
 }
 
 // ── Auth ─────────────────────────────────────────────────────────────────
@@ -270,6 +302,7 @@ impl ConfluentSchemaRegistry {
                     err.message, err.error_code
                 )))
             } else {
+                let body = sanitized_error_body_preview(&body);
                 Err(KrafkaError::schema_registry(format!(
                     "HTTP {status}: {body}"
                 )))
@@ -708,6 +741,20 @@ mod tests {
         assert_eq!(percent_encode("has space"), "has%20space");
         assert_eq!(percent_encode("100%"), "100%25");
         assert_eq!(percent_encode("a?b#c"), "a%3Fb%23c");
+    }
+
+    #[test]
+    fn test_sanitized_error_body_preview_caps_and_escapes() {
+        let body = format!("line1\nline2\r\t{}", "x".repeat(ERROR_BODY_PREVIEW_LIMIT));
+        let preview = sanitized_error_body_preview(&body);
+        assert!(preview.contains("line1\\nline2\\r\\t"));
+        assert!(preview.ends_with("...[truncated]"));
+        assert!(preview.len() <= ERROR_BODY_PREVIEW_LIMIT + "...[truncated]".len());
+    }
+
+    #[test]
+    fn test_sanitized_error_body_preview_handles_empty_body() {
+        assert_eq!(sanitized_error_body_preview(""), "<empty>");
     }
 
     #[test]
