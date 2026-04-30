@@ -389,6 +389,31 @@ fn apply_list_offsets_response(
     }
 }
 
+/// Compute revoked partitions as `old - new`.
+///
+/// Used by eager rebalance cleanup to preserve local state for partitions that
+/// remain assigned to the same consumer after the rebalance completes.
+fn revoked_partitions_diff(
+    old: &HashMap<String, Vec<PartitionId>>,
+    new: &HashMap<String, Vec<PartitionId>>,
+) -> Vec<TopicPartition> {
+    let new_sets: HashMap<&String, HashSet<PartitionId>> = new
+        .iter()
+        .map(|(topic, partitions)| (topic, partitions.iter().copied().collect()))
+        .collect();
+    let mut result = Vec::new();
+    for (topic, partitions) in old {
+        let new_set = new_sets.get(topic);
+        for &partition in partitions {
+            let gone = new_set.is_none_or(|assigned| !assigned.contains(&partition));
+            if gone {
+                result.push(TopicPartition::new(topic, partition));
+            }
+        }
+    }
+    result
+}
+
 impl Consumer {
     /// Create a new consumer builder.
     pub fn builder() -> ConsumerBuilder {
@@ -568,17 +593,23 @@ impl Consumer {
                 if joined {
                     // An actual JoinGroup/SyncGroup occurred (first join or topic change).
 
-                    // Eager revocation: notify listener and clean up stale per-partition
-                    // state from the previous assignment before applying the new one.
-                    // Without this, re-subscribing with different topics would leak
-                    // old offsets, buffered records, paused state, and fetch sessions.
+                    // Eager revocation: notify the listener for the full previous
+                    // assignment, but only clean up partitions that were actually
+                    // revoked by the new assignment so retained partitions keep
+                    // their local pause/offset/fetch state.
                     if !old_assignments.is_empty() {
                         let revoked: Vec<TopicPartition> = old_assignments
                             .iter()
                             .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
                             .collect();
                         self.safe_on_partitions_revoked(&revoked);
-                        self.clear_partition_state().await;
+
+                        let revoked_tuples: Vec<(String, PartitionId)> =
+                            revoked_partitions_diff(&old_assignments, &assignment.partitions)
+                                .into_iter()
+                                .map(|tp| (tp.topic, tp.partition))
+                                .collect();
+                        self.apply_partition_revocations(&revoked_tuples).await;
                     }
 
                     self.metrics.rebalances.inc();
@@ -4978,6 +5009,32 @@ mod tests {
 
         let result = cooperative_revocations(&old, &new);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_eager_cleanup_preserves_pause_for_retained_partitions() {
+        let old: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0, 1])].into_iter().collect();
+        let new: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![1, 2])].into_iter().collect();
+
+        let revoked = revoked_partitions_diff(&old, &new);
+        let revoked_tuples: Vec<(String, PartitionId)> = revoked
+            .into_iter()
+            .map(|tp| (tp.topic, tp.partition))
+            .collect();
+
+        let mut paused: HashSet<(String, PartitionId)> =
+            [("topic1".to_string(), 0), ("topic1".to_string(), 1)]
+                .into_iter()
+                .collect();
+
+        for key in &revoked_tuples {
+            paused.remove(key);
+        }
+
+        assert!(!paused.contains(&("topic1".to_string(), 0)));
+        assert!(paused.contains(&("topic1".to_string(), 1)));
     }
 
     #[test]

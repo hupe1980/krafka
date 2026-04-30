@@ -76,6 +76,10 @@ pub fn kafka_producer_span(
     partition: Option<PartitionId>,
     key: Option<&[u8]>,
 ) -> Span {
+    if !tracing::enabled!(target: module_path!(), Level::INFO) {
+        return Span::none();
+    }
+
     let span = tracing::span!(
         Level::INFO,
         "kafka.produce",
@@ -132,6 +136,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// A tracing `Span` configured with Kafka consumer attributes.
 #[inline]
 pub fn kafka_consumer_poll_span(group_id: Option<&str>, topics: &[String]) -> Span {
+    if !tracing::enabled!(target: module_path!(), Level::INFO) {
+        return Span::none();
+    }
+
     let topics_str = topics.join(",");
     let span = tracing::span!(
         Level::INFO,
@@ -228,6 +236,10 @@ pub fn kafka_commit_span(
 /// A tracing `Span` configured with Kafka admin attributes.
 #[inline]
 pub fn kafka_admin_span(operation: &str, resource: Option<&str>) -> Span {
+    if !tracing::enabled!(target: module_path!(), Level::INFO) {
+        return Span::none();
+    }
+
     let span = tracing::span!(
         Level::INFO,
         "kafka.admin",
@@ -321,6 +333,10 @@ pub fn kafka_group_span(group_id: &str, operation: &str) -> Span {
 /// A tracing `Span` configured with rebalance attributes.
 #[inline]
 pub fn kafka_rebalance_span(group_id: &str, event: &str, partition_count: usize) -> Span {
+    if !tracing::enabled!(target: module_path!(), Level::INFO) {
+        return Span::none();
+    }
+
     tracing::span!(
         Level::INFO,
         "kafka.rebalance",

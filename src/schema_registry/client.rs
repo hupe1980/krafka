@@ -482,8 +482,12 @@ impl SchemaRegistryClient for ConfluentSchemaRegistry {
 /// userinfo (`user:pass@`) to prevent credential leakage through `Debug`
 /// output or logs.
 ///
-/// If userinfo is detected, a warning is logged advising the caller to use
-/// `basic_auth()` instead.
+/// If userinfo is detected, a warning is logged with a fully redacted marker
+/// and host, advising the caller to use `basic_auth()` instead.
+fn masked_userinfo_indicator(_userinfo: &str) -> &'static str {
+    "<***@>"
+}
+
 fn sanitize_url(mut url: String) -> String {
     // Trim trailing slashes in-place (avoids a second allocation).
     let trimmed_len = url.trim_end_matches('/').len();
@@ -502,7 +506,11 @@ fn sanitize_url(mut url: String) -> String {
 
     // Check for `@` indicating userinfo.
     if let Some(at_pos) = authority_slice.find('@') {
+        let userinfo = &authority_slice[..at_pos];
+        let host = &authority_slice[at_pos + 1..];
         warn!(
+            userinfo = %masked_userinfo_indicator(userinfo),
+            host = %host,
             "schema registry URL contains embedded credentials — \
              stripping userinfo; use basic_auth() instead"
         );
@@ -576,18 +584,22 @@ impl ConfluentSchemaRegistryBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the URL is not set, basic auth is used over
-    /// plain HTTP (credential exposure risk), or the HTTP client cannot be
-    /// constructed.
+    /// Returns an error if the URL is not set, credentialed auth is used
+    /// over plain HTTP (credential exposure risk), or the HTTP client
+    /// cannot be constructed.
     pub fn build(self) -> Result<ConfluentSchemaRegistry> {
         let url = self
             .url
             .ok_or_else(|| KrafkaError::config("schema registry URL is required"))?;
 
-        // Reject basic auth over plain HTTP to prevent credential exposure.
-        if matches!(self.auth, RegistryAuth::Basic { .. }) && url.starts_with("http://") {
+        // Reject credentialed auth over plain HTTP to prevent token exposure.
+        if matches!(
+            self.auth,
+            RegistryAuth::Basic { .. } | RegistryAuth::Bearer { .. }
+        ) && url.starts_with("http://")
+        {
             return Err(KrafkaError::config(
-                "basic auth requires HTTPS — credentials would be sent in cleartext over HTTP",
+                "schema registry auth requires HTTPS — credentials would be sent in cleartext over HTTP",
             ));
         }
 
@@ -662,13 +674,27 @@ mod tests {
     #[test]
     fn test_debug_redacts_bearer_token() {
         let client = ConfluentSchemaRegistryBuilder::default()
-            .url("http://localhost:8081")
+            .url("https://localhost:8081")
             .bearer_token("my-secret-token")
             .build()
             .unwrap();
         let debug = format!("{client:?}");
         assert!(debug.contains("bearer(***)"));
         assert!(!debug.contains("my-secret-token"));
+    }
+
+    #[test]
+    fn test_builder_rejects_bearer_token_over_http() {
+        let err = ConfluentSchemaRegistryBuilder::default()
+            .url("http://localhost:8081")
+            .bearer_token("my-secret-token")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("requires HTTPS"),
+            "expected HTTPS auth guard, got: {err}"
+        );
     }
 
     #[test]
@@ -714,6 +740,14 @@ mod tests {
     fn test_sanitize_url_strips_userinfo_and_trailing_slash() {
         let url = sanitize_url("https://user:pass@host:8081/".to_string());
         assert_eq!(url, "https://host:8081");
+    }
+
+    #[test]
+    fn test_masked_userinfo_indicator_never_reveals_userinfo() {
+        assert_eq!(masked_userinfo_indicator("admin:s3cret"), "<***@>");
+        assert_eq!(masked_userinfo_indicator("admin"), "<***@>");
+        assert_eq!(masked_userinfo_indicator("opaque-token"), "<***@>");
+        assert_eq!(masked_userinfo_indicator(":s3cret"), "<***@>");
     }
 
     #[test]

@@ -535,7 +535,7 @@ Paused partitions are skipped during `poll()` until resumed. This is useful for:
 - Prioritizing certain partitions
 - Implementing rate limiting
 
-> **Rebalance caveat:** During an eager rebalance (or unsubscribe), *all* pause state is cleared — even for partitions that are re-assigned to the same consumer. In cooperative rebalance mode, only revoked partitions lose their pause state; retained partitions stay paused. If your application relies on pause for backpressure, re-apply `pause()` in your `on_partitions_assigned` callback.
+> **Rebalance behavior:** Pause state is preserved for partitions that remain assigned to the same consumer across both eager and cooperative rebalances. Only revoked partitions lose their pause state. `unsubscribe()` and `close()` still clear all pause state.
 
 ## Manual Partition Assignment
 

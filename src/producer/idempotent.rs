@@ -49,7 +49,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 
 use parking_lot::RwLock;
 
@@ -66,6 +66,9 @@ pub struct ProducerIdentity {
     producer_id: AtomicI64,
     /// Producer epoch assigned by the broker (-1 if not initialized).
     producer_epoch: AtomicI32,
+    /// Set when an unrecoverable `UnknownProducerId` was observed while newer
+    /// in-flight batches still depended on the current sequence state.
+    poisoned: AtomicBool,
     /// Sequence numbers per topic-partition (two-level map avoids
     /// per-call `String` allocations on lookups).
     sequences: RwLock<HashMap<String, HashMap<PartitionId, SequenceState>>>,
@@ -146,6 +149,7 @@ impl ProducerIdentity {
         Self {
             producer_id: AtomicI64::new(-1),
             producer_epoch: AtomicI32::new(-1),
+            poisoned: AtomicBool::new(false),
             sequences: RwLock::new(HashMap::new()),
         }
     }
@@ -178,6 +182,7 @@ impl ProducerIdentity {
         self.producer_id.store(producer_id, Ordering::SeqCst);
         self.producer_epoch
             .store(producer_epoch as i32, Ordering::SeqCst);
+        self.poisoned.store(false, Ordering::SeqCst);
         sequences.clear();
     }
 
@@ -189,7 +194,18 @@ impl ProducerIdentity {
         let mut sequences = self.sequences.write();
         self.producer_id.store(-1, Ordering::SeqCst);
         self.producer_epoch.store(-1, Ordering::SeqCst);
+        self.poisoned.store(false, Ordering::SeqCst);
         sequences.clear();
+    }
+
+    #[inline]
+    pub(crate) fn poison(&self) {
+        self.poisoned.store(true, Ordering::SeqCst);
+    }
+
+    #[inline]
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::SeqCst)
     }
 
     /// Get the next sequence number for a topic-partition (single-record batch).
@@ -350,6 +366,33 @@ impl ProducerIdentity {
             .and_then(|parts| parts.get(&partition))
             .map(|s| s.last_acked_sequence)
             .unwrap_or(-1)
+    }
+
+    /// Return whether an `UnknownProducerId` for this batch can be retried
+    /// safely after resetting producer state.
+    ///
+    /// Recovery is only safe when the failing batch is still the oldest
+    /// unresolved sequence range for the partition and no newer sequence range
+    /// has been allocated locally. That matches the local condition we can
+    /// verify before reinitializing the producer identity and rebuilding the
+    /// batch under a fresh PID/epoch.
+    pub(crate) fn can_retry_unknown_producer_id(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+        base_sequence: i32,
+        count: i32,
+    ) -> Result<bool> {
+        let last_sequence = last_sequence_of_batch(base_sequence, count)?;
+        let sequences = self.sequences.read();
+        let Some(state) = sequences.get(topic).and_then(|parts| parts.get(&partition)) else {
+            return Ok(false);
+        };
+
+        Ok(
+            base_sequence == next_sequence_after(state.last_acked_sequence)
+                && state.next_sequence == next_sequence_after(last_sequence),
+        )
     }
 
     /// Create a snapshot of the current idempotent state.
@@ -577,6 +620,50 @@ mod tests {
         assert_eq!(snapshot.producer_id, 100);
         assert_eq!(snapshot.producer_epoch, 1);
         assert_eq!(snapshot.partition_sequences.len(), 2);
+    }
+
+    #[test]
+    fn test_can_retry_unknown_producer_id_for_oldest_unacked_batch() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+
+        assert_eq!(identity.allocate_sequence("topic", 0, 2).unwrap(), 0);
+
+        assert!(
+            identity
+                .can_retry_unknown_producer_id("topic", 0, 0, 2)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_cannot_retry_unknown_producer_id_when_newer_batch_exists() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+
+        assert_eq!(identity.allocate_sequence("topic", 0, 2).unwrap(), 0);
+        assert_eq!(identity.allocate_sequence("topic", 0, 1).unwrap(), 2);
+
+        assert!(
+            !identity
+                .can_retry_unknown_producer_id("topic", 0, 0, 2)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_poison_flag_clears_on_reset_and_reinitialize() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+        identity.poison();
+
+        assert!(identity.is_poisoned());
+
+        identity.reset();
+        assert!(!identity.is_poisoned());
+
+        identity.initialize(2, 1);
+        assert!(!identity.is_poisoned());
     }
 
     #[test]

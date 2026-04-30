@@ -54,6 +54,7 @@ use crate::protocol::{
 };
 
 use self::barrier::InFlightBarrier;
+use self::record::{RoutedRecord, TopicHandle};
 
 /// A Kafka producer.
 pub struct Producer {
@@ -79,6 +80,359 @@ pub struct Producer {
     interceptor: Arc<dyn crate::interceptor::ProducerInterceptor>,
     /// Producer identity for idempotent production (PID, epoch, sequences).
     identity: Option<Arc<ProducerIdentity>>,
+}
+
+fn is_unknown_producer_id_error(error: &KrafkaError) -> bool {
+    matches!(
+        error,
+        KrafkaError::Broker {
+            code: ErrorCode::UnknownProducerId,
+            ..
+        }
+    )
+}
+
+async fn init_idempotent_producer_id(
+    identity: &ProducerIdentity,
+    metadata: &ClusterMetadata,
+    retry_policy: &RetryPolicy,
+) -> Result<()> {
+    let started_at = Instant::now();
+
+    for attempt in 0..=retry_policy.max_retries {
+        if let Some(deadline) = retry_policy.delivery_timeout
+            && started_at.elapsed() >= deadline
+        {
+            return Err(KrafkaError::timeout("InitProducerId"));
+        }
+
+        if attempt > 0 {
+            let mut backoff = retry_policy.calculate_backoff(attempt);
+            if let Some(deadline) = retry_policy.delivery_timeout {
+                let elapsed = started_at.elapsed();
+                if elapsed >= deadline {
+                    return Err(KrafkaError::timeout("InitProducerId"));
+                }
+                backoff = backoff.min(deadline.saturating_sub(elapsed));
+            }
+            if !backoff.is_zero() {
+                tokio::time::sleep(backoff).await;
+            }
+        }
+
+        if let Some(deadline) = retry_policy.delivery_timeout
+            && started_at.elapsed() >= deadline
+        {
+            return Err(KrafkaError::timeout("InitProducerId"));
+        }
+
+        let brokers = metadata.brokers();
+        if brokers.is_empty() {
+            if attempt < retry_policy.max_retries {
+                warn!(attempt, "No brokers available for InitProducerId, retrying");
+                continue;
+            }
+            return Err(KrafkaError::protocol(
+                "no brokers available for InitProducerId",
+            ));
+        }
+
+        let broker = &brokers[attempt as usize % brokers.len()];
+        let conn = match metadata.get_broker_connection(broker.id).await {
+            Ok(connection) => connection,
+            Err(error) if error.is_retriable() && attempt < retry_policy.max_retries => {
+                warn!(
+                    attempt,
+                    error = %error,
+                    "Connection failed for InitProducerId, retrying"
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+
+        let ip_version = match conn
+            .negotiate_api_version(
+                ApiKey::InitProducerId,
+                versions::INIT_PRODUCER_ID_MAX,
+                versions::INIT_PRODUCER_ID_MIN,
+            )
+            .await
+        {
+            Some(version) => version,
+            None => {
+                return Err(KrafkaError::protocol(
+                    "no mutually supported InitProducerId API version",
+                ));
+            }
+        };
+
+        let request = InitProducerIdRequest::idempotent();
+        let response_bytes = match conn
+            .send_request(ApiKey::InitProducerId, ip_version, |buf| {
+                request.encode_versioned(ip_version, buf)
+            })
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(error) if error.is_retriable() && attempt < retry_policy.max_retries => {
+                warn!(
+                    attempt,
+                    error = %error,
+                    "InitProducerId request failed, retrying"
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+
+        let mut buf = response_bytes;
+        let response = InitProducerIdResponse::decode_versioned(ip_version, &mut buf)?;
+
+        if response.is_ok() {
+            identity.initialize(response.producer_id, response.producer_epoch);
+            info!(
+                "Idempotent producer initialized: PID={}, epoch={}",
+                response.producer_id, response.producer_epoch
+            );
+            return Ok(());
+        }
+
+        if response.error_code.is_retriable() && attempt < retry_policy.max_retries {
+            warn!(
+                error_code = ?response.error_code,
+                attempt,
+                "InitProducerId returned retriable error, retrying"
+            );
+        } else {
+            return Err(KrafkaError::broker(
+                response.error_code,
+                "failed to initialize producer ID",
+            ));
+        }
+    }
+
+    Err(KrafkaError::protocol(format!(
+        "InitProducerId retry loop exhausted after {} retries",
+        retry_policy.max_retries
+    )))
+}
+
+async fn ensure_idempotent_producer_id_initialized(
+    identity: &ProducerIdentity,
+    metadata: &ClusterMetadata,
+    retry_policy: &RetryPolicy,
+) -> Result<()> {
+    if identity.is_poisoned() {
+        return Err(KrafkaError::invalid_state(
+            "producer identity is poisoned after an unrecoverable UnknownProducerId; recreate the producer",
+        ));
+    }
+
+    if identity.is_initialized() {
+        return Ok(());
+    }
+
+    init_idempotent_producer_id(identity, metadata, retry_policy).await
+}
+
+async fn recover_unknown_producer_id(
+    identity: &ProducerIdentity,
+    metadata: &ClusterMetadata,
+    retry_policy: &RetryPolicy,
+    topic: &str,
+    partition: PartitionId,
+    base_sequence: i32,
+    record_count: i32,
+) -> Result<i32> {
+    if identity.is_poisoned() {
+        return Err(KrafkaError::invalid_state(
+            "producer identity is poisoned after an unrecoverable UnknownProducerId; recreate the producer",
+        ));
+    }
+
+    if !identity.can_retry_unknown_producer_id(topic, partition, base_sequence, record_count)? {
+        identity.poison();
+        return Err(KrafkaError::invalid_state(format!(
+            "UnknownProducerId for {topic}-{partition} cannot be retried safely while newer batches are still in flight; producer identity poisoned, recreate the producer after in-flight work drains"
+        )));
+    }
+
+    identity.reset();
+    init_idempotent_producer_id(identity, metadata, retry_policy).await?;
+    identity.allocate_sequence(topic, partition, record_count)
+}
+
+fn unsigned_varint_size(mut value: u32) -> usize {
+    let mut size = 1;
+    while value >= 0x80 {
+        size += 1;
+        value >>= 7;
+    }
+    size
+}
+
+fn kafka_string_size(value: Option<&str>) -> Result<usize> {
+    match value {
+        Some(value) => {
+            i16::try_from(value.len()).map_err(|_| {
+                KrafkaError::protocol(format!(
+                    "KafkaString length {} exceeds protocol limit of {}",
+                    value.len(),
+                    i16::MAX
+                ))
+            })?;
+            Ok(2 + value.len())
+        }
+        None => Ok(2),
+    }
+}
+
+fn compact_kafka_string_size(value: Option<&str>) -> Result<usize> {
+    match value {
+        Some(value) => {
+            let len_plus_one = u32::try_from(value.len().saturating_add(1)).map_err(|_| {
+                KrafkaError::protocol(format!(
+                    "compact KafkaString length {} exceeds u32 limit",
+                    value.len()
+                ))
+            })?;
+            Ok(unsigned_varint_size(len_plus_one) + value.len())
+        }
+        None => Ok(unsigned_varint_size(0)),
+    }
+}
+
+fn kafka_bytes_size(len: usize) -> Result<usize> {
+    i32::try_from(len).map_err(|_| {
+        KrafkaError::protocol(format!(
+            "KafkaBytes length {} exceeds protocol limit of {}",
+            len,
+            i32::MAX
+        ))
+    })?;
+    Ok(4 + len)
+}
+
+fn compact_kafka_bytes_size(len: usize) -> Result<usize> {
+    let len_plus_one = u32::try_from(len.saturating_add(1)).map_err(|_| {
+        KrafkaError::protocol(format!(
+            "compact KafkaBytes length {} exceeds u32 limit",
+            len
+        ))
+    })?;
+    Ok(unsigned_varint_size(len_plus_one) + len)
+}
+
+fn array_len_size(len: usize) -> Result<usize> {
+    i32::try_from(len).map_err(|_| {
+        KrafkaError::protocol(format!("Kafka array length {len} exceeds protocol limit"))
+    })?;
+    Ok(4)
+}
+
+fn compact_array_len_size(len: usize) -> Result<usize> {
+    let len_plus_one = u32::try_from(len.saturating_add(1)).map_err(|_| {
+        KrafkaError::protocol(format!(
+            "compact Kafka array length {len} exceeds u32 limit"
+        ))
+    })?;
+    Ok(unsigned_varint_size(len_plus_one))
+}
+
+fn request_header_size(api_key: ApiKey, api_version: i16, client_id: &str) -> Result<usize> {
+    let base = 2 + 2 + 4 + kafka_string_size(Some(client_id))?;
+    match crate::protocol::RequestHeader::header_version(api_key, api_version) {
+        1 => Ok(base),
+        2 => Ok(base + 1),
+        version => Err(KrafkaError::protocol(format!(
+            "unsupported request header version {version}"
+        ))),
+    }
+}
+
+fn produce_request_body_size(api_version: i16, request: &ProduceRequest) -> Result<usize> {
+    let mut size = match api_version {
+        3..=8 => kafka_string_size(request.transactional_id.as_deref())? + 2 + 4,
+        9..=13 => compact_kafka_string_size(request.transactional_id.as_deref())? + 2 + 4,
+        _ => {
+            return Err(KrafkaError::protocol(format!(
+                "unsupported ProduceRequest version {api_version}"
+            )));
+        }
+    };
+
+    match api_version {
+        3..=8 => {
+            size += array_len_size(request.topic_data.len())?;
+            for topic in &request.topic_data {
+                size += kafka_string_size(Some(&topic.name))?;
+                size += array_len_size(topic.partition_data.len())?;
+                for partition in &topic.partition_data {
+                    size += 4 + kafka_bytes_size(partition.records.len())?;
+                }
+            }
+        }
+        9..=12 => {
+            size += compact_array_len_size(request.topic_data.len())?;
+            for topic in &request.topic_data {
+                size += compact_kafka_string_size(Some(&topic.name))?;
+                size += compact_array_len_size(topic.partition_data.len())?;
+                for partition in &topic.partition_data {
+                    size += 4 + compact_kafka_bytes_size(partition.records.len())? + 1;
+                }
+                size += 1;
+            }
+            size += 1;
+        }
+        13 => {
+            size += compact_array_len_size(request.topic_data.len())?;
+            for topic in &request.topic_data {
+                if topic.topic_id.is_none() {
+                    return Err(KrafkaError::protocol(
+                        "topic_id is required for Produce v13+ (KIP-516)",
+                    ));
+                }
+                size += 16;
+                size += compact_array_len_size(topic.partition_data.len())?;
+                for partition in &topic.partition_data {
+                    size += 4 + compact_kafka_bytes_size(partition.records.len())? + 1;
+                }
+                size += 1;
+            }
+            size += 1;
+        }
+        _ => unreachable!("validated above"),
+    }
+
+    Ok(size)
+}
+
+fn produce_request_frame_size(
+    client_id: &str,
+    api_version: i16,
+    request: &ProduceRequest,
+) -> Result<usize> {
+    Ok(
+        4 + request_header_size(ApiKey::Produce, api_version, client_id)?
+            + produce_request_body_size(api_version, request)?,
+    )
+}
+
+fn validate_produce_request_size(
+    client_id: &str,
+    max_request_size: usize,
+    api_version: i16,
+    request: &ProduceRequest,
+) -> Result<()> {
+    let frame_size = produce_request_frame_size(client_id, api_version, request)?;
+    if frame_size > max_request_size {
+        return Err(KrafkaError::protocol(format!(
+            "produce request size {frame_size} exceeds max_request_size {max_request_size}"
+        )));
+    }
+
+    Ok(())
 }
 
 impl Producer {
@@ -135,10 +489,16 @@ impl Producer {
             metadata.brokers().len()
         );
 
+        let init_retry_policy = RetryPolicy::new()
+            .with_max_retries(config.retries)
+            .with_initial_backoff(config.retry_backoff)
+            .with_max_backoff(Duration::from_secs(10))
+            .with_delivery_timeout(Some(config.delivery_timeout));
+
         // Initialize idempotent producer identity (PID + epoch) if enabled.
         let identity = if config.idempotent {
             let identity = Arc::new(ProducerIdentity::new());
-            Self::init_producer_id(&identity, &metadata, &pool, &config).await?;
+            init_idempotent_producer_id(&identity, &metadata, &init_retry_policy).await?;
             Some(identity)
         } else {
             None
@@ -168,7 +528,9 @@ impl Producer {
                 linger: config.linger,
                 compression: config.compression,
                 acks: config.acks.to_i16(),
+                client_id: config.client_id.clone(),
                 request_timeout: config.request_timeout,
+                max_request_size: config.max_request_size,
                 buffer_memory: config.buffer_memory,
                 max_block_ms: config.max_block,
                 in_flight_semaphore: in_flight_semaphore.clone(),
@@ -199,144 +561,6 @@ impl Producer {
             interceptor,
             identity,
         })
-    }
-
-    /// Obtain a producer ID and epoch via `InitProducerId`.
-    ///
-    /// Retries on retriable errors (e.g. `CoordinatorLoadInProgress`) with
-    /// exponential backoff and jitter, rotating through available brokers on
-    /// each attempt so that transient per-broker failures are tolerated.
-    async fn init_producer_id(
-        identity: &ProducerIdentity,
-        metadata: &ClusterMetadata,
-        pool: &ConnectionPool,
-        config: &ProducerConfig,
-    ) -> Result<()> {
-        let retry_policy = RetryPolicy::new()
-            .with_max_retries(config.retries)
-            .with_initial_backoff(config.retry_backoff)
-            .with_max_backoff(Duration::from_secs(10))
-            .with_delivery_timeout(Some(config.delivery_timeout));
-
-        let started_at = Instant::now();
-
-        for attempt in 0..=retry_policy.max_retries {
-            if let Some(deadline) = retry_policy.delivery_timeout
-                && started_at.elapsed() >= deadline
-            {
-                return Err(KrafkaError::timeout("InitProducerId"));
-            }
-
-            if attempt > 0 {
-                let mut backoff = retry_policy.calculate_backoff(attempt);
-                if let Some(deadline) = retry_policy.delivery_timeout {
-                    let elapsed = started_at.elapsed();
-                    if elapsed >= deadline {
-                        return Err(KrafkaError::timeout("InitProducerId"));
-                    }
-                    backoff = backoff.min(deadline.saturating_sub(elapsed));
-                }
-                if !backoff.is_zero() {
-                    tokio::time::sleep(backoff).await;
-                }
-            }
-            if let Some(deadline) = retry_policy.delivery_timeout
-                && started_at.elapsed() >= deadline
-            {
-                return Err(KrafkaError::timeout("InitProducerId"));
-            }
-
-            let brokers = metadata.brokers();
-            if brokers.is_empty() {
-                if attempt < retry_policy.max_retries {
-                    warn!(attempt, "No brokers available for InitProducerId, retrying");
-                    continue;
-                }
-                return Err(KrafkaError::protocol(
-                    "no brokers available for InitProducerId",
-                ));
-            }
-
-            // Rotate through brokers across attempts.
-            let broker = &brokers[attempt as usize % brokers.len()];
-            let conn = match pool.get_connection_by_id(broker.id, broker.address()).await {
-                Ok(c) => c,
-                Err(e) if e.is_retriable() && attempt < retry_policy.max_retries => {
-                    warn!(
-                        attempt,
-                        error = %e,
-                        "Connection failed for InitProducerId, retrying"
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-
-            let ip_version = match conn
-                .negotiate_api_version(
-                    ApiKey::InitProducerId,
-                    versions::INIT_PRODUCER_ID_MAX,
-                    versions::INIT_PRODUCER_ID_MIN,
-                )
-                .await
-            {
-                Some(v) => v,
-                None => {
-                    return Err(KrafkaError::protocol(
-                        "no mutually supported InitProducerId API version",
-                    ));
-                }
-            };
-
-            let request = InitProducerIdRequest::idempotent();
-            let response_bytes = match conn
-                .send_request(ApiKey::InitProducerId, ip_version, |buf| {
-                    request.encode_versioned(ip_version, buf)
-                })
-                .await
-            {
-                Ok(b) => b,
-                Err(e) if e.is_retriable() && attempt < retry_policy.max_retries => {
-                    warn!(
-                        attempt,
-                        error = %e,
-                        "InitProducerId request failed, retrying"
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-
-            let mut buf = response_bytes;
-            let response = InitProducerIdResponse::decode_versioned(ip_version, &mut buf)?;
-
-            if response.is_ok() {
-                identity.initialize(response.producer_id, response.producer_epoch);
-                info!(
-                    "Idempotent producer initialized: PID={}, epoch={}",
-                    response.producer_id, response.producer_epoch
-                );
-                return Ok(());
-            }
-
-            if response.error_code.is_retriable() && attempt < retry_policy.max_retries {
-                warn!(
-                    error_code = ?response.error_code,
-                    attempt,
-                    "InitProducerId returned retriable error, retrying"
-                );
-            } else {
-                return Err(KrafkaError::broker(
-                    response.error_code,
-                    "failed to initialize producer ID",
-                ));
-            }
-        }
-
-        Err(KrafkaError::protocol(format!(
-            "InitProducerId retry loop exhausted after {} retries",
-            retry_policy.max_retries
-        )))
     }
 
     /// Send a record to a topic.
@@ -399,31 +623,34 @@ impl Producer {
         // Runs after the interceptor since interceptors can mutate the record.
         record.validate()?;
 
-        let topic = record.topic.clone();
+        let record_size = record.estimated_size();
+        let routed = record.into_routed_parts();
+        let topic = routed.topic;
+        let record = routed.record;
 
         // Determine partition
-        let partition = match record.partition {
+        let partition = match routed.partition {
             Some(p) => p,
             None => {
                 let partition_count = self
                     .metadata
-                    .partition_count(&topic)
+                    .partition_count(topic.as_ref())
                     .ok_or_else(|| KrafkaError::invalid_state(format!("unknown topic: {topic}")))?;
                 self.partitioner
-                    .partition(&topic, record.key.as_deref(), partition_count)
+                    .partition(topic.as_ref(), record.key_bytes(), partition_count)
             }
         };
 
         // Use accumulator for batching if available (linger > 0)
         if let Some(ref accumulator) = self.accumulator {
             return accumulator
-                .append_with_guard(record, partition, operation_guard)
+                .append_routed_with_guard(topic, record, record_size, partition, operation_guard)
                 .await;
         }
 
         // Direct send (non-batched mode when linger = 0)
         let _operation_guard = operation_guard;
-        self.send_to_partition(&topic, partition, record).await
+        self.send_to_partition(topic, partition, record).await
     }
 
     /// Send a record to a specific partition.
@@ -435,13 +662,18 @@ impl Producer {
     /// `OutOfOrderSequenceNumber` with sequence reset + batch rebuild.
     async fn send_to_partition(
         &self,
-        topic: &str,
+        topic: TopicHandle,
         partition: PartitionId,
-        record: ProducerRecord,
+        record: RoutedRecord,
     ) -> Result<RecordMetadata> {
         // Build the owned topic string once for RecordMetadata construction,
         // avoiding repeated allocations in the retry loop.
         let topic_owned = topic.to_string();
+
+        if let Some(identity) = self.identity.as_ref() {
+            ensure_idempotent_producer_id_initialized(identity, &self.metadata, &self.retry_policy)
+                .await?;
+        }
 
         // Acquire in-flight permit before sending
         let _permit = self
@@ -455,7 +687,7 @@ impl Producer {
         let mut sequence: Option<i32> = match self
             .identity
             .as_ref()
-            .map(|id| id.next_sequence(topic, partition))
+            .map(|id| id.next_sequence(topic.as_ref(), partition))
             .transpose()
         {
             Ok(s) => s,
@@ -463,15 +695,16 @@ impl Producer {
         };
 
         // Build the produce request once (reused across retries).
-        let mut request = match self.build_produce_request(topic, partition, &record, sequence) {
-            Ok(r) => r,
-            Err(e) => {
-                if let Some(ref identity) = self.identity {
-                    let _ = identity.rollback_sequence(topic, partition);
+        let mut request =
+            match self.build_produce_request(topic.as_ref(), partition, &record, sequence) {
+                Ok(r) => r,
+                Err(e) => {
+                    if let Some(ref identity) = self.identity {
+                        let _ = identity.rollback_sequence(topic.as_ref(), partition);
+                    }
+                    return Err(e);
                 }
-                return Err(e);
-            }
-        };
+            };
 
         let mut retry_ctx = RetryContext::new(
             self.retry_policy.clone(),
@@ -479,7 +712,7 @@ impl Producer {
         );
 
         loop {
-            let result = self.do_send(topic, partition, &request).await;
+            let result = self.do_send(topic.as_ref(), partition, &request).await;
             // Convert DuplicateSequenceNumber to success — the broker
             // already committed this batch (idempotent dedup worked).
             let result = if let Err(KrafkaError::Broker { code, .. }) = &result
@@ -487,7 +720,7 @@ impl Producer {
                 && self.identity.is_some()
             {
                 debug!(
-                    topic = topic,
+                    topic = %topic,
                     partition = partition,
                     "DuplicateSequenceNumber — dedup confirmed"
                 );
@@ -507,13 +740,10 @@ impl Producer {
 
                     // Acknowledge sequence on success
                     if let (Some(identity), Some(seq)) = (&self.identity, sequence) {
-                        identity.acknowledge(topic, partition, seq);
+                        identity.acknowledge(topic.as_ref(), partition, seq);
                     }
 
-                    self.metrics.record_send(
-                        record.value.len() as u64
-                            + record.key.as_ref().map(|k| k.len() as u64).unwrap_or(0),
-                    );
+                    self.metrics.record_send(record.payload_size_bytes());
                     self.metrics.connections.set(self.pool.len() as u64);
                     crate::interceptor::safe_on_acknowledgement(
                         &*self.interceptor,
@@ -523,32 +753,96 @@ impl Producer {
                     return Ok(metadata);
                 }
                 Err(e) => {
-                    // OutOfOrderSequenceNumber: atomically reset the
-                    // partition sequence and rebuild the batch with a fresh
-                    // sequence before retrying. Skip the metadata refresh —
-                    // OOSN is a sequence mismatch, not a leader-change error.
-                    if let KrafkaError::Broker { code, .. } = &e
+                    if is_unknown_producer_id_error(&e)
+                        && let (Some(identity), Some(current_sequence)) =
+                            (self.identity.as_ref(), sequence)
+                    {
+                        warn!(
+                            topic = %topic,
+                            partition = partition,
+                            "UnknownProducerId, reinitializing idempotent producer state"
+                        );
+                        let new_sequence = match recover_unknown_producer_id(
+                            identity,
+                            &self.metadata,
+                            &self.retry_policy,
+                            topic.as_ref(),
+                            partition,
+                            current_sequence,
+                            1,
+                        )
+                        .await
+                        {
+                            Ok(new_sequence) => new_sequence,
+                            Err(recovery_error) => {
+                                self.metrics.record_error();
+                                let dummy_metadata = RecordMetadata {
+                                    topic: topic_owned.clone(),
+                                    partition,
+                                    offset: -1,
+                                    timestamp: 0,
+                                };
+                                crate::interceptor::safe_on_acknowledgement(
+                                    &*self.interceptor,
+                                    &dummy_metadata,
+                                    Some(&recovery_error),
+                                );
+                                return Err(recovery_error);
+                            }
+                        };
+                        sequence = Some(new_sequence);
+                        match self.build_produce_request(
+                            topic.as_ref(),
+                            partition,
+                            &record,
+                            sequence,
+                        ) {
+                            Ok(new_request) => request = new_request,
+                            Err(build_error) => {
+                                let _ = identity.rollback_sequence(topic.as_ref(), partition);
+                                self.metrics.record_error();
+                                let dummy_metadata = RecordMetadata {
+                                    topic: topic_owned.clone(),
+                                    partition,
+                                    offset: -1,
+                                    timestamp: 0,
+                                };
+                                crate::interceptor::safe_on_acknowledgement(
+                                    &*self.interceptor,
+                                    &dummy_metadata,
+                                    Some(&build_error),
+                                );
+                                return Err(build_error);
+                            }
+                        }
+                    } else if let KrafkaError::Broker { code, .. } = &e
                         && *code == ErrorCode::OutOfOrderSequenceNumber
                         && let Some(ref identity) = self.identity
                     {
                         warn!(
-                            topic = topic,
+                            topic = %topic,
                             partition = partition,
                             "OutOfOrderSequenceNumber, resetting sequence and rebuilding batch"
                         );
-                        let new_seq = match identity.reset_and_allocate(topic, partition, 1) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                self.metrics.record_error();
-                                return Err(e);
-                            }
-                        };
+                        let new_seq =
+                            match identity.reset_and_allocate(topic.as_ref(), partition, 1) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    self.metrics.record_error();
+                                    return Err(e);
+                                }
+                            };
                         sequence = Some(new_seq);
-                        match self.build_produce_request(topic, partition, &record, sequence) {
+                        match self.build_produce_request(
+                            topic.as_ref(),
+                            partition,
+                            &record,
+                            sequence,
+                        ) {
                             Ok(r) => request = r,
                             Err(build_err) => {
                                 // Rollback the freshly allocated sequence
-                                let _ = identity.rollback_sequence(topic, partition);
+                                let _ = identity.rollback_sequence(topic.as_ref(), partition);
                                 self.metrics.record_error();
                                 let dummy_metadata = RecordMetadata {
                                     topic: topic_owned.clone(),
@@ -568,13 +862,15 @@ impl Producer {
                     } else if e.is_retriable() {
                         // Refresh metadata on leader-not-available / not-leader errors
                         debug!(
-                            topic = topic,
+                            topic = %topic,
                             partition = partition,
                             error = %e,
                             "Transient error, refreshing metadata"
                         );
-                        if let Err(refresh_err) =
-                            self.metadata.refresh_for_topics(Some(&[topic])).await
+                        if let Err(refresh_err) = self
+                            .metadata
+                            .refresh_for_topics(Some(&[topic.as_ref()]))
+                            .await
                         {
                             debug!(error = %refresh_err, "Metadata refresh failed during retry");
                         }
@@ -588,7 +884,7 @@ impl Producer {
                     // Final failure — rollback unused sequence so the next
                     // send doesn't trigger an unnecessary OOSN round-trip.
                     if let Some(ref identity) = self.identity {
-                        let _ = identity.rollback_sequence(topic, partition);
+                        let _ = identity.rollback_sequence(topic.as_ref(), partition);
                     }
                     self.metrics.record_error();
                     let dummy_metadata = RecordMetadata {
@@ -616,7 +912,7 @@ impl Producer {
         &self,
         topic: &str,
         partition: PartitionId,
-        record: &ProducerRecord,
+        record: &RoutedRecord,
         sequence: Option<i32>,
     ) -> Result<ProduceRequest> {
         let mut batch_builder = RecordBatchBuilder::new().compression(self.config.compression);
@@ -632,20 +928,7 @@ impl Producer {
                 batch_builder.producer(identity.producer_id(), identity.producer_epoch(), seq);
         }
 
-        if record.headers.is_empty() {
-            batch_builder =
-                batch_builder.add_record(record.key.clone(), Some(record.value.clone()));
-        } else {
-            batch_builder = batch_builder.add_record_with_headers(
-                record.key.clone(),
-                Some(record.value.clone()),
-                record
-                    .headers
-                    .iter()
-                    .map(|(k, v)| (k.clone(), Bytes::from(v.clone())))
-                    .collect(),
-            );
-        }
+        batch_builder = record.append_to_batch_builder(batch_builder);
 
         let batch = batch_builder.build();
         let batch_bytes = batch.encode()?;
@@ -689,6 +972,13 @@ impl Producer {
             )
             .await
             .ok_or_else(|| KrafkaError::protocol("no mutually supported Produce API version"))?;
+
+        validate_produce_request_size(
+            &self.config.client_id,
+            self.config.max_request_size,
+            version,
+            request,
+        )?;
 
         // acks=0 (fire-and-forget): Kafka sends no response, so don't wait for one (R6.1 fix)
         if self.config.acks == Acks::None {
@@ -965,6 +1255,12 @@ impl ProducerBuilder {
         self
     }
 
+    /// Set the maximum encoded Kafka request frame size in bytes.
+    pub fn max_request_size(mut self, bytes: usize) -> Self {
+        self.config.max_request_size = bytes;
+        self
+    }
+
     /// Set metadata max age before refresh.
     pub fn metadata_max_age(mut self, duration: Duration) -> Self {
         self.config.metadata_max_age = duration;
@@ -1142,6 +1438,9 @@ impl ProducerBuilder {
                 self.config.max_in_flight
             )));
         }
+        if self.config.max_request_size == 0 {
+            return Err(KrafkaError::config("max_request_size must be >= 1"));
+        }
         if self.config.batch_size == 0 {
             return Err(KrafkaError::config(format!(
                 "batch_size must be >= 1 (got {})",
@@ -1178,6 +1477,12 @@ impl ProducerBuilder {
                 self.config.batch_size, self.config.buffer_memory
             )));
         }
+        if self.config.batch_size > self.config.max_request_size {
+            return Err(KrafkaError::config(format!(
+                "batch_size must not exceed max_request_size (got batch_size={}, max_request_size={})",
+                self.config.batch_size, self.config.max_request_size
+            )));
+        }
         let interceptor: Arc<dyn crate::interceptor::ProducerInterceptor> =
             if self.interceptors.is_empty() {
                 Arc::new(crate::interceptor::NoOpProducerInterceptor)
@@ -1202,6 +1507,9 @@ impl ProducerBuilder {
 mod tests {
     use super::*;
 
+    use crate::metadata::ClusterMetadata;
+    use crate::network::{ConnectionConfig, ConnectionPool};
+
     #[test]
     fn test_producer_builder() {
         let builder = Producer::builder()
@@ -1210,6 +1518,7 @@ mod tests {
             .acks(Acks::All)
             .compression(Compression::Gzip)
             .batch_size(32768)
+            .max_request_size(65536)
             .linger(Duration::from_millis(10));
 
         assert_eq!(builder.config.bootstrap_servers, "localhost:9092");
@@ -1217,6 +1526,7 @@ mod tests {
         assert_eq!(builder.config.acks, Acks::All);
         assert_eq!(builder.config.compression, Compression::Gzip);
         assert_eq!(builder.config.batch_size, 32768);
+        assert_eq!(builder.config.max_request_size, 65536);
         assert_eq!(builder.config.linger, Duration::from_millis(10));
         assert!(builder.config.auth.is_none());
     }
@@ -1308,6 +1618,114 @@ mod tests {
 
         assert_eq!(builder.config.retries, 5);
         assert_eq!(builder.config.retry_backoff, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn test_validate_produce_request_size_rejects_oversized_frame() {
+        let request = ProduceRequest {
+            transactional_id: None,
+            acks: Acks::All.to_i16(),
+            timeout_ms: 30_000,
+            topic_data: vec![ProduceTopicData {
+                name: "topic".to_string(),
+                topic_id: None,
+                partition_data: vec![ProducePartitionData {
+                    index: 0,
+                    records: Bytes::from(vec![0; 512]),
+                }],
+            }],
+        };
+
+        let error = validate_produce_request_size("client", 128, versions::PRODUCE_MIN, &request)
+            .expect_err("oversized frame should be rejected");
+
+        assert!(error.to_string().contains("max_request_size"));
+    }
+
+    #[test]
+    fn test_validate_produce_request_size_uses_exact_flexible_encoding_size() {
+        let request = ProduceRequest {
+            transactional_id: Some("txn-123".to_string()),
+            acks: Acks::All.to_i16(),
+            timeout_ms: 30_000,
+            topic_data: vec![ProduceTopicData {
+                name: "topic".to_string(),
+                topic_id: None,
+                partition_data: vec![ProducePartitionData {
+                    index: 0,
+                    records: Bytes::from(vec![1; 32]),
+                }],
+            }],
+        };
+
+        let exact_size =
+            produce_request_frame_size("client", versions::PRODUCE_MAX, &request).unwrap();
+
+        validate_produce_request_size("client", exact_size, versions::PRODUCE_MAX, &request)
+            .unwrap();
+
+        let error = validate_produce_request_size(
+            "client",
+            exact_size.saturating_sub(1),
+            versions::PRODUCE_MAX,
+            &request,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("max_request_size"));
+    }
+
+    #[test]
+    fn test_validate_produce_request_size_v13_requires_topic_id() {
+        let request = ProduceRequest {
+            transactional_id: None,
+            acks: Acks::All.to_i16(),
+            timeout_ms: 30_000,
+            topic_data: vec![ProduceTopicData {
+                name: "topic".to_string(),
+                topic_id: None,
+                partition_data: vec![ProducePartitionData {
+                    index: 0,
+                    records: Bytes::from_static(b"payload"),
+                }],
+            }],
+        };
+
+        let error = validate_produce_request_size("client", 1024, 13, &request).unwrap_err();
+        assert!(error.to_string().contains("topic_id is required"));
+    }
+
+    #[tokio::test]
+    async fn test_recover_unknown_producer_id_poisoned_when_newer_batches_in_flight() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(7, 1);
+        assert_eq!(identity.allocate_sequence("topic", 0, 2).unwrap(), 0);
+        assert_eq!(identity.allocate_sequence("topic", 0, 1).unwrap(), 2);
+
+        let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
+        let metadata = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        );
+        let retry_policy = RetryPolicy::default();
+
+        let error =
+            recover_unknown_producer_id(&identity, &metadata, &retry_policy, "topic", 0, 0, 2)
+                .await
+                .unwrap_err();
+
+        assert!(error.to_string().contains("poisoned"));
+        assert!(identity.is_initialized());
+        assert!(identity.is_poisoned());
+        assert_eq!(identity.producer_id(), 7);
+        assert_eq!(identity.peek_sequence("topic", 0), 3);
+
+        let ensure_error =
+            ensure_idempotent_producer_id_initialized(&identity, &metadata, &retry_policy)
+                .await
+                .unwrap_err();
+        assert!(ensure_error.to_string().contains("poisoned"));
     }
 
     #[test]

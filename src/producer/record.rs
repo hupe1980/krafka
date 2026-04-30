@@ -1,9 +1,11 @@
 //! Producer record types.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 
 use crate::error::{KrafkaError, Result};
-use crate::protocol::{MAX_RECORD_HEADERS, validate_topic_name};
+use crate::protocol::{MAX_RECORD_HEADERS, RecordBatchBuilder, validate_topic_name};
 use crate::{PartitionId, Timestamp};
 
 /// A record to be sent to Kafka.
@@ -163,6 +165,78 @@ impl ProducerRecord {
 
         Ok(())
     }
+
+    /// Split the public record into an interned topic handle and routed payload.
+    pub(crate) fn into_routed_parts(self) -> RoutedRecordParts {
+        let Self {
+            topic,
+            partition,
+            key,
+            value,
+            timestamp,
+            headers,
+        } = self;
+
+        RoutedRecordParts {
+            topic: Arc::<str>::from(topic),
+            partition,
+            record: RoutedRecord {
+                key,
+                value,
+                timestamp,
+                headers,
+            },
+        }
+    }
+}
+
+/// Interned topic handle reused across the producer routing path.
+pub(crate) type TopicHandle = Arc<str>;
+
+/// Internal payload retained after partition routing strips the topic.
+#[derive(Debug, Clone)]
+pub(crate) struct RoutedRecord {
+    pub key: Option<Bytes>,
+    pub value: Bytes,
+    pub timestamp: Option<Timestamp>,
+    pub headers: Vec<(String, Vec<u8>)>,
+}
+
+impl RoutedRecord {
+    #[inline]
+    pub(crate) fn key_bytes(&self) -> Option<&[u8]> {
+        self.key.as_deref()
+    }
+
+    #[inline]
+    pub(crate) fn payload_size_bytes(&self) -> u64 {
+        self.value.len() as u64 + self.key.as_ref().map(|key| key.len() as u64).unwrap_or(0)
+    }
+
+    pub(crate) fn append_to_batch_builder(
+        &self,
+        batch_builder: RecordBatchBuilder,
+    ) -> RecordBatchBuilder {
+        if self.headers.is_empty() {
+            batch_builder.add_record(self.key.clone(), Some(self.value.clone()))
+        } else {
+            batch_builder.add_record_with_headers(
+                self.key.clone(),
+                Some(self.value.clone()),
+                self.headers
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// Internal representation of a routed record after topic extraction.
+pub(crate) struct RoutedRecordParts {
+    pub topic: TopicHandle,
+    pub partition: Option<PartitionId>,
+    pub record: RoutedRecord,
 }
 
 /// Metadata returned after successfully sending a record.
@@ -236,6 +310,25 @@ mod tests {
 
         let size = record.estimated_size();
         assert!(size > 3 + 11); // key + value at minimum
+    }
+
+    #[test]
+    fn test_producer_record_into_routed_parts() {
+        let record = ProducerRecord::new("test-topic", b"hello".to_vec())
+            .with_partition(2)
+            .with_key(b"key".to_vec())
+            .with_timestamp(1234)
+            .with_header("h1", b"v1".to_vec());
+
+        let routed = record.into_routed_parts();
+
+        assert_eq!(routed.topic.as_ref(), "test-topic");
+        assert_eq!(routed.partition, Some(2));
+        assert_eq!(routed.record.key, Some(Bytes::from_static(b"key")));
+        assert_eq!(routed.record.value, Bytes::from_static(b"hello"));
+        assert_eq!(routed.record.timestamp, Some(1234));
+        assert_eq!(routed.record.headers.len(), 1);
+        assert_eq!(routed.record.headers[0].0, "h1");
     }
 
     #[test]

@@ -35,6 +35,10 @@ use crate::auth::{
 use crate::error::{KrafkaError, Result};
 use crate::metrics::ConnectionMetrics;
 
+/// Maximum number of consecutive high-priority commands the event loop will
+/// process before forcing one normal-priority drain attempt.
+const MAX_HIGH_PRIORITY_BYPASSES_PER_ROUND: usize = 4;
+
 /// SOCKS5 proxy configuration for connecting to brokers through a proxy.
 ///
 /// When set on a [`ConnectionConfig`], all TCP connections to Kafka brokers
@@ -161,8 +165,7 @@ use crate::protocol::{
     RequestHeader, ResponseHeader, SaslAuthenticateRequest, SaslAuthenticateResponse,
     SaslHandshakeRequest, SaslHandshakeResponse,
 };
-use crate::util::CorrelationIdGenerator;
-use crate::util::extract_sni_hostname;
+use crate::util::{CorrelationIdGenerator, NO_RESPONSE_CORRELATION_ID, extract_sni_hostname};
 
 use super::secure::{ChallengeResponse, SaslAuthenticator};
 
@@ -709,6 +712,9 @@ pub struct ConnectionStats {
     pub normal_priority_requests: AtomicU64,
     /// High-priority requests that bypassed the queue (processed immediately).
     pub high_priority_bypasses: AtomicU64,
+    /// Number of times the loop yielded to normal-priority work after hitting
+    /// the high-priority bypass budget.
+    pub high_priority_bypass_yields: AtomicU64,
 }
 
 impl ConnectionStats {
@@ -728,6 +734,12 @@ impl ConnectionStats {
     #[inline]
     pub fn bypass_count(&self) -> u64 {
         self.high_priority_bypasses.load(Ordering::Relaxed)
+    }
+
+    /// Get the number of fairness yields after exhausting the bypass budget.
+    #[inline]
+    pub fn bypass_yield_count(&self) -> u64 {
+        self.high_priority_bypass_yields.load(Ordering::Relaxed)
     }
 }
 
@@ -1513,15 +1525,81 @@ impl BrokerConnection {
         });
 
         let mut terminal_error: Option<KrafkaError> = None;
+        let mut consecutive_high_priority_commands = 0usize;
+        let mut deferred_high_priority_cmd: Option<ConnectionCommand> = None;
 
         // Main event loop — lock-free on the hot path.
         loop {
-            // Fast path: drain the high-priority channel without yielding to the
-            // scheduler.  Heartbeats are the most latency-sensitive request type.
-            if let Ok(cmd) = high_priority_rx.try_recv() {
-                stats.high_priority_bypasses.fetch_add(1, Ordering::Relaxed);
-                metrics.record_high_priority_bypass();
-                match Self::handle_command_direct(
+            if consecutive_high_priority_commands >= MAX_HIGH_PRIORITY_BYPASSES_PER_ROUND {
+                if deferred_high_priority_cmd.is_none() {
+                    match high_priority_rx.try_recv() {
+                        Ok(ConnectionCommand::Close) => {
+                            consecutive_high_priority_commands = 0;
+                            match Self::process_loop_command(
+                                &mut writer,
+                                &mut pending,
+                                &mut delay_queue,
+                                &mut delay_keys,
+                                ConnectionCommand::Close,
+                                max_in_flight_requests,
+                                request_timeout,
+                            )
+                            .await
+                            {
+                                Ok(true) => break,
+                                Ok(false) => {}
+                                Err(err) => {
+                                    terminal_error = Some(err);
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+                        Ok(cmd) => {
+                            deferred_high_priority_cmd = Some(cmd);
+                        }
+                        Err(mpsc::error::TryRecvError::Empty)
+                        | Err(mpsc::error::TryRecvError::Disconnected) => {}
+                    }
+                }
+
+                match normal_priority_rx.try_recv() {
+                    Ok(cmd) => {
+                        stats
+                            .high_priority_bypass_yields
+                            .fetch_add(1, Ordering::Relaxed);
+                        metrics.record_high_priority_bypass_yield();
+                        consecutive_high_priority_commands = 0;
+                        match Self::process_loop_command(
+                            &mut writer,
+                            &mut pending,
+                            &mut delay_queue,
+                            &mut delay_keys,
+                            cmd,
+                            max_in_flight_requests,
+                            request_timeout,
+                        )
+                        .await
+                        {
+                            Ok(true) => break,
+                            Ok(false) => {}
+                            Err(err) => {
+                                terminal_error = Some(err);
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    Err(mpsc::error::TryRecvError::Empty)
+                    | Err(mpsc::error::TryRecvError::Disconnected) => {
+                        consecutive_high_priority_commands = 0;
+                    }
+                }
+            }
+
+            if let Some(cmd) = deferred_high_priority_cmd.take() {
+                consecutive_high_priority_commands += 1;
+                match Self::process_loop_command(
                     &mut writer,
                     &mut pending,
                     &mut delay_queue,
@@ -1533,12 +1611,40 @@ impl BrokerConnection {
                 .await
                 {
                     Ok(true) => break,
-                    Ok(false) => continue,
-                    Err(e) => {
-                        terminal_error = Some(e);
+                    Ok(false) => {}
+                    Err(err) => {
+                        terminal_error = Some(err);
                         break;
                     }
                 }
+                continue;
+            }
+
+            // Fast path: drain the high-priority channel without yielding to the
+            // scheduler.  Heartbeats are the most latency-sensitive request type.
+            if let Ok(cmd) = high_priority_rx.try_recv() {
+                stats.high_priority_bypasses.fetch_add(1, Ordering::Relaxed);
+                metrics.record_high_priority_bypass();
+                consecutive_high_priority_commands += 1;
+                match Self::process_loop_command(
+                    &mut writer,
+                    &mut pending,
+                    &mut delay_queue,
+                    &mut delay_keys,
+                    cmd,
+                    max_in_flight_requests,
+                    request_timeout,
+                )
+                .await
+                {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(err) => {
+                        terminal_error = Some(err);
+                        break;
+                    }
+                }
+                continue;
             }
 
             tokio::select! {
@@ -1547,6 +1653,7 @@ impl BrokerConnection {
                 // Response frames from the reader task — dispatch immediately so
                 // callers receive results as soon as the bytes arrive.
                 frame_result = frame_rx.recv() => {
+                    consecutive_high_priority_commands = 0;
                     match frame_result {
                         Some(Ok(frame)) => {
                             if let Err(e) = Self::dispatch_response(
@@ -1578,6 +1685,7 @@ impl BrokerConnection {
                     use futures_core::Stream;
                     std::pin::Pin::new(&mut delay_queue).poll_next(cx)
                 }) => {
+                    consecutive_high_priority_commands = 0;
                     let id = expired.into_inner();
                     if let Some(req) = pending.remove(&id) {
                         delay_keys.remove(&id);
@@ -1595,7 +1703,8 @@ impl BrokerConnection {
                 cmd = high_priority_rx.recv() => {
                     match cmd {
                         Some(cmd) => {
-                            match Self::handle_command_direct(
+                            consecutive_high_priority_commands += 1;
+                            match Self::process_loop_command(
                                 &mut writer,
                                 &mut pending,
                                 &mut delay_queue,
@@ -1604,12 +1713,11 @@ impl BrokerConnection {
                                 max_in_flight_requests,
                                 request_timeout,
                             )
-                            .await
-                            {
+                            .await {
                                 Ok(true) => break,
                                 Ok(false) => {}
-                                Err(e) => {
-                                    terminal_error = Some(e);
+                                Err(err) => {
+                                    terminal_error = Some(err);
                                     break;
                                 }
                             }
@@ -1622,7 +1730,8 @@ impl BrokerConnection {
                 cmd = normal_priority_rx.recv() => {
                     match cmd {
                         Some(cmd) => {
-                            match Self::handle_command_direct(
+                            consecutive_high_priority_commands = 0;
+                            match Self::process_loop_command(
                                 &mut writer,
                                 &mut pending,
                                 &mut delay_queue,
@@ -1631,12 +1740,11 @@ impl BrokerConnection {
                                 max_in_flight_requests,
                                 request_timeout,
                             )
-                            .await
-                            {
+                            .await {
                                 Ok(true) => break,
                                 Ok(false) => {}
-                                Err(e) => {
-                                    terminal_error = Some(e);
+                                Err(err) => {
+                                    terminal_error = Some(err);
                                     break;
                                 }
                             }
@@ -1668,6 +1776,27 @@ impl BrokerConnection {
         Ok(())
     }
 
+    async fn process_loop_command<W: AsyncWrite + Unpin>(
+        writer: &mut W,
+        pending: &mut HashMap<CorrelationId, PendingRequest>,
+        delay_queue: &mut DelayQueue<CorrelationId>,
+        delay_keys: &mut HashMap<CorrelationId, delay_queue::Key>,
+        cmd: ConnectionCommand,
+        max_in_flight_requests: usize,
+        request_timeout: Duration,
+    ) -> Result<bool> {
+        Self::handle_command_direct(
+            writer,
+            pending,
+            delay_queue,
+            delay_keys,
+            cmd,
+            max_in_flight_requests,
+            request_timeout,
+        )
+        .await
+    }
+
     /// Handle a single connection command.
     ///
     /// Returns `true` if the connection should close.
@@ -1693,6 +1822,20 @@ impl BrokerConnection {
                 api_version,
                 response_tx,
             } => {
+                if pending.contains_key(&correlation_id) {
+                    let error = KrafkaError::invalid_state(format!(
+                        "correlation ID collision on broker connection: correlation_id={correlation_id}, pending_requests={}; closing connection",
+                        pending.len()
+                    ));
+                    error!(
+                        correlation_id,
+                        pending_requests = pending.len(),
+                        "Detected correlation ID collision; closing connection"
+                    );
+                    let _ = response_tx.send(Err(error.clone()));
+                    return Err(error);
+                }
+
                 // Reject when at capacity to prevent unbounded memory growth.
                 if pending.len() >= max_in_flight_requests {
                     warn!(
@@ -2068,7 +2211,9 @@ impl BrokerConnection {
     ///
     /// Used for `acks=0` produce requests where the Kafka broker does not
     /// send a response. The request is written to the wire but no response
-    /// channel is registered in the pending map, avoiding resource leaks.
+    /// channel is registered in the pending map, avoiding resource leaks and
+    /// preserving the normal correlation-ID space for requests that expect
+    /// responses.
     pub async fn send_fire_and_forget(
         &self,
         api_key: ApiKey,
@@ -2078,12 +2223,11 @@ impl BrokerConnection {
         // M1: refresh the idle timestamp on every submission.
         self.mark_used();
 
-        let correlation_id = self.correlation_id_gen.next();
         let mut encoder = Encoder::new();
 
         // Build request
         let pos = encoder.start_message();
-        let header = RequestHeader::new(api_key, api_version, correlation_id)
+        let header = RequestHeader::new(api_key, api_version, NO_RESPONSE_CORRELATION_ID)
             .with_client_id(&self.config.client_id);
         header.encode(encoder.buffer_mut())?;
         request_body(encoder.buffer_mut())?;
@@ -2477,6 +2621,7 @@ mod tests {
         assert_eq!(stats.high_priority_count(), 0);
         assert_eq!(stats.normal_priority_count(), 0);
         assert_eq!(stats.bypass_count(), 0);
+        assert_eq!(stats.bypass_yield_count(), 0);
     }
 
     #[test]
@@ -2487,10 +2632,14 @@ mod tests {
             .normal_priority_requests
             .fetch_add(10, Ordering::Relaxed);
         stats.high_priority_bypasses.fetch_add(2, Ordering::Relaxed);
+        stats
+            .high_priority_bypass_yields
+            .fetch_add(1, Ordering::Relaxed);
 
         assert_eq!(stats.high_priority_count(), 5);
         assert_eq!(stats.normal_priority_count(), 10);
         assert_eq!(stats.bypass_count(), 2);
+        assert_eq!(stats.bypass_yield_count(), 1);
     }
 
     #[test]
@@ -3066,6 +3215,134 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_connection_loop_yields_to_normal_priority_after_bypass_budget() {
+        use tokio::io::AsyncReadExt;
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(client);
+        let (high_tx, high_rx) = mpsc::channel(16);
+        let (normal_tx, normal_rx) = mpsc::channel(16);
+        let stats = Arc::new(ConnectionStats::default());
+        let metrics = Arc::new(ConnectionMetrics::default());
+
+        for index in 0..8 {
+            let (response_tx, _response_rx) = oneshot::channel();
+            high_tx
+                .try_send(ConnectionCommand::Request {
+                    data: Bytes::copy_from_slice(format!("H{index:03}").as_bytes()),
+                    correlation_id: index + 1,
+                    api_key: ApiKey::Heartbeat,
+                    api_version: 0,
+                    response_tx,
+                })
+                .unwrap();
+        }
+
+        let (normal_response_tx, _normal_response_rx) = oneshot::channel();
+        normal_tx
+            .try_send(ConnectionCommand::Request {
+                data: Bytes::from_static(b"N000"),
+                correlation_id: 100,
+                api_key: ApiKey::Produce,
+                api_version: 0,
+                response_tx: normal_response_tx,
+            })
+            .unwrap();
+
+        let loop_task = tokio::spawn(BrokerConnection::run_connection_loop(
+            "test-broker".to_string(),
+            reader,
+            writer,
+            high_rx,
+            normal_rx,
+            Duration::from_secs(30),
+            stats.clone(),
+            metrics.clone(),
+            crate::protocol::MAX_MESSAGE_SIZE,
+            32,
+        ));
+
+        let mut writes = Vec::new();
+        for _ in 0..5 {
+            let mut frame = [0u8; 4];
+            server.read_exact(&mut frame).await.unwrap();
+            writes.push(String::from_utf8(frame.to_vec()).unwrap());
+        }
+
+        assert_eq!(writes[0], "H000");
+        assert_eq!(writes[1], "H001");
+        assert_eq!(writes[2], "H002");
+        assert_eq!(writes[3], "H003");
+        assert_eq!(writes[4], "N000");
+        assert_eq!(stats.bypass_yield_count(), 1);
+        assert_eq!(metrics.snapshot().high_priority_bypass_yields, 1);
+
+        loop_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_connection_loop_rejects_correlation_id_collision() {
+        use tokio::io::AsyncReadExt;
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(client);
+        let (_high_tx, high_rx) = mpsc::channel(4);
+        let (normal_tx, normal_rx) = mpsc::channel(4);
+        let stats = Arc::new(ConnectionStats::default());
+        let metrics = Arc::new(ConnectionMetrics::default());
+
+        let loop_task = tokio::spawn(BrokerConnection::run_connection_loop(
+            "test-broker".to_string(),
+            reader,
+            writer,
+            high_rx,
+            normal_rx,
+            Duration::from_secs(30),
+            stats,
+            metrics,
+            crate::protocol::MAX_MESSAGE_SIZE,
+            32,
+        ));
+
+        let (first_response_tx, first_response_rx) = oneshot::channel();
+        normal_tx
+            .send(ConnectionCommand::Request {
+                data: Bytes::from_static(b"req1"),
+                correlation_id: 77,
+                api_key: ApiKey::Metadata,
+                api_version: 0,
+                response_tx: first_response_tx,
+            })
+            .await
+            .unwrap();
+
+        let mut first_write = [0u8; 4];
+        server.read_exact(&mut first_write).await.unwrap();
+        assert_eq!(&first_write, b"req1");
+
+        let (second_response_tx, second_response_rx) = oneshot::channel();
+        normal_tx
+            .send(ConnectionCommand::Request {
+                data: Bytes::from_static(b"req2"),
+                correlation_id: 77,
+                api_key: ApiKey::Metadata,
+                api_version: 0,
+                response_tx: second_response_tx,
+            })
+            .await
+            .unwrap();
+
+        let second_err = second_response_rx.await.unwrap().unwrap_err();
+        assert!(second_err.to_string().contains("correlation ID collision"));
+
+        let first_err = first_response_rx.await.unwrap().unwrap_err();
+        assert!(first_err.to_string().contains("correlation ID collision"));
+
+        let loop_err = loop_task.await.unwrap().unwrap_err();
+        assert!(loop_err.to_string().contains("correlation ID collision"));
+    }
+
     #[test]
     fn test_connection_config_builder_max_response_size() {
         let config = ConnectionConfig::builder()
@@ -3231,6 +3508,76 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "socks5")]
+    #[tokio::test]
+    async fn test_connect_via_proxy_stalled_handshake_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = ProxyConfig::new(listener.local_addr().unwrap().to_string());
+        let config = ConnectionConfig::builder()
+            .connect_timeout(Duration::from_millis(75))
+            .proxy(proxy.clone())
+            .build();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mock_proxy = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            let _ = shutdown_rx.await;
+        });
+
+        let started_at = Instant::now();
+        let err = BrokerConnection::connect_via_proxy("broker.internal:9092", &proxy, &config)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, KrafkaError::Timeout { .. }));
+        assert!(
+            err.to_string().contains("SOCKS5 proxy connection"),
+            "timeout should identify the proxy connect path: {err}"
+        );
+        assert!(
+            started_at.elapsed() < Duration::from_secs(1),
+            "proxy handshake timeout should respect the configured deadline"
+        );
+
+        let _ = shutdown_tx.send(());
+        mock_proxy.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_send_fire_and_forget_uses_reserved_correlation_id() {
+        let (high_priority_tx, _high_priority_rx) = mpsc::channel(1);
+        let (normal_priority_tx, mut normal_priority_rx) = mpsc::channel(1);
+        let conn = BrokerConnection {
+            address: "test-broker".to_string(),
+            config: ConnectionConfig::default(),
+            correlation_id_gen: Arc::new(CorrelationIdGenerator::new()),
+            high_priority_tx,
+            normal_priority_tx,
+            api_versions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            session_expiry: None,
+            stats: Arc::new(ConnectionStats::default()),
+            throttle_until: Arc::new(parking_lot::Mutex::new(Instant::now())),
+            created_at: Instant::now(),
+            last_used_nanos: AtomicU64::new(0),
+        };
+
+        conn.send_fire_and_forget(ApiKey::Produce, 0, |_| Ok(()))
+            .await
+            .unwrap();
+
+        let Some(ConnectionCommand::FireAndForget { data }) = normal_priority_rx.recv().await
+        else {
+            panic!("expected fire-and-forget command");
+        };
+
+        let frame_len = i32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
+        assert_eq!(frame_len, data.len() - 4);
+        let correlation_id = i32::from_be_bytes(data[8..12].try_into().unwrap());
+        assert_eq!(correlation_id, NO_RESPONSE_CORRELATION_ID);
+        assert_eq!(conn.correlation_id_gen.next(), 1);
+    }
+
     // ========================================================================
     // KIP-368: Session lifetime / reauthentication
     // ========================================================================
@@ -3375,12 +3722,14 @@ mod tests {
 
     #[test]
     fn test_throttle_initial_state_is_past() {
-        // The throttle_until starts at Instant::now() which is immediately
-        // in the past (or at most the current instant), meaning no delay.
+        // The throttle deadline starts at `Instant::now()`, so any remaining
+        // delay must be effectively zero. Consecutive `Instant::now()` calls
+        // can observe the same instant on fast machines, which yields `Some(0)`.
         let deadline = Instant::now();
         let throttle = parking_lot::Mutex::new(deadline);
         let guard = throttle.lock();
-        assert!(guard.checked_duration_since(Instant::now()).is_none());
+        let remaining = guard.checked_duration_since(Instant::now());
+        assert!(remaining.unwrap_or_default() <= Duration::from_millis(1));
     }
 
     #[test]

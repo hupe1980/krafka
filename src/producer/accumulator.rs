@@ -15,14 +15,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::interval;
 use tracing::{debug, trace, warn};
 
 use super::barrier::{InFlightBarrier, InFlightOpGuard};
 use super::batch::ProducerBatch;
-use super::record::{ProducerRecord, RecordMetadata};
+use super::record::{ProducerRecord, RecordMetadata, RoutedRecord, TopicHandle};
 use super::retry::{RetryContext, RetryPolicy};
 use crate::PartitionId;
 use crate::error::{ErrorCode, KrafkaError, Result};
@@ -96,6 +95,17 @@ enum AppendResponse {
     Done(Result<RecordMetadata>),
 }
 
+#[derive(Debug)]
+struct AppendCommand {
+    topic: TopicHandle,
+    record: RoutedRecord,
+    partition: PartitionId,
+    record_size: usize,
+    response_tx: oneshot::Sender<AppendResponse>,
+    operation_guard: InFlightOpGuard,
+    permit_reservation: PermitReservation,
+}
+
 /// Message sent to the accumulator background task.
 #[derive(Debug)]
 enum AccumulatorMessage {
@@ -108,14 +118,7 @@ enum AccumulatorMessage {
     /// without explicit handling (accumulator task panics, channel send
     /// race during shutdown, etc.) releases the permits via `Drop` so
     /// `buffer_memory` is never leaked.
-    Append {
-        record: ProducerRecord,
-        partition: PartitionId,
-        record_size: usize,
-        response_tx: oneshot::Sender<AppendResponse>,
-        operation_guard: InFlightOpGuard,
-        permit_reservation: PermitReservation,
-    },
+    Append(AppendCommand),
     /// Flush all batches.
     Flush {
         response_tx: oneshot::Sender<Result<()>>,
@@ -212,8 +215,27 @@ impl RecordAccumulatorHandle {
         partition: PartitionId,
         operation_guard: InFlightOpGuard,
     ) -> Result<RecordMetadata> {
-        let deadline = tokio::time::Instant::now() + self.max_block_ms;
         let record_size = record.estimated_size();
+        let routed = record.into_routed_parts();
+        self.append_routed_with_guard(
+            routed.topic,
+            routed.record,
+            record_size,
+            partition,
+            operation_guard,
+        )
+        .await
+    }
+
+    pub(crate) async fn append_routed_with_guard(
+        &self,
+        topic: TopicHandle,
+        record: RoutedRecord,
+        record_size: usize,
+        partition: PartitionId,
+        operation_guard: InFlightOpGuard,
+    ) -> Result<RecordMetadata> {
+        let deadline = tokio::time::Instant::now() + self.max_block_ms;
 
         // Reject records that cannot physically be admitted (exceeds the
         // semaphore permit limit or the configured buffer_memory budget).
@@ -262,14 +284,15 @@ impl RecordAccumulatorHandle {
         // owns the release obligation via the message contents.
         match tokio::time::timeout(
             remaining,
-            self.sender.send(AccumulatorMessage::Append {
+            self.sender.send(AccumulatorMessage::Append(AppendCommand {
+                topic,
                 record,
                 partition,
                 record_size,
                 response_tx,
                 operation_guard,
                 permit_reservation,
-            }),
+            })),
         )
         .await
         {
@@ -335,8 +358,12 @@ pub struct AccumulatorConfig {
     pub compression: Compression,
     /// Acknowledgment level.
     pub acks: i16,
+    /// Client ID used for request frame sizing.
+    pub client_id: String,
     /// Request timeout.
     pub request_timeout: Duration,
+    /// Maximum encoded Kafka request frame size in bytes.
+    pub max_request_size: usize,
     /// Maximum total memory for buffering (bytes).
     /// When this limit is reached, append operations will block until memory is freed.
     /// Set to 0 for unlimited (not recommended for production).
@@ -359,7 +386,9 @@ impl Clone for AccumulatorConfig {
             linger: self.linger,
             compression: self.compression,
             acks: self.acks,
+            client_id: self.client_id.clone(),
             request_timeout: self.request_timeout,
+            max_request_size: self.max_request_size,
             buffer_memory: self.buffer_memory,
             max_block_ms: self.max_block_ms,
             in_flight_semaphore: self.in_flight_semaphore.clone(),
@@ -376,7 +405,9 @@ impl fmt::Debug for AccumulatorConfig {
             .field("linger", &self.linger)
             .field("compression", &self.compression)
             .field("acks", &self.acks)
+            .field("client_id", &self.client_id)
             .field("request_timeout", &self.request_timeout)
+            .field("max_request_size", &self.max_request_size)
             .field("buffer_memory", &self.buffer_memory)
             .field("max_block_ms", &self.max_block_ms)
             .field("interceptor", &self.interceptor)
@@ -391,7 +422,9 @@ impl Default for AccumulatorConfig {
             linger: Duration::from_millis(0),
             compression: Compression::None,
             acks: -1,
+            client_id: "krafka".to_string(),
             request_timeout: Duration::from_secs(30),
+            max_request_size: crate::protocol::MAX_MESSAGE_SIZE,
             buffer_memory: 32 * 1024 * 1024, // 32 MB default (same as Kafka Java client)
             max_block_ms: Duration::from_secs(60), // 60 seconds default
             in_flight_semaphore: Arc::new(Semaphore::new(5)), // default max_in_flight
@@ -403,7 +436,7 @@ impl Default for AccumulatorConfig {
 
 /// A pending record waiting for its batch to be sent.
 struct PendingRecord {
-    record: ProducerRecord,
+    record: RoutedRecord,
     response_tx: oneshot::Sender<AppendResponse>,
     offset_in_batch: i64,
     /// Estimated size in bytes for memory tracking.
@@ -443,13 +476,13 @@ struct AccumulatorBatch {
 
 impl AccumulatorBatch {
     fn new(
-        topic: String,
+        topic: TopicHandle,
         partition: PartitionId,
         max_size: usize,
         compression: Compression,
     ) -> Self {
         Self {
-            batch: ProducerBatch::new(topic, partition, max_size, compression),
+            batch: ProducerBatch::new(topic.to_string(), partition, max_size, compression),
             pending: Vec::new(),
             created_at: Instant::now(),
         }
@@ -465,7 +498,7 @@ pub struct RecordAccumulator {
     /// Configuration.
     config: AccumulatorConfig,
     /// Batches per topic-partition.
-    batches: HashMap<(String, PartitionId), AccumulatorBatch>,
+    batches: HashMap<(TopicHandle, PartitionId), AccumulatorBatch>,
     /// Cluster metadata for sending.
     metadata: Arc<ClusterMetadata>,
     /// Memory held by in-flight send tasks (extracted but not yet completed).
@@ -582,15 +615,8 @@ impl RecordAccumulator {
             tokio::select! {
                 msg = receiver.recv() => {
                     match msg {
-                        Some(AccumulatorMessage::Append {
-                            record,
-                            partition,
-                            record_size,
-                            response_tx,
-                            operation_guard,
-                            permit_reservation,
-                        }) => {
-                            self.handle_append(record, partition, record_size, response_tx, operation_guard, permit_reservation).await;
+                        Some(AccumulatorMessage::Append(append)) => {
+                            self.handle_append(append).await;
                         }
                         Some(AccumulatorMessage::Flush { response_tx }) => {
                             let result = self.flush_all().await;
@@ -625,16 +651,17 @@ impl RecordAccumulator {
     /// `permit_reservation.forget()` so the eventual `InFlightGuard` can
     /// release the permits on batch completion; error paths let the
     /// reservation drop naturally, returning the permits to the pool.
-    async fn handle_append(
-        &mut self,
-        record: ProducerRecord,
-        partition: PartitionId,
-        record_size: usize,
-        response_tx: oneshot::Sender<AppendResponse>,
-        operation_guard: InFlightOpGuard,
-        permit_reservation: PermitReservation,
-    ) {
-        let key = (record.topic.clone(), partition);
+    async fn handle_append(&mut self, append: AppendCommand) {
+        let AppendCommand {
+            topic,
+            record,
+            partition,
+            record_size,
+            response_tx,
+            operation_guard,
+            permit_reservation,
+        } = append;
+        let key = (topic, partition);
 
         // Backpressure is enforced in `append_with_guard` via
         // `memory_permits.acquire_many(record_size)`; by the time we get
@@ -794,7 +821,10 @@ impl RecordAccumulator {
     /// than derived from `num_cpus` — the send tasks are I/O bound and a
     /// fixed ceiling caps scheduler pressure predictably.
     async fn spawn_batches_bounded(
-        extracted: Vec<((String, PartitionId), (AccumulatorBatch, InFlightGuard))>,
+        extracted: Vec<(
+            (TopicHandle, PartitionId),
+            (AccumulatorBatch, InFlightGuard),
+        )>,
         metadata: &Arc<ClusterMetadata>,
         config: &AccumulatorConfig,
         retry_policy: &RetryPolicy,
@@ -843,7 +873,10 @@ impl RecordAccumulator {
     /// Cross-wave parallelism is bounded by the `InFlightGuard` semaphore
     /// inside `send_extracted_batch`.
     fn spawn_batches_detached(
-        extracted: Vec<((String, PartitionId), (AccumulatorBatch, InFlightGuard))>,
+        extracted: Vec<(
+            (TopicHandle, PartitionId),
+            (AccumulatorBatch, InFlightGuard),
+        )>,
         metadata: &Arc<ClusterMetadata>,
         config: &AccumulatorConfig,
         retry_policy: &RetryPolicy,
@@ -876,7 +909,7 @@ impl RecordAccumulator {
     /// the send task completes or panics — see `send_extracted_batch`.
     fn extract_batch(
         &mut self,
-        key: &(String, PartitionId),
+        key: &(TopicHandle, PartitionId),
     ) -> Option<(AccumulatorBatch, InFlightGuard)> {
         let batch = self.batches.remove(key)?;
         if batch.batch.is_empty() {
@@ -901,7 +934,7 @@ impl RecordAccumulator {
     /// A single-entry vec exits the bounded loop before any backpressure
     /// point, so this path adds no observable overhead beyond the outer
     /// wrapper task that `spawn_batches_detached` spawns.
-    fn flush_batch(&mut self, key: &(String, PartitionId)) {
+    fn flush_batch(&mut self, key: &(TopicHandle, PartitionId)) {
         if let Some(item) = self.extract_batch(key) {
             Self::spawn_batches_detached(
                 vec![(key.clone(), item)],
@@ -919,7 +952,7 @@ impl RecordAccumulator {
     /// Acquires an in-flight semaphore permit to respect `max_in_flight` concurrency limits.
     #[allow(clippy::too_many_arguments)]
     async fn send_extracted_batch(
-        topic: String,
+        topic: TopicHandle,
         partition: PartitionId,
         pending: Vec<PendingRecord>,
         enqueued_at: Instant,
@@ -929,6 +962,20 @@ impl RecordAccumulator {
         retry_policy: RetryPolicy,
         metrics: Arc<ProducerMetrics>,
     ) {
+        if let Some(identity) = config.identity.as_ref()
+            && let Err(error) =
+                super::ensure_idempotent_producer_id_initialized(identity, &metadata, &retry_policy)
+                    .await
+        {
+            metrics.record_error();
+            for pending_record in pending {
+                let _ = pending_record
+                    .response_tx
+                    .send(AppendResponse::Done(Err(error.clone())));
+            }
+            return;
+        }
+
         // Acquire in-flight permit before sending (accumulator was
         // bypassing max_in_flight). The permit is held until this batch completes.
         let _permit = config.in_flight_semaphore.acquire().await;
@@ -940,7 +987,7 @@ impl RecordAccumulator {
         let mut sequence: Option<i32> = match config
             .identity
             .as_ref()
-            .map(|id| id.allocate_sequence(&topic, partition, record_count))
+            .map(|id| id.allocate_sequence(topic.as_ref(), partition, record_count))
             .transpose()
         {
             Ok(s) => s,
@@ -965,21 +1012,7 @@ impl RecordAccumulator {
             }
 
             for p in &pending {
-                let key = p.record.key.clone();
-                let value = Some(p.record.value.clone());
-                if p.record.headers.is_empty() {
-                    batch_builder = batch_builder.add_record(key, value);
-                } else {
-                    batch_builder = batch_builder.add_record_with_headers(
-                        key,
-                        value,
-                        p.record
-                            .headers
-                            .iter()
-                            .map(|(k, v)| (k.clone(), Bytes::from(v.clone())))
-                            .collect(),
-                    );
-                }
+                batch_builder = p.record.append_to_batch_builder(batch_builder);
             }
             let batch = batch_builder.build();
             let batch_bytes = batch.encode()?;
@@ -989,7 +1022,7 @@ impl RecordAccumulator {
                 acks: cfg.acks,
                 timeout_ms: crate::util::duration_to_millis_i32(cfg.request_timeout),
                 topic_data: vec![ProduceTopicData {
-                    name: topic.clone(),
+                    name: topic.to_string(),
                     topic_id: None,
                     partition_data: vec![ProducePartitionData {
                         index: partition,
@@ -1004,7 +1037,8 @@ impl RecordAccumulator {
             Err(e) => {
                 // Rollback sequence on encode failure
                 if let Some(ref identity) = config.identity {
-                    let _ = identity.rollback_sequence_range(&topic, partition, record_count);
+                    let _ =
+                        identity.rollback_sequence_range(topic.as_ref(), partition, record_count);
                 }
                 for p in pending {
                     let _ = p.response_tx.send(AppendResponse::Done(Err(e.clone())));
@@ -1018,14 +1052,17 @@ impl RecordAccumulator {
         // so that time spent in the linger window / backpressure counts
         // against the delivery budget (matching Java client behavior).
         let mut retry_ctx = RetryContext::new_with_start(
-            retry_policy,
+            retry_policy.clone(),
             format!("batch({topic}-{partition})"),
             enqueued_at,
         );
 
         let result: std::result::Result<(i64, i64), KrafkaError> = loop {
             // Get connection to leader
-            let conn = match metadata.get_leader_connection(&topic, partition).await {
+            let conn = match metadata
+                .get_leader_connection(topic.as_ref(), partition)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     if e.is_retriable() {
@@ -1035,7 +1072,8 @@ impl RecordAccumulator {
                             error = %e,
                             "Batch connection error, refreshing metadata"
                         );
-                        if let Err(refresh_err) = metadata.refresh_for_topics(Some(&[&topic])).await
+                        if let Err(refresh_err) =
+                            metadata.refresh_for_topics(Some(&[topic.as_ref()])).await
                         {
                             debug!(error = %refresh_err, "Metadata refresh failed during batch retry");
                         }
@@ -1066,7 +1104,9 @@ impl RecordAccumulator {
                         partition = partition,
                         "Produce version negotiation failed, refreshing metadata"
                     );
-                    if let Err(refresh_err) = metadata.refresh_for_topics(Some(&[&topic])).await {
+                    if let Err(refresh_err) =
+                        metadata.refresh_for_topics(Some(&[topic.as_ref()])).await
+                    {
                         debug!(
                             error = %refresh_err,
                             "Metadata refresh failed during batch retry"
@@ -1080,6 +1120,25 @@ impl RecordAccumulator {
                     break Err(e);
                 }
             };
+
+            if let Err(error) = super::validate_produce_request_size(
+                &config.client_id,
+                config.max_request_size,
+                produce_version,
+                &request,
+            ) {
+                if let (Some(identity), Some(_)) = (config.identity.as_ref(), sequence) {
+                    let _ =
+                        identity.rollback_sequence_range(topic.as_ref(), partition, record_count);
+                }
+                metrics.record_error();
+                for pending_record in pending {
+                    let _ = pending_record
+                        .response_tx
+                        .send(AppendResponse::Done(Err(error.clone())));
+                }
+                return;
+            }
 
             // acks=0 (fire-and-forget): Kafka sends no response (R6.1 fix)
             if config.acks == 0 {
@@ -1120,7 +1179,7 @@ impl RecordAccumulator {
                             let pr = produce_response
                                 .responses
                                 .iter()
-                                .find(|r| r.name == topic)
+                                .find(|r| r.name == topic.as_ref())
                                 .and_then(|r| {
                                     r.partition_responses.iter().find(|p| p.index == partition)
                                 });
@@ -1152,11 +1211,35 @@ impl RecordAccumulator {
                                         format!("batch produce failed for {topic}-{partition}"),
                                     );
 
-                                    // OutOfOrderSequenceNumber: atomically reset
-                                    // sequence and rebuild batch before retrying.
-                                    // Skip metadata refresh — OOSN is a sequence
-                                    // mismatch, not a leader-change error.
-                                    if pr.error_code == ErrorCode::OutOfOrderSequenceNumber
+                                    if pr.error_code == ErrorCode::UnknownProducerId
+                                        && let (Some(identity), Some(current_sequence)) =
+                                            (config.identity.as_ref(), sequence)
+                                    {
+                                        warn!(
+                                            topic = %topic,
+                                            partition = partition,
+                                            "UnknownProducerId in batch, reinitializing idempotent producer state"
+                                        );
+                                        let new_sequence = match super::recover_unknown_producer_id(
+                                            identity,
+                                            &metadata,
+                                            &retry_policy,
+                                            topic.as_ref(),
+                                            partition,
+                                            current_sequence,
+                                            record_count,
+                                        )
+                                        .await
+                                        {
+                                            Ok(new_sequence) => new_sequence,
+                                            Err(recovery_error) => break Err(recovery_error),
+                                        };
+                                        sequence = Some(new_sequence);
+                                        match build_batch(sequence, &config) {
+                                            Ok(new_request) => request = new_request,
+                                            Err(encode_err) => break Err(encode_err),
+                                        }
+                                    } else if pr.error_code == ErrorCode::OutOfOrderSequenceNumber
                                         && let Some(identity) = config.identity.as_ref()
                                     {
                                         warn!(
@@ -1165,7 +1248,7 @@ impl RecordAccumulator {
                                             "OutOfOrderSequenceNumber in batch, resetting sequence"
                                         );
                                         let new_seq = match identity.reset_and_allocate(
-                                            &topic,
+                                            topic.as_ref(),
                                             partition,
                                             record_count,
                                         ) {
@@ -1180,8 +1263,9 @@ impl RecordAccumulator {
                                             }
                                         }
                                     } else if err.is_retriable()
-                                        && let Err(refresh_err) =
-                                            metadata.refresh_for_topics(Some(&[&topic])).await
+                                        && let Err(refresh_err) = metadata
+                                            .refresh_for_topics(Some(&[topic.as_ref()]))
+                                            .await
                                     {
                                         debug!(error = %refresh_err, "Metadata refresh failed during batch retry");
                                     }
@@ -1217,7 +1301,8 @@ impl RecordAccumulator {
                             error = %e,
                             "Batch send error, refreshing metadata"
                         );
-                        if let Err(refresh_err) = metadata.refresh_for_topics(Some(&[&topic])).await
+                        if let Err(refresh_err) =
+                            metadata.refresh_for_topics(Some(&[topic.as_ref()])).await
                         {
                             debug!(error = %refresh_err, "Metadata refresh failed during batch retry");
                         }
@@ -1243,15 +1328,16 @@ impl RecordAccumulator {
                     && let Ok(last_seq) =
                         super::idempotent::last_sequence_of_batch(seq, record_count)
                 {
-                    identity.acknowledge(&topic, partition, last_seq);
+                    identity.acknowledge(topic.as_ref(), partition, last_seq);
                 }
 
                 let batch_bytes_total: u64 = pending.iter().map(|p| p.estimated_size as u64).sum();
                 metrics.record_batch(pending.len() as u64);
                 metrics.bytes_sent.add(batch_bytes_total);
+                let topic_owned = topic.to_string();
                 for p in pending {
                     let meta = RecordMetadata {
-                        topic: topic.clone(),
+                        topic: topic_owned.clone(),
                         partition,
                         offset: if base_offset >= 0 {
                             base_offset + p.offset_in_batch
@@ -1268,12 +1354,14 @@ impl RecordAccumulator {
                 // Rollback unused sequence range so the next batch to
                 // this partition doesn't trigger unnecessary OOSN.
                 if let Some(identity) = config.identity.as_ref() {
-                    let _ = identity.rollback_sequence_range(&topic, partition, record_count);
+                    let _ =
+                        identity.rollback_sequence_range(topic.as_ref(), partition, record_count);
                 }
                 metrics.record_error();
+                let topic_owned = topic.to_string();
                 for p in pending {
                     let meta = RecordMetadata {
-                        topic: topic.clone(),
+                        topic: topic_owned.clone(),
                         partition,
                         offset: -1,
                         timestamp: 0,
@@ -1341,14 +1429,15 @@ mod tests {
 
     #[test]
     fn test_accumulator_batch_age() {
-        let batch = AccumulatorBatch::new("test".to_string(), 0, 16384, Compression::None);
+        let batch = AccumulatorBatch::new("test".to_string().into(), 0, 16384, Compression::None);
         std::thread::sleep(Duration::from_millis(10));
         assert!(batch.age() >= Duration::from_millis(10));
     }
 
     #[test]
     fn test_accumulator_batch_new() {
-        let batch = AccumulatorBatch::new("test-topic".to_string(), 1, 32768, Compression::Gzip);
+        let batch =
+            AccumulatorBatch::new("test-topic".to_string().into(), 1, 32768, Compression::Gzip);
         assert!(batch.batch.is_empty());
         assert!(batch.pending.is_empty());
     }
@@ -1360,7 +1449,9 @@ mod tests {
             linger: Duration::from_millis(50),
             compression: Compression::Snappy,
             acks: 1,
+            client_id: "test-client".to_string(),
             request_timeout: Duration::from_secs(10),
+            max_request_size: 131072,
             buffer_memory: 64 * 1024 * 1024,
             max_block_ms: Duration::from_secs(30),
             in_flight_semaphore: Arc::new(Semaphore::new(5)),
@@ -1370,6 +1461,8 @@ mod tests {
         assert_eq!(config.batch_size, 65536);
         assert_eq!(config.linger, Duration::from_millis(50));
         assert_eq!(config.acks, 1);
+        assert_eq!(config.client_id, "test-client");
+        assert_eq!(config.max_request_size, 131072);
         assert_eq!(config.buffer_memory, 64 * 1024 * 1024);
     }
 

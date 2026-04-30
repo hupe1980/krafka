@@ -132,10 +132,10 @@ To trim binary size further, disable defaults and select only the codecs you nee
 
 ```toml
 # Option 1: enable only the codecs you need
-krafka = { version = "0.6", default-features = false, features = ["lz4"] }
+krafka = { version = "0.7.0", default-features = false, features = ["lz4"] }
 
 # Option 2: enable all compression codecs, including zstd
-# krafka = { version = "0.6", features = ["compression-all"] }
+# krafka = { version = "0.7.0", features = ["compression-all"] }
 ```
 
 ### Batching
@@ -167,6 +167,22 @@ When `linger` is set (> 0ms), the producer uses a background accumulator to batc
 For ultra-low latency (linger = 0), records are sent immediately without batching.
 
 > **Note:** `batch_size` must be at least 1. Setting `batch_size` to 0 will cause the builder to return a configuration error.
+
+### Request Size Cap
+
+Use `max_request_size` when you want the producer to fail locally before sending a Produce request frame larger than your broker or network budget:
+
+```rust
+use krafka::producer::Producer;
+
+let producer = Producer::builder()
+    .bootstrap_servers("localhost:9092")
+    .max_request_size(1 * 1024 * 1024)      // 1 MiB encoded Produce frame cap
+    .build()
+    .await?;
+```
+
+The producer encodes the final request using the negotiated Produce API version and rejects frames that exceed `max_request_size` before any broker I/O. The default is 100 MiB, matching Kafka's protocol request-size ceiling. Leave some headroom between `batch_size` and `max_request_size` for request headers and topic names; the builder rejects configurations where `batch_size > max_request_size`. The same knob is available on `TransactionalProducer::builder()`.
 
 ```rust
 // High-throughput configuration

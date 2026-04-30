@@ -50,6 +50,16 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::{KrafkaError, Result};
 
+const OAUTHBEARER_EXPIRY_SKEW_MARGIN_MS: i64 = 30_000;
+
+fn current_epoch_ms() -> i64 {
+    let now_u128 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    i64::try_from(now_u128).unwrap_or(i64::MAX)
+}
+
 /// Trait for providing fresh OAuth 2.0 bearer tokens on each broker connection.
 ///
 /// Implement this to integrate with your OAuth/OIDC provider. The provider is
@@ -203,8 +213,8 @@ impl OAuthBearerToken {
     /// Set the token expiry time as milliseconds since the Unix epoch.
     ///
     /// When set, the client validates the token is not expired before sending
-    /// it to the broker. This prevents futile authentication attempts with
-    /// stale tokens.
+    /// it to the broker and rejects tokens in the final 30 seconds before
+    /// expiry to avoid clock-skew races during SASL/OAUTHBEARER handshakes.
     ///
     /// # Example
     ///
@@ -225,18 +235,21 @@ impl OAuthBearerToken {
 
     /// Returns `true` if the token has a known expiry and that expiry is in the past.
     pub fn is_expired(&self) -> bool {
-        if let Some(lifetime_ms) = self.lifetime_ms {
-            let now_u128 = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            // Clamp to i64::MAX so an overflow is treated as "definitely expired"
-            // rather than wrapping to a negative value.
-            let now_ms = i64::try_from(now_u128).unwrap_or(i64::MAX);
-            now_ms >= lifetime_ms
-        } else {
-            false
-        }
+        self.lifetime_ms
+            .is_some_and(|lifetime_ms| current_epoch_ms() >= lifetime_ms)
+    }
+
+    /// Returns `true` if the token should be refreshed before starting a new
+    /// SASL handshake.
+    ///
+    /// Tokens in their final 30 seconds are treated as stale even if their
+    /// expiry timestamp is still in the future. This mirrors the common Kafka
+    /// client practice of refreshing before the edge of expiry so broker/client
+    /// clock skew does not cause avoidable authentication failures.
+    pub fn needs_refresh(&self) -> bool {
+        self.lifetime_ms.is_some_and(|lifetime_ms| {
+            current_epoch_ms() >= lifetime_ms.saturating_sub(OAUTHBEARER_EXPIRY_SKEW_MARGIN_MS)
+        })
     }
 
     /// Build the initial client response in GS2 framing format (RFC 7628).
@@ -510,5 +523,22 @@ mod tests {
             - 3_600_000;
         let token = OAuthBearerToken::new("tok").with_lifetime_ms(past_ms);
         assert!(token.is_expired());
+    }
+
+    #[test]
+    fn test_oauthbearer_token_needs_refresh_near_expiry() {
+        let near_future_ms = current_epoch_ms() + 10_000;
+        let token = OAuthBearerToken::new("tok").with_lifetime_ms(near_future_ms);
+
+        assert!(!token.is_expired());
+        assert!(token.needs_refresh());
+    }
+
+    #[test]
+    fn test_oauthbearer_token_does_not_need_refresh_with_safe_margin() {
+        let future_ms = current_epoch_ms() + 60_000;
+        let token = OAuthBearerToken::new("tok").with_lifetime_ms(future_ms);
+
+        assert!(!token.needs_refresh());
     }
 }

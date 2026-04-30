@@ -3215,9 +3215,13 @@ impl GroupCoordinator {
     ///
     /// Unlike [`reset_member_identity`], this preserves `member_id`:
     /// KIP-848 requires fenced members to "rejoin with the same member id
-    /// and epoch 0".  Assignment and target state are cleared because the
-    /// coordinator revoked all partitions on fencing.
+    /// and epoch 0". Sticky assignor, assignment, and target state are
+    /// cleared because the coordinator revoked all partitions on fencing.
     async fn reset_for_kip848_fencing(&self) {
+        let member_id = self.member_id.read().await.clone();
+        if !member_id.is_empty() {
+            self.sticky_assignor.clear_member(&member_id);
+        }
         *self.member_epoch.write().await = 0;
         *self.generation_id.write().await = -1;
         *self.state.write().await = GroupState::Unjoined;
@@ -3680,6 +3684,64 @@ mod tests {
         group.reset().await;
         assert_eq!(group.state().await, GroupState::Unjoined);
         assert!(group.member_id().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_kip848_fencing_reset_clears_sticky_assignor_state() {
+        let coordinator = test_coordinator(
+            crate::consumer::config::PartitionAssignmentStrategy::CooperativeSticky,
+        )
+        .with_group_protocol(crate::consumer::config::GroupProtocol::Consumer);
+
+        *coordinator.member_id.write().await = "member-1".to_string();
+        *coordinator.member_epoch.write().await = 7;
+        *coordinator.generation_id.write().await = 42;
+        *coordinator.state.write().await = GroupState::Stable;
+
+        let mut assignment = MemberAssignment::empty();
+        assignment.add("topic-a", vec![0, 1]);
+        *coordinator.assignment.write().await = assignment.clone();
+        coordinator
+            .sticky_assignor
+            .record_assignment("member-1", &assignment);
+
+        coordinator
+            .target_assignment
+            .write()
+            .await
+            .push(ConsumerGroupTopicPartitions {
+                topic_id: [1; 16],
+                partitions: vec![0, 1],
+            });
+        coordinator
+            .topic_names_cache
+            .write()
+            .await
+            .insert([1; 16], "topic-a".to_string());
+
+        coordinator.reset_for_kip848_fencing().await;
+
+        assert_eq!(*coordinator.member_id.read().await, "member-1");
+        assert_eq!(*coordinator.member_epoch.read().await, 0);
+        assert_eq!(*coordinator.generation_id.read().await, -1);
+        assert_eq!(*coordinator.state.read().await, GroupState::Unjoined);
+        assert!(coordinator.assignment.read().await.is_empty());
+        assert!(coordinator.target_assignment.read().await.is_empty());
+        assert!(coordinator.topic_names_cache.read().await.is_empty());
+        assert!(
+            !coordinator
+                .sticky_assignor
+                .previous_assignments
+                .read()
+                .contains_key("member-1")
+        );
+        assert!(
+            coordinator
+                .sticky_assignor
+                .get_partitions_to_revoke("member-1", &MemberAssignment::empty())
+                .is_empty(),
+            "fencing reset should clear preserved sticky assignments for the fenced member"
+        );
     }
 
     #[test]
