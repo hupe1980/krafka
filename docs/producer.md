@@ -131,8 +131,11 @@ gzip, snappy, and LZ4. Zstd remains available through the explicit `zstd` or
 To trim binary size further, disable defaults and select only the codecs you need:
 
 ```toml
+# Option 1: enable only the codecs you need
 krafka = { version = "0.6", default-features = false, features = ["lz4"] }
-krafka = { version = "0.6", features = ["compression-all"] } # includes zstd
+
+# Option 2: enable all compression codecs, including zstd
+# krafka = { version = "0.6", features = ["compression-all"] }
 ```
 
 ### Batching

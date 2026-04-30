@@ -238,8 +238,11 @@ and LZ4. Zstd remains available through the explicit `zstd` or
 To select only what you need:
 
 ```toml
+# Option 1: enable only the codecs you need
 krafka = { version = "0.6", default-features = false, features = ["lz4", "snappy"] }
-krafka = { version = "0.6", features = ["compression-all"] } # includes zstd
+
+# Option 2: enable all compression codecs, including zstd
+# krafka = { version = "0.6", features = ["compression-all"] }
 ```
 
 ## ⚡ Performance Tuning
