@@ -35,7 +35,7 @@ pub use transaction::{
 };
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::Semaphore;
@@ -45,7 +45,7 @@ use crate::PartitionId;
 use crate::auth::AuthConfig;
 use crate::error::{ErrorCode, KrafkaError, Result};
 use crate::metadata::ClusterMetadata;
-use crate::metrics::ProducerMetrics as ProducerMetricsInner;
+use crate::metrics::{ConnectionMetrics, ProducerMetrics as ProducerMetricsInner};
 use crate::network::{ConnectionConfig, ConnectionPool};
 use crate::protocol::{
     ApiKey, Compression, InitProducerIdRequest, InitProducerIdResponse, ProducePartitionData,
@@ -114,11 +114,18 @@ impl Producer {
 
         let bootstrap_servers = crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
 
-        let metadata = Arc::new(
-            ClusterMetadata::new(bootstrap_servers, pool.clone(), config.metadata_max_age)
-                .with_recovery_strategy(config.metadata_recovery_strategy)
-                .with_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger),
-        );
+        let metadata = Arc::new({
+            let mut meta =
+                ClusterMetadata::new(bootstrap_servers, pool.clone(), config.metadata_max_age)
+                    .with_recovery_strategy(config.metadata_recovery_strategy)
+                    .with_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger);
+            if let Some(ttl) = config.metadata_topic_cache_ttl {
+                meta = meta.with_topic_cache_ttl(ttl);
+            } else {
+                meta = meta.with_topic_cache_ttl_disabled();
+            }
+            meta
+        });
 
         // Initial metadata fetch
         metadata.refresh().await?;
@@ -144,7 +151,8 @@ impl Producer {
         let retry_policy = RetryPolicy::new()
             .with_max_retries(config.retries)
             .with_initial_backoff(config.retry_backoff)
-            .with_max_backoff(Duration::from_secs(30));
+            .with_max_backoff(Duration::from_secs(30))
+            .with_delivery_timeout(Some(config.delivery_timeout));
 
         // Shared metrics
         let metrics = Arc::new(ProducerMetricsInner::default());
@@ -207,12 +215,35 @@ impl Producer {
         let retry_policy = RetryPolicy::new()
             .with_max_retries(config.retries)
             .with_initial_backoff(config.retry_backoff)
-            .with_max_backoff(Duration::from_secs(10));
+            .with_max_backoff(Duration::from_secs(10))
+            .with_delivery_timeout(Some(config.delivery_timeout));
+
+        let started_at = Instant::now();
 
         for attempt in 0..=retry_policy.max_retries {
+            if let Some(deadline) = retry_policy.delivery_timeout
+                && started_at.elapsed() >= deadline
+            {
+                return Err(KrafkaError::timeout("InitProducerId"));
+            }
+
             if attempt > 0 {
-                let backoff = retry_policy.calculate_backoff(attempt);
-                tokio::time::sleep(backoff).await;
+                let mut backoff = retry_policy.calculate_backoff(attempt);
+                if let Some(deadline) = retry_policy.delivery_timeout {
+                    let elapsed = started_at.elapsed();
+                    if elapsed >= deadline {
+                        return Err(KrafkaError::timeout("InitProducerId"));
+                    }
+                    backoff = backoff.min(deadline.saturating_sub(elapsed));
+                }
+                if !backoff.is_zero() {
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+            if let Some(deadline) = retry_policy.delivery_timeout
+                && started_at.elapsed() >= deadline
+            {
+                return Err(KrafkaError::timeout("InitProducerId"));
             }
 
             let brokers = metadata.brokers();
@@ -302,7 +333,10 @@ impl Producer {
             }
         }
 
-        unreachable!("retry loop always returns")
+        Err(KrafkaError::protocol(format!(
+            "InitProducerId retry loop exhausted after {} retries",
+            retry_policy.max_retries
+        )))
     }
 
     /// Send a record to a topic.
@@ -811,6 +845,12 @@ impl Producer {
     pub fn metrics_handle(&self) -> Arc<ProducerMetricsInner> {
         self.metrics.clone()
     }
+
+    /// Get the shared connection metrics handle used by this producer's broker pool.
+    #[inline]
+    pub fn connection_metrics(&self) -> Arc<ConnectionMetrics> {
+        self.pool.metrics()
+    }
 }
 
 impl Drop for Producer {
@@ -894,6 +934,15 @@ impl ProducerBuilder {
         self
     }
 
+    /// Set the total delivery timeout.
+    ///
+    /// Bounds the total time a record may spend queued and retried before it
+    /// fails locally. Default: 120 seconds.
+    pub fn delivery_timeout(mut self, timeout: Duration) -> Self {
+        self.config.delivery_timeout = timeout;
+        self
+    }
+
     /// Set the number of retries.
     pub fn retries(mut self, retries: u32) -> Self {
         self.config.retries = retries;
@@ -919,6 +968,27 @@ impl ProducerBuilder {
     /// Set metadata max age before refresh.
     pub fn metadata_max_age(mut self, duration: Duration) -> Self {
         self.config.metadata_max_age = duration;
+        self
+    }
+
+    /// Set the topic cache TTL for partial metadata refreshes.
+    ///
+    /// During partial refreshes, cached topics that have not been refreshed
+    /// within this duration are evicted to prevent unbounded cache growth.
+    ///
+    /// Default: 5 minutes (matching Java's `metadata.max.idle.ms`).
+    pub fn metadata_topic_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.config.metadata_topic_cache_ttl = Some(ttl);
+        self
+    }
+
+    /// Disable topic cache TTL eviction for partial metadata refreshes.
+    ///
+    /// By default, cached topics are evicted after 5 minutes to prevent
+    /// unbounded growth on topic churn. Call this to opt out of TTL eviction;
+    /// entries will then persist across partial refreshes indefinitely.
+    pub fn disable_metadata_topic_cache_ttl(mut self) -> Self {
+        self.config.metadata_topic_cache_ttl = None;
         self
     }
 
@@ -1078,7 +1148,17 @@ impl ProducerBuilder {
                 self.config.batch_size
             )));
         }
+        if self.config.delivery_timeout.is_zero() {
+            return Err(KrafkaError::config(
+                "delivery_timeout must be greater than zero",
+            ));
+        }
         if self.config.idempotent {
+            if self.config.retries == 0 {
+                return Err(KrafkaError::config(
+                    "idempotent producer requires retries > 0",
+                ));
+            }
             if self.config.acks != Acks::All {
                 return Err(KrafkaError::config(format!(
                     "idempotent producer requires acks = All (got {:?})",

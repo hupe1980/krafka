@@ -703,6 +703,31 @@ impl MetricsVisitable for ConnectionMetrics {
             "Total connection errors",
             self.connection_errors.get(),
         );
+        exporter.export_counter(
+            &format!("{prefix}_high_priority_requests"),
+            "Total high-priority requests sent",
+            self.high_priority_requests.get(),
+        );
+        exporter.export_counter(
+            &format!("{prefix}_normal_priority_requests"),
+            "Total normal-priority requests sent",
+            self.normal_priority_requests.get(),
+        );
+        exporter.export_counter(
+            &format!("{prefix}_high_priority_bypasses"),
+            "High-priority requests processed ahead of normal-priority work",
+            self.high_priority_bypasses.get(),
+        );
+        exporter.export_counter(
+            &format!("{prefix}_throttle_delays"),
+            "Normal-priority requests delayed due to broker throttling",
+            self.throttle_delays.get(),
+        );
+        exporter.export_counter(
+            &format!("{prefix}_throttle_delay_ms"),
+            "Total broker-throttle delay applied to normal-priority requests in milliseconds",
+            self.throttle_delay_ms.get(),
+        );
         exporter.export_gauge(
             &format!("{prefix}_active_connections"),
             "Current active connections",
@@ -866,6 +891,11 @@ impl KrafkaMetrics {
         self.connection.connections_created.reset();
         self.connection.connections_closed.reset();
         self.connection.connection_errors.reset();
+        self.connection.high_priority_requests.reset();
+        self.connection.normal_priority_requests.reset();
+        self.connection.high_priority_bypasses.reset();
+        self.connection.throttle_delays.reset();
+        self.connection.throttle_delay_ms.reset();
         self.connection.active_connections.set(0);
         self.connection.connect_latency.reset();
     }
@@ -1109,6 +1139,16 @@ pub struct ConnectionMetrics {
     pub connections_closed: Counter,
     /// Number of connection errors.
     pub connection_errors: Counter,
+    /// Number of high-priority requests sent.
+    pub high_priority_requests: Counter,
+    /// Number of normal-priority requests sent.
+    pub normal_priority_requests: Counter,
+    /// Number of high-priority requests processed ahead of normal-priority work.
+    pub high_priority_bypasses: Counter,
+    /// Number of normal-priority requests delayed by broker throttling.
+    pub throttle_delays: Counter,
+    /// Total broker-throttle delay applied to normal-priority requests, in milliseconds.
+    pub throttle_delay_ms: Counter,
     /// Current active connections.
     pub active_connections: Gauge,
     /// Connection establishment latency.
@@ -1141,12 +1181,43 @@ impl ConnectionMetrics {
         self.connection_errors.inc();
     }
 
+    /// Record a high-priority request.
+    #[inline]
+    pub fn record_high_priority_request(&self) {
+        self.high_priority_requests.inc();
+    }
+
+    /// Record a normal-priority request.
+    #[inline]
+    pub fn record_normal_priority_request(&self) {
+        self.normal_priority_requests.inc();
+    }
+
+    /// Record a high-priority request processed ahead of normal-priority work.
+    #[inline]
+    pub fn record_high_priority_bypass(&self) {
+        self.high_priority_bypasses.inc();
+    }
+
+    /// Record a normal-priority delay caused by broker throttling.
+    #[inline]
+    pub fn record_throttle_delay(&self, delay: Duration) {
+        self.throttle_delays.inc();
+        let millis = delay.as_millis().min(u64::MAX as u128) as u64;
+        self.throttle_delay_ms.add(millis);
+    }
+
     /// Get a snapshot of all metrics.
     pub fn snapshot(&self) -> ConnectionMetricsSnapshot {
         ConnectionMetricsSnapshot {
             connections_created: self.connections_created.get(),
             connections_closed: self.connections_closed.get(),
             connection_errors: self.connection_errors.get(),
+            high_priority_requests: self.high_priority_requests.get(),
+            normal_priority_requests: self.normal_priority_requests.get(),
+            high_priority_bypasses: self.high_priority_bypasses.get(),
+            throttle_delays: self.throttle_delays.get(),
+            throttle_delay_ms: self.throttle_delay_ms.get(),
             active_connections: self.active_connections.get(),
             connect_latency: self.connect_latency.snapshot(),
         }
@@ -1163,6 +1234,16 @@ pub struct ConnectionMetricsSnapshot {
     pub connections_closed: u64,
     /// Connection errors.
     pub connection_errors: u64,
+    /// Total high-priority requests sent.
+    pub high_priority_requests: u64,
+    /// Total normal-priority requests sent.
+    pub normal_priority_requests: u64,
+    /// High-priority requests processed ahead of normal-priority work.
+    pub high_priority_bypasses: u64,
+    /// Normal-priority requests delayed by broker throttling.
+    pub throttle_delays: u64,
+    /// Total broker-throttle delay applied to normal-priority requests, in milliseconds.
+    pub throttle_delay_ms: u64,
     /// Current active connections.
     pub active_connections: u64,
     /// Connection latency statistics.
@@ -1312,12 +1393,21 @@ mod tests {
         metrics.record_connect();
         metrics.record_close();
         metrics.record_error();
+        metrics.record_high_priority_request();
+        metrics.record_normal_priority_request();
+        metrics.record_high_priority_bypass();
+        metrics.record_throttle_delay(Duration::from_millis(25));
 
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.connections_created, 2);
         assert_eq!(snapshot.connections_closed, 1);
         assert_eq!(snapshot.active_connections, 1);
         assert_eq!(snapshot.connection_errors, 1);
+        assert_eq!(snapshot.high_priority_requests, 1);
+        assert_eq!(snapshot.normal_priority_requests, 1);
+        assert_eq!(snapshot.high_priority_bypasses, 1);
+        assert_eq!(snapshot.throttle_delays, 1);
+        assert_eq!(snapshot.throttle_delay_ms, 25);
     }
 
     #[test]
@@ -1376,6 +1466,23 @@ mod tests {
     }
 
     #[test]
+    fn test_connection_priority_prometheus_export() {
+        let metrics = ConnectionMetrics::new();
+        metrics.record_high_priority_request();
+        metrics.record_normal_priority_request();
+        metrics.record_high_priority_bypass();
+        metrics.record_throttle_delay(Duration::from_millis(75));
+
+        let output = metrics.to_prometheus_text("krafka_connection");
+
+        assert!(output.contains("krafka_connection_high_priority_requests_total 1"));
+        assert!(output.contains("krafka_connection_normal_priority_requests_total 1"));
+        assert!(output.contains("krafka_connection_high_priority_bypasses_total 1"));
+        assert!(output.contains("krafka_connection_throttle_delays_total 1"));
+        assert!(output.contains("krafka_connection_throttle_delay_ms_total 75"));
+    }
+
+    #[test]
     fn test_krafka_metrics_registry() {
         let registry = KrafkaMetrics::new();
 
@@ -1397,12 +1504,19 @@ mod tests {
     fn test_krafka_metrics_reset() {
         let registry = KrafkaMetrics::new();
         let producer = registry.producer_metrics();
+        let connection = registry.connection_metrics();
 
         producer.record_send(100);
+        connection.record_high_priority_request();
+        connection.record_throttle_delay(Duration::from_millis(10));
         assert_eq!(producer.records_sent.get(), 1);
+        assert_eq!(connection.high_priority_requests.get(), 1);
+        assert_eq!(connection.throttle_delay_ms.get(), 10);
 
         registry.reset();
         assert_eq!(producer.records_sent.get(), 0);
+        assert_eq!(connection.high_priority_requests.get(), 0);
+        assert_eq!(connection.throttle_delay_ms.get(), 0);
     }
 
     #[test]

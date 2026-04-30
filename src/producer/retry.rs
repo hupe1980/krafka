@@ -105,8 +105,9 @@ impl RetryPolicy {
         }
 
         // Exponential backoff: initial * multiplier^(attempt-1)
+        let exponent = attempt.saturating_sub(1).min(i32::MAX as u32) as i32;
         let base_backoff =
-            self.initial_backoff.as_secs_f64() * self.backoff_multiplier.powi((attempt - 1) as i32);
+            self.initial_backoff.as_secs_f64() * self.backoff_multiplier.powi(exponent);
 
         // Cap at max backoff
         let capped_backoff = base_backoff.min(self.max_backoff.as_secs_f64());
@@ -342,6 +343,16 @@ mod tests {
 
         // Attempt 2 would be 10 seconds, but capped at 5
         assert_eq!(policy.calculate_backoff(2), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_calculate_backoff_handles_max_attempt() {
+        let policy = RetryPolicy::new()
+            .with_initial_backoff(Duration::from_millis(100))
+            .with_max_backoff(Duration::from_secs(10))
+            .with_jitter_factor(0.0);
+
+        assert_eq!(policy.calculate_backoff(u32::MAX), Duration::from_secs(10));
     }
 
     #[test]

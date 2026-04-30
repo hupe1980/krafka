@@ -54,6 +54,7 @@ use tracing::{debug, info, warn};
 use crate::auth::{AuthConfig, ScramMechanism};
 use crate::error::{KrafkaError, Result};
 use crate::metadata::{ClusterMetadata, MetadataRecoveryStrategy, TopicInfo};
+use crate::metrics::ConnectionMetrics;
 use crate::network::{BrokerConnection, ConnectionConfig, ConnectionPool};
 
 use crate::protocol::{
@@ -743,7 +744,7 @@ impl Default for AdminConfig {
             bootstrap_servers: String::new(),
             client_id: "krafka-admin".to_string(),
             request_timeout: Duration::from_secs(30),
-            metadata_recovery_strategy: MetadataRecoveryStrategy::None,
+            metadata_recovery_strategy: MetadataRecoveryStrategy::Rebootstrap,
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             auth: None,
             #[cfg(feature = "socks5")]
@@ -2196,7 +2197,9 @@ impl AdminClient {
             info!("Deleted records from {} partition(s)", results.len());
             return Ok(results);
         }
-        unreachable!()
+        Err(KrafkaError::protocol(
+            "DeleteRecords retry loop exhausted after metadata refresh",
+        ))
     }
 
     /// Get the end offset for each partition at the given leader epoch.
@@ -2343,7 +2346,9 @@ impl AdminClient {
             );
             return Ok(results);
         }
-        unreachable!()
+        Err(KrafkaError::protocol(
+            "OffsetForLeaderEpoch retry loop exhausted after metadata refresh",
+        ))
     }
 
     // ── Delegation Tokens ────────────────────────────────────────────────
@@ -3042,6 +3047,12 @@ impl AdminClient {
     #[inline]
     pub fn is_closed(&self) -> bool {
         self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Get the shared connection metrics handle used by this admin client's broker pool.
+    #[inline]
+    pub fn connection_metrics(&self) -> Arc<ConnectionMetrics> {
+        self.pool.metrics()
     }
 
     /// Describe broker-supported and cluster-finalized features (KIP-584).
@@ -4264,7 +4275,9 @@ impl AdminClient {
             info!("DescribeProducers returned {} topic(s)", results.len());
             return Ok(results);
         }
-        unreachable!()
+        Err(KrafkaError::protocol(
+            "DescribeProducers retry loop exhausted after metadata refresh",
+        ))
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -5521,6 +5534,10 @@ mod tests {
         let config = AdminConfig::default();
         assert_eq!(config.client_id, "krafka-admin");
         assert_eq!(config.request_timeout, Duration::from_secs(30));
+        assert_eq!(
+            config.metadata_recovery_strategy,
+            MetadataRecoveryStrategy::Rebootstrap
+        );
     }
 
     #[test]

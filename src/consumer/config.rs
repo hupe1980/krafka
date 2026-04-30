@@ -230,7 +230,7 @@ impl Default for ConsumerConfig {
             group_protocol: GroupProtocol::Classic,
             group_instance_id: None,
             client_rack: None,
-            metadata_recovery_strategy: MetadataRecoveryStrategy::None,
+            metadata_recovery_strategy: MetadataRecoveryStrategy::Rebootstrap,
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             metadata_topic_cache_ttl: Some(Duration::from_secs(300)),
             auth: None,
@@ -837,7 +837,7 @@ mod tests {
         let config = ConsumerConfig::default();
         assert_eq!(
             config.metadata_recovery_strategy,
-            MetadataRecoveryStrategy::None,
+            MetadataRecoveryStrategy::Rebootstrap,
         );
         assert_eq!(
             config.metadata_recovery_rebootstrap_trigger,

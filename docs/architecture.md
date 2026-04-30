@@ -114,7 +114,10 @@ Krafka implements the Kafka binary protocol:
 
 ### Compression
 
-All four Kafka compression codecs are supported:
+All four Kafka compression codecs are supported when their features are enabled.
+The default `compression` feature keeps the dependency stack pure-Rust by
+enabling gzip, snappy, and LZ4; zstd is available through the explicit `zstd`
+or `compression-all` feature.
 
 | Codec | Implementation | Characteristics |
 |-------|---------------|-----------------|
@@ -271,7 +274,7 @@ where
 
 ### KIP-899 Metadata Recovery (Rebootstrap)
 
-When `MetadataRecoveryStrategy::Rebootstrap` is configured and no broker is
+Clients default to `MetadataRecoveryStrategy::Rebootstrap`. When no broker is
 reachable for longer than the rebootstrap trigger (default 5 min), the client
 automatically closes all connections, clears the metadata cache, and falls back
 to bootstrap servers to re-discover the cluster. This handles scenarios like

@@ -15,9 +15,9 @@ Krafka provides built-in metrics collection that is automatically wired into all
 
 - **Producer metrics**: Records sent, bytes, batches, errors, retries, send latency — recorded in `send()`, `send_to_partition()`, and batch accumulator flush
 - **Consumer metrics**: Records received, polls, fetches, commits, rebalances, assigned partitions, lag, poll latency — recorded in `poll()`, `commit()`, and `close()`
-- **Connection metrics**: Connections created/closed, errors, establishment latency
+- **Connection metrics**: Connections created/closed, errors, establishment latency, priority scheduling counters, and broker throttle delays
 
-All metrics are lock-free using atomic operations for minimal performance impact. Access metrics via `producer.metrics_handle()` or `consumer.metrics()`.
+All metrics are lock-free using atomic operations for minimal performance impact. Access metrics via `producer.metrics_handle()`, `consumer.metrics()`, or the connection metric handles exposed by producer, consumer, share-consumer, admin, and connection-pool APIs.
 
 ## Pluggable Export
 
@@ -228,6 +228,11 @@ async fn main() {
 | `connections_created_total` | Counter | Total connections created |
 | `connections_closed_total` | Counter | Total connections closed |
 | `connection_errors_total` | Counter | Connection errors |
+| `high_priority_requests_total` | Counter | High-priority requests sent |
+| `normal_priority_requests_total` | Counter | Normal-priority requests sent |
+| `high_priority_bypasses_total` | Counter | High-priority requests processed ahead of normal-priority work |
+| `throttle_delays_total` | Counter | Normal-priority requests delayed due to broker throttling |
+| `throttle_delay_ms_total` | Counter | Total broker-throttle delay applied to normal-priority requests, in milliseconds |
 | `active_connections` | Gauge | Current active connections |
 | `connect_latency_seconds` | Summary | Connection establishment latency |
 

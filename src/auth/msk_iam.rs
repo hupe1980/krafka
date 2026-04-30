@@ -62,6 +62,9 @@ const ACTION: &str = "kafka-cluster:Connect";
 /// User agent for MSK IAM (includes crate version for diagnostics).
 const USER_AGENT: &str = concat!("krafka-rust-client/", env!("CARGO_PKG_VERSION"));
 
+/// Maximum clock offset applied to MSK IAM SigV4 timestamps.
+pub(crate) const MAX_SIGV4_CLOCK_SKEW_SECS: i64 = 300;
+
 /// MSK IAM authenticator using AWS Signature v4.
 pub struct MskIamAuthenticator {
     /// AWS access key ID.
@@ -134,19 +137,17 @@ impl MskIamAuthenticator {
     /// mismatch. Not part of the public API — SigV4 timestamps should
     /// come from the system clock.
     ///
-    /// The offset is clamped to ±86 400 s (24 hours). AWS SigV4 only
-    /// tolerates ±5 minutes, so larger offsets indicate a misconfigured
-    /// clock.
+    /// The offset is limited to ±5 minutes, matching the useful SigV4
+    /// tolerance window. Larger offsets indicate a misconfigured local clock.
     pub(crate) fn new_with_clock_offset(
         credentials: &AwsMskIamCredentials,
         host: impl Into<String>,
         clock_offset_secs: i64,
     ) -> crate::Result<Self> {
-        const MAX_OFFSET_SECS: i64 = 86_400;
-        if clock_offset_secs.abs() > MAX_OFFSET_SECS {
+        if !(-MAX_SIGV4_CLOCK_SKEW_SECS..=MAX_SIGV4_CLOCK_SKEW_SECS).contains(&clock_offset_secs) {
             return Err(crate::error::KrafkaError::config(format!(
-                "clock_offset_secs ({clock_offset_secs}) exceeds ±{MAX_OFFSET_SECS}s; \
-                 AWS SigV4 only tolerates ±300s"
+                "clock_offset_secs ({clock_offset_secs}) exceeds ±{MAX_SIGV4_CLOCK_SKEW_SECS}s; \
+                 AWS SigV4 only tolerates roughly ±5 minutes"
             )));
         }
         let mut auth = Self::new(credentials, host)?;
@@ -664,7 +665,7 @@ mod tests {
         let creds = test_credentials();
         let auth_no_offset = MskIamAuthenticator::new(&creds, "broker:9098").unwrap();
         let auth_offset =
-            MskIamAuthenticator::new_with_clock_offset(&creds, "broker:9098", 3600).unwrap();
+            MskIamAuthenticator::new_with_clock_offset(&creds, "broker:9098", 300).unwrap();
 
         let payload_no = String::from_utf8(auth_no_offset.create_auth_payload()).unwrap();
         let payload_off = String::from_utf8(auth_offset.create_auth_payload()).unwrap();
@@ -686,10 +687,21 @@ mod tests {
     #[test]
     fn test_msk_iam_clock_offset_negative() {
         let creds = test_credentials();
-        let auth =
-            MskIamAuthenticator::new_with_clock_offset(&creds, "broker:9098", -3600).unwrap();
+        let auth = MskIamAuthenticator::new_with_clock_offset(&creds, "broker:9098", -300).unwrap();
         let payload = String::from_utf8(auth.create_auth_payload()).unwrap();
         assert!(payload.contains("\"x-amz-date\":"));
+    }
+
+    #[test]
+    fn test_msk_iam_clock_offset_rejects_outside_sigv4_window() {
+        let creds = test_credentials();
+        let err =
+            MskIamAuthenticator::new_with_clock_offset(&creds, "broker:9098", 301).unwrap_err();
+        assert!(err.to_string().contains("±300s"));
+
+        let err = MskIamAuthenticator::new_with_clock_offset(&creds, "broker:9098", i64::MIN)
+            .unwrap_err();
+        assert!(err.to_string().contains("±300s"));
     }
 
     /// Helper to extract `x-amz-date` value from the JSON payload.

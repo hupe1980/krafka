@@ -32,11 +32,11 @@ Add Krafka to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-krafka = "0.5"
+krafka = "0.6"
 tokio = { version = "1", features = ["full"] }
 
 # For AWS MSK IAM authentication with full SDK support:
-# krafka = { version = "0.5", features = ["aws-msk"] }
+# krafka = { version = "0.6", features = ["aws-msk"] }
 ```
 
 ### Producer
@@ -232,10 +232,14 @@ let producer = Producer::builder()
 | `Compression::Lz4` | `lz4` | lz4_flex | Fastest |
 | `Compression::Zstd` | `zstd` | zstd | Best modern choice (requires C toolchain) |
 
-All codecs are enabled by default via the `compression` feature. To select only what you need:
+The default `compression` feature enables the pure-Rust codecs: gzip, snappy,
+and LZ4. Zstd remains available through the explicit `zstd` or
+`compression-all` feature because it requires a C toolchain via `zstd-sys`.
+To select only what you need:
 
 ```toml
-krafka = { version = "0.5", default-features = false, features = ["lz4", "snappy"] }
+krafka = { version = "0.6", default-features = false, features = ["lz4", "snappy"] }
+krafka = { version = "0.6", features = ["compression-all"] } # includes zstd
 ```
 
 ## ⚡ Performance Tuning

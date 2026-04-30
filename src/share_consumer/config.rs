@@ -120,7 +120,7 @@ impl Default for ShareConsumerConfig {
             heartbeat_interval: Duration::from_secs(5),
             client_rack: None,
             metadata_max_age: Duration::from_secs(300),
-            metadata_recovery_strategy: MetadataRecoveryStrategy::None,
+            metadata_recovery_strategy: MetadataRecoveryStrategy::Rebootstrap,
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             metadata_topic_cache_ttl: Some(Duration::from_secs(300)),
             auth: None,

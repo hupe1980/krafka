@@ -87,11 +87,12 @@
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
-//! | `compression` | **yes** | Enables all compression codecs (`gzip` + `snappy` + `lz4` + `zstd`). |
+//! | `compression` | **yes** | Enables pure-Rust compression codecs (`gzip` + `snappy` + `lz4`). |
+//! | `compression-all` | no | Enables all compression codecs, including `zstd`. |
 //! | `gzip` | via `compression` | Gzip record batch compression via `flate2`. |
 //! | `snappy` | via `compression` | Snappy compression via `snap`. |
 //! | `lz4` | via `compression` | LZ4 compression via `lz4_flex`. |
-//! | `zstd` | via `compression` | Zstd compression via `zstd` (requires C toolchain). |
+//! | `zstd` | no | Zstd compression via `zstd` (requires C toolchain). |
 //! | `aws-msk` | no | AWS MSK IAM authentication with SDK credential chain. |
 //! | `schema-registry` | no | Confluent Schema Registry HTTP client. |
 //! | `aws-glue-schema-registry` | no | AWS Glue Schema Registry SDK client. |
@@ -102,7 +103,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! krafka = { version = "0.5", default-features = false, features = ["lz4"] }
+//! krafka = { version = "0.6", default-features = false, features = ["lz4"] }
 //! ```
 
 #![cfg_attr(docsrs, feature(doc_cfg))]

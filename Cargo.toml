@@ -1,6 +1,6 @@
 [package]
 name = "krafka"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["hupe1980"]
@@ -84,8 +84,10 @@ serde_json = { version = "1", optional = true }
 
 [features]
 default = ["compression"]
-# Enable all compression codecs.
-compression = ["gzip", "snappy", "lz4", "zstd"]
+# Enable pure-Rust compression codecs.
+compression = ["gzip", "snappy", "lz4"]
+# Enable all compression codecs, including zstd.
+compression-all = ["compression", "zstd"]
 # Enable gzip record-batch compression/decompression codepaths.
 # NOTE: `flate2` is always compiled (required for Glue ZLIB); this feature
 # gates the gzip *codec selection* at runtime, not the dependency itself.

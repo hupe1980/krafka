@@ -20,12 +20,14 @@ Complete reference for all Krafka configuration options.
 | `batch_size` | usize | `16384` | Maximum bytes per batch (must be >= 1) |
 | `linger` | Duration | `0ms` | Time to wait for batching |
 | `request_timeout` | Duration | `30s` | Timeout for broker requests |
-| `retries` | u32 | `3` | Number of retries on failure |
+| `delivery_timeout` | Duration | `120s` | Total time budget for queueing, sending, and retries |
+| `retries` | u32 | `u32::MAX` | Number of retries on failure; bounded by `delivery_timeout` |
 | `retry_backoff` | Duration | `100ms` | Wait between retries |
 | `max_in_flight` | usize | `5` | Max concurrent in-flight requests per connection |
 | `metadata_max_age` | Duration | `5m` | Max age before metadata refresh |
+| `metadata_topic_cache_ttl` | `Option<Duration>` | `Some(5m)` | TTL for topic entries in the partial-refresh cache. `None` disables eviction. |
 | `idempotent` | bool | `true` | Enable idempotent production (KIP-679, requires acks=All) |
-| `metadata_recovery_strategy` | MetadataRecoveryStrategy | `None` | Recovery strategy when metadata refresh fails (KIP-899) |
+| `metadata_recovery_strategy` | MetadataRecoveryStrategy | `Rebootstrap` | Recovery strategy when metadata refresh fails (KIP-899) |
 | `metadata_recovery_rebootstrap_trigger` | Duration | `5m` | Duration after which failing refreshes trigger a rebootstrap |
 
 ### Acks Values
@@ -41,7 +43,9 @@ Acks::All     // -1: Wait for all in-sync replicas
 ### Compression Values
 
 Each codec requires its corresponding Cargo feature (`gzip`, `snappy`, `lz4`, `zstd`).
-All are enabled by default via the `compression` feature.
+The default `compression` feature enables gzip, snappy, and LZ4. Zstd is
+explicitly opt-in through `zstd` or `compression-all` because it requires a C
+toolchain via `zstd-sys`.
 Use [`Compression::is_available()`] to check at runtime.
 
 ```rust
@@ -68,8 +72,10 @@ let producer = Producer::builder()
     .batch_size(65536)
     .linger(Duration::from_millis(5))
     .request_timeout(Duration::from_secs(30))
+    .delivery_timeout(Duration::from_secs(120))
     .retries(5)
     .retry_backoff(Duration::from_millis(200))
+    .metadata_topic_cache_ttl(Duration::from_secs(300))
     .build()
     .await?;
 ```
@@ -98,7 +104,7 @@ let producer = Producer::builder()
 | `request_timeout` | Duration | `30s` | Timeout for broker requests |
 | `metadata_max_age` | Duration | `5m` | Max age before metadata refresh |
 | `metadata_topic_cache_ttl` | `Option<Duration>` | `Some(5m)` | TTL for topic entries in the partial-refresh cache. `None` disables eviction. |
-| `metadata_recovery_strategy` | MetadataRecoveryStrategy | `None` | Recovery strategy when metadata refresh fails (KIP-899) |
+| `metadata_recovery_strategy` | MetadataRecoveryStrategy | `Rebootstrap` | Recovery strategy when metadata refresh fails (KIP-899) |
 | `metadata_recovery_rebootstrap_trigger` | Duration | `5m` | Duration after which failing refreshes trigger a rebootstrap |
 
 ### AutoOffsetReset Values
@@ -152,7 +158,7 @@ let consumer = Consumer::builder()
 | `bootstrap_servers` | String | Required | Comma-separated list of host:port pairs |
 | `client_id` | String | `"krafka-admin"` | Client identifier |
 | `request_timeout` | Duration | `30s` | Timeout for admin operations |
-| `metadata_recovery_strategy` | MetadataRecoveryStrategy | `None` | Recovery strategy when metadata refresh fails (KIP-899) |
+| `metadata_recovery_strategy` | MetadataRecoveryStrategy | `Rebootstrap` | Recovery strategy when metadata refresh fails (KIP-899) |
 | `metadata_recovery_rebootstrap_trigger` | Duration | `5m` | Duration after which failing refreshes trigger a rebootstrap |
 
 ### Admin Client Builder Example
@@ -189,7 +195,7 @@ DNS resolution, so broker hostnames are sent as-is (not pre-resolved).
 Enable the `socks5` feature:
 
 ```toml
-krafka = { version = "0.5", features = ["socks5"] }
+krafka = { version = "0.6", features = ["socks5"] }
 ```
 
 ### Proxy Without Authentication

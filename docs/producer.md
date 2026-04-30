@@ -124,12 +124,15 @@ let producer = Producer::builder()
 | LZ4 | `lz4` | Fastest | Good | High-throughput, real-time |
 | Zstd | `zstd` | Medium | Best | Best balance of speed/ratio |
 
-All codecs are enabled by default via the `compression` convenience feature.
-To trim binary size or avoid the C toolchain (needed by `zstd`), disable defaults
-and select only the codecs you need:
+The default `compression` convenience feature enables the pure-Rust codecs:
+gzip, snappy, and LZ4. Zstd remains available through the explicit `zstd` or
+`compression-all` feature because it requires a C toolchain via `zstd-sys`.
+
+To trim binary size further, disable defaults and select only the codecs you need:
 
 ```toml
-krafka = { version = "0.5", default-features = false, features = ["lz4"] }
+krafka = { version = "0.6", default-features = false, features = ["lz4"] }
+krafka = { version = "0.6", features = ["compression-all"] } # includes zstd
 ```
 
 ### Batching
@@ -288,6 +291,29 @@ impl Partitioner for RegionPartitioner {
 }
 ```
 
+## Metadata Topic Cache TTL
+
+During a partial metadata refresh for produced topics, Krafka caches topic metadata between refreshes. By default, a topic entry is evicted after **5 minutes** without a successful refresh, matching Java's `metadata.max.idle.ms`, so topic churn does not grow the cache indefinitely.
+
+```rust
+use krafka::producer::Producer;
+use std::time::Duration;
+
+let producer = Producer::builder()
+    .bootstrap_servers("localhost:9092")
+    .metadata_topic_cache_ttl(Duration::from_secs(600))
+    .build()
+    .await?;
+
+let producer = Producer::builder()
+    .bootstrap_servers("localhost:9092")
+    .disable_metadata_topic_cache_ttl()
+    .build()
+    .await?;
+```
+
+A full metadata refresh still replaces the cache unconditionally.
+
 ## Error Handling
 
 ### Record Validation
@@ -314,7 +340,7 @@ use std::time::Duration;
 
 let producer = Producer::builder()
     .bootstrap_servers("localhost:9092")
-    .retries(5)                                      // Max retry attempts
+    .retries(5)                                      // Max retry attempts; defaults to u32::MAX
     .retry_backoff(Duration::from_millis(100))        // Initial backoff
     .build()
     .await?;
@@ -340,7 +366,7 @@ let producer = Producer::builder()
     .await?;
 ```
 
-When `delivery_timeout` is set, backoff durations are clamped to the remaining budget so the producer does not overshoot. If the budget is exhausted, the send fails immediately regardless of the remaining retry count.
+The producer defaults to `delivery_timeout = 120s` and `retries = u32::MAX`, so transient failures are retried until the delivery budget is exhausted. Backoff durations are clamped to the remaining budget so the producer does not overshoot. If the budget is exhausted, the send fails immediately regardless of the remaining retry count.
 
 > **Note:** By default `linger` is `0` (no batching delay), so the delivery timeout is nearly equivalent to network time + retry time. With `linger > 0`, add the maximum linger window to your delivery timeout budget.
 
