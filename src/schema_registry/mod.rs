@@ -414,22 +414,24 @@ pub fn detect_wire_format(data: &[u8]) -> DetectedWireFormat {
                 payload_offset: HEADER_SIZE,
             }
         }
-        // Glue wire header: version byte 0x03 + compression + 16-byte UUID.
-        0x03 => {
-            const GLUE_HEADER_SIZE: usize = 18;
-            if data.len() < GLUE_HEADER_SIZE {
+        // Glue wire header: version byte + compression + 16-byte UUID.
+        // Constants are defined (and validated) in schema_registry::glue.
+        glue::GLUE_HEADER_VERSION_BYTE => {
+            if data.len() < glue::GLUE_HEADER_SIZE {
                 return DetectedWireFormat::Unknown;
             }
             let compression = data[1];
-            if compression != 0x00 && compression != 0x05 {
+            if compression != glue::GLUE_COMPRESSION_NONE_BYTE
+                && compression != glue::GLUE_COMPRESSION_ZLIB_BYTE
+            {
                 return DetectedWireFormat::Unknown;
             }
 
             let mut version_bytes = [0u8; 16];
-            version_bytes.copy_from_slice(&data[2..GLUE_HEADER_SIZE]);
+            version_bytes.copy_from_slice(&data[2..glue::GLUE_HEADER_SIZE]);
             DetectedWireFormat::Glue {
                 version_id: GlueSchemaVersionId::from_bytes(version_bytes),
-                payload_offset: GLUE_HEADER_SIZE,
+                payload_offset: glue::GLUE_HEADER_SIZE,
             }
         }
         _ => DetectedWireFormat::Unknown,

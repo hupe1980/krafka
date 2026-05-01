@@ -1404,6 +1404,18 @@ impl Consumer {
                     offsets.insert(key, offset);
                     continue;
                 }
+
+                // No committed offset — try caller-supplied initial_offsets before
+                // falling back to auto_offset_reset.
+                if let Some(&initial) = self.config.initial_offsets.get(&key) {
+                    debug!(
+                        "Using initial_offsets {} for {}-{} (no committed offset)",
+                        initial, topic, partition
+                    );
+                    offsets.insert(key, initial);
+                    continue;
+                }
+
                 // No committed offset or negative (unknown)
                 debug!(
                     "No committed offset for {}-{} (committed={:?}), will auto-reset",
@@ -2147,8 +2159,36 @@ impl Consumer {
                     "Retrying offset resolution for {} partition(s) without tracked offsets",
                     missing.len()
                 );
+
+                // Pre-seed from initial_offsets before hitting the network.
+                // This covers the case where initial_offsets was configured but
+                // fetch_and_apply_committed_offsets ran before the config was
+                // observed (e.g., a late rebalance that bypassed the committed
+                // path), and avoids an unnecessary ListOffsets RPC.
+                let still_missing: Vec<(String, PartitionId)> =
+                    if self.config.initial_offsets.is_empty() {
+                        missing
+                    } else {
+                        let mut offsets = self.offsets.write().await;
+                        missing
+                            .into_iter()
+                            .filter(|key| {
+                                if let Some(&initial) = self.config.initial_offsets.get(key) {
+                                    debug!(
+                                        "Poll retry: using initial_offsets {} for {}-{}",
+                                        initial, key.0, key.1
+                                    );
+                                    offsets.insert(key.clone(), initial);
+                                    false
+                                } else {
+                                    true
+                                }
+                            })
+                            .collect()
+                    };
+
                 let mut reset_partitions: HashMap<String, Vec<PartitionId>> = HashMap::new();
-                for (topic, partition) in &missing {
+                for (topic, partition) in &still_missing {
                     reset_partitions
                         .entry(topic.clone())
                         .or_default()
@@ -2168,7 +2208,7 @@ impl Consumer {
 
                                 // Fallback for partitions the coordinator path
                                 // silently dropped (partition-level errors).
-                                for (topic, partition) in &missing {
+                                for (topic, partition) in &still_missing {
                                     if !resolved.contains_key(&(topic.clone(), *partition)) {
                                         debug!(
                                             "Poll retry: falling back to direct ListOffsets for {}-{}",
@@ -2186,8 +2226,8 @@ impl Consumer {
                             }
                             Err(e) => {
                                 warn!("Offset resolution retry via coordinator failed: {}", e);
-                                // Fall back to direct path for all missing partitions
-                                for (topic, partition) in &missing {
+                                // Fall back to direct path for all still-missing partitions
+                                for (topic, partition) in &still_missing {
                                     if let Ok(offset) =
                                         self.resolve_list_offset(topic, *partition, timestamp).await
                                     {
@@ -2211,7 +2251,7 @@ impl Consumer {
                 {
                     let offsets = self.offsets.read().await;
                     let mut partition_state = self.partition_state.write().await;
-                    for (topic, partition) in &missing {
+                    for (topic, partition) in &still_missing {
                         let key = (topic.clone(), *partition);
                         if offsets.contains_key(&key) {
                             // Successfully resolved — clear backoff.

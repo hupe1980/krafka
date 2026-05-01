@@ -70,16 +70,16 @@ use crate::schema_registry::AnySchemaCache;
 // ── Constants ────────────────────────────────────────────────────────────
 
 /// Header version byte for the AWS Glue wire format.
-const GLUE_HEADER_VERSION_BYTE: u8 = 0x03;
+pub(crate) const GLUE_HEADER_VERSION_BYTE: u8 = 0x03;
 
 /// Compression indicator: no compression.
-const GLUE_COMPRESSION_NONE_BYTE: u8 = 0x00;
+pub(crate) const GLUE_COMPRESSION_NONE_BYTE: u8 = 0x00;
 
 /// Compression indicator: ZLIB compression.
-const GLUE_COMPRESSION_ZLIB_BYTE: u8 = 0x05;
+pub(crate) const GLUE_COMPRESSION_ZLIB_BYTE: u8 = 0x05;
 
 /// Size of the Glue wire format header (version + compression + 16-byte UUID).
-const GLUE_HEADER_SIZE: usize = 18;
+pub(crate) const GLUE_HEADER_SIZE: usize = 18;
 
 /// Size of the UUID field in the Glue wire format.
 const UUID_SIZE: usize = 16;
