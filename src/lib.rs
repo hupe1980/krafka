@@ -81,6 +81,7 @@
 //!         Ok(msg)                          => println!("{:?}", msg),
 //!         Err(krafka::RecvError::Closed)   => break,
 //!         Err(krafka::RecvError::Error(e)) => return Err(e),
+//!         Err(_)                           => break,
 //!     }
 //! }
 //! # Ok(())
