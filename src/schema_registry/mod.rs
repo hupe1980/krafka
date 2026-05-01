@@ -569,47 +569,41 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
     ///
     /// This inherent method mirrors [`SchemaRegistryClient::get_schema_by_id`]
     /// so callers of `CachedSchemaRegistry` do not need to import the trait.
-    pub fn get_schema_by_id(
-        &self,
-        id: SchemaId,
-    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
-        <Self as SchemaRegistryClient>::get_schema_by_id(self, id)
+    pub async fn get_schema_by_id(&self, id: SchemaId) -> Result<Schema> {
+        <Self as SchemaRegistryClient>::get_schema_by_id(self, id).await
     }
 
     /// Retrieve the latest schema registered under the given subject.
     ///
     /// This inherent method mirrors [`SchemaRegistryClient::get_latest_schema`]
     /// so callers of `CachedSchemaRegistry` do not need to import the trait.
-    pub fn get_latest_schema(
-        &self,
-        subject: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
-        <Self as SchemaRegistryClient>::get_latest_schema(self, subject)
+    pub async fn get_latest_schema(&self, subject: &str) -> Result<Schema> {
+        <Self as SchemaRegistryClient>::get_latest_schema(self, subject).await
     }
 
     /// Retrieve a specific version of a schema under a subject.
     ///
     /// This inherent method mirrors [`SchemaRegistryClient::get_schema_by_version`]
     /// so callers of `CachedSchemaRegistry` do not need to import the trait.
-    pub fn get_schema_by_version(
+    pub async fn get_schema_by_version(
         &self,
         subject: &str,
         version: SchemaVersion,
-    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
-        <Self as SchemaRegistryClient>::get_schema_by_version(self, subject, version)
+    ) -> Result<Schema> {
+        <Self as SchemaRegistryClient>::get_schema_by_version(self, subject, version).await
     }
 
     /// Register a schema under the given subject.
     ///
     /// This inherent method mirrors [`SchemaRegistryClient::register_schema`]
     /// so callers of `CachedSchemaRegistry` do not need to import the trait.
-    pub fn register_schema(
+    pub async fn register_schema(
         &self,
         subject: &str,
         schema: &str,
         schema_type: SchemaType,
         references: &[SchemaReference],
-    ) -> Pin<Box<dyn Future<Output = Result<SchemaId>> + Send + '_>> {
+    ) -> Result<SchemaId> {
         <Self as SchemaRegistryClient>::register_schema(
             self,
             subject,
@@ -617,6 +611,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             schema_type,
             references,
         )
+        .await
     }
 
     fn insert_cache_entry(&self, id: SchemaId, schema: Schema) {
@@ -1298,5 +1293,89 @@ mod tests {
 
         ok(cached.get_schema_by_id(1).await);
         assert_eq!(cached.inner().get_by_id_call_count(), 3);
+    }
+
+    mod inherent_api_tests {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        use crate::Result;
+        use crate::schema_registry::{
+            CachedSchemaRegistry, Schema, SchemaReference, SchemaType, SchemaVersion,
+        };
+
+        struct InherentMockRegistry;
+
+        impl crate::schema_registry::SchemaRegistryClient for InherentMockRegistry {
+            fn get_schema_by_id(
+                &self,
+                id: u32,
+            ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
+                Box::pin(
+                    async move { Ok(Schema::new(id, SchemaType::Avro, r#"{"type":"string"}"#)) },
+                )
+            }
+
+            fn get_latest_schema(
+                &self,
+                subject: &str,
+            ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
+                let subject = subject.to_string();
+                Box::pin(async move {
+                    Ok(Schema::new(7, SchemaType::Avro, r#"{"type":"string"}"#)
+                        .with_subject(subject, 1))
+                })
+            }
+
+            fn get_schema_by_version(
+                &self,
+                subject: &str,
+                version: SchemaVersion,
+            ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
+                let subject = subject.to_string();
+                Box::pin(async move {
+                    Ok(Schema::new(9, SchemaType::Avro, r#"{"type":"string"}"#)
+                        .with_subject(subject, version))
+                })
+            }
+
+            fn register_schema(
+                &self,
+                _subject: &str,
+                _schema: &str,
+                _schema_type: SchemaType,
+                _references: &[SchemaReference],
+            ) -> Pin<Box<dyn Future<Output = Result<u32>> + Send + '_>> {
+                Box::pin(async { Ok(42) })
+            }
+        }
+
+        #[tokio::test]
+        async fn cached_schema_registry_methods_work_without_trait_import() {
+            let cached = CachedSchemaRegistry::new(InherentMockRegistry);
+
+            let by_id = cached.get_schema_by_id(1).await.unwrap();
+            assert_eq!(by_id.id, 1);
+
+            let latest = cached.get_latest_schema("orders-value").await.unwrap();
+            assert_eq!(latest.id, 7);
+
+            let by_version = cached
+                .get_schema_by_version("orders-value", 3)
+                .await
+                .unwrap();
+            assert_eq!(by_version.id, 9);
+
+            let registered = cached
+                .register_schema(
+                    "orders-value",
+                    r#"{"type":"string"}"#,
+                    SchemaType::Avro,
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_eq!(registered, 42);
+        }
     }
 }

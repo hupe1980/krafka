@@ -631,24 +631,22 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
     /// This inherent method mirrors
     /// [`GlueSchemaRegistryClient::get_schema_by_version_id`] so callers of
     /// `CachedGlueSchemaRegistry` do not need to import the trait.
-    pub fn get_schema_by_version_id(
-        &self,
-        id: GlueSchemaVersionId,
-    ) -> Pin<Box<dyn Future<Output = Result<GlueSchema>> + Send + '_>> {
-        <Self as GlueSchemaRegistryClient>::get_schema_by_version_id(self, id)
+    pub async fn get_schema_by_version_id(&self, id: GlueSchemaVersionId) -> Result<GlueSchema> {
+        <Self as GlueSchemaRegistryClient>::get_schema_by_version_id(self, id).await
     }
 
     /// Register a schema version under the given schema name.
     ///
     /// This inherent method mirrors [`GlueSchemaRegistryClient::register_schema`]
     /// so callers of `CachedGlueSchemaRegistry` do not need to import the trait.
-    pub fn register_schema(
+    pub async fn register_schema(
         &self,
         schema_name: &str,
         schema: &str,
         data_format: GlueDataFormat,
-    ) -> Pin<Box<dyn Future<Output = Result<GlueSchemaVersionId>> + Send + '_>> {
+    ) -> Result<GlueSchemaVersionId> {
         <Self as GlueSchemaRegistryClient>::register_schema(self, schema_name, schema, data_format)
+            .await
     }
 
     fn insert_cache_entry(&self, id: GlueSchemaVersionId, schema: GlueSchema) {
@@ -1333,5 +1331,59 @@ mod tests {
         let cached = CachedGlueSchemaRegistry::new(MockGlueRegistry::new());
         let debug = format!("{cached:?}");
         assert!(debug.contains("cache_len"));
+    }
+
+    mod inherent_api_tests {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        use crate::Result;
+        use crate::schema_registry::glue::{
+            CachedGlueSchemaRegistry, GlueDataFormat, GlueSchema, GlueSchemaVersionId,
+        };
+
+        struct InherentMockGlueRegistry;
+
+        impl crate::schema_registry::glue::GlueSchemaRegistryClient for InherentMockGlueRegistry {
+            fn get_schema_by_version_id(
+                &self,
+                id: GlueSchemaVersionId,
+            ) -> Pin<Box<dyn Future<Output = Result<GlueSchema>> + Send + '_>> {
+                Box::pin(async move {
+                    Ok(GlueSchema::new(
+                        id,
+                        GlueDataFormat::Avro,
+                        r#"{"type":"string"}"#,
+                    ))
+                })
+            }
+
+            fn register_schema(
+                &self,
+                _schema_name: &str,
+                _schema: &str,
+                _data_format: GlueDataFormat,
+            ) -> Pin<Box<dyn Future<Output = Result<GlueSchemaVersionId>> + Send + '_>>
+            {
+                let id = "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
+                Box::pin(async move { Ok(id) })
+            }
+        }
+
+        #[tokio::test]
+        async fn cached_glue_registry_methods_work_without_trait_import() {
+            let cached = CachedGlueSchemaRegistry::new(InherentMockGlueRegistry);
+            let version_id: GlueSchemaVersionId =
+                "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
+
+            let schema = cached.get_schema_by_version_id(version_id).await.unwrap();
+            assert_eq!(schema.schema_version_id, version_id);
+
+            let registered = cached
+                .register_schema("orders-value", r#"{"type":"string"}"#, GlueDataFormat::Avro)
+                .await
+                .unwrap();
+            assert_eq!(registered, version_id);
+        }
     }
 }
