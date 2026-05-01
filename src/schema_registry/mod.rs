@@ -121,8 +121,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use parking_lot::RwLock;
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
+use parking_lot::{Mutex, RwLock};
+use tokio::sync::oneshot;
 
 use crate::error::{KrafkaError, Result};
 
@@ -504,7 +504,7 @@ pub struct CachedSchemaRegistry<C> {
     /// Optional maximum number of cached entries.
     max_entries: Option<usize>,
     /// Waiters for coalescing concurrent cold misses by schema ID.
-    in_flight: AsyncMutex<HashMap<SchemaId, Vec<oneshot::Sender<Result<Schema>>>>>,
+    in_flight: Mutex<HashMap<SchemaId, Vec<oneshot::Sender<Result<Schema>>>>>,
 }
 
 impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
@@ -515,7 +515,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             cache: RwLock::new(HashMap::new()),
             insertion_order: RwLock::new(VecDeque::new()),
             max_entries: None,
-            in_flight: AsyncMutex::new(HashMap::new()),
+            in_flight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -526,7 +526,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             cache: RwLock::new(HashMap::with_capacity(capacity)),
             insertion_order: RwLock::new(VecDeque::with_capacity(capacity)),
             max_entries: None,
-            in_flight: AsyncMutex::new(HashMap::new()),
+            in_flight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -540,7 +540,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             cache: RwLock::new(HashMap::with_capacity(max_entries)),
             insertion_order: RwLock::new(VecDeque::with_capacity(max_entries)),
             max_entries: Some(max_entries),
-            in_flight: AsyncMutex::new(HashMap::new()),
+            in_flight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -571,32 +571,64 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             return Ok(schema.clone());
         }
 
-        let mut in_flight = self.in_flight.lock().await;
-        if let Some(schema) = self.cache.read().get(&id) {
-            return Ok(schema.clone());
-        }
+        let waiter_rx = {
+            let mut in_flight = self.in_flight.lock();
+            if let Some(schema) = self.cache.read().get(&id) {
+                return Ok(schema.clone());
+            }
 
-        if let Some(waiters) = in_flight.get_mut(&id) {
-            let (tx, rx) = oneshot::channel();
-            waiters.push(tx);
-            drop(in_flight);
+            if let Some(waiters) = in_flight.get_mut(&id) {
+                let (tx, rx) = oneshot::channel();
+                waiters.push(tx);
+                Some(rx)
+            } else {
+                in_flight.insert(id, Vec::new());
+                None
+            }
+        };
+
+        if let Some(rx) = waiter_rx {
             return rx
                 .await
                 .map_err(|_| KrafkaError::invalid_state("schema lookup coalescer dropped"))?;
         }
 
-        in_flight.insert(id, Vec::new());
-        drop(in_flight);
+        struct InFlightSchemaFetchGuard<'a> {
+            in_flight: &'a Mutex<HashMap<SchemaId, Vec<oneshot::Sender<Result<Schema>>>>>,
+            id: SchemaId,
+            completed: bool,
+        }
+
+        impl Drop for InFlightSchemaFetchGuard<'_> {
+            fn drop(&mut self) {
+                if self.completed {
+                    return;
+                }
+                let waiters = self.in_flight.lock().remove(&self.id).unwrap_or_default();
+                for waiter in waiters {
+                    let _ = waiter.send(Err(KrafkaError::invalid_state(
+                        "schema lookup cancelled before completion",
+                    )));
+                }
+            }
+        }
+
+        let mut guard = InFlightSchemaFetchGuard {
+            in_flight: &self.in_flight,
+            id,
+            completed: false,
+        };
 
         let result = self.inner.get_schema_by_id(id).await;
         if let Ok(schema) = &result {
             self.insert_cache_entry(id, schema.clone());
         }
 
-        let waiters = self.in_flight.lock().await.remove(&id).unwrap_or_default();
+        let waiters = self.in_flight.lock().remove(&id).unwrap_or_default();
         for waiter in waiters {
             let _ = waiter.send(result.clone());
         }
+        guard.completed = true;
 
         result
     }
@@ -634,6 +666,9 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
     ///
     /// This inherent method mirrors [`SchemaRegistryClient::get_schema_by_id`]
     /// so callers of `CachedSchemaRegistry` do not need to import the trait.
+    ///
+    /// Inherent methods intentionally shadow trait methods for the concrete type.
+    /// If you need the boxed trait future shape, call the trait explicitly via UFCS.
     pub async fn get_schema_by_id(&self, id: SchemaId) -> Result<Schema> {
         self.get_schema_by_id_impl(id).await
     }
@@ -1154,6 +1189,42 @@ mod tests {
 
         assert_eq!(first_schema, second_schema);
         assert_eq!(cached.inner().get_by_id_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cache_coalescer_cleans_up_when_leader_is_cancelled() {
+        let cached = Arc::new(CachedSchemaRegistry::new(BlockingMockRegistry::new()));
+
+        let first = {
+            let cached = cached.clone();
+            tokio::spawn(async move { ok(cached.get_schema_by_id(9).await) })
+        };
+
+        cached.inner().wait_started().await;
+        first.abort();
+        tokio::task::yield_now().await;
+
+        let second = {
+            let cached = cached.clone();
+            tokio::spawn(async move { ok(cached.get_schema_by_id(9).await) })
+        };
+
+        // If cancellation cleanup is broken, this waits forever because second
+        // caller never becomes leader and never reaches the inner mock.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cached.inner().wait_started(),
+        )
+        .await
+        .expect("second lookup did not reach inner registry");
+
+        cached.inner().release();
+        let schema = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .expect("second lookup timed out")
+            .expect("second task failed");
+
+        assert_eq!(schema.id, 9);
     }
 
     #[tokio::test]
