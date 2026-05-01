@@ -565,6 +565,60 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         self.insertion_order.write().clear();
     }
 
+    /// Retrieve a schema by its globally unique ID.
+    ///
+    /// This inherent method mirrors [`SchemaRegistryClient::get_schema_by_id`]
+    /// so callers of `CachedSchemaRegistry` do not need to import the trait.
+    pub fn get_schema_by_id(
+        &self,
+        id: SchemaId,
+    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
+        <Self as SchemaRegistryClient>::get_schema_by_id(self, id)
+    }
+
+    /// Retrieve the latest schema registered under the given subject.
+    ///
+    /// This inherent method mirrors [`SchemaRegistryClient::get_latest_schema`]
+    /// so callers of `CachedSchemaRegistry` do not need to import the trait.
+    pub fn get_latest_schema(
+        &self,
+        subject: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
+        <Self as SchemaRegistryClient>::get_latest_schema(self, subject)
+    }
+
+    /// Retrieve a specific version of a schema under a subject.
+    ///
+    /// This inherent method mirrors [`SchemaRegistryClient::get_schema_by_version`]
+    /// so callers of `CachedSchemaRegistry` do not need to import the trait.
+    pub fn get_schema_by_version(
+        &self,
+        subject: &str,
+        version: SchemaVersion,
+    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
+        <Self as SchemaRegistryClient>::get_schema_by_version(self, subject, version)
+    }
+
+    /// Register a schema under the given subject.
+    ///
+    /// This inherent method mirrors [`SchemaRegistryClient::register_schema`]
+    /// so callers of `CachedSchemaRegistry` do not need to import the trait.
+    pub fn register_schema(
+        &self,
+        subject: &str,
+        schema: &str,
+        schema_type: SchemaType,
+        references: &[SchemaReference],
+    ) -> Pin<Box<dyn Future<Output = Result<SchemaId>> + Send + '_>> {
+        <Self as SchemaRegistryClient>::register_schema(
+            self,
+            subject,
+            schema,
+            schema_type,
+            references,
+        )
+    }
+
     fn insert_cache_entry(&self, id: SchemaId, schema: Schema) {
         let mut cache = self.cache.write();
 

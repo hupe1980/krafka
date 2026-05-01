@@ -626,6 +626,31 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
         self.insertion_order.write().clear();
     }
 
+    /// Retrieve a schema by its version ID (the UUID from the wire format).
+    ///
+    /// This inherent method mirrors
+    /// [`GlueSchemaRegistryClient::get_schema_by_version_id`] so callers of
+    /// `CachedGlueSchemaRegistry` do not need to import the trait.
+    pub fn get_schema_by_version_id(
+        &self,
+        id: GlueSchemaVersionId,
+    ) -> Pin<Box<dyn Future<Output = Result<GlueSchema>> + Send + '_>> {
+        <Self as GlueSchemaRegistryClient>::get_schema_by_version_id(self, id)
+    }
+
+    /// Register a schema version under the given schema name.
+    ///
+    /// This inherent method mirrors [`GlueSchemaRegistryClient::register_schema`]
+    /// so callers of `CachedGlueSchemaRegistry` do not need to import the trait.
+    pub fn register_schema(
+        &self,
+        schema_name: &str,
+        schema: &str,
+        data_format: GlueDataFormat,
+    ) -> Pin<Box<dyn Future<Output = Result<GlueSchemaVersionId>> + Send + '_>> {
+        <Self as GlueSchemaRegistryClient>::register_schema(self, schema_name, schema, data_format)
+    }
+
     fn insert_cache_entry(&self, id: GlueSchemaVersionId, schema: GlueSchema) {
         let mut cache = self.cache.write();
 

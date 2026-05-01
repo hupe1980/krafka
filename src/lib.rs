@@ -148,3 +148,133 @@ pub type Offset = i64;
 
 /// Kafka timestamp (milliseconds since epoch).
 pub type Timestamp = i64;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod cached_schema_registry_inherent_methods_tests {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use crate::Result;
+    use crate::schema_registry::glue::{
+        CachedGlueSchemaRegistry, GlueDataFormat, GlueSchema, GlueSchemaVersionId,
+    };
+    use crate::schema_registry::{
+        CachedSchemaRegistry, Schema, SchemaReference, SchemaType, SchemaVersion,
+    };
+
+    struct MockRegistry;
+
+    impl crate::schema_registry::SchemaRegistryClient for MockRegistry {
+        fn get_schema_by_id(
+            &self,
+            id: u32,
+        ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
+            Box::pin(async move { Ok(Schema::new(id, SchemaType::Avro, r#"{"type":"string"}"#)) })
+        }
+
+        fn get_latest_schema(
+            &self,
+            subject: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
+            let subject = subject.to_string();
+            Box::pin(async move {
+                Ok(Schema::new(7, SchemaType::Avro, r#"{"type":"string"}"#)
+                    .with_subject(subject, 1))
+            })
+        }
+
+        fn get_schema_by_version(
+            &self,
+            subject: &str,
+            version: SchemaVersion,
+        ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
+            let subject = subject.to_string();
+            Box::pin(async move {
+                Ok(Schema::new(9, SchemaType::Avro, r#"{"type":"string"}"#)
+                    .with_subject(subject, version))
+            })
+        }
+
+        fn register_schema(
+            &self,
+            _subject: &str,
+            _schema: &str,
+            _schema_type: SchemaType,
+            _references: &[SchemaReference],
+        ) -> Pin<Box<dyn Future<Output = Result<u32>> + Send + '_>> {
+            Box::pin(async { Ok(42) })
+        }
+    }
+
+    struct MockGlueRegistry;
+
+    impl crate::schema_registry::glue::GlueSchemaRegistryClient for MockGlueRegistry {
+        fn get_schema_by_version_id(
+            &self,
+            id: GlueSchemaVersionId,
+        ) -> Pin<Box<dyn Future<Output = Result<GlueSchema>> + Send + '_>> {
+            Box::pin(async move {
+                Ok(GlueSchema::new(
+                    id,
+                    GlueDataFormat::Avro,
+                    r#"{"type":"string"}"#,
+                ))
+            })
+        }
+
+        fn register_schema(
+            &self,
+            _schema_name: &str,
+            _schema: &str,
+            _data_format: GlueDataFormat,
+        ) -> Pin<Box<dyn Future<Output = Result<GlueSchemaVersionId>> + Send + '_>> {
+            let id = "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
+            Box::pin(async move { Ok(id) })
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_schema_registry_methods_work_without_trait_import() {
+        let cached = CachedSchemaRegistry::new(MockRegistry);
+
+        let by_id = cached.get_schema_by_id(1).await.unwrap();
+        assert_eq!(by_id.id, 1);
+
+        let latest = cached.get_latest_schema("orders-value").await.unwrap();
+        assert_eq!(latest.id, 7);
+
+        let by_version = cached
+            .get_schema_by_version("orders-value", 3)
+            .await
+            .unwrap();
+        assert_eq!(by_version.id, 9);
+
+        let registered = cached
+            .register_schema(
+                "orders-value",
+                r#"{"type":"string"}"#,
+                SchemaType::Avro,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(registered, 42);
+    }
+
+    #[tokio::test]
+    async fn cached_glue_registry_methods_work_without_trait_import() {
+        let cached = CachedGlueSchemaRegistry::new(MockGlueRegistry);
+        let version_id: GlueSchemaVersionId =
+            "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
+
+        let schema = cached.get_schema_by_version_id(version_id).await.unwrap();
+        assert_eq!(schema.schema_version_id, version_id);
+
+        let registered = cached
+            .register_schema("orders-value", r#"{"type":"string"}"#, GlueDataFormat::Avro)
+            .await
+            .unwrap();
+        assert_eq!(registered, version_id);
+    }
+}

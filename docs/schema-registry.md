@@ -400,7 +400,7 @@ krafka = { version = "0.7.0", features = ["aws-glue-schema-registry"] }
 ```rust
 use krafka::schema_registry::glue::{
     AwsGlueSchemaRegistry, CachedGlueSchemaRegistry,
-    decode_glue_wire_format, GlueSchemaRegistryClient,
+    decode_glue_wire_format,
 };
 
 // Create from AWS config
