@@ -76,8 +76,12 @@
 //!
 //! consumer.subscribe(&["my-topic"]).await?;
 //!
-//! while let Some(msg) = consumer.recv().await? {
-//!     println!("{:?}", msg);
+//! loop {
+//!     match consumer.recv().await {
+//!         Ok(msg)                          => println!("{:?}", msg),
+//!         Err(krafka::RecvError::Closed)   => break,
+//!         Err(krafka::RecvError::Error(e)) => return Err(e),
+//!     }
 //! }
 //! # Ok(())
 //! # }
@@ -103,7 +107,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! krafka = { version = "0.6", default-features = false, features = ["lz4"] }
+//! krafka = { version = "0.8", default-features = false, features = ["lz4"] }
 //! ```
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -128,7 +132,7 @@ pub mod telemetry;
 pub mod tracing_ext;
 pub mod util;
 
-pub use error::{KrafkaError, ProtocolErrorKind, Result};
+pub use error::{KrafkaError, ProtocolErrorKind, RecvError, Result};
 pub use metadata::MetadataRecoveryStrategy;
 
 /// Kafka protocol API version.

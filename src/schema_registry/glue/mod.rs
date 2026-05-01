@@ -36,7 +36,7 @@
 //!
 //! let (id, payload) = decode_glue_wire_format(&framed).unwrap();
 //! assert_eq!(id, uuid);
-//! assert_eq!(&payload, b"avro data");
+//! assert_eq!(payload.as_ref(), b"avro data");
 //! ```
 
 #[cfg(feature = "aws-glue-schema-registry")]
@@ -46,6 +46,8 @@ mod glue_client;
 #[cfg_attr(docsrs, doc(cfg(feature = "aws-glue-schema-registry")))]
 pub use glue_client::{AwsGlueSchemaRegistry, AwsGlueSchemaRegistryBuilder};
 
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
@@ -60,7 +62,10 @@ use flate2::write::ZlibEncoder;
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::oneshot;
 
+use tracing::debug;
+
 use crate::error::{KrafkaError, Result};
+use crate::schema_registry::AnySchemaCache;
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -370,9 +375,10 @@ pub fn encode_glue_wire_format(
 /// Decode an AWS Glue wire format message.
 ///
 /// Validates the 18-byte header, extracts the schema version ID, and
-/// decompresses the payload if ZLIB-compressed. Always returns an owned
-/// `Vec<u8>` — for zero-copy decoding of uncompressed [`Bytes`] payloads,
-/// use [`decode_glue_wire_format_bytes()`] instead.
+/// decompresses the payload if ZLIB-compressed.
+///
+/// Returns [`Cow::Borrowed`] for uncompressed payloads (zero-copy) and
+/// [`Cow::Owned`] when ZLIB decompression is required.
 ///
 /// # Errors
 ///
@@ -394,14 +400,14 @@ pub fn encode_glue_wire_format(
 /// let framed = encode_glue_wire_format(uuid, b"data", GlueCompression::None).unwrap();
 /// let (id, payload) = decode_glue_wire_format(&framed).unwrap();
 /// assert_eq!(id, uuid);
-/// assert_eq!(&payload, b"data");
+/// assert_eq!(payload.as_ref(), b"data");
 /// ```
-pub fn decode_glue_wire_format(data: &[u8]) -> Result<(GlueSchemaVersionId, Vec<u8>)> {
+pub fn decode_glue_wire_format(data: &[u8]) -> Result<(GlueSchemaVersionId, Cow<'_, [u8]>)> {
     let (schema_version_id, compression) = validate_glue_wire_header(data)?;
     let raw = &data[GLUE_HEADER_SIZE..];
     let payload = match compression {
-        GlueCompression::None => raw.to_vec(),
-        GlueCompression::Zlib => decompress_zlib(raw)?,
+        GlueCompression::None => Cow::Borrowed(raw),
+        GlueCompression::Zlib => Cow::Owned(decompress_zlib(raw)?),
     };
     Ok((schema_version_id, payload))
 }
@@ -632,15 +638,44 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
         self.insertion_order.write().clear();
     }
 
+    /// Remove a single schema version ID from the cache.
+    pub fn invalidate(&self, version_id: GlueSchemaVersionId) {
+        self.cache.write().remove(&version_id);
+        self.insertion_order
+            .write()
+            .retain(|cached_id| *cached_id != version_id);
+    }
+
+    /// Remove all cached schemas.
+    pub fn invalidate_all(&self) {
+        self.clear_cache();
+    }
+
+    /// Pre-fetch a set of schema version IDs into the cache.
+    ///
+    /// Duplicate IDs are ignored to avoid redundant lookups.
+    pub async fn warm_cache(&self, version_ids: &[GlueSchemaVersionId]) -> Result<()> {
+        let mut seen = HashSet::with_capacity(version_ids.len());
+        for &id in version_ids {
+            if !seen.insert(id) {
+                continue;
+            }
+            self.get_schema_by_version_id_impl(id).await?;
+        }
+        Ok(())
+    }
+
     async fn get_schema_by_version_id_impl(&self, id: GlueSchemaVersionId) -> Result<GlueSchema> {
         // Fast path: read lock only.
         if let Some(schema) = self.cache.read().get(&id) {
+            debug!(version_id = %id, "glue schema cache hit");
             return Ok(schema.clone());
         }
 
         let waiter_rx = {
             let mut in_flight = self.in_flight.lock();
             if let Some(schema) = self.cache.read().get(&id) {
+                debug!(version_id = %id, "glue schema cache hit (double-checked)");
                 return Ok(schema.clone());
             }
 
@@ -687,6 +722,7 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
 
         let result = self.inner.get_schema_by_version_id(id).await;
         if let Ok(schema) = &result {
+            debug!(version_id = %id, "glue schema cache miss — fetched from registry");
             self.insert_cache_entry(id, schema.clone());
         }
 
@@ -789,6 +825,37 @@ impl<C: GlueSchemaRegistryClient> GlueSchemaRegistryClient for CachedGlueSchemaR
             self.register_schema_impl(&schema_name, &schema, data_format)
                 .await
         })
+    }
+}
+
+impl<C: GlueSchemaRegistryClient> AnySchemaCache for CachedGlueSchemaRegistry<C> {
+    type Id = GlueSchemaVersionId;
+
+    fn cache_len(&self) -> usize {
+        Self::cache_len(self)
+    }
+
+    fn cache_is_empty(&self) -> bool {
+        Self::cache_is_empty(self)
+    }
+
+    fn clear_cache(&self) {
+        Self::clear_cache(self)
+    }
+
+    fn invalidate(&self, id: Self::Id) {
+        Self::invalidate(self, id)
+    }
+
+    fn invalidate_all(&self) {
+        Self::invalidate_all(self)
+    }
+
+    fn warm_cache<'a>(
+        &'a self,
+        ids: &'a [Self::Id],
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move { Self::warm_cache(self, ids).await })
     }
 }
 
@@ -993,7 +1060,7 @@ mod tests {
         let encoded = encode_glue_wire_format(id, payload, GlueCompression::None).unwrap();
         let (decoded_id, decoded_payload) = decode_glue_wire_format(&encoded).unwrap();
         assert_eq!(decoded_id, id);
-        assert_eq!(&decoded_payload, payload);
+        assert_eq!(decoded_payload.as_ref(), payload);
     }
 
     #[test]
@@ -1026,7 +1093,7 @@ mod tests {
         assert_eq!(encoded[1], 0x05); // ZLIB compression byte
         let (decoded_id, decoded_payload) = decode_glue_wire_format(&encoded).unwrap();
         assert_eq!(decoded_id, id);
-        assert_eq!(&decoded_payload, payload);
+        assert_eq!(decoded_payload.as_ref(), payload);
     }
 
     #[test]
@@ -1292,6 +1359,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cache_invalidate_single_entry() {
+        let mock = MockGlueRegistry::new();
+        let cached = CachedGlueSchemaRegistry::new(mock);
+        let id1: GlueSchemaVersionId = TEST_UUID_STR.parse().unwrap();
+        let id2: GlueSchemaVersionId = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+
+        cached.get_schema_by_version_id(id1).await.unwrap();
+        cached.get_schema_by_version_id(id2).await.unwrap();
+        assert_eq!(cached.cache_len(), 2);
+
+        cached.invalidate(id1);
+        assert_eq!(cached.cache_len(), 1);
+
+        // ID 2 should still be cached; ID 1 should miss after invalidation.
+        cached.get_schema_by_version_id(id2).await.unwrap();
+        assert_eq!(cached.inner().get_call_count(), 2);
+        cached.get_schema_by_version_id(id1).await.unwrap();
+        assert_eq!(cached.inner().get_call_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_cache_warm_cache_deduplicates_ids() {
+        let mock = MockGlueRegistry::new();
+        let cached = CachedGlueSchemaRegistry::new(mock);
+        let id1: GlueSchemaVersionId = TEST_UUID_STR.parse().unwrap();
+        let id2: GlueSchemaVersionId = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+
+        cached.warm_cache(&[id1, id2, id1, id2]).await.unwrap();
+
+        assert_eq!(cached.inner().get_call_count(), 2);
+        assert_eq!(cached.cache_len(), 2);
+
+        cached.get_schema_by_version_id(id1).await.unwrap();
+        cached.get_schema_by_version_id(id2).await.unwrap();
+        assert_eq!(cached.inner().get_call_count(), 2);
+    }
+
+    #[tokio::test]
     async fn test_cache_coalesces_concurrent_misses() {
         let cached = Arc::new(CachedGlueSchemaRegistry::new(
             BlockingMockGlueRegistry::new(),
@@ -1476,5 +1581,27 @@ mod tests {
                 .unwrap();
             assert_eq!(registered, version_id);
         }
+    }
+
+    #[tokio::test]
+    async fn test_any_schema_cache_trait_for_glue_cache() {
+        let mock = MockGlueRegistry::new();
+        let cached = CachedGlueSchemaRegistry::new(mock);
+
+        let generic_cache: &dyn crate::schema_registry::AnySchemaCache<Id = GlueSchemaVersionId> =
+            &cached;
+
+        let id1: GlueSchemaVersionId = TEST_UUID_STR.parse().unwrap();
+        let id2: GlueSchemaVersionId = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        cached.warm_cache(&[id1, id2, id1]).await.unwrap();
+
+        assert_eq!(generic_cache.cache_len(), 2);
+        assert!(!generic_cache.cache_is_empty());
+
+        generic_cache.invalidate(id1);
+        assert_eq!(generic_cache.cache_len(), 1);
+
+        generic_cache.invalidate_all();
+        assert!(generic_cache.cache_is_empty());
     }
 }

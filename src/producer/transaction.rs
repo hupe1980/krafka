@@ -80,6 +80,7 @@ use super::record::{ProducerRecord, RecordMetadata, RoutedRecord, TopicHandle};
 use super::retry::RetryPolicy;
 
 /// Transaction state machine states.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TransactionState {

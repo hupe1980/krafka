@@ -575,8 +575,10 @@ impl ConfluentSchemaRegistryBuilder {
     }
 
     /// Set the HTTP request timeout.
-    pub fn request_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = Some(timeout);
+    ///
+    /// Pass `None` to keep the default reqwest timeout behavior.
+    pub fn request_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.request_timeout = timeout;
         self
     }
 
@@ -638,6 +640,26 @@ mod tests {
     fn test_builder_with_url() {
         let client = ConfluentSchemaRegistryBuilder::default()
             .url("http://localhost:8081")
+            .build()
+            .unwrap();
+        assert_eq!(client.base_url, "http://localhost:8081");
+    }
+
+    #[test]
+    fn test_builder_with_optional_request_timeout_some() {
+        let client = ConfluentSchemaRegistryBuilder::default()
+            .url("http://localhost:8081")
+            .request_timeout(Some(Duration::from_secs(2)))
+            .build()
+            .unwrap();
+        assert_eq!(client.base_url, "http://localhost:8081");
+    }
+
+    #[test]
+    fn test_builder_with_optional_request_timeout_none() {
+        let client = ConfluentSchemaRegistryBuilder::default()
+            .url("http://localhost:8081")
+            .request_timeout(None)
             .build()
             .unwrap();
         assert_eq!(client.base_url, "http://localhost:8081");

@@ -507,12 +507,44 @@ println!("Current position: {:?}", offset);
 // Seek to a specific offset
 consumer.seek("topic", 0, 1000).await?;
 
+// Seek multiple partitions atomically (one lock acquisition)
+use std::collections::HashMap;
+consumer.seek_many(&HashMap::from([
+    (("orders".to_string(), 0), 1_000),
+    (("orders".to_string(), 1), 2_000),
+])).await?;
+
 // Seek to the beginning (earliest available)
 consumer.seek_to_beginning("topic", 0).await?;
 
 // Seek to the end (latest, only receive new messages)
 consumer.seek_to_end("topic", 0).await?;
 ```
+
+### Starting from Known Offsets (Exactly-Once Recovery)
+
+Use `initial_offsets` on the builder to set per-partition start positions before
+`auto_offset_reset` is applied. This is ideal for recovery pipelines that
+checkpoint positions externally:
+
+```rust
+use std::collections::HashMap;
+use krafka::consumer::Consumer;
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .initial_offsets(HashMap::from([
+        (("orders".to_string(), 0), 1_234),
+        (("orders".to_string(), 1), 5_678),
+    ]))
+    .build()
+    .await?;
+```
+
+Initial offsets are applied when a partition is first assigned and has no
+committed group offset. They override `auto_offset_reset` for the matching
+partitions; unmatched partitions still follow `auto_offset_reset`.
 
 ### Pause and Resume
 
@@ -656,19 +688,51 @@ async fn consume_with_error_handling(consumer: &Consumer) {
 The `recv()` method returns individual records as a stream-like API.
 It internally buffers records fetched by `poll()` and returns them one by one,
 ensuring no data loss even when `poll()` returns multiple records.
-Errors propagate to the caller rather than being silently swallowed:
+
+`recv()` returns `Result<ConsumerRecord, RecvError>` instead of `Result<Option<ConsumerRecord>>`:
+- `Ok(record)` — a record was received.
+- `Err(RecvError::Closed)` — the consumer was shut down.
+- `Err(RecvError::Error(e))` — a broker or network error occurred.
 
 ```rust
 use krafka::consumer::Consumer;
 use krafka::error::Result;
+use krafka::RecvError;
 
 async fn consume_stream(consumer: &Consumer) -> Result<()> {
-    while let Some(record) = consumer.recv().await? {
-        println!(
-            "topic={}, partition={}, offset={}, timestamp_type={}",
-            record.topic, record.partition, record.offset, record.timestamp_type
-        );
-        // timestamp_type: 0 = CreateTime, 1 = LogAppendTime
+    loop {
+        match consumer.recv().await {
+            Ok(record) => println!(
+                "topic={}, partition={}, offset={}",
+                record.topic, record.partition, record.offset
+            ),
+            Err(RecvError::Closed)   => break,
+            Err(RecvError::Error(e)) => return Err(e),
+        }
+    }
+    Ok(())
+}
+```
+
+### High-Throughput Batch Receive
+
+`batch_recv(max_records, timeout)` collects up to `max_records` in one call,
+returning as soon as the limit is reached or `timeout` elapses:
+
+```rust
+use std::time::Duration;
+use krafka::consumer::Consumer;
+use krafka::error::Result;
+
+async fn process_batches(consumer: &Consumer) -> Result<()> {
+    loop {
+        let batch = consumer.batch_recv(100, Duration::from_millis(200)).await?;
+        if batch.is_empty() {
+            break; // consumer closed
+        }
+        for record in batch {
+            println!("offset={}", record.offset);
+        }
     }
     Ok(())
 }

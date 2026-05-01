@@ -644,6 +644,11 @@ impl MetricsVisitable for ConsumerMetrics {
             "Total rebalances",
             self.rebalances.get(),
         );
+        exporter.export_counter(
+            &format!("{prefix}_seeks"),
+            "Total seek operations (seek + seek_many partition count)",
+            self.seeks.get(),
+        );
         exporter.export_gauge(
             &format!("{prefix}_lag"),
             "Total consumer lag across all assigned partitions",
@@ -882,6 +887,7 @@ impl KrafkaMetrics {
         self.consumer.commits.reset();
         self.consumer.errors.reset();
         self.consumer.rebalances.reset();
+        self.consumer.seeks.reset();
         self.consumer.poll_latency.reset();
         self.consumer.fetch_latency.reset();
         self.consumer.lag.set(0);
@@ -1030,12 +1036,22 @@ pub struct ConsumerMetrics {
     pub paused_partitions: Gauge,
     /// Current number of records buffered in the recv() buffer.
     pub buffered_records: Gauge,
+    /// Total number of seek operations (seek + seek_many).
+    pub seeks: Counter,
 }
 
 impl ConsumerMetrics {
     /// Create new consumer metrics.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record a seek operation.
+    ///
+    /// Pass `n = 1` for a single-partition seek, or the number of partitions for `seek_many`.
+    #[inline]
+    pub fn record_seek(&self, n: u64) {
+        self.seeks.add(n);
     }
 
     /// Record records received.
@@ -1096,6 +1112,7 @@ impl ConsumerMetrics {
             assigned_partitions: self.assigned_partitions.get(),
             paused_partitions: self.paused_partitions.get(),
             buffered_records: self.buffered_records.get(),
+            seeks: self.seeks.get(),
         }
     }
 }
@@ -1134,6 +1151,8 @@ pub struct ConsumerMetricsSnapshot {
     pub paused_partitions: u64,
     /// Buffered records in recv() buffer.
     pub buffered_records: u64,
+    /// Total seek operations (seek + seek_many partition count).
+    pub seeks: u64,
 }
 
 /// Connection pool metrics.

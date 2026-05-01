@@ -980,6 +980,32 @@ impl From<ErrorCode> for i16 {
 /// A specialized Result type for Krafka operations.
 pub type Result<T> = std::result::Result<T, KrafkaError>;
 
+/// Error returned by [`Consumer::recv()`](crate::consumer::Consumer::recv).
+///
+/// This mirrors the pattern of `tokio::sync::mpsc::error::RecvError` — the
+/// `Closed` variant signals that the consumer has been shut down, while
+/// `Error` wraps any broker or network failure encountered during polling.
+///
+/// # Example
+///
+/// ```ignore
+/// match consumer.recv().await {
+///     Ok(record)                          => process(record),
+///     Err(RecvError::Closed)              => break,
+///     Err(RecvError::Error(e))            => return Err(e),
+/// }
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Error)]
+pub enum RecvError {
+    /// The consumer was closed and no more records will be delivered.
+    #[error("consumer closed")]
+    Closed,
+    /// A broker or network error occurred while polling for records.
+    #[error(transparent)]
+    Error(#[from] KrafkaError),
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {

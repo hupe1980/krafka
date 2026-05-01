@@ -14,7 +14,7 @@ This guide covers metrics collection and export in Krafka.
 Krafka provides built-in metrics collection that is automatically wired into all hot paths:
 
 - **Producer metrics**: Records sent, bytes, batches, errors, retries, send latency — recorded in `send()`, `send_to_partition()`, and batch accumulator flush
-- **Consumer metrics**: Records received, polls, fetches, commits, rebalances, assigned partitions, lag, poll latency — recorded in `poll()`, `commit()`, and `close()`
+- **Consumer metrics**: Records received, polls, fetches, commits, rebalances, seeks, assigned partitions, lag, poll latency — recorded in `poll()`, `commit()`, `seek()`, `seek_many()`, and `close()`
 - **Connection metrics**: Connections created/closed, errors, establishment latency, priority scheduling counters, and broker throttle delays
 
 All metrics are lock-free using atomic operations for minimal performance impact. Access metrics via `producer.metrics_handle()`, `consumer.metrics()`, or the connection metric handles exposed by producer, consumer, share-consumer, admin, and connection-pool APIs.
@@ -213,6 +213,7 @@ async fn main() {
 | `commits_total` | Counter | Total offset commits |
 | `errors_total` | Counter | Total errors |
 | `rebalances_total` | Counter | Total rebalance operations |
+| `seeks_total` | Counter | Total seek operations (seek + seek_many partition count) |
 | `lag` | Gauge | Total consumer lag across all assigned partitions |
 | `lag_max` | Gauge | Maximum per-partition consumer lag |
 | `assigned_partitions` | Gauge | Currently assigned partitions |

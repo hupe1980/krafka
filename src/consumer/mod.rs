@@ -69,7 +69,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use crate::auth::AuthConfig;
-use crate::error::{KrafkaError, Result};
+use crate::error::{KrafkaError, RecvError, Result};
 use crate::metadata::{BrokerInfo, ClusterMetadata, TopicInfo};
 use crate::metrics::{ConnectionMetrics, ConsumerMetrics};
 use crate::network::{ConnectionConfig, ConnectionPool};
@@ -1528,6 +1528,24 @@ impl Consumer {
         &self,
         assigned: &HashMap<String, Vec<PartitionId>>,
     ) -> Result<()> {
+        // Pre-seed any caller-supplied initial offsets for newly assigned
+        // partitions that don't yet have a tracked position. These override
+        // `auto_offset_reset`.
+        if !self.config.initial_offsets.is_empty() {
+            let mut offsets = self.offsets.write().await;
+            for (topic, partitions) in assigned {
+                for &p in partitions {
+                    let key = (topic.clone(), p);
+                    if let std::collections::hash_map::Entry::Vacant(e) = offsets.entry(key.clone())
+                        && let Some(&initial) = self.config.initial_offsets.get(&key)
+                    {
+                        debug!("Applying initial offset {} for {}-{}", initial, topic, p);
+                        e.insert(initial);
+                    }
+                }
+            }
+        }
+
         // Collect partitions that don't already have a tracked offset
         let need_reset: Vec<(String, PartitionId)> = {
             let offsets = self.offsets.read().await;
@@ -1593,7 +1611,41 @@ impl Consumer {
             offsets.insert((topic.to_string(), partition), offset);
         }
         self.recompute_lag_metrics().await;
+        self.metrics.record_seek(1);
         debug!("Seek to offset {} for {}-{}", offset, topic, partition);
+        Ok(())
+    }
+
+    /// Seek multiple partitions to the given offsets in one atomic update.
+    ///
+    /// Equivalent to calling [`seek`](Self::seek) for each entry, but acquires
+    /// the offset lock only once and recomputes lag metrics once at the end.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::collections::HashMap;
+    ///
+    /// consumer
+    ///     .seek_many(&HashMap::from([
+    ///         (("orders".to_string(), 0), 1_000),
+    ///         (("orders".to_string(), 1), 2_000),
+    ///     ]))
+    ///     .await?;
+    /// ```
+    pub async fn seek_many(&self, offsets: &HashMap<(String, PartitionId), Offset>) -> Result<()> {
+        if offsets.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut stored = self.offsets.write().await;
+            for ((topic, partition), offset) in offsets {
+                stored.insert((topic.clone(), *partition), *offset);
+            }
+        }
+        self.recompute_lag_metrics().await;
+        self.metrics.record_seek(offsets.len() as u64);
+        debug!("Seeked {} partitions via seek_many", offsets.len());
         Ok(())
     }
 
@@ -2948,20 +3000,33 @@ impl Consumer {
     /// Internally buffers records from `poll()` and returns them one by one,
     /// ensuring no records are lost.
     ///
-    /// Returns `Ok(None)` if the consumer is closed, or `Err` on failure.
-    pub async fn recv(&self) -> Result<Option<ConsumerRecord>> {
+    /// Returns `Err(RecvError::Closed)` when the consumer is shut down.
+    /// Returns `Err(RecvError::Error(e))` on broker or network failures.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// loop {
+    ///     match consumer.recv().await {
+    ///         Ok(record)               => process(record),
+    ///         Err(RecvError::Closed)   => break,
+    ///         Err(RecvError::Error(e)) => return Err(e),
+    ///     }
+    /// }
+    /// ```
+    pub async fn recv(&self) -> std::result::Result<ConsumerRecord, RecvError> {
         loop {
             // Return buffered records first
             {
                 let mut buffer = self.recv_buffer.lock();
                 if let Some(record) = buffer.pop_front() {
                     self.metrics.buffered_records.set(buffer.len() as u64);
-                    return Ok(Some(record));
+                    return Ok(record);
                 }
             }
 
             if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
-                return Ok(None);
+                return Err(RecvError::Closed);
             }
 
             match self.poll(Duration::from_secs(1)).await {
@@ -2977,15 +3042,112 @@ impl Consumer {
                         buffer.extend(iter);
                         self.metrics.buffered_records.set(buffer.len() as u64);
                     }
-                    return Ok(Some(first));
+                    return Ok(first);
                 }
                 Ok(_) => continue,
                 Err(_) if self.closed.load(std::sync::atomic::Ordering::SeqCst) => {
-                    return Ok(None);
+                    return Err(RecvError::Closed);
                 }
                 Err(e) => {
-                    return Err(e);
+                    return Err(RecvError::Error(e));
                 }
+            }
+        }
+    }
+
+    /// Collect up to `max_records` records, waiting at most `timeout`.
+    ///
+    /// Returns as soon as `max_records` have been collected **or** `timeout`
+    /// elapses, whichever comes first.  Returns an empty `Vec` when the
+    /// consumer is closed or no records arrive within the deadline.
+    ///
+    /// Unlike [`poll()`](Self::poll), which performs a single broker fetch
+    /// round-trip, `batch_recv` drains the internal record buffer first and
+    /// then performs additional fetch rounds until the batch is full or the
+    /// deadline is reached.  It never blocks longer than `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on broker or network errors.  A closed consumer returns
+    /// `Ok(vec![])`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::time::Duration;
+    ///
+    /// let records = consumer
+    ///     .batch_recv(100, Duration::from_millis(200))
+    ///     .await?;
+    /// for record in records {
+    ///     println!("{}: {:?}", record.offset, record.value);
+    /// }
+    /// ```
+    pub async fn batch_recv(
+        &self,
+        max_records: usize,
+        timeout: Duration,
+    ) -> Result<Vec<ConsumerRecord>> {
+        if max_records == 0 {
+            return Ok(vec![]);
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut batch = Vec::with_capacity(max_records.min(64));
+
+        loop {
+            // Drain buffer first.
+            {
+                let mut buffer = self.recv_buffer.lock();
+                while batch.len() < max_records {
+                    match buffer.pop_front() {
+                        Some(r) => batch.push(r),
+                        None => break,
+                    }
+                }
+                self.metrics.buffered_records.set(buffer.len() as u64);
+            }
+            if batch.len() >= max_records {
+                return Ok(batch);
+            }
+            if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(batch);
+            }
+
+            // Compute remaining budget.
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(batch);
+            }
+            let remaining = deadline - now;
+
+            match tokio::time::timeout(remaining, self.poll(remaining)).await {
+                Ok(Ok(records)) => {
+                    let mut iter = records.into_iter();
+                    while batch.len() < max_records {
+                        match iter.next() {
+                            Some(r) => batch.push(r),
+                            None => break,
+                        }
+                    }
+                    // Put overflow back into the recv buffer.
+                    let leftover: Vec<_> = iter.collect();
+                    if !leftover.is_empty() {
+                        let mut buffer = self.recv_buffer.lock();
+                        for r in leftover.into_iter().rev() {
+                            buffer.push_front(r);
+                        }
+                        self.metrics.buffered_records.set(buffer.len() as u64);
+                    }
+                    if batch.len() >= max_records {
+                        return Ok(batch);
+                    }
+                }
+                Ok(Err(e)) if self.closed.load(std::sync::atomic::Ordering::SeqCst) => {
+                    let _ = e;
+                    return Ok(batch);
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_elapsed) => return Ok(batch),
             }
         }
     }
@@ -3010,6 +3172,7 @@ impl Consumer {
     ///     println!("{}: {}", record.topic, record.offset);
     /// }
     /// ```
+    #[must_use = "stream does nothing unless polled"]
     pub fn stream(&self) -> ConsumerStream<'_> {
         ConsumerStream::new(self)
     }
@@ -3871,6 +4034,31 @@ impl ConsumerBuilder {
     /// entries will then persist across partial refreshes indefinitely.
     pub fn disable_metadata_topic_cache_ttl(mut self) -> Self {
         self.config.metadata_topic_cache_ttl = None;
+        self
+    }
+
+    /// Set per-partition initial offsets applied before auto-offset-reset.
+    ///
+    /// When a partition is first assigned and has no committed group offset,
+    /// the consumer starts fetching from the given offset instead of applying
+    /// `auto_offset_reset`. Useful for exactly-once recovery.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::collections::HashMap;
+    ///
+    /// Consumer::builder()
+    ///     .bootstrap_servers("localhost:9092")
+    ///     .initial_offsets(HashMap::from([
+    ///         (("orders".to_string(), 0), 1_000),
+    ///         (("orders".to_string(), 1), 2_000),
+    ///     ]))
+    ///     .build()
+    ///     .await?;
+    /// ```
+    pub fn initial_offsets(mut self, offsets: HashMap<(String, PartitionId), Offset>) -> Self {
+        self.config.initial_offsets = offsets;
         self
     }
 

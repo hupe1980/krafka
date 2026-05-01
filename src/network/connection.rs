@@ -173,6 +173,7 @@ use super::secure::{ChallengeResponse, SaslAuthenticator};
 ///
 /// High-priority requests are processed before normal-priority requests,
 /// which is critical for preventing consumer group ejection during backpressure.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestPriority {
     /// High priority for time-critical requests like heartbeats and metadata.

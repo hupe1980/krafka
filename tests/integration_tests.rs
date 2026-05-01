@@ -1804,10 +1804,11 @@ async fn test_consumer_recv() {
     let mut received = Vec::new();
     for _ in 0..3 {
         match tokio::time::timeout(Duration::from_secs(30), consumer.recv()).await {
-            Ok(Ok(Some(record))) => received.push(record),
-            Ok(Ok(None)) => break,
-            Ok(Err(e)) => panic!("recv error: {}", e),
-            Err(_) => break,
+            Ok(Ok(record)) => received.push(record),
+            Ok(Err(krafka::RecvError::Closed)) => break,
+            Ok(Err(krafka::RecvError::Error(e))) => panic!("recv error: {}", e),
+            Ok(Err(_)) => break,
+            Err(_elapsed) => break,
         }
     }
 
