@@ -57,8 +57,8 @@ use bytes::{BufMut, Bytes, BytesMut};
 use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
-use parking_lot::RwLock;
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
+use parking_lot::{Mutex, RwLock};
+use tokio::sync::oneshot;
 
 use crate::error::{KrafkaError, Result};
 
@@ -196,6 +196,12 @@ fn hex_digit(c: u8) -> Option<u8> {
         b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
     }
+}
+
+fn glue_schema_lookup_cancelled_error(id: GlueSchemaVersionId) -> KrafkaError {
+    KrafkaError::invalid_state(format!(
+        "glue schema lookup cancelled before completion for id {id}"
+    ))
 }
 
 /// Compression type used in the AWS Glue wire format.
@@ -565,7 +571,7 @@ pub struct CachedGlueSchemaRegistry<C> {
     /// Optional maximum number of cached entries.
     max_entries: Option<usize>,
     /// Waiters for coalescing concurrent cold misses by schema version ID.
-    in_flight: AsyncMutex<HashMap<GlueSchemaVersionId, Vec<oneshot::Sender<Result<GlueSchema>>>>>,
+    in_flight: Mutex<HashMap<GlueSchemaVersionId, Vec<oneshot::Sender<Result<GlueSchema>>>>>,
 }
 
 impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
@@ -576,7 +582,7 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
             cache: RwLock::new(HashMap::new()),
             insertion_order: RwLock::new(VecDeque::new()),
             max_entries: None,
-            in_flight: AsyncMutex::new(HashMap::new()),
+            in_flight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -587,7 +593,7 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
             cache: RwLock::new(HashMap::with_capacity(capacity)),
             insertion_order: RwLock::new(VecDeque::with_capacity(capacity)),
             max_entries: None,
-            in_flight: AsyncMutex::new(HashMap::new()),
+            in_flight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -601,7 +607,7 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
             cache: RwLock::new(HashMap::with_capacity(max_entries)),
             insertion_order: RwLock::new(VecDeque::with_capacity(max_entries)),
             max_entries: Some(max_entries),
-            in_flight: AsyncMutex::new(HashMap::new()),
+            in_flight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -624,6 +630,110 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
     pub fn clear_cache(&self) {
         self.cache.write().clear();
         self.insertion_order.write().clear();
+    }
+
+    async fn get_schema_by_version_id_impl(&self, id: GlueSchemaVersionId) -> Result<GlueSchema> {
+        // Fast path: read lock only.
+        if let Some(schema) = self.cache.read().get(&id) {
+            return Ok(schema.clone());
+        }
+
+        let waiter_rx = {
+            let mut in_flight = self.in_flight.lock();
+            if let Some(schema) = self.cache.read().get(&id) {
+                return Ok(schema.clone());
+            }
+
+            if let Some(waiters) = in_flight.get_mut(&id) {
+                let (tx, rx) = oneshot::channel();
+                waiters.push(tx);
+                Some(rx)
+            } else {
+                in_flight.insert(id, Vec::new());
+                None
+            }
+        };
+
+        if let Some(rx) = waiter_rx {
+            return rx
+                .await
+                .map_err(|_| glue_schema_lookup_cancelled_error(id))?;
+        }
+
+        struct InFlightGlueFetchGuard<'a> {
+            in_flight:
+                &'a Mutex<HashMap<GlueSchemaVersionId, Vec<oneshot::Sender<Result<GlueSchema>>>>>,
+            id: GlueSchemaVersionId,
+            completed: bool,
+        }
+
+        impl Drop for InFlightGlueFetchGuard<'_> {
+            fn drop(&mut self) {
+                if self.completed {
+                    return;
+                }
+                let waiters = self.in_flight.lock().remove(&self.id).unwrap_or_default();
+                for waiter in waiters {
+                    let _ = waiter.send(Err(glue_schema_lookup_cancelled_error(self.id)));
+                }
+            }
+        }
+
+        let mut guard = InFlightGlueFetchGuard {
+            in_flight: &self.in_flight,
+            id,
+            completed: false,
+        };
+
+        let result = self.inner.get_schema_by_version_id(id).await;
+        if let Ok(schema) = &result {
+            self.insert_cache_entry(id, schema.clone());
+        }
+
+        let waiters = self.in_flight.lock().remove(&id).unwrap_or_default();
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
+        guard.completed = true;
+
+        result
+    }
+
+    async fn register_schema_impl(
+        &self,
+        schema_name: &str,
+        schema: &str,
+        data_format: GlueDataFormat,
+    ) -> Result<GlueSchemaVersionId> {
+        self.inner
+            .register_schema(schema_name, schema, data_format)
+            .await
+    }
+
+    /// Retrieve a schema by its version ID (the UUID from the wire format).
+    ///
+    /// This inherent method mirrors
+    /// [`GlueSchemaRegistryClient::get_schema_by_version_id`] so callers of
+    /// `CachedGlueSchemaRegistry` do not need to import the trait.
+    ///
+    /// Inherent methods intentionally shadow trait methods for the concrete type.
+    /// If you need the boxed trait future shape, call the trait explicitly via UFCS.
+    pub async fn get_schema_by_version_id(&self, id: GlueSchemaVersionId) -> Result<GlueSchema> {
+        self.get_schema_by_version_id_impl(id).await
+    }
+
+    /// Register a schema version under the given schema name.
+    ///
+    /// This inherent method mirrors [`GlueSchemaRegistryClient::register_schema`]
+    /// so callers of `CachedGlueSchemaRegistry` do not need to import the trait.
+    pub async fn register_schema(
+        &self,
+        schema_name: &str,
+        schema: &str,
+        data_format: GlueDataFormat,
+    ) -> Result<GlueSchemaVersionId> {
+        self.register_schema_impl(schema_name, schema, data_format)
+            .await
     }
 
     fn insert_cache_entry(&self, id: GlueSchemaVersionId, schema: GlueSchema) {
@@ -664,41 +774,7 @@ impl<C: GlueSchemaRegistryClient> GlueSchemaRegistryClient for CachedGlueSchemaR
         &self,
         id: GlueSchemaVersionId,
     ) -> Pin<Box<dyn Future<Output = Result<GlueSchema>> + Send + '_>> {
-        Box::pin(async move {
-            // Fast path: read lock only.
-            if let Some(schema) = self.cache.read().get(&id) {
-                return Ok(schema.clone());
-            }
-
-            let mut in_flight = self.in_flight.lock().await;
-            if let Some(schema) = self.cache.read().get(&id) {
-                return Ok(schema.clone());
-            }
-
-            if let Some(waiters) = in_flight.get_mut(&id) {
-                let (tx, rx) = oneshot::channel();
-                waiters.push(tx);
-                drop(in_flight);
-                return rx.await.map_err(|_| {
-                    KrafkaError::invalid_state("glue schema lookup coalescer dropped")
-                })?;
-            }
-
-            in_flight.insert(id, Vec::new());
-            drop(in_flight);
-
-            let result = self.inner.get_schema_by_version_id(id).await;
-            if let Ok(schema) = &result {
-                self.insert_cache_entry(id, schema.clone());
-            }
-
-            let waiters = self.in_flight.lock().await.remove(&id).unwrap_or_default();
-            for waiter in waiters {
-                let _ = waiter.send(result.clone());
-            }
-
-            result
-        })
+        Box::pin(async move { self.get_schema_by_version_id_impl(id).await })
     }
 
     fn register_schema(
@@ -710,8 +786,7 @@ impl<C: GlueSchemaRegistryClient> GlueSchemaRegistryClient for CachedGlueSchemaR
         let schema_name = schema_name.to_string();
         let schema = schema.to_string();
         Box::pin(async move {
-            self.inner
-                .register_schema(&schema_name, &schema, data_format)
+            self.register_schema_impl(&schema_name, &schema, data_format)
                 .await
         })
     }
@@ -1246,6 +1321,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cache_coalescer_cleans_up_when_leader_is_cancelled() {
+        let cached = Arc::new(CachedGlueSchemaRegistry::new(
+            BlockingMockGlueRegistry::new(),
+        ));
+        let id: GlueSchemaVersionId = TEST_UUID_STR.parse().unwrap();
+
+        let first = {
+            let cached = cached.clone();
+            tokio::spawn(async move { cached.get_schema_by_version_id(id).await.unwrap() })
+        };
+
+        cached.inner().wait_started().await;
+        first.abort();
+        tokio::task::yield_now().await;
+
+        let second = {
+            let cached = cached.clone();
+            tokio::spawn(async move { cached.get_schema_by_version_id(id).await.unwrap() })
+        };
+
+        // If cancellation cleanup is broken, this waits forever because second
+        // caller never becomes leader and never reaches the inner mock.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            cached.inner().wait_started(),
+        )
+        .await
+        .expect("second lookup did not reach inner registry");
+
+        cached.inner().release();
+        let schema = tokio::time::timeout(std::time::Duration::from_secs(5), second)
+            .await
+            .expect("second lookup timed out")
+            .expect("second task failed");
+
+        assert_eq!(schema.schema_version_id, id);
+    }
+
+    #[tokio::test]
     async fn test_cache_register_forwards() {
         let mock = MockGlueRegistry::new();
         let cached = CachedGlueSchemaRegistry::new(mock);
@@ -1308,5 +1422,59 @@ mod tests {
         let cached = CachedGlueSchemaRegistry::new(MockGlueRegistry::new());
         let debug = format!("{cached:?}");
         assert!(debug.contains("cache_len"));
+    }
+
+    mod inherent_api_tests {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        use crate::Result;
+        use crate::schema_registry::glue::{
+            CachedGlueSchemaRegistry, GlueDataFormat, GlueSchema, GlueSchemaVersionId,
+        };
+
+        struct InherentMockGlueRegistry;
+
+        impl crate::schema_registry::glue::GlueSchemaRegistryClient for InherentMockGlueRegistry {
+            fn get_schema_by_version_id(
+                &self,
+                id: GlueSchemaVersionId,
+            ) -> Pin<Box<dyn Future<Output = Result<GlueSchema>> + Send + '_>> {
+                Box::pin(async move {
+                    Ok(GlueSchema::new(
+                        id,
+                        GlueDataFormat::Avro,
+                        r#"{"type":"string"}"#,
+                    ))
+                })
+            }
+
+            fn register_schema(
+                &self,
+                _schema_name: &str,
+                _schema: &str,
+                _data_format: GlueDataFormat,
+            ) -> Pin<Box<dyn Future<Output = Result<GlueSchemaVersionId>> + Send + '_>>
+            {
+                let id = "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
+                Box::pin(async move { Ok(id) })
+            }
+        }
+
+        #[tokio::test]
+        async fn cached_glue_registry_methods_work_without_trait_import() {
+            let cached = CachedGlueSchemaRegistry::new(InherentMockGlueRegistry);
+            let version_id: GlueSchemaVersionId =
+                "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
+
+            let schema = cached.get_schema_by_version_id(version_id).await.unwrap();
+            assert_eq!(schema.schema_version_id, version_id);
+
+            let registered = cached
+                .register_schema("orders-value", r#"{"type":"string"}"#, GlueDataFormat::Avro)
+                .await
+                .unwrap();
+            assert_eq!(registered, version_id);
+        }
     }
 }

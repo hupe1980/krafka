@@ -172,6 +172,12 @@ cached.clear_cache();
 let bounded = CachedSchemaRegistry::with_max_entries(other_registry, 1024);
 ```
 
+`CachedSchemaRegistry` and `CachedGlueSchemaRegistry` also provide inherent async methods with the same names as their client traits for ergonomic calls on concrete cached types. If you explicitly need the trait method return shape (`Pin<Box<dyn Future<...>>>`), call through UFCS, for example:
+
+```rust
+let fut = <_ as krafka::schema_registry::SchemaRegistryClient>::get_schema_by_id(&cached, 1);
+```
+
 `CachedGlueSchemaRegistry` follows the same rules for AWS Glue schema version IDs: immutable-ID caching, concurrent miss coalescing, and optional bounded eviction via `with_max_entries()`.
 
 ## Confluent Schema Registry HTTP Client
@@ -400,7 +406,7 @@ krafka = { version = "0.7.0", features = ["aws-glue-schema-registry"] }
 ```rust
 use krafka::schema_registry::glue::{
     AwsGlueSchemaRegistry, CachedGlueSchemaRegistry,
-    decode_glue_wire_format, GlueSchemaRegistryClient,
+    decode_glue_wire_format,
 };
 
 // Create from AWS config
