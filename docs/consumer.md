@@ -708,6 +708,7 @@ async fn consume_stream(consumer: &Consumer) -> Result<()> {
             ),
             Err(RecvError::Closed)   => break,
             Err(RecvError::Error(e)) => return Err(e),
+            Err(_) => break,
         }
     }
     Ok(())
@@ -728,7 +729,10 @@ async fn process_batches(consumer: &Consumer) -> Result<()> {
     loop {
         let batch = consumer.batch_recv(100, Duration::from_millis(200)).await?;
         if batch.is_empty() {
-            break; // consumer closed
+            if consumer.is_closed() {
+                break;
+            }
+            continue; // deadline elapsed without records
         }
         for record in batch {
             println!("offset={}", record.offset);

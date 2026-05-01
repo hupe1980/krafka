@@ -412,6 +412,15 @@ pub fn decode_glue_wire_format(data: &[u8]) -> Result<(GlueSchemaVersionId, Cow<
     Ok((schema_version_id, payload))
 }
 
+/// Decode an AWS Glue wire format message into an owned payload.
+///
+/// This is a convenience wrapper over [`decode_glue_wire_format()`] for callers
+/// that always need owned bytes.
+pub fn decode_glue_wire_format_owned(data: &[u8]) -> Result<(GlueSchemaVersionId, Vec<u8>)> {
+    let (schema_version_id, payload) = decode_glue_wire_format(data)?;
+    Ok((schema_version_id, payload.into_owned()))
+}
+
 /// Decode an AWS Glue wire format message, returning a [`Bytes`] payload.
 ///
 /// For uncompressed payloads, the returned [`Bytes`] shares the same
@@ -1593,7 +1602,7 @@ mod tests {
 
         let id1: GlueSchemaVersionId = TEST_UUID_STR.parse().unwrap();
         let id2: GlueSchemaVersionId = "00000000-0000-0000-0000-000000000001".parse().unwrap();
-        cached.warm_cache(&[id1, id2, id1]).await.unwrap();
+        generic_cache.warm_cache(&[id1, id2, id1]).await.unwrap();
 
         assert_eq!(generic_cache.cache_len(), 2);
         assert!(!generic_cache.cache_is_empty());

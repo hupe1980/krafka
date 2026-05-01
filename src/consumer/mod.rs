@@ -1533,15 +1533,21 @@ impl Consumer {
         // `auto_offset_reset`.
         if !self.config.initial_offsets.is_empty() {
             let mut offsets = self.offsets.write().await;
-            for (topic, partitions) in assigned {
-                for &p in partitions {
-                    let key = (topic.clone(), p);
-                    if let std::collections::hash_map::Entry::Vacant(e) = offsets.entry(key.clone())
-                        && let Some(&initial) = self.config.initial_offsets.get(&key)
-                    {
-                        debug!("Applying initial offset {} for {}-{}", initial, topic, p);
-                        e.insert(initial);
-                    }
+            for ((topic, partition), &initial) in &self.config.initial_offsets {
+                if !assigned
+                    .get(topic)
+                    .is_some_and(|partitions| partitions.contains(partition))
+                {
+                    continue;
+                }
+
+                let key = (topic.clone(), *partition);
+                if let std::collections::hash_map::Entry::Vacant(e) = offsets.entry(key) {
+                    debug!(
+                        "Applying initial offset {} for {}-{}",
+                        initial, topic, partition
+                    );
+                    e.insert(initial);
                 }
             }
         }
@@ -3058,8 +3064,11 @@ impl Consumer {
     /// Collect up to `max_records` records, waiting at most `timeout`.
     ///
     /// Returns as soon as `max_records` have been collected **or** `timeout`
-    /// elapses, whichever comes first.  Returns an empty `Vec` when the
-    /// consumer is closed or no records arrive within the deadline.
+    /// elapses, whichever comes first.
+    ///
+    /// If the consumer closes after some records were already buffered or
+    /// fetched, those records are returned as a partial batch. Returns an
+    /// empty `Vec` only when no records were available before close/deadline.
     ///
     /// Unlike [`poll()`](Self::poll), which performs a single broker fetch
     /// round-trip, `batch_recv` drains the internal record buffer first and
@@ -3068,8 +3077,7 @@ impl Consumer {
     ///
     /// # Errors
     ///
-    /// Returns `Err` on broker or network errors.  A closed consumer returns
-    /// `Ok(vec![])`.
+    /// Returns `Err` on broker or network errors.
     ///
     /// # Example
     ///

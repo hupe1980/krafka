@@ -1807,8 +1807,8 @@ async fn test_consumer_recv() {
             Ok(Ok(record)) => received.push(record),
             Ok(Err(krafka::RecvError::Closed)) => break,
             Ok(Err(krafka::RecvError::Error(e))) => panic!("recv error: {}", e),
-            Ok(Err(_)) => break,
-            Err(_elapsed) => break,
+            Ok(Err(_)) => panic!("unexpected non-exhaustive RecvError variant"),
+            Err(_elapsed) => panic!("recv timed out before collecting expected records"),
         }
     }
 

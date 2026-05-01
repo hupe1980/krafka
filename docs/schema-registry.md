@@ -292,7 +292,7 @@ let client = ConfluentSchemaRegistry::builder()
 // Custom timeout
 let client = ConfluentSchemaRegistry::builder()
     .url("http://localhost:8081")
-    .request_timeout(Some(Duration::from_secs(10)))
+    .request_timeout_duration(Duration::from_secs(10))
     .build()?;
 ```
 

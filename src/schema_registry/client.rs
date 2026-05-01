@@ -582,6 +582,22 @@ impl ConfluentSchemaRegistryBuilder {
         self
     }
 
+    /// Set the HTTP request timeout with a non-optional duration.
+    ///
+    /// Equivalent to calling `request_timeout(Some(timeout))`.
+    pub fn request_timeout_duration(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
+
+    /// Clear any explicit HTTP request timeout override.
+    ///
+    /// Equivalent to calling `request_timeout(None)`.
+    pub fn clear_request_timeout(mut self) -> Self {
+        self.request_timeout = None;
+        self
+    }
+
     /// Build the [`ConfluentSchemaRegistry`] client.
     ///
     /// # Errors
@@ -660,6 +676,27 @@ mod tests {
         let client = ConfluentSchemaRegistryBuilder::default()
             .url("http://localhost:8081")
             .request_timeout(None)
+            .build()
+            .unwrap();
+        assert_eq!(client.base_url, "http://localhost:8081");
+    }
+
+    #[test]
+    fn test_builder_with_request_timeout_duration() {
+        let client = ConfluentSchemaRegistryBuilder::default()
+            .url("http://localhost:8081")
+            .request_timeout_duration(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert_eq!(client.base_url, "http://localhost:8081");
+    }
+
+    #[test]
+    fn test_builder_clear_request_timeout() {
+        let client = ConfluentSchemaRegistryBuilder::default()
+            .url("http://localhost:8081")
+            .request_timeout_duration(Duration::from_secs(2))
+            .clear_request_timeout()
             .build()
             .unwrap();
         assert_eq!(client.base_url, "http://localhost:8081");
