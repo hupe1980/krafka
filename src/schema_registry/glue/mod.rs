@@ -649,9 +649,11 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
         };
 
         if let Some(rx) = waiter_rx {
-            return rx
-                .await
-                .map_err(|_| KrafkaError::invalid_state("glue schema lookup coalescer dropped"))?;
+            return rx.await.map_err(|_| {
+                KrafkaError::invalid_state(format!(
+                    "glue schema lookup cancelled before completion for id {id}"
+                ))
+            })?;
         }
 
         struct InFlightGlueFetchGuard<'a> {
@@ -668,9 +670,10 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
                 }
                 let waiters = self.in_flight.lock().remove(&self.id).unwrap_or_default();
                 for waiter in waiters {
-                    let _ = waiter.send(Err(KrafkaError::invalid_state(
-                        "glue schema lookup cancelled before completion",
-                    )));
+                    let _ = waiter.send(Err(KrafkaError::invalid_state(format!(
+                        "glue schema lookup cancelled before completion for id {}",
+                        self.id
+                    ))));
                 }
             }
         }
