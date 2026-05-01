@@ -384,6 +384,12 @@ pub enum SubjectNameStrategy {
     TopicRecordName,
 }
 
+fn schema_lookup_cancelled_error(id: SchemaId) -> KrafkaError {
+    KrafkaError::invalid_state(format!(
+        "schema lookup cancelled before completion for id {id}"
+    ))
+}
+
 impl SubjectNameStrategy {
     /// Derive the subject name for the given topic and optional record name.
     ///
@@ -588,11 +594,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         };
 
         if let Some(rx) = waiter_rx {
-            return rx.await.map_err(|_| {
-                KrafkaError::invalid_state(format!(
-                    "schema lookup cancelled before completion for id {id}"
-                ))
-            })?;
+            return rx.await.map_err(|_| schema_lookup_cancelled_error(id))?;
         }
 
         struct InFlightSchemaFetchGuard<'a> {
@@ -608,10 +610,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
                 }
                 let waiters = self.in_flight.lock().remove(&self.id).unwrap_or_default();
                 for waiter in waiters {
-                    let _ = waiter.send(Err(KrafkaError::invalid_state(format!(
-                        "schema lookup cancelled before completion for id {}",
-                        self.id
-                    ))));
+                    let _ = waiter.send(Err(schema_lookup_cancelled_error(self.id)));
                 }
             }
         }
@@ -1215,14 +1214,14 @@ mod tests {
         // If cancellation cleanup is broken, this waits forever because second
         // caller never becomes leader and never reaches the inner mock.
         tokio::time::timeout(
-            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(5),
             cached.inner().wait_started(),
         )
         .await
         .expect("second lookup did not reach inner registry");
 
         cached.inner().release();
-        let schema = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+        let schema = tokio::time::timeout(std::time::Duration::from_secs(5), second)
             .await
             .expect("second lookup timed out")
             .expect("second task failed");

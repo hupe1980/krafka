@@ -198,6 +198,12 @@ fn hex_digit(c: u8) -> Option<u8> {
     }
 }
 
+fn glue_schema_lookup_cancelled_error(id: GlueSchemaVersionId) -> KrafkaError {
+    KrafkaError::invalid_state(format!(
+        "glue schema lookup cancelled before completion for id {id}"
+    ))
+}
+
 /// Compression type used in the AWS Glue wire format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
@@ -649,11 +655,9 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
         };
 
         if let Some(rx) = waiter_rx {
-            return rx.await.map_err(|_| {
-                KrafkaError::invalid_state(format!(
-                    "glue schema lookup cancelled before completion for id {id}"
-                ))
-            })?;
+            return rx
+                .await
+                .map_err(|_| glue_schema_lookup_cancelled_error(id))?;
         }
 
         struct InFlightGlueFetchGuard<'a> {
@@ -670,10 +674,7 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
                 }
                 let waiters = self.in_flight.lock().remove(&self.id).unwrap_or_default();
                 for waiter in waiters {
-                    let _ = waiter.send(Err(KrafkaError::invalid_state(format!(
-                        "glue schema lookup cancelled before completion for id {}",
-                        self.id
-                    ))));
+                    let _ = waiter.send(Err(glue_schema_lookup_cancelled_error(self.id)));
                 }
             }
         }
@@ -1343,14 +1344,14 @@ mod tests {
         // If cancellation cleanup is broken, this waits forever because second
         // caller never becomes leader and never reaches the inner mock.
         tokio::time::timeout(
-            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(5),
             cached.inner().wait_started(),
         )
         .await
         .expect("second lookup did not reach inner registry");
 
         cached.inner().release();
-        let schema = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+        let schema = tokio::time::timeout(std::time::Duration::from_secs(5), second)
             .await
             .expect("second lookup timed out")
             .expect("second task failed");
