@@ -626,13 +626,60 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
         self.insertion_order.write().clear();
     }
 
+    async fn get_schema_by_version_id_impl(&self, id: GlueSchemaVersionId) -> Result<GlueSchema> {
+        // Fast path: read lock only.
+        if let Some(schema) = self.cache.read().get(&id) {
+            return Ok(schema.clone());
+        }
+
+        let mut in_flight = self.in_flight.lock().await;
+        if let Some(schema) = self.cache.read().get(&id) {
+            return Ok(schema.clone());
+        }
+
+        if let Some(waiters) = in_flight.get_mut(&id) {
+            let (tx, rx) = oneshot::channel();
+            waiters.push(tx);
+            drop(in_flight);
+            return rx
+                .await
+                .map_err(|_| KrafkaError::invalid_state("glue schema lookup coalescer dropped"))?;
+        }
+
+        in_flight.insert(id, Vec::new());
+        drop(in_flight);
+
+        let result = self.inner.get_schema_by_version_id(id).await;
+        if let Ok(schema) = &result {
+            self.insert_cache_entry(id, schema.clone());
+        }
+
+        let waiters = self.in_flight.lock().await.remove(&id).unwrap_or_default();
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
+
+        result
+    }
+
+    async fn register_schema_impl(
+        &self,
+        schema_name: &str,
+        schema: &str,
+        data_format: GlueDataFormat,
+    ) -> Result<GlueSchemaVersionId> {
+        self.inner
+            .register_schema(schema_name, schema, data_format)
+            .await
+    }
+
     /// Retrieve a schema by its version ID (the UUID from the wire format).
     ///
     /// This inherent method mirrors
     /// [`GlueSchemaRegistryClient::get_schema_by_version_id`] so callers of
     /// `CachedGlueSchemaRegistry` do not need to import the trait.
     pub async fn get_schema_by_version_id(&self, id: GlueSchemaVersionId) -> Result<GlueSchema> {
-        <Self as GlueSchemaRegistryClient>::get_schema_by_version_id(self, id).await
+        self.get_schema_by_version_id_impl(id).await
     }
 
     /// Register a schema version under the given schema name.
@@ -645,7 +692,7 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
         schema: &str,
         data_format: GlueDataFormat,
     ) -> Result<GlueSchemaVersionId> {
-        <Self as GlueSchemaRegistryClient>::register_schema(self, schema_name, schema, data_format)
+        self.register_schema_impl(schema_name, schema, data_format)
             .await
     }
 
@@ -687,41 +734,7 @@ impl<C: GlueSchemaRegistryClient> GlueSchemaRegistryClient for CachedGlueSchemaR
         &self,
         id: GlueSchemaVersionId,
     ) -> Pin<Box<dyn Future<Output = Result<GlueSchema>> + Send + '_>> {
-        Box::pin(async move {
-            // Fast path: read lock only.
-            if let Some(schema) = self.cache.read().get(&id) {
-                return Ok(schema.clone());
-            }
-
-            let mut in_flight = self.in_flight.lock().await;
-            if let Some(schema) = self.cache.read().get(&id) {
-                return Ok(schema.clone());
-            }
-
-            if let Some(waiters) = in_flight.get_mut(&id) {
-                let (tx, rx) = oneshot::channel();
-                waiters.push(tx);
-                drop(in_flight);
-                return rx.await.map_err(|_| {
-                    KrafkaError::invalid_state("glue schema lookup coalescer dropped")
-                })?;
-            }
-
-            in_flight.insert(id, Vec::new());
-            drop(in_flight);
-
-            let result = self.inner.get_schema_by_version_id(id).await;
-            if let Ok(schema) = &result {
-                self.insert_cache_entry(id, schema.clone());
-            }
-
-            let waiters = self.in_flight.lock().await.remove(&id).unwrap_or_default();
-            for waiter in waiters {
-                let _ = waiter.send(result.clone());
-            }
-
-            result
-        })
+        Box::pin(async move { self.get_schema_by_version_id_impl(id).await })
     }
 
     fn register_schema(
@@ -733,8 +746,7 @@ impl<C: GlueSchemaRegistryClient> GlueSchemaRegistryClient for CachedGlueSchemaR
         let schema_name = schema_name.to_string();
         let schema = schema.to_string();
         Box::pin(async move {
-            self.inner
-                .register_schema(&schema_name, &schema, data_format)
+            self.register_schema_impl(&schema_name, &schema, data_format)
                 .await
         })
     }

@@ -565,12 +565,77 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         self.insertion_order.write().clear();
     }
 
+    async fn get_schema_by_id_impl(&self, id: SchemaId) -> Result<Schema> {
+        // Fast path: read lock only.
+        if let Some(schema) = self.cache.read().get(&id) {
+            return Ok(schema.clone());
+        }
+
+        let mut in_flight = self.in_flight.lock().await;
+        if let Some(schema) = self.cache.read().get(&id) {
+            return Ok(schema.clone());
+        }
+
+        if let Some(waiters) = in_flight.get_mut(&id) {
+            let (tx, rx) = oneshot::channel();
+            waiters.push(tx);
+            drop(in_flight);
+            return rx
+                .await
+                .map_err(|_| KrafkaError::invalid_state("schema lookup coalescer dropped"))?;
+        }
+
+        in_flight.insert(id, Vec::new());
+        drop(in_flight);
+
+        let result = self.inner.get_schema_by_id(id).await;
+        if let Ok(schema) = &result {
+            self.insert_cache_entry(id, schema.clone());
+        }
+
+        let waiters = self.in_flight.lock().await.remove(&id).unwrap_or_default();
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
+
+        result
+    }
+
+    async fn get_latest_schema_impl(&self, subject: &str) -> Result<Schema> {
+        // Always forward (latest may change), but cache by ID.
+        let schema = self.inner.get_latest_schema(subject).await?;
+        self.insert_cache_entry(schema.id, schema.clone());
+        Ok(schema)
+    }
+
+    async fn get_schema_by_version_impl(
+        &self,
+        subject: &str,
+        version: SchemaVersion,
+    ) -> Result<Schema> {
+        let schema = self.inner.get_schema_by_version(subject, version).await?;
+        self.insert_cache_entry(schema.id, schema.clone());
+        Ok(schema)
+    }
+
+    async fn register_schema_impl(
+        &self,
+        subject: &str,
+        schema: &str,
+        schema_type: SchemaType,
+        references: &[SchemaReference],
+    ) -> Result<SchemaId> {
+        self.inner
+            .register_schema(subject, schema, schema_type, references)
+            .await
+    }
+
     /// Retrieve a schema by its globally unique ID.
     ///
     /// This inherent method mirrors [`SchemaRegistryClient::get_schema_by_id`]
     /// so callers of `CachedSchemaRegistry` do not need to import the trait.
     pub async fn get_schema_by_id(&self, id: SchemaId) -> Result<Schema> {
-        <Self as SchemaRegistryClient>::get_schema_by_id(self, id).await
+        self.get_schema_by_id_impl(id).await
     }
 
     /// Retrieve the latest schema registered under the given subject.
@@ -578,7 +643,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
     /// This inherent method mirrors [`SchemaRegistryClient::get_latest_schema`]
     /// so callers of `CachedSchemaRegistry` do not need to import the trait.
     pub async fn get_latest_schema(&self, subject: &str) -> Result<Schema> {
-        <Self as SchemaRegistryClient>::get_latest_schema(self, subject).await
+        self.get_latest_schema_impl(subject).await
     }
 
     /// Retrieve a specific version of a schema under a subject.
@@ -590,7 +655,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         subject: &str,
         version: SchemaVersion,
     ) -> Result<Schema> {
-        <Self as SchemaRegistryClient>::get_schema_by_version(self, subject, version).await
+        self.get_schema_by_version_impl(subject, version).await
     }
 
     /// Register a schema under the given subject.
@@ -604,14 +669,8 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         schema_type: SchemaType,
         references: &[SchemaReference],
     ) -> Result<SchemaId> {
-        <Self as SchemaRegistryClient>::register_schema(
-            self,
-            subject,
-            schema,
-            schema_type,
-            references,
-        )
-        .await
+        self.register_schema_impl(subject, schema, schema_type, references)
+            .await
     }
 
     fn insert_cache_entry(&self, id: SchemaId, schema: Schema) {
@@ -652,41 +711,7 @@ impl<C: SchemaRegistryClient> SchemaRegistryClient for CachedSchemaRegistry<C> {
         &self,
         id: SchemaId,
     ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
-        Box::pin(async move {
-            // Fast path: read lock only.
-            if let Some(schema) = self.cache.read().get(&id) {
-                return Ok(schema.clone());
-            }
-
-            let mut in_flight = self.in_flight.lock().await;
-            if let Some(schema) = self.cache.read().get(&id) {
-                return Ok(schema.clone());
-            }
-
-            if let Some(waiters) = in_flight.get_mut(&id) {
-                let (tx, rx) = oneshot::channel();
-                waiters.push(tx);
-                drop(in_flight);
-                return rx
-                    .await
-                    .map_err(|_| KrafkaError::invalid_state("schema lookup coalescer dropped"))?;
-            }
-
-            in_flight.insert(id, Vec::new());
-            drop(in_flight);
-
-            let result = self.inner.get_schema_by_id(id).await;
-            if let Ok(schema) = &result {
-                self.insert_cache_entry(id, schema.clone());
-            }
-
-            let waiters = self.in_flight.lock().await.remove(&id).unwrap_or_default();
-            for waiter in waiters {
-                let _ = waiter.send(result.clone());
-            }
-
-            result
-        })
+        Box::pin(async move { self.get_schema_by_id_impl(id).await })
     }
 
     fn get_latest_schema(
@@ -694,12 +719,7 @@ impl<C: SchemaRegistryClient> SchemaRegistryClient for CachedSchemaRegistry<C> {
         subject: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
         let subject = subject.to_string();
-        Box::pin(async move {
-            // Always forward (latest may change), but cache by ID.
-            let schema = self.inner.get_latest_schema(&subject).await?;
-            self.insert_cache_entry(schema.id, schema.clone());
-            Ok(schema)
-        })
+        Box::pin(async move { self.get_latest_schema_impl(&subject).await })
     }
 
     fn get_schema_by_version(
@@ -708,11 +728,7 @@ impl<C: SchemaRegistryClient> SchemaRegistryClient for CachedSchemaRegistry<C> {
         version: SchemaVersion,
     ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
         let subject = subject.to_string();
-        Box::pin(async move {
-            let schema = self.inner.get_schema_by_version(&subject, version).await?;
-            self.insert_cache_entry(schema.id, schema.clone());
-            Ok(schema)
-        })
+        Box::pin(async move { self.get_schema_by_version_impl(&subject, version).await })
     }
 
     fn register_schema(
@@ -726,8 +742,7 @@ impl<C: SchemaRegistryClient> SchemaRegistryClient for CachedSchemaRegistry<C> {
         let schema = schema.to_string();
         let references = references.to_vec();
         Box::pin(async move {
-            self.inner
-                .register_schema(&subject, &schema, schema_type, &references)
+            self.register_schema_impl(&subject, &schema, schema_type, &references)
                 .await
         })
     }
