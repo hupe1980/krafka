@@ -559,6 +559,10 @@ impl<'a> SchemaDecoder<'a> {
     /// - Confluent (`0x00`): decodes schema ID and fetches via Confluent client.
     /// - Glue (`0x03`): decodes schema version ID and fetches via Glue client.
     /// - Unknown framing: returns payload as-is with `SchemaFormat::Unknown`.
+    ///
+    /// Returns an error if the first byte matches a known framing magic byte
+    /// but the header is truncated or otherwise malformed, so that data
+    /// corruption is not silently hidden from callers.
     pub async fn decode(&self, data: &[u8]) -> Result<DecodedMessage> {
         match detect_wire_format(data) {
             DetectedWireFormat::Confluent { schema_id, .. } => {
@@ -593,11 +597,29 @@ impl<'a> SchemaDecoder<'a> {
                     schema_metadata: Some(SchemaMetadata::Glue(schema)),
                 })
             }
-            DetectedWireFormat::Unknown => Ok(DecodedMessage {
-                schema_format: SchemaFormat::Unknown,
-                payload: data.to_vec(),
-                schema_metadata: None,
-            }),
+            DetectedWireFormat::Unknown => {
+                // If the first byte looks like a known framing magic byte but
+                // detect_wire_format() returned Unknown, the header is truncated
+                // or malformed. Return an error instead of silently treating the
+                // data as a raw payload, which would hide data corruption.
+                if let Some(&first) = data.first() {
+                    if first == MAGIC_BYTE {
+                        return Err(KrafkaError::serialization(
+                            "malformed Confluent wire format: header too short or invalid",
+                        ));
+                    }
+                    if first == glue::GLUE_HEADER_VERSION_BYTE {
+                        return Err(KrafkaError::serialization(
+                            "malformed Glue wire format: header too short or invalid compression byte",
+                        ));
+                    }
+                }
+                Ok(DecodedMessage {
+                    schema_format: SchemaFormat::Unknown,
+                    payload: data.to_vec(),
+                    schema_metadata: None,
+                })
+            }
         }
     }
 }
@@ -1348,6 +1370,39 @@ mod tests {
             err(result)
                 .to_string()
                 .contains("missing Confluent registry")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_schema_decoder_truncated_confluent_header_is_error() {
+        // Only 3 bytes — Confluent header needs 5. First byte is 0x00 (magic),
+        // so detect_wire_format returns Unknown; decode() must reject it.
+        let decoder = SchemaDecoder::new();
+        let truncated = [MAGIC_BYTE, 0x00, 0x01];
+        let result = decoder.decode(&truncated).await;
+        assert!(
+            result.is_err(),
+            "expected error for truncated Confluent header"
+        );
+        assert!(
+            err(result)
+                .to_string()
+                .contains("malformed Confluent wire format"),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_schema_decoder_truncated_glue_header_is_error() {
+        // Only 4 bytes — Glue header needs 18. First byte is 0x03 (version),
+        // so detect_wire_format returns Unknown; decode() must reject it.
+        let decoder = SchemaDecoder::new();
+        let truncated = [glue::GLUE_HEADER_VERSION_BYTE, 0x00, 0x01, 0x02];
+        let result = decoder.decode(&truncated).await;
+        assert!(result.is_err(), "expected error for truncated Glue header");
+        assert!(
+            err(result)
+                .to_string()
+                .contains("malformed Glue wire format"),
         );
     }
 
