@@ -629,11 +629,6 @@ impl ConsumerConfigBuilder {
         self
     }
 
-    /// Build the config.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if timing or value constraints are violated:
     /// Set per-partition initial offsets applied before auto-offset-reset.
     ///
     /// When a partition is first assigned and has no committed group offset,
@@ -659,6 +654,11 @@ impl ConsumerConfigBuilder {
         self
     }
 
+    /// Build the config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if timing or value constraints are violated:
     /// - `heartbeat_interval` must be less than `session_timeout`
     /// - `session_timeout` must be less than or equal to `max_poll_interval`
     /// - `max_buffered_records` must be >= 0 (0 disables the cap)

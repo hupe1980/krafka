@@ -120,6 +120,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock};
@@ -390,6 +391,10 @@ pub enum DetectedWireFormat {
         /// Offset where payload bytes start.
         payload_offset: usize,
     },
+    /// Looks like Confluent framing (`0x00`) but header is invalid/truncated.
+    InvalidConfluent,
+    /// Looks like Glue framing (`0x03`) but header is invalid/truncated.
+    InvalidGlue,
     /// Unknown or invalid wire format.
     Unknown,
 }
@@ -406,9 +411,14 @@ pub fn detect_wire_format(data: &[u8]) -> DetectedWireFormat {
     match data[0] {
         MAGIC_BYTE => {
             if data.len() < HEADER_SIZE {
-                return DetectedWireFormat::Unknown;
+                return DetectedWireFormat::InvalidConfluent;
             }
             let schema_id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+            // Treat schema ID 0 as unknown framing to reduce false positives
+            // for arbitrary raw payloads beginning with 0x00.
+            if schema_id == 0 {
+                return DetectedWireFormat::Unknown;
+            }
             DetectedWireFormat::Confluent {
                 schema_id,
                 payload_offset: HEADER_SIZE,
@@ -418,17 +428,24 @@ pub fn detect_wire_format(data: &[u8]) -> DetectedWireFormat {
         // Constants are defined (and validated) in schema_registry::glue.
         glue::GLUE_HEADER_VERSION_BYTE => {
             if data.len() < glue::GLUE_HEADER_SIZE {
-                return DetectedWireFormat::Unknown;
+                return DetectedWireFormat::InvalidGlue;
             }
             let compression = data[1];
             if compression != glue::GLUE_COMPRESSION_NONE_BYTE
                 && compression != glue::GLUE_COMPRESSION_ZLIB_BYTE
             {
-                return DetectedWireFormat::Unknown;
+                return DetectedWireFormat::InvalidGlue;
             }
 
             let mut version_bytes = [0u8; 16];
             version_bytes.copy_from_slice(&data[2..glue::GLUE_HEADER_SIZE]);
+            // Heuristic guard: require RFC 4122 version/variant bits so random
+            // raw payloads are less likely to be misclassified as Glue-framed.
+            let version = (version_bytes[6] & 0xF0) >> 4;
+            let rfc4122_variant = (version_bytes[8] & 0xC0) == 0x80;
+            if !(1..=5).contains(&version) || !rfc4122_variant {
+                return DetectedWireFormat::Unknown;
+            }
             DetectedWireFormat::Glue {
                 version_id: GlueSchemaVersionId::from_bytes(version_bytes),
                 payload_offset: glue::GLUE_HEADER_SIZE,
@@ -559,10 +576,7 @@ impl<'a> SchemaDecoder<'a> {
     /// - Confluent (`0x00`): decodes schema ID and fetches via Confluent client.
     /// - Glue (`0x03`): decodes schema version ID and fetches via Glue client.
     /// - Unknown framing: returns payload as-is with `SchemaFormat::Unknown`.
-    ///
-    /// Returns an error if the first byte matches a known framing magic byte
-    /// but the header is truncated or otherwise malformed, so that data
-    /// corruption is not silently hidden from callers.
+    /// - Invalid/truncated known framing: returns a serialization error.
     pub async fn decode(&self, data: &[u8]) -> Result<DecodedMessage> {
         match detect_wire_format(data) {
             DetectedWireFormat::Confluent { schema_id, .. } => {
@@ -597,29 +611,17 @@ impl<'a> SchemaDecoder<'a> {
                     schema_metadata: Some(SchemaMetadata::Glue(schema)),
                 })
             }
-            DetectedWireFormat::Unknown => {
-                // If the first byte looks like a known framing magic byte but
-                // detect_wire_format() returned Unknown, the header is truncated
-                // or malformed. Return an error instead of silently treating the
-                // data as a raw payload, which would hide data corruption.
-                if let Some(&first) = data.first() {
-                    if first == MAGIC_BYTE {
-                        return Err(KrafkaError::serialization(
-                            "malformed Confluent wire format: header too short or invalid",
-                        ));
-                    }
-                    if first == glue::GLUE_HEADER_VERSION_BYTE {
-                        return Err(KrafkaError::serialization(
-                            "malformed Glue wire format: header too short or invalid compression byte",
-                        ));
-                    }
-                }
-                Ok(DecodedMessage {
-                    schema_format: SchemaFormat::Unknown,
-                    payload: data.to_vec(),
-                    schema_metadata: None,
-                })
-            }
+            DetectedWireFormat::InvalidConfluent => Err(KrafkaError::serialization(
+                "malformed Confluent wire format: header too short or invalid",
+            )),
+            DetectedWireFormat::InvalidGlue => Err(KrafkaError::serialization(
+                "malformed Glue wire format: header too short or invalid compression byte",
+            )),
+            DetectedWireFormat::Unknown => Ok(DecodedMessage {
+                schema_format: SchemaFormat::Unknown,
+                payload: data.to_vec(),
+                schema_metadata: None,
+            }),
         }
     }
 }
@@ -808,6 +810,9 @@ pub struct CachedSchemaRegistry<C> {
     insertion_order: RwLock<VecDeque<SchemaId>>,
     /// Optional maximum number of cached entries.
     max_entries: Option<usize>,
+    /// Monotonic cache epoch used to prevent stale in-flight inserts after
+    /// invalidation under contention.
+    cache_epoch: AtomicU64,
     /// Waiters for coalescing concurrent cold misses by schema ID.
     in_flight: Mutex<HashMap<SchemaId, Vec<oneshot::Sender<Result<Schema>>>>>,
 }
@@ -820,6 +825,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             cache: RwLock::new(HashMap::new()),
             insertion_order: RwLock::new(VecDeque::new()),
             max_entries: None,
+            cache_epoch: AtomicU64::new(0),
             in_flight: Mutex::new(HashMap::new()),
         }
     }
@@ -831,6 +837,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             cache: RwLock::new(HashMap::with_capacity(capacity)),
             insertion_order: RwLock::new(VecDeque::with_capacity(capacity)),
             max_entries: None,
+            cache_epoch: AtomicU64::new(0),
             in_flight: Mutex::new(HashMap::new()),
         }
     }
@@ -845,6 +852,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             cache: RwLock::new(HashMap::with_capacity(max_entries)),
             insertion_order: RwLock::new(VecDeque::with_capacity(max_entries)),
             max_entries: Some(max_entries),
+            cache_epoch: AtomicU64::new(0),
             in_flight: Mutex::new(HashMap::new()),
         }
     }
@@ -872,15 +880,31 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
 
     /// Remove a single schema ID from the cache.
     pub fn invalidate(&self, schema_id: SchemaId) {
+        self.cache_epoch.fetch_add(1, Ordering::SeqCst);
         self.cache.write().remove(&schema_id);
         self.insertion_order
             .write()
             .retain(|cached_id| *cached_id != schema_id);
+
+        // Cancel any coalesced waiters so invalidation is observable immediately.
+        let waiters = self.in_flight.lock().remove(&schema_id).unwrap_or_default();
+        for waiter in waiters {
+            let _ = waiter.send(Err(schema_lookup_cancelled_error(schema_id)));
+        }
     }
 
     /// Remove all cached schemas.
     pub fn invalidate_all(&self) {
+        self.cache_epoch.fetch_add(1, Ordering::SeqCst);
         self.clear_cache();
+
+        // Cancel all in-flight lookups so no stale insertions survive reset.
+        let mut in_flight = self.in_flight.lock();
+        for (id, waiters) in in_flight.drain() {
+            for waiter in waiters {
+                let _ = waiter.send(Err(schema_lookup_cancelled_error(id)));
+            }
+        }
     }
 
     /// Pre-fetch a set of schema IDs into the cache.
@@ -949,10 +973,37 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             completed: false,
         };
 
+        let fetch_epoch = self.cache_epoch.load(Ordering::SeqCst);
         let result = self.inner.get_schema_by_id(id).await;
         if let Ok(schema) = &result {
-            debug!(schema_id = id, "schema cache miss — fetched from registry");
-            self.insert_cache_entry(id, schema.clone());
+            // Guard against invalidate()/invalidate_all() races while this
+            // request was in flight.
+            let mut cache = self.cache.write();
+            if self.cache_epoch.load(Ordering::SeqCst) == fetch_epoch {
+                debug!(schema_id = id, "schema cache miss — fetched from registry");
+                // Inline insertion to reuse the held cache write lock.
+                if let Some(existing) = cache.get_mut(&id) {
+                    *existing = schema.clone();
+                } else {
+                    if let Some(max_entries) = self.max_entries {
+                        let mut insertion_order = self.insertion_order.write();
+                        if cache.len() >= max_entries
+                            && let Some(evicted) = insertion_order.pop_front()
+                        {
+                            cache.remove(&evicted);
+                        }
+                        insertion_order.push_back(id);
+                    } else {
+                        self.insertion_order.write().push_back(id);
+                    }
+                    cache.insert(id, schema.clone());
+                }
+            } else {
+                debug!(
+                    schema_id = id,
+                    "schema fetch completed after invalidation; skipping cache insert"
+                );
+            }
         }
 
         let waiters = self.in_flight.lock().remove(&id).unwrap_or_default();
@@ -1281,6 +1332,40 @@ mod tests {
             detect_wire_format(&[0x99, 0x00, 0x00]),
             DetectedWireFormat::Unknown
         );
+        // Schema ID 0 is treated as unknown to reduce false positives for
+        // arbitrary raw payloads starting with 0x00.
+        assert_eq!(
+            detect_wire_format(&[MAGIC_BYTE, 0x00, 0x00, 0x00, 0x00, 0x41]),
+            DetectedWireFormat::Unknown
+        );
+    }
+
+    #[test]
+    fn test_detect_wire_format_invalid_known_headers() {
+        assert_eq!(
+            detect_wire_format(&[MAGIC_BYTE, 0x01, 0x02]),
+            DetectedWireFormat::InvalidConfluent
+        );
+        assert_eq!(
+            detect_wire_format(&[
+                glue::GLUE_HEADER_VERSION_BYTE,
+                glue::GLUE_COMPRESSION_NONE_BYTE
+            ]),
+            DetectedWireFormat::InvalidGlue
+        );
+    }
+
+    #[test]
+    fn test_detect_wire_format_glue_requires_rfc4122_uuid_bits() {
+        // Header is structurally valid but UUID bytes do not satisfy RFC 4122
+        // version/variant bits, so classify as Unknown to reduce false positives.
+        let mut data = vec![0u8; glue::GLUE_HEADER_SIZE + 1];
+        data[0] = glue::GLUE_HEADER_VERSION_BYTE;
+        data[1] = glue::GLUE_COMPRESSION_NONE_BYTE;
+        data[2 + 6] = 0x00; // version nibble = 0 (invalid)
+        data[2 + 8] = 0x00; // variant bits != 10xxxxxx (invalid)
+
+        assert_eq!(detect_wire_format(&data), DetectedWireFormat::Unknown);
     }
 
     struct DecoderMockGlueRegistry;
@@ -1718,6 +1803,42 @@ mod tests {
         assert_eq!(cached.inner().get_by_id_call_count(), 2);
         ok(cached.get_schema_by_id(1).await);
         assert_eq!(cached.inner().get_by_id_call_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_cache_invalidate_does_not_repopulate_from_inflight_fetch() {
+        let cached = Arc::new(CachedSchemaRegistry::new(BlockingMockRegistry::new()));
+
+        let first = {
+            let cached = cached.clone();
+            tokio::spawn(async move { ok(cached.get_schema_by_id(7).await) })
+        };
+
+        cached.inner().wait_started().await;
+        cached.invalidate(7);
+        {
+            let cached = cached.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                cached.inner().release();
+            });
+        }
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), first)
+            .await
+            .expect("in-flight fetch did not complete")
+            .expect("in-flight task failed");
+        assert_eq!(cached.cache_len(), 0);
+
+        // Must fetch again because invalidation prevented stale re-population.
+        let second = {
+            let cached = cached.clone();
+            tokio::spawn(async move { ok(cached.get_schema_by_id(7).await) })
+        };
+        cached.inner().wait_started().await;
+        cached.inner().release();
+        let _ = join_ok(second.await);
+        assert_eq!(cached.inner().get_by_id_call_count(), 2);
     }
 
     #[tokio::test]

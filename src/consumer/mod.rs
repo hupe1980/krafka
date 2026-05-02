@@ -3170,6 +3170,7 @@ impl Consumer {
 
             match tokio::time::timeout(remaining, self.poll(remaining)).await {
                 Ok(Ok(records)) => {
+                    let before_len = batch.len();
                     let mut iter = records.into_iter();
                     while batch.len() < max_records {
                         match iter.next() {
@@ -3188,6 +3189,12 @@ impl Consumer {
                     }
                     if batch.len() >= max_records {
                         return Ok(batch);
+                    }
+                    // Avoid a tight busy loop when poll() returns quickly with
+                    // no records (e.g., no assignment, rebalance, or buffer cap).
+                    if batch.len() == before_len {
+                        let backoff = remaining.min(Duration::from_millis(10));
+                        tokio::time::sleep(backoff).await;
                     }
                 }
                 Ok(Err(e)) if self.closed.load(std::sync::atomic::Ordering::SeqCst) => {
