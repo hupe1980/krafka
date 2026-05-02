@@ -408,7 +408,7 @@ where
                     tokio::time::sleep(backoff).await;
                 }
             }
-            Ok(Err(e)) if is_closed() => {
+            Ok(Err(_)) if is_closed() => {
                 return if batch.is_empty() {
                     Ok(BatchRecvOutcome::Closed)
                 } else {
