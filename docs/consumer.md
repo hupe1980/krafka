@@ -718,24 +718,26 @@ async fn consume_stream(consumer: &Consumer) -> Result<()> {
 ### High-Throughput Batch Receive
 
 `batch_recv(max_records, timeout)` collects up to `max_records` in one call,
-returning as soon as the limit is reached or `timeout` elapses:
+returning an explicit [`BatchRecvOutcome`] so timeout/close/empty-request are
+unambiguous:
 
 ```rust
 use std::time::Duration;
-use krafka::consumer::Consumer;
+use krafka::consumer::{BatchRecvOutcome, Consumer};
 use krafka::error::Result;
 
 async fn process_batches(consumer: &Consumer) -> Result<()> {
     loop {
-        let batch = consumer.batch_recv(100, Duration::from_millis(200)).await?;
-        if batch.is_empty() {
-            if consumer.is_closed() {
-                break;
+        match consumer.batch_recv(100, Duration::from_millis(200)).await? {
+            BatchRecvOutcome::Records(batch) => {
+                for record in batch {
+                    println!("offset={}", record.offset);
+                }
             }
-            continue; // deadline elapsed without records
-        }
-        for record in batch {
-            println!("offset={}", record.offset);
+            BatchRecvOutcome::TimedOut => continue,
+            BatchRecvOutcome::Closed => break,
+            BatchRecvOutcome::EmptyRequest => continue,
+            _ => continue,
         }
     }
     Ok(())

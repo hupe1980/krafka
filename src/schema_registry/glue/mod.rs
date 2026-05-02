@@ -1226,6 +1226,24 @@ mod tests {
         assert!(payload.is_empty());
     }
 
+    #[test]
+    fn test_wire_format_borrowed_uncompressed_returns_borrowed() {
+        let id: GlueSchemaVersionId = TEST_UUID_STR.parse().unwrap();
+        let encoded = encode_glue_wire_format(id, b"borrowed", GlueCompression::None).unwrap();
+        let (_, payload) = decode_glue_wire_format_borrowed(&encoded).unwrap();
+        assert!(matches!(payload, Cow::Borrowed(_)));
+        assert_eq!(payload.as_ref(), b"borrowed");
+    }
+
+    #[test]
+    fn test_wire_format_borrowed_zlib_returns_owned() {
+        let id: GlueSchemaVersionId = TEST_UUID_STR.parse().unwrap();
+        let encoded = encode_glue_wire_format(id, b"owned", GlueCompression::Zlib).unwrap();
+        let (_, payload) = decode_glue_wire_format_borrowed(&encoded).unwrap();
+        assert!(matches!(payload, Cow::Owned(_)));
+        assert_eq!(payload.as_ref(), b"owned");
+    }
+
     // ── Wire format (Bytes variant) ──────────────────────────────────────
 
     #[test]

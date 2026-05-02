@@ -437,14 +437,6 @@ pub fn detect_wire_format(data: &[u8]) -> DetectedWireFormat {
 
             let mut version_bytes = [0u8; 16];
             version_bytes.copy_from_slice(&data[2..glue::GLUE_HEADER_SIZE]);
-            // Heuristic guard: require RFC 9562 version/variant bits so random
-            // raw payloads are less likely to be misclassified as Glue-framed.
-            // Versions 1–8 are assigned by RFC 4122 and RFC 9562 (v6/v7/v8).
-            let version = (version_bytes[6] & 0xF0) >> 4;
-            let rfc4122_variant = (version_bytes[8] & 0xC0) == 0x80;
-            if !(1..=8).contains(&version) || !rfc4122_variant {
-                return DetectedWireFormat::Unknown;
-            }
             DetectedWireFormat::Glue {
                 version_id: GlueSchemaVersionId::from_bytes(version_bytes),
                 payload_offset: glue::GLUE_HEADER_SIZE,
@@ -1407,16 +1399,24 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_wire_format_glue_requires_rfc4122_uuid_bits() {
-        // Header is structurally valid but UUID bytes do not satisfy RFC 4122
-        // version/variant bits, so classify as Unknown to reduce false positives.
-        let mut data = vec![0u8; glue::GLUE_HEADER_SIZE + 1];
-        data[0] = glue::GLUE_HEADER_VERSION_BYTE;
-        data[1] = glue::GLUE_COMPRESSION_NONE_BYTE;
-        data[2 + 6] = 0x00; // version nibble = 0 (invalid)
-        data[2 + 8] = 0x00; // variant bits != 10xxxxxx (invalid)
+    fn test_detect_wire_format_glue_accepts_non_rfc_uuid_layout() {
+        // Structurally valid Glue framing with a nil UUID should still be
+        // classified as Glue so it can be decoded symmetrically.
+        let nil: GlueSchemaVersionId = "00000000-0000-0000-0000-000000000000".parse().unwrap();
+        let encoded = crate::schema_registry::glue::encode_glue_wire_format(
+            nil,
+            b"data",
+            crate::schema_registry::glue::GlueCompression::None,
+        )
+        .unwrap();
 
-        assert_eq!(detect_wire_format(&data), DetectedWireFormat::Unknown);
+        assert_eq!(
+            detect_wire_format(&encoded),
+            DetectedWireFormat::Glue {
+                version_id: nil,
+                payload_offset: glue::GLUE_HEADER_SIZE,
+            }
+        );
     }
 
     struct DecoderMockGlueRegistry;

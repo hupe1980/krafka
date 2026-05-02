@@ -61,6 +61,7 @@ pub use record::{ConsumerRecord, ConsumerRecords, TopicPartition};
 pub use stream::ConsumerStream;
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -178,6 +179,20 @@ pub struct FetchMetadataResult {
     pub topics: Vec<TopicInfo>,
 }
 
+/// Outcome of [`Consumer::batch_recv`].
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum BatchRecvOutcome {
+    /// Records were collected (possibly a partial batch).
+    Records(Vec<ConsumerRecord>),
+    /// The timeout elapsed before any records were collected.
+    TimedOut,
+    /// The consumer closed before any records were collected.
+    Closed,
+    /// The call requested zero records (`max_records == 0`).
+    EmptyRequest,
+}
+
 /// A Kafka consumer.
 pub struct Consumer {
     /// Consumer configuration.
@@ -260,6 +275,168 @@ fn compute_aggregate_lag(
         }
     }
     (total_lag, max_lag)
+}
+
+fn seed_initial_offsets_for_assigned(
+    assigned: &HashMap<String, Vec<PartitionId>>,
+    initial_offsets: &HashMap<(String, PartitionId), Offset>,
+    stored_offsets: &mut HashMap<(String, PartitionId), Offset>,
+) -> usize {
+    let mut inserted = 0;
+    for ((topic, partition), &initial) in initial_offsets {
+        if !assigned
+            .get(topic)
+            .is_some_and(|partitions| partitions.contains(partition))
+        {
+            continue;
+        }
+
+        let key = (topic.clone(), *partition);
+        if let std::collections::hash_map::Entry::Vacant(e) = stored_offsets.entry(key) {
+            e.insert(initial);
+            inserted += 1;
+        }
+    }
+    inserted
+}
+
+fn apply_seek_many_offsets(
+    stored_offsets: &mut HashMap<(String, PartitionId), Offset>,
+    offsets: &HashMap<(String, PartitionId), Offset>,
+) -> usize {
+    for ((topic, partition), offset) in offsets {
+        stored_offsets.insert((topic.clone(), *partition), *offset);
+    }
+    offsets.len()
+}
+
+async fn batch_recv_with<FClosed, FPoll, FPollFut, FSetBuffered>(
+    recv_buffer: &SyncMutex<std::collections::VecDeque<ConsumerRecord>>,
+    mut set_buffered_records: FSetBuffered,
+    max_records: usize,
+    timeout: Duration,
+    is_closed: FClosed,
+    mut poll: FPoll,
+) -> Result<BatchRecvOutcome>
+where
+    FClosed: Fn() -> bool,
+    FPoll: FnMut(Duration) -> FPollFut,
+    FPollFut: Future<Output = Result<Vec<ConsumerRecord>>>,
+    FSetBuffered: FnMut(u64),
+{
+    if max_records == 0 {
+        return Ok(BatchRecvOutcome::EmptyRequest);
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut batch = Vec::with_capacity(max_records.min(64));
+
+    loop {
+        // Drain buffer first.
+        {
+            let mut buffer = recv_buffer.lock();
+            while batch.len() < max_records {
+                match buffer.pop_front() {
+                    Some(r) => batch.push(r),
+                    None => break,
+                }
+            }
+            set_buffered_records(buffer.len() as u64);
+        }
+
+        if batch.len() >= max_records {
+            return Ok(BatchRecvOutcome::Records(batch));
+        }
+
+        if is_closed() {
+            return if batch.is_empty() {
+                Ok(BatchRecvOutcome::Closed)
+            } else {
+                Ok(BatchRecvOutcome::Records(batch))
+            };
+        }
+
+        // Compute remaining budget.
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return if batch.is_empty() {
+                Ok(BatchRecvOutcome::TimedOut)
+            } else {
+                Ok(BatchRecvOutcome::Records(batch))
+            };
+        }
+        let remaining = deadline - now;
+
+        match tokio::time::timeout(remaining, poll(remaining)).await {
+            Ok(Ok(records)) => {
+                let before_len = batch.len();
+                let mut iter = records.into_iter();
+                while batch.len() < max_records {
+                    match iter.next() {
+                        Some(r) => batch.push(r),
+                        None => break,
+                    }
+                }
+
+                // Put overflow back into the recv buffer.
+                let leftover: Vec<_> = iter.collect();
+                if !leftover.is_empty() {
+                    let mut buffer = recv_buffer.lock();
+                    for r in leftover.into_iter().rev() {
+                        buffer.push_front(r);
+                    }
+                    set_buffered_records(buffer.len() as u64);
+                }
+
+                if batch.len() >= max_records {
+                    return Ok(BatchRecvOutcome::Records(batch));
+                }
+
+                // Avoid a tight busy loop when poll() returns quickly with no records
+                // (e.g., no assignment, rebalance, or buffer cap).
+                if batch.len() == before_len {
+                    let now_after_poll = tokio::time::Instant::now();
+                    if now_after_poll >= deadline {
+                        return if batch.is_empty() {
+                            Ok(BatchRecvOutcome::TimedOut)
+                        } else {
+                            Ok(BatchRecvOutcome::Records(batch))
+                        };
+                    }
+                    let remaining_after_poll = deadline - now_after_poll;
+                    let backoff = remaining_after_poll.min(Duration::from_millis(10));
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+            Ok(Err(e)) if is_closed() => {
+                return if batch.is_empty() {
+                    Ok(BatchRecvOutcome::Closed)
+                } else {
+                    Ok(BatchRecvOutcome::Records(batch))
+                };
+            }
+            Ok(Err(e)) => {
+                // Preserve delivery semantics: if we already drained buffered
+                // records before this poll error, put them back so callers
+                // can retry without data loss.
+                if !batch.is_empty() {
+                    let mut buffer = recv_buffer.lock();
+                    for record in batch.into_iter().rev() {
+                        buffer.push_front(record);
+                    }
+                    set_buffered_records(buffer.len() as u64);
+                }
+                return Err(e);
+            }
+            Err(_elapsed) => {
+                return if batch.is_empty() {
+                    Ok(BatchRecvOutcome::TimedOut)
+                } else {
+                    Ok(BatchRecvOutcome::Records(batch))
+                };
+            }
+        }
+    }
 }
 
 /// Result of routing assigned partitions to brokers for fetching.
@@ -1545,22 +1722,13 @@ impl Consumer {
         // `auto_offset_reset`.
         if !self.config.initial_offsets.is_empty() {
             let mut offsets = self.offsets.write().await;
-            for ((topic, partition), &initial) in &self.config.initial_offsets {
-                if !assigned
-                    .get(topic)
-                    .is_some_and(|partitions| partitions.contains(partition))
-                {
-                    continue;
-                }
-
-                let key = (topic.clone(), *partition);
-                if let std::collections::hash_map::Entry::Vacant(e) = offsets.entry(key) {
-                    debug!(
-                        "Applying initial offset {} for {}-{}",
-                        initial, topic, partition
-                    );
-                    e.insert(initial);
-                }
+            let inserted = seed_initial_offsets_for_assigned(
+                assigned,
+                &self.config.initial_offsets,
+                &mut offsets,
+            );
+            if inserted > 0 {
+                debug!("Applied {} assignment-time initial offsets", inserted);
             }
         }
 
@@ -1657,13 +1825,11 @@ impl Consumer {
         }
         {
             let mut stored = self.offsets.write().await;
-            for ((topic, partition), offset) in offsets {
-                stored.insert((topic.clone(), *partition), *offset);
-            }
+            apply_seek_many_offsets(&mut stored, offsets);
         }
         self.recompute_lag_metrics().await;
         self.metrics.record_seek(offsets.len() as u64);
-        debug!("Seeked {} partitions via seek_many", offsets.len());
+        debug!("Sought {} partitions via seek_many", offsets.len());
         Ok(())
     }
 
@@ -3108,8 +3274,7 @@ impl Consumer {
     /// elapses, whichever comes first.
     ///
     /// If the consumer closes after some records were already buffered or
-    /// fetched, those records are returned as a partial batch. Returns an
-    /// empty `Vec` only when no records were available before close/deadline.
+    /// fetched, those records are returned as a partial batch.
     ///
     /// Unlike [`poll()`](Self::poll), which performs a single broker fetch
     /// round-trip, `batch_recv` drains the internal record buffer first and
@@ -3125,99 +3290,34 @@ impl Consumer {
     /// ```ignore
     /// use std::time::Duration;
     ///
-    /// let records = consumer
-    ///     .batch_recv(100, Duration::from_millis(200))
-    ///     .await?;
-    /// for record in records {
-    ///     println!("{}: {:?}", record.offset, record.value);
+    /// use krafka::consumer::BatchRecvOutcome;
+    ///
+    /// match consumer.batch_recv(100, Duration::from_millis(200)).await? {
+    ///     BatchRecvOutcome::Records(records) => {
+    ///         for record in records {
+    ///             println!("{}: {:?}", record.offset, record.value);
+    ///         }
+    ///     }
+    ///     BatchRecvOutcome::TimedOut => {}
+    ///     BatchRecvOutcome::Closed => break,
+    ///     BatchRecvOutcome::EmptyRequest => {}
+    ///     _ => {}
     /// }
     /// ```
     pub async fn batch_recv(
         &self,
         max_records: usize,
         timeout: Duration,
-    ) -> Result<Vec<ConsumerRecord>> {
-        if max_records == 0 {
-            return Ok(vec![]);
-        }
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut batch = Vec::with_capacity(max_records.min(64));
-
-        loop {
-            // Drain buffer first.
-            {
-                let mut buffer = self.recv_buffer.lock();
-                while batch.len() < max_records {
-                    match buffer.pop_front() {
-                        Some(r) => batch.push(r),
-                        None => break,
-                    }
-                }
-                self.metrics.buffered_records.set(buffer.len() as u64);
-            }
-            if batch.len() >= max_records {
-                return Ok(batch);
-            }
-            if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
-                return Ok(batch);
-            }
-
-            // Compute remaining budget.
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                return Ok(batch);
-            }
-            let remaining = deadline - now;
-
-            match tokio::time::timeout(remaining, self.poll(remaining)).await {
-                Ok(Ok(records)) => {
-                    let before_len = batch.len();
-                    let mut iter = records.into_iter();
-                    while batch.len() < max_records {
-                        match iter.next() {
-                            Some(r) => batch.push(r),
-                            None => break,
-                        }
-                    }
-                    // Put overflow back into the recv buffer.
-                    let leftover: Vec<_> = iter.collect();
-                    if !leftover.is_empty() {
-                        let mut buffer = self.recv_buffer.lock();
-                        for r in leftover.into_iter().rev() {
-                            buffer.push_front(r);
-                        }
-                        self.metrics.buffered_records.set(buffer.len() as u64);
-                    }
-                    if batch.len() >= max_records {
-                        return Ok(batch);
-                    }
-                    // Avoid a tight busy loop when poll() returns quickly with
-                    // no records (e.g., no assignment, rebalance, or buffer cap).
-                    if batch.len() == before_len {
-                        let backoff = remaining.min(Duration::from_millis(10));
-                        tokio::time::sleep(backoff).await;
-                    }
-                }
-                Ok(Err(e)) if self.closed.load(std::sync::atomic::Ordering::SeqCst) => {
-                    let _ = e;
-                    return Ok(batch);
-                }
-                Ok(Err(e)) => {
-                    // Preserve delivery semantics: if we already drained buffered
-                    // records before this poll error, put them back so callers
-                    // can retry without data loss.
-                    if !batch.is_empty() {
-                        let mut buffer = self.recv_buffer.lock();
-                        for record in batch.into_iter().rev() {
-                            buffer.push_front(record);
-                        }
-                        self.metrics.buffered_records.set(buffer.len() as u64);
-                    }
-                    return Err(e);
-                }
-                Err(_elapsed) => return Ok(batch),
-            }
-        }
+    ) -> Result<BatchRecvOutcome> {
+        batch_recv_with(
+            &self.recv_buffer,
+            |len| self.metrics.buffered_records.set(len),
+            max_records,
+            timeout,
+            || self.closed.load(std::sync::atomic::Ordering::SeqCst),
+            |remaining| self.poll(remaining),
+        )
+        .await
     }
 
     /// Create an async [`Stream`](futures_core::Stream) of records.
@@ -5783,105 +5883,118 @@ mod tests {
         }
     }
 
-    /// batch_recv: draining from a VecDeque up to max_records yields records
-    /// in FIFO order, and overflow stays at the front in original order.
-    #[test]
-    fn test_batch_recv_drain_order_and_overflow() {
-        let mut buffer: std::collections::VecDeque<ConsumerRecord> =
-            std::collections::VecDeque::new();
-        for i in 0..5 {
-            buffer.push_back(make_record("t", 0, i as Offset));
-        }
+    #[tokio::test]
+    async fn test_batch_recv_with_returns_empty_request_for_zero_max_records() {
+        let buffer = SyncMutex::new(std::collections::VecDeque::new());
+        let outcome = batch_recv_with(
+            &buffer,
+            |_| {},
+            0,
+            Duration::from_millis(10),
+            || false,
+            |_| async { Ok(vec![]) },
+        )
+        .await
+        .unwrap();
 
-        let max_records = 3;
-        let mut batch = Vec::new();
-
-        // Drain up to max_records
-        while batch.len() < max_records {
-            match buffer.pop_front() {
-                Some(r) => batch.push(r),
-                None => break,
-            }
-        }
-
-        assert_eq!(batch.len(), 3);
-        assert_eq!(batch[0].offset, 0);
-        assert_eq!(batch[1].offset, 1);
-        assert_eq!(batch[2].offset, 2);
-
-        // Remaining records stay in buffer (overflow not consumed)
-        assert_eq!(buffer.len(), 2);
-        assert_eq!(buffer[0].offset, 3);
-        assert_eq!(buffer[1].offset, 4);
+        assert!(matches!(outcome, BatchRecvOutcome::EmptyRequest));
     }
 
-    /// When poll() returns more records than the remaining batch budget,
-    /// overflow records are requeued at the front of the buffer in original order.
-    #[test]
-    fn test_batch_recv_overflow_requeue_preserves_order() {
-        let max_records = 3usize;
-        let mut batch: Vec<ConsumerRecord> = Vec::new();
-        // batch already has 2 records
-        batch.push(make_record("t", 0, 0));
-        batch.push(make_record("t", 0, 1));
+    #[tokio::test]
+    async fn test_batch_recv_with_returns_closed_when_no_records_and_closed() {
+        let buffer = SyncMutex::new(std::collections::VecDeque::new());
+        let outcome = batch_recv_with(
+            &buffer,
+            |_| {},
+            10,
+            Duration::from_millis(20),
+            || true,
+            |_| async { Ok(vec![]) },
+        )
+        .await
+        .unwrap();
 
-        // poll() returns 4 records; we can only fit 1 more
-        let poll_records: Vec<ConsumerRecord> = (10..14).map(|i| make_record("t", 0, i)).collect();
-
-        let mut buffer: std::collections::VecDeque<ConsumerRecord> =
-            std::collections::VecDeque::new();
-        let mut iter = poll_records.into_iter();
-        while batch.len() < max_records {
-            match iter.next() {
-                Some(r) => batch.push(r),
-                None => break,
-            }
-        }
-        // Requeue leftover in order at front
-        let leftover: Vec<_> = iter.collect();
-        for r in leftover.iter().rev() {
-            buffer.push_front(r.clone());
-        }
-
-        assert_eq!(batch.len(), 3);
-        assert_eq!(batch[2].offset, 10); // first of poll batch fits
-
-        // Buffer gets 3 leftover records (offsets 11, 12, 13) in original order
-        assert_eq!(buffer.len(), 3);
-        assert_eq!(buffer[0].offset, 11);
-        assert_eq!(buffer[1].offset, 12);
-        assert_eq!(buffer[2].offset, 13);
+        assert!(matches!(outcome, BatchRecvOutcome::Closed));
     }
 
-    /// Zero max_records: batch_recv must return empty immediately without polling.
-    #[test]
-    fn test_batch_recv_zero_max_records_returns_empty() {
-        // Simulate the fast-path guard: if max_records == 0, return immediately.
-        let max_records = 0usize;
-        assert!(max_records == 0); // guard condition
-        let result: Vec<ConsumerRecord> = if max_records == 0 {
-            vec![]
-        } else {
-            unreachable!()
-        };
-        assert!(result.is_empty());
-    }
+    #[tokio::test]
+    async fn test_batch_recv_with_rebuffers_partial_batch_on_poll_error() {
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(make_record("t", 0, 10));
+        q.push_back(make_record("t", 0, 11));
+        let buffer = SyncMutex::new(q);
 
-    /// If poll() fails after some records were already accumulated for a
-    /// batch, the partial batch must be re-buffered in front, preserving order.
-    #[test]
-    fn test_batch_recv_error_rebuffers_partial_batch_in_order() {
-        let mut buffer: std::collections::VecDeque<ConsumerRecord> =
-            std::collections::VecDeque::new();
-        let batch = vec![make_record("t", 0, 10), make_record("t", 0, 11)];
+        let result = batch_recv_with(
+            &buffer,
+            |_| {},
+            10,
+            Duration::from_millis(20),
+            || false,
+            |_| async {
+                Err(KrafkaError::network(std::io::Error::other(
+                    "simulated poll failure",
+                )))
+            },
+        )
+        .await;
 
-        for record in batch.into_iter().rev() {
-            buffer.push_front(record);
-        }
-
+        assert!(result.is_err());
+        let buffer = buffer.lock();
         assert_eq!(buffer.len(), 2);
         assert_eq!(buffer[0].offset, 10);
         assert_eq!(buffer[1].offset, 11);
+    }
+
+    #[tokio::test]
+    async fn test_batch_recv_with_timeout_returns_timed_out_without_oversleeping() {
+        let buffer = SyncMutex::new(std::collections::VecDeque::new());
+        let start = tokio::time::Instant::now();
+
+        let outcome = batch_recv_with(
+            &buffer,
+            |_| {},
+            10,
+            Duration::from_millis(15),
+            || false,
+            |_| async { Ok(vec![]) },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, BatchRecvOutcome::TimedOut));
+        assert!(start.elapsed() < Duration::from_millis(60));
+    }
+
+    #[tokio::test]
+    async fn test_batch_recv_with_requeues_overflow_in_order() {
+        let buffer = SyncMutex::new(std::collections::VecDeque::new());
+        let poll_records = SyncMutex::new(Some(vec![
+            make_record("t", 0, 1),
+            make_record("t", 0, 2),
+            make_record("t", 0, 3),
+        ]));
+
+        let outcome = batch_recv_with(
+            &buffer,
+            |_| {},
+            2,
+            Duration::from_millis(50),
+            || false,
+            |_| async { Ok(poll_records.lock().take().unwrap_or_default()) },
+        )
+        .await
+        .unwrap();
+
+        let BatchRecvOutcome::Records(batch) = outcome else {
+            panic!("expected records outcome");
+        };
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].offset, 1);
+        assert_eq!(batch[1].offset, 2);
+
+        let buffer = buffer.lock();
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer[0].offset, 3);
     }
 
     // ── initial_offsets precedence tests ───────────────────────────────
@@ -5907,6 +6020,34 @@ mod tests {
         }
 
         assert_eq!(result_offsets.get(&key), Some(&500));
+    }
+
+    #[test]
+    fn test_seed_initial_offsets_for_assigned_filters_and_vacant_only() {
+        let assigned: HashMap<String, Vec<PartitionId>> = [
+            ("topic1".to_string(), vec![0, 1]),
+            ("topic2".to_string(), vec![0]),
+        ]
+        .into_iter()
+        .collect();
+
+        let initial_offsets: HashMap<(String, PartitionId), Offset> = [
+            (("topic1".to_string(), 0), 100),
+            (("topic1".to_string(), 2), 200), // unassigned
+            (("topic3".to_string(), 0), 300), // unassigned topic
+        ]
+        .into_iter()
+        .collect();
+
+        let mut stored: HashMap<(String, PartitionId), Offset> =
+            [(("topic1".to_string(), 1), 999)].into_iter().collect();
+
+        let inserted = seed_initial_offsets_for_assigned(&assigned, &initial_offsets, &mut stored);
+        assert_eq!(inserted, 1);
+        assert_eq!(stored.get(&("topic1".to_string(), 0)), Some(&100));
+        assert_eq!(stored.get(&("topic1".to_string(), 1)), Some(&999));
+        assert!(!stored.contains_key(&("topic1".to_string(), 2)));
+        assert!(!stored.contains_key(&("topic3".to_string(), 0)));
     }
 
     /// Committed group offset takes precedence over initial_offsets — existing
@@ -5974,5 +6115,22 @@ mod tests {
 
         assert_eq!(result_offsets.get(&("topic1".to_string(), 0)), Some(&100));
         assert!(!result_offsets.contains_key(&("topic1".to_string(), 1)));
+    }
+
+    #[test]
+    fn test_apply_seek_many_offsets_updates_multiple_partitions() {
+        let mut stored: HashMap<(String, PartitionId), Offset> =
+            [(("orders".to_string(), 0), 10)].into_iter().collect();
+        let updates: HashMap<(String, PartitionId), Offset> = [
+            (("orders".to_string(), 0), 20),
+            (("orders".to_string(), 1), 30),
+        ]
+        .into_iter()
+        .collect();
+
+        let updated = apply_seek_many_offsets(&mut stored, &updates);
+        assert_eq!(updated, 2);
+        assert_eq!(stored.get(&("orders".to_string(), 0)), Some(&20));
+        assert_eq!(stored.get(&("orders".to_string(), 1)), Some(&30));
     }
 }
