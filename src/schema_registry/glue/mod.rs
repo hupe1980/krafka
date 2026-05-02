@@ -36,7 +36,7 @@
 //!
 //! let (id, payload) = decode_glue_wire_format(&framed).unwrap();
 //! assert_eq!(id, uuid);
-//! assert_eq!(payload.as_ref(), b"avro data");
+//! assert_eq!(payload.as_slice(), b"avro data");
 //! ```
 
 #[cfg(feature = "aws-glue-schema-registry")]
