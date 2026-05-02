@@ -993,6 +993,7 @@ pub type Result<T> = std::result::Result<T, KrafkaError>;
 ///     Ok(record)                          => process(record),
 ///     Err(RecvError::Closed)              => break,
 ///     Err(RecvError::Error(e))            => return Err(e),
+///     _                                   => break,
 /// }
 /// ```
 #[non_exhaustive]

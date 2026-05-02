@@ -655,22 +655,24 @@ mod tests {
 
     #[test]
     fn test_builder_with_request_timeout() {
-        let client = ConfluentSchemaRegistryBuilder::default()
+        let builder = ConfluentSchemaRegistryBuilder::default()
             .url("http://localhost:8081")
-            .request_timeout(Duration::from_secs(2))
-            .build()
-            .unwrap();
+            .request_timeout(Duration::from_secs(2));
+        assert_eq!(builder.request_timeout, Some(Duration::from_secs(2)));
+
+        let client = builder.build().unwrap();
         assert_eq!(client.base_url, "http://localhost:8081");
     }
 
     #[test]
     fn test_builder_clear_request_timeout() {
-        let client = ConfluentSchemaRegistryBuilder::default()
+        let builder = ConfluentSchemaRegistryBuilder::default()
             .url("http://localhost:8081")
             .request_timeout(Duration::from_secs(2))
-            .clear_request_timeout()
-            .build()
-            .unwrap();
+            .clear_request_timeout();
+        assert_eq!(builder.request_timeout, None);
+
+        let client = builder.build().unwrap();
         assert_eq!(client.base_url, "http://localhost:8081");
     }
 

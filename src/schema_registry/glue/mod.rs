@@ -378,8 +378,9 @@ pub fn encode_glue_wire_format(
 /// Validates the 18-byte header, extracts the schema version ID, and
 /// decompresses the payload if ZLIB-compressed.
 ///
-/// Returns [`Cow::Borrowed`] for uncompressed payloads (zero-copy) and
-/// [`Cow::Owned`] when ZLIB decompression is required.
+/// Always returns an owned [`Vec<u8>`]. For zero-copy decoding of
+/// uncompressed payloads, use [`decode_glue_wire_format_borrowed()`] or
+/// [`decode_glue_wire_format_bytes()`].
 ///
 /// # Errors
 ///
@@ -456,6 +457,7 @@ pub fn decode_glue_wire_format_borrowed(
 /// # Errors
 ///
 /// Same as [`decode_glue_wire_format()`].
+///
 pub fn decode_glue_wire_format_owned(data: &[u8]) -> Result<(GlueSchemaVersionId, Vec<u8>)> {
     decode_glue_wire_format(data)
 }
@@ -624,11 +626,16 @@ pub struct CachedGlueSchemaRegistry<C> {
     insertion_order: RwLock<VecDeque<GlueSchemaVersionId>>,
     /// Optional maximum number of cached entries.
     max_entries: Option<usize>,
-    /// Monotonic cache epoch used to prevent stale in-flight inserts after
-    /// invalidation under contention.
-    cache_epoch: AtomicU64,
+    /// Monotonic token used to identify distinct in-flight lookup generations.
+    in_flight_token: AtomicU64,
     /// Waiters for coalescing concurrent cold misses by schema version ID.
-    in_flight: Mutex<HashMap<GlueSchemaVersionId, Vec<oneshot::Sender<Result<GlueSchema>>>>>,
+    in_flight: Mutex<HashMap<GlueSchemaVersionId, GlueInFlightEntry>>,
+}
+
+#[derive(Default)]
+struct GlueInFlightEntry {
+    token: u64,
+    waiters: Vec<oneshot::Sender<Result<GlueSchema>>>,
 }
 
 impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
@@ -639,7 +646,7 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
             cache: RwLock::new(HashMap::new()),
             insertion_order: RwLock::new(VecDeque::new()),
             max_entries: None,
-            cache_epoch: AtomicU64::new(0),
+            in_flight_token: AtomicU64::new(0),
             in_flight: Mutex::new(HashMap::new()),
         }
     }
@@ -651,7 +658,7 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
             cache: RwLock::new(HashMap::with_capacity(capacity)),
             insertion_order: RwLock::new(VecDeque::with_capacity(capacity)),
             max_entries: None,
-            cache_epoch: AtomicU64::new(0),
+            in_flight_token: AtomicU64::new(0),
             in_flight: Mutex::new(HashMap::new()),
         }
     }
@@ -666,7 +673,7 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
             cache: RwLock::new(HashMap::with_capacity(max_entries)),
             insertion_order: RwLock::new(VecDeque::with_capacity(max_entries)),
             max_entries: Some(max_entries),
-            cache_epoch: AtomicU64::new(0),
+            in_flight_token: AtomicU64::new(0),
             in_flight: Mutex::new(HashMap::new()),
         }
     }
@@ -694,7 +701,6 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
 
     /// Remove a single schema version ID from the cache.
     pub fn invalidate(&self, version_id: GlueSchemaVersionId) {
-        self.cache_epoch.fetch_add(1, Ordering::SeqCst);
         self.cache.write().remove(&version_id);
         self.insertion_order
             .write()
@@ -705,6 +711,7 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
             .in_flight
             .lock()
             .remove(&version_id)
+            .map(|entry| entry.waiters)
             .unwrap_or_default();
         for waiter in waiters {
             let _ = waiter.send(Err(glue_schema_lookup_cancelled_error(version_id)));
@@ -713,13 +720,12 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
 
     /// Remove all cached schemas.
     pub fn invalidate_all(&self) {
-        self.cache_epoch.fetch_add(1, Ordering::SeqCst);
         self.clear_cache();
 
         // Cancel all in-flight lookups so no stale insertions survive reset.
         let mut in_flight = self.in_flight.lock();
-        for (id, waiters) in in_flight.drain() {
-            for waiter in waiters {
+        for (id, entry) in in_flight.drain() {
+            for waiter in entry.waiters {
                 let _ = waiter.send(Err(glue_schema_lookup_cancelled_error(id)));
             }
         }
@@ -746,20 +752,27 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
             return Ok(schema.clone());
         }
 
-        let waiter_rx = {
+        let (waiter_rx, leader_token) = {
             let mut in_flight = self.in_flight.lock();
             if let Some(schema) = self.cache.read().get(&id) {
                 debug!(version_id = %id, "glue schema cache hit (double-checked)");
                 return Ok(schema.clone());
             }
 
-            if let Some(waiters) = in_flight.get_mut(&id) {
+            if let Some(entry) = in_flight.get_mut(&id) {
                 let (tx, rx) = oneshot::channel();
-                waiters.push(tx);
-                Some(rx)
+                entry.waiters.push(tx);
+                (Some(rx), None)
             } else {
-                in_flight.insert(id, Vec::new());
-                None
+                let token = self.in_flight_token.fetch_add(1, Ordering::SeqCst) + 1;
+                in_flight.insert(
+                    id,
+                    GlueInFlightEntry {
+                        token,
+                        waiters: Vec::new(),
+                    },
+                );
+                (None, Some(token))
             }
         };
 
@@ -770,9 +783,9 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
         }
 
         struct InFlightGlueFetchGuard<'a> {
-            in_flight:
-                &'a Mutex<HashMap<GlueSchemaVersionId, Vec<oneshot::Sender<Result<GlueSchema>>>>>,
+            in_flight: &'a Mutex<HashMap<GlueSchemaVersionId, GlueInFlightEntry>>,
             id: GlueSchemaVersionId,
+            token: u64,
             completed: bool,
         }
 
@@ -781,26 +794,46 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
                 if self.completed {
                     return;
                 }
-                let waiters = self.in_flight.lock().remove(&self.id).unwrap_or_default();
+                let waiters = {
+                    let mut in_flight = self.in_flight.lock();
+                    if matches!(in_flight.get(&self.id), Some(entry) if entry.token == self.token) {
+                        in_flight
+                            .remove(&self.id)
+                            .map(|entry| entry.waiters)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                };
+
                 for waiter in waiters {
                     let _ = waiter.send(Err(glue_schema_lookup_cancelled_error(self.id)));
                 }
             }
         }
 
+        let Some(leader_token) = leader_token else {
+            return Err(glue_schema_lookup_cancelled_error(id));
+        };
+
         let mut guard = InFlightGlueFetchGuard {
             in_flight: &self.in_flight,
             id,
+            token: leader_token,
             completed: false,
         };
 
-        let fetch_epoch = self.cache_epoch.load(Ordering::SeqCst);
         let result = self.inner.get_schema_by_version_id(id).await;
         if let Ok(schema) = &result {
-            // Guard against invalidate()/invalidate_all() races while this
-            // request was in flight.
-            let mut cache = self.cache.write();
-            if self.cache_epoch.load(Ordering::SeqCst) == fetch_epoch {
+            // Cache only if this lookup generation is still the active in-flight
+            // slot for this ID (i.e., it was not invalidated/replaced).
+            let should_insert = {
+                let in_flight = self.in_flight.lock();
+                matches!(in_flight.get(&id), Some(entry) if entry.token == leader_token)
+            };
+
+            if should_insert {
+                let mut cache = self.cache.write();
                 debug!(version_id = %id, "glue schema cache miss — fetched from registry");
                 // Inline insertion to reuse the held cache write lock.
                 if let Some(existing) = cache.get_mut(&id) {
@@ -827,7 +860,18 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
             }
         }
 
-        let waiters = self.in_flight.lock().remove(&id).unwrap_or_default();
+        let waiters = {
+            let mut in_flight = self.in_flight.lock();
+            if matches!(in_flight.get(&id), Some(entry) if entry.token == leader_token) {
+                in_flight
+                    .remove(&id)
+                    .map(|entry| entry.waiters)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        };
+
         for waiter in waiters {
             let _ = waiter.send(result.clone());
         }
@@ -1494,6 +1538,60 @@ mod tests {
         cached.inner().release();
         let _ = second.await.unwrap();
         assert_eq!(cached.inner().get_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_single_id_does_not_block_other_inflight_cache_insert() {
+        let cached = Arc::new(CachedGlueSchemaRegistry::new(
+            BlockingMockGlueRegistry::new(),
+        ));
+        let id_cancelled: GlueSchemaVersionId = TEST_UUID_STR.parse().unwrap();
+        let id_unrelated: GlueSchemaVersionId =
+            "00000000-0000-0000-0000-000000000008".parse().unwrap();
+
+        let t1 = {
+            let cached = cached.clone();
+            tokio::spawn(
+                async move { cached.get_schema_by_version_id(id_cancelled).await.unwrap() },
+            )
+        };
+        let t2 = {
+            let cached = cached.clone();
+            tokio::spawn(
+                async move { cached.get_schema_by_version_id(id_unrelated).await.unwrap() },
+            )
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while cached.inner().get_call_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both in-flight lookups did not start");
+
+        cached.invalidate(id_cancelled);
+        cached.inner().release();
+
+        let _ = t1.await.unwrap();
+        let _ = t2.await.unwrap();
+
+        // Unrelated in-flight lookup should still have been cached.
+        let calls_after_inflight = cached.inner().get_call_count();
+        cached.get_schema_by_version_id(id_unrelated).await.unwrap();
+        assert_eq!(cached.inner().get_call_count(), calls_after_inflight);
+
+        // Invalidated ID should miss and fetch again.
+        let miss = {
+            let cached = cached.clone();
+            tokio::spawn(
+                async move { cached.get_schema_by_version_id(id_cancelled).await.unwrap() },
+            )
+        };
+        cached.inner().wait_started().await;
+        cached.inner().release();
+        let _ = miss.await.unwrap();
+        assert_eq!(cached.inner().get_call_count(), calls_after_inflight + 1);
     }
 
     #[tokio::test]

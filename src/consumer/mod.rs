@@ -3202,7 +3202,19 @@ impl Consumer {
                     let _ = e;
                     return Ok(batch);
                 }
-                Ok(Err(e)) => return Err(e),
+                Ok(Err(e)) => {
+                    // Preserve delivery semantics: if we already drained buffered
+                    // records before this poll error, put them back so callers
+                    // can retry without data loss.
+                    if !batch.is_empty() {
+                        let mut buffer = self.recv_buffer.lock();
+                        for record in batch.into_iter().rev() {
+                            buffer.push_front(record);
+                        }
+                        self.metrics.buffered_records.set(buffer.len() as u64);
+                    }
+                    return Err(e);
+                }
                 Err(_elapsed) => return Ok(batch),
             }
         }
@@ -5853,6 +5865,23 @@ mod tests {
             unreachable!()
         };
         assert!(result.is_empty());
+    }
+
+    /// If poll() fails after some records were already accumulated for a
+    /// batch, the partial batch must be re-buffered in front, preserving order.
+    #[test]
+    fn test_batch_recv_error_rebuffers_partial_batch_in_order() {
+        let mut buffer: std::collections::VecDeque<ConsumerRecord> =
+            std::collections::VecDeque::new();
+        let batch = vec![make_record("t", 0, 10), make_record("t", 0, 11)];
+
+        for record in batch.into_iter().rev() {
+            buffer.push_front(record);
+        }
+
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(buffer[0].offset, 10);
+        assert_eq!(buffer[1].offset, 11);
     }
 
     // ── initial_offsets precedence tests ───────────────────────────────
