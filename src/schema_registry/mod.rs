@@ -414,11 +414,6 @@ pub fn detect_wire_format(data: &[u8]) -> DetectedWireFormat {
                 return DetectedWireFormat::InvalidConfluent;
             }
             let schema_id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-            // Treat schema ID 0 as unknown framing to reduce false positives
-            // for arbitrary raw payloads beginning with 0x00.
-            if schema_id == 0 {
-                return DetectedWireFormat::Unknown;
-            }
             DetectedWireFormat::Confluent {
                 schema_id,
                 payload_offset: HEADER_SIZE,
@@ -1332,11 +1327,16 @@ mod tests {
             detect_wire_format(&[0x99, 0x00, 0x00]),
             DetectedWireFormat::Unknown
         );
-        // Schema ID 0 is treated as unknown to reduce false positives for
-        // arbitrary raw payloads starting with 0x00.
+    }
+
+    #[test]
+    fn test_detect_wire_format_confluent_schema_id_zero() {
         assert_eq!(
             detect_wire_format(&[MAGIC_BYTE, 0x00, 0x00, 0x00, 0x00, 0x41]),
-            DetectedWireFormat::Unknown
+            DetectedWireFormat::Confluent {
+                schema_id: 0,
+                payload_offset: HEADER_SIZE,
+            }
         );
     }
 
