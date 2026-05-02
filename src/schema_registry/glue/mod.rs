@@ -401,9 +401,44 @@ pub fn encode_glue_wire_format(
 /// let framed = encode_glue_wire_format(uuid, b"data", GlueCompression::None).unwrap();
 /// let (id, payload) = decode_glue_wire_format(&framed).unwrap();
 /// assert_eq!(id, uuid);
+/// assert_eq!(&payload, b"data");
+/// ```
+pub fn decode_glue_wire_format(data: &[u8]) -> Result<(GlueSchemaVersionId, Vec<u8>)> {
+    let (schema_version_id, compression) = validate_glue_wire_header(data)?;
+    let raw = &data[GLUE_HEADER_SIZE..];
+    let payload = match compression {
+        GlueCompression::None => raw.to_vec(),
+        GlueCompression::Zlib => decompress_zlib(raw)?,
+    };
+    Ok((schema_version_id, payload))
+}
+
+/// Decode an AWS Glue wire format message, borrowing the payload when possible.
+///
+/// For uncompressed payloads, the returned [`Cow`] borrows directly from
+/// `data` (zero-copy). For ZLIB-compressed payloads, the data is decompressed
+/// into a new allocation.
+///
+/// # Errors
+///
+/// Same as [`decode_glue_wire_format()`].
+///
+/// # Example
+///
+/// ```rust
+/// use krafka::schema_registry::glue::{
+///     encode_glue_wire_format, decode_glue_wire_format_borrowed, GlueCompression,
+/// };
+///
+/// let uuid = "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
+/// let framed = encode_glue_wire_format(uuid, b"data", GlueCompression::None).unwrap();
+/// let (id, payload) = decode_glue_wire_format_borrowed(&framed).unwrap();
+/// assert_eq!(id, uuid);
 /// assert_eq!(payload.as_ref(), b"data");
 /// ```
-pub fn decode_glue_wire_format(data: &[u8]) -> Result<(GlueSchemaVersionId, Cow<'_, [u8]>)> {
+pub fn decode_glue_wire_format_borrowed(
+    data: &[u8],
+) -> Result<(GlueSchemaVersionId, Cow<'_, [u8]>)> {
     let (schema_version_id, compression) = validate_glue_wire_header(data)?;
     let raw = &data[GLUE_HEADER_SIZE..];
     let payload = match compression {
@@ -415,11 +450,14 @@ pub fn decode_glue_wire_format(data: &[u8]) -> Result<(GlueSchemaVersionId, Cow<
 
 /// Decode an AWS Glue wire format message into an owned payload.
 ///
-/// This is a convenience wrapper over [`decode_glue_wire_format()`] for callers
-/// that always need owned bytes.
+/// This is an alias for [`decode_glue_wire_format()`], kept for API
+/// symmetry with callers that prefer the explicit `_owned` suffix.
+///
+/// # Errors
+///
+/// Same as [`decode_glue_wire_format()`].
 pub fn decode_glue_wire_format_owned(data: &[u8]) -> Result<(GlueSchemaVersionId, Vec<u8>)> {
-    let (schema_version_id, payload) = decode_glue_wire_format(data)?;
-    Ok((schema_version_id, payload.into_owned()))
+    decode_glue_wire_format(data)
 }
 
 /// Decode an AWS Glue wire format message, returning a [`Bytes`] payload.
@@ -1100,7 +1138,7 @@ mod tests {
         let encoded = encode_glue_wire_format(id, payload, GlueCompression::None).unwrap();
         let (decoded_id, decoded_payload) = decode_glue_wire_format(&encoded).unwrap();
         assert_eq!(decoded_id, id);
-        assert_eq!(decoded_payload.as_ref(), payload);
+        assert_eq!(decoded_payload.as_slice(), payload);
     }
 
     #[test]
@@ -1133,7 +1171,7 @@ mod tests {
         assert_eq!(encoded[1], 0x05); // ZLIB compression byte
         let (decoded_id, decoded_payload) = decode_glue_wire_format(&encoded).unwrap();
         assert_eq!(decoded_id, id);
-        assert_eq!(decoded_payload.as_ref(), payload);
+        assert_eq!(decoded_payload.as_slice(), payload);
     }
 
     #[test]

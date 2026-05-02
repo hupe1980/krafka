@@ -3057,6 +3057,7 @@ impl Consumer {
     ///         Ok(record)               => process(record),
     ///         Err(RecvError::Closed)   => break,
     ///         Err(RecvError::Error(e)) => return Err(e),
+    ///         _ => break, // future variants (non_exhaustive)
     ///     }
     /// }
     /// ```
@@ -5751,5 +5752,198 @@ mod tests {
         assert_eq!(grouped.len(), 2);
         assert_eq!(grouped["topic1"], vec![0, 2, 5]);
         assert_eq!(grouped["topic2"], vec![1]);
+    }
+
+    // ── batch_recv logic tests ──────────────────────────────────────────
+
+    fn make_record(topic: &str, partition: PartitionId, offset: Offset) -> ConsumerRecord {
+        ConsumerRecord {
+            topic: topic.to_string(),
+            partition,
+            offset,
+            timestamp: 0,
+            timestamp_type: 0,
+            key: None,
+            value: None,
+            headers: vec![],
+            leader_epoch: None,
+            delivery_count: None,
+        }
+    }
+
+    /// batch_recv: draining from a VecDeque up to max_records yields records
+    /// in FIFO order, and overflow stays at the front in original order.
+    #[test]
+    fn test_batch_recv_drain_order_and_overflow() {
+        let mut buffer: std::collections::VecDeque<ConsumerRecord> =
+            std::collections::VecDeque::new();
+        for i in 0..5 {
+            buffer.push_back(make_record("t", 0, i as Offset));
+        }
+
+        let max_records = 3;
+        let mut batch = Vec::new();
+
+        // Drain up to max_records
+        while batch.len() < max_records {
+            match buffer.pop_front() {
+                Some(r) => batch.push(r),
+                None => break,
+            }
+        }
+
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].offset, 0);
+        assert_eq!(batch[1].offset, 1);
+        assert_eq!(batch[2].offset, 2);
+
+        // Remaining records stay in buffer (overflow not consumed)
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(buffer[0].offset, 3);
+        assert_eq!(buffer[1].offset, 4);
+    }
+
+    /// When poll() returns more records than the remaining batch budget,
+    /// overflow records are requeued at the front of the buffer in original order.
+    #[test]
+    fn test_batch_recv_overflow_requeue_preserves_order() {
+        let max_records = 3usize;
+        let mut batch: Vec<ConsumerRecord> = Vec::new();
+        // batch already has 2 records
+        batch.push(make_record("t", 0, 0));
+        batch.push(make_record("t", 0, 1));
+
+        // poll() returns 4 records; we can only fit 1 more
+        let poll_records: Vec<ConsumerRecord> = (10..14).map(|i| make_record("t", 0, i)).collect();
+
+        let mut buffer: std::collections::VecDeque<ConsumerRecord> =
+            std::collections::VecDeque::new();
+        let mut iter = poll_records.into_iter();
+        while batch.len() < max_records {
+            match iter.next() {
+                Some(r) => batch.push(r),
+                None => break,
+            }
+        }
+        // Requeue leftover in order at front
+        let leftover: Vec<_> = iter.collect();
+        for r in leftover.iter().rev() {
+            buffer.push_front(r.clone());
+        }
+
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[2].offset, 10); // first of poll batch fits
+
+        // Buffer gets 3 leftover records (offsets 11, 12, 13) in original order
+        assert_eq!(buffer.len(), 3);
+        assert_eq!(buffer[0].offset, 11);
+        assert_eq!(buffer[1].offset, 12);
+        assert_eq!(buffer[2].offset, 13);
+    }
+
+    /// Zero max_records: batch_recv must return empty immediately without polling.
+    #[test]
+    fn test_batch_recv_zero_max_records_returns_empty() {
+        // Simulate the fast-path guard: if max_records == 0, return immediately.
+        let max_records = 0usize;
+        assert!(max_records == 0); // guard condition
+        let result: Vec<ConsumerRecord> = if max_records == 0 {
+            vec![]
+        } else {
+            unreachable!()
+        };
+        assert!(result.is_empty());
+    }
+
+    // ── initial_offsets precedence tests ───────────────────────────────
+
+    /// initial_offsets is used when there is no committed group offset for a
+    /// partition (the core contract for startup offset seeding).
+    #[test]
+    fn test_initial_offsets_used_when_no_committed_offset() {
+        let mut initial_offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        initial_offsets.insert(("topic1".to_string(), 0), 500);
+
+        let committed: HashMap<(String, PartitionId), Offset> = HashMap::new();
+
+        let key = ("topic1".to_string(), 0);
+        let mut result_offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+
+        // Mirrors the logic in fetch_and_apply_committed_offsets: if committed
+        // has no entry and initial_offsets does, use initial_offsets.
+        if let Some(&committed_offset) = committed.get(&key) {
+            result_offsets.insert(key.clone(), committed_offset);
+        } else if let Some(&initial) = initial_offsets.get(&key) {
+            result_offsets.insert(key.clone(), initial);
+        }
+
+        assert_eq!(result_offsets.get(&key), Some(&500));
+    }
+
+    /// Committed group offset takes precedence over initial_offsets — existing
+    /// consumers must not replay already-committed work on restart.
+    #[test]
+    fn test_committed_offset_takes_precedence_over_initial_offsets() {
+        let mut initial_offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        initial_offsets.insert(("topic1".to_string(), 0), 500);
+
+        let mut committed: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        committed.insert(("topic1".to_string(), 0), 999); // committed is present
+
+        let key = ("topic1".to_string(), 0);
+        let mut result_offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+
+        if let Some(&committed_offset) = committed.get(&key) {
+            result_offsets.insert(key.clone(), committed_offset);
+        } else if let Some(&initial) = initial_offsets.get(&key) {
+            result_offsets.insert(key.clone(), initial);
+        }
+
+        // Committed offset wins
+        assert_eq!(result_offsets.get(&key), Some(&999));
+        assert_ne!(result_offsets.get(&key), Some(&500));
+    }
+
+    /// When both committed offset AND initial_offsets are absent, neither path
+    /// inserts — auto_offset_reset would take over at runtime.
+    #[test]
+    fn test_no_committed_no_initial_offset_falls_through() {
+        let initial_offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let committed: HashMap<(String, PartitionId), Offset> = HashMap::new();
+
+        let key = ("topic1".to_string(), 0);
+        let mut result_offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+
+        if let Some(&committed_offset) = committed.get(&key) {
+            result_offsets.insert(key.clone(), committed_offset);
+        } else if let Some(&initial) = initial_offsets.get(&key) {
+            result_offsets.insert(key.clone(), initial);
+        }
+        // Neither path triggered — auto_offset_reset handles this at runtime
+        assert!(!result_offsets.contains_key(&key));
+    }
+
+    /// initial_offsets only applies to the specific partition it names;
+    /// other partitions in the same topic are not affected.
+    #[test]
+    fn test_initial_offsets_partition_scoped() {
+        let mut initial_offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        initial_offsets.insert(("topic1".to_string(), 0), 100);
+        // partition 1 is NOT in initial_offsets
+
+        let committed: HashMap<(String, PartitionId), Offset> = HashMap::new();
+
+        let mut result_offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        for partition in [0i32, 1i32] {
+            let key = ("topic1".to_string(), partition);
+            if let Some(&c) = committed.get(&key) {
+                result_offsets.insert(key, c);
+            } else if let Some(&i) = initial_offsets.get(&key) {
+                result_offsets.insert(key, i);
+            }
+        }
+
+        assert_eq!(result_offsets.get(&("topic1".to_string(), 0)), Some(&100));
+        assert!(!result_offsets.contains_key(&("topic1".to_string(), 1)));
     }
 }

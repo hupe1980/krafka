@@ -401,8 +401,11 @@ pub enum DetectedWireFormat {
 
 /// Detect schema wire format from the message header.
 ///
-/// Returns [`DetectedWireFormat::Unknown`] for empty buffers, unrecognized
-/// magic bytes, or invalid/incomplete headers.
+/// Returns [`DetectedWireFormat::Unknown`] for empty buffers or unrecognized
+/// magic bytes. Returns [`DetectedWireFormat::InvalidConfluent`] for a valid
+/// Confluent magic byte (`0x00`) with a truncated header. Returns
+/// [`DetectedWireFormat::InvalidGlue`] for a valid Glue version byte (`0x03`)
+/// with an invalid compression indicator or truncated UUID.
 pub fn detect_wire_format(data: &[u8]) -> DetectedWireFormat {
     if data.is_empty() {
         return DetectedWireFormat::Unknown;
@@ -434,11 +437,12 @@ pub fn detect_wire_format(data: &[u8]) -> DetectedWireFormat {
 
             let mut version_bytes = [0u8; 16];
             version_bytes.copy_from_slice(&data[2..glue::GLUE_HEADER_SIZE]);
-            // Heuristic guard: require RFC 4122 version/variant bits so random
+            // Heuristic guard: require RFC 9562 version/variant bits so random
             // raw payloads are less likely to be misclassified as Glue-framed.
+            // Versions 1–8 are assigned by RFC 4122 and RFC 9562 (v6/v7/v8).
             let version = (version_bytes[6] & 0xF0) >> 4;
             let rfc4122_variant = (version_bytes[8] & 0xC0) == 0x80;
-            if !(1..=5).contains(&version) || !rfc4122_variant {
+            if !(1..=8).contains(&version) || !rfc4122_variant {
                 return DetectedWireFormat::Unknown;
             }
             DetectedWireFormat::Glue {
@@ -602,7 +606,7 @@ impl<'a> SchemaDecoder<'a> {
 
                 Ok(DecodedMessage {
                     schema_format: schema.data_format.into(),
-                    payload: payload.into_owned(),
+                    payload,
                     schema_metadata: Some(SchemaMetadata::Glue(schema)),
                 })
             }

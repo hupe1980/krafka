@@ -576,23 +576,15 @@ impl ConfluentSchemaRegistryBuilder {
 
     /// Set the HTTP request timeout.
     ///
-    /// Pass `None` to keep the default reqwest timeout behavior.
-    pub fn request_timeout(mut self, timeout: Option<Duration>) -> Self {
-        self.request_timeout = timeout;
-        self
-    }
-
-    /// Set the HTTP request timeout with a non-optional duration.
-    ///
-    /// Equivalent to calling `request_timeout(Some(timeout))`.
-    pub fn request_timeout_duration(mut self, timeout: Duration) -> Self {
+    /// To remove a previously set timeout, call [`clear_request_timeout()`](Self::clear_request_timeout).
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = Some(timeout);
         self
     }
 
     /// Clear any explicit HTTP request timeout override.
     ///
-    /// Equivalent to calling `request_timeout(None)`.
+    /// Equivalent to removing a timeout set via [`request_timeout()`](Self::request_timeout).
     pub fn clear_request_timeout(mut self) -> Self {
         self.request_timeout = None;
         self
@@ -662,30 +654,10 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_with_optional_request_timeout_some() {
+    fn test_builder_with_request_timeout() {
         let client = ConfluentSchemaRegistryBuilder::default()
             .url("http://localhost:8081")
-            .request_timeout(Some(Duration::from_secs(2)))
-            .build()
-            .unwrap();
-        assert_eq!(client.base_url, "http://localhost:8081");
-    }
-
-    #[test]
-    fn test_builder_with_optional_request_timeout_none() {
-        let client = ConfluentSchemaRegistryBuilder::default()
-            .url("http://localhost:8081")
-            .request_timeout(None)
-            .build()
-            .unwrap();
-        assert_eq!(client.base_url, "http://localhost:8081");
-    }
-
-    #[test]
-    fn test_builder_with_request_timeout_duration() {
-        let client = ConfluentSchemaRegistryBuilder::default()
-            .url("http://localhost:8081")
-            .request_timeout_duration(Duration::from_secs(2))
+            .request_timeout(Duration::from_secs(2))
             .build()
             .unwrap();
         assert_eq!(client.base_url, "http://localhost:8081");
@@ -695,7 +667,7 @@ mod tests {
     fn test_builder_clear_request_timeout() {
         let client = ConfluentSchemaRegistryBuilder::default()
             .url("http://localhost:8081")
-            .request_timeout_duration(Duration::from_secs(2))
+            .request_timeout(Duration::from_secs(2))
             .clear_request_timeout()
             .build()
             .unwrap();

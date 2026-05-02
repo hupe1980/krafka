@@ -67,7 +67,10 @@ match detect_wire_format(data) {
     DetectedWireFormat::Glue { version_id, payload_offset } => {
         // route to Glue registry
     }
-    DetectedWireFormat::Unknown => {
+    DetectedWireFormat::InvalidConfluent | DetectedWireFormat::InvalidGlue => {
+        // reject malformed framed data
+    }
+    DetectedWireFormat::Unknown | _ => {
         // passthrough or custom handling
     }
 }

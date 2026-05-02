@@ -645,7 +645,7 @@ impl MetricsVisitable for ConsumerMetrics {
             self.rebalances.get(),
         );
         exporter.export_counter(
-            &format!("{prefix}_seeks"),
+            &format!("{prefix}_seeks_total"),
             "Total seek operations (seek + seek_many partition count)",
             self.seeks.get(),
         );
