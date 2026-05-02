@@ -876,11 +876,6 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
 
     /// Remove a single schema ID from the cache.
     pub fn invalidate(&self, schema_id: SchemaId) {
-        self.cache.write().remove(&schema_id);
-        self.insertion_order
-            .write()
-            .retain(|cached_id| *cached_id != schema_id);
-
         // Cancel any coalesced waiters so invalidation is observable immediately.
         let waiters = self
             .in_flight
@@ -888,6 +883,12 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             .remove(&schema_id)
             .map(|entry| entry.waiters)
             .unwrap_or_default();
+
+        self.cache.write().remove(&schema_id);
+        self.insertion_order
+            .write()
+            .retain(|cached_id| *cached_id != schema_id);
+
         for waiter in waiters {
             let _ = waiter.send(Err(schema_lookup_cancelled_error(schema_id)));
         }
@@ -895,11 +896,12 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
 
     /// Remove all cached schemas.
     pub fn invalidate_all(&self) {
+        // Cancel all in-flight lookups so no stale insertions survive reset.
+        let cancelled: Vec<_> = self.in_flight.lock().drain().collect();
+
         self.clear_cache();
 
-        // Cancel all in-flight lookups so no stale insertions survive reset.
-        let mut in_flight = self.in_flight.lock();
-        for (id, entry) in in_flight.drain() {
+        for (id, entry) in cancelled {
             for waiter in entry.waiters {
                 let _ = waiter.send(Err(schema_lookup_cancelled_error(id)));
             }
@@ -929,11 +931,6 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
 
         let (waiter_rx, leader_token) = {
             let mut in_flight = self.in_flight.lock();
-            if let Some(schema) = self.cache.read().get(&id) {
-                debug!(schema_id = id, "schema cache hit (double-checked)");
-                return Ok(schema.clone());
-            }
-
             if let Some(entry) = in_flight.get_mut(&id) {
                 let (tx, rx) = oneshot::channel();
                 entry.waiters.push(tx);
@@ -1512,7 +1509,7 @@ mod tests {
     #[tokio::test]
     async fn test_schema_decoder_truncated_confluent_header_is_error() {
         // Only 3 bytes — Confluent header needs 5. First byte is 0x00 (magic),
-        // so detect_wire_format returns Unknown; decode() must reject it.
+        // so detect_wire_format returns InvalidConfluent; decode() must reject it.
         let decoder = SchemaDecoder::new();
         let truncated = [MAGIC_BYTE, 0x00, 0x01];
         let result = decoder.decode(&truncated).await;
@@ -1530,7 +1527,7 @@ mod tests {
     #[tokio::test]
     async fn test_schema_decoder_truncated_glue_header_is_error() {
         // Only 4 bytes — Glue header needs 18. First byte is 0x03 (version),
-        // so detect_wire_format returns Unknown; decode() must reject it.
+        // so detect_wire_format returns InvalidGlue; decode() must reject it.
         let decoder = SchemaDecoder::new();
         let truncated = [glue::GLUE_HEADER_VERSION_BYTE, 0x00, 0x01, 0x02];
         let result = decoder.decode(&truncated).await;

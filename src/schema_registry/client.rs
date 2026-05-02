@@ -636,6 +636,7 @@ impl ConfluentSchemaRegistryBuilder {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_builder_missing_url() {
@@ -674,6 +675,59 @@ mod tests {
 
         let client = builder.build().unwrap();
         assert_eq!(client.base_url, "http://localhost:8081");
+    }
+
+    #[tokio::test]
+    async fn test_builder_request_timeout_applies_to_built_client() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+
+        let client = ConfluentSchemaRegistryBuilder::default()
+            .url(format!("http://{addr}"))
+            .request_timeout(Duration::from_millis(30))
+            .build()
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let err = client.get_schema_by_id(1).await.unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(elapsed < Duration::from_millis(200));
+        assert!(err.to_string().contains("request failed"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_builder_clear_request_timeout_removes_client_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+
+        let client = ConfluentSchemaRegistryBuilder::default()
+            .url(format!("http://{addr}"))
+            .request_timeout(Duration::from_millis(20))
+            .clear_request_timeout()
+            .build()
+            .unwrap();
+
+        let result =
+            tokio::time::timeout(Duration::from_millis(60), client.get_schema_by_id(1)).await;
+        assert!(
+            result.is_err(),
+            "request unexpectedly completed with cleared timeout"
+        );
+
+        server.abort();
     }
 
     #[test]

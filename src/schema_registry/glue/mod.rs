@@ -701,11 +701,6 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
 
     /// Remove a single schema version ID from the cache.
     pub fn invalidate(&self, version_id: GlueSchemaVersionId) {
-        self.cache.write().remove(&version_id);
-        self.insertion_order
-            .write()
-            .retain(|cached_id| *cached_id != version_id);
-
         // Cancel any coalesced waiters so invalidation is observable immediately.
         let waiters = self
             .in_flight
@@ -713,6 +708,12 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
             .remove(&version_id)
             .map(|entry| entry.waiters)
             .unwrap_or_default();
+
+        self.cache.write().remove(&version_id);
+        self.insertion_order
+            .write()
+            .retain(|cached_id| *cached_id != version_id);
+
         for waiter in waiters {
             let _ = waiter.send(Err(glue_schema_lookup_cancelled_error(version_id)));
         }
@@ -720,11 +721,12 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
 
     /// Remove all cached schemas.
     pub fn invalidate_all(&self) {
+        // Cancel all in-flight lookups so no stale insertions survive reset.
+        let cancelled: Vec<_> = self.in_flight.lock().drain().collect();
+
         self.clear_cache();
 
-        // Cancel all in-flight lookups so no stale insertions survive reset.
-        let mut in_flight = self.in_flight.lock();
-        for (id, entry) in in_flight.drain() {
+        for (id, entry) in cancelled {
             for waiter in entry.waiters {
                 let _ = waiter.send(Err(glue_schema_lookup_cancelled_error(id)));
             }
@@ -754,11 +756,6 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
 
         let (waiter_rx, leader_token) = {
             let mut in_flight = self.in_flight.lock();
-            if let Some(schema) = self.cache.read().get(&id) {
-                debug!(version_id = %id, "glue schema cache hit (double-checked)");
-                return Ok(schema.clone());
-            }
-
             if let Some(entry) = in_flight.get_mut(&id) {
                 let (tx, rx) = oneshot::channel();
                 entry.waiters.push(tx);

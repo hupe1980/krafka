@@ -310,6 +310,45 @@ fn apply_seek_many_offsets(
     offsets.len()
 }
 
+fn apply_assignment_offset_precedence(
+    assigned: &HashMap<String, Vec<PartitionId>>,
+    committed: &HashMap<(String, PartitionId), Offset>,
+    initial_offsets: &HashMap<(String, PartitionId), Offset>,
+    stored_offsets: &mut HashMap<(String, PartitionId), Offset>,
+) -> Vec<(String, PartitionId)> {
+    let mut need_reset: Vec<(String, PartitionId)> = Vec::new();
+
+    for (topic, partitions) in assigned {
+        for &partition in partitions {
+            let key = (topic.clone(), partition);
+
+            // Respect user-set offsets (e.g., from seek() in on_partitions_assigned).
+            // If the caller already positioned this partition, do not overwrite.
+            if stored_offsets.contains_key(&key) {
+                continue;
+            }
+
+            if let Some(&offset) = committed.get(&key)
+                && offset >= 0
+            {
+                stored_offsets.insert(key, offset);
+                continue;
+            }
+
+            // No committed offset — try caller-supplied initial_offsets before
+            // falling back to auto_offset_reset.
+            if let Some(&initial) = initial_offsets.get(&key) {
+                stored_offsets.insert(key, initial);
+                continue;
+            }
+
+            need_reset.push(key);
+        }
+    }
+
+    need_reset
+}
+
 async fn batch_recv_with<FClosed, FPoll, FPollFut, FSetBuffered>(
     recv_buffer: &SyncMutex<std::collections::VecDeque<ConsumerRecord>>,
     mut set_buffered_records: FSetBuffered,
@@ -1549,58 +1588,17 @@ impl Consumer {
         // Fetch committed offsets
         let committed = coordinator.fetch_committed_offsets(assigned).await?;
 
-        // Determine which partitions are missing committed offsets
-        let mut need_reset: Vec<(String, PartitionId)> = Vec::new();
         let mut offsets = self.offsets.write().await;
 
         // Log the initial offsets state before processing committed offsets
         debug!("fetch_and_apply: existing offsets: {:?}", *offsets);
 
-        for (topic, partitions) in assigned {
-            for &partition in partitions {
-                let key = (topic.clone(), partition);
-
-                // Respect user-set offsets (e.g., from seek() in on_partitions_assigned).
-                // If the caller already positioned this partition, do not overwrite.
-                if offsets.contains_key(&key) {
-                    debug!(
-                        "Keeping existing offset for {}-{} (user-set or prior)",
-                        topic, partition
-                    );
-                    continue;
-                }
-
-                let committed_val = committed.get(&key);
-                if let Some(&offset) = committed_val
-                    && offset >= 0
-                {
-                    debug!(
-                        "Using committed offset {} for {}-{}",
-                        offset, topic, partition
-                    );
-                    offsets.insert(key, offset);
-                    continue;
-                }
-
-                // No committed offset — try caller-supplied initial_offsets before
-                // falling back to auto_offset_reset.
-                if let Some(&initial) = self.config.initial_offsets.get(&key) {
-                    debug!(
-                        "Using initial_offsets {} for {}-{} (no committed offset)",
-                        initial, topic, partition
-                    );
-                    offsets.insert(key, initial);
-                    continue;
-                }
-
-                // No committed offset or negative (unknown)
-                debug!(
-                    "No committed offset for {}-{} (committed={:?}), will auto-reset",
-                    topic, partition, committed_val
-                );
-                need_reset.push(key);
-            }
-        }
+        let need_reset = apply_assignment_offset_precedence(
+            assigned,
+            &committed,
+            &self.config.initial_offsets,
+            &mut offsets,
+        );
 
         if need_reset.is_empty() {
             return Ok(());
@@ -2326,32 +2324,62 @@ impl Consumer {
                     missing.len()
                 );
 
-                // Pre-seed from initial_offsets before hitting the network.
-                // This covers the case where initial_offsets was configured but
-                // fetch_and_apply_committed_offsets ran before the config was
-                // observed (e.g., a late rebalance that bypassed the committed
-                // path), and avoids an unnecessary ListOffsets RPC.
-                let still_missing: Vec<(String, PartitionId)> =
-                    if self.config.initial_offsets.is_empty() {
-                        missing
-                    } else {
-                        let mut offsets = self.offsets.write().await;
-                        missing
-                            .into_iter()
-                            .filter(|key| {
-                                if let Some(&initial) = self.config.initial_offsets.get(key) {
-                                    debug!(
-                                        "Poll retry: using initial_offsets {} for {}-{}",
-                                        initial, key.0, key.1
-                                    );
-                                    offsets.insert(key.clone(), initial);
-                                    false
-                                } else {
-                                    true
-                                }
-                            })
-                            .collect()
-                    };
+                let mut still_missing = missing;
+
+                // For group consumers, always re-check committed offsets first.
+                // Only partitions with no committed offset may fall back to
+                // caller-supplied initial_offsets.
+                if let Some(ref coordinator) = self.group_coordinator {
+                    let mut topic_map: HashMap<String, Vec<PartitionId>> = HashMap::new();
+                    for (topic, partition) in &still_missing {
+                        topic_map.entry(topic.clone()).or_default().push(*partition);
+                    }
+
+                    if !topic_map.is_empty() {
+                        match coordinator.fetch_committed_offsets(&topic_map).await {
+                            Ok(committed) => {
+                                let mut offsets = self.offsets.write().await;
+                                still_missing.retain(|key| {
+                                    if let Some(&offset) = committed.get(key)
+                                        && offset >= 0
+                                    {
+                                        offsets.insert(key.clone(), offset);
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Retry committed-offset fetch failed, continuing with fallback paths: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if !self.config.initial_offsets.is_empty() {
+                    let mut offsets = self.offsets.write().await;
+                    still_missing.retain(|key| {
+                        if let Some(&initial) = self.config.initial_offsets.get(key) {
+                            debug!(
+                                "Poll retry: using initial_offsets {} for {}-{}",
+                                initial, key.0, key.1
+                            );
+                            offsets.insert(key.clone(), initial);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+
+                if still_missing.is_empty() {
+                    self.recompute_lag_metrics().await;
+                    return Ok(Vec::new());
+                }
 
                 let mut reset_partitions: HashMap<String, Vec<PartitionId>> = HashMap::new();
                 for (topic, partition) in &still_missing {
@@ -3258,9 +3286,6 @@ impl Consumer {
                     return Ok(first);
                 }
                 Ok(_) => continue,
-                Err(_) if self.closed.load(std::sync::atomic::Ordering::SeqCst) => {
-                    return Err(RecvError::Closed);
-                }
                 Err(e) => {
                     return Err(RecvError::Error(e));
                 }
@@ -5883,6 +5908,76 @@ mod tests {
         }
     }
 
+    fn make_test_consumer() -> Consumer {
+        let config = ConsumerConfig::default();
+        let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
+        let metadata = Arc::new(
+            ClusterMetadata::new(
+                vec!["127.0.0.1:9092".to_string()],
+                pool.clone(),
+                config.metadata_max_age,
+            )
+            .with_topic_cache_ttl_disabled(),
+        );
+
+        Consumer {
+            config,
+            metadata,
+            pool,
+            subscriptions: RwLock::new(HashSet::new()),
+            assignments: RwLock::new(HashMap::new()),
+            offsets: RwLock::new(HashMap::new()),
+            paused: RwLock::new(HashSet::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            group_coordinator: None,
+            metrics: Arc::new(ConsumerMetrics::default()),
+            rebalance_listener: Arc::new(NoOpRebalanceListener),
+            interceptor: Arc::new(crate::interceptor::NoOpConsumerInterceptor),
+            last_auto_commit: SyncMutex::new(Instant::now()),
+            recv_buffer: SyncMutex::new(std::collections::VecDeque::new()),
+            fetch_sessions: SyncMutex::new(FetchSessionCache::new()),
+            partition_state: RwLock::new(HashMap::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_recv_public_api_returns_closed_when_consumer_closed() {
+        let consumer = make_test_consumer();
+        consumer
+            .closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let outcome = consumer
+            .batch_recv(5, Duration::from_millis(10))
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, BatchRecvOutcome::Closed));
+    }
+
+    #[tokio::test]
+    async fn test_batch_recv_public_api_uses_buffer_and_updates_metric() {
+        let consumer = make_test_consumer();
+        {
+            let mut buffer = consumer.recv_buffer.lock();
+            buffer.push_back(make_record("orders", 0, 1));
+            buffer.push_back(make_record("orders", 0, 2));
+        }
+
+        let outcome = consumer
+            .batch_recv(1, Duration::from_millis(10))
+            .await
+            .unwrap();
+        let BatchRecvOutcome::Records(records) = outcome else {
+            panic!("expected records outcome");
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].offset, 1);
+
+        let metrics = consumer.metrics().snapshot();
+        assert_eq!(metrics.buffered_records, 1);
+    }
+
     #[tokio::test]
     async fn test_batch_recv_with_returns_empty_request_for_zero_max_records() {
         let buffer = SyncMutex::new(std::collections::VecDeque::new());
@@ -5999,27 +6094,24 @@ mod tests {
 
     // ── initial_offsets precedence tests ───────────────────────────────
 
-    /// initial_offsets is used when there is no committed group offset for a
-    /// partition (the core contract for startup offset seeding).
     #[test]
-    fn test_initial_offsets_used_when_no_committed_offset() {
-        let mut initial_offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
-        initial_offsets.insert(("topic1".to_string(), 0), 500);
-
+    fn test_assignment_offset_precedence_uses_initial_when_no_committed() {
+        let assigned: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0])].into_iter().collect();
         let committed: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let initial_offsets: HashMap<(String, PartitionId), Offset> =
+            [(("topic1".to_string(), 0), 500)].into_iter().collect();
+        let mut stored: HashMap<(String, PartitionId), Offset> = HashMap::new();
 
-        let key = ("topic1".to_string(), 0);
-        let mut result_offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let need_reset = apply_assignment_offset_precedence(
+            &assigned,
+            &committed,
+            &initial_offsets,
+            &mut stored,
+        );
 
-        // Mirrors the logic in fetch_and_apply_committed_offsets: if committed
-        // has no entry and initial_offsets does, use initial_offsets.
-        if let Some(&committed_offset) = committed.get(&key) {
-            result_offsets.insert(key.clone(), committed_offset);
-        } else if let Some(&initial) = initial_offsets.get(&key) {
-            result_offsets.insert(key.clone(), initial);
-        }
-
-        assert_eq!(result_offsets.get(&key), Some(&500));
+        assert!(need_reset.is_empty());
+        assert_eq!(stored.get(&("topic1".to_string(), 0)), Some(&500));
     }
 
     #[test]
@@ -6050,71 +6142,66 @@ mod tests {
         assert!(!stored.contains_key(&("topic3".to_string(), 0)));
     }
 
-    /// Committed group offset takes precedence over initial_offsets — existing
-    /// consumers must not replay already-committed work on restart.
     #[test]
-    fn test_committed_offset_takes_precedence_over_initial_offsets() {
-        let mut initial_offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
-        initial_offsets.insert(("topic1".to_string(), 0), 500);
+    fn test_assignment_offset_precedence_committed_wins_initial() {
+        let assigned: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0])].into_iter().collect();
+        let committed: HashMap<(String, PartitionId), Offset> =
+            [(("topic1".to_string(), 0), 999)].into_iter().collect();
+        let initial_offsets: HashMap<(String, PartitionId), Offset> =
+            [(("topic1".to_string(), 0), 500)].into_iter().collect();
+        let mut stored: HashMap<(String, PartitionId), Offset> = HashMap::new();
 
-        let mut committed: HashMap<(String, PartitionId), Offset> = HashMap::new();
-        committed.insert(("topic1".to_string(), 0), 999); // committed is present
+        let need_reset = apply_assignment_offset_precedence(
+            &assigned,
+            &committed,
+            &initial_offsets,
+            &mut stored,
+        );
 
-        let key = ("topic1".to_string(), 0);
-        let mut result_offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
-
-        if let Some(&committed_offset) = committed.get(&key) {
-            result_offsets.insert(key.clone(), committed_offset);
-        } else if let Some(&initial) = initial_offsets.get(&key) {
-            result_offsets.insert(key.clone(), initial);
-        }
-
-        // Committed offset wins
-        assert_eq!(result_offsets.get(&key), Some(&999));
-        assert_ne!(result_offsets.get(&key), Some(&500));
+        assert!(need_reset.is_empty());
+        assert_eq!(stored.get(&("topic1".to_string(), 0)), Some(&999));
     }
 
-    /// When both committed offset AND initial_offsets are absent, neither path
-    /// inserts — auto_offset_reset would take over at runtime.
     #[test]
-    fn test_no_committed_no_initial_offset_falls_through() {
+    fn test_assignment_offset_precedence_missing_offsets_require_reset() {
+        let assigned: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0])].into_iter().collect();
+        let committed: HashMap<(String, PartitionId), Offset> = HashMap::new();
         let initial_offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
-        let committed: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let mut stored: HashMap<(String, PartitionId), Offset> = HashMap::new();
 
-        let key = ("topic1".to_string(), 0);
-        let mut result_offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let need_reset = apply_assignment_offset_precedence(
+            &assigned,
+            &committed,
+            &initial_offsets,
+            &mut stored,
+        );
 
-        if let Some(&committed_offset) = committed.get(&key) {
-            result_offsets.insert(key.clone(), committed_offset);
-        } else if let Some(&initial) = initial_offsets.get(&key) {
-            result_offsets.insert(key.clone(), initial);
-        }
-        // Neither path triggered — auto_offset_reset handles this at runtime
-        assert!(!result_offsets.contains_key(&key));
+        assert_eq!(need_reset, vec![("topic1".to_string(), 0)]);
+        assert!(stored.is_empty());
     }
 
-    /// initial_offsets only applies to the specific partition it names;
-    /// other partitions in the same topic are not affected.
     #[test]
-    fn test_initial_offsets_partition_scoped() {
-        let mut initial_offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
-        initial_offsets.insert(("topic1".to_string(), 0), 100);
-        // partition 1 is NOT in initial_offsets
+    fn test_assignment_offset_precedence_preserves_existing_user_offset() {
+        let assigned: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0])].into_iter().collect();
+        let committed: HashMap<(String, PartitionId), Offset> =
+            [(("topic1".to_string(), 0), 999)].into_iter().collect();
+        let initial_offsets: HashMap<(String, PartitionId), Offset> =
+            [(("topic1".to_string(), 0), 500)].into_iter().collect();
+        let mut stored: HashMap<(String, PartitionId), Offset> =
+            [(("topic1".to_string(), 0), 42)].into_iter().collect();
 
-        let committed: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let need_reset = apply_assignment_offset_precedence(
+            &assigned,
+            &committed,
+            &initial_offsets,
+            &mut stored,
+        );
 
-        let mut result_offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
-        for partition in [0i32, 1i32] {
-            let key = ("topic1".to_string(), partition);
-            if let Some(&c) = committed.get(&key) {
-                result_offsets.insert(key, c);
-            } else if let Some(&i) = initial_offsets.get(&key) {
-                result_offsets.insert(key, i);
-            }
-        }
-
-        assert_eq!(result_offsets.get(&("topic1".to_string(), 0)), Some(&100));
-        assert!(!result_offsets.contains_key(&("topic1".to_string(), 1)));
+        assert!(need_reset.is_empty());
+        assert_eq!(stored.get(&("topic1".to_string(), 0)), Some(&42));
     }
 
     #[test]
@@ -6132,5 +6219,34 @@ mod tests {
         assert_eq!(updated, 2);
         assert_eq!(stored.get(&("orders".to_string(), 0)), Some(&20));
         assert_eq!(stored.get(&("orders".to_string(), 1)), Some(&30));
+    }
+
+    #[tokio::test]
+    async fn test_seek_many_public_api_recomputes_lag_and_increments_metric() {
+        let consumer = make_test_consumer();
+
+        {
+            let mut offsets = consumer.offsets.write().await;
+            offsets.insert(("orders".to_string(), 0), 100);
+        }
+        {
+            let mut state = consumer.partition_state.write().await;
+            state.insert(
+                ("orders".to_string(), 0),
+                PartitionState {
+                    high_watermark: Some(120),
+                    ..PartitionState::default()
+                },
+            );
+        }
+
+        let updates: HashMap<(String, PartitionId), Offset> =
+            [(("orders".to_string(), 0), 110)].into_iter().collect();
+        consumer.seek_many(&updates).await.unwrap();
+
+        let metrics = consumer.metrics().snapshot();
+        assert_eq!(metrics.seeks, 1);
+        assert_eq!(metrics.lag, 10);
+        assert_eq!(metrics.lag_max, 10);
     }
 }

@@ -982,7 +982,7 @@ pub type Result<T> = std::result::Result<T, KrafkaError>;
 
 /// Error returned by [`Consumer::recv()`](crate::consumer::Consumer::recv).
 ///
-/// This mirrors the pattern of `tokio::sync::mpsc::error::RecvError` — the
+/// This mirrors the pattern of `tokio::sync::broadcast::error::RecvError` — the
 /// `Closed` variant signals that the consumer has been shut down, while
 /// `Error` wraps any broker or network failure encountered during polling.
 ///
