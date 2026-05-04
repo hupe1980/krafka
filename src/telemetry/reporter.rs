@@ -184,6 +184,9 @@ enum TelemetryChunkingError {
         payload_bytes: usize,
         max_bytes: usize,
     },
+    NoUsableCompressionCodec {
+        accepted_compression_types: Vec<Compression>,
+    },
 }
 
 /// A background KIP-714 telemetry reporter.
@@ -528,6 +531,15 @@ impl TelemetryReporter {
                 );
                 return PushResult::ReSubscribe;
             }
+            Err(TelemetryChunkingError::NoUsableCompressionCodec {
+                accepted_compression_types,
+            }) => {
+                warn!(
+                    ?accepted_compression_types,
+                    "Broker advertised no telemetry compression codec that is locally usable; stopping telemetry reporter"
+                );
+                return PushResult::Fatal;
+            }
         };
 
         let chunk_count = chunks.len();
@@ -713,10 +725,12 @@ impl TelemetryReporter {
         subscription: &Subscription,
         unsupported_compression_types: &mut HashSet<Compression>,
         payload: &[u8],
-    ) -> (Vec<u8>, Compression) {
+    ) -> Result<(Vec<u8>, Compression), TelemetryChunkingError> {
+        let mut fallback_compression = None;
+
         for compression in &subscription.accepted_compression_types {
             if *compression == Compression::None {
-                return (payload.to_vec(), Compression::None);
+                return Ok((payload.to_vec(), Compression::None));
             }
 
             if unsupported_compression_types.contains(compression) {
@@ -731,6 +745,9 @@ impl TelemetryReporter {
             match compression.compress(payload) {
                 Ok(compressed) => {
                     if compressed.len() >= payload.len() {
+                        if fallback_compression.is_none() {
+                            fallback_compression = Some((compressed.to_vec(), *compression));
+                        }
                         continue;
                     }
                     debug!(
@@ -739,7 +756,7 @@ impl TelemetryReporter {
                         compressed_payload_bytes = compressed.len(),
                         "Compressed telemetry payload"
                     );
-                    return (compressed.to_vec(), *compression);
+                    return Ok((compressed.to_vec(), *compression));
                 }
                 Err(error) => {
                     unsupported_compression_types.insert(*compression);
@@ -752,7 +769,19 @@ impl TelemetryReporter {
             }
         }
 
-        (payload.to_vec(), Compression::None)
+        if let Some((compressed, compression)) = fallback_compression {
+            debug!(
+                ?compression,
+                original_payload_bytes = payload.len(),
+                compressed_payload_bytes = compressed.len(),
+                "Using broker-advertised telemetry compression despite no size reduction"
+            );
+            return Ok((compressed, compression));
+        }
+
+        Err(TelemetryChunkingError::NoUsableCompressionCodec {
+            accepted_compression_types: subscription.accepted_compression_types.clone(),
+        })
     }
 
     fn encode_payload(
@@ -762,7 +791,7 @@ impl TelemetryReporter {
         start_time_nanos: u64,
         time_nanos: u64,
         unsupported_compression_types: &mut HashSet<Compression>,
-    ) -> (Vec<u8>, Compression) {
+    ) -> Result<(Vec<u8>, Compression), TelemetryChunkingError> {
         let payload = Self::build_payload_from_metrics(
             resource_attributes,
             metric_bytes,
@@ -805,7 +834,7 @@ impl TelemetryReporter {
                 start_time_nanos,
                 time_nanos,
                 unsupported_compression_types,
-            );
+            )?;
             if payload.len() > max_bytes {
                 return Err(TelemetryChunkingError::SingleMetricTooLarge {
                     payload_bytes: payload.len(),
@@ -838,7 +867,7 @@ impl TelemetryReporter {
                 start_time_nanos,
                 time_nanos,
                 unsupported_compression_types,
-            );
+            )?;
 
             if candidate_payload.len() <= max_bytes {
                 current_metrics = candidate_metrics;
@@ -862,7 +891,7 @@ impl TelemetryReporter {
                 start_time_nanos,
                 time_nanos,
                 unsupported_compression_types,
-            );
+            )?;
             chunks.push(PreparedTelemetryChunk {
                 payload,
                 compression,
@@ -881,7 +910,7 @@ impl TelemetryReporter {
                 start_time_nanos,
                 time_nanos,
                 unsupported_compression_types,
-            );
+            )?;
             if single_payload.len() > max_bytes {
                 return Err(TelemetryChunkingError::SingleMetricTooLarge {
                     payload_bytes: single_payload.len(),
@@ -897,7 +926,7 @@ impl TelemetryReporter {
             start_time_nanos,
             time_nanos,
             unsupported_compression_types,
-        );
+        )?;
         chunks.push(PreparedTelemetryChunk {
             payload,
             compression,
@@ -1469,7 +1498,8 @@ mod tests {
         let mut unsupported = HashSet::new();
 
         let (_, compression) =
-            TelemetryReporter::choose_compression(&subscription, &mut unsupported, &payload);
+            TelemetryReporter::choose_compression(&subscription, &mut unsupported, &payload)
+                .expect("gzip or none should be usable");
 
         if Compression::Gzip.is_available() {
             assert_eq!(compression, Compression::Gzip);
@@ -1498,7 +1528,10 @@ mod tests {
         let mut unsupported = HashSet::from([Compression::Zstd]);
 
         let (_, compression) =
-            TelemetryReporter::choose_compression(&subscription, &mut unsupported, &payload);
+            TelemetryReporter::choose_compression(&subscription, &mut unsupported, &payload)
+                .expect(
+                    "a cached unsupported codec should fall through to the next advertised option",
+                );
 
         assert!(
             !unsupported.remove(&Compression::Zstd)
@@ -1510,6 +1543,68 @@ mod tests {
         } else {
             assert_eq!(compression, Compression::None);
             assert!(unsupported.contains(&Compression::Gzip));
+        }
+    }
+
+    #[test]
+    fn test_choose_compression_uses_broker_codec_when_none_is_not_advertised() {
+        let subscription = Subscription {
+            client_instance_id: [0; 16],
+            subscription_id: 1,
+            push_interval: Duration::from_secs(1),
+            delta_temporality: false,
+            accepted_compression_types: vec![Compression::Gzip],
+            telemetry_max_bytes: 1_048_576,
+            requested_metrics: vec!["*".to_string()],
+        };
+        let payload = vec![b'a'];
+        let mut unsupported = HashSet::new();
+
+        let result =
+            TelemetryReporter::choose_compression(&subscription, &mut unsupported, &payload);
+
+        if Compression::Gzip.is_available() {
+            let (_, compression) = result.expect("gzip should remain the only legal fallback");
+            assert_eq!(compression, Compression::Gzip);
+        } else {
+            let error =
+                result.expect_err("without gzip or none, compression selection should fail");
+            assert!(matches!(
+                error,
+                TelemetryChunkingError::NoUsableCompressionCodec { .. }
+            ));
+            assert!(unsupported.contains(&Compression::Gzip));
+        }
+    }
+
+    #[test]
+    fn test_choose_compression_errors_without_usable_broker_codec() {
+        let subscription = Subscription {
+            client_instance_id: [0; 16],
+            subscription_id: 1,
+            push_interval: Duration::from_secs(1),
+            delta_temporality: false,
+            accepted_compression_types: vec![Compression::Gzip],
+            telemetry_max_bytes: 1_048_576,
+            requested_metrics: vec!["*".to_string()],
+        };
+        let payload = vec![b'a'; 1024];
+        let mut unsupported = HashSet::from([Compression::Gzip]);
+
+        let error = TelemetryReporter::choose_compression(
+            &subscription,
+            &mut unsupported,
+            &payload,
+        )
+        .expect_err(
+            "without an advertised none codec, selection must fail when all codecs are unusable",
+        );
+
+        match error {
+            TelemetryChunkingError::NoUsableCompressionCodec {
+                accepted_compression_types,
+            } => assert_eq!(accepted_compression_types, vec![Compression::Gzip]),
+            other => panic!("unexpected compression selection error: {other:?}"),
         }
     }
 

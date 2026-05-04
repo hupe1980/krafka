@@ -782,37 +782,13 @@ impl ShareConsumer {
         Ok(())
     }
 
-    fn restore_unacked_offsets(unacked_offsets: &mut HashSet<RecordKey>, acks: &[PendingAck]) {
-        for ack in acks {
-            for offset in ack.first_offset..=ack.last_offset {
-                unacked_offsets.insert((ack.topic.clone(), ack.partition, offset));
-            }
-        }
-    }
-
     async fn restore_pending_acks(&self, mut acks: Vec<PendingAck>) {
-        Self::restore_ack_state(
-            self.config.acknowledgement_mode,
-            self.pending_acks.as_ref(),
-            self.unacked_offsets.as_ref(),
-            &mut acks,
-        )
-        .await;
+        Self::restore_ack_state(self.pending_acks.as_ref(), &mut acks).await;
     }
 
-    async fn restore_ack_state(
-        ack_mode: AcknowledgementMode,
-        pending_acks: &RwLock<Vec<PendingAck>>,
-        unacked_offsets: &RwLock<HashSet<RecordKey>>,
-        acks: &mut Vec<PendingAck>,
-    ) {
+    async fn restore_ack_state(pending_acks: &RwLock<Vec<PendingAck>>, acks: &mut Vec<PendingAck>) {
         if acks.is_empty() {
             return;
-        }
-
-        if ack_mode == AcknowledgementMode::Explicit {
-            let mut unacked = unacked_offsets.write().await;
-            Self::restore_unacked_offsets(&mut unacked, acks);
         }
 
         let mut pending = pending_acks.write().await;
@@ -904,9 +880,6 @@ impl ShareConsumer {
         };
 
         let pending_acks = self.pending_acks.clone();
-        let unacked_offsets = self.unacked_offsets.clone();
-        let ack_mode = self.config.acknowledgement_mode;
-
         let Ok(mut pending) = self.pending_acks.try_write() else {
             return ShareCommitHandle::ready(Err(KrafkaError::invalid_state(
                 "commit_async: pending_acks lock contention",
@@ -927,15 +900,8 @@ impl ShareConsumer {
         ShareCommitHandle::Task(tokio::spawn(async move {
             let restore_acks = |mut acks: Vec<PendingAck>| {
                 let pending_acks = pending_acks.clone();
-                let unacked_offsets = unacked_offsets.clone();
                 async move {
-                    ShareConsumer::restore_ack_state(
-                        ack_mode,
-                        pending_acks.as_ref(),
-                        unacked_offsets.as_ref(),
-                        &mut acks,
-                    )
-                    .await;
+                    ShareConsumer::restore_ack_state(pending_acks.as_ref(), &mut acks).await;
                 }
             };
             if let Err(error) = ShareConsumer::send_share_acknowledge_with_state(
@@ -1889,10 +1855,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_restore_unacked_offsets_reinserts_explicit_ack_ranges() {
-        let mut unacked = HashSet::new();
-        let acks = vec![PendingAck {
+    #[tokio::test]
+    async fn test_restore_ack_state_requeues_pending_acks_without_reinserting_unacked() {
+        let pending = RwLock::new(Vec::new());
+        let mut acks_to_restore = vec![PendingAck {
             topic: "topic-a".into(),
             topic_id: [0; 16],
             partition: 2,
@@ -1901,11 +1867,16 @@ mod tests {
             ack_type: AcknowledgeType::Accept.to_i8(),
         }];
 
-        ShareConsumer::restore_unacked_offsets(&mut unacked, &acks);
+        ShareConsumer::restore_ack_state(&pending, &mut acks_to_restore).await;
 
-        assert!(unacked.contains(&("topic-a".to_string(), 2, 11)));
-        assert!(unacked.contains(&("topic-a".to_string(), 2, 12)));
-        assert!(unacked.contains(&("topic-a".to_string(), 2, 13)));
+        assert!(acks_to_restore.is_empty());
+        let pending = pending.read().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].topic, "topic-a");
+        assert_eq!(pending[0].partition, 2);
+        assert_eq!(pending[0].first_offset, 11);
+        assert_eq!(pending[0].last_offset, 13);
+        assert_eq!(pending[0].ack_type, AcknowledgeType::Accept.to_i8());
     }
 
     #[tokio::test]

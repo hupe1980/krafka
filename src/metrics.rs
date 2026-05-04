@@ -587,7 +587,7 @@ impl MetricsVisitable for ProducerMetrics {
         );
         exporter.export_gauge(
             &format!("{prefix}_buffered_records"),
-            "Currently buffered records",
+            "Producer records currently admitted under the memory budget",
             self.buffered_records.get(),
         );
         exporter.export_latency(
