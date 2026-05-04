@@ -187,7 +187,7 @@ Sessions are managed automatically. They reset on errors or assignment changes.
 
 ## Concurrent Fetching
 
-Each `poll()` issues ShareFetch requests to all assigned brokers **concurrently** using a `tokio::task::JoinSet`. Pending acknowledgements are piggybacked on fetch requests to reduce round trips. If a broker fetch fails, records from other brokers are still returned, the session for the failed broker is reset, and the unsent piggyback acknowledgements are restored for the next commit cycle.
+Each `poll()` issues ShareFetch requests to all assigned brokers **concurrently** by spawning one Tokio task per broker and awaiting the handles directly. Pending acknowledgements are piggybacked on fetch requests to reduce round trips. If a broker fetch fails, records from other brokers are still returned, the session for the failed broker is reset, and the unsent piggyback acknowledgements are restored for the next commit cycle.
 
 ## Coordinator Handling
 
@@ -214,7 +214,7 @@ consumer.subscribe(&["topic1", "topic2"]).await?;
 let records = consumer.poll(Duration::from_secs(1)).await?;
 
 // Unsubscribe (leaves group, generates a new member ID)
-consumer.unsubscribe().await?;
+consumer.unsubscribe().await;
 
 // Close (idempotent)
 consumer.close().await?;
@@ -231,7 +231,7 @@ consumer.close().await?;
 
 ### Unsubscribe Semantics
 
-`unsubscribe()` leaves the group, clears all partition state (pending acks, sessions, coordinator), and generates a fresh member ID. The consumer can be resubscribed afterwards.
+`unsubscribe()` attempts a best-effort leave-group heartbeat, logs any leave failure internally, clears all partition state (pending acks, sessions, coordinator), and generates a fresh member ID. The consumer can be resubscribed afterwards.
 
 ## Wire Protocol
 
