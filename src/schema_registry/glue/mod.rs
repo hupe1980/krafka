@@ -1481,6 +1481,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_unbounded_cache_does_not_populate_insertion_order() {
+        let mock = MockGlueRegistry::new();
+        let cached = CachedGlueSchemaRegistry::new(mock);
+        let id1: GlueSchemaVersionId = TEST_UUID_STR.parse().unwrap();
+        let id2: GlueSchemaVersionId = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+
+        cached.get_schema_by_version_id(id1).await.unwrap();
+        cached.get_schema_by_version_id(id2).await.unwrap();
+
+        assert_eq!(cached.cache_len(), 2);
+        assert!(cached.insertion_order.read().is_empty());
+
+        cached.invalidate(id1);
+        assert_eq!(cached.cache_len(), 1);
+        assert!(cached.insertion_order.read().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_cache_clear() {
         let mock = MockGlueRegistry::new();
         let cached = CachedGlueSchemaRegistry::new(mock);

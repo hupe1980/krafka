@@ -1821,6 +1821,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_unbounded_cache_does_not_populate_insertion_order() {
+        let mock = MockRegistry::new();
+        let cached = CachedSchemaRegistry::new(mock);
+
+        ok(cached.get_schema_by_id(1).await);
+        ok(cached.get_schema_by_id(2).await);
+
+        assert_eq!(cached.cache_len(), 2);
+        assert!(cached.insertion_order.read().is_empty());
+
+        cached.invalidate(1);
+        assert_eq!(cached.cache_len(), 1);
+        assert!(cached.insertion_order.read().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_cache_clear() {
         let mock = MockRegistry::new();
         let cached = CachedSchemaRegistry::new(mock);
