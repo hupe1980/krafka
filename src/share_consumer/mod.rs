@@ -79,6 +79,12 @@ use session::ShareSessionCache;
 /// Key for tracking unacknowledged records in explicit mode.
 type RecordKey = (String, PartitionId, Offset);
 
+/// Key for piggybacked acknowledgements grouped by broker and partition.
+type BrokerAckKey = ([u8; 16], PartitionId);
+
+/// Pending piggybacked acknowledgements grouped by broker and partition.
+type BrokerPendingAcks = HashMap<BrokerId, HashMap<BrokerAckKey, Vec<PendingAck>>>;
+
 /// Pending acknowledgement for a share group record.
 #[derive(Debug, Clone)]
 struct PendingAck {
@@ -88,6 +94,29 @@ struct PendingAck {
     first_offset: Offset,
     last_offset: Offset,
     ack_type: i8,
+}
+
+fn flatten_partition_acks(
+    partition_acks: HashMap<BrokerAckKey, Vec<PendingAck>>,
+) -> Vec<PendingAck> {
+    partition_acks.into_values().flatten().collect()
+}
+
+fn drain_broker_partition_acks(
+    broker_acks: &mut HashMap<BrokerAckKey, Vec<PendingAck>>,
+    topic_id: [u8; 16],
+    partition: PartitionId,
+) -> Vec<PendingAck> {
+    broker_acks
+        .remove(&(topic_id, partition))
+        .unwrap_or_default()
+}
+
+fn drain_broker_acks(broker_acks: &mut BrokerPendingAcks, broker_id: BrokerId) -> Vec<PendingAck> {
+    broker_acks
+        .remove(&broker_id)
+        .map(flatten_partition_acks)
+        .unwrap_or_default()
 }
 
 /// Handle returned by [`ShareConsumer::commit_async`].
@@ -405,20 +434,22 @@ impl ShareConsumer {
         let (ack_batches, mut failed_piggyback_acks): (Vec<_>, Vec<_>) = drained_ack_batches
             .into_iter()
             .partition(|ack| sendable_ack_partitions.contains(&(ack.topic.clone(), ack.partition)));
-        let mut ack_batches_by_broker: HashMap<BrokerId, Vec<PendingAck>> = HashMap::new();
-        for ack in &ack_batches {
+        let mut ack_batches_by_broker: BrokerPendingAcks = HashMap::new();
+        for ack in ack_batches {
             if let Some(broker_id) = self.metadata.leader(&ack.topic, ack.partition) {
                 ack_batches_by_broker
                     .entry(broker_id)
                     .or_default()
-                    .push(ack.clone());
+                    .entry((ack.topic_id, ack.partition))
+                    .or_default()
+                    .push(ack);
             } else {
-                failed_piggyback_acks.push(ack.clone());
+                failed_piggyback_acks.push(ack);
             }
         }
 
         // Fetch from all brokers concurrently.
-        let mut join_set = tokio::task::JoinSet::new();
+        let mut fetch_tasks = Vec::with_capacity(partitions_by_broker.len());
         let member_id = self.member_id.read().await.clone();
         let group_id = self.config.group_id.clone();
 
@@ -430,16 +461,22 @@ impl ShareConsumer {
 
             // Build per-topic partition requests with piggybacked acks.
             let mut topics_map: HashMap<[u8; 16], Vec<ShareFetchPartition>> = HashMap::new();
-            for (topic_name, partition, topic_id) in partitions {
-                let ack_batches_for_partition: Vec<ShareAcknowledgementBatch> = ack_batches
-                    .iter()
-                    .filter(|a| a.topic == *topic_name && a.partition == *partition)
-                    .map(|a| ShareAcknowledgementBatch {
-                        first_offset: a.first_offset,
-                        last_offset: a.last_offset,
-                        acknowledge_types: vec![a.ack_type],
-                    })
-                    .collect();
+            let broker_ack_partitions = ack_batches_by_broker.get(broker_id);
+            for (_, partition, topic_id) in partitions {
+                let ack_batches_for_partition: Vec<ShareAcknowledgementBatch> =
+                    broker_ack_partitions
+                        .and_then(|partition_acks| partition_acks.get(&(*topic_id, *partition)))
+                        .map(|partition_acks| {
+                            partition_acks
+                                .iter()
+                                .map(|a| ShareAcknowledgementBatch {
+                                    first_offset: a.first_offset,
+                                    last_offset: a.last_offset,
+                                    acknowledge_types: vec![a.ack_type],
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
 
                 topics_map
                     .entry(*topic_id)
@@ -474,7 +511,7 @@ impl ShareConsumer {
             let bid = *broker_id;
             let metadata = self.metadata.clone();
             let pool = self.pool.clone();
-            join_set.spawn(async move {
+            let task = tokio::spawn(async move {
                 let broker_addr = metadata
                     .broker(bid)
                     .map(|b| b.address().to_string())
@@ -508,19 +545,21 @@ impl ShareConsumer {
 
                 Result::<(BrokerId, crate::protocol::ShareFetchResponse)>::Ok((bid, response))
             });
+            fetch_tasks.push((bid, task));
         }
 
         // Collect results from all brokers.
         let mut all_records = Vec::new();
         let topic_ids_guard = self.topic_ids.read().await;
 
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(Ok((broker_id, response))) => {
-                    let broker_acks = ack_batches_by_broker.remove(&broker_id).unwrap_or_default();
+        for (broker_id, task) in fetch_tasks {
+            match task.await {
+                Ok(Ok((_, response))) => {
+                    let mut broker_acks =
+                        ack_batches_by_broker.remove(&broker_id).unwrap_or_default();
 
                     if !response.error_code.is_ok() {
-                        failed_piggyback_acks.extend(broker_acks);
+                        failed_piggyback_acks.extend(flatten_partition_acks(broker_acks));
                         warn!(
                             "ShareFetch to broker {broker_id} returned {:?}: {}",
                             response.error_code,
@@ -537,8 +576,8 @@ impl ShareConsumer {
                         sessions.get_or_create(broker_id).on_success();
                     }
 
-                    // Decode records from the response.
-                    let mut broker_ack_failed = false;
+                    // Decode records from the response and restore only the
+                    // partitions whose piggybacked acknowledgements failed.
                     for topic_response in &response.responses {
                         let topic_name = if let Some(name) =
                             self.metadata.topic_name_for_id(&topic_response.topic_id)
@@ -565,12 +604,32 @@ impl ShareConsumer {
                         };
 
                         for partition_response in &topic_response.partitions {
+                            let partition_acks = drain_broker_partition_acks(
+                                &mut broker_acks,
+                                topic_response.topic_id,
+                                partition_response.partition_index,
+                            );
+
                             if !partition_response.error_code.is_ok() {
-                                broker_ack_failed = true;
+                                failed_piggyback_acks.extend(partition_acks);
                                 warn!(
                                     "ShareFetch error for {topic_name}-{}: {:?}",
                                     partition_response.partition_index,
                                     partition_response.error_code
+                                );
+                                continue;
+                            }
+
+                            if !partition_response.acknowledge_error_code.is_ok() {
+                                failed_piggyback_acks.extend(partition_acks);
+                                warn!(
+                                    "Piggybacked ShareFetch acknowledge error for {topic_name}-{}: {:?}: {}",
+                                    partition_response.partition_index,
+                                    partition_response.acknowledge_error_code,
+                                    partition_response
+                                        .acknowledge_error_message
+                                        .as_deref()
+                                        .unwrap_or("unknown error")
                                 );
                                 continue;
                             }
@@ -631,29 +690,17 @@ impl ShareConsumer {
                         }
                     }
 
-                    if broker_ack_failed {
-                        failed_piggyback_acks.extend(broker_acks);
-                    }
+                    failed_piggyback_acks.extend(flatten_partition_acks(broker_acks));
                 }
                 Ok(Err(e)) => {
-                    failed_piggyback_acks.extend(
-                        ack_batches_by_broker
-                            .drain()
-                            .flat_map(|(_, acks)| acks)
-                            .collect::<Vec<_>>(),
-                    );
-                    warn!("ShareFetch to broker failed: {e}");
+                    failed_piggyback_acks
+                        .extend(drain_broker_acks(&mut ack_batches_by_broker, broker_id));
+                    warn!("ShareFetch to broker {broker_id} failed: {e}");
                 }
                 Err(e) => {
-                    // Join errors do not expose the broker id here; restore all
-                    // remaining piggybacked acknowledgements conservatively.
-                    failed_piggyback_acks.extend(
-                        ack_batches_by_broker
-                            .drain()
-                            .flat_map(|(_, acks)| acks)
-                            .collect::<Vec<_>>(),
-                    );
-                    warn!("ShareFetch task panicked: {e}");
+                    failed_piggyback_acks
+                        .extend(drain_broker_acks(&mut ack_batches_by_broker, broker_id));
+                    warn!("ShareFetch task for broker {broker_id} panicked: {e}");
                 }
             }
         }
@@ -662,7 +709,7 @@ impl ShareConsumer {
         failed_piggyback_acks.extend(
             ack_batches_by_broker
                 .drain()
-                .flat_map(|(_, acks)| acks)
+                .flat_map(|(_, acks)| flatten_partition_acks(acks))
                 .collect::<Vec<_>>(),
         );
         self.restore_pending_acks(failed_piggyback_acks).await;
@@ -790,10 +837,12 @@ impl ShareConsumer {
                 if !part_response.error_code.is_ok() {
                     return Some(KrafkaError::broker(
                         part_response.error_code,
-                        format!(
-                            "ShareAcknowledge error for partition {}",
-                            part_response.partition_index
-                        ),
+                        part_response.error_message.clone().unwrap_or_else(|| {
+                            format!(
+                                "ShareAcknowledge error for partition {}",
+                                part_response.partition_index
+                            )
+                        }),
                     ));
                 }
             }
@@ -845,6 +894,15 @@ impl ShareConsumer {
             )));
         }
 
+        let member_id = match self.member_id.try_read() {
+            Ok(g) => g.clone(),
+            Err(_) => {
+                return ShareCommitHandle::ready(Err(KrafkaError::invalid_state(
+                    "commit_async: member_id lock contention",
+                )));
+            }
+        };
+
         let pending_acks = self.pending_acks.clone();
         let unacked_offsets = self.unacked_offsets.clone();
         let ack_mode = self.config.acknowledgement_mode;
@@ -865,14 +923,6 @@ impl ShareConsumer {
         let pool = self.pool.clone();
         let share_sessions = self.share_sessions.clone();
         let group_id = self.config.group_id.clone();
-        let member_id = match self.member_id.try_read() {
-            Ok(g) => g.clone(),
-            Err(_) => {
-                return ShareCommitHandle::ready(Err(KrafkaError::invalid_state(
-                    "commit_async: member_id lock contention",
-                )));
-            }
-        };
 
         ShareCommitHandle::Task(tokio::spawn(async move {
             let restore_acks = |mut acks: Vec<PendingAck>| {

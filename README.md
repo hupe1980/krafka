@@ -26,6 +26,7 @@ A pure Rust, async-native Apache Kafka client designed for high performance, saf
 - 🧪 **Fuzz tested**: cargo-fuzz targets for protocol arrays, record batches, and response decoders
 
 > **Minimum Broker Version:** Krafka requires **Apache Kafka 3.9+**. Protocol versions older than the Kafka 3.9 baseline have been removed.
+
 ## 🚀 Quick Start
 
 Add Krafka to your `Cargo.toml`:

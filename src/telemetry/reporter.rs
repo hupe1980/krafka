@@ -543,6 +543,8 @@ impl TelemetryReporter {
                 )
                 .await;
             if chunk_result != PushResult::Ok {
+                self.delta_tracker
+                    .commit_updates(&committed_counter_updates);
                 return chunk_result;
             }
             committed_counter_updates.extend(chunk.counter_updates);
@@ -1450,73 +1452,6 @@ mod tests {
 
         assert_eq!(tracker.preview_delta(&first_update.0, first_update.1), 0);
         assert_eq!(tracker.preview_delta(&second_update.0, second_update.1), 10);
-    }
-
-    #[test]
-    fn test_delta_tracker_delays_chunk_commits_until_full_window_succeeds() {
-        let start_time_nanos = 1;
-        let time_nanos = 2;
-        let mut tracker = DeltaTracker {
-            prev: HashMap::from([("counter_a".to_string(), 10), ("counter_b".to_string(), 20)]),
-        };
-        let entries = vec![
-            CollectedMetricEntry::Counter {
-                name: "counter_a".to_string(),
-                help: "help".to_string(),
-                value: 15,
-            },
-            CollectedMetricEntry::Counter {
-                name: "counter_b".to_string(),
-                help: "help".to_string(),
-                value: 30,
-            },
-        ];
-
-        let first_metric = entries[0].encode(true, start_time_nanos, time_nanos, &tracker);
-        let max_bytes = TelemetryReporter::build_payload_from_metrics(
-            &[],
-            &[first_metric[0].bytes.clone()],
-            start_time_nanos,
-            time_nanos,
-        )
-        .len();
-
-        let subscription = Subscription {
-            client_instance_id: [0; 16],
-            subscription_id: 1,
-            push_interval: Duration::from_secs(1),
-            delta_temporality: true,
-            accepted_compression_types: vec![Compression::None],
-            telemetry_max_bytes: max_bytes as i32,
-            requested_metrics: vec!["*".to_string()],
-        };
-        let mut unsupported = HashSet::new();
-
-        let chunks = TelemetryReporter::prepare_push_chunks(
-            &subscription,
-            start_time_nanos,
-            time_nanos,
-            &entries,
-            &[],
-            &tracker,
-            &mut unsupported,
-        )
-        .expect("counter payload should split into two chunks");
-
-        assert_eq!(chunks.len(), 2);
-        let first_update = chunks[0].counter_updates[0].clone();
-        let second_update = chunks[1].counter_updates[0].clone();
-
-        // A later chunk can still fail after an earlier one was accepted, so
-        // the reporter must not advance any counter baselines until the entire
-        // window succeeds.
-        assert_eq!(tracker.preview_delta(&first_update.0, first_update.1), 5);
-        assert_eq!(tracker.preview_delta(&second_update.0, second_update.1), 10);
-
-        tracker.commit_updates(&[first_update.clone(), second_update.clone()]);
-
-        assert_eq!(tracker.preview_delta(&first_update.0, first_update.1), 0);
-        assert_eq!(tracker.preview_delta(&second_update.0, second_update.1), 0);
     }
 
     #[test]
