@@ -315,7 +315,6 @@ impl TelemetryReporter {
                             .await
                         {
                             Some(s) => {
-                                self.delta_tracker.reset();
                                 subscription = s;
                             }
                             None => {
@@ -736,9 +735,7 @@ impl TelemetryReporter {
 
         for compression in &subscription.accepted_compression_types {
             if *compression == Compression::None {
-                return Ok(
-                    fallback_compression.unwrap_or_else(|| (payload.to_vec(), Compression::None))
-                );
+                return Ok((payload.to_vec(), Compression::None));
             }
 
             if unsupported_compression_types.contains(compression) {
@@ -1589,7 +1586,7 @@ mod tests {
     }
 
     #[test]
-    fn test_choose_compression_keeps_earlier_fallback_before_none() {
+    fn test_choose_compression_prefers_none_over_expanding_fallback() {
         let subscription = Subscription {
             client_instance_id: [0; 16],
             subscription_id: 1,
@@ -1606,10 +1603,8 @@ mod tests {
             TelemetryReporter::choose_compression(&subscription, &mut unsupported, &payload)
                 .expect("gzip or none should be usable");
 
-        if Compression::Gzip.is_available() {
-            assert_eq!(compression, Compression::Gzip);
-        } else {
-            assert_eq!(compression, Compression::None);
+        assert_eq!(compression, Compression::None);
+        if !Compression::Gzip.is_available() {
             assert!(unsupported.contains(&Compression::Gzip));
         }
     }
