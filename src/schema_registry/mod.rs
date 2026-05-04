@@ -931,6 +931,10 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
 
         let (waiter_rx, leader_token) = {
             let mut in_flight = self.in_flight.lock();
+            if let Some(schema) = self.cache.read().get(&id) {
+                return Ok(schema.clone());
+            }
+
             if let Some(entry) = in_flight.get_mut(&id) {
                 let (tx, rx) = oneshot::channel();
                 entry.waiters.push(tx);
@@ -1017,8 +1021,6 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
                             cache.remove(&evicted);
                         }
                         insertion_order.push_back(id);
-                    } else {
-                        self.insertion_order.write().push_back(id);
                     }
                     cache.insert(id, schema.clone());
                 }

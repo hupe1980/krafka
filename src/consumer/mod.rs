@@ -2329,6 +2329,7 @@ impl Consumer {
                 // For group consumers, always re-check committed offsets first.
                 // Only partitions with no committed offset may fall back to
                 // caller-supplied initial_offsets.
+                let mut committed_fetch_failed = false;
                 if let Some(ref coordinator) = self.group_coordinator {
                     let mut topic_map: HashMap<String, Vec<PartitionId>> = HashMap::new();
                     for (topic, partition) in &still_missing {
@@ -2352,62 +2353,78 @@ impl Consumer {
                             }
                             Err(e) => {
                                 warn!(
-                                    "Retry committed-offset fetch failed, continuing with fallback paths: {}",
+                                    "Retry committed-offset fetch failed; deferring offset resolution until retry: {}",
                                     e
                                 );
+                                committed_fetch_failed = true;
                             }
                         }
                     }
                 }
 
-                if !self.config.initial_offsets.is_empty() {
-                    let mut offsets = self.offsets.write().await;
-                    still_missing.retain(|key| {
-                        if let Some(&initial) = self.config.initial_offsets.get(key) {
-                            debug!(
-                                "Poll retry: using initial_offsets {} for {}-{}",
-                                initial, key.0, key.1
-                            );
-                            offsets.insert(key.clone(), initial);
-                            false
-                        } else {
-                            true
-                        }
-                    });
-                }
+                if !committed_fetch_failed {
+                    if !self.config.initial_offsets.is_empty() {
+                        let mut offsets = self.offsets.write().await;
+                        still_missing.retain(|key| {
+                            if let Some(&initial) = self.config.initial_offsets.get(key) {
+                                debug!(
+                                    "Poll retry: using initial_offsets {} for {}-{}",
+                                    initial, key.0, key.1
+                                );
+                                offsets.insert(key.clone(), initial);
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                    }
 
-                if still_missing.is_empty() {
-                    self.recompute_lag_metrics().await;
-                    return Ok(Vec::new());
-                }
+                    if still_missing.is_empty() {
+                        self.recompute_lag_metrics().await;
+                        return Ok(Vec::new());
+                    }
 
-                let mut reset_partitions: HashMap<String, Vec<PartitionId>> = HashMap::new();
-                for (topic, partition) in &still_missing {
-                    reset_partitions
-                        .entry(topic.clone())
-                        .or_default()
-                        .push(*partition);
-                }
+                    let mut reset_partitions: HashMap<String, Vec<PartitionId>> = HashMap::new();
+                    for (topic, partition) in &still_missing {
+                        reset_partitions
+                            .entry(topic.clone())
+                            .or_default()
+                            .push(*partition);
+                    }
 
-                // Use group coordinator path if available, otherwise direct path
-                if let Some(ref coordinator) = self.group_coordinator {
-                    if let Some(timestamp) = self.config.auto_offset_reset.to_offset() {
-                        match coordinator.list_offsets(&reset_partitions, timestamp).await {
-                            Ok(resolved) => {
-                                let mut offsets = self.offsets.write().await;
-                                for (key, offset) in &resolved {
-                                    offsets.insert(key.clone(), *offset);
+                    // Use group coordinator path if available, otherwise direct path
+                    if let Some(ref coordinator) = self.group_coordinator {
+                        if let Some(timestamp) = self.config.auto_offset_reset.to_offset() {
+                            match coordinator.list_offsets(&reset_partitions, timestamp).await {
+                                Ok(resolved) => {
+                                    let mut offsets = self.offsets.write().await;
+                                    for (key, offset) in &resolved {
+                                        offsets.insert(key.clone(), *offset);
+                                    }
+                                    drop(offsets);
+
+                                    // Fallback for partitions the coordinator path
+                                    // silently dropped (partition-level errors).
+                                    for (topic, partition) in &still_missing {
+                                        if !resolved.contains_key(&(topic.clone(), *partition)) {
+                                            debug!(
+                                                "Poll retry: falling back to direct ListOffsets for {}-{}",
+                                                topic, partition
+                                            );
+                                            if let Ok(offset) = self
+                                                .resolve_list_offset(topic, *partition, timestamp)
+                                                .await
+                                            {
+                                                let mut offsets = self.offsets.write().await;
+                                                offsets.insert((topic.clone(), *partition), offset);
+                                            }
+                                        }
+                                    }
                                 }
-                                drop(offsets);
-
-                                // Fallback for partitions the coordinator path
-                                // silently dropped (partition-level errors).
-                                for (topic, partition) in &still_missing {
-                                    if !resolved.contains_key(&(topic.clone(), *partition)) {
-                                        debug!(
-                                            "Poll retry: falling back to direct ListOffsets for {}-{}",
-                                            topic, partition
-                                        );
+                                Err(e) => {
+                                    warn!("Offset resolution retry via coordinator failed: {}", e);
+                                    // Fall back to direct path for all still-missing partitions
+                                    for (topic, partition) in &still_missing {
                                         if let Ok(offset) = self
                                             .resolve_list_offset(topic, *partition, timestamp)
                                             .await
@@ -2418,22 +2435,10 @@ impl Consumer {
                                     }
                                 }
                             }
-                            Err(e) => {
-                                warn!("Offset resolution retry via coordinator failed: {}", e);
-                                // Fall back to direct path for all still-missing partitions
-                                for (topic, partition) in &still_missing {
-                                    if let Ok(offset) =
-                                        self.resolve_list_offset(topic, *partition, timestamp).await
-                                    {
-                                        let mut offsets = self.offsets.write().await;
-                                        offsets.insert((topic.clone(), *partition), offset);
-                                    }
-                                }
-                            }
                         }
+                    } else if let Err(e) = self.apply_auto_offset_reset(&reset_partitions).await {
+                        warn!("Auto-offset-reset failed for missing partitions: {e}");
                     }
-                } else if let Err(e) = self.apply_auto_offset_reset(&reset_partitions).await {
-                    warn!("Auto-offset-reset failed for missing partitions: {e}");
                 }
 
                 // Recompute lag after resolving offsets for missing partitions
@@ -3287,6 +3292,9 @@ impl Consumer {
                 }
                 Ok(_) => continue,
                 Err(e) => {
+                    if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(RecvError::Closed);
+                    }
                     return Err(RecvError::Error(e));
                 }
             }

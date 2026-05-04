@@ -984,7 +984,8 @@ pub type Result<T> = std::result::Result<T, KrafkaError>;
 ///
 /// This mirrors the pattern of `tokio::sync::broadcast::error::RecvError` — the
 /// `Closed` variant signals that the consumer has been shut down, while
-/// `Error` wraps any broker or network failure encountered during polling.
+/// `Error` wraps any poll-time [`KrafkaError`] (broker, network, metadata,
+/// authentication, serialization, and related failures).
 ///
 /// # Example
 ///
@@ -1002,7 +1003,7 @@ pub enum RecvError {
     /// The consumer was closed and no more records will be delivered.
     #[error("consumer closed")]
     Closed,
-    /// A broker or network error occurred while polling for records.
+    /// A poll-time Krafka error occurred while polling for records.
     #[error(transparent)]
     Error(#[from] KrafkaError),
 }
