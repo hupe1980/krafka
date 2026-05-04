@@ -198,7 +198,7 @@ async fn main() {
 | `errors_total` | Counter | Total send errors |
 | `retries_total` | Counter | Total retry attempts |
 | `connections` | Gauge | Current active connections |
-| `buffered_records` | Gauge | Currently buffered records |
+| `buffered_records` | Gauge | Producer records currently admitted under the memory budget |
 | `send_latency_seconds` | Summary | Send latency statistics |
 
 ### Consumer Metrics
@@ -316,8 +316,14 @@ let reporter = TelemetryReporter::new(connection, krafka_metrics, config, shutdo
 tokio::spawn(reporter.run());
 ```
 
-The reporter handles subscription polling, push interval jitter, re-subscription on
-`UNKNOWN_SUBSCRIPTION_ID`, and a graceful terminating push on shutdown — all per KIP-714.
+The reporter handles subscription polling, push interval jitter, local OTLP payload
+chunking under the broker's `TelemetryMaxBytes` limit, re-subscription on
+`UNKNOWN_SUBSCRIPTION_ID` or unsplittable oversized metrics, and a graceful terminating
+push on shutdown. When the broker advertises accepted compression codecs, the reporter
+tries them in broker preference order, skips locally unavailable codecs after the first
+failure, and falls back to uncompressed payloads only when no supported codec remains.
+In delta mode, counter baselines advance only after the broker accepts the corresponding
+chunk.
 
 ### Manual Bridge to External OTel SDKs
 

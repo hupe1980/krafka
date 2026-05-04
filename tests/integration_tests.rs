@@ -345,7 +345,7 @@ async fn test_producer_send_receive() {
     assert_eq!(record.key_str(), Some("test-key"));
     assert_eq!(record.value_str(), Some("test-value"));
 
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
     producer.close().await;
 }
 
@@ -463,7 +463,7 @@ async fn test_compression_roundtrip() {
             "Value mismatch for {:?}",
             compression
         );
-        consumer.close().await;
+        consumer.close().await.expect("consumer close");
     }
 }
 
@@ -605,8 +605,8 @@ async fn test_consumer_group_rebalance() {
         total_records > 0,
         "Expected at least some records from consumer group"
     );
-    consumer1.close().await;
-    consumer2.close().await;
+    consumer1.close().await.expect("consumer1 close");
+    consumer2.close().await.expect("consumer2 close");
 }
 
 // ============================================================================
@@ -711,7 +711,7 @@ async fn test_consumer_handles_no_messages_gracefully() {
 
     // May be empty or have the setup message depending on timing
     drop(records);
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 #[tokio::test]
@@ -773,7 +773,7 @@ async fn test_multiple_producers_same_topic() {
     let all_records = poll_for_records(&consumer, 6, Duration::from_secs(3), 8).await;
 
     assert_eq!(all_records.len(), 6, "Expected 6 messages from 2 producers");
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 #[tokio::test]
@@ -825,7 +825,7 @@ async fn test_large_message_handling() {
         records[0].value.as_ref().map(|v| v.len()).unwrap_or(0),
         100 * 1024
     );
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 // ============================================================================
@@ -885,7 +885,7 @@ async fn test_message_headers() {
 
     // Verify headers are present
     assert!(record.header("trace-id").is_some());
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 #[tokio::test]
@@ -972,7 +972,7 @@ async fn test_null_key_and_value() {
     // Verify null key is received as None
     assert!(record.key.is_none());
     assert!(record.value.is_some());
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 #[tokio::test]
@@ -1032,7 +1032,7 @@ async fn test_multiple_topics_subscription() {
         "Should contain messages from both topics, got: {:?}",
         topics
     );
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 #[tokio::test]
@@ -1140,7 +1140,7 @@ async fn test_concurrent_producers() {
         15,
         "Expected 15 messages from 3 concurrent producers"
     );
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 #[tokio::test]
@@ -1192,7 +1192,7 @@ async fn test_producer_with_batching() {
 
     let records = poll_for_records(&consumer, 10, Duration::from_secs(5), 5).await;
     assert_eq!(records.len(), 10, "Expected 10 messages");
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 // Note: TransactionalProducer tests are skipped because transaction coordinator
@@ -1481,7 +1481,7 @@ async fn test_producer_timestamp_propagation() {
             record.timestamp
         );
     }
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 #[tokio::test]
@@ -1538,7 +1538,7 @@ async fn test_consumer_manual_assign() {
         assert_eq!(record.partition, 0, "Should only get partition 0");
     }
     assert!(!records.is_empty(), "Expected records from partition 0");
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 #[tokio::test]
@@ -1588,7 +1588,7 @@ async fn test_admin_list_consumer_groups() {
         group_id,
         groups.iter().map(|g| &g.group_id).collect::<Vec<_>>()
     );
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 #[tokio::test]
@@ -1617,7 +1617,7 @@ async fn test_consumer_unsubscribe() {
     let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
 
     // Unsubscribe
-    consumer.unsubscribe().await;
+    consumer.unsubscribe().await.expect("consumer unsubscribe");
 
     // Subscription should be empty
     let subscription = consumer.subscription().await;
@@ -1625,7 +1625,7 @@ async fn test_consumer_unsubscribe() {
         subscription.is_empty(),
         "Subscription should be empty after unsubscribe"
     );
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 #[tokio::test]
@@ -1735,7 +1735,7 @@ async fn test_consumer_commit_and_resume_verified() {
         let all = poll_for_records(&consumer, 10, Duration::from_secs(3), 8).await;
         assert_eq!(all.len(), 10, "Should read all 10 messages");
         consumer.commit_sync().await.expect("commit failed");
-        consumer.close().await;
+        consumer.close().await.expect("consumer close");
     }
 
     // Second consumer: should get NO new messages (all committed)
@@ -1760,7 +1760,7 @@ async fn test_consumer_commit_and_resume_verified() {
             "Second consumer should get 0 records after commit, got {}",
             records.len()
         );
-        consumer.close().await;
+        consumer.close().await.expect("consumer close");
     }
 }
 
@@ -1813,7 +1813,7 @@ async fn test_consumer_recv() {
     }
 
     assert_eq!(received.len(), 3, "Should receive 3 records via recv()");
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 /// Test producer flush() forces pending messages to be sent.
@@ -1876,7 +1876,7 @@ async fn test_producer_flush() {
 
     let all = poll_for_records(&consumer, 5, Duration::from_secs(3), 8).await;
     assert_eq!(all.len(), 5, "All 5 flushed messages should be received");
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 /// Test admin describe_groups returns member information.
@@ -1982,7 +1982,7 @@ async fn test_admin_describe_consumer_group() {
         !descriptions[0].members.is_empty(),
         "Group should have at least 1 member"
     );
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 /// Test consumer close() properly leaves the group.
@@ -2011,7 +2011,7 @@ async fn test_consumer_close_leaves_group() {
     let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
 
     // Explicitly close
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let admin = AdminClient::builder()
@@ -2075,7 +2075,7 @@ async fn test_empty_value_message() {
         Some(0),
         "Empty value should be preserved as zero-length"
     );
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 /// Test admin describe_configs returns broker configuration.
@@ -2172,7 +2172,7 @@ async fn test_many_partitions_topic() {
         "60 keys across 12 partitions should hit many partitions, got {}",
         partitions.len()
     );
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 /// Test consumer pause/resume with verified assertions.
@@ -2232,7 +2232,7 @@ async fn test_consumer_pause_resume_verified() {
         !paused.contains(&(topic.to_string(), 0)),
         "Partition 0 should no longer be paused"
     );
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 /// Test consumer seek with verified offset positioning.
@@ -2286,7 +2286,7 @@ async fn test_consumer_seek_verified() {
         Some("msg-5"),
         "First record after seek to offset 5 should be msg-5"
     );
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 /// Test topic creation with custom configs.
@@ -2377,7 +2377,7 @@ async fn test_consumer_metrics() {
         metrics.bytes_received.get() > 0,
         "Should have received bytes"
     );
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }
 
 #[tokio::test]
@@ -2494,5 +2494,5 @@ async fn test_offsets_for_times_and_watermarks_and_metadata() {
         assert_eq!(*result.as_ref().expect("partition offset should be Ok"), 0);
     }
 
-    consumer.close().await;
+    consumer.close().await.expect("consumer close");
 }

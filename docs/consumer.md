@@ -123,7 +123,7 @@ let consumer = Consumer::builder()
 
 ### Offset Commit
 
-Control how offsets are committed. When auto-commit is enabled (the default), Krafka automatically commits offsets during each `poll()` call when the commit interval has elapsed, during `close()`, and **before partition revocations** during rebalances (so the new partition owner sees up-to-date committed positions):
+Control how offsets are committed. When auto-commit is enabled (the default), Krafka automatically commits offsets during each `poll()` call when the commit interval has elapsed, during `close()`, and **before partition revocations** during rebalances (so the new partition owner sees up-to-date committed positions). `close().await` now returns the first auto-commit or leave-group error after local state and connections have still been torn down:
 
 > **Warning — at-least-once caveat:** Auto-commit commits the offset of the last record *returned* by `poll()`, not the last record *processed* by the application. If the application crashes after `poll()` returns but before processing completes, those records may be skipped on restart. For strict at-least-once guarantees, disable auto-commit and call `commit()` explicitly after processing each batch.
 
@@ -461,11 +461,12 @@ loop {
 For non-blocking commits:
 
 ```rust
-// Commit asynchronously (spawns a background task)
-// The commit is tracked and errors are logged if it fails.
-// If offset lock contention occurs, the commit cycle is skipped
-// and a warning is logged (rather than silently dropping the commit).
-consumer.commit_async();
+// Commit asynchronously and await the final outcome.
+// Snapshot, transport, and broker failures are surfaced on the handle.
+// Retriable coordinator failures use the same short retry loop as commit().
+// If the assignment or offset snapshot cannot be taken, the handle resolves
+// to an error instead of silently skipping the commit cycle.
+consumer.commit_async().await?;
 ```
 
 ### Commit with Metadata
@@ -489,6 +490,10 @@ offsets.insert(
 
 consumer.commit_with_metadata(offsets).await?;
 ```
+
+In group mode, only currently assigned partitions are committed. Retriable
+coordinator failures use the same short retry loop as `commit()` and
+`commit_async()`.
 
 This is useful for:
 - Storing application checkpoints
@@ -622,10 +627,11 @@ println!("Assigned partitions: {:?}", assignments);
 
 Calling `unsubscribe()` performs a full cleanup: revokes partitions (notifying
 the rebalance listener), leaves the consumer group, and clears all internal
-state (offsets, paused partitions, buffered records).
+state (offsets, paused partitions, buffered records). It returns a leave-group
+error after local state has still been cleared.
 
 ```rust
-consumer.unsubscribe().await;
+consumer.unsubscribe().await?;
 ```
 
 ### Pause and Resume
@@ -805,7 +811,7 @@ tokio::select! {
 
 // Commit final offsets and close
 consumer.commit().await?;
-consumer.close().await;
+consumer.close().await?;
 ```
 
 ## Poll Architecture

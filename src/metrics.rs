@@ -930,7 +930,7 @@ pub struct ProducerMetrics {
     pub send_latency: LatencyTracker,
     /// Current number of active connections.
     pub connections: Gauge,
-    /// Number of records currently buffered.
+    /// Producer records currently admitted under the memory budget.
     pub buffered_records: Gauge,
 }
 
@@ -999,7 +999,7 @@ pub struct ProducerMetricsSnapshot {
     pub send_latency: LatencySnapshot,
     /// Current connections.
     pub connections: u64,
-    /// Currently buffered records.
+    /// Records currently admitted under the producer memory budget.
     pub buffered_records: u64,
 }
 

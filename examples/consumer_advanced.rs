@@ -129,7 +129,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // Clean shutdown
     consumer.commit().await?;
-    consumer.close().await;
+    consumer.close().await?;
     println!("Consumer closed gracefully.");
 
     Ok(())

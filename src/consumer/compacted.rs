@@ -628,9 +628,9 @@ impl CompactedTopicConsumer {
         (self.consumer, self.table)
     }
 
-    /// Close the underlying consumer.
-    pub async fn close(&self) {
-        self.consumer.close().await;
+    /// Close the underlying consumer and surface shutdown errors.
+    pub async fn close(&self) -> Result<()> {
+        self.consumer.close().await
     }
 
     /// Check if all assigned partitions have reached their high watermarks.

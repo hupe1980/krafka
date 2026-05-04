@@ -286,9 +286,27 @@ impl OtlpExporter {
         }
     }
 
+    pub(crate) fn with_timestamps(delta: bool, start_time_nanos: u64, time_nanos: u64) -> Self {
+        Self {
+            delta,
+            time_nanos,
+            start_time_nanos,
+            metrics: Vec::with_capacity(32),
+            resource_attrs: Vec::new(),
+        }
+    }
+
     /// Add a resource attribute (e.g., `"service.name"` → `"krafka"`).
     pub fn add_resource_attribute(&mut self, key: impl Into<String>, value: impl Into<String>) {
         self.resource_attrs.push((key.into(), value.into()));
+    }
+
+    pub(crate) fn push_metric_bytes(&mut self, metric: Vec<u8>) {
+        self.metrics.push(metric);
+    }
+
+    pub(crate) fn into_metric_bytes(self) -> Vec<Vec<u8>> {
+        self.metrics
     }
 
     /// Return the number of metric entries collected so far (for testing).

@@ -19,7 +19,7 @@ use crate::util::{crc32c, varint};
 /// Use [`Compression::is_available`] to check at runtime whether the
 /// underlying codec implementation was compiled in.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u8)]
 pub enum Compression {
     /// No compression.
@@ -45,6 +45,20 @@ pub enum Compression {
 }
 
 impl Compression {
+    /// Create from a raw telemetry / protocol compression identifier.
+    #[inline]
+    #[must_use]
+    pub const fn from_i8(value: i8) -> Option<Self> {
+        match value {
+            0 => Some(Self::None),
+            1 => Some(Self::Gzip),
+            2 => Some(Self::Snappy),
+            3 => Some(Self::Lz4),
+            4 => Some(Self::Zstd),
+            _ => None,
+        }
+    }
+
     /// Create from a raw value.
     #[inline]
     pub fn from_u8(value: u8) -> Self {
@@ -94,6 +108,71 @@ impl Compression {
             Self::Snappy => Option::Some("snappy"),
             Self::Lz4 => Option::Some("lz4"),
             Self::Zstd => Option::Some("zstd"),
+        }
+    }
+
+    /// Compress an arbitrary payload with this codec.
+    pub(crate) fn compress(&self, payload: &[u8]) -> Result<Bytes> {
+        match self {
+            Self::None => Ok(Bytes::copy_from_slice(payload)),
+            #[cfg(feature = "gzip")]
+            Self::Gzip => {
+                use flate2::write::GzEncoder;
+                use std::io::Write;
+
+                let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder
+                    .write_all(payload)
+                    .map_err(|e| KrafkaError::compression(e.to_string()))?;
+                let compressed = encoder
+                    .finish()
+                    .map_err(|e| KrafkaError::compression(e.to_string()))?;
+                Ok(Bytes::from(compressed))
+            }
+            #[cfg(not(feature = "gzip"))]
+            Self::Gzip => Err(KrafkaError::compression(
+                "gzip compression requires the `gzip` Cargo feature",
+            )),
+            #[cfg(feature = "snappy")]
+            Self::Snappy => {
+                let mut encoder = snap::raw::Encoder::new();
+                let compressed = encoder
+                    .compress_vec(payload)
+                    .map_err(|e| KrafkaError::compression(e.to_string()))?;
+                Ok(Bytes::from(compressed))
+            }
+            #[cfg(not(feature = "snappy"))]
+            Self::Snappy => Err(KrafkaError::compression(
+                "snappy compression requires the `snappy` Cargo feature",
+            )),
+            #[cfg(feature = "lz4")]
+            Self::Lz4 => {
+                use std::io::Write;
+
+                let mut compressed = Vec::new();
+                let mut encoder = lz4_flex::frame::FrameEncoder::new(&mut compressed);
+                encoder
+                    .write_all(payload)
+                    .map_err(|e| KrafkaError::compression(e.to_string()))?;
+                encoder
+                    .finish()
+                    .map_err(|e| KrafkaError::compression(e.to_string()))?;
+                Ok(Bytes::from(compressed))
+            }
+            #[cfg(not(feature = "lz4"))]
+            Self::Lz4 => Err(KrafkaError::compression(
+                "lz4 compression requires the `lz4` Cargo feature",
+            )),
+            #[cfg(feature = "zstd")]
+            Self::Zstd => {
+                let compressed = zstd::encode_all(payload, 3)
+                    .map_err(|e| KrafkaError::compression(e.to_string()))?;
+                Ok(Bytes::from(compressed))
+            }
+            #[cfg(not(feature = "zstd"))]
+            Self::Zstd => Err(KrafkaError::compression(
+                "zstd compression requires the `zstd` Cargo feature",
+            )),
         }
     }
 }
@@ -529,66 +608,7 @@ impl RecordBatch {
     }
 
     fn compress_records(&self, records: &[u8]) -> Result<Bytes> {
-        match self.attributes.compression {
-            Compression::None => Ok(Bytes::copy_from_slice(records)),
-            #[cfg(feature = "gzip")]
-            Compression::Gzip => {
-                use flate2::write::GzEncoder;
-                use std::io::Write;
-
-                let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
-                encoder
-                    .write_all(records)
-                    .map_err(|e| KrafkaError::compression(e.to_string()))?;
-                let compressed = encoder
-                    .finish()
-                    .map_err(|e| KrafkaError::compression(e.to_string()))?;
-                Ok(Bytes::from(compressed))
-            }
-            #[cfg(not(feature = "gzip"))]
-            Compression::Gzip => Err(KrafkaError::compression(
-                "gzip compression requires the `gzip` Cargo feature",
-            )),
-            #[cfg(feature = "snappy")]
-            Compression::Snappy => {
-                let mut encoder = snap::raw::Encoder::new();
-                let compressed = encoder
-                    .compress_vec(records)
-                    .map_err(|e| KrafkaError::compression(e.to_string()))?;
-                Ok(Bytes::from(compressed))
-            }
-            #[cfg(not(feature = "snappy"))]
-            Compression::Snappy => Err(KrafkaError::compression(
-                "snappy compression requires the `snappy` Cargo feature",
-            )),
-            #[cfg(feature = "lz4")]
-            Compression::Lz4 => {
-                use std::io::Write;
-                let mut compressed = Vec::new();
-                let mut encoder = lz4_flex::frame::FrameEncoder::new(&mut compressed);
-                encoder
-                    .write_all(records)
-                    .map_err(|e| KrafkaError::compression(e.to_string()))?;
-                encoder
-                    .finish()
-                    .map_err(|e| KrafkaError::compression(e.to_string()))?;
-                Ok(Bytes::from(compressed))
-            }
-            #[cfg(not(feature = "lz4"))]
-            Compression::Lz4 => Err(KrafkaError::compression(
-                "lz4 compression requires the `lz4` Cargo feature",
-            )),
-            #[cfg(feature = "zstd")]
-            Compression::Zstd => {
-                let compressed = zstd::encode_all(records, 3)
-                    .map_err(|e| KrafkaError::compression(e.to_string()))?;
-                Ok(Bytes::from(compressed))
-            }
-            #[cfg(not(feature = "zstd"))]
-            Compression::Zstd => Err(KrafkaError::compression(
-                "zstd compression requires the `zstd` Cargo feature",
-            )),
-        }
+        self.attributes.compression.compress(records)
     }
 
     /// Decode a record batch from bytes.

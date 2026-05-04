@@ -18,7 +18,7 @@ pub enum AcknowledgementMode {
     Implicit,
     /// The application must explicitly acknowledge each record via
     /// [`ShareConsumer::acknowledge`](super::ShareConsumer::acknowledge)
-    /// before calling `commit_sync()` or `commit_async()`.
+    /// before calling `commit_sync()` or awaiting `commit_async()`.
     Explicit,
 }
 

@@ -63,7 +63,7 @@ const MAX_CONCURRENT_BATCH_SENDS: usize = 64;
 /// The u32 check comes first so the error message is always accurate:
 /// a record larger than both limits is a semaphore-API violation, not a
 /// tunable configuration problem.
-fn check_record_admission(record_size: usize, memory_capacity: usize) -> Result<()> {
+pub(crate) fn check_record_admission(record_size: usize, memory_capacity: usize) -> Result<()> {
     if record_size > u32::MAX as usize {
         return Err(KrafkaError::config(format!(
             "record size {record_size} B exceeds the semaphore \
@@ -81,6 +81,50 @@ fn check_record_admission(record_size: usize, memory_capacity: usize) -> Result<
         )));
     }
     Ok(())
+}
+
+pub(crate) fn effective_memory_capacity(buffer_memory: usize) -> usize {
+    if buffer_memory > 0 {
+        if buffer_memory > Semaphore::MAX_PERMITS {
+            warn!(
+                requested = buffer_memory,
+                effective = Semaphore::MAX_PERMITS,
+                "buffer_memory exceeds Semaphore::MAX_PERMITS; clamping effective \
+                 producer memory capacity"
+            );
+            Semaphore::MAX_PERMITS
+        } else {
+            buffer_memory
+        }
+    } else {
+        Semaphore::MAX_PERMITS
+    }
+}
+
+pub(crate) struct BufferedRecordGuard {
+    buffered_records: Arc<AtomicUsize>,
+    metrics: Arc<ProducerMetrics>,
+}
+
+impl BufferedRecordGuard {
+    pub(crate) fn new(buffered_records: Arc<AtomicUsize>, metrics: Arc<ProducerMetrics>) -> Self {
+        let current = buffered_records.fetch_add(1, Ordering::Relaxed) + 1;
+        metrics.buffered_records.set(current as u64);
+        Self {
+            buffered_records,
+            metrics,
+        }
+    }
+}
+
+impl Drop for BufferedRecordGuard {
+    fn drop(&mut self) {
+        let remaining = self
+            .buffered_records
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
+        self.metrics.buffered_records.set(remaining as u64);
+    }
 }
 
 /// Response from the accumulator for an append attempt.
@@ -441,6 +485,9 @@ struct PendingRecord {
     offset_in_batch: i64,
     /// Estimated size in bytes for memory tracking.
     estimated_size: usize,
+    /// Tracks this record in the producer buffered-records gauge until it is
+    /// acknowledged or dropped on failure.
+    _buffered_record_guard: BufferedRecordGuard,
     /// Producer-wide operation guard that completes only after ack/failure.
     _operation_guard: InFlightOpGuard,
 }
@@ -504,6 +551,8 @@ pub struct RecordAccumulator {
     /// Memory held by in-flight send tasks (extracted but not yet completed).
     /// Exposed for metrics only; backpressure is enforced by `memory_permits`.
     in_flight_memory: Arc<AtomicUsize>,
+    /// Number of records currently pending or in flight in the accumulator path.
+    buffered_records: Arc<AtomicUsize>,
     /// Retry policy for transient failures.
     retry_policy: RetryPolicy,
     /// Shared metrics.
@@ -543,37 +592,18 @@ impl RecordAccumulator {
         // (`usize::MAX >> 3`, only reachable on 32-bit targets in practice),
         // we clamp and emit a single `warn!` so the effective cap is
         // explicit rather than silent.
-        let memory_capacity = if config.buffer_memory > 0 {
-            if config.buffer_memory > Semaphore::MAX_PERMITS {
-                warn!(
-                    requested = config.buffer_memory,
-                    effective = Semaphore::MAX_PERMITS,
-                    "buffer_memory exceeds Semaphore::MAX_PERMITS; clamping effective \
-                     producer memory capacity"
-                );
-                Semaphore::MAX_PERMITS
-            } else {
-                config.buffer_memory
-            }
-        } else {
-            Semaphore::MAX_PERMITS
-        };
+        let memory_capacity = effective_memory_capacity(config.buffer_memory);
         let memory_permits = Arc::new(Semaphore::new(memory_capacity));
         let in_flight_memory = Arc::new(AtomicUsize::new(0));
+        let buffered_records = Arc::new(AtomicUsize::new(0));
         let max_block_ms = config.max_block_ms;
-
-        if config.buffer_memory == 0 {
-            warn!(
-                "buffer_memory=0 disables producer backpressure; \
-                 memory usage is unbounded. Not recommended for production."
-            );
-        }
 
         let accumulator = Self {
             config,
             batches: HashMap::new(),
             metadata,
             in_flight_memory,
+            buffered_records,
             retry_policy,
             metrics,
             memory_permits: memory_permits.clone(),
@@ -687,6 +717,10 @@ impl RecordAccumulator {
                 response_tx,
                 offset_in_batch: offset,
                 estimated_size: record_size,
+                _buffered_record_guard: BufferedRecordGuard::new(
+                    self.buffered_records.clone(),
+                    self.metrics.clone(),
+                ),
                 _operation_guard: operation_guard,
             });
             // Release is now owned by the eventual `InFlightGuard`.
@@ -717,6 +751,10 @@ impl RecordAccumulator {
                     response_tx,
                     offset_in_batch: 0,
                     estimated_size: record_size,
+                    _buffered_record_guard: BufferedRecordGuard::new(
+                        self.buffered_records.clone(),
+                        self.metrics.clone(),
+                    ),
                     _operation_guard: operation_guard,
                 });
                 self.batches.insert(key, new_batch);
@@ -1704,5 +1742,18 @@ mod tests {
             !msg.contains("buffer_memory"),
             "must not cite buffer_memory for a u32::MAX rejection, got: {msg}"
         );
+    }
+
+    #[test]
+    fn test_buffered_record_guard_updates_metric() {
+        let metrics = Arc::new(ProducerMetrics::default());
+        let buffered_records = Arc::new(AtomicUsize::new(0));
+
+        {
+            let _guard = BufferedRecordGuard::new(buffered_records.clone(), metrics.clone());
+            assert_eq!(metrics.buffered_records.get(), 1);
+        }
+
+        assert_eq!(metrics.buffered_records.get(), 0);
     }
 }
