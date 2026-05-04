@@ -1017,6 +1017,7 @@ impl DeltaTracker {
 
     /// Return the delta for a counter metric. Stores `value` as the new
     /// baseline for subsequent calls.
+    #[cfg(test)]
     fn delta(&mut self, name: &str, value: u64) -> u64 {
         if let Some(prev_val) = self.prev.get_mut(name) {
             let prev = *prev_val;
@@ -1441,7 +1442,7 @@ mod tests {
         let first_update = chunks[0].counter_updates[0].clone();
         let second_update = chunks[1].counter_updates[0].clone();
 
-        tracker.commit_updates(&[first_update.clone()]);
+        tracker.commit_updates(std::slice::from_ref(&first_update));
 
         assert_eq!(tracker.preview_delta(&first_update.0, first_update.1), 0);
         assert_eq!(tracker.preview_delta(&second_update.0, second_update.1), 10);

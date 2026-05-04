@@ -195,6 +195,8 @@ pub enum BatchRecvOutcome {
     EmptyRequest,
 }
 
+type CommitRequestOffsets = HashMap<(String, PartitionId), (i64, Option<String>)>;
+
 /// Handle returned by [`Consumer::commit_async`].
 ///
 /// Await the handle to observe the final commit outcome. Dropping it detaches
@@ -3558,7 +3560,7 @@ impl Consumer {
         offsets: &HashMap<(String, PartitionId), Offset>,
         assigned_set: Option<&HashSet<(String, PartitionId)>>,
         has_group: bool,
-    ) -> Result<HashMap<(String, PartitionId), (i64, Option<String>)>> {
+    ) -> Result<CommitRequestOffsets> {
         if has_group && assigned_set.is_none() {
             return Err(KrafkaError::invalid_state(
                 "commit_async: assignments snapshot unavailable",
@@ -3577,7 +3579,7 @@ impl Consumer {
     }
 
     fn build_committed_offsets(
-        commit_offsets: &HashMap<(String, PartitionId), (i64, Option<String>)>,
+        commit_offsets: &CommitRequestOffsets,
     ) -> HashMap<(String, PartitionId), Offset> {
         commit_offsets
             .iter()
@@ -3609,7 +3611,7 @@ impl Consumer {
 
     fn build_commit_offsets_with_metadata(
         filtered_offsets: &HashMap<TopicPartition, OffsetAndMetadata>,
-    ) -> HashMap<(String, PartitionId), (i64, Option<String>)> {
+    ) -> CommitRequestOffsets {
         filtered_offsets
             .iter()
             .map(|(tp, offset_meta)| {
@@ -3654,7 +3656,7 @@ impl Consumer {
     async fn commit_group_offsets_with_retry(
         coordinator: Arc<GroupCoordinator>,
         interceptor: Arc<dyn crate::interceptor::ConsumerInterceptor>,
-        commit_offsets: HashMap<(String, PartitionId), (i64, Option<String>)>,
+        commit_offsets: CommitRequestOffsets,
         committed_offsets: HashMap<(String, PartitionId), Offset>,
     ) -> Result<()> {
         let result = Self::retry_commit_with(|| coordinator.commit_offsets(&commit_offsets)).await;
