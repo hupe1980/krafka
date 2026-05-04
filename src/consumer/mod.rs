@@ -3956,9 +3956,24 @@ impl Consumer {
         leave_group_result: Result<()>,
     ) -> Result<()> {
         match auto_commit_result {
+            Err(error) if Self::should_ignore_close_auto_commit_error(&error) => leave_group_result,
             Ok(()) => leave_group_result,
             Err(error) => Err(error),
         }
+    }
+
+    fn should_ignore_close_auto_commit_error(error: &KrafkaError) -> bool {
+        matches!(
+            error,
+            KrafkaError::Broker {
+                code: crate::error::ErrorCode::UnknownMemberId
+                    | crate::error::ErrorCode::IllegalGeneration
+                    | crate::error::ErrorCode::RebalanceInProgress
+                    | crate::error::ErrorCode::FencedMemberEpoch
+                    | crate::error::ErrorCode::StaleMemberEpoch,
+                ..
+            }
+        )
     }
 
     /// Close the consumer.
@@ -5207,6 +5222,32 @@ mod tests {
         .expect_err("auto-commit error must take precedence");
 
         assert!(error.to_string().contains("commit failed"));
+    }
+
+    #[test]
+    fn test_select_close_result_ignores_rebalance_close_commit_error() {
+        let error = Consumer::select_close_result(
+            Err(KrafkaError::broker(
+                crate::error::ErrorCode::UnknownMemberId,
+                "rebalance needed",
+            )),
+            Err(KrafkaError::invalid_state("leave failed")),
+        )
+        .expect_err("leave-group error must surface when close-time commit error is benign");
+
+        assert!(error.to_string().contains("leave failed"));
+    }
+
+    #[test]
+    fn test_select_close_result_swallows_rebalance_close_commit_error_when_leave_succeeds() {
+        Consumer::select_close_result(
+            Err(KrafkaError::broker(
+                crate::error::ErrorCode::RebalanceInProgress,
+                "rebalance needed",
+            )),
+            Ok(()),
+        )
+        .expect("rebalance-related close-time commit errors should be ignored");
     }
 
     #[test]

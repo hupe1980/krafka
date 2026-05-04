@@ -123,7 +123,7 @@ let consumer = Consumer::builder()
 
 ### Offset Commit
 
-Control how offsets are committed. When auto-commit is enabled (the default), Krafka automatically commits offsets during each `poll()` call when the commit interval has elapsed, during `close()`, and **before partition revocations** during rebalances (so the new partition owner sees up-to-date committed positions). `close().await` now returns the first auto-commit or leave-group error after local state and connections have still been torn down:
+Control how offsets are committed. When auto-commit is enabled (the default), Krafka automatically commits offsets during each `poll()` call when the commit interval has elapsed, during `close()`, and **before partition revocations** during rebalances (so the new partition owner sees up-to-date committed positions). `close().await` still tears down local state before returning; final auto-commit failures that only indicate the member already lost the group during a rebalance are treated as best-effort shutdown races, while other close-time commit failures still surface:
 
 > **Warning — at-least-once caveat:** Auto-commit commits the offset of the last record *returned* by `poll()`, not the last record *processed* by the application. If the application crashes after `poll()` returns but before processing completes, those records may be skipped on restart. For strict at-least-once guarantees, disable auto-commit and call `commit()` explicitly after processing each batch.
 

@@ -152,7 +152,7 @@ pub struct ShareConsumer {
     /// Whether the consumer is closed.
     closed: AtomicBool,
     /// Per-broker share session cache.
-    share_sessions: tokio::sync::Mutex<ShareSessionCache>,
+    share_sessions: Arc<tokio::sync::Mutex<ShareSessionCache>>,
     /// Pending acknowledgements (accumulated between polls or before commit).
     pending_acks: Arc<RwLock<Vec<PendingAck>>>,
     /// Topic name → UUID cache (populated from heartbeat assignments and metadata).
@@ -252,7 +252,7 @@ impl ShareConsumer {
             member_epoch: RwLock::new(0),
             heartbeat_interval_ms: RwLock::new(5000),
             closed: AtomicBool::new(false),
-            share_sessions: tokio::sync::Mutex::new(ShareSessionCache::new()),
+            share_sessions: Arc::new(tokio::sync::Mutex::new(ShareSessionCache::new())),
             pending_acks: Arc::new(RwLock::new(Vec::new())),
             topic_ids: RwLock::new(HashMap::new()),
             recv_buffer: RwLock::new(VecDeque::new()),
@@ -714,16 +714,14 @@ impl ShareConsumer {
         drop(topic_ids);
 
         let record_key = (record.topic.clone(), record.partition, record.offset);
+        let mut pending = self.pending_acks.write().await;
         let mut unacked = self.unacked_offsets.write().await;
-        if !unacked.remove(&record_key) {
+        if !unacked.contains(&record_key) {
             return Err(KrafkaError::invalid_state(format!(
                 "record {}-{}@{} is not pending acknowledgement",
                 record.topic, record.partition, record.offset
             )));
         }
-        drop(unacked);
-
-        let mut pending = self.pending_acks.write().await;
         pending.push(PendingAck {
             topic: record.topic.clone(),
             topic_id,
@@ -732,6 +730,7 @@ impl ShareConsumer {
             last_offset: record.offset,
             ack_type: ack_type.to_i8(),
         });
+        unacked.remove(&record_key);
 
         Ok(())
     }
@@ -850,27 +849,6 @@ impl ShareConsumer {
         let unacked_offsets = self.unacked_offsets.clone();
         let ack_mode = self.config.acknowledgement_mode;
 
-        let member_id_val = match self.member_id.try_read() {
-            Ok(g) => g.clone(),
-            Err(_) => {
-                return ShareCommitHandle::ready(Err(KrafkaError::invalid_state(
-                    "commit_async: member_id lock contention",
-                )));
-            }
-        };
-        let coord_id = self.coordinator_id.try_read().ok().and_then(|g| *g);
-        let coord_addr = self
-            .coordinator_address
-            .try_read()
-            .ok()
-            .and_then(|g| g.clone());
-
-        let (Some(coord_id), Some(coord_addr)) = (coord_id, coord_addr) else {
-            return ShareCommitHandle::ready(Err(KrafkaError::invalid_state(
-                "commit_async: no coordinator available",
-            )));
-        };
-
         let Ok(mut pending) = self.pending_acks.try_write() else {
             return ShareCommitHandle::ready(Err(KrafkaError::invalid_state(
                 "commit_async: pending_acks lock contention",
@@ -883,15 +861,17 @@ impl ShareConsumer {
             return ShareCommitHandle::ready(Ok(()));
         }
 
-        let topics = Self::build_acknowledge_topics(&acks);
-        let group_id = self.config.group_id.clone();
+        let metadata = self.metadata.clone();
         let pool = self.pool.clone();
-
-        let request = ShareAcknowledgeRequest {
-            group_id: Some(group_id),
-            member_id: Some(member_id_val),
-            share_session_epoch: 0,
-            topics,
+        let share_sessions = self.share_sessions.clone();
+        let group_id = self.config.group_id.clone();
+        let member_id = match self.member_id.try_read() {
+            Ok(g) => g.clone(),
+            Err(_) => {
+                return ShareCommitHandle::ready(Err(KrafkaError::invalid_state(
+                    "commit_async: member_id lock contention",
+                )));
+            }
         };
 
         ShareCommitHandle::Task(tokio::spawn(async move {
@@ -908,58 +888,16 @@ impl ShareConsumer {
                     .await;
                 }
             };
-
-            let conn = match pool.get_connection_by_id(coord_id, &coord_addr).await {
-                Ok(c) => c,
-                Err(e) => {
-                    restore_acks(acks).await;
-                    return Err(e);
-                }
-            };
-
-            let version = match conn
-                .negotiate_api_version(
-                    ApiKey::ShareAcknowledge,
-                    versions::SHARE_ACKNOWLEDGE_MAX,
-                    versions::SHARE_ACKNOWLEDGE_MIN,
-                )
-                .await
+            if let Err(error) = ShareConsumer::send_share_acknowledge_with_state(
+                metadata,
+                pool,
+                share_sessions,
+                group_id,
+                member_id,
+                &acks,
+            )
+            .await
             {
-                Some(v) => v,
-                None => {
-                    restore_acks(acks).await;
-                    return Err(KrafkaError::protocol(
-                        "broker does not support ShareAcknowledge",
-                    ));
-                }
-            };
-
-            let response_buf = match conn
-                .send_request(ApiKey::ShareAcknowledge, version, |buf| match version {
-                    2 => request.encode_v2(buf, false),
-                    _ => request.encode_v1(buf),
-                })
-                .await
-            {
-                Ok(buf) => buf,
-                Err(e) => {
-                    restore_acks(acks).await;
-                    return Err(e);
-                }
-            };
-
-            let response = match crate::protocol::ShareAcknowledgeResponse::decode_versioned(
-                version,
-                &mut response_buf.as_ref(),
-            ) {
-                Ok(response) => response,
-                Err(e) => {
-                    restore_acks(acks).await;
-                    return Err(e);
-                }
-            };
-
-            if let Some(error) = ShareConsumer::share_acknowledge_response_error(&response) {
                 restore_acks(acks).await;
                 return Err(error);
             }
@@ -1378,24 +1316,38 @@ impl ShareConsumer {
     /// Routes acknowledgements to the correct partition leaders. Returns an
     /// error if any leader cannot be determined or any broker rejects the acks.
     async fn send_share_acknowledge(&self, acks: &[PendingAck]) -> Result<()> {
+        let member_id = self.member_id.read().await.clone();
+        Self::send_share_acknowledge_with_state(
+            self.metadata.clone(),
+            self.pool.clone(),
+            self.share_sessions.clone(),
+            self.config.group_id.clone(),
+            member_id,
+            acks,
+        )
+        .await
+    }
+
+    async fn send_share_acknowledge_with_state(
+        metadata: Arc<ClusterMetadata>,
+        pool: Arc<ConnectionPool>,
+        share_sessions: Arc<tokio::sync::Mutex<ShareSessionCache>>,
+        group_id: String,
+        member_id: String,
+        acks: &[PendingAck],
+    ) -> Result<()> {
         // Group acks by partition leader.
         let mut broker_acks: HashMap<BrokerId, Vec<&PendingAck>> = HashMap::new();
 
         for ack in acks {
-            let broker_id = self
-                .metadata
-                .leader(&ack.topic, ack.partition)
-                .ok_or_else(|| {
-                    KrafkaError::invalid_state(format!(
-                        "no leader for {}-{} in metadata",
-                        ack.topic, ack.partition
-                    ))
-                })?;
+            let broker_id = metadata.leader(&ack.topic, ack.partition).ok_or_else(|| {
+                KrafkaError::invalid_state(format!(
+                    "no leader for {}-{} in metadata",
+                    ack.topic, ack.partition
+                ))
+            })?;
             broker_acks.entry(broker_id).or_default().push(ack);
         }
-
-        let member_id = self.member_id.read().await.clone();
-        let group_id = self.config.group_id.clone();
 
         for (broker_id, broker_ack_list) in &broker_acks {
             let topics = Self::build_acknowledge_topics(
@@ -1406,7 +1358,7 @@ impl ShareConsumer {
             );
 
             let session_epoch = {
-                let sessions = self.share_sessions.lock().await;
+                let sessions = share_sessions.lock().await;
                 sessions
                     .get(*broker_id)
                     .map(|s: &session::ShareSessionState| s.epoch())
@@ -1420,8 +1372,7 @@ impl ShareConsumer {
                 topics,
             };
 
-            let broker_addr = self
-                .metadata
+            let broker_addr = metadata
                 .broker(*broker_id)
                 .map(|b| b.address().to_string())
                 .ok_or_else(|| {
@@ -1430,10 +1381,7 @@ impl ShareConsumer {
                         broker_id
                     ))
                 })?;
-            let conn = self
-                .pool
-                .get_connection_by_id(*broker_id, &broker_addr)
-                .await?;
+            let conn = pool.get_connection_by_id(*broker_id, &broker_addr).await?;
             let version = conn
                 .negotiate_api_version(
                     ApiKey::ShareAcknowledge,
@@ -1677,6 +1625,42 @@ mod tests {
     use super::*;
     use crate::error::ErrorCode;
 
+    fn test_share_consumer(acknowledgement_mode: AcknowledgementMode) -> ShareConsumer {
+        let mut config = ShareConsumer::builder()
+            .bootstrap_servers("localhost:9092")
+            .group_id("sg")
+            .acknowledgement_mode(acknowledgement_mode)
+            .config;
+        config.bootstrap_servers = "localhost:9092".to_string();
+        config.group_id = "sg".to_string();
+
+        let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
+        let metadata = Arc::new(ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool.clone(),
+            config.metadata_max_age,
+        ));
+
+        ShareConsumer {
+            config,
+            metadata,
+            pool,
+            subscriptions: RwLock::new(HashSet::new()),
+            assignments: RwLock::new(HashMap::new()),
+            member_id: RwLock::new(crate::util::random_uuid_v4()),
+            member_epoch: RwLock::new(0),
+            heartbeat_interval_ms: RwLock::new(3000),
+            closed: AtomicBool::new(false),
+            share_sessions: Arc::new(tokio::sync::Mutex::new(ShareSessionCache::new())),
+            pending_acks: Arc::new(RwLock::new(Vec::new())),
+            topic_ids: RwLock::new(HashMap::new()),
+            recv_buffer: RwLock::new(VecDeque::new()),
+            coordinator_id: RwLock::new(None),
+            coordinator_address: RwLock::new(None),
+            unacked_offsets: Arc::new(RwLock::new(HashSet::new())),
+        }
+    }
+
     #[test]
     fn test_share_consumer_builder_config() {
         let builder = ShareConsumer::builder()
@@ -1895,6 +1879,68 @@ mod tests {
         .expect_err("task error must surface");
 
         assert!(error.to_string().contains("task failed"));
+    }
+
+    #[tokio::test]
+    async fn test_acknowledge_keeps_record_pending_until_ack_is_queued() {
+        let consumer = Arc::new(test_share_consumer(AcknowledgementMode::Explicit));
+
+        consumer
+            .topic_ids
+            .write()
+            .await
+            .insert("topic-a".to_string(), [7; 16]);
+
+        let record = ConsumerRecord {
+            topic: "topic-a".into(),
+            partition: 3,
+            offset: 11,
+            timestamp: 0,
+            timestamp_type: 0,
+            key: None,
+            value: None,
+            headers: Vec::new(),
+            leader_epoch: None,
+            delivery_count: None,
+        };
+        let record_key = (record.topic.clone(), record.partition, record.offset);
+
+        consumer
+            .unacked_offsets
+            .write()
+            .await
+            .insert(record_key.clone());
+
+        let pending_guard = consumer.pending_acks.write().await;
+        let task_consumer = consumer.clone();
+        let task = tokio::spawn(async move {
+            task_consumer
+                .acknowledge(&record, AcknowledgeType::Accept)
+                .await
+        });
+
+        tokio::task::yield_now().await;
+
+        assert!(consumer.unacked_offsets.read().await.contains(&record_key));
+        assert!(
+            !task.is_finished(),
+            "acknowledge should still be waiting on the pending_acks lock"
+        );
+
+        drop(pending_guard);
+
+        task.await
+            .expect("acknowledge task should join")
+            .expect("acknowledge should succeed once pending lock is released");
+
+        assert!(!consumer.unacked_offsets.read().await.contains(&record_key));
+        let pending = consumer.pending_acks.read().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].topic, "topic-a");
+        assert_eq!(pending[0].partition, 3);
+        assert_eq!(pending[0].first_offset, 11);
+        assert_eq!(pending[0].last_offset, 11);
+        assert_eq!(pending[0].ack_type, AcknowledgeType::Accept.to_i8());
     }
 
     #[test]

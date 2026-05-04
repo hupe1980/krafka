@@ -108,8 +108,8 @@ pub(crate) struct BufferedRecordGuard {
 
 impl BufferedRecordGuard {
     pub(crate) fn new(buffered_records: Arc<AtomicUsize>, metrics: Arc<ProducerMetrics>) -> Self {
-        let current = buffered_records.fetch_add(1, Ordering::Relaxed) + 1;
-        metrics.buffered_records.set(current as u64);
+        buffered_records.fetch_add(1, Ordering::Relaxed);
+        metrics.buffered_records.inc();
         Self {
             buffered_records,
             metrics,
@@ -119,11 +119,8 @@ impl BufferedRecordGuard {
 
 impl Drop for BufferedRecordGuard {
     fn drop(&mut self) {
-        let remaining = self
-            .buffered_records
-            .fetch_sub(1, Ordering::Relaxed)
-            .saturating_sub(1);
-        self.metrics.buffered_records.set(remaining as u64);
+        self.buffered_records.fetch_sub(1, Ordering::Relaxed);
+        self.metrics.buffered_records.dec();
     }
 }
 
