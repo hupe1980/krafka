@@ -52,7 +52,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::{Future, Ready, ready};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -184,6 +184,12 @@ pub struct ShareConsumer {
     share_sessions: Arc<tokio::sync::Mutex<ShareSessionCache>>,
     /// Pending acknowledgements (accumulated between polls or before commit).
     pending_acks: Arc<RwLock<Vec<PendingAck>>>,
+    /// Monotonic token for the current local ack state.
+    ///
+    /// Incremented whenever local partition state is cleared so detached
+    /// flush tasks cannot requeue stale acknowledgements from an older
+    /// membership/session after `unsubscribe()` or `close()`.
+    ack_state_generation: Arc<AtomicU64>,
     /// Topic name → UUID cache (populated from heartbeat assignments and metadata).
     topic_ids: RwLock<HashMap<String, [u8; 16]>>,
     /// Buffer for records returned by `recv()`.
@@ -283,6 +289,7 @@ impl ShareConsumer {
             closed: AtomicBool::new(false),
             share_sessions: Arc::new(tokio::sync::Mutex::new(ShareSessionCache::new())),
             pending_acks: Arc::new(RwLock::new(Vec::new())),
+            ack_state_generation: Arc::new(AtomicU64::new(0)),
             topic_ids: RwLock::new(HashMap::new()),
             recv_buffer: RwLock::new(VecDeque::new()),
             coordinator_id: RwLock::new(None),
@@ -416,6 +423,8 @@ impl ShareConsumer {
             }
         }
         drop(topic_ids);
+
+        let ack_state_generation = self.ack_state_generation.load(Ordering::SeqCst);
 
         let sendable_ack_partitions: HashSet<(String, PartitionId)> = partitions_by_broker
             .values()
@@ -712,7 +721,8 @@ impl ShareConsumer {
                 .flat_map(|(_, acks)| flatten_partition_acks(acks))
                 .collect::<Vec<_>>(),
         );
-        self.restore_pending_acks(failed_piggyback_acks).await;
+        self.restore_pending_acks(ack_state_generation, failed_piggyback_acks)
+            .await;
 
         // In implicit mode, queue all fetched records as coalesced accepts for next poll.
         if self.config.acknowledgement_mode == AcknowledgementMode::Implicit {
@@ -782,16 +792,31 @@ impl ShareConsumer {
         Ok(())
     }
 
-    async fn restore_pending_acks(&self, mut acks: Vec<PendingAck>) {
-        Self::restore_ack_state(self.pending_acks.as_ref(), &mut acks).await;
+    async fn restore_pending_acks(&self, ack_state_generation: u64, mut acks: Vec<PendingAck>) {
+        Self::restore_ack_state(
+            self.ack_state_generation.as_ref(),
+            self.pending_acks.as_ref(),
+            ack_state_generation,
+            &mut acks,
+        )
+        .await;
     }
 
-    async fn restore_ack_state(pending_acks: &RwLock<Vec<PendingAck>>, acks: &mut Vec<PendingAck>) {
+    async fn restore_ack_state(
+        current_generation: &AtomicU64,
+        pending_acks: &RwLock<Vec<PendingAck>>,
+        ack_state_generation: u64,
+        acks: &mut Vec<PendingAck>,
+    ) {
         if acks.is_empty() {
             return;
         }
 
         let mut pending = pending_acks.write().await;
+        if current_generation.load(Ordering::SeqCst) != ack_state_generation {
+            acks.clear();
+            return;
+        }
         pending.append(acks);
     }
 
@@ -840,6 +865,7 @@ impl ShareConsumer {
     }
 
     async fn flush_pending_acks(&self) -> Result<()> {
+        let ack_state_generation = self.ack_state_generation.load(Ordering::SeqCst);
         let acks = {
             let mut pending = self.pending_acks.write().await;
             std::mem::take(&mut *pending)
@@ -852,7 +878,7 @@ impl ShareConsumer {
         match self.send_share_acknowledge(&acks).await {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.restore_pending_acks(acks).await;
+                self.restore_pending_acks(ack_state_generation, acks).await;
                 Err(error)
             }
         }
@@ -879,7 +905,9 @@ impl ShareConsumer {
             }
         };
 
+        let ack_state_generation = self.ack_state_generation.load(Ordering::SeqCst);
         let pending_acks = self.pending_acks.clone();
+        let current_ack_state_generation = self.ack_state_generation.clone();
         let Ok(mut pending) = self.pending_acks.try_write() else {
             return ShareCommitHandle::ready(Err(KrafkaError::invalid_state(
                 "commit_async: pending_acks lock contention",
@@ -900,8 +928,15 @@ impl ShareConsumer {
         ShareCommitHandle::Task(tokio::spawn(async move {
             let restore_acks = |mut acks: Vec<PendingAck>| {
                 let pending_acks = pending_acks.clone();
+                let current_ack_state_generation = current_ack_state_generation.clone();
                 async move {
-                    ShareConsumer::restore_ack_state(pending_acks.as_ref(), &mut acks).await;
+                    ShareConsumer::restore_ack_state(
+                        current_ack_state_generation.as_ref(),
+                        pending_acks.as_ref(),
+                        ack_state_generation,
+                        &mut acks,
+                    )
+                    .await;
                 }
             };
             if let Err(error) = ShareConsumer::send_share_acknowledge_with_state(
@@ -1033,6 +1068,7 @@ impl ShareConsumer {
 
     /// Clear all per-partition state. Called from `unsubscribe()` and `close()`.
     async fn clear_partition_state(&self) {
+        self.ack_state_generation.fetch_add(1, Ordering::SeqCst);
         self.pending_acks.write().await.clear();
         self.recv_buffer.write().await.clear();
         self.share_sessions.lock().await.reset_all();
@@ -1669,6 +1705,7 @@ mod tests {
             closed: AtomicBool::new(false),
             share_sessions: Arc::new(tokio::sync::Mutex::new(ShareSessionCache::new())),
             pending_acks: Arc::new(RwLock::new(Vec::new())),
+            ack_state_generation: Arc::new(AtomicU64::new(0)),
             topic_ids: RwLock::new(HashMap::new()),
             recv_buffer: RwLock::new(VecDeque::new()),
             coordinator_id: RwLock::new(None),
@@ -1857,6 +1894,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_restore_ack_state_requeues_pending_acks_without_reinserting_unacked() {
+        let ack_state_generation = AtomicU64::new(0);
         let pending = RwLock::new(Vec::new());
         let mut acks_to_restore = vec![PendingAck {
             topic: "topic-a".into(),
@@ -1867,7 +1905,8 @@ mod tests {
             ack_type: AcknowledgeType::Accept.to_i8(),
         }];
 
-        ShareConsumer::restore_ack_state(&pending, &mut acks_to_restore).await;
+        ShareConsumer::restore_ack_state(&ack_state_generation, &pending, 0, &mut acks_to_restore)
+            .await;
 
         assert!(acks_to_restore.is_empty());
         let pending = pending.read().await;
@@ -1877,6 +1916,26 @@ mod tests {
         assert_eq!(pending[0].first_offset, 11);
         assert_eq!(pending[0].last_offset, 13);
         assert_eq!(pending[0].ack_type, AcknowledgeType::Accept.to_i8());
+    }
+
+    #[tokio::test]
+    async fn test_restore_ack_state_skips_stale_generation() {
+        let ack_state_generation = AtomicU64::new(1);
+        let pending = RwLock::new(Vec::new());
+        let mut acks_to_restore = vec![PendingAck {
+            topic: "topic-a".into(),
+            topic_id: [0; 16],
+            partition: 2,
+            first_offset: 11,
+            last_offset: 13,
+            ack_type: AcknowledgeType::Accept.to_i8(),
+        }];
+
+        ShareConsumer::restore_ack_state(&ack_state_generation, &pending, 0, &mut acks_to_restore)
+            .await;
+
+        assert!(pending.read().await.is_empty());
+        assert!(acks_to_restore.is_empty());
     }
 
     #[tokio::test]

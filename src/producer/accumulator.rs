@@ -101,6 +101,7 @@ pub(crate) fn effective_memory_capacity(buffer_memory: usize) -> usize {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct BufferedRecordGuard {
     buffered_records: Arc<AtomicUsize>,
     metrics: Arc<ProducerMetrics>,
@@ -144,6 +145,10 @@ struct AppendCommand {
     record_size: usize,
     response_tx: oneshot::Sender<AppendResponse>,
     operation_guard: InFlightOpGuard,
+    /// Tracks this append in the buffered-records gauge from successful
+    /// admission into the channel until it is either moved into a pending
+    /// batch or dropped on failure.
+    _buffered_record_guard: BufferedRecordGuard,
     permit_reservation: PermitReservation,
 }
 
@@ -232,6 +237,10 @@ pub struct RecordAccumulatorHandle {
     max_block_ms: Duration,
     /// Barrier over all producer sends, including detached batch tasks.
     in_flight_barrier: Arc<InFlightBarrier>,
+    /// Number of records currently admitted under the memory budget.
+    buffered_records: Arc<AtomicUsize>,
+    /// Shared producer metrics used to export buffered-record state.
+    metrics: Arc<ProducerMetrics>,
 }
 
 impl RecordAccumulatorHandle {
@@ -317,6 +326,8 @@ impl RecordAccumulatorHandle {
         permit.forget();
 
         let (response_tx, response_rx) = oneshot::channel();
+        let buffered_record_guard =
+            BufferedRecordGuard::new(self.buffered_records.clone(), self.metrics.clone());
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
 
         // Send the Append; on failure (timeout / closed channel),
@@ -332,6 +343,7 @@ impl RecordAccumulatorHandle {
                 record_size,
                 response_tx,
                 operation_guard,
+                _buffered_record_guard: buffered_record_guard,
                 permit_reservation,
             })),
         )
@@ -548,8 +560,6 @@ pub struct RecordAccumulator {
     /// Memory held by in-flight send tasks (extracted but not yet completed).
     /// Exposed for metrics only; backpressure is enforced by `memory_permits`.
     in_flight_memory: Arc<AtomicUsize>,
-    /// Number of records currently pending or in flight in the accumulator path.
-    buffered_records: Arc<AtomicUsize>,
     /// Retry policy for transient failures.
     retry_policy: RetryPolicy,
     /// Shared metrics.
@@ -593,6 +603,8 @@ impl RecordAccumulator {
         let memory_permits = Arc::new(Semaphore::new(memory_capacity));
         let in_flight_memory = Arc::new(AtomicUsize::new(0));
         let buffered_records = Arc::new(AtomicUsize::new(0));
+        let handle_buffered_records = buffered_records.clone();
+        let handle_metrics = metrics.clone();
         let max_block_ms = config.max_block_ms;
 
         let accumulator = Self {
@@ -600,7 +612,6 @@ impl RecordAccumulator {
             batches: HashMap::new(),
             metadata,
             in_flight_memory,
-            buffered_records,
             retry_policy,
             metrics,
             memory_permits: memory_permits.clone(),
@@ -628,6 +639,8 @@ impl RecordAccumulator {
             memory_capacity,
             max_block_ms,
             in_flight_barrier,
+            buffered_records: handle_buffered_records,
+            metrics: handle_metrics,
         }
     }
 
@@ -686,6 +699,7 @@ impl RecordAccumulator {
             record_size,
             response_tx,
             operation_guard,
+            _buffered_record_guard: buffered_record_guard,
             permit_reservation,
         } = append;
         let key = (topic, partition);
@@ -714,10 +728,7 @@ impl RecordAccumulator {
                 response_tx,
                 offset_in_batch: offset,
                 estimated_size: record_size,
-                _buffered_record_guard: BufferedRecordGuard::new(
-                    self.buffered_records.clone(),
-                    self.metrics.clone(),
-                ),
+                _buffered_record_guard: buffered_record_guard,
                 _operation_guard: operation_guard,
             });
             // Release is now owned by the eventual `InFlightGuard`.
@@ -748,10 +759,7 @@ impl RecordAccumulator {
                     response_tx,
                     offset_in_batch: 0,
                     estimated_size: record_size,
-                    _buffered_record_guard: BufferedRecordGuard::new(
-                        self.buffered_records.clone(),
-                        self.metrics.clone(),
-                    ),
+                    _buffered_record_guard: buffered_record_guard,
                     _operation_guard: operation_guard,
                 });
                 self.batches.insert(key, new_batch);
@@ -1563,6 +1571,8 @@ mod tests {
             memory_capacity: 1024 * 1024, // larger than any test record
             max_block_ms: Duration::from_millis(50),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
+            buffered_records: Arc::new(AtomicUsize::new(0)),
+            metrics: Arc::new(ProducerMetrics::default()),
         };
 
         let record = ProducerRecord::new("topic", b"value".to_vec());
@@ -1611,6 +1621,8 @@ mod tests {
             memory_capacity: 16, // deliberately tiny
             max_block_ms: Duration::from_secs(60),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
+            buffered_records: Arc::new(AtomicUsize::new(0)),
+            metrics: Arc::new(ProducerMetrics::default()),
         };
 
         let record = ProducerRecord::new("topic", vec![0u8; 1024]);
@@ -1637,6 +1649,8 @@ mod tests {
             memory_capacity: 1024 * 1024,
             max_block_ms: Duration::from_secs(60),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
+            buffered_records: Arc::new(AtomicUsize::new(0)),
+            metrics: Arc::new(ProducerMetrics::default()),
         };
 
         let sem_close = sem.clone();
@@ -1668,12 +1682,16 @@ mod tests {
     async fn test_permits_released_when_append_message_dropped() {
         let (sender, mut receiver) = mpsc::channel::<AccumulatorMessage>(16);
         let sem = Arc::new(Semaphore::new(1024));
+        let metrics = Arc::new(ProducerMetrics::default());
+        let buffered_records = Arc::new(AtomicUsize::new(0));
         let handle = RecordAccumulatorHandle {
             sender,
             memory_permits: sem.clone(),
             memory_capacity: 1024,
             max_block_ms: Duration::from_millis(500),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
+            buffered_records: buffered_records.clone(),
+            metrics: metrics.clone(),
         };
 
         let record = ProducerRecord::new("topic", vec![0u8; 256]);
@@ -1687,6 +1705,10 @@ mod tests {
             .await
             .expect("timed out waiting for Append message to arrive in channel")
             .expect("channel closed before message arrived");
+
+        assert_eq!(metrics.buffered_records.get(), 1);
+        assert_eq!(buffered_records.load(Ordering::Relaxed), 1);
+
         drop(msg);
         drop(receiver);
 
@@ -1700,6 +1722,8 @@ mod tests {
             1024,
             "permits leaked when the Append message was dropped"
         );
+        assert_eq!(metrics.buffered_records.get(), 0);
+        assert_eq!(buffered_records.load(Ordering::Relaxed), 0);
     }
 
     /// `check_record_admission` rejects records that exceed `buffer_memory`.

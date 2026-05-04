@@ -302,8 +302,9 @@ impl TelemetryReporter {
             // KIP-714: only push when the broker has subscribed to metrics.
             // When requested_metrics is empty, skip the push entirely and
             // re-poll for subscription changes after the interval.
+            let had_metrics = subscription.has_metrics();
             let mut push_result = None;
-            if subscription.has_metrics() {
+            if had_metrics {
                 let result = self.push_metrics(&subscription, window_start, false).await;
                 match result {
                     PushResult::Ok => {}
@@ -326,6 +327,11 @@ impl TelemetryReporter {
                     PushResult::Transient => {
                         // Logged already; we'll just retry on the next interval.
                     }
+                    PushResult::Throttled => {
+                        // The broker did not accept this interval's payload.
+                        // Preserve the collection window so the next interval
+                        // retries the same telemetry slice.
+                    }
                     PushResult::Fatal => {
                         warn!("Fatal telemetry push error; reporter exiting");
                         return;
@@ -334,7 +340,7 @@ impl TelemetryReporter {
                 push_result = Some(result);
             }
 
-            if should_advance_window(subscription.has_metrics(), push_result) {
+            if should_advance_window(had_metrics, push_result) {
                 window_start = Self::nanos_since_epoch();
             }
 
@@ -643,7 +649,7 @@ impl TelemetryReporter {
             }
             ErrorCode::ThrottlingQuotaExceeded => {
                 debug!("PushTelemetry throttled; will retry next interval");
-                PushResult::Ok
+                PushResult::Throttled
             }
             other => {
                 warn!(error_code = ?other, "PushTelemetry returned unexpected error");
@@ -1018,6 +1024,8 @@ enum PushResult {
     ReSubscribe,
     /// Transient error — skip this push, retry next interval.
     Transient,
+    /// Broker throttled the push; keep the current collection window.
+    Throttled,
     /// Non-retriable error — stop the reporter.
     Fatal,
 }
@@ -1365,6 +1373,7 @@ mod tests {
         assert!(should_advance_window(false, None));
         assert!(should_advance_window(true, Some(PushResult::Ok)));
         assert!(!should_advance_window(true, Some(PushResult::Transient)));
+        assert!(!should_advance_window(true, Some(PushResult::Throttled)));
         assert!(!should_advance_window(true, Some(PushResult::ReSubscribe)));
     }
 
