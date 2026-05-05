@@ -57,7 +57,7 @@ Records fetched by the previous `poll()` are automatically accepted when the nex
 
 ### Explicit
 
-The application controls acknowledgement per record. **All records from the previous `poll()` must be acknowledged before calling `poll()` again** — otherwise `poll()` returns an error. `acknowledge()` is one-shot per record: acknowledging the same record twice returns an error instead of sending duplicate broker intent. If a later `commit_sync()` or `commit_async().await` attempt fails, the consumer restores that batch locally so the application cannot silently advance past a failed flush.
+The application controls acknowledgement per record. **All records from the previous `poll()` must be acknowledged before calling `poll()` again** — otherwise `poll()` returns an error. `acknowledge()` is one-shot per record: acknowledging the same record twice returns an error instead of sending duplicate broker intent. If a later `commit_sync()` or `commit_async()` flush fails, the consumer restores that batch locally and later `poll()` calls keep returning an error until the commit is retried successfully or the local share-consumer state is cleared.
 
 ```rust
 use krafka::share_consumer::{ShareConsumer, AcknowledgementMode, AcknowledgeType};

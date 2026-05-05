@@ -190,6 +190,12 @@ pub struct ShareConsumer {
     /// flush tasks cannot requeue stale acknowledgements from an older
     /// membership/session after `unsubscribe()` or `close()`.
     ack_state_generation: Arc<AtomicU64>,
+    /// Explicit-mode barrier raised after a commit flush fails.
+    ///
+    /// While this is set, `poll()` refuses to fetch more records until the
+    /// application retries `commit_sync()`/`commit_async()` successfully or
+    /// local state is cleared during unsubscribe/close.
+    explicit_flush_retry_required: Arc<AtomicBool>,
     /// Topic name → UUID cache (populated from heartbeat assignments and metadata).
     topic_ids: RwLock<HashMap<String, [u8; 16]>>,
     /// Buffer for records returned by `recv()`.
@@ -290,6 +296,7 @@ impl ShareConsumer {
             share_sessions: Arc::new(tokio::sync::Mutex::new(ShareSessionCache::new())),
             pending_acks: Arc::new(RwLock::new(Vec::new())),
             ack_state_generation: Arc::new(AtomicU64::new(0)),
+            explicit_flush_retry_required: Arc::new(AtomicBool::new(false)),
             topic_ids: RwLock::new(HashMap::new()),
             recv_buffer: RwLock::new(VecDeque::new()),
             coordinator_id: RwLock::new(None),
@@ -376,6 +383,11 @@ impl ShareConsumer {
             if !unacked.is_empty() {
                 return Err(KrafkaError::invalid_state(
                     "all records from the previous poll() must be acknowledged before calling poll() again",
+                ));
+            }
+            if self.explicit_flush_retry_required.load(Ordering::SeqCst) {
+                return Err(KrafkaError::invalid_state(
+                    "the previous commit_sync()/commit_async() flush failed; retry the commit before calling poll() again",
                 ));
             }
         }
@@ -721,7 +733,7 @@ impl ShareConsumer {
                 .flat_map(|(_, acks)| flatten_partition_acks(acks))
                 .collect::<Vec<_>>(),
         );
-        self.restore_pending_acks(ack_state_generation, failed_piggyback_acks)
+        self.restore_pending_acks(ack_state_generation, failed_piggyback_acks, false)
             .await;
 
         // In implicit mode, queue all fetched records as coalesced accepts for next poll.
@@ -792,11 +804,18 @@ impl ShareConsumer {
         Ok(())
     }
 
-    async fn restore_pending_acks(&self, ack_state_generation: u64, mut acks: Vec<PendingAck>) {
+    async fn restore_pending_acks(
+        &self,
+        ack_state_generation: u64,
+        mut acks: Vec<PendingAck>,
+        require_explicit_retry: bool,
+    ) {
         Self::restore_ack_state(
             self.ack_state_generation.as_ref(),
             self.pending_acks.as_ref(),
+            self.explicit_flush_retry_required.as_ref(),
             ack_state_generation,
+            require_explicit_retry,
             &mut acks,
         )
         .await;
@@ -805,7 +824,9 @@ impl ShareConsumer {
     async fn restore_ack_state(
         current_generation: &AtomicU64,
         pending_acks: &RwLock<Vec<PendingAck>>,
+        explicit_flush_retry_required: &AtomicBool,
         ack_state_generation: u64,
+        require_explicit_retry: bool,
         acks: &mut Vec<PendingAck>,
     ) {
         if acks.is_empty() {
@@ -816,6 +837,9 @@ impl ShareConsumer {
         if current_generation.load(Ordering::SeqCst) != ack_state_generation {
             acks.clear();
             return;
+        }
+        if require_explicit_retry {
+            explicit_flush_retry_required.store(true, Ordering::SeqCst);
         }
         pending.append(acks);
     }
@@ -876,9 +900,14 @@ impl ShareConsumer {
         }
 
         match self.send_share_acknowledge(&acks).await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.explicit_flush_retry_required
+                    .store(false, Ordering::SeqCst);
+                Ok(())
+            }
             Err(error) => {
-                self.restore_pending_acks(ack_state_generation, acks).await;
+                self.restore_pending_acks(ack_state_generation, acks, true)
+                    .await;
                 Err(error)
             }
         }
@@ -908,6 +937,7 @@ impl ShareConsumer {
         let ack_state_generation = self.ack_state_generation.load(Ordering::SeqCst);
         let pending_acks = self.pending_acks.clone();
         let current_ack_state_generation = self.ack_state_generation.clone();
+        let explicit_flush_retry_required = self.explicit_flush_retry_required.clone();
         let Ok(mut pending) = self.pending_acks.try_write() else {
             return ShareCommitHandle::ready(Err(KrafkaError::invalid_state(
                 "commit_async: pending_acks lock contention",
@@ -929,11 +959,14 @@ impl ShareConsumer {
             let restore_acks = |mut acks: Vec<PendingAck>| {
                 let pending_acks = pending_acks.clone();
                 let current_ack_state_generation = current_ack_state_generation.clone();
+                let explicit_flush_retry_required = explicit_flush_retry_required.clone();
                 async move {
                     ShareConsumer::restore_ack_state(
                         current_ack_state_generation.as_ref(),
                         pending_acks.as_ref(),
+                        explicit_flush_retry_required.as_ref(),
                         ack_state_generation,
+                        true,
                         &mut acks,
                     )
                     .await;
@@ -952,6 +985,8 @@ impl ShareConsumer {
                 restore_acks(acks).await;
                 return Err(error);
             }
+
+            explicit_flush_retry_required.store(false, Ordering::SeqCst);
 
             Ok(())
         }))
@@ -1069,6 +1104,8 @@ impl ShareConsumer {
     /// Clear all per-partition state. Called from `unsubscribe()` and `close()`.
     async fn clear_partition_state(&self) {
         self.ack_state_generation.fetch_add(1, Ordering::SeqCst);
+        self.explicit_flush_retry_required
+            .store(false, Ordering::SeqCst);
         self.pending_acks.write().await.clear();
         self.recv_buffer.write().await.clear();
         self.share_sessions.lock().await.reset_all();
@@ -1706,6 +1743,7 @@ mod tests {
             share_sessions: Arc::new(tokio::sync::Mutex::new(ShareSessionCache::new())),
             pending_acks: Arc::new(RwLock::new(Vec::new())),
             ack_state_generation: Arc::new(AtomicU64::new(0)),
+            explicit_flush_retry_required: Arc::new(AtomicBool::new(false)),
             topic_ids: RwLock::new(HashMap::new()),
             recv_buffer: RwLock::new(VecDeque::new()),
             coordinator_id: RwLock::new(None),
@@ -1895,6 +1933,7 @@ mod tests {
     #[tokio::test]
     async fn test_restore_ack_state_requeues_pending_acks_without_reinserting_unacked() {
         let ack_state_generation = AtomicU64::new(0);
+        let explicit_flush_retry_required = AtomicBool::new(false);
         let pending = RwLock::new(Vec::new());
         let mut acks_to_restore = vec![PendingAck {
             topic: "topic-a".into(),
@@ -1905,10 +1944,18 @@ mod tests {
             ack_type: AcknowledgeType::Accept.to_i8(),
         }];
 
-        ShareConsumer::restore_ack_state(&ack_state_generation, &pending, 0, &mut acks_to_restore)
-            .await;
+        ShareConsumer::restore_ack_state(
+            &ack_state_generation,
+            &pending,
+            &explicit_flush_retry_required,
+            0,
+            false,
+            &mut acks_to_restore,
+        )
+        .await;
 
         assert!(acks_to_restore.is_empty());
+        assert!(!explicit_flush_retry_required.load(Ordering::SeqCst));
         let pending = pending.read().await;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].topic, "topic-a");
@@ -1921,6 +1968,7 @@ mod tests {
     #[tokio::test]
     async fn test_restore_ack_state_skips_stale_generation() {
         let ack_state_generation = AtomicU64::new(1);
+        let explicit_flush_retry_required = AtomicBool::new(false);
         let pending = RwLock::new(Vec::new());
         let mut acks_to_restore = vec![PendingAck {
             topic: "topic-a".into(),
@@ -1931,11 +1979,83 @@ mod tests {
             ack_type: AcknowledgeType::Accept.to_i8(),
         }];
 
-        ShareConsumer::restore_ack_state(&ack_state_generation, &pending, 0, &mut acks_to_restore)
-            .await;
+        ShareConsumer::restore_ack_state(
+            &ack_state_generation,
+            &pending,
+            &explicit_flush_retry_required,
+            0,
+            true,
+            &mut acks_to_restore,
+        )
+        .await;
 
         assert!(pending.read().await.is_empty());
         assert!(acks_to_restore.is_empty());
+        assert!(!explicit_flush_retry_required.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_restore_ack_state_marks_explicit_flush_retry_required() {
+        let ack_state_generation = AtomicU64::new(0);
+        let explicit_flush_retry_required = AtomicBool::new(false);
+        let pending = RwLock::new(Vec::new());
+        let mut acks_to_restore = vec![PendingAck {
+            topic: "topic-a".into(),
+            topic_id: [0; 16],
+            partition: 2,
+            first_offset: 11,
+            last_offset: 13,
+            ack_type: AcknowledgeType::Accept.to_i8(),
+        }];
+
+        ShareConsumer::restore_ack_state(
+            &ack_state_generation,
+            &pending,
+            &explicit_flush_retry_required,
+            0,
+            true,
+            &mut acks_to_restore,
+        )
+        .await;
+
+        assert!(acks_to_restore.is_empty());
+        assert!(explicit_flush_retry_required.load(Ordering::SeqCst));
+        assert_eq!(pending.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_poll_rejects_after_failed_explicit_flush() {
+        let consumer = test_share_consumer(AcknowledgementMode::Explicit);
+        consumer
+            .explicit_flush_retry_required
+            .store(true, Ordering::SeqCst);
+
+        let error = consumer
+            .poll(Duration::from_millis(1))
+            .await
+            .expect_err("poll must block after a failed explicit flush");
+
+        assert!(
+            error
+                .to_string()
+                .contains("retry the commit before calling poll() again")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clear_partition_state_clears_explicit_flush_retry_required() {
+        let consumer = test_share_consumer(AcknowledgementMode::Explicit);
+        consumer
+            .explicit_flush_retry_required
+            .store(true, Ordering::SeqCst);
+
+        consumer.clear_partition_state().await;
+
+        assert!(
+            !consumer
+                .explicit_flush_retry_required
+                .load(Ordering::SeqCst)
+        );
     }
 
     #[tokio::test]

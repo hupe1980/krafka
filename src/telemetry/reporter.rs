@@ -173,9 +173,29 @@ struct PreparedMetric {
 
 #[derive(Debug)]
 struct PreparedTelemetryChunk {
-    payload: Vec<u8>,
-    compression: Compression,
+    metric_bytes: Vec<Vec<u8>>,
     counter_updates: Vec<(String, u64)>,
+}
+
+#[derive(Debug)]
+struct PendingPushWindow {
+    window_start_nanos: u64,
+    chunks: Vec<PreparedTelemetryChunk>,
+}
+
+struct ChunkPreparationContext<'a> {
+    subscription: &'a Subscription,
+    resource_attributes: &'a [(String, String)],
+    max_bytes: usize,
+    supports_uncompressed: bool,
+    unsupported_compression_types: &'a mut HashSet<Compression>,
+}
+
+#[derive(Default)]
+struct ChunkBuilderState {
+    metric_bytes: Vec<Vec<u8>>,
+    counter_updates: Vec<(String, u64)>,
+    metric_entries_len: usize,
 }
 
 #[derive(Debug)]
@@ -232,6 +252,8 @@ pub struct TelemetryReporter {
     unsupported_compression_types: HashSet<Compression>,
     /// Last observed `delta_temporality` flag — reset tracker on change.
     last_delta_temporality: bool,
+    /// Remaining chunks from a partially accepted collection window.
+    pending_push_window: Option<PendingPushWindow>,
 }
 
 impl TelemetryReporter {
@@ -255,6 +277,7 @@ impl TelemetryReporter {
             delta_tracker: DeltaTracker::new(),
             unsupported_compression_types: HashSet::new(),
             last_delta_temporality: false,
+            pending_push_window: None,
         }
     }
 
@@ -428,7 +451,6 @@ impl TelemetryReporter {
             }
         };
 
-        // Respect throttle_time_ms if set.
         if resp.throttle_time_ms > 0 {
             debug!(throttle_ms = resp.throttle_time_ms, "Throttled by broker");
         }
@@ -455,10 +477,6 @@ impl TelemetryReporter {
         }
         let push_interval = Duration::from_millis(clamped_push_interval_ms as u64);
 
-        // KIP-714: the response only contains a non-null ClientInstanceId on
-        // the initial handshake (request had null UUID). On subsequent requests
-        // (re-subscriptions) the response field is null. Preserve the original
-        // broker-assigned ID in that case.
         let effective_id = if client_instance_id == [0u8; 16] {
             resp.client_instance_id
         } else {
@@ -501,67 +519,105 @@ impl TelemetryReporter {
         window_start_nanos: u64,
         terminating: bool,
     ) -> PushResult {
-        // KIP-714: detect temporality change and reset delta tracker.
-        if subscription.delta_temporality != self.last_delta_temporality {
-            debug!(
-                old = self.last_delta_temporality,
-                new = subscription.delta_temporality,
-                "Delta temporality changed; resetting tracker"
-            );
-            self.delta_tracker.reset();
-            self.last_delta_temporality = subscription.delta_temporality;
-        }
+        let chunks = if let Some(pending_window) = self.take_pending_push_window(window_start_nanos)
+        {
+            pending_window.chunks
+        } else {
+            if subscription.delta_temporality != self.last_delta_temporality {
+                debug!(
+                    old = self.last_delta_temporality,
+                    new = subscription.delta_temporality,
+                    "Delta temporality changed; resetting tracker"
+                );
+                self.delta_tracker.reset();
+                self.last_delta_temporality = subscription.delta_temporality;
+            }
 
-        let entries = self.collect_metrics(subscription);
-        let push_time_nanos = Self::nanos_since_epoch();
+            let entries = self.collect_metrics(subscription);
+            let push_time_nanos = Self::nanos_since_epoch();
 
-        let chunks = match Self::prepare_push_chunks(
-            subscription,
-            window_start_nanos,
-            push_time_nanos,
-            &entries,
-            &self.config.resource_attributes,
-            &self.delta_tracker,
-            &mut self.unsupported_compression_types,
-        ) {
-            Ok(chunks) => chunks,
-            Err(TelemetryChunkingError::SingleMetricTooLarge {
-                payload_bytes,
-                max_bytes,
-            }) => {
-                warn!(
+            match Self::prepare_push_chunks(
+                subscription,
+                window_start_nanos,
+                push_time_nanos,
+                &entries,
+                &self.config.resource_attributes,
+                &self.delta_tracker,
+                &mut self.unsupported_compression_types,
+            ) {
+                Ok(chunks) => chunks,
+                Err(TelemetryChunkingError::SingleMetricTooLarge {
                     payload_bytes,
                     max_bytes,
-                    "Telemetry payload chunk exceeds broker TelemetryMaxBytes; re-subscribing"
-                );
-                return PushResult::ReSubscribe;
-            }
-            Err(TelemetryChunkingError::NoUsableCompressionCodec {
-                accepted_compression_types,
-            }) => {
-                warn!(
-                    ?accepted_compression_types,
-                    "Broker advertised no telemetry compression codec that is locally usable; stopping telemetry reporter"
-                );
-                return PushResult::Fatal;
+                }) => {
+                    warn!(
+                        payload_bytes,
+                        max_bytes,
+                        "Telemetry payload chunk exceeds broker TelemetryMaxBytes; re-subscribing"
+                    );
+                    return PushResult::ReSubscribe;
+                }
+                Err(TelemetryChunkingError::NoUsableCompressionCodec {
+                    accepted_compression_types,
+                }) => {
+                    warn!(
+                        ?accepted_compression_types,
+                        "Broker advertised no telemetry compression codec that is locally usable; stopping telemetry reporter"
+                    );
+                    return PushResult::Fatal;
+                }
             }
         };
 
         let chunk_count = chunks.len();
         let mut committed_counter_updates = Vec::new();
-        for (index, chunk) in chunks.into_iter().enumerate() {
+        let mut chunk_iter = chunks.into_iter().enumerate();
+
+        while let Some((index, chunk)) = chunk_iter.next() {
             let chunk_terminating = terminating && index + 1 == chunk_count;
+            let (payload, compression) = match Self::encode_prepared_chunk(
+                subscription,
+                &self.config.resource_attributes,
+                &chunk,
+                &mut self.unsupported_compression_types,
+            ) {
+                Ok(encoded) => encoded,
+                Err(TelemetryChunkingError::SingleMetricTooLarge {
+                    payload_bytes,
+                    max_bytes,
+                }) => {
+                    warn!(
+                        payload_bytes,
+                        max_bytes,
+                        "Telemetry payload chunk exceeds broker TelemetryMaxBytes; re-subscribing"
+                    );
+                    return PushResult::ReSubscribe;
+                }
+                Err(TelemetryChunkingError::NoUsableCompressionCodec {
+                    accepted_compression_types,
+                }) => {
+                    warn!(
+                        ?accepted_compression_types,
+                        "Broker advertised no telemetry compression codec that is locally usable; stopping telemetry reporter"
+                    );
+                    return PushResult::Fatal;
+                }
+            };
+
             let chunk_result = self
-                .push_payload_with_retry(
-                    subscription,
-                    chunk_terminating,
-                    chunk.payload,
-                    chunk.compression,
-                )
+                .push_payload_with_retry(subscription, chunk_terminating, payload, compression)
                 .await;
             if chunk_result != PushResult::Ok {
                 self.delta_tracker
                     .commit_updates(&committed_counter_updates);
+                if chunk_result != PushResult::Fatal {
+                    let mut remaining_chunks = vec![chunk];
+                    remaining_chunks.extend(chunk_iter.map(|(_, pending_chunk)| pending_chunk));
+                    self.pending_push_window = Some(PendingPushWindow {
+                        window_start_nanos,
+                        chunks: remaining_chunks,
+                    });
+                }
                 return chunk_result;
             }
             committed_counter_updates.extend(chunk.counter_updates);
@@ -571,6 +627,19 @@ impl TelemetryReporter {
             .commit_updates(&committed_counter_updates);
 
         PushResult::Ok
+    }
+
+    fn take_pending_push_window(&mut self, window_start_nanos: u64) -> Option<PendingPushWindow> {
+        match self.pending_push_window.take() {
+            Some(pending_window) if pending_window.window_start_nanos == window_start_nanos => {
+                Some(pending_window)
+            }
+            Some(pending_window) => {
+                self.pending_push_window = Some(pending_window);
+                None
+            }
+            None => None,
+        }
     }
 
     async fn push_payload_once(
@@ -713,10 +782,8 @@ impl TelemetryReporter {
     fn build_payload_from_metrics(
         resource_attributes: &[(String, String)],
         metric_bytes: &[Vec<u8>],
-        start_time_nanos: u64,
-        time_nanos: u64,
     ) -> Vec<u8> {
-        let mut exporter = OtlpExporter::with_timestamps(false, start_time_nanos, time_nanos);
+        let mut exporter = OtlpExporter::new(false, 0);
         for (k, v) in resource_attributes {
             exporter.add_resource_attribute(k.as_str(), v.as_str());
         }
@@ -793,17 +860,127 @@ impl TelemetryReporter {
         subscription: &Subscription,
         resource_attributes: &[(String, String)],
         metric_bytes: &[Vec<u8>],
-        start_time_nanos: u64,
-        time_nanos: u64,
         unsupported_compression_types: &mut HashSet<Compression>,
     ) -> Result<(Vec<u8>, Compression), TelemetryChunkingError> {
-        let payload = Self::build_payload_from_metrics(
-            resource_attributes,
-            metric_bytes,
-            start_time_nanos,
-            time_nanos,
-        );
+        let payload = Self::build_payload_from_metrics(resource_attributes, metric_bytes);
         Self::choose_compression(subscription, unsupported_compression_types, &payload)
+    }
+
+    fn encode_prepared_chunk(
+        subscription: &Subscription,
+        resource_attributes: &[(String, String)],
+        chunk: &PreparedTelemetryChunk,
+        unsupported_compression_types: &mut HashSet<Compression>,
+    ) -> Result<(Vec<u8>, Compression), TelemetryChunkingError> {
+        Self::encode_payload(
+            subscription,
+            resource_attributes,
+            &chunk.metric_bytes,
+            unsupported_compression_types,
+        )
+    }
+
+    fn varint_len(mut value: usize) -> usize {
+        let mut len = 1;
+        while value >= 0x80 {
+            value >>= 7;
+            len += 1;
+        }
+        len
+    }
+
+    fn len_delimited_field_len(payload_len: usize) -> usize {
+        1 + Self::varint_len(payload_len) + payload_len
+    }
+
+    fn string_field_len(value: &str) -> usize {
+        if value.is_empty() {
+            0
+        } else {
+            Self::len_delimited_field_len(value.len())
+        }
+    }
+
+    fn resource_attributes_payload_len(resource_attributes: &[(String, String)]) -> usize {
+        resource_attributes
+            .iter()
+            .map(|(key, value)| {
+                let any_value_len = Self::string_field_len(value);
+                let key_value_len =
+                    Self::string_field_len(key) + Self::len_delimited_field_len(any_value_len);
+                Self::len_delimited_field_len(key_value_len)
+            })
+            .sum()
+    }
+
+    fn uncompressed_payload_len(
+        resource_attributes: &[(String, String)],
+        metric_entries_len: usize,
+    ) -> usize {
+        let scope_len =
+            Self::string_field_len("krafka") + Self::string_field_len(env!("CARGO_PKG_VERSION"));
+        let scope_metrics_len = Self::len_delimited_field_len(scope_len) + metric_entries_len;
+
+        let mut resource_metrics_len = Self::len_delimited_field_len(scope_metrics_len);
+        let resource_len = Self::resource_attributes_payload_len(resource_attributes);
+        if resource_len > 0 {
+            resource_metrics_len += Self::len_delimited_field_len(resource_len);
+        }
+
+        Self::len_delimited_field_len(resource_metrics_len)
+    }
+
+    fn take_current_chunk(current_chunk: &mut ChunkBuilderState) -> PreparedTelemetryChunk {
+        PreparedTelemetryChunk {
+            metric_bytes: std::mem::take(&mut current_chunk.metric_bytes),
+            counter_updates: std::mem::take(&mut current_chunk.counter_updates),
+        }
+    }
+
+    fn start_chunk_with_metric(
+        context: &mut ChunkPreparationContext<'_>,
+        current_chunk: &mut ChunkBuilderState,
+        bytes: Vec<u8>,
+        counter_update: Option<(String, u64)>,
+    ) -> Result<Option<PreparedTelemetryChunk>, TelemetryChunkingError> {
+        let metric_entry_len = Self::len_delimited_field_len(bytes.len());
+        current_chunk.metric_bytes.push(bytes);
+        current_chunk.metric_entries_len = metric_entry_len;
+
+        if context.supports_uncompressed
+            && Self::uncompressed_payload_len(context.resource_attributes, metric_entry_len)
+                <= context.max_bytes
+        {
+            current_chunk.counter_updates.extend(counter_update);
+            return Ok(None);
+        }
+
+        let single_metric_chunk = PreparedTelemetryChunk {
+            metric_bytes: std::mem::take(&mut current_chunk.metric_bytes),
+            counter_updates: counter_update.into_iter().collect(),
+        };
+        let (payload, _) = Self::encode_prepared_chunk(
+            context.subscription,
+            context.resource_attributes,
+            &single_metric_chunk,
+            context.unsupported_compression_types,
+        )?;
+        if payload.len() > context.max_bytes {
+            return Err(TelemetryChunkingError::SingleMetricTooLarge {
+                payload_bytes: payload.len(),
+                max_bytes: context.max_bytes,
+            });
+        }
+
+        if context.supports_uncompressed {
+            current_chunk.metric_entries_len = 0;
+            return Ok(Some(single_metric_chunk));
+        }
+
+        current_chunk.metric_entries_len = metric_entry_len;
+        current_chunk.metric_bytes = single_metric_chunk.metric_bytes;
+        current_chunk.counter_updates = single_metric_chunk.counter_updates;
+        Ok(None)
     }
 
     fn prepare_push_chunks(
@@ -830,14 +1007,19 @@ impl TelemetryReporter {
         } else {
             usize::MAX
         };
+        let supports_uncompressed = subscription
+            .accepted_compression_types
+            .contains(&Compression::None);
 
         if prepared_metrics.is_empty() {
-            let (payload, compression) = Self::encode_payload(
+            let empty_chunk = PreparedTelemetryChunk {
+                metric_bytes: Vec::new(),
+                counter_updates: Vec::new(),
+            };
+            let (payload, _) = Self::encode_prepared_chunk(
                 subscription,
                 resource_attributes,
-                &[],
-                start_time_nanos,
-                time_nanos,
+                &empty_chunk,
                 unsupported_compression_types,
             )?;
             if payload.len() > max_bytes {
@@ -846,16 +1028,18 @@ impl TelemetryReporter {
                     max_bytes,
                 });
             }
-            return Ok(vec![PreparedTelemetryChunk {
-                payload,
-                compression,
-                counter_updates: Vec::new(),
-            }]);
+            return Ok(vec![empty_chunk]);
         }
 
         let mut chunks = Vec::new();
-        let mut current_metrics: Vec<Vec<u8>> = Vec::new();
-        let mut current_updates: Vec<(String, u64)> = Vec::new();
+        let mut current_chunk = ChunkBuilderState::default();
+        let mut context = ChunkPreparationContext {
+            subscription,
+            resource_attributes,
+            max_bytes,
+            supports_uncompressed,
+            unsupported_compression_types,
+        };
 
         for prepared_metric in prepared_metrics {
             let PreparedMetric {
@@ -863,80 +1047,62 @@ impl TelemetryReporter {
                 counter_update,
             } = prepared_metric;
 
-            let mut candidate_metrics = current_metrics.clone();
-            candidate_metrics.push(bytes.clone());
-            let (candidate_payload, _) = Self::encode_payload(
-                subscription,
-                resource_attributes,
-                &candidate_metrics,
-                start_time_nanos,
-                time_nanos,
-                unsupported_compression_types,
-            )?;
-
-            if candidate_payload.len() <= max_bytes {
-                current_metrics = candidate_metrics;
-                if let Some(update) = counter_update {
-                    current_updates.push(update);
+            if current_chunk.metric_bytes.is_empty() {
+                if let Some(single_metric_chunk) = Self::start_chunk_with_metric(
+                    &mut context,
+                    &mut current_chunk,
+                    bytes,
+                    counter_update,
+                )? {
+                    chunks.push(single_metric_chunk);
                 }
                 continue;
             }
 
-            if current_metrics.is_empty() {
-                return Err(TelemetryChunkingError::SingleMetricTooLarge {
-                    payload_bytes: candidate_payload.len(),
-                    max_bytes,
-                });
+            let metric_entry_len = Self::len_delimited_field_len(bytes.len());
+            let fits_current_chunk = if supports_uncompressed {
+                Self::uncompressed_payload_len(
+                    resource_attributes,
+                    current_chunk.metric_entries_len + metric_entry_len,
+                ) <= max_bytes
+            } else {
+                current_chunk.metric_bytes.push(bytes.clone());
+                let fits = Self::encode_payload(
+                    subscription,
+                    resource_attributes,
+                    &current_chunk.metric_bytes,
+                    context.unsupported_compression_types,
+                )?
+                .0
+                .len()
+                    <= max_bytes;
+                current_chunk.metric_bytes.pop();
+                fits
+            };
+
+            if fits_current_chunk {
+                current_chunk.metric_entries_len += metric_entry_len;
+                current_chunk.metric_bytes.push(bytes);
+                current_chunk.counter_updates.extend(counter_update);
+                continue;
             }
 
-            let (payload, compression) = Self::encode_payload(
-                subscription,
-                resource_attributes,
-                &current_metrics,
-                start_time_nanos,
-                time_nanos,
-                unsupported_compression_types,
-            )?;
-            chunks.push(PreparedTelemetryChunk {
-                payload,
-                compression,
-                counter_updates: std::mem::take(&mut current_updates),
-            });
+            chunks.push(Self::take_current_chunk(&mut current_chunk));
+            current_chunk.metric_entries_len = 0;
 
-            current_metrics = vec![bytes];
-            if let Some(update) = counter_update {
-                current_updates.push(update);
-            }
-
-            let (single_payload, _) = Self::encode_payload(
-                subscription,
-                resource_attributes,
-                &current_metrics,
-                start_time_nanos,
-                time_nanos,
-                unsupported_compression_types,
-            )?;
-            if single_payload.len() > max_bytes {
-                return Err(TelemetryChunkingError::SingleMetricTooLarge {
-                    payload_bytes: single_payload.len(),
-                    max_bytes,
-                });
+            if let Some(single_metric_chunk) = Self::start_chunk_with_metric(
+                &mut context,
+                &mut current_chunk,
+                bytes,
+                counter_update,
+            )? {
+                chunks.push(single_metric_chunk);
             }
         }
 
-        let (payload, compression) = Self::encode_payload(
-            subscription,
-            resource_attributes,
-            &current_metrics,
-            start_time_nanos,
-            time_nanos,
-            unsupported_compression_types,
-        )?;
-        chunks.push(PreparedTelemetryChunk {
-            payload,
-            compression,
-            counter_updates: current_updates,
-        });
+        if !current_chunk.metric_bytes.is_empty() {
+            chunks.push(Self::take_current_chunk(&mut current_chunk));
+        }
 
         Ok(chunks)
     }
@@ -1393,13 +1559,9 @@ mod tests {
         ];
 
         let first_metric = entries[0].encode(false, start_time_nanos, time_nanos, &tracker);
-        let max_bytes = TelemetryReporter::build_payload_from_metrics(
-            &[],
-            &[first_metric[0].bytes.clone()],
-            start_time_nanos,
-            time_nanos,
-        )
-        .len();
+        let max_bytes =
+            TelemetryReporter::build_payload_from_metrics(&[], &[first_metric[0].bytes.clone()])
+                .len();
 
         let subscription = Subscription {
             client_instance_id: [0; 16],
@@ -1424,7 +1586,14 @@ mod tests {
         .expect("payload should split into multiple chunks");
 
         assert_eq!(chunks.len(), 2);
-        assert!(chunks.iter().all(|chunk| chunk.payload.len() <= max_bytes));
+        assert!(chunks.iter().all(|chunk| {
+            let mut unsupported = HashSet::new();
+            TelemetryReporter::encode_prepared_chunk(&subscription, &[], chunk, &mut unsupported)
+                .expect("chunk should encode")
+                .0
+                .len()
+                <= max_bytes
+        }));
     }
 
     #[test]
@@ -1448,13 +1617,9 @@ mod tests {
         ];
 
         let first_metric = entries[0].encode(true, start_time_nanos, time_nanos, &tracker);
-        let max_bytes = TelemetryReporter::build_payload_from_metrics(
-            &[],
-            &[first_metric[0].bytes.clone()],
-            start_time_nanos,
-            time_nanos,
-        )
-        .len();
+        let max_bytes =
+            TelemetryReporter::build_payload_from_metrics(&[], &[first_metric[0].bytes.clone()])
+                .len();
 
         let subscription = Subscription {
             client_instance_id: [0; 16],
@@ -1489,6 +1654,43 @@ mod tests {
 
         assert_eq!(tracker.preview_delta(&first_update.0, first_update.1), 0);
         assert_eq!(tracker.preview_delta(&second_update.0, second_update.1), 10);
+    }
+
+    #[test]
+    fn test_uncompressed_payload_len_matches_encoded_payload() {
+        let start_time_nanos = 1;
+        let time_nanos = 2;
+        let tracker = DeltaTracker::new();
+        let entries = vec![
+            CollectedMetricEntry::Counter {
+                name: "counter_a".to_string(),
+                help: "help".to_string(),
+                value: 15,
+            },
+            CollectedMetricEntry::Gauge {
+                name: "gauge_b".to_string(),
+                help: "help".to_string(),
+                value: 2,
+            },
+        ];
+        let mut metric_bytes = Vec::new();
+        let mut metric_entries_len = 0;
+
+        for entry in entries {
+            for prepared in entry.encode(false, start_time_nanos, time_nanos, &tracker) {
+                metric_entries_len +=
+                    TelemetryReporter::len_delimited_field_len(prepared.bytes.len());
+                metric_bytes.push(prepared.bytes);
+            }
+        }
+
+        let resource_attributes = vec![("service.name".to_string(), "krafka".to_string())];
+
+        assert_eq!(
+            TelemetryReporter::uncompressed_payload_len(&resource_attributes, metric_entries_len,),
+            TelemetryReporter::build_payload_from_metrics(&resource_attributes, &metric_bytes)
+                .len()
+        );
     }
 
     #[test]

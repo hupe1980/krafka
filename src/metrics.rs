@@ -1480,6 +1480,7 @@ mod tests {
         let metrics = ConsumerMetrics::new();
         metrics.record_receive(10, 500);
         metrics.record_poll(10);
+        metrics.record_seek(3);
         metrics.assigned_partitions.set(3);
 
         let output = metrics.to_prometheus_text("krafka_consumer");
@@ -1487,6 +1488,7 @@ mod tests {
         assert!(output.contains("# TYPE krafka_consumer_records_received_total counter"));
         assert!(output.contains("krafka_consumer_records_received_total 10"));
         assert!(output.contains("krafka_consumer_bytes_received_total 500"));
+        assert!(output.contains("krafka_consumer_seeks_total 3"));
         assert!(output.contains("krafka_consumer_assigned_partitions 3"));
     }
 
@@ -1545,19 +1547,23 @@ mod tests {
     fn test_krafka_metrics_reset() {
         let registry = KrafkaMetrics::new();
         let producer = registry.producer_metrics();
+        let consumer = registry.consumer_metrics();
         let connection = registry.connection_metrics();
 
         producer.record_send(100);
+        consumer.record_seek(2);
         connection.record_high_priority_request();
         connection.record_high_priority_bypass_yield();
         connection.record_throttle_delay(Duration::from_millis(10));
         assert_eq!(producer.records_sent.get(), 1);
+        assert_eq!(consumer.seeks.get(), 2);
         assert_eq!(connection.high_priority_requests.get(), 1);
         assert_eq!(connection.high_priority_bypass_yields.get(), 1);
         assert_eq!(connection.throttle_delay_ms.get(), 10);
 
         registry.reset();
         assert_eq!(producer.records_sent.get(), 0);
+        assert_eq!(consumer.seeks.get(), 0);
         assert_eq!(connection.high_priority_requests.get(), 0);
         assert_eq!(connection.high_priority_bypass_yields.get(), 0);
         assert_eq!(connection.throttle_delay_ms.get(), 0);
