@@ -85,6 +85,17 @@ type BrokerAckKey = ([u8; 16], PartitionId);
 /// Pending piggybacked acknowledgements grouped by broker and partition.
 type BrokerPendingAcks = HashMap<BrokerId, HashMap<BrokerAckKey, Vec<PendingAck>>>;
 
+#[derive(Clone)]
+struct ShareAcknowledgeContext {
+    metadata: Arc<ClusterMetadata>,
+    pool: Arc<ConnectionPool>,
+    share_sessions: Arc<tokio::sync::Mutex<ShareSessionCache>>,
+    group_id: String,
+    member_id: String,
+    current_ack_state_generation: Arc<AtomicU64>,
+    ack_state_generation: u64,
+}
+
 /// Pending acknowledgement for a share group record.
 #[derive(Debug, Clone)]
 struct PendingAck {
@@ -975,13 +986,15 @@ impl ShareConsumer {
                 }
             };
             if let Err(error) = ShareConsumer::send_share_acknowledge_with_state(
-                metadata,
-                pool,
-                share_sessions,
-                group_id,
-                member_id,
-                send_ack_state_generation,
-                ack_state_generation,
+                ShareAcknowledgeContext {
+                    metadata,
+                    pool,
+                    share_sessions,
+                    group_id,
+                    member_id,
+                    current_ack_state_generation: send_ack_state_generation,
+                    ack_state_generation,
+                },
                 &acks,
             )
             .await
@@ -1419,30 +1432,35 @@ impl ShareConsumer {
     /// error if any leader cannot be determined or any broker rejects the acks.
     async fn send_share_acknowledge(&self, acks: &[PendingAck]) -> Result<()> {
         let member_id = self.member_id.read().await.clone();
-        let ack_state_generation = self.ack_state_generation.load(Ordering::SeqCst);
         Self::send_share_acknowledge_with_state(
-            self.metadata.clone(),
-            self.pool.clone(),
-            self.share_sessions.clone(),
-            self.config.group_id.clone(),
-            member_id,
-            self.ack_state_generation.clone(),
-            ack_state_generation,
+            ShareAcknowledgeContext {
+                metadata: self.metadata.clone(),
+                pool: self.pool.clone(),
+                share_sessions: self.share_sessions.clone(),
+                group_id: self.config.group_id.clone(),
+                member_id,
+                current_ack_state_generation: self.ack_state_generation.clone(),
+                ack_state_generation: self.ack_state_generation.load(Ordering::SeqCst),
+            },
             acks,
         )
         .await
     }
 
     async fn send_share_acknowledge_with_state(
-        metadata: Arc<ClusterMetadata>,
-        pool: Arc<ConnectionPool>,
-        share_sessions: Arc<tokio::sync::Mutex<ShareSessionCache>>,
-        group_id: String,
-        member_id: String,
-        current_ack_state_generation: Arc<AtomicU64>,
-        ack_state_generation: u64,
+        context: ShareAcknowledgeContext,
         acks: &[PendingAck],
     ) -> Result<()> {
+        let ShareAcknowledgeContext {
+            metadata,
+            pool,
+            share_sessions,
+            group_id,
+            member_id,
+            current_ack_state_generation,
+            ack_state_generation,
+        } = context;
+
         Self::ensure_ack_state_current(
             current_ack_state_generation.as_ref(),
             ack_state_generation,
@@ -2149,13 +2167,15 @@ mod tests {
     async fn test_send_share_acknowledge_rejects_stale_ack_generation() {
         let consumer = test_share_consumer(AcknowledgementMode::Explicit);
         let error = ShareConsumer::send_share_acknowledge_with_state(
-            consumer.metadata.clone(),
-            consumer.pool.clone(),
-            consumer.share_sessions.clone(),
-            consumer.config.group_id.clone(),
-            consumer.member_id.read().await.clone(),
-            Arc::new(AtomicU64::new(1)),
-            0,
+            ShareAcknowledgeContext {
+                metadata: consumer.metadata.clone(),
+                pool: consumer.pool.clone(),
+                share_sessions: consumer.share_sessions.clone(),
+                group_id: consumer.config.group_id.clone(),
+                member_id: consumer.member_id.read().await.clone(),
+                current_ack_state_generation: Arc::new(AtomicU64::new(1)),
+                ack_state_generation: 0,
+            },
             &[PendingAck {
                 topic: "topic-a".to_string(),
                 topic_id: [1; 16],
