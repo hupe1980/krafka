@@ -338,6 +338,8 @@ impl TelemetryReporter {
                             .await
                         {
                             Some(s) => {
+                                self.pending_push_window = None;
+                                self.delta_tracker.reset();
                                 subscription = s;
                             }
                             None => {
@@ -610,7 +612,7 @@ impl TelemetryReporter {
             if chunk_result != PushResult::Ok {
                 self.delta_tracker
                     .commit_updates(&committed_counter_updates);
-                if chunk_result != PushResult::Fatal {
+                if should_preserve_pending_window(chunk_result) {
                     let mut remaining_chunks = vec![chunk];
                     remaining_chunks.extend(chunk_iter.map(|(_, pending_chunk)| pending_chunk));
                     self.pending_push_window = Some(PendingPushWindow {
@@ -1193,6 +1195,10 @@ enum PushResult {
     Fatal,
 }
 
+fn should_preserve_pending_window(result: PushResult) -> bool {
+    matches!(result, PushResult::Transient | PushResult::Throttled)
+}
+
 fn should_advance_window(has_metrics: bool, push_result: Option<PushResult>) -> bool {
     if !has_metrics {
         return true;
@@ -1538,6 +1544,15 @@ mod tests {
         assert!(!should_advance_window(true, Some(PushResult::Transient)));
         assert!(!should_advance_window(true, Some(PushResult::Throttled)));
         assert!(!should_advance_window(true, Some(PushResult::ReSubscribe)));
+    }
+
+    #[test]
+    fn test_preserve_pending_window_only_for_same_subscription_retries() {
+        assert!(should_preserve_pending_window(PushResult::Transient));
+        assert!(should_preserve_pending_window(PushResult::Throttled));
+        assert!(!should_preserve_pending_window(PushResult::Ok));
+        assert!(!should_preserve_pending_window(PushResult::ReSubscribe));
+        assert!(!should_preserve_pending_window(PushResult::Fatal));
     }
 
     #[test]

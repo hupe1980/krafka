@@ -1101,11 +1101,15 @@ impl ShareConsumer {
 
     // ── Internal helpers ────────────────────────────────────────────────
 
-    /// Clear all per-partition state. Called from `unsubscribe()` and `close()`.
-    async fn clear_partition_state(&self) {
+    fn invalidate_ack_state(&self) {
         self.ack_state_generation.fetch_add(1, Ordering::SeqCst);
         self.explicit_flush_retry_required
             .store(false, Ordering::SeqCst);
+    }
+
+    /// Clear all per-partition state. Called from `unsubscribe()` and `close()`.
+    async fn clear_partition_state(&self) {
+        self.invalidate_ack_state();
         self.pending_acks.write().await.clear();
         self.recv_buffer.write().await.clear();
         self.share_sessions.lock().await.reset_all();
@@ -1394,6 +1398,7 @@ impl ShareConsumer {
                 new_assignments.len(),
                 new_assignments.values().map(|v| v.len()).sum::<usize>()
             );
+            self.invalidate_ack_state();
             self.share_sessions.lock().await.reset_all();
         }
 
@@ -2051,6 +2056,32 @@ mod tests {
 
         consumer.clear_partition_state().await;
 
+        assert!(
+            !consumer
+                .explicit_flush_retry_required
+                .load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_assignment_advances_ack_state_generation_on_change() {
+        let consumer = test_share_consumer(AcknowledgementMode::Explicit);
+        consumer
+            .assignments
+            .write()
+            .await
+            .insert("topic-a".to_string(), vec![0]);
+        consumer
+            .explicit_flush_retry_required
+            .store(true, Ordering::SeqCst);
+
+        let old_generation = consumer.ack_state_generation.load(Ordering::SeqCst);
+        consumer.apply_assignment(&[]).await;
+
+        assert_eq!(
+            consumer.ack_state_generation.load(Ordering::SeqCst),
+            old_generation + 1
+        );
         assert!(
             !consumer
                 .explicit_flush_retry_required

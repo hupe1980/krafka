@@ -803,6 +803,8 @@ pub struct CachedSchemaRegistry<C> {
     max_entries: Option<usize>,
     /// Monotonic token used to identify distinct in-flight lookup generations.
     in_flight_token: AtomicU64,
+    /// Monotonic generation for invalidation-sensitive cache insertions.
+    invalidation_generation: AtomicU64,
     /// Waiters for coalescing concurrent cold misses by schema ID.
     in_flight: Mutex<HashMap<SchemaId, SchemaInFlightEntry>>,
 }
@@ -822,6 +824,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             insertion_order: RwLock::new(VecDeque::new()),
             max_entries: None,
             in_flight_token: AtomicU64::new(0),
+            invalidation_generation: AtomicU64::new(0),
             in_flight: Mutex::new(HashMap::new()),
         }
     }
@@ -834,6 +837,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             insertion_order: RwLock::new(VecDeque::with_capacity(capacity)),
             max_entries: None,
             in_flight_token: AtomicU64::new(0),
+            invalidation_generation: AtomicU64::new(0),
             in_flight: Mutex::new(HashMap::new()),
         }
     }
@@ -849,6 +853,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             insertion_order: RwLock::new(VecDeque::with_capacity(max_entries)),
             max_entries: Some(max_entries),
             in_flight_token: AtomicU64::new(0),
+            invalidation_generation: AtomicU64::new(0),
             in_flight: Mutex::new(HashMap::new()),
         }
     }
@@ -876,6 +881,8 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
 
     /// Remove a single schema ID from the cache.
     pub fn invalidate(&self, schema_id: SchemaId) {
+        self.invalidation_generation.fetch_add(1, Ordering::SeqCst);
+
         // Cancel any coalesced waiters so invalidation is observable immediately.
         let waiters = self
             .in_flight
@@ -896,6 +903,8 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
 
     /// Remove all cached schemas.
     pub fn invalidate_all(&self) {
+        self.invalidation_generation.fetch_add(1, Ordering::SeqCst);
+
         // Cancel all in-flight lookups so no stale insertions survive reset.
         let cancelled: Vec<_> = self.in_flight.lock().drain().collect();
 
@@ -1054,8 +1063,9 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
 
     async fn get_latest_schema_impl(&self, subject: &str) -> Result<Schema> {
         // Always forward (latest may change), but cache by ID.
+        let observed_generation = self.invalidation_generation.load(Ordering::SeqCst);
         let schema = self.inner.get_latest_schema(subject).await?;
-        self.insert_cache_entry(schema.id, schema.clone());
+        self.insert_cache_entry_if_current(schema.id, schema.clone(), observed_generation);
         Ok(schema)
     }
 
@@ -1064,8 +1074,9 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         subject: &str,
         version: SchemaVersion,
     ) -> Result<Schema> {
+        let observed_generation = self.invalidation_generation.load(Ordering::SeqCst);
         let schema = self.inner.get_schema_by_version(subject, version).await?;
-        self.insert_cache_entry(schema.id, schema.clone());
+        self.insert_cache_entry_if_current(schema.id, schema.clone(), observed_generation);
         Ok(schema)
     }
 
@@ -1148,6 +1159,23 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         }
 
         cache.insert(id, schema);
+    }
+
+    fn insert_cache_entry_if_current(
+        &self,
+        id: SchemaId,
+        schema: Schema,
+        observed_generation: u64,
+    ) {
+        if self.invalidation_generation.load(Ordering::SeqCst) != observed_generation {
+            debug!(
+                schema_id = id,
+                "schema fetch completed after invalidation; skipping cache insert"
+            );
+            return;
+        }
+
+        self.insert_cache_entry(id, schema);
     }
 }
 
@@ -1241,7 +1269,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use tokio::sync::Notify;
+    use tokio::sync::{Notify, Semaphore};
 
     fn ok<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> T {
         match result {
@@ -1714,16 +1742,22 @@ mod tests {
 
     struct BlockingMockRegistry {
         get_by_id_calls: AtomicU32,
+        get_latest_calls: AtomicU32,
+        get_by_version_calls: AtomicU32,
         started: Notify,
-        release: Notify,
+        release: Semaphore,
+        waiting_calls: AtomicU32,
     }
 
     impl BlockingMockRegistry {
         fn new() -> Self {
             Self {
                 get_by_id_calls: AtomicU32::new(0),
+                get_latest_calls: AtomicU32::new(0),
+                get_by_version_calls: AtomicU32::new(0),
                 started: Notify::new(),
-                release: Notify::new(),
+                release: Semaphore::new(0),
+                waiting_calls: AtomicU32::new(0),
             }
         }
 
@@ -1731,12 +1765,21 @@ mod tests {
             self.get_by_id_calls.load(Ordering::SeqCst)
         }
 
+        fn get_latest_call_count(&self) -> u32 {
+            self.get_latest_calls.load(Ordering::SeqCst)
+        }
+
+        fn get_by_version_call_count(&self) -> u32 {
+            self.get_by_version_calls.load(Ordering::SeqCst)
+        }
+
         async fn wait_started(&self) {
             self.started.notified().await;
         }
 
         fn release(&self) {
-            self.release.notify_waiters();
+            let waiting = self.waiting_calls.swap(0, Ordering::SeqCst);
+            self.release.add_permits(waiting as usize);
         }
     }
 
@@ -1748,7 +1791,12 @@ mod tests {
             self.get_by_id_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 self.started.notify_waiters();
-                self.release.notified().await;
+                self.waiting_calls.fetch_add(1, Ordering::SeqCst);
+                let _ = self
+                    .release
+                    .acquire()
+                    .await
+                    .expect("blocking registry release permit");
                 Ok(Schema::new(id, SchemaType::Avro, r#"{"type":"string"}"#))
             })
         }
@@ -1758,7 +1806,15 @@ mod tests {
             subject: &str,
         ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
             let subject = subject.to_string();
+            self.get_latest_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
+                self.started.notify_waiters();
+                self.waiting_calls.fetch_add(1, Ordering::SeqCst);
+                let _ = self
+                    .release
+                    .acquire()
+                    .await
+                    .expect("blocking registry release permit");
                 Ok(Schema::new(100, SchemaType::Avro, r#"{"type":"string"}"#)
                     .with_subject(subject, 1))
             })
@@ -1770,7 +1826,15 @@ mod tests {
             version: SchemaVersion,
         ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
             let subject = subject.to_string();
+            self.get_by_version_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
+                self.started.notify_waiters();
+                self.waiting_calls.fetch_add(1, Ordering::SeqCst);
+                let _ = self
+                    .release
+                    .acquire()
+                    .await
+                    .expect("blocking registry release permit");
                 Ok(Schema::new(100, SchemaType::Avro, r#"{"type":"string"}"#)
                     .with_subject(subject, version))
             })
@@ -2052,6 +2116,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_invalidate_drops_inflight_get_latest_cache_population() {
+        let cached = Arc::new(CachedSchemaRegistry::new(BlockingMockRegistry::new()));
+
+        let latest = {
+            let cached = cached.clone();
+            tokio::spawn(async move { ok(cached.get_latest_schema("test-value").await) })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while cached.inner().get_latest_call_count() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("latest lookup did not start");
+        cached.invalidate(100);
+        cached.inner().release();
+
+        let _ = join_ok(latest.await);
+        assert_eq!(cached.cache_len(), 0);
+
+        ok(cached.get_schema_by_id(100).await);
+        assert_eq!(cached.inner().get_by_id_call_count(), 1);
+    }
+
+    #[tokio::test]
     async fn test_cache_get_by_version_populates_id_cache() {
         let mock = MockRegistry::new();
         let cached = CachedSchemaRegistry::new(mock);
@@ -2062,6 +2152,32 @@ mod tests {
         let by_id = ok(cached.get_schema_by_id(schema.id).await);
         assert_eq!(cached.inner().get_by_id_call_count(), 0);
         assert_eq!(by_id.id, schema.id);
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_drops_inflight_get_by_version_cache_population() {
+        let cached = Arc::new(CachedSchemaRegistry::new(BlockingMockRegistry::new()));
+
+        let by_version = {
+            let cached = cached.clone();
+            tokio::spawn(async move { ok(cached.get_schema_by_version("test-value", 1).await) })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while cached.inner().get_by_version_call_count() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("version lookup did not start");
+        cached.invalidate(100);
+        cached.inner().release();
+
+        let _ = join_ok(by_version.await);
+        assert_eq!(cached.cache_len(), 0);
+
+        ok(cached.get_schema_by_id(100).await);
+        assert_eq!(cached.inner().get_by_id_call_count(), 1);
     }
 
     #[tokio::test]

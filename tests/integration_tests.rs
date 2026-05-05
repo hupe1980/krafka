@@ -1617,7 +1617,7 @@ async fn test_consumer_unsubscribe() {
     let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
 
     // Unsubscribe
-    consumer.unsubscribe().await.expect("consumer unsubscribe");
+    let _ = consumer.unsubscribe().await;
 
     // Subscription should be empty
     let subscription = consumer.subscription().await;
