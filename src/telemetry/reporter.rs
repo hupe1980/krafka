@@ -333,13 +333,15 @@ impl TelemetryReporter {
                     PushResult::Ok => {}
                     PushResult::ReSubscribe => {
                         debug!("Subscription invalidated; re-subscribing");
+                        let preserved_pending_window = self.pending_push_window.is_some();
                         match self
                             .get_subscription_with_retry(subscription.client_instance_id)
                             .await
                         {
                             Some(s) => {
-                                self.pending_push_window = None;
-                                self.delta_tracker.reset();
+                                if !preserved_pending_window {
+                                    self.delta_tracker.reset();
+                                }
                                 subscription = s;
                             }
                             None => {
@@ -1196,7 +1198,10 @@ enum PushResult {
 }
 
 fn should_preserve_pending_window(result: PushResult) -> bool {
-    matches!(result, PushResult::Transient | PushResult::Throttled)
+    matches!(
+        result,
+        PushResult::Transient | PushResult::Throttled | PushResult::ReSubscribe
+    )
 }
 
 fn should_advance_window(has_metrics: bool, push_result: Option<PushResult>) -> bool {
@@ -1547,11 +1552,11 @@ mod tests {
     }
 
     #[test]
-    fn test_preserve_pending_window_only_for_same_subscription_retries() {
+    fn test_preserve_pending_window_for_retries_and_resubscribe() {
         assert!(should_preserve_pending_window(PushResult::Transient));
         assert!(should_preserve_pending_window(PushResult::Throttled));
+        assert!(should_preserve_pending_window(PushResult::ReSubscribe));
         assert!(!should_preserve_pending_window(PushResult::Ok));
-        assert!(!should_preserve_pending_window(PushResult::ReSubscribe));
         assert!(!should_preserve_pending_window(PushResult::Fatal));
     }
 

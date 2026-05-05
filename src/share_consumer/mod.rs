@@ -186,9 +186,10 @@ pub struct ShareConsumer {
     pending_acks: Arc<RwLock<Vec<PendingAck>>>,
     /// Monotonic token for the current local ack state.
     ///
-    /// Incremented whenever local partition state is cleared so detached
-    /// flush tasks cannot requeue stale acknowledgements from an older
-    /// membership/session after `unsubscribe()` or `close()`.
+    /// Incremented whenever local ack state is cleared or invalidated so
+    /// detached flush tasks cannot send or requeue stale acknowledgements
+    /// from an older membership/session after assignment changes,
+    /// `unsubscribe()`, or `close()`.
     ack_state_generation: Arc<AtomicU64>,
     /// Explicit-mode barrier raised after a commit flush fails.
     ///
@@ -954,6 +955,7 @@ impl ShareConsumer {
         let pool = self.pool.clone();
         let share_sessions = self.share_sessions.clone();
         let group_id = self.config.group_id.clone();
+        let send_ack_state_generation = current_ack_state_generation.clone();
 
         ShareCommitHandle::Task(tokio::spawn(async move {
             let restore_acks = |mut acks: Vec<PendingAck>| {
@@ -978,6 +980,8 @@ impl ShareConsumer {
                 share_sessions,
                 group_id,
                 member_id,
+                send_ack_state_generation,
+                ack_state_generation,
                 &acks,
             )
             .await
@@ -1107,13 +1111,17 @@ impl ShareConsumer {
             .store(false, Ordering::SeqCst);
     }
 
-    /// Clear all per-partition state. Called from `unsubscribe()` and `close()`.
-    async fn clear_partition_state(&self) {
+    async fn clear_ack_state(&self) {
         self.invalidate_ack_state();
         self.pending_acks.write().await.clear();
+        self.unacked_offsets.write().await.clear();
+    }
+
+    /// Clear all per-partition state. Called from `unsubscribe()` and `close()`.
+    async fn clear_partition_state(&self) {
+        self.clear_ack_state().await;
         self.recv_buffer.write().await.clear();
         self.share_sessions.lock().await.reset_all();
-        self.unacked_offsets.write().await.clear();
         *self.coordinator_id.write().await = None;
         *self.coordinator_address.write().await = None;
     }
@@ -1398,7 +1406,7 @@ impl ShareConsumer {
                 new_assignments.len(),
                 new_assignments.values().map(|v| v.len()).sum::<usize>()
             );
-            self.invalidate_ack_state();
+            self.clear_ack_state().await;
             self.share_sessions.lock().await.reset_all();
         }
 
@@ -1411,12 +1419,15 @@ impl ShareConsumer {
     /// error if any leader cannot be determined or any broker rejects the acks.
     async fn send_share_acknowledge(&self, acks: &[PendingAck]) -> Result<()> {
         let member_id = self.member_id.read().await.clone();
+        let ack_state_generation = self.ack_state_generation.load(Ordering::SeqCst);
         Self::send_share_acknowledge_with_state(
             self.metadata.clone(),
             self.pool.clone(),
             self.share_sessions.clone(),
             self.config.group_id.clone(),
             member_id,
+            self.ack_state_generation.clone(),
+            ack_state_generation,
             acks,
         )
         .await
@@ -1428,8 +1439,15 @@ impl ShareConsumer {
         share_sessions: Arc<tokio::sync::Mutex<ShareSessionCache>>,
         group_id: String,
         member_id: String,
+        current_ack_state_generation: Arc<AtomicU64>,
+        ack_state_generation: u64,
         acks: &[PendingAck],
     ) -> Result<()> {
+        Self::ensure_ack_state_current(
+            current_ack_state_generation.as_ref(),
+            ack_state_generation,
+        )?;
+
         // Group acks by partition leader.
         let mut broker_acks: HashMap<BrokerId, Vec<&PendingAck>> = HashMap::new();
 
@@ -1444,6 +1462,11 @@ impl ShareConsumer {
         }
 
         for (broker_id, broker_ack_list) in &broker_acks {
+            Self::ensure_ack_state_current(
+                current_ack_state_generation.as_ref(),
+                ack_state_generation,
+            )?;
+
             let topics = Self::build_acknowledge_topics(
                 &broker_ack_list
                     .iter()
@@ -1485,6 +1508,11 @@ impl ShareConsumer {
                 .await
                 .ok_or_else(|| KrafkaError::protocol("broker does not support ShareAcknowledge"))?;
 
+            Self::ensure_ack_state_current(
+                current_ack_state_generation.as_ref(),
+                ack_state_generation,
+            )?;
+
             let buf = conn
                 .send_request(ApiKey::ShareAcknowledge, version, |buf| match version {
                     2 => request.encode_v2(buf, false),
@@ -1503,6 +1531,19 @@ impl ShareConsumer {
         }
 
         Ok(())
+    }
+
+    fn ensure_ack_state_current(
+        current_generation: &AtomicU64,
+        ack_state_generation: u64,
+    ) -> Result<()> {
+        if current_generation.load(Ordering::SeqCst) == ack_state_generation {
+            return Ok(());
+        }
+
+        Err(KrafkaError::invalid_state(
+            "share acknowledgement state was invalidated",
+        ))
     }
 
     /// Leave the share group via heartbeat with member_epoch = -1.
@@ -2071,6 +2112,19 @@ mod tests {
             .write()
             .await
             .insert("topic-a".to_string(), vec![0]);
+        consumer.pending_acks.write().await.push(PendingAck {
+            topic: "topic-a".to_string(),
+            topic_id: [1; 16],
+            partition: 0,
+            first_offset: 5,
+            last_offset: 5,
+            ack_type: AcknowledgeType::Accept.to_i8(),
+        });
+        consumer
+            .unacked_offsets
+            .write()
+            .await
+            .insert(("topic-a".to_string(), 0, 5));
         consumer
             .explicit_flush_retry_required
             .store(true, Ordering::SeqCst);
@@ -2086,6 +2140,38 @@ mod tests {
             !consumer
                 .explicit_flush_retry_required
                 .load(Ordering::SeqCst)
+        );
+        assert!(consumer.pending_acks.read().await.is_empty());
+        assert!(consumer.unacked_offsets.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_send_share_acknowledge_rejects_stale_ack_generation() {
+        let consumer = test_share_consumer(AcknowledgementMode::Explicit);
+        let error = ShareConsumer::send_share_acknowledge_with_state(
+            consumer.metadata.clone(),
+            consumer.pool.clone(),
+            consumer.share_sessions.clone(),
+            consumer.config.group_id.clone(),
+            consumer.member_id.read().await.clone(),
+            Arc::new(AtomicU64::new(1)),
+            0,
+            &[PendingAck {
+                topic: "topic-a".to_string(),
+                topic_id: [1; 16],
+                partition: 0,
+                first_offset: 5,
+                last_offset: 5,
+                ack_type: AcknowledgeType::Accept.to_i8(),
+            }],
+        )
+        .await
+        .expect_err("stale ack generation must be rejected before sending");
+
+        assert!(
+            error
+                .to_string()
+                .contains("acknowledgement state was invalidated")
         );
     }
 

@@ -609,10 +609,6 @@ async fn test_consumer_group_rebalance() {
     consumer2.close().await.expect("consumer2 close");
 }
 
-// ============================================================================
-// Chaos Testing (Story 10.3)
-// ============================================================================
-
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_connection_timeout_handling() {
@@ -1407,10 +1403,6 @@ async fn test_admin_describe_topics() {
         .ok();
 }
 
-// ============================================================================
-// Round 14 Integration Tests
-// ============================================================================
-
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn test_producer_timestamp_propagation() {
@@ -1595,6 +1587,7 @@ async fn test_admin_list_consumer_groups() {
 #[ignore = "requires Docker"]
 async fn test_consumer_unsubscribe() {
     use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::error::{ErrorCode, KrafkaError};
 
     let (_container, bootstrap_servers) = kafka_container().await;
 
@@ -1617,7 +1610,7 @@ async fn test_consumer_unsubscribe() {
     let _ = poll_for_records(&consumer, 0, Duration::from_secs(3), 3).await;
 
     // Unsubscribe
-    let _ = consumer.unsubscribe().await;
+    let unsubscribe_result = consumer.unsubscribe().await;
 
     // Subscription should be empty
     let subscription = consumer.subscription().await;
@@ -1625,6 +1618,22 @@ async fn test_consumer_unsubscribe() {
         subscription.is_empty(),
         "Subscription should be empty after unsubscribe"
     );
+    if let Err(error) = unsubscribe_result {
+        assert!(
+            matches!(
+                error,
+                KrafkaError::Broker {
+                    code: ErrorCode::UnknownMemberId
+                        | ErrorCode::IllegalGeneration
+                        | ErrorCode::RebalanceInProgress
+                        | ErrorCode::NotCoordinator
+                        | ErrorCode::CoordinatorLoadInProgress,
+                    ..
+                }
+            ),
+            "unsubscribe should either succeed or fail only with a bounded coordinator race after clearing local state: {error}"
+        );
+    }
     consumer.close().await.expect("consumer close");
 }
 
@@ -1661,10 +1670,6 @@ async fn test_producer_metrics() {
     producer.close().await;
     assert!(producer.is_closed(), "Producer should be closed");
 }
-
-// ============================================================================
-// Round 15 — New integration tests for coverage gaps
-// ============================================================================
 
 /// Test that sending after producer.close() returns an error (not a panic).
 #[tokio::test]
