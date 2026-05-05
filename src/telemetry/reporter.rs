@@ -339,7 +339,16 @@ impl TelemetryReporter {
                             .await
                         {
                             Some(s) => {
-                                if !preserved_pending_window {
+                                if preserved_pending_window
+                                    && !can_reuse_pending_window(&subscription, &s)
+                                {
+                                    debug!(
+                                        "Telemetry subscription changed; dropping preserved pending window"
+                                    );
+                                    self.pending_push_window = None;
+                                    self.delta_tracker.reset();
+                                    window_start = Self::nanos_since_epoch();
+                                } else if !preserved_pending_window {
                                     self.delta_tracker.reset();
                                 }
                                 subscription = s;
@@ -987,6 +996,36 @@ impl TelemetryReporter {
         Ok(None)
     }
 
+    fn start_chunk_with_metric_or_skip(
+        context: &mut ChunkPreparationContext<'_>,
+        current_chunk: &mut ChunkBuilderState,
+        chunks: &mut Vec<PreparedTelemetryChunk>,
+        bytes: Vec<u8>,
+        counter_update: Option<(String, u64)>,
+    ) -> Result<(), TelemetryChunkingError> {
+        match Self::start_chunk_with_metric(context, current_chunk, bytes, counter_update) {
+            Ok(Some(single_metric_chunk)) => chunks.push(single_metric_chunk),
+            Ok(None) => {}
+            Err(TelemetryChunkingError::SingleMetricTooLarge {
+                payload_bytes,
+                max_bytes,
+            }) => {
+                current_chunk.metric_entries_len = 0;
+                current_chunk.metric_bytes.clear();
+                current_chunk.counter_updates.clear();
+                warn!(
+                    payload_bytes,
+                    max_bytes, "Skipping telemetry metric that exceeds broker TelemetryMaxBytes"
+                );
+            }
+            Err(error @ TelemetryChunkingError::NoUsableCompressionCodec { .. }) => {
+                return Err(error);
+            }
+        }
+
+        Ok(())
+    }
+
     fn prepare_push_chunks(
         subscription: &Subscription,
         start_time_nanos: u64,
@@ -1052,14 +1091,13 @@ impl TelemetryReporter {
             } = prepared_metric;
 
             if current_chunk.metric_bytes.is_empty() {
-                if let Some(single_metric_chunk) = Self::start_chunk_with_metric(
+                Self::start_chunk_with_metric_or_skip(
                     &mut context,
                     &mut current_chunk,
+                    &mut chunks,
                     bytes,
                     counter_update,
-                )? {
-                    chunks.push(single_metric_chunk);
-                }
+                )?;
                 continue;
             }
 
@@ -1094,14 +1132,13 @@ impl TelemetryReporter {
             chunks.push(Self::take_current_chunk(&mut current_chunk));
             current_chunk.metric_entries_len = 0;
 
-            if let Some(single_metric_chunk) = Self::start_chunk_with_metric(
+            Self::start_chunk_with_metric_or_skip(
                 &mut context,
                 &mut current_chunk,
+                &mut chunks,
                 bytes,
                 counter_update,
-            )? {
-                chunks.push(single_metric_chunk);
-            }
+            )?;
         }
 
         if !current_chunk.metric_bytes.is_empty() {
@@ -1202,6 +1239,17 @@ fn should_preserve_pending_window(result: PushResult) -> bool {
         result,
         PushResult::Transient | PushResult::Throttled | PushResult::ReSubscribe
     )
+}
+
+fn requested_metrics_match(current: &[String], next: &[String]) -> bool {
+    current.len() == next.len() && current.iter().all(|metric| next.contains(metric))
+}
+
+fn can_reuse_pending_window(current: &Subscription, next: &Subscription) -> bool {
+    current.delta_temporality == next.delta_temporality
+        && current.telemetry_max_bytes == next.telemetry_max_bytes
+        && current.accepted_compression_types == next.accepted_compression_types
+        && requested_metrics_match(&current.requested_metrics, &next.requested_metrics)
 }
 
 fn should_advance_window(has_metrics: bool, push_result: Option<PushResult>) -> bool {
@@ -1561,6 +1609,40 @@ mod tests {
     }
 
     #[test]
+    fn test_reuse_pending_window_requires_matching_subscription_shape() {
+        let base = Subscription {
+            client_instance_id: [0; 16],
+            subscription_id: 1,
+            push_interval: Duration::from_secs(1),
+            delta_temporality: true,
+            accepted_compression_types: vec![Compression::Gzip, Compression::None],
+            telemetry_max_bytes: 1024,
+            requested_metrics: vec!["foo".to_string(), "bar".to_string()],
+        };
+
+        let mut same = base.clone();
+        same.subscription_id = 2;
+        same.push_interval = Duration::from_secs(2);
+        assert!(can_reuse_pending_window(&base, &same));
+
+        let mut changed_filter = base.clone();
+        changed_filter.requested_metrics = vec!["foo".to_string()];
+        assert!(!can_reuse_pending_window(&base, &changed_filter));
+
+        let mut changed_delta = base.clone();
+        changed_delta.delta_temporality = false;
+        assert!(!can_reuse_pending_window(&base, &changed_delta));
+
+        let mut changed_max_bytes = base.clone();
+        changed_max_bytes.telemetry_max_bytes = 2048;
+        assert!(!can_reuse_pending_window(&base, &changed_max_bytes));
+
+        let mut changed_compression = base.clone();
+        changed_compression.accepted_compression_types = vec![Compression::None];
+        assert!(!can_reuse_pending_window(&base, &changed_compression));
+    }
+
+    #[test]
     fn test_prepare_push_chunks_splits_oversized_payload() {
         let start_time_nanos = 1;
         let time_nanos = 2;
@@ -1606,6 +1688,75 @@ mod tests {
         .expect("payload should split into multiple chunks");
 
         assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|chunk| {
+            let mut unsupported = HashSet::new();
+            TelemetryReporter::encode_prepared_chunk(&subscription, &[], chunk, &mut unsupported)
+                .expect("chunk should encode")
+                .0
+                .len()
+                <= max_bytes
+        }));
+    }
+
+    #[test]
+    fn test_prepare_push_chunks_skips_single_metric_too_large() {
+        let start_time_nanos = 1;
+        let time_nanos = 2;
+        let tracker = DeltaTracker::new();
+        let entries = vec![
+            CollectedMetricEntry::Gauge {
+                name: "small_metric_a".to_string(),
+                help: "help".to_string(),
+                value: 1,
+            },
+            CollectedMetricEntry::Gauge {
+                name: "oversized_metric".to_string(),
+                help: "x".repeat(8_192),
+                value: 2,
+            },
+            CollectedMetricEntry::Gauge {
+                name: "small_metric_b".to_string(),
+                help: "help".to_string(),
+                value: 3,
+            },
+        ];
+
+        let first_metric = entries[0].encode(false, start_time_nanos, time_nanos, &tracker);
+        let max_bytes =
+            TelemetryReporter::build_payload_from_metrics(&[], &[first_metric[0].bytes.clone()])
+                .len();
+        let oversized_metric = entries[1].encode(false, start_time_nanos, time_nanos, &tracker);
+        let oversized_payload_len = TelemetryReporter::build_payload_from_metrics(
+            &[],
+            &[oversized_metric[0].bytes.clone()],
+        )
+        .len();
+        assert!(oversized_payload_len > max_bytes);
+
+        let subscription = Subscription {
+            client_instance_id: [0; 16],
+            subscription_id: 1,
+            push_interval: Duration::from_secs(1),
+            delta_temporality: false,
+            accepted_compression_types: vec![Compression::None],
+            telemetry_max_bytes: max_bytes as i32,
+            requested_metrics: vec!["*".to_string()],
+        };
+        let mut unsupported = HashSet::new();
+
+        let chunks = TelemetryReporter::prepare_push_chunks(
+            &subscription,
+            start_time_nanos,
+            time_nanos,
+            &entries,
+            &[],
+            &tracker,
+            &mut unsupported,
+        )
+        .expect("oversized metrics should be skipped instead of stalling telemetry");
+
+        let emitted_metric_count: usize = chunks.iter().map(|chunk| chunk.metric_bytes.len()).sum();
+        assert_eq!(emitted_metric_count, 2);
         assert!(chunks.iter().all(|chunk| {
             let mut unsupported = HashSet::new();
             TelemetryReporter::encode_prepared_chunk(&subscription, &[], chunk, &mut unsupported)

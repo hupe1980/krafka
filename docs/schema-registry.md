@@ -500,6 +500,12 @@ match decoded.schema_format {
 }
 ```
 
+    `SchemaDecoder::decode()` biases toward safe passthrough on ambiguous payloads
+    whose first byte collides with a Confluent (`0x00`) or Glue (`0x03`) framing
+    prefix but do not carry a complete valid header. If you need strict malformed
+    header rejection, call `detect_wire_format()` and the low-level
+    `decode_wire_format()` / `decode_glue_wire_format()` helpers directly.
+
 Advanced configuration via the builder:
 
 ```rust
