@@ -188,6 +188,7 @@ struct ChunkPreparationContext<'a> {
     resource_attributes: &'a [(String, String)],
     max_bytes: usize,
     prefer_uncompressed_chunking: bool,
+    can_bound_encoded_payload_by_uncompressed: bool,
     unsupported_compression_types: &'a mut HashSet<Compression>,
 }
 
@@ -960,7 +961,7 @@ impl TelemetryReporter {
         current_chunk.metric_bytes.push(bytes);
         current_chunk.metric_entries_len = metric_entry_len;
 
-        if context.prefer_uncompressed_chunking
+        if context.can_bound_encoded_payload_by_uncompressed
             && Self::uncompressed_payload_len(context.resource_attributes, metric_entry_len)
                 <= context.max_bytes
         {
@@ -1051,6 +1052,8 @@ impl TelemetryReporter {
             usize::MAX
         };
         let prefer_uncompressed_chunking = prefers_uncompressed_chunking(subscription);
+        let can_bound_encoded_payload_by_uncompressed =
+            supports_uncompressed_fallback(subscription);
 
         if prepared_metrics.is_empty() {
             let empty_chunk = PreparedTelemetryChunk {
@@ -1072,6 +1075,28 @@ impl TelemetryReporter {
             return Ok(vec![empty_chunk]);
         }
 
+        if max_bytes == usize::MAX {
+            let mut chunk = PreparedTelemetryChunk {
+                metric_bytes: Vec::with_capacity(prepared_metrics.len()),
+                counter_updates: Vec::new(),
+            };
+            for prepared_metric in prepared_metrics {
+                chunk.metric_bytes.push(prepared_metric.bytes);
+                chunk.counter_updates.extend(prepared_metric.counter_update);
+            }
+
+            // Unlimited broker budgets still need one encode pass here so we
+            // surface unusable broker codec combinations before enqueueing the window.
+            let _ = Self::encode_prepared_chunk(
+                subscription,
+                resource_attributes,
+                &chunk,
+                unsupported_compression_types,
+            )?;
+
+            return Ok(vec![chunk]);
+        }
+
         let mut chunks = Vec::new();
         let mut current_chunk = ChunkBuilderState::default();
         let mut context = ChunkPreparationContext {
@@ -1079,6 +1104,7 @@ impl TelemetryReporter {
             resource_attributes,
             max_bytes,
             prefer_uncompressed_chunking,
+            can_bound_encoded_payload_by_uncompressed,
             unsupported_compression_types,
         };
 
@@ -1100,11 +1126,15 @@ impl TelemetryReporter {
             }
 
             let metric_entry_len = Self::len_delimited_field_len(bytes.len());
-            let fits_current_chunk = if prefer_uncompressed_chunking {
-                Self::uncompressed_payload_len(
-                    resource_attributes,
-                    current_chunk.metric_entries_len + metric_entry_len,
-                ) <= max_bytes
+            let candidate_metric_entries_len = current_chunk.metric_entries_len + metric_entry_len;
+            let fits_current_chunk = if context.can_bound_encoded_payload_by_uncompressed
+                && Self::uncompressed_payload_len(resource_attributes, candidate_metric_entries_len)
+                    <= max_bytes
+            {
+                true
+            } else if prefer_uncompressed_chunking {
+                Self::uncompressed_payload_len(resource_attributes, candidate_metric_entries_len)
+                    <= max_bytes
             } else {
                 current_chunk.metric_bytes.push(bytes.clone());
                 let fits = Self::encode_payload(
@@ -1249,6 +1279,12 @@ fn prefers_uncompressed_chunking(subscription: &Subscription) -> bool {
         subscription.accepted_compression_types.first(),
         Some(Compression::None)
     )
+}
+
+fn supports_uncompressed_fallback(subscription: &Subscription) -> bool {
+    subscription
+        .accepted_compression_types
+        .contains(&Compression::None)
 }
 
 fn can_reuse_pending_window(current: &Subscription, next: &Subscription) -> bool {
@@ -1633,6 +1669,24 @@ mod tests {
     }
 
     #[test]
+    fn test_supports_uncompressed_fallback_when_none_is_advertised() {
+        let mut subscription = Subscription {
+            client_instance_id: [0; 16],
+            subscription_id: 1,
+            push_interval: Duration::from_secs(1),
+            delta_temporality: false,
+            accepted_compression_types: vec![Compression::Gzip],
+            telemetry_max_bytes: 1_024,
+            requested_metrics: vec!["*".to_string()],
+        };
+
+        assert!(!supports_uncompressed_fallback(&subscription));
+
+        subscription.accepted_compression_types = vec![Compression::Gzip, Compression::None];
+        assert!(supports_uncompressed_fallback(&subscription));
+    }
+
+    #[test]
     fn test_reuse_pending_window_requires_matching_subscription_shape() {
         let base = Subscription {
             client_instance_id: [0; 16],
@@ -1874,6 +1928,44 @@ mod tests {
         .expect("chunk should encode");
         assert_eq!(encoded.1, Compression::Gzip);
         assert!(encoded.0.len() <= max_bytes);
+    }
+
+    #[test]
+    fn test_prepare_push_chunks_unbounded_max_bytes_still_validates_codec() {
+        let start_time_nanos = 1;
+        let time_nanos = 2;
+        let tracker = DeltaTracker::new();
+        let entries = vec![CollectedMetricEntry::Gauge {
+            name: "metric_a".to_string(),
+            help: "help".to_string(),
+            value: 1,
+        }];
+        let subscription = Subscription {
+            client_instance_id: [0; 16],
+            subscription_id: 1,
+            push_interval: Duration::from_secs(1),
+            delta_temporality: false,
+            accepted_compression_types: Vec::new(),
+            telemetry_max_bytes: 0,
+            requested_metrics: vec!["*".to_string()],
+        };
+        let mut unsupported = HashSet::new();
+
+        let error = TelemetryReporter::prepare_push_chunks(
+            &subscription,
+            start_time_nanos,
+            time_nanos,
+            &entries,
+            &[],
+            &tracker,
+            &mut unsupported,
+        )
+        .expect_err("unbounded chunking must still reject missing broker codecs");
+
+        assert!(matches!(
+            error,
+            TelemetryChunkingError::NoUsableCompressionCodec { .. }
+        ));
     }
 
     #[test]
