@@ -485,6 +485,7 @@ impl ShareConsumer {
         let mut fetch_tasks = Vec::with_capacity(partitions_by_broker.len());
         let member_id = self.member_id.read().await.clone();
         let group_id = self.config.group_id.clone();
+        let current_ack_state_generation = self.ack_state_generation.clone();
 
         for (broker_id, partitions) in &partitions_by_broker {
             let session_epoch = {
@@ -544,7 +545,13 @@ impl ShareConsumer {
             let bid = *broker_id;
             let metadata = self.metadata.clone();
             let pool = self.pool.clone();
+            let current_ack_state_generation = current_ack_state_generation.clone();
             let task = tokio::spawn(async move {
+                ShareConsumer::ensure_ack_state_current(
+                    current_ack_state_generation.as_ref(),
+                    ack_state_generation,
+                )?;
+
                 let broker_addr = metadata
                     .broker(bid)
                     .map(|b| b.address().to_string())
@@ -560,6 +567,11 @@ impl ShareConsumer {
                     )
                     .await
                     .ok_or_else(|| KrafkaError::protocol("broker does not support ShareFetch"))?;
+
+                ShareConsumer::ensure_ack_state_current(
+                    current_ack_state_generation.as_ref(),
+                    ack_state_generation,
+                )?;
 
                 let buf = conn
                     .send_request(ApiKey::ShareFetch, version, |buf| match version {

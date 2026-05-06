@@ -187,7 +187,7 @@ struct ChunkPreparationContext<'a> {
     subscription: &'a Subscription,
     resource_attributes: &'a [(String, String)],
     max_bytes: usize,
-    supports_uncompressed: bool,
+    prefer_uncompressed_chunking: bool,
     unsupported_compression_types: &'a mut HashSet<Compression>,
 }
 
@@ -960,7 +960,7 @@ impl TelemetryReporter {
         current_chunk.metric_bytes.push(bytes);
         current_chunk.metric_entries_len = metric_entry_len;
 
-        if context.supports_uncompressed
+        if context.prefer_uncompressed_chunking
             && Self::uncompressed_payload_len(context.resource_attributes, metric_entry_len)
                 <= context.max_bytes
         {
@@ -985,7 +985,7 @@ impl TelemetryReporter {
             });
         }
 
-        if context.supports_uncompressed {
+        if context.prefer_uncompressed_chunking {
             current_chunk.metric_entries_len = 0;
             return Ok(Some(single_metric_chunk));
         }
@@ -1050,9 +1050,7 @@ impl TelemetryReporter {
         } else {
             usize::MAX
         };
-        let supports_uncompressed = subscription
-            .accepted_compression_types
-            .contains(&Compression::None);
+        let prefer_uncompressed_chunking = prefers_uncompressed_chunking(subscription);
 
         if prepared_metrics.is_empty() {
             let empty_chunk = PreparedTelemetryChunk {
@@ -1080,7 +1078,7 @@ impl TelemetryReporter {
             subscription,
             resource_attributes,
             max_bytes,
-            supports_uncompressed,
+            prefer_uncompressed_chunking,
             unsupported_compression_types,
         };
 
@@ -1102,7 +1100,7 @@ impl TelemetryReporter {
             }
 
             let metric_entry_len = Self::len_delimited_field_len(bytes.len());
-            let fits_current_chunk = if supports_uncompressed {
+            let fits_current_chunk = if prefer_uncompressed_chunking {
                 Self::uncompressed_payload_len(
                     resource_attributes,
                     current_chunk.metric_entries_len + metric_entry_len,
@@ -1243,6 +1241,13 @@ fn should_preserve_pending_window(result: PushResult) -> bool {
 
 fn requested_metrics_match(current: &[String], next: &[String]) -> bool {
     current.len() == next.len() && current.iter().all(|metric| next.contains(metric))
+}
+
+fn prefers_uncompressed_chunking(subscription: &Subscription) -> bool {
+    matches!(
+        subscription.accepted_compression_types.first(),
+        Some(Compression::None)
+    )
 }
 
 fn can_reuse_pending_window(current: &Subscription, next: &Subscription) -> bool {
@@ -1609,6 +1614,24 @@ mod tests {
     }
 
     #[test]
+    fn test_prefers_uncompressed_chunking_only_when_none_is_first() {
+        let mut subscription = Subscription {
+            client_instance_id: [0; 16],
+            subscription_id: 1,
+            push_interval: Duration::from_secs(1),
+            delta_temporality: false,
+            accepted_compression_types: vec![Compression::None],
+            telemetry_max_bytes: 1_024,
+            requested_metrics: vec!["*".to_string()],
+        };
+
+        assert!(prefers_uncompressed_chunking(&subscription));
+
+        subscription.accepted_compression_types = vec![Compression::Gzip, Compression::None];
+        assert!(!prefers_uncompressed_chunking(&subscription));
+    }
+
+    #[test]
     fn test_reuse_pending_window_requires_matching_subscription_shape() {
         let base = Subscription {
             client_instance_id: [0; 16],
@@ -1765,6 +1788,79 @@ mod tests {
                 .len()
                 <= max_bytes
         }));
+    }
+
+    #[test]
+    fn test_prepare_push_chunks_keeps_compressible_payload_together_when_none_is_fallback() {
+        if !Compression::Gzip.is_available() {
+            return;
+        }
+
+        let start_time_nanos = 1;
+        let time_nanos = 2;
+        let tracker = DeltaTracker::new();
+        let repeated_help = "compressible".repeat(512);
+        let entries = vec![
+            CollectedMetricEntry::Gauge {
+                name: "metric_a".to_string(),
+                help: repeated_help.clone(),
+                value: 1,
+            },
+            CollectedMetricEntry::Gauge {
+                name: "metric_b".to_string(),
+                help: repeated_help,
+                value: 2,
+            },
+        ];
+
+        let prepared_metrics: Vec<_> = entries
+            .iter()
+            .flat_map(|entry| entry.encode(false, start_time_nanos, time_nanos, &tracker))
+            .collect();
+        let metric_bytes: Vec<_> = prepared_metrics
+            .iter()
+            .map(|metric| metric.bytes.clone())
+            .collect();
+        let payload = TelemetryReporter::build_payload_from_metrics(&[], &metric_bytes);
+        let compressed = Compression::Gzip
+            .compress(&payload)
+            .expect("gzip compression should succeed in this test");
+
+        assert!(payload.len() > compressed.len());
+        let max_bytes = compressed.len();
+
+        let subscription = Subscription {
+            client_instance_id: [0; 16],
+            subscription_id: 1,
+            push_interval: Duration::from_secs(1),
+            delta_temporality: false,
+            accepted_compression_types: vec![Compression::Gzip, Compression::None],
+            telemetry_max_bytes: max_bytes as i32,
+            requested_metrics: vec!["*".to_string()],
+        };
+        let mut unsupported = HashSet::new();
+
+        let chunks = TelemetryReporter::prepare_push_chunks(
+            &subscription,
+            start_time_nanos,
+            time_nanos,
+            &entries,
+            &[],
+            &tracker,
+            &mut unsupported,
+        )
+        .expect("compressible payload should fit in one chunk with gzip-first subscriptions");
+
+        assert_eq!(chunks.len(), 1);
+        let encoded = TelemetryReporter::encode_prepared_chunk(
+            &subscription,
+            &[],
+            &chunks[0],
+            &mut unsupported,
+        )
+        .expect("chunk should encode");
+        assert_eq!(encoded.1, Compression::Gzip);
+        assert!(encoded.0.len() <= max_bytes);
     }
 
     #[test]

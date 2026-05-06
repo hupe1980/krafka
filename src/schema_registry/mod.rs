@@ -746,7 +746,7 @@ pub trait AnySchemaCache: Send + Sync {
     /// Returns `true` when the cache contains no entries.
     fn cache_is_empty(&self) -> bool;
 
-    /// Clear all cached entries.
+    /// Clear all cached entries and cancel in-flight cache repopulation.
     fn clear_cache(&self);
 
     /// Invalidate a specific cache entry.
@@ -871,10 +871,23 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         self.cache.read().is_empty()
     }
 
-    /// Clear the schema cache.
-    pub fn clear_cache(&self) {
+    fn clear_cache_storage(&self) {
         self.cache.write().clear();
         self.insertion_order.write().clear();
+    }
+
+    /// Clear the schema cache.
+    pub fn clear_cache(&self) {
+        self.invalidation_generation.fetch_add(1, Ordering::SeqCst);
+
+        let cancelled: Vec<_> = self.in_flight.lock().drain().collect();
+        self.clear_cache_storage();
+
+        for (id, entry) in cancelled {
+            for waiter in entry.waiters {
+                let _ = waiter.send(Err(schema_lookup_cancelled_error(id)));
+            }
+        }
     }
 
     /// Remove a single schema ID from the cache.
@@ -901,18 +914,7 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
 
     /// Remove all cached schemas.
     pub fn invalidate_all(&self) {
-        self.invalidation_generation.fetch_add(1, Ordering::SeqCst);
-
-        // Cancel all in-flight lookups so no stale insertions survive reset.
-        let cancelled: Vec<_> = self.in_flight.lock().drain().collect();
-
         self.clear_cache();
-
-        for (id, entry) in cancelled {
-            for waiter in entry.waiters {
-                let _ = waiter.send(Err(schema_lookup_cancelled_error(id)));
-            }
-        }
     }
 
     /// Pre-fetch a set of schema IDs into the cache.
@@ -1948,6 +1950,41 @@ mod tests {
         assert_eq!(cached.cache_len(), 0);
 
         // Must fetch again because invalidation prevented stale re-population.
+        let second = {
+            let cached = cached.clone();
+            tokio::spawn(async move { ok(cached.get_schema_by_id(7).await) })
+        };
+        cached.inner().wait_started().await;
+        cached.inner().release();
+        let _ = join_ok(second.await);
+        assert_eq!(cached.inner().get_by_id_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cache_clear_does_not_repopulate_from_inflight_fetch() {
+        let cached = Arc::new(CachedSchemaRegistry::new(BlockingMockRegistry::new()));
+
+        let first = {
+            let cached = cached.clone();
+            tokio::spawn(async move { ok(cached.get_schema_by_id(7).await) })
+        };
+
+        cached.inner().wait_started().await;
+        cached.clear_cache();
+        {
+            let cached = cached.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                cached.inner().release();
+            });
+        }
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), first)
+            .await
+            .expect("in-flight fetch did not complete")
+            .expect("in-flight task failed");
+        assert_eq!(cached.cache_len(), 0);
+
         let second = {
             let cached = cached.clone();
             tokio::spawn(async move { ok(cached.get_schema_by_id(7).await) })

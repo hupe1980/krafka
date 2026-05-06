@@ -693,10 +693,21 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
         self.cache.read().is_empty()
     }
 
-    /// Clear the schema cache.
-    pub fn clear_cache(&self) {
+    fn clear_cache_storage(&self) {
         self.cache.write().clear();
         self.insertion_order.write().clear();
+    }
+
+    /// Clear the schema cache.
+    pub fn clear_cache(&self) {
+        let cancelled: Vec<_> = self.in_flight.lock().drain().collect();
+        self.clear_cache_storage();
+
+        for (id, entry) in cancelled {
+            for waiter in entry.waiters {
+                let _ = waiter.send(Err(glue_schema_lookup_cancelled_error(id)));
+            }
+        }
     }
 
     /// Remove a single schema version ID from the cache.
@@ -721,16 +732,7 @@ impl<C: GlueSchemaRegistryClient> CachedGlueSchemaRegistry<C> {
 
     /// Remove all cached schemas.
     pub fn invalidate_all(&self) {
-        // Cancel all in-flight lookups so no stale insertions survive reset.
-        let cancelled: Vec<_> = self.in_flight.lock().drain().collect();
-
         self.clear_cache();
-
-        for (id, entry) in cancelled {
-            for waiter in entry.waiters {
-                let _ = waiter.send(Err(glue_schema_lookup_cancelled_error(id)));
-            }
-        }
     }
 
     /// Pre-fetch a set of schema version IDs into the cache.
@@ -1566,6 +1568,44 @@ mod tests {
         assert_eq!(cached.cache_len(), 0);
 
         // Must fetch again because invalidation prevented stale re-population.
+        let second = {
+            let cached = cached.clone();
+            tokio::spawn(async move { cached.get_schema_by_version_id(id).await.unwrap() })
+        };
+        cached.inner().wait_started().await;
+        cached.inner().release();
+        let _ = second.await.unwrap();
+        assert_eq!(cached.inner().get_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cache_clear_does_not_repopulate_from_inflight_fetch() {
+        let cached = Arc::new(CachedGlueSchemaRegistry::new(
+            BlockingMockGlueRegistry::new(),
+        ));
+        let id: GlueSchemaVersionId = TEST_UUID_STR.parse().unwrap();
+
+        let first = {
+            let cached = cached.clone();
+            tokio::spawn(async move { cached.get_schema_by_version_id(id).await.unwrap() })
+        };
+
+        cached.inner().wait_started().await;
+        cached.clear_cache();
+        {
+            let cached = cached.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                cached.inner().release();
+            });
+        }
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), first)
+            .await
+            .expect("in-flight fetch did not complete")
+            .expect("in-flight task failed");
+        assert_eq!(cached.cache_len(), 0);
+
         let second = {
             let cached = cached.clone();
             tokio::spawn(async move { cached.get_schema_by_version_id(id).await.unwrap() })
