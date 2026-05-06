@@ -1240,7 +1240,8 @@ fn should_preserve_pending_window(result: PushResult) -> bool {
 }
 
 fn requested_metrics_match(current: &[String], next: &[String]) -> bool {
-    current.len() == next.len() && current.iter().all(|metric| next.contains(metric))
+    current.iter().map(String::as_str).collect::<HashSet<_>>()
+        == next.iter().map(String::as_str).collect::<HashSet<_>>()
 }
 
 fn prefers_uncompressed_chunking(subscription: &Subscription) -> bool {
@@ -1663,6 +1664,18 @@ mod tests {
         let mut changed_compression = base.clone();
         changed_compression.accepted_compression_types = vec![Compression::None];
         assert!(!can_reuse_pending_window(&base, &changed_compression));
+    }
+
+    #[test]
+    fn test_requested_metrics_match_compares_effective_prefix_sets() {
+        assert!(requested_metrics_match(
+            &["a".to_string(), "a".to_string()],
+            &["a".to_string()]
+        ));
+        assert!(!requested_metrics_match(
+            &["a".to_string(), "a".to_string()],
+            &["a".to_string(), "b".to_string()]
+        ));
     }
 
     #[test]
