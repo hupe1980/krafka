@@ -14,7 +14,7 @@ This guide covers metrics collection and export in Krafka.
 Krafka provides built-in metrics collection that is automatically wired into all hot paths:
 
 - **Producer metrics**: Records sent, bytes, batches, errors, retries, send latency — recorded in `send()`, `send_to_partition()`, and batch accumulator flush
-- **Consumer metrics**: Records received, polls, fetches, commits, rebalances, assigned partitions, lag, poll latency — recorded in `poll()`, `commit()`, and `close()`
+- **Consumer metrics**: Records received, polls, fetches, commits, rebalances, seeks, assigned partitions, lag, poll latency — recorded in `poll()`, `commit()`, `seek()`, `seek_many()`, and `close()`
 - **Connection metrics**: Connections created/closed, errors, establishment latency, priority scheduling counters, and broker throttle delays
 
 All metrics are lock-free using atomic operations for minimal performance impact. Access metrics via `producer.metrics_handle()`, `consumer.metrics()`, or the connection metric handles exposed by producer, consumer, share-consumer, admin, and connection-pool APIs.
@@ -198,7 +198,7 @@ async fn main() {
 | `errors_total` | Counter | Total send errors |
 | `retries_total` | Counter | Total retry attempts |
 | `connections` | Gauge | Current active connections |
-| `buffered_records` | Gauge | Currently buffered records |
+| `buffered_records` | Gauge | Producer records currently admitted under the memory budget |
 | `send_latency_seconds` | Summary | Send latency statistics |
 
 ### Consumer Metrics
@@ -213,6 +213,7 @@ async fn main() {
 | `commits_total` | Counter | Total offset commits |
 | `errors_total` | Counter | Total errors |
 | `rebalances_total` | Counter | Total rebalance operations |
+| `seeks_total` | Counter | Total seek operations (seek + seek_many partition count) |
 | `lag` | Gauge | Total consumer lag across all assigned partitions |
 | `lag_max` | Gauge | Maximum per-partition consumer lag |
 | `assigned_partitions` | Gauge | Currently assigned partitions |
@@ -315,8 +316,16 @@ let reporter = TelemetryReporter::new(connection, krafka_metrics, config, shutdo
 tokio::spawn(reporter.run());
 ```
 
-The reporter handles subscription polling, push interval jitter, re-subscription on
-`UNKNOWN_SUBSCRIPTION_ID`, and a graceful terminating push on shutdown — all per KIP-714.
+The reporter handles subscription polling, push interval jitter, local OTLP payload
+chunking under the broker's `TelemetryMaxBytes` limit, re-subscription on
+`UNKNOWN_SUBSCRIPTION_ID` or unsplittable oversized metrics, and a graceful terminating
+push on shutdown. When the broker advertises accepted compression codecs, the reporter
+tries them in broker preference order, skips locally unavailable codecs after the first
+failure, and only uses uncompressed payloads when the broker explicitly advertises
+`Compression::None`; otherwise the reporter stops if none of the advertised codecs is
+locally usable. If a multi-chunk push is only partially accepted, the reporter commits
+delta baselines for the accepted chunks and retries the exact remaining chunk slice on the
+next interval.
 
 ### Manual Bridge to External OTel SDKs
 

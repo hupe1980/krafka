@@ -56,20 +56,28 @@ const MAX_CONCURRENT_BATCH_SENDS: usize = 64;
 /// Validate that `record_size` bytes can be admitted into the memory pool.
 ///
 /// Returns an error immediately if the record would permanently block
-/// `acquire_many` — either because it exceeds `u32::MAX` (the hard limit of
-/// `Semaphore::acquire_many`) or because it exceeds the configured
-/// `buffer_memory` budget (permits can never accumulate to that level).
+/// `acquire_many` — either because it exceeds the effective semaphore limit
+/// (`min(u32::MAX, Semaphore::MAX_PERMITS)`) or because it exceeds the
+/// configured `buffer_memory` budget (permits can never accumulate to that
+/// level).
 ///
-/// The u32 check comes first so the error message is always accurate:
-/// a record larger than both limits is a semaphore-API violation, not a
-/// tunable configuration problem.
-fn check_record_admission(record_size: usize, memory_capacity: usize) -> Result<()> {
-    if record_size > u32::MAX as usize {
+/// The semaphore-limit check comes first so the error message is always
+/// accurate: a record larger than both limits is a semaphore constraint, not
+/// a tunable configuration problem.
+fn max_record_semaphore_permits() -> usize {
+    Semaphore::MAX_PERMITS.min(u32::MAX as usize)
+}
+
+pub(crate) fn check_record_admission(record_size: usize, memory_capacity: usize) -> Result<()> {
+    let semaphore_limit = max_record_semaphore_permits();
+
+    if record_size > semaphore_limit {
         return Err(KrafkaError::config(format!(
             "record size {record_size} B exceeds the semaphore \
-             permit-count limit ({} B, u32::MAX); Kafka records must \
-             be smaller",
-            u32::MAX
+             permit-count limit ({} B; min(u32::MAX, \
+             Semaphore::MAX_PERMITS)); Kafka records must be \
+             smaller",
+            semaphore_limit
         )));
     }
     if record_size > memory_capacity {
@@ -81,6 +89,48 @@ fn check_record_admission(record_size: usize, memory_capacity: usize) -> Result<
         )));
     }
     Ok(())
+}
+
+pub(crate) fn effective_memory_capacity(buffer_memory: usize) -> usize {
+    if buffer_memory > 0 {
+        if buffer_memory > Semaphore::MAX_PERMITS {
+            warn!(
+                requested = buffer_memory,
+                effective = Semaphore::MAX_PERMITS,
+                "buffer_memory exceeds Semaphore::MAX_PERMITS; clamping effective \
+                 producer memory capacity"
+            );
+            Semaphore::MAX_PERMITS
+        } else {
+            buffer_memory
+        }
+    } else {
+        Semaphore::MAX_PERMITS
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct BufferedRecordGuard {
+    buffered_records: Arc<AtomicUsize>,
+    metrics: Arc<ProducerMetrics>,
+}
+
+impl BufferedRecordGuard {
+    pub(crate) fn new(buffered_records: Arc<AtomicUsize>, metrics: Arc<ProducerMetrics>) -> Self {
+        buffered_records.fetch_add(1, Ordering::Relaxed);
+        metrics.buffered_records.inc();
+        Self {
+            buffered_records,
+            metrics,
+        }
+    }
+}
+
+impl Drop for BufferedRecordGuard {
+    fn drop(&mut self) {
+        self.buffered_records.fetch_sub(1, Ordering::Relaxed);
+        self.metrics.buffered_records.dec();
+    }
 }
 
 /// Response from the accumulator for an append attempt.
@@ -103,6 +153,10 @@ struct AppendCommand {
     record_size: usize,
     response_tx: oneshot::Sender<AppendResponse>,
     operation_guard: InFlightOpGuard,
+    /// Tracks this append in the buffered-records gauge from successful
+    /// admission into the channel until it is either moved into a pending
+    /// batch or dropped on failure.
+    _buffered_record_guard: BufferedRecordGuard,
     permit_reservation: PermitReservation,
 }
 
@@ -191,6 +245,10 @@ pub struct RecordAccumulatorHandle {
     max_block_ms: Duration,
     /// Barrier over all producer sends, including detached batch tasks.
     in_flight_barrier: Arc<InFlightBarrier>,
+    /// Number of records currently admitted under the memory budget.
+    buffered_records: Arc<AtomicUsize>,
+    /// Shared producer metrics used to export buffered-record state.
+    metrics: Arc<ProducerMetrics>,
 }
 
 impl RecordAccumulatorHandle {
@@ -276,6 +334,8 @@ impl RecordAccumulatorHandle {
         permit.forget();
 
         let (response_tx, response_rx) = oneshot::channel();
+        let buffered_record_guard =
+            BufferedRecordGuard::new(self.buffered_records.clone(), self.metrics.clone());
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
 
         // Send the Append; on failure (timeout / closed channel),
@@ -291,6 +351,7 @@ impl RecordAccumulatorHandle {
                 record_size,
                 response_tx,
                 operation_guard,
+                _buffered_record_guard: buffered_record_guard,
                 permit_reservation,
             })),
         )
@@ -441,6 +502,9 @@ struct PendingRecord {
     offset_in_batch: i64,
     /// Estimated size in bytes for memory tracking.
     estimated_size: usize,
+    /// Tracks this record in the producer buffered-records gauge until it is
+    /// acknowledged or dropped on failure.
+    _buffered_record_guard: BufferedRecordGuard,
     /// Producer-wide operation guard that completes only after ack/failure.
     _operation_guard: InFlightOpGuard,
 }
@@ -543,31 +607,13 @@ impl RecordAccumulator {
         // (`usize::MAX >> 3`, only reachable on 32-bit targets in practice),
         // we clamp and emit a single `warn!` so the effective cap is
         // explicit rather than silent.
-        let memory_capacity = if config.buffer_memory > 0 {
-            if config.buffer_memory > Semaphore::MAX_PERMITS {
-                warn!(
-                    requested = config.buffer_memory,
-                    effective = Semaphore::MAX_PERMITS,
-                    "buffer_memory exceeds Semaphore::MAX_PERMITS; clamping effective \
-                     producer memory capacity"
-                );
-                Semaphore::MAX_PERMITS
-            } else {
-                config.buffer_memory
-            }
-        } else {
-            Semaphore::MAX_PERMITS
-        };
+        let memory_capacity = effective_memory_capacity(config.buffer_memory);
         let memory_permits = Arc::new(Semaphore::new(memory_capacity));
         let in_flight_memory = Arc::new(AtomicUsize::new(0));
+        let buffered_records = Arc::new(AtomicUsize::new(0));
+        let handle_buffered_records = buffered_records.clone();
+        let handle_metrics = metrics.clone();
         let max_block_ms = config.max_block_ms;
-
-        if config.buffer_memory == 0 {
-            warn!(
-                "buffer_memory=0 disables producer backpressure; \
-                 memory usage is unbounded. Not recommended for production."
-            );
-        }
 
         let accumulator = Self {
             config,
@@ -601,6 +647,8 @@ impl RecordAccumulator {
             memory_capacity,
             max_block_ms,
             in_flight_barrier,
+            buffered_records: handle_buffered_records,
+            metrics: handle_metrics,
         }
     }
 
@@ -659,6 +707,7 @@ impl RecordAccumulator {
             record_size,
             response_tx,
             operation_guard,
+            _buffered_record_guard: buffered_record_guard,
             permit_reservation,
         } = append;
         let key = (topic, partition);
@@ -687,6 +736,7 @@ impl RecordAccumulator {
                 response_tx,
                 offset_in_batch: offset,
                 estimated_size: record_size,
+                _buffered_record_guard: buffered_record_guard,
                 _operation_guard: operation_guard,
             });
             // Release is now owned by the eventual `InFlightGuard`.
@@ -717,6 +767,7 @@ impl RecordAccumulator {
                     response_tx,
                     offset_in_batch: 0,
                     estimated_size: record_size,
+                    _buffered_record_guard: buffered_record_guard,
                     _operation_guard: operation_guard,
                 });
                 self.batches.insert(key, new_batch);
@@ -1528,6 +1579,8 @@ mod tests {
             memory_capacity: 1024 * 1024, // larger than any test record
             max_block_ms: Duration::from_millis(50),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
+            buffered_records: Arc::new(AtomicUsize::new(0)),
+            metrics: Arc::new(ProducerMetrics::default()),
         };
 
         let record = ProducerRecord::new("topic", b"value".to_vec());
@@ -1576,6 +1629,8 @@ mod tests {
             memory_capacity: 16, // deliberately tiny
             max_block_ms: Duration::from_secs(60),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
+            buffered_records: Arc::new(AtomicUsize::new(0)),
+            metrics: Arc::new(ProducerMetrics::default()),
         };
 
         let record = ProducerRecord::new("topic", vec![0u8; 1024]);
@@ -1602,6 +1657,8 @@ mod tests {
             memory_capacity: 1024 * 1024,
             max_block_ms: Duration::from_secs(60),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
+            buffered_records: Arc::new(AtomicUsize::new(0)),
+            metrics: Arc::new(ProducerMetrics::default()),
         };
 
         let sem_close = sem.clone();
@@ -1633,12 +1690,16 @@ mod tests {
     async fn test_permits_released_when_append_message_dropped() {
         let (sender, mut receiver) = mpsc::channel::<AccumulatorMessage>(16);
         let sem = Arc::new(Semaphore::new(1024));
+        let metrics = Arc::new(ProducerMetrics::default());
+        let buffered_records = Arc::new(AtomicUsize::new(0));
         let handle = RecordAccumulatorHandle {
             sender,
             memory_permits: sem.clone(),
             memory_capacity: 1024,
             max_block_ms: Duration::from_millis(500),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
+            buffered_records: buffered_records.clone(),
+            metrics: metrics.clone(),
         };
 
         let record = ProducerRecord::new("topic", vec![0u8; 256]);
@@ -1652,6 +1713,10 @@ mod tests {
             .await
             .expect("timed out waiting for Append message to arrive in channel")
             .expect("channel closed before message arrived");
+
+        assert_eq!(metrics.buffered_records.get(), 1);
+        assert_eq!(buffered_records.load(Ordering::Relaxed), 1);
+
         drop(msg);
         drop(receiver);
 
@@ -1665,6 +1730,8 @@ mod tests {
             1024,
             "permits leaked when the Append message was dropped"
         );
+        assert_eq!(metrics.buffered_records.get(), 0);
+        assert_eq!(buffered_records.load(Ordering::Relaxed), 0);
     }
 
     /// `check_record_admission` rejects records that exceed `buffer_memory`.
@@ -1686,23 +1753,36 @@ mod tests {
         );
     }
 
-    /// `check_record_admission` rejects records that exceed `u32::MAX`.
+    /// `check_record_admission` rejects records that exceed the effective
+    /// semaphore permit-count limit.
     ///
-    /// Tests the `u32::MAX` branch directly via the extracted helper —
-    /// no >4 GiB allocation needed.
+    /// Tests the semaphore-limit branch directly via the extracted helper —
+    /// no large allocation needed.
     #[test]
-    fn test_check_record_admission_rejects_oversized_for_u32_max() {
-        // Synthetic size just above u32::MAX — no allocation required.
-        let oversized = u32::MAX as usize + 1;
+    fn test_check_record_admission_rejects_oversized_for_semaphore_limit() {
+        let oversized = max_record_semaphore_permits() + 1;
         let err = check_record_admission(oversized, usize::MAX).expect_err("must reject");
         let msg = err.to_string();
         assert!(
-            msg.contains("u32::MAX"),
-            "error must cite u32::MAX, got: {msg}"
+            msg.contains("Semaphore::MAX_PERMITS"),
+            "error must cite the effective semaphore limit, got: {msg}"
         );
         assert!(
             !msg.contains("buffer_memory"),
-            "must not cite buffer_memory for a u32::MAX rejection, got: {msg}"
+            "must not cite buffer_memory for a semaphore-limit rejection, got: {msg}"
         );
+    }
+
+    #[test]
+    fn test_buffered_record_guard_updates_metric() {
+        let metrics = Arc::new(ProducerMetrics::default());
+        let buffered_records = Arc::new(AtomicUsize::new(0));
+
+        {
+            let _guard = BufferedRecordGuard::new(buffered_records.clone(), metrics.clone());
+            assert_eq!(metrics.buffered_records.get(), 1);
+        }
+
+        assert_eq!(metrics.buffered_records.get(), 0);
     }
 }

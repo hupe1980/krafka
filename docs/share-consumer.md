@@ -57,7 +57,7 @@ Records fetched by the previous `poll()` are automatically accepted when the nex
 
 ### Explicit
 
-The application controls acknowledgement per record. **All records from the previous `poll()` must be acknowledged before calling `poll()` again** — otherwise `poll()` returns an error. This prevents accidentally losing records:
+The application controls acknowledgement per record. **All records from the previous `poll()` must be acknowledged before calling `poll()` again** — otherwise `poll()` returns an error. `acknowledge()` is one-shot per record: acknowledging the same record twice returns an error instead of sending duplicate broker intent. If a later `commit_sync()` or `commit_async()` flush fails, the consumer restores that batch locally and later `poll()` calls keep returning an error until the commit is retried successfully or the local share-consumer state is cleared.
 
 ```rust
 use krafka::share_consumer::{ShareConsumer, AcknowledgementMode, AcknowledgeType};
@@ -107,10 +107,10 @@ for record in &records {
 
 ## Async Commit
 
-For fire-and-forget acknowledgement (errors logged, not returned). If lock contention or a missing coordinator prevents the snapshot, pending acks are **preserved** for the next commit cycle rather than silently dropped:
+`commit_async()` returns a handle that resolves to the final commit outcome. This keeps the send off the caller's immediate path while still surfacing transport, decode, and broker errors explicitly. If any failure occurs, the batch is restored locally for the next commit cycle rather than silently dropped:
 
 ```rust
-consumer.commit_async();
+consumer.commit_async().await?;
 ```
 
 ## Streaming API
@@ -187,7 +187,7 @@ Sessions are managed automatically. They reset on errors or assignment changes.
 
 ## Concurrent Fetching
 
-Each `poll()` issues ShareFetch requests to all assigned brokers **concurrently** using a `tokio::task::JoinSet`. Pending acknowledgements are piggybacked on fetch requests to reduce round trips. If a broker fetch fails, records from other brokers are still returned — the error is logged and the session for the failed broker is reset.
+Each `poll()` issues ShareFetch requests to all assigned brokers **concurrently** by spawning one Tokio task per broker and awaiting the handles directly. Pending acknowledgements are piggybacked on fetch requests to reduce round trips. If a broker fetch fails, records from other brokers are still returned, the session for the failed broker is reset, and the unsent piggyback acknowledgements are restored for the next commit cycle.
 
 ## Coordinator Handling
 
@@ -214,7 +214,7 @@ consumer.subscribe(&["topic1", "topic2"]).await?;
 let records = consumer.poll(Duration::from_secs(1)).await?;
 
 // Unsubscribe (leaves group, generates a new member ID)
-consumer.unsubscribe().await?;
+consumer.unsubscribe().await;
 
 // Close (idempotent)
 consumer.close().await?;
@@ -222,16 +222,16 @@ consumer.close().await?;
 
 ### Close Semantics
 
-`close()` performs best-effort cleanup:
+`close()` is terminal and returns the first cleanup error after local state and connections have still been closed:
 
 1. **Implicit mode**: all pending accept acks are converted to **releases** so acquired records return to the pool for redelivery by other consumers.
 2. **Explicit mode**: pending acks (accept/release/reject) are flushed as-is.
-3. Sends a leave-group heartbeat.
+3. Sends and validates a leave-group heartbeat.
 4. Clears all local state and closes connections.
 
 ### Unsubscribe Semantics
 
-`unsubscribe()` leaves the group, clears all partition state (pending acks, sessions, coordinator), and generates a fresh member ID. The consumer can be resubscribed afterwards.
+`unsubscribe()` attempts a best-effort leave-group heartbeat, logs any leave failure internally, clears all partition state (pending acks, sessions, coordinator), and generates a fresh member ID. The consumer can be resubscribed afterwards.
 
 ## Wire Protocol
 

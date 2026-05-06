@@ -49,8 +49,11 @@ pub use config::{AcknowledgeType, AcknowledgementMode, ShareConsumerConfig};
 pub use stream::ShareConsumerStream;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::{Future, Ready, ready};
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::sync::RwLock;
@@ -76,6 +79,23 @@ use session::ShareSessionCache;
 /// Key for tracking unacknowledged records in explicit mode.
 type RecordKey = (String, PartitionId, Offset);
 
+/// Key for piggybacked acknowledgements grouped by broker and partition.
+type BrokerAckKey = ([u8; 16], PartitionId);
+
+/// Pending piggybacked acknowledgements grouped by broker and partition.
+type BrokerPendingAcks = HashMap<BrokerId, HashMap<BrokerAckKey, Vec<PendingAck>>>;
+
+#[derive(Clone)]
+struct ShareAcknowledgeContext {
+    metadata: Arc<ClusterMetadata>,
+    pool: Arc<ConnectionPool>,
+    share_sessions: Arc<tokio::sync::Mutex<ShareSessionCache>>,
+    group_id: String,
+    member_id: String,
+    current_ack_state_generation: Arc<AtomicU64>,
+    ack_state_generation: u64,
+}
+
 /// Pending acknowledgement for a share group record.
 #[derive(Debug, Clone)]
 struct PendingAck {
@@ -85,6 +105,74 @@ struct PendingAck {
     first_offset: Offset,
     last_offset: Offset,
     ack_type: i8,
+}
+
+fn flatten_partition_acks(
+    partition_acks: HashMap<BrokerAckKey, Vec<PendingAck>>,
+) -> Vec<PendingAck> {
+    partition_acks.into_values().flatten().collect()
+}
+
+fn drain_broker_partition_acks(
+    broker_acks: &mut HashMap<BrokerAckKey, Vec<PendingAck>>,
+    topic_id: [u8; 16],
+    partition: PartitionId,
+) -> Vec<PendingAck> {
+    broker_acks
+        .remove(&(topic_id, partition))
+        .unwrap_or_default()
+}
+
+fn drain_broker_acks(broker_acks: &mut BrokerPendingAcks, broker_id: BrokerId) -> Vec<PendingAck> {
+    broker_acks
+        .remove(&broker_id)
+        .map(flatten_partition_acks)
+        .unwrap_or_default()
+}
+
+fn describe_share_fetch_join_error(error: &tokio::task::JoinError) -> &'static str {
+    if error.is_panic() {
+        "panicked"
+    } else if error.is_cancelled() {
+        "was cancelled"
+    } else {
+        "failed"
+    }
+}
+
+/// Handle returned by [`ShareConsumer::commit_async`].
+///
+/// Await the handle to observe the final broker outcome. Dropping it detaches
+/// the background task and discards the result.
+#[must_use = "await the returned handle to observe share-commit outcome"]
+pub enum ShareCommitHandle {
+    /// Immediate commit result without spawning a background task.
+    Ready(Ready<Result<()>>),
+    /// Background task handle that resolves to the commit result.
+    Task(tokio::task::JoinHandle<Result<()>>),
+}
+
+impl ShareCommitHandle {
+    fn ready(result: Result<()>) -> Self {
+        Self::Ready(ready(result))
+    }
+}
+
+impl Future for ShareCommitHandle {
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.get_mut() {
+            Self::Ready(fut) => Pin::new(fut).poll(cx),
+            Self::Task(handle) => match Pin::new(handle).poll(cx) {
+                Poll::Ready(Ok(result)) => Poll::Ready(result),
+                Poll::Ready(Err(error)) => Poll::Ready(Err(KrafkaError::invalid_state(format!(
+                    "share commit task failed: {error}"
+                )))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
 }
 
 /// A Kafka share consumer (KIP-932).
@@ -114,9 +202,22 @@ pub struct ShareConsumer {
     /// Whether the consumer is closed.
     closed: AtomicBool,
     /// Per-broker share session cache.
-    share_sessions: tokio::sync::Mutex<ShareSessionCache>,
+    share_sessions: Arc<tokio::sync::Mutex<ShareSessionCache>>,
     /// Pending acknowledgements (accumulated between polls or before commit).
-    pending_acks: RwLock<Vec<PendingAck>>,
+    pending_acks: Arc<RwLock<Vec<PendingAck>>>,
+    /// Monotonic token for the current local ack state.
+    ///
+    /// Incremented whenever local ack state is cleared or invalidated so
+    /// detached flush tasks cannot send or requeue stale acknowledgements
+    /// from an older membership/session after assignment changes,
+    /// `unsubscribe()`, or `close()`.
+    ack_state_generation: Arc<AtomicU64>,
+    /// Explicit-mode barrier raised after a commit flush fails.
+    ///
+    /// While this is set, `poll()` refuses to fetch more records until the
+    /// application retries `commit_sync()`/`commit_async()` successfully or
+    /// local state is cleared during unsubscribe/close.
+    explicit_flush_retry_required: Arc<AtomicBool>,
     /// Topic name → UUID cache (populated from heartbeat assignments and metadata).
     topic_ids: RwLock<HashMap<String, [u8; 16]>>,
     /// Buffer for records returned by `recv()`.
@@ -127,7 +228,7 @@ pub struct ShareConsumer {
     coordinator_address: RwLock<Option<String>>,
     /// Tracks unacknowledged records from the previous `poll()` in explicit mode.
     /// Must be empty before the next `poll()` can fetch new records.
-    unacked_offsets: RwLock<HashSet<RecordKey>>,
+    unacked_offsets: Arc<RwLock<HashSet<RecordKey>>>,
 }
 
 impl std::fmt::Debug for ShareConsumer {
@@ -214,13 +315,15 @@ impl ShareConsumer {
             member_epoch: RwLock::new(0),
             heartbeat_interval_ms: RwLock::new(5000),
             closed: AtomicBool::new(false),
-            share_sessions: tokio::sync::Mutex::new(ShareSessionCache::new()),
-            pending_acks: RwLock::new(Vec::new()),
+            share_sessions: Arc::new(tokio::sync::Mutex::new(ShareSessionCache::new())),
+            pending_acks: Arc::new(RwLock::new(Vec::new())),
+            ack_state_generation: Arc::new(AtomicU64::new(0)),
+            explicit_flush_retry_required: Arc::new(AtomicBool::new(false)),
             topic_ids: RwLock::new(HashMap::new()),
             recv_buffer: RwLock::new(VecDeque::new()),
             coordinator_id: RwLock::new(None),
             coordinator_address: RwLock::new(None),
-            unacked_offsets: RwLock::new(HashSet::new()),
+            unacked_offsets: Arc::new(RwLock::new(HashSet::new())),
         })
     }
 
@@ -304,6 +407,11 @@ impl ShareConsumer {
                     "all records from the previous poll() must be acknowledged before calling poll() again",
                 ));
             }
+            if self.explicit_flush_retry_required.load(Ordering::SeqCst) {
+                return Err(KrafkaError::invalid_state(
+                    "the previous commit_sync()/commit_async() flush failed; retry the commit before calling poll() again",
+                ));
+            }
         }
 
         // Send heartbeat to maintain membership and receive assignments.
@@ -350,16 +458,44 @@ impl ShareConsumer {
         }
         drop(topic_ids);
 
+        let ack_state_generation = self.ack_state_generation.load(Ordering::SeqCst);
+
+        let sendable_ack_partitions: HashSet<(String, PartitionId)> = partitions_by_broker
+            .values()
+            .flat_map(|partitions| {
+                partitions
+                    .iter()
+                    .map(|(topic, partition, _)| (topic.clone(), *partition))
+            })
+            .collect();
+
         // Drain acknowledgement batches to piggyback on fetch requests.
-        let ack_batches = {
+        let drained_ack_batches = {
             let mut pending = self.pending_acks.write().await;
             std::mem::take(&mut *pending)
         };
+        let (ack_batches, mut failed_piggyback_acks): (Vec<_>, Vec<_>) = drained_ack_batches
+            .into_iter()
+            .partition(|ack| sendable_ack_partitions.contains(&(ack.topic.clone(), ack.partition)));
+        let mut ack_batches_by_broker: BrokerPendingAcks = HashMap::new();
+        for ack in ack_batches {
+            if let Some(broker_id) = self.metadata.leader(&ack.topic, ack.partition) {
+                ack_batches_by_broker
+                    .entry(broker_id)
+                    .or_default()
+                    .entry((ack.topic_id, ack.partition))
+                    .or_default()
+                    .push(ack);
+            } else {
+                failed_piggyback_acks.push(ack);
+            }
+        }
 
         // Fetch from all brokers concurrently.
-        let mut join_set = tokio::task::JoinSet::new();
+        let mut fetch_tasks = Vec::with_capacity(partitions_by_broker.len());
         let member_id = self.member_id.read().await.clone();
         let group_id = self.config.group_id.clone();
+        let current_ack_state_generation = self.ack_state_generation.clone();
 
         for (broker_id, partitions) in &partitions_by_broker {
             let session_epoch = {
@@ -369,16 +505,22 @@ impl ShareConsumer {
 
             // Build per-topic partition requests with piggybacked acks.
             let mut topics_map: HashMap<[u8; 16], Vec<ShareFetchPartition>> = HashMap::new();
-            for (topic_name, partition, topic_id) in partitions {
-                let ack_batches_for_partition: Vec<ShareAcknowledgementBatch> = ack_batches
-                    .iter()
-                    .filter(|a| a.topic == *topic_name && a.partition == *partition)
-                    .map(|a| ShareAcknowledgementBatch {
-                        first_offset: a.first_offset,
-                        last_offset: a.last_offset,
-                        acknowledge_types: vec![a.ack_type],
-                    })
-                    .collect();
+            let broker_ack_partitions = ack_batches_by_broker.get(broker_id);
+            for (_, partition, topic_id) in partitions {
+                let ack_batches_for_partition: Vec<ShareAcknowledgementBatch> =
+                    broker_ack_partitions
+                        .and_then(|partition_acks| partition_acks.get(&(*topic_id, *partition)))
+                        .map(|partition_acks| {
+                            partition_acks
+                                .iter()
+                                .map(|a| ShareAcknowledgementBatch {
+                                    first_offset: a.first_offset,
+                                    last_offset: a.last_offset,
+                                    acknowledge_types: vec![a.ack_type],
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
 
                 topics_map
                     .entry(*topic_id)
@@ -413,7 +555,13 @@ impl ShareConsumer {
             let bid = *broker_id;
             let metadata = self.metadata.clone();
             let pool = self.pool.clone();
-            join_set.spawn(async move {
+            let current_ack_state_generation = current_ack_state_generation.clone();
+            let task = tokio::spawn(async move {
+                ShareConsumer::ensure_ack_state_current(
+                    current_ack_state_generation.as_ref(),
+                    ack_state_generation,
+                )?;
+
                 let broker_addr = metadata
                     .broker(bid)
                     .map(|b| b.address().to_string())
@@ -429,6 +577,11 @@ impl ShareConsumer {
                     )
                     .await
                     .ok_or_else(|| KrafkaError::protocol("broker does not support ShareFetch"))?;
+
+                ShareConsumer::ensure_ack_state_current(
+                    current_ack_state_generation.as_ref(),
+                    ack_state_generation,
+                )?;
 
                 let buf = conn
                     .send_request(ApiKey::ShareFetch, version, |buf| match version {
@@ -447,16 +600,21 @@ impl ShareConsumer {
 
                 Result::<(BrokerId, crate::protocol::ShareFetchResponse)>::Ok((bid, response))
             });
+            fetch_tasks.push((bid, task));
         }
 
         // Collect results from all brokers.
         let mut all_records = Vec::new();
         let topic_ids_guard = self.topic_ids.read().await;
 
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(Ok((broker_id, response))) => {
+        for (broker_id, task) in fetch_tasks {
+            match task.await {
+                Ok(Ok((_, response))) => {
+                    let mut broker_acks =
+                        ack_batches_by_broker.remove(&broker_id).unwrap_or_default();
+
                     if !response.error_code.is_ok() {
+                        failed_piggyback_acks.extend(flatten_partition_acks(broker_acks));
                         warn!(
                             "ShareFetch to broker {broker_id} returned {:?}: {}",
                             response.error_code,
@@ -473,7 +631,8 @@ impl ShareConsumer {
                         sessions.get_or_create(broker_id).on_success();
                     }
 
-                    // Decode records from the response.
+                    // Decode records from the response and restore only the
+                    // partitions whose piggybacked acknowledgements failed.
                     for topic_response in &response.responses {
                         let topic_name = if let Some(name) =
                             self.metadata.topic_name_for_id(&topic_response.topic_id)
@@ -500,11 +659,32 @@ impl ShareConsumer {
                         };
 
                         for partition_response in &topic_response.partitions {
+                            let partition_acks = drain_broker_partition_acks(
+                                &mut broker_acks,
+                                topic_response.topic_id,
+                                partition_response.partition_index,
+                            );
+
                             if !partition_response.error_code.is_ok() {
+                                failed_piggyback_acks.extend(partition_acks);
                                 warn!(
                                     "ShareFetch error for {topic_name}-{}: {:?}",
                                     partition_response.partition_index,
                                     partition_response.error_code
+                                );
+                                continue;
+                            }
+
+                            if !partition_response.acknowledge_error_code.is_ok() {
+                                failed_piggyback_acks.extend(partition_acks);
+                                warn!(
+                                    "Piggybacked ShareFetch acknowledge error for {topic_name}-{}: {:?}: {}",
+                                    partition_response.partition_index,
+                                    partition_response.acknowledge_error_code,
+                                    partition_response
+                                        .acknowledge_error_message
+                                        .as_deref()
+                                        .unwrap_or("unknown error")
                                 );
                                 continue;
                             }
@@ -564,16 +744,34 @@ impl ShareConsumer {
                             }
                         }
                     }
+
+                    failed_piggyback_acks.extend(flatten_partition_acks(broker_acks));
                 }
                 Ok(Err(e)) => {
-                    warn!("ShareFetch to broker failed: {e}");
+                    failed_piggyback_acks
+                        .extend(drain_broker_acks(&mut ack_batches_by_broker, broker_id));
+                    warn!("ShareFetch to broker {broker_id} failed: {e}");
                 }
                 Err(e) => {
-                    warn!("ShareFetch task panicked: {e}");
+                    failed_piggyback_acks
+                        .extend(drain_broker_acks(&mut ack_batches_by_broker, broker_id));
+                    warn!(
+                        "ShareFetch task for broker {broker_id} {}: {e}",
+                        describe_share_fetch_join_error(&e)
+                    );
                 }
             }
         }
         drop(topic_ids_guard);
+
+        failed_piggyback_acks.extend(
+            ack_batches_by_broker
+                .drain()
+                .flat_map(|(_, acks)| flatten_partition_acks(acks))
+                .collect::<Vec<_>>(),
+        );
+        self.restore_pending_acks(ack_state_generation, failed_piggyback_acks, false)
+            .await;
 
         // In implicit mode, queue all fetched records as coalesced accepts for next poll.
         if self.config.acknowledgement_mode == AcknowledgementMode::Implicit {
@@ -621,7 +819,15 @@ impl ShareConsumer {
         })?;
         drop(topic_ids);
 
+        let record_key = (record.topic.clone(), record.partition, record.offset);
         let mut pending = self.pending_acks.write().await;
+        let mut unacked = self.unacked_offsets.write().await;
+        if !unacked.contains(&record_key) {
+            return Err(KrafkaError::invalid_state(format!(
+                "record {}-{}@{} is not pending acknowledgement",
+                record.topic, record.partition, record.offset
+            )));
+        }
         pending.push(PendingAck {
             topic: record.topic.clone(),
             topic_id,
@@ -630,13 +836,81 @@ impl ShareConsumer {
             last_offset: record.offset,
             ack_type: ack_type.to_i8(),
         });
-        drop(pending);
-
-        // Mark record as acknowledged.
-        let mut unacked = self.unacked_offsets.write().await;
-        unacked.remove(&(record.topic.clone(), record.partition, record.offset));
+        unacked.remove(&record_key);
 
         Ok(())
+    }
+
+    async fn restore_pending_acks(
+        &self,
+        ack_state_generation: u64,
+        mut acks: Vec<PendingAck>,
+        require_explicit_retry: bool,
+    ) {
+        Self::restore_ack_state(
+            self.ack_state_generation.as_ref(),
+            self.pending_acks.as_ref(),
+            self.explicit_flush_retry_required.as_ref(),
+            ack_state_generation,
+            require_explicit_retry,
+            &mut acks,
+        )
+        .await;
+    }
+
+    async fn restore_ack_state(
+        current_generation: &AtomicU64,
+        pending_acks: &RwLock<Vec<PendingAck>>,
+        explicit_flush_retry_required: &AtomicBool,
+        ack_state_generation: u64,
+        require_explicit_retry: bool,
+        acks: &mut Vec<PendingAck>,
+    ) {
+        if acks.is_empty() {
+            return;
+        }
+
+        let mut pending = pending_acks.write().await;
+        if current_generation.load(Ordering::SeqCst) != ack_state_generation {
+            acks.clear();
+            return;
+        }
+        if require_explicit_retry {
+            explicit_flush_retry_required.store(true, Ordering::SeqCst);
+        }
+        pending.append(acks);
+    }
+
+    fn share_acknowledge_response_error(
+        response: &crate::protocol::ShareAcknowledgeResponse,
+    ) -> Option<KrafkaError> {
+        if !response.error_code.is_ok() {
+            return Some(KrafkaError::broker(
+                response.error_code,
+                response
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "ShareAcknowledge failed".to_string()),
+            ));
+        }
+
+        for topic_response in &response.responses {
+            for part_response in &topic_response.partitions {
+                if !part_response.error_code.is_ok() {
+                    return Some(KrafkaError::broker(
+                        part_response.error_code,
+                        part_response.error_message.clone().unwrap_or_else(|| {
+                            format!(
+                                "ShareAcknowledge error for partition {}",
+                                part_response.partition_index
+                            )
+                        }),
+                    ));
+                }
+            }
+        }
+
+        None
     }
 
     /// Commit all pending acknowledgements synchronously.
@@ -648,6 +922,11 @@ impl ShareConsumer {
             return Err(KrafkaError::invalid_state("share consumer is closed"));
         }
 
+        self.flush_pending_acks().await
+    }
+
+    async fn flush_pending_acks(&self) -> Result<()> {
+        let ack_state_generation = self.ack_state_generation.load(Ordering::SeqCst);
         let acks = {
             let mut pending = self.pending_acks.write().await;
             std::mem::take(&mut *pending)
@@ -657,100 +936,102 @@ impl ShareConsumer {
             return Ok(());
         }
 
-        self.send_share_acknowledge(&acks).await
+        match self.send_share_acknowledge(&acks).await {
+            Ok(()) => {
+                self.explicit_flush_retry_required
+                    .store(false, Ordering::SeqCst);
+                Ok(())
+            }
+            Err(error) => {
+                self.restore_pending_acks(ack_state_generation, acks, true)
+                    .await;
+                Err(error)
+            }
+        }
     }
 
     /// Commit all pending acknowledgements asynchronously.
     ///
-    /// Spawns a background task to send the acknowledgements. Errors are
-    /// logged but not returned. If lock contention prevents snapshot, acks
-    /// are preserved for the next commit cycle.
-    pub fn commit_async(&self) {
-        // Snapshot pending acks.
+    /// Await the returned handle to observe transport, decode, and broker
+    /// errors. If the handle is dropped, the task continues in the background
+    /// and its result is discarded.
+    pub fn commit_async(&self) -> ShareCommitHandle {
+        if self.closed.load(Ordering::SeqCst) {
+            return ShareCommitHandle::ready(Err(KrafkaError::invalid_state(
+                "share consumer is closed",
+            )));
+        }
+
+        let member_id = match self.member_id.try_read() {
+            Ok(g) => g.clone(),
+            Err(_) => {
+                return ShareCommitHandle::ready(Err(KrafkaError::invalid_state(
+                    "commit_async: member_id lock contention",
+                )));
+            }
+        };
+
+        let ack_state_generation = self.ack_state_generation.load(Ordering::SeqCst);
+        let pending_acks = self.pending_acks.clone();
+        let current_ack_state_generation = self.ack_state_generation.clone();
+        let explicit_flush_retry_required = self.explicit_flush_retry_required.clone();
         let Ok(mut pending) = self.pending_acks.try_write() else {
-            warn!("commit_async: pending_acks lock contention, will retry next cycle");
-            return;
+            return ShareCommitHandle::ready(Err(KrafkaError::invalid_state(
+                "commit_async: pending_acks lock contention",
+            )));
         };
         let acks = std::mem::take(&mut *pending);
         drop(pending);
 
         if acks.is_empty() {
-            return;
+            return ShareCommitHandle::ready(Ok(()));
         }
 
-        // Snapshot coordinator and member info. On failure, restore acks.
-        let member_id_val = match self.member_id.try_read() {
-            Ok(g) => g.clone(),
-            Err(_) => {
-                if let Ok(mut pending) = self.pending_acks.try_write() {
-                    pending.extend(acks);
-                }
-                warn!("commit_async: member_id lock contention, restoring acks");
-                return;
-            }
-        };
-        let coord_id = self.coordinator_id.try_read().ok().and_then(|g| *g);
-        let coord_addr = self
-            .coordinator_address
-            .try_read()
-            .ok()
-            .and_then(|g| g.clone());
-
-        let (Some(coord_id), Some(coord_addr)) = (coord_id, coord_addr) else {
-            if let Ok(mut pending) = self.pending_acks.try_write() {
-                pending.extend(acks);
-            }
-            warn!("commit_async: no coordinator available, restoring acks for next cycle");
-            return;
-        };
-
-        // Build a single ShareAcknowledge request (all acks go to coordinator).
-        let topics = Self::build_acknowledge_topics(&acks);
-        let group_id = self.config.group_id.clone();
+        let metadata = self.metadata.clone();
         let pool = self.pool.clone();
+        let share_sessions = self.share_sessions.clone();
+        let group_id = self.config.group_id.clone();
+        let send_ack_state_generation = current_ack_state_generation.clone();
 
-        let request = ShareAcknowledgeRequest {
-            group_id: Some(group_id),
-            member_id: Some(member_id_val),
-            share_session_epoch: 0,
-            topics,
-        };
-
-        tokio::spawn(async move {
-            let conn = match pool.get_connection_by_id(coord_id, &coord_addr).await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("commit_async: coordinator {coord_id} connection failed: {e}");
-                    return;
+        ShareCommitHandle::Task(tokio::spawn(async move {
+            let restore_acks = |mut acks: Vec<PendingAck>| {
+                let pending_acks = pending_acks.clone();
+                let current_ack_state_generation = current_ack_state_generation.clone();
+                let explicit_flush_retry_required = explicit_flush_retry_required.clone();
+                async move {
+                    ShareConsumer::restore_ack_state(
+                        current_ack_state_generation.as_ref(),
+                        pending_acks.as_ref(),
+                        explicit_flush_retry_required.as_ref(),
+                        ack_state_generation,
+                        true,
+                        &mut acks,
+                    )
+                    .await;
                 }
             };
-
-            let version = match conn
-                .negotiate_api_version(
-                    ApiKey::ShareAcknowledge,
-                    versions::SHARE_ACKNOWLEDGE_MAX,
-                    versions::SHARE_ACKNOWLEDGE_MIN,
-                )
-                .await
+            if let Err(error) = ShareConsumer::send_share_acknowledge_with_state(
+                ShareAcknowledgeContext {
+                    metadata,
+                    pool,
+                    share_sessions,
+                    group_id,
+                    member_id,
+                    current_ack_state_generation: send_ack_state_generation,
+                    ack_state_generation,
+                },
+                &acks,
+            )
+            .await
             {
-                Some(v) => v,
-                None => {
-                    warn!("commit_async: coordinator {coord_id} does not support ShareAcknowledge");
-                    return;
-                }
-            };
-
-            let result = conn
-                .send_request(ApiKey::ShareAcknowledge, version, |buf| match version {
-                    2 => request.encode_v2(buf, false),
-                    _ => request.encode_v1(buf),
-                })
-                .await;
-
-            if let Err(e) = result {
-                warn!("commit_async: ShareAcknowledge to coordinator {coord_id} failed: {e}");
+                restore_acks(acks).await;
+                return Err(error);
             }
-        });
+
+            explicit_flush_retry_required.store(false, Ordering::SeqCst);
+
+            Ok(())
+        }))
     }
 
     /// Receive a single record (convenience wrapper over `poll()`).
@@ -813,9 +1094,12 @@ impl ShareConsumer {
     /// they become available for other consumers. In explicit mode, pending
     /// acks are flushed. Leaves the group and closes all connections.
     /// Idempotent.
-    pub async fn close(&self) {
+    ///
+    /// Returns the first cleanup error after local state and connections have
+    /// still been closed.
+    pub async fn close(&self) -> Result<()> {
         if self.closed.swap(true, Ordering::SeqCst) {
-            return;
+            return Ok(());
         }
 
         // In implicit mode, convert pending accepts to releases so acquired
@@ -827,15 +1111,10 @@ impl ShareConsumer {
             }
         }
 
-        // Best-effort commit of pending acks (releases or explicit acks).
-        if let Err(e) = self.commit_sync().await {
-            warn!("Final commit failed during close: {e}");
-        }
+        let commit_result = self.flush_pending_acks().await;
 
         // Leave the group.
-        if let Err(e) = self.leave_group().await {
-            warn!("Leave group failed during close: {e}");
-        }
+        let leave_result = self.leave_group().await;
 
         // Clear state.
         self.subscriptions.write().await.clear();
@@ -845,6 +1124,9 @@ impl ShareConsumer {
         self.pool.close_all().await;
 
         info!("ShareConsumer closed (group '{}')", self.config.group_id);
+
+        commit_result?;
+        leave_result
     }
 
     /// Returns true if the consumer has been closed.
@@ -861,12 +1143,23 @@ impl ShareConsumer {
 
     // ── Internal helpers ────────────────────────────────────────────────
 
+    fn invalidate_ack_state(&self) {
+        self.ack_state_generation.fetch_add(1, Ordering::SeqCst);
+        self.explicit_flush_retry_required
+            .store(false, Ordering::SeqCst);
+    }
+
+    async fn clear_ack_state(&self) {
+        self.invalidate_ack_state();
+        self.pending_acks.write().await.clear();
+        self.unacked_offsets.write().await.clear();
+    }
+
     /// Clear all per-partition state. Called from `unsubscribe()` and `close()`.
     async fn clear_partition_state(&self) {
-        self.pending_acks.write().await.clear();
+        self.clear_ack_state().await;
         self.recv_buffer.write().await.clear();
         self.share_sessions.lock().await.reset_all();
-        self.unacked_offsets.write().await.clear();
         *self.coordinator_id.write().await = None;
         *self.coordinator_address.write().await = None;
     }
@@ -1151,6 +1444,7 @@ impl ShareConsumer {
                 new_assignments.len(),
                 new_assignments.values().map(|v| v.len()).sum::<usize>()
             );
+            self.clear_ack_state().await;
             self.share_sessions.lock().await.reset_all();
         }
 
@@ -1162,26 +1456,60 @@ impl ShareConsumer {
     /// Routes acknowledgements to the correct partition leaders. Returns an
     /// error if any leader cannot be determined or any broker rejects the acks.
     async fn send_share_acknowledge(&self, acks: &[PendingAck]) -> Result<()> {
+        let member_id = self.member_id.read().await.clone();
+        Self::send_share_acknowledge_with_state(
+            ShareAcknowledgeContext {
+                metadata: self.metadata.clone(),
+                pool: self.pool.clone(),
+                share_sessions: self.share_sessions.clone(),
+                group_id: self.config.group_id.clone(),
+                member_id,
+                current_ack_state_generation: self.ack_state_generation.clone(),
+                ack_state_generation: self.ack_state_generation.load(Ordering::SeqCst),
+            },
+            acks,
+        )
+        .await
+    }
+
+    async fn send_share_acknowledge_with_state(
+        context: ShareAcknowledgeContext,
+        acks: &[PendingAck],
+    ) -> Result<()> {
+        let ShareAcknowledgeContext {
+            metadata,
+            pool,
+            share_sessions,
+            group_id,
+            member_id,
+            current_ack_state_generation,
+            ack_state_generation,
+        } = context;
+
+        Self::ensure_ack_state_current(
+            current_ack_state_generation.as_ref(),
+            ack_state_generation,
+        )?;
+
         // Group acks by partition leader.
         let mut broker_acks: HashMap<BrokerId, Vec<&PendingAck>> = HashMap::new();
 
         for ack in acks {
-            let broker_id = self
-                .metadata
-                .leader(&ack.topic, ack.partition)
-                .ok_or_else(|| {
-                    KrafkaError::invalid_state(format!(
-                        "no leader for {}-{} in metadata",
-                        ack.topic, ack.partition
-                    ))
-                })?;
+            let broker_id = metadata.leader(&ack.topic, ack.partition).ok_or_else(|| {
+                KrafkaError::invalid_state(format!(
+                    "no leader for {}-{} in metadata",
+                    ack.topic, ack.partition
+                ))
+            })?;
             broker_acks.entry(broker_id).or_default().push(ack);
         }
 
-        let member_id = self.member_id.read().await.clone();
-        let group_id = self.config.group_id.clone();
-
         for (broker_id, broker_ack_list) in &broker_acks {
+            Self::ensure_ack_state_current(
+                current_ack_state_generation.as_ref(),
+                ack_state_generation,
+            )?;
+
             let topics = Self::build_acknowledge_topics(
                 &broker_ack_list
                     .iter()
@@ -1190,7 +1518,7 @@ impl ShareConsumer {
             );
 
             let session_epoch = {
-                let sessions = self.share_sessions.lock().await;
+                let sessions = share_sessions.lock().await;
                 sessions
                     .get(*broker_id)
                     .map(|s: &session::ShareSessionState| s.epoch())
@@ -1204,8 +1532,7 @@ impl ShareConsumer {
                 topics,
             };
 
-            let broker_addr = self
-                .metadata
+            let broker_addr = metadata
                 .broker(*broker_id)
                 .map(|b| b.address().to_string())
                 .ok_or_else(|| {
@@ -1214,10 +1541,7 @@ impl ShareConsumer {
                         broker_id
                     ))
                 })?;
-            let conn = self
-                .pool
-                .get_connection_by_id(*broker_id, &broker_addr)
-                .await?;
+            let conn = pool.get_connection_by_id(*broker_id, &broker_addr).await?;
             let version = conn
                 .negotiate_api_version(
                     ApiKey::ShareAcknowledge,
@@ -1226,6 +1550,11 @@ impl ShareConsumer {
                 )
                 .await
                 .ok_or_else(|| KrafkaError::protocol("broker does not support ShareAcknowledge"))?;
+
+            Self::ensure_ack_state_current(
+                current_ack_state_generation.as_ref(),
+                ack_state_generation,
+            )?;
 
             let buf = conn
                 .send_request(ApiKey::ShareAcknowledge, version, |buf| match version {
@@ -1239,29 +1568,25 @@ impl ShareConsumer {
                 &mut buf.as_ref(),
             )?;
 
-            if !response.error_code.is_ok() {
-                return Err(KrafkaError::broker(
-                    response.error_code,
-                    response
-                        .error_message
-                        .unwrap_or_else(|| "ShareAcknowledge failed".to_string()),
-                ));
-            }
-
-            // Check per-partition errors.
-            for topic_response in &response.responses {
-                for part_response in &topic_response.partitions {
-                    if !part_response.error_code.is_ok() {
-                        warn!(
-                            "ShareAcknowledge error for partition {}: {:?}",
-                            part_response.partition_index, part_response.error_code
-                        );
-                    }
-                }
+            if let Some(error) = Self::share_acknowledge_response_error(&response) {
+                return Err(error);
             }
         }
 
         Ok(())
+    }
+
+    fn ensure_ack_state_current(
+        current_generation: &AtomicU64,
+        ack_state_generation: u64,
+    ) -> Result<()> {
+        if current_generation.load(Ordering::SeqCst) == ack_state_generation {
+            return Ok(());
+        }
+
+        Err(KrafkaError::invalid_state(
+            "share acknowledgement state was invalidated",
+        ))
     }
 
     /// Leave the share group via heartbeat with member_epoch = -1.
@@ -1289,13 +1614,10 @@ impl ShareConsumer {
             None => return Ok(()),
         };
 
-        let conn = match self.pool.get_connection_by_id(coord_id, &coord_addr).await {
-            Ok(c) => c,
-            Err(e) => {
-                debug!("Cannot connect to coordinator for leave: {e}");
-                return Ok(());
-            }
-        };
+        let conn = self
+            .pool
+            .get_connection_by_id(coord_id, &coord_addr)
+            .await?;
 
         let version = match conn
             .negotiate_api_version(
@@ -1306,19 +1628,31 @@ impl ShareConsumer {
             .await
         {
             Some(v) => v,
-            None => return Ok(()),
+            None => {
+                return Err(KrafkaError::protocol(
+                    "broker does not support ShareGroupHeartbeat",
+                ));
+            }
         };
 
-        let result = conn
+        let buf = conn
             .send_request(ApiKey::ShareGroupHeartbeat, version, |buf| {
                 request.encode_versioned(version, buf)
             })
             .await;
 
-        match result {
-            Ok(_) => debug!("Left share group '{}' successfully", self.config.group_id),
-            Err(e) => debug!("Leave group heartbeat failed (best effort): {e}"),
+        let response = ShareGroupHeartbeatResponse::decode_versioned(version, &mut buf?.as_ref())?;
+
+        if !response.error_code.is_ok() {
+            return Err(KrafkaError::broker(
+                response.error_code,
+                response
+                    .error_message
+                    .unwrap_or_else(|| "ShareGroupHeartbeat failed".to_string()),
+            ));
         }
+
+        debug!("Left share group '{}' successfully", self.config.group_id);
 
         self.invalidate_coordinator().await;
         Ok(())
@@ -1467,6 +1801,45 @@ impl ShareConsumerBuilder {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::error::ErrorCode;
+
+    fn test_share_consumer(acknowledgement_mode: AcknowledgementMode) -> ShareConsumer {
+        let mut config = ShareConsumer::builder()
+            .bootstrap_servers("localhost:9092")
+            .group_id("sg")
+            .acknowledgement_mode(acknowledgement_mode)
+            .config;
+        config.bootstrap_servers = "localhost:9092".to_string();
+        config.group_id = "sg".to_string();
+
+        let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
+        let metadata = Arc::new(ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool.clone(),
+            config.metadata_max_age,
+        ));
+
+        ShareConsumer {
+            config,
+            metadata,
+            pool,
+            subscriptions: RwLock::new(HashSet::new()),
+            assignments: RwLock::new(HashMap::new()),
+            member_id: RwLock::new(crate::util::random_uuid_v4()),
+            member_epoch: RwLock::new(0),
+            heartbeat_interval_ms: RwLock::new(3000),
+            closed: AtomicBool::new(false),
+            share_sessions: Arc::new(tokio::sync::Mutex::new(ShareSessionCache::new())),
+            pending_acks: Arc::new(RwLock::new(Vec::new())),
+            ack_state_generation: Arc::new(AtomicU64::new(0)),
+            explicit_flush_retry_required: Arc::new(AtomicBool::new(false)),
+            topic_ids: RwLock::new(HashMap::new()),
+            recv_buffer: RwLock::new(VecDeque::new()),
+            coordinator_id: RwLock::new(None),
+            coordinator_address: RwLock::new(None),
+            unacked_offsets: Arc::new(RwLock::new(HashSet::new())),
+        }
+    }
 
     #[test]
     fn test_share_consumer_builder_config() {
@@ -1610,6 +1983,351 @@ mod tests {
         // Verify partition counts.
         let total_partitions: usize = topics.iter().map(|t| t.partitions.len()).sum();
         assert_eq!(total_partitions, 3);
+    }
+
+    #[test]
+    fn test_share_acknowledge_response_error_detects_partition_failure() {
+        let response = crate::protocol::ShareAcknowledgeResponse {
+            throttle_time_ms: 0,
+            error_code: ErrorCode::None,
+            error_message: None,
+            acquisition_lock_timeout_ms: -1,
+            responses: vec![crate::protocol::ShareAcknowledgeTopicResponse {
+                topic_id: [1; 16],
+                partitions: vec![crate::protocol::ShareAcknowledgePartitionResponse {
+                    partition_index: 7,
+                    error_code: ErrorCode::UnknownTopicOrPartition,
+                    error_message: Some("gone".to_string()),
+                    current_leader: crate::protocol::ShareLeaderIdAndEpoch {
+                        leader_id: -1,
+                        leader_epoch: 0,
+                    },
+                }],
+            }],
+            node_endpoints: Vec::new(),
+        };
+
+        let error = ShareConsumer::share_acknowledge_response_error(&response)
+            .expect("partition error must surface as an error");
+
+        assert!(matches!(
+            error,
+            KrafkaError::Broker {
+                code: ErrorCode::UnknownTopicOrPartition,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_restore_ack_state_requeues_pending_acks_without_reinserting_unacked() {
+        let ack_state_generation = AtomicU64::new(0);
+        let explicit_flush_retry_required = AtomicBool::new(false);
+        let pending = RwLock::new(Vec::new());
+        let mut acks_to_restore = vec![PendingAck {
+            topic: "topic-a".into(),
+            topic_id: [0; 16],
+            partition: 2,
+            first_offset: 11,
+            last_offset: 13,
+            ack_type: AcknowledgeType::Accept.to_i8(),
+        }];
+
+        ShareConsumer::restore_ack_state(
+            &ack_state_generation,
+            &pending,
+            &explicit_flush_retry_required,
+            0,
+            false,
+            &mut acks_to_restore,
+        )
+        .await;
+
+        assert!(acks_to_restore.is_empty());
+        assert!(!explicit_flush_retry_required.load(Ordering::SeqCst));
+        let pending = pending.read().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].topic, "topic-a");
+        assert_eq!(pending[0].partition, 2);
+        assert_eq!(pending[0].first_offset, 11);
+        assert_eq!(pending[0].last_offset, 13);
+        assert_eq!(pending[0].ack_type, AcknowledgeType::Accept.to_i8());
+    }
+
+    #[tokio::test]
+    async fn test_restore_ack_state_skips_stale_generation() {
+        let ack_state_generation = AtomicU64::new(1);
+        let explicit_flush_retry_required = AtomicBool::new(false);
+        let pending = RwLock::new(Vec::new());
+        let mut acks_to_restore = vec![PendingAck {
+            topic: "topic-a".into(),
+            topic_id: [0; 16],
+            partition: 2,
+            first_offset: 11,
+            last_offset: 13,
+            ack_type: AcknowledgeType::Accept.to_i8(),
+        }];
+
+        ShareConsumer::restore_ack_state(
+            &ack_state_generation,
+            &pending,
+            &explicit_flush_retry_required,
+            0,
+            true,
+            &mut acks_to_restore,
+        )
+        .await;
+
+        assert!(pending.read().await.is_empty());
+        assert!(acks_to_restore.is_empty());
+        assert!(!explicit_flush_retry_required.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_restore_ack_state_marks_explicit_flush_retry_required() {
+        let ack_state_generation = AtomicU64::new(0);
+        let explicit_flush_retry_required = AtomicBool::new(false);
+        let pending = RwLock::new(Vec::new());
+        let mut acks_to_restore = vec![PendingAck {
+            topic: "topic-a".into(),
+            topic_id: [0; 16],
+            partition: 2,
+            first_offset: 11,
+            last_offset: 13,
+            ack_type: AcknowledgeType::Accept.to_i8(),
+        }];
+
+        ShareConsumer::restore_ack_state(
+            &ack_state_generation,
+            &pending,
+            &explicit_flush_retry_required,
+            0,
+            true,
+            &mut acks_to_restore,
+        )
+        .await;
+
+        assert!(acks_to_restore.is_empty());
+        assert!(explicit_flush_retry_required.load(Ordering::SeqCst));
+        assert_eq!(pending.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_poll_rejects_after_failed_explicit_flush() {
+        let consumer = test_share_consumer(AcknowledgementMode::Explicit);
+        consumer
+            .explicit_flush_retry_required
+            .store(true, Ordering::SeqCst);
+
+        let error = consumer
+            .poll(Duration::from_millis(1))
+            .await
+            .expect_err("poll must block after a failed explicit flush");
+
+        assert!(
+            error
+                .to_string()
+                .contains("retry the commit before calling poll() again")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clear_partition_state_clears_explicit_flush_retry_required() {
+        let consumer = test_share_consumer(AcknowledgementMode::Explicit);
+        consumer
+            .explicit_flush_retry_required
+            .store(true, Ordering::SeqCst);
+
+        consumer.clear_partition_state().await;
+
+        assert!(
+            !consumer
+                .explicit_flush_retry_required
+                .load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_assignment_advances_ack_state_generation_on_change() {
+        let consumer = test_share_consumer(AcknowledgementMode::Explicit);
+        consumer
+            .assignments
+            .write()
+            .await
+            .insert("topic-a".to_string(), vec![0]);
+        consumer.pending_acks.write().await.push(PendingAck {
+            topic: "topic-a".to_string(),
+            topic_id: [1; 16],
+            partition: 0,
+            first_offset: 5,
+            last_offset: 5,
+            ack_type: AcknowledgeType::Accept.to_i8(),
+        });
+        consumer
+            .unacked_offsets
+            .write()
+            .await
+            .insert(("topic-a".to_string(), 0, 5));
+        consumer
+            .explicit_flush_retry_required
+            .store(true, Ordering::SeqCst);
+
+        let old_generation = consumer.ack_state_generation.load(Ordering::SeqCst);
+        consumer.apply_assignment(&[]).await;
+
+        assert_eq!(
+            consumer.ack_state_generation.load(Ordering::SeqCst),
+            old_generation + 1
+        );
+        assert!(
+            !consumer
+                .explicit_flush_retry_required
+                .load(Ordering::SeqCst)
+        );
+        assert!(consumer.pending_acks.read().await.is_empty());
+        assert!(consumer.unacked_offsets.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_send_share_acknowledge_rejects_stale_ack_generation() {
+        let consumer = test_share_consumer(AcknowledgementMode::Explicit);
+        let error = ShareConsumer::send_share_acknowledge_with_state(
+            ShareAcknowledgeContext {
+                metadata: consumer.metadata.clone(),
+                pool: consumer.pool.clone(),
+                share_sessions: consumer.share_sessions.clone(),
+                group_id: consumer.config.group_id.clone(),
+                member_id: consumer.member_id.read().await.clone(),
+                current_ack_state_generation: Arc::new(AtomicU64::new(1)),
+                ack_state_generation: 0,
+            },
+            &[PendingAck {
+                topic: "topic-a".to_string(),
+                topic_id: [1; 16],
+                partition: 0,
+                first_offset: 5,
+                last_offset: 5,
+                ack_type: AcknowledgeType::Accept.to_i8(),
+            }],
+        )
+        .await
+        .expect_err("stale ack generation must be rejected before sending");
+
+        assert!(
+            error
+                .to_string()
+                .contains("acknowledgement state was invalidated")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_share_commit_handle_ready_flattens_result() {
+        ShareCommitHandle::ready(Ok(()))
+            .await
+            .expect("ready ok result");
+
+        let error = ShareCommitHandle::ready(Err(KrafkaError::invalid_state("boom")))
+            .await
+            .expect_err("ready error must surface");
+        assert!(error.to_string().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn test_share_commit_handle_flattens_task_result() {
+        let error = ShareCommitHandle::Task(tokio::spawn(async {
+            Err(KrafkaError::invalid_state("task failed"))
+        }))
+        .await
+        .expect_err("task error must surface");
+
+        assert!(error.to_string().contains("task failed"));
+    }
+
+    #[tokio::test]
+    async fn test_describe_share_fetch_join_error_reports_panic() {
+        let error = tokio::spawn(async {
+            panic!("boom");
+        })
+        .await
+        .expect_err("panic must surface as a JoinError");
+
+        assert_eq!(describe_share_fetch_join_error(&error), "panicked");
+    }
+
+    #[tokio::test]
+    async fn test_describe_share_fetch_join_error_reports_cancellation() {
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        handle.abort();
+
+        let error = handle
+            .await
+            .expect_err("aborted task must surface as a JoinError");
+
+        assert_eq!(describe_share_fetch_join_error(&error), "was cancelled");
+    }
+
+    #[tokio::test]
+    async fn test_acknowledge_keeps_record_pending_until_ack_is_queued() {
+        let consumer = Arc::new(test_share_consumer(AcknowledgementMode::Explicit));
+
+        consumer
+            .topic_ids
+            .write()
+            .await
+            .insert("topic-a".to_string(), [7; 16]);
+
+        let record = ConsumerRecord {
+            topic: "topic-a".into(),
+            partition: 3,
+            offset: 11,
+            timestamp: 0,
+            timestamp_type: 0,
+            key: None,
+            value: None,
+            headers: Vec::new(),
+            leader_epoch: None,
+            delivery_count: None,
+        };
+        let record_key = (record.topic.clone(), record.partition, record.offset);
+
+        consumer
+            .unacked_offsets
+            .write()
+            .await
+            .insert(record_key.clone());
+
+        let pending_guard = consumer.pending_acks.write().await;
+        let task_consumer = consumer.clone();
+        let task = tokio::spawn(async move {
+            task_consumer
+                .acknowledge(&record, AcknowledgeType::Accept)
+                .await
+        });
+
+        tokio::task::yield_now().await;
+
+        assert!(consumer.unacked_offsets.read().await.contains(&record_key));
+        assert!(
+            !task.is_finished(),
+            "acknowledge should still be waiting on the pending_acks lock"
+        );
+
+        drop(pending_guard);
+
+        task.await
+            .expect("acknowledge task should join")
+            .expect("acknowledge should succeed once pending lock is released");
+
+        assert!(!consumer.unacked_offsets.read().await.contains(&record_key));
+        let pending = consumer.pending_acks.read().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].topic, "topic-a");
+        assert_eq!(pending[0].partition, 3);
+        assert_eq!(pending[0].first_offset, 11);
+        assert_eq!(pending[0].last_offset, 11);
+        assert_eq!(pending[0].ack_type, AcknowledgeType::Accept.to_i8());
     }
 
     #[test]

@@ -123,7 +123,7 @@ let consumer = Consumer::builder()
 
 ### Offset Commit
 
-Control how offsets are committed. When auto-commit is enabled (the default), Krafka automatically commits offsets during each `poll()` call when the commit interval has elapsed, during `close()`, and **before partition revocations** during rebalances (so the new partition owner sees up-to-date committed positions):
+Control how offsets are committed. When auto-commit is enabled (the default), Krafka automatically commits offsets during each `poll()` call when the commit interval has elapsed, during `close()`, and **before partition revocations** during rebalances (so the new partition owner sees up-to-date committed positions). `close().await` still tears down local state before returning; final auto-commit failures that only indicate the member already lost the group during a rebalance are treated as best-effort shutdown races, while other close-time commit failures still surface:
 
 > **Warning — at-least-once caveat:** Auto-commit commits the offset of the last record *returned* by `poll()`, not the last record *processed* by the application. If the application crashes after `poll()` returns but before processing completes, those records may be skipped on restart. For strict at-least-once guarantees, disable auto-commit and call `commit()` explicitly after processing each batch.
 
@@ -461,11 +461,12 @@ loop {
 For non-blocking commits:
 
 ```rust
-// Commit asynchronously (spawns a background task)
-// The commit is tracked and errors are logged if it fails.
-// If offset lock contention occurs, the commit cycle is skipped
-// and a warning is logged (rather than silently dropping the commit).
-consumer.commit_async();
+// Commit asynchronously and await the final outcome.
+// Snapshot, transport, and broker failures are surfaced on the handle.
+// Retriable coordinator failures use the same short retry loop as commit().
+// If the assignment or offset snapshot cannot be taken, the handle resolves
+// to an error instead of silently skipping the commit cycle.
+consumer.commit_async().await?;
 ```
 
 ### Commit with Metadata
@@ -490,6 +491,10 @@ offsets.insert(
 consumer.commit_with_metadata(offsets).await?;
 ```
 
+In group mode, only currently assigned partitions are committed. Retriable
+coordinator failures use the same short retry loop as `commit()` and
+`commit_async()`.
+
 This is useful for:
 - Storing application checkpoints
 - Recording processing state
@@ -507,12 +512,44 @@ println!("Current position: {:?}", offset);
 // Seek to a specific offset
 consumer.seek("topic", 0, 1000).await?;
 
+// Seek multiple partitions atomically (one lock acquisition)
+use std::collections::HashMap;
+consumer.seek_many(&HashMap::from([
+    (("orders".to_string(), 0), 1_000),
+    (("orders".to_string(), 1), 2_000),
+])).await?;
+
 // Seek to the beginning (earliest available)
 consumer.seek_to_beginning("topic", 0).await?;
 
 // Seek to the end (latest, only receive new messages)
 consumer.seek_to_end("topic", 0).await?;
 ```
+
+### Starting from Known Offsets (Exactly-Once Recovery)
+
+Use `initial_offsets` on the builder to set per-partition start positions before
+`auto_offset_reset` is applied. This is ideal for recovery pipelines that
+checkpoint positions externally:
+
+```rust
+use std::collections::HashMap;
+use krafka::consumer::Consumer;
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .initial_offsets(HashMap::from([
+        (("orders".to_string(), 0), 1_234),
+        (("orders".to_string(), 1), 5_678),
+    ]))
+    .build()
+    .await?;
+```
+
+Initial offsets are applied when a partition is first assigned and has no
+committed group offset. They override `auto_offset_reset` for the matching
+partitions; unmatched partitions still follow `auto_offset_reset`.
 
 ### Pause and Resume
 
@@ -590,10 +627,11 @@ println!("Assigned partitions: {:?}", assignments);
 
 Calling `unsubscribe()` performs a full cleanup: revokes partitions (notifying
 the rebalance listener), leaves the consumer group, and clears all internal
-state (offsets, paused partitions, buffered records).
+state (offsets, paused partitions, buffered records). It returns a leave-group
+error after local state has still been cleared.
 
 ```rust
-consumer.unsubscribe().await;
+consumer.unsubscribe().await?;
 ```
 
 ### Pause and Resume
@@ -656,19 +694,57 @@ async fn consume_with_error_handling(consumer: &Consumer) {
 The `recv()` method returns individual records as a stream-like API.
 It internally buffers records fetched by `poll()` and returns them one by one,
 ensuring no data loss even when `poll()` returns multiple records.
-Errors propagate to the caller rather than being silently swallowed:
+
+`recv()` returns `Result<ConsumerRecord, RecvError>` instead of `Result<Option<ConsumerRecord>>`:
+- `Ok(record)` — a record was received.
+- `Err(RecvError::Closed)` — the consumer was shut down.
+- `Err(RecvError::Error(e))` — a broker or network error occurred.
 
 ```rust
 use krafka::consumer::Consumer;
 use krafka::error::Result;
+use krafka::RecvError;
 
 async fn consume_stream(consumer: &Consumer) -> Result<()> {
-    while let Some(record) = consumer.recv().await? {
-        println!(
-            "topic={}, partition={}, offset={}, timestamp_type={}",
-            record.topic, record.partition, record.offset, record.timestamp_type
-        );
-        // timestamp_type: 0 = CreateTime, 1 = LogAppendTime
+    loop {
+        match consumer.recv().await {
+            Ok(record) => println!(
+                "topic={}, partition={}, offset={}",
+                record.topic, record.partition, record.offset
+            ),
+            Err(RecvError::Closed)   => break,
+            Err(RecvError::Error(e)) => return Err(e),
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+```
+
+### High-Throughput Batch Receive
+
+`batch_recv(max_records, timeout)` collects up to `max_records` in one call,
+returning an explicit [`BatchRecvOutcome`] so timeout/close/empty-request are
+unambiguous:
+
+```rust
+use std::time::Duration;
+use krafka::consumer::{BatchRecvOutcome, Consumer};
+use krafka::error::Result;
+
+async fn process_batches(consumer: &Consumer) -> Result<()> {
+    loop {
+        match consumer.batch_recv(100, Duration::from_millis(200)).await? {
+            BatchRecvOutcome::Records(batch) => {
+                for record in batch {
+                    println!("offset={}", record.offset);
+                }
+            }
+            BatchRecvOutcome::TimedOut => continue,
+            BatchRecvOutcome::Closed => break,
+            BatchRecvOutcome::EmptyRequest => continue,
+            _ => continue,
+        }
     }
     Ok(())
 }
@@ -735,7 +811,7 @@ tokio::select! {
 
 // Commit final offsets and close
 consumer.commit().await?;
-consumer.close().await;
+consumer.close().await?;
 ```
 
 ## Poll Architecture

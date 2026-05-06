@@ -115,16 +115,19 @@ pub mod glue;
 #[cfg_attr(docsrs, doc(cfg(feature = "schema-registry")))]
 pub use client::{ConfluentSchemaRegistry, ConfluentSchemaRegistryBuilder};
 
-use std::collections::{HashMap, VecDeque};
+use self::glue::{GlueSchema, GlueSchemaRegistryClient, GlueSchemaVersionId};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::oneshot;
 
 use crate::error::{KrafkaError, Result};
+use tracing::debug;
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -314,6 +317,19 @@ pub fn decode_wire_format(data: &[u8]) -> Result<(SchemaId, &[u8])> {
     Ok((schema_id, &data[HEADER_SIZE..]))
 }
 
+/// Decode a Confluent wire format message, returning an owned payload.
+///
+/// This is useful when the payload needs to outlive the source buffer, for
+/// example when passing decoded bytes across an `.await` boundary.
+///
+/// # Errors
+///
+/// Same as [`decode_wire_format()`].
+pub fn decode_wire_format_owned(data: &[u8]) -> Result<(SchemaId, Vec<u8>)> {
+    let (schema_id, payload) = decode_wire_format(data)?;
+    Ok((schema_id, payload.to_vec()))
+}
+
 /// Decode a Confluent wire format message, returning a zero-copy [`Bytes`] payload.
 ///
 /// This is the preferred variant when working with [`Bytes`] values such as
@@ -355,6 +371,248 @@ fn validate_wire_header(data: &[u8]) -> Result<SchemaId> {
         )));
     }
     Ok(u32::from_be_bytes([data[1], data[2], data[3], data[4]]))
+}
+
+/// Detected schema wire format for payload dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DetectedWireFormat {
+    /// Confluent wire format (`0x00` magic + schema ID).
+    Confluent {
+        /// Confluent schema ID.
+        schema_id: SchemaId,
+        /// Offset where payload bytes start.
+        payload_offset: usize,
+    },
+    /// AWS Glue wire format (`0x03` version + compression + UUID).
+    Glue {
+        /// Glue schema version UUID.
+        version_id: GlueSchemaVersionId,
+        /// Offset where payload bytes start.
+        payload_offset: usize,
+    },
+    /// Looks like Confluent framing (`0x00`) but header is invalid/truncated.
+    InvalidConfluent,
+    /// Looks like Glue framing (`0x03`) but header is invalid/truncated.
+    InvalidGlue,
+    /// Unknown or invalid wire format.
+    Unknown,
+}
+
+/// Detect schema wire format from the message header.
+///
+/// Returns [`DetectedWireFormat::Unknown`] for empty buffers or unrecognized
+/// magic bytes. Returns [`DetectedWireFormat::InvalidConfluent`] for a valid
+/// Confluent magic byte (`0x00`) with a truncated header. Returns
+/// [`DetectedWireFormat::InvalidGlue`] for a valid Glue version byte (`0x03`)
+/// with an invalid compression indicator or truncated UUID.
+pub fn detect_wire_format(data: &[u8]) -> DetectedWireFormat {
+    if data.is_empty() {
+        return DetectedWireFormat::Unknown;
+    }
+
+    match data[0] {
+        MAGIC_BYTE => {
+            if data.len() < HEADER_SIZE {
+                return DetectedWireFormat::InvalidConfluent;
+            }
+            let schema_id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+            DetectedWireFormat::Confluent {
+                schema_id,
+                payload_offset: HEADER_SIZE,
+            }
+        }
+        // Glue wire header: version byte + compression + 16-byte UUID.
+        // Constants are defined (and validated) in schema_registry::glue.
+        glue::GLUE_HEADER_VERSION_BYTE => {
+            if data.len() < glue::GLUE_HEADER_SIZE {
+                return DetectedWireFormat::InvalidGlue;
+            }
+            let compression = data[1];
+            if compression != glue::GLUE_COMPRESSION_NONE_BYTE
+                && compression != glue::GLUE_COMPRESSION_ZLIB_BYTE
+            {
+                return DetectedWireFormat::InvalidGlue;
+            }
+
+            let mut version_bytes = [0u8; 16];
+            version_bytes.copy_from_slice(&data[2..glue::GLUE_HEADER_SIZE]);
+            DetectedWireFormat::Glue {
+                version_id: GlueSchemaVersionId::from_bytes(version_bytes),
+                payload_offset: glue::GLUE_HEADER_SIZE,
+            }
+        }
+        _ => DetectedWireFormat::Unknown,
+    }
+}
+
+/// Unified schema format across Confluent and Glue registries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SchemaFormat {
+    /// Apache Avro.
+    Avro,
+    /// JSON Schema.
+    Json,
+    /// Protocol Buffers.
+    Protobuf,
+    /// Not schema-framed (or unknown framing).
+    Unknown,
+}
+
+impl From<SchemaType> for SchemaFormat {
+    fn from(value: SchemaType) -> Self {
+        match value {
+            SchemaType::Avro => Self::Avro,
+            SchemaType::Json => Self::Json,
+            SchemaType::Protobuf => Self::Protobuf,
+        }
+    }
+}
+
+impl From<glue::GlueDataFormat> for SchemaFormat {
+    fn from(value: glue::GlueDataFormat) -> Self {
+        match value {
+            glue::GlueDataFormat::Avro => Self::Avro,
+            glue::GlueDataFormat::Json => Self::Json,
+            glue::GlueDataFormat::Protobuf => Self::Protobuf,
+        }
+    }
+}
+
+/// Registry-specific schema metadata associated with a decoded payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SchemaMetadata {
+    /// Metadata fetched from a Confluent-compatible registry.
+    Confluent(Schema),
+    /// Metadata fetched from the AWS Glue Schema Registry.
+    Glue(GlueSchema),
+}
+
+impl SchemaMetadata {
+    /// Return the normalized schema format for this metadata.
+    pub fn schema_format(&self) -> SchemaFormat {
+        match self {
+            Self::Confluent(schema) => schema.schema_type.into(),
+            Self::Glue(schema) => schema.data_format.into(),
+        }
+    }
+}
+
+/// Decoded schema-framed payload plus resolved schema metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DecodedMessage {
+    /// Unified schema format.
+    pub schema_format: SchemaFormat,
+    /// Decoded payload bytes.
+    pub payload: Vec<u8>,
+    /// Registry metadata when a known schema wire format was detected.
+    pub schema_metadata: Option<SchemaMetadata>,
+}
+
+/// Unified decoder that dispatches based on detected wire format.
+///
+/// Use this to centralize Confluent/Glue dispatch logic and avoid repeating
+/// magic-byte checks in application code.
+#[derive(Default, Clone, Copy)]
+pub struct SchemaDecoder<'a> {
+    confluent: Option<&'a dyn SchemaRegistryClient>,
+    glue: Option<&'a dyn GlueSchemaRegistryClient>,
+}
+
+impl fmt::Debug for SchemaDecoder<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SchemaDecoder")
+            .field("has_confluent", &self.confluent.is_some())
+            .field("has_glue", &self.glue.is_some())
+            .finish()
+    }
+}
+
+impl<'a> SchemaDecoder<'a> {
+    /// Create an empty decoder.
+    ///
+    /// Use [`with_confluent`](Self::with_confluent) and/or
+    /// [`with_glue`](Self::with_glue) before calling [`decode`](Self::decode).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a decoder configured with only a Confluent registry.
+    pub fn confluent(registry: &'a dyn SchemaRegistryClient) -> Self {
+        Self::new().with_confluent(registry)
+    }
+
+    /// Create a decoder configured with only a Glue registry.
+    pub fn glue(registry: &'a dyn GlueSchemaRegistryClient) -> Self {
+        Self::new().with_glue(registry)
+    }
+
+    /// Attach a Confluent registry client.
+    pub fn with_confluent(mut self, registry: &'a dyn SchemaRegistryClient) -> Self {
+        self.confluent = Some(registry);
+        self
+    }
+
+    /// Attach a Glue registry client.
+    pub fn with_glue(mut self, registry: &'a dyn GlueSchemaRegistryClient) -> Self {
+        self.glue = Some(registry);
+        self
+    }
+
+    /// Decode a schema-framed payload and fetch associated schema metadata.
+    ///
+    /// - Confluent (`0x00`): decodes schema ID and fetches via Confluent client.
+    /// - Glue (`0x03`): decodes schema version ID and fetches via Glue client.
+    /// - Unknown framing: returns payload as-is with `SchemaFormat::Unknown`.
+    /// - Ambiguous truncated/invalid known framing: falls back to passthrough
+    ///   with `SchemaFormat::Unknown`; use `detect_wire_format()` plus the
+    ///   low-level decode helpers for strict malformed-header rejection.
+    pub async fn decode(&self, data: &[u8]) -> Result<DecodedMessage> {
+        match detect_wire_format(data) {
+            DetectedWireFormat::Confluent { schema_id, .. } => {
+                let registry = self.confluent.ok_or_else(|| {
+                    KrafkaError::config(
+                        "schema decoder missing Confluent registry for Confluent-framed payload",
+                    )
+                })?;
+
+                let (_, payload) = decode_wire_format_owned(data)?;
+                let schema = registry.get_schema_by_id(schema_id).await?;
+
+                Ok(DecodedMessage {
+                    schema_format: schema.schema_type.into(),
+                    payload,
+                    schema_metadata: Some(SchemaMetadata::Confluent(schema)),
+                })
+            }
+            DetectedWireFormat::Glue { version_id, .. } => {
+                let registry = self.glue.ok_or_else(|| {
+                    KrafkaError::config(
+                        "schema decoder missing Glue registry for Glue-framed payload",
+                    )
+                })?;
+
+                let (_, payload) = glue::decode_glue_wire_format(data)?;
+                let schema = registry.get_schema_by_version_id(version_id).await?;
+
+                Ok(DecodedMessage {
+                    schema_format: schema.data_format.into(),
+                    payload,
+                    schema_metadata: Some(SchemaMetadata::Glue(schema)),
+                })
+            }
+            DetectedWireFormat::InvalidConfluent
+            | DetectedWireFormat::InvalidGlue
+            | DetectedWireFormat::Unknown => Ok(DecodedMessage {
+                schema_format: SchemaFormat::Unknown,
+                payload: data.to_vec(),
+                schema_metadata: None,
+            }),
+        }
+    }
 }
 
 // ── Subject name strategy ────────────────────────────────────────────────
@@ -472,6 +730,38 @@ pub trait SchemaRegistryClient: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<SchemaId>> + Send + '_>>;
 }
 
+/// Shared cache-management interface implemented by schema cache wrappers.
+///
+/// This trait allows generic orchestration over both
+/// [`CachedSchemaRegistry`] and [`glue::CachedGlueSchemaRegistry`] for cache
+/// lifecycle operations (invalidate, clear, prewarm), without coupling to a
+/// specific registry provider.
+pub trait AnySchemaCache: Send + Sync {
+    /// Identifier type used by this cache (schema ID or schema version ID).
+    type Id: Copy + Send + Sync;
+
+    /// Number of entries currently held in the cache.
+    fn cache_len(&self) -> usize;
+
+    /// Returns `true` when the cache contains no entries.
+    fn cache_is_empty(&self) -> bool;
+
+    /// Clear all cached entries and cancel in-flight cache repopulation.
+    fn clear_cache(&self);
+
+    /// Invalidate a specific cache entry.
+    fn invalidate(&self, id: Self::Id);
+
+    /// Invalidate all cache entries.
+    fn invalidate_all(&self);
+
+    /// Pre-warm the cache for a set of immutable IDs.
+    fn warm_cache<'a>(
+        &'a self,
+        ids: &'a [Self::Id],
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+}
+
 // ── CachedSchemaRegistry ─────────────────────────────────────────────────
 
 /// Caching wrapper around any [`SchemaRegistryClient`].
@@ -509,8 +799,18 @@ pub struct CachedSchemaRegistry<C> {
     insertion_order: RwLock<VecDeque<SchemaId>>,
     /// Optional maximum number of cached entries.
     max_entries: Option<usize>,
+    /// Monotonic token used to identify distinct in-flight lookup generations.
+    in_flight_token: AtomicU64,
+    /// Monotonic generation for invalidation-sensitive cache insertions.
+    invalidation_generation: AtomicU64,
     /// Waiters for coalescing concurrent cold misses by schema ID.
-    in_flight: Mutex<HashMap<SchemaId, Vec<oneshot::Sender<Result<Schema>>>>>,
+    in_flight: Mutex<HashMap<SchemaId, SchemaInFlightEntry>>,
+}
+
+#[derive(Default)]
+struct SchemaInFlightEntry {
+    token: u64,
+    waiters: Vec<oneshot::Sender<Result<Schema>>>,
 }
 
 impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
@@ -521,6 +821,8 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             cache: RwLock::new(HashMap::new()),
             insertion_order: RwLock::new(VecDeque::new()),
             max_entries: None,
+            in_flight_token: AtomicU64::new(0),
+            invalidation_generation: AtomicU64::new(0),
             in_flight: Mutex::new(HashMap::new()),
         }
     }
@@ -532,6 +834,8 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             cache: RwLock::new(HashMap::with_capacity(capacity)),
             insertion_order: RwLock::new(VecDeque::with_capacity(capacity)),
             max_entries: None,
+            in_flight_token: AtomicU64::new(0),
+            invalidation_generation: AtomicU64::new(0),
             in_flight: Mutex::new(HashMap::new()),
         }
     }
@@ -546,6 +850,8 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
             cache: RwLock::new(HashMap::with_capacity(max_entries)),
             insertion_order: RwLock::new(VecDeque::with_capacity(max_entries)),
             max_entries: Some(max_entries),
+            in_flight_token: AtomicU64::new(0),
+            invalidation_generation: AtomicU64::new(0),
             in_flight: Mutex::new(HashMap::new()),
         }
     }
@@ -565,31 +871,93 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         self.cache.read().is_empty()
     }
 
-    /// Clear the schema cache.
-    pub fn clear_cache(&self) {
+    fn clear_cache_storage(&self) {
         self.cache.write().clear();
         self.insertion_order.write().clear();
+    }
+
+    /// Clear the schema cache.
+    pub fn clear_cache(&self) {
+        self.invalidation_generation.fetch_add(1, Ordering::SeqCst);
+
+        let cancelled: Vec<_> = self.in_flight.lock().drain().collect();
+        self.clear_cache_storage();
+
+        for (id, entry) in cancelled {
+            for waiter in entry.waiters {
+                let _ = waiter.send(Err(schema_lookup_cancelled_error(id)));
+            }
+        }
+    }
+
+    /// Remove a single schema ID from the cache.
+    pub fn invalidate(&self, schema_id: SchemaId) {
+        self.invalidation_generation.fetch_add(1, Ordering::SeqCst);
+
+        // Cancel any coalesced waiters so invalidation is observable immediately.
+        let waiters = self
+            .in_flight
+            .lock()
+            .remove(&schema_id)
+            .map(|entry| entry.waiters)
+            .unwrap_or_default();
+
+        self.cache.write().remove(&schema_id);
+        self.insertion_order
+            .write()
+            .retain(|cached_id| *cached_id != schema_id);
+
+        for waiter in waiters {
+            let _ = waiter.send(Err(schema_lookup_cancelled_error(schema_id)));
+        }
+    }
+
+    /// Remove all cached schemas.
+    pub fn invalidate_all(&self) {
+        self.clear_cache();
+    }
+
+    /// Pre-fetch a set of schema IDs into the cache.
+    ///
+    /// Duplicate IDs are ignored to avoid redundant lookups.
+    pub async fn warm_cache(&self, schema_ids: &[SchemaId]) -> Result<()> {
+        let mut seen = HashSet::with_capacity(schema_ids.len());
+        for &id in schema_ids {
+            if !seen.insert(id) {
+                continue;
+            }
+            self.get_schema_by_id_impl(id).await?;
+        }
+        Ok(())
     }
 
     async fn get_schema_by_id_impl(&self, id: SchemaId) -> Result<Schema> {
         // Fast path: read lock only.
         if let Some(schema) = self.cache.read().get(&id) {
+            debug!(schema_id = id, "schema cache hit");
             return Ok(schema.clone());
         }
 
-        let waiter_rx = {
+        let (waiter_rx, leader_token) = {
             let mut in_flight = self.in_flight.lock();
             if let Some(schema) = self.cache.read().get(&id) {
                 return Ok(schema.clone());
             }
 
-            if let Some(waiters) = in_flight.get_mut(&id) {
+            if let Some(entry) = in_flight.get_mut(&id) {
                 let (tx, rx) = oneshot::channel();
-                waiters.push(tx);
-                Some(rx)
+                entry.waiters.push(tx);
+                (Some(rx), None)
             } else {
-                in_flight.insert(id, Vec::new());
-                None
+                let token = self.in_flight_token.fetch_add(1, Ordering::SeqCst) + 1;
+                in_flight.insert(
+                    id,
+                    SchemaInFlightEntry {
+                        token,
+                        waiters: Vec::new(),
+                    },
+                );
+                (None, Some(token))
             }
         };
 
@@ -598,8 +966,9 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         }
 
         struct InFlightSchemaFetchGuard<'a> {
-            in_flight: &'a Mutex<HashMap<SchemaId, Vec<oneshot::Sender<Result<Schema>>>>>,
+            in_flight: &'a Mutex<HashMap<SchemaId, SchemaInFlightEntry>>,
             id: SchemaId,
+            token: u64,
             completed: bool,
         }
 
@@ -608,25 +977,82 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
                 if self.completed {
                     return;
                 }
-                let waiters = self.in_flight.lock().remove(&self.id).unwrap_or_default();
+                let waiters = {
+                    let mut in_flight = self.in_flight.lock();
+                    if matches!(in_flight.get(&self.id), Some(entry) if entry.token == self.token) {
+                        in_flight
+                            .remove(&self.id)
+                            .map(|entry| entry.waiters)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                };
+
                 for waiter in waiters {
                     let _ = waiter.send(Err(schema_lookup_cancelled_error(self.id)));
                 }
             }
         }
 
+        let Some(leader_token) = leader_token else {
+            return Err(schema_lookup_cancelled_error(id));
+        };
+
         let mut guard = InFlightSchemaFetchGuard {
             in_flight: &self.in_flight,
             id,
+            token: leader_token,
             completed: false,
         };
 
         let result = self.inner.get_schema_by_id(id).await;
         if let Ok(schema) = &result {
-            self.insert_cache_entry(id, schema.clone());
+            // Cache only if this lookup generation is still the active in-flight
+            // slot for this ID (i.e., it was not invalidated/replaced).
+            let should_insert = {
+                let in_flight = self.in_flight.lock();
+                matches!(in_flight.get(&id), Some(entry) if entry.token == leader_token)
+            };
+
+            if should_insert {
+                let mut cache = self.cache.write();
+                debug!(schema_id = id, "schema cache miss — fetched from registry");
+                // Inline insertion to reuse the held cache write lock.
+                if let Some(existing) = cache.get_mut(&id) {
+                    *existing = schema.clone();
+                } else {
+                    if let Some(max_entries) = self.max_entries {
+                        let mut insertion_order = self.insertion_order.write();
+                        if cache.len() >= max_entries
+                            && let Some(evicted) = insertion_order.pop_front()
+                        {
+                            cache.remove(&evicted);
+                        }
+                        insertion_order.push_back(id);
+                    }
+                    cache.insert(id, schema.clone());
+                }
+            } else {
+                debug!(
+                    schema_id = id,
+                    "schema fetch completed after invalidation; skipping cache insert"
+                );
+            }
         }
 
-        let waiters = self.in_flight.lock().remove(&id).unwrap_or_default();
+        let waiters = {
+            let mut in_flight = self.in_flight.lock();
+            if matches!(in_flight.get(&id), Some(entry) if entry.token == leader_token) {
+                in_flight
+                    .remove(&id)
+                    .map(|entry| entry.waiters)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        };
+
         for waiter in waiters {
             let _ = waiter.send(result.clone());
         }
@@ -637,8 +1063,9 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
 
     async fn get_latest_schema_impl(&self, subject: &str) -> Result<Schema> {
         // Always forward (latest may change), but cache by ID.
+        let observed_generation = self.invalidation_generation.load(Ordering::SeqCst);
         let schema = self.inner.get_latest_schema(subject).await?;
-        self.insert_cache_entry(schema.id, schema.clone());
+        self.insert_cache_entry_if_current(schema.id, schema.clone(), observed_generation);
         Ok(schema)
     }
 
@@ -647,8 +1074,9 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
         subject: &str,
         version: SchemaVersion,
     ) -> Result<Schema> {
+        let observed_generation = self.invalidation_generation.load(Ordering::SeqCst);
         let schema = self.inner.get_schema_by_version(subject, version).await?;
-        self.insert_cache_entry(schema.id, schema.clone());
+        self.insert_cache_entry_if_current(schema.id, schema.clone(), observed_generation);
         Ok(schema)
     }
 
@@ -732,6 +1160,23 @@ impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
 
         cache.insert(id, schema);
     }
+
+    fn insert_cache_entry_if_current(
+        &self,
+        id: SchemaId,
+        schema: Schema,
+        observed_generation: u64,
+    ) {
+        if self.invalidation_generation.load(Ordering::SeqCst) != observed_generation {
+            debug!(
+                schema_id = id,
+                "schema fetch completed after invalidation; skipping cache insert"
+            );
+            return;
+        }
+
+        self.insert_cache_entry(id, schema);
+    }
 }
 
 impl<C> fmt::Debug for CachedSchemaRegistry<C> {
@@ -785,6 +1230,37 @@ impl<C: SchemaRegistryClient> SchemaRegistryClient for CachedSchemaRegistry<C> {
     }
 }
 
+impl<C: SchemaRegistryClient> AnySchemaCache for CachedSchemaRegistry<C> {
+    type Id = SchemaId;
+
+    fn cache_len(&self) -> usize {
+        Self::cache_len(self)
+    }
+
+    fn cache_is_empty(&self) -> bool {
+        Self::cache_is_empty(self)
+    }
+
+    fn clear_cache(&self) {
+        Self::clear_cache(self)
+    }
+
+    fn invalidate(&self, id: Self::Id) {
+        Self::invalidate(self, id)
+    }
+
+    fn invalidate_all(&self) {
+        Self::invalidate_all(self)
+    }
+
+    fn warm_cache<'a>(
+        &'a self,
+        ids: &'a [Self::Id],
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move { Self::warm_cache(self, ids).await })
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -793,7 +1269,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use tokio::sync::Notify;
+    use tokio::sync::{Notify, Semaphore};
 
     fn ok<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> T {
         match result {
@@ -823,6 +1299,15 @@ mod tests {
         let payload = b"hello world";
         let encoded = encode_wire_format(42, payload);
         let (id, decoded) = ok(decode_wire_format(&encoded));
+        assert_eq!(id, 42);
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn test_wire_format_owned_roundtrip() {
+        let payload = b"hello owned world";
+        let encoded = encode_wire_format(42, payload);
+        let (id, decoded) = ok(decode_wire_format_owned(&encoded));
         assert_eq!(id, 42);
         assert_eq!(decoded, payload);
     }
@@ -870,6 +1355,207 @@ mod tests {
     fn test_wire_format_empty_data() {
         let result = decode_wire_format(&[]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_detect_wire_format_confluent() {
+        let encoded = encode_wire_format(42, b"data");
+        let detected = detect_wire_format(&encoded);
+        assert_eq!(
+            detected,
+            DetectedWireFormat::Confluent {
+                schema_id: 42,
+                payload_offset: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn test_detect_wire_format_glue() {
+        let version_id: GlueSchemaVersionId =
+            "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
+        let encoded = crate::schema_registry::glue::encode_glue_wire_format(
+            version_id,
+            b"data",
+            crate::schema_registry::glue::GlueCompression::None,
+        )
+        .unwrap();
+        let detected = detect_wire_format(&encoded);
+        assert_eq!(
+            detected,
+            DetectedWireFormat::Glue {
+                version_id,
+                payload_offset: 18,
+            }
+        );
+    }
+
+    #[test]
+    fn test_detect_wire_format_unknown() {
+        assert_eq!(detect_wire_format(&[]), DetectedWireFormat::Unknown);
+        assert_eq!(
+            detect_wire_format(&[0x99, 0x00, 0x00]),
+            DetectedWireFormat::Unknown
+        );
+    }
+
+    #[test]
+    fn test_detect_wire_format_confluent_schema_id_zero() {
+        assert_eq!(
+            detect_wire_format(&[MAGIC_BYTE, 0x00, 0x00, 0x00, 0x00, 0x41]),
+            DetectedWireFormat::Confluent {
+                schema_id: 0,
+                payload_offset: HEADER_SIZE,
+            }
+        );
+    }
+
+    #[test]
+    fn test_detect_wire_format_invalid_known_headers() {
+        assert_eq!(
+            detect_wire_format(&[MAGIC_BYTE, 0x01, 0x02]),
+            DetectedWireFormat::InvalidConfluent
+        );
+        assert_eq!(
+            detect_wire_format(&[
+                glue::GLUE_HEADER_VERSION_BYTE,
+                glue::GLUE_COMPRESSION_NONE_BYTE
+            ]),
+            DetectedWireFormat::InvalidGlue
+        );
+    }
+
+    #[test]
+    fn test_detect_wire_format_glue_accepts_non_rfc_uuid_layout() {
+        // Structurally valid Glue framing with a nil UUID should still be
+        // classified as Glue so it can be decoded symmetrically.
+        let nil: GlueSchemaVersionId = "00000000-0000-0000-0000-000000000000".parse().unwrap();
+        let encoded = crate::schema_registry::glue::encode_glue_wire_format(
+            nil,
+            b"data",
+            crate::schema_registry::glue::GlueCompression::None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_wire_format(&encoded),
+            DetectedWireFormat::Glue {
+                version_id: nil,
+                payload_offset: glue::GLUE_HEADER_SIZE,
+            }
+        );
+    }
+
+    struct DecoderMockGlueRegistry;
+
+    impl glue::GlueSchemaRegistryClient for DecoderMockGlueRegistry {
+        fn get_schema_by_version_id(
+            &self,
+            id: GlueSchemaVersionId,
+        ) -> Pin<Box<dyn Future<Output = Result<glue::GlueSchema>> + Send + '_>> {
+            Box::pin(async move {
+                Ok(glue::GlueSchema::new(
+                    id,
+                    glue::GlueDataFormat::Json,
+                    r#"{"type":"object"}"#,
+                ))
+            })
+        }
+
+        fn register_schema(
+            &self,
+            _schema_name: &str,
+            _schema: &str,
+            _data_format: glue::GlueDataFormat,
+        ) -> Pin<Box<dyn Future<Output = Result<GlueSchemaVersionId>> + Send + '_>> {
+            Box::pin(async {
+                Ok("550e8400-e29b-41d4-a716-446655440000"
+                    .parse::<GlueSchemaVersionId>()
+                    .unwrap())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_schema_decoder_confluent() {
+        let registry = CachedSchemaRegistry::new(MockRegistry::new());
+        let decoder = SchemaDecoder::confluent(&registry);
+
+        let encoded = encode_wire_format(7, b"payload");
+        let decoded = ok(decoder.decode(&encoded).await);
+
+        assert_eq!(decoded.schema_format, SchemaFormat::Avro);
+        assert_eq!(decoded.payload, b"payload");
+        match decoded.schema_metadata {
+            Some(SchemaMetadata::Confluent(schema)) => assert_eq!(schema.id, 7),
+            _ => unreachable!("expected confluent metadata"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_schema_decoder_glue() {
+        let registry = glue::CachedGlueSchemaRegistry::new(DecoderMockGlueRegistry);
+        let decoder = SchemaDecoder::glue(&registry);
+
+        let version_id: GlueSchemaVersionId =
+            "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
+        let encoded =
+            glue::encode_glue_wire_format(version_id, b"payload", glue::GlueCompression::None)
+                .unwrap();
+
+        let decoded = ok(decoder.decode(&encoded).await);
+        assert_eq!(decoded.schema_format, SchemaFormat::Json);
+        assert_eq!(decoded.payload, b"payload");
+        match decoded.schema_metadata {
+            Some(SchemaMetadata::Glue(schema)) => assert_eq!(schema.schema_version_id, version_id),
+            _ => unreachable!("expected glue metadata"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_schema_decoder_unknown_passthrough() {
+        let decoder = SchemaDecoder::new();
+        let decoded = ok(decoder.decode(b"plain-data").await);
+
+        assert_eq!(decoded.schema_format, SchemaFormat::Unknown);
+        assert_eq!(decoded.payload, b"plain-data");
+        assert!(decoded.schema_metadata.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_schema_decoder_missing_registry_is_error() {
+        let decoder = SchemaDecoder::new();
+        let encoded = encode_wire_format(1, b"x");
+
+        let result = decoder.decode(&encoded).await;
+        assert!(result.is_err());
+        assert!(
+            err(result)
+                .to_string()
+                .contains("missing Confluent registry")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_schema_decoder_truncated_confluent_header_passthrough() {
+        let decoder = SchemaDecoder::new();
+        let truncated = [MAGIC_BYTE, 0x00, 0x01];
+        let decoded = ok(decoder.decode(&truncated).await);
+
+        assert_eq!(decoded.schema_format, SchemaFormat::Unknown);
+        assert_eq!(decoded.payload, truncated);
+        assert!(decoded.schema_metadata.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_schema_decoder_truncated_glue_header_passthrough() {
+        let decoder = SchemaDecoder::new();
+        let truncated = [glue::GLUE_HEADER_VERSION_BYTE, 0x00, 0x01, 0x02];
+        let decoded = ok(decoder.decode(&truncated).await);
+
+        assert_eq!(decoded.schema_format, SchemaFormat::Unknown);
+        assert_eq!(decoded.payload, truncated);
+        assert!(decoded.schema_metadata.is_none());
     }
 
     // ── SubjectNameStrategy ──────────────────────────────────────────────
@@ -1045,16 +1731,22 @@ mod tests {
 
     struct BlockingMockRegistry {
         get_by_id_calls: AtomicU32,
+        get_latest_calls: AtomicU32,
+        get_by_version_calls: AtomicU32,
         started: Notify,
-        release: Notify,
+        release: Semaphore,
+        waiting_calls: AtomicU32,
     }
 
     impl BlockingMockRegistry {
         fn new() -> Self {
             Self {
                 get_by_id_calls: AtomicU32::new(0),
+                get_latest_calls: AtomicU32::new(0),
+                get_by_version_calls: AtomicU32::new(0),
                 started: Notify::new(),
-                release: Notify::new(),
+                release: Semaphore::new(0),
+                waiting_calls: AtomicU32::new(0),
             }
         }
 
@@ -1062,12 +1754,21 @@ mod tests {
             self.get_by_id_calls.load(Ordering::SeqCst)
         }
 
+        fn get_latest_call_count(&self) -> u32 {
+            self.get_latest_calls.load(Ordering::SeqCst)
+        }
+
+        fn get_by_version_call_count(&self) -> u32 {
+            self.get_by_version_calls.load(Ordering::SeqCst)
+        }
+
         async fn wait_started(&self) {
             self.started.notified().await;
         }
 
         fn release(&self) {
-            self.release.notify_waiters();
+            let waiting = self.waiting_calls.swap(0, Ordering::SeqCst);
+            self.release.add_permits(waiting as usize);
         }
     }
 
@@ -1079,7 +1780,12 @@ mod tests {
             self.get_by_id_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 self.started.notify_waiters();
-                self.release.notified().await;
+                self.waiting_calls.fetch_add(1, Ordering::SeqCst);
+                let _ = self
+                    .release
+                    .acquire()
+                    .await
+                    .expect("blocking registry release permit");
                 Ok(Schema::new(id, SchemaType::Avro, r#"{"type":"string"}"#))
             })
         }
@@ -1089,7 +1795,15 @@ mod tests {
             subject: &str,
         ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
             let subject = subject.to_string();
+            self.get_latest_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
+                self.started.notify_waiters();
+                self.waiting_calls.fetch_add(1, Ordering::SeqCst);
+                let _ = self
+                    .release
+                    .acquire()
+                    .await
+                    .expect("blocking registry release permit");
                 Ok(Schema::new(100, SchemaType::Avro, r#"{"type":"string"}"#)
                     .with_subject(subject, 1))
             })
@@ -1101,7 +1815,15 @@ mod tests {
             version: SchemaVersion,
         ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
             let subject = subject.to_string();
+            self.get_by_version_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
+                self.started.notify_waiters();
+                self.waiting_calls.fetch_add(1, Ordering::SeqCst);
+                let _ = self
+                    .release
+                    .acquire()
+                    .await
+                    .expect("blocking registry release permit");
                 Ok(Schema::new(100, SchemaType::Avro, r#"{"type":"string"}"#)
                     .with_subject(subject, version))
             })
@@ -1152,6 +1874,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_unbounded_cache_does_not_populate_insertion_order() {
+        let mock = MockRegistry::new();
+        let cached = CachedSchemaRegistry::new(mock);
+
+        ok(cached.get_schema_by_id(1).await);
+        ok(cached.get_schema_by_id(2).await);
+
+        assert_eq!(cached.cache_len(), 2);
+        assert!(cached.insertion_order.read().is_empty());
+
+        cached.invalidate(1);
+        assert_eq!(cached.cache_len(), 1);
+        assert!(cached.insertion_order.read().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_cache_clear() {
         let mock = MockRegistry::new();
         let cached = CachedSchemaRegistry::new(mock);
@@ -1165,6 +1903,162 @@ mod tests {
         // After clear, next call hits mock again
         ok(cached.get_schema_by_id(1).await);
         assert_eq!(cached.inner().get_by_id_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cache_invalidate_single_entry() {
+        let mock = MockRegistry::new();
+        let cached = CachedSchemaRegistry::new(mock);
+
+        ok(cached.get_schema_by_id(1).await);
+        ok(cached.get_schema_by_id(2).await);
+        assert_eq!(cached.cache_len(), 2);
+
+        cached.invalidate(1);
+        assert_eq!(cached.cache_len(), 1);
+
+        // ID 1 should miss after invalidation; ID 2 should still hit.
+        ok(cached.get_schema_by_id(2).await);
+        assert_eq!(cached.inner().get_by_id_call_count(), 2);
+        ok(cached.get_schema_by_id(1).await);
+        assert_eq!(cached.inner().get_by_id_call_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_cache_invalidate_does_not_repopulate_from_inflight_fetch() {
+        let cached = Arc::new(CachedSchemaRegistry::new(BlockingMockRegistry::new()));
+
+        let first = {
+            let cached = cached.clone();
+            tokio::spawn(async move { ok(cached.get_schema_by_id(7).await) })
+        };
+
+        cached.inner().wait_started().await;
+        cached.invalidate(7);
+        {
+            let cached = cached.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                cached.inner().release();
+            });
+        }
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), first)
+            .await
+            .expect("in-flight fetch did not complete")
+            .expect("in-flight task failed");
+        assert_eq!(cached.cache_len(), 0);
+
+        // Must fetch again because invalidation prevented stale re-population.
+        let second = {
+            let cached = cached.clone();
+            tokio::spawn(async move { ok(cached.get_schema_by_id(7).await) })
+        };
+        cached.inner().wait_started().await;
+        cached.inner().release();
+        let _ = join_ok(second.await);
+        assert_eq!(cached.inner().get_by_id_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cache_clear_does_not_repopulate_from_inflight_fetch() {
+        let cached = Arc::new(CachedSchemaRegistry::new(BlockingMockRegistry::new()));
+
+        let first = {
+            let cached = cached.clone();
+            tokio::spawn(async move { ok(cached.get_schema_by_id(7).await) })
+        };
+
+        cached.inner().wait_started().await;
+        cached.clear_cache();
+        {
+            let cached = cached.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                cached.inner().release();
+            });
+        }
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), first)
+            .await
+            .expect("in-flight fetch did not complete")
+            .expect("in-flight task failed");
+        assert_eq!(cached.cache_len(), 0);
+
+        let second = {
+            let cached = cached.clone();
+            tokio::spawn(async move { ok(cached.get_schema_by_id(7).await) })
+        };
+        cached.inner().wait_started().await;
+        cached.inner().release();
+        let _ = join_ok(second.await);
+        assert_eq!(cached.inner().get_by_id_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_single_id_does_not_block_other_inflight_cache_insert() {
+        let cached = Arc::new(CachedSchemaRegistry::new(BlockingMockRegistry::new()));
+
+        let id_cancelled = 7;
+        let id_unrelated = 8;
+
+        let t1 = {
+            let cached = cached.clone();
+            tokio::spawn(async move { ok(cached.get_schema_by_id(id_cancelled).await) })
+        };
+        let t2 = {
+            let cached = cached.clone();
+            tokio::spawn(async move { ok(cached.get_schema_by_id(id_unrelated).await) })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while cached.inner().get_by_id_call_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both in-flight lookups did not start");
+
+        cached.invalidate(id_cancelled);
+        cached.inner().release();
+
+        let _ = join_ok(t1.await);
+        let _ = join_ok(t2.await);
+
+        // Unrelated in-flight lookup should still have been cached.
+        let calls_after_inflight = cached.inner().get_by_id_call_count();
+        ok(cached.get_schema_by_id(id_unrelated).await);
+        assert_eq!(cached.inner().get_by_id_call_count(), calls_after_inflight);
+
+        // Invalidated ID should miss and fetch again.
+        let miss = {
+            let cached = cached.clone();
+            tokio::spawn(async move { ok(cached.get_schema_by_id(id_cancelled).await) })
+        };
+        cached.inner().wait_started().await;
+        cached.inner().release();
+        let _ = join_ok(miss.await);
+        assert_eq!(
+            cached.inner().get_by_id_call_count(),
+            calls_after_inflight + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_warm_cache_deduplicates_ids() {
+        let mock = MockRegistry::new();
+        let cached = CachedSchemaRegistry::new(mock);
+
+        ok(cached.warm_cache(&[1, 2, 1, 2, 3]).await);
+
+        assert_eq!(cached.inner().get_by_id_call_count(), 3);
+        assert_eq!(cached.cache_len(), 3);
+
+        // Subsequent gets should be cache hits only.
+        ok(cached.get_schema_by_id(1).await);
+        ok(cached.get_schema_by_id(2).await);
+        ok(cached.get_schema_by_id(3).await);
+        assert_eq!(cached.inner().get_by_id_call_count(), 3);
     }
 
     #[tokio::test]
@@ -1246,6 +2140,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_invalidate_drops_inflight_get_latest_cache_population() {
+        let cached = Arc::new(CachedSchemaRegistry::new(BlockingMockRegistry::new()));
+
+        let latest = {
+            let cached = cached.clone();
+            tokio::spawn(async move { ok(cached.get_latest_schema("test-value").await) })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while cached.inner().get_latest_call_count() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("latest lookup did not start");
+        cached.invalidate(100);
+        cached.inner().release();
+
+        let _ = join_ok(latest.await);
+        assert_eq!(cached.cache_len(), 0);
+
+        ok(cached.get_schema_by_id(100).await);
+        assert_eq!(cached.inner().get_by_id_call_count(), 1);
+    }
+
+    #[tokio::test]
     async fn test_cache_get_by_version_populates_id_cache() {
         let mock = MockRegistry::new();
         let cached = CachedSchemaRegistry::new(mock);
@@ -1256,6 +2176,32 @@ mod tests {
         let by_id = ok(cached.get_schema_by_id(schema.id).await);
         assert_eq!(cached.inner().get_by_id_call_count(), 0);
         assert_eq!(by_id.id, schema.id);
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_drops_inflight_get_by_version_cache_population() {
+        let cached = Arc::new(CachedSchemaRegistry::new(BlockingMockRegistry::new()));
+
+        let by_version = {
+            let cached = cached.clone();
+            tokio::spawn(async move { ok(cached.get_schema_by_version("test-value", 1).await) })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while cached.inner().get_by_version_call_count() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("version lookup did not start");
+        cached.invalidate(100);
+        cached.inner().release();
+
+        let _ = join_ok(by_version.await);
+        assert_eq!(cached.cache_len(), 0);
+
+        ok(cached.get_schema_by_id(100).await);
+        assert_eq!(cached.inner().get_by_id_call_count(), 1);
     }
 
     #[tokio::test]
@@ -1465,5 +2411,23 @@ mod tests {
                 .unwrap();
             assert_eq!(registered, 42);
         }
+    }
+
+    #[tokio::test]
+    async fn test_any_schema_cache_trait_for_confluent_cache() {
+        let mock = MockRegistry::new();
+        let cached = CachedSchemaRegistry::new(mock);
+
+        let generic_cache: &dyn AnySchemaCache<Id = SchemaId> = &cached;
+        ok(generic_cache.warm_cache(&[11, 12, 11]).await);
+
+        assert_eq!(generic_cache.cache_len(), 2);
+        assert!(!generic_cache.cache_is_empty());
+
+        generic_cache.invalidate(11);
+        assert_eq!(generic_cache.cache_len(), 1);
+
+        generic_cache.invalidate_all();
+        assert!(generic_cache.cache_is_empty());
     }
 }

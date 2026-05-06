@@ -1,9 +1,11 @@
 //! Consumer configuration.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::auth::AuthConfig;
 use crate::metadata::MetadataRecoveryStrategy;
+use crate::{Offset, PartitionId};
 
 /// Auto offset reset behavior.
 #[non_exhaustive]
@@ -204,6 +206,15 @@ pub struct ConsumerConfig {
     /// SOCKS5 proxy configuration (optional).
     #[cfg(feature = "socks5")]
     pub(crate) proxy: Option<crate::network::ProxyConfig>,
+    /// Per-partition initial offsets applied before auto-offset-reset.
+    ///
+    /// When a partition is first assigned and has no committed group offset,
+    /// the corresponding entry from this map is used as the starting fetch
+    /// position, overriding `auto_offset_reset`.
+    ///
+    /// Keyed by `(topic, partition)`.  Build via
+    /// [`ConsumerConfigBuilder::initial_offsets`].
+    pub(crate) initial_offsets: HashMap<(String, PartitionId), Offset>,
 }
 
 impl Default for ConsumerConfig {
@@ -237,6 +248,7 @@ impl Default for ConsumerConfig {
             max_decompressed_size: crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE,
             #[cfg(feature = "socks5")]
             proxy: None,
+            initial_offsets: HashMap::new(),
         }
     }
 }
@@ -614,6 +626,31 @@ impl ConsumerConfigBuilder {
     /// entries will then persist across partial refreshes indefinitely.
     pub fn disable_metadata_topic_cache_ttl(mut self) -> Self {
         self.config.metadata_topic_cache_ttl = None;
+        self
+    }
+
+    /// Set per-partition initial offsets applied before auto-offset-reset.
+    ///
+    /// When a partition is first assigned and has no committed group offset,
+    /// the consumer will start fetching from the given offset instead of
+    /// applying `auto_offset_reset`.  This is useful for exactly-once recovery
+    /// when you know the exact position to resume from.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::collections::HashMap;
+    ///
+    /// ConsumerConfig::builder()
+    ///     .bootstrap_servers("localhost:9092")
+    ///     .initial_offsets(HashMap::from([
+    ///         (("my-topic".to_string(), 0), 1_000),
+    ///         (("my-topic".to_string(), 1), 2_000),
+    ///     ]))
+    ///     .build()?;
+    /// ```
+    pub fn initial_offsets(mut self, offsets: HashMap<(String, PartitionId), Offset>) -> Self {
+        self.config.initial_offsets = offsets;
         self
     }
 

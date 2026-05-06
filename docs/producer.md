@@ -132,10 +132,10 @@ To trim binary size further, disable defaults and select only the codecs you nee
 
 ```toml
 # Option 1: enable only the codecs you need
-krafka = { version = "0.7.0", default-features = false, features = ["lz4"] }
+krafka = { version = "0.8.0", default-features = false, features = ["lz4"] }
 
 # Option 2: enable all compression codecs, including zstd
-# krafka = { version = "0.7.0", features = ["compression-all"] }
+# krafka = { version = "0.8.0", features = ["compression-all"] }
 ```
 
 ### Batching
@@ -223,7 +223,7 @@ let producer = Producer::builder()
 | `buffer_memory` | 32 MB | Maximum total memory for buffering records |
 | `max_block` | 60s | Maximum time to block when buffer is full |
 
-When batching/accumulation is enabled (i.e., `linger > 0`) and the buffer memory limit is reached, `send()` will block the caller for up to `max_block` waiting for in-flight batches to complete and free memory. If memory is still unavailable after the timeout, an error is returned. This provides backpressure matching the Kafka Java client's `max.block.ms` behavior, preventing both OOM conditions and unnecessary record loss under bursty load. In direct-send mode (`linger = 0`), records bypass the accumulator, so `buffer_memory`/`max_block` do not apply.
+The `buffer_memory` and `max_block` settings apply to both batching (`linger > 0`) and direct-send mode (`linger = 0`). Once a record is admitted, it holds a share of the producer memory budget until it is acknowledged or fails, so direct sends and accumulator batches obey the same backpressure contract. If memory is unavailable, `send()` blocks the caller for up to `max_block` before returning an error. This matches the Kafka Java client's `max.block.ms` behavior and prevents both OOM conditions and unnecessary record loss under bursty load.
 
 ## Flushing
 

@@ -26,17 +26,18 @@ A pure Rust, async-native Apache Kafka client designed for high performance, saf
 - 🧪 **Fuzz tested**: cargo-fuzz targets for protocol arrays, record batches, and response decoders
 
 > **Minimum Broker Version:** Krafka requires **Apache Kafka 3.9+**. Protocol versions older than the Kafka 3.9 baseline have been removed.
+
 ## 🚀 Quick Start
 
 Add Krafka to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-krafka = "0.7.0"
+krafka = "0.8.0"
 tokio = { version = "1", features = ["full"] }
 
 # For AWS MSK IAM authentication with full SDK support:
-# krafka = { version = "0.7.0", features = ["aws-msk"] }
+# krafka = { version = "0.8.0", features = ["aws-msk"] }
 ```
 
 ### Producer
@@ -239,10 +240,10 @@ To select only what you need:
 
 ```toml
 # Option 1: enable only the codecs you need
-krafka = { version = "0.7.0", default-features = false, features = ["lz4", "snappy"] }
+krafka = { version = "0.8.0", default-features = false, features = ["lz4", "snappy"] }
 
 # Option 2: enable all compression codecs, including zstd
-# krafka = { version = "0.7.0", features = ["compression-all"] }
+# krafka = { version = "0.8.0", features = ["compression-all"] }
 ```
 
 ## ⚡ Performance Tuning

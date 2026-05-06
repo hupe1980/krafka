@@ -587,7 +587,7 @@ impl MetricsVisitable for ProducerMetrics {
         );
         exporter.export_gauge(
             &format!("{prefix}_buffered_records"),
-            "Currently buffered records",
+            "Producer records currently admitted under the memory budget",
             self.buffered_records.get(),
         );
         exporter.export_latency(
@@ -643,6 +643,11 @@ impl MetricsVisitable for ConsumerMetrics {
             &format!("{prefix}_rebalances"),
             "Total rebalances",
             self.rebalances.get(),
+        );
+        exporter.export_counter(
+            &format!("{prefix}_seeks"),
+            "Total seek operations (seek + seek_many partition count)",
+            self.seeks.get(),
         );
         exporter.export_gauge(
             &format!("{prefix}_lag"),
@@ -882,6 +887,7 @@ impl KrafkaMetrics {
         self.consumer.commits.reset();
         self.consumer.errors.reset();
         self.consumer.rebalances.reset();
+        self.consumer.seeks.reset();
         self.consumer.poll_latency.reset();
         self.consumer.fetch_latency.reset();
         self.consumer.lag.set(0);
@@ -924,7 +930,7 @@ pub struct ProducerMetrics {
     pub send_latency: LatencyTracker,
     /// Current number of active connections.
     pub connections: Gauge,
-    /// Number of records currently buffered.
+    /// Producer records currently admitted under the memory budget.
     pub buffered_records: Gauge,
 }
 
@@ -993,7 +999,7 @@ pub struct ProducerMetricsSnapshot {
     pub send_latency: LatencySnapshot,
     /// Current connections.
     pub connections: u64,
-    /// Currently buffered records.
+    /// Records currently admitted under the producer memory budget.
     pub buffered_records: u64,
 }
 
@@ -1030,12 +1036,22 @@ pub struct ConsumerMetrics {
     pub paused_partitions: Gauge,
     /// Current number of records buffered in the recv() buffer.
     pub buffered_records: Gauge,
+    /// Total number of seek operations (seek + seek_many).
+    pub seeks: Counter,
 }
 
 impl ConsumerMetrics {
     /// Create new consumer metrics.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record a seek operation.
+    ///
+    /// Pass `n = 1` for a single-partition seek, or the number of partitions for `seek_many`.
+    #[inline]
+    pub fn record_seek(&self, n: u64) {
+        self.seeks.add(n);
     }
 
     /// Record records received.
@@ -1096,6 +1112,7 @@ impl ConsumerMetrics {
             assigned_partitions: self.assigned_partitions.get(),
             paused_partitions: self.paused_partitions.get(),
             buffered_records: self.buffered_records.get(),
+            seeks: self.seeks.get(),
         }
     }
 }
@@ -1134,6 +1151,8 @@ pub struct ConsumerMetricsSnapshot {
     pub paused_partitions: u64,
     /// Buffered records in recv() buffer.
     pub buffered_records: u64,
+    /// Total seek operations (seek + seek_many partition count).
+    pub seeks: u64,
 }
 
 /// Connection pool metrics.
@@ -1461,6 +1480,7 @@ mod tests {
         let metrics = ConsumerMetrics::new();
         metrics.record_receive(10, 500);
         metrics.record_poll(10);
+        metrics.record_seek(3);
         metrics.assigned_partitions.set(3);
 
         let output = metrics.to_prometheus_text("krafka_consumer");
@@ -1468,6 +1488,7 @@ mod tests {
         assert!(output.contains("# TYPE krafka_consumer_records_received_total counter"));
         assert!(output.contains("krafka_consumer_records_received_total 10"));
         assert!(output.contains("krafka_consumer_bytes_received_total 500"));
+        assert!(output.contains("krafka_consumer_seeks_total 3"));
         assert!(output.contains("krafka_consumer_assigned_partitions 3"));
     }
 
@@ -1526,19 +1547,23 @@ mod tests {
     fn test_krafka_metrics_reset() {
         let registry = KrafkaMetrics::new();
         let producer = registry.producer_metrics();
+        let consumer = registry.consumer_metrics();
         let connection = registry.connection_metrics();
 
         producer.record_send(100);
+        consumer.record_seek(2);
         connection.record_high_priority_request();
         connection.record_high_priority_bypass_yield();
         connection.record_throttle_delay(Duration::from_millis(10));
         assert_eq!(producer.records_sent.get(), 1);
+        assert_eq!(consumer.seeks.get(), 2);
         assert_eq!(connection.high_priority_requests.get(), 1);
         assert_eq!(connection.high_priority_bypass_yields.get(), 1);
         assert_eq!(connection.throttle_delay_ms.get(), 10);
 
         registry.reset();
         assert_eq!(producer.records_sent.get(), 0);
+        assert_eq!(consumer.seeks.get(), 0);
         assert_eq!(connection.high_priority_requests.get(), 0);
         assert_eq!(connection.high_priority_bypass_yields.get(), 0);
         assert_eq!(connection.throttle_delay_ms.get(), 0);

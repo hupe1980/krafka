@@ -44,6 +44,38 @@ let (schema_id, payload) = decode_wire_format(&record.value.unwrap())?;
 // Use schema_id to look up the schema, then deserialize payload
 ```
 
+If you need owned bytes (for example, to move payload data across an `.await`
+boundary), use `decode_wire_format_owned()`:
+
+```rust
+use krafka::schema_registry::decode_wire_format_owned;
+
+let (schema_id, payload) = decode_wire_format_owned(&record.value.unwrap())?;
+// payload: Vec<u8>
+```
+
+You can also detect wire format before dispatching to Confluent/Glue-specific
+decoders:
+
+```rust
+use krafka::schema_registry::{detect_wire_format, DetectedWireFormat};
+
+match detect_wire_format(data) {
+    DetectedWireFormat::Confluent { schema_id, payload_offset } => {
+        // route to Confluent registry
+    }
+    DetectedWireFormat::Glue { version_id, payload_offset } => {
+        // route to Glue registry
+    }
+    DetectedWireFormat::InvalidConfluent | DetectedWireFormat::InvalidGlue => {
+        // reject malformed framed data
+    }
+    DetectedWireFormat::Unknown | _ => {
+        // passthrough or custom handling
+    }
+}
+```
+
 ### Zero-Copy Decoding with `Bytes`
 
 When working with `Bytes` values (e.g., from `CompactedTable`), use `decode_wire_format_bytes()` for zero-copy slicing — the returned payload shares the same backing allocation:
@@ -168,6 +200,13 @@ let by_id = cached.get_schema_by_id(latest.id).await?; // cache hit
 println!("Cached schemas: {}", cached.cache_len());
 cached.clear_cache();
 
+// Invalidate one entry or all entries
+cached.invalidate(1);
+cached.invalidate_all();
+
+// Optional: pre-warm immutable IDs at startup
+cached.warm_cache(&[1, 2, 3]).await?;
+
 // Optional: bound cache growth by evicting the oldest inserted IDs
 let bounded = CachedSchemaRegistry::with_max_entries(other_registry, 1024);
 ```
@@ -180,13 +219,24 @@ let fut = <_ as krafka::schema_registry::SchemaRegistryClient>::get_schema_by_id
 
 `CachedGlueSchemaRegistry` follows the same rules for AWS Glue schema version IDs: immutable-ID caching, concurrent miss coalescing, and optional bounded eviction via `with_max_entries()`.
 
+For provider-agnostic cache lifecycle operations, both wrappers implement `AnySchemaCache`:
+
+```rust
+use krafka::schema_registry::{AnySchemaCache, CachedSchemaRegistry, SchemaId};
+
+async fn reset_and_prewarm(cache: &dyn AnySchemaCache<Id = SchemaId>) -> krafka::Result<()> {
+    cache.invalidate_all();
+    cache.warm_cache(&[1, 2, 3]).await
+}
+```
+
 ## Confluent Schema Registry HTTP Client
 
 Enable the `schema-registry` feature to use the built-in HTTP client:
 
 ```toml
 [dependencies]
-krafka = { version = "0.7.0", features = ["schema-registry"] }
+krafka = { version = "0.8.0", features = ["schema-registry"] }
 ```
 
 ### Basic Usage
@@ -368,6 +418,7 @@ producer.send("my-topic", Some(b"key"), &framed).await?;
 
 // Decoding
 let (version_id, payload) = decode_glue_wire_format(&record_bytes)?;
+let payload = payload.as_ref();
 ```
 
 ZLIB compression is supported out of the box:
@@ -378,6 +429,7 @@ let framed = encode_glue_wire_format(uuid, &payload, GlueCompression::Zlib)?;
 
 // Decode automatically decompresses
 let (version_id, original) = decode_glue_wire_format(&framed)?;
+let original = original.as_ref();
 ```
 
 > **Note:** ZLIB decompression output is capped at 128 MiB to protect against decompression bombs, matching the limit used by record-batch decompression.
@@ -400,7 +452,7 @@ Enable the `aws-glue-schema-registry` feature to use the built-in SDK client:
 
 ```toml
 [dependencies]
-krafka = { version = "0.7.0", features = ["aws-glue-schema-registry"] }
+krafka = { version = "0.8.0", features = ["aws-glue-schema-registry"] }
 ```
 
 ```rust
@@ -421,9 +473,38 @@ let registry = CachedGlueSchemaRegistry::new(
 
 // Decode and look up schema
 let (version_id, payload) = decode_glue_wire_format(&record_bytes)?;
+let payload = payload.as_ref();
 let schema = registry.get_schema_by_version_id(version_id).await?;
 // Deserialize payload using schema.schema_definition
 ```
+
+### Unified Decoder Dispatch
+
+Use `SchemaDecoder` to centralize Confluent/Glue dispatch and schema lookups:
+
+```rust
+use krafka::schema_registry::{SchemaDecoder, SchemaFormat};
+
+let decoder = SchemaDecoder::new()
+    .with_confluent(&confluent_registry)
+    .with_glue(&glue_registry);
+
+let decoded = decoder.decode(data).await?;
+match decoded.schema_format {
+    SchemaFormat::Unknown => {
+        // pass through non-schema-framed payload
+    }
+    _ => {
+        // decoded.payload + decoded.schema_metadata are available
+    }
+}
+```
+
+    `SchemaDecoder::decode()` biases toward safe passthrough on ambiguous payloads
+    whose first byte collides with a Confluent (`0x00`) or Glue (`0x03`) framing
+    prefix but do not carry a complete valid header. If you need strict malformed
+    header rejection, call `detect_wire_format()` and the low-level
+    `decode_wire_format()` / `decode_glue_wire_format()` helpers directly.
 
 Advanced configuration via the builder:
 

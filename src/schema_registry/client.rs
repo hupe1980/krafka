@@ -575,8 +575,18 @@ impl ConfluentSchemaRegistryBuilder {
     }
 
     /// Set the HTTP request timeout.
+    ///
+    /// To remove a previously set timeout, call [`clear_request_timeout()`](Self::clear_request_timeout).
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = Some(timeout);
+        self
+    }
+
+    /// Clear any explicit HTTP request timeout override.
+    ///
+    /// Equivalent to removing a timeout set via [`request_timeout()`](Self::request_timeout).
+    pub fn clear_request_timeout(mut self) -> Self {
+        self.request_timeout = None;
         self
     }
 
@@ -626,6 +636,7 @@ impl ConfluentSchemaRegistryBuilder {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_builder_missing_url() {
@@ -641,6 +652,82 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(client.base_url, "http://localhost:8081");
+    }
+
+    #[test]
+    fn test_builder_with_request_timeout() {
+        let builder = ConfluentSchemaRegistryBuilder::default()
+            .url("http://localhost:8081")
+            .request_timeout(Duration::from_secs(2));
+        assert_eq!(builder.request_timeout, Some(Duration::from_secs(2)));
+
+        let client = builder.build().unwrap();
+        assert_eq!(client.base_url, "http://localhost:8081");
+    }
+
+    #[test]
+    fn test_builder_clear_request_timeout() {
+        let builder = ConfluentSchemaRegistryBuilder::default()
+            .url("http://localhost:8081")
+            .request_timeout(Duration::from_secs(2))
+            .clear_request_timeout();
+        assert_eq!(builder.request_timeout, None);
+
+        let client = builder.build().unwrap();
+        assert_eq!(client.base_url, "http://localhost:8081");
+    }
+
+    #[tokio::test]
+    async fn test_builder_request_timeout_applies_to_built_client() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        let client = ConfluentSchemaRegistryBuilder::default()
+            .url(format!("http://{addr}"))
+            .request_timeout(Duration::from_millis(30))
+            .build()
+            .unwrap();
+
+        let timed = tokio::time::timeout(Duration::from_secs(2), client.get_schema_by_id(1))
+            .await
+            .expect("request_timeout should complete the request with an error");
+        let err = timed.unwrap_err();
+
+        assert!(err.to_string().contains("request failed"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_builder_clear_request_timeout_removes_client_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        let client = ConfluentSchemaRegistryBuilder::default()
+            .url(format!("http://{addr}"))
+            .request_timeout(Duration::from_millis(20))
+            .clear_request_timeout()
+            .build()
+            .unwrap();
+
+        let result =
+            tokio::time::timeout(Duration::from_millis(150), client.get_schema_by_id(1)).await;
+        assert!(
+            result.is_err(),
+            "request unexpectedly completed with cleared timeout"
+        );
+
+        server.abort();
     }
 
     #[test]

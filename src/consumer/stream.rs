@@ -23,11 +23,12 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures_core::Stream;
+use futures_core::stream::FusedStream;
 use tokio_util::sync::ReusableBoxFuture;
 
 use super::Consumer;
 use super::record::ConsumerRecord;
-use crate::error::Result;
+use crate::error::{RecvError, Result};
 
 /// Async stream of [`ConsumerRecord`]s from a [`Consumer`].
 ///
@@ -37,14 +38,17 @@ use crate::error::Result;
 ///
 /// The stream terminates (returns `None`) when the consumer is closed.
 /// Errors from the broker or network are propagated as `Some(Err(...))`.
+///
+/// This type also implements [`FusedStream`], so stream combinators such as
+/// `futures::stream::select` can detect termination without an extra poll.
 pub struct ConsumerStream<'a> {
     consumer: &'a Consumer,
     /// Reusable boxed future for the in-progress `recv()` call.
     /// Avoids a fresh heap allocation per record by reusing the box
     /// when the future's size and alignment match (which they always
     /// do since `recv()` returns the same concrete type each time).
-    fut: ReusableBoxFuture<'a, Result<Option<ConsumerRecord>>>,
-    /// Set to `true` once `recv()` returns `Ok(None)` (consumer closed).
+    fut: ReusableBoxFuture<'a, std::result::Result<ConsumerRecord, RecvError>>,
+    /// Set to `true` once `recv()` returns `Err(RecvError::Closed)`.
     /// After that, `poll_next` returns `None` without starting new calls.
     done: bool,
 }
@@ -73,22 +77,32 @@ impl Stream for ConsumerStream<'_> {
         match this.fut.poll(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(result) => match result {
-                Ok(Some(record)) => {
+                Ok(record) => {
                     // Reuse the allocation for the next recv() call.
                     this.fut.set(this.consumer.recv());
                     Poll::Ready(Some(Ok(record)))
                 }
-                Ok(None) => {
+                Err(RecvError::Closed) => {
                     // Consumer closed — fuse the stream.
                     this.done = true;
                     Poll::Ready(None)
                 }
-                Err(e) => {
+                Err(RecvError::Error(e)) => {
                     // Reuse the allocation for the next recv() call.
                     this.fut.set(this.consumer.recv());
                     Poll::Ready(Some(Err(e)))
                 }
             },
         }
+    }
+}
+
+impl FusedStream for ConsumerStream<'_> {
+    /// Returns `true` after the consumer has been closed.
+    ///
+    /// Stream combinators (e.g. `select`, `merge`) use this to short-circuit
+    /// polling after the consumer shuts down.
+    fn is_terminated(&self) -> bool {
+        self.done
     }
 }

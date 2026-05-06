@@ -35,6 +35,7 @@ pub use transaction::{
 };
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -53,8 +54,20 @@ use crate::protocol::{
     VersionedEncode, versions,
 };
 
-use self::barrier::InFlightBarrier;
+use self::barrier::{InFlightBarrier, InFlightOpGuard};
 use self::record::{RoutedRecord, TopicHandle};
+
+struct SendMemoryReservation {
+    bytes: usize,
+    memory_permits: Arc<Semaphore>,
+    _buffered_record_guard: accumulator::BufferedRecordGuard,
+}
+
+impl Drop for SendMemoryReservation {
+    fn drop(&mut self) {
+        self.memory_permits.add_permits(self.bytes);
+    }
+}
 
 /// A Kafka producer.
 pub struct Producer {
@@ -74,6 +87,12 @@ pub struct Producer {
     retry_policy: RetryPolicy,
     /// Shared metrics.
     metrics: Arc<ProducerMetricsInner>,
+    /// FIFO memory gate used by the direct-send path when linger = 0.
+    memory_permits: Arc<Semaphore>,
+    /// Effective producer memory capacity after semaphore-limit clamping.
+    memory_capacity: usize,
+    /// Number of records currently admitted into the direct-send path.
+    buffered_records: Arc<AtomicUsize>,
     /// Semaphore limiting concurrent in-flight requests per producer.
     in_flight_semaphore: Arc<Semaphore>,
     /// Producer interceptor.
@@ -441,6 +460,37 @@ impl Producer {
         ProducerBuilder::default()
     }
 
+    async fn reserve_send_memory(&self, record_size: usize) -> Result<SendMemoryReservation> {
+        accumulator::check_record_admission(record_size, self.memory_capacity)?;
+
+        let permit = match tokio::time::timeout(
+            self.config.max_block,
+            self.memory_permits.acquire_many(record_size as u32),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(KrafkaError::invalid_state("producer memory gate closed")),
+            Err(_) => {
+                return Err(KrafkaError::timeout(
+                    "producer send: max_block exceeded while waiting for buffer memory \
+                     (ProducerConfig::max_block)",
+                ));
+            }
+        };
+
+        permit.forget();
+
+        Ok(SendMemoryReservation {
+            bytes: record_size,
+            memory_permits: self.memory_permits.clone(),
+            _buffered_record_guard: accumulator::BufferedRecordGuard::new(
+                self.buffered_records.clone(),
+                self.metrics.clone(),
+            ),
+        })
+    }
+
     /// Create a new producer with the given configuration.
     async fn new(
         config: ProducerConfig,
@@ -516,6 +566,16 @@ impl Producer {
 
         // Shared metrics
         let metrics = Arc::new(ProducerMetricsInner::default());
+        let memory_capacity = accumulator::effective_memory_capacity(config.buffer_memory);
+        let memory_permits = Arc::new(Semaphore::new(memory_capacity));
+        let buffered_records = Arc::new(AtomicUsize::new(0));
+
+        if config.buffer_memory == 0 {
+            warn!(
+                "buffer_memory=0 disables producer backpressure; \
+                 memory usage is unbounded. Not recommended for production."
+            );
+        }
 
         // In-flight semaphore (shared between direct and batched send paths)
         let in_flight_semaphore = Arc::new(Semaphore::new(config.max_in_flight));
@@ -557,6 +617,9 @@ impl Producer {
             in_flight_barrier,
             retry_policy,
             metrics,
+            memory_permits,
+            memory_capacity,
+            buffered_records,
             in_flight_semaphore,
             interceptor,
             identity,
@@ -649,8 +712,8 @@ impl Producer {
         }
 
         // Direct send (non-batched mode when linger = 0)
-        let _operation_guard = operation_guard;
-        self.send_to_partition(topic, partition, record).await
+        self.send_to_partition(topic, partition, record, record_size, operation_guard)
+            .await
     }
 
     /// Send a record to a specific partition.
@@ -665,7 +728,12 @@ impl Producer {
         topic: TopicHandle,
         partition: PartitionId,
         record: RoutedRecord,
+        record_size: usize,
+        operation_guard: InFlightOpGuard,
     ) -> Result<RecordMetadata> {
+        let _operation_guard = operation_guard;
+        let _memory_reservation = self.reserve_send_memory(record_size).await?;
+
         // Build the owned topic string once for RecordMetadata construction,
         // avoiding repeated allocations in the retry loop.
         let topic_owned = topic.to_string();
@@ -1127,6 +1195,7 @@ impl Producer {
             bytes_sent: self.metrics.bytes_sent.get(),
             errors: self.metrics.errors.get(),
             retries: self.metrics.retries.get(),
+            buffered_records: self.metrics.buffered_records.get(),
         }
     }
 
@@ -1159,6 +1228,7 @@ impl Drop for Producer {
 
 /// Producer metrics snapshot.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ProducerMetricsSnapshot {
     /// Number of active connections.
     pub connections: usize,
@@ -1170,6 +1240,8 @@ pub struct ProducerMetricsSnapshot {
     pub errors: u64,
     /// Total retries.
     pub retries: u64,
+    /// Records currently admitted under the producer memory budget.
+    pub buffered_records: u64,
 }
 
 /// Builder for creating producers.
@@ -1736,12 +1808,66 @@ mod tests {
             bytes_sent: 50000,
             errors: 2,
             retries: 5,
+            buffered_records: 7,
         };
         assert_eq!(snapshot.connections, 3);
         assert_eq!(snapshot.records_sent, 100);
         assert_eq!(snapshot.bytes_sent, 50000);
         assert_eq!(snapshot.errors, 2);
         assert_eq!(snapshot.retries, 5);
+        assert_eq!(snapshot.buffered_records, 7);
+    }
+
+    #[tokio::test]
+    async fn test_direct_send_rejects_record_larger_than_buffer_memory() {
+        let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
+        let metadata = Arc::new(ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool.clone(),
+            Duration::from_secs(300),
+        ));
+        let metrics = Arc::new(ProducerMetricsInner::default());
+
+        let producer = Producer {
+            config: ProducerConfig {
+                buffer_memory: 16,
+                ..ProducerConfig::default()
+            },
+            metadata,
+            pool,
+            partitioner: Arc::new(DefaultPartitioner::new()),
+            accumulator: None,
+            in_flight_barrier: Arc::new(InFlightBarrier::new()),
+            retry_policy: RetryPolicy::default(),
+            metrics: metrics.clone(),
+            memory_permits: Arc::new(Semaphore::new(16)),
+            memory_capacity: 16,
+            buffered_records: Arc::new(AtomicUsize::new(0)),
+            in_flight_semaphore: Arc::new(Semaphore::new(1)),
+            interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
+            identity: None,
+        };
+
+        let record = RoutedRecord {
+            key: None,
+            value: Bytes::from(vec![0u8; 1024]),
+            timestamp: None,
+            headers: Vec::new(),
+        };
+
+        let err = producer
+            .send_to_partition(
+                Arc::<str>::from("topic"),
+                0,
+                record,
+                1024,
+                producer.in_flight_barrier.start("producer").unwrap(),
+            )
+            .await
+            .expect_err("direct send must reject records larger than buffer_memory");
+
+        assert!(err.to_string().contains("buffer_memory"));
+        assert_eq!(metrics.buffered_records.get(), 0);
     }
 
     #[test]

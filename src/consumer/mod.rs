@@ -61,7 +61,10 @@ pub use record::{ConsumerRecord, ConsumerRecords, TopicPartition};
 pub use stream::ConsumerStream;
 
 use std::collections::{HashMap, HashSet};
+use std::future::{Future, Ready, ready};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex as SyncMutex;
@@ -69,7 +72,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use crate::auth::AuthConfig;
-use crate::error::{KrafkaError, Result};
+use crate::error::{KrafkaError, RecvError, Result};
 use crate::metadata::{BrokerInfo, ClusterMetadata, TopicInfo};
 use crate::metrics::{ConnectionMetrics, ConsumerMetrics};
 use crate::network::{ConnectionConfig, ConnectionPool};
@@ -178,6 +181,57 @@ pub struct FetchMetadataResult {
     pub topics: Vec<TopicInfo>,
 }
 
+/// Outcome of [`Consumer::batch_recv`].
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum BatchRecvOutcome {
+    /// Records were collected (possibly a partial batch).
+    Records(Vec<ConsumerRecord>),
+    /// The timeout elapsed before any records were collected.
+    TimedOut,
+    /// The consumer closed before any records were collected.
+    Closed,
+    /// The call requested zero records (`max_records == 0`).
+    EmptyRequest,
+}
+
+type CommitRequestOffsets = HashMap<(String, PartitionId), (i64, Option<String>)>;
+
+/// Handle returned by [`Consumer::commit_async`].
+///
+/// Await the handle to observe the final commit outcome. Dropping it detaches
+/// the background task and discards the result.
+#[must_use = "await the returned handle to observe async offset commit outcome"]
+pub enum OffsetCommitHandle {
+    /// Immediate commit result without spawning a background task.
+    Ready(Ready<Result<()>>),
+    /// Background task handle that resolves to the commit result.
+    Task(tokio::task::JoinHandle<Result<()>>),
+}
+
+impl OffsetCommitHandle {
+    fn ready(result: Result<()>) -> Self {
+        Self::Ready(ready(result))
+    }
+}
+
+impl Future for OffsetCommitHandle {
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.get_mut() {
+            Self::Ready(fut) => Pin::new(fut).poll(cx),
+            Self::Task(handle) => match Pin::new(handle).poll(cx) {
+                Poll::Ready(Ok(result)) => Poll::Ready(result),
+                Poll::Ready(Err(error)) => Poll::Ready(Err(KrafkaError::invalid_state(format!(
+                    "consumer commit task failed: {error}"
+                )))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+}
+
 /// A Kafka consumer.
 pub struct Consumer {
     /// Consumer configuration.
@@ -260,6 +314,207 @@ fn compute_aggregate_lag(
         }
     }
     (total_lag, max_lag)
+}
+
+fn seed_initial_offsets_for_assigned(
+    assigned: &HashMap<String, Vec<PartitionId>>,
+    initial_offsets: &HashMap<(String, PartitionId), Offset>,
+    stored_offsets: &mut HashMap<(String, PartitionId), Offset>,
+) -> usize {
+    let mut inserted = 0;
+    for ((topic, partition), &initial) in initial_offsets {
+        if !assigned
+            .get(topic)
+            .is_some_and(|partitions| partitions.contains(partition))
+        {
+            continue;
+        }
+
+        let key = (topic.clone(), *partition);
+        if let std::collections::hash_map::Entry::Vacant(e) = stored_offsets.entry(key) {
+            e.insert(initial);
+            inserted += 1;
+        }
+    }
+    inserted
+}
+
+fn apply_seek_many_offsets(
+    stored_offsets: &mut HashMap<(String, PartitionId), Offset>,
+    offsets: &HashMap<(String, PartitionId), Offset>,
+) -> usize {
+    for ((topic, partition), offset) in offsets {
+        stored_offsets.insert((topic.clone(), *partition), *offset);
+    }
+    offsets.len()
+}
+
+fn apply_assignment_offset_precedence(
+    assigned: &HashMap<String, Vec<PartitionId>>,
+    committed: &HashMap<(String, PartitionId), Offset>,
+    initial_offsets: &HashMap<(String, PartitionId), Offset>,
+    stored_offsets: &mut HashMap<(String, PartitionId), Offset>,
+) -> Vec<(String, PartitionId)> {
+    let mut need_reset: Vec<(String, PartitionId)> = Vec::new();
+
+    for (topic, partitions) in assigned {
+        for &partition in partitions {
+            let key = (topic.clone(), partition);
+
+            // Respect user-set offsets (e.g., from seek() in on_partitions_assigned).
+            // If the caller already positioned this partition, do not overwrite.
+            if stored_offsets.contains_key(&key) {
+                continue;
+            }
+
+            if let Some(&offset) = committed.get(&key)
+                && offset >= 0
+            {
+                stored_offsets.insert(key, offset);
+                continue;
+            }
+
+            // No committed offset — try caller-supplied initial_offsets before
+            // falling back to auto_offset_reset.
+            if let Some(&initial) = initial_offsets.get(&key) {
+                stored_offsets.insert(key, initial);
+                continue;
+            }
+
+            need_reset.push(key);
+        }
+    }
+
+    need_reset
+}
+
+async fn batch_recv_with<FClosed, FPoll, FPollFut, FSetBuffered>(
+    recv_buffer: &SyncMutex<std::collections::VecDeque<ConsumerRecord>>,
+    mut set_buffered_records: FSetBuffered,
+    max_records: usize,
+    timeout: Duration,
+    is_closed: FClosed,
+    mut poll: FPoll,
+) -> Result<BatchRecvOutcome>
+where
+    FClosed: Fn() -> bool,
+    FPoll: FnMut(Duration) -> FPollFut,
+    FPollFut: Future<Output = Result<Vec<ConsumerRecord>>>,
+    FSetBuffered: FnMut(u64),
+{
+    if max_records == 0 {
+        return Ok(BatchRecvOutcome::EmptyRequest);
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut batch = Vec::with_capacity(max_records.min(64));
+
+    loop {
+        // Drain buffer first.
+        {
+            let mut buffer = recv_buffer.lock();
+            while batch.len() < max_records {
+                match buffer.pop_front() {
+                    Some(r) => batch.push(r),
+                    None => break,
+                }
+            }
+            set_buffered_records(buffer.len() as u64);
+        }
+
+        if batch.len() >= max_records {
+            return Ok(BatchRecvOutcome::Records(batch));
+        }
+
+        if is_closed() {
+            return if batch.is_empty() {
+                Ok(BatchRecvOutcome::Closed)
+            } else {
+                Ok(BatchRecvOutcome::Records(batch))
+            };
+        }
+
+        // Compute remaining budget.
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return if batch.is_empty() {
+                Ok(BatchRecvOutcome::TimedOut)
+            } else {
+                Ok(BatchRecvOutcome::Records(batch))
+            };
+        }
+        let remaining = deadline - now;
+
+        match tokio::time::timeout(remaining, poll(remaining)).await {
+            Ok(Ok(records)) => {
+                let before_len = batch.len();
+                let mut iter = records.into_iter();
+                while batch.len() < max_records {
+                    match iter.next() {
+                        Some(r) => batch.push(r),
+                        None => break,
+                    }
+                }
+
+                // Put overflow back into the recv buffer.
+                let leftover: Vec<_> = iter.collect();
+                if !leftover.is_empty() {
+                    let mut buffer = recv_buffer.lock();
+                    for r in leftover.into_iter().rev() {
+                        buffer.push_front(r);
+                    }
+                    set_buffered_records(buffer.len() as u64);
+                }
+
+                if batch.len() >= max_records {
+                    return Ok(BatchRecvOutcome::Records(batch));
+                }
+
+                // Avoid a tight busy loop when poll() returns quickly with no records
+                // (e.g., no assignment, rebalance, or buffer cap).
+                if batch.len() == before_len {
+                    let now_after_poll = tokio::time::Instant::now();
+                    if now_after_poll >= deadline {
+                        return if batch.is_empty() {
+                            Ok(BatchRecvOutcome::TimedOut)
+                        } else {
+                            Ok(BatchRecvOutcome::Records(batch))
+                        };
+                    }
+                    let remaining_after_poll = deadline - now_after_poll;
+                    let backoff = remaining_after_poll.min(Duration::from_millis(10));
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+            Ok(Err(_)) if is_closed() => {
+                return if batch.is_empty() {
+                    Ok(BatchRecvOutcome::Closed)
+                } else {
+                    Ok(BatchRecvOutcome::Records(batch))
+                };
+            }
+            Ok(Err(e)) => {
+                // Preserve delivery semantics: if we already drained buffered
+                // records before this poll error, put them back so callers
+                // can retry without data loss.
+                if !batch.is_empty() {
+                    let mut buffer = recv_buffer.lock();
+                    for record in batch.into_iter().rev() {
+                        buffer.push_front(record);
+                    }
+                    set_buffered_records(buffer.len() as u64);
+                }
+                return Err(e);
+            }
+            Err(_elapsed) => {
+                return if batch.is_empty() {
+                    Ok(BatchRecvOutcome::TimedOut)
+                } else {
+                    Ok(BatchRecvOutcome::Records(batch))
+                };
+            }
+        }
+    }
 }
 
 /// Result of routing assigned partitions to brokers for fetching.
@@ -1372,46 +1627,17 @@ impl Consumer {
         // Fetch committed offsets
         let committed = coordinator.fetch_committed_offsets(assigned).await?;
 
-        // Determine which partitions are missing committed offsets
-        let mut need_reset: Vec<(String, PartitionId)> = Vec::new();
         let mut offsets = self.offsets.write().await;
 
         // Log the initial offsets state before processing committed offsets
         debug!("fetch_and_apply: existing offsets: {:?}", *offsets);
 
-        for (topic, partitions) in assigned {
-            for &partition in partitions {
-                let key = (topic.clone(), partition);
-
-                // Respect user-set offsets (e.g., from seek() in on_partitions_assigned).
-                // If the caller already positioned this partition, do not overwrite.
-                if offsets.contains_key(&key) {
-                    debug!(
-                        "Keeping existing offset for {}-{} (user-set or prior)",
-                        topic, partition
-                    );
-                    continue;
-                }
-
-                let committed_val = committed.get(&key);
-                if let Some(&offset) = committed_val
-                    && offset >= 0
-                {
-                    debug!(
-                        "Using committed offset {} for {}-{}",
-                        offset, topic, partition
-                    );
-                    offsets.insert(key, offset);
-                    continue;
-                }
-                // No committed offset or negative (unknown)
-                debug!(
-                    "No committed offset for {}-{} (committed={:?}), will auto-reset",
-                    topic, partition, committed_val
-                );
-                need_reset.push(key);
-            }
-        }
+        let need_reset = apply_assignment_offset_precedence(
+            assigned,
+            &committed,
+            &self.config.initial_offsets,
+            &mut offsets,
+        );
 
         if need_reset.is_empty() {
             return Ok(());
@@ -1528,6 +1754,21 @@ impl Consumer {
         &self,
         assigned: &HashMap<String, Vec<PartitionId>>,
     ) -> Result<()> {
+        // Pre-seed any caller-supplied initial offsets for newly assigned
+        // partitions that don't yet have a tracked position. These override
+        // `auto_offset_reset`.
+        if !self.config.initial_offsets.is_empty() {
+            let mut offsets = self.offsets.write().await;
+            let inserted = seed_initial_offsets_for_assigned(
+                assigned,
+                &self.config.initial_offsets,
+                &mut offsets,
+            );
+            if inserted > 0 {
+                debug!("Applied {} assignment-time initial offsets", inserted);
+            }
+        }
+
         // Collect partitions that don't already have a tracked offset
         let need_reset: Vec<(String, PartitionId)> = {
             let offsets = self.offsets.read().await;
@@ -1593,7 +1834,39 @@ impl Consumer {
             offsets.insert((topic.to_string(), partition), offset);
         }
         self.recompute_lag_metrics().await;
+        self.metrics.record_seek(1);
         debug!("Seek to offset {} for {}-{}", offset, topic, partition);
+        Ok(())
+    }
+
+    /// Seek multiple partitions to the given offsets in one atomic update.
+    ///
+    /// Equivalent to calling [`seek`](Self::seek) for each entry, but acquires
+    /// the offset lock only once and recomputes lag metrics once at the end.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::collections::HashMap;
+    ///
+    /// consumer
+    ///     .seek_many(&HashMap::from([
+    ///         (("orders".to_string(), 0), 1_000),
+    ///         (("orders".to_string(), 1), 2_000),
+    ///     ]))
+    ///     .await?;
+    /// ```
+    pub async fn seek_many(&self, offsets: &HashMap<(String, PartitionId), Offset>) -> Result<()> {
+        if offsets.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut stored = self.offsets.write().await;
+            apply_seek_many_offsets(&mut stored, offsets);
+        }
+        self.recompute_lag_metrics().await;
+        self.metrics.record_seek(offsets.len() as u64);
+        debug!("Sought {} partitions via seek_many", offsets.len());
         Ok(())
     }
 
@@ -2089,33 +2362,108 @@ impl Consumer {
                     "Retrying offset resolution for {} partition(s) without tracked offsets",
                     missing.len()
                 );
-                let mut reset_partitions: HashMap<String, Vec<PartitionId>> = HashMap::new();
-                for (topic, partition) in &missing {
-                    reset_partitions
-                        .entry(topic.clone())
-                        .or_default()
-                        .push(*partition);
+
+                let mut still_missing = missing;
+
+                // For group consumers, always re-check committed offsets first.
+                // Only partitions with no committed offset may fall back to
+                // caller-supplied initial_offsets.
+                let mut committed_fetch_failed = false;
+                if let Some(ref coordinator) = self.group_coordinator {
+                    let mut topic_map: HashMap<String, Vec<PartitionId>> = HashMap::new();
+                    for (topic, partition) in &still_missing {
+                        topic_map.entry(topic.clone()).or_default().push(*partition);
+                    }
+
+                    if !topic_map.is_empty() {
+                        match coordinator.fetch_committed_offsets(&topic_map).await {
+                            Ok(committed) => {
+                                let mut offsets = self.offsets.write().await;
+                                still_missing.retain(|key| {
+                                    if let Some(&offset) = committed.get(key)
+                                        && offset >= 0
+                                    {
+                                        offsets.insert(key.clone(), offset);
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Retry committed-offset fetch failed; deferring offset resolution until retry: {}",
+                                    e
+                                );
+                                committed_fetch_failed = true;
+                            }
+                        }
+                    }
                 }
 
-                // Use group coordinator path if available, otherwise direct path
-                if let Some(ref coordinator) = self.group_coordinator {
-                    if let Some(timestamp) = self.config.auto_offset_reset.to_offset() {
-                        match coordinator.list_offsets(&reset_partitions, timestamp).await {
-                            Ok(resolved) => {
-                                let mut offsets = self.offsets.write().await;
-                                for (key, offset) in &resolved {
-                                    offsets.insert(key.clone(), *offset);
-                                }
-                                drop(offsets);
+                if !committed_fetch_failed {
+                    if !self.config.initial_offsets.is_empty() {
+                        let mut offsets = self.offsets.write().await;
+                        still_missing.retain(|key| {
+                            if let Some(&initial) = self.config.initial_offsets.get(key) {
+                                debug!(
+                                    "Poll retry: using initial_offsets {} for {}-{}",
+                                    initial, key.0, key.1
+                                );
+                                offsets.insert(key.clone(), initial);
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                    }
 
-                                // Fallback for partitions the coordinator path
-                                // silently dropped (partition-level errors).
-                                for (topic, partition) in &missing {
-                                    if !resolved.contains_key(&(topic.clone(), *partition)) {
-                                        debug!(
-                                            "Poll retry: falling back to direct ListOffsets for {}-{}",
-                                            topic, partition
-                                        );
+                    if still_missing.is_empty() {
+                        self.recompute_lag_metrics().await;
+                        return Ok(Vec::new());
+                    }
+
+                    let mut reset_partitions: HashMap<String, Vec<PartitionId>> = HashMap::new();
+                    for (topic, partition) in &still_missing {
+                        reset_partitions
+                            .entry(topic.clone())
+                            .or_default()
+                            .push(*partition);
+                    }
+
+                    // Use group coordinator path if available, otherwise direct path
+                    if let Some(ref coordinator) = self.group_coordinator {
+                        if let Some(timestamp) = self.config.auto_offset_reset.to_offset() {
+                            match coordinator.list_offsets(&reset_partitions, timestamp).await {
+                                Ok(resolved) => {
+                                    let mut offsets = self.offsets.write().await;
+                                    for (key, offset) in &resolved {
+                                        offsets.insert(key.clone(), *offset);
+                                    }
+                                    drop(offsets);
+
+                                    // Fallback for partitions the coordinator path
+                                    // silently dropped (partition-level errors).
+                                    for (topic, partition) in &still_missing {
+                                        if !resolved.contains_key(&(topic.clone(), *partition)) {
+                                            debug!(
+                                                "Poll retry: falling back to direct ListOffsets for {}-{}",
+                                                topic, partition
+                                            );
+                                            if let Ok(offset) = self
+                                                .resolve_list_offset(topic, *partition, timestamp)
+                                                .await
+                                            {
+                                                let mut offsets = self.offsets.write().await;
+                                                offsets.insert((topic.clone(), *partition), offset);
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Offset resolution retry via coordinator failed: {}", e);
+                                    // Fall back to direct path for all still-missing partitions
+                                    for (topic, partition) in &still_missing {
                                         if let Ok(offset) = self
                                             .resolve_list_offset(topic, *partition, timestamp)
                                             .await
@@ -2126,22 +2474,10 @@ impl Consumer {
                                     }
                                 }
                             }
-                            Err(e) => {
-                                warn!("Offset resolution retry via coordinator failed: {}", e);
-                                // Fall back to direct path for all missing partitions
-                                for (topic, partition) in &missing {
-                                    if let Ok(offset) =
-                                        self.resolve_list_offset(topic, *partition, timestamp).await
-                                    {
-                                        let mut offsets = self.offsets.write().await;
-                                        offsets.insert((topic.clone(), *partition), offset);
-                                    }
-                                }
-                            }
                         }
+                    } else if let Err(e) = self.apply_auto_offset_reset(&reset_partitions).await {
+                        warn!("Auto-offset-reset failed for missing partitions: {e}");
                     }
-                } else if let Err(e) = self.apply_auto_offset_reset(&reset_partitions).await {
-                    warn!("Auto-offset-reset failed for missing partitions: {e}");
                 }
 
                 // Recompute lag after resolving offsets for missing partitions
@@ -2153,7 +2489,7 @@ impl Consumer {
                 {
                     let offsets = self.offsets.read().await;
                     let mut partition_state = self.partition_state.write().await;
-                    for (topic, partition) in &missing {
+                    for (topic, partition) in &still_missing {
                         let key = (topic.clone(), *partition);
                         if offsets.contains_key(&key) {
                             // Successfully resolved — clear backoff.
@@ -2948,20 +3284,34 @@ impl Consumer {
     /// Internally buffers records from `poll()` and returns them one by one,
     /// ensuring no records are lost.
     ///
-    /// Returns `Ok(None)` if the consumer is closed, or `Err` on failure.
-    pub async fn recv(&self) -> Result<Option<ConsumerRecord>> {
+    /// Returns `Err(RecvError::Closed)` when the consumer is shut down.
+    /// Returns `Err(RecvError::Error(e))` on broker or network failures.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// loop {
+    ///     match consumer.recv().await {
+    ///         Ok(record)               => process(record),
+    ///         Err(RecvError::Closed)   => break,
+    ///         Err(RecvError::Error(e)) => return Err(e),
+    ///         _ => break, // future variants (non_exhaustive)
+    ///     }
+    /// }
+    /// ```
+    pub async fn recv(&self) -> std::result::Result<ConsumerRecord, RecvError> {
         loop {
             // Return buffered records first
             {
                 let mut buffer = self.recv_buffer.lock();
                 if let Some(record) = buffer.pop_front() {
                     self.metrics.buffered_records.set(buffer.len() as u64);
-                    return Ok(Some(record));
+                    return Ok(record);
                 }
             }
 
             if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
-                return Ok(None);
+                return Err(RecvError::Closed);
             }
 
             match self.poll(Duration::from_secs(1)).await {
@@ -2977,17 +3327,69 @@ impl Consumer {
                         buffer.extend(iter);
                         self.metrics.buffered_records.set(buffer.len() as u64);
                     }
-                    return Ok(Some(first));
+                    return Ok(first);
                 }
                 Ok(_) => continue,
-                Err(_) if self.closed.load(std::sync::atomic::Ordering::SeqCst) => {
-                    return Ok(None);
-                }
                 Err(e) => {
-                    return Err(e);
+                    if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(RecvError::Closed);
+                    }
+                    return Err(RecvError::Error(e));
                 }
             }
         }
+    }
+
+    /// Collect up to `max_records` records, waiting at most `timeout`.
+    ///
+    /// Returns as soon as `max_records` have been collected **or** `timeout`
+    /// elapses, whichever comes first.
+    ///
+    /// If the consumer closes after some records were already buffered or
+    /// fetched, those records are returned as a partial batch.
+    ///
+    /// Unlike [`poll()`](Self::poll), which performs a single broker fetch
+    /// round-trip, `batch_recv` drains the internal record buffer first and
+    /// then performs additional fetch rounds until the batch is full or the
+    /// deadline is reached.  It never blocks longer than `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on broker or network errors.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::time::Duration;
+    ///
+    /// use krafka::consumer::BatchRecvOutcome;
+    ///
+    /// match consumer.batch_recv(100, Duration::from_millis(200)).await? {
+    ///     BatchRecvOutcome::Records(records) => {
+    ///         for record in records {
+    ///             println!("{}: {:?}", record.offset, record.value);
+    ///         }
+    ///     }
+    ///     BatchRecvOutcome::TimedOut => {}
+    ///     BatchRecvOutcome::Closed => break,
+    ///     BatchRecvOutcome::EmptyRequest => {}
+    ///     _ => {}
+    /// }
+    /// ```
+    pub async fn batch_recv(
+        &self,
+        max_records: usize,
+        timeout: Duration,
+    ) -> Result<BatchRecvOutcome> {
+        batch_recv_with(
+            &self.recv_buffer,
+            |len| self.metrics.buffered_records.set(len),
+            max_records,
+            timeout,
+            || self.closed.load(std::sync::atomic::Ordering::SeqCst),
+            |remaining| self.poll(remaining),
+        )
+        .await
     }
 
     /// Create an async [`Stream`](futures_core::Stream) of records.
@@ -3010,6 +3412,7 @@ impl Consumer {
     ///     println!("{}: {}", record.topic, record.offset);
     /// }
     /// ```
+    #[must_use = "stream does nothing unless polled"]
     pub fn stream(&self) -> ConsumerStream<'_> {
         ConsumerStream::new(self)
     }
@@ -3020,113 +3423,60 @@ impl Consumer {
     /// When using a consumer group, this sends an OffsetCommit request to the group coordinator.
     /// Offsets for revoked partitions are excluded to avoid overwriting the new owner's progress.
     pub async fn commit(&self) -> Result<()> {
-        let offsets = self.offsets.read().await;
-        if offsets.is_empty() {
-            debug!("No offsets to commit");
-            return Ok(());
-        }
+        let offsets_snapshot = {
+            let offsets = self.offsets.read().await;
+            if offsets.is_empty() {
+                debug!("No offsets to commit");
+                return Ok(());
+            }
+            offsets.clone()
+        };
 
         self.metrics.commits.inc();
 
-        // Build the set of currently assigned partitions, so we don't commit
-        // stale offsets for revoked partitions.
-        let assignments = self.assignments.read().await;
-        let assigned_set: HashSet<(String, PartitionId)> = assignments
-            .iter()
-            .flat_map(|(topic, parts)| parts.iter().map(move |&p| (topic.clone(), p)))
-            .collect();
-
-        // If we have a group coordinator, send actual OffsetCommit request
-        if let Some(ref coordinator) = self.group_coordinator {
-            // Convert offsets to the format expected by coordinator,
-            // filtering to only currently assigned partitions.
-            // Use explicit group check instead of assigned_set.is_empty()
-            // to avoid committing stale offsets when assignments are temporarily empty.
-            let commit_offsets: HashMap<(String, PartitionId), (i64, Option<String>)> = offsets
-                .iter()
-                .filter(|((topic, partition), _)| {
-                    assigned_set.contains(&(topic.clone(), *partition))
-                })
-                .map(|((topic, partition), offset)| ((topic.clone(), *partition), (*offset, None)))
-                .collect();
-
-            if commit_offsets.is_empty() {
-                debug!("No assigned partition offsets to commit");
-                return Ok(());
-            }
-
-            // Only pass actually-committed offsets to interceptor
-            let committed_offsets: HashMap<(String, PartitionId), Offset> = commit_offsets
-                .iter()
-                .map(|((topic, partition), (offset, _))| ((topic.clone(), *partition), *offset))
-                .collect();
-
-            match coordinator.commit_offsets(&commit_offsets).await {
-                Ok(()) => {
-                    crate::interceptor::safe_on_commit(
-                        &*self.interceptor,
-                        &committed_offsets,
-                        None,
-                    );
-                }
-                Err(e) if e.is_retriable() => {
-                    // Retry retriable errors up to 2 more times with short backoff.
-                    let mut last_err = e;
-                    let backoffs = [Duration::from_millis(100), Duration::from_millis(250)];
-                    for delay in &backoffs {
-                        debug!(
-                            "Commit failed with retriable error, retrying in {:?}: {last_err}",
-                            delay
-                        );
-                        tokio::time::sleep(*delay).await;
-                        match coordinator.commit_offsets(&commit_offsets).await {
-                            Ok(()) => {
-                                crate::interceptor::safe_on_commit(
-                                    &*self.interceptor,
-                                    &committed_offsets,
-                                    None,
-                                );
-                                return Ok(());
-                            }
-                            Err(e) if e.is_retriable() => {
-                                last_err = e;
-                            }
-                            Err(e) => {
-                                crate::interceptor::safe_on_commit(
-                                    &*self.interceptor,
-                                    &committed_offsets,
-                                    Some(&e),
-                                );
-                                return Err(e);
-                            }
-                        }
-                    }
-                    // All retries exhausted.
-                    crate::interceptor::safe_on_commit(
-                        &*self.interceptor,
-                        &committed_offsets,
-                        Some(&last_err),
-                    );
-                    return Err(last_err);
-                }
-                Err(e) => {
-                    crate::interceptor::safe_on_commit(
-                        &*self.interceptor,
-                        &committed_offsets,
-                        Some(&e),
-                    );
-                    return Err(e);
-                }
-            }
+        let assigned_set = if self.group_coordinator.is_some() {
+            let assignments = self.assignments.read().await;
+            Some(
+                assignments
+                    .iter()
+                    .flat_map(|(topic, parts)| parts.iter().map(move |&p| (topic.clone(), p)))
+                    .collect::<HashSet<_>>(),
+            )
         } else {
-            // Log offsets for non-group consumers
-            for ((topic, partition), offset) in offsets.iter() {
-                debug!("Committed offset for {}-{}: {}", topic, partition, offset);
-            }
-            info!("Committed {} partition offsets (local only)", offsets.len());
+            None
+        };
+
+        let commit_offsets = Self::build_commit_offsets(
+            &offsets_snapshot,
+            assigned_set.as_ref(),
+            self.group_coordinator.is_some(),
+        )?;
+
+        if commit_offsets.is_empty() {
+            debug!("No assigned partition offsets to commit");
+            return Ok(());
         }
 
-        Ok(())
+        let committed_offsets = Self::build_committed_offsets(&commit_offsets);
+
+        if let Some(coordinator) = self.group_coordinator.clone() {
+            Self::commit_group_offsets_with_retry(
+                coordinator,
+                self.interceptor.clone(),
+                commit_offsets,
+                committed_offsets,
+            )
+            .await
+        } else {
+            for ((topic, partition), offset) in &committed_offsets {
+                debug!("Committed offset for {}-{}: {}", topic, partition, offset);
+            }
+            info!(
+                "Committed {} partition offsets (local only)",
+                committed_offsets.len()
+            );
+            Ok(())
+        }
     }
 
     /// Commit offsets synchronously.
@@ -3136,63 +3486,191 @@ impl Consumer {
 
     /// Commit offsets asynchronously.
     ///
-    /// Spawns the offset commit as a background task. Errors are logged
-    /// but not propagated to the caller. Use `commit_sync()` if you need
-    /// to handle commit errors.
-    pub fn commit_async(&self) {
-        // Snapshot offsets without blocking (try_read avoids async in non-async fn)
-        // Also filter to only assigned partitions
-        let assigned_set: HashSet<(String, PartitionId)> = match self.assignments.try_read() {
-            Ok(guard) => guard
-                .iter()
-                .flat_map(|(topic, parts)| parts.iter().map(move |&p| (topic.clone(), p)))
-                .collect(),
-            Err(_) => HashSet::new(), // If lock contention, include all (safe fallback)
+    /// Spawns the offset commit as a background task.
+    ///
+    /// Await the returned handle to observe offset-snapshot, transport, and
+    /// broker errors. Retriable coordinator failures use the same short
+    /// backoff loop as [`Consumer::commit`]. If the handle is dropped, the
+    /// task continues in the background and its result is discarded.
+    pub fn commit_async(&self) -> OffsetCommitHandle {
+        let assigned_set = if self.group_coordinator.is_some() {
+            match self.assignments.try_read() {
+                Ok(guard) => Some(
+                    guard
+                        .iter()
+                        .flat_map(|(topic, parts)| parts.iter().map(move |&p| (topic.clone(), p)))
+                        .collect::<HashSet<_>>(),
+                ),
+                Err(_) => {
+                    return OffsetCommitHandle::ready(Err(KrafkaError::invalid_state(
+                        "commit_async: assignments lock contention",
+                    )));
+                }
+            }
+        } else {
+            None
         };
 
-        let offsets_snapshot: HashMap<(String, PartitionId), (i64, Option<String>)> = match self
-            .offsets
-            .try_read()
-        {
+        let offsets_snapshot = match self.offsets.try_read() {
             Ok(guard) => {
                 if guard.is_empty() {
-                    return;
+                    return OffsetCommitHandle::ready(Ok(()));
                 }
-                guard
-                    .iter()
-                    .filter(|((topic, partition), _)| {
-                        // Only commit offsets for assigned partitions
-                        // when using group coordination. Manual assign mode commits all.
-                        self.group_coordinator.is_none()
-                            || assigned_set.contains(&(topic.clone(), *partition))
-                    })
-                    .map(|((topic, partition), offset)| {
-                        ((topic.clone(), *partition), (*offset, None))
-                    })
-                    .collect()
+                self.metrics.commits.inc();
+                match Self::build_commit_offsets(
+                    &guard,
+                    assigned_set.as_ref(),
+                    self.group_coordinator.is_some(),
+                ) {
+                    Ok(offsets) => offsets,
+                    Err(error) => return OffsetCommitHandle::ready(Err(error)),
+                }
             }
             Err(_) => {
-                // Log warning on contention so dropped commits are visible
-                tracing::warn!("commit_async: offset lock contention, skipping this commit cycle");
-                return;
+                return OffsetCommitHandle::ready(Err(KrafkaError::invalid_state(
+                    "commit_async: offset lock contention",
+                )));
             }
         };
 
-        let coordinator = self.group_coordinator.clone();
-        let group_id = self.config.group_id.clone();
-        tokio::spawn(async move {
-            if let Some(ref coordinator) = coordinator {
-                if let Err(e) = coordinator.commit_offsets(&offsets_snapshot).await {
-                    tracing::warn!(
-                        group_id = ?group_id,
-                        error = %e,
-                        "Async offset commit failed"
+        if offsets_snapshot.is_empty() {
+            debug!("Async commit: no eligible partition offsets to commit");
+            return OffsetCommitHandle::ready(Ok(()));
+        }
+
+        let committed_offsets: HashMap<(String, PartitionId), Offset> = offsets_snapshot
+            .iter()
+            .map(|((topic, partition), (offset, _))| ((topic.clone(), *partition), *offset))
+            .collect();
+
+        let Some(coordinator) = self.group_coordinator.clone() else {
+            debug!("Async commit: no group coordinator, offsets stored locally");
+            return OffsetCommitHandle::ready(Ok(()));
+        };
+
+        OffsetCommitHandle::Task(tokio::spawn(Self::commit_group_offsets_with_retry(
+            coordinator,
+            self.interceptor.clone(),
+            offsets_snapshot,
+            committed_offsets,
+        )))
+    }
+
+    fn build_commit_offsets(
+        offsets: &HashMap<(String, PartitionId), Offset>,
+        assigned_set: Option<&HashSet<(String, PartitionId)>>,
+        has_group: bool,
+    ) -> Result<CommitRequestOffsets> {
+        if has_group && assigned_set.is_none() {
+            return Err(KrafkaError::invalid_state(
+                "commit_async: assignments snapshot unavailable",
+            ));
+        }
+
+        Ok(offsets
+            .iter()
+            .filter(|((topic, partition), _)| {
+                !has_group
+                    || assigned_set
+                        .is_some_and(|assigned| assigned.contains(&(topic.clone(), *partition)))
+            })
+            .map(|((topic, partition), offset)| ((topic.clone(), *partition), (*offset, None)))
+            .collect())
+    }
+
+    fn build_committed_offsets(
+        commit_offsets: &CommitRequestOffsets,
+    ) -> HashMap<(String, PartitionId), Offset> {
+        commit_offsets
+            .iter()
+            .map(|((topic, partition), (offset, _))| ((topic.clone(), *partition), *offset))
+            .collect()
+    }
+
+    fn filter_commit_with_metadata_offsets(
+        offsets: HashMap<TopicPartition, OffsetAndMetadata>,
+        assigned_set: Option<&HashSet<(String, PartitionId)>>,
+        has_group: bool,
+    ) -> Result<HashMap<TopicPartition, OffsetAndMetadata>> {
+        if has_group && assigned_set.is_none() {
+            return Err(KrafkaError::invalid_state(
+                "commit_with_metadata: assignments snapshot unavailable",
+            ));
+        }
+
+        Ok(offsets
+            .into_iter()
+            .filter(|(tp, _)| {
+                !has_group
+                    || assigned_set.is_some_and(|assigned| {
+                        assigned.contains(&(tp.topic.clone(), tp.partition))
+                    })
+            })
+            .collect())
+    }
+
+    fn build_commit_offsets_with_metadata(
+        filtered_offsets: &HashMap<TopicPartition, OffsetAndMetadata>,
+    ) -> CommitRequestOffsets {
+        filtered_offsets
+            .iter()
+            .map(|(tp, offset_meta)| {
+                (
+                    (tp.topic.clone(), tp.partition),
+                    (offset_meta.offset, offset_meta.metadata.clone()),
+                )
+            })
+            .collect()
+    }
+
+    async fn retry_commit_with<F, Fut>(mut commit_once: F) -> Result<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        match commit_once().await {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_retriable() => {
+                let mut last_error = error;
+                let backoffs = [Duration::from_millis(100), Duration::from_millis(250)];
+                for delay in &backoffs {
+                    debug!(
+                        "Commit failed with retriable error, retrying in {:?}: {last_error}",
+                        delay
                     );
+                    tokio::time::sleep(*delay).await;
+                    match commit_once().await {
+                        Ok(()) => return Ok(()),
+                        Err(error) if error.is_retriable() => {
+                            last_error = error;
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
-            } else {
-                tracing::debug!("Async commit: no group coordinator, offsets stored locally");
+                Err(last_error)
             }
-        });
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn commit_group_offsets_with_retry(
+        coordinator: Arc<GroupCoordinator>,
+        interceptor: Arc<dyn crate::interceptor::ConsumerInterceptor>,
+        commit_offsets: CommitRequestOffsets,
+        committed_offsets: HashMap<(String, PartitionId), Offset>,
+    ) -> Result<()> {
+        let result = Self::retry_commit_with(|| coordinator.commit_offsets(&commit_offsets)).await;
+
+        match result {
+            Ok(()) => {
+                crate::interceptor::safe_on_commit(&*interceptor, &committed_offsets, None);
+                Ok(())
+            }
+            Err(error) => {
+                crate::interceptor::safe_on_commit(&*interceptor, &committed_offsets, Some(&error));
+                Err(error)
+            }
+        }
     }
 
     /// Commit specific offsets with metadata.
@@ -3226,23 +3704,25 @@ impl Consumer {
             return Ok(());
         }
 
-        // Filter to only assigned partitions
-        let assignments = self.assignments.read().await;
-        let filtered_offsets: HashMap<TopicPartition, OffsetAndMetadata> = if assignments.is_empty()
-        {
-            // No group membership — accept all
-            offsets
+        self.metrics.commits.inc();
+
+        let assigned_set = if self.group_coordinator.is_some() {
+            let assignments = self.assignments.read().await;
+            Some(
+                assignments
+                    .iter()
+                    .flat_map(|(topic, parts)| parts.iter().map(move |&p| (topic.clone(), p)))
+                    .collect::<HashSet<_>>(),
+            )
         } else {
-            offsets
-                .into_iter()
-                .filter(|(tp, _)| {
-                    assignments
-                        .get(&tp.topic)
-                        .is_some_and(|ps| ps.contains(&tp.partition))
-                })
-                .collect()
+            None
         };
-        drop(assignments);
+
+        let filtered_offsets = Self::filter_commit_with_metadata_offsets(
+            offsets,
+            assigned_set.as_ref(),
+            self.group_coordinator.is_some(),
+        )?;
 
         if filtered_offsets.is_empty() {
             debug!("No offsets to commit after filtering by assigned partitions");
@@ -3250,41 +3730,17 @@ impl Consumer {
         }
 
         // If we have a group coordinator, send actual OffsetCommit request
-        if let Some(ref coordinator) = self.group_coordinator {
-            // Convert offsets to the format expected by coordinator
-            let commit_offsets: HashMap<(String, PartitionId), (i64, Option<String>)> =
-                filtered_offsets
-                    .iter()
-                    .map(|(tp, offset_meta)| {
-                        (
-                            (tp.topic.clone(), tp.partition),
-                            (offset_meta.offset, offset_meta.metadata.clone()),
-                        )
-                    })
-                    .collect();
+        if let Some(coordinator) = self.group_coordinator.clone() {
+            let commit_offsets = Self::build_commit_offsets_with_metadata(&filtered_offsets);
+            let committed_offsets = Self::build_committed_offsets(&commit_offsets);
 
-            let interceptor_offsets: HashMap<(String, PartitionId), i64> = filtered_offsets
-                .iter()
-                .map(|(tp, om)| ((tp.topic.clone(), tp.partition), om.offset))
-                .collect();
-
-            match coordinator.commit_offsets(&commit_offsets).await {
-                Ok(()) => {
-                    crate::interceptor::safe_on_commit(
-                        &*self.interceptor,
-                        &interceptor_offsets,
-                        None,
-                    );
-                }
-                Err(e) => {
-                    crate::interceptor::safe_on_commit(
-                        &*self.interceptor,
-                        &interceptor_offsets,
-                        Some(&e),
-                    );
-                    return Err(e);
-                }
-            }
+            Self::commit_group_offsets_with_retry(
+                coordinator,
+                self.interceptor.clone(),
+                commit_offsets,
+                committed_offsets,
+            )
+            .await?;
 
             // Update internal offset store
             let mut internal_offsets = self.offsets.write().await;
@@ -3301,14 +3757,13 @@ impl Consumer {
                 );
             }
 
+            let count = filtered_offsets.len();
+
             // Update internal offset store
-            let count = {
-                let mut internal_offsets = self.offsets.write().await;
-                for (tp, offset_meta) in filtered_offsets {
-                    internal_offsets.insert((tp.topic, tp.partition), offset_meta.offset);
-                }
-                internal_offsets.len()
-            };
+            let mut internal_offsets = self.offsets.write().await;
+            for (tp, offset_meta) in filtered_offsets {
+                internal_offsets.insert((tp.topic, tp.partition), offset_meta.offset);
+            }
 
             info!(
                 "Committed {} partition offsets with metadata (local only)",
@@ -3417,7 +3872,9 @@ impl Consumer {
     ///
     /// properly notifies the rebalance listener, leaves the
     /// consumer group, clears offsets, paused set, and drains recv buffer.
-    pub async fn unsubscribe(&self) {
+    ///
+    /// Returns a leave-group error after local state has still been cleared.
+    pub async fn unsubscribe(&self) -> Result<()> {
         // Notify listener of revoked partitions before clearing
         let assignments = self.assignments.read().await;
         if !assignments.is_empty() {
@@ -3430,11 +3887,11 @@ impl Consumer {
         drop(assignments);
 
         // Leave consumer group
-        if let Some(ref coordinator) = self.group_coordinator
-            && let Err(e) = coordinator.leave_group().await
-        {
-            warn!("Error leaving consumer group during unsubscribe: {}", e);
-        }
+        let leave_group_result = if let Some(ref coordinator) = self.group_coordinator {
+            coordinator.leave_group().await
+        } else {
+            Ok(())
+        };
 
         self.subscriptions.write().await.clear();
         self.assignments.write().await.clear();
@@ -3442,6 +3899,7 @@ impl Consumer {
         self.metrics.assigned_partitions.set(0);
 
         debug!("Unsubscribed from all topics");
+        leave_group_result
     }
 
     /// Pause consumption of specific partitions.
@@ -3493,21 +3951,49 @@ impl Consumer {
         self.metadata.rebootstrap().await;
     }
 
+    fn select_close_result(
+        auto_commit_result: Result<()>,
+        leave_group_result: Result<()>,
+    ) -> Result<()> {
+        match auto_commit_result {
+            Err(error) if Self::should_ignore_close_auto_commit_error(&error) => leave_group_result,
+            Ok(()) => leave_group_result,
+            Err(error) => Err(error),
+        }
+    }
+
+    fn should_ignore_close_auto_commit_error(error: &KrafkaError) -> bool {
+        matches!(
+            error,
+            KrafkaError::Broker {
+                code: crate::error::ErrorCode::UnknownMemberId
+                    | crate::error::ErrorCode::IllegalGeneration
+                    | crate::error::ErrorCode::RebalanceInProgress
+                    | crate::error::ErrorCode::FencedMemberEpoch
+                    | crate::error::ErrorCode::StaleMemberEpoch,
+                ..
+            }
+        )
+    }
+
     /// Close the consumer.
     ///
     /// Commits offsets (if auto-commit is enabled), leaves the consumer group,
     /// and tears down connections. Calling `close()` more than once is a no-op.
-    pub async fn close(&self) {
+    ///
+    /// Returns the first cleanup error after local state and connections have
+    /// still been torn down.
+    pub async fn close(&self) -> Result<()> {
         if self.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return;
+            return Ok(());
         }
 
         // Auto-commit on close (if enabled)
-        if self.config.enable_auto_commit
-            && let Err(e) = self.commit().await
-        {
-            warn!("Auto-commit on close failed: {}", e);
-        }
+        let auto_commit_result = if self.config.enable_auto_commit {
+            self.commit().await
+        } else {
+            Ok(())
+        };
 
         // Notify listener that partitions are being lost
         let assignments = self.assignments.read().await;
@@ -3521,11 +4007,11 @@ impl Consumer {
         drop(assignments);
 
         // Leave consumer group if we have a group coordinator
-        if let Some(ref coordinator) = self.group_coordinator
-            && let Err(e) = coordinator.leave_group().await
-        {
-            warn!("Error leaving consumer group: {e}");
-        }
+        let leave_group_result = if let Some(ref coordinator) = self.group_coordinator {
+            coordinator.leave_group().await
+        } else {
+            Ok(())
+        };
 
         // Clear per-partition state so post-close recv() cannot return records
         // from partitions already signaled as lost via on_partitions_lost above.
@@ -3539,6 +4025,8 @@ impl Consumer {
 
         self.pool.close_all().await;
         info!("Consumer closed");
+
+        Self::select_close_result(auto_commit_result, leave_group_result)
     }
 
     /// Check if the consumer is closed.
@@ -3871,6 +4359,31 @@ impl ConsumerBuilder {
     /// entries will then persist across partial refreshes indefinitely.
     pub fn disable_metadata_topic_cache_ttl(mut self) -> Self {
         self.config.metadata_topic_cache_ttl = None;
+        self
+    }
+
+    /// Set per-partition initial offsets applied before auto-offset-reset.
+    ///
+    /// When a partition is first assigned and has no committed group offset,
+    /// the consumer starts fetching from the given offset instead of applying
+    /// `auto_offset_reset`. Useful for exactly-once recovery.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::collections::HashMap;
+    ///
+    /// Consumer::builder()
+    ///     .bootstrap_servers("localhost:9092")
+    ///     .initial_offsets(HashMap::from([
+    ///         (("orders".to_string(), 0), 1_000),
+    ///         (("orders".to_string(), 1), 2_000),
+    ///     ]))
+    ///     .build()
+    ///     .await?;
+    /// ```
+    pub fn initial_offsets(mut self, offsets: HashMap<(String, PartitionId), Offset>) -> Self {
+        self.config.initial_offsets = offsets;
         self
     }
 
@@ -4515,38 +5028,235 @@ mod tests {
     // Commit filtering uses group_coordinator check, not assigned_set emptiness.
     #[test]
     fn test_commit_filter_does_not_leak_stale_offsets() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let offsets: HashMap<(String, PartitionId), Offset> = [
+            (("topic1".into(), 0), 100),
+            (("topic2".into(), 0), 200), // stale: not assigned
+        ]
+        .into_iter()
+        .collect();
 
-        rt.block_on(async {
-            let offsets: HashMap<(String, PartitionId), Offset> = [
-                (("topic1".into(), 0), 100),
-                (("topic2".into(), 0), 200), // stale: not assigned
-            ]
-            .into_iter()
-            .collect();
+        let assigned_set: HashSet<(String, PartitionId)> = HashSet::new();
 
-            let assigned_set: HashSet<(String, PartitionId)> = HashSet::new(); // empty
+        let filtered = Consumer::build_commit_offsets(&offsets, Some(&assigned_set), true)
+            .expect("empty assigned set is valid and must filter everything");
 
-            // OLD behavior: is_empty() would let ALL offsets through — BAD
-            let old_filtered: Vec<_> = offsets
-                .iter()
-                .filter(|((t, p), _)| {
-                    assigned_set.is_empty() || assigned_set.contains(&(t.clone(), *p))
-                })
-                .collect();
-            assert_eq!(old_filtered.len(), 2); // Both pass — wrong
+        assert!(filtered.is_empty());
+    }
 
-            // NEW behavior: group consumers never commit unassigned
-            let has_group = true;
-            let new_filtered: Vec<_> = offsets
-                .iter()
-                .filter(|((t, p), _)| !has_group || assigned_set.contains(&(t.clone(), *p)))
-                .collect();
-            assert_eq!(new_filtered.len(), 0); // None pass when empty — correct
-        });
+    #[test]
+    fn test_commit_filter_requires_assignment_snapshot_for_group_commit() {
+        let offsets: HashMap<(String, PartitionId), Offset> =
+            [(("topic1".into(), 0), 100)].into_iter().collect();
+
+        let error = Consumer::build_commit_offsets(&offsets, None, true)
+            .expect_err("group commits require an assignment snapshot");
+
+        assert!(
+            error
+                .to_string()
+                .contains("assignments snapshot unavailable")
+        );
+    }
+
+    #[test]
+    fn test_commit_with_metadata_filter_does_not_leak_stale_offsets() {
+        let offsets: HashMap<TopicPartition, OffsetAndMetadata> = [
+            (
+                TopicPartition::new("topic1", 0),
+                OffsetAndMetadata::with_metadata(100, "keep"),
+            ),
+            (
+                TopicPartition::new("topic2", 0),
+                OffsetAndMetadata::with_metadata(200, "stale"),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let assigned_set: HashSet<(String, PartitionId)> = HashSet::new();
+
+        let filtered =
+            Consumer::filter_commit_with_metadata_offsets(offsets, Some(&assigned_set), true)
+                .expect("empty assigned set is valid and must filter everything");
+
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_commit_with_metadata_filter_keeps_all_offsets_without_group() {
+        let offsets: HashMap<TopicPartition, OffsetAndMetadata> = [
+            (
+                TopicPartition::new("topic1", 0),
+                OffsetAndMetadata::new(100),
+            ),
+            (
+                TopicPartition::new("topic2", 1),
+                OffsetAndMetadata::new(200),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let filtered = Consumer::filter_commit_with_metadata_offsets(offsets, None, false)
+            .expect("standalone consumers should commit all provided offsets");
+
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_offset_commit_handle_ready_flattens_result() {
+        OffsetCommitHandle::ready(Ok(()))
+            .await
+            .expect("ready ok result");
+
+        let error = OffsetCommitHandle::ready(Err(KrafkaError::invalid_state("boom")))
+            .await
+            .expect_err("ready error must surface");
+        assert!(error.to_string().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn test_offset_commit_handle_flattens_task_result() {
+        let error = OffsetCommitHandle::Task(tokio::spawn(async {
+            Err(KrafkaError::invalid_state("task failed"))
+        }))
+        .await
+        .expect_err("task error must surface");
+
+        assert!(error.to_string().contains("task failed"));
+    }
+
+    #[tokio::test]
+    async fn test_retry_commit_with_succeeds_after_retriable_errors() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        Consumer::retry_commit_with({
+            let attempts = attempts.clone();
+            move || {
+                let attempts = attempts.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if attempt < 2 {
+                        Err(KrafkaError::broker(
+                            crate::error::ErrorCode::CoordinatorLoadInProgress,
+                            "retry",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+        })
+        .await
+        .expect("retriable errors should eventually succeed");
+
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_retry_commit_with_returns_last_retriable_error_after_exhaustion() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let error = Consumer::retry_commit_with({
+            let attempts = attempts.clone();
+            move || {
+                let attempts = attempts.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(KrafkaError::broker(
+                        crate::error::ErrorCode::CoordinatorLoadInProgress,
+                        "retry",
+                    ))
+                }
+            }
+        })
+        .await
+        .expect_err("exhausted retriable errors must surface the final error");
+
+        assert!(matches!(
+            error,
+            KrafkaError::Broker {
+                code: crate::error::ErrorCode::CoordinatorLoadInProgress,
+                ..
+            }
+        ));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_retry_commit_with_stops_on_non_retriable_error() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let error = Consumer::retry_commit_with({
+            let attempts = attempts.clone();
+            move || {
+                let attempts = attempts.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(KrafkaError::broker(
+                        crate::error::ErrorCode::GroupAuthorizationFailed,
+                        "stop",
+                    ))
+                }
+            }
+        })
+        .await
+        .expect_err("non-retriable errors must stop immediately");
+
+        assert!(matches!(
+            error,
+            KrafkaError::Broker {
+                code: crate::error::ErrorCode::GroupAuthorizationFailed,
+                ..
+            }
+        ));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_select_close_result_prefers_auto_commit_error() {
+        let error = Consumer::select_close_result(
+            Err(KrafkaError::invalid_state("commit failed")),
+            Err(KrafkaError::invalid_state("leave failed")),
+        )
+        .expect_err("auto-commit error must take precedence");
+
+        assert!(error.to_string().contains("commit failed"));
+    }
+
+    #[test]
+    fn test_select_close_result_ignores_rebalance_close_commit_error() {
+        let error = Consumer::select_close_result(
+            Err(KrafkaError::broker(
+                crate::error::ErrorCode::UnknownMemberId,
+                "rebalance needed",
+            )),
+            Err(KrafkaError::invalid_state("leave failed")),
+        )
+        .expect_err("leave-group error must surface when close-time commit error is benign");
+
+        assert!(error.to_string().contains("leave failed"));
+    }
+
+    #[test]
+    fn test_select_close_result_swallows_rebalance_close_commit_error_when_leave_succeeds() {
+        Consumer::select_close_result(
+            Err(KrafkaError::broker(
+                crate::error::ErrorCode::RebalanceInProgress,
+                "rebalance needed",
+            )),
+            Ok(()),
+        )
+        .expect("rebalance-related close-time commit errors should be ignored");
+    }
+
+    #[test]
+    fn test_select_close_result_returns_leave_group_error_when_commit_succeeds() {
+        let error =
+            Consumer::select_close_result(Ok(()), Err(KrafkaError::invalid_state("leave failed")))
+                .expect_err("leave-group error must surface when commit succeeded");
+
+        assert!(error.to_string().contains("leave failed"));
     }
 
     // group field removed — only group_coordinator accessor exists.
@@ -5508,5 +6218,470 @@ mod tests {
         assert_eq!(grouped.len(), 2);
         assert_eq!(grouped["topic1"], vec![0, 2, 5]);
         assert_eq!(grouped["topic2"], vec![1]);
+    }
+
+    // ── batch_recv logic tests ──────────────────────────────────────────
+
+    fn make_record(topic: &str, partition: PartitionId, offset: Offset) -> ConsumerRecord {
+        ConsumerRecord {
+            topic: topic.to_string(),
+            partition,
+            offset,
+            timestamp: 0,
+            timestamp_type: 0,
+            key: None,
+            value: None,
+            headers: vec![],
+            leader_epoch: None,
+            delivery_count: None,
+        }
+    }
+
+    fn make_test_consumer() -> Consumer {
+        let config = ConsumerConfig::default();
+        let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
+        let metadata = Arc::new(
+            ClusterMetadata::new(
+                vec!["127.0.0.1:9092".to_string()],
+                pool.clone(),
+                config.metadata_max_age,
+            )
+            .with_topic_cache_ttl_disabled(),
+        );
+
+        Consumer {
+            config,
+            metadata,
+            pool,
+            subscriptions: RwLock::new(HashSet::new()),
+            assignments: RwLock::new(HashMap::new()),
+            offsets: RwLock::new(HashMap::new()),
+            paused: RwLock::new(HashSet::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            group_coordinator: None,
+            metrics: Arc::new(ConsumerMetrics::default()),
+            rebalance_listener: Arc::new(NoOpRebalanceListener),
+            interceptor: Arc::new(crate::interceptor::NoOpConsumerInterceptor),
+            last_auto_commit: SyncMutex::new(Instant::now()),
+            recv_buffer: SyncMutex::new(std::collections::VecDeque::new()),
+            fetch_sessions: SyncMutex::new(FetchSessionCache::new()),
+            partition_state: RwLock::new(HashMap::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_recv_public_api_returns_closed_when_consumer_closed() {
+        let consumer = make_test_consumer();
+        consumer
+            .closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let outcome = consumer
+            .batch_recv(5, Duration::from_millis(10))
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, BatchRecvOutcome::Closed));
+    }
+
+    #[tokio::test]
+    async fn test_close_clears_local_state_and_is_idempotent() {
+        let consumer = make_test_consumer();
+
+        consumer.subscriptions.write().await.insert("orders".into());
+        consumer
+            .assignments
+            .write()
+            .await
+            .insert("orders".into(), vec![0]);
+        consumer
+            .offsets
+            .write()
+            .await
+            .insert(("orders".into(), 0), 42);
+        consumer.paused.write().await.insert(("orders".into(), 0));
+        consumer.partition_state.write().await.insert(
+            ("orders".into(), 0),
+            PartitionState {
+                high_watermark: Some(100),
+                ..PartitionState::default()
+            },
+        );
+        consumer
+            .recv_buffer
+            .lock()
+            .push_back(make_record("orders", 0, 42));
+        consumer.metrics.buffered_records.set(1);
+        consumer.metrics.paused_partitions.set(1);
+        consumer.metrics.lag.set(5);
+        consumer.metrics.lag_max.set(5);
+
+        consumer.close().await.expect("close succeeds");
+
+        assert!(consumer.is_closed());
+        assert!(consumer.subscriptions.read().await.is_empty());
+        assert!(consumer.assignments.read().await.is_empty());
+        assert!(consumer.offsets.read().await.is_empty());
+        assert!(consumer.paused.read().await.is_empty());
+        assert!(consumer.partition_state.read().await.is_empty());
+        assert!(consumer.recv_buffer.lock().is_empty());
+        assert_eq!(consumer.metrics.buffered_records.get(), 0);
+        assert_eq!(consumer.metrics.paused_partitions.get(), 0);
+        assert_eq!(consumer.metrics.lag.get(), 0);
+        assert_eq!(consumer.metrics.lag_max.get(), 0);
+
+        consumer
+            .close()
+            .await
+            .expect("second close remains a no-op");
+    }
+
+    #[tokio::test]
+    async fn test_unsubscribe_clears_local_state_and_is_idempotent() {
+        let consumer = make_test_consumer();
+
+        consumer.subscriptions.write().await.insert("orders".into());
+        consumer
+            .assignments
+            .write()
+            .await
+            .insert("orders".into(), vec![0]);
+        consumer
+            .offsets
+            .write()
+            .await
+            .insert(("orders".into(), 0), 42);
+        consumer.paused.write().await.insert(("orders".into(), 0));
+        consumer.partition_state.write().await.insert(
+            ("orders".into(), 0),
+            PartitionState {
+                high_watermark: Some(100),
+                ..PartitionState::default()
+            },
+        );
+        consumer
+            .recv_buffer
+            .lock()
+            .push_back(make_record("orders", 0, 42));
+        consumer.metrics.buffered_records.set(1);
+        consumer.metrics.paused_partitions.set(1);
+        consumer.metrics.lag.set(5);
+        consumer.metrics.lag_max.set(5);
+        consumer.metrics.assigned_partitions.set(1);
+
+        consumer.unsubscribe().await.expect("unsubscribe succeeds");
+
+        assert!(!consumer.is_closed());
+        assert!(consumer.subscriptions.read().await.is_empty());
+        assert!(consumer.assignments.read().await.is_empty());
+        assert!(consumer.offsets.read().await.is_empty());
+        assert!(consumer.paused.read().await.is_empty());
+        assert!(consumer.partition_state.read().await.is_empty());
+        assert!(consumer.recv_buffer.lock().is_empty());
+        assert_eq!(consumer.metrics.buffered_records.get(), 0);
+        assert_eq!(consumer.metrics.paused_partitions.get(), 0);
+        assert_eq!(consumer.metrics.lag.get(), 0);
+        assert_eq!(consumer.metrics.lag_max.get(), 0);
+        assert_eq!(consumer.metrics.assigned_partitions.get(), 0);
+
+        consumer
+            .unsubscribe()
+            .await
+            .expect("second unsubscribe remains a no-op");
+    }
+
+    #[tokio::test]
+    async fn test_batch_recv_public_api_uses_buffer_and_updates_metric() {
+        let consumer = make_test_consumer();
+        {
+            let mut buffer = consumer.recv_buffer.lock();
+            buffer.push_back(make_record("orders", 0, 1));
+            buffer.push_back(make_record("orders", 0, 2));
+        }
+
+        let outcome = consumer
+            .batch_recv(1, Duration::from_millis(10))
+            .await
+            .unwrap();
+        let BatchRecvOutcome::Records(records) = outcome else {
+            panic!("expected records outcome");
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].offset, 1);
+
+        let metrics = consumer.metrics().snapshot();
+        assert_eq!(metrics.buffered_records, 1);
+    }
+
+    #[tokio::test]
+    async fn test_batch_recv_with_returns_empty_request_for_zero_max_records() {
+        let buffer = SyncMutex::new(std::collections::VecDeque::new());
+        let outcome = batch_recv_with(
+            &buffer,
+            |_| {},
+            0,
+            Duration::from_millis(10),
+            || false,
+            |_| async { Ok(vec![]) },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, BatchRecvOutcome::EmptyRequest));
+    }
+
+    #[tokio::test]
+    async fn test_batch_recv_with_returns_closed_when_no_records_and_closed() {
+        let buffer = SyncMutex::new(std::collections::VecDeque::new());
+        let outcome = batch_recv_with(
+            &buffer,
+            |_| {},
+            10,
+            Duration::from_millis(20),
+            || true,
+            |_| async { Ok(vec![]) },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, BatchRecvOutcome::Closed));
+    }
+
+    #[tokio::test]
+    async fn test_batch_recv_with_rebuffers_partial_batch_on_poll_error() {
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(make_record("t", 0, 10));
+        q.push_back(make_record("t", 0, 11));
+        let buffer = SyncMutex::new(q);
+
+        let result = batch_recv_with(
+            &buffer,
+            |_| {},
+            10,
+            Duration::from_millis(20),
+            || false,
+            |_| async {
+                Err(KrafkaError::network(std::io::Error::other(
+                    "simulated poll failure",
+                )))
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        let buffer = buffer.lock();
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(buffer[0].offset, 10);
+        assert_eq!(buffer[1].offset, 11);
+    }
+
+    #[tokio::test]
+    async fn test_batch_recv_with_timeout_returns_timed_out_without_oversleeping() {
+        let buffer = SyncMutex::new(std::collections::VecDeque::new());
+        let start = tokio::time::Instant::now();
+
+        let outcome = batch_recv_with(
+            &buffer,
+            |_| {},
+            10,
+            Duration::from_millis(15),
+            || false,
+            |_| async { Ok(vec![]) },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, BatchRecvOutcome::TimedOut));
+        assert!(start.elapsed() < Duration::from_millis(60));
+    }
+
+    #[tokio::test]
+    async fn test_batch_recv_with_requeues_overflow_in_order() {
+        let buffer = SyncMutex::new(std::collections::VecDeque::new());
+        let poll_records = SyncMutex::new(Some(vec![
+            make_record("t", 0, 1),
+            make_record("t", 0, 2),
+            make_record("t", 0, 3),
+        ]));
+
+        let outcome = batch_recv_with(
+            &buffer,
+            |_| {},
+            2,
+            Duration::from_millis(50),
+            || false,
+            |_| async { Ok(poll_records.lock().take().unwrap_or_default()) },
+        )
+        .await
+        .unwrap();
+
+        let BatchRecvOutcome::Records(batch) = outcome else {
+            panic!("expected records outcome");
+        };
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].offset, 1);
+        assert_eq!(batch[1].offset, 2);
+
+        let buffer = buffer.lock();
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer[0].offset, 3);
+    }
+
+    // ── initial_offsets precedence tests ───────────────────────────────
+
+    #[test]
+    fn test_assignment_offset_precedence_uses_initial_when_no_committed() {
+        let assigned: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0])].into_iter().collect();
+        let committed: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let initial_offsets: HashMap<(String, PartitionId), Offset> =
+            [(("topic1".to_string(), 0), 500)].into_iter().collect();
+        let mut stored: HashMap<(String, PartitionId), Offset> = HashMap::new();
+
+        let need_reset = apply_assignment_offset_precedence(
+            &assigned,
+            &committed,
+            &initial_offsets,
+            &mut stored,
+        );
+
+        assert!(need_reset.is_empty());
+        assert_eq!(stored.get(&("topic1".to_string(), 0)), Some(&500));
+    }
+
+    #[test]
+    fn test_seed_initial_offsets_for_assigned_filters_and_vacant_only() {
+        let assigned: HashMap<String, Vec<PartitionId>> = [
+            ("topic1".to_string(), vec![0, 1]),
+            ("topic2".to_string(), vec![0]),
+        ]
+        .into_iter()
+        .collect();
+
+        let initial_offsets: HashMap<(String, PartitionId), Offset> = [
+            (("topic1".to_string(), 0), 100),
+            (("topic1".to_string(), 2), 200), // unassigned
+            (("topic3".to_string(), 0), 300), // unassigned topic
+        ]
+        .into_iter()
+        .collect();
+
+        let mut stored: HashMap<(String, PartitionId), Offset> =
+            [(("topic1".to_string(), 1), 999)].into_iter().collect();
+
+        let inserted = seed_initial_offsets_for_assigned(&assigned, &initial_offsets, &mut stored);
+        assert_eq!(inserted, 1);
+        assert_eq!(stored.get(&("topic1".to_string(), 0)), Some(&100));
+        assert_eq!(stored.get(&("topic1".to_string(), 1)), Some(&999));
+        assert!(!stored.contains_key(&("topic1".to_string(), 2)));
+        assert!(!stored.contains_key(&("topic3".to_string(), 0)));
+    }
+
+    #[test]
+    fn test_assignment_offset_precedence_committed_wins_initial() {
+        let assigned: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0])].into_iter().collect();
+        let committed: HashMap<(String, PartitionId), Offset> =
+            [(("topic1".to_string(), 0), 999)].into_iter().collect();
+        let initial_offsets: HashMap<(String, PartitionId), Offset> =
+            [(("topic1".to_string(), 0), 500)].into_iter().collect();
+        let mut stored: HashMap<(String, PartitionId), Offset> = HashMap::new();
+
+        let need_reset = apply_assignment_offset_precedence(
+            &assigned,
+            &committed,
+            &initial_offsets,
+            &mut stored,
+        );
+
+        assert!(need_reset.is_empty());
+        assert_eq!(stored.get(&("topic1".to_string(), 0)), Some(&999));
+    }
+
+    #[test]
+    fn test_assignment_offset_precedence_missing_offsets_require_reset() {
+        let assigned: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0])].into_iter().collect();
+        let committed: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let initial_offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        let mut stored: HashMap<(String, PartitionId), Offset> = HashMap::new();
+
+        let need_reset = apply_assignment_offset_precedence(
+            &assigned,
+            &committed,
+            &initial_offsets,
+            &mut stored,
+        );
+
+        assert_eq!(need_reset, vec![("topic1".to_string(), 0)]);
+        assert!(stored.is_empty());
+    }
+
+    #[test]
+    fn test_assignment_offset_precedence_preserves_existing_user_offset() {
+        let assigned: HashMap<String, Vec<PartitionId>> =
+            [("topic1".to_string(), vec![0])].into_iter().collect();
+        let committed: HashMap<(String, PartitionId), Offset> =
+            [(("topic1".to_string(), 0), 999)].into_iter().collect();
+        let initial_offsets: HashMap<(String, PartitionId), Offset> =
+            [(("topic1".to_string(), 0), 500)].into_iter().collect();
+        let mut stored: HashMap<(String, PartitionId), Offset> =
+            [(("topic1".to_string(), 0), 42)].into_iter().collect();
+
+        let need_reset = apply_assignment_offset_precedence(
+            &assigned,
+            &committed,
+            &initial_offsets,
+            &mut stored,
+        );
+
+        assert!(need_reset.is_empty());
+        assert_eq!(stored.get(&("topic1".to_string(), 0)), Some(&42));
+    }
+
+    #[test]
+    fn test_apply_seek_many_offsets_updates_multiple_partitions() {
+        let mut stored: HashMap<(String, PartitionId), Offset> =
+            [(("orders".to_string(), 0), 10)].into_iter().collect();
+        let updates: HashMap<(String, PartitionId), Offset> = [
+            (("orders".to_string(), 0), 20),
+            (("orders".to_string(), 1), 30),
+        ]
+        .into_iter()
+        .collect();
+
+        let updated = apply_seek_many_offsets(&mut stored, &updates);
+        assert_eq!(updated, 2);
+        assert_eq!(stored.get(&("orders".to_string(), 0)), Some(&20));
+        assert_eq!(stored.get(&("orders".to_string(), 1)), Some(&30));
+    }
+
+    #[tokio::test]
+    async fn test_seek_many_public_api_recomputes_lag_and_increments_metric() {
+        let consumer = make_test_consumer();
+
+        {
+            let mut offsets = consumer.offsets.write().await;
+            offsets.insert(("orders".to_string(), 0), 100);
+        }
+        {
+            let mut state = consumer.partition_state.write().await;
+            state.insert(
+                ("orders".to_string(), 0),
+                PartitionState {
+                    high_watermark: Some(120),
+                    ..PartitionState::default()
+                },
+            );
+        }
+
+        let updates: HashMap<(String, PartitionId), Offset> =
+            [(("orders".to_string(), 0), 110)].into_iter().collect();
+        consumer.seek_many(&updates).await.unwrap();
+
+        let metrics = consumer.metrics().snapshot();
+        assert_eq!(metrics.seeks, 1);
+        assert_eq!(metrics.lag, 10);
+        assert_eq!(metrics.lag_max, 10);
     }
 }
