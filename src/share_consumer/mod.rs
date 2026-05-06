@@ -130,6 +130,16 @@ fn drain_broker_acks(broker_acks: &mut BrokerPendingAcks, broker_id: BrokerId) -
         .unwrap_or_default()
 }
 
+fn describe_share_fetch_join_error(error: &tokio::task::JoinError) -> &'static str {
+    if error.is_panic() {
+        "panicked"
+    } else if error.is_cancelled() {
+        "was cancelled"
+    } else {
+        "failed"
+    }
+}
+
 /// Handle returned by [`ShareConsumer::commit_async`].
 ///
 /// Await the handle to observe the final broker outcome. Dropping it detaches
@@ -745,7 +755,10 @@ impl ShareConsumer {
                 Err(e) => {
                     failed_piggyback_acks
                         .extend(drain_broker_acks(&mut ack_batches_by_broker, broker_id));
-                    warn!("ShareFetch task for broker {broker_id} panicked: {e}");
+                    warn!(
+                        "ShareFetch task for broker {broker_id} {}: {e}",
+                        describe_share_fetch_join_error(&e)
+                    );
                 }
             }
         }
@@ -2228,6 +2241,31 @@ mod tests {
         .expect_err("task error must surface");
 
         assert!(error.to_string().contains("task failed"));
+    }
+
+    #[tokio::test]
+    async fn test_describe_share_fetch_join_error_reports_panic() {
+        let error = tokio::spawn(async {
+            panic!("boom");
+        })
+        .await
+        .expect_err("panic must surface as a JoinError");
+
+        assert_eq!(describe_share_fetch_join_error(&error), "panicked");
+    }
+
+    #[tokio::test]
+    async fn test_describe_share_fetch_join_error_reports_cancellation() {
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        handle.abort();
+
+        let error = handle
+            .await
+            .expect_err("aborted task must surface as a JoinError");
+
+        assert_eq!(describe_share_fetch_join_error(&error), "was cancelled");
     }
 
     #[tokio::test]

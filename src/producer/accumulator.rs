@@ -56,20 +56,28 @@ const MAX_CONCURRENT_BATCH_SENDS: usize = 64;
 /// Validate that `record_size` bytes can be admitted into the memory pool.
 ///
 /// Returns an error immediately if the record would permanently block
-/// `acquire_many` — either because it exceeds `u32::MAX` (the hard limit of
-/// `Semaphore::acquire_many`) or because it exceeds the configured
-/// `buffer_memory` budget (permits can never accumulate to that level).
+/// `acquire_many` — either because it exceeds the effective semaphore limit
+/// (`min(u32::MAX, Semaphore::MAX_PERMITS)`) or because it exceeds the
+/// configured `buffer_memory` budget (permits can never accumulate to that
+/// level).
 ///
-/// The u32 check comes first so the error message is always accurate:
-/// a record larger than both limits is a semaphore-API violation, not a
-/// tunable configuration problem.
+/// The semaphore-limit check comes first so the error message is always
+/// accurate: a record larger than both limits is a semaphore constraint, not
+/// a tunable configuration problem.
+fn max_record_semaphore_permits() -> usize {
+    Semaphore::MAX_PERMITS.min(u32::MAX as usize)
+}
+
 pub(crate) fn check_record_admission(record_size: usize, memory_capacity: usize) -> Result<()> {
-    if record_size > u32::MAX as usize {
+    let semaphore_limit = max_record_semaphore_permits();
+
+    if record_size > semaphore_limit {
         return Err(KrafkaError::config(format!(
             "record size {record_size} B exceeds the semaphore \
-             permit-count limit ({} B, u32::MAX); Kafka records must \
-             be smaller",
-            u32::MAX
+             permit-count limit ({} B; min(u32::MAX, \
+             Semaphore::MAX_PERMITS)); Kafka records must be \
+             smaller",
+            semaphore_limit
         )));
     }
     if record_size > memory_capacity {
@@ -1745,23 +1753,23 @@ mod tests {
         );
     }
 
-    /// `check_record_admission` rejects records that exceed `u32::MAX`.
+    /// `check_record_admission` rejects records that exceed the effective
+    /// semaphore permit-count limit.
     ///
-    /// Tests the `u32::MAX` branch directly via the extracted helper —
-    /// no >4 GiB allocation needed.
+    /// Tests the semaphore-limit branch directly via the extracted helper —
+    /// no large allocation needed.
     #[test]
-    fn test_check_record_admission_rejects_oversized_for_u32_max() {
-        // Synthetic size just above u32::MAX — no allocation required.
-        let oversized = u32::MAX as usize + 1;
+    fn test_check_record_admission_rejects_oversized_for_semaphore_limit() {
+        let oversized = max_record_semaphore_permits() + 1;
         let err = check_record_admission(oversized, usize::MAX).expect_err("must reject");
         let msg = err.to_string();
         assert!(
-            msg.contains("u32::MAX"),
-            "error must cite u32::MAX, got: {msg}"
+            msg.contains("Semaphore::MAX_PERMITS"),
+            "error must cite the effective semaphore limit, got: {msg}"
         );
         assert!(
             !msg.contains("buffer_memory"),
-            "must not cite buffer_memory for a u32::MAX rejection, got: {msg}"
+            "must not cite buffer_memory for a semaphore-limit rejection, got: {msg}"
         );
     }
 
