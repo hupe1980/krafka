@@ -770,9 +770,7 @@ pub trait SchemaRegistryClient: Send + Sync {
     ///
     /// Implementations that do not support this operation return
     /// `Err(KrafkaError::schema_registry("get_subjects: not implemented"))`.
-    fn get_subjects(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
+    fn get_subjects(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
         Box::pin(std::future::ready(Err(KrafkaError::schema_registry(
             "get_subjects: not implemented for this registry",
         ))))
@@ -1310,9 +1308,7 @@ impl<C: SchemaRegistryClient> SchemaRegistryClient for CachedSchemaRegistry<C> {
         self.inner.delete_subject(subject, permanent)
     }
 
-    fn get_subjects(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
+    fn get_subjects(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
         self.inner.get_subjects()
     }
 

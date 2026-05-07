@@ -487,7 +487,14 @@ impl SchemaRegistryClient for ConfluentSchemaRegistry {
         let schema = schema.to_string();
         let references = references.to_vec();
         Box::pin(async move {
-            ConfluentSchemaRegistry::check_compatibility(self, &subject, &schema, schema_type, &references).await
+            ConfluentSchemaRegistry::check_compatibility(
+                self,
+                &subject,
+                &schema,
+                schema_type,
+                &references,
+            )
+            .await
         })
     }
 
@@ -497,14 +504,12 @@ impl SchemaRegistryClient for ConfluentSchemaRegistry {
         permanent: bool,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaVersion>>> + Send + '_>> {
         let subject = subject.to_string();
-        Box::pin(async move {
-            ConfluentSchemaRegistry::delete_subject(self, &subject, permanent).await
-        })
+        Box::pin(
+            async move { ConfluentSchemaRegistry::delete_subject(self, &subject, permanent).await },
+        )
     }
 
-    fn get_subjects(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
+    fn get_subjects(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
         Box::pin(async move { ConfluentSchemaRegistry::get_subjects(self).await })
     }
 

@@ -457,7 +457,7 @@ pub struct AccumulatorConfig {
     /// Partitioner for batch-advance notifications (KIP-794).
     ///
     /// When a batch for `(topic, partition)` fills up, the accumulator calls
-    /// [`Partitioner::on_new_batch`] so that batch-boundary partitioners such as
+    /// [`super::partitioner::Partitioner::on_new_batch`] so that batch-boundary partitioners such as
     /// [`UniformStickyPartitioner`] can advance their sticky partition before the
     /// next record is routed. Partitioners that ignore batch events (the default
     /// no-op implementation) incur no overhead.

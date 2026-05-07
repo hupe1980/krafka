@@ -1950,9 +1950,11 @@ mod tests {
         // We can't call .build() without a real broker, but the validation runs
         // before the connection attempt, so we can detect the cap via the semaphore
         // capacity.  Test against the internal config directly.
-        let mut cfg = ProducerConfig::default();
-        cfg.max_in_flight = 10;
-        cfg.bootstrap_servers = "localhost:9092".to_string();
+        let mut cfg = ProducerConfig {
+            max_in_flight: 10,
+            bootstrap_servers: "localhost:9092".to_string(),
+            ..Default::default()
+        };
         // Simulate what build() does for the auto-cap path.
         if cfg.idempotent && cfg.max_in_flight > 5 {
             cfg.max_in_flight = 5;
