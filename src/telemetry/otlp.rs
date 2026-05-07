@@ -444,6 +444,42 @@ impl MetricsExporter for OtlpExporter {
             );
             self.metrics.push(buf);
         }
+        if let Some(p50) = snapshot.p50 {
+            let mut buf = Vec::new();
+            encode_metric_gauge_double(
+                &format!("{name}_p50_seconds"),
+                help,
+                p50.as_secs_f64(),
+                self.time_nanos,
+                self.start_time_nanos,
+                &mut buf,
+            );
+            self.metrics.push(buf);
+        }
+        if let Some(p95) = snapshot.p95 {
+            let mut buf = Vec::new();
+            encode_metric_gauge_double(
+                &format!("{name}_p95_seconds"),
+                help,
+                p95.as_secs_f64(),
+                self.time_nanos,
+                self.start_time_nanos,
+                &mut buf,
+            );
+            self.metrics.push(buf);
+        }
+        if let Some(p99) = snapshot.p99 {
+            let mut buf = Vec::new();
+            encode_metric_gauge_double(
+                &format!("{name}_p99_seconds"),
+                help,
+                p99.as_secs_f64(),
+                self.time_nanos,
+                self.start_time_nanos,
+                &mut buf,
+            );
+            self.metrics.push(buf);
+        }
     }
 }
 
@@ -518,6 +554,9 @@ mod tests {
             min: Some(Duration::from_millis(10)),
             max: Some(Duration::from_millis(100)),
             avg: Some(Duration::from_millis(50)),
+            p50: Some(Duration::from_millis(45)),
+            p95: Some(Duration::from_millis(90)),
+            p99: Some(Duration::from_millis(99)),
         };
         exporter.export_latency("test_latency", "A test latency", &snapshot);
 
@@ -571,6 +610,9 @@ mod tests {
             min: None,
             max: None,
             avg: None,
+            p50: None,
+            p95: None,
+            p99: None,
         };
         exporter.export_latency("test_latency", "A sparse latency", &snapshot);
 

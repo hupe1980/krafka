@@ -117,9 +117,10 @@ impl AwsGlueSchemaRegistry {
                 .send()
                 .await
                 .map_err(|e| {
-                    KrafkaError::schema_registry(format!(
-                        "failed to get schema version status: {e}"
-                    ))
+                    KrafkaError::schema_registry_with_source(
+                        "failed to get schema version status",
+                        e,
+                    )
                 })?;
 
             match response.status() {
@@ -208,7 +209,7 @@ impl GlueSchemaRegistryClient for AwsGlueSchemaRegistry {
                 .send()
                 .await
                 .map_err(|e| {
-                    KrafkaError::schema_registry(format!("failed to get schema version: {e}"))
+                    KrafkaError::schema_registry_with_source("failed to get schema version", e)
                 })?;
 
             let data_format = response
@@ -287,10 +288,11 @@ impl GlueSchemaRegistryClient for AwsGlueSchemaRegistry {
                 }
                 Err(register_err) => {
                     if !self.auto_register {
-                        return Err(KrafkaError::schema_registry(format!(
+                        return Err(KrafkaError::schema_registry_with_source(
                             "failed to register schema version (schema may not exist, \
-                             enable auto_register to create it): {register_err}"
-                        )));
+                             enable auto_register to create it)",
+                            register_err,
+                        ));
                     }
 
                     // Step 3: Auto-register — create the schema (first version).

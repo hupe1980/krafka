@@ -290,10 +290,9 @@ impl ConfluentSchemaRegistry {
     ) -> Result<T> {
         let status = response.status();
         if status.is_success() {
-            response
-                .json::<T>()
-                .await
-                .map_err(|e| KrafkaError::schema_registry(format!("failed to parse response: {e}")))
+            response.json::<T>().await.map_err(|e| {
+                KrafkaError::schema_registry_with_source("failed to parse response", e)
+            })
         } else {
             let body = response.text().await.unwrap_or_default();
             if let Ok(err) = serde_json::from_str::<ErrorResponse>(&body) {
@@ -319,7 +318,7 @@ impl ConfluentSchemaRegistry {
             .apply_auth(request)
             .send()
             .await
-            .map_err(|e| KrafkaError::schema_registry(format!("request failed: {e}")))?;
+            .map_err(|e| KrafkaError::schema_registry_with_source("request failed", e))?;
         Self::handle_response(response).await
     }
 
@@ -475,6 +474,46 @@ impl SchemaRegistryClient for ConfluentSchemaRegistry {
                 .await?;
             Ok(result.id)
         })
+    }
+
+    fn check_compatibility(
+        &self,
+        subject: &str,
+        schema: &str,
+        schema_type: SchemaType,
+        references: &[SchemaReference],
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + '_>> {
+        let subject = subject.to_string();
+        let schema = schema.to_string();
+        let references = references.to_vec();
+        Box::pin(async move {
+            ConfluentSchemaRegistry::check_compatibility(self, &subject, &schema, schema_type, &references).await
+        })
+    }
+
+    fn delete_subject(
+        &self,
+        subject: &str,
+        permanent: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaVersion>>> + Send + '_>> {
+        let subject = subject.to_string();
+        Box::pin(async move {
+            ConfluentSchemaRegistry::delete_subject(self, &subject, permanent).await
+        })
+    }
+
+    fn get_subjects(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
+        Box::pin(async move { ConfluentSchemaRegistry::get_subjects(self).await })
+    }
+
+    fn get_versions(
+        &self,
+        subject: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaVersion>>> + Send + '_>> {
+        let subject = subject.to_string();
+        Box::pin(async move { ConfluentSchemaRegistry::get_versions(self, &subject).await })
     }
 }
 

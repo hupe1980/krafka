@@ -395,7 +395,7 @@ async fn ensure_topic_exists(
 ) -> Result<(), KrafkaError> {
     let topic = NewTopic::new(name, partitions, replication_factor);
     
-    match admin.create_topics(vec![topic], Duration::from_secs(30)).await {
+    match admin.create_topics(vec![topic], Duration::from_secs(30), false).await {
         Ok(results) => {
             for result in results {
                 match &result.error {

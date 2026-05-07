@@ -157,6 +157,9 @@ pub enum SaslMechanism {
     /// OAuth Bearer token authentication.
     OAuthBearer,
     /// GSSAPI (Kerberos) authentication.
+    ///
+    /// Not yet implemented — configuring this mechanism returns a runtime error.
+    /// Use one of the other mechanisms for production deployments.
     Gssapi,
 }
 
@@ -192,6 +195,11 @@ impl PlainCredentials {
     pub fn new(username: impl Into<String>, password: impl Into<String>) -> crate::Result<Self> {
         let username = username.into();
         let password = password.into();
+        if username.is_empty() {
+            return Err(crate::error::KrafkaError::config(
+                "PLAIN username must not be empty",
+            ));
+        }
         if username.contains('\0') {
             return Err(crate::error::KrafkaError::config(
                 "PLAIN username must not contain null bytes",

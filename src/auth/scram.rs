@@ -30,7 +30,7 @@ use rand::Rng;
 use sha2::{Digest, Sha256, Sha512};
 use std::fmt;
 use subtle::ConstantTimeEq;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{KrafkaError, Result};
 
@@ -141,8 +141,8 @@ pub enum ScramState {
 pub struct ScramClient {
     /// Username.
     username: String,
-    /// Password (zeroized on drop).
-    password: String,
+    /// Password (zeroized on drop via `Zeroizing<String>`).
+    password: Zeroizing<String>,
     /// SCRAM mechanism.
     mechanism: ScramMechanism,
     /// Channel binding configuration.
@@ -167,7 +167,7 @@ pub struct ScramClient {
 
 impl Drop for ScramClient {
     fn drop(&mut self) {
-        self.password.zeroize();
+        // `password` is `Zeroizing<String>` — zeroized automatically.
         if let Some(ref mut salted) = self.salted_password {
             salted.zeroize();
         }
@@ -197,7 +197,7 @@ impl ScramClient {
         let client_nonce = generate_nonce();
         Self {
             username: username.to_string(),
-            password: password.to_string(),
+            password: Zeroizing::new(password.to_string()),
             mechanism,
             channel_binding,
             client_nonce,

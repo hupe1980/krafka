@@ -68,7 +68,11 @@ fn max_record_semaphore_permits() -> usize {
     Semaphore::MAX_PERMITS.min(u32::MAX as usize)
 }
 
-pub(crate) fn check_record_admission(record_size: usize, memory_capacity: usize) -> Result<()> {
+pub(crate) fn check_record_admission(
+    record_size: usize,
+    memory_capacity: usize,
+    max_request_size: usize,
+) -> Result<()> {
     let semaphore_limit = max_record_semaphore_permits();
 
     if record_size > semaphore_limit {
@@ -78,6 +82,14 @@ pub(crate) fn check_record_admission(record_size: usize, memory_capacity: usize)
              Semaphore::MAX_PERMITS)); Kafka records must be \
              smaller",
             semaphore_limit
+        )));
+    }
+    if max_request_size > 0 && record_size > max_request_size {
+        return Err(KrafkaError::config(format!(
+            "record size {record_size} B exceeds max_request_size \
+             ({max_request_size} B); the broker will reject the record \
+             with MESSAGE_TOO_LARGE — raise ProducerConfig::max_request_size \
+             or shrink the record",
         )));
     }
     if record_size > memory_capacity {
@@ -241,6 +253,10 @@ pub struct RecordAccumulatorHandle {
     /// unlimited). Used to reject records larger than the entire budget
     /// with a structured error instead of blocking forever on `acquire_many`.
     memory_capacity: usize,
+    /// Maximum encoded Kafka request frame size in bytes (0 = unlimited).
+    /// Records that would exceed this limit are rejected before enqueueing
+    /// rather than waiting to be rejected by the broker with MESSAGE_TOO_LARGE.
+    max_request_size: usize,
     /// Maximum time to block waiting for buffer memory.
     max_block_ms: Duration,
     /// Barrier over all producer sends, including detached batch tasks.
@@ -296,10 +312,10 @@ impl RecordAccumulatorHandle {
         let deadline = tokio::time::Instant::now() + self.max_block_ms;
 
         // Reject records that cannot physically be admitted (exceeds the
-        // semaphore permit limit or the configured buffer_memory budget).
-        // Uses the module-level helper so both branches are unit-testable
-        // without allocating large buffers.
-        check_record_admission(record_size, self.memory_capacity)?;
+        // semaphore permit limit, max_request_size, or the configured
+        // buffer_memory budget). Uses the module-level helper so all three
+        // branches are unit-testable without allocating large buffers.
+        check_record_admission(record_size, self.memory_capacity, self.max_request_size)?;
 
         // FIFO-fair reservation of `record_size` bytes from the shared pool.
         // On timeout or closed semaphore (accumulator panicked), the permit
@@ -438,6 +454,16 @@ pub struct AccumulatorConfig {
     pub interceptor: Arc<dyn ProducerInterceptor>,
     /// Producer identity for idempotent production (PID, epoch, sequences).
     pub identity: Option<Arc<super::idempotent::ProducerIdentity>>,
+    /// Partitioner for batch-advance notifications (KIP-794).
+    ///
+    /// When a batch for `(topic, partition)` fills up, the accumulator calls
+    /// [`Partitioner::on_new_batch`] so that batch-boundary partitioners such as
+    /// [`UniformStickyPartitioner`] can advance their sticky partition before the
+    /// next record is routed. Partitioners that ignore batch events (the default
+    /// no-op implementation) incur no overhead.
+    ///
+    /// [`UniformStickyPartitioner`]: super::partitioner::UniformStickyPartitioner
+    pub partitioner: Arc<dyn super::partitioner::Partitioner>,
 }
 
 impl Clone for AccumulatorConfig {
@@ -455,6 +481,7 @@ impl Clone for AccumulatorConfig {
             in_flight_semaphore: self.in_flight_semaphore.clone(),
             interceptor: self.interceptor.clone(),
             identity: self.identity.clone(),
+            partitioner: self.partitioner.clone(),
         }
     }
 }
@@ -472,6 +499,7 @@ impl fmt::Debug for AccumulatorConfig {
             .field("buffer_memory", &self.buffer_memory)
             .field("max_block_ms", &self.max_block_ms)
             .field("interceptor", &self.interceptor)
+            .field("partitioner", &"<dyn Partitioner>")
             .finish()
     }
 }
@@ -491,6 +519,7 @@ impl Default for AccumulatorConfig {
             in_flight_semaphore: Arc::new(Semaphore::new(5)), // default max_in_flight
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             identity: None,
+            partitioner: Arc::new(super::partitioner::DefaultPartitioner::new()),
         }
     }
 }
@@ -574,6 +603,8 @@ pub struct RecordAccumulator {
     metrics: Arc<ProducerMetrics>,
     /// Byte-granular FIFO semaphore gating `buffer_memory` (shared with handle).
     memory_permits: Arc<Semaphore>,
+    /// Partitioner reference for KIP-794 batch-boundary advance notifications.
+    partitioner: Arc<dyn super::partitioner::Partitioner>,
 }
 
 impl RecordAccumulator {
@@ -614,6 +645,9 @@ impl RecordAccumulator {
         let handle_buffered_records = buffered_records.clone();
         let handle_metrics = metrics.clone();
         let max_block_ms = config.max_block_ms;
+        let max_request_size = config.max_request_size;
+        // Extract partitioner before config is moved into the accumulator.
+        let accumulator_partitioner = config.partitioner.clone();
 
         let accumulator = Self {
             config,
@@ -623,6 +657,7 @@ impl RecordAccumulator {
             retry_policy,
             metrics,
             memory_permits: memory_permits.clone(),
+            partitioner: accumulator_partitioner,
         };
 
         let memory_permits_panic = memory_permits.clone();
@@ -645,6 +680,7 @@ impl RecordAccumulator {
             sender,
             memory_permits,
             memory_capacity,
+            max_request_size,
             max_block_ms,
             in_flight_barrier,
             buffered_records: handle_buffered_records,
@@ -745,6 +781,12 @@ impl RecordAccumulator {
             // Check if batch is full
             if accumulator_batch.batch.is_full() {
                 trace!("Batch full for {}-{}, flushing", key.0, partition);
+                let partition_count = self
+                    .metadata
+                    .partition_count(key.0.as_ref())
+                    .unwrap_or(partition as usize + 1);
+                self.partitioner
+                    .on_new_batch(key.0.as_ref(), partition, partition_count);
                 self.flush_batch(&key);
             } else if self.config.linger.is_zero() {
                 // linger=0 means send immediately without waiting
@@ -754,6 +796,12 @@ impl RecordAccumulator {
             }
         } else {
             // Batch is full, flush it first and then add to new batch
+            let partition_count = self
+                .metadata
+                .partition_count(key.0.as_ref())
+                .unwrap_or(partition as usize + 1);
+            self.partitioner
+                .on_new_batch(key.0.as_ref(), partition, partition_count);
             self.flush_batch(&key);
 
             // Create new batch and add record
@@ -1051,9 +1099,11 @@ impl RecordAccumulator {
         };
 
         // Build and encode the record batch (rebuilt on OutOfOrderSequenceNumber).
+        // Returns the request plus (compressed_bytes, uncompressed_bytes) for
+        // tracking the compression ratio when a codec is active.
         let build_batch = |seq: Option<i32>,
                            cfg: &AccumulatorConfig|
-         -> crate::error::Result<ProduceRequest> {
+         -> crate::error::Result<(ProduceRequest, u64, u64)> {
             let mut batch_builder = RecordBatchBuilder::new().compression(cfg.compression);
 
             // Tag with idempotent producer identity
@@ -1062,28 +1112,36 @@ impl RecordAccumulator {
                     batch_builder.producer(identity.producer_id(), identity.producer_epoch(), s);
             }
 
+            // Accumulate uncompressed payload size before encoding.
+            let uncompressed_len: u64 = pending.iter().map(|p| p.estimated_size as u64).sum();
+
             for p in &pending {
                 batch_builder = p.record.append_to_batch_builder(batch_builder);
             }
             let batch = batch_builder.build();
             let batch_bytes = batch.encode()?;
+            let compressed_len = batch_bytes.len() as u64;
 
-            Ok(ProduceRequest {
-                transactional_id: None,
-                acks: cfg.acks,
-                timeout_ms: crate::util::duration_to_millis_i32(cfg.request_timeout),
-                topic_data: vec![ProduceTopicData {
-                    name: topic.to_string(),
-                    topic_id: None,
-                    partition_data: vec![ProducePartitionData {
-                        index: partition,
-                        records: batch_bytes,
+            Ok((
+                ProduceRequest {
+                    transactional_id: None,
+                    acks: cfg.acks,
+                    timeout_ms: crate::util::duration_to_millis_i32(cfg.request_timeout),
+                    topic_data: vec![ProduceTopicData {
+                        name: topic.to_string(),
+                        topic_id: None,
+                        partition_data: vec![ProducePartitionData {
+                            index: partition,
+                            records: batch_bytes,
+                        }],
                     }],
-                }],
-            })
+                },
+                compressed_len,
+                uncompressed_len,
+            ))
         };
 
-        let mut request = match build_batch(sequence, &config) {
+        let (mut request, compressed_len, uncompressed_len) = match build_batch(sequence, &config) {
             Ok(r) => r,
             Err(e) => {
                 // Rollback sequence on encode failure
@@ -1097,6 +1155,11 @@ impl RecordAccumulator {
                 return;
             }
         };
+
+        // Track compression ratio for compressed batches.
+        if config.compression != Compression::None {
+            metrics.record_compression(compressed_len, uncompressed_len);
+        }
 
         // Retry loop — delivery timeout starts from when the first record
         // entered the batch (enqueued_at), not from the first send attempt,
@@ -1287,7 +1350,7 @@ impl RecordAccumulator {
                                         };
                                         sequence = Some(new_sequence);
                                         match build_batch(sequence, &config) {
-                                            Ok(new_request) => request = new_request,
+                                            Ok((new_request, ..)) => request = new_request,
                                             Err(encode_err) => break Err(encode_err),
                                         }
                                     } else if pr.error_code == ErrorCode::OutOfOrderSequenceNumber
@@ -1308,7 +1371,7 @@ impl RecordAccumulator {
                                         };
                                         sequence = Some(new_seq);
                                         match build_batch(sequence, &config) {
-                                            Ok(r) => request = r,
+                                            Ok((r, ..)) => request = r,
                                             Err(encode_err) => {
                                                 break Err(encode_err);
                                             }
@@ -1508,6 +1571,7 @@ mod tests {
             in_flight_semaphore: Arc::new(Semaphore::new(5)),
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             identity: None,
+            partitioner: Arc::new(crate::producer::partitioner::DefaultPartitioner::new()),
         };
         assert_eq!(config.batch_size, 65536);
         assert_eq!(config.linger, Duration::from_millis(50));
@@ -1577,6 +1641,7 @@ mod tests {
             sender,
             memory_permits: Arc::new(Semaphore::new(0)),
             memory_capacity: 1024 * 1024, // larger than any test record
+            max_request_size: 0,
             max_block_ms: Duration::from_millis(50),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
             buffered_records: Arc::new(AtomicUsize::new(0)),
@@ -1627,6 +1692,7 @@ mod tests {
             sender,
             memory_permits: Arc::new(Semaphore::new(16)),
             memory_capacity: 16, // deliberately tiny
+            max_request_size: 0,
             max_block_ms: Duration::from_secs(60),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
             buffered_records: Arc::new(AtomicUsize::new(0)),
@@ -1655,6 +1721,7 @@ mod tests {
             sender,
             memory_permits: sem.clone(),
             memory_capacity: 1024 * 1024,
+            max_request_size: 0,
             max_block_ms: Duration::from_secs(60),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
             buffered_records: Arc::new(AtomicUsize::new(0)),
@@ -1696,6 +1763,7 @@ mod tests {
             sender,
             memory_permits: sem.clone(),
             memory_capacity: 1024,
+            max_request_size: 0,
             max_block_ms: Duration::from_millis(500),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
             buffered_records: buffered_records.clone(),
@@ -1741,7 +1809,7 @@ mod tests {
     /// needing to allocate large buffers.
     #[test]
     fn test_check_record_admission_rejects_oversized_for_buffer() {
-        let err = check_record_admission(1024, 16).expect_err("must reject");
+        let err = check_record_admission(1024, 16, 0).expect_err("must reject");
         let msg = err.to_string();
         assert!(
             msg.contains("buffer_memory"),
@@ -1761,7 +1829,7 @@ mod tests {
     #[test]
     fn test_check_record_admission_rejects_oversized_for_semaphore_limit() {
         let oversized = max_record_semaphore_permits() + 1;
-        let err = check_record_admission(oversized, usize::MAX).expect_err("must reject");
+        let err = check_record_admission(oversized, usize::MAX, 0).expect_err("must reject");
         let msg = err.to_string();
         assert!(
             msg.contains("Semaphore::MAX_PERMITS"),

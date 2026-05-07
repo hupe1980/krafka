@@ -84,7 +84,8 @@ pub struct ProducerConfig {
     /// obtains a Producer ID from the broker and tracks sequence numbers per
     /// partition to guarantee exactly-once delivery within a session.
     ///
-    /// Requires `acks = All` and `max_in_flight <= 5`.
+    /// Requires `acks = All`. `max_in_flight` is automatically capped to 5
+    /// at build time if a higher value is configured.
     pub(crate) idempotent: bool,
     /// Max block time when buffer is full.
     pub(crate) max_block: Duration,
@@ -363,6 +364,10 @@ impl ProducerConfigBuilder {
     }
 
     /// Set max in-flight requests per connection.
+    ///
+    /// When idempotent production is enabled, this value is automatically
+    /// capped to 5 at build time (per the Kafka protocol guarantee), with an
+    /// `info!` log if a higher value was explicitly configured.
     pub fn max_in_flight(mut self, max: usize) -> Self {
         self.config.max_in_flight = max;
         self
@@ -381,7 +386,9 @@ impl ProducerConfigBuilder {
     /// attaches sequence numbers to every batch, allowing the broker to
     /// de-duplicate retries.
     ///
-    /// Requires `acks = All` and `max_in_flight <= 5`.
+    /// Requires `acks = All`. If `max_in_flight` exceeds 5, it is automatically
+    /// capped to 5 at build time (with an `info!` log), matching Java client
+    /// and librdkafka behaviour.
     pub fn idempotent(mut self, enable: bool) -> Self {
         self.config.idempotent = enable;
         self
@@ -449,10 +456,10 @@ impl ProducerConfigBuilder {
     /// - `max_in_flight` must be >= 1
     /// - `max_request_size` must be >= 1
     /// - `delivery_timeout` must be greater than zero
-    /// - Idempotent mode requires `acks = All` and `max_in_flight <= 5`
+    /// - Idempotent mode requires `acks = All`; `max_in_flight` is auto-capped to 5
     /// - `batch_size` must not exceed `buffer_memory` (when `buffer_memory > 0`)
     /// - `batch_size` must not exceed `max_request_size`
-    pub fn build(self) -> Result<ProducerConfig> {
+    pub fn build(mut self) -> Result<ProducerConfig> {
         if self.config.batch_size == 0 {
             return Err(KrafkaError::config(format!(
                 "batch_size must be >= 1 (got {})",
@@ -485,11 +492,18 @@ impl ProducerConfigBuilder {
                     self.config.acks
                 )));
             }
+            // Idempotent production requires max_in_flight ≤ 5 per the Kafka
+            // protocol specification (KIP-679).  Rather than rejecting the
+            // configuration with an error, we silently cap it to 5 — the same
+            // behaviour as the Java client, librdkafka, and kafka-go — and emit
+            // an info-level message so operators can see the adjustment.
             if self.config.max_in_flight > 5 {
-                return Err(KrafkaError::config(format!(
-                    "idempotent producer requires max_in_flight <= 5 (got {})",
-                    self.config.max_in_flight
-                )));
+                tracing::info!(
+                    configured = self.config.max_in_flight,
+                    effective = 5,
+                    "idempotent producer requires max_in_flight ≤ 5; capping automatically"
+                );
+                self.config.max_in_flight = 5;
             }
         }
         if self.config.buffer_memory > 0 && self.config.batch_size > self.config.buffer_memory {
@@ -740,12 +754,25 @@ mod tests {
     }
 
     #[test]
-    fn test_config_builder_rejects_idempotent_with_high_in_flight() {
-        let err = ProducerConfig::builder()
+    fn test_config_builder_autocaps_idempotent_with_high_in_flight() {
+        // max_in_flight > 5 with idempotent enabled: auto-capped to 5, not an error.
+        let config = ProducerConfig::builder()
             .idempotent(true)
-            .max_in_flight(6)
-            .build();
-        assert!(err.is_err());
+            .max_in_flight(10)
+            .build()
+            .expect("should auto-cap, not error");
+        assert_eq!(config.max_in_flight(), 5);
+    }
+
+    #[test]
+    fn test_config_builder_idempotent_keeps_low_in_flight() {
+        // max_in_flight ≤ 5 is preserved exactly.
+        let config = ProducerConfig::builder()
+            .idempotent(true)
+            .max_in_flight(3)
+            .build()
+            .expect("should succeed");
+        assert_eq!(config.max_in_flight(), 3);
     }
 
     #[test]

@@ -25,7 +25,7 @@ use tracing::{debug, info, warn};
 
 use crate::error::ErrorCode;
 use crate::metrics::{KrafkaMetrics, LatencySnapshot, MetricsExporter};
-use crate::network::BrokerConnection;
+use crate::network::{BrokerConnection, ConnectionPool};
 use crate::protocol::{
     ApiKey, Compression, GetTelemetrySubscriptionsRequest, GetTelemetrySubscriptionsResponse,
     PushTelemetryRequest, PushTelemetryResponse, VersionedDecode,
@@ -244,6 +244,10 @@ enum TelemetryChunkingError {
 /// ```
 pub struct TelemetryReporter {
     connection: Arc<BrokerConnection>,
+    /// Connection pool — used to reconnect when `connection` drops.
+    pool: Arc<ConnectionPool>,
+    /// Broker addresses to try when reconnecting, in preference order.
+    broker_addresses: Vec<String>,
     metrics: Arc<KrafkaMetrics>,
     config: TelemetryConfig,
     shutdown: watch::Receiver<bool>,
@@ -260,18 +264,24 @@ pub struct TelemetryReporter {
 impl TelemetryReporter {
     /// Create a new telemetry reporter.
     ///
-    /// * `connection` — broker connection to use for telemetry RPCs.
+    /// * `connection` — initial broker connection to use for telemetry RPCs.
+    /// * `pool` — connection pool for reconnection when the current broker drops.
+    /// * `broker_addresses` — ordered list of broker addresses to try on reconnect.
     /// * `metrics` — the shared metrics registry to read from.
     /// * `config` — telemetry configuration.
     /// * `shutdown` — a watch channel; set to `true` to stop the reporter.
     pub fn new(
         connection: Arc<BrokerConnection>,
+        pool: Arc<ConnectionPool>,
+        broker_addresses: Vec<String>,
         metrics: Arc<KrafkaMetrics>,
         config: TelemetryConfig,
         shutdown: watch::Receiver<bool>,
     ) -> Self {
         Self {
             connection,
+            pool,
+            broker_addresses,
             metrics,
             config,
             shutdown,
@@ -369,8 +379,27 @@ impl TelemetryReporter {
                         // retries the same telemetry slice.
                     }
                     PushResult::Fatal => {
-                        warn!("Fatal telemetry push error; reporter exiting");
-                        return;
+                        warn!("Fatal telemetry push error; attempting reconnection");
+                        if self.reconnect().await {
+                            match self
+                                .get_subscription_with_retry(subscription.client_instance_id)
+                                .await
+                            {
+                                Some(s) => {
+                                    self.delta_tracker.reset();
+                                    subscription = s;
+                                }
+                                None => {
+                                    warn!(
+                                        "Re-subscription failed after reconnect; reporter exiting"
+                                    );
+                                    return;
+                                }
+                            }
+                        } else {
+                            warn!("All broker connections failed; reporter exiting");
+                            return;
+                        }
                     }
                 }
                 push_result = Some(result);
@@ -406,6 +435,28 @@ impl TelemetryReporter {
                 }
             }
         }
+    }
+
+    /// Try to reconnect to any known broker after a fatal connection error.
+    ///
+    /// Iterates `broker_addresses` in order and replaces `self.connection` on
+    /// the first success. Returns `true` if reconnected, `false` if all fail.
+    async fn reconnect(&mut self) -> bool {
+        for addr in &self.broker_addresses.clone() {
+            match self.pool.get_connection(addr).await {
+                Ok(conn) => {
+                    info!(broker = %addr, "Telemetry reporter reconnected to broker");
+                    self.connection = conn;
+                    // Reset per-connection state on reconnect.
+                    self.unsupported_compression_types.clear();
+                    return true;
+                }
+                Err(err) => {
+                    warn!(broker = %addr, %err, "Telemetry reconnection attempt failed");
+                }
+            }
+        }
+        false
     }
 
     /// Try to obtain a subscription, retrying transient failures with backoff.
@@ -1587,6 +1638,9 @@ mod tests {
                     min: Some(Duration::from_millis(50)),
                     max: Some(Duration::from_millis(50)),
                     avg: Some(Duration::from_millis(50)),
+                    p50: Some(Duration::from_millis(50)),
+                    p95: Some(Duration::from_millis(50)),
+                    p99: Some(Duration::from_millis(50)),
                 },
             );
 
@@ -1602,6 +1656,9 @@ mod tests {
                     min: Some(Duration::from_millis(10)),
                     max: Some(Duration::from_millis(10)),
                     avg: Some(Duration::from_millis(10)),
+                    p50: Some(Duration::from_millis(10)),
+                    p95: Some(Duration::from_millis(10)),
+                    p99: Some(Duration::from_millis(10)),
                 },
             );
         }

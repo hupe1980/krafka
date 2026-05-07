@@ -414,6 +414,17 @@ impl ShareConsumer {
             }
         }
 
+        // If the recv_buffer is already at capacity, skip fetching to let the
+        // application drain it first. This bounds memory usage when recv() is
+        // called more slowly than poll().
+        let max_buffered = self.config.max_buffered_records;
+        if max_buffered > 0 {
+            let buf_len = self.recv_buffer.read().await.len();
+            if buf_len >= max_buffered as usize {
+                return Ok(Vec::new());
+            }
+        }
+
         // Send heartbeat to maintain membership and receive assignments.
         // Cap the heartbeat RPC at 10 s so a slow/stuck coordinator does not
         // block the entire poll() for the full connection-level request_timeout.
@@ -1056,9 +1067,14 @@ impl ShareConsumer {
         }
 
         let mut buf = self.recv_buffer.write().await;
+        let max = self.config.max_buffered_records;
         let mut iter = records.into_iter();
         let first = iter.next();
         for record in iter {
+            // Enforce max_buffered_records cap (0 = unlimited).
+            if max > 0 && buf.len() >= max as usize {
+                break;
+            }
             buf.push_back(record);
         }
 
@@ -1403,7 +1419,21 @@ impl ShareConsumer {
             *self.member_id.write().await = new_member_id;
         }
         *self.member_epoch.write().await = response.member_epoch;
-        *self.heartbeat_interval_ms.write().await = response.heartbeat_interval_ms;
+        // Clamp the broker-supplied heartbeat interval to [50 ms, 30 s] to
+        // prevent excessively fast polling (which exhausts broker connections)
+        // or excessively slow polling (which causes session timeouts).
+        let raw_interval_ms = response.heartbeat_interval_ms;
+        const HEARTBEAT_MIN_MS: i32 = 50;
+        const HEARTBEAT_MAX_MS: i32 = 30_000;
+        let clamped_interval_ms = raw_interval_ms.clamp(HEARTBEAT_MIN_MS, HEARTBEAT_MAX_MS);
+        if clamped_interval_ms != raw_interval_ms {
+            tracing::warn!(
+                raw_ms = raw_interval_ms,
+                clamped_ms = clamped_interval_ms,
+                "broker heartbeat_interval_ms is out of safe range [{HEARTBEAT_MIN_MS}..={HEARTBEAT_MAX_MS}]; clamping"
+            );
+        }
+        *self.heartbeat_interval_ms.write().await = clamped_interval_ms;
 
         // Process assignment if present.
         if let Some(assignment) = response.assignment {
@@ -1694,6 +1724,16 @@ impl ShareConsumerBuilder {
     /// Set maximum number of records per poll.
     pub fn max_poll_records(mut self, max: i32) -> Self {
         self.config.max_poll_records = max;
+        self
+    }
+
+    /// Set maximum records buffered internally by [`recv()`](ShareConsumer::recv).
+    ///
+    /// When the internal buffer reaches this limit, `poll()` skips fetching
+    /// until the buffer drains below the cap. Set to `0` for unlimited.
+    /// Defaults to 500.
+    pub fn max_buffered_records(mut self, max: i32) -> Self {
+        self.config.max_buffered_records = max;
         self
     }
 

@@ -135,8 +135,9 @@ impl Gauge {
 
     /// Decrement the gauge by 1 (saturates at 0 to prevent underflow).
     ///
-    /// In debug builds, logs a warning if the gauge was already zero,
-    /// which typically indicates a mismatched `inc()`/`dec()` pair.
+    /// Logs a warning if the gauge was already zero, which typically indicates
+    /// a mismatched `inc()`/`dec()` pair. The warning fires in both debug and
+    /// release builds so lifecycle bugs are visible in production logs.
     #[inline]
     pub fn dec(&self) {
         let prev = self
@@ -144,7 +145,6 @@ impl Gauge {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             });
-        #[cfg(debug_assertions)]
         if let Ok(0) = prev {
             tracing::warn!(
                 "Gauge::dec() called when value was already 0 — possible inc/dec mismatch"
@@ -153,13 +153,34 @@ impl Gauge {
     }
 }
 
-/// Latency tracker using atomic min/max/sum/count.
-#[derive(Debug, Default)]
+/// Latency tracker using atomic min/max/sum/count plus a 64-bucket
+/// power-of-2 histogram for p50/p95/p99 estimates.
+///
+/// # Bucket layout
+///
+/// Bucket `i` counts samples whose nanosecond value satisfies `2^i ≤ ns < 2^(i+1)`.
+/// Bucket 0 collects the special case of 0-nanosecond samples.
+/// The relative error is at most ~100 % within any single bucket (i.e., the
+/// reported percentile may be up to 2× the true value), which is acceptable
+/// for production SLO alerting where the important distinction is between
+/// "under 1 ms" and "over 10 ms".
+///
+/// This approach requires no external dependencies and no heap allocation.
+#[derive(Debug)]
 pub struct LatencyTracker {
     count: AtomicU64,
     sum_nanos: AtomicU64,
     min_nanos: AtomicU64,
     max_nanos: AtomicU64,
+    /// Power-of-2 histogram: 64 buckets, bucket[i] = count of samples
+    /// where floor(log2(nanos)) == i (bucket[0] also captures nanos == 0).
+    histogram: [AtomicU64; 64],
+}
+
+impl Default for LatencyTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LatencyTracker {
@@ -170,6 +191,7 @@ impl LatencyTracker {
             sum_nanos: AtomicU64::new(0),
             min_nanos: AtomicU64::new(u64::MAX),
             max_nanos: AtomicU64::new(0),
+            histogram: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
@@ -181,6 +203,13 @@ impl LatencyTracker {
         self.sum_nanos.fetch_add(nanos, Ordering::Relaxed);
         self.min_nanos.fetch_min(nanos, Ordering::Relaxed);
         self.max_nanos.fetch_max(nanos, Ordering::Relaxed);
+        // Map to bucket: bucket[0] for 0 ns, otherwise floor(log2(nanos)).
+        let bucket = if nanos == 0 {
+            0
+        } else {
+            (63 - nanos.leading_zeros()) as usize
+        };
+        self.histogram[bucket].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Start timing an operation. Returns a guard that records when dropped.
@@ -230,6 +259,43 @@ impl LatencyTracker {
         sum.checked_div(count).map(Duration::from_nanos)
     }
 
+    /// Estimate the p-th percentile latency from the histogram.
+    ///
+    /// `percentile` must be in `[0.0, 100.0]`. Returns `None` if no samples
+    /// have been recorded. The estimate is derived from power-of-2 buckets
+    /// so the relative error is at most ~100 % within any bucket (i.e., the
+    /// reported value is within 2× of the true percentile). This is suitable
+    /// for production alerting and SLO dashboards.
+    pub fn percentile(&self, percentile: f64) -> Option<Duration> {
+        let total = self.count();
+        if total == 0 {
+            return None;
+        }
+        // Clamp percentile to [0, 100].
+        let p = percentile.clamp(0.0, 100.0);
+        // Number of samples that must be at or below the target percentile.
+        let target = ((p / 100.0) * total as f64).ceil() as u64;
+        let mut cumulative: u64 = 0;
+        for (i, bucket) in self.histogram.iter().enumerate() {
+            cumulative += bucket.load(Ordering::Relaxed);
+            if cumulative >= target {
+                // Represent this bucket by the geometric midpoint: 2^i * sqrt(2)
+                // (clamped to integer nanos). For i=0 we return 0.
+                let nanos = if i == 0 {
+                    0u64
+                } else {
+                    // Lower bound of bucket i is 2^i; use the midpoint 2^i * 1.5
+                    // as a representative estimate.
+                    let lower = 1u64 << i;
+                    lower + lower / 2
+                };
+                return Some(Duration::from_nanos(nanos));
+            }
+        }
+        // All counts are in the histogram; return max as fallback.
+        self.max()
+    }
+
     /// Get a snapshot of the latency statistics.
     pub fn snapshot(&self) -> LatencySnapshot {
         LatencySnapshot {
@@ -238,6 +304,9 @@ impl LatencyTracker {
             min: self.min(),
             max: self.max(),
             avg: self.avg(),
+            p50: self.percentile(50.0),
+            p95: self.percentile(95.0),
+            p99: self.percentile(99.0),
         }
     }
 
@@ -247,6 +316,9 @@ impl LatencyTracker {
         self.sum_nanos.store(0, Ordering::Relaxed);
         self.min_nanos.store(u64::MAX, Ordering::Relaxed);
         self.max_nanos.store(0, Ordering::Relaxed);
+        for bucket in &self.histogram {
+            bucket.store(0, Ordering::Relaxed);
+        }
     }
 }
 
@@ -276,6 +348,16 @@ pub struct LatencySnapshot {
     pub max: Option<Duration>,
     /// Average latency.
     pub avg: Option<Duration>,
+    /// 50th-percentile (median) latency estimate.
+    ///
+    /// Derived from a 64-bucket power-of-2 histogram; the relative error is
+    /// at most ~100 % within any single bucket (i.e., the estimate may be up
+    /// to 2× the true p50). Returns `None` when no samples have been recorded.
+    pub p50: Option<Duration>,
+    /// 95th-percentile latency estimate (same accuracy caveat as `p50`).
+    pub p95: Option<Duration>,
+    /// 99th-percentile latency estimate (same accuracy caveat as `p50`).
+    pub p99: Option<Duration>,
 }
 
 /// Trait for exporting metrics to a pluggable backend.
@@ -430,6 +512,30 @@ impl MetricsExporter for PrometheusExporter {
         if let Some(max) = snapshot.max {
             let _ = writeln!(self.output, "{}_seconds_max {:.9}", name, max.as_secs_f64());
         }
+        if let Some(p50) = snapshot.p50 {
+            let _ = writeln!(
+                self.output,
+                "{{name=\"{}\",quantile=\"0.5\"}} {:.9}",
+                name,
+                p50.as_secs_f64()
+            );
+        }
+        if let Some(p95) = snapshot.p95 {
+            let _ = writeln!(
+                self.output,
+                "{{name=\"{}\",quantile=\"0.95\"}} {:.9}",
+                name,
+                p95.as_secs_f64()
+            );
+        }
+        if let Some(p99) = snapshot.p99 {
+            let _ = writeln!(
+                self.output,
+                "{{name=\"{}\",quantile=\"0.99\"}} {:.9}",
+                name,
+                p99.as_secs_f64()
+            );
+        }
     }
 }
 
@@ -535,9 +641,21 @@ impl MetricsExporter for JsonExporter {
             .avg
             .map(|d| format!("{:.9}", d.as_secs_f64()))
             .unwrap_or_else(|| "null".to_string());
+        let p50_str = snapshot
+            .p50
+            .map(|d| format!("{:.9}", d.as_secs_f64()))
+            .unwrap_or_else(|| "null".to_string());
+        let p95_str = snapshot
+            .p95
+            .map(|d| format!("{:.9}", d.as_secs_f64()))
+            .unwrap_or_else(|| "null".to_string());
+        let p99_str = snapshot
+            .p99
+            .map(|d| format!("{:.9}", d.as_secs_f64()))
+            .unwrap_or_else(|| "null".to_string());
 
         self.entries.push(format!(
-            "{{\"name\":\"{}\",\"type\":\"latency\",\"help\":\"{}\",\"count\":{},\"sum_seconds\":{:.9},\"min_seconds\":{},\"max_seconds\":{},\"avg_seconds\":{}}}",
+            "{{\"name\":\"{}\",\"type\":\"latency\",\"help\":\"{}\",\"count\":{},\"sum_seconds\":{:.9},\"min_seconds\":{},\"max_seconds\":{},\"avg_seconds\":{},\"p50_seconds\":{},\"p95_seconds\":{},\"p99_seconds\":{}}}",
             json_escape(name),
             json_escape(help),
             snapshot.count,
@@ -545,6 +663,9 @@ impl MetricsExporter for JsonExporter {
             min_str,
             max_str,
             avg_str,
+            p50_str,
+            p95_str,
+            p99_str,
         ));
     }
 }
@@ -589,6 +710,16 @@ impl MetricsVisitable for ProducerMetrics {
             &format!("{prefix}_buffered_records"),
             "Producer records currently admitted under the memory budget",
             self.buffered_records.get(),
+        );
+        exporter.export_counter(
+            &format!("{prefix}_compressed_bytes"),
+            "Total compressed bytes written for compressed batches",
+            self.compressed_bytes.get(),
+        );
+        exporter.export_counter(
+            &format!("{prefix}_uncompressed_bytes"),
+            "Total uncompressed bytes for the same compressed batches",
+            self.uncompressed_bytes.get(),
         );
         exporter.export_latency(
             &format!("{prefix}_send_latency"),
@@ -898,6 +1029,8 @@ impl KrafkaMetrics {
 
         self.producer.connections.set(0);
         self.producer.buffered_records.set(0);
+        self.producer.compressed_bytes.reset();
+        self.producer.uncompressed_bytes.reset();
 
         self.connection.connections_created.reset();
         self.connection.connections_closed.reset();
@@ -932,6 +1065,14 @@ pub struct ProducerMetrics {
     pub connections: Gauge,
     /// Producer records currently admitted under the memory budget.
     pub buffered_records: Gauge,
+    /// Compressed bytes written to the wire (numerator for compression ratio).
+    ///
+    /// Only incremented for compressed batches (`compression != None`).
+    pub compressed_bytes: Counter,
+    /// Uncompressed bytes for the same batches (denominator for compression ratio).
+    ///
+    /// Only incremented for compressed batches (`compression != None`).
+    pub uncompressed_bytes: Counter,
 }
 
 impl ProducerMetrics {
@@ -966,8 +1107,27 @@ impl ProducerMetrics {
         self.retries.inc();
     }
 
+    /// Record bytes before and after compression for a batch.
+    ///
+    /// Only call this for batches that actually used compression
+    /// (`compression != Compression::None`). Passing equal values
+    /// (e.g. for an incompressible batch) is valid and contributes a
+    /// ratio of 1.0 to the running average.
+    #[inline]
+    pub fn record_compression(&self, compressed: u64, uncompressed: u64) {
+        self.compressed_bytes.add(compressed);
+        self.uncompressed_bytes.add(uncompressed);
+    }
+
     /// Get a snapshot of all metrics.
     pub fn snapshot(&self) -> ProducerMetricsSnapshot {
+        let compressed = self.compressed_bytes.get();
+        let uncompressed = self.uncompressed_bytes.get();
+        let compression_ratio_avg = if uncompressed > 0 {
+            Some(compressed as f64 / uncompressed as f64)
+        } else {
+            None
+        };
         ProducerMetricsSnapshot {
             records_sent: self.records_sent.get(),
             bytes_sent: self.bytes_sent.get(),
@@ -977,6 +1137,9 @@ impl ProducerMetrics {
             send_latency: self.send_latency.snapshot(),
             connections: self.connections.get(),
             buffered_records: self.buffered_records.get(),
+            compressed_bytes: compressed,
+            uncompressed_bytes: uncompressed,
+            compression_ratio_avg,
         }
     }
 }
@@ -1001,6 +1164,14 @@ pub struct ProducerMetricsSnapshot {
     pub connections: u64,
     /// Records currently admitted under the producer memory budget.
     pub buffered_records: u64,
+    /// Total compressed bytes written for compressed batches.
+    pub compressed_bytes: u64,
+    /// Total uncompressed bytes for the same compressed batches.
+    pub uncompressed_bytes: u64,
+    /// Average compression ratio (`compressed_bytes / uncompressed_bytes`),
+    /// in the range `[0.0, 1.0]` for a compressing codec (lower is better).
+    /// `None` when no compressed batches have been sent yet.
+    pub compression_ratio_avg: Option<f64>,
 }
 
 /// Consumer metrics.
@@ -1720,8 +1891,8 @@ mod tests {
         };
         metrics.export_metrics("test", &mut exporter);
 
-        // ProducerMetrics has 5 counters, 2 gauges, 1 latency
-        assert_eq!(exporter.counters, 5);
+        // ProducerMetrics has 7 counters, 2 gauges, 1 latency
+        assert_eq!(exporter.counters, 7);
         assert_eq!(exporter.gauges, 2);
         assert_eq!(exporter.latencies, 1);
     }

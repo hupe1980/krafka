@@ -238,10 +238,7 @@ pub use alter_client_quotas::*;
 mod sasl;
 pub use sasl::*;
 
-#[cfg(feature = "unstable-protocol")]
 mod share;
-#[cfg(feature = "unstable-protocol")]
-#[cfg_attr(docsrs, doc(cfg(feature = "unstable-protocol")))]
 pub use share::*;
 
 #[cfg(feature = "telemetry")]

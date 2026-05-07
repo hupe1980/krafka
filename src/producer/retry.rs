@@ -73,8 +73,16 @@ impl RetryPolicy {
     }
 
     /// Set the backoff multiplier.
+    ///
+    /// Must be finite and ≥ 1.0. Values below 1.0 are clamped to 1.0 (no
+    /// shrinkage). Non-finite values (NaN, ±Inf) are replaced with 2.0.
     pub fn with_backoff_multiplier(mut self, multiplier: f64) -> Self {
-        self.backoff_multiplier = multiplier;
+        self.backoff_multiplier = if multiplier.is_finite() {
+            multiplier.max(1.0)
+        } else {
+            warn!("backoff_multiplier is not finite ({multiplier}); using default 2.0");
+            2.0
+        };
         self
     }
 
@@ -123,6 +131,15 @@ impl RetryPolicy {
         };
 
         let final_backoff = (capped_backoff + jitter).max(0.0);
+        // Guard against non-finite results (e.g. from extreme jitter or
+        // backoff_multiplier that was set directly on the struct without
+        // going through `with_backoff_multiplier`).
+        if !final_backoff.is_finite() {
+            warn!(
+                "calculate_backoff produced non-finite value ({final_backoff}); capping at max_backoff"
+            );
+            return self.max_backoff;
+        }
         Duration::from_secs_f64(final_backoff)
     }
 

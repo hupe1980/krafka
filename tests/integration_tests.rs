@@ -287,6 +287,7 @@ async fn create_topic(bootstrap_servers: &str, topic: &str, partitions: i32) {
         .create_topics(
             vec![NewTopic::new(topic, partitions, 1).unwrap()],
             Duration::from_secs(10),
+            false,
         )
         .await
         .expect("Failed to create topic");
@@ -368,7 +369,7 @@ async fn test_admin_client() {
     let new_topic = NewTopic::new(topic_name, 3, 1).unwrap();
 
     admin
-        .create_topics(vec![new_topic], Duration::from_secs(10))
+        .create_topics(vec![new_topic], Duration::from_secs(10), false)
         .await
         .expect("Failed to create topic");
 
@@ -486,7 +487,7 @@ async fn test_multiple_partitions() {
     let new_topic = NewTopic::new(topic_name, 6, 1).unwrap();
 
     admin
-        .create_topics(vec![new_topic], Duration::from_secs(10))
+        .create_topics(vec![new_topic], Duration::from_secs(10), false)
         .await
         .expect("Failed to create topic");
 
@@ -541,7 +542,7 @@ async fn test_consumer_group_rebalance() {
 
     let new_topic = NewTopic::new(topic_name, 4, 1).unwrap();
     admin
-        .create_topics(vec![new_topic], Duration::from_secs(10))
+        .create_topics(vec![new_topic], Duration::from_secs(10), false)
         .await
         .expect("Failed to create topic");
 
@@ -1049,7 +1050,7 @@ async fn test_admin_describe_configs() {
     let topic_name = "config-test-topic";
     let new_topic = NewTopic::new(topic_name, 1, 1).unwrap();
     admin
-        .create_topics(vec![new_topic], Duration::from_secs(10))
+        .create_topics(vec![new_topic], Duration::from_secs(10), false)
         .await
         .expect("Failed to create topic");
 
@@ -1216,6 +1217,7 @@ async fn test_admin_create_partitions() {
         .create_topics(
             vec![NewTopic::new(topic_name, 2, 1).unwrap()],
             Duration::from_secs(10),
+            false,
         )
         .await
         .expect("Failed to create topic");
@@ -1271,6 +1273,7 @@ async fn test_admin_alter_topic_config() {
         .create_topics(
             vec![NewTopic::new(topic_name, 1, 1).unwrap()],
             Duration::from_secs(10),
+            false,
         )
         .await
         .expect("Failed to create topic");
@@ -1367,6 +1370,7 @@ async fn test_admin_describe_topics() {
                 NewTopic::new(topic2, 3, 1).unwrap(),
             ],
             Duration::from_secs(10),
+            false,
         )
         .await
         .expect("Failed to create topics");
@@ -2137,6 +2141,7 @@ async fn test_many_partitions_topic() {
         .create_topics(
             vec![NewTopic::new(topic, 12, 1).unwrap()],
             Duration::from_secs(10),
+            false,
         )
         .await
         .unwrap();
@@ -2315,7 +2320,7 @@ async fn test_admin_create_topic_with_config() {
         .with_config("cleanup.policy", "compact");
 
     admin
-        .create_topics(vec![new_topic], Duration::from_secs(10))
+        .create_topics(vec![new_topic], Duration::from_secs(10), false)
         .await
         .unwrap();
 

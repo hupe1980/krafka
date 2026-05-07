@@ -129,7 +129,7 @@ let admin = AdminClient::builder()
 let topic = NewTopic::new("my-topic", 6, 3);
 
 let results = admin
-    .create_topics(vec![topic], Duration::from_secs(30))
+    .create_topics(vec![topic], Duration::from_secs(30), false)
     .await?;
 
 for result in results {
@@ -151,7 +151,7 @@ let topic = NewTopic::new("compacted-topic", 12, 3)
     .with_config("min.insync.replicas", "2")
     .with_config("retention.ms", "604800000");  // 7 days
 
-admin.create_topics(vec![topic], Duration::from_secs(30)).await?;
+admin.create_topics(vec![topic], Duration::from_secs(30), false).await?;
 ```
 
 ### Deleting Topics
@@ -325,7 +325,7 @@ async fn create_topic_if_not_exists(
     // Create the topic
     let topic = NewTopic::new(name, partitions, replication_factor);
     let results = admin
-        .create_topics(vec![topic], Duration::from_secs(30))
+        .create_topics(vec![topic], Duration::from_secs(30), false)
         .await?;
 
     for result in results {
@@ -360,7 +360,7 @@ async fn create_topic_if_not_exists(
 ### Always Check Results
 
 ```rust
-let results = admin.create_topics(topics, timeout).await?;
+let results = admin.create_topics(topics, timeout, false).await?;
 
 let mut success = true;
 for result in results {
@@ -384,14 +384,14 @@ use std::time::Duration;
 admin.list_topics().await?;  // Uses default timeout
 
 // Longer timeout for operations that may take time
-admin.create_topics(topics, Duration::from_secs(60)).await?;
+admin.create_topics(topics, Duration::from_secs(60), false).await?;
 admin.delete_topics(topics, Duration::from_secs(60)).await?;
 ```
 
 ### Handle Topic Already Exists
 
 ```rust
-let results = admin.create_topics(vec![topic], timeout).await?;
+let results = admin.create_topics(vec![topic], timeout, false).await?;
 
 for result in results {
     match &result.error {

@@ -15,10 +15,20 @@ pub(crate) const NO_RESPONSE_CORRELATION_ID: i32 = i32::MIN;
 ///
 /// `Duration::as_millis()` returns `u128`, which would silently truncate
 /// when cast to `i32`. This function caps the value at `i32::MAX` (~24.8 days)
-/// to prevent silent wraparound.
+/// to prevent silent wraparound. A warning is logged when the cap fires so
+/// over-large timeouts are visible in production logs rather than silently
+/// becoming a much smaller value.
 #[inline]
 pub fn duration_to_millis_i32(d: Duration) -> i32 {
-    d.as_millis().min(i32::MAX as u128) as i32
+    let ms = d.as_millis();
+    if ms > i32::MAX as u128 {
+        tracing::warn!(
+            duration_ms = %ms,
+            capped_at = i32::MAX,
+            "duration exceeds i32::MAX (~24.8 days); clamping to i32::MAX"
+        );
+    }
+    ms.min(i32::MAX as u128) as i32
 }
 
 /// Convert a `Duration` to milliseconds as `i64`, capping at `i64::MAX`.

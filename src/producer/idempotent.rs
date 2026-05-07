@@ -177,6 +177,15 @@ impl ProducerIdentity {
     /// This should be called once with the response from InitProducerId.
     /// The sequences lock is acquired first so concurrent readers
     /// cannot observe a half-updated identity.
+    ///
+    /// # Lock-free readers
+    ///
+    /// [`is_initialized`](Self::is_initialized) reads `producer_id` atomically
+    /// **without** acquiring the sequences lock. Callers that need a fully
+    /// consistent `(producer_id, sequences)` snapshot must hold the sequences
+    /// read lock themselves. `is_initialized` may therefore transiently return
+    /// `true` while `initialize` is still clearing the sequences map — readers
+    /// must be prepared for an empty sequences entry while the ID is ≥ 0.
     pub fn initialize(&self, producer_id: i64, producer_epoch: i16) {
         let mut sequences = self.sequences.write();
         self.producer_id.store(producer_id, Ordering::SeqCst);

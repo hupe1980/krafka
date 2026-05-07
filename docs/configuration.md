@@ -23,10 +23,10 @@ Complete reference for all Krafka configuration options.
 | `delivery_timeout` | Duration | `120s` | Total time budget for queueing, sending, and retries |
 | `retries` | u32 | `u32::MAX` | Number of retries on failure; bounded by `delivery_timeout` |
 | `retry_backoff` | Duration | `100ms` | Wait between retries |
-| `max_in_flight` | usize | `5` | Max concurrent in-flight requests per connection |
+| `max_in_flight` | usize | `5` | Max concurrent in-flight requests per connection. Automatically capped to 5 when idempotent is enabled. |
 | `metadata_max_age` | Duration | `5m` | Max age before metadata refresh |
 | `metadata_topic_cache_ttl` | `Option<Duration>` | `Some(5m)` | TTL for topic entries in the partial-refresh cache. `None` disables eviction. |
-| `idempotent` | bool | `true` | Enable idempotent production (KIP-679, requires acks=All) |
+| `idempotent` | bool | `true` | Enable idempotent production (KIP-679, requires acks=All; `max_in_flight` is auto-capped to 5) |
 | `metadata_recovery_strategy` | MetadataRecoveryStrategy | `Rebootstrap` | Recovery strategy when metadata refresh fails (KIP-899) |
 | `metadata_recovery_rebootstrap_trigger` | Duration | `5m` | Duration after which failing refreshes trigger a rebootstrap |
 

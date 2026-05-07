@@ -137,7 +137,10 @@ pub struct ConsumerConfig {
     pub(crate) fetch_max_bytes: i32,
     /// Maximum bytes per partition.
     pub(crate) max_partition_fetch_bytes: i32,
-    /// Maximum poll records.
+    /// Maximum records returned by a single [`poll()`](super::Consumer::poll) call.
+    ///
+    /// `0` means unlimited (no truncation). Positive values cap the batch.
+    /// Must be >= 0; negative values are rejected by the builder.
     pub(crate) max_poll_records: i32,
     /// Maximum records buffered internally by [`recv()`](super::Consumer::recv).
     ///
@@ -539,7 +542,13 @@ impl ConsumerConfigBuilder {
         self
     }
 
-    /// Set maximum records per poll.
+    /// Set maximum records per [`poll()`](super::Consumer::poll) call.
+    ///
+    /// - `0` (or any negative value) means unlimited — no truncation.
+    ///   Use `0` for unlimited; negative values are rejected at build time.
+    /// - Positive values cap each poll batch at that many records.
+    ///
+    /// Default: 500.
     pub fn max_poll_records(mut self, max: i32) -> Self {
         self.config.max_poll_records = max;
         self
@@ -662,6 +671,7 @@ impl ConsumerConfigBuilder {
     /// - `heartbeat_interval` must be less than `session_timeout`
     /// - `session_timeout` must be less than or equal to `max_poll_interval`
     /// - `max_buffered_records` must be >= 0 (0 disables the cap)
+    /// - `fetch_min_bytes` must be <= `fetch_max_bytes`
     pub fn build(self) -> crate::Result<ConsumerConfig> {
         if self.config.heartbeat_interval >= self.config.session_timeout {
             return Err(crate::error::KrafkaError::config(format!(
@@ -679,6 +689,18 @@ impl ConsumerConfigBuilder {
             return Err(crate::error::KrafkaError::config(format!(
                 "max_buffered_records ({}) must be >= 0",
                 self.config.max_buffered_records,
+            )));
+        }
+        if self.config.fetch_min_bytes > self.config.fetch_max_bytes {
+            return Err(crate::error::KrafkaError::config(format!(
+                "fetch_min_bytes ({}) must be <= fetch_max_bytes ({})",
+                self.config.fetch_min_bytes, self.config.fetch_max_bytes,
+            )));
+        }
+        if self.config.max_poll_records < 0 {
+            return Err(crate::error::KrafkaError::config(format!(
+                "max_poll_records ({}) must be >= 0 (use 0 for unlimited)",
+                self.config.max_poll_records,
             )));
         }
         Ok(self.config)
@@ -919,5 +941,29 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(config.max_buffered_records(), 0);
+    }
+
+    #[test]
+    fn test_config_builder_accepts_zero_max_poll_records_as_unlimited() {
+        // 0 means unlimited — poll() must not truncate any records.
+        let config = ConsumerConfig::builder()
+            .max_poll_records(0)
+            .build()
+            .unwrap();
+        assert_eq!(
+            config.max_poll_records(),
+            0,
+            "max_poll_records=0 should be accepted as unlimited"
+        );
+    }
+
+    #[test]
+    fn test_config_builder_rejects_negative_max_poll_records() {
+        let result = ConsumerConfig::builder().max_poll_records(-1).build();
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("max_poll_records"),
+            "error message should mention max_poll_records"
+        );
     }
 }

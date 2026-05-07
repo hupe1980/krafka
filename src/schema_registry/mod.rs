@@ -728,6 +728,68 @@ pub trait SchemaRegistryClient: Send + Sync {
         schema_type: SchemaType,
         references: &[SchemaReference],
     ) -> Pin<Box<dyn Future<Output = Result<SchemaId>> + Send + '_>>;
+
+    /// Check whether a schema is compatible with the latest version registered
+    /// under `subject`.
+    ///
+    /// Returns `true` when the schema is compatible according to the subject's
+    /// configured compatibility level, `false` otherwise.
+    ///
+    /// Implementations that do not support this operation return
+    /// `Err(KrafkaError::schema_registry("check_compatibility: not implemented"))`.
+    fn check_compatibility(
+        &self,
+        _subject: &str,
+        _schema: &str,
+        _schema_type: SchemaType,
+        _references: &[SchemaReference],
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + '_>> {
+        Box::pin(std::future::ready(Err(KrafkaError::schema_registry(
+            "check_compatibility: not implemented for this registry",
+        ))))
+    }
+
+    /// Delete a subject and all its registered versions.
+    ///
+    /// Returns the list of deleted version numbers. Set `permanent` to `true`
+    /// to perform a hard delete (bypasses the soft-delete stage).
+    ///
+    /// Implementations that do not support this operation return
+    /// `Err(KrafkaError::schema_registry("delete_subject: not implemented"))`.
+    fn delete_subject(
+        &self,
+        _subject: &str,
+        _permanent: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaVersion>>> + Send + '_>> {
+        Box::pin(std::future::ready(Err(KrafkaError::schema_registry(
+            "delete_subject: not implemented for this registry",
+        ))))
+    }
+
+    /// List all subjects currently registered in the registry.
+    ///
+    /// Implementations that do not support this operation return
+    /// `Err(KrafkaError::schema_registry("get_subjects: not implemented"))`.
+    fn get_subjects(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
+        Box::pin(std::future::ready(Err(KrafkaError::schema_registry(
+            "get_subjects: not implemented for this registry",
+        ))))
+    }
+
+    /// List all version numbers registered under `subject`.
+    ///
+    /// Implementations that do not support this operation return
+    /// `Err(KrafkaError::schema_registry("get_versions: not implemented"))`.
+    fn get_versions(
+        &self,
+        _subject: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaVersion>>> + Send + '_>> {
+        Box::pin(std::future::ready(Err(KrafkaError::schema_registry(
+            "get_versions: not implemented for this registry",
+        ))))
+    }
 }
 
 /// Shared cache-management interface implemented by schema cache wrappers.
@@ -1227,6 +1289,38 @@ impl<C: SchemaRegistryClient> SchemaRegistryClient for CachedSchemaRegistry<C> {
             self.register_schema_impl(&subject, &schema, schema_type, &references)
                 .await
         })
+    }
+
+    fn check_compatibility(
+        &self,
+        subject: &str,
+        schema: &str,
+        schema_type: SchemaType,
+        references: &[SchemaReference],
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + '_>> {
+        self.inner
+            .check_compatibility(subject, schema, schema_type, references)
+    }
+
+    fn delete_subject(
+        &self,
+        subject: &str,
+        permanent: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaVersion>>> + Send + '_>> {
+        self.inner.delete_subject(subject, permanent)
+    }
+
+    fn get_subjects(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
+        self.inner.get_subjects()
+    }
+
+    fn get_versions(
+        &self,
+        subject: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaVersion>>> + Send + '_>> {
+        self.inner.get_versions(subject)
     }
 }
 

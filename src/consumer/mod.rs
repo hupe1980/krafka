@@ -998,6 +998,15 @@ impl Consumer {
                 partition_state.remove(key);
             }
         }
+        // Evict fetch sessions for brokers no longer present in cluster
+        // metadata. Sessions for departed brokers can never become active
+        // again; evicting them prevents unbounded map growth on clusters
+        // with high broker churn.
+        {
+            let live_broker_ids: Vec<crate::BrokerId> =
+                self.metadata.brokers().iter().map(|b| b.id).collect();
+            self.fetch_sessions.lock().retain_brokers(&live_broker_ids);
+        }
         // Recompute lag metrics from remaining caches so revoked
         // partitions no longer contribute to exported values.
         self.recompute_lag_metrics().await;

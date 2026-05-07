@@ -197,9 +197,13 @@ async fn main() {
 | `batches_sent_total` | Counter | Total batches sent |
 | `errors_total` | Counter | Total send errors |
 | `retries_total` | Counter | Total retry attempts |
+| `compressed_bytes_total` | Counter | Total compressed bytes written for compressed batches |
+| `uncompressed_bytes_total` | Counter | Total uncompressed bytes for the same compressed batches |
 | `connections` | Gauge | Current active connections |
 | `buffered_records` | Gauge | Producer records currently admitted under the memory budget |
 | `send_latency_seconds` | Summary | Send latency statistics |
+
+`compression_ratio_avg` is available as a derived field in `ProducerMetricsSnapshot` (computed as `compressed_bytes / uncompressed_bytes`). A value of 0.3 means the codec reduced data to 30% of original size. The field is `None` when no compressed batches have been sent.
 
 ### Consumer Metrics
 

@@ -520,7 +520,9 @@ let producer = Producer::builder()
 > **Idempotent by default (KIP-679):** Since Kafka 3.0, idempotent production is the default.
 > The regular `Producer` now obtains a Producer ID via `InitProducerId` at startup,
 > tracks sequence numbers per partition, and de-duplicates retries automatically.
-> `acks = All` and `max_in_flight <= 5` are enforced when idempotent is enabled.
+> `acks = All` is required when idempotent is enabled. If `max_in_flight` is set
+> above 5, it is **automatically capped to 5** (matching Java client and librdkafka
+> behaviour), with an `info!` log so operators can see the adjustment.
 > The `InitProducerId` call retries on retriable errors (e.g. `CoordinatorLoadInProgress`)
 > with exponential backoff, rotating through available brokers on each attempt.
 >

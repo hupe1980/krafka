@@ -966,10 +966,19 @@ impl AdminClient {
     }
 
     /// Create topics.
+    ///
+    /// # Parameters
+    ///
+    /// * `topics` — Descriptions of the topics to create.
+    /// * `timeout` — How long the broker should wait for the creation to complete.
+    /// * `validate_only` — When `true`, the broker validates the request but does **not**
+    ///   create any topics. Useful for pre-flight checks. Requires CreateTopics v2+
+    ///   (Kafka 0.11+); all modern brokers support this.
     pub async fn create_topics(
         &self,
         topics: Vec<NewTopic>,
         timeout: Duration,
+        validate_only: bool,
     ) -> Result<Vec<CreateTopicResult>> {
         let conn = self.get_any_broker_connection().await?;
 
@@ -993,7 +1002,7 @@ impl AdminClient {
                 })
                 .collect(),
             timeout_ms: crate::util::duration_to_millis_i32(timeout),
-            validate_only: false,
+            validate_only,
         };
 
         // Send request — negotiate API version with broker

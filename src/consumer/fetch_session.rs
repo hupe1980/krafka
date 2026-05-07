@@ -286,8 +286,12 @@ impl FetchSessionCache {
     }
 
     /// Remove sessions for brokers not in the given set.
-    #[cfg(test)]
-    pub fn retain_brokers(&mut self, broker_ids: &[BrokerId]) {
+    ///
+    /// Call this during metadata refresh or after a rebalance when the set of
+    /// live brokers changes, so sessions for departed brokers do not accumulate
+    /// indefinitely. The next fetch to a re-joined broker will start a fresh
+    /// full fetch, which is correct behavior.
+    pub(crate) fn retain_brokers(&mut self, broker_ids: &[BrokerId]) {
         self.sessions.retain(|id, _| broker_ids.contains(id));
     }
 }

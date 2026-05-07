@@ -67,6 +67,12 @@ pub struct ShareConsumerConfig {
     pub(crate) fetch_max_bytes: i32,
     /// Maximum poll records returned to the application per `poll()`.
     pub(crate) max_poll_records: i32,
+    /// Maximum records buffered internally by [`recv()`](super::ShareConsumer::recv).
+    ///
+    /// When the internal buffer reaches this limit, `poll()` skips fetching
+    /// new data until the buffer drains. Set to `0` to disable the cap
+    /// (unlimited). Defaults to 500.
+    pub(crate) max_buffered_records: i32,
     /// Maximum records to acquire per fetch request.
     pub(crate) max_records: i32,
     /// Optimal batch size for acquired records.
@@ -112,6 +118,7 @@ impl Default for ShareConsumerConfig {
             fetch_min_bytes: 1,
             fetch_max_bytes: 52_428_800, // 50 MiB
             max_poll_records: 500,
+            max_buffered_records: 500,
             max_records: 5000,
             batch_size: 500,
             fetch_max_wait_ms: 500,

@@ -58,9 +58,22 @@ use crate::protocol::{
 /// - Keep callbacks fast.  Long-running work should be deferred to a
 ///   separate channel that the application drains at its own pace.
 ///
-/// If you need **async** work inside a callback, block on it inside
-/// the callback (e.g., `Handle::current().block_on(my_future)`) so
-/// it completes before the callback returns.
+/// If you need **async** work inside a callback, block on it using
+/// `tokio::task::block_in_place` so it completes before the callback
+/// returns.  Do **not** call `Handle::current().block_on(...)` directly
+/// — that panics when called from inside a Tokio worker thread.
+///
+/// ```rust,ignore
+/// use tokio::runtime::Handle;
+///
+/// fn on_partitions_revoked(&self, partitions: &[TopicPartition]) {
+///     tokio::task::block_in_place(|| {
+///         Handle::current().block_on(async {
+///             // e.g., commit offsets synchronously
+///         });
+///     });
+/// }
+/// ```
 ///
 /// # Example
 ///

@@ -52,12 +52,11 @@ use crate::error::{KrafkaError, Result};
 
 const OAUTHBEARER_EXPIRY_SKEW_MARGIN_MS: i64 = 30_000;
 
-fn current_epoch_ms() -> i64 {
-    let now_u128 = SystemTime::now()
+fn current_epoch_ms() -> Result<i64> {
+    let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    i64::try_from(now_u128).unwrap_or(i64::MAX)
+        .map_err(|_| KrafkaError::auth("system clock predates Unix epoch"))?;
+    i64::try_from(d.as_millis()).map_err(|_| KrafkaError::auth("current epoch_ms overflows i64"))
 }
 
 /// Trait for providing fresh OAuth 2.0 bearer tokens on each broker connection.
@@ -234,9 +233,11 @@ impl OAuthBearerToken {
     }
 
     /// Returns `true` if the token has a known expiry and that expiry is in the past.
+    ///
+    /// Returns `true` conservatively when the system clock is unavailable (fail-safe).
     pub fn is_expired(&self) -> bool {
         self.lifetime_ms
-            .is_some_and(|lifetime_ms| current_epoch_ms() >= lifetime_ms)
+            .is_some_and(|lifetime_ms| current_epoch_ms().map_or(true, |now| now >= lifetime_ms))
     }
 
     /// Returns `true` if the token should be refreshed before starting a new
@@ -246,9 +247,13 @@ impl OAuthBearerToken {
     /// expiry timestamp is still in the future. This mirrors the common Kafka
     /// client practice of refreshing before the edge of expiry so broker/client
     /// clock skew does not cause avoidable authentication failures.
+    ///
+    /// Returns `true` conservatively when the system clock is unavailable (fail-safe).
     pub fn needs_refresh(&self) -> bool {
         self.lifetime_ms.is_some_and(|lifetime_ms| {
-            current_epoch_ms() >= lifetime_ms.saturating_sub(OAUTHBEARER_EXPIRY_SKEW_MARGIN_MS)
+            current_epoch_ms().map_or(true, |now| {
+                now >= lifetime_ms.saturating_sub(OAUTHBEARER_EXPIRY_SKEW_MARGIN_MS)
+            })
         })
     }
 
@@ -527,7 +532,7 @@ mod tests {
 
     #[test]
     fn test_oauthbearer_token_needs_refresh_near_expiry() {
-        let near_future_ms = current_epoch_ms() + 10_000;
+        let near_future_ms = current_epoch_ms().unwrap() + 10_000;
         let token = OAuthBearerToken::new("tok").with_lifetime_ms(near_future_ms);
 
         assert!(!token.is_expired());
@@ -536,7 +541,7 @@ mod tests {
 
     #[test]
     fn test_oauthbearer_token_does_not_need_refresh_with_safe_margin() {
-        let future_ms = current_epoch_ms() + 60_000;
+        let future_ms = current_epoch_ms().unwrap() + 60_000;
         let token = OAuthBearerToken::new("tok").with_lifetime_ms(future_ms);
 
         assert!(!token.needs_refresh());

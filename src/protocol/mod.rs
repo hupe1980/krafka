@@ -389,11 +389,7 @@ pub mod versions {
     // ── ApiVersions (API key 18) ─────────────────────────────────────────
     /// Minimum supported ApiVersions version.
     pub const API_VERSIONS_MIN: i16 = 0;
-    /// Maximum supported ApiVersions version (v4 KAFKA-17011 SupportedFeatures fix).
-    #[cfg(not(feature = "unstable-protocol"))]
-    pub const API_VERSIONS_MAX: i16 = 4;
     /// Maximum supported ApiVersions version (v5 KIP-1242 ClusterId/NodeId).
-    #[cfg(feature = "unstable-protocol")]
     pub const API_VERSIONS_MAX: i16 = 5;
 
     // ── CreateTopics (API key 19) ────────────────────────────────────────
@@ -720,34 +716,26 @@ pub mod versions {
 
     // ── ShareGroupHeartbeat (API key 76) — KIP-932 ──────────────────────
     /// Minimum supported ShareGroupHeartbeat version.
-    #[cfg(feature = "unstable-protocol")]
     pub const SHARE_GROUP_HEARTBEAT_MIN: i16 = 1;
     /// Maximum supported ShareGroupHeartbeat version.
-    #[cfg(feature = "unstable-protocol")]
     pub const SHARE_GROUP_HEARTBEAT_MAX: i16 = 1;
 
     // ── ShareGroupDescribe (API key 77) — KIP-932 ───────────────────────
     /// Minimum supported ShareGroupDescribe version.
-    #[cfg(feature = "unstable-protocol")]
     pub const SHARE_GROUP_DESCRIBE_MIN: i16 = 1;
     /// Maximum supported ShareGroupDescribe version.
-    #[cfg(feature = "unstable-protocol")]
     pub const SHARE_GROUP_DESCRIBE_MAX: i16 = 1;
 
     // ── ShareFetch (API key 78) — KIP-932 ───────────────────────────────
     /// Minimum supported ShareFetch version.
-    #[cfg(feature = "unstable-protocol")]
     pub const SHARE_FETCH_MIN: i16 = 1;
     /// Maximum supported ShareFetch version (KIP-1206 + KIP-1222).
-    #[cfg(feature = "unstable-protocol")]
     pub const SHARE_FETCH_MAX: i16 = 2;
 
     // ── ShareAcknowledge (API key 79) — KIP-932 ─────────────────────────
     /// Minimum supported ShareAcknowledge version.
-    #[cfg(feature = "unstable-protocol")]
     pub const SHARE_ACKNOWLEDGE_MIN: i16 = 1;
     /// Maximum supported ShareAcknowledge version (KIP-1222).
-    #[cfg(feature = "unstable-protocol")]
     pub const SHARE_ACKNOWLEDGE_MAX: i16 = 2;
 }
 

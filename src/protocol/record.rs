@@ -59,16 +59,22 @@ impl Compression {
         }
     }
 
-    /// Create from a raw value.
+    /// Create from the lower 3 bits of a record batch attributes field.
+    ///
+    /// Returns `None` for unknown discriminants (values 5–7). Callers should
+    /// propagate `None` as a `ProtocolErrorKind::InvalidValue` rather than
+    /// silently falling back to `Compression::None`, which would attempt to
+    /// interpret compressed bytes as raw data and produce garbage records.
     #[inline]
-    pub fn from_u8(value: u8) -> Self {
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Option<Self> {
         match value & 0x07 {
-            0 => Self::None,
-            1 => Self::Gzip,
-            2 => Self::Snappy,
-            3 => Self::Lz4,
-            4 => Self::Zstd,
-            _ => Self::None,
+            0 => Some(Self::None),
+            1 => Some(Self::Gzip),
+            2 => Some(Self::Snappy),
+            3 => Some(Self::Lz4),
+            4 => Some(Self::Zstd),
+            _ => None,
         }
     }
 
@@ -467,14 +473,25 @@ pub struct RecordBatchAttributes {
 
 impl RecordBatchAttributes {
     /// Create from raw attributes value.
+    ///
+    /// Returns an error if the compression discriminant (bits 0–2) is not a
+    /// recognised Kafka codec. This prevents silently decoding compressed
+    /// bytes as uncompressed data when a new codec is added to the protocol.
     #[inline]
-    pub fn from_i16(value: i16) -> Self {
-        Self {
-            compression: Compression::from_u8((value & 0x07) as u8),
+    pub fn from_i16(value: i16) -> Result<Self> {
+        let compression_bits = (value & 0x07) as u8;
+        let compression = Compression::from_u8(compression_bits).ok_or_else(|| {
+            KrafkaError::protocol_kind(
+                crate::error::ProtocolErrorKind::InvalidValue,
+                format!("unknown compression codec discriminant: {compression_bits}"),
+            )
+        })?;
+        Ok(Self {
+            compression,
             timestamp_type: TimestampType::from_attributes(value),
             is_transactional: value & 0x10 != 0,
             is_control_batch: value & 0x20 != 0,
-        }
+        })
     }
 
     /// Convert to raw attributes value.
@@ -657,7 +674,7 @@ impl RecordBatch {
         }
 
         let crc = buf.get_u32();
-        let attributes = RecordBatchAttributes::from_i16(buf.get_i16());
+        let attributes = RecordBatchAttributes::from_i16(buf.get_i16())?;
         let last_offset_delta = buf.get_i32();
         let base_timestamp = buf.get_i64();
         let max_timestamp = buf.get_i64();
@@ -1063,7 +1080,7 @@ impl LazyRecordBatch {
         }
 
         let crc = buf.get_u32();
-        let attributes = RecordBatchAttributes::from_i16(buf.get_i16());
+        let attributes = RecordBatchAttributes::from_i16(buf.get_i16())?;
         let last_offset_delta = buf.get_i32();
         let base_timestamp = buf.get_i64();
         let max_timestamp = buf.get_i64();
@@ -1434,7 +1451,7 @@ mod tests {
         };
 
         let raw = attrs.to_i16();
-        let decoded = RecordBatchAttributes::from_i16(raw);
+        let decoded = RecordBatchAttributes::from_i16(raw).unwrap();
 
         assert_eq!(decoded.compression, Compression::Lz4);
         assert_eq!(decoded.timestamp_type, TimestampType::LogAppendTime);
@@ -1631,7 +1648,7 @@ mod tests {
     #[test]
     fn test_record_batch_attributes_transactional_bit() {
         // Verify the transactional bit (0x10) is correctly set/read
-        let attrs = RecordBatchAttributes::from_i16(0x10);
+        let attrs = RecordBatchAttributes::from_i16(0x10).unwrap();
         assert!(attrs.is_transactional);
         assert!(!attrs.is_control_batch);
 
@@ -1639,7 +1656,7 @@ mod tests {
         assert_eq!(raw & 0x10, 0x10);
 
         // Non-transactional
-        let attrs = RecordBatchAttributes::from_i16(0x00);
+        let attrs = RecordBatchAttributes::from_i16(0x00).unwrap();
         assert!(!attrs.is_transactional);
     }
 
