@@ -221,14 +221,17 @@ enum TelemetryChunkingError {
 /// use std::sync::Arc;
 /// use krafka::metrics::KrafkaMetrics;
 /// use krafka::telemetry::reporter::{TelemetryReporter, TelemetryConfig};
-/// use krafka::network::BrokerConnection;
+/// use krafka::network::{BrokerConnection, ConnectionPool};
 ///
-/// # async fn example(conn: Arc<BrokerConnection>) {
+/// # async fn example(conn: Arc<BrokerConnection>, pool: Arc<ConnectionPool>) {
 /// let metrics = Arc::new(KrafkaMetrics::new());
 /// let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+/// let broker_addresses = vec!["localhost:9092".to_string()];
 ///
 /// let reporter = TelemetryReporter::new(
 ///     conn,
+///     pool,
+///     broker_addresses,
 ///     metrics,
 ///     TelemetryConfig::default(),
 ///     shutdown_rx,
