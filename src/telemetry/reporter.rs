@@ -1663,8 +1663,9 @@ mod tests {
             );
         }
 
-        // 2 direct metrics + 5 from matching latency (count, sum, min, max, avg)
-        assert_eq!(otlp.finish_metric_count(), 7);
+        // 2 direct metrics + 8 from matching latency
+        // (count, sum, min, max, avg, p50, p95, p99)
+        assert_eq!(otlp.finish_metric_count(), 10);
     }
 
     #[test]
