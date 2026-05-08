@@ -91,7 +91,7 @@ pub struct Producer {
     memory_permits: Arc<Semaphore>,
     /// Effective producer memory capacity after semaphore-limit clamping.
     memory_capacity: usize,
-    /// Maximum encoded Kafka request frame size in bytes (0 = unlimited).
+    /// Maximum encoded Kafka request frame size in bytes.
     /// Records exceeding this limit are rejected before reaching the network.
     max_request_size: usize,
     /// Number of records currently admitted into the direct-send path.

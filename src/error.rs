@@ -35,7 +35,7 @@ impl fmt::Display for ArcError {
 
 impl std::error::Error for ArcError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.0.source()
+        Some(self.0.as_ref())
     }
 }
 

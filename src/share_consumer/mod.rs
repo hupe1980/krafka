@@ -414,16 +414,15 @@ impl ShareConsumer {
             }
         }
 
-        // If the recv_buffer is already at capacity, skip fetching to let the
-        // application drain it first. This bounds memory usage when recv() is
-        // called more slowly than poll().
+        // If recv_buffer is at capacity, skip only the fetch step (after
+        // heartbeat/coordination) so group membership remains healthy.
         let max_buffered = self.config.max_buffered_records;
-        if max_buffered > 0 {
+        let skip_fetch_due_to_buffer_cap = if max_buffered > 0 {
             let buf_len = self.recv_buffer.read().await.len();
-            if buf_len >= max_buffered as usize {
-                return Ok(Vec::new());
-            }
-        }
+            buf_len >= max_buffered as usize
+        } else {
+            false
+        };
 
         // Send heartbeat to maintain membership and receive assignments.
         // Cap the heartbeat RPC at 10 s so a slow/stuck coordinator does not
@@ -444,7 +443,7 @@ impl ShareConsumer {
         }
 
         let assignments = self.assignments.read().await.clone();
-        if assignments.is_empty() {
+        if assignments.is_empty() || skip_fetch_due_to_buffer_cap {
             return Ok(Vec::new());
         }
 
@@ -1067,14 +1066,10 @@ impl ShareConsumer {
         }
 
         let mut buf = self.recv_buffer.write().await;
-        let max = self.config.max_buffered_records;
         let mut iter = records.into_iter();
         let first = iter.next();
+        // Preserve overflow records so recv() never drops data.
         for record in iter {
-            // Enforce max_buffered_records cap (0 = unlimited).
-            if max > 0 && buf.len() >= max as usize {
-                break;
-            }
             buf.push_back(record);
         }
 
@@ -1430,7 +1425,9 @@ impl ShareConsumer {
             tracing::warn!(
                 raw_ms = raw_interval_ms,
                 clamped_ms = clamped_interval_ms,
-                "broker heartbeat_interval_ms is out of safe range [{HEARTBEAT_MIN_MS}..={HEARTBEAT_MAX_MS}]; clamping"
+                min_ms = HEARTBEAT_MIN_MS,
+                max_ms = HEARTBEAT_MAX_MS,
+                "broker heartbeat_interval_ms is out of safe range; clamping"
             );
         }
         *self.heartbeat_interval_ms.write().await = clamped_interval_ms;
@@ -1731,7 +1728,7 @@ impl ShareConsumerBuilder {
     ///
     /// When the internal buffer reaches this limit, `poll()` skips fetching
     /// until the buffer drains below the cap. Set to `0` for unlimited.
-    /// Defaults to 500.
+    /// Negative values are rejected at build time. Defaults to 500.
     pub fn max_buffered_records(mut self, max: i32) -> Self {
         self.config.max_buffered_records = max;
         self
@@ -1831,6 +1828,12 @@ impl ShareConsumerBuilder {
             return Err(KrafkaError::config(format!(
                 "heartbeat_interval ({:?}) must be less than session_timeout ({:?})",
                 self.config.heartbeat_interval, self.config.session_timeout,
+            )));
+        }
+        if self.config.max_buffered_records < 0 {
+            return Err(KrafkaError::config(format!(
+                "max_buffered_records ({}) must be >= 0 (use 0 for unlimited)",
+                self.config.max_buffered_records,
             )));
         }
         ShareConsumer::new(self.config).await
@@ -1950,6 +1953,19 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("heartbeat_interval"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_share_consumer_builder_rejects_negative_max_buffered_records() {
+        let result = ShareConsumer::builder()
+            .bootstrap_servers("localhost:9092")
+            .group_id("sg")
+            .max_buffered_records(-1)
+            .build()
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("max_buffered_records"), "got: {err}");
     }
 
     #[test]

@@ -159,7 +159,7 @@ impl Gauge {
 /// # Bucket layout
 ///
 /// Bucket `i` counts samples whose nanosecond value satisfies `2^i ≤ ns < 2^(i+1)`.
-/// Bucket 0 collects the special case of 0-nanosecond samples.
+/// Bucket 0 contains both `0 ns` and the range `[1 ns, 2 ns)`.
 /// The relative error is at most ~100 % within any single bucket (i.e., the
 /// reported percentile may be up to 2× the true value), which is acceptable
 /// for production SLO alerting where the important distinction is between
@@ -280,8 +280,8 @@ impl LatencyTracker {
         for (i, bucket) in self.histogram.iter().enumerate() {
             cumulative += bucket.load(Ordering::Relaxed);
             if cumulative >= target {
-                // Represent this bucket by the geometric midpoint: 2^i * sqrt(2)
-                // (clamped to integer nanos). For i=0 we return 0.
+                // Represent this bucket by an arithmetic midpoint estimate.
+                // For i=0 we return 0.
                 let nanos = if i == 0 {
                     0u64
                 } else {
@@ -516,7 +516,7 @@ impl MetricsExporter for PrometheusExporter {
         if let Some(p50) = snapshot.p50 {
             let _ = writeln!(
                 self.output,
-                "{}{{quantile=\"0.5\"}} {:.9}",
+                "{}_seconds{{quantile=\"0.5\"}} {:.9}",
                 name,
                 p50.as_secs_f64()
             );
@@ -524,7 +524,7 @@ impl MetricsExporter for PrometheusExporter {
         if let Some(p95) = snapshot.p95 {
             let _ = writeln!(
                 self.output,
-                "{}{{quantile=\"0.95\"}} {:.9}",
+                "{}_seconds{{quantile=\"0.95\"}} {:.9}",
                 name,
                 p95.as_secs_f64()
             );
@@ -532,7 +532,7 @@ impl MetricsExporter for PrometheusExporter {
         if let Some(p99) = snapshot.p99 {
             let _ = writeln!(
                 self.output,
-                "{}{{quantile=\"0.99\"}} {:.9}",
+                "{}_seconds{{quantile=\"0.99\"}} {:.9}",
                 name,
                 p99.as_secs_f64()
             );
@@ -1169,8 +1169,10 @@ pub struct ProducerMetricsSnapshot {
     pub compressed_bytes: u64,
     /// Total uncompressed bytes for the same compressed batches.
     pub uncompressed_bytes: u64,
-    /// Average compression ratio (`compressed_bytes / uncompressed_bytes`),
-    /// in the range `[0.0, 1.0]` for a compressing codec (lower is better).
+    /// Average compression ratio (`compressed_bytes / uncompressed_bytes`).
+    ///
+    /// Values `< 1.0` indicate net compression; values `> 1.0` indicate
+    /// expansion (possible for incompressible or already-compressed inputs).
     /// `None` when no compressed batches have been sent yet.
     pub compression_ratio_avg: Option<f64>,
 }
