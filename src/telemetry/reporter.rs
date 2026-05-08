@@ -445,8 +445,9 @@ impl TelemetryReporter {
     /// Iterates `broker_addresses` in order and replaces `self.connection` on
     /// the first success. Returns `true` if reconnected, `false` if all fail.
     async fn reconnect(&mut self) -> bool {
-        for addr in &self.broker_addresses.clone() {
-            match self.pool.get_connection(addr).await {
+        for idx in 0..self.broker_addresses.len() {
+            let addr = self.broker_addresses[idx].clone();
+            match self.pool.get_connection(&addr).await {
                 Ok(conn) => {
                     info!(broker = %addr, "Telemetry reporter reconnected to broker");
                     self.connection = conn;

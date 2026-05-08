@@ -1726,9 +1726,11 @@ impl ShareConsumerBuilder {
 
     /// Set maximum records buffered internally by [`recv()`](ShareConsumer::recv).
     ///
-    /// When the internal buffer reaches this limit, `poll()` skips fetching
-    /// until the buffer drains below the cap. Set to `0` for unlimited.
-    /// Negative values are rejected at build time. Defaults to 500.
+    /// This is a soft threshold: once the buffer is at/above this value,
+    /// `poll()` skips fetches until it drains. A single `recv()` call may
+    /// buffer beyond the threshold due to batched fetch responses. Set to `0`
+    /// for unlimited. Negative values are rejected at build time.
+    /// Defaults to 500.
     pub fn max_buffered_records(mut self, max: i32) -> Self {
         self.config.max_buffered_records = max;
         self

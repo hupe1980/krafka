@@ -1156,7 +1156,7 @@ impl RecordAccumulator {
             }
         };
 
-        // Track compression ratio for compressed batches.
+        // Track estimated compression ratio for compressed batches.
         if config.compression != Compression::None {
             metrics.record_compression(compressed_len, uncompressed_len);
         }

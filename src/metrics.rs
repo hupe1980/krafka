@@ -199,7 +199,6 @@ impl LatencyTracker {
     #[inline]
     pub fn record(&self, duration: Duration) {
         let nanos = duration.as_nanos() as u64;
-        self.count.fetch_add(1, Ordering::Relaxed);
         self.sum_nanos.fetch_add(nanos, Ordering::Relaxed);
         self.min_nanos.fetch_min(nanos, Ordering::Relaxed);
         self.max_nanos.fetch_max(nanos, Ordering::Relaxed);
@@ -210,6 +209,8 @@ impl LatencyTracker {
             (63 - nanos.leading_zeros()) as usize
         };
         self.histogram[bucket].fetch_add(1, Ordering::Relaxed);
+        // Increment count last so snapshots never observe count > histogram sum.
+        self.count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Start timing an operation. Returns a guard that records when dropped.
@@ -1066,13 +1067,17 @@ pub struct ProducerMetrics {
     pub connections: Gauge,
     /// Producer records currently admitted under the memory budget.
     pub buffered_records: Gauge,
-    /// Compressed bytes written to the wire (numerator for compression ratio).
+    /// Estimated compressed bytes written to the wire for compressed batches
+    /// (numerator for compression ratio).
     ///
-    /// Only incremented for compressed batches (`compression != None`).
+    /// These values are derived from batch-size estimates and are best-effort
+    /// rather than exact protocol-frame byte counts.
     pub compressed_bytes: Counter,
-    /// Uncompressed bytes for the same batches (denominator for compression ratio).
+    /// Estimated uncompressed bytes for the same compressed batches
+    /// (denominator for compression ratio).
     ///
-    /// Only incremented for compressed batches (`compression != None`).
+    /// These values are derived from batch-size estimates and are best-effort
+    /// rather than exact protocol-frame byte counts.
     pub uncompressed_bytes: Counter,
 }
 
@@ -1108,11 +1113,12 @@ impl ProducerMetrics {
         self.retries.inc();
     }
 
-    /// Record bytes before and after compression for a batch.
+    /// Record estimated bytes before and after compression for a batch.
     ///
     /// Only call this for batches that actually used compression
-    /// (`compression != Compression::None`). Passing equal values
-    /// (e.g. for an incompressible batch) is valid and contributes a
+    /// (`compression != Compression::None`). Values are based on size
+    /// estimates used by the accumulator and are best-effort. Passing equal
+    /// values (e.g. for an incompressible batch) is valid and contributes a
     /// ratio of 1.0 to the running average.
     #[inline]
     pub fn record_compression(&self, compressed: u64, uncompressed: u64) {
@@ -1165,11 +1171,11 @@ pub struct ProducerMetricsSnapshot {
     pub connections: u64,
     /// Records currently admitted under the producer memory budget.
     pub buffered_records: u64,
-    /// Total compressed bytes written for compressed batches.
+    /// Total estimated compressed bytes for compressed batches.
     pub compressed_bytes: u64,
-    /// Total uncompressed bytes for the same compressed batches.
+    /// Total estimated uncompressed bytes for the same compressed batches.
     pub uncompressed_bytes: u64,
-    /// Average compression ratio (`compressed_bytes / uncompressed_bytes`).
+    /// Average estimated compression ratio (`compressed_bytes / uncompressed_bytes`).
     ///
     /// Values `< 1.0` indicate net compression; values `> 1.0` indicate
     /// expansion (possible for incompressible or already-compressed inputs).

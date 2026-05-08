@@ -69,9 +69,10 @@ pub struct ShareConsumerConfig {
     pub(crate) max_poll_records: i32,
     /// Maximum records buffered internally by [`recv()`](super::ShareConsumer::recv).
     ///
-    /// When the internal buffer reaches this limit, `poll()` skips fetching
-    /// new data until the buffer drains. Set to `0` to disable the cap
-    /// (unlimited). Defaults to 500.
+    /// This is a soft threshold: when the buffer is at/above this value,
+    /// `poll()` skips new fetches until the buffer drains. A single `recv()`
+    /// call may buffer more records than the threshold due to batched fetch
+    /// responses. Set to `0` to disable the cap (unlimited). Defaults to 500.
     pub(crate) max_buffered_records: i32,
     /// Maximum records to acquire per fetch request.
     pub(crate) max_records: i32,

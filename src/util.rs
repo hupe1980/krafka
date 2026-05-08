@@ -1,5 +1,6 @@
 //! Utility functions for Krafka.\n//!\n//! This module provides low-level utilities used throughout the crate:\n//!\n//! - **Correlation ID generation**: Thread-safe ID generation for request/response matching\n//! - **CRC32C**: Checksum calculation for Kafka record validation\n//! - **Varint encoding**: Variable-length integer encoding for compact protocols\n//! - **SNI hostname extraction**: Parse hostnames from address strings for TLS SNI
 
+use std::sync::Once;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
@@ -20,13 +21,17 @@ pub(crate) const NO_RESPONSE_CORRELATION_ID: i32 = i32::MIN;
 /// becoming a much smaller value.
 #[inline]
 pub fn duration_to_millis_i32(d: Duration) -> i32 {
+    static WARN_ONCE_DURATION_TO_I32_CLAMP: Once = Once::new();
+
     let ms = d.as_millis();
     if ms > i32::MAX as u128 {
-        tracing::warn!(
-            duration_ms = %ms,
-            capped_at = i32::MAX,
-            "duration exceeds i32::MAX (~24.8 days); clamping to i32::MAX"
-        );
+        WARN_ONCE_DURATION_TO_I32_CLAMP.call_once(|| {
+            tracing::warn!(
+                duration_ms = %ms,
+                capped_at = i32::MAX,
+                "duration exceeds i32::MAX (~24.8 days); clamping to i32::MAX (further clamp events suppressed)"
+            );
+        });
     }
     ms.min(i32::MAX as u128) as i32
 }
