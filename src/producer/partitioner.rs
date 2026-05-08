@@ -403,16 +403,16 @@ impl Partitioner for UniformStickyPartitioner {
 
         // Unkeyed: return (or initialise) the sticky partition under the lock.
         let mut map = self.sticky.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = map
+        let partition = map
             .entry(topic.to_string())
             .or_insert_with(|| rand::rng().random_range(0..partition_count as i32));
 
         // Guard against partition_count shrinking after the sticky was set.
-        if (*entry as usize) < partition_count {
-            *entry
+        if (*partition as usize) < partition_count {
+            *partition
         } else {
             let fresh = rand::rng().random_range(0..partition_count as i32);
-            *entry = fresh;
+            *partition = fresh;
             fresh
         }
     }

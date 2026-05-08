@@ -544,9 +544,9 @@ impl ConsumerConfigBuilder {
 
     /// Set maximum records per [`poll()`](super::Consumer::poll) call.
     ///
-    /// - `0` (or any negative value) means unlimited — no truncation.
-    ///   Use `0` for unlimited; negative values are rejected at build time.
+    /// - `0` means unlimited — no truncation. This is the recommended mode.
     /// - Positive values cap each poll batch at that many records.
+    /// - Negative values are rejected at build time.
     ///
     /// Default: 500.
     pub fn max_poll_records(mut self, max: i32) -> Self {

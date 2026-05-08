@@ -14,7 +14,7 @@
 //! session state and sends only the new/changed partitions in the `topics`
 //! field plus any removed partitions in the `forgotten_topics` field.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::protocol::{FetchForgottenTopic, FetchPartitionRequest, FetchTopicRequest};
 use crate::{BrokerId, PartitionId};
@@ -292,7 +292,8 @@ impl FetchSessionCache {
     /// indefinitely. The next fetch to a re-joined broker will start a fresh
     /// full fetch, which is correct behavior.
     pub(crate) fn retain_brokers(&mut self, broker_ids: &[BrokerId]) {
-        self.sessions.retain(|id, _| broker_ids.contains(id));
+        let broker_set: HashSet<_> = broker_ids.iter().copied().collect();
+        self.sessions.retain(|id, _| broker_set.contains(id));
     }
 }
 

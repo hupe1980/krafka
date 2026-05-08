@@ -274,7 +274,8 @@ impl LatencyTracker {
         // Clamp percentile to [0, 100].
         let p = percentile.clamp(0.0, 100.0);
         // Number of samples that must be at or below the target percentile.
-        let target = ((p / 100.0) * total as f64).ceil() as u64;
+        // Ensure target >= 1 so p=0 returns min, not bucket 0 artificially.
+        let target = ((p / 100.0) * total as f64).ceil().max(1.0) as u64;
         let mut cumulative: u64 = 0;
         for (i, bucket) in self.histogram.iter().enumerate() {
             cumulative += bucket.load(Ordering::Relaxed);
@@ -515,7 +516,7 @@ impl MetricsExporter for PrometheusExporter {
         if let Some(p50) = snapshot.p50 {
             let _ = writeln!(
                 self.output,
-                "{{name=\"{}\",quantile=\"0.5\"}} {:.9}",
+                "{}{{quantile=\"0.5\"}} {:.9}",
                 name,
                 p50.as_secs_f64()
             );
@@ -523,7 +524,7 @@ impl MetricsExporter for PrometheusExporter {
         if let Some(p95) = snapshot.p95 {
             let _ = writeln!(
                 self.output,
-                "{{name=\"{}\",quantile=\"0.95\"}} {:.9}",
+                "{}{{quantile=\"0.95\"}} {:.9}",
                 name,
                 p95.as_secs_f64()
             );
@@ -531,7 +532,7 @@ impl MetricsExporter for PrometheusExporter {
         if let Some(p99) = snapshot.p99 {
             let _ = writeln!(
                 self.output,
-                "{{name=\"{}\",quantile=\"0.99\"}} {:.9}",
+                "{}{{quantile=\"0.99\"}} {:.9}",
                 name,
                 p99.as_secs_f64()
             );
