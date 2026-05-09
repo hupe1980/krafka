@@ -4,8 +4,6 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use rand::Rng as _;
-
 use crate::PartitionId;
 
 /// Compute murmur2 hash (Kafka's default hash function).
@@ -61,6 +59,19 @@ pub fn murmur2(data: &[u8]) -> u32 {
     h ^= h >> 15;
 
     h
+}
+
+/// Map a record key to a partition using Java-compatible `toPositive` masking.
+#[inline]
+fn partition_for_key(key: &[u8], partition_count: usize) -> PartitionId {
+    (((murmur2(key) & 0x7fff_ffff) as usize) % partition_count) as PartitionId
+}
+
+/// Draw a random partition in `[0, partition_count)`.
+#[inline]
+fn random_partition(partition_count: usize) -> i32 {
+    debug_assert!(partition_count > 0);
+    (rand::random::<u32>() % partition_count as u32) as i32
 }
 
 /// Trait for partitioning records across topic partitions.
@@ -139,10 +150,8 @@ impl Partitioner for DefaultPartitioner {
 
         match key {
             Some(k) if !k.is_empty() => {
-                // Use murmur2 hash for keyed records
-                let hash = murmur2(k);
-                // Use positive modulo
-                (hash as usize % partition_count) as PartitionId
+                // Java-compatible keyed routing: toPositive(murmur2(key)) % partition_count.
+                partition_for_key(k, partition_count)
             }
             _ => {
                 // Round-robin for records without keys
@@ -262,9 +271,8 @@ impl Partitioner for StickyPartitioner {
 
         match key {
             Some(k) if !k.is_empty() => {
-                // Use murmur2 hash for keyed records
-                let hash = murmur2(k);
-                (hash as usize % partition_count) as PartitionId
+                // Java-compatible keyed routing: toPositive(murmur2(key)) % partition_count.
+                partition_for_key(k, partition_count)
             }
             _ => {
                 // Auto-advance after batch_threshold records
@@ -283,7 +291,7 @@ impl Partitioner for StickyPartitioner {
 /// Hash-based partitioner using the same murmur2 algorithm as the Java Kafka client.
 ///
 /// Unlike `DefaultPartitioner` (which uses round-robin for null keys), this
-/// partitioner hashes both keyed and unkeyed records. Null/empty keys hash to
+/// partitioner hashes only keyed records. Null/empty keys are routed to
 /// partition 0.
 ///
 /// # Determinism
@@ -314,8 +322,7 @@ impl Partitioner for HashPartitioner {
                 // Previously used DefaultHasher here which is NOT stable across
                 // Rust versions (stdlib explicitly reserves the right to change it),
                 // violating the Partitioner determinism contract.
-                let hash = murmur2(k);
-                (hash as usize % partition_count) as PartitionId
+                partition_for_key(k, partition_count)
             }
             _ => 0,
         }
@@ -376,7 +383,7 @@ impl UniformStickyPartitioner {
         if partition_count <= 1 {
             return 0;
         }
-        let candidate = rand::rng().random_range(0..partition_count as i32);
+        let candidate = random_partition(partition_count);
         // Shift by 1 if we randomly drew the same partition we just flushed,
         // so every advance always changes the sticky target.
         if candidate == avoid {
@@ -398,7 +405,7 @@ impl Partitioner for UniformStickyPartitioner {
         if let Some(k) = key
             && !k.is_empty()
         {
-            return (murmur2(k) as usize % partition_count) as PartitionId;
+            return partition_for_key(k, partition_count);
         }
 
         // Unkeyed: return (or initialise) the sticky partition under the lock.
@@ -406,14 +413,14 @@ impl Partitioner for UniformStickyPartitioner {
         let mut partition = if let Some(existing) = map.get_mut(topic) {
             *existing
         } else {
-            let fresh = rand::rng().random_range(0..partition_count as i32);
+            let fresh = random_partition(partition_count);
             map.insert(topic.to_string(), fresh);
             fresh
         };
 
         // Guard against partition_count shrinking after the sticky was set.
         if (partition as usize) >= partition_count {
-            partition = rand::rng().random_range(0..partition_count as i32);
+            partition = random_partition(partition_count);
             map.insert(topic.to_string(), partition);
         }
         partition

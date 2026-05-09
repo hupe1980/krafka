@@ -442,6 +442,19 @@ impl ShareConsumer {
             }
         }
 
+        // If `recv()` previously buffered records, return them first so mixed
+        // `recv()`/`poll()` callers do not strand available data.
+        {
+            let mut buffered = self.recv_buffer.write().await;
+            if !buffered.is_empty() {
+                let take = (self.config.max_poll_records.max(0) as usize).min(buffered.len());
+                let drained: Vec<_> = buffered.drain(..take).collect();
+                if !drained.is_empty() {
+                    return Ok(drained);
+                }
+            }
+        }
+
         let assignments = self.assignments.read().await.clone();
         if assignments.is_empty() || skip_fetch_due_to_buffer_cap {
             return Ok(Vec::new());

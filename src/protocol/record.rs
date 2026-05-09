@@ -1460,6 +1460,18 @@ mod tests {
     }
 
     #[test]
+    fn test_record_batch_attributes_rejects_unknown_compression_discriminant() {
+        // Compression discriminant lives in bits 0..=2. Values 5..=7 are unknown.
+        let err = RecordBatchAttributes::from_i16(0x0005).unwrap_err();
+        match err {
+            KrafkaError::Protocol { kind, .. } => {
+                assert_eq!(kind, crate::error::ProtocolErrorKind::InvalidValue)
+            }
+            other => panic!("expected protocol invalid-value error, got: {other}"),
+        }
+    }
+
+    #[test]
     fn test_lazy_record_batch_decode() {
         let batch = RecordBatchBuilder::new()
             .compression(Compression::None)

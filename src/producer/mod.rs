@@ -1944,22 +1944,17 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_idempotent_autocaps_max_in_flight() {
-        // max_in_flight > 5 with idempotent enabled: auto-capped to 5, not an error.
-        // We can't call .build() without a real broker, but the validation runs
-        // before the connection attempt, so we can detect the cap via the semaphore
-        // capacity.  Test against the internal config directly.
-        let mut cfg = ProducerConfig {
-            max_in_flight: 10,
-            bootstrap_servers: "localhost:9092".to_string(),
-            ..Default::default()
-        };
-        // Simulate what build() does for the auto-cap path.
-        if cfg.idempotent && cfg.max_in_flight > 5 {
-            cfg.max_in_flight = 5;
-        }
-        assert_eq!(cfg.max_in_flight, 5);
+    #[test]
+    fn test_idempotent_autocaps_max_in_flight() {
+        // Source-of-truth validation lives in ProducerConfigBuilder and is
+        // testable without requiring a live broker connection.
+        let cfg = ProducerConfig::builder()
+            .bootstrap_servers("localhost:9092")
+            .idempotent(true)
+            .max_in_flight(10)
+            .build()
+            .expect("idempotent config should auto-cap max_in_flight to 5");
+        assert_eq!(cfg.max_in_flight(), 5);
     }
 
     #[tokio::test]

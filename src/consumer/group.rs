@@ -60,18 +60,31 @@ use crate::protocol::{
 ///
 /// If you need **async** work inside a callback, block on it using
 /// `tokio::task::block_in_place` so it completes before the callback
-/// returns.  Do **not** call `Handle::current().block_on(...)` directly
-/// — that panics when called from inside a Tokio worker thread.
+/// returns. `block_in_place` requires Tokio's multi-thread runtime;
+/// on a current-thread runtime, use a dedicated thread and a channel
+/// to synchronously bridge async work. Do **not** call
+/// `Handle::current().block_on(...)` directly — that panics when called
+/// from inside a Tokio worker thread.
 ///
 /// ```rust,ignore
 /// use tokio::runtime::Handle;
 ///
 /// fn on_partitions_revoked(&self, partitions: &[TopicPartition]) {
+///     // Multi-thread runtime only:
 ///     tokio::task::block_in_place(|| {
 ///         Handle::current().block_on(async {
 ///             // e.g., commit offsets synchronously
 ///         });
 ///     });
+///
+///     // Current-thread runtime alternative:
+///     // let handle = Handle::current();
+///     // let (tx, rx) = std::sync::mpsc::channel();
+///     // std::thread::spawn(move || {
+///     //     let result = handle.block_on(async { Ok::<_, ()>(()) });
+///     //     let _ = tx.send(result);
+///     // });
+///     // let _ = rx.recv();
 /// }
 /// ```
 ///
