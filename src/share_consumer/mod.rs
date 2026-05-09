@@ -447,11 +447,9 @@ impl ShareConsumer {
         {
             let mut buffered = self.recv_buffer.write().await;
             if !buffered.is_empty() {
-                let take = (self.config.max_poll_records.max(0) as usize).min(buffered.len());
-                let drained: Vec<_> = buffered.drain(..take).collect();
-                if !drained.is_empty() {
-                    return Ok(drained);
-                }
+                // max_poll_records is validated >= 1 in the builder, so take >= 1.
+                let take = (self.config.max_poll_records as usize).min(buffered.len());
+                return Ok(buffered.drain(..take).collect());
             }
         }
 
@@ -811,11 +809,9 @@ impl ShareConsumer {
             }
         }
 
-        // Truncate to max_poll_records.
+        // Truncate to max_poll_records (validated >= 1 in the builder).
         let max = self.config.max_poll_records as usize;
-        if all_records.len() > max {
-            all_records.truncate(max);
-        }
+        all_records.truncate(max);
 
         Ok(all_records)
     }
@@ -1731,7 +1727,9 @@ impl ShareConsumerBuilder {
         self
     }
 
-    /// Set maximum number of records per poll.
+    /// Set the maximum number of records returned per `poll()` call.
+    ///
+    /// Must be >= 1. Rejected at build time otherwise. Defaults to 500.
     pub fn max_poll_records(mut self, max: i32) -> Self {
         self.config.max_poll_records = max;
         self
@@ -1849,6 +1847,12 @@ impl ShareConsumerBuilder {
             return Err(KrafkaError::config(format!(
                 "max_buffered_records ({}) must be >= 0 (use 0 for unlimited)",
                 self.config.max_buffered_records,
+            )));
+        }
+        if self.config.max_poll_records < 1 {
+            return Err(KrafkaError::config(format!(
+                "max_poll_records ({}) must be >= 1",
+                self.config.max_poll_records,
             )));
         }
         ShareConsumer::new(self.config).await
@@ -1981,6 +1985,21 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("max_buffered_records"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_share_consumer_builder_rejects_zero_max_poll_records() {
+        for bad in [0, -1, i32::MIN] {
+            let result = ShareConsumer::builder()
+                .bootstrap_servers("localhost:9092")
+                .group_id("sg")
+                .max_poll_records(bad)
+                .build()
+                .await;
+            assert!(result.is_err(), "expected error for max_poll_records={bad}");
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("max_poll_records"), "got: {err}");
+        }
     }
 
     #[test]
