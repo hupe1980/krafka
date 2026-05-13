@@ -144,9 +144,9 @@ impl EndTxnResponse {
         })
     }
 
-    /// Decode from version 4+ (KIP-890: bumped `ProducerId` and `ProducerEpoch`
-    /// appended before tagged fields).
-    pub fn decode_v4(buf: &mut impl Buf) -> Result<Self> {
+    /// Decode from version 5+ (KIP-890: bumped `ProducerId` and
+    /// `ProducerEpoch` appended before tagged fields).
+    pub fn decode_v5(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let producer_id = i64::decode(buf)?;
@@ -182,8 +182,8 @@ impl VersionedDecode for EndTxnResponse {
     fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
         match version {
             0..=2 => Self::decode_v0(buf),
-            3 => Self::decode_v3(buf),
-            4..=5 => Self::decode_v4(buf),
+            3..=4 => Self::decode_v3(buf),
+            5 => Self::decode_v5(buf),
             _ => unsupported_decode!("EndTxnResponse", version),
         }
     }
@@ -293,11 +293,10 @@ mod tests {
         assert_eq!(resp.producer_epoch, None);
     }
 
-    /// KIP-890: v4+ response includes bumped ProducerId and ProducerEpoch.
+    /// KIP-890: v5 response includes bumped ProducerId and ProducerEpoch.
     #[rstest]
-    #[case::v4(4)]
     #[case::v5(5)]
-    fn test_end_txn_response_v4_epoch_bump(#[case] version: i16) {
+    fn test_end_txn_response_v5_epoch_bump(#[case] version: i16) {
         let mut buf = BytesMut::new();
         buf.put_i32(0); // throttle_time_ms
         buf.put_i16(0); // error_code (NONE)
@@ -309,6 +308,19 @@ mod tests {
         assert!(resp.error_code.is_ok());
         assert_eq!(resp.producer_id, Some(42));
         assert_eq!(resp.producer_epoch, Some(3));
+    }
+
+    #[test]
+    fn test_end_txn_response_v4_decode_versioned_uses_v3_shape() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0);
+        buf.put_i16(0);
+        buf.put_u8(0); // tagged fields
+
+        let resp = EndTxnResponse::decode_versioned(4, &mut buf.freeze()).unwrap();
+        assert!(resp.error_code.is_ok());
+        assert_eq!(resp.producer_id, None);
+        assert_eq!(resp.producer_epoch, None);
     }
 
     #[test]

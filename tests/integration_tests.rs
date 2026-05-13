@@ -239,6 +239,49 @@ async fn subscribe_with_retry(
     Err(last_error.unwrap())
 }
 
+/// Helper to initialize transactions with retry for coordinator warm-up.
+async fn init_transactions_with_retry(
+    producer: &krafka::producer::TransactionalProducer,
+    max_retries: u32,
+) -> Result<(), krafka::error::KrafkaError> {
+    use krafka::error::{ErrorCode, KrafkaError};
+
+    let attempts = max_retries.max(1);
+    let mut last_error = None;
+    for attempt in 0..attempts {
+        match producer.init_transactions().await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let is_coordinator_warmup_error = matches!(
+                    &e,
+                    KrafkaError::Broker {
+                        code: ErrorCode::CoordinatorLoadInProgress
+                            | ErrorCode::CoordinatorNotAvailable
+                            | ErrorCode::NotCoordinator,
+                        ..
+                    }
+                );
+                let should_retry = is_coordinator_warmup_error || e.is_retriable();
+
+                if should_retry && attempt < attempts - 1 {
+                    eprintln!(
+                        "init_transactions attempt {} failed ({e}), retrying in 2s...",
+                        attempt + 1
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    last_error = Some(e);
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        KrafkaError::invalid_state("init_transactions_with_retry exhausted without attempts")
+    }))
+}
+
 /// Helper to poll for records with retry.
 ///
 /// The first poll after subscribe often yields 0 records because the
@@ -2534,8 +2577,7 @@ async fn test_transactional_producer_commit() {
         .await
         .expect("Failed to create transactional producer");
 
-    producer
-        .init_transactions()
+    init_transactions_with_retry(&producer, 12)
         .await
         .expect("init_transactions failed");
     producer
@@ -2608,8 +2650,7 @@ async fn test_transactional_producer_abort() {
         .await
         .expect("Failed to create transactional producer");
 
-    producer
-        .init_transactions()
+    init_transactions_with_retry(&producer, 12)
         .await
         .expect("init_transactions failed");
 
@@ -2703,8 +2744,7 @@ async fn test_transactional_producer_multi_partition() {
         .await
         .expect("Failed to create transactional producer");
 
-    producer
-        .init_transactions()
+    init_transactions_with_retry(&producer, 12)
         .await
         .expect("init_transactions failed");
     producer
@@ -2782,8 +2822,7 @@ async fn test_transactional_producer_multiple_transactions() {
         .await
         .expect("Failed to create transactional producer");
 
-    producer
-        .init_transactions()
+    init_transactions_with_retry(&producer, 12)
         .await
         .expect("init_transactions failed");
 
@@ -2882,7 +2921,9 @@ async fn test_transactional_producer_epoch_fencing() {
         .await
         .expect("Failed to create producer 1");
 
-    producer1.init_transactions().await.expect("init 1 failed");
+    init_transactions_with_retry(&producer1, 12)
+        .await
+        .expect("init 1 failed");
     let epoch1 = producer1.producer_epoch();
 
     producer1.begin_transaction().expect("begin 1 failed");
@@ -2904,7 +2945,9 @@ async fn test_transactional_producer_epoch_fencing() {
         .await
         .expect("Failed to create producer 2");
 
-    producer2.init_transactions().await.expect("init 2 failed");
+    init_transactions_with_retry(&producer2, 12)
+        .await
+        .expect("init 2 failed");
     let epoch2 = producer2.producer_epoch();
 
     assert!(
@@ -3013,8 +3056,7 @@ async fn test_transactional_send_offsets_to_transaction() {
         .await
         .expect("Failed to create transactional producer");
 
-    txn_producer
-        .init_transactions()
+    init_transactions_with_retry(&txn_producer, 12)
         .await
         .expect("init_transactions failed");
 
