@@ -261,9 +261,9 @@ impl ConfluentSchemaRegistry {
         match &self.auth {
             RegistryAuth::None => builder,
             RegistryAuth::Basic { username, password } => {
-                builder.basic_auth(username, Some(password))
+                builder.basic_auth(username.as_str(), Some(password.as_str()))
             }
-            RegistryAuth::Bearer { token } => builder.bearer_auth(token),
+            RegistryAuth::Bearer { token } => builder.bearer_auth(token.as_str()),
         }
     }
 

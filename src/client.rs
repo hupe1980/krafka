@@ -116,7 +116,7 @@ pub struct KrafkaClientBuilder {
     metadata_recovery_rebootstrap_trigger: Duration,
     metadata_topic_cache_ttl: Option<Duration>,
     #[cfg(feature = "socks5")]
-    proxy: Option<crate::network::connection::ProxyConfig>,
+    proxy: Option<crate::network::ProxyConfig>,
 }
 
 impl KrafkaClientBuilder {
@@ -201,7 +201,7 @@ impl KrafkaClientBuilder {
     /// Configure a SOCKS5 proxy for all broker connections.
     #[cfg(feature = "socks5")]
     #[cfg_attr(docsrs, doc(cfg(feature = "socks5")))]
-    pub fn proxy(mut self, proxy: crate::network::connection::ProxyConfig) -> Self {
+    pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
         self.proxy = Some(proxy);
         self
     }

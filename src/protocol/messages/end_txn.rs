@@ -106,6 +106,16 @@ pub struct EndTxnResponse {
     pub throttle_time_ms: i32,
     /// Error code.
     pub error_code: ErrorCode,
+    /// Bumped producer ID returned by the broker (KIP-890, v4+).
+    ///
+    /// `None` for protocol versions 0–3. Present when the broker supports
+    /// KIP-890 epoch bumping after each `EndTxn`; the client must store this
+    /// value and use it for subsequent transactions.
+    pub producer_id: Option<i64>,
+    /// Bumped producer epoch returned by the broker (KIP-890, v4+).
+    ///
+    /// `None` for protocol versions 0–3.
+    pub producer_epoch: Option<i16>,
 }
 
 impl EndTxnResponse {
@@ -116,10 +126,12 @@ impl EndTxnResponse {
         Ok(Self {
             throttle_time_ms,
             error_code,
+            producer_id: None,
+            producer_epoch: None,
         })
     }
 
-    /// Decode from version 3–5 (flexible: tagged fields appended).
+    /// Decode from version 3 (flexible: tagged fields appended, no epoch).
     pub fn decode_v3(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -127,6 +139,24 @@ impl EndTxnResponse {
         Ok(Self {
             throttle_time_ms,
             error_code,
+            producer_id: None,
+            producer_epoch: None,
+        })
+    }
+
+    /// Decode from version 4+ (KIP-890: bumped `ProducerId` and `ProducerEpoch`
+    /// appended before tagged fields).
+    pub fn decode_v4(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let producer_id = i64::decode(buf)?;
+        let producer_epoch = i16::decode(buf)?;
+        let _ = TaggedFields::decode(buf)?;
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            producer_id: Some(producer_id),
+            producer_epoch: Some(producer_epoch),
         })
     }
 
@@ -152,7 +182,8 @@ impl VersionedDecode for EndTxnResponse {
     fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
         match version {
             0..=2 => Self::decode_v0(buf),
-            3..=5 => Self::decode_v3(buf),
+            3 => Self::decode_v3(buf),
+            4..=5 => Self::decode_v4(buf),
             _ => unsupported_decode!("EndTxnResponse", version),
         }
     }
@@ -231,6 +262,8 @@ mod tests {
         let resp = EndTxnResponse::decode_v0(&mut buf.freeze()).unwrap();
         assert_eq!(resp.throttle_time_ms, 10);
         assert!(resp.error_code.is_ok());
+        assert_eq!(resp.producer_id, None);
+        assert_eq!(resp.producer_epoch, None);
     }
 
     #[test]
@@ -243,19 +276,39 @@ mod tests {
         let resp = EndTxnResponse::decode_v3(&mut buf.freeze()).unwrap();
         assert_eq!(resp.throttle_time_ms, 5);
         assert!(resp.error_code.is_ok());
+        assert_eq!(resp.producer_id, None);
+        assert_eq!(resp.producer_epoch, None);
     }
 
     #[rstest]
     #[case::v3(3)]
-    #[case::v4(4)]
-    #[case::v5(5)]
-    fn test_end_txn_response_v3_v5_decode(#[case] version: i16) {
+    fn test_end_txn_response_v3_decode_versioned(#[case] version: i16) {
         let mut buf = BytesMut::new();
         buf.put_i32(0);
         buf.put_i16(0);
         buf.put_u8(0);
         let resp = EndTxnResponse::decode_versioned(version, &mut buf.freeze()).unwrap();
         assert!(resp.error_code.is_ok());
+        assert_eq!(resp.producer_id, None);
+        assert_eq!(resp.producer_epoch, None);
+    }
+
+    /// KIP-890: v4+ response includes bumped ProducerId and ProducerEpoch.
+    #[rstest]
+    #[case::v4(4)]
+    #[case::v5(5)]
+    fn test_end_txn_response_v4_epoch_bump(#[case] version: i16) {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_i16(0); // error_code (NONE)
+        buf.put_i64(42); // ProducerId (bumped)
+        buf.put_i16(3); // ProducerEpoch (bumped)
+        buf.put_u8(0); // tagged fields
+
+        let resp = EndTxnResponse::decode_versioned(version, &mut buf.freeze()).unwrap();
+        assert!(resp.error_code.is_ok());
+        assert_eq!(resp.producer_id, Some(42));
+        assert_eq!(resp.producer_epoch, Some(3));
     }
 
     #[test]

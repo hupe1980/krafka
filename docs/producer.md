@@ -738,6 +738,16 @@ automatically handle coordinator failover:
 - If no coordinator is cached (e.g. after invalidation), `coordinator_connection()` auto-discovers
   one transparently before returning the connection.
 
+### KIP-890 Epoch Bumping (Kafka 3.7+)
+
+Kafka 3.7+ brokers implement **KIP-890 epoch bumping**: after every successful `EndTxn` (commit
+or abort) the broker increments the producer epoch and returns the new `ProducerId` and
+`ProducerEpoch` in the `EndTxn` v4+ response. Krafka reads these fields and automatically applies
+them to the local identity, so subsequent `AddPartitionsToTxn` requests use the correct epoch.
+
+For brokers that do not support `EndTxn` v4+ (Kafka < 3.7), the response omits these fields and
+Krafka continues with the unchanged epoch — the pre-KIP-890 protocol is used transparently.
+
 ### Timestamps
 
 Both `Producer` and `TransactionalProducer` propagate the `timestamp` field from `ProducerRecord` to the Kafka record batch. If set, the timestamp is used as the `base_timestamp` of the record batch:

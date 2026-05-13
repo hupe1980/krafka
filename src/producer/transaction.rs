@@ -1635,6 +1635,20 @@ impl TransactionalProducer {
                 ));
             }
 
+            // KIP-890 (Kafka 3.9+): the broker returns the bumped PID and epoch
+            // in EndTxn v4+ responses. Apply the new identity so subsequent
+            // AddPartitionsToTxn requests use the correct epoch.
+            if let (Some(pid), Some(epoch)) = (response.producer_id, response.producer_epoch)
+                && pid >= 0
+                && epoch >= 0
+            {
+                debug!(
+                    pid,
+                    epoch, "KIP-890: applying broker-bumped epoch from EndTxn response"
+                );
+                self.identity.initialize(pid, epoch);
+            }
+
             Ok(())
         })
         .await
