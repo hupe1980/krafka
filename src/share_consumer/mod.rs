@@ -52,16 +52,17 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::{Future, Ready, ready};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::auth::AuthConfig;
 use crate::consumer::ConsumerRecord;
-use crate::error::{KrafkaError, Result};
+use crate::error::{KrafkaError, ProtocolErrorKind, Result};
 use crate::metadata::ClusterMetadata;
 use crate::metrics::ConnectionMetrics;
 use crate::network::{ConnectionConfig, ConnectionPool};
@@ -145,6 +146,7 @@ fn describe_share_fetch_join_error(error: &tokio::task::JoinError) -> &'static s
 /// Await the handle to observe the final broker outcome. Dropping it detaches
 /// the background task and discards the result.
 #[must_use = "await the returned handle to observe share-commit outcome"]
+#[non_exhaustive]
 pub enum ShareCommitHandle {
     /// Immediate commit result without spawning a background task.
     Ready(Ready<Result<()>>),
@@ -194,17 +196,19 @@ pub struct ShareConsumer {
     /// Maps topic name → partition IDs.
     assignments: RwLock<HashMap<String, Vec<PartitionId>>>,
     /// Client-generated member ID (UUID, per KIP-932).
-    member_id: RwLock<String>,
+    member_id: ArcSwap<String>,
     /// Current member epoch.
-    member_epoch: RwLock<i32>,
+    member_epoch: AtomicI32,
     /// Heartbeat interval returned by the coordinator.
-    heartbeat_interval_ms: RwLock<i32>,
+    heartbeat_interval_ms: AtomicI32,
     /// Whether the consumer is closed.
     closed: AtomicBool,
     /// Per-broker share session cache.
     share_sessions: Arc<tokio::sync::Mutex<ShareSessionCache>>,
     /// Pending acknowledgements (accumulated between polls or before commit).
-    pending_acks: Arc<RwLock<Vec<PendingAck>>>,
+    /// Keyed by `(topic_id, partition)` for O(1) per-partition drain when
+    /// piggybacking acks on fetch requests.
+    pending_acks: Arc<RwLock<HashMap<BrokerAckKey, Vec<PendingAck>>>>,
     /// Monotonic token for the current local ack state.
     ///
     /// Incremented whenever local ack state is cleared or invalidated so
@@ -276,7 +280,7 @@ impl ShareConsumer {
             pool_config_builder = pool_config_builder.proxy(proxy.clone());
         }
 
-        let mut pool_config = pool_config_builder.build();
+        let mut pool_config = pool_config_builder.build()?;
         pool_config.init_tls().await?;
 
         let pool = Arc::new(ConnectionPool::new(pool_config));
@@ -311,12 +315,12 @@ impl ShareConsumer {
             pool,
             subscriptions: RwLock::new(HashSet::new()),
             assignments: RwLock::new(HashMap::new()),
-            member_id: RwLock::new(crate::util::random_uuid_v4()),
-            member_epoch: RwLock::new(0),
-            heartbeat_interval_ms: RwLock::new(5000),
+            member_id: ArcSwap::new(Arc::new(crate::util::random_uuid_v4())),
+            member_epoch: AtomicI32::new(0),
+            heartbeat_interval_ms: AtomicI32::new(5000),
             closed: AtomicBool::new(false),
             share_sessions: Arc::new(tokio::sync::Mutex::new(ShareSessionCache::new())),
-            pending_acks: Arc::new(RwLock::new(Vec::new())),
+            pending_acks: Arc::new(RwLock::new(HashMap::new())),
             ack_state_generation: Arc::new(AtomicU64::new(0)),
             explicit_flush_retry_required: Arc::new(AtomicBool::new(false)),
             topic_ids: RwLock::new(HashMap::new()),
@@ -380,13 +384,13 @@ impl ShareConsumer {
     }
 
     /// Returns the member ID assigned by the coordinator.
-    pub async fn member_id(&self) -> String {
-        self.member_id.read().await.clone()
+    pub fn member_id(&self) -> String {
+        (**self.member_id.load()).clone()
     }
 
     /// Returns the current member epoch.
-    pub async fn member_epoch(&self) -> i32 {
-        *self.member_epoch.read().await
+    pub fn member_epoch(&self) -> i32 {
+        self.member_epoch.load(Ordering::Acquire)
     }
 
     /// Poll for new records.
@@ -414,6 +418,16 @@ impl ShareConsumer {
             }
         }
 
+        // If recv_buffer is at capacity, skip only the fetch step (after
+        // heartbeat/coordination) so group membership remains healthy.
+        let max_buffered = self.config.max_buffered_records;
+        let skip_fetch_due_to_buffer_cap = if max_buffered > 0 {
+            let buf_len = self.recv_buffer.read().await.len();
+            buf_len >= max_buffered as usize
+        } else {
+            false
+        };
+
         // Send heartbeat to maintain membership and receive assignments.
         // Cap the heartbeat RPC at 10 s so a slow/stuck coordinator does not
         // block the entire poll() for the full connection-level request_timeout.
@@ -432,8 +446,19 @@ impl ShareConsumer {
             }
         }
 
+        // If `recv()` previously buffered records, return them first so mixed
+        // `recv()`/`poll()` callers do not strand available data.
+        {
+            let mut buffered = self.recv_buffer.write().await;
+            if !buffered.is_empty() {
+                // max_poll_records is validated >= 1 in the builder, so take >= 1.
+                let take = (self.config.max_poll_records as usize).min(buffered.len());
+                return Ok(buffered.drain(..take).collect());
+            }
+        }
+
         let assignments = self.assignments.read().await.clone();
-        if assignments.is_empty() {
+        if assignments.is_empty() || skip_fetch_due_to_buffer_cap {
             return Ok(Vec::new());
         }
 
@@ -470,30 +495,35 @@ impl ShareConsumer {
             .collect();
 
         // Drain acknowledgement batches to piggyback on fetch requests.
-        let drained_ack_batches = {
-            let mut pending = self.pending_acks.write().await;
-            std::mem::take(&mut *pending)
-        };
-        let (ack_batches, mut failed_piggyback_acks): (Vec<_>, Vec<_>) = drained_ack_batches
-            .into_iter()
-            .partition(|ack| sendable_ack_partitions.contains(&(ack.topic.clone(), ack.partition)));
+        // pending_acks is keyed by (topic_id, partition) — no linear scan needed.
+        let mut failed_piggyback_acks: Vec<PendingAck> = Vec::new();
         let mut ack_batches_by_broker: BrokerPendingAcks = HashMap::new();
-        for ack in ack_batches {
-            if let Some(broker_id) = self.metadata.leader(&ack.topic, ack.partition) {
-                ack_batches_by_broker
-                    .entry(broker_id)
-                    .or_default()
-                    .entry((ack.topic_id, ack.partition))
-                    .or_default()
-                    .push(ack);
-            } else {
-                failed_piggyback_acks.push(ack);
+        {
+            let mut pending = self.pending_acks.write().await;
+            let drained = std::mem::take(&mut *pending);
+            for ((topic_id, partition), acks) in drained {
+                // Use the first ack's topic name for leader lookup (all share the same topic).
+                let topic = acks.first().map(|a| a.topic.as_str()).unwrap_or("");
+                if sendable_ack_partitions.contains(&(topic.to_owned(), partition)) {
+                    if let Some(broker_id) = self.metadata.leader(topic, partition) {
+                        ack_batches_by_broker
+                            .entry(broker_id)
+                            .or_default()
+                            .entry((topic_id, partition))
+                            .or_default()
+                            .extend(acks);
+                    } else {
+                        failed_piggyback_acks.extend(acks);
+                    }
+                } else {
+                    failed_piggyback_acks.extend(acks);
+                }
             }
         }
 
         // Fetch from all brokers concurrently.
         let mut fetch_tasks = Vec::with_capacity(partitions_by_broker.len());
-        let member_id = self.member_id.read().await.clone();
+        let member_id = (**self.member_id.load()).clone();
         let group_id = self.config.group_id.clone();
         let current_ack_state_generation = self.ack_state_generation.clone();
 
@@ -576,7 +606,12 @@ impl ShareConsumer {
                         versions::SHARE_FETCH_MIN,
                     )
                     .await
-                    .ok_or_else(|| KrafkaError::protocol("broker does not support ShareFetch"))?;
+                    .ok_or_else(|| {
+                        KrafkaError::protocol_kind(
+                            ProtocolErrorKind::UnknownApiVersion,
+                            "broker does not support ShareFetch",
+                        )
+                    })?;
 
                 ShareConsumer::ensure_ack_state_current(
                     current_ack_state_generation.as_ref(),
@@ -788,11 +823,9 @@ impl ShareConsumer {
             }
         }
 
-        // Truncate to max_poll_records.
+        // Truncate to max_poll_records (validated >= 1 in the builder).
         let max = self.config.max_poll_records as usize;
-        if all_records.len() > max {
-            all_records.truncate(max);
-        }
+        all_records.truncate(max);
 
         Ok(all_records)
     }
@@ -828,14 +861,17 @@ impl ShareConsumer {
                 record.topic, record.partition, record.offset
             )));
         }
-        pending.push(PendingAck {
-            topic: record.topic.clone(),
-            topic_id,
-            partition: record.partition,
-            first_offset: record.offset,
-            last_offset: record.offset,
-            ack_type: ack_type.to_i8(),
-        });
+        pending
+            .entry((topic_id, record.partition))
+            .or_default()
+            .push(PendingAck {
+                topic: record.topic.clone(),
+                topic_id,
+                partition: record.partition,
+                first_offset: record.offset,
+                last_offset: record.offset,
+                ack_type: ack_type.to_i8(),
+            });
         unacked.remove(&record_key);
 
         Ok(())
@@ -860,7 +896,7 @@ impl ShareConsumer {
 
     async fn restore_ack_state(
         current_generation: &AtomicU64,
-        pending_acks: &RwLock<Vec<PendingAck>>,
+        pending_acks: &RwLock<HashMap<BrokerAckKey, Vec<PendingAck>>>,
         explicit_flush_retry_required: &AtomicBool,
         ack_state_generation: u64,
         require_explicit_retry: bool,
@@ -878,7 +914,12 @@ impl ShareConsumer {
         if require_explicit_retry {
             explicit_flush_retry_required.store(true, Ordering::SeqCst);
         }
-        pending.append(acks);
+        for ack in acks.drain(..) {
+            pending
+                .entry((ack.topic_id, ack.partition))
+                .or_default()
+                .push(ack);
+        }
     }
 
     fn share_acknowledge_response_error(
@@ -927,9 +968,12 @@ impl ShareConsumer {
 
     async fn flush_pending_acks(&self) -> Result<()> {
         let ack_state_generation = self.ack_state_generation.load(Ordering::SeqCst);
-        let acks = {
+        let acks: Vec<PendingAck> = {
             let mut pending = self.pending_acks.write().await;
             std::mem::take(&mut *pending)
+                .into_values()
+                .flatten()
+                .collect()
         };
 
         if acks.is_empty() {
@@ -962,14 +1006,7 @@ impl ShareConsumer {
             )));
         }
 
-        let member_id = match self.member_id.try_read() {
-            Ok(g) => g.clone(),
-            Err(_) => {
-                return ShareCommitHandle::ready(Err(KrafkaError::invalid_state(
-                    "commit_async: member_id lock contention",
-                )));
-            }
-        };
+        let member_id = (**self.member_id.load()).clone();
 
         let ack_state_generation = self.ack_state_generation.load(Ordering::SeqCst);
         let pending_acks = self.pending_acks.clone();
@@ -980,7 +1017,10 @@ impl ShareConsumer {
                 "commit_async: pending_acks lock contention",
             )));
         };
-        let acks = std::mem::take(&mut *pending);
+        let acks: Vec<PendingAck> = std::mem::take(&mut *pending)
+            .into_values()
+            .flatten()
+            .collect();
         drop(pending);
 
         if acks.is_empty() {
@@ -1058,6 +1098,7 @@ impl ShareConsumer {
         let mut buf = self.recv_buffer.write().await;
         let mut iter = records.into_iter();
         let first = iter.next();
+        // Preserve overflow records so recv() never drops data.
         for record in iter {
             buf.push_back(record);
         }
@@ -1082,8 +1123,9 @@ impl ShareConsumer {
         self.subscriptions.write().await.clear();
         self.assignments.write().await.clear();
         self.clear_partition_state().await;
-        *self.member_id.write().await = crate::util::random_uuid_v4();
-        *self.member_epoch.write().await = 0;
+        self.member_id
+            .store(Arc::new(crate::util::random_uuid_v4()));
+        self.member_epoch.store(0, Ordering::Release);
 
         debug!("Unsubscribed from share group '{}'", self.config.group_id);
     }
@@ -1106,8 +1148,10 @@ impl ShareConsumer {
         // records are returned to the pool for redelivery (KIP-932 §close).
         if self.config.acknowledgement_mode == AcknowledgementMode::Implicit {
             let mut pending = self.pending_acks.write().await;
-            for ack in pending.iter_mut() {
-                ack.ack_type = AcknowledgeType::Release.to_i8();
+            for acks in pending.values_mut() {
+                for ack in acks.iter_mut() {
+                    ack.ack_type = AcknowledgeType::Release.to_i8();
+                }
             }
         }
 
@@ -1176,7 +1220,7 @@ impl ShareConsumer {
     fn coalesce_implicit_acks(
         records: &[ConsumerRecord],
         topic_ids: &HashMap<String, [u8; 16]>,
-        pending: &mut Vec<PendingAck>,
+        pending: &mut HashMap<BrokerAckKey, Vec<PendingAck>>,
     ) {
         // Group by (topic, partition) and sort offsets.
         let mut by_tp: HashMap<(&str, PartitionId), Vec<Offset>> = HashMap::new();
@@ -1202,14 +1246,17 @@ impl ShareConsumer {
                     i += 1;
                     last = offsets[i];
                 }
-                pending.push(PendingAck {
-                    topic: topic.to_string(),
-                    topic_id,
-                    partition,
-                    first_offset: first,
-                    last_offset: last,
-                    ack_type: AcknowledgeType::Accept.to_i8(),
-                });
+                pending
+                    .entry((topic_id, partition))
+                    .or_default()
+                    .push(PendingAck {
+                        topic: topic.to_string(),
+                        topic_id,
+                        partition,
+                        first_offset: first,
+                        last_offset: last,
+                        ack_type: AcknowledgeType::Accept.to_i8(),
+                    });
                 i += 1;
             }
         }
@@ -1268,7 +1315,7 @@ impl ShareConsumer {
         for broker in &brokers {
             let conn = match self
                 .pool
-                .get_connection_by_id(broker.id, broker.address())
+                .get_connection_by_id(broker.id(), broker.address())
                 .await
             {
                 Ok(c) => c,
@@ -1296,7 +1343,7 @@ impl ShareConsumer {
             let buf = match result {
                 Ok(b) => b,
                 Err(e) => {
-                    debug!("FindCoordinator via broker {} failed: {e}", broker.id);
+                    debug!("FindCoordinator via broker {} failed: {e}", broker.id());
                     continue;
                 }
             };
@@ -1338,8 +1385,8 @@ impl ShareConsumer {
             .await
             .ok_or_else(|| KrafkaError::invalid_state("no coordinator discovered"))?;
 
-        let member_id = self.member_id.read().await.clone();
-        let member_epoch = *self.member_epoch.read().await;
+        let member_id = (**self.member_id.load()).clone();
+        let member_epoch = self.member_epoch.load(Ordering::Acquire);
 
         let subscribed_topic_names = if send_subscription {
             Some(
@@ -1379,7 +1426,12 @@ impl ShareConsumer {
                 versions::SHARE_GROUP_HEARTBEAT_MIN,
             )
             .await
-            .ok_or_else(|| KrafkaError::protocol("broker does not support ShareGroupHeartbeat"))?;
+            .ok_or_else(|| {
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "broker does not support ShareGroupHeartbeat",
+                )
+            })?;
 
         let buf = conn
             .send_request(ApiKey::ShareGroupHeartbeat, version, |buf| {
@@ -1400,10 +1452,28 @@ impl ShareConsumer {
 
         // Update member state from response.
         if let Some(new_member_id) = response.member_id {
-            *self.member_id.write().await = new_member_id;
+            self.member_id.store(Arc::new(new_member_id));
         }
-        *self.member_epoch.write().await = response.member_epoch;
-        *self.heartbeat_interval_ms.write().await = response.heartbeat_interval_ms;
+        self.member_epoch
+            .store(response.member_epoch, Ordering::Release);
+        // Clamp the broker-supplied heartbeat interval to [50 ms, 30 s] to
+        // prevent excessively fast polling (which exhausts broker connections)
+        // or excessively slow polling (which causes session timeouts).
+        let raw_interval_ms = response.heartbeat_interval_ms;
+        const HEARTBEAT_MIN_MS: i32 = 50;
+        const HEARTBEAT_MAX_MS: i32 = 30_000;
+        let clamped_interval_ms = raw_interval_ms.clamp(HEARTBEAT_MIN_MS, HEARTBEAT_MAX_MS);
+        if clamped_interval_ms != raw_interval_ms {
+            tracing::warn!(
+                raw_ms = raw_interval_ms,
+                clamped_ms = clamped_interval_ms,
+                min_ms = HEARTBEAT_MIN_MS,
+                max_ms = HEARTBEAT_MAX_MS,
+                "broker heartbeat_interval_ms is out of safe range; clamping"
+            );
+        }
+        self.heartbeat_interval_ms
+            .store(clamped_interval_ms, Ordering::Release);
 
         // Process assignment if present.
         if let Some(assignment) = response.assignment {
@@ -1456,7 +1526,7 @@ impl ShareConsumer {
     /// Routes acknowledgements to the correct partition leaders. Returns an
     /// error if any leader cannot be determined or any broker rejects the acks.
     async fn send_share_acknowledge(&self, acks: &[PendingAck]) -> Result<()> {
-        let member_id = self.member_id.read().await.clone();
+        let member_id = (**self.member_id.load()).clone();
         Self::send_share_acknowledge_with_state(
             ShareAcknowledgeContext {
                 metadata: self.metadata.clone(),
@@ -1549,7 +1619,12 @@ impl ShareConsumer {
                     versions::SHARE_ACKNOWLEDGE_MIN,
                 )
                 .await
-                .ok_or_else(|| KrafkaError::protocol("broker does not support ShareAcknowledge"))?;
+                .ok_or_else(|| {
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::UnknownApiVersion,
+                        "broker does not support ShareAcknowledge",
+                    )
+                })?;
 
             Self::ensure_ack_state_current(
                 current_ack_state_generation.as_ref(),
@@ -1596,7 +1671,7 @@ impl ShareConsumer {
             None => return Ok(()),
         };
 
-        let member_id = self.member_id.read().await.clone();
+        let member_id = (**self.member_id.load()).clone();
         if member_id.is_empty() {
             return Ok(());
         }
@@ -1629,7 +1704,8 @@ impl ShareConsumer {
         {
             Some(v) => v,
             None => {
-                return Err(KrafkaError::protocol(
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
                     "broker does not support ShareGroupHeartbeat",
                 ));
             }
@@ -1691,9 +1767,23 @@ impl ShareConsumerBuilder {
         self
     }
 
-    /// Set maximum number of records per poll.
+    /// Set the maximum number of records returned per `poll()` call.
+    ///
+    /// Must be >= 1. Rejected at build time otherwise. Defaults to 500.
     pub fn max_poll_records(mut self, max: i32) -> Self {
         self.config.max_poll_records = max;
+        self
+    }
+
+    /// Set maximum records buffered internally by [`recv()`](ShareConsumer::recv).
+    ///
+    /// This is a soft threshold: once the buffer is at/above this value,
+    /// `poll()` skips fetches until it drains. A single `recv()` call may
+    /// buffer beyond the threshold due to batched fetch responses. Set to `0`
+    /// for unlimited. Negative values are rejected at build time.
+    /// Defaults to 500.
+    pub fn max_buffered_records(mut self, max: i32) -> Self {
+        self.config.max_buffered_records = max;
         self
     }
 
@@ -1793,6 +1883,18 @@ impl ShareConsumerBuilder {
                 self.config.heartbeat_interval, self.config.session_timeout,
             )));
         }
+        if self.config.max_buffered_records < 0 {
+            return Err(KrafkaError::config(format!(
+                "max_buffered_records ({}) must be >= 0 (use 0 for unlimited)",
+                self.config.max_buffered_records,
+            )));
+        }
+        if self.config.max_poll_records < 1 {
+            return Err(KrafkaError::config(format!(
+                "max_poll_records ({}) must be >= 1",
+                self.config.max_poll_records,
+            )));
+        }
         ShareConsumer::new(self.config).await
     }
 }
@@ -1825,12 +1927,12 @@ mod tests {
             pool,
             subscriptions: RwLock::new(HashSet::new()),
             assignments: RwLock::new(HashMap::new()),
-            member_id: RwLock::new(crate::util::random_uuid_v4()),
-            member_epoch: RwLock::new(0),
-            heartbeat_interval_ms: RwLock::new(3000),
+            member_id: ArcSwap::new(Arc::new(crate::util::random_uuid_v4())),
+            member_epoch: AtomicI32::new(0),
+            heartbeat_interval_ms: AtomicI32::new(3000),
             closed: AtomicBool::new(false),
             share_sessions: Arc::new(tokio::sync::Mutex::new(ShareSessionCache::new())),
-            pending_acks: Arc::new(RwLock::new(Vec::new())),
+            pending_acks: Arc::new(RwLock::new(HashMap::new())),
             ack_state_generation: Arc::new(AtomicU64::new(0)),
             explicit_flush_retry_required: Arc::new(AtomicBool::new(false)),
             topic_ids: RwLock::new(HashMap::new()),
@@ -1910,6 +2012,34 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("heartbeat_interval"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_share_consumer_builder_rejects_negative_max_buffered_records() {
+        let result = ShareConsumer::builder()
+            .bootstrap_servers("localhost:9092")
+            .group_id("sg")
+            .max_buffered_records(-1)
+            .build()
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("max_buffered_records"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_share_consumer_builder_rejects_zero_max_poll_records() {
+        for bad in [0, -1, i32::MIN] {
+            let result = ShareConsumer::builder()
+                .bootstrap_servers("localhost:9092")
+                .group_id("sg")
+                .max_poll_records(bad)
+                .build()
+                .await;
+            assert!(result.is_err(), "expected error for max_poll_records={bad}");
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("max_poll_records"), "got: {err}");
+        }
     }
 
     #[test]
@@ -2023,7 +2153,7 @@ mod tests {
     async fn test_restore_ack_state_requeues_pending_acks_without_reinserting_unacked() {
         let ack_state_generation = AtomicU64::new(0);
         let explicit_flush_retry_required = AtomicBool::new(false);
-        let pending = RwLock::new(Vec::new());
+        let pending: RwLock<HashMap<BrokerAckKey, Vec<PendingAck>>> = RwLock::new(HashMap::new());
         let mut acks_to_restore = vec![PendingAck {
             topic: "topic-a".into(),
             topic_id: [0; 16],
@@ -2045,20 +2175,21 @@ mod tests {
 
         assert!(acks_to_restore.is_empty());
         assert!(!explicit_flush_retry_required.load(Ordering::SeqCst));
-        let pending = pending.read().await;
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].topic, "topic-a");
-        assert_eq!(pending[0].partition, 2);
-        assert_eq!(pending[0].first_offset, 11);
-        assert_eq!(pending[0].last_offset, 13);
-        assert_eq!(pending[0].ack_type, AcknowledgeType::Accept.to_i8());
+        let guard = pending.read().await;
+        let all_acks: Vec<&PendingAck> = guard.values().flatten().collect();
+        assert_eq!(all_acks.len(), 1);
+        assert_eq!(all_acks[0].topic, "topic-a");
+        assert_eq!(all_acks[0].partition, 2);
+        assert_eq!(all_acks[0].first_offset, 11);
+        assert_eq!(all_acks[0].last_offset, 13);
+        assert_eq!(all_acks[0].ack_type, AcknowledgeType::Accept.to_i8());
     }
 
     #[tokio::test]
     async fn test_restore_ack_state_skips_stale_generation() {
         let ack_state_generation = AtomicU64::new(1);
         let explicit_flush_retry_required = AtomicBool::new(false);
-        let pending = RwLock::new(Vec::new());
+        let pending: RwLock<HashMap<BrokerAckKey, Vec<PendingAck>>> = RwLock::new(HashMap::new());
         let mut acks_to_restore = vec![PendingAck {
             topic: "topic-a".into(),
             topic_id: [0; 16],
@@ -2087,7 +2218,7 @@ mod tests {
     async fn test_restore_ack_state_marks_explicit_flush_retry_required() {
         let ack_state_generation = AtomicU64::new(0);
         let explicit_flush_retry_required = AtomicBool::new(false);
-        let pending = RwLock::new(Vec::new());
+        let pending: RwLock<HashMap<BrokerAckKey, Vec<PendingAck>>> = RwLock::new(HashMap::new());
         let mut acks_to_restore = vec![PendingAck {
             topic: "topic-a".into(),
             topic_id: [0; 16],
@@ -2109,7 +2240,7 @@ mod tests {
 
         assert!(acks_to_restore.is_empty());
         assert!(explicit_flush_retry_required.load(Ordering::SeqCst));
-        assert_eq!(pending.read().await.len(), 1);
+        assert_eq!(pending.read().await.values().flatten().count(), 1);
     }
 
     #[tokio::test]
@@ -2155,14 +2286,20 @@ mod tests {
             .write()
             .await
             .insert("topic-a".to_string(), vec![0]);
-        consumer.pending_acks.write().await.push(PendingAck {
-            topic: "topic-a".to_string(),
-            topic_id: [1; 16],
-            partition: 0,
-            first_offset: 5,
-            last_offset: 5,
-            ack_type: AcknowledgeType::Accept.to_i8(),
-        });
+        consumer
+            .pending_acks
+            .write()
+            .await
+            .entry(([1; 16], 0))
+            .or_default()
+            .push(PendingAck {
+                topic: "topic-a".to_string(),
+                topic_id: [1; 16],
+                partition: 0,
+                first_offset: 5,
+                last_offset: 5,
+                ack_type: AcknowledgeType::Accept.to_i8(),
+            });
         consumer
             .unacked_offsets
             .write()
@@ -2197,7 +2334,7 @@ mod tests {
                 pool: consumer.pool.clone(),
                 share_sessions: consumer.share_sessions.clone(),
                 group_id: consumer.config.group_id.clone(),
-                member_id: consumer.member_id.read().await.clone(),
+                member_id: (**consumer.member_id.load()).clone(),
                 current_ack_state_generation: Arc::new(AtomicU64::new(1)),
                 ack_state_generation: 0,
             },
@@ -2321,13 +2458,14 @@ mod tests {
             .expect("acknowledge should succeed once pending lock is released");
 
         assert!(!consumer.unacked_offsets.read().await.contains(&record_key));
-        let pending = consumer.pending_acks.read().await;
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].topic, "topic-a");
-        assert_eq!(pending[0].partition, 3);
-        assert_eq!(pending[0].first_offset, 11);
-        assert_eq!(pending[0].last_offset, 11);
-        assert_eq!(pending[0].ack_type, AcknowledgeType::Accept.to_i8());
+        let pending_guard = consumer.pending_acks.read().await;
+        let all_acks: Vec<&PendingAck> = pending_guard.values().flatten().collect();
+        assert_eq!(all_acks.len(), 1);
+        assert_eq!(all_acks[0].topic, "topic-a");
+        assert_eq!(all_acks[0].partition, 3);
+        assert_eq!(all_acks[0].first_offset, 11);
+        assert_eq!(all_acks[0].last_offset, 11);
+        assert_eq!(all_acks[0].ack_type, AcknowledgeType::Accept.to_i8());
     }
 
     #[test]
@@ -2387,16 +2525,17 @@ mod tests {
         let mut topic_ids = HashMap::new();
         topic_ids.insert("t1".to_string(), [1u8; 16]);
 
-        let mut pending = Vec::new();
+        let mut pending: HashMap<BrokerAckKey, Vec<PendingAck>> = HashMap::new();
         ShareConsumer::coalesce_implicit_acks(&records, &topic_ids, &mut pending);
 
         // Should produce two ranges: [0,2] and [4,4].
-        assert_eq!(pending.len(), 2);
-        pending.sort_by_key(|a| a.first_offset);
-        assert_eq!(pending[0].first_offset, 0);
-        assert_eq!(pending[0].last_offset, 2);
-        assert_eq!(pending[1].first_offset, 4);
-        assert_eq!(pending[1].last_offset, 4);
+        let mut all_acks: Vec<PendingAck> = pending.into_values().flatten().collect();
+        assert_eq!(all_acks.len(), 2);
+        all_acks.sort_by_key(|a| a.first_offset);
+        assert_eq!(all_acks[0].first_offset, 0);
+        assert_eq!(all_acks[0].last_offset, 2);
+        assert_eq!(all_acks[1].first_offset, 4);
+        assert_eq!(all_acks[1].last_offset, 4);
     }
 
     #[test]

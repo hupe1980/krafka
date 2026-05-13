@@ -44,16 +44,6 @@ let (schema_id, payload) = decode_wire_format(&record.value.unwrap())?;
 // Use schema_id to look up the schema, then deserialize payload
 ```
 
-If you need owned bytes (for example, to move payload data across an `.await`
-boundary), use `decode_wire_format_owned()`:
-
-```rust
-use krafka::schema_registry::decode_wire_format_owned;
-
-let (schema_id, payload) = decode_wire_format_owned(&record.value.unwrap())?;
-// payload: Vec<u8>
-```
-
 You can also detect wire format before dispatching to Confluent/Glue-specific
 decoders:
 
@@ -131,46 +121,32 @@ The `SchemaRegistryClient` trait allows pluggable registry backends:
 ```rust
 use krafka::schema_registry::{SchemaRegistryClient, Schema, SchemaId, SchemaType, SchemaVersion, SchemaReference};
 use krafka::error::Result;
-use std::future::Future;
-use std::pin::Pin;
 
 struct MyRegistry { /* ... */ }
 
 impl SchemaRegistryClient for MyRegistry {
-    fn get_schema_by_id(
-        &self,
-        id: SchemaId,
-    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
-        Box::pin(async move {
-            // Fetch from your registry backend
-            Ok(Schema::new(id, SchemaType::Avro, r#"{"type":"string"}"#))
-        })
+    async fn get_schema_by_id(&self, id: SchemaId) -> Result<Schema> {
+        // Fetch from your registry backend
+        Ok(Schema::new(id, SchemaType::Avro, r#"{"type":"string"}"#))
     }
 
-    fn get_latest_schema(
-        &self,
-        subject: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
+    async fn get_latest_schema(&self, subject: &str) -> Result<Schema> {
         // ...
         # todo!()
     }
 
-    fn get_schema_by_version(
-        &self,
-        subject: &str,
-        version: SchemaVersion,
-    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
+    async fn get_schema_by_version(&self, subject: &str, version: SchemaVersion) -> Result<Schema> {
         // ...
         # todo!()
     }
 
-    fn register_schema(
+    async fn register_schema(
         &self,
         subject: &str,
         schema: &str,
         schema_type: SchemaType,
         references: &[SchemaReference],
-    ) -> Pin<Box<dyn Future<Output = Result<SchemaId>> + Send + '_>> {
+    ) -> Result<SchemaId> {
         // ...
         # todo!()
     }
@@ -211,11 +187,7 @@ cached.warm_cache(&[1, 2, 3]).await?;
 let bounded = CachedSchemaRegistry::with_max_entries(other_registry, 1024);
 ```
 
-`CachedSchemaRegistry` and `CachedGlueSchemaRegistry` also provide inherent async methods with the same names as their client traits for ergonomic calls on concrete cached types. If you explicitly need the trait method return shape (`Pin<Box<dyn Future<...>>>`), call through UFCS, for example:
-
-```rust
-let fut = <_ as krafka::schema_registry::SchemaRegistryClient>::get_schema_by_id(&cached, 1);
-```
+`CachedSchemaRegistry` and `CachedGlueSchemaRegistry` also provide inherent async methods with the same names as their client traits for ergonomic calls on concrete cached types.
 
 `CachedGlueSchemaRegistry` follows the same rules for AWS Glue schema version IDs: immutable-ID caching, concurrent miss coalescing, and optional bounded eviction via `with_max_entries()`.
 
@@ -480,27 +452,30 @@ let schema = registry.get_schema_by_version_id(version_id).await?;
 
 ### Unified Decoder Dispatch
 
-Use `SchemaDecoder` to centralize Confluent/Glue dispatch and schema lookups:
+Use `WireFormatDecoder` to centralize Confluent/Glue dispatch and schema lookups
+without writing magic-byte detection in application code.
+It accepts `Bytes` and returns a [`DecodedMessage`] with a zero-copy `payload`:
 
 ```rust
-use krafka::schema_registry::{SchemaDecoder, SchemaFormat};
+use bytes::Bytes;
+use krafka::schema_registry::{WireFormatDecoder, SchemaFormat};
 
-let decoder = SchemaDecoder::new()
+let decoder = WireFormatDecoder::new()
     .with_confluent(&confluent_registry)
     .with_glue(&glue_registry);
 
-let decoded = decoder.decode(data).await?;
+let decoded = decoder.decode(record_bytes).await?;
 match decoded.schema_format {
     SchemaFormat::Unknown => {
         // pass through non-schema-framed payload
     }
     _ => {
-        // decoded.payload + decoded.schema_metadata are available
+        // decoded.payload (Bytes, zero-copy) + decoded.schema_metadata available
     }
 }
 ```
 
-    `SchemaDecoder::decode()` biases toward safe passthrough on ambiguous payloads
+    `WireFormatDecoder::decode()` biases toward safe passthrough on ambiguous payloads
     whose first byte collides with a Confluent (`0x00`) or Glue (`0x03`) framing
     prefix but do not carry a complete valid header. If you need strict malformed
     header rejection, call `detect_wire_format()` and the low-level
@@ -528,6 +503,206 @@ let registry = AwsGlueSchemaRegistry::builder(glue_client)
 | Feature flag | `schema-registry` | `aws-glue-schema-registry` |
 | Trait | `SchemaRegistryClient` | `GlueSchemaRegistryClient` |
 | Caching wrapper | `CachedSchemaRegistry` | `CachedGlueSchemaRegistry` |
+
+## Producer-Level Schema Encoding (`ConfluentSchemaEncoder`)
+
+For the common case of encoding all records sent to a producer with the same schema,
+use `ConfluentSchemaEncoder` to attach encoding directly to the producer.
+This is the Rust equivalent of `key.serializer` / `value.serializer` in the Java `KafkaProducer`:
+encoding is automatic on every `send_record()` call — no per-record boilerplate required.
+
+```toml
+[dependencies]
+krafka = { version = "0.8.0", features = ["schema-registry"] }
+```
+
+```rust
+use std::sync::Arc;
+use krafka::schema_registry::{
+    ConfluentSchemaEncoder, CachedSchemaRegistry, ConfluentSchemaRegistry, SchemaType,
+};
+use krafka::producer::{Producer, ProducerRecord};
+
+let registry = CachedSchemaRegistry::new(
+    ConfluentSchemaRegistry::new("http://localhost:8081"),
+);
+
+// Build once — schema ID is cached after the first send
+let encoder = Arc::new(
+    ConfluentSchemaEncoder::builder()
+        .registry(registry)
+        .schema(
+            r#"{"type":"record","name":"Order","fields":[{"name":"id","type":"string"}]}"#,
+            SchemaType::Avro,
+        )
+        .build()?,
+);
+
+let producer = Producer::builder()
+    .bootstrap_servers("localhost:9092")
+    .value_encoder(encoder)   // encoding is now automatic
+    .build()
+    .await?;
+
+// Send raw (pre-serialized) bytes — wire framing is transparent
+producer.send_record(ProducerRecord::new("orders", avro_bytes)).await?;
+```
+
+### Key + Value Encoding
+
+Attach separate encoders for key and value:
+
+```rust
+let producer = Producer::builder()
+    .bootstrap_servers("localhost:9092")
+    .key_encoder(key_encoder)
+    .value_encoder(value_encoder)
+    .build()
+    .await?;
+```
+
+### Per-Record Subject Name Override
+
+For `RecordName` or `TopicRecordName` strategies, set the record name on individual records:
+
+```rust
+use krafka::schema_registry::SubjectNameStrategy;
+
+let encoder = Arc::new(
+    ConfluentSchemaEncoder::builder()
+        .registry(registry)
+        .schema(my_schema, SchemaType::Avro)
+        .strategy(SubjectNameStrategy::TopicRecordName)
+        .build()?,
+);
+
+let producer = Producer::builder()
+    .bootstrap_servers("localhost:9092")
+    .value_encoder(encoder)
+    .build()
+    .await?;
+
+producer.send_record(
+    ProducerRecord::new("orders", avro_bytes)
+        .with_record_name("com.example.Order"),
+).await?;
+```
+
+### Custom Encoder
+
+Implement `SchemaEncoder` for custom framing logic (e.g., non-Confluent registries,
+multi-schema routing):
+
+```rust
+use std::pin::Pin;
+use std::future::Future;
+use bytes::Bytes;
+use krafka::schema_registry::SchemaEncoder;
+use krafka::error::Result;
+
+struct MyEncoder;
+
+impl SchemaEncoder for MyEncoder {
+    fn encode(
+        &self,
+        payload: Bytes,
+        topic: &str,
+        record_name: Option<&str>,
+        is_key: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
+        let payload = payload.clone();
+        Box::pin(async move {
+            // Custom framing logic here
+            Ok(payload)
+        })
+    }
+}
+```
+
+## Consumer-Level Schema Decoding (`SchemaDecoder` / `ConfluentSchemaDecoder`)
+
+Symmetric to the producer-level `SchemaEncoder`, a consumer can be configured with
+`key_decoder` and/or `value_decoder`. After each `poll()` or `recv()`, and after
+the consumer interceptor, every record's key/value bytes are automatically passed
+through the configured decoder before being returned to the caller.
+
+This eliminates manual wire-format stripping in application code — equivalent to
+`key.deserializer` / `value.deserializer` in the Java `KafkaConsumer`.
+
+### Basic Usage
+
+```rust,ignore
+use std::sync::Arc;
+use krafka::consumer::Consumer;
+use krafka::schema_registry::ConfluentSchemaDecoder;
+
+// Strip Confluent wire-format header from all values automatically.
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .value_decoder(Arc::new(ConfluentSchemaDecoder::new()))
+    .build()
+    .await?;
+
+consumer.subscribe(&["avro-topic"]).await?;
+
+loop {
+    let records = consumer.poll(Duration::from_secs(1)).await?;
+    for record in &records {
+        // record.value already has the wire-format header stripped — it is
+        // the raw Avro/Protobuf/JSON bytes, as a zero-copy Bytes slice.
+        if let Some(payload) = &record.value {
+            let order = deserialize_order(payload)?;
+        }
+    }
+}
+```
+
+### Key + Value Decoding
+
+```rust,ignore
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .key_decoder(Arc::new(ConfluentSchemaDecoder::new()))
+    .value_decoder(Arc::new(ConfluentSchemaDecoder::new()))
+    .build()
+    .await?;
+```
+
+### Custom Decoder
+
+Implement the `SchemaDecoder` trait to handle any custom framing or encryption layer:
+
+```rust,ignore
+use std::pin::Pin;
+use std::future::Future;
+use bytes::Bytes;
+use krafka::schema_registry::SchemaDecoder;
+use krafka::error::Result;
+
+struct AesDecryptingDecoder { /* key material */ }
+
+impl SchemaDecoder for AesDecryptingDecoder {
+    fn decode(
+        &self,
+        payload: Bytes,
+        _topic: &str,
+        _is_key: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
+        Box::pin(async move {
+            // Decrypt and return
+            let plaintext = self.decrypt(&payload)?;
+            Ok(Bytes::from(plaintext))
+        })
+    }
+}
+```
+
+> **Design note**: `value_decoder` runs *after* the consumer interceptor.
+> If your interceptor modifies the raw (framed) bytes, the decoder will see
+> the modified value. If you need decoding to happen before the interceptor,
+> implement it inside the interceptor itself.
 
 ## Next Steps
 

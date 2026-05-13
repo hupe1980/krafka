@@ -25,12 +25,12 @@ pub use config::{Acks, ProducerConfig, ProducerConfigBuilder};
 pub use idempotent::{PartitionSequenceSnapshot, ProducerIdentity, ProducerIdentitySnapshot};
 pub use partitioner::{
     DefaultPartitioner, HashPartitioner, Partitioner, RoundRobinPartitioner, StickyPartitioner,
-    murmur2,
+    UniformStickyPartitioner, murmur2,
 };
 pub use record::{ProducerRecord, RecordMetadata};
 pub use retry::{RetryContext, RetryPolicy};
 pub use transaction::{
-    TransactionState, TransactionalProducer, TransactionalProducerBuilder,
+    TopicPartitionOffset, TransactionState, TransactionalProducer, TransactionalProducerBuilder,
     TransactionalProducerConfig,
 };
 
@@ -44,7 +44,7 @@ use tracing::{debug, info, warn};
 
 use crate::PartitionId;
 use crate::auth::AuthConfig;
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::metadata::ClusterMetadata;
 use crate::metrics::{ConnectionMetrics, ProducerMetrics as ProducerMetricsInner};
 use crate::network::{ConnectionConfig, ConnectionPool};
@@ -53,6 +53,7 @@ use crate::protocol::{
     ProduceRequest, ProduceResponse, ProduceTopicData, RecordBatchBuilder, VersionedDecode,
     VersionedEncode, versions,
 };
+use crate::schema_registry::SchemaEncoder;
 
 use self::barrier::{InFlightBarrier, InFlightOpGuard};
 use self::record::{RoutedRecord, TopicHandle};
@@ -91,6 +92,9 @@ pub struct Producer {
     memory_permits: Arc<Semaphore>,
     /// Effective producer memory capacity after semaphore-limit clamping.
     memory_capacity: usize,
+    /// Maximum encoded Kafka request frame size in bytes.
+    /// Records exceeding this limit are rejected before reaching the network.
+    max_request_size: usize,
     /// Number of records currently admitted into the direct-send path.
     buffered_records: Arc<AtomicUsize>,
     /// Semaphore limiting concurrent in-flight requests per producer.
@@ -99,6 +103,19 @@ pub struct Producer {
     interceptor: Arc<dyn crate::interceptor::ProducerInterceptor>,
     /// Producer identity for idempotent production (PID, epoch, sequences).
     identity: Option<Arc<ProducerIdentity>>,
+    /// Optional key encoder applied transparently in `send_record`.
+    ///
+    /// When set, the record key is passed through this encoder (schema
+    /// registration + Confluent wire framing) on every `send_record` call,
+    /// before partitioning or batching.  Equivalent to `key.serializer` in
+    /// the Java `KafkaProducer`.
+    key_encoder: Option<Arc<dyn SchemaEncoder>>,
+    /// Optional value encoder applied transparently in `send_record`.
+    ///
+    /// When set, the record value is passed through this encoder on every
+    /// `send_record` call.  Equivalent to `value.serializer` in the Java
+    /// `KafkaProducer`.
+    value_encoder: Option<Arc<dyn SchemaEncoder>>,
 }
 
 fn is_unknown_producer_id_error(error: &KrafkaError) -> bool {
@@ -151,13 +168,14 @@ async fn init_idempotent_producer_id(
                 warn!(attempt, "No brokers available for InitProducerId, retrying");
                 continue;
             }
-            return Err(KrafkaError::protocol(
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::Malformed,
                 "no brokers available for InitProducerId",
             ));
         }
 
         let broker = &brokers[attempt as usize % brokers.len()];
-        let conn = match metadata.get_broker_connection(broker.id).await {
+        let conn = match metadata.get_broker_connection(broker.id()).await {
             Ok(connection) => connection,
             Err(error) if error.is_retriable() && attempt < retry_policy.max_retries => {
                 warn!(
@@ -180,7 +198,8 @@ async fn init_idempotent_producer_id(
         {
             Some(version) => version,
             None => {
-                return Err(KrafkaError::protocol(
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
                     "no mutually supported InitProducerId API version",
                 ));
             }
@@ -231,10 +250,13 @@ async fn init_idempotent_producer_id(
         }
     }
 
-    Err(KrafkaError::protocol(format!(
-        "InitProducerId retry loop exhausted after {} retries",
-        retry_policy.max_retries
-    )))
+    Err(KrafkaError::protocol_kind(
+        ProtocolErrorKind::Malformed,
+        format!(
+            "InitProducerId retry loop exhausted after {} retries",
+            retry_policy.max_retries
+        ),
+    ))
 }
 
 async fn ensure_idempotent_producer_id_initialized(
@@ -270,14 +292,17 @@ async fn recover_unknown_producer_id(
         ));
     }
 
-    if !identity.can_retry_unknown_producer_id(topic, partition, base_sequence, record_count)? {
+    // Use the atomic check-and-reset to avoid the TOCTOU window between a
+    // separate can_retry_unknown_producer_id() (read lock) + reset() (write
+    // lock) pair: no concurrent thread can allocate sequences against the
+    // current PID between the retryability check and the state reset.
+    if !identity.check_and_reset_if_retryable(topic, partition, base_sequence, record_count)? {
         identity.poison();
         return Err(KrafkaError::invalid_state(format!(
             "UnknownProducerId for {topic}-{partition} cannot be retried safely while newer batches are still in flight; producer identity poisoned, recreate the producer after in-flight work drains"
         )));
     }
 
-    identity.reset();
     init_idempotent_producer_id(identity, metadata, retry_policy).await?;
     identity.allocate_sequence(topic, partition, record_count)
 }
@@ -295,11 +320,14 @@ fn kafka_string_size(value: Option<&str>) -> Result<usize> {
     match value {
         Some(value) => {
             i16::try_from(value.len()).map_err(|_| {
-                KrafkaError::protocol(format!(
-                    "KafkaString length {} exceeds protocol limit of {}",
-                    value.len(),
-                    i16::MAX
-                ))
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidLength,
+                    format!(
+                        "KafkaString length {} exceeds protocol limit of {}",
+                        value.len(),
+                        i16::MAX
+                    ),
+                )
             })?;
             Ok(2 + value.len())
         }
@@ -311,10 +339,13 @@ fn compact_kafka_string_size(value: Option<&str>) -> Result<usize> {
     match value {
         Some(value) => {
             let len_plus_one = u32::try_from(value.len().saturating_add(1)).map_err(|_| {
-                KrafkaError::protocol(format!(
-                    "compact KafkaString length {} exceeds u32 limit",
-                    value.len()
-                ))
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidLength,
+                    format!(
+                        "compact KafkaString length {} exceeds u32 limit",
+                        value.len()
+                    ),
+                )
             })?;
             Ok(unsigned_varint_size(len_plus_one) + value.len())
         }
@@ -324,37 +355,44 @@ fn compact_kafka_string_size(value: Option<&str>) -> Result<usize> {
 
 fn kafka_bytes_size(len: usize) -> Result<usize> {
     i32::try_from(len).map_err(|_| {
-        KrafkaError::protocol(format!(
-            "KafkaBytes length {} exceeds protocol limit of {}",
-            len,
-            i32::MAX
-        ))
+        KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidLength,
+            format!(
+                "KafkaBytes length {} exceeds protocol limit of {}",
+                len,
+                i32::MAX
+            ),
+        )
     })?;
     Ok(4 + len)
 }
 
 fn compact_kafka_bytes_size(len: usize) -> Result<usize> {
     let len_plus_one = u32::try_from(len.saturating_add(1)).map_err(|_| {
-        KrafkaError::protocol(format!(
-            "compact KafkaBytes length {} exceeds u32 limit",
-            len
-        ))
+        KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidLength,
+            format!("compact KafkaBytes length {} exceeds u32 limit", len),
+        )
     })?;
     Ok(unsigned_varint_size(len_plus_one) + len)
 }
 
 fn array_len_size(len: usize) -> Result<usize> {
     i32::try_from(len).map_err(|_| {
-        KrafkaError::protocol(format!("Kafka array length {len} exceeds protocol limit"))
+        KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidLength,
+            format!("Kafka array length {len} exceeds protocol limit"),
+        )
     })?;
     Ok(4)
 }
 
 fn compact_array_len_size(len: usize) -> Result<usize> {
     let len_plus_one = u32::try_from(len.saturating_add(1)).map_err(|_| {
-        KrafkaError::protocol(format!(
-            "compact Kafka array length {len} exceeds u32 limit"
-        ))
+        KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidLength,
+            format!("compact Kafka array length {len} exceeds u32 limit"),
+        )
     })?;
     Ok(unsigned_varint_size(len_plus_one))
 }
@@ -364,20 +402,22 @@ fn request_header_size(api_key: ApiKey, api_version: i16, client_id: &str) -> Re
     match crate::protocol::RequestHeader::header_version(api_key, api_version) {
         1 => Ok(base),
         2 => Ok(base + 1),
-        version => Err(KrafkaError::protocol(format!(
-            "unsupported request header version {version}"
-        ))),
+        version => Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::UnknownApiVersion,
+            format!("unsupported request header version {version}"),
+        )),
     }
 }
 
 fn produce_request_body_size(api_version: i16, request: &ProduceRequest) -> Result<usize> {
     let mut size = match api_version {
         3..=8 => kafka_string_size(request.transactional_id.as_deref())? + 2 + 4,
-        9..=13 => compact_kafka_string_size(request.transactional_id.as_deref())? + 2 + 4,
+        9..=13 | 14.. => compact_kafka_string_size(request.transactional_id.as_deref())? + 2 + 4,
         _ => {
-            return Err(KrafkaError::protocol(format!(
-                "unsupported ProduceRequest version {api_version}"
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::UnknownApiVersion,
+                format!("unsupported ProduceRequest version {api_version}"),
+            ));
         }
     };
 
@@ -408,8 +448,40 @@ fn produce_request_body_size(api_version: i16, request: &ProduceRequest) -> Resu
             size += compact_array_len_size(request.topic_data.len())?;
             for topic in &request.topic_data {
                 if topic.topic_id.is_none() {
-                    return Err(KrafkaError::protocol(
+                    return Err(KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidValue,
                         "topic_id is required for Produce v13+ (KIP-516)",
+                    ));
+                }
+                size += 16;
+                size += compact_array_len_size(topic.partition_data.len())?;
+                for partition in &topic.partition_data {
+                    size += 4 + compact_kafka_bytes_size(partition.records.len())? + 1;
+                }
+                size += 1;
+            }
+            size += 1;
+        }
+        v @ 14.. => {
+            // Forward-compat: assume the same compact encoding as v13 (topic-id based).
+            // Emit a one-time warning so operator logs reveal the mismatch when a newer
+            // broker requests a version we have not yet implemented.
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::AcqRel) {
+                tracing::warn!(
+                    api_version = v,
+                    "ProduceRequest version {v} exceeds max known version 13; \
+                     using v13 compact encoding as a best-effort fallback. \
+                     Update produce_request_body_size() to add explicit v{v}+ support."
+                );
+            }
+            size += compact_array_len_size(request.topic_data.len())?;
+            for topic in &request.topic_data {
+                if topic.topic_id.is_none() {
+                    return Err(KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidValue,
+                        "topic_id is required for Produce v14+ (KIP-516)",
                     ));
                 }
                 size += 16;
@@ -438,6 +510,29 @@ fn produce_request_frame_size(
     )
 }
 
+/// Populate `topic_id` fields for Produce v13+ (KIP-516).
+///
+/// Looks up each topic's UUID from the metadata cache and fills it in.
+/// Returns `true` if **all** topic IDs were resolved; returns `false` if any
+/// UUID was missing (caller should cap the wire version to v12 and retry with
+/// topic names instead).
+pub(crate) fn fill_produce_topic_ids(
+    request: &mut ProduceRequest,
+    metadata: &ClusterMetadata,
+) -> bool {
+    let mut all_resolved = true;
+    for topic_data in &mut request.topic_data {
+        if topic_data.topic_id.is_none() {
+            if let Some(id) = metadata.topic_id_for_name(&topic_data.name) {
+                topic_data.topic_id = Some(id);
+            } else {
+                all_resolved = false;
+            }
+        }
+    }
+    all_resolved
+}
+
 fn validate_produce_request_size(
     client_id: &str,
     max_request_size: usize,
@@ -446,9 +541,12 @@ fn validate_produce_request_size(
 ) -> Result<()> {
     let frame_size = produce_request_frame_size(client_id, api_version, request)?;
     if frame_size > max_request_size {
-        return Err(KrafkaError::protocol(format!(
-            "produce request size {frame_size} exceeds max_request_size {max_request_size}"
-        )));
+        return Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidLength,
+            format!(
+                "produce request size {frame_size} exceeds max_request_size {max_request_size}"
+            ),
+        ));
     }
 
     Ok(())
@@ -461,7 +559,11 @@ impl Producer {
     }
 
     async fn reserve_send_memory(&self, record_size: usize) -> Result<SendMemoryReservation> {
-        accumulator::check_record_admission(record_size, self.memory_capacity)?;
+        accumulator::check_record_admission(
+            record_size,
+            self.memory_capacity,
+            self.max_request_size,
+        )?;
 
         let permit = match tokio::time::timeout(
             self.config.max_block,
@@ -496,48 +598,61 @@ impl Producer {
         config: ProducerConfig,
         interceptor: Arc<dyn crate::interceptor::ProducerInterceptor>,
         partitioner: Option<Arc<dyn Partitioner>>,
+        key_encoder: Option<Arc<dyn SchemaEncoder>>,
+        value_encoder: Option<Arc<dyn SchemaEncoder>>,
+        shared: Option<(Arc<ConnectionPool>, Arc<crate::metadata::ClusterMetadata>)>,
     ) -> Result<Self> {
-        let mut pool_config_builder = ConnectionConfig::builder()
-            .client_id(&config.client_id)
-            .request_timeout(config.request_timeout);
+        let (pool, metadata) = if let Some((pool, metadata)) = shared {
+            // Use the pre-built shared pool and metadata from a KrafkaClient.
+            // No need to construct a new pool or perform an initial metadata
+            // fetch — the KrafkaClient already did that at build time.
+            (pool, metadata)
+        } else {
+            let mut pool_config_builder = ConnectionConfig::builder()
+                .client_id(&config.client_id)
+                .request_timeout(config.request_timeout);
 
-        if let Some(ref auth) = config.auth {
-            pool_config_builder = pool_config_builder.auth(auth.clone());
-        }
-
-        #[cfg(feature = "socks5")]
-        if let Some(ref proxy) = config.proxy {
-            pool_config_builder = pool_config_builder.proxy(proxy.clone());
-        }
-
-        let mut pool_config = pool_config_builder.build();
-        pool_config.init_tls().await?;
-
-        let pool = Arc::new(ConnectionPool::new(pool_config));
-        pool.start_idle_evictor();
-
-        let bootstrap_servers = crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
-
-        let metadata = Arc::new({
-            let mut meta =
-                ClusterMetadata::new(bootstrap_servers, pool.clone(), config.metadata_max_age)
-                    .with_recovery_strategy(config.metadata_recovery_strategy)
-                    .with_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger);
-            if let Some(ttl) = config.metadata_topic_cache_ttl {
-                meta = meta.with_topic_cache_ttl(ttl);
-            } else {
-                meta = meta.with_topic_cache_ttl_disabled();
+            if let Some(ref auth) = config.auth {
+                pool_config_builder = pool_config_builder.auth(auth.clone());
             }
-            meta
-        });
 
-        // Initial metadata fetch
-        metadata.refresh().await?;
+            #[cfg(feature = "socks5")]
+            if let Some(ref proxy) = config.proxy {
+                pool_config_builder = pool_config_builder.proxy(proxy.clone());
+            }
 
-        info!(
-            "Producer initialized with {} brokers",
-            metadata.brokers().len()
-        );
+            let mut pool_config = pool_config_builder.build()?;
+            pool_config.init_tls().await?;
+
+            let pool = Arc::new(ConnectionPool::new(pool_config));
+            pool.start_idle_evictor();
+
+            let bootstrap_servers =
+                crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
+
+            let metadata = Arc::new({
+                let mut meta =
+                    ClusterMetadata::new(bootstrap_servers, pool.clone(), config.metadata_max_age)
+                        .with_recovery_strategy(config.metadata_recovery_strategy)
+                        .with_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger);
+                if let Some(ttl) = config.metadata_topic_cache_ttl {
+                    meta = meta.with_topic_cache_ttl(ttl);
+                } else {
+                    meta = meta.with_topic_cache_ttl_disabled();
+                }
+                meta
+            });
+
+            // Initial metadata fetch
+            metadata.refresh().await?;
+
+            info!(
+                "Producer initialized with {} brokers",
+                metadata.brokers().len()
+            );
+
+            (pool, metadata)
+        };
 
         let init_retry_policy = RetryPolicy::new()
             .with_max_retries(config.retries)
@@ -554,8 +669,20 @@ impl Producer {
             None
         };
 
-        let partitioner: Arc<dyn Partitioner> =
-            partitioner.unwrap_or_else(|| Arc::new(DefaultPartitioner::new()));
+        // KIP-794: when linger > 0 and no explicit partitioner was provided,
+        // default to UniformStickyPartitioner which sticks to one partition per
+        // batch and advances on batch boundaries.  This matches the Java 3.3+
+        // default and produces significantly larger, more efficient batches for
+        // high-throughput keyless workloads.  With linger = 0 (fire-and-forget),
+        // round-robin via DefaultPartitioner remains the better choice because
+        // there are no batch boundaries to stick to.
+        let partitioner: Arc<dyn Partitioner> = partitioner.unwrap_or_else(|| {
+            if config.linger > Duration::ZERO {
+                Arc::new(UniformStickyPartitioner::new())
+            } else {
+                Arc::new(DefaultPartitioner::new())
+            }
+        });
 
         // Build retry policy from config
         let retry_policy = RetryPolicy::new()
@@ -596,6 +723,7 @@ impl Producer {
                 in_flight_semaphore: in_flight_semaphore.clone(),
                 interceptor: interceptor.clone(),
                 identity: identity.clone(),
+                partitioner: partitioner.clone(),
             };
             Some(accumulator::RecordAccumulator::spawn(
                 acc_config,
@@ -619,10 +747,13 @@ impl Producer {
             metrics,
             memory_permits,
             memory_capacity,
+            max_request_size: config.max_request_size,
             buffered_records,
             in_flight_semaphore,
             interceptor,
             identity,
+            key_encoder,
+            value_encoder,
         })
     }
 
@@ -664,7 +795,7 @@ impl Producer {
         topic: &str,
         key: Option<&[u8]>,
         value: &[u8],
-        headers: Vec<(String, Vec<u8>)>,
+        headers: Vec<(String, Bytes)>,
     ) -> Result<RecordMetadata> {
         let mut record = ProducerRecord::new(topic, Bytes::copy_from_slice(value));
         if let Some(k) = key {
@@ -681,6 +812,27 @@ impl Producer {
         // Invoke interceptor before send
         let mut record = record;
         crate::interceptor::safe_on_send(&*self.interceptor, &mut record);
+
+        // Transparently apply producer-level schema encoders if configured.
+        // Runs after the interceptor (which may set topic/key/value) but before
+        // validation, so oversized encoded payloads are still caught.
+        if let Some(enc) = &self.value_encoder {
+            record.value = enc
+                .encode(
+                    record.value.clone(),
+                    &record.topic,
+                    record.record_name.as_deref(),
+                    false,
+                )
+                .await?;
+        }
+        if let Some(enc) = &self.key_encoder {
+            let key = record.key.clone().unwrap_or_default();
+            record.key = Some(
+                enc.encode(key, &record.topic, record.record_name.as_deref(), true)
+                    .await?,
+            );
+        }
 
         // Validate record fields against Kafka protocol wire-format limits.
         // Runs after the interceptor since interceptors can mutate the record.
@@ -738,6 +890,8 @@ impl Producer {
         // avoiding repeated allocations in the retry loop.
         let topic_owned = topic.to_string();
 
+        // Ensure the idempotent PID is initialized before acquiring the in-flight
+        // permit. This keeps the semaphore pressure zero during the init RPC.
         if let Some(identity) = self.identity.as_ref() {
             ensure_idempotent_producer_id_initialized(identity, &self.metadata, &self.retry_policy)
                 .await?;
@@ -752,14 +906,32 @@ impl Producer {
 
         // Allocate sequence for idempotent production (before retry loop — retries
         // must resend the same sequence for the broker to de-duplicate).
-        let mut sequence: Option<i32> = match self
-            .identity
-            .as_ref()
-            .map(|id| id.next_sequence(topic.as_ref(), partition))
-            .transpose()
-        {
-            Ok(s) => s,
-            Err(e) => return Err(e),
+        //
+        // Uses checked_allocate_sequence to atomically verify that the identity
+        // is still initialized at the moment of allocation, eliminating the TOCTOU
+        // window where a concurrent reset() could clear the PID between
+        // is_initialized() and next_sequence().
+        let mut sequence: Option<i32> = if let Some(ref identity) = self.identity {
+            match identity.checked_allocate_sequence(topic.as_ref(), partition, 1)? {
+                Some(seq) => Some(seq),
+                None => {
+                    // Race: identity was reset between ensure_initialized and now.
+                    // Re-initialize and retry the allocation once.
+                    ensure_idempotent_producer_id_initialized(
+                        identity,
+                        &self.metadata,
+                        &self.retry_policy,
+                    )
+                    .await?;
+                    Some(identity.checked_allocate_sequence(topic.as_ref(), partition, 1)?.ok_or_else(|| {
+                        KrafkaError::invalid_state(
+                            "producer identity reset during sequence allocation; retry the send",
+                        )
+                    })?)
+                }
+            }
+        } else {
+            None
         };
 
         // Build the produce request once (reused across retries).
@@ -1032,26 +1204,47 @@ impl Producer {
             .await?;
 
         // Negotiate Produce version for this broker.
-        let version = conn
+        let mut version = conn
             .negotiate_api_version(
                 ApiKey::Produce,
                 versions::PRODUCE_MAX,
                 versions::PRODUCE_MIN,
             )
             .await
-            .ok_or_else(|| KrafkaError::protocol("no mutually supported Produce API version"))?;
+            .ok_or_else(|| {
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported Produce API version",
+                )
+            })?;
+
+        // KIP-516: Produce v13+ uses topic UUIDs on the wire instead of names.
+        // We need a mutable copy only when filling topic IDs.
+        let mut owned_request;
+        let effective_request: &ProduceRequest = if version >= 13 {
+            owned_request = request.clone();
+            if !fill_produce_topic_ids(&mut owned_request, &self.metadata) {
+                // UUIDs not yet in cache — fall back to name-based v12
+                version = 12;
+                request
+            } else {
+                &owned_request
+            }
+        } else {
+            request
+        };
 
         validate_produce_request_size(
             &self.config.client_id,
             self.config.max_request_size,
             version,
-            request,
+            effective_request,
         )?;
 
         // acks=0 (fire-and-forget): Kafka sends no response, so don't wait for one (R6.1 fix)
         if self.config.acks == Acks::None {
             conn.send_fire_and_forget(ApiKey::Produce, version, |buf| {
-                request.encode_versioned(version, buf)
+                effective_request.encode_versioned(version, buf)
             })
             .await?;
 
@@ -1066,7 +1259,7 @@ impl Producer {
         // Send request and wait for response (acks=1 or acks=-1/all)
         let response = conn
             .send_request(ApiKey::Produce, version, |buf| {
-                request.encode_versioned(version, buf)
+                effective_request.encode_versioned(version, buf)
             })
             .await?;
 
@@ -1095,7 +1288,10 @@ impl Producer {
             }
         }
 
-        Err(KrafkaError::protocol("partition not found in response"))
+        Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::Malformed,
+            "partition not found in response",
+        ))
     }
 
     /// Flush all pending records.
@@ -1251,6 +1447,10 @@ pub struct ProducerBuilder {
     config: ProducerConfig,
     interceptors: Vec<Arc<dyn crate::interceptor::ProducerInterceptor>>,
     partitioner: Option<Arc<dyn Partitioner>>,
+    key_encoder: Option<Arc<dyn SchemaEncoder>>,
+    value_encoder: Option<Arc<dyn SchemaEncoder>>,
+    /// Pre-built pool and metadata from a [`KrafkaClient`](crate::client::KrafkaClient).
+    shared: Option<(Arc<ConnectionPool>, Arc<crate::metadata::ClusterMetadata>)>,
 }
 
 impl ProducerBuilder {
@@ -1367,7 +1567,8 @@ impl ProducerBuilder {
     /// attaches sequence numbers to every batch, allowing the broker to
     /// de-duplicate retries.
     ///
-    /// Requires `acks = All` and `max_in_flight <= 5`.
+    /// Requires `acks = All`. If `max_in_flight` is set above 5, it is
+    /// automatically capped to 5 at build time (with an `info!` log).
     pub fn idempotent(mut self, enable: bool) -> Self {
         self.config.idempotent = enable;
         self
@@ -1499,9 +1700,54 @@ impl ProducerBuilder {
         self
     }
 
+    /// Attach a key encoder applied automatically on every [`send_record`](Producer::send_record) call.
+    ///
+    /// The encoder runs after the interceptor and before partitioning, so the
+    /// partitioner sees the Confluent-wire-framed key bytes.
+    ///
+    /// This is the Rust equivalent of `key.serializer` in the Java
+    /// `KafkaProducer`. Configure it once here and encoding is transparent
+    /// on every send.
+    ///
+    /// For per-record subject-name strategies (`RecordName`, `TopicRecordName`),
+    /// set [`ProducerRecord::record_name`] (via
+    /// [`with_record_name`](ProducerRecord::with_record_name)) on each record
+    /// before sending.
+    pub fn key_encoder(mut self, encoder: Arc<dyn SchemaEncoder>) -> Self {
+        self.key_encoder = Some(encoder);
+        self
+    }
+
+    /// Attach a value encoder applied automatically on every [`send_record`](Producer::send_record) call.
+    ///
+    /// This is the Rust equivalent of `value.serializer` in the Java
+    /// `KafkaProducer`. Configure it once here and encoding is transparent
+    /// on every send.
+    pub fn value_encoder(mut self, encoder: Arc<dyn SchemaEncoder>) -> Self {
+        self.value_encoder = Some(encoder);
+        self
+    }
+
+    /// Share a [`KrafkaClient`](crate::client::KrafkaClient)'s connection pool
+    /// and metadata cache instead of creating a new one.
+    ///
+    /// When multiple producers, consumers, or admin clients are created in the
+    /// same process you should create a single
+    /// [`crate::client::KrafkaClient`] and pass it to each builder. All clients
+    /// will then multiplex over the same TCP
+    /// connections, reducing the total connection count from `N × brokers` to
+    /// `brokers`.
+    ///
+    /// When this method is called, `bootstrap_servers` is optional on the
+    /// builder (the client was already connected at `KrafkaClient::build` time).
+    pub fn with_client(mut self, client: &crate::client::KrafkaClient) -> Self {
+        self.shared = Some((client.pool().clone(), client.metadata().clone()));
+        self
+    }
+
     /// Build the producer.
-    pub async fn build(self) -> Result<Producer> {
-        if self.config.bootstrap_servers.is_empty() {
+    pub async fn build(mut self) -> Result<Producer> {
+        if self.shared.is_none() && self.config.bootstrap_servers.is_empty() {
             return Err(KrafkaError::config("bootstrap.servers is required"));
         }
         if self.config.max_in_flight == 0 {
@@ -1536,11 +1782,15 @@ impl ProducerBuilder {
                     self.config.acks
                 )));
             }
+            // Auto-cap to 5 per the Kafka protocol guarantee (KIP-679),
+            // matching Java client and librdkafka behaviour.
             if self.config.max_in_flight > 5 {
-                return Err(KrafkaError::config(format!(
-                    "idempotent producer requires max_in_flight <= 5 (got {})",
-                    self.config.max_in_flight
-                )));
+                tracing::info!(
+                    configured = self.config.max_in_flight,
+                    effective = 5,
+                    "idempotent producer requires max_in_flight ≤ 5; capping automatically"
+                );
+                self.config.max_in_flight = 5;
             }
         }
         if self.config.buffer_memory > 0 && self.config.batch_size > self.config.buffer_memory {
@@ -1569,7 +1819,15 @@ impl ProducerBuilder {
                     self.interceptors,
                 ))
             };
-        let producer = Producer::new(self.config, interceptor, self.partitioner).await?;
+        let producer = Producer::new(
+            self.config,
+            interceptor,
+            self.partitioner,
+            self.key_encoder,
+            self.value_encoder,
+            self.shared,
+        )
+        .await?;
         Ok(producer)
     }
 }
@@ -1722,7 +1980,8 @@ mod tests {
             timeout_ms: 30_000,
             topic_data: vec![ProduceTopicData {
                 name: "topic".to_string(),
-                topic_id: None,
+                // PRODUCE_MAX is v13 which requires topic_id on the wire.
+                topic_id: Some([0u8; 16]),
                 partition_data: vec![ProducePartitionData {
                     index: 0,
                     records: Bytes::from(vec![1; 32]),
@@ -1842,10 +2101,13 @@ mod tests {
             metrics: metrics.clone(),
             memory_permits: Arc::new(Semaphore::new(16)),
             memory_capacity: 16,
+            max_request_size: 0,
             buffered_records: Arc::new(AtomicUsize::new(0)),
             in_flight_semaphore: Arc::new(Semaphore::new(1)),
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             identity: None,
+            key_encoder: None,
+            value_encoder: None,
         };
 
         let record = RoutedRecord {
@@ -1878,8 +2140,8 @@ mod tests {
             .with_max_backoff(Duration::from_secs(30));
 
         assert_eq!(policy.max_retries, 10);
-        assert_eq!(policy.initial_backoff, Duration::from_millis(50));
-        assert_eq!(policy.max_backoff, Duration::from_secs(30));
+        assert_eq!(policy.initial_backoff(), Duration::from_millis(50));
+        assert_eq!(policy.max_backoff(), Duration::from_secs(30));
     }
 
     #[test]
@@ -1929,16 +2191,17 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_idempotent_requires_max_in_flight_le_5() {
-        let mut builder = Producer::builder().bootstrap_servers("localhost:9092");
-        builder.config.max_in_flight = 10;
-
-        let result = builder.build().await;
-        match result {
-            Err(e) => assert!(e.to_string().contains("max_in_flight")),
-            Ok(_) => panic!("expected config error for idempotent with max_in_flight > 5"),
-        }
+    #[test]
+    fn test_idempotent_autocaps_max_in_flight() {
+        // Source-of-truth validation lives in ProducerConfigBuilder and is
+        // testable without requiring a live broker connection.
+        let cfg = ProducerConfig::builder()
+            .bootstrap_servers("localhost:9092")
+            .idempotent(true)
+            .max_in_flight(10)
+            .build()
+            .expect("idempotent config should auto-cap max_in_flight to 5");
+        assert_eq!(cfg.max_in_flight(), 5);
     }
 
     #[tokio::test]

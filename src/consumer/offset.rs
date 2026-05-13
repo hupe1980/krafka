@@ -47,9 +47,12 @@ impl OffsetAndMetadata {
 
 /// Tracks committed and fetched offsets.
 ///
-/// Internally uses nested maps (`topic → partition → value`) so that
-/// read-only lookups (`committed`, `position`) never allocate. Only
-/// mutating operations that introduce a new topic key allocate a `String`.
+/// Keyed as `topic → partition → value` using two-level `HashMap` nesting.
+/// This gives zero-allocation reads (the inner `HashMap::get` takes `&PartitionId`
+/// which is `Copy`, and the outer takes `&str` via `String: Borrow<str>`).
+///
+/// The previous flat `(String, PartitionId)` key required calling `.to_owned()`
+/// on every read path because Rust's `Borrow` trait does not extend to tuples.
 #[derive(Debug, Default)]
 pub struct OffsetStore {
     /// Committed offsets: topic → partition → metadata.
@@ -67,13 +70,10 @@ impl OffsetStore {
     /// Set the committed offset for a topic-partition.
     #[inline]
     pub fn commit(&mut self, topic: &str, partition: PartitionId, offset: OffsetAndMetadata) {
-        if let Some(partitions) = self.committed.get_mut(topic) {
-            partitions.insert(partition, offset);
-        } else {
-            let mut partitions = HashMap::new();
-            partitions.insert(partition, offset);
-            self.committed.insert(topic.to_string(), partitions);
-        }
+        self.committed
+            .entry(topic.to_owned())
+            .or_default()
+            .insert(partition, offset);
     }
 
     /// Get the committed offset for a topic-partition.
@@ -85,13 +85,10 @@ impl OffsetStore {
     /// Set the current position for a topic-partition.
     #[inline]
     pub fn set_position(&mut self, topic: &str, partition: PartitionId, offset: Offset) {
-        if let Some(partitions) = self.position.get_mut(topic) {
-            partitions.insert(partition, offset);
-        } else {
-            let mut partitions = HashMap::new();
-            partitions.insert(partition, offset);
-            self.position.insert(topic.to_string(), partitions);
-        }
+        self.position
+            .entry(topic.to_owned())
+            .or_default()
+            .insert(partition, offset);
     }
 
     /// Get the current position for a topic-partition.
@@ -100,16 +97,20 @@ impl OffsetStore {
         self.position.get(topic)?.get(&partition).copied()
     }
 
-    /// Get all committed offsets.
+    /// Iterate over all committed offsets.
     #[inline]
-    pub fn all_committed(&self) -> &HashMap<String, HashMap<PartitionId, OffsetAndMetadata>> {
-        &self.committed
+    pub fn all_committed(&self) -> impl Iterator<Item = ((&str, PartitionId), &OffsetAndMetadata)> {
+        self.committed
+            .iter()
+            .flat_map(|(t, parts)| parts.iter().map(move |(p, v)| ((t.as_str(), *p), v)))
     }
 
-    /// Get all positions.
+    /// Iterate over all positions.
     #[inline]
-    pub fn all_positions(&self) -> &HashMap<String, HashMap<PartitionId, Offset>> {
-        &self.position
+    pub fn all_positions(&self) -> impl Iterator<Item = ((&str, PartitionId), Offset)> {
+        self.position
+            .iter()
+            .flat_map(|(t, parts)| parts.iter().map(move |(p, v)| ((t.as_str(), *p), *v)))
     }
 
     /// Clear all offsets for a topic.

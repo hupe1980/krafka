@@ -103,6 +103,8 @@
 //! | `aws-glue-schema-registry` | no | AWS Glue Schema Registry SDK client. |
 //! | `socks5` | no | SOCKS5 proxy support via `tokio-socks`. |
 //! | `danger-insecure-tls` | no | Allow disabling TLS certificate verification (MITM risk!). |
+//! | `telemetry` | no | OpenTelemetry exporter for producer/consumer metrics. |
+//! | `unstable-protocol` | no | Reserved for future experimental protocol APIs. APIs under this feature may change without semver notice. |
 //!
 //! To disable the default compression codecs and pick only what you need:
 //!
@@ -115,6 +117,7 @@
 
 pub mod admin;
 pub mod auth;
+pub mod client;
 pub mod consumer;
 pub mod error;
 pub mod interceptor;
@@ -124,8 +127,6 @@ pub mod network;
 pub mod producer;
 pub mod protocol;
 pub mod schema_registry;
-#[cfg(feature = "unstable-protocol")]
-#[cfg_attr(docsrs, doc(cfg(feature = "unstable-protocol")))]
 pub mod share_consumer;
 #[cfg(feature = "telemetry")]
 #[cfg_attr(docsrs, doc(cfg(feature = "telemetry")))]

@@ -71,6 +71,12 @@ pub struct ProducerConfig {
     /// Total delivery timeout for a record, including retries and time spent queued.
     pub(crate) delivery_timeout: Duration,
     /// Number of retries.
+    ///
+    /// Defaults to `u32::MAX` (effectively unlimited). The retry loop is
+    /// always bounded by [`delivery_timeout`](ProducerConfig::delivery_timeout),
+    /// which is enforced to be greater than zero. Setting `retries = u32::MAX`
+    /// **without** a finite `delivery_timeout` would create an infinite loop;
+    /// use a finite retry count when disabling the delivery timeout.
     pub(crate) retries: u32,
     /// Time between retries.
     pub(crate) retry_backoff: Duration,
@@ -84,7 +90,8 @@ pub struct ProducerConfig {
     /// obtains a Producer ID from the broker and tracks sequence numbers per
     /// partition to guarantee exactly-once delivery within a session.
     ///
-    /// Requires `acks = All` and `max_in_flight <= 5`.
+    /// Requires `acks = All`. `max_in_flight` is automatically capped to 5
+    /// at build time if a higher value is configured.
     pub(crate) idempotent: bool,
     /// Max block time when buffer is full.
     pub(crate) max_block: Duration,
@@ -119,7 +126,7 @@ impl Default for ProducerConfig {
             acks: Acks::All,
             compression: Compression::None,
             batch_size: 16384,
-            linger: Duration::from_millis(0),
+            linger: Duration::ZERO,
             request_timeout: Duration::from_secs(30),
             delivery_timeout: Duration::from_secs(120),
             retries: u32::MAX,
@@ -351,6 +358,11 @@ impl ProducerConfigBuilder {
     }
 
     /// Set number of retries.
+    ///
+    /// The default is `u32::MAX` (effectively unlimited), which is safe
+    /// because the retry loop is always bounded by `delivery_timeout`.
+    /// Use a finite value when you want to limit retries independently of
+    /// the delivery timeout.
     pub fn retries(mut self, retries: u32) -> Self {
         self.config.retries = retries;
         self
@@ -363,6 +375,10 @@ impl ProducerConfigBuilder {
     }
 
     /// Set max in-flight requests per connection.
+    ///
+    /// When idempotent production is enabled, this value is automatically
+    /// capped to 5 at build time (per the Kafka protocol guarantee), with an
+    /// `info!` log if a higher value was explicitly configured.
     pub fn max_in_flight(mut self, max: usize) -> Self {
         self.config.max_in_flight = max;
         self
@@ -381,7 +397,9 @@ impl ProducerConfigBuilder {
     /// attaches sequence numbers to every batch, allowing the broker to
     /// de-duplicate retries.
     ///
-    /// Requires `acks = All` and `max_in_flight <= 5`.
+    /// Requires `acks = All`. If `max_in_flight` exceeds 5, it is automatically
+    /// capped to 5 at build time (with an `info!` log), matching Java client
+    /// and librdkafka behaviour.
     pub fn idempotent(mut self, enable: bool) -> Self {
         self.config.idempotent = enable;
         self
@@ -445,14 +463,26 @@ impl ProducerConfigBuilder {
     /// # Errors
     ///
     /// Returns an error if the configuration is invalid:
+    /// - `bootstrap_servers` must be non-empty
     /// - `batch_size` must be >= 1
     /// - `max_in_flight` must be >= 1
     /// - `max_request_size` must be >= 1
     /// - `delivery_timeout` must be greater than zero
-    /// - Idempotent mode requires `acks = All` and `max_in_flight <= 5`
+    /// - Idempotent mode requires `acks = All`; `max_in_flight` is auto-capped to 5
     /// - `batch_size` must not exceed `buffer_memory` (when `buffer_memory > 0`)
     /// - `batch_size` must not exceed `max_request_size`
-    pub fn build(self) -> Result<ProducerConfig> {
+    pub fn build(mut self) -> Result<ProducerConfig> {
+        if self.config.bootstrap_servers.is_empty() {
+            return Err(KrafkaError::config("bootstrap_servers must not be empty"));
+        }
+        // Validate client_id against the Kafka wire limit for KafkaString (i16::MAX).
+        const MAX_KAFKA_STRING_LEN: usize = i16::MAX as usize;
+        if self.config.client_id.len() > MAX_KAFKA_STRING_LEN {
+            return Err(KrafkaError::config(format!(
+                "client_id is {} bytes, exceeding the Kafka wire limit of {MAX_KAFKA_STRING_LEN}",
+                self.config.client_id.len()
+            )));
+        }
         if self.config.batch_size == 0 {
             return Err(KrafkaError::config(format!(
                 "batch_size must be >= 1 (got {})",
@@ -485,11 +515,18 @@ impl ProducerConfigBuilder {
                     self.config.acks
                 )));
             }
+            // Idempotent production requires max_in_flight ≤ 5 per the Kafka
+            // protocol specification (KIP-679).  Rather than rejecting the
+            // configuration with an error, we silently cap it to 5 — the same
+            // behaviour as the Java client, librdkafka, and kafka-go — and emit
+            // an info-level message so operators can see the adjustment.
             if self.config.max_in_flight > 5 {
-                return Err(KrafkaError::config(format!(
-                    "idempotent producer requires max_in_flight <= 5 (got {})",
-                    self.config.max_in_flight
-                )));
+                tracing::info!(
+                    configured = self.config.max_in_flight,
+                    effective = 5,
+                    "idempotent producer requires max_in_flight ≤ 5; capping automatically"
+                );
+                self.config.max_in_flight = 5;
             }
         }
         if self.config.buffer_memory > 0 && self.config.batch_size > self.config.buffer_memory {
@@ -503,6 +540,24 @@ impl ProducerConfigBuilder {
                 "batch_size must not exceed max_request_size (got batch_size={}, max_request_size={})",
                 self.config.batch_size, self.config.max_request_size
             )));
+        }
+        // Warn when linger >= delivery_timeout — records would time out before
+        // the linger period expires, making lingering counterproductive.
+        if self.config.linger >= self.config.delivery_timeout {
+            tracing::warn!(
+                linger_ms = self.config.linger.as_millis(),
+                delivery_timeout_ms = self.config.delivery_timeout.as_millis(),
+                "linger >= delivery_timeout: records may expire before they are sent"
+            );
+        }
+        // Warn when retries = u32::MAX — the retry loop is bounded by
+        // delivery_timeout (validated non-zero above), but a future caller
+        // that disables that guard would create an infinite loop.
+        if self.config.retries == u32::MAX {
+            tracing::debug!(
+                "retries = u32::MAX; retry loop is bounded by delivery_timeout ({:?})",
+                self.config.delivery_timeout
+            );
         }
         Ok(self.config)
     }
@@ -566,6 +621,7 @@ mod tests {
     #[test]
     fn test_config_builder_request_timeout() {
         let config = ProducerConfig::builder()
+            .bootstrap_servers("localhost:9092")
             .request_timeout(Duration::from_secs(60))
             .build()
             .unwrap();
@@ -579,6 +635,7 @@ mod tests {
     #[test]
     fn test_config_builder_delivery_timeout() {
         let config = ProducerConfig::builder()
+            .bootstrap_servers("localhost:9092")
             .delivery_timeout(Duration::from_secs(45))
             .build()
             .unwrap();
@@ -589,6 +646,7 @@ mod tests {
     fn test_config_builder_max_in_flight() {
         // max_in_flight=10 requires idempotent=false
         let config = ProducerConfig::builder()
+            .bootstrap_servers("localhost:9092")
             .idempotent(false)
             .max_in_flight(10)
             .build()
@@ -602,6 +660,7 @@ mod tests {
     #[test]
     fn test_config_builder_metadata_max_age() {
         let config = ProducerConfig::builder()
+            .bootstrap_servers("localhost:9092")
             .metadata_max_age(Duration::from_secs(120))
             .build()
             .unwrap();
@@ -615,6 +674,7 @@ mod tests {
     #[test]
     fn test_config_builder_metadata_topic_cache_ttl() {
         let config = ProducerConfig::builder()
+            .bootstrap_servers("localhost:9092")
             .metadata_topic_cache_ttl(Duration::from_secs(600))
             .build()
             .unwrap();
@@ -627,6 +687,7 @@ mod tests {
     #[test]
     fn test_config_builder_disable_metadata_topic_cache_ttl() {
         let config = ProducerConfig::builder()
+            .bootstrap_servers("localhost:9092")
             .disable_metadata_topic_cache_ttl()
             .build()
             .unwrap();
@@ -661,6 +722,7 @@ mod tests {
     #[test]
     fn test_config_builder_proxy_round_trip() {
         let config = ProducerConfig::builder()
+            .bootstrap_servers("localhost:9092")
             .proxy(crate::network::ProxyConfig::new("proxy:1080"))
             .build()
             .unwrap();
@@ -684,6 +746,7 @@ mod tests {
     #[test]
     fn test_config_builder_recovery_strategy() {
         let config = ProducerConfig::builder()
+            .bootstrap_servers("localhost:9092")
             .metadata_recovery_strategy(MetadataRecoveryStrategy::Rebootstrap)
             .metadata_recovery_rebootstrap_trigger(Duration::from_secs(120))
             .build()
@@ -740,12 +803,27 @@ mod tests {
     }
 
     #[test]
-    fn test_config_builder_rejects_idempotent_with_high_in_flight() {
-        let err = ProducerConfig::builder()
+    fn test_config_builder_autocaps_idempotent_with_high_in_flight() {
+        // max_in_flight > 5 with idempotent enabled: auto-capped to 5, not an error.
+        let config = ProducerConfig::builder()
+            .bootstrap_servers("localhost:9092")
             .idempotent(true)
-            .max_in_flight(6)
-            .build();
-        assert!(err.is_err());
+            .max_in_flight(10)
+            .build()
+            .expect("should auto-cap, not error");
+        assert_eq!(config.max_in_flight(), 5);
+    }
+
+    #[test]
+    fn test_config_builder_idempotent_keeps_low_in_flight() {
+        // max_in_flight ≤ 5 is preserved exactly.
+        let config = ProducerConfig::builder()
+            .bootstrap_servers("localhost:9092")
+            .idempotent(true)
+            .max_in_flight(3)
+            .build()
+            .expect("should succeed");
+        assert_eq!(config.max_in_flight(), 3);
     }
 
     #[test]
@@ -764,5 +842,18 @@ mod tests {
             .max_request_size(512)
             .build();
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_config_builder_rejects_empty_bootstrap_servers() {
+        let err = ProducerConfig::builder().bootstrap_servers("").build();
+        assert!(
+            err.is_err(),
+            "empty bootstrap_servers should be rejected at build time"
+        );
+        assert!(
+            err.unwrap_err().to_string().contains("bootstrap_servers"),
+            "error message should mention bootstrap_servers"
+        );
     }
 }

@@ -7,7 +7,7 @@ use bytes::{Buf, BufMut};
 
 use super::api::ApiKey;
 use super::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
-use crate::error::{KrafkaError, Result};
+use crate::error::{KrafkaError, ProtocolErrorKind, Result};
 
 /// Request header for Kafka protocol.
 ///
@@ -102,9 +102,10 @@ impl RequestHeader {
             1 => self.encode_v1(buf)?,
             2 => self.encode_v2(buf)?,
             v => {
-                return Err(KrafkaError::protocol(format!(
-                    "unsupported request header version {v}"
-                )));
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    format!("unsupported request header version {v}"),
+                ));
             }
         }
         Ok(())
@@ -170,9 +171,10 @@ impl ResponseHeader {
         match header_version {
             0 => Self::decode_v0(buf),
             1 => Self::decode_v1(buf),
-            v => Err(KrafkaError::protocol(format!(
-                "unsupported response header version {v}"
-            ))),
+            v => Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::UnknownApiVersion,
+                format!("unsupported response header version {v}"),
+            )),
         }
     }
 }

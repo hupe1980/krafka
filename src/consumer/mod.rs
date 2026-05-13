@@ -38,6 +38,7 @@
 mod config;
 mod fetch_session;
 mod group;
+mod lock_order;
 mod offset;
 mod record;
 mod stream;
@@ -45,16 +46,18 @@ mod stream;
 pub mod compacted;
 
 pub use compacted::{
-    CompactedTable, CompactedTopicConsumer, CompactedTopicConsumerBuilder, TableChange,
+    CompactedTable, CompactedTableSnapshot, CompactedTopicConsumer, CompactedTopicConsumerBuilder,
+    TableChange,
 };
 pub use config::{
     AutoOffsetReset, ConsumerConfig, ConsumerConfigBuilder, GroupProtocol, IsolationLevel,
     PartitionAssignmentStrategy,
 };
 pub use group::{
-    ConsumerGroup, ConsumerRebalanceListener, CooperativeStickyAssignor, GroupCoordinator,
-    GroupMember, GroupState, HeartbeatController, HeartbeatStatus, MemberAssignment,
-    NoOpRebalanceListener, PartitionAssignor, RangeAssignor, RoundRobinAssignor,
+    AsyncConsumerRebalanceListener, ConsumerGroup, ConsumerRebalanceListener,
+    CooperativeStickyAssignor, GroupCoordinator, GroupMember, GroupState, HeartbeatController,
+    HeartbeatStatus, MemberAssignment, NoOpRebalanceListener, PartitionAssignor, RangeAssignor,
+    RoundRobinAssignor,
 };
 pub use offset::{OffsetAndMetadata, OffsetStore, ResetOffset};
 pub use record::{ConsumerRecord, ConsumerRecords, TopicPartition};
@@ -68,11 +71,12 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex as SyncMutex;
-use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
+use lock_order::LeveledRwLock;
+
 use crate::auth::AuthConfig;
-use crate::error::{KrafkaError, RecvError, Result};
+use crate::error::{KrafkaError, ProtocolErrorKind, RecvError, Result};
 use crate::metadata::{BrokerInfo, ClusterMetadata, TopicInfo};
 use crate::metrics::{ConnectionMetrics, ConsumerMetrics};
 use crate::network::{ConnectionConfig, ConnectionPool};
@@ -83,11 +87,6 @@ use crate::protocol::{
     versions,
 };
 use crate::{Offset, PartitionId};
-
-/// Maximum number of cooperative rebalance rejoin rounds before deferring
-/// to the next poll cycle. Cascading membership changes in large groups
-/// may require multiple rounds; this cap prevents unbounded looping.
-const MAX_COOPERATIVE_ROUNDS: usize = 5;
 
 use fetch_session::FetchSessionCache;
 
@@ -147,6 +146,9 @@ struct PartitionState {
     /// (the broker reports it on every response with `high_watermark >= 0`,
     /// including empty and error responses).
     high_watermark: Option<Offset>,
+    /// Monotonic instant at which `high_watermark` was last updated.
+    /// Used by [`Consumer::lag`] to report stale partitions.
+    watermark_updated_at: Option<Instant>,
     /// Latest known log start offset, from `FetchResponse`.
     /// `None` until first observed in a fetch response for this partition
     /// (reported in Fetch v5+ whenever `log_start_offset >= 0`, including
@@ -195,6 +197,32 @@ pub enum BatchRecvOutcome {
     EmptyRequest,
 }
 
+/// Result of [`Consumer::lag`], containing per-partition lag and staleness
+/// information.
+///
+/// High watermarks are cached from the most recent fetch response. A partition
+/// is considered *stale* if its cached watermark has not been updated within
+/// [`crate::consumer::ConsumerConfigBuilder::lag_staleness_threshold`]
+/// (default: 60 s). Stale lag
+/// values are still returned, but the calling code can decide to treat them
+/// as unreliable.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct LagResult {
+    /// Per-partition lag in messages.
+    ///
+    /// Only partitions where both the high watermark and current position are
+    /// known are included. Newly-assigned partitions that haven't yet received
+    /// a fetch response are omitted.
+    pub lag: HashMap<(String, PartitionId), u64>,
+    /// Partitions whose cached high watermark is stale.
+    ///
+    /// A partition appears here when its watermark has not been refreshed
+    /// within the staleness threshold. The corresponding lag value is still
+    /// present in [`Self::lag`] but may be outdated.
+    pub stale_partitions: Vec<(String, PartitionId)>,
+}
+
 type CommitRequestOffsets = HashMap<(String, PartitionId), (i64, Option<String>)>;
 
 /// Handle returned by [`Consumer::commit_async`].
@@ -202,6 +230,7 @@ type CommitRequestOffsets = HashMap<(String, PartitionId), (i64, Option<String>)
 /// Await the handle to observe the final commit outcome. Dropping it detaches
 /// the background task and discards the result.
 #[must_use = "await the returned handle to observe async offset commit outcome"]
+#[non_exhaustive]
 pub enum OffsetCommitHandle {
     /// Immediate commit result without spawning a background task.
     Ready(Ready<Result<()>>),
@@ -240,14 +269,14 @@ pub struct Consumer {
     metadata: Arc<ClusterMetadata>,
     /// Connection pool.
     pool: Arc<ConnectionPool>,
-    /// Subscribed topics.
-    subscriptions: RwLock<HashSet<String>>,
-    /// Assigned partitions.
-    assignments: RwLock<HashMap<String, Vec<PartitionId>>>,
-    /// Current offsets.
-    offsets: RwLock<HashMap<(String, PartitionId), Offset>>,
-    /// Paused partitions.
-    paused: RwLock<HashSet<(String, PartitionId)>>,
+    /// Subscribed topics. Lock level 1 — acquire first (see `LOCK ORDER`).
+    subscriptions: LeveledRwLock<1, HashSet<String>>,
+    /// Assigned partitions. Lock level 2 — acquire after `subscriptions`.
+    assignments: LeveledRwLock<2, HashMap<String, Vec<PartitionId>>>,
+    /// Current offsets. Lock level 3 — acquire after `assignments`.
+    offsets: LeveledRwLock<3, HashMap<(String, PartitionId), Offset>>,
+    /// Paused partitions. Lock level 4 — acquire after `offsets`.
+    paused: LeveledRwLock<4, HashSet<(String, PartitionId)>>,
     /// Whether the consumer is closed.
     closed: std::sync::atomic::AtomicBool,
     /// Group coordinator for full group protocol support.
@@ -281,10 +310,23 @@ pub struct Consumer {
     /// critical section straight-line-sync.
     fetch_sessions: SyncMutex<FetchSessionCache>,
     /// Consolidated per-partition state: high watermark, log start offset,
-    /// preferred replica (KIP-392), and offset-retry backoff. A single lock
-    /// replaces what was previously four separate `RwLock<HashMap>` fields;
-    /// see the `LOCK ORDER` comment above and [`PartitionState`] for details.
-    partition_state: RwLock<HashMap<(String, PartitionId), PartitionState>>,
+    /// preferred replica (KIP-392), and offset-retry backoff. Lock level 5 —
+    /// acquire last among async locks. A single lock replaces what was
+    /// previously four separate `RwLock<HashMap>` fields; see the `LOCK ORDER`
+    /// comment above and [`PartitionState`] for details.
+    partition_state: LeveledRwLock<5, HashMap<(String, PartitionId), PartitionState>>,
+    /// Optional key decoder applied transparently after each `poll()` / `recv()`.
+    ///
+    /// When set, every consumed record's key is passed through this decoder
+    /// before being returned to the caller. Equivalent to `key.deserializer`
+    /// in the Java `KafkaConsumer`.
+    key_decoder: Option<Arc<dyn crate::schema_registry::SchemaDecoder>>,
+    /// Optional value decoder applied transparently after each `poll()` / `recv()`.
+    ///
+    /// When set, every consumed record's value is passed through this decoder
+    /// before being returned to the caller. Equivalent to `value.deserializer`
+    /// in the Java `KafkaConsumer`.
+    value_decoder: Option<Arc<dyn crate::schema_registry::SchemaDecoder>>,
 }
 
 /// Compute aggregate lag from offset and high-watermark caches.
@@ -407,7 +449,7 @@ where
     }
 
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut batch = Vec::with_capacity(max_records.min(64));
+    let mut batch = Vec::with_capacity(max_records);
 
     loop {
         // Drain buffer first.
@@ -676,43 +718,54 @@ impl Consumer {
     }
 
     /// Create a new consumer with the given configuration.
-    async fn new(config: ConsumerConfig) -> Result<Self> {
-        let mut pool_config_builder = ConnectionConfig::builder()
-            .client_id(&config.client_id)
-            .request_timeout(config.request_timeout);
+    async fn new(
+        config: ConsumerConfig,
+        shared: Option<(Arc<ConnectionPool>, Arc<ClusterMetadata>)>,
+    ) -> Result<Self> {
+        let (pool, metadata) = if let Some((pool, metadata)) = shared {
+            // Use the pre-built shared pool and metadata from a KrafkaClient.
+            (pool, metadata)
+        } else {
+            let mut pool_config_builder = ConnectionConfig::builder()
+                .client_id(&config.client_id)
+                .request_timeout(config.request_timeout);
 
-        if let Some(ref auth) = config.auth {
-            pool_config_builder = pool_config_builder.auth(auth.clone());
-        }
-
-        #[cfg(feature = "socks5")]
-        if let Some(ref proxy) = config.proxy {
-            pool_config_builder = pool_config_builder.proxy(proxy.clone());
-        }
-
-        let mut pool_config = pool_config_builder.build();
-        pool_config.init_tls().await?;
-
-        let pool = Arc::new(ConnectionPool::new(pool_config));
-        pool.start_idle_evictor();
-
-        let bootstrap_servers = crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
-
-        let metadata = Arc::new({
-            let mut meta =
-                ClusterMetadata::new(bootstrap_servers, pool.clone(), config.metadata_max_age)
-                    .with_recovery_strategy(config.metadata_recovery_strategy)
-                    .with_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger);
-            if let Some(ttl) = config.metadata_topic_cache_ttl {
-                meta = meta.with_topic_cache_ttl(ttl);
-            } else {
-                meta = meta.with_topic_cache_ttl_disabled();
+            if let Some(ref auth) = config.auth {
+                pool_config_builder = pool_config_builder.auth(auth.clone());
             }
-            meta
-        });
 
-        // Initial metadata fetch
-        metadata.refresh().await?;
+            #[cfg(feature = "socks5")]
+            if let Some(ref proxy) = config.proxy {
+                pool_config_builder = pool_config_builder.proxy(proxy.clone());
+            }
+
+            let mut pool_config = pool_config_builder.build()?;
+            pool_config.init_tls().await?;
+
+            let pool = Arc::new(ConnectionPool::new(pool_config));
+            pool.start_idle_evictor();
+
+            let bootstrap_servers =
+                crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
+
+            let metadata = Arc::new({
+                let mut meta =
+                    ClusterMetadata::new(bootstrap_servers, pool.clone(), config.metadata_max_age)
+                        .with_recovery_strategy(config.metadata_recovery_strategy)
+                        .with_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger);
+                if let Some(ttl) = config.metadata_topic_cache_ttl {
+                    meta = meta.with_topic_cache_ttl(ttl);
+                } else {
+                    meta = meta.with_topic_cache_ttl_disabled();
+                }
+                meta
+            });
+
+            // Initial metadata fetch
+            metadata.refresh().await?;
+
+            (pool, metadata)
+        };
 
         // Create group coordinator if group_id is specified
         let group_coordinator = if let Some(ref group_id) = config.group_id {
@@ -727,6 +780,7 @@ impl Consumer {
                 )
                 .with_assignor_strategy(config.partition_assignment_strategy)
                 .with_group_instance_id(config.group_instance_id.clone())
+                .with_client_rack(config.client_rack.clone())
                 .with_isolation_level(config.isolation_level.to_i8())
                 .with_group_protocol(config.group_protocol),
             ))
@@ -750,10 +804,10 @@ impl Consumer {
             config,
             metadata,
             pool,
-            subscriptions: RwLock::new(HashSet::new()),
-            assignments: RwLock::new(HashMap::new()),
-            offsets: RwLock::new(HashMap::new()),
-            paused: RwLock::new(HashSet::new()),
+            subscriptions: LeveledRwLock::new(HashSet::new()),
+            assignments: LeveledRwLock::new(HashMap::new()),
+            offsets: LeveledRwLock::new(HashMap::new()),
+            paused: LeveledRwLock::new(HashSet::new()),
             closed: std::sync::atomic::AtomicBool::new(false),
             group_coordinator,
             metrics,
@@ -762,7 +816,9 @@ impl Consumer {
             last_auto_commit: SyncMutex::new(Instant::now()),
             recv_buffer: SyncMutex::new(std::collections::VecDeque::new()),
             fetch_sessions: SyncMutex::new(FetchSessionCache::new()),
-            partition_state: RwLock::new(HashMap::new()),
+            partition_state: LeveledRwLock::new(HashMap::new()),
+            key_decoder: None,
+            value_decoder: None,
         })
     }
 
@@ -790,8 +846,7 @@ impl Consumer {
 
         // If we have a group coordinator, join the group
         if let Some(ref coordinator) = self.group_coordinator {
-            let topic_strings: Vec<String> = topics.iter().map(|s| s.to_string()).collect();
-            let mut topics_sorted = topic_strings.clone();
+            let mut topics_sorted: Vec<String> = topics.iter().map(|s| s.to_string()).collect();
             topics_sorted.sort();
 
             if coordinator.is_consumer_protocol() {
@@ -813,7 +868,7 @@ impl Consumer {
                     }
                 }
 
-                coordinator.set_subscribed_topics(topic_strings).await;
+                coordinator.set_subscribed_topics(topics_sorted).await;
             } else if coordinator.is_cooperative() {
                 // Cooperative (KIP-429): defer the join/sync to poll(), which
                 // implements the full two-phase rebalance protocol (revocations,
@@ -833,7 +888,7 @@ impl Consumer {
                     }
                 }
 
-                coordinator.set_subscribed_topics(topic_strings).await;
+                coordinator.set_subscribed_topics(topics_sorted).await;
             } else {
                 // Eager: join immediately in subscribe() — single-phase is correct.
 
@@ -843,7 +898,7 @@ impl Consumer {
                 let old_assignments = self.assignments.read().await.clone();
 
                 let (assignment, joined) =
-                    coordinator.ensure_active_membership(&topic_strings).await?;
+                    coordinator.ensure_active_membership(&topics_sorted).await?;
 
                 if joined {
                     // An actual JoinGroup/SyncGroup occurred (first join or topic change).
@@ -905,8 +960,11 @@ impl Consumer {
             let mut assignments = self.assignments.write().await;
             for topic in topics {
                 if let Some(topic_info) = self.metadata.topic(topic) {
-                    let partitions: Vec<_> =
-                        topic_info.partitions.iter().map(|p| p.partition).collect();
+                    let partitions: Vec<_> = topic_info
+                        .partitions
+                        .values()
+                        .map(|p| p.partition)
+                        .collect();
                     assignments.insert((*topic).to_string(), partitions);
                 }
             }
@@ -998,6 +1056,15 @@ impl Consumer {
                 partition_state.remove(key);
             }
         }
+        // Evict fetch sessions for brokers no longer present in cluster
+        // metadata. Sessions for departed brokers can never become active
+        // again; evicting them prevents unbounded map growth on clusters
+        // with high broker churn.
+        {
+            let live_broker_ids: Vec<crate::BrokerId> =
+                self.metadata.brokers().iter().map(|b| b.id()).collect();
+            self.fetch_sessions.lock().retain_brokers(&live_broker_ids);
+        }
         // Recompute lag metrics from remaining caches so revoked
         // partitions no longer contribute to exported values.
         self.recompute_lag_metrics().await;
@@ -1039,19 +1106,13 @@ impl Consumer {
             }
         }
 
-        // Notify listener with the full post-rebalance assignment,
-        // not just the diff. Always fire, even when the assignment
-        // is empty (e.g., more consumers than partitions).
-        let full_assigned: Vec<TopicPartition> = assignment
-            .partitions
-            .iter()
-            .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
-            .collect();
-        self.rebalance_listener
-            .on_partitions_assigned(&full_assigned);
-        self.metrics
-            .assigned_partitions
-            .set(full_assigned.len() as u64);
+        // Notify listener with only the *newly* assigned partitions (delta),
+        // consistent with the KIP-848 and cooperative-sticky paths.
+        // Listeners must not assume the slice contains all owned partitions;
+        // they should consult the assignment API for the full view.
+        self.safe_on_partitions_assigned(&newly_assigned);
+        let total_assigned: usize = assignment.partitions.values().map(|ps| ps.len()).sum();
+        self.metrics.assigned_partitions.set(total_assigned as u64);
 
         // Fetch committed offsets for newly assigned partitions only
         // (retained partitions already have tracked offsets).
@@ -1289,7 +1350,7 @@ impl Consumer {
             // additional revocations may be needed. Loop with a bound.
             coordinator.trigger_rejoin().await;
             let mut final_assignment = MemberAssignment::empty();
-            for round in 0..MAX_COOPERATIVE_ROUNDS {
+            for round in 0..self.config.max_cooperative_rebalance_rounds {
                 let (assignment, extra_revoke) =
                     coordinator.perform_cooperative_join_and_sync().await?;
                 final_assignment = assignment;
@@ -1310,12 +1371,12 @@ impl Consumer {
                     return Ok(true);
                 }
 
-                if round == MAX_COOPERATIVE_ROUNDS - 1 {
+                if round == self.config.max_cooperative_rebalance_rounds - 1 {
                     warn!(
                         "Cooperative rebalance exceeded {} rounds with pending revocations; \
                          this may indicate cascading membership changes. \
                          Deferring assignment to next poll cycle.",
-                        MAX_COOPERATIVE_ROUNDS
+                        self.config.max_cooperative_rebalance_rounds
                     );
                     // Start heartbeat to avoid session timeout while we
                     // defer the additional cooperative rebalance round
@@ -1495,21 +1556,9 @@ impl Consumer {
 
         self.metrics.rebalances.inc();
 
-        // Fire assignment callback with the full post-rebalance assignment
-        // (consistent with the cooperative/eager paths in this crate).
-        // Always fire, even when the assignment is empty or only revocations
-        // occurred, so listeners can react to the post-rebalance state.
-        let full_assignment: Vec<TopicPartition> = new_assignment
-            .partitions
-            .iter()
-            .flat_map(|(topic, partitions)| {
-                partitions
-                    .iter()
-                    .copied()
-                    .map(move |partition| TopicPartition::new(topic, partition))
-            })
-            .collect();
-        self.safe_on_partitions_assigned(&full_assignment);
+        // Fire assignment callback with only the *newly* assigned partitions
+        // (delta), consistent with the classic eager/cooperative paths.
+        self.safe_on_partitions_assigned(&assigned);
 
         let count: usize = new_assignment.partitions.values().map(|ps| ps.len()).sum();
         self.metrics.assigned_partitions.set(count as u64);
@@ -1968,7 +2017,7 @@ impl Consumer {
         let mut grouped: HashMap<String, Vec<PartitionId>> = HashMap::new();
         grouped.insert(
             topic.to_string(),
-            info.partitions.iter().map(|p| p.partition).collect(),
+            info.partitions.values().map(|p| p.partition).collect(),
         );
         let results = self.resolve_list_offsets(&grouped, timestamp).await;
 
@@ -2041,9 +2090,10 @@ impl Consumer {
         results
             .remove(&(topic_owned, partition))
             .unwrap_or_else(|| {
-                Err(KrafkaError::protocol(format!(
-                    "no offset returned for {topic}-{partition}"
-                )))
+                Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::Malformed,
+                    format!("no offset returned for {topic}-{partition}"),
+                ))
             })
     }
 
@@ -2190,9 +2240,12 @@ impl Consumer {
             {
                 Some(v) => v,
                 None => {
-                    let err = KrafkaError::protocol(format!(
-                        "no mutually supported ListOffsets API version for broker {leader_id}"
-                    ));
+                    let err = KrafkaError::protocol_kind(
+                        ProtocolErrorKind::UnknownApiVersion,
+                        format!(
+                            "no mutually supported ListOffsets API version for broker {leader_id}"
+                        ),
+                    );
                     warn!("{err}");
                     for (topic, partition) in leader_partitions {
                         result.insert((topic.clone(), *partition), Err(err.clone()));
@@ -2229,9 +2282,12 @@ impl Consumer {
                         "Failed to decode ListOffsets v{} response from broker {}: {}, skipping",
                         list_version, leader_id, e
                     );
-                    let err = KrafkaError::protocol(format!(
-                        "failed to decode ListOffsets response from broker {leader_id}: {e}"
-                    ));
+                    let err = KrafkaError::protocol_kind(
+                        ProtocolErrorKind::Malformed,
+                        format!(
+                            "failed to decode ListOffsets response from broker {leader_id}: {e}"
+                        ),
+                    );
                     for (topic, partition) in leader_partitions {
                         result.insert((topic.clone(), *partition), Err(err.clone()));
                     }
@@ -2247,7 +2303,22 @@ impl Consumer {
 
     /// Poll for new records.
     ///
-    /// This is the main method for consuming messages.
+    /// Performs **one** broker fetch round-trip per assigned broker, waits up
+    /// to `timeout` for records to arrive, and returns all records received in
+    /// that single round.  `max_poll_records` (from [`ConsumerConfig`]) caps
+    /// the returned slice.
+    ///
+    /// **When to use `poll`**: for simple event loops where low per-call
+    /// overhead matters and a single broker round-trip per iteration is
+    /// acceptable.  Processing happens synchronously in the loop; the fetch
+    /// latency equals your per-iteration latency.
+    ///
+    /// **When to use [`batch_recv`](Self::batch_recv) instead**: when you need
+    /// a fixed batch size for downstream batching (e.g., bulk database inserts
+    /// or transactional exactly-once pipelines). `batch_recv` drains the
+    /// internal buffer first and keeps fetching until `max_records` are
+    /// collected *or* the deadline elapses — it is the throughput-optimised
+    /// path.
     ///
     /// # Example
     ///
@@ -2601,10 +2672,10 @@ impl Consumer {
         }
 
         // Enforce max_poll_records
-        // Negative values are treated as unlimited (no truncation)
+        // -1 means unlimited (no truncation); positive values cap the batch.
         // Only advance offsets for records actually delivered.
         // When truncating, recompute offset updates from delivered records only.
-        if self.config.max_poll_records > 0 {
+        if self.config.max_poll_records != -1 {
             let max = self.config.max_poll_records as usize;
             if all_records.len() > max {
                 all_records.truncate(max);
@@ -2638,9 +2709,12 @@ impl Consumer {
         // Update high watermarks
         let hw_changed = !all_hw_updates.is_empty();
         if hw_changed {
+            let now = Instant::now();
             let mut partition_state = self.partition_state.write().await;
             for (key, watermark) in all_hw_updates {
-                partition_state.entry(key).or_default().high_watermark = Some(watermark);
+                let s = partition_state.entry(key).or_default();
+                s.high_watermark = Some(watermark);
+                s.watermark_updated_at = Some(now);
             }
         }
 
@@ -2663,6 +2737,20 @@ impl Consumer {
         // Invoke consumer interceptor after fetching records
         if !all_records.is_empty() {
             crate::interceptor::safe_on_consume(&*self.interceptor, &all_records);
+        }
+
+        // Transparently apply consumer-level schema decoders if configured.
+        // Runs after the interceptor (which may rewrite key/value) and before
+        // the records are returned to the caller.
+        if self.key_decoder.is_some() || self.value_decoder.is_some() {
+            for record in &mut all_records {
+                if let (Some(dec), Some(value)) = (&self.value_decoder, record.value.take()) {
+                    record.value = Some(dec.decode(value, &record.topic, false).await?);
+                }
+                if let (Some(dec), Some(key)) = (&self.key_decoder, record.key.take()) {
+                    record.key = Some(dec.decode(key, &record.topic, true).await?);
+                }
+            }
         }
 
         Ok(all_records)
@@ -2736,7 +2824,12 @@ impl Consumer {
                     fetch_offset: offset,
                     last_fetched_epoch: -1,
                     log_start_offset: -1,
-                    partition_max_bytes: self.config.max_partition_fetch_bytes,
+                    partition_max_bytes: self
+                        .config
+                        .topic_fetch_max_bytes
+                        .get(topic.as_str())
+                        .copied()
+                        .unwrap_or(self.config.max_partition_fetch_bytes),
                     replica_directory_id: None,
                     high_watermark: None,
                 });
@@ -2750,24 +2843,15 @@ impl Consumer {
         // Drop the read lock before the network call.
         drop(offsets_snapshot);
 
-        // Negotiate fetch API version — prefer v11 (KIP-392 closest-replica
-        // fetching), fall back through v7 (sessions) to v4.
-        // We implement encode/decode for v4, v7-v10, and v11.
-        // v5/v6 are unsupported (different request wire format).
-        // Prefer the highest version we implement:
+        // Negotiate fetch API version — prefer FETCH_MAX (up to v16) and fall
+        // back gracefully.  Key milestones:
+        //   v7  — incremental fetch sessions (KIP-227)
+        //   v9  — current_leader_epoch fencing (KIP-320)
         //   v11 — rack_id for closest-replica routing (KIP-392)
-        //   v9/v10 — current_leader_epoch for leader fencing (KIP-320;
-        //            v10 shares the same request wire format as v9)
-        // When client_rack is not set, cap at v10 (highest version without
-        // rack_id) so we still get epoch fencing without sending an
-        // unnecessary rack_id.
-        let preferred_version = if self.config.client_rack.is_some() {
-            11
-        } else {
-            10
-        };
-        let fetch_version = conn
-            .negotiate_api_version(ApiKey::Fetch, preferred_version, 7)
+        //   v13 — topic UUIDs replace topic names (KIP-516)
+        //   v15 — remove ReplicaId from header (KIP-903)
+        let mut fetch_version = conn
+            .negotiate_api_version(ApiKey::Fetch, versions::FETCH_MAX, 7)
             .await
             .unwrap_or_else(|| {
                 debug!(
@@ -2775,6 +2859,31 @@ impl Consumer {
                 );
                 4
             });
+
+        // KIP-516: Fetch v13+ sends topic UUIDs instead of names.
+        // Fill in UUIDs from the metadata cache; cap to v12 if any are missing.
+        if fetch_version >= 13 {
+            let all_resolved = fetch_topics.iter_mut().all(|t| {
+                if let Some(id) = self.metadata.topic_id_for_name(&t.topic) {
+                    t.topic_id = Some(id);
+                    true
+                } else {
+                    false
+                }
+            });
+            if !all_resolved {
+                fetch_version = 12;
+            }
+        }
+
+        // When the broker supports v11+ but the client has no rack preference,
+        // there is no functional reason to send rack_id; cap at v12 if rack
+        // is unset and we would otherwise use v13+ (avoids accidental UUID
+        // sends when IDs are not cached).  If rack IS set, v11+ is correct.
+        // Note: v13+ requires rack-unrelated UUID support so we only impose
+        // the rack cap on v11-v12 when NOT already constrained by UUID cache.
+        // (Above UUID fallback already handles v13+ → v12 correctly.)
+        // No additional cap needed here.
 
         // Build the fetch request. For v7, compute an incremental session diff
         // from fetch_topics without cloning the full topic list into the base request.
@@ -2800,8 +2909,30 @@ impl Consumer {
             (
                 session_req.session_id,
                 session_req.session_epoch,
-                session_req.topics,
-                session_req.forgotten_topics,
+                {
+                    // KIP-516: fill topic_id for any topics sent to broker on v13+.
+                    // The session builds diffs with topic_id: None; back-fill from cache.
+                    let mut topics = session_req.topics;
+                    if fetch_version >= 13 {
+                        for t in &mut topics {
+                            if t.topic_id.is_none() {
+                                t.topic_id = self.metadata.topic_id_for_name(&t.topic);
+                            }
+                        }
+                    }
+                    topics
+                },
+                {
+                    let mut forgotten = session_req.forgotten_topics;
+                    if fetch_version >= 13 {
+                        for t in &mut forgotten {
+                            if t.topic_id.is_none() {
+                                t.topic_id = self.metadata.topic_id_for_name(&t.topic);
+                            }
+                        }
+                    }
+                    forgotten
+                },
             )
         } else {
             // v4: move fetch_topics into the request; update_from_response
@@ -2844,7 +2975,7 @@ impl Consumer {
 
         // Decode response with matching version
         let mut buf = response;
-        let fetch_response = match FetchResponse::decode_versioned(fetch_version, &mut buf) {
+        let mut fetch_response = match FetchResponse::decode_versioned(fetch_version, &mut buf) {
             Ok(r) => r,
             Err(e) => {
                 if fetch_version >= 7 {
@@ -2857,6 +2988,28 @@ impl Consumer {
 
         // KIP-219: honour broker-reported throttle time.
         conn.notify_throttle(fetch_response.throttle_time_ms);
+
+        // KIP-516: For Fetch v13+, response topics carry a UUID but no name.
+        // Resolve each UUID back to the topic name so the rest of the pipeline
+        // can treat all versions uniformly.
+        if fetch_version >= 13 {
+            for topic_response in &mut fetch_response.responses {
+                if topic_response.topic.is_empty() {
+                    let Some(id) = topic_response.topic_id else {
+                        continue;
+                    };
+                    if let Some(name) = self.metadata.topic_name_for_id(&id) {
+                        topic_response.topic = name;
+                    } else {
+                        warn!(
+                            "Received FetchResponse v13+ with unknown topic_id {:?}; \
+                             discarding partitions (metadata will refresh)",
+                            id
+                        );
+                    }
+                }
+            }
+        }
 
         // Handle top-level session errors (v7+)
         if fetch_version >= 7 {
@@ -2984,6 +3137,23 @@ impl Consumer {
                     continue; // Continue with other partitions
                 }
 
+                // Capture aborted-transaction metadata before consuming `records`.
+                // For READ_COMMITTED, the broker still includes data batches from
+                // aborted transactions in the FetchResponse but lists their
+                // (producer_id, first_offset) pairs in `aborted_transactions` so
+                // the client can filter them.  Control batches (abort/commit
+                // markers) are already filtered below; this handles the data
+                // records themselves.
+                //
+                // Sort by first_offset so we can activate entries in-order as
+                // we scan batches.
+                let mut aborted_txns = partition_response.aborted_transactions;
+                aborted_txns.sort_unstable_by_key(|at| at.first_offset);
+                let mut aborted_txns_iter = aborted_txns.iter().peekable();
+                // Producer IDs currently inside an open aborted transaction.
+                let mut aborted_producers: std::collections::HashSet<i64> =
+                    std::collections::HashSet::new();
+
                 if let Some(record_bytes) = partition_response.records {
                     let mut batch_buf = record_bytes;
                     let mut last_offset_for_partition: Option<Offset> = None;
@@ -3022,6 +3192,51 @@ impl Consumer {
                             self.config.max_decompressed_size,
                         ) {
                             Ok(batch) => {
+                                // Advance the aborted-transaction state machine.
+                                // Activate any AbortedTransaction entries whose
+                                // first_offset has been reached.  The list is
+                                // sorted by first_offset so we only peek at the
+                                // front.
+                                while aborted_txns_iter
+                                    .peek()
+                                    .is_some_and(|at| at.first_offset <= batch.base_offset)
+                                {
+                                    if let Some(at) = aborted_txns_iter.next() {
+                                        aborted_producers.insert(at.producer_id);
+                                    }
+                                }
+
+                                // Skip transaction control batches (commit/abort markers).
+                                // These are internal Kafka bookkeeping records that must not
+                                // be surfaced to consumers.  When the control batch belongs
+                                // to a tracked aborted producer we also deactivate it so
+                                // subsequent transactions from the same producer are not
+                                // incorrectly filtered.  The offset must still be advanced
+                                // past them so that subsequent fetches do not re-process them.
+                                if batch.attributes.is_control_batch {
+                                    aborted_producers.remove(&batch.producer_id);
+                                    let control_offset = batch
+                                        .base_offset
+                                        .saturating_add(batch.last_offset_delta as i64);
+                                    last_offset_for_partition = Some(control_offset);
+                                    continue;
+                                }
+
+                                // Skip data records from aborted transactions.
+                                // Once the abort marker (control batch) is seen,
+                                // the producer_id is removed from the set, so
+                                // later committed transactions from the same
+                                // producer are not affected.
+                                if batch.attributes.is_transactional
+                                    && aborted_producers.contains(&batch.producer_id)
+                                {
+                                    let aborted_last = batch
+                                        .base_offset
+                                        .saturating_add(batch.last_offset_delta as i64);
+                                    last_offset_for_partition = Some(aborted_last);
+                                    continue;
+                                }
+
                                 for record in batch.records.into_iter() {
                                     // Use offset_delta for correct offset in compacted topics
                                     // where records may have been deleted (log compaction awareness).
@@ -3223,7 +3438,10 @@ impl Consumer {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported OffsetForLeaderEpoch API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported OffsetForLeaderEpoch API version",
+                )
             })?;
 
         let response_bytes = conn
@@ -3348,10 +3566,21 @@ impl Consumer {
     /// If the consumer closes after some records were already buffered or
     /// fetched, those records are returned as a partial batch.
     ///
-    /// Unlike [`poll()`](Self::poll), which performs a single broker fetch
-    /// round-trip, `batch_recv` drains the internal record buffer first and
-    /// then performs additional fetch rounds until the batch is full or the
-    /// deadline is reached.  It never blocks longer than `timeout`.
+    /// **When to use `batch_recv`**: for throughput-optimised pipelines that
+    /// need fixed-size batches — bulk database inserts, transactional
+    /// exactly-once produce-consume loops, or processing frameworks that
+    /// benefit from amortising per-batch overhead.  `batch_recv` drains the
+    /// internal record buffer before issuing new fetches and keeps looping
+    /// until `max_records` are collected or the deadline elapses.
+    ///
+    /// **When to use [`poll`](Self::poll) instead**: for simple event loops
+    /// that process records as they arrive and where the number of records
+    /// per iteration does not need to be bounded.
+    ///
+    /// # `BatchRecvOutcome`
+    ///
+    /// The enum is `#[non_exhaustive]`, so match arms must include a catch-all
+    /// (`_ => {}`) to remain forward-compatible with new variants.
     ///
     /// # Errors
     ///
@@ -3373,7 +3602,7 @@ impl Consumer {
     ///     BatchRecvOutcome::TimedOut => {}
     ///     BatchRecvOutcome::Closed => break,
     ///     BatchRecvOutcome::EmptyRequest => {}
-    ///     _ => {}
+    ///     _ => {} // required: BatchRecvOutcome is #[non_exhaustive]
     /// }
     /// ```
     pub async fn batch_recv(
@@ -3819,21 +4048,37 @@ impl Consumer {
 
     /// Get per-partition lag for all assigned partitions.
     ///
-    /// Returns a map of `(topic, partition) → lag` for every partition where
-    /// both the high watermark and current position are known. Partitions that
-    /// haven't been fetched yet are omitted.
-    pub async fn lag(&self) -> HashMap<(String, PartitionId), u64> {
+    /// Returns a [`LagResult`] containing per-partition lag values and a list
+    /// of partitions whose cached high watermark is older than
+    /// [`crate::consumer::ConsumerConfigBuilder::lag_staleness_threshold`]
+    /// (default: 60 s).
+    ///
+    /// Partitions whose high watermark or position is not yet known are
+    /// omitted from `LagResult::lag` entirely.
+    pub async fn lag(&self) -> LagResult {
         // Acquire offsets before partition_state to match the documented
         // lock ordering: assignments → offsets → partition_state.
         let offsets = self.offsets.read().await;
         let partition_state = self.partition_state.read().await;
-        let mut result = HashMap::with_capacity(partition_state.len());
+        let now = Instant::now();
+        let threshold = self.config.lag_staleness_threshold;
+        let mut lag = HashMap::with_capacity(partition_state.len());
+        let mut stale_partitions = Vec::new();
         for (key, state) in partition_state.iter() {
             if let (Some(watermark), Some(&position)) = (state.high_watermark, offsets.get(key)) {
-                result.insert(key.clone(), (watermark - position).max(0) as u64);
+                lag.insert(key.clone(), (watermark - position).max(0) as u64);
+                let is_stale = state
+                    .watermark_updated_at
+                    .is_none_or(|t| now.saturating_duration_since(t) > threshold);
+                if is_stale {
+                    stale_partitions.push(key.clone());
+                }
             }
         }
-        result
+        LagResult {
+            lag,
+            stale_partitions,
+        }
     }
 
     /// Get the cached beginning (log start) offset for a partition.
@@ -3866,6 +4111,66 @@ impl Consumer {
             .await
             .get(&key)
             .and_then(|s| s.high_watermark)
+    }
+
+    /// Fetch the current end (high-watermark) offset for a single partition
+    /// with a live `ListOffsets` RPC.
+    ///
+    /// Unlike [`cached_end_offset`](Self::cached_end_offset), which returns a
+    /// value from the most-recent fetch response, this method always contacts
+    /// the partition leader and returns a fresh value.  Use it when staleness
+    /// is unacceptable — for example, before the first poll, when a partition
+    /// is paused, or when computing precise consumer-lag metrics.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the topic name is invalid, no leader is available, or
+    /// the broker returns an error.
+    pub async fn fetch_end_offset(&self, topic: &str, partition: PartitionId) -> Result<Offset> {
+        validate_topic_name(topic)?;
+        // timestamp = -1 means "latest offset" in the ListOffsets API.
+        self.resolve_list_offset(topic, partition, -1).await
+    }
+
+    /// Returns `true` if the consumer's current position has reached or
+    /// exceeded the high-watermark (end offset) on **every** assigned partition.
+    ///
+    /// "Caught up" means there are no more records available to consume right
+    /// now.  This check uses **cached** high-watermarks updated on each
+    /// successful fetch response; the values are not refreshed by this call.
+    ///
+    /// Returns `false` if:
+    /// - Any assigned partition's high-watermark has not yet been cached
+    ///   (i.e. no successful fetch has completed for that partition).
+    /// - The consumer's position on any partition is behind its cached
+    ///   high-watermark.
+    ///
+    /// For a precise check against fresh broker state, call
+    /// [`fetch_end_offset`](Self::fetch_end_offset) on each partition and
+    /// compare it to [`position`](Self::position).
+    pub async fn is_caught_up(&self) -> bool {
+        // Lock ordering: assignments (2) → offsets (3) → partition_state (5).
+        let assignments = self.assignments.read().await;
+        if assignments.is_empty() {
+            return true; // no assignment ⇒ nothing to consume
+        }
+        let offsets = self.offsets.read().await;
+        let partition_state = self.partition_state.read().await;
+
+        for (topic, partitions) in assignments.iter() {
+            for &partition in partitions {
+                let key = (topic.clone(), partition);
+                let Some(hw) = partition_state.get(&key).and_then(|s| s.high_watermark) else {
+                    // High-watermark not yet cached — cannot confirm caught-up.
+                    return false;
+                };
+                let position = offsets.get(&key).copied().unwrap_or(0);
+                if position < hw {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Unsubscribe from all topics.
@@ -4077,6 +4382,10 @@ pub struct ConsumerBuilder {
     config: ConsumerConfig,
     rebalance_listener: Option<Arc<dyn ConsumerRebalanceListener>>,
     interceptors: Vec<Arc<dyn crate::interceptor::ConsumerInterceptor>>,
+    key_decoder: Option<Arc<dyn crate::schema_registry::SchemaDecoder>>,
+    value_decoder: Option<Arc<dyn crate::schema_registry::SchemaDecoder>>,
+    /// Pre-built pool and metadata from a [`KrafkaClient`](crate::client::KrafkaClient).
+    shared: Option<(Arc<ConnectionPool>, Arc<ClusterMetadata>)>,
 }
 
 impl ConsumerBuilder {
@@ -4131,6 +4440,14 @@ impl ConsumerBuilder {
     /// Set max partition fetch bytes.
     pub fn max_partition_fetch_bytes(mut self, bytes: i32) -> Self {
         self.config.max_partition_fetch_bytes = bytes;
+        self
+    }
+
+    /// Override the per-partition fetch byte limit for a specific topic.
+    pub fn topic_fetch_max_bytes(mut self, topic: impl Into<String>, bytes: i32) -> Self {
+        self.config
+            .topic_fetch_max_bytes
+            .insert(topic.into(), bytes);
         self
     }
 
@@ -4387,9 +4704,49 @@ impl ConsumerBuilder {
         self
     }
 
+    /// Set a key decoder applied transparently after each `poll()` / `recv()`.
+    ///
+    /// When set, every consumed record's key bytes are passed through this
+    /// decoder before being returned to the caller.  The decoder runs after
+    /// the interceptor.  Equivalent to `key.deserializer` in the Java
+    /// `KafkaConsumer`.
+    pub fn key_decoder(mut self, decoder: Arc<dyn crate::schema_registry::SchemaDecoder>) -> Self {
+        self.key_decoder = Some(decoder);
+        self
+    }
+
+    /// Set a value decoder applied transparently after each `poll()` / `recv()`.
+    ///
+    /// When set, every consumed record's value bytes are passed through this
+    /// decoder before being returned to the caller.  The decoder runs after
+    /// the interceptor.  Equivalent to `value.deserializer` in the Java
+    /// `KafkaConsumer`.
+    pub fn value_decoder(
+        mut self,
+        decoder: Arc<dyn crate::schema_registry::SchemaDecoder>,
+    ) -> Self {
+        self.value_decoder = Some(decoder);
+        self
+    }
+
+    /// Share a [`KrafkaClient`](crate::client::KrafkaClient)'s connection pool
+    /// and metadata cache instead of creating a new one.
+    ///
+    /// When multiple clients are created in the same process you should create
+    /// a single [`crate::client::KrafkaClient`] and pass it to each builder.
+    /// All clients will
+    /// then multiplex over the same TCP connections.
+    ///
+    /// When this method is called, `bootstrap_servers` is optional on the
+    /// builder (the client was already connected at `KrafkaClient::build` time).
+    pub fn with_client(mut self, client: &crate::client::KrafkaClient) -> Self {
+        self.shared = Some((client.pool().clone(), client.metadata().clone()));
+        self
+    }
+
     /// Build the consumer.
     pub async fn build(self) -> Result<Consumer> {
-        if self.config.bootstrap_servers.is_empty() {
+        if self.shared.is_none() && self.config.bootstrap_servers.is_empty() {
             return Err(KrafkaError::config("bootstrap.servers is required"));
         }
         if self.config.enable_auto_commit && self.config.group_id.is_none() {
@@ -4411,7 +4768,7 @@ impl ConsumerBuilder {
                 self.config.session_timeout, self.config.max_poll_interval,
             )));
         }
-        let mut consumer = Consumer::new(self.config).await?;
+        let mut consumer = Consumer::new(self.config, self.shared).await?;
         if let Some(listener) = self.rebalance_listener {
             consumer.rebalance_listener = listener;
         }
@@ -4428,6 +4785,12 @@ impl ConsumerBuilder {
                 ))
             };
         }
+        if let Some(dec) = self.key_decoder {
+            consumer.key_decoder = Some(dec);
+        }
+        if let Some(dec) = self.value_decoder {
+            consumer.value_decoder = Some(dec);
+        }
         Ok(consumer)
     }
 }
@@ -4436,6 +4799,7 @@ impl ConsumerBuilder {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use tokio::sync::RwLock;
 
     #[test]
     fn test_consumer_builder() {
@@ -5883,14 +6247,14 @@ mod tests {
         // Simulate cooperative rebalance callback sequence:
         // 1. Revoke phase
         let revoked = vec![TopicPartition::new("topic1", 2)];
-        tracker.on_partitions_revoked(&revoked);
+        ConsumerRebalanceListener::on_partitions_revoked(&*tracker, &revoked);
         // 2. Assign phase
         let assigned = vec![
             TopicPartition::new("topic1", 0),
             TopicPartition::new("topic1", 1),
             TopicPartition::new("topic1", 3),
         ];
-        tracker.on_partitions_assigned(&assigned);
+        ConsumerRebalanceListener::on_partitions_assigned(&*tracker, &assigned);
 
         let revoke_order = tracker.revoke_seq.load(Ordering::SeqCst);
         let assign_order = tracker.assign_seq.load(Ordering::SeqCst);
@@ -5921,7 +6285,7 @@ mod tests {
         let tracker = EmptyTracker {
             assigned_called: AtomicBool::new(false),
         };
-        tracker.on_partitions_assigned(&[]);
+        ConsumerRebalanceListener::on_partitions_assigned(&tracker, &[]);
         assert!(tracker.assigned_called.load(Ordering::SeqCst));
     }
 
@@ -6053,6 +6417,7 @@ mod tests {
                 log_start_offset: Some(0),
                 preferred_replica: Some((3_i32, Instant::now() + Duration::from_secs(60))),
                 offset_retry_backoff: Some((Instant::now(), Duration::from_millis(100))),
+                watermark_updated_at: None,
             },
         );
 
@@ -6253,10 +6618,10 @@ mod tests {
             config,
             metadata,
             pool,
-            subscriptions: RwLock::new(HashSet::new()),
-            assignments: RwLock::new(HashMap::new()),
-            offsets: RwLock::new(HashMap::new()),
-            paused: RwLock::new(HashSet::new()),
+            subscriptions: LeveledRwLock::new(HashSet::new()),
+            assignments: LeveledRwLock::new(HashMap::new()),
+            offsets: LeveledRwLock::new(HashMap::new()),
+            paused: LeveledRwLock::new(HashSet::new()),
             closed: std::sync::atomic::AtomicBool::new(false),
             group_coordinator: None,
             metrics: Arc::new(ConsumerMetrics::default()),
@@ -6265,7 +6630,9 @@ mod tests {
             last_auto_commit: SyncMutex::new(Instant::now()),
             recv_buffer: SyncMutex::new(std::collections::VecDeque::new()),
             fetch_sessions: SyncMutex::new(FetchSessionCache::new()),
-            partition_state: RwLock::new(HashMap::new()),
+            partition_state: LeveledRwLock::new(HashMap::new()),
+            key_decoder: None,
+            value_decoder: None,
         }
     }
 

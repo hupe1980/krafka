@@ -236,6 +236,7 @@ async fn test_sasl_admin_client() {
         .create_topics(
             vec![NewTopic::new(topic, 1, 1).unwrap()],
             Duration::from_secs(10),
+            false,
         )
         .await
         .expect("Failed to create topic via SASL");
@@ -277,6 +278,7 @@ async fn test_sasl_producer_consumer() {
         .create_topics(
             vec![NewTopic::new(topic, 1, 1).unwrap()],
             Duration::from_secs(10),
+            false,
         )
         .await
         .expect("Failed to create topic");

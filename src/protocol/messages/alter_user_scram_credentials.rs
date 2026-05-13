@@ -5,7 +5,7 @@ use zeroize::Zeroizing;
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_string};
 use crate::auth::scram::{MAX_PBKDF2_ITERATIONS, MIN_PBKDF2_ITERATIONS, ScramMechanism};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{check_compact_array_len, encode_compact_array_len};
@@ -107,11 +107,18 @@ impl AlterUserScramCredentialsRequest {
 
     /// Encode compact bytes: varint(len+1) followed by raw bytes.
     fn encode_compact_bytes(data: &[u8], buf: &mut impl BufMut) -> Result<()> {
-        let wire =
-            u32::try_from(data.len().checked_add(1).ok_or_else(|| {
-                crate::error::KrafkaError::protocol("compact bytes length overflow")
-            })?)
-            .map_err(|_| crate::error::KrafkaError::protocol("compact bytes length exceeds u32"))?;
+        let wire = u32::try_from(data.len().checked_add(1).ok_or_else(|| {
+            crate::error::KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                "compact bytes length overflow",
+            )
+        })?)
+        .map_err(|_| {
+            crate::error::KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                "compact bytes length exceeds u32",
+            )
+        })?;
         crate::util::varint::encode_unsigned_varint(wire, buf);
         buf.put_slice(data);
         Ok(())

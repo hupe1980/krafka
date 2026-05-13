@@ -157,6 +157,9 @@ pub enum SaslMechanism {
     /// OAuth Bearer token authentication.
     OAuthBearer,
     /// GSSAPI (Kerberos) authentication.
+    ///
+    /// Not yet implemented — configuring this mechanism returns a runtime error.
+    /// Use one of the other mechanisms for production deployments.
     Gssapi,
 }
 
@@ -192,6 +195,11 @@ impl PlainCredentials {
     pub fn new(username: impl Into<String>, password: impl Into<String>) -> crate::Result<Self> {
         let username = username.into();
         let password = password.into();
+        if username.is_empty() {
+            return Err(crate::error::KrafkaError::config(
+                "PLAIN username must not be empty",
+            ));
+        }
         if username.contains('\0') {
             return Err(crate::error::KrafkaError::config(
                 "PLAIN username must not contain null bytes",
@@ -312,6 +320,14 @@ impl AwsMskIamCredentials {
     /// - `AWS_SECRET_ACCESS_KEY` - Required    
     /// - `AWS_SESSION_TOKEN` - Optional (for temporary credentials)
     /// - `AWS_REGION` or `AWS_DEFAULT_REGION` - Required
+    ///
+    /// # No feature flag required
+    ///
+    /// This method works **without** the `aws-msk` feature. The `aws-msk`
+    /// feature is only needed for `AwsMskIamCredentials::from_default_chain`,
+    /// which pulls in the full AWS SDK credential provider chain (~100 crates).
+    /// Use this method when you have static credentials available in the
+    /// environment to keep your dependency footprint small.
     ///
     /// # Errors
     ///
@@ -477,7 +493,7 @@ impl TlsConfig {
     /// (`ssl.truststore.location`) and librdkafka (`ssl.ca.location`).
     ///
     /// To trust both platform roots **and** the custom CA, combine with
-    /// [`with_native_roots()`](Self::with_native_roots).
+    /// `with_native_roots()`.
     pub fn with_ca_cert(mut self, path: impl Into<String>) -> Self {
         self.ca_cert_path = Some(path.into());
         self

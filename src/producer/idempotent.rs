@@ -48,30 +48,63 @@
 //!     .await?;
 //! ```
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use ahash::AHashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::RwLock;
 
 use crate::PartitionId;
-use crate::error::{KrafkaError, Result};
+use crate::error::{KrafkaError, ProtocolErrorKind, Result};
 
 /// Producer identity for idempotent production.
 ///
 /// This struct holds the producer ID and epoch assigned by the broker,
 /// along with sequence numbers for each partition.
+///
+/// All mutable identity state (`producer_id`, `producer_epoch`, and
+/// `sequences`) is protected by a single [`RwLock`].  This eliminates the
+/// TOCTOU window that would otherwise exist between a lock-free
+/// `is_initialized()` read and a concurrent `initialize()` that clears
+/// sequences: callers always observe a fully consistent snapshot.
+///
+/// The `poisoned` flag is a separate [`AtomicBool`] because it is set and
+/// checked on an independent code path that does not need to be coordinated
+/// with sequence state.
 #[derive(Debug)]
 pub struct ProducerIdentity {
-    /// Producer ID assigned by the broker (-1 if not initialized).
-    producer_id: AtomicI64,
-    /// Producer epoch assigned by the broker (-1 if not initialized).
-    producer_epoch: AtomicI32,
     /// Set when an unrecoverable `UnknownProducerId` was observed while newer
     /// in-flight batches still depended on the current sequence state.
     poisoned: AtomicBool,
-    /// Sequence numbers per topic-partition (two-level map avoids
-    /// per-call `String` allocations on lookups).
-    sequences: RwLock<HashMap<String, HashMap<PartitionId, SequenceState>>>,
+    /// All mutable identity state behind one lock for consistency.
+    inner: RwLock<IdentityInner>,
+}
+
+/// Mutable state held inside [`ProducerIdentity`].
+#[derive(Debug)]
+struct IdentityInner {
+    /// Producer ID assigned by the broker (-1 if not initialized).
+    producer_id: i64,
+    /// Producer epoch assigned by the broker (-1 if not initialized).
+    ///
+    /// Stored as `i16` to match the Kafka wire type, eliminating the need for
+    /// a truncating `as i16` cast on read paths.
+    producer_epoch: i16,
+    /// Sequence numbers per topic-partition.
+    sequences: AHashMap<String, AHashMap<PartitionId, SequenceState>>,
+}
+
+impl IdentityInner {
+    fn uninitialized() -> Self {
+        Self {
+            producer_id: -1,
+            producer_epoch: -1_i16,
+            sequences: AHashMap::new(),
+        }
+    }
+
+    fn is_initialized(&self) -> bool {
+        self.producer_id >= 0
+    }
 }
 
 /// Sequence number state for a partition.
@@ -97,7 +130,10 @@ const HALF_SEQUENCE_SPACE: u32 = SEQUENCE_SPACE / 2;
 /// Returns an error if `count <= 0`.
 pub(crate) fn last_sequence_of_batch(base_sequence: i32, count: i32) -> Result<i32> {
     if count <= 0 {
-        return Err(KrafkaError::protocol("count must be positive"));
+        return Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidValue,
+            "count must be positive",
+        ));
     }
     Ok(((base_sequence as u32).wrapping_add((count - 1) as u32) % SEQUENCE_SPACE) as i32)
 }
@@ -147,65 +183,63 @@ impl ProducerIdentity {
     /// Create a new uninitialized producer identity.
     pub fn new() -> Self {
         Self {
-            producer_id: AtomicI64::new(-1),
-            producer_epoch: AtomicI32::new(-1),
             poisoned: AtomicBool::new(false),
-            sequences: RwLock::new(HashMap::new()),
+            inner: RwLock::new(IdentityInner::uninitialized()),
         }
     }
 
     /// Check if the producer identity has been initialized.
-    #[inline]
+    ///
+    /// The check is performed while holding the inner read lock, so the result
+    /// is always consistent with the current `producer_id` and `sequences`
+    /// state — there is no TOCTOU window with a concurrent
+    /// [`initialize`](Self::initialize) or [`reset`](Self::reset).
     pub fn is_initialized(&self) -> bool {
-        self.producer_id.load(Ordering::SeqCst) >= 0
+        self.inner.read().is_initialized()
     }
 
     /// Get the producer ID.
-    #[inline]
     pub fn producer_id(&self) -> i64 {
-        self.producer_id.load(Ordering::SeqCst)
+        self.inner.read().producer_id
     }
 
     /// Get the producer epoch.
-    #[inline]
     pub fn producer_epoch(&self) -> i16 {
-        self.producer_epoch.load(Ordering::SeqCst) as i16
+        self.inner.read().producer_epoch
     }
 
     /// Initialize with the producer ID and epoch from the broker.
     ///
-    /// This should be called once with the response from InitProducerId.
-    /// The sequences lock is acquired first so concurrent readers
-    /// cannot observe a half-updated identity.
+    /// All fields — `producer_id`, `producer_epoch`, and `sequences` — are
+    /// updated atomically under the write lock.  Concurrent callers of
+    /// [`is_initialized`](Self::is_initialized), [`producer_id`](Self::producer_id),
+    /// or any sequence method will either see the fully-old state or the
+    /// fully-new state; there is no intermediate window.
     pub fn initialize(&self, producer_id: i64, producer_epoch: i16) {
-        let mut sequences = self.sequences.write();
-        self.producer_id.store(producer_id, Ordering::SeqCst);
-        self.producer_epoch
-            .store(producer_epoch as i32, Ordering::SeqCst);
-        self.poisoned.store(false, Ordering::SeqCst);
-        sequences.clear();
+        let mut inner = self.inner.write();
+        inner.producer_id = producer_id;
+        inner.producer_epoch = producer_epoch;
+        self.poisoned.store(false, Ordering::Release);
+        inner.sequences.clear();
     }
 
     /// Reset the identity (e.g., after a fatal error).
     ///
-    /// The sequences lock is acquired first so concurrent readers
-    /// cannot observe a half-updated identity.
+    /// All fields are updated atomically under the write lock.
     pub fn reset(&self) {
-        let mut sequences = self.sequences.write();
-        self.producer_id.store(-1, Ordering::SeqCst);
-        self.producer_epoch.store(-1, Ordering::SeqCst);
-        self.poisoned.store(false, Ordering::SeqCst);
-        sequences.clear();
+        let mut inner = self.inner.write();
+        inner.producer_id = -1;
+        inner.producer_epoch = -1_i16;
+        self.poisoned.store(false, Ordering::Release);
+        inner.sequences.clear();
     }
 
-    #[inline]
     pub(crate) fn poison(&self) {
-        self.poisoned.store(true, Ordering::SeqCst);
+        self.poisoned.store(true, Ordering::Release);
     }
 
-    #[inline]
     pub(crate) fn is_poisoned(&self) -> bool {
-        self.poisoned.load(Ordering::SeqCst)
+        self.poisoned.load(Ordering::Acquire)
     }
 
     /// Get the next sequence number for a topic-partition (single-record batch).
@@ -234,11 +268,15 @@ impl ProducerIdentity {
         count: i32,
     ) -> Result<i32> {
         if count <= 0 {
-            return Err(KrafkaError::protocol("count must be positive"));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidValue,
+                "count must be positive",
+            ));
         }
 
-        let mut sequences = self.sequences.write();
-        let state = sequences
+        let mut inner = self.inner.write();
+        let state = inner
+            .sequences
             .entry(topic.to_string())
             .or_default()
             .entry(partition)
@@ -249,10 +287,10 @@ impl ProducerIdentity {
     }
 
     /// Peek at the next sequence number without incrementing.
-    #[inline]
     pub fn peek_sequence(&self, topic: &str, partition: PartitionId) -> i32 {
-        let sequences = self.sequences.read();
-        sequences
+        let inner = self.inner.read();
+        inner
+            .sequences
             .get(topic)
             .and_then(|parts| parts.get(&partition))
             .map(|s| s.next_sequence)
@@ -263,8 +301,9 @@ impl ProducerIdentity {
     ///
     /// Call this when a batch is successfully acknowledged by the broker.
     pub fn acknowledge(&self, topic: &str, partition: PartitionId, sequence: i32) {
-        let mut sequences = self.sequences.write();
-        if let Some(state) = sequences
+        let mut inner = self.inner.write();
+        if let Some(state) = inner
+            .sequences
             .get_mut(topic)
             .and_then(|parts| parts.get_mut(&partition))
             && is_newer_sequence(state.last_acked_sequence, sequence)
@@ -298,11 +337,15 @@ impl ProducerIdentity {
         count: i32,
     ) -> Result<()> {
         if count <= 0 {
-            return Err(KrafkaError::protocol("count must be positive"));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidValue,
+                "count must be positive",
+            ));
         }
 
-        let mut sequences = self.sequences.write();
-        if let Some(state) = sequences
+        let mut inner = self.inner.write();
+        if let Some(state) = inner
+            .sequences
             .get_mut(topic)
             .and_then(|parts| parts.get_mut(&partition))
         {
@@ -315,8 +358,9 @@ impl ProducerIdentity {
 
     /// Reset sequence number for a partition (e.g., after an out-of-order error).
     pub fn reset_sequence(&self, topic: &str, partition: PartitionId) {
-        let mut sequences = self.sequences.write();
-        if let Some(state) = sequences
+        let mut inner = self.inner.write();
+        if let Some(state) = inner
+            .sequences
             .get_mut(topic)
             .and_then(|parts| parts.get_mut(&partition))
         {
@@ -342,11 +386,15 @@ impl ProducerIdentity {
         count: i32,
     ) -> Result<i32> {
         if count <= 0 {
-            return Err(KrafkaError::protocol("count must be positive"));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidValue,
+                "count must be positive",
+            ));
         }
 
-        let mut sequences = self.sequences.write();
-        let state = sequences
+        let mut inner = self.inner.write();
+        let state = inner
+            .sequences
             .entry(topic.to_string())
             .or_default()
             .entry(partition)
@@ -358,10 +406,10 @@ impl ProducerIdentity {
     }
 
     /// Get the last acknowledged sequence for a partition.
-    #[inline]
     pub fn last_acked_sequence(&self, topic: &str, partition: PartitionId) -> i32 {
-        let sequences = self.sequences.read();
-        sequences
+        let inner = self.inner.read();
+        inner
+            .sequences
             .get(topic)
             .and_then(|parts| parts.get(&partition))
             .map(|s| s.last_acked_sequence)
@@ -376,6 +424,10 @@ impl ProducerIdentity {
     /// has been allocated locally. That matches the local condition we can
     /// verify before reinitializing the producer identity and rebuilding the
     /// batch under a fresh PID/epoch.
+    ///
+    /// Only used in unit tests — production code uses the atomic
+    /// `check_and_reset_if_retryable()` to avoid the TOCTOU window.
+    #[cfg(test)]
     pub(crate) fn can_retry_unknown_producer_id(
         &self,
         topic: &str,
@@ -384,8 +436,12 @@ impl ProducerIdentity {
         count: i32,
     ) -> Result<bool> {
         let last_sequence = last_sequence_of_batch(base_sequence, count)?;
-        let sequences = self.sequences.read();
-        let Some(state) = sequences.get(topic).and_then(|parts| parts.get(&partition)) else {
+        let inner = self.inner.read();
+        let Some(state) = inner
+            .sequences
+            .get(topic)
+            .and_then(|parts| parts.get(&partition))
+        else {
             return Ok(false);
         };
 
@@ -395,30 +451,139 @@ impl ProducerIdentity {
         )
     }
 
-    /// Create a snapshot of the current idempotent state.
-    pub fn snapshot(&self) -> ProducerIdentitySnapshot {
-        let partition_sequences = {
-            let sequences = self.sequences.read();
-            sequences
-                .iter()
-                .flat_map(|(topic, parts)| {
-                    parts
-                        .iter()
-                        .map(move |(part, state)| PartitionSequenceSnapshot {
-                            topic: topic.clone(),
-                            partition: *part,
-                            next_sequence: state.next_sequence,
-                            last_acked_sequence: state.last_acked_sequence,
-                        })
-                })
-                .collect()
+    /// Atomically check whether this `UnknownProducerId` error is retryable
+    /// and, if so, reset all identity state in the same write-lock acquisition.
+    ///
+    /// This eliminates the TOCTOU window that would exist between a separate
+    /// `can_retry_unknown_producer_id()` (read lock) and `reset()` (write lock)
+    /// call: a concurrent thread cannot allocate new sequence numbers between
+    /// the check and the reset.
+    ///
+    /// Returns `true` if the identity was reset and recovery can proceed.
+    /// Returns `false` (and leaves state unchanged) if recovery is unsafe
+    /// (newer in-flight batches already used the current PID+epoch).
+    pub(crate) fn check_and_reset_if_retryable(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+        base_sequence: i32,
+        count: i32,
+    ) -> Result<bool> {
+        let last_sequence = last_sequence_of_batch(base_sequence, count)?;
+        let mut inner = self.inner.write();
+        let Some(state) = inner
+            .sequences
+            .get(topic)
+            .and_then(|parts| parts.get(&partition))
+        else {
+            return Ok(false);
         };
 
+        let retryable = base_sequence == next_sequence_after(state.last_acked_sequence)
+            && state.next_sequence == next_sequence_after(last_sequence);
+
+        if retryable {
+            inner.producer_id = -1;
+            inner.producer_epoch = -1_i16;
+            inner.sequences.clear();
+            self.poisoned.store(false, Ordering::Release);
+        }
+        Ok(retryable)
+    }
+
+    /// Allocate a sequence range only if the identity is currently initialized.
+    ///
+    /// Combines the `is_initialized()` check and `allocate_sequence()` into a
+    /// single write-lock acquisition, eliminating the TOCTOU window where a
+    /// concurrent `reset()` could clear the PID between the check and the
+    /// allocation.
+    ///
+    /// Returns `None` if the identity is not yet initialized (caller should
+    /// invoke `init_idempotent_producer_id` and retry). Returns `Some(base)`
+    /// with the allocated base sequence on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `count <= 0`.
+    pub(crate) fn checked_allocate_sequence(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+        count: i32,
+    ) -> Result<Option<i32>> {
+        if count <= 0 {
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidValue,
+                "count must be positive",
+            ));
+        }
+        let mut inner = self.inner.write();
+        if !inner.is_initialized() {
+            return Ok(None);
+        }
+        let state = inner
+            .sequences
+            .entry(topic.to_string())
+            .or_default()
+            .entry(partition)
+            .or_default();
+        let base = state.next_sequence;
+        state.next_sequence = ((base as u32).wrapping_add(count as u32) % SEQUENCE_SPACE) as i32;
+        Ok(Some(base))
+    }
+
+    /// Create a consistent snapshot of the current idempotent state.
+    ///
+    /// `producer_id`, `producer_epoch`, and all partition sequences are read
+    /// under a single read lock, so the snapshot is always self-consistent.
+    pub fn snapshot(&self) -> ProducerIdentitySnapshot {
+        let inner = self.inner.read();
+        let partition_sequences = inner
+            .sequences
+            .iter()
+            .flat_map(|(topic, parts)| {
+                parts
+                    .iter()
+                    .map(move |(part, state)| PartitionSequenceSnapshot {
+                        topic: topic.clone(),
+                        partition: *part,
+                        next_sequence: state.next_sequence,
+                        last_acked_sequence: state.last_acked_sequence,
+                    })
+            })
+            .collect();
+
         ProducerIdentitySnapshot {
-            producer_id: self.producer_id(),
-            producer_epoch: self.producer_epoch(),
+            producer_id: inner.producer_id,
+            producer_epoch: inner.producer_epoch,
             partition_sequences,
         }
+    }
+
+    /// Directly set sequence state for a partition.
+    ///
+    /// Used in tests to seed specific sequence states without going through
+    /// the public API (which would require fabricating a full produce cycle).
+    #[cfg(test)]
+    fn set_sequence_state(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+        next_sequence: i32,
+        last_acked_sequence: i32,
+    ) {
+        self.inner
+            .write()
+            .sequences
+            .entry(topic.to_string())
+            .or_default()
+            .insert(
+                partition,
+                SequenceState {
+                    next_sequence,
+                    last_acked_sequence,
+                },
+            );
     }
 }
 
@@ -553,17 +718,7 @@ mod tests {
     fn test_acknowledge_wraps_from_max_to_zero() {
         let identity = ProducerIdentity::new();
         identity.initialize(1, 0);
-
-        {
-            let mut sequences = identity.sequences.write();
-            sequences.entry("topic".to_string()).or_default().insert(
-                0,
-                SequenceState {
-                    next_sequence: 1,
-                    last_acked_sequence: i32::MAX,
-                },
-            );
-        }
+        identity.set_sequence_state("topic", 0, 1, i32::MAX);
 
         identity.acknowledge("topic", 0, 0);
         assert_eq!(identity.last_acked_sequence("topic", 0), 0);
@@ -576,17 +731,7 @@ mod tests {
     fn test_reset_sequence_wraps_to_zero_after_max_ack() {
         let identity = ProducerIdentity::new();
         identity.initialize(1, 0);
-
-        {
-            let mut sequences = identity.sequences.write();
-            sequences.entry("topic".to_string()).or_default().insert(
-                0,
-                SequenceState {
-                    next_sequence: 1,
-                    last_acked_sequence: i32::MAX,
-                },
-            );
-        }
+        identity.set_sequence_state("topic", 0, 1, i32::MAX);
 
         identity.reset_sequence("topic", 0);
         assert_eq!(identity.peek_sequence("topic", 0), 0);
@@ -672,16 +817,7 @@ mod tests {
         identity.initialize(1, 0);
 
         // Set up state near max
-        {
-            let mut sequences = identity.sequences.write();
-            sequences.entry("topic".to_string()).or_default().insert(
-                0,
-                SequenceState {
-                    next_sequence: i32::MAX,
-                    last_acked_sequence: i32::MAX - 1,
-                },
-            );
-        }
+        identity.set_sequence_state("topic", 0, i32::MAX, i32::MAX - 1);
 
         // Should wrap to 0 (matching Kafka Java client behavior)
         assert_eq!(identity.next_sequence("topic", 0).unwrap(), i32::MAX);
@@ -709,16 +845,7 @@ mod tests {
         identity.initialize(1, 0);
 
         // Set up state at 0 (just wrapped)
-        {
-            let mut sequences = identity.sequences.write();
-            sequences.entry("topic".to_string()).or_default().insert(
-                0,
-                SequenceState {
-                    next_sequence: 0,
-                    last_acked_sequence: i32::MAX - 1,
-                },
-            );
-        }
+        identity.set_sequence_state("topic", 0, 0, i32::MAX - 1);
 
         // Rollback from 0 should wrap to i32::MAX
         identity.rollback_sequence("topic", 0).unwrap();

@@ -105,6 +105,29 @@ impl TableChange {
     }
 }
 
+/// Metrics snapshot for a [`CompactedTable`] or [`CompactedTopicConsumer`].
+///
+/// Returned by [`CompactedTable::metrics_snapshot()`] and
+/// [`CompactedTopicConsumer::metrics_snapshot()`]. All counts are
+/// monotonically increasing since the table was created.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactedTableSnapshot {
+    /// Number of distinct keys currently held in the table.
+    pub entry_count: u64,
+    /// Total records processed (including tombstones and keyless records).
+    pub records_processed: u64,
+    /// Total tombstone records processed (keys removed from the table).
+    pub tombstones_processed: u64,
+    /// `true` once all assigned partitions have been read up to the
+    /// high-water mark at scan time.
+    ///
+    /// Always `false` for a bare [`CompactedTable`] (which has no consumer
+    /// attached); use [`CompactedTopicConsumer::metrics_snapshot()`] to
+    /// obtain an accurate `caught_up` value.
+    pub caught_up: bool,
+}
+
 /// In-memory key→value table built from log-compacted Kafka records.
 ///
 /// `CompactedTable` is a standalone data structure with no dependency on
@@ -190,7 +213,9 @@ impl CompactedTable {
     /// are `None`.
     #[must_use = "use ingest() if changes are not needed"]
     pub fn apply(&mut self, records: &[ConsumerRecord]) -> Vec<TableChange> {
-        let mut changes = Vec::with_capacity(records.len());
+        // Don't pre-allocate records.len(): keyless records are skipped and
+        // produce no change, so that would over-allocate for mixed batches.
+        let mut changes = Vec::new();
 
         for record in records {
             self.records_processed += 1;
@@ -265,6 +290,21 @@ impl CompactedTable {
     /// Total tombstones processed.
     pub fn tombstones_processed(&self) -> u64 {
         self.tombstones_processed
+    }
+
+    /// Return a metrics snapshot for this table.
+    ///
+    /// The `caught_up` field is always `false` for a bare `CompactedTable`.
+    /// Use [`CompactedTopicConsumer::metrics_snapshot()`] for a snapshot that
+    /// includes the caught-up status.
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> CompactedTableSnapshot {
+        CompactedTableSnapshot {
+            entry_count: self.entries.len() as u64,
+            records_processed: self.records_processed,
+            tombstones_processed: self.tombstones_processed,
+            caught_up: false,
+        }
     }
 
     /// Apply records to the table without tracking changes.
@@ -602,6 +642,15 @@ impl CompactedTopicConsumer {
     /// when [`poll()`](Self::poll) naturally reaches the end.
     pub fn is_caught_up(&self) -> bool {
         self.caught_up
+    }
+
+    /// Return a metrics snapshot for this consumer, including table statistics
+    /// and the caught-up flag.
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> CompactedTableSnapshot {
+        let mut snap = self.table.metrics_snapshot();
+        snap.caught_up = self.caught_up;
+        snap
     }
 
     /// Returns the topic name.

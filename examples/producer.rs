@@ -52,8 +52,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Send with headers
     let headers = vec![
-        ("trace-id".to_string(), b"abc123".to_vec()),
-        ("source".to_string(), b"producer-example".to_vec()),
+        ("trace-id".to_string(), bytes::Bytes::from_static(b"abc123")),
+        (
+            "source".to_string(),
+            bytes::Bytes::from_static(b"producer-example"),
+        ),
     ];
 
     let metadata = producer

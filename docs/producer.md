@@ -520,7 +520,9 @@ let producer = Producer::builder()
 > **Idempotent by default (KIP-679):** Since Kafka 3.0, idempotent production is the default.
 > The regular `Producer` now obtains a Producer ID via `InitProducerId` at startup,
 > tracks sequence numbers per partition, and de-duplicates retries automatically.
-> `acks = All` and `max_in_flight <= 5` are enforced when idempotent is enabled.
+> `acks = All` is required when idempotent is enabled. If `max_in_flight` is set
+> above 5, it is **automatically capped to 5** (matching Java client and librdkafka
+> behaviour), with an `info!` log so operators can see the adjustment.
 > The `InitProducerId` call retries on retriable errors (e.g. `CoordinatorLoadInProgress`)
 > with exponential backoff, rotating through available brokers on each attempt.
 >
@@ -735,6 +737,16 @@ automatically handle coordinator failover:
   `InvalidTxnState`) are never retried.
 - If no coordinator is cached (e.g. after invalidation), `coordinator_connection()` auto-discovers
   one transparently before returning the connection.
+
+### KIP-890 Epoch Bumping (Kafka 3.7+)
+
+Kafka 3.7+ brokers implement **KIP-890 epoch bumping**: after every successful `EndTxn` (commit
+or abort) the broker increments the producer epoch and returns the new `ProducerId` and
+`ProducerEpoch` in the `EndTxn` v4+ response. Krafka reads these fields and automatically applies
+them to the local identity, so subsequent `AddPartitionsToTxn` requests use the correct epoch.
+
+For brokers that do not support `EndTxn` v4+ (Kafka < 3.7), the response omits these fields and
+Krafka continues with the unchanged epoch — the pre-KIP-890 protocol is used transparently.
 
 ### Timestamps
 

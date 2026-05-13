@@ -7,10 +7,7 @@ description: "Queue-like consumption with KIP-932 share groups"
 
 # Share Consumer Guide
 
-{: .label .label-yellow }
-**Unstable** — requires the `unstable-protocol` feature flag.
-
-This guide covers the share consumer, which provides queue-like consumption semantics via [KIP-932 share groups](https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka). Share groups are available in Apache Kafka 4.0+.
+This guide covers the share consumer, which provides queue-like consumption semantics via [KIP-932 share groups](https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka). Share groups are stable as of Apache Kafka 4.0+.
 
 ## Overview
 

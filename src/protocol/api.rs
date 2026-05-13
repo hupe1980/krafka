@@ -382,7 +382,7 @@ impl ApiKey {
             Self::DeleteRecords => 2,
             Self::InitProducerId => 2,
             Self::OffsetForLeaderEpoch => 4,
-            Self::AddPartitionsToTxn => 4,
+            Self::AddPartitionsToTxn => 3,
             Self::AddOffsetsToTxn => 3,
             Self::EndTxn => 3,
             Self::WriteTxnMarkers => 1,
@@ -805,9 +805,12 @@ impl ApiVersionsResponse {
         let raw_count = crate::util::varint::decode_unsigned_varint(&mut buf)?;
         let items = super::check_compact_array_len(raw_count)?;
         if items > MAX_SUPPORTED_FEATURES {
-            return Err(crate::error::KrafkaError::protocol(format!(
-                "SupportedFeatures array length {items} exceeds limit {MAX_SUPPORTED_FEATURES}"
-            )));
+            return Err(crate::error::KrafkaError::protocol_kind(
+                crate::error::ProtocolErrorKind::InvalidLength,
+                format!(
+                    "SupportedFeatures array length {items} exceeds limit {MAX_SUPPORTED_FEATURES}"
+                ),
+            ));
         }
         let mut features = Vec::with_capacity(items);
         for _ in 0..items {
@@ -826,10 +829,13 @@ impl ApiVersionsResponse {
             });
         }
         if buf.has_remaining() {
-            return Err(crate::error::KrafkaError::protocol(format!(
-                "SupportedFeatures: {} trailing bytes after parsing {items} entries",
-                buf.remaining()
-            )));
+            return Err(crate::error::KrafkaError::protocol_kind(
+                crate::error::ProtocolErrorKind::Malformed,
+                format!(
+                    "SupportedFeatures: {} trailing bytes after parsing {items} entries",
+                    buf.remaining()
+                ),
+            ));
         }
         Ok(features)
     }
@@ -871,9 +877,12 @@ impl ApiVersionsResponse {
         let raw_count = crate::util::varint::decode_unsigned_varint(&mut buf)?;
         let items = super::check_compact_array_len(raw_count)?;
         if items > MAX_SUPPORTED_FEATURES {
-            return Err(crate::error::KrafkaError::protocol(format!(
-                "FinalizedFeatures array length {items} exceeds limit {MAX_SUPPORTED_FEATURES}"
-            )));
+            return Err(crate::error::KrafkaError::protocol_kind(
+                crate::error::ProtocolErrorKind::InvalidLength,
+                format!(
+                    "FinalizedFeatures array length {items} exceeds limit {MAX_SUPPORTED_FEATURES}"
+                ),
+            ));
         }
         let mut features = Vec::with_capacity(items);
         for _ in 0..items {
@@ -892,10 +901,13 @@ impl ApiVersionsResponse {
             });
         }
         if buf.has_remaining() {
-            return Err(crate::error::KrafkaError::protocol(format!(
-                "FinalizedFeatures: {} trailing bytes after parsing {items} entries",
-                buf.remaining()
-            )));
+            return Err(crate::error::KrafkaError::protocol_kind(
+                crate::error::ProtocolErrorKind::Malformed,
+                format!(
+                    "FinalizedFeatures: {} trailing bytes after parsing {items} entries",
+                    buf.remaining()
+                ),
+            ));
         }
         Ok(features)
     }

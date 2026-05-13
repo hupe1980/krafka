@@ -120,7 +120,7 @@ async fn main() -> Result<()> {
     let topic = NewTopic::new("new-topic", 6, 3)
         .with_config("retention.ms", "604800000");
 
-    admin.create_topics(vec![topic], Duration::from_secs(30)).await?;
+    admin.create_topics(vec![topic], Duration::from_secs(30), false).await?;
 
     // List topics
     let topics = admin.list_topics().await?;

@@ -59,12 +59,12 @@ this range are rejected with a protocol error.
 
 | API | Min | Max | Key Features |
 |-----|-----|-----|--------------|
-| Produce | 3 | 11 | v3 transactions, v9 flexible encoding, v11 ZStd compression |
-| Fetch | 4 | 12 | v4 isolation level, v7 fetch sessions (KIP-227), v9 leader epoch (KIP-320), v11 closest-replica (KIP-392), v12 flexible |
-| ListOffsets | 1 | 8 | v1 timestamp queries, v2 isolation level, v4 leader epoch, v6 flexible, v7 max_timestamp, v8 tiered-storage |
+| Produce | 3 | 13 | v3 transactions, v9 flexible encoding, v11 ZStd compression, v13 topic UUIDs (KIP-516) |
+| Fetch | 4 | 16 | v4 isolation level, v7 fetch sessions (KIP-227), v9 leader epoch (KIP-320), v11 closest-replica (KIP-392), v12 flexible, v13 topic UUIDs (KIP-516), v15 remove ReplicaId (KIP-903) |
+| ListOffsets | 1 | 11 | v1 timestamp queries, v2 isolation level, v4 leader epoch, v6 flexible, v7 max_timestamp, v8 tiered-storage, v9 KIP-1005, v10 KIP-1075 timeout, v11 KIP-1023 |
 | Metadata | 1 | 13 | v1 controller + rack, v7 leader epoch, v8 authorized-ops, v9 flexible, v10 topic UUIDs, v12 topic-ID lookup, v13 top-level error_code |
-| OffsetCommit | 2 | 9 | v2 retention, v5 drops retention_time, v6 leader epoch, v8 flexible, v9 KIP-848 |
-| OffsetFetch | 1 | 9 | v1 group coordinator, v2 top-level error, v6 flexible, v8 batched groups, v9 KIP-848 |
+| OffsetCommit | 2 | 10 | v2 retention, v5 drops retention_time, v6 leader epoch, v8 flexible, v9 KIP-848 member_epoch, v10 topic UUIDs (KIP-848) |
+| OffsetFetch | 1 | 10 | v1 group coordinator, v2 top-level error, v6 flexible, v8 batched groups, v9 KIP-848 member_epoch, v10 topic UUIDs (KIP-848) |
 | FindCoordinator | 1 | 6 | v1 key_type, v3 flexible, v4 batched keys (KIP-699), v6 share groups (KIP-932) |
 | JoinGroup | 4 | 9 | v4 group_instance_id (KIP-345), v6 flexible, v8 reason (KIP-800) |
 | Heartbeat | 3 | 4 | v3 group_instance_id (KIP-345), v4 flexible |
@@ -82,11 +82,11 @@ this range are rejected with a protocol error.
 | ListGroups | 1 | 5 | v3 flexible, v4 state filter (KIP-518), v5 type filter (KIP-848) |
 | DeleteRecords | 0 | 2 | v0 baseline, v2 flexible encoding |
 | OffsetForLeaderEpoch | 2 | 4 | v2 leader epoch validation, v3 replica_id, v4 flexible |
-| InitProducerId | 0 | 4 | v0 idempotent, v2 flexible, v3 epoch recovery, v4 latest stable |
-| AddPartitionsToTxn | 0 | 3 | v0 baseline, v3 flexible encoding |
-| AddOffsetsToTxn | 0 | 3 | v0 baseline, v3 flexible encoding |
-| EndTxn | 0 | 3 | v0 baseline, v3 flexible encoding |
-| TxnOffsetCommit | 0 | 3 | v0 baseline, v2 leader epoch, v3 flexible + consumer fields |
+| InitProducerId | 0 | 5 | v0 idempotent, v2 flexible, v3 epoch recovery, v4 latest stable, v5 KIP-890 txn_state |
+| AddPartitionsToTxn | 0 | 5 | v0 baseline, v3 flexible encoding, v4–v5 KIP-890 Transactions array format |
+| AddOffsetsToTxn | 0 | 4 | v0 baseline, v3 flexible encoding, v4 KIP-890 error codes |
+| EndTxn | 0 | 5 | v0 baseline, v3 flexible encoding, v4–v5 KIP-890 epoch bump + txn_state |
+| TxnOffsetCommit | 0 | 5 | v0 baseline, v2 leader epoch, v3 flexible + consumer fields, v4–v5 KIP-890 fields |
 | CreateDelegationToken | 1 | 3 | v2 flexible, v3 owner override |
 | RenewDelegationToken | 1 | 2 | v2 flexible encoding |
 | ExpireDelegationToken | 1 | 2 | v2 flexible encoding |
@@ -110,8 +110,6 @@ this range are rejected with a protocol error.
 > ¹ Requires `unstable-protocol` feature flag. Max shown in parentheses is the feature-gated max.
 >
 > ² Requires `telemetry` feature flag.
->
-> **Note:** Encode/decode implementations exist for even higher versions of some APIs (e.g., Produce up to v13, Fetch up to v18) but the negotiated MAX is set conservatively for topic-UUID-based paths until those have been integration-tested against a real broker.
 
 ### Version Constants
 
@@ -122,9 +120,9 @@ use krafka::protocol::versions;
 
 // Each API has both MIN and MAX constants
 let min_fetch = versions::FETCH_MIN;        // 4  (Kafka 3.9+ baseline)
-let max_fetch = versions::FETCH_MAX;        // 12 (v12 flexible encoding)
+let max_fetch = versions::FETCH_MAX;        // 16 (v16 KIP-903)
 let min_produce = versions::PRODUCE_MIN;    // 3  (v3+ transactions)
-let max_produce = versions::PRODUCE_MAX;    // 11 (v11 ZStd compression)
+let max_produce = versions::PRODUCE_MAX;    // 13 (v13 topic UUIDs, KIP-516)
 let max_metadata = versions::METADATA_MAX;  // 13 (v13 top-level error_code)
 ```
 

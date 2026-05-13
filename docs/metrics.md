@@ -197,9 +197,13 @@ async fn main() {
 | `batches_sent_total` | Counter | Total batches sent |
 | `errors_total` | Counter | Total send errors |
 | `retries_total` | Counter | Total retry attempts |
+| `compressed_bytes_total` | Counter | Total compressed bytes written for compressed batches |
+| `uncompressed_bytes_total` | Counter | Total uncompressed bytes for the same compressed batches |
 | `connections` | Gauge | Current active connections |
 | `buffered_records` | Gauge | Producer records currently admitted under the memory budget |
 | `send_latency_seconds` | Summary | Send latency statistics |
+
+`compression_ratio_avg` is available as a derived field in `ProducerMetricsSnapshot` (computed as `compressed_bytes / uncompressed_bytes`). A value of 0.3 means the codec reduced data to 30% of original size. The field is `None` when no compressed batches have been sent.
 
 ### Consumer Metrics
 
@@ -241,6 +245,29 @@ async fn main() {
 ## Latency Tracking
 
 The `LatencyTracker` provides detailed latency statistics:
+
+> **Accuracy note — percentile estimates:** `LatencyTracker` uses a 64-bucket
+> power-of-2 histogram. Each bucket covers one doubling of latency
+> (e.g., 1 ms – 2 ms, 2 ms – 4 ms). The percentile estimate is the
+> **arithmetic midpoint** of the matching bucket (`1.5 × lower_bound`),
+> giving a **relative error of up to ±50 %** within any bucket. In practice:
+>
+> | True p99      | Reported as | Max error |
+> |---------------|-------------|-----------|
+> | 31 ms – 64 ms | 48 ms       | ±33 %     |
+> | 64 ms – 128 ms| 96 ms       | ±50 %     |
+> | 128 ms – 256 ms | 192 ms    | ±50 %     |
+>
+> For an alert threshold like "p99 > 50 ms", a true p99 of 47 ms can appear
+> as 48 ms (false-positive) and a true p99 of 65 ms can appear as 48 ms
+> (false-negative), depending on which side of a bucket boundary the samples
+> fall.
+>
+> This precision is adequate for order-of-magnitude capacity planning and
+> "are we above 1 s?" alerting at zero allocation cost.  For tight SLO
+> contracts (alert thresholds closer than 2× apart), use the OTLP exporter
+> and aggregate into a proper HDR histogram or T-Digest in your observability
+> backend.
 
 ```rust
 use krafka::metrics::LatencyTracker;

@@ -9,7 +9,7 @@
 //! This enables efficient network utilization through batching while
 //! providing low latency through the linger timer mechanism.
 
-use std::collections::HashMap;
+use ahash::AHashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,7 +24,7 @@ use super::batch::ProducerBatch;
 use super::record::{ProducerRecord, RecordMetadata, RoutedRecord, TopicHandle};
 use super::retry::{RetryContext, RetryPolicy};
 use crate::PartitionId;
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::interceptor::ProducerInterceptor;
 use crate::metadata::ClusterMetadata;
 use crate::metrics::ProducerMetrics;
@@ -33,24 +33,24 @@ use crate::protocol::{
     RecordBatchBuilder, VersionedDecode, VersionedEncode, versions,
 };
 
-/// Maximum number of concurrent `send_extracted_batch` tasks in a single
-/// bounded drain wave.
+/// Maximum number of concurrent `send_extracted_batch` tasks across **all**
+/// in-flight drain waves.
 ///
-/// `flush_all` (Flush/Shutdown commands) awaits `spawn_batches_bounded`
-/// directly so completion is confirmed before the caller is unblocked.
-/// Linger-triggered paths (`check_linger_expiry`, `flush_all_ready`) and
-/// single-batch flushes (`flush_batch`) detach their send work via
-/// `spawn_batches_detached` so the accumulator run loop is never held
-/// waiting for network I/O. `spawn_batches_bounded` enforces this cap
-/// inside each detached wave; `InFlightGuard` limits per-broker parallelism
-/// across concurrent waves.
+/// This shared cap (enforced by `RecordAccumulator::send_semaphore`) ensures
+/// that overlapping linger waves do not compound — the combined task count
+/// across all waves is always ≤ this constant.
 ///
-/// Fix for H3: prior implementations spawned one task per batch with no
-/// cap, meaning 10k partitions at `linger.ms=5` produced a 10k-task burst
-/// every linger tick. This number is deliberately modest — batch sends are
-/// I/O-bound and the per-broker connection pipeline already serializes
-/// requests, so extra parallelism beyond a few dozen tasks does not
-/// translate to throughput and only adds scheduler pressure.
+/// `flush_all` (Flush/Shutdown) awaits `spawn_batches_bounded` directly so
+/// completion is confirmed before the caller unblocks.  Linger-triggered
+/// paths (`check_linger_expiry`, `flush_all_ready`) and single-batch flushes
+/// (`flush_batch`) detach their work via `spawn_batches_detached`; the
+/// semaphore gates spawning so the run loop is never flooded.
+///
+/// Fix for H3: prior implementations spawned one task per batch with no cap,
+/// causing 10k-task bursts for high-partition topics at short linger windows.
+/// This constant is deliberately fixed — batch sends are I/O-bound and the
+/// per-broker connection already serialises, so extra parallelism beyond a
+/// few dozen tasks adds scheduler pressure without throughput gain.
 const MAX_CONCURRENT_BATCH_SENDS: usize = 64;
 
 /// Validate that `record_size` bytes can be admitted into the memory pool.
@@ -68,7 +68,11 @@ fn max_record_semaphore_permits() -> usize {
     Semaphore::MAX_PERMITS.min(u32::MAX as usize)
 }
 
-pub(crate) fn check_record_admission(record_size: usize, memory_capacity: usize) -> Result<()> {
+pub(crate) fn check_record_admission(
+    record_size: usize,
+    memory_capacity: usize,
+    max_request_size: usize,
+) -> Result<()> {
     let semaphore_limit = max_record_semaphore_permits();
 
     if record_size > semaphore_limit {
@@ -78,6 +82,14 @@ pub(crate) fn check_record_admission(record_size: usize, memory_capacity: usize)
              Semaphore::MAX_PERMITS)); Kafka records must be \
              smaller",
             semaphore_limit
+        )));
+    }
+    if max_request_size > 0 && record_size > max_request_size {
+        return Err(KrafkaError::config(format!(
+            "record size {record_size} B exceeds max_request_size \
+             ({max_request_size} B); the broker will reject the record \
+             with MESSAGE_TOO_LARGE — raise ProducerConfig::max_request_size \
+             or shrink the record",
         )));
     }
     if record_size > memory_capacity {
@@ -241,6 +253,10 @@ pub struct RecordAccumulatorHandle {
     /// unlimited). Used to reject records larger than the entire budget
     /// with a structured error instead of blocking forever on `acquire_many`.
     memory_capacity: usize,
+    /// Maximum encoded Kafka request frame size in bytes (0 = unlimited).
+    /// Records that would exceed this limit are rejected before enqueueing
+    /// rather than waiting to be rejected by the broker with MESSAGE_TOO_LARGE.
+    max_request_size: usize,
     /// Maximum time to block waiting for buffer memory.
     max_block_ms: Duration,
     /// Barrier over all producer sends, including detached batch tasks.
@@ -296,10 +312,10 @@ impl RecordAccumulatorHandle {
         let deadline = tokio::time::Instant::now() + self.max_block_ms;
 
         // Reject records that cannot physically be admitted (exceeds the
-        // semaphore permit limit or the configured buffer_memory budget).
-        // Uses the module-level helper so both branches are unit-testable
-        // without allocating large buffers.
-        check_record_admission(record_size, self.memory_capacity)?;
+        // semaphore permit limit, max_request_size, or the configured
+        // buffer_memory budget). Uses the module-level helper so all three
+        // branches are unit-testable without allocating large buffers.
+        check_record_admission(record_size, self.memory_capacity, self.max_request_size)?;
 
         // FIFO-fair reservation of `record_size` bytes from the shared pool.
         // On timeout or closed semaphore (accumulator panicked), the permit
@@ -438,6 +454,16 @@ pub struct AccumulatorConfig {
     pub interceptor: Arc<dyn ProducerInterceptor>,
     /// Producer identity for idempotent production (PID, epoch, sequences).
     pub identity: Option<Arc<super::idempotent::ProducerIdentity>>,
+    /// Partitioner for batch-advance notifications (KIP-794).
+    ///
+    /// When a batch for `(topic, partition)` fills up, the accumulator calls
+    /// [`super::partitioner::Partitioner::on_new_batch`] so that batch-boundary partitioners such as
+    /// [`UniformStickyPartitioner`] can advance their sticky partition before the
+    /// next record is routed. Partitioners that ignore batch events (the default
+    /// no-op implementation) incur no overhead.
+    ///
+    /// [`UniformStickyPartitioner`]: super::partitioner::UniformStickyPartitioner
+    pub partitioner: Arc<dyn super::partitioner::Partitioner>,
 }
 
 impl Clone for AccumulatorConfig {
@@ -455,6 +481,7 @@ impl Clone for AccumulatorConfig {
             in_flight_semaphore: self.in_flight_semaphore.clone(),
             interceptor: self.interceptor.clone(),
             identity: self.identity.clone(),
+            partitioner: self.partitioner.clone(),
         }
     }
 }
@@ -472,6 +499,7 @@ impl fmt::Debug for AccumulatorConfig {
             .field("buffer_memory", &self.buffer_memory)
             .field("max_block_ms", &self.max_block_ms)
             .field("interceptor", &self.interceptor)
+            .field("partitioner", &"<dyn Partitioner>")
             .finish()
     }
 }
@@ -480,7 +508,7 @@ impl Default for AccumulatorConfig {
     fn default() -> Self {
         Self {
             batch_size: 16384,
-            linger: Duration::from_millis(0),
+            linger: Duration::ZERO,
             compression: Compression::None,
             acks: -1,
             client_id: "krafka".to_string(),
@@ -491,6 +519,7 @@ impl Default for AccumulatorConfig {
             in_flight_semaphore: Arc::new(Semaphore::new(5)), // default max_in_flight
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             identity: None,
+            partitioner: Arc::new(super::partitioner::DefaultPartitioner::new()),
         }
     }
 }
@@ -562,9 +591,16 @@ pub struct RecordAccumulator {
     /// Configuration.
     config: AccumulatorConfig,
     /// Batches per topic-partition.
-    batches: HashMap<(TopicHandle, PartitionId), AccumulatorBatch>,
+    batches: AHashMap<(TopicHandle, PartitionId), AccumulatorBatch>,
     /// Cluster metadata for sending.
     metadata: Arc<ClusterMetadata>,
+    /// Shared semaphore limiting the total concurrent `send_extracted_batch`
+    /// tasks across **all** drain waves (linger, flush, close).
+    ///
+    /// Each task acquires one permit before being spawned and holds it until
+    /// completion.  This ensures overlapping linger waves cannot compound the
+    /// task count beyond `MAX_CONCURRENT_BATCH_SENDS`.
+    send_semaphore: Arc<Semaphore>,
     /// Memory held by in-flight send tasks (extracted but not yet completed).
     /// Exposed for metrics only; backpressure is enforced by `memory_permits`.
     in_flight_memory: Arc<AtomicUsize>,
@@ -574,6 +610,8 @@ pub struct RecordAccumulator {
     metrics: Arc<ProducerMetrics>,
     /// Byte-granular FIFO semaphore gating `buffer_memory` (shared with handle).
     memory_permits: Arc<Semaphore>,
+    /// Partitioner reference for KIP-794 batch-boundary advance notifications.
+    partitioner: Arc<dyn super::partitioner::Partitioner>,
 }
 
 impl RecordAccumulator {
@@ -614,15 +652,20 @@ impl RecordAccumulator {
         let handle_buffered_records = buffered_records.clone();
         let handle_metrics = metrics.clone();
         let max_block_ms = config.max_block_ms;
+        let max_request_size = config.max_request_size;
+        // Extract partitioner before config is moved into the accumulator.
+        let accumulator_partitioner = config.partitioner.clone();
 
         let accumulator = Self {
             config,
-            batches: HashMap::new(),
+            batches: AHashMap::new(),
             metadata,
+            send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_BATCH_SENDS)),
             in_flight_memory,
             retry_policy,
             metrics,
             memory_permits: memory_permits.clone(),
+            partitioner: accumulator_partitioner,
         };
 
         let memory_permits_panic = memory_permits.clone();
@@ -645,6 +688,7 @@ impl RecordAccumulator {
             sender,
             memory_permits,
             memory_capacity,
+            max_request_size,
             max_block_ms,
             in_flight_barrier,
             buffered_records: handle_buffered_records,
@@ -745,6 +789,12 @@ impl RecordAccumulator {
             // Check if batch is full
             if accumulator_batch.batch.is_full() {
                 trace!("Batch full for {}-{}, flushing", key.0, partition);
+                let partition_count = self
+                    .metadata
+                    .partition_count(key.0.as_ref())
+                    .unwrap_or(partition as usize + 1);
+                self.partitioner
+                    .on_new_batch(key.0.as_ref(), partition, partition_count);
                 self.flush_batch(&key);
             } else if self.config.linger.is_zero() {
                 // linger=0 means send immediately without waiting
@@ -754,6 +804,12 @@ impl RecordAccumulator {
             }
         } else {
             // Batch is full, flush it first and then add to new batch
+            let partition_count = self
+                .metadata
+                .partition_count(key.0.as_ref())
+                .unwrap_or(partition as usize + 1);
+            self.partitioner
+                .on_new_batch(key.0.as_ref(), partition, partition_count);
             self.flush_batch(&key);
 
             // Create new batch and add record
@@ -822,6 +878,7 @@ impl RecordAccumulator {
             &self.config,
             &self.retry_policy,
             &self.metrics,
+            self.send_semaphore.clone(),
         );
     }
 
@@ -829,8 +886,8 @@ impl RecordAccumulator {
     ///
     /// Extracts all non-empty batches synchronously, then hands them off to
     /// `spawn_batches_detached` so the run loop is never blocked by network
-    /// I/O. The send cap (`MAX_CONCURRENT_BATCH_SENDS`) is enforced inside
-    /// the detached wave.
+    /// I/O. The shared `send_semaphore` caps the total concurrent task count
+    /// across all in-flight waves to `MAX_CONCURRENT_BATCH_SENDS`.
     fn flush_all_ready(&mut self) {
         let keys_to_flush: Vec<_> = self
             .batches
@@ -856,21 +913,23 @@ impl RecordAccumulator {
             &self.config,
             &self.retry_policy,
             &self.metrics,
+            self.send_semaphore.clone(),
         );
     }
 
-    /// Spawn at most `MAX_CONCURRENT_BATCH_SENDS` send tasks at a time.
+    /// Drive up to `MAX_CONCURRENT_BATCH_SENDS` send tasks to completion.
     ///
-    /// Fix for H3: the previous implementation did `join_set.spawn(...)` in
-    /// a tight loop with no cap, materializing every batch into a Tokio
-    /// task in a single linger tick. With 10k partitions at `linger.ms=5`
-    /// this meant 10k spawns per tick, flooding the global injection queue
-    /// and degrading tail latency for no throughput gain (the per-broker
-    /// connection already serializes). We now drain in a bounded fashion:
-    /// spawn up to the cap, then await one task before spawning the next.
-    /// The cap is deliberately fixed (`MAX_CONCURRENT_BATCH_SENDS`) rather
-    /// than derived from `num_cpus` — the send tasks are I/O bound and a
-    /// fixed ceiling caps scheduler pressure predictably.
+    /// Each task acquires one permit from `send_semaphore` before being
+    /// spawned and holds it until completion.  Because `send_semaphore` is
+    /// **shared across all in-flight waves**, the total number of concurrent
+    /// `send_extracted_batch` tasks across every overlapping linger wave is
+    /// bounded by `MAX_CONCURRENT_BATCH_SENDS` — not multiplied by the
+    /// number of simultaneous waves (F-021 fix).
+    ///
+    /// When `send_semaphore` is saturated, `acquire_owned().await` parks the
+    /// current wave-wrapper task until a slot frees up.  The Tokio runtime
+    /// continues executing the already-spawned tasks, so no deadlock can
+    /// occur.
     async fn spawn_batches_bounded(
         extracted: Vec<(
             (TopicHandle, PartitionId),
@@ -880,30 +939,47 @@ impl RecordAccumulator {
         config: &AccumulatorConfig,
         retry_policy: &RetryPolicy,
         metrics: &Arc<ProducerMetrics>,
+        send_semaphore: Arc<Semaphore>,
     ) {
         let mut join_set = tokio::task::JoinSet::new();
         for ((topic, partition), (batch, guard)) in extracted {
-            if join_set.len() >= MAX_CONCURRENT_BATCH_SENDS {
-                // Drain one slot before admitting the next task.
-                // `join_next` returning `None` cannot happen here because
-                // `len() >= cap >= 1`.
-                if let Some(Err(e)) = join_set.join_next().await
-                    && e.is_panic()
-                {
-                    warn!("send_extracted_batch task panicked: {e}");
+            // Clone shared handles outside the acquire so the borrow ends
+            // before entering the `async move` block (which must be `'static`).
+            let metadata = metadata.clone();
+            let config = config.clone();
+            let retry_policy = retry_policy.clone();
+            let metrics = metrics.clone();
+            // Acquire a global send slot before spawning.  Blocks the
+            // wave-wrapper task (not the run loop) when 64 tasks are already
+            // live across all waves.  If the semaphore is closed the
+            // accumulator is shutting down — drop remaining batches and abort.
+            let permit = match send_semaphore.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_closed) => {
+                    // Accumulator shutting down: abort this wave.
+                    // InFlightGuard::drop() returns memory permits for all
+                    // remaining items; PendingRecord senders are dropped
+                    // (callers observe RecvError, which is acceptable on close).
+                    return;
                 }
-            }
-            join_set.spawn(Self::send_extracted_batch(
-                topic,
-                partition,
-                batch.pending,
-                batch.created_at,
-                guard,
-                metadata.clone(),
-                config.clone(),
-                retry_policy.clone(),
-                metrics.clone(),
-            ));
+            };
+            join_set.spawn(async move {
+                // Hold the permit for the entire duration of the send task;
+                // dropping it on completion returns the slot to the shared pool.
+                let _permit = permit;
+                Self::send_extracted_batch(
+                    topic,
+                    partition,
+                    batch.pending,
+                    batch.created_at,
+                    guard,
+                    metadata,
+                    config,
+                    retry_policy,
+                    metrics,
+                )
+                .await;
+            });
         }
         while let Some(result) = join_set.join_next().await {
             if let Err(e) = result
@@ -918,11 +994,10 @@ impl RecordAccumulator {
     /// blocked by in-flight network I/O.
     ///
     /// Clones the shared handles, spawns a single Tokio task, and returns
-    /// immediately. Inside the task, `spawn_batches_bounded` enforces the
-    /// `MAX_CONCURRENT_BATCH_SENDS` cap so at most that many
-    /// `send_extracted_batch` tasks run concurrently within each wave.
-    /// Cross-wave parallelism is bounded by the `InFlightGuard` semaphore
-    /// inside `send_extracted_batch`.
+    /// immediately.  Inside the task, `spawn_batches_bounded` acquires
+    /// permits from `send_semaphore` (shared across **all** waves) before
+    /// each spawn, so the total concurrent task count across overlapping
+    /// waves is bounded by `MAX_CONCURRENT_BATCH_SENDS`.
     fn spawn_batches_detached(
         extracted: Vec<(
             (TopicHandle, PartitionId),
@@ -932,6 +1007,7 @@ impl RecordAccumulator {
         config: &AccumulatorConfig,
         retry_policy: &RetryPolicy,
         metrics: &Arc<ProducerMetrics>,
+        send_semaphore: Arc<Semaphore>,
     ) {
         if extracted.is_empty() {
             return;
@@ -945,8 +1021,15 @@ impl RecordAccumulator {
         // `InFlightGuard` reclaims memory permits on completion or panic —
         // so there is nothing to join.
         drop(tokio::spawn(async move {
-            Self::spawn_batches_bounded(extracted, &metadata, &config, &retry_policy, &metrics)
-                .await;
+            Self::spawn_batches_bounded(
+                extracted,
+                &metadata,
+                &config,
+                &retry_policy,
+                &metrics,
+                send_semaphore,
+            )
+            .await;
         }));
     }
 
@@ -993,6 +1076,7 @@ impl RecordAccumulator {
                 &self.config,
                 &self.retry_policy,
                 &self.metrics,
+                self.send_semaphore.clone(),
             );
         }
     }
@@ -1051,9 +1135,11 @@ impl RecordAccumulator {
         };
 
         // Build and encode the record batch (rebuilt on OutOfOrderSequenceNumber).
+        // Returns the request plus (compressed_bytes, uncompressed_bytes) for
+        // tracking the compression ratio when a codec is active.
         let build_batch = |seq: Option<i32>,
                            cfg: &AccumulatorConfig|
-         -> crate::error::Result<ProduceRequest> {
+         -> crate::error::Result<(ProduceRequest, u64, u64)> {
             let mut batch_builder = RecordBatchBuilder::new().compression(cfg.compression);
 
             // Tag with idempotent producer identity
@@ -1062,28 +1148,36 @@ impl RecordAccumulator {
                     batch_builder.producer(identity.producer_id(), identity.producer_epoch(), s);
             }
 
+            // Accumulate uncompressed payload size before encoding.
+            let uncompressed_len: u64 = pending.iter().map(|p| p.estimated_size as u64).sum();
+
             for p in &pending {
                 batch_builder = p.record.append_to_batch_builder(batch_builder);
             }
             let batch = batch_builder.build();
             let batch_bytes = batch.encode()?;
+            let compressed_len = batch_bytes.len() as u64;
 
-            Ok(ProduceRequest {
-                transactional_id: None,
-                acks: cfg.acks,
-                timeout_ms: crate::util::duration_to_millis_i32(cfg.request_timeout),
-                topic_data: vec![ProduceTopicData {
-                    name: topic.to_string(),
-                    topic_id: None,
-                    partition_data: vec![ProducePartitionData {
-                        index: partition,
-                        records: batch_bytes,
+            Ok((
+                ProduceRequest {
+                    transactional_id: None,
+                    acks: cfg.acks,
+                    timeout_ms: crate::util::duration_to_millis_i32(cfg.request_timeout),
+                    topic_data: vec![ProduceTopicData {
+                        name: topic.to_string(),
+                        topic_id: None,
+                        partition_data: vec![ProducePartitionData {
+                            index: partition,
+                            records: batch_bytes,
+                        }],
                     }],
-                }],
-            })
+                },
+                compressed_len,
+                uncompressed_len,
+            ))
         };
 
-        let mut request = match build_batch(sequence, &config) {
+        let (mut request, compressed_len, uncompressed_len) = match build_batch(sequence, &config) {
             Ok(r) => r,
             Err(e) => {
                 // Rollback sequence on encode failure
@@ -1097,6 +1191,11 @@ impl RecordAccumulator {
                 return;
             }
         };
+
+        // Track estimated compression ratio for compressed batches.
+        if config.compression != Compression::None {
+            metrics.record_compression(compressed_len, uncompressed_len);
+        }
 
         // Retry loop — delivery timeout starts from when the first record
         // entered the batch (enqueued_at), not from the first send attempt,
@@ -1138,8 +1237,24 @@ impl RecordAccumulator {
                 }
             };
 
+            // KIP-219: honour broker throttle before dispatching the batch.
+            //
+            // `send_request_with_priority` also enforces the throttle for
+            // normal-priority requests, but checking here avoids performing
+            // API-version negotiation while the quota window is still open,
+            // reducing wasted work per iteration.
+            if let Some(delay) = conn.throttle_remaining() {
+                debug!(
+                    delay_ms = delay.as_millis() as u64,
+                    topic = %topic,
+                    partition = partition,
+                    "Delaying batch send due to broker throttle (KIP-219)"
+                );
+                tokio::time::sleep(delay).await;
+            }
+
             // Negotiate Produce version for this broker.
-            let produce_version = match conn
+            let mut produce_version = match conn
                 .negotiate_api_version(
                     ApiKey::Produce,
                     versions::PRODUCE_MAX,
@@ -1149,7 +1264,10 @@ impl RecordAccumulator {
             {
                 Some(v) => v,
                 None => {
-                    let e = KrafkaError::protocol("no mutually supported Produce API version");
+                    let e = KrafkaError::protocol_kind(
+                        ProtocolErrorKind::UnknownApiVersion,
+                        "no mutually supported Produce API version",
+                    );
                     debug!(
                         topic = %topic,
                         partition = partition,
@@ -1171,6 +1289,12 @@ impl RecordAccumulator {
                     break Err(e);
                 }
             };
+
+            // KIP-516: Produce v13+ sends topic UUIDs instead of names.
+            // Fill IDs from cache; fall back to v12 if any UUID is not yet known.
+            if produce_version >= 13 && !super::fill_produce_topic_ids(&mut request, &metadata) {
+                produce_version = 12;
+            }
 
             if let Err(error) = super::validate_produce_request_size(
                 &config.client_id,
@@ -1230,7 +1354,18 @@ impl RecordAccumulator {
                             let pr = produce_response
                                 .responses
                                 .iter()
-                                .find(|r| r.name == topic.as_ref())
+                                .find(|r| {
+                                    // KIP-516: v13+ returns empty name and a topic_id.
+                                    // For prior versions match by name.
+                                    if produce_version >= 13 {
+                                        r.topic_id.as_ref().is_some_and(|id| {
+                                            metadata.topic_name_for_id(id).as_deref()
+                                                == Some(topic.as_ref())
+                                        })
+                                    } else {
+                                        r.name == topic.as_ref()
+                                    }
+                                })
                                 .and_then(|r| {
                                     r.partition_responses.iter().find(|p| p.index == partition)
                                 });
@@ -1287,7 +1422,7 @@ impl RecordAccumulator {
                                         };
                                         sequence = Some(new_sequence);
                                         match build_batch(sequence, &config) {
-                                            Ok(new_request) => request = new_request,
+                                            Ok((new_request, ..)) => request = new_request,
                                             Err(encode_err) => break Err(encode_err),
                                         }
                                     } else if pr.error_code == ErrorCode::OutOfOrderSequenceNumber
@@ -1308,7 +1443,7 @@ impl RecordAccumulator {
                                         };
                                         sequence = Some(new_seq);
                                         match build_batch(sequence, &config) {
-                                            Ok(r) => request = r,
+                                            Ok((r, ..)) => request = r,
                                             Err(encode_err) => {
                                                 break Err(encode_err);
                                             }
@@ -1328,7 +1463,8 @@ impl RecordAccumulator {
                                     break Err(err);
                                 }
                                 None => {
-                                    break Err(KrafkaError::protocol(
+                                    break Err(KrafkaError::protocol_kind(
+                                        ProtocolErrorKind::Malformed,
                                         "partition not found in response",
                                     ));
                                 }
@@ -1459,6 +1595,7 @@ impl RecordAccumulator {
             &self.config,
             &self.retry_policy,
             &self.metrics,
+            self.send_semaphore.clone(),
         )
         .await;
         Ok(())
@@ -1474,7 +1611,7 @@ mod tests {
     fn test_accumulator_config_default() {
         let config = AccumulatorConfig::default();
         assert_eq!(config.batch_size, 16384);
-        assert_eq!(config.linger, Duration::from_millis(0));
+        assert_eq!(config.linger, Duration::ZERO);
         assert_eq!(config.acks, -1);
     }
 
@@ -1508,6 +1645,7 @@ mod tests {
             in_flight_semaphore: Arc::new(Semaphore::new(5)),
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             identity: None,
+            partitioner: Arc::new(crate::producer::partitioner::DefaultPartitioner::new()),
         };
         assert_eq!(config.batch_size, 65536);
         assert_eq!(config.linger, Duration::from_millis(50));
@@ -1536,7 +1674,7 @@ mod tests {
     #[test]
     fn test_linger_zero_check_interval() {
         // With linger=0, the check interval should be 1ms (minimum)
-        let linger = Duration::from_millis(0);
+        let linger = Duration::ZERO;
         let check_interval = Duration::from_millis(1).max(linger / 10);
         assert_eq!(check_interval, Duration::from_millis(1));
     }
@@ -1545,7 +1683,7 @@ mod tests {
     #[test]
     fn test_linger_zero_is_zero() {
         let config = AccumulatorConfig {
-            linger: Duration::from_millis(0),
+            linger: Duration::ZERO,
             ..Default::default()
         };
         assert!(config.linger.is_zero());
@@ -1577,6 +1715,7 @@ mod tests {
             sender,
             memory_permits: Arc::new(Semaphore::new(0)),
             memory_capacity: 1024 * 1024, // larger than any test record
+            max_request_size: 0,
             max_block_ms: Duration::from_millis(50),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
             buffered_records: Arc::new(AtomicUsize::new(0)),
@@ -1627,6 +1766,7 @@ mod tests {
             sender,
             memory_permits: Arc::new(Semaphore::new(16)),
             memory_capacity: 16, // deliberately tiny
+            max_request_size: 0,
             max_block_ms: Duration::from_secs(60),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
             buffered_records: Arc::new(AtomicUsize::new(0)),
@@ -1655,6 +1795,7 @@ mod tests {
             sender,
             memory_permits: sem.clone(),
             memory_capacity: 1024 * 1024,
+            max_request_size: 0,
             max_block_ms: Duration::from_secs(60),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
             buffered_records: Arc::new(AtomicUsize::new(0)),
@@ -1696,6 +1837,7 @@ mod tests {
             sender,
             memory_permits: sem.clone(),
             memory_capacity: 1024,
+            max_request_size: 0,
             max_block_ms: Duration::from_millis(500),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
             buffered_records: buffered_records.clone(),
@@ -1741,7 +1883,7 @@ mod tests {
     /// needing to allocate large buffers.
     #[test]
     fn test_check_record_admission_rejects_oversized_for_buffer() {
-        let err = check_record_admission(1024, 16).expect_err("must reject");
+        let err = check_record_admission(1024, 16, 0).expect_err("must reject");
         let msg = err.to_string();
         assert!(
             msg.contains("buffer_memory"),
@@ -1761,7 +1903,7 @@ mod tests {
     #[test]
     fn test_check_record_admission_rejects_oversized_for_semaphore_limit() {
         let oversized = max_record_semaphore_permits() + 1;
-        let err = check_record_admission(oversized, usize::MAX).expect_err("must reject");
+        let err = check_record_admission(oversized, usize::MAX, 0).expect_err("must reject");
         let msg = err.to_string();
         assert!(
             msg.contains("Semaphore::MAX_PERMITS"),

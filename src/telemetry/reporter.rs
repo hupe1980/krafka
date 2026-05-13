@@ -19,13 +19,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use rand::Rng;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::error::ErrorCode;
 use crate::metrics::{KrafkaMetrics, LatencySnapshot, MetricsExporter};
-use crate::network::BrokerConnection;
+use crate::network::{BrokerConnection, ConnectionPool};
 use crate::protocol::{
     ApiKey, Compression, GetTelemetrySubscriptionsRequest, GetTelemetrySubscriptionsResponse,
     PushTelemetryRequest, PushTelemetryResponse, VersionedDecode,
@@ -47,7 +46,10 @@ const MAX_PUSH_INTERVAL_MS: i32 = 60 * 60 * 1000;
 
 fn retry_backoff(attempt: u32) -> Duration {
     debug_assert!(attempt > 0, "retry_backoff expects attempts starting at 1");
-    RETRY_BACKOFF_BASE * 2u32.saturating_pow(attempt.saturating_sub(1))
+    let base = RETRY_BACKOFF_BASE * 2u32.saturating_pow(attempt.saturating_sub(1));
+    // Add ±25% jitter to prevent thundering herd on concurrent reconnects.
+    let jitter = rand::random_range(0.75..1.25);
+    base.mul_f64(jitter)
 }
 
 fn clamp_push_interval_ms(raw_ms: i32) -> i32 {
@@ -221,14 +223,17 @@ enum TelemetryChunkingError {
 /// use std::sync::Arc;
 /// use krafka::metrics::KrafkaMetrics;
 /// use krafka::telemetry::reporter::{TelemetryReporter, TelemetryConfig};
-/// use krafka::network::BrokerConnection;
+/// use krafka::network::{BrokerConnection, ConnectionPool};
 ///
-/// # async fn example(conn: Arc<BrokerConnection>) {
+/// # async fn example(conn: Arc<BrokerConnection>, pool: Arc<ConnectionPool>) {
 /// let metrics = Arc::new(KrafkaMetrics::new());
 /// let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+/// let broker_addresses = vec!["localhost:9092".to_string()];
 ///
 /// let reporter = TelemetryReporter::new(
 ///     conn,
+///     pool,
+///     broker_addresses,
 ///     metrics,
 ///     TelemetryConfig::default(),
 ///     shutdown_rx,
@@ -244,6 +249,10 @@ enum TelemetryChunkingError {
 /// ```
 pub struct TelemetryReporter {
     connection: Arc<BrokerConnection>,
+    /// Connection pool — used to reconnect when `connection` drops.
+    pool: Arc<ConnectionPool>,
+    /// Broker addresses to try when reconnecting, in preference order.
+    broker_addresses: Vec<String>,
     metrics: Arc<KrafkaMetrics>,
     config: TelemetryConfig,
     shutdown: watch::Receiver<bool>,
@@ -260,18 +269,24 @@ pub struct TelemetryReporter {
 impl TelemetryReporter {
     /// Create a new telemetry reporter.
     ///
-    /// * `connection` — broker connection to use for telemetry RPCs.
+    /// * `connection` — initial broker connection to use for telemetry RPCs.
+    /// * `pool` — connection pool for reconnection when the current broker drops.
+    /// * `broker_addresses` — ordered list of broker addresses to try on reconnect.
     /// * `metrics` — the shared metrics registry to read from.
     /// * `config` — telemetry configuration.
     /// * `shutdown` — a watch channel; set to `true` to stop the reporter.
     pub fn new(
         connection: Arc<BrokerConnection>,
+        pool: Arc<ConnectionPool>,
+        broker_addresses: Vec<String>,
         metrics: Arc<KrafkaMetrics>,
         config: TelemetryConfig,
         shutdown: watch::Receiver<bool>,
     ) -> Self {
         Self {
             connection,
+            pool,
+            broker_addresses,
             metrics,
             config,
             shutdown,
@@ -309,7 +324,7 @@ impl TelemetryReporter {
         );
 
         // KIP-714: First push randomised between 0.5 × interval … 1.5 × interval.
-        let jitter_factor: f64 = rand::rng().random_range(0.5..1.5);
+        let jitter_factor: f64 = rand::random_range(0.5..1.5);
         let first_delay = subscription.push_interval.mul_f64(jitter_factor);
         let collection_start = Self::nanos_since_epoch();
 
@@ -369,8 +384,27 @@ impl TelemetryReporter {
                         // retries the same telemetry slice.
                     }
                     PushResult::Fatal => {
-                        warn!("Fatal telemetry push error; reporter exiting");
-                        return;
+                        warn!("Fatal telemetry push error; attempting reconnection");
+                        if self.reconnect().await {
+                            match self
+                                .get_subscription_with_retry(subscription.client_instance_id)
+                                .await
+                            {
+                                Some(s) => {
+                                    self.delta_tracker.reset();
+                                    subscription = s;
+                                }
+                                None => {
+                                    warn!(
+                                        "Re-subscription failed after reconnect; reporter exiting"
+                                    );
+                                    return;
+                                }
+                            }
+                        } else {
+                            warn!("All broker connections failed; reporter exiting");
+                            return;
+                        }
                     }
                 }
                 push_result = Some(result);
@@ -406,6 +440,29 @@ impl TelemetryReporter {
                 }
             }
         }
+    }
+
+    /// Try to reconnect to any known broker after a fatal connection error.
+    ///
+    /// Iterates `broker_addresses` in order and replaces `self.connection` on
+    /// the first success. Returns `true` if reconnected, `false` if all fail.
+    async fn reconnect(&mut self) -> bool {
+        for idx in 0..self.broker_addresses.len() {
+            let addr = self.broker_addresses[idx].clone();
+            match self.pool.get_connection(&addr).await {
+                Ok(conn) => {
+                    info!(broker = %addr, "Telemetry reporter reconnected to broker");
+                    self.connection = conn;
+                    // Reset per-connection state on reconnect.
+                    self.unsupported_compression_types.clear();
+                    return true;
+                }
+                Err(err) => {
+                    warn!(broker = %addr, %err, "Telemetry reconnection attempt failed");
+                }
+            }
+        }
+        false
     }
 
     /// Try to obtain a subscription, retrying transient failures with backoff.
@@ -1587,6 +1644,9 @@ mod tests {
                     min: Some(Duration::from_millis(50)),
                     max: Some(Duration::from_millis(50)),
                     avg: Some(Duration::from_millis(50)),
+                    p50: Some(Duration::from_millis(50)),
+                    p95: Some(Duration::from_millis(50)),
+                    p99: Some(Duration::from_millis(50)),
                 },
             );
 
@@ -1602,12 +1662,16 @@ mod tests {
                     min: Some(Duration::from_millis(10)),
                     max: Some(Duration::from_millis(10)),
                     avg: Some(Duration::from_millis(10)),
+                    p50: Some(Duration::from_millis(10)),
+                    p95: Some(Duration::from_millis(10)),
+                    p99: Some(Duration::from_millis(10)),
                 },
             );
         }
 
-        // 2 direct metrics + 5 from matching latency (count, sum, min, max, avg)
-        assert_eq!(otlp.finish_metric_count(), 7);
+        // 2 direct metrics + 8 from matching latency
+        // (count, sum, min, max, avg, p50, p95, p99)
+        assert_eq!(otlp.finish_metric_count(), 10);
     }
 
     #[test]
@@ -1627,9 +1691,13 @@ mod tests {
 
     #[test]
     fn test_retry_backoff_exponential() {
-        assert_eq!(retry_backoff(1), Duration::from_secs(1));
-        assert_eq!(retry_backoff(2), Duration::from_secs(2));
-        assert_eq!(retry_backoff(3), Duration::from_secs(4));
+        // With ±25% jitter the actual duration falls within [0.75×base, 1.25×base].
+        let b1 = retry_backoff(1);
+        assert!(b1 >= Duration::from_millis(750) && b1 <= Duration::from_millis(1250));
+        let b2 = retry_backoff(2);
+        assert!(b2 >= Duration::from_millis(1500) && b2 <= Duration::from_millis(2500));
+        let b3 = retry_backoff(3);
+        assert!(b3 >= Duration::from_millis(3000) && b3 <= Duration::from_millis(5000));
     }
 
     #[test]
@@ -1761,7 +1829,7 @@ mod tests {
             push_interval: Duration::from_secs(1),
             delta_temporality: false,
             accepted_compression_types: vec![Compression::None],
-            telemetry_max_bytes: max_bytes as i32,
+            telemetry_max_bytes: i32::try_from(max_bytes).unwrap(),
             requested_metrics: vec!["*".to_string()],
         };
         let mut unsupported = HashSet::new();
@@ -1829,7 +1897,7 @@ mod tests {
             push_interval: Duration::from_secs(1),
             delta_temporality: false,
             accepted_compression_types: vec![Compression::None],
-            telemetry_max_bytes: max_bytes as i32,
+            telemetry_max_bytes: i32::try_from(max_bytes).unwrap(),
             requested_metrics: vec!["*".to_string()],
         };
         let mut unsupported = HashSet::new();
@@ -1902,7 +1970,7 @@ mod tests {
             push_interval: Duration::from_secs(1),
             delta_temporality: false,
             accepted_compression_types: vec![Compression::Gzip, Compression::None],
-            telemetry_max_bytes: max_bytes as i32,
+            telemetry_max_bytes: i32::try_from(max_bytes).unwrap(),
             requested_metrics: vec!["*".to_string()],
         };
         let mut unsupported = HashSet::new();
@@ -1999,7 +2067,7 @@ mod tests {
             push_interval: Duration::from_secs(1),
             delta_temporality: true,
             accepted_compression_types: vec![Compression::None],
-            telemetry_max_bytes: max_bytes as i32,
+            telemetry_max_bytes: i32::try_from(max_bytes).unwrap(),
             requested_metrics: vec!["*".to_string()],
         };
         let mut unsupported = HashSet::new();

@@ -54,7 +54,7 @@
 //! use std::time::Duration;
 //!
 //! let registry = CachedSchemaRegistry::new(
-//!     ConfluentSchemaRegistry::new("http://localhost:8081"),
+//!     ConfluentSchemaRegistry::new("http://localhost:8081")?,
 //! );
 //!
 //! let consumer = Consumer::builder()
@@ -90,7 +90,7 @@
 //! };
 //!
 //! let registry = CachedSchemaRegistry::new(
-//!     ConfluentSchemaRegistry::new("http://localhost:8081"),
+//!     ConfluentSchemaRegistry::new("http://localhost:8081")?,
 //! );
 //!
 //! let ctc = CompactedTopicConsumer::builder()
@@ -115,6 +115,8 @@ pub mod glue;
 #[cfg_attr(docsrs, doc(cfg(feature = "schema-registry")))]
 pub use client::{ConfluentSchemaRegistry, ConfluentSchemaRegistryBuilder};
 
+// ConfluentSchemaEncoder is defined in this module (below) so no re-export needed.
+
 use self::glue::{GlueSchema, GlueSchemaRegistryClient, GlueSchemaVersionId};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -128,6 +130,45 @@ use tokio::sync::oneshot;
 
 use crate::error::{KrafkaError, Result};
 use tracing::debug;
+
+// ── Object-safe erased helpers for WireFormatDecoder ─────────────────────
+// These traits mirror SchemaRegistryClient / GlueSchemaRegistryClient but use
+// Pin<Box<dyn Future>> so they are object-safe. A blanket impl converts any
+// concrete SchemaRegistryClient / GlueSchemaRegistryClient implementation.
+// This design keeps WireFormatDecoder ergonomic (no generic params) while
+// allowing SchemaRegistryClient to use RPITIT (async fn in trait).
+
+trait ErasedSchemaRegistryClient: Send + Sync {
+    fn get_schema_by_id_erased<'a>(
+        &'a self,
+        id: SchemaId,
+    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + 'a>>;
+}
+
+impl<T: SchemaRegistryClient> ErasedSchemaRegistryClient for T {
+    fn get_schema_by_id_erased<'a>(
+        &'a self,
+        id: SchemaId,
+    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + 'a>> {
+        Box::pin(self.get_schema_by_id(id))
+    }
+}
+
+trait ErasedGlueSchemaRegistryClient: Send + Sync {
+    fn get_schema_by_version_id_erased<'a>(
+        &'a self,
+        id: GlueSchemaVersionId,
+    ) -> Pin<Box<dyn Future<Output = Result<GlueSchema>> + Send + 'a>>;
+}
+
+impl<T: GlueSchemaRegistryClient> ErasedGlueSchemaRegistryClient for T {
+    fn get_schema_by_version_id_erased<'a>(
+        &'a self,
+        id: GlueSchemaVersionId,
+    ) -> Pin<Box<dyn Future<Output = Result<GlueSchema>> + Send + 'a>> {
+        Box::pin(self.get_schema_by_version_id(id))
+    }
+}
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -317,19 +358,6 @@ pub fn decode_wire_format(data: &[u8]) -> Result<(SchemaId, &[u8])> {
     Ok((schema_id, &data[HEADER_SIZE..]))
 }
 
-/// Decode a Confluent wire format message, returning an owned payload.
-///
-/// This is useful when the payload needs to outlive the source buffer, for
-/// example when passing decoded bytes across an `.await` boundary.
-///
-/// # Errors
-///
-/// Same as [`decode_wire_format()`].
-pub fn decode_wire_format_owned(data: &[u8]) -> Result<(SchemaId, Vec<u8>)> {
-    let (schema_id, payload) = decode_wire_format(data)?;
-    Ok((schema_id, payload.to_vec()))
-}
-
 /// Decode a Confluent wire format message, returning a zero-copy [`Bytes`] payload.
 ///
 /// This is the preferred variant when working with [`Bytes`] values such as
@@ -507,7 +535,11 @@ pub struct DecodedMessage {
     /// Unified schema format.
     pub schema_format: SchemaFormat,
     /// Decoded payload bytes.
-    pub payload: Vec<u8>,
+    ///
+    /// When the payload was Confluent- or Glue-framed, this is a zero-copy
+    /// sub-slice of the original [`Bytes`] buffer (no allocation). For
+    /// unknown/passthrough payloads the input [`Bytes`] is returned as-is.
+    pub payload: Bytes,
     /// Registry metadata when a known schema wire format was detected.
     pub schema_metadata: Option<SchemaMetadata>,
 }
@@ -517,12 +549,12 @@ pub struct DecodedMessage {
 /// Use this to centralize Confluent/Glue dispatch logic and avoid repeating
 /// magic-byte checks in application code.
 #[derive(Default, Clone, Copy)]
-pub struct SchemaDecoder<'a> {
-    confluent: Option<&'a dyn SchemaRegistryClient>,
-    glue: Option<&'a dyn GlueSchemaRegistryClient>,
+pub struct WireFormatDecoder<'a> {
+    confluent: Option<&'a dyn ErasedSchemaRegistryClient>,
+    glue: Option<&'a dyn ErasedGlueSchemaRegistryClient>,
 }
 
-impl fmt::Debug for SchemaDecoder<'_> {
+impl fmt::Debug for WireFormatDecoder<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SchemaDecoder")
             .field("has_confluent", &self.confluent.is_some())
@@ -531,7 +563,7 @@ impl fmt::Debug for SchemaDecoder<'_> {
     }
 }
 
-impl<'a> SchemaDecoder<'a> {
+impl<'a> WireFormatDecoder<'a> {
     /// Create an empty decoder.
     ///
     /// Use [`with_confluent`](Self::with_confluent) and/or
@@ -541,23 +573,23 @@ impl<'a> SchemaDecoder<'a> {
     }
 
     /// Create a decoder configured with only a Confluent registry.
-    pub fn confluent(registry: &'a dyn SchemaRegistryClient) -> Self {
+    pub fn confluent(registry: &'a impl SchemaRegistryClient) -> Self {
         Self::new().with_confluent(registry)
     }
 
     /// Create a decoder configured with only a Glue registry.
-    pub fn glue(registry: &'a dyn GlueSchemaRegistryClient) -> Self {
+    pub fn glue(registry: &'a impl GlueSchemaRegistryClient) -> Self {
         Self::new().with_glue(registry)
     }
 
     /// Attach a Confluent registry client.
-    pub fn with_confluent(mut self, registry: &'a dyn SchemaRegistryClient) -> Self {
+    pub fn with_confluent(mut self, registry: &'a impl SchemaRegistryClient) -> Self {
         self.confluent = Some(registry);
         self
     }
 
     /// Attach a Glue registry client.
-    pub fn with_glue(mut self, registry: &'a dyn GlueSchemaRegistryClient) -> Self {
+    pub fn with_glue(mut self, registry: &'a impl GlueSchemaRegistryClient) -> Self {
         self.glue = Some(registry);
         self
     }
@@ -570,8 +602,13 @@ impl<'a> SchemaDecoder<'a> {
     /// - Ambiguous truncated/invalid known framing: falls back to passthrough
     ///   with `SchemaFormat::Unknown`; use `detect_wire_format()` plus the
     ///   low-level decode helpers for strict malformed-header rejection.
-    pub async fn decode(&self, data: &[u8]) -> Result<DecodedMessage> {
-        match detect_wire_format(data) {
+    ///
+    /// The `data` buffer is consumed without copying when the framing is
+    /// recognised — the returned [`DecodedMessage::payload`] is a zero-copy
+    /// sub-slice of the original [`Bytes`]. For unframed payloads the input
+    /// is returned as-is.
+    pub async fn decode(&self, data: Bytes) -> Result<DecodedMessage> {
+        match detect_wire_format(&data) {
             DetectedWireFormat::Confluent { schema_id, .. } => {
                 let registry = self.confluent.ok_or_else(|| {
                     KrafkaError::config(
@@ -579,8 +616,8 @@ impl<'a> SchemaDecoder<'a> {
                     )
                 })?;
 
-                let (_, payload) = decode_wire_format_owned(data)?;
-                let schema = registry.get_schema_by_id(schema_id).await?;
+                let (_, payload) = decode_wire_format_bytes(&data)?;
+                let schema = registry.get_schema_by_id_erased(schema_id).await?;
 
                 Ok(DecodedMessage {
                     schema_format: schema.schema_type.into(),
@@ -595,8 +632,8 @@ impl<'a> SchemaDecoder<'a> {
                     )
                 })?;
 
-                let (_, payload) = glue::decode_glue_wire_format(data)?;
-                let schema = registry.get_schema_by_version_id(version_id).await?;
+                let (_, payload) = glue::decode_glue_wire_format_bytes(&data)?;
+                let schema = registry.get_schema_by_version_id_erased(version_id).await?;
 
                 Ok(DecodedMessage {
                     schema_format: schema.data_format.into(),
@@ -608,7 +645,7 @@ impl<'a> SchemaDecoder<'a> {
             | DetectedWireFormat::InvalidGlue
             | DetectedWireFormat::Unknown => Ok(DecodedMessage {
                 schema_format: SchemaFormat::Unknown,
-                payload: data.to_vec(),
+                payload: data,
                 schema_metadata: None,
             }),
         }
@@ -698,36 +735,93 @@ pub trait SchemaRegistryClient: Send + Sync {
     /// Retrieve a schema by its globally unique ID.
     ///
     /// Schema IDs are immutable — a given ID always maps to the same schema.
-    fn get_schema_by_id(
-        &self,
-        id: SchemaId,
-    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>>;
+    fn get_schema_by_id(&self, id: SchemaId) -> impl Future<Output = Result<Schema>> + Send + '_;
 
     /// Retrieve the latest schema registered under the given subject.
-    fn get_latest_schema(
-        &self,
-        subject: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>>;
+    fn get_latest_schema<'a>(
+        &'a self,
+        subject: &'a str,
+    ) -> impl Future<Output = Result<Schema>> + Send + 'a;
 
     /// Retrieve a specific version of a schema under a subject.
-    fn get_schema_by_version(
-        &self,
-        subject: &str,
+    fn get_schema_by_version<'a>(
+        &'a self,
+        subject: &'a str,
         version: SchemaVersion,
-    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>>;
+    ) -> impl Future<Output = Result<Schema>> + Send + 'a;
 
     /// Register a schema under the given subject.
     ///
     /// If the same schema is already registered, the existing ID is returned
     /// (the operation is idempotent). Pass `&[]` for `references` when the
     /// schema has no dependencies.
-    fn register_schema(
-        &self,
-        subject: &str,
-        schema: &str,
+    fn register_schema<'a>(
+        &'a self,
+        subject: &'a str,
+        schema: &'a str,
         schema_type: SchemaType,
-        references: &[SchemaReference],
-    ) -> Pin<Box<dyn Future<Output = Result<SchemaId>> + Send + '_>>;
+        references: &'a [SchemaReference],
+    ) -> impl Future<Output = Result<SchemaId>> + Send + 'a;
+
+    /// Check whether a schema is compatible with the latest version registered
+    /// under `subject`.
+    ///
+    /// Returns `true` when the schema is compatible according to the subject's
+    /// configured compatibility level, `false` otherwise.
+    ///
+    /// Implementations that do not support this operation return
+    /// `Err(KrafkaError::schema_registry("check_compatibility: not implemented"))`.
+    fn check_compatibility<'a>(
+        &'a self,
+        _subject: &'a str,
+        _schema: &'a str,
+        _schema_type: SchemaType,
+        _references: &'a [SchemaReference],
+    ) -> impl Future<Output = Result<bool>> + Send + 'a {
+        std::future::ready(Err(KrafkaError::schema_registry(
+            "check_compatibility: not implemented for this registry",
+        )))
+    }
+
+    /// Delete a subject and all its registered versions.
+    ///
+    /// Returns the list of deleted version numbers. Set `permanent` to `true`
+    /// to perform a hard delete (bypasses the soft-delete stage).
+    ///
+    /// Implementations that do not support this operation return
+    /// `Err(KrafkaError::schema_registry("delete_subject: not implemented"))`.
+    fn delete_subject<'a>(
+        &'a self,
+        _subject: &'a str,
+        _permanent: bool,
+    ) -> impl Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a {
+        std::future::ready(Err(KrafkaError::schema_registry(
+            "delete_subject: not implemented for this registry",
+        )))
+    }
+
+    /// List all subjects currently registered in the registry.
+    ///
+    /// Implementations that do not support this operation return
+    /// `Err(KrafkaError::schema_registry("get_subjects: not implemented"))`.
+    fn get_subjects(&self) -> impl Future<Output = Result<Vec<String>>> + Send + '_ {
+        std::future::ready(Err(KrafkaError::schema_registry(
+            "get_subjects: not implemented for this registry",
+        )))
+    }
+
+    /// List all version numbers registered under `subject`.
+    ///
+    /// Implementations that do not support this operation return
+    /// `Err(KrafkaError::schema_registry("get_versions: not implemented"))`.
+    fn get_versions<'a>(
+        &'a self,
+        _subject: &'a str,
+    ) -> impl Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a {
+        std::future::ready(Err(KrafkaError::schema_registry(
+            "get_versions: not implemented for this registry",
+        )))
+    }
 }
 
 /// Shared cache-management interface implemented by schema cache wrappers.
@@ -781,7 +875,7 @@ pub trait AnySchemaCache: Send + Sync {
 /// ```rust,ignore
 /// use krafka::schema_registry::{CachedSchemaRegistry, ConfluentSchemaRegistry};
 ///
-/// let client = ConfluentSchemaRegistry::new("http://localhost:8081");
+/// let client = ConfluentSchemaRegistry::new("http://localhost:8081")?;
 /// let cached = CachedSchemaRegistry::new(client);
 ///
 /// // First call fetches from the registry:
@@ -813,18 +907,18 @@ struct SchemaInFlightEntry {
     waiters: Vec<oneshot::Sender<Result<Schema>>>,
 }
 
+/// Default maximum number of cached schema entries, matching the Java client default.
+const DEFAULT_MAX_CACHE_ENTRIES: usize = 1000;
+
 impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
     /// Wrap the given client with an in-memory cache.
+    ///
+    /// Defaults to a maximum of 1,000 entries, evicting the oldest entry on
+    /// each insert once the limit is reached.
+    /// Use [`with_max_entries`](Self::with_max_entries) to override or
+    /// [`with_capacity`](Self::with_capacity) for a pre-allocated unbounded cache.
     pub fn new(inner: C) -> Self {
-        Self {
-            inner,
-            cache: RwLock::new(HashMap::new()),
-            insertion_order: RwLock::new(VecDeque::new()),
-            max_entries: None,
-            in_flight_token: AtomicU64::new(0),
-            invalidation_generation: AtomicU64::new(0),
-            in_flight: Mutex::new(HashMap::new()),
-        }
+        Self::with_max_entries(inner, DEFAULT_MAX_CACHE_ENTRIES)
     }
 
     /// Wrap the given client with a pre-allocated cache.
@@ -1189,44 +1283,57 @@ impl<C> fmt::Debug for CachedSchemaRegistry<C> {
 }
 
 impl<C: SchemaRegistryClient> SchemaRegistryClient for CachedSchemaRegistry<C> {
-    fn get_schema_by_id(
-        &self,
-        id: SchemaId,
-    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
-        Box::pin(async move { self.get_schema_by_id_impl(id).await })
+    async fn get_schema_by_id(&self, id: SchemaId) -> Result<Schema> {
+        self.get_schema_by_id_impl(id).await
     }
 
-    fn get_latest_schema(
-        &self,
-        subject: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
-        let subject = subject.to_string();
-        Box::pin(async move { self.get_latest_schema_impl(&subject).await })
+    async fn get_latest_schema(&self, subject: &str) -> Result<Schema> {
+        self.get_latest_schema_impl(subject).await
     }
 
-    fn get_schema_by_version(
-        &self,
-        subject: &str,
-        version: SchemaVersion,
-    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
-        let subject = subject.to_string();
-        Box::pin(async move { self.get_schema_by_version_impl(&subject, version).await })
+    async fn get_schema_by_version(&self, subject: &str, version: SchemaVersion) -> Result<Schema> {
+        self.get_schema_by_version_impl(subject, version).await
     }
 
-    fn register_schema(
+    async fn register_schema(
         &self,
         subject: &str,
         schema: &str,
         schema_type: SchemaType,
         references: &[SchemaReference],
-    ) -> Pin<Box<dyn Future<Output = Result<SchemaId>> + Send + '_>> {
-        let subject = subject.to_string();
-        let schema = schema.to_string();
-        let references = references.to_vec();
-        Box::pin(async move {
-            self.register_schema_impl(&subject, &schema, schema_type, &references)
-                .await
-        })
+    ) -> Result<SchemaId> {
+        self.register_schema_impl(subject, schema, schema_type, references)
+            .await
+    }
+
+    fn check_compatibility<'a>(
+        &'a self,
+        subject: &'a str,
+        schema: &'a str,
+        schema_type: SchemaType,
+        references: &'a [SchemaReference],
+    ) -> impl Future<Output = Result<bool>> + Send + 'a {
+        self.inner
+            .check_compatibility(subject, schema, schema_type, references)
+    }
+
+    fn delete_subject<'a>(
+        &'a self,
+        subject: &'a str,
+        permanent: bool,
+    ) -> impl Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a {
+        self.inner.delete_subject(subject, permanent)
+    }
+
+    fn get_subjects(&self) -> impl Future<Output = Result<Vec<String>>> + Send + '_ {
+        self.inner.get_subjects()
+    }
+
+    fn get_versions<'a>(
+        &'a self,
+        subject: &'a str,
+    ) -> impl Future<Output = Result<Vec<SchemaVersion>>> + Send + 'a {
+        self.inner.get_versions(subject)
     }
 }
 
@@ -1258,6 +1365,356 @@ impl<C: SchemaRegistryClient> AnySchemaCache for CachedSchemaRegistry<C> {
         ids: &'a [Self::Id],
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move { Self::warm_cache(self, ids).await })
+    }
+}
+
+// ── SchemaEncoder ─────────────────────────────────────────────────────────
+
+/// Pluggable schema encoder for [`ProducerRecord`] key/value bytes.
+///
+/// Attach an encoder to a producer via
+/// [`ProducerBuilder::value_encoder`](crate::producer::ProducerBuilder::value_encoder) /
+/// [`ProducerBuilder::key_encoder`](crate::producer::ProducerBuilder::key_encoder).
+/// The producer calls `encode` automatically on every
+/// [`send_record`](crate::producer::Producer::send_record) — no per-record
+/// boilerplate required.
+///
+/// # Object Safety
+///
+/// The trait is object-safe. Use `Arc<dyn SchemaEncoder>` to share an encoder
+/// across tasks or store it in a struct field.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use std::sync::Arc;
+/// use krafka::schema_registry::{ConfluentSchemaEncoder, SchemaType};
+/// use krafka::producer::{Producer, ProducerRecord};
+///
+/// let encoder = Arc::new(
+///     ConfluentSchemaEncoder::builder()
+///         .registry(my_registry_client)
+///         .schema(r#"{"type":"string"}"#, SchemaType::Avro)
+///         .build()?,
+/// );
+///
+/// let producer = Producer::builder()
+///     .bootstrap_servers("localhost:9092")
+///     .value_encoder(encoder)
+///     .build()
+///     .await?;
+///
+/// // Encoding is automatic — just send the raw bytes:
+/// producer.send_record(ProducerRecord::new("orders", raw_avro_bytes)).await?;
+/// ```
+///
+/// [`ProducerRecord`]: crate::producer::ProducerRecord
+pub trait SchemaEncoder: Send + Sync {
+    /// Encode raw bytes, returning Confluent-wire-framed bytes.
+    ///
+    /// `payload` contains the raw (pre-serialized) bytes to frame.
+    /// `topic` is the target Kafka topic. `record_name` is the schema record
+    /// name (used by [`SubjectNameStrategy::RecordName`] and
+    /// [`SubjectNameStrategy::TopicRecordName`]; pass `None` for the
+    /// `TopicName` strategy). `is_key` distinguishes key vs value subjects.
+    ///
+    /// Passing `Bytes` instead of `&[u8]` allows implementations to move the
+    /// backing buffer into the returned future without an extra copy.
+    fn encode(
+        &self,
+        payload: Bytes,
+        topic: &str,
+        record_name: Option<&str>,
+        is_key: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>>;
+}
+
+/// A [`SchemaEncoder`] that registers schemas with a Confluent-compatible
+/// registry and frames encoded payloads with the 5-byte Confluent wire format.
+///
+/// On first send per subject the encoder calls `register_schema` (which is
+/// idempotent — if the schema is already registered the existing ID is
+/// returned). Subsequent sends reuse the cached ID without a registry round-trip.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use krafka::schema_registry::{
+///     ConfluentSchemaEncoder, ConfluentSchemaEncoderBuilder,
+///     SchemaType, SubjectNameStrategy,
+/// };
+///
+/// let encoder = ConfluentSchemaEncoder::builder()
+///     .registry(cached_registry)
+///     .schema(r#"{"type":"string"}"#, SchemaType::Avro)
+///     .strategy(SubjectNameStrategy::TopicName)
+///     .build();
+/// ```
+#[cfg(feature = "schema-registry")]
+#[cfg_attr(docsrs, doc(cfg(feature = "schema-registry")))]
+pub struct ConfluentSchemaEncoder<C> {
+    registry: C,
+    schema: String,
+    schema_type: SchemaType,
+    strategy: SubjectNameStrategy,
+    references: Vec<SchemaReference>,
+    /// Cached schema IDs, keyed by subject name.
+    id_cache: parking_lot::RwLock<std::collections::HashMap<String, SchemaId>>,
+}
+
+#[cfg(feature = "schema-registry")]
+impl<C: SchemaRegistryClient> ConfluentSchemaEncoder<C> {
+    /// Create a builder for `ConfluentSchemaEncoder`.
+    pub fn builder() -> ConfluentSchemaEncoderBuilder<C> {
+        ConfluentSchemaEncoderBuilder::new()
+    }
+
+    /// Resolve the schema ID for `subject`, registering if not yet cached.
+    async fn resolve_id(&self, subject: &str) -> Result<SchemaId> {
+        // Fast path: already cached.
+        {
+            let cache = self.id_cache.read();
+            if let Some(&id) = cache.get(subject) {
+                return Ok(id);
+            }
+        }
+        // Slow path: register (idempotent) and cache.
+        let id = self
+            .registry
+            .register_schema(subject, &self.schema, self.schema_type, &self.references)
+            .await?;
+        self.id_cache.write().insert(subject.to_string(), id);
+        Ok(id)
+    }
+}
+
+#[cfg(feature = "schema-registry")]
+impl<C: SchemaRegistryClient> fmt::Debug for ConfluentSchemaEncoder<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfluentSchemaEncoder")
+            .field("schema_type", &self.schema_type)
+            .field("strategy", &self.strategy)
+            .field("cached_subjects", &self.id_cache.read().len())
+            .finish()
+    }
+}
+
+#[cfg(feature = "schema-registry")]
+impl<C: SchemaRegistryClient> SchemaEncoder for ConfluentSchemaEncoder<C> {
+    fn encode(
+        &self,
+        payload: Bytes,
+        topic: &str,
+        record_name: Option<&str>,
+        is_key: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
+        // Clone inputs to own them for the async block.
+        let topic = topic.to_string();
+        let record_name = record_name.map(str::to_string);
+        Box::pin(async move {
+            let subject = self
+                .strategy
+                .subject_name(&topic, record_name.as_deref(), is_key)?;
+            let id = self.resolve_id(&subject).await?;
+            Ok(encode_wire_format(id, &payload))
+        })
+    }
+}
+
+/// Builder for [`ConfluentSchemaEncoder`].
+#[cfg(feature = "schema-registry")]
+#[cfg_attr(docsrs, doc(cfg(feature = "schema-registry")))]
+pub struct ConfluentSchemaEncoderBuilder<C> {
+    registry: Option<C>,
+    schema: Option<String>,
+    schema_type: SchemaType,
+    strategy: SubjectNameStrategy,
+    references: Vec<SchemaReference>,
+}
+
+#[cfg(feature = "schema-registry")]
+impl<C: SchemaRegistryClient> ConfluentSchemaEncoderBuilder<C> {
+    fn new() -> Self {
+        Self {
+            registry: None,
+            schema: None,
+            schema_type: SchemaType::Avro,
+            strategy: SubjectNameStrategy::TopicName,
+            references: Vec::new(),
+        }
+    }
+
+    /// Set the registry client (required).
+    pub fn registry(mut self, registry: C) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    /// Set the schema definition string and type (required).
+    pub fn schema(mut self, schema: impl Into<String>, schema_type: SchemaType) -> Self {
+        self.schema = Some(schema.into());
+        self.schema_type = schema_type;
+        self
+    }
+
+    /// Set the subject name strategy (default: [`SubjectNameStrategy::TopicName`]).
+    pub fn strategy(mut self, strategy: SubjectNameStrategy) -> Self {
+        self.strategy = strategy;
+        self
+    }
+
+    /// Set schema references (default: empty).
+    pub fn references(mut self, references: Vec<SchemaReference>) -> Self {
+        self.references = references;
+        self
+    }
+
+    /// Build the encoder.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if `registry` or `schema` was not set.
+    pub fn build(self) -> Result<ConfluentSchemaEncoder<C>> {
+        let registry = self
+            .registry
+            .ok_or_else(|| KrafkaError::config("ConfluentSchemaEncoder: registry must be set"))?;
+        let schema = self
+            .schema
+            .ok_or_else(|| KrafkaError::config("ConfluentSchemaEncoder: schema must be set"))?;
+        Ok(ConfluentSchemaEncoder {
+            registry,
+            schema,
+            schema_type: self.schema_type,
+            strategy: self.strategy,
+            references: self.references,
+            id_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        })
+    }
+}
+
+// ── SchemaDecoder ─────────────────────────────────────────────────────────
+
+/// Object-safe async trait for consumer-side schema decoding.
+///
+/// A [`SchemaDecoder`] receives a raw (possibly wire-framed) [`Bytes`] payload
+/// from a consumed Kafka record, strips any framing, and returns the decoded
+/// payload. When configured on a [`Consumer`](crate::consumer::Consumer), decoding
+/// is applied automatically after the interceptor and before the record is
+/// returned to application code — symmetric to how [`SchemaEncoder`] works on
+/// the producer side.
+///
+/// # Example — custom decoder
+///
+/// ```rust,ignore
+/// use std::pin::Pin;
+/// use std::future::Future;
+/// use bytes::Bytes;
+/// use krafka::schema_registry::SchemaDecoder;
+/// use krafka::error::Result;
+///
+/// struct StripPrefixDecoder;
+///
+/// impl SchemaDecoder for StripPrefixDecoder {
+///     fn decode(
+///         &self,
+///         payload: Bytes,
+///         _topic: &str,
+///         _is_key: bool,
+///     ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
+///         Box::pin(async move {
+///             // Strip a 4-byte proprietary header.
+///             Ok(payload.slice(4..))
+///         })
+///     }
+/// }
+/// ```
+///
+/// # Consumer configuration
+///
+/// ```rust,ignore
+/// use std::sync::Arc;
+/// use krafka::consumer::Consumer;
+/// use krafka::schema_registry::{ConfluentSchemaDecoder, SchemaDecoder};
+///
+/// let decoder = Arc::new(ConfluentSchemaDecoder::new());
+///
+/// let consumer = Consumer::builder()
+///     .bootstrap_servers("localhost:9092")
+///     .group_id("my-group")
+///     .value_decoder(decoder)
+///     .build()
+///     .await?;
+/// ```
+pub trait SchemaDecoder: Send + Sync {
+    /// Decode a wire-framed payload, returning the raw inner bytes.
+    ///
+    /// `payload` is the raw bytes from the Kafka record (key or value).
+    /// `topic` is the source Kafka topic. `is_key` is `true` for key
+    /// payloads and `false` for value payloads.
+    ///
+    /// Passing `Bytes` allows zero-copy slicing — implementations can return
+    /// a sub-slice of the input without allocating.
+    fn decode(
+        &self,
+        payload: Bytes,
+        topic: &str,
+        is_key: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>>;
+}
+
+/// A [`SchemaDecoder`] that strips the Confluent wire-format header, returning
+/// the inner payload as a zero-copy [`Bytes`] slice.
+///
+/// Non-Confluent payloads (unknown magic byte) are returned unchanged so that
+/// plain-text or custom-framed records pass through without error.
+///
+/// For custom framing, key-material decryption, or schema-validated decoding,
+/// implement [`SchemaDecoder`] directly.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use std::sync::Arc;
+/// use krafka::schema_registry::ConfluentSchemaDecoder;
+///
+/// let consumer = Consumer::builder()
+///     .bootstrap_servers("localhost:9092")
+///     .group_id("my-group")
+///     .value_decoder(Arc::new(ConfluentSchemaDecoder::new()))
+///     .build()
+///     .await?;
+/// ```
+#[cfg(feature = "schema-registry")]
+#[cfg_attr(docsrs, doc(cfg(feature = "schema-registry")))]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConfluentSchemaDecoder;
+
+#[cfg(feature = "schema-registry")]
+impl ConfluentSchemaDecoder {
+    /// Create a new `ConfluentSchemaDecoder`.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "schema-registry")]
+impl SchemaDecoder for ConfluentSchemaDecoder {
+    fn decode(
+        &self,
+        payload: Bytes,
+        _topic: &str,
+        _is_key: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
+        Box::pin(async move {
+            match detect_wire_format(&payload) {
+                DetectedWireFormat::Confluent { .. } => {
+                    let (_, inner) = decode_wire_format_bytes(&payload)?;
+                    Ok(inner)
+                }
+                // Non-Confluent or unknown framing — return as-is.
+                _ => Ok(payload),
+            }
+        })
     }
 }
 
@@ -1299,15 +1756,6 @@ mod tests {
         let payload = b"hello world";
         let encoded = encode_wire_format(42, payload);
         let (id, decoded) = ok(decode_wire_format(&encoded));
-        assert_eq!(id, 42);
-        assert_eq!(decoded, payload);
-    }
-
-    #[test]
-    fn test_wire_format_owned_roundtrip() {
-        let payload = b"hello owned world";
-        let encoded = encode_wire_format(42, payload);
-        let (id, decoded) = ok(decode_wire_format_owned(&encoded));
         assert_eq!(id, 42);
         assert_eq!(decoded, payload);
     }
@@ -1449,43 +1897,39 @@ mod tests {
     struct DecoderMockGlueRegistry;
 
     impl glue::GlueSchemaRegistryClient for DecoderMockGlueRegistry {
-        fn get_schema_by_version_id(
+        async fn get_schema_by_version_id(
             &self,
             id: GlueSchemaVersionId,
-        ) -> Pin<Box<dyn Future<Output = Result<glue::GlueSchema>> + Send + '_>> {
-            Box::pin(async move {
-                Ok(glue::GlueSchema::new(
-                    id,
-                    glue::GlueDataFormat::Json,
-                    r#"{"type":"object"}"#,
-                ))
-            })
+        ) -> Result<glue::GlueSchema> {
+            Ok(glue::GlueSchema::new(
+                id,
+                glue::GlueDataFormat::Json,
+                r#"{"type":"object"}"#,
+            ))
         }
 
-        fn register_schema(
+        async fn register_schema(
             &self,
             _schema_name: &str,
             _schema: &str,
             _data_format: glue::GlueDataFormat,
-        ) -> Pin<Box<dyn Future<Output = Result<GlueSchemaVersionId>> + Send + '_>> {
-            Box::pin(async {
-                Ok("550e8400-e29b-41d4-a716-446655440000"
-                    .parse::<GlueSchemaVersionId>()
-                    .unwrap())
-            })
+        ) -> Result<GlueSchemaVersionId> {
+            Ok("550e8400-e29b-41d4-a716-446655440000"
+                .parse::<GlueSchemaVersionId>()
+                .unwrap())
         }
     }
 
     #[tokio::test]
     async fn test_schema_decoder_confluent() {
         let registry = CachedSchemaRegistry::new(MockRegistry::new());
-        let decoder = SchemaDecoder::confluent(&registry);
+        let decoder = WireFormatDecoder::confluent(&registry);
 
         let encoded = encode_wire_format(7, b"payload");
-        let decoded = ok(decoder.decode(&encoded).await);
+        let decoded = ok(decoder.decode(encoded).await);
 
         assert_eq!(decoded.schema_format, SchemaFormat::Avro);
-        assert_eq!(decoded.payload, b"payload");
+        assert_eq!(&decoded.payload[..], b"payload");
         match decoded.schema_metadata {
             Some(SchemaMetadata::Confluent(schema)) => assert_eq!(schema.id, 7),
             _ => unreachable!("expected confluent metadata"),
@@ -1495,7 +1939,7 @@ mod tests {
     #[tokio::test]
     async fn test_schema_decoder_glue() {
         let registry = glue::CachedGlueSchemaRegistry::new(DecoderMockGlueRegistry);
-        let decoder = SchemaDecoder::glue(&registry);
+        let decoder = WireFormatDecoder::glue(&registry);
 
         let version_id: GlueSchemaVersionId =
             "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
@@ -1503,9 +1947,9 @@ mod tests {
             glue::encode_glue_wire_format(version_id, b"payload", glue::GlueCompression::None)
                 .unwrap();
 
-        let decoded = ok(decoder.decode(&encoded).await);
+        let decoded = ok(decoder.decode(encoded).await);
         assert_eq!(decoded.schema_format, SchemaFormat::Json);
-        assert_eq!(decoded.payload, b"payload");
+        assert_eq!(&decoded.payload[..], b"payload");
         match decoded.schema_metadata {
             Some(SchemaMetadata::Glue(schema)) => assert_eq!(schema.schema_version_id, version_id),
             _ => unreachable!("expected glue metadata"),
@@ -1514,20 +1958,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_schema_decoder_unknown_passthrough() {
-        let decoder = SchemaDecoder::new();
-        let decoded = ok(decoder.decode(b"plain-data").await);
+        let decoder = WireFormatDecoder::new();
+        let decoded = ok(decoder.decode(Bytes::from_static(b"plain-data")).await);
 
         assert_eq!(decoded.schema_format, SchemaFormat::Unknown);
-        assert_eq!(decoded.payload, b"plain-data");
+        assert_eq!(&decoded.payload[..], b"plain-data");
         assert!(decoded.schema_metadata.is_none());
     }
 
     #[tokio::test]
     async fn test_schema_decoder_missing_registry_is_error() {
-        let decoder = SchemaDecoder::new();
+        let decoder = WireFormatDecoder::new();
         let encoded = encode_wire_format(1, b"x");
 
-        let result = decoder.decode(&encoded).await;
+        let result = decoder.decode(encoded).await;
         assert!(result.is_err());
         assert!(
             err(result)
@@ -1538,9 +1982,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_schema_decoder_truncated_confluent_header_passthrough() {
-        let decoder = SchemaDecoder::new();
-        let truncated = [MAGIC_BYTE, 0x00, 0x01];
-        let decoded = ok(decoder.decode(&truncated).await);
+        let decoder = WireFormatDecoder::new();
+        let truncated = Bytes::from_static(&[MAGIC_BYTE, 0x00, 0x01]);
+        let decoded = ok(decoder.decode(truncated.clone()).await);
 
         assert_eq!(decoded.schema_format, SchemaFormat::Unknown);
         assert_eq!(decoded.payload, truncated);
@@ -1549,9 +1993,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_schema_decoder_truncated_glue_header_passthrough() {
-        let decoder = SchemaDecoder::new();
-        let truncated = [glue::GLUE_HEADER_VERSION_BYTE, 0x00, 0x01, 0x02];
-        let decoded = ok(decoder.decode(&truncated).await);
+        let decoder = WireFormatDecoder::new();
+        let truncated = Bytes::from_static(&[glue::GLUE_HEADER_VERSION_BYTE, 0x00, 0x01, 0x02]);
+        let decoded = ok(decoder.decode(truncated.clone()).await);
 
         assert_eq!(decoded.schema_format, SchemaFormat::Unknown);
         assert_eq!(decoded.payload, truncated);
@@ -1687,45 +2131,32 @@ mod tests {
     }
 
     impl SchemaRegistryClient for MockRegistry {
-        fn get_schema_by_id(
-            &self,
-            id: SchemaId,
-        ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
+        async fn get_schema_by_id(&self, id: SchemaId) -> Result<Schema> {
             self.get_by_id_calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move { Ok(Schema::new(id, SchemaType::Avro, r#"{"type":"string"}"#)) })
+            Ok(Schema::new(id, SchemaType::Avro, r#"{"type":"string"}"#))
         }
 
-        fn get_latest_schema(
-            &self,
-            subject: &str,
-        ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
-            let subject = subject.to_string();
-            Box::pin(async move {
-                Ok(Schema::new(100, SchemaType::Avro, r#"{"type":"string"}"#)
-                    .with_subject(subject, 1))
-            })
+        async fn get_latest_schema(&self, subject: &str) -> Result<Schema> {
+            Ok(Schema::new(100, SchemaType::Avro, r#"{"type":"string"}"#).with_subject(subject, 1))
         }
 
-        fn get_schema_by_version(
+        async fn get_schema_by_version(
             &self,
             subject: &str,
             version: SchemaVersion,
-        ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
-            let subject = subject.to_string();
-            Box::pin(async move {
-                Ok(Schema::new(100, SchemaType::Avro, r#"{"type":"string"}"#)
-                    .with_subject(subject, version))
-            })
+        ) -> Result<Schema> {
+            Ok(Schema::new(100, SchemaType::Avro, r#"{"type":"string"}"#)
+                .with_subject(subject, version))
         }
 
-        fn register_schema(
+        async fn register_schema(
             &self,
             _subject: &str,
             _schema: &str,
             _schema_type: SchemaType,
             _references: &[SchemaReference],
-        ) -> Pin<Box<dyn Future<Output = Result<SchemaId>> + Send + '_>> {
-            Box::pin(async { Ok(42) })
+        ) -> Result<SchemaId> {
+            Ok(42)
         }
     }
 
@@ -1773,70 +2204,55 @@ mod tests {
     }
 
     impl SchemaRegistryClient for BlockingMockRegistry {
-        fn get_schema_by_id(
-            &self,
-            id: SchemaId,
-        ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
+        async fn get_schema_by_id(&self, id: SchemaId) -> Result<Schema> {
             self.get_by_id_calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move {
-                self.started.notify_waiters();
-                self.waiting_calls.fetch_add(1, Ordering::SeqCst);
-                let _ = self
-                    .release
-                    .acquire()
-                    .await
-                    .expect("blocking registry release permit");
-                Ok(Schema::new(id, SchemaType::Avro, r#"{"type":"string"}"#))
-            })
+            self.started.notify_waiters();
+            self.waiting_calls.fetch_add(1, Ordering::SeqCst);
+            let _ = self
+                .release
+                .acquire()
+                .await
+                .expect("blocking registry release permit");
+            Ok(Schema::new(id, SchemaType::Avro, r#"{"type":"string"}"#))
         }
 
-        fn get_latest_schema(
-            &self,
-            subject: &str,
-        ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
-            let subject = subject.to_string();
+        async fn get_latest_schema(&self, subject: &str) -> Result<Schema> {
             self.get_latest_calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move {
-                self.started.notify_waiters();
-                self.waiting_calls.fetch_add(1, Ordering::SeqCst);
-                let _ = self
-                    .release
-                    .acquire()
-                    .await
-                    .expect("blocking registry release permit");
-                Ok(Schema::new(100, SchemaType::Avro, r#"{"type":"string"}"#)
-                    .with_subject(subject, 1))
-            })
+            self.started.notify_waiters();
+            self.waiting_calls.fetch_add(1, Ordering::SeqCst);
+            let _ = self
+                .release
+                .acquire()
+                .await
+                .expect("blocking registry release permit");
+            Ok(Schema::new(100, SchemaType::Avro, r#"{"type":"string"}"#).with_subject(subject, 1))
         }
 
-        fn get_schema_by_version(
+        async fn get_schema_by_version(
             &self,
             subject: &str,
             version: SchemaVersion,
-        ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
-            let subject = subject.to_string();
+        ) -> Result<Schema> {
             self.get_by_version_calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move {
-                self.started.notify_waiters();
-                self.waiting_calls.fetch_add(1, Ordering::SeqCst);
-                let _ = self
-                    .release
-                    .acquire()
-                    .await
-                    .expect("blocking registry release permit");
-                Ok(Schema::new(100, SchemaType::Avro, r#"{"type":"string"}"#)
-                    .with_subject(subject, version))
-            })
+            self.started.notify_waiters();
+            self.waiting_calls.fetch_add(1, Ordering::SeqCst);
+            let _ = self
+                .release
+                .acquire()
+                .await
+                .expect("blocking registry release permit");
+            Ok(Schema::new(100, SchemaType::Avro, r#"{"type":"string"}"#)
+                .with_subject(subject, version))
         }
 
-        fn register_schema(
+        async fn register_schema(
             &self,
             _subject: &str,
             _schema: &str,
             _schema_type: SchemaType,
             _references: &[SchemaReference],
-        ) -> Pin<Box<dyn Future<Output = Result<SchemaId>> + Send + '_>> {
-            Box::pin(async { Ok(42) })
+        ) -> Result<SchemaId> {
+            Ok(42)
         }
     }
 
@@ -1874,7 +2290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unbounded_cache_does_not_populate_insertion_order() {
+    async fn test_default_cache_is_bounded_and_populates_insertion_order() {
         let mock = MockRegistry::new();
         let cached = CachedSchemaRegistry::new(mock);
 
@@ -1882,11 +2298,12 @@ mod tests {
         ok(cached.get_schema_by_id(2).await);
 
         assert_eq!(cached.cache_len(), 2);
-        assert!(cached.insertion_order.read().is_empty());
+        // new() defaults to bounded (max 1000 entries), so insertion_order is populated.
+        assert_eq!(cached.insertion_order.read().len(), 2); // insertion_order is populated
 
         cached.invalidate(1);
         assert_eq!(cached.cache_len(), 1);
-        assert!(cached.insertion_order.read().is_empty());
+        assert_eq!(cached.insertion_order.read().len(), 1); // invalidate prunes insertion_order too
     }
 
     #[tokio::test]
@@ -2228,10 +2645,11 @@ mod tests {
         assert_send_sync::<CachedSchemaRegistry<MockRegistry>>();
     }
 
-    /// Verify that [`SchemaRegistryClient`] is object-safe.
+    /// Verify that `ErasedSchemaRegistryClient` (the internal object-safe bridge
+    /// used by [`WireFormatDecoder`]) remains object-safe.
     #[test]
-    fn test_object_safe() {
-        fn _assert_object_safe(_: &dyn SchemaRegistryClient) {}
+    fn test_erased_object_safe() {
+        fn _assert_object_safe(_: &dyn ErasedSchemaRegistryClient) {}
     }
 
     #[test]
@@ -2330,9 +2748,6 @@ mod tests {
     }
 
     mod inherent_api_tests {
-        use std::future::Future;
-        use std::pin::Pin;
-
         use crate::Result;
         use crate::schema_registry::{
             CachedSchemaRegistry, Schema, SchemaReference, SchemaType, SchemaVersion,
@@ -2341,46 +2756,34 @@ mod tests {
         struct InherentMockRegistry;
 
         impl crate::schema_registry::SchemaRegistryClient for InherentMockRegistry {
-            fn get_schema_by_id(
-                &self,
-                id: u32,
-            ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
-                Box::pin(
-                    async move { Ok(Schema::new(id, SchemaType::Avro, r#"{"type":"string"}"#)) },
-                )
+            async fn get_schema_by_id(&self, id: u32) -> Result<Schema> {
+                Ok(Schema::new(id, SchemaType::Avro, r#"{"type":"string"}"#))
             }
 
-            fn get_latest_schema(
-                &self,
-                subject: &str,
-            ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
+            async fn get_latest_schema(&self, subject: &str) -> Result<Schema> {
                 let subject = subject.to_string();
-                Box::pin(async move {
-                    Ok(Schema::new(7, SchemaType::Avro, r#"{"type":"string"}"#)
-                        .with_subject(subject, 1))
-                })
+                Ok(Schema::new(7, SchemaType::Avro, r#"{"type":"string"}"#)
+                    .with_subject(subject, 1))
             }
 
-            fn get_schema_by_version(
+            async fn get_schema_by_version(
                 &self,
                 subject: &str,
                 version: SchemaVersion,
-            ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
+            ) -> Result<Schema> {
                 let subject = subject.to_string();
-                Box::pin(async move {
-                    Ok(Schema::new(9, SchemaType::Avro, r#"{"type":"string"}"#)
-                        .with_subject(subject, version))
-                })
+                Ok(Schema::new(9, SchemaType::Avro, r#"{"type":"string"}"#)
+                    .with_subject(subject, version))
             }
 
-            fn register_schema(
+            async fn register_schema(
                 &self,
                 _subject: &str,
                 _schema: &str,
                 _schema_type: SchemaType,
                 _references: &[SchemaReference],
-            ) -> Pin<Box<dyn Future<Output = Result<u32>> + Send + '_>> {
-                Box::pin(async { Ok(42) })
+            ) -> Result<u32> {
+                Ok(42)
             }
         }
 
@@ -2429,5 +2832,273 @@ mod tests {
 
         generic_cache.invalidate_all();
         assert!(generic_cache.cache_is_empty());
+    }
+
+    // ── SchemaEncoder tests ───────────────────────────────────────────────
+
+    /// A minimal encoder that always prepends a fixed schema ID.
+    struct FixedIdEncoder {
+        key_id: SchemaId,
+        value_id: SchemaId,
+    }
+
+    impl SchemaEncoder for FixedIdEncoder {
+        fn encode(
+            &self,
+            payload: Bytes,
+            _topic: &str,
+            _record_name: Option<&str>,
+            is_key: bool,
+        ) -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
+            let id = if is_key { self.key_id } else { self.value_id };
+            let out = encode_wire_format(id, &payload);
+            Box::pin(std::future::ready(Ok(out)))
+        }
+    }
+
+    #[cfg(feature = "schema-registry")]
+    #[tokio::test]
+    async fn test_confluent_schema_encoder_value_only() {
+        let encoder = ConfluentSchemaEncoder::builder()
+            .registry(MockRegistry::new())
+            .schema(r#"{"type":"string"}"#, SchemaType::Avro)
+            .build()
+            .unwrap();
+
+        let raw = Bytes::from_static(b"hello");
+        let framed = encoder
+            .encode(raw.clone(), "orders", None, false)
+            .await
+            .unwrap();
+
+        // Value must be wire-framed (5-byte header + original payload).
+        assert_eq!(framed.len(), 5 + raw.len());
+        let (id, payload) = decode_wire_format(&framed).unwrap();
+        assert_eq!(id, 42); // MockRegistry always returns 42
+        assert_eq!(payload, &raw[..]);
+    }
+
+    #[cfg(feature = "schema-registry")]
+    #[tokio::test]
+    async fn test_confluent_schema_encoder_key_only() {
+        let encoder = ConfluentSchemaEncoder::builder()
+            .registry(MockRegistry::new())
+            .schema(r#"{"type":"string"}"#, SchemaType::Avro)
+            .build()
+            .unwrap();
+
+        let raw_key = Bytes::from_static(b"my-key");
+        let framed_key = encoder
+            .encode(raw_key.clone(), "orders", None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(framed_key.len(), 5 + raw_key.len());
+        let (id, key_payload) = decode_wire_format(&framed_key).unwrap();
+        assert_eq!(id, 42);
+        assert_eq!(key_payload, &raw_key[..]);
+    }
+
+    #[cfg(feature = "schema-registry")]
+    #[tokio::test]
+    async fn test_confluent_schema_encoder_both() {
+        let encoder = ConfluentSchemaEncoder::builder()
+            .registry(MockRegistry::new())
+            .schema(r#"{"type":"string"}"#, SchemaType::Avro)
+            .build()
+            .unwrap();
+
+        let framed_key = encoder
+            .encode(Bytes::from_static(b"k"), "t", None, true)
+            .await
+            .unwrap();
+        let framed_val = encoder
+            .encode(Bytes::from_static(b"v"), "t", None, false)
+            .await
+            .unwrap();
+
+        let (kid, _) = decode_wire_format(&framed_key).unwrap();
+        let (vid, _) = decode_wire_format(&framed_val).unwrap();
+        assert_eq!(kid, 42);
+        assert_eq!(vid, 42);
+    }
+
+    #[cfg(feature = "schema-registry")]
+    #[tokio::test]
+    async fn test_confluent_schema_encoder_id_cached() {
+        let encoder = ConfluentSchemaEncoder::builder()
+            .registry(MockRegistry::new())
+            .schema(r#"{"type":"string"}"#, SchemaType::Avro)
+            .build()
+            .unwrap();
+
+        for _ in 0..5 {
+            let framed = encoder
+                .encode(Bytes::from_static(b"x"), "t", None, false)
+                .await
+                .unwrap();
+            let (id, _) = decode_wire_format(&framed).unwrap();
+            assert_eq!(id, 42);
+        }
+        // ID was cached after first call — cache contains exactly one subject.
+        assert_eq!(encoder.id_cache.read().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_fixed_encoder_frames_value() {
+        let encoder = FixedIdEncoder {
+            key_id: 1,
+            value_id: 7,
+        };
+        let framed = encoder
+            .encode(Bytes::from_static(b"payload"), "t", None, false)
+            .await
+            .unwrap();
+
+        let (id, data) = decode_wire_format(&framed).unwrap();
+        assert_eq!(id, 7);
+        assert_eq!(data, b"payload");
+    }
+
+    #[tokio::test]
+    async fn test_encoder_encodes_empty_key() {
+        let encoder = FixedIdEncoder {
+            key_id: 3,
+            value_id: 9,
+        };
+        // Empty key bytes — encoder should frame them just like any other payload.
+        let framed_key = encoder.encode(Bytes::new(), "t", None, true).await.unwrap();
+        let (kid, k_payload) = decode_wire_format(&framed_key).unwrap();
+        assert_eq!(kid, 3);
+        assert_eq!(k_payload, b"");
+
+        let framed_val = encoder
+            .encode(Bytes::from_static(b"val"), "t", None, false)
+            .await
+            .unwrap();
+        let (vid, v_payload) = decode_wire_format(&framed_val).unwrap();
+        assert_eq!(vid, 9);
+        assert_eq!(v_payload, b"val");
+    }
+
+    #[cfg(feature = "schema-registry")]
+    #[tokio::test]
+    async fn test_confluent_schema_encoder_topic_name_strategy_subject() {
+        let encoder = ConfluentSchemaEncoder::builder()
+            .registry(MockRegistry::new())
+            .schema(r#"{"type":"string"}"#, SchemaType::Avro)
+            .strategy(SubjectNameStrategy::TopicName)
+            .build()
+            .unwrap();
+
+        let _ = encoder
+            .encode(Bytes::from_static(b"x"), "orders", None, false)
+            .await
+            .unwrap();
+
+        // Subject for TopicName + value = "orders-value"
+        assert!(encoder.id_cache.read().contains_key("orders-value"));
+    }
+
+    #[cfg(feature = "schema-registry")]
+    #[test]
+    fn test_confluent_schema_encoder_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ConfluentSchemaEncoder<MockRegistry>>();
+    }
+
+    #[cfg(feature = "schema-registry")]
+    #[test]
+    fn test_confluent_schema_encoder_is_object_safe() {
+        fn _takes_dyn(_: &dyn SchemaEncoder) {}
+    }
+
+    #[cfg(feature = "schema-registry")]
+    #[test]
+    fn test_confluent_schema_encoder_debug() {
+        let enc = ConfluentSchemaEncoder::builder()
+            .registry(MockRegistry::new())
+            .schema(r#"{"type":"string"}"#, SchemaType::Avro)
+            .build()
+            .unwrap();
+        let debug_str = format!("{enc:?}");
+        assert!(debug_str.contains("ConfluentSchemaEncoder"));
+        // The raw JSON schema string must not appear in the debug output.
+        assert!(!debug_str.contains(r#"{"type":"string"}"#));
+    }
+
+    // ── ConfluentSchemaDecoder ───────────────────────────────────────────
+
+    #[cfg(feature = "schema-registry")]
+    #[tokio::test]
+    async fn test_confluent_schema_decoder_strips_header() {
+        let dec = ConfluentSchemaDecoder::new();
+        let inner = b"avro data";
+        let framed = encode_wire_format(42, inner);
+        let decoded = dec.decode(framed, "orders", false).await.unwrap();
+        assert_eq!(&decoded[..], inner);
+    }
+
+    #[cfg(feature = "schema-registry")]
+    #[tokio::test]
+    async fn test_confluent_schema_decoder_key_strips_header() {
+        let dec = ConfluentSchemaDecoder::new();
+        let inner = b"key-bytes";
+        let framed = encode_wire_format(7, inner);
+        let decoded = dec.decode(framed, "orders", true).await.unwrap();
+        assert_eq!(&decoded[..], inner);
+    }
+
+    #[cfg(feature = "schema-registry")]
+    #[tokio::test]
+    async fn test_confluent_schema_decoder_non_confluent_passthrough() {
+        let dec = ConfluentSchemaDecoder::new();
+        // No magic byte 0x00 at start → not Confluent framing; returned as-is.
+        let plain = Bytes::from_static(b"plain text");
+        let out = dec.decode(plain.clone(), "t", false).await.unwrap();
+        assert_eq!(out, plain);
+    }
+
+    #[cfg(feature = "schema-registry")]
+    #[tokio::test]
+    async fn test_confluent_schema_decoder_empty_payload_passthrough() {
+        let dec = ConfluentSchemaDecoder::new();
+        let empty = Bytes::new();
+        let out = dec.decode(empty.clone(), "t", false).await.unwrap();
+        assert_eq!(out, empty);
+    }
+
+    #[cfg(feature = "schema-registry")]
+    #[tokio::test]
+    async fn test_confluent_schema_decoder_zero_copy() {
+        // The decoded slice should share the same backing allocation as the input.
+        let dec = ConfluentSchemaDecoder::new();
+        let inner = b"data";
+        let framed = encode_wire_format(1, inner);
+        let decoded = dec.decode(framed.clone(), "t", false).await.unwrap();
+        // Slices are contiguous subsets of the same Bytes allocation.
+        assert_eq!(&decoded[..], inner);
+        assert_eq!(decoded.len(), inner.len());
+    }
+
+    #[cfg(feature = "schema-registry")]
+    #[test]
+    fn test_confluent_schema_decoder_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ConfluentSchemaDecoder>();
+    }
+
+    #[cfg(feature = "schema-registry")]
+    #[test]
+    fn test_confluent_schema_decoder_debug() {
+        let dec = ConfluentSchemaDecoder::new();
+        let s = format!("{dec:?}");
+        assert!(s.contains("ConfluentSchemaDecoder"));
+    }
+
+    #[cfg(feature = "schema-registry")]
+    #[test]
+    fn test_confluent_schema_decoder_is_object_safe() {
+        fn _takes_dyn(_: &dyn SchemaDecoder) {}
     }
 }

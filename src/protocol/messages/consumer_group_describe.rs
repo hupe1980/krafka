@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_string};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::primitives::{Decode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{check_compact_array_len, encode_compact_array_len};
 
@@ -124,7 +124,10 @@ impl ConsumerGroupDescribeResponse {
         for _ in 0..tp_count {
             let mut topic_id = [0u8; 16];
             if buf.remaining() < 16 {
-                return Err(KrafkaError::protocol("short buf for topic_id"));
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::TruncatedFrame,
+                    "short buf for topic_id",
+                ));
             }
             buf.copy_to_slice(&mut topic_id);
             let topic_name =

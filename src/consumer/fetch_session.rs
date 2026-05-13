@@ -7,20 +7,64 @@
 //! A per-broker `FetchSessionState` tracks:
 //! - `session_id` (returned by the broker) and `session_epoch` (maintained by
 //!   the client)
-//! - The set of partitions (with their fetch offsets and parameters) that
-//!   are currently registered in the session
+//! - The set of topics/partitions (with their fetch offsets and parameters)
+//!   that are currently registered in the session
 //!
 //! On each fetch cycle the consumer computes a diff against the previous
 //! session state and sends only the new/changed partitions in the `topics`
 //! field plus any removed partitions in the `forgotten_topics` field.
+//!
+//! ## Topic keying (KIP-227 + KIP-516)
+//!
+//! When the broker supports Fetch v13+, each topic carries a 128-bit UUID
+//! (`topic_id`). When a non-zero UUID is present the session uses it as the
+//! primary key for the internal state map, reducing per-poll diff lookups
+//! from variable-length string comparisons to fixed 16-byte equality tests.
+//! Fallback to name-based keys is automatic when UUIDs are unavailable
+//! (Fetch ≤ v12 or zero UUID).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::protocol::{FetchForgottenTopic, FetchPartitionRequest, FetchTopicRequest};
 use crate::{BrokerId, PartitionId};
 
 /// Epoch value indicating the initial (full) fetch.
 pub const INITIAL_EPOCH: i32 = 0;
+
+/// All-zeroes UUID sentinel — indicates "no UUID" in Kafka wire protocol.
+const ZERO_UUID: [u8; 16] = [0u8; 16];
+
+/// Internal key used to track a topic inside a fetch session.
+///
+/// When the broker provides a non-zero `topic_id` (Fetch v13+), the UUID is
+/// used directly, enabling O(1) diff lookups with 16-byte fixed-size keys.
+/// When no UUID is available the topic name is used as a fallback.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SessionKey {
+    /// Topic name (Fetch v12 and below, or zero UUID).
+    Name(String),
+    /// Topic UUID (Fetch v13+).
+    Uuid([u8; 16]),
+}
+
+impl SessionKey {
+    fn from_request(topic: &FetchTopicRequest) -> Self {
+        match topic.topic_id {
+            Some(id) if id != ZERO_UUID => Self::Uuid(id),
+            _ => Self::Name(topic.topic.clone()),
+        }
+    }
+}
+
+/// Tracked state for one topic inside a fetch session.
+#[derive(Debug)]
+struct TopicSession {
+    /// Topic name — always stored so wire requests can be built correctly
+    /// even when the primary session key is a UUID.
+    name: String,
+    /// Per-partition fetch state.
+    partitions: HashMap<PartitionId, PartitionState>,
+}
 
 /// Snapshot of partition fetch parameters, used to detect changes between
 /// consecutive fetches so that incremental requests only carry deltas.
@@ -44,10 +88,13 @@ pub struct FetchSessionState {
     session_id: i32,
     /// Current epoch.
     epoch: i32,
-    /// Partitions currently registered in the session, keyed by
-    /// topic → partition → state. Nested map avoids cloning topic strings
-    /// per partition on every update.
-    partitions: HashMap<String, HashMap<PartitionId, PartitionState>>,
+    /// Topics currently registered in the session.
+    ///
+    /// Keyed by [`SessionKey::Uuid`] when a non-zero `topic_id` is available
+    /// (Fetch v13+), otherwise by [`SessionKey::Name`].  Both variants map to
+    /// a [`TopicSession`] which retains the human-readable topic name so that
+    /// wire requests can be constructed correctly regardless of key type.
+    topics: HashMap<SessionKey, TopicSession>,
 }
 
 /// The result of computing a fetch request from session state.
@@ -72,7 +119,7 @@ impl FetchSessionState {
             broker_id,
             session_id: 0,
             epoch: INITIAL_EPOCH,
-            partitions: HashMap::new(),
+            topics: HashMap::new(),
         }
     }
 
@@ -98,28 +145,21 @@ impl FetchSessionState {
 
     #[cfg(test)]
     pub fn partition_count(&self) -> usize {
-        self.partitions.values().map(|m| m.len()).sum()
+        self.topics.values().map(|t| t.partitions.len()).sum()
     }
 
     /// Build the fetch request parameters by computing the diff between the
     /// desired partition set and the current session state.
+    ///
+    /// When the supplied topics carry non-zero `topic_id` values (Fetch v13+),
+    /// the diff uses 16-byte UUID keys for O(1) lookup.  For Fetch ≤ v12 the
+    /// fallback is topic-name keys, identical to the prior behaviour.
     ///
     /// Returns a `FetchSessionRequest` containing:
     /// - `session_id` / `session_epoch` to set on the wire
     /// - `topics` with only new/changed partitions (or all if full fetch)
     /// - `forgotten_topics` with removed partitions
     pub fn build_request(&self, desired: &[FetchTopicRequest]) -> FetchSessionRequest {
-        // Build a flat set of the desired partitions for fast lookup.
-        // Keys borrow topic strings from `desired` to avoid per-poll cloning.
-        let total_partitions: usize = desired.iter().map(|t| t.partitions.len()).sum();
-        let mut desired_map: HashMap<(&str, PartitionId), &FetchPartitionRequest> =
-            HashMap::with_capacity(total_partitions);
-        for topic in desired {
-            for part in &topic.partitions {
-                desired_map.insert((topic.topic.as_str(), part.partition), part);
-            }
-        }
-
         if !self.has_session() {
             // No established session → full fetch (epoch 0).
             return FetchSessionRequest {
@@ -136,49 +176,104 @@ impl FetchSessionState {
         // it is bumped by update_from_response() after a successful response.
         let epoch = self.epoch;
 
+        // Build a keyed map of the desired partitions for O(1) lookup.
+        // Key matches the scheme used to store session state: UUID when
+        // available, topic name otherwise.
+        let total: usize = desired.iter().map(|t| t.partitions.len()).sum();
+        let mut desired_map: HashMap<SessionKey, HashMap<PartitionId, &FetchPartitionRequest>> =
+            HashMap::with_capacity(desired.len());
+        for topic in desired {
+            let key = SessionKey::from_request(topic);
+            let part_map = desired_map.entry(key).or_default();
+            part_map.reserve(topic.partitions.len());
+            for part in &topic.partitions {
+                part_map.insert(part.partition, part);
+            }
+        }
+        let _ = total; // capacity hint used above
+
         // 1. Find new or changed partitions.
         let mut changed: HashMap<&str, Vec<FetchPartitionRequest>> = HashMap::new();
-        for (&(topic, partition), req) in &desired_map {
-            let is_new_or_changed = match self.partitions.get(topic).and_then(|m| m.get(&partition))
-            {
-                None => true, // New partition.
-                Some(prev) => {
-                    prev.fetch_offset != req.fetch_offset
-                        || prev.partition_max_bytes != req.partition_max_bytes
+        for topic in desired {
+            let key = SessionKey::from_request(topic);
+            let session_topic = self.topics.get(&key);
+            for part in &topic.partitions {
+                let is_new_or_changed =
+                    match session_topic.and_then(|t| t.partitions.get(&part.partition)) {
+                        None => true,
+                        Some(prev) => {
+                            prev.fetch_offset != part.fetch_offset
+                                || prev.partition_max_bytes != part.partition_max_bytes
+                        }
+                    };
+                if is_new_or_changed {
+                    changed
+                        .entry(topic.topic.as_str())
+                        .or_default()
+                        .push(part.clone());
                 }
-            };
-            if is_new_or_changed {
-                changed.entry(topic).or_default().push((*req).clone());
             }
         }
 
-        // 2. Find removed partitions.
+        // 2. Find removed topics/partitions.
+        let desired_keys: HashSet<SessionKey> =
+            desired.iter().map(SessionKey::from_request).collect();
         let mut forgotten_map: HashMap<&str, Vec<i32>> = HashMap::new();
-        for (topic, partitions) in &self.partitions {
-            for &partition in partitions.keys() {
-                if !desired_map.contains_key(&(topic.as_str(), partition)) {
+        for (key, session_topic) in &self.topics {
+            if desired_keys.contains(key) {
+                // Topic still present — check for removed partitions.
+                let desired_parts = desired_map.get(key);
+                for &partition in session_topic.partitions.keys() {
+                    let still_wanted = desired_parts.and_then(|m| m.get(&partition)).is_some();
+                    if !still_wanted {
+                        forgotten_map
+                            .entry(session_topic.name.as_str())
+                            .or_default()
+                            .push(partition);
+                    }
+                }
+            } else {
+                // Entire topic removed.
+                let parts: Vec<i32> = session_topic.partitions.keys().copied().collect();
+                if !parts.is_empty() {
                     forgotten_map
-                        .entry(topic.as_str())
+                        .entry(session_topic.name.as_str())
                         .or_default()
-                        .push(partition);
+                        .extend(parts);
                 }
             }
         }
+
+        // Build a name → UUID lookup so we can set `topic_id` correctly in both
+        // the changed-topics and forgotten-topics lists.
+        //
+        // KIP-516: when Fetch v13+ sessions are keyed by UUID the broker uses
+        // `topic_id` as the primary key; sending `topic_id: None` in incremental
+        // or forgotten-topic entries causes the broker to treat those entries as
+        // name-keyed, silently mismatching the UUID-keyed session state.
+        let name_to_uuid: HashMap<&str, [u8; 16]> = desired
+            .iter()
+            .filter_map(|t| {
+                t.topic_id
+                    .filter(|id| *id != ZERO_UUID)
+                    .map(|id| (t.topic.as_str(), id))
+            })
+            .collect();
 
         let topics: Vec<FetchTopicRequest> = changed
             .into_iter()
-            .map(|(topic, partitions)| FetchTopicRequest {
-                topic: topic.to_string(),
-                topic_id: None,
+            .map(|(name, partitions)| FetchTopicRequest {
+                topic: name.to_string(),
+                topic_id: name_to_uuid.get(name).copied(),
                 partitions,
             })
             .collect();
 
         let forgotten_topics: Vec<FetchForgottenTopic> = forgotten_map
             .into_iter()
-            .map(|(topic, partitions)| FetchForgottenTopic {
-                topic: topic.to_string(),
-                topic_id: None,
+            .map(|(name, partitions)| FetchForgottenTopic {
+                topic: name.to_string(),
+                topic_id: name_to_uuid.get(name).copied(),
                 partitions,
             })
             .collect();
@@ -199,7 +294,7 @@ impl FetchSessionState {
     /// - If the broker returned `session_id == 0`, the session was closed.
     ///
     /// `desired` is the full partition list the consumer requested this cycle,
-    /// used to rebuild the tracked partition set.
+    /// used to rebuild the tracked topic/partition set.
     pub fn update_from_response(
         &mut self,
         response_session_id: i32,
@@ -215,13 +310,14 @@ impl FetchSessionState {
         self.session_id = response_session_id;
         self.epoch = self.next_epoch();
 
-        // Rebuild tracked partition set from the full desired list.
+        // Rebuild tracked topic/partition set from the full desired list.
         // This ensures our state matches what the broker tracked.
-        self.partitions.clear();
+        self.topics.clear();
         for topic in desired {
-            let topic_map = self.partitions.entry(topic.topic.clone()).or_default();
+            let key = SessionKey::from_request(topic);
+            let mut partitions = HashMap::with_capacity(topic.partitions.len());
             for part in &topic.partitions {
-                topic_map.insert(
+                partitions.insert(
                     part.partition,
                     PartitionState {
                         fetch_offset: part.fetch_offset,
@@ -229,6 +325,13 @@ impl FetchSessionState {
                     },
                 );
             }
+            self.topics.insert(
+                key,
+                TopicSession {
+                    name: topic.topic.clone(),
+                    partitions,
+                },
+            );
         }
     }
 
@@ -237,7 +340,7 @@ impl FetchSessionState {
     pub fn reset(&mut self) {
         self.session_id = 0;
         self.epoch = INITIAL_EPOCH;
-        self.partitions.clear();
+        self.topics.clear();
     }
 
     fn next_epoch(&self) -> i32 {
@@ -286,9 +389,14 @@ impl FetchSessionCache {
     }
 
     /// Remove sessions for brokers not in the given set.
-    #[cfg(test)]
-    pub fn retain_brokers(&mut self, broker_ids: &[BrokerId]) {
-        self.sessions.retain(|id, _| broker_ids.contains(id));
+    ///
+    /// Call this during metadata refresh or after a rebalance when the set of
+    /// live brokers changes, so sessions for departed brokers do not accumulate
+    /// indefinitely. The next fetch to a re-joined broker will start a fresh
+    /// full fetch, which is correct behavior.
+    pub(crate) fn retain_brokers(&mut self, broker_ids: &[BrokerId]) {
+        let broker_set: HashSet<_> = broker_ids.iter().copied().collect();
+        self.sessions.retain(|id, _| broker_set.contains(id));
     }
 }
 
@@ -622,6 +730,138 @@ mod tests {
         assert!(req.is_full_fetch);
         assert_eq!(req.session_id, 0);
         assert_eq!(req.session_epoch, INITIAL_EPOCH);
+    }
+
+    fn make_uuid_topic_request(
+        topic: &str,
+        uuid: [u8; 16],
+        partitions: &[(i32, i64, i32)],
+    ) -> FetchTopicRequest {
+        FetchTopicRequest {
+            topic: topic.to_string(),
+            topic_id: Some(uuid),
+            partitions: partitions
+                .iter()
+                .map(|&(partition, offset, max_bytes)| FetchPartitionRequest {
+                    partition,
+                    current_leader_epoch: -1,
+                    fetch_offset: offset,
+                    last_fetched_epoch: -1,
+                    log_start_offset: -1,
+                    partition_max_bytes: max_bytes,
+                    replica_directory_id: None,
+                    high_watermark: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_uuid_keyed_incremental_no_changes() {
+        let uuid: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let mut state = FetchSessionState::new(1);
+        let desired = vec![make_uuid_topic_request(
+            "topic-a",
+            uuid,
+            &[(0, 100, 1048576)],
+        )];
+        state.update_from_response(42, &desired);
+
+        assert_eq!(state.partition_count(), 1);
+
+        // Same request — no changes.
+        let req = state.build_request(&desired);
+        assert!(!req.is_full_fetch);
+        assert!(req.topics.is_empty());
+        assert!(req.forgotten_topics.is_empty());
+    }
+
+    #[test]
+    fn test_uuid_keyed_offset_change() {
+        let uuid: [u8; 16] = [0xAA; 16];
+        let mut state = FetchSessionState::new(1);
+        let desired = vec![make_uuid_topic_request(
+            "topic-a",
+            uuid,
+            &[(0, 100, 1048576)],
+        )];
+        state.update_from_response(42, &desired);
+
+        let desired2 = vec![make_uuid_topic_request(
+            "topic-a",
+            uuid,
+            &[(0, 200, 1048576)],
+        )];
+        let req = state.build_request(&desired2);
+
+        assert!(!req.is_full_fetch);
+        assert_eq!(req.topics.len(), 1);
+        assert_eq!(req.topics[0].topic, "topic-a");
+        assert_eq!(req.topics[0].partitions[0].fetch_offset, 200);
+    }
+
+    #[test]
+    fn test_uuid_keyed_partition_removed() {
+        let uuid: [u8; 16] = [0xBB; 16];
+        let mut state = FetchSessionState::new(1);
+        let desired = vec![make_uuid_topic_request(
+            "topic-a",
+            uuid,
+            &[(0, 100, 1048576), (1, 50, 1048576)],
+        )];
+        state.update_from_response(42, &desired);
+
+        // Remove partition 1.
+        let desired2 = vec![make_uuid_topic_request(
+            "topic-a",
+            uuid,
+            &[(0, 100, 1048576)],
+        )];
+        let req = state.build_request(&desired2);
+
+        assert!(!req.is_full_fetch);
+        assert!(req.topics.is_empty()); // partition 0 unchanged
+        assert_eq!(req.forgotten_topics.len(), 1);
+        assert_eq!(req.forgotten_topics[0].topic, "topic-a");
+        assert_eq!(req.forgotten_topics[0].partitions, vec![1]);
+    }
+
+    #[test]
+    fn test_zero_uuid_falls_back_to_name_key() {
+        // topic_id = [0; 16] (zero UUID sentinel) must fall back to name keying.
+        let zero_uuid = [0u8; 16];
+        let mut state = FetchSessionState::new(1);
+        let desired = vec![make_uuid_topic_request(
+            "topic-a",
+            zero_uuid,
+            &[(0, 100, 1048576)],
+        )];
+        state.update_from_response(42, &desired);
+
+        // Same desired → no diff.
+        let req = state.build_request(&desired);
+        assert!(!req.is_full_fetch);
+        assert!(req.topics.is_empty());
+        assert!(req.forgotten_topics.is_empty());
+    }
+
+    #[test]
+    fn test_mixed_uuid_and_name_keying() {
+        // Two topics: one with UUID, one without.
+        let uuid: [u8; 16] = [0xCC; 16];
+        let mut state = FetchSessionState::new(1);
+        let desired = vec![
+            make_uuid_topic_request("topic-uuid", uuid, &[(0, 100, 1048576)]),
+            make_topic_request("topic-name", &[(0, 200, 1048576)]),
+        ];
+        state.update_from_response(42, &desired);
+        assert_eq!(state.partition_count(), 2);
+
+        // No changes.
+        let req = state.build_request(&desired);
+        assert!(!req.is_full_fetch);
+        assert!(req.topics.is_empty());
+        assert!(req.forgotten_topics.is_empty());
     }
 
     #[test]

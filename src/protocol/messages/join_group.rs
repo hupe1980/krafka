@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut, Bytes};
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_bytes, non_nullable_string};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{
     Decode, Encode, KafkaBytes, KafkaString, TaggedFields, TryEncode,
@@ -96,8 +96,12 @@ impl JoinGroupRequest {
         }
         KafkaString::new(&self.protocol_type).try_encode_compact(buf)?;
 
-        let len = u32::try_from(self.protocols.len().saturating_add(1))
-            .map_err(|_| KrafkaError::protocol("protocols array too large"))?;
+        let len = u32::try_from(self.protocols.len().saturating_add(1)).map_err(|_| {
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                "protocols array too large",
+            )
+        })?;
         crate::util::varint::encode_unsigned_varint(len, buf);
         for protocol in &self.protocols {
             KafkaString::new(&protocol.name).try_encode_compact(buf)?;
@@ -120,8 +124,12 @@ impl JoinGroupRequest {
         }
         KafkaString::new(&self.protocol_type).try_encode_compact(buf)?;
 
-        let len = u32::try_from(self.protocols.len().saturating_add(1))
-            .map_err(|_| KrafkaError::protocol("protocols array too large"))?;
+        let len = u32::try_from(self.protocols.len().saturating_add(1)).map_err(|_| {
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                "protocols array too large",
+            )
+        })?;
         crate::util::varint::encode_unsigned_varint(len, buf);
         for protocol in &self.protocols {
             KafkaString::new(&protocol.name).try_encode_compact(buf)?;

@@ -5,36 +5,29 @@ use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 use crate::error::KrafkaError;
+use crate::util::BackoffPolicy;
 
 /// Configuration for retry behavior with exponential backoff.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
     /// Maximum number of retries (0 = no retries).
-    pub max_retries: u32,
-    /// Initial backoff duration.
-    pub initial_backoff: Duration,
-    /// Maximum backoff duration (caps exponential growth).
-    pub max_backoff: Duration,
-    /// Backoff multiplier for exponential growth (typically 2.0).
-    pub backoff_multiplier: f64,
-    /// Jitter factor (0.0-1.0) to add randomness to backoff.
-    pub jitter_factor: f64,
+    pub(crate) max_retries: u32,
+    /// Shared exponential-backoff parameters.
+    pub(crate) backoff: BackoffPolicy,
     /// Total time budget for all retries.
     ///
     /// When set, retries stop once the elapsed time since the first attempt
     /// exceeds this duration, even if `max_retries` has not been reached.
     /// Similar to Kafka's `delivery.timeout.ms`.
-    pub delivery_timeout: Option<Duration>,
+    pub(crate) delivery_timeout: Option<Duration>,
 }
 
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
             max_retries: 3,
-            initial_backoff: Duration::from_millis(100),
-            max_backoff: Duration::from_secs(10),
-            backoff_multiplier: 2.0,
-            jitter_factor: 0.1,
+            backoff: BackoffPolicy::default(),
             delivery_timeout: Some(Duration::from_secs(120)),
         }
     }
@@ -54,6 +47,36 @@ impl RetryPolicy {
         }
     }
 
+    /// Maximum number of retries (0 = no retries).
+    pub fn max_retries(&self) -> u32 {
+        self.max_retries
+    }
+
+    /// Initial backoff duration.
+    pub fn initial_backoff(&self) -> Duration {
+        self.backoff.initial_backoff
+    }
+
+    /// Maximum backoff duration (caps exponential growth).
+    pub fn max_backoff(&self) -> Duration {
+        self.backoff.max_backoff
+    }
+
+    /// Backoff multiplier for exponential growth.
+    pub fn backoff_multiplier(&self) -> f64 {
+        self.backoff.backoff_multiplier
+    }
+
+    /// Jitter factor (0.0-1.0) applied to backoff.
+    pub fn jitter_factor(&self) -> f64 {
+        self.backoff.jitter_factor
+    }
+
+    /// Total time budget for all retries, or `None` if unlimited.
+    pub fn delivery_timeout(&self) -> Option<Duration> {
+        self.delivery_timeout
+    }
+
     /// Set the maximum number of retries.
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
@@ -62,25 +85,33 @@ impl RetryPolicy {
 
     /// Set the initial backoff duration.
     pub fn with_initial_backoff(mut self, duration: Duration) -> Self {
-        self.initial_backoff = duration;
+        self.backoff.initial_backoff = duration;
         self
     }
 
     /// Set the maximum backoff duration.
     pub fn with_max_backoff(mut self, duration: Duration) -> Self {
-        self.max_backoff = duration;
+        self.backoff.max_backoff = duration;
         self
     }
 
     /// Set the backoff multiplier.
+    ///
+    /// Must be finite and ≥ 1.0. Values below 1.0 are clamped to 1.0 (no
+    /// shrinkage). Non-finite values (NaN, ±Inf) are replaced with 2.0.
     pub fn with_backoff_multiplier(mut self, multiplier: f64) -> Self {
-        self.backoff_multiplier = multiplier;
+        self.backoff.backoff_multiplier = if multiplier.is_finite() {
+            multiplier.max(1.0)
+        } else {
+            warn!("backoff_multiplier is not finite ({multiplier}); using default 2.0");
+            2.0
+        };
         self
     }
 
     /// Set the jitter factor (0.0-1.0).
     pub fn with_jitter_factor(mut self, factor: f64) -> Self {
-        self.jitter_factor = factor.clamp(0.0, 1.0);
+        self.backoff.jitter_factor = factor.clamp(0.0, 1.0);
         self
     }
 
@@ -96,34 +127,10 @@ impl RetryPolicy {
 
     /// Calculate the backoff duration for a given attempt number.
     ///
-    /// Attempt 0 returns `Duration::ZERO` (no retry yet). Attempt 1 = first
-    /// retry = `initial_backoff`. Subsequent attempts grow exponentially.
+    /// Delegates to the embedded [`BackoffPolicy`].
     #[inline]
     pub fn calculate_backoff(&self, attempt: u32) -> Duration {
-        if attempt == 0 {
-            return Duration::ZERO;
-        }
-
-        // Exponential backoff: initial * multiplier^(attempt-1)
-        let exponent = attempt.saturating_sub(1).min(i32::MAX as u32) as i32;
-        let base_backoff =
-            self.initial_backoff.as_secs_f64() * self.backoff_multiplier.powi(exponent);
-
-        // Cap at max backoff
-        let capped_backoff = base_backoff.min(self.max_backoff.as_secs_f64());
-
-        // Add jitter: ±jitter_factor * backoff (randomized to prevent thundering herd)
-        let jitter_range = capped_backoff * self.jitter_factor;
-        let jitter = if self.jitter_factor > 0.0 {
-            use rand::Rng;
-            let mut rng = rand::rng();
-            rng.random_range(-jitter_range..=jitter_range)
-        } else {
-            0.0
-        };
-
-        let final_backoff = (capped_backoff + jitter).max(0.0);
-        Duration::from_secs_f64(final_backoff)
+        self.backoff.calculate_backoff(attempt)
     }
 
     /// Check if an error is retriable and we haven't exceeded max retries.
@@ -286,9 +293,9 @@ mod tests {
     fn test_retry_policy_default() {
         let policy = RetryPolicy::default();
         assert_eq!(policy.max_retries, 3);
-        assert_eq!(policy.initial_backoff, Duration::from_millis(100));
-        assert_eq!(policy.max_backoff, Duration::from_secs(10));
-        assert_eq!(policy.backoff_multiplier, 2.0);
+        assert_eq!(policy.initial_backoff(), Duration::from_millis(100));
+        assert_eq!(policy.max_backoff(), Duration::from_secs(10));
+        assert_eq!(policy.backoff_multiplier(), 2.0);
     }
 
     #[test]
@@ -307,10 +314,10 @@ mod tests {
             .with_jitter_factor(0.2);
 
         assert_eq!(policy.max_retries, 5);
-        assert_eq!(policy.initial_backoff, Duration::from_millis(50));
-        assert_eq!(policy.max_backoff, Duration::from_secs(5));
-        assert_eq!(policy.backoff_multiplier, 3.0);
-        assert_eq!(policy.jitter_factor, 0.2);
+        assert_eq!(policy.initial_backoff(), Duration::from_millis(50));
+        assert_eq!(policy.max_backoff(), Duration::from_secs(5));
+        assert_eq!(policy.backoff_multiplier(), 3.0);
+        assert_eq!(policy.jitter_factor(), 0.2);
     }
 
     #[test]
@@ -419,10 +426,29 @@ mod tests {
     #[test]
     fn test_jitter_factor_clamped() {
         let policy = RetryPolicy::new().with_jitter_factor(2.0); // Over 1.0, should clamp
-        assert_eq!(policy.jitter_factor, 1.0);
+        assert_eq!(policy.jitter_factor(), 1.0);
 
         let policy = RetryPolicy::new().with_jitter_factor(-0.5); // Negative, should clamp
-        assert_eq!(policy.jitter_factor, 0.0);
+        assert_eq!(policy.jitter_factor(), 0.0);
+    }
+
+    #[test]
+    fn test_calculate_backoff_never_below_initial_backoff() {
+        // Even with maximum jitter (factor=1.0), no backoff result should fall
+        // below `initial_backoff`. Previously `.max(0.0)` allowed near-zero delays.
+        let policy = RetryPolicy::new()
+            .with_initial_backoff(Duration::from_millis(100))
+            .with_backoff_multiplier(2.0)
+            .with_jitter_factor(1.0); // maximum — ±100% of backoff
+
+        let floor = policy.initial_backoff();
+        for attempt in 1..=5 {
+            let backoff = policy.calculate_backoff(attempt);
+            assert!(
+                backoff >= floor,
+                "attempt {attempt}: backoff {backoff:?} fell below initial_backoff {floor:?}"
+            );
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_string};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{array_len_i32, check_compact_array_len, check_decode_array_len};
@@ -113,13 +113,22 @@ impl OffsetFetchRequest {
         // Topics with topic_id instead of name
         match &self.topics {
             Some(topics) => {
-                let len = u32::try_from(topics.len().saturating_add(1))
-                    .map_err(|_| KrafkaError::protocol("topics array too large"))?;
+                let len = u32::try_from(topics.len().saturating_add(1)).map_err(|_| {
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        "topics array too large",
+                    )
+                })?;
                 crate::util::varint::encode_unsigned_varint(len, buf);
                 for topic in topics {
                     buf.put_slice(&topic.topic_id.unwrap_or([0u8; 16]));
                     let parts_len = u32::try_from(topic.partition_indexes.len().saturating_add(1))
-                        .map_err(|_| KrafkaError::protocol("partitions array too large"))?;
+                        .map_err(|_| {
+                            KrafkaError::protocol_kind(
+                                ProtocolErrorKind::InvalidLength,
+                                "partitions array too large",
+                            )
+                        })?;
                     crate::util::varint::encode_unsigned_varint(parts_len, buf);
                     for partition in &topic.partition_indexes {
                         partition.encode(buf);
@@ -162,13 +171,22 @@ impl OffsetFetchRequest {
     fn encode_topics_compact(&self, buf: &mut impl BufMut) -> Result<()> {
         match &self.topics {
             Some(topics) => {
-                let len = u32::try_from(topics.len().saturating_add(1))
-                    .map_err(|_| KrafkaError::protocol("topics array too large"))?;
+                let len = u32::try_from(topics.len().saturating_add(1)).map_err(|_| {
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        "topics array too large",
+                    )
+                })?;
                 crate::util::varint::encode_unsigned_varint(len, buf);
                 for topic in topics {
                     KafkaString::new(&topic.name).try_encode_compact(buf)?;
                     let parts_len = u32::try_from(topic.partition_indexes.len().saturating_add(1))
-                        .map_err(|_| KrafkaError::protocol("partitions array too large"))?;
+                        .map_err(|_| {
+                            KrafkaError::protocol_kind(
+                                ProtocolErrorKind::InvalidLength,
+                                "partitions array too large",
+                            )
+                        })?;
                     crate::util::varint::encode_unsigned_varint(parts_len, buf);
                     for partition in &topic.partition_indexes {
                         partition.encode(buf);
@@ -290,7 +308,8 @@ impl OffsetFetchResponse {
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
         if group_count == 0 {
             let _ = TaggedFields::decode(buf)?;
-            return Err(KrafkaError::protocol(
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::Malformed,
                 "OffsetFetchResponse v8-v9 contained empty Groups array",
             ));
         }
@@ -327,7 +346,8 @@ impl OffsetFetchResponse {
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
         if group_count == 0 {
             let _ = TaggedFields::decode(buf)?;
-            return Err(KrafkaError::protocol(
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::Malformed,
                 "OffsetFetchResponse v10 contained empty Groups array",
             ));
         }
@@ -340,7 +360,10 @@ impl OffsetFetchResponse {
 
         for _ in 0..topic_count {
             if buf.remaining() < 16 {
-                return Err(KrafkaError::protocol("not enough bytes for topic_id UUID"));
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::TruncatedFrame,
+                    "not enough bytes for topic_id UUID",
+                ));
             }
             let mut topic_id = [0u8; 16];
             buf.copy_to_slice(&mut topic_id);
@@ -382,7 +405,10 @@ impl OffsetFetchResponse {
             let tc = check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
             for _ in 0..tc {
                 if buf.remaining() < 16 {
-                    return Err(KrafkaError::protocol("not enough bytes for topic_id UUID"));
+                    return Err(KrafkaError::protocol_kind(
+                        ProtocolErrorKind::TruncatedFrame,
+                        "not enough bytes for topic_id UUID",
+                    ));
                 }
                 buf.advance(16); // skip topic_id
                 let pc =

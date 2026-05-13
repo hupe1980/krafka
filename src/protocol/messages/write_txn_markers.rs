@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode};
-use crate::error::{ErrorCode, Result};
+use crate::error::{ErrorCode, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{check_compact_array_len, encode_compact_array_len};
@@ -133,19 +133,24 @@ impl WriteTxnMarkersResponse {
                 let name = {
                     let len = decode_unsigned_varint(buf)? as usize;
                     if len < 1 {
-                        return Err(crate::error::KrafkaError::protocol(
+                        return Err(crate::error::KrafkaError::protocol_kind(
+                            ProtocolErrorKind::Malformed,
                             "compact string length 0 is null but field is non-nullable",
                         ));
                     }
                     let str_len = len - 1;
                     if buf.remaining() < str_len {
-                        return Err(crate::error::KrafkaError::protocol(
+                        return Err(crate::error::KrafkaError::protocol_kind(
+                            ProtocolErrorKind::TruncatedFrame,
                             "not enough bytes for compact string",
                         ));
                     }
                     let bytes = buf.copy_to_bytes(str_len);
                     String::from_utf8(bytes.to_vec()).map_err(|e| {
-                        crate::error::KrafkaError::protocol(format!("invalid UTF-8: {e}"))
+                        crate::error::KrafkaError::protocol_kind(
+                            ProtocolErrorKind::InvalidUtf8,
+                            format!("invalid UTF-8: {e}"),
+                        )
                     })?
                 };
                 let partition_count =

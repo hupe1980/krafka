@@ -33,3 +33,8 @@ doc = false
 name = "fuzz_response_decode"
 path = "fuzz_targets/fuzz_response_decode.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_scram"
+path = "fuzz_targets/fuzz_scram.rs"
+doc = false

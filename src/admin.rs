@@ -52,7 +52,7 @@ use bytes::Bytes;
 use tracing::{debug, info, warn};
 
 use crate::auth::{AuthConfig, ScramMechanism};
-use crate::error::{KrafkaError, Result};
+use crate::error::{KrafkaError, ProtocolErrorKind, Result};
 use crate::metadata::{ClusterMetadata, MetadataRecoveryStrategy, TopicInfo};
 use crate::metrics::ConnectionMetrics;
 use crate::network::{BrokerConnection, ConnectionConfig, ConnectionPool};
@@ -961,15 +961,24 @@ impl AdminClient {
         }
         let broker = &brokers[0];
         self.pool
-            .get_connection_by_id(broker.id, broker.address())
+            .get_connection_by_id(broker.id(), broker.address())
             .await
     }
 
     /// Create topics.
+    ///
+    /// # Parameters
+    ///
+    /// * `topics` — Descriptions of the topics to create.
+    /// * `timeout` — How long the broker should wait for the creation to complete.
+    /// * `validate_only` — When `true`, the broker validates the request but does **not**
+    ///   create any topics. Useful for pre-flight checks. Requires CreateTopics v2+
+    ///   (Kafka 0.11+); all modern brokers support this.
     pub async fn create_topics(
         &self,
         topics: Vec<NewTopic>,
         timeout: Duration,
+        validate_only: bool,
     ) -> Result<Vec<CreateTopicResult>> {
         let conn = self.get_any_broker_connection().await?;
 
@@ -993,7 +1002,7 @@ impl AdminClient {
                 })
                 .collect(),
             timeout_ms: crate::util::duration_to_millis_i32(timeout),
-            validate_only: false,
+            validate_only,
         };
 
         // Send request — negotiate API version with broker
@@ -1005,7 +1014,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported CreateTopics API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported CreateTopics API version",
+                )
             })?;
 
         let response_bytes = conn
@@ -1076,7 +1088,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported DeleteTopics API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported DeleteTopics API version",
+                )
             })?;
 
         let response_bytes = conn
@@ -1145,7 +1160,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported CreatePartitions API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported CreatePartitions API version",
+                )
             })?;
 
         let response_bytes = conn
@@ -1206,7 +1224,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported DescribeConfigs API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported DescribeConfigs API version",
+                )
             })?;
 
         let response_bytes = conn
@@ -1285,7 +1306,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported IncrementalAlterConfigs API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported IncrementalAlterConfigs API version",
+                )
             })?;
 
         let response_bytes = conn
@@ -1362,7 +1386,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported DescribeCluster API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported DescribeCluster API version",
+                )
             })?;
 
         let response_bytes = conn
@@ -1378,7 +1405,10 @@ impl AdminClient {
             let msg = response
                 .error_message
                 .unwrap_or_else(|| format!("{:?}", response.error_code));
-            return Err(KrafkaError::protocol(msg));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::Malformed,
+                msg,
+            ));
         }
 
         Ok(DescribeClusterResult {
@@ -1447,7 +1477,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported DescribeAcls API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported DescribeAcls API version",
+                )
             })?;
 
         let response_bytes = conn
@@ -1501,10 +1534,9 @@ impl AdminClient {
     /// ```
     pub async fn create_acls(&self, acls: Vec<AclBinding>) -> Result<CreateAclsResult> {
         let conn = self.get_any_broker_connection().await?;
+        let acl_count = acls.len();
 
-        let request = CreateAclsRequest {
-            creations: acls.clone(),
-        };
+        let request = CreateAclsRequest { creations: acls };
 
         let version = conn
             .negotiate_api_version(
@@ -1513,7 +1545,12 @@ impl AdminClient {
                 versions::CREATE_ACLS_MIN,
             )
             .await
-            .ok_or_else(|| KrafkaError::protocol("no mutually supported CreateAcls API version"))?;
+            .ok_or_else(|| {
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported CreateAcls API version",
+                )
+            })?;
 
         let response_bytes = conn
             .send_request(ApiKey::CreateAcls, version, |buf| {
@@ -1539,7 +1576,7 @@ impl AdminClient {
             })
             .collect();
 
-        info!("Created {} ACLs", acls.len());
+        info!("Created {} ACLs", acl_count);
         Ok(CreateAclsResult { results })
     }
 
@@ -1564,10 +1601,9 @@ impl AdminClient {
     /// ```
     pub async fn delete_acls(&self, filters: Vec<AclBindingFilter>) -> Result<DeleteAclsResult> {
         let conn = self.get_any_broker_connection().await?;
+        let filter_count = filters.len();
 
-        let request = DeleteAclsRequest {
-            filters: filters.clone(),
-        };
+        let request = DeleteAclsRequest { filters };
 
         let version = conn
             .negotiate_api_version(
@@ -1576,7 +1612,12 @@ impl AdminClient {
                 versions::DELETE_ACLS_MIN,
             )
             .await
-            .ok_or_else(|| KrafkaError::protocol("no mutually supported DeleteAcls API version"))?;
+            .ok_or_else(|| {
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported DeleteAcls API version",
+                )
+            })?;
 
         let response_bytes = conn
             .send_request(ApiKey::DeleteAcls, version, |buf| {
@@ -1603,7 +1644,7 @@ impl AdminClient {
             })
             .collect();
 
-        info!("Deleted ACLs with {} filters", filters.len());
+        info!("Deleted ACLs with {} filters", filter_count);
         Ok(DeleteAclsResult { filter_results })
     }
 
@@ -1645,7 +1686,7 @@ impl AdminClient {
         let any_broker = &brokers[0];
         let any_conn = self
             .pool
-            .get_connection_by_id(any_broker.id, any_broker.address())
+            .get_connection_by_id(any_broker.id(), any_broker.address())
             .await?;
 
         for group_id in &group_ids {
@@ -1658,7 +1699,10 @@ impl AdminClient {
                 )
                 .await
                 .ok_or_else(|| {
-                    KrafkaError::protocol("no mutually supported FindCoordinator API version")
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::UnknownApiVersion,
+                        "no mutually supported FindCoordinator API version",
+                    )
                 })?;
 
             let coord_response_bytes = any_conn
@@ -1678,10 +1722,12 @@ impl AdminClient {
             } else {
                 warn!(
                     "FindCoordinator failed for group '{}': {:?}, falling back to broker {}",
-                    group_id, coord_response.error_code, any_broker.id
+                    group_id,
+                    coord_response.error_code,
+                    any_broker.id()
                 );
                 coordinator_groups
-                    .entry(any_broker.id)
+                    .entry(any_broker.id())
                     .or_default()
                     .push(group_id.clone());
             }
@@ -1692,11 +1738,11 @@ impl AdminClient {
         for (broker_id, groups) in &coordinator_groups {
             let broker = brokers
                 .iter()
-                .find(|b| b.id == *broker_id)
+                .find(|b| b.id() == *broker_id)
                 .unwrap_or(any_broker);
             let conn = self
                 .pool
-                .get_connection_by_id(broker.id, broker.address())
+                .get_connection_by_id(broker.id(), broker.address())
                 .await?;
 
             // Try ConsumerGroupDescribe (Key 69) first for all groups on this broker.
@@ -1844,7 +1890,10 @@ impl AdminClient {
                     )
                     .await
                     .ok_or_else(|| {
-                        KrafkaError::protocol("no mutually supported DescribeGroups API version")
+                        KrafkaError::protocol_kind(
+                            ProtocolErrorKind::UnknownApiVersion,
+                            "no mutually supported DescribeGroups API version",
+                        )
                     })?;
 
                 let response_bytes = conn
@@ -1959,14 +2008,15 @@ impl AdminClient {
         for broker in &brokers {
             let conn = match self
                 .pool
-                .get_connection_by_id(broker.id, broker.address())
+                .get_connection_by_id(broker.id(), broker.address())
                 .await
             {
                 Ok(c) => c,
                 Err(e) => {
                     warn!(
                         "Failed to connect to broker {} for ListGroups, skipping: {}",
-                        broker.id, e
+                        broker.id(),
+                        e
                     );
                     broker_failures += 1;
                     continue;
@@ -1990,7 +2040,7 @@ impl AdminClient {
                 None => {
                     warn!(
                         "No mutually supported ListGroups API version for broker {}, skipping",
-                        broker.id
+                        broker.id()
                     );
                     broker_failures += 1;
                     continue;
@@ -2005,7 +2055,7 @@ impl AdminClient {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!("ListGroups RPC failed on broker {}: {}", broker.id, e);
+                    warn!("ListGroups RPC failed on broker {}: {}", broker.id(), e);
                     broker_failures += 1;
                     continue;
                 }
@@ -2015,7 +2065,7 @@ impl AdminClient {
             let response = match ListGroupsResponse::decode_versioned(version, &mut buf) {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!("ListGroups decode failed on broker {}: {}", broker.id, e);
+                    warn!("ListGroups decode failed on broker {}: {}", broker.id(), e);
                     broker_failures += 1;
                     continue;
                 }
@@ -2024,7 +2074,7 @@ impl AdminClient {
             if !response.error_code.is_ok() {
                 tracing::warn!(
                     "ListGroups error on broker {}: {:?}",
-                    broker.id,
+                    broker.id(),
                     response.error_code
                 );
                 broker_failures += 1;
@@ -2108,7 +2158,7 @@ impl AdminClient {
             // Group offsets by partition leader
             let mut leader_offsets: HashMap<i32, HashMap<String, Vec<DeleteRecordsPartition>>> =
                 HashMap::new();
-            let fallback_broker_id = brokers[0].id;
+            let fallback_broker_id = brokers[0].id();
 
             for ((topic, partition), offset) in &offsets {
                 let leader_id = self
@@ -2132,11 +2182,11 @@ impl AdminClient {
             for (broker_id, topics_map) in leader_offsets {
                 let broker = brokers
                     .iter()
-                    .find(|b| b.id == broker_id)
+                    .find(|b| b.id() == broker_id)
                     .unwrap_or(&brokers[0]);
                 let conn = self
                     .pool
-                    .get_connection_by_id(broker.id, broker.address())
+                    .get_connection_by_id(broker.id(), broker.address())
                     .await?;
 
                 let request = DeleteRecordsRequest {
@@ -2155,7 +2205,10 @@ impl AdminClient {
                     )
                     .await
                     .ok_or_else(|| {
-                        KrafkaError::protocol("no mutually supported DeleteRecords API version")
+                        KrafkaError::protocol_kind(
+                            ProtocolErrorKind::UnknownApiVersion,
+                            "no mutually supported DeleteRecords API version",
+                        )
                     })?;
 
                 let response_bytes = conn
@@ -2197,7 +2250,8 @@ impl AdminClient {
             info!("Deleted records from {} partition(s)", results.len());
             return Ok(results);
         }
-        Err(KrafkaError::protocol(
+        Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::Malformed,
             "DeleteRecords retry loop exhausted after metadata refresh",
         ))
     }
@@ -2246,7 +2300,7 @@ impl AdminClient {
             }
 
             // Group partitions by their leader broker
-            let fallback_broker_id = brokers[0].id;
+            let fallback_broker_id = brokers[0].id();
             let mut leader_partitions: HashMap<
                 i32,
                 HashMap<String, Vec<OffsetForLeaderEpochPartition>>,
@@ -2275,11 +2329,11 @@ impl AdminClient {
             for (broker_id, topics_map) in leader_partitions {
                 let broker = brokers
                     .iter()
-                    .find(|b| b.id == broker_id)
+                    .find(|b| b.id() == broker_id)
                     .unwrap_or(&brokers[0]);
                 let conn = self
                     .pool
-                    .get_connection_by_id(broker.id, broker.address())
+                    .get_connection_by_id(broker.id(), broker.address())
                     .await?;
 
                 let request = OffsetForLeaderEpochRequest {
@@ -2298,7 +2352,8 @@ impl AdminClient {
                     )
                     .await
                     .ok_or_else(|| {
-                        KrafkaError::protocol(
+                        KrafkaError::protocol_kind(
+                            ProtocolErrorKind::UnknownApiVersion,
                             "no mutually supported OffsetForLeaderEpoch API version",
                         )
                     })?;
@@ -2346,7 +2401,8 @@ impl AdminClient {
             );
             return Ok(results);
         }
-        Err(KrafkaError::protocol(
+        Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::Malformed,
             "OffsetForLeaderEpoch retry loop exhausted after metadata refresh",
         ))
     }
@@ -2395,7 +2451,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported CreateDelegationToken API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported CreateDelegationToken API version",
+                )
             })?;
 
         let response_bytes = conn
@@ -2458,7 +2517,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported RenewDelegationToken API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported RenewDelegationToken API version",
+                )
             })?;
 
         let response_bytes = conn
@@ -2513,7 +2575,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported ExpireDelegationToken API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported ExpireDelegationToken API version",
+                )
             })?;
 
         let response_bytes = conn
@@ -2570,7 +2635,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported DescribeDelegationToken API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported DescribeDelegationToken API version",
+                )
             })?;
 
         let response_bytes = conn
@@ -2672,7 +2740,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported DescribeClientQuotas API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported DescribeClientQuotas API version",
+                )
             })?;
 
         let response_bytes = conn
@@ -2790,7 +2861,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported AlterClientQuotas API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported AlterClientQuotas API version",
+                )
             })?;
 
         let response_bytes = conn
@@ -2850,7 +2924,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported DeleteGroups API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported DeleteGroups API version",
+                )
             })?;
 
         let response_bytes = conn
@@ -2913,7 +2990,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported DescribeTopicPartitions API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported DescribeTopicPartitions API version",
+                )
             })?;
 
         // Collect all pages into a single result.
@@ -3088,7 +3168,8 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol(
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
                     "no mutually supported ApiVersions v3+; feature discovery requires v3+",
                 )
             })?;
@@ -3161,12 +3242,16 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported UpdateFeatures API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported UpdateFeatures API version",
+                )
             })?;
 
         // validate_only requires v1+; reject early to avoid silently applying changes
         if validate_only && version < 1 {
-            return Err(KrafkaError::protocol(
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::UnknownApiVersion,
                 "validate_only requires UpdateFeatures v1+, but broker only supports v0",
             ));
         }
@@ -3184,7 +3269,10 @@ impl AdminClient {
             let msg = response
                 .error_message
                 .unwrap_or_else(|| format!("{:?}", response.error_code));
-            return Err(KrafkaError::protocol(msg));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::Malformed,
+                msg,
+            ));
         }
 
         Ok(UpdateFeaturesResult {
@@ -3265,7 +3353,7 @@ impl AdminClient {
         for broker in &brokers {
             let conn = self
                 .pool
-                .get_connection_by_id(broker.id, broker.address())
+                .get_connection_by_id(broker.id(), broker.address())
                 .await?;
 
             let version = conn
@@ -3276,7 +3364,10 @@ impl AdminClient {
                 )
                 .await
                 .ok_or_else(|| {
-                    KrafkaError::protocol("no mutually supported DescribeLogDirs API version")
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::UnknownApiVersion,
+                        "no mutually supported DescribeLogDirs API version",
+                    )
                 })?;
 
             let response_bytes = match conn
@@ -3289,7 +3380,9 @@ impl AdminClient {
                 Err(e) => {
                     warn!(
                         "DescribeLogDirs request failed on broker {} ({}): {}",
-                        broker.id, topic_scope, e
+                        broker.id(),
+                        topic_scope,
+                        e
                     );
                     continue;
                 }
@@ -3301,7 +3394,9 @@ impl AdminClient {
                 Err(e) => {
                     warn!(
                         "DescribeLogDirs decode failed on broker {} ({}): {}",
-                        broker.id, topic_scope, e
+                        broker.id(),
+                        topic_scope,
+                        e
                     );
                     continue;
                 }
@@ -3311,7 +3406,9 @@ impl AdminClient {
             if !response.error_code.is_ok() {
                 warn!(
                     "DescribeLogDirs top-level error on broker {} ({}): {:?}",
-                    broker.id, topic_scope, response.error_code
+                    broker.id(),
+                    topic_scope,
+                    response.error_code
                 );
             }
 
@@ -3321,13 +3418,15 @@ impl AdminClient {
                 warn!(
                     "DescribeLogDirs returned empty results on broker {} (v{}, {}); \
                      likely CLUSTER_AUTHORIZATION_FAILED",
-                    broker.id, version, topic_scope
+                    broker.id(),
+                    version,
+                    topic_scope
                 );
             }
 
             for result in response.results {
                 all_dirs.push(LogDirInfo {
-                    broker_id: broker.id,
+                    broker_id: broker.id(),
                     log_dir: result.log_dir,
                     error: if result.error_code.is_ok() {
                         None
@@ -3414,7 +3513,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported ElectLeaders API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported ElectLeaders API version",
+                )
             })?;
 
         let response_bytes = conn
@@ -3509,7 +3611,8 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol(
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
                     "no mutually supported AlterPartitionReassignments API version",
                 )
             })?;
@@ -3618,7 +3721,8 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol(
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
                     "no mutually supported ListPartitionReassignments API version",
                 )
             })?;
@@ -3721,7 +3825,7 @@ impl AdminClient {
         for broker in &brokers {
             let conn = self
                 .pool
-                .get_connection_by_id(broker.id, broker.address())
+                .get_connection_by_id(broker.id(), broker.address())
                 .await?;
 
             let version = conn
@@ -3732,7 +3836,10 @@ impl AdminClient {
                 )
                 .await
                 .ok_or_else(|| {
-                    KrafkaError::protocol("no mutually supported AlterReplicaLogDirs API version")
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::UnknownApiVersion,
+                        "no mutually supported AlterReplicaLogDirs API version",
+                    )
                 })?;
 
             let response_bytes = match conn
@@ -3745,7 +3852,7 @@ impl AdminClient {
                 Err(e) => {
                     warn!(
                         "AlterReplicaLogDirs request failed on broker {} ({} dir(s)): {}",
-                        broker.id,
+                        broker.id(),
                         request.dirs.len(),
                         e
                     );
@@ -3759,7 +3866,7 @@ impl AdminClient {
                 Err(e) => {
                     warn!(
                         "AlterReplicaLogDirs decode failed on broker {} ({} dir(s)): {}",
-                        broker.id,
+                        broker.id(),
                         request.dirs.len(),
                         e
                     );
@@ -3769,7 +3876,7 @@ impl AdminClient {
 
             for topic in response.results {
                 all_results.push(AlterReplicaLogDirsResult {
-                    broker_id: broker.id,
+                    broker_id: broker.id(),
                     topic_name: topic.topic_name,
                     partitions: topic
                         .partitions
@@ -3831,7 +3938,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported FindCoordinator API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported FindCoordinator API version",
+                )
             })?;
         let coord_response_bytes = any_conn
             .send_request(ApiKey::FindCoordinator, coord_version, |buf| {
@@ -3879,7 +3989,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported OffsetDelete API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported OffsetDelete API version",
+                )
             })?;
 
         let response_bytes = coordinator
@@ -3960,7 +4073,8 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol(
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
                     "no mutually supported DescribeUserScramCredentials API version",
                 )
             })?;
@@ -4071,7 +4185,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported AlterUserScramCredentials API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported AlterUserScramCredentials API version",
+                )
             })?;
 
         let response_bytes = conn
@@ -4145,7 +4262,7 @@ impl AdminClient {
                 ));
             }
 
-            let fallback_id = brokers[0].id;
+            let fallback_id = brokers[0].id();
 
             // Group topic-partitions by leader broker.
             let mut by_leader: HashMap<i32, HashMap<String, Vec<i32>>> = HashMap::new();
@@ -4167,11 +4284,11 @@ impl AdminClient {
             for (broker_id, topic_map) in by_leader {
                 let broker = brokers
                     .iter()
-                    .find(|b| b.id == broker_id)
+                    .find(|b| b.id() == broker_id)
                     .unwrap_or(&brokers[0]);
                 let conn = self
                     .pool
-                    .get_connection_by_id(broker.id, broker.address())
+                    .get_connection_by_id(broker.id(), broker.address())
                     .await?;
 
                 let topics = topic_map
@@ -4192,7 +4309,10 @@ impl AdminClient {
                     )
                     .await
                     .ok_or_else(|| {
-                        KrafkaError::protocol("no mutually supported DescribeProducers API version")
+                        KrafkaError::protocol_kind(
+                            ProtocolErrorKind::UnknownApiVersion,
+                            "no mutually supported DescribeProducers API version",
+                        )
                     })?;
 
                 let response_bytes = match conn
@@ -4205,7 +4325,8 @@ impl AdminClient {
                     Err(e) => {
                         warn!(
                             "DescribeProducers request failed on broker {}: {}",
-                            broker.id, e
+                            broker.id(),
+                            e
                         );
                         continue;
                     }
@@ -4218,7 +4339,8 @@ impl AdminClient {
                     Err(e) => {
                         warn!(
                             "DescribeProducers decode failed on broker {}: {}",
-                            broker.id, e
+                            broker.id(),
+                            e
                         );
                         continue;
                     }
@@ -4275,7 +4397,8 @@ impl AdminClient {
             info!("DescribeProducers returned {} topic(s)", results.len());
             return Ok(results);
         }
-        Err(KrafkaError::protocol(
+        Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::Malformed,
             "DescribeProducers retry loop exhausted after metadata refresh",
         ))
     }
@@ -4313,7 +4436,7 @@ impl AdminClient {
         let any_broker = &brokers[0];
         let any_conn = self
             .pool
-            .get_connection_by_id(any_broker.id, any_broker.address())
+            .get_connection_by_id(any_broker.id(), any_broker.address())
             .await?;
 
         let mut coordinator_txns: HashMap<i32, Vec<String>> = HashMap::new();
@@ -4328,7 +4451,10 @@ impl AdminClient {
                 )
                 .await
                 .ok_or_else(|| {
-                    KrafkaError::protocol("no mutually supported FindCoordinator API version")
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::UnknownApiVersion,
+                        "no mutually supported FindCoordinator API version",
+                    )
                 })?;
 
             let coord_response_bytes = any_conn
@@ -4348,10 +4474,12 @@ impl AdminClient {
             } else {
                 warn!(
                     "FindCoordinator failed for txn '{}': {:?}, falling back to broker {}",
-                    txn_id, coord_response.error_code, any_broker.id
+                    txn_id,
+                    coord_response.error_code,
+                    any_broker.id()
                 );
                 coordinator_txns
-                    .entry(any_broker.id)
+                    .entry(any_broker.id())
                     .or_default()
                     .push((*txn_id).to_string());
             }
@@ -4362,11 +4490,11 @@ impl AdminClient {
         for (broker_id, txn_ids) in coordinator_txns {
             let broker = brokers
                 .iter()
-                .find(|b| b.id == broker_id)
+                .find(|b| b.id() == broker_id)
                 .unwrap_or(any_broker);
             let conn = self
                 .pool
-                .get_connection_by_id(broker.id, broker.address())
+                .get_connection_by_id(broker.id(), broker.address())
                 .await?;
 
             let request = DescribeTransactionsRequest {
@@ -4381,7 +4509,10 @@ impl AdminClient {
                 )
                 .await
                 .ok_or_else(|| {
-                    KrafkaError::protocol("no mutually supported DescribeTransactions API version")
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::UnknownApiVersion,
+                        "no mutually supported DescribeTransactions API version",
+                    )
                 })?;
 
             let response_bytes = match conn
@@ -4394,7 +4525,8 @@ impl AdminClient {
                 Err(e) => {
                     warn!(
                         "DescribeTransactions request failed on broker {}: {}",
-                        broker.id, e
+                        broker.id(),
+                        e
                     );
                     continue;
                 }
@@ -4406,7 +4538,8 @@ impl AdminClient {
                 Err(e) => {
                     warn!(
                         "DescribeTransactions decode failed on broker {}: {}",
-                        broker.id, e
+                        broker.id(),
+                        e
                     );
                     continue;
                 }
@@ -4492,7 +4625,7 @@ impl AdminClient {
         for broker in &brokers {
             let conn = self
                 .pool
-                .get_connection_by_id(broker.id, broker.address())
+                .get_connection_by_id(broker.id(), broker.address())
                 .await?;
 
             let version = conn
@@ -4503,7 +4636,10 @@ impl AdminClient {
                 )
                 .await
                 .ok_or_else(|| {
-                    KrafkaError::protocol("no mutually supported ListTransactions API version")
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::UnknownApiVersion,
+                        "no mutually supported ListTransactions API version",
+                    )
                 })?;
 
             let response_bytes = match conn
@@ -4516,7 +4652,8 @@ impl AdminClient {
                 Err(e) => {
                     warn!(
                         "ListTransactions request failed on broker {}: {}",
-                        broker.id, e
+                        broker.id(),
+                        e
                     );
                     continue;
                 }
@@ -4528,7 +4665,8 @@ impl AdminClient {
                 Err(e) => {
                     warn!(
                         "ListTransactions decode failed on broker {}: {}",
-                        broker.id, e
+                        broker.id(),
+                        e
                     );
                     continue;
                 }
@@ -4537,7 +4675,8 @@ impl AdminClient {
             if !response.error_code.is_ok() {
                 warn!(
                     "ListTransactions error on broker {}: {:?}",
-                    broker.id, response.error_code
+                    broker.id(),
+                    response.error_code
                 );
                 last_error = Some(format!("{:?}", response.error_code));
             }
@@ -4600,7 +4739,8 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol(
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
                     "no mutually supported ListClientMetricsResources API version",
                 )
             })?;
@@ -4685,7 +4825,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported WriteTxnMarkers API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported WriteTxnMarkers API version",
+                )
             })?;
 
         let response_bytes = conn
@@ -4752,15 +4895,18 @@ impl AdminClient {
         // Describe the transaction to get producer_id, producer_epoch,
         // coordinator_epoch, and the affected topic-partitions.
         let descriptions = self.describe_transactions(&[transactional_id]).await?;
-        let desc = descriptions
-            .first()
-            .ok_or_else(|| KrafkaError::protocol("no transaction description returned"))?;
+        let desc = descriptions.first().ok_or_else(|| {
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::Malformed,
+                "no transaction description returned",
+            )
+        })?;
 
         if let Some(ref err) = desc.error {
-            return Err(KrafkaError::protocol(format!(
-                "cannot abort transaction '{}': {}",
-                transactional_id, err,
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::Malformed,
+                format!("cannot abort transaction '{}': {}", transactional_id, err,),
+            ));
         }
 
         let topics: Vec<WritableTxnMarkerTopic> = desc
@@ -4829,7 +4975,10 @@ impl AdminClient {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol("no mutually supported DescribeQuorum API version")
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "no mutually supported DescribeQuorum API version",
+                )
             })?;
 
         let response_bytes = conn
@@ -5321,9 +5470,11 @@ pub struct DescribeQuorumResult {
 
 /// Builder for AdminClient.
 #[must_use = "builders do nothing until .build() is called"]
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct AdminClientBuilder {
     config: AdminConfig,
+    /// Pre-built pool and metadata from a [`KrafkaClient`](crate::client::KrafkaClient).
+    shared: Option<(Arc<ConnectionPool>, Arc<ClusterMetadata>)>,
 }
 
 impl AdminClientBuilder {
@@ -5424,41 +5575,58 @@ impl AdminClientBuilder {
         self
     }
 
+    /// Share a [`KrafkaClient`](crate::client::KrafkaClient)'s connection pool
+    /// and metadata cache instead of creating a new one.
+    ///
+    /// When this method is called, `bootstrap_servers` is optional on the
+    /// builder (the client was already connected at `KrafkaClient::build` time).
+    pub fn with_client(mut self, client: &crate::client::KrafkaClient) -> Self {
+        self.shared = Some((client.pool().clone(), client.metadata().clone()));
+        self
+    }
+
     /// Build the admin client.
     pub async fn build(self) -> Result<AdminClient> {
-        if self.config.bootstrap_servers.is_empty() {
+        if self.shared.is_none() && self.config.bootstrap_servers.is_empty() {
             return Err(KrafkaError::config("bootstrap.servers is required"));
         }
 
-        let bootstrap_servers =
-            crate::util::parse_bootstrap_servers(&self.config.bootstrap_servers)?;
+        let (pool, metadata) = if let Some((pool, metadata)) = self.shared {
+            // Use the pre-built shared pool and metadata from a KrafkaClient.
+            (pool, metadata)
+        } else {
+            let bootstrap_servers =
+                crate::util::parse_bootstrap_servers(&self.config.bootstrap_servers)?;
 
-        // Create connection config with client ID and auth
-        let mut conn_config_builder = ConnectionConfig::builder()
-            .client_id(&self.config.client_id)
-            .request_timeout(self.config.request_timeout);
+            // Create connection config with client ID and auth
+            let mut conn_config_builder = ConnectionConfig::builder()
+                .client_id(&self.config.client_id)
+                .request_timeout(self.config.request_timeout);
 
-        if let Some(ref auth) = self.config.auth {
-            conn_config_builder = conn_config_builder.auth(auth.clone());
-        }
+            if let Some(ref auth) = self.config.auth {
+                conn_config_builder = conn_config_builder.auth(auth.clone());
+            }
 
-        #[cfg(feature = "socks5")]
-        if let Some(ref proxy) = self.config.proxy {
-            conn_config_builder = conn_config_builder.proxy(proxy.clone());
-        }
+            #[cfg(feature = "socks5")]
+            if let Some(ref proxy) = self.config.proxy {
+                conn_config_builder = conn_config_builder.proxy(proxy.clone());
+            }
 
-        let mut conn_config = conn_config_builder.build();
-        conn_config.init_tls().await?;
+            let mut conn_config = conn_config_builder.build()?;
+            conn_config.init_tls().await?;
 
-        let pool = Arc::new(ConnectionPool::new(conn_config));
-        pool.start_idle_evictor();
-        let metadata = Arc::new(
-            ClusterMetadata::new(bootstrap_servers, pool.clone(), Duration::from_secs(300))
-                .with_recovery_strategy(self.config.metadata_recovery_strategy)
-                .with_rebootstrap_trigger(self.config.metadata_recovery_rebootstrap_trigger),
-        );
+            let pool = Arc::new(ConnectionPool::new(conn_config));
+            pool.start_idle_evictor();
+            let metadata = Arc::new(
+                ClusterMetadata::new(bootstrap_servers, pool.clone(), Duration::from_secs(300))
+                    .with_recovery_strategy(self.config.metadata_recovery_strategy)
+                    .with_rebootstrap_trigger(self.config.metadata_recovery_rebootstrap_trigger),
+            );
 
-        metadata.refresh().await?;
+            metadata.refresh().await?;
+
+            (pool, metadata)
+        };
 
         info!(
             "AdminClient initialized with auth: {}",
@@ -5517,15 +5685,15 @@ mod tests {
             "expected empty-name error, got: {empty}"
         );
 
-        let oversize = "x".repeat(i16::MAX as usize + 1);
+        let oversize = "x".repeat(250);
         let err = NewTopic::new(oversize, 1, 1).unwrap_err().to_string();
         assert!(
-            err.contains("exceeds protocol limit"),
-            "expected protocol-limit error, got: {err}"
+            err.contains("exceeds maximum of 249"),
+            "expected topic-name-length error, got: {err}"
         );
 
-        // Boundary: exactly i16::MAX bytes is accepted.
-        let max_ok = "x".repeat(i16::MAX as usize);
+        // Boundary: exactly 249 bytes is accepted.
+        let max_ok = "x".repeat(249);
         assert!(NewTopic::new(max_ok, 1, 1).is_ok());
     }
 

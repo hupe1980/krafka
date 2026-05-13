@@ -10,7 +10,7 @@
 
 use bytes::{Buf, BufMut, Bytes};
 
-use crate::error::{KrafkaError, Result};
+use crate::error::{KrafkaError, ProtocolErrorKind, Result};
 use crate::util::varint;
 
 /// Trait for encoding values to the Kafka wire format.
@@ -147,7 +147,10 @@ impl Decode for i8 {
     #[inline]
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         if buf.remaining() < 1 {
-            return Err(KrafkaError::protocol("not enough bytes for i8"));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
+                "not enough bytes for i8",
+            ));
         }
         Ok(buf.get_i8())
     }
@@ -164,7 +167,10 @@ impl Decode for i16 {
     #[inline]
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         if buf.remaining() < 2 {
-            return Err(KrafkaError::protocol("not enough bytes for i16"));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
+                "not enough bytes for i16",
+            ));
         }
         Ok(buf.get_i16())
     }
@@ -186,7 +192,10 @@ impl Decode for i32 {
     #[inline]
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         if buf.remaining() < 4 {
-            return Err(KrafkaError::protocol("not enough bytes for i32"));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
+                "not enough bytes for i32",
+            ));
         }
         Ok(buf.get_i32())
     }
@@ -227,7 +236,10 @@ impl Decode for i64 {
     #[inline]
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         if buf.remaining() < 8 {
-            return Err(KrafkaError::protocol("not enough bytes for i64"));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
+                "not enough bytes for i64",
+            ));
         }
         Ok(buf.get_i64())
     }
@@ -249,7 +261,10 @@ impl Decode for bool {
     #[inline]
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         if buf.remaining() < 1 {
-            return Err(KrafkaError::protocol("not enough bytes for bool"));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
+                "not enough bytes for bool",
+            ));
         }
         Ok(buf.get_u8() != 0)
     }
@@ -327,11 +342,14 @@ impl TryEncode for KafkaString {
             None => buf.put_i16(-1),
             Some(s) => {
                 let len = i16::try_from(s.len()).map_err(|_| {
-                    KrafkaError::protocol(format!(
-                        "KafkaString length {} exceeds protocol limit of {}",
-                        s.len(),
-                        i16::MAX
-                    ))
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        format!(
+                            "KafkaString length {} exceeds protocol limit of {}",
+                            s.len(),
+                            i16::MAX
+                        ),
+                    )
                 })?;
                 buf.put_i16(len);
                 buf.put_slice(s.as_bytes());
@@ -345,10 +363,10 @@ impl TryEncode for KafkaString {
             None => varint::encode_unsigned_varint(0, buf),
             Some(s) => {
                 let len_plus_one = u32::try_from(s.len().saturating_add(1)).map_err(|_| {
-                    KrafkaError::protocol(format!(
-                        "compact KafkaString length {} exceeds u32 limit",
-                        s.len()
-                    ))
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        format!("compact KafkaString length {} exceeds u32 limit", s.len()),
+                    )
                 })?;
                 varint::encode_unsigned_varint(len_plus_one, buf);
                 buf.put_slice(s.as_bytes());
@@ -365,19 +383,27 @@ impl Decode for KafkaString {
             return Ok(Self(None));
         }
         if len < 0 {
-            return Err(KrafkaError::protocol(format!(
-                "invalid negative string length {len} (only -1 is valid for null)"
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::Malformed,
+                format!("invalid negative string length {len} (only -1 is valid for null)"),
+            ));
         }
 
         let len = len as usize;
         if buf.remaining() < len {
-            return Err(KrafkaError::protocol("not enough bytes for string"));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
+                "not enough bytes for string",
+            ));
         }
 
         let bytes = buf.copy_to_bytes(len);
-        let s = String::from_utf8(bytes.to_vec())
-            .map_err(|e| KrafkaError::protocol(format!("invalid UTF-8 string: {e}")))?;
+        let s = String::from_utf8(bytes.to_vec()).map_err(|e| {
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidUtf8,
+                format!("invalid UTF-8 string: {e}"),
+            )
+        })?;
         Ok(Self(Some(s)))
     }
 
@@ -389,12 +415,19 @@ impl Decode for KafkaString {
 
         let len = (len - 1) as usize;
         if buf.remaining() < len {
-            return Err(KrafkaError::protocol("not enough bytes for compact string"));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
+                "not enough bytes for compact string",
+            ));
         }
 
         let bytes = buf.copy_to_bytes(len);
-        let s = String::from_utf8(bytes.to_vec())
-            .map_err(|e| KrafkaError::protocol(format!("invalid UTF-8 string: {e}")))?;
+        let s = String::from_utf8(bytes.to_vec()).map_err(|e| {
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidUtf8,
+                format!("invalid UTF-8 string: {e}"),
+            )
+        })?;
         Ok(Self(Some(s)))
     }
 }
@@ -468,11 +501,14 @@ impl TryEncode for KafkaBytes {
             None => buf.put_i32(-1),
             Some(bytes) => {
                 let len = i32::try_from(bytes.len()).map_err(|_| {
-                    KrafkaError::protocol(format!(
-                        "KafkaBytes length {} exceeds protocol limit of {}",
-                        bytes.len(),
-                        i32::MAX
-                    ))
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        format!(
+                            "KafkaBytes length {} exceeds protocol limit of {}",
+                            bytes.len(),
+                            i32::MAX
+                        ),
+                    )
                 })?;
                 buf.put_i32(len);
                 buf.put_slice(bytes);
@@ -486,10 +522,13 @@ impl TryEncode for KafkaBytes {
             None => varint::encode_unsigned_varint(0, buf),
             Some(bytes) => {
                 let len_plus_one = u32::try_from(bytes.len().saturating_add(1)).map_err(|_| {
-                    KrafkaError::protocol(format!(
-                        "compact KafkaBytes length {} exceeds u32 limit",
-                        bytes.len()
-                    ))
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        format!(
+                            "compact KafkaBytes length {} exceeds u32 limit",
+                            bytes.len()
+                        ),
+                    )
                 })?;
                 varint::encode_unsigned_varint(len_plus_one, buf);
                 buf.put_slice(bytes);
@@ -506,14 +545,18 @@ impl Decode for KafkaBytes {
             return Ok(Self(None));
         }
         if len < 0 {
-            return Err(KrafkaError::protocol(format!(
-                "invalid negative bytes length {len} (only -1 is valid for null)"
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::Malformed,
+                format!("invalid negative bytes length {len} (only -1 is valid for null)"),
+            ));
         }
 
         let len = len as usize;
         if buf.remaining() < len {
-            return Err(KrafkaError::protocol("not enough bytes for bytes field"));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
+                "not enough bytes for bytes field",
+            ));
         }
 
         Ok(Self(Some(buf.copy_to_bytes(len))))
@@ -527,7 +570,8 @@ impl Decode for KafkaBytes {
 
         let len = (len - 1) as usize;
         if buf.remaining() < len {
-            return Err(KrafkaError::protocol(
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
                 "not enough bytes for compact bytes field",
             ));
         }
@@ -624,11 +668,14 @@ impl<T: TryEncode> TryEncode for KafkaArray<T> {
             None => buf.put_i32(-1),
             Some(items) => {
                 let len = i32::try_from(items.len()).map_err(|_| {
-                    KrafkaError::protocol(format!(
-                        "KafkaArray length {} exceeds protocol limit of {}",
-                        items.len(),
-                        i32::MAX
-                    ))
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        format!(
+                            "KafkaArray length {} exceeds protocol limit of {}",
+                            items.len(),
+                            i32::MAX
+                        ),
+                    )
                 })?;
                 buf.put_i32(len);
                 for item in items {
@@ -644,10 +691,13 @@ impl<T: TryEncode> TryEncode for KafkaArray<T> {
             None => varint::encode_unsigned_varint(0, buf),
             Some(items) => {
                 let len_plus_one = u32::try_from(items.len().saturating_add(1)).map_err(|_| {
-                    KrafkaError::protocol(format!(
-                        "compact KafkaArray length {} exceeds u32 limit",
-                        items.len()
-                    ))
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        format!(
+                            "compact KafkaArray length {} exceeds u32 limit",
+                            items.len()
+                        ),
+                    )
                 })?;
                 varint::encode_unsigned_varint(len_plus_one, buf);
                 for item in items {
@@ -666,17 +716,21 @@ impl<T: Decode> Decode for KafkaArray<T> {
             return Ok(Self(None));
         }
         if len < 0 {
-            return Err(crate::error::KrafkaError::protocol(format!(
-                "invalid negative array length {len} (only -1 is valid for null)"
-            )));
+            return Err(crate::error::KrafkaError::protocol_kind(
+                crate::error::ProtocolErrorKind::Malformed,
+                format!("invalid negative array length {len} (only -1 is valid for null)"),
+            ));
         }
 
         let len = len as usize;
         if len > super::MAX_DECODE_ARRAY_LEN {
-            return Err(crate::error::KrafkaError::protocol(format!(
-                "array length {len} exceeds safety limit {}",
-                super::MAX_DECODE_ARRAY_LEN
-            )));
+            return Err(crate::error::KrafkaError::protocol_kind(
+                crate::error::ProtocolErrorKind::InvalidLength,
+                format!(
+                    "array length {len} exceeds safety limit {}",
+                    super::MAX_DECODE_ARRAY_LEN
+                ),
+            ));
         }
         let mut items = Vec::with_capacity(len);
         for _ in 0..len {
@@ -693,10 +747,13 @@ impl<T: Decode> Decode for KafkaArray<T> {
 
         let len = (len - 1) as usize;
         if len > super::MAX_DECODE_ARRAY_LEN {
-            return Err(crate::error::KrafkaError::protocol(format!(
-                "array length {len} exceeds safety limit {}",
-                super::MAX_DECODE_ARRAY_LEN
-            )));
+            return Err(crate::error::KrafkaError::protocol_kind(
+                crate::error::ProtocolErrorKind::InvalidLength,
+                format!(
+                    "array length {len} exceeds safety limit {}",
+                    super::MAX_DECODE_ARRAY_LEN
+                ),
+            ));
         }
         let mut items = Vec::with_capacity(len);
         for _ in 0..len {
@@ -733,19 +790,22 @@ impl Encode for TaggedFields {
 impl TryEncode for TaggedFields {
     fn try_encode(&self, buf: &mut impl BufMut) -> Result<()> {
         let count = u32::try_from(self.0.len()).map_err(|_| {
-            KrafkaError::protocol(format!(
-                "TaggedFields count {} exceeds u32 limit",
-                self.0.len()
-            ))
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                format!("TaggedFields count {} exceeds u32 limit", self.0.len()),
+            )
         })?;
         varint::encode_unsigned_varint(count, buf);
         for field in &self.0 {
             varint::encode_unsigned_varint(field.tag, buf);
             let data_len = u32::try_from(field.data.len()).map_err(|_| {
-                KrafkaError::protocol(format!(
-                    "TaggedField data length {} exceeds u32 limit",
-                    field.data.len()
-                ))
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidLength,
+                    format!(
+                        "TaggedField data length {} exceeds u32 limit",
+                        field.data.len()
+                    ),
+                )
             })?;
             varint::encode_unsigned_varint(data_len, buf);
             buf.put_slice(&field.data);
@@ -758,10 +818,13 @@ impl Decode for TaggedFields {
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         let count = varint::decode_unsigned_varint(buf)? as usize;
         if count > super::MAX_DECODE_ARRAY_LEN {
-            return Err(KrafkaError::protocol(format!(
-                "tagged fields count {count} exceeds safety limit {}",
-                super::MAX_DECODE_ARRAY_LEN
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                format!(
+                    "tagged fields count {count} exceeds safety limit {}",
+                    super::MAX_DECODE_ARRAY_LEN
+                ),
+            ));
         }
         let mut fields = Vec::with_capacity(count);
 
@@ -769,7 +832,10 @@ impl Decode for TaggedFields {
             let tag = varint::decode_unsigned_varint(buf)?;
             let len = varint::decode_unsigned_varint(buf)? as usize;
             if buf.remaining() < len {
-                return Err(KrafkaError::protocol("not enough bytes for tagged field"));
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::TruncatedFrame,
+                    "not enough bytes for tagged field",
+                ));
             }
             let data = buf.copy_to_bytes(len);
             fields.push(TaggedField { tag, data });

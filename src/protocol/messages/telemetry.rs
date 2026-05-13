@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut, Bytes};
 
 use super::{VersionedDecode, VersionedEncode};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::check_compact_array_len;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 
@@ -56,7 +56,8 @@ impl GetTelemetrySubscriptionsResponse {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let mut client_instance_id = [0u8; 16];
         if buf.remaining() < 16 {
-            return Err(KrafkaError::protocol(
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
                 "not enough bytes for client_instance_id UUID",
             ));
         }
@@ -74,7 +75,8 @@ impl GetTelemetrySubscriptionsResponse {
         let telemetry_max_bytes = i32::decode(buf)?;
         let delta_temporality = {
             if buf.remaining() < 1 {
-                return Err(KrafkaError::protocol(
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::TruncatedFrame,
                     "not enough bytes for delta_temporality",
                 ));
             }
@@ -135,8 +137,12 @@ impl PushTelemetryRequest {
         buf.put_u8(u8::from(self.terminating));
         self.compression_type.encode(buf);
         // Metrics as compact bytes (varint length + 1, then data)
-        let metrics_len = u32::try_from(self.metrics.len().saturating_add(1))
-            .map_err(|_| KrafkaError::protocol("metrics payload too large"))?;
+        let metrics_len = u32::try_from(self.metrics.len().saturating_add(1)).map_err(|_| {
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                "metrics payload too large",
+            )
+        })?;
         crate::util::varint::encode_unsigned_varint(metrics_len, buf);
         buf.put_slice(&self.metrics);
         TaggedFields::default().try_encode(buf)?;

@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut, Bytes};
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_bytes, non_nullable_string};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{
     Decode, Encode, KafkaBytes, KafkaString, TaggedFields, TryEncode,
@@ -48,8 +48,9 @@ impl DescribeGroupsRequest {
 
     /// Encode for version 5–6 (flexible: compact strings + tagged fields).
     pub fn encode_v5(&self, buf: &mut impl BufMut) -> Result<()> {
-        let len = u32::try_from(self.groups.len().saturating_add(1))
-            .map_err(|_| KrafkaError::protocol("groups array too large"))?;
+        let len = u32::try_from(self.groups.len().saturating_add(1)).map_err(|_| {
+            KrafkaError::protocol_kind(ProtocolErrorKind::InvalidLength, "groups array too large")
+        })?;
         crate::util::varint::encode_unsigned_varint(len, buf);
         for group in &self.groups {
             KafkaString::new(group).try_encode_compact(buf)?;

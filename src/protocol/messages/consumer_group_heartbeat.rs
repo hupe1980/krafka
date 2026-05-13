@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::check_compact_array_len;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
@@ -155,10 +155,13 @@ impl ConsumerGroupHeartbeatRequest {
             }
             Some(names) => {
                 let len_plus_one = u32::try_from(names.len().saturating_add(1)).map_err(|_| {
-                    KrafkaError::protocol(format!(
-                        "subscribed topic names array length {} exceeds u32 limit",
-                        names.len()
-                    ))
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        format!(
+                            "subscribed topic names array length {} exceeds u32 limit",
+                            names.len()
+                        ),
+                    )
                 })?;
                 crate::util::varint::encode_unsigned_varint(len_plus_one, buf);
                 for name in names {
@@ -178,10 +181,13 @@ impl ConsumerGroupHeartbeatRequest {
             }
             Some(tps) => {
                 let len_plus_one = u32::try_from(tps.len().saturating_add(1)).map_err(|_| {
-                    KrafkaError::protocol(format!(
-                        "topic partitions array length {} exceeds u32 limit",
-                        tps.len()
-                    ))
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        format!(
+                            "topic partitions array length {} exceeds u32 limit",
+                            tps.len()
+                        ),
+                    )
                 })?;
                 crate::util::varint::encode_unsigned_varint(len_plus_one, buf);
                 for tp in tps {
@@ -190,10 +196,13 @@ impl ConsumerGroupHeartbeatRequest {
                     // Partitions — compact array of i32
                     let part_len_plus_one = u32::try_from(tp.partitions.len().saturating_add(1))
                         .map_err(|_| {
-                            KrafkaError::protocol(format!(
-                                "partitions array length {} exceeds u32 limit",
-                                tp.partitions.len()
-                            ))
+                            KrafkaError::protocol_kind(
+                                ProtocolErrorKind::InvalidLength,
+                                format!(
+                                    "partitions array length {} exceeds u32 limit",
+                                    tp.partitions.len()
+                                ),
+                            )
                         })?;
                     crate::util::varint::encode_unsigned_varint(part_len_plus_one, buf);
                     for &p in &tp.partitions {
@@ -286,7 +295,8 @@ impl ConsumerGroupHeartbeatResponse {
     /// `if (_readable.readByte() < 0) { … null … } else { … read struct … }`.
     fn decode_assignment(buf: &mut impl Buf) -> Result<Option<ConsumerGroupAssignment>> {
         if buf.remaining() < 1 {
-            return Err(KrafkaError::protocol(
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
                 "not enough bytes for assignment presence tag",
             ));
         }
@@ -295,9 +305,12 @@ impl ConsumerGroupHeartbeatResponse {
             return Ok(None);
         }
         if presence != 1 {
-            return Err(KrafkaError::protocol(format!(
-                "invalid assignment presence tag: expected negative for null or 1 for present, got {presence}"
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::Malformed,
+                format!(
+                    "invalid assignment presence tag: expected negative for null or 1 for present, got {presence}"
+                ),
+            ));
         }
 
         // Struct is present — decode TopicPartitions compact array + tagged fields.
@@ -320,7 +333,10 @@ impl ConsumerGroupHeartbeatResponse {
         for _ in 0..len {
             // TopicId — 16-byte UUID
             if buf.remaining() < 16 {
-                return Err(KrafkaError::protocol("not enough bytes for topic ID UUID"));
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::TruncatedFrame,
+                    "not enough bytes for topic ID UUID",
+                ));
             }
             let mut topic_id = [0u8; 16];
             buf.copy_to_slice(&mut topic_id);

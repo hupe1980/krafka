@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
         .with_config("retention.ms", "86400000");
 
     let results = admin
-        .create_topics(vec![topic], Duration::from_secs(30))
+        .create_topics(vec![topic], Duration::from_secs(30), false)
         .await?;
 
     for result in results {

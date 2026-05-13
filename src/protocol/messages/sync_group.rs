@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut, Bytes};
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_bytes};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::array_len_i32;
 use crate::protocol::primitives::{
@@ -74,8 +74,12 @@ impl SyncGroupRequest {
             None => KafkaString::null().try_encode_compact(buf)?,
         }
 
-        let len = u32::try_from(self.assignments.len().saturating_add(1))
-            .map_err(|_| KrafkaError::protocol("assignments array too large"))?;
+        let len = u32::try_from(self.assignments.len().saturating_add(1)).map_err(|_| {
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                "assignments array too large",
+            )
+        })?;
         crate::util::varint::encode_unsigned_varint(len, buf);
         for assignment in &self.assignments {
             KafkaString::new(&assignment.member_id).try_encode_compact(buf)?;
@@ -104,8 +108,12 @@ impl SyncGroupRequest {
             None => KafkaString::null().try_encode_compact(buf)?,
         }
 
-        let len = u32::try_from(self.assignments.len().saturating_add(1))
-            .map_err(|_| KrafkaError::protocol("assignments array too large"))?;
+        let len = u32::try_from(self.assignments.len().saturating_add(1)).map_err(|_| {
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                "assignments array too large",
+            )
+        })?;
         crate::util::varint::encode_unsigned_varint(len, buf);
         for assignment in &self.assignments {
             KafkaString::new(&assignment.member_id).try_encode_compact(buf)?;

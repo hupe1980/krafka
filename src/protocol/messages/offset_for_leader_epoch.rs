@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_string};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{array_len_i32, check_compact_array_len, check_decode_array_len};
@@ -79,13 +79,19 @@ impl OffsetForLeaderEpochRequest {
     /// Encode for version 4 (flexible: compact strings/arrays + tagged fields).
     pub fn encode_v4(&self, buf: &mut impl BufMut) -> Result<()> {
         self.replica_id.encode(buf);
-        let topics_len = u32::try_from(self.topics.len().saturating_add(1))
-            .map_err(|_| KrafkaError::protocol("topics array too large"))?;
+        let topics_len = u32::try_from(self.topics.len().saturating_add(1)).map_err(|_| {
+            KrafkaError::protocol_kind(ProtocolErrorKind::InvalidLength, "topics array too large")
+        })?;
         crate::util::varint::encode_unsigned_varint(topics_len, buf);
         for topic in &self.topics {
             KafkaString::new(&topic.topic).try_encode_compact(buf)?;
-            let parts_len = u32::try_from(topic.partitions.len().saturating_add(1))
-                .map_err(|_| KrafkaError::protocol("partitions array too large"))?;
+            let parts_len =
+                u32::try_from(topic.partitions.len().saturating_add(1)).map_err(|_| {
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        "partitions array too large",
+                    )
+                })?;
             crate::util::varint::encode_unsigned_varint(parts_len, buf);
             for partition in &topic.partitions {
                 partition.partition.encode(buf);

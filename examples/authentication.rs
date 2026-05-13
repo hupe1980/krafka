@@ -177,8 +177,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Example 12: SaslAuthenticator
     println!("\n=== SaslAuthenticator Demo ===\n");
     let auth_config = AuthConfig::sasl_scram_sha256("alice", "secret");
-    let mut authenticator =
-        SaslAuthenticator::new(&auth_config, ChannelBinding::None).ok_or_else(|| {
+    let mut authenticator = SaslAuthenticator::new(&auth_config, ChannelBinding::None)?
+        .ok_or_else(|| {
             io::Error::other("SCRAM auth config did not produce a SASL authenticator")
         })?;
     println!("Mechanism: {}", authenticator.mechanism_name());

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::error::{KrafkaError, Result};
+use crate::error::{KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::{MAX_RECORD_HEADERS, RecordBatchBuilder, validate_topic_name};
 use crate::{PartitionId, Timestamp};
 
@@ -24,7 +24,15 @@ pub struct ProducerRecord {
     /// Record timestamp (optional, will use current time if not set).
     pub timestamp: Option<Timestamp>,
     /// Record headers.
-    pub headers: Vec<(String, Vec<u8>)>,
+    pub headers: Vec<(String, Bytes)>,
+    /// Optional record name forwarded to the schema encoder's subject-name strategy.
+    ///
+    /// Required when using
+    /// [`crate::schema_registry::SubjectNameStrategy::RecordName`] or
+    /// [`crate::schema_registry::SubjectNameStrategy::TopicRecordName`]. Pass
+    /// `None` (or omit) when using the default
+    /// [`crate::schema_registry::SubjectNameStrategy::TopicName`] strategy.
+    pub record_name: Option<String>,
 }
 
 impl ProducerRecord {
@@ -37,6 +45,7 @@ impl ProducerRecord {
             value: value.into(),
             timestamp: None,
             headers: Vec::new(),
+            record_name: None,
         }
     }
 
@@ -65,8 +74,20 @@ impl ProducerRecord {
     }
 
     /// Add a header.
-    pub fn with_header(mut self, key: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
+    pub fn with_header(mut self, key: impl Into<String>, value: impl Into<Bytes>) -> Self {
         self.headers.push((key.into(), value.into()));
+        self
+    }
+
+    /// Set the record name for schema subject-name resolution.
+    ///
+    /// Only needed when using
+    /// [`crate::schema_registry::SubjectNameStrategy::RecordName`] or
+    /// [`crate::schema_registry::SubjectNameStrategy::TopicRecordName`].
+    /// Ignored by the default
+    /// `TopicName` strategy.
+    pub fn with_record_name(mut self, name: impl Into<String>) -> Self {
+        self.record_name = Some(name.into());
         self
     }
 
@@ -84,21 +105,77 @@ impl ProducerRecord {
 
     /// Get the estimated size in bytes.
     ///
-    /// Accounts for key, value, headers (including per-header wire overhead),
-    /// topic name, and struct metadata overhead. This is the single source of
-    /// truth used by both batch size-gating and memory backpressure.
+    /// Returns a conservative upper-bound on the wire-encoded size of this
+    /// record within a RecordBatch v2 frame.  The estimate is used for both
+    /// batch size-gating and memory backpressure; an undercount can cause
+    /// batches to exceed `max_request_size` and trigger broker-side
+    /// `MESSAGE_TOO_LARGE` errors.
+    ///
+    /// # Wire layout (RecordBatch v2 per-record)
+    ///
+    /// ```text
+    /// signed_varint(body_size)      — record length prefix (exact)
+    /// i8 attributes                 — 1 byte (fixed)
+    /// signed_varlong(ts_delta)      — ≤ 5 bytes (conservative for typical batch windows)
+    /// signed_varint(off_delta)      — ≤ 2 bytes (covers batches up to ~16 k records)
+    /// signed_varint(key_len) + key  — exact varint + bytes
+    /// signed_varint(val_len) + val  — exact varint + bytes
+    /// signed_varint(hdr_count)      — exact varint
+    ///   per header: varint(k_len) + k + varint(v_len) + v
+    /// ```
+    ///
+    /// An additional per-record batch-overhead allowance is added to amortise
+    /// the RecordBatch fixed header (61 bytes) and per-topic produce-request
+    /// framing across records.
     #[inline]
     pub fn estimated_size(&self) -> usize {
-        let key_size = self.key.as_ref().map(|k| k.len()).unwrap_or(0);
-        let value_size = self.value.len();
-        let headers_size: usize = self
+        use crate::util::varint;
+
+        // Unknowns at this point; conservative fixed estimates:
+        //   timestamp_delta ≤ 5 bytes (covers ~67 s at ms resolution — typical batch window)
+        //   offset_delta    ≤ 2 bytes (covers batches up to 16383 records)
+        const TIMESTAMP_DELTA_BYTES: usize = 5;
+        const OFFSET_DELTA_BYTES: usize = 2;
+
+        let key_bytes = self.key.as_ref().map_or(0, |k| k.len());
+        let val_bytes = self.value.len();
+
+        let key_varint = match &self.key {
+            Some(k) => varint::signed_varint_size(k.len() as i32),
+            None => varint::signed_varint_size(-1), // null sentinel
+        };
+        let val_varint = varint::signed_varint_size(val_bytes as i32);
+        let hdr_count_varint = varint::signed_varint_size(self.headers.len() as i32);
+
+        let headers_wire: usize = self
             .headers
             .iter()
-            .map(|(k, v)| k.len() + v.len() + 8) // 8 bytes wire overhead per header
+            .map(|(k, v)| {
+                varint::signed_varint_size(k.len() as i32)
+                    + k.len()
+                    + varint::signed_varint_size(v.len() as i32)
+                    + v.len()
+            })
             .sum();
-        let topic_overhead = self.topic.len() + 64; // struct metadata overhead
 
-        key_size + value_size + headers_size + topic_overhead
+        let body_size = 1 // attributes byte
+            + TIMESTAMP_DELTA_BYTES
+            + OFFSET_DELTA_BYTES
+            + key_varint
+            + key_bytes
+            + val_varint
+            + val_bytes
+            + hdr_count_varint
+            + headers_wire;
+
+        // Record framing: body_size is itself encoded as a signed varint prefix.
+        let framing = varint::signed_varint_size(body_size as i32);
+
+        // Amortised batch-level overhead: RecordBatch fixed header (61 bytes),
+        // produce-request topic/partition framing (~20 bytes), topic String heap.
+        let batch_overhead = self.topic.len() + 64;
+
+        framing + body_size + batch_overhead
     }
 
     /// Validate that this record's fields do not exceed Kafka wire-format limits.
@@ -119,47 +196,62 @@ impl ProducerRecord {
         if let Some(ref key) = self.key
             && key.len() > i32::MAX as usize
         {
-            return Err(KrafkaError::protocol(format!(
-                "record key length {} exceeds protocol limit of {}",
-                key.len(),
-                i32::MAX
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                format!(
+                    "record key length {} exceeds protocol limit of {}",
+                    key.len(),
+                    i32::MAX
+                ),
+            ));
         }
 
         // Value is encoded as KafkaBytes (i32 length prefix)
         if self.value.len() > i32::MAX as usize {
-            return Err(KrafkaError::protocol(format!(
-                "record value length {} exceeds protocol limit of {}",
-                self.value.len(),
-                i32::MAX
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                format!(
+                    "record value length {} exceeds protocol limit of {}",
+                    self.value.len(),
+                    i32::MAX
+                ),
+            ));
         }
 
         // Header keys and values are encoded with varint i32 length prefixes
         // in the record batch v2 format. Limit header count to prevent
         // excessively large batches from bypassing max_request_size.
         if self.headers.len() > MAX_RECORD_HEADERS {
-            return Err(KrafkaError::protocol(format!(
-                "record has {} headers, exceeding limit of {MAX_RECORD_HEADERS}",
-                self.headers.len()
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                format!(
+                    "record has {} headers, exceeding limit of {MAX_RECORD_HEADERS}",
+                    self.headers.len()
+                ),
+            ));
         }
         for (i, (key, value)) in self.headers.iter().enumerate() {
             if key.len() > i32::MAX as usize {
-                return Err(KrafkaError::protocol(format!(
-                    "header[{}] key length {} exceeds protocol limit of {}",
-                    i,
-                    key.len(),
-                    i32::MAX
-                )));
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidLength,
+                    format!(
+                        "header[{}] key length {} exceeds protocol limit of {}",
+                        i,
+                        key.len(),
+                        i32::MAX
+                    ),
+                ));
             }
             if value.len() > i32::MAX as usize {
-                return Err(KrafkaError::protocol(format!(
-                    "header[{}] value length {} exceeds protocol limit of {}",
-                    i,
-                    value.len(),
-                    i32::MAX
-                )));
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidLength,
+                    format!(
+                        "header[{}] value length {} exceeds protocol limit of {}",
+                        i,
+                        value.len(),
+                        i32::MAX
+                    ),
+                ));
             }
         }
 
@@ -175,6 +267,7 @@ impl ProducerRecord {
             value,
             timestamp,
             headers,
+            record_name: _,
         } = self;
 
         RoutedRecordParts {
@@ -199,7 +292,7 @@ pub(crate) struct RoutedRecord {
     pub key: Option<Bytes>,
     pub value: Bytes,
     pub timestamp: Option<Timestamp>,
-    pub headers: Vec<(String, Vec<u8>)>,
+    pub headers: Vec<(String, Bytes)>,
 }
 
 impl RoutedRecord {
@@ -223,10 +316,7 @@ impl RoutedRecord {
             batch_builder.add_record_with_headers(
                 self.key.clone(),
                 Some(self.value.clone()),
-                self.headers
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect(),
+                self.headers.clone(),
             )
         }
     }
@@ -240,6 +330,13 @@ pub(crate) struct RoutedRecordParts {
 }
 
 /// Metadata returned after successfully sending a record.
+///
+/// When an idempotent producer detects a `DuplicateSequenceNumber` response,
+/// it means the broker already committed the batch from a previous attempt.
+/// The record is returned as `Ok(RecordMetadata)` with `offset = -1` and
+/// `timestamp = -1` to signal deduplication.  Use [`is_deduplicated()`](Self::is_deduplicated)
+/// to distinguish this from a normal commit, and [`is_success()`](Self::is_success) to check
+/// whether a valid log offset is available.
 #[non_exhaustive]
 #[must_use = "contains the result of a send operation"]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,17 +345,33 @@ pub struct RecordMetadata {
     pub topic: String,
     /// Partition the record was sent to.
     pub partition: PartitionId,
-    /// Offset of the record.
+    /// Log offset of the committed record, or `-1` when the broker deduplicated
+    /// the batch (idempotent `DuplicateSequenceNumber`).  Check
+    /// [`is_deduplicated()`](Self::is_deduplicated) before relying on this value.
     pub offset: i64,
-    /// Timestamp of the record.
+    /// Broker-assigned timestamp of the record, or `-1` when deduplicated.
     pub timestamp: Timestamp,
 }
 
 impl RecordMetadata {
-    /// Check if the record was successfully sent.
+    /// Returns `true` if the record was committed with a known log offset.
+    ///
+    /// Returns `false` for deduplicated records (`offset == -1`).  Use
+    /// [`is_deduplicated()`](Self::is_deduplicated) to tell those apart.
     #[inline]
     pub fn is_success(&self) -> bool {
         self.offset >= 0
+    }
+
+    /// Returns `true` when the broker deduplicated this record.
+    ///
+    /// An idempotent producer receives `DuplicateSequenceNumber` when the
+    /// broker has already committed the batch from an earlier attempt.  The
+    /// data **is** in Kafka, but the original log offset is not available;
+    /// both `offset` and `timestamp` are set to `-1`.
+    #[inline]
+    pub fn is_deduplicated(&self) -> bool {
+        self.offset == -1
     }
 }
 
@@ -309,7 +422,27 @@ mod tests {
             ProducerRecord::new("test-topic", b"hello world".to_vec()).with_key(b"key".to_vec());
 
         let size = record.estimated_size();
-        assert!(size > 3 + 11); // key + value at minimum
+        // Must include at least key + value bytes, the varint framing overhead,
+        // and the batch-level header overhead.
+        assert!(size > 3 + 11 + 8, "estimated_size={size} too small");
+
+        // Must not be unreasonably large (< 512 for this tiny record).
+        assert!(size < 512, "estimated_size={size} unexpectedly large");
+
+        // A record with no key should still estimate correctly.
+        let no_key = ProducerRecord::new("test-topic", b"hello world".to_vec());
+        let no_key_size = no_key.estimated_size();
+        // No key → slightly smaller than with key (only null sentinel varint, no key bytes).
+        assert!(no_key_size < size, "no-key estimate should be smaller");
+
+        // A record with headers should be larger than one without.
+        let with_headers = ProducerRecord::new("test-topic", b"hello world".to_vec())
+            .with_header("h1", b"v1".to_vec())
+            .with_header("h2", b"v2".to_vec());
+        assert!(
+            with_headers.estimated_size() > no_key_size,
+            "headers should increase estimate"
+        );
     }
 
     #[test]
@@ -370,8 +503,8 @@ mod tests {
 
     #[test]
     fn test_validate_accepts_max_valid_sizes() {
-        // Topic at max i16 length
-        let record = ProducerRecord::new("a".repeat(i16::MAX as usize), b"v".to_vec());
+        // Topic name max is 249 bytes (Kafka protocol limit).
+        let record = ProducerRecord::new("a".repeat(249), b"v".to_vec());
         assert!(record.validate().is_ok());
     }
 

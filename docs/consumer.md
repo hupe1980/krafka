@@ -368,8 +368,13 @@ let consumer = ConsumerBuilder::default()
 4. Revoked partitions are released and `on_partitions_revoked` fires.
 5. Phase 2: Members rejoin with updated owned-partition metadata.
 6. Final assignments are distributed and `on_partitions_assigned` fires
-   with the full post-rebalance assignment (committed offsets are only
-   fetched for newly acquired partitions).
+   with **only the newly acquired partitions** (delta vs previous round).
+   Committed offsets are fetched only for the newly acquired partitions.
+
+> **Java client parity:** `on_partitions_assigned` follows the same
+> delta semantics as the Java `ConsumerRebalanceListener.onPartitionsAssigned`.
+> To get the **full** post-rebalance assignment call `consumer.assignment()`
+> from inside the callback.
 
 ### Rebalance Listener
 
@@ -1168,10 +1173,24 @@ The `handle_group_rebalance()` path then calls `ensure_active_membership()`,
 which sends a **full heartbeat** (subscription, rebalance timeout, all
 top-level fields) and starts a fresh heartbeat task.
 
-### Requirements
+### Requirements and Compatibility
 
-- Requires Kafka 4.0+ (or earlier brokers with `group.coordinator.new.enable=true`)
-- The broker must support API key 68 (`ConsumerGroupHeartbeat`)
+- **Minimum broker version**: Kafka 4.0 (GA). Earlier brokers (3.7–3.9) expose
+  KIP-848 behind `group.coordinator.new.enable=true` but it is **not production-stable
+  before 4.0**. The client selects between classic (`GroupProtocol::Classic`) and
+  KIP-848 (`GroupProtocol::Consumer`) at runtime via the `group_protocol` builder
+  option — no Cargo feature flag is required.
+- **Protocol stability**: `GroupProtocol::Classic` (the default) works with all
+  Kafka versions ≥ 0.10. Use `GroupProtocol::Consumer` only when you can guarantee
+  all brokers in the cluster run Kafka 4.0+.
+- **Required API key**: API key 68 (`ConsumerGroupHeartbeat`), versions 0–1.
+- **Known limitations vs classic protocol**:
+  - Transactional offset commits (`TxnOffsetCommit`) are not yet implemented on
+    the KIP-848 path.
+  - Regex-based subscriptions require `ConsumerGroupHeartbeat` v1 (Kafka 4.0+).
+  - The server-side assignor name is always the Kafka broker's uniform assignor;
+    client-side assignors (`range`, `roundrobin`, `cooperative-sticky`) are
+    ignored when `GroupProtocol::Consumer` is active.
 
 ### Describing KIP-848 Groups
 

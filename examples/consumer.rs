@@ -53,13 +53,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if !record.headers.is_empty() {
                         println!("  Headers:");
                         for (key, value) in &record.headers {
+                            let key_str = std::str::from_utf8(key).unwrap_or("<binary>");
                             match value {
                                 Some(v) => println!(
                                     "    {}: {:?}",
-                                    key,
+                                    key_str,
                                     std::str::from_utf8(v).unwrap_or("<binary>")
                                 ),
-                                None => println!("    {}: <null>", key),
+                                None => println!("    {}: <null>", key_str),
                             }
                         }
                     }

@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_string};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{array_len_i32, check_compact_array_len, check_decode_array_len};
@@ -105,13 +105,19 @@ impl ListOffsetsRequest {
         buf.put_i32(self.replica_id);
         buf.put_i8(self.isolation_level);
 
-        let topic_len = u32::try_from(self.topics.len().saturating_add(1))
-            .map_err(|_| KrafkaError::protocol("topics array too large"))?;
+        let topic_len = u32::try_from(self.topics.len().saturating_add(1)).map_err(|_| {
+            KrafkaError::protocol_kind(ProtocolErrorKind::InvalidLength, "topics array too large")
+        })?;
         crate::util::varint::encode_unsigned_varint(topic_len, buf);
         for topic in &self.topics {
             KafkaString::new(&topic.name).try_encode_compact(buf)?;
-            let part_len = u32::try_from(topic.partitions.len().saturating_add(1))
-                .map_err(|_| KrafkaError::protocol("partitions array too large"))?;
+            let part_len =
+                u32::try_from(topic.partitions.len().saturating_add(1)).map_err(|_| {
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        "partitions array too large",
+                    )
+                })?;
             crate::util::varint::encode_unsigned_varint(part_len, buf);
             for partition in &topic.partitions {
                 buf.put_i32(partition.partition_index);
@@ -130,13 +136,19 @@ impl ListOffsetsRequest {
         buf.put_i32(self.replica_id);
         buf.put_i8(self.isolation_level);
 
-        let topic_len = u32::try_from(self.topics.len().saturating_add(1))
-            .map_err(|_| KrafkaError::protocol("topics array too large"))?;
+        let topic_len = u32::try_from(self.topics.len().saturating_add(1)).map_err(|_| {
+            KrafkaError::protocol_kind(ProtocolErrorKind::InvalidLength, "topics array too large")
+        })?;
         crate::util::varint::encode_unsigned_varint(topic_len, buf);
         for topic in &self.topics {
             KafkaString::new(&topic.name).try_encode_compact(buf)?;
-            let part_len = u32::try_from(topic.partitions.len().saturating_add(1))
-                .map_err(|_| KrafkaError::protocol("partitions array too large"))?;
+            let part_len =
+                u32::try_from(topic.partitions.len().saturating_add(1)).map_err(|_| {
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        "partitions array too large",
+                    )
+                })?;
             crate::util::varint::encode_unsigned_varint(part_len, buf);
             for partition in &topic.partitions {
                 buf.put_i32(partition.partition_index);
@@ -192,7 +204,8 @@ impl ListOffsetsResponse {
     /// The v1 response format has the topics array directly (no throttle_time_ms).
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
         if buf.remaining() < 4 {
-            return Err(crate::error::KrafkaError::protocol(
+            return Err(crate::error::KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
                 "ListOffsetsResponse: truncated (no topic count)",
             ));
         }
@@ -201,7 +214,8 @@ impl ListOffsetsResponse {
         for _ in 0..topic_count {
             let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             if buf.remaining() < 4 {
-                return Err(crate::error::KrafkaError::protocol(
+                return Err(crate::error::KrafkaError::protocol_kind(
+                    ProtocolErrorKind::TruncatedFrame,
                     "ListOffsetsResponse: truncated (no partition count)",
                 ));
             }
@@ -210,7 +224,8 @@ impl ListOffsetsResponse {
             // Each partition needs 4 + 2 + 8 + 8 = 22 bytes
             for _ in 0..partition_count {
                 if buf.remaining() < 22 {
-                    return Err(crate::error::KrafkaError::protocol(
+                    return Err(crate::error::KrafkaError::protocol_kind(
+                        ProtocolErrorKind::TruncatedFrame,
                         "ListOffsetsResponse: truncated partition data",
                     ));
                 }
@@ -237,7 +252,8 @@ impl ListOffsetsResponse {
     /// followed by the same topics array as v1.
     pub fn decode_v2(buf: &mut impl Buf) -> Result<Self> {
         if buf.remaining() < 4 {
-            return Err(crate::error::KrafkaError::protocol(
+            return Err(crate::error::KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
                 "ListOffsetsResponse v2: truncated (no throttle_time_ms)",
             ));
         }
@@ -250,7 +266,8 @@ impl ListOffsetsResponse {
     /// Decode version 4–5 response (adds `leader_epoch` per partition).
     pub fn decode_v4(buf: &mut impl Buf) -> Result<Self> {
         if buf.remaining() < 4 {
-            return Err(crate::error::KrafkaError::protocol(
+            return Err(crate::error::KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
                 "ListOffsetsResponse v4: truncated (no throttle_time_ms)",
             ));
         }

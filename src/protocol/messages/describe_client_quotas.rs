@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_string};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{
@@ -151,7 +151,10 @@ impl DescribeClientQuotasResponse {
                 for _ in 0..value_count {
                     let key = non_nullable_string("quota key", KafkaString::decode(buf)?.0)?;
                     if buf.remaining() < 8 {
-                        return Err(KrafkaError::protocol("not enough bytes for f64"));
+                        return Err(KrafkaError::protocol_kind(
+                            ProtocolErrorKind::TruncatedFrame,
+                            "not enough bytes for f64",
+                        ));
                     }
                     let value = buf.get_f64();
                     values.push(QuotaValue { key, value });
@@ -206,7 +209,10 @@ impl DescribeClientQuotasResponse {
                     let key =
                         non_nullable_string("quota key", KafkaString::decode_compact(buf)?.0)?;
                     if buf.remaining() < 8 {
-                        return Err(KrafkaError::protocol("not enough bytes for f64"));
+                        return Err(KrafkaError::protocol_kind(
+                            ProtocolErrorKind::TruncatedFrame,
+                            "not enough bytes for f64",
+                        ));
                     }
                     let value = buf.get_f64();
                     let _ = TaggedFields::decode(buf)?;
