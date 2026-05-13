@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use rand::Rng;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 

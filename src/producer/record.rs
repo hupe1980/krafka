@@ -27,9 +27,11 @@ pub struct ProducerRecord {
     pub headers: Vec<(String, Bytes)>,
     /// Optional record name forwarded to the schema encoder's subject-name strategy.
     ///
-    /// Required when using [`SubjectNameStrategy::RecordName`] or
-    /// [`SubjectNameStrategy::TopicRecordName`]. Pass `None` (or omit) when
-    /// using the default [`SubjectNameStrategy::TopicName`] strategy.
+    /// Required when using
+    /// [`crate::schema_registry::SubjectNameStrategy::RecordName`] or
+    /// [`crate::schema_registry::SubjectNameStrategy::TopicRecordName`]. Pass
+    /// `None` (or omit) when using the default
+    /// [`crate::schema_registry::SubjectNameStrategy::TopicName`] strategy.
     pub record_name: Option<String>,
 }
 
@@ -79,8 +81,10 @@ impl ProducerRecord {
 
     /// Set the record name for schema subject-name resolution.
     ///
-    /// Only needed when using [`SubjectNameStrategy::RecordName`] or
-    /// [`SubjectNameStrategy::TopicRecordName`]. Ignored by the default
+    /// Only needed when using
+    /// [`crate::schema_registry::SubjectNameStrategy::RecordName`] or
+    /// [`crate::schema_registry::SubjectNameStrategy::TopicRecordName`].
+    /// Ignored by the default
     /// `TopicName` strategy.
     pub fn with_record_name(mut self, name: impl Into<String>) -> Self {
         self.record_name = Some(name.into());
@@ -120,7 +124,7 @@ impl ProducerRecord {
     ///   per header: varint(k_len) + k + varint(v_len) + v
     /// ```
     ///
-    /// An additional per-record [`BATCH_OVERHEAD`] bytes is added to amortise
+    /// An additional per-record batch-overhead allowance is added to amortise
     /// the RecordBatch fixed header (61 bytes) and per-topic produce-request
     /// framing across records.
     #[inline]

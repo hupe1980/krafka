@@ -913,8 +913,8 @@ const DEFAULT_MAX_CACHE_ENTRIES: usize = 1000;
 impl<C: SchemaRegistryClient> CachedSchemaRegistry<C> {
     /// Wrap the given client with an in-memory cache.
     ///
-    /// Defaults to a maximum of [`DEFAULT_MAX_CACHE_ENTRIES`] (1 000) entries,
-    /// evicting the oldest entry on each insert once the limit is reached.
+    /// Defaults to a maximum of 1,000 entries, evicting the oldest entry on
+    /// each insert once the limit is reached.
     /// Use [`with_max_entries`](Self::with_max_entries) to override or
     /// [`with_capacity`](Self::with_capacity) for a pre-allocated unbounded cache.
     pub fn new(inner: C) -> Self {

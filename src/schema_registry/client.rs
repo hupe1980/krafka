@@ -494,10 +494,6 @@ fn reject_embedded_credentials(url: &str) -> Result<()> {
     Ok(())
 }
 
-fn masked_userinfo_indicator(_userinfo: &str) -> &'static str {
-    "<***@>"
-}
-
 /// Kept for backward-compat with existing private call sites that need the
 /// old strip-and-normalize behaviour (builder `build()` path validates first,
 /// then normalizes; this is only used in tests now).

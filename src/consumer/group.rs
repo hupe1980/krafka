@@ -127,7 +127,8 @@ pub trait ConsumerRebalanceListener: Send + Sync {
     ///
     /// For the cooperative and KIP-848 paths the slice may be empty if
     /// the rebalance left this consumer's assignment unchanged.  To obtain
-    /// the **full** post-rebalance assignment call [`Consumer::assignment`]
+    /// the **full** post-rebalance assignment call
+    /// [`crate::consumer::Consumer::assignment`]
     /// from inside the callback.
     ///
     /// **Must complete synchronously** — see the [trait-level docs](ConsumerRebalanceListener)

@@ -324,7 +324,7 @@ impl AwsMskIamCredentials {
     /// # No feature flag required
     ///
     /// This method works **without** the `aws-msk` feature. The `aws-msk`
-    /// feature is only needed for [`AwsMskIamCredentials::from_default_chain`],
+    /// feature is only needed for `AwsMskIamCredentials::from_default_chain`,
     /// which pulls in the full AWS SDK credential provider chain (~100 crates).
     /// Use this method when you have static credentials available in the
     /// environment to keep your dependency footprint small.
@@ -493,7 +493,7 @@ impl TlsConfig {
     /// (`ssl.truststore.location`) and librdkafka (`ssl.ca.location`).
     ///
     /// To trust both platform roots **and** the custom CA, combine with
-    /// [`with_native_roots()`](Self::with_native_roots).
+    /// `with_native_roots()`.
     pub fn with_ca_cert(mut self, path: impl Into<String>) -> Self {
         self.ca_cert_path = Some(path.into());
         self

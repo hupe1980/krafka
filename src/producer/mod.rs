@@ -1732,8 +1732,9 @@ impl ProducerBuilder {
     /// and metadata cache instead of creating a new one.
     ///
     /// When multiple producers, consumers, or admin clients are created in the
-    /// same process you should create a single [`KrafkaClient`] and pass it to
-    /// each builder. All clients will then multiplex over the same TCP
+    /// same process you should create a single
+    /// [`crate::client::KrafkaClient`] and pass it to each builder. All clients
+    /// will then multiplex over the same TCP
     /// connections, reducing the total connection count from `N × brokers` to
     /// `brokers`.
     ///

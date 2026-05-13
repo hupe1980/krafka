@@ -715,7 +715,8 @@ impl ConsumerConfigBuilder {
     /// Set the staleness threshold for high-watermark freshness in `lag()`.
     ///
     /// Partitions whose cached watermark is older than this threshold appear in
-    /// [`LagResult::stale_partitions`]. Pass `Duration::MAX` to disable
+    /// [`crate::consumer::LagResult::stale_partitions`]. Pass `Duration::MAX`
+    /// to disable
     /// staleness reporting.
     ///
     /// Default: 60 s.

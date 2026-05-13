@@ -202,7 +202,8 @@ pub enum BatchRecvOutcome {
 ///
 /// High watermarks are cached from the most recent fetch response. A partition
 /// is considered *stale* if its cached watermark has not been updated within
-/// [`ConsumerConfig::lag_staleness_threshold`] (default: 60 s). Stale lag
+/// [`crate::consumer::ConsumerConfigBuilder::lag_staleness_threshold`]
+/// (default: 60 s). Stale lag
 /// values are still returned, but the calling code can decide to treat them
 /// as unreliable.
 #[non_exhaustive]
@@ -4049,7 +4050,8 @@ impl Consumer {
     ///
     /// Returns a [`LagResult`] containing per-partition lag values and a list
     /// of partitions whose cached high watermark is older than
-    /// [`ConsumerConfig::lag_staleness_threshold`] (default: 60 s).
+    /// [`crate::consumer::ConsumerConfigBuilder::lag_staleness_threshold`]
+    /// (default: 60 s).
     ///
     /// Partitions whose high watermark or position is not yet known are
     /// omitted from `LagResult::lag` entirely.
@@ -4731,7 +4733,8 @@ impl ConsumerBuilder {
     /// and metadata cache instead of creating a new one.
     ///
     /// When multiple clients are created in the same process you should create
-    /// a single [`KrafkaClient`] and pass it to each builder. All clients will
+    /// a single [`crate::client::KrafkaClient`] and pass it to each builder.
+    /// All clients will
     /// then multiplex over the same TCP connections.
     ///
     /// When this method is called, `bootstrap_servers` is optional on the
