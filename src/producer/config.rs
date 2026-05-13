@@ -722,6 +722,7 @@ mod tests {
     #[test]
     fn test_config_builder_proxy_round_trip() {
         let config = ProducerConfig::builder()
+            .bootstrap_servers("localhost:9092")
             .proxy(crate::network::ProxyConfig::new("proxy:1080"))
             .build()
             .unwrap();
