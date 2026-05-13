@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::check_compact_array_len;
 use crate::protocol::primitives::{Decode, KafkaArray, KafkaString, TaggedFields, TryEncode};
@@ -67,7 +67,8 @@ impl MetadataRequest {
             .iter()
             .map(|t| {
                 t.name.as_ref().map(KafkaString::new).ok_or_else(|| {
-                    crate::error::KrafkaError::protocol(
+                    crate::error::KrafkaError::protocol_kind(
+                        ProtocolErrorKind::Malformed,
                         "MetadataRequestTopic.name is required for v0-v8",
                     )
                 })
@@ -171,10 +172,10 @@ impl MetadataRequest {
             }
             Some(topics) => {
                 let len_plus_one = u32::try_from(topics.len().saturating_add(1)).map_err(|_| {
-                    crate::error::KrafkaError::protocol(format!(
-                        "topics array length {} exceeds u32 limit",
-                        topics.len()
-                    ))
+                    crate::error::KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        format!("topics array length {} exceeds u32 limit", topics.len()),
+                    )
                 })?;
                 crate::util::varint::encode_unsigned_varint(len_plus_one, buf);
                 for t in topics {
@@ -182,7 +183,8 @@ impl MetadataRequest {
                         TopicIdMode::Omit | TopicIdMode::ForceZero => {
                             // v9-v11: TopicId is absent or zero — name is required.
                             if t.name.is_none() {
-                                return Err(crate::error::KrafkaError::protocol(
+                                return Err(crate::error::KrafkaError::protocol_kind(
+                                    ProtocolErrorKind::InvalidValue,
                                     "MetadataRequest topic name must be non-null \
                                      when TopicId is absent or zero",
                                 ));
@@ -194,7 +196,8 @@ impl MetadataRequest {
                         TopicIdMode::UseField => {
                             // v12+: at least one of topic_id/name must be set.
                             if t.topic_id.is_none() && t.name.is_none() {
-                                return Err(crate::error::KrafkaError::protocol(
+                                return Err(crate::error::KrafkaError::protocol_kind(
+                                    ProtocolErrorKind::Malformed,
                                     "MetadataRequest topic must have at least one \
                                      of topic_id or name set",
                                 ));
@@ -488,7 +491,8 @@ fn decode_array<W: Decode + Into<T>, T>(buf: &mut impl Buf) -> Result<Vec<T>> {
 /// defined as non-nullable in the Kafka protocol schema.
 fn decode_compact_array<W: Decode + Into<T>, T>(buf: &mut impl Buf) -> Result<Vec<T>> {
     let items = KafkaArray::<W>::decode_compact(buf)?.0.ok_or_else(|| {
-        crate::error::KrafkaError::protocol(
+        crate::error::KrafkaError::protocol_kind(
+            ProtocolErrorKind::Malformed,
             "compact array raw value 0 (null) is invalid for a non-nullable field",
         )
     })?;
@@ -502,7 +506,8 @@ fn decode_compact_array<W: Decode + Into<T>, T>(buf: &mut impl Buf) -> Result<Ve
 /// a protocol error instead of silently defaulting to an empty `Vec`.
 fn non_nullable_array<T>(opt: Option<Vec<T>>) -> Result<Vec<T>> {
     opt.ok_or_else(|| {
-        crate::error::KrafkaError::protocol(
+        crate::error::KrafkaError::protocol_kind(
+            ProtocolErrorKind::Malformed,
             "array length -1 (null) is invalid for a non-nullable field",
         )
     })
@@ -522,7 +527,10 @@ impl Decode for MetadataBrokerV0 {
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         let node_id = i32::decode(buf)?;
         let host = KafkaString::decode(buf)?.0.ok_or_else(|| {
-            KrafkaError::protocol("metadata broker host must be a non-null string")
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidValue,
+                "metadata broker host must be a non-null string",
+            )
         })?;
         let port = i32::decode(buf)?;
         Ok(Self(MetadataBroker {
@@ -547,7 +555,10 @@ impl Decode for MetadataBrokerV1 {
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         let node_id = i32::decode(buf)?;
         let host = KafkaString::decode(buf)?.0.ok_or_else(|| {
-            KrafkaError::protocol("metadata broker host must be a non-null string")
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidValue,
+                "metadata broker host must be a non-null string",
+            )
         })?;
         let port = i32::decode(buf)?;
         let rack = KafkaString::decode(buf)?.0;
@@ -573,7 +584,10 @@ impl Decode for MetadataBrokerV9 {
     fn decode(buf: &mut impl Buf) -> Result<Self> {
         let node_id = i32::decode(buf)?;
         let host = KafkaString::decode_compact(buf)?.0.ok_or_else(|| {
-            KrafkaError::protocol("metadata broker host must be a non-null compact string")
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidValue,
+                "metadata broker host must be a non-null compact string",
+            )
         })?;
         let port = i32::decode(buf)?;
         let rack = KafkaString::decode_compact(buf)?.0;
@@ -904,7 +918,8 @@ impl Decode for MetadataTopicResponseV10 {
         // topic_id: 16-byte UUID
         let mut topic_id = [0u8; 16];
         if buf.remaining() < 16 {
-            return Err(crate::error::KrafkaError::protocol(
+            return Err(crate::error::KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
                 "not enough bytes for topic_id UUID",
             ));
         }

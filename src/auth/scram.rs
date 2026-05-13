@@ -30,9 +30,9 @@ use rand::Rng;
 use sha2::{Digest, Sha256, Sha512};
 use std::fmt;
 use subtle::ConstantTimeEq;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
-use crate::error::{KrafkaError, Result};
+use crate::error::{KrafkaError, ProtocolErrorKind, Result};
 
 /// Minimum allowed PBKDF2 iteration count to prevent downgrade attacks.
 pub const MIN_PBKDF2_ITERATIONS: u32 = 4096;
@@ -46,6 +46,7 @@ pub const MAX_PBKDF2_ITERATIONS: u32 = 1_000_000;
 /// even if the password is compromised.
 ///
 /// See RFC 5802 §6 and RFC 5929 §4 for details.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum ChannelBinding {
     /// No channel binding (`n,,` GS2 header).
@@ -60,6 +61,7 @@ pub enum ChannelBinding {
 }
 
 /// SCRAM mechanism variant.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScramMechanism {
     /// SCRAM-SHA-256
@@ -107,9 +109,10 @@ impl ScramMechanism {
         match b {
             1 => Ok(ScramMechanism::Sha256),
             2 => Ok(ScramMechanism::Sha512),
-            other => Err(KrafkaError::protocol(format!(
-                "unknown SCRAM mechanism code: {other}"
-            ))),
+            other => Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidValue,
+                format!("unknown SCRAM mechanism code: {other}"),
+            )),
         }
     }
 }
@@ -121,6 +124,7 @@ impl fmt::Display for ScramMechanism {
 }
 
 /// SCRAM client state machine.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScramState {
     /// Initial state, before client-first message.
@@ -151,32 +155,14 @@ pub struct ScramClient {
     client_nonce: String,
     /// Current state.
     state: ScramState,
-    /// Client-first-message-bare (cached for proof calculation).
-    client_first_bare: String,
-    /// Server nonce (combined).
-    server_nonce: Option<String>,
-    /// Salt from server.
-    salt: Option<Vec<u8>>,
-    /// Iteration count.
-    iteration_count: Option<u32>,
-    /// Salted password (zeroized on drop).
-    salted_password: Option<Vec<u8>>,
-    /// Server signature (for verification).
-    server_signature: Option<Vec<u8>>,
+    /// Client-first-message-bare (cached for proof calculation, zeroized on drop).
+    client_first_bare: Zeroizing<String>,
+    /// Server signature (for verification, zeroized on drop via `Zeroizing`).
+    server_signature: Option<Zeroizing<Vec<u8>>>,
 }
 
-impl Drop for ScramClient {
-    fn drop(&mut self) {
-        // `password` is `Zeroizing<String>` — zeroized automatically.
-        if let Some(ref mut salted) = self.salted_password {
-            salted.zeroize();
-        }
-        if let Some(ref mut sig) = self.server_signature {
-            sig.zeroize();
-        }
-        self.client_first_bare.zeroize();
-    }
-}
+// `password`, `server_signature`, and `client_first_bare` are all `Zeroizing<_>`
+// and zeroize automatically on drop — no manual `Drop` implementation needed.
 
 impl ScramClient {
     /// Create a new SCRAM client.
@@ -202,11 +188,7 @@ impl ScramClient {
             channel_binding,
             client_nonce,
             state: ScramState::Initial,
-            client_first_bare: String::new(),
-            server_nonce: None,
-            salt: None,
-            iteration_count: None,
-            salted_password: None,
+            client_first_bare: Zeroizing::new(String::new()),
             server_signature: None,
         }
     }
@@ -242,10 +224,11 @@ impl ScramClient {
         let escaped_username = escape_username(&self.username);
 
         // client-first-message-bare
-        self.client_first_bare = format!("n={},r={}", escaped_username, self.client_nonce);
+        self.client_first_bare =
+            Zeroizing::new(format!("n={},r={}", escaped_username, self.client_nonce));
 
         // Full client-first-message
-        let message = format!("{}{}", gs2_header, self.client_first_bare);
+        let message = format!("{}{}", gs2_header, &*self.client_first_bare);
 
         self.state = ScramState::WaitingServerFirst;
         message.into_bytes()
@@ -321,13 +304,8 @@ impl ScramClient {
             ));
         }
 
-        self.server_nonce = Some(server_nonce.clone());
-        self.salt = Some(salt.clone());
-        self.iteration_count = Some(iteration_count);
-
         // Calculate salted password
-        let salted_password = self.compute_salted_password(&salt, iteration_count);
-        self.salted_password = Some(salted_password.clone());
+        let salted_password = Zeroizing::new(self.compute_salted_password(&salt, iteration_count));
 
         // Calculate client proof
         let client_key = self.compute_client_key(&salted_password);
@@ -351,7 +329,7 @@ impl ScramClient {
         // AuthMessage
         let auth_message = format!(
             "{},{},{}",
-            self.client_first_bare, server_first_str, client_final_without_proof
+            &*self.client_first_bare, server_first_str, client_final_without_proof
         );
 
         let client_signature = self.compute_hmac(&stored_key, auth_message.as_bytes());
@@ -359,7 +337,9 @@ impl ScramClient {
 
         // Calculate server signature for later verification
         let server_key = self.compute_server_key(&salted_password);
-        self.server_signature = Some(self.compute_hmac(&server_key, auth_message.as_bytes()));
+        self.server_signature = Some(Zeroizing::new(
+            self.compute_hmac(&server_key, auth_message.as_bytes()),
+        ));
 
         // client-final-message
         let client_final = format!(

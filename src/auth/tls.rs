@@ -38,6 +38,7 @@ use crate::auth::TlsConfig;
 use crate::error::{KrafkaError, Result};
 
 /// A stream that can be either plain TCP or TLS.
+#[non_exhaustive]
 pub enum MaybeSecureStream {
     /// Plain TCP stream.
     Plain(TcpStream),

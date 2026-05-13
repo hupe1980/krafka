@@ -7,7 +7,8 @@
 //! - **TLS/SSL encryption**: Automatic TLS upgrade when configured.
 //! - **SASL authentication**: PLAIN, SCRAM-SHA-256/512, AWS MSK IAM handshake on connect.
 
-use std::collections::HashMap;
+use ahash::AHashMap;
+use futures::FutureExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -32,12 +33,34 @@ use crate::auth::{
     AuthConfig, ChannelBinding, SaslMechanism, SecurityProtocol, connect_tls,
     extract_tls_server_end_point,
 };
-use crate::error::{KrafkaError, Result};
+use crate::error::{KrafkaError, ProtocolErrorKind, Result};
 use crate::metrics::ConnectionMetrics;
 
-/// Maximum number of consecutive high-priority commands the event loop will
-/// process before forcing one normal-priority drain attempt.
-const MAX_HIGH_PRIORITY_BYPASSES_PER_ROUND: usize = 4;
+/// Named parameter bundle for a connection event-loop task.
+///
+/// Replacing a 13-positional-argument macro with a named struct eliminates
+/// the risk of silent argument transpositions at call sites.  Every field
+/// has the same type as before; they just carry explicit names now.
+struct ConnectionLoopParams {
+    /// Broker address string used in log messages.
+    address: String,
+    /// Receiver end of the high-priority request channel.
+    high_priority_rx: mpsc::Receiver<ConnectionCommand>,
+    /// Receiver end of the normal-priority request channel.
+    normal_priority_rx: mpsc::Receiver<ConnectionCommand>,
+    /// Per-request timeout applied via the `DelayQueue` timer wheel.
+    request_timeout: Duration,
+    /// Shared connection statistics counters.
+    stats: Arc<ConnectionStats>,
+    /// Shared connection metrics (latency, error counts, etc.).
+    metrics: Arc<ConnectionMetrics>,
+    /// Maximum frame size the reader will accept before closing the connection.
+    max_response_size: usize,
+    /// Maximum number of concurrently in-flight requests.
+    max_in_flight_requests: usize,
+    /// How many high-priority requests may bypass normal-priority in a row.
+    max_high_priority_bypasses: usize,
+}
 
 /// SOCKS5 proxy configuration for connecting to brokers through a proxy.
 ///
@@ -57,7 +80,7 @@ const MAX_HIGH_PRIORITY_BYPASSES_PER_ROUND: usize = 4;
 /// let proxy = ProxyConfig::new("socks5-proxy:1080");
 /// let config = ConnectionConfig::builder()
 ///     .proxy(proxy)
-///     .build();
+///     .build()?;
 /// ```
 #[cfg(feature = "socks5")]
 #[derive(Clone)]
@@ -87,8 +110,8 @@ impl ProxyConfig {
         Self {
             address: address.into(),
             credentials: Some(ProxyCredentials {
-                username: username.into(),
-                password: password.into(),
+                username: zeroize::Zeroizing::new(username.into()),
+                password: zeroize::Zeroizing::new(password.into()),
             }),
         }
     }
@@ -125,15 +148,19 @@ impl std::fmt::Debug for ProxyConfig {
 
 /// Credentials for SOCKS5 proxy authentication.
 ///
-/// Implements [`Zeroize`](zeroize::Zeroize) to ensure the password is scrubbed
-/// from memory on drop.
+/// Both fields are stored as [`zeroize::Zeroizing<String>`] so that the
+/// password (and username) are reliably scrubbed from memory when the struct
+/// drops or is cloned — including any intermediate copies produced by the
+/// SOCKS5 handshake path.
 #[cfg(feature = "socks5")]
-#[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+#[derive(Clone, zeroize::ZeroizeOnDrop)]
 pub struct ProxyCredentials {
     /// Proxy username.
-    username: String,
-    /// Proxy password.
-    password: String,
+    username: zeroize::Zeroizing<String>,
+    /// Proxy password — stored as `Zeroizing<String>` so that any copy of this
+    /// field is also zeroed on drop, providing defense-in-depth beyond the
+    /// struct-level `ZeroizeOnDrop`.
+    password: zeroize::Zeroizing<String>,
 }
 
 #[cfg(feature = "socks5")]
@@ -155,7 +182,7 @@ impl ProxyCredentials {
 impl std::fmt::Debug for ProxyCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProxyCredentials")
-            .field("username", &self.username)
+            .field("username", &self.username.as_str())
             .field("password", &"[REDACTED]")
             .finish()
     }
@@ -173,6 +200,7 @@ use super::secure::{ChallengeResponse, SaslAuthenticator};
 ///
 /// High-priority requests are processed before normal-priority requests,
 /// which is critical for preventing consumer group ejection during backpressure.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestPriority {
     /// High priority for time-critical requests like heartbeats and metadata.
@@ -191,8 +219,17 @@ impl RequestPriority {
     #[inline]
     pub fn for_api_key(api_key: ApiKey) -> Self {
         match api_key {
-            // Group coordination - must not be delayed
-            ApiKey::Heartbeat | ApiKey::ConsumerGroupHeartbeat => Self::High,
+            // Group coordination — must not be delayed behind produce/fetch
+            // backpressure.  Heartbeat delays > session.timeout.ms trigger
+            // rebalances; JoinGroup/SyncGroup delays stall the entire group;
+            // LeaveGroup delays leave stale entries in the coordinator;
+            // OffsetCommit delays risk duplicate delivery on restart.
+            ApiKey::Heartbeat
+            | ApiKey::ConsumerGroupHeartbeat
+            | ApiKey::JoinGroup
+            | ApiKey::SyncGroup
+            | ApiKey::LeaveGroup
+            | ApiKey::OffsetCommit => Self::High,
             // Metadata refresh - critical for proper routing
             ApiKey::Metadata => Self::High,
             // Coordinator discovery - needed for heartbeats
@@ -213,6 +250,29 @@ impl RequestPriority {
 /// Call [`init_tls()`](ConnectionConfig::init_tls) after building when TLS is
 /// configured to pre-build and cache the TLS connector, avoiding repeated disk
 /// I/O for certificates on every reconnection.
+///
+/// # Memory Sizing
+///
+/// The theoretical per-connection memory ceiling is:
+///
+/// ```text
+/// max_response_size × max_in_flight_requests
+/// ```
+///
+/// With the defaults (100 MB × 256 = **25.6 GB**) that ceiling is rarely
+/// approached in practice because the broker limits outstanding fetches via
+/// `fetch.max.bytes`; however, for high-throughput consumer deployments you
+/// should size these values intentionally:
+///
+/// | Workload | `max_response_size` | `max_in_flight_requests` | Ceiling |
+/// |----------|--------------------|--------------------------|---------||
+/// | Default  | 100 MB             | 256                      | 25.6 GB |
+/// | Consumer | 50 MB              | 16                       | 800 MB  |
+/// | Producer | 10 MB              | 5 (idempotent)           | 50 MB   |
+///
+/// The Java client defaults to `fetch.max.bytes = 50 MB` and
+/// `max.in.flight.requests.per.connection = 5`.  Consider lowering these
+/// values to match the Java defaults if RSS is a concern.
 #[derive(Clone)]
 pub struct ConnectionConfig {
     /// Connection timeout.
@@ -252,6 +312,13 @@ pub struct ConnectionConfig {
     /// Default: 256. Use 5 for idempotent producers to match Kafka's
     /// `max.in.flight.requests.per.connection` guarantee.
     pub(crate) max_in_flight_requests: usize,
+    /// Maximum consecutive high-priority commands the event loop processes
+    /// before forcing one normal-priority drain.
+    ///
+    /// Higher values give heartbeats stronger priority at the cost of
+    /// potentially delaying produce/fetch requests under heavy load.
+    /// Default: 4.
+    pub(crate) max_high_priority_bypasses_per_round: usize,
     /// Authentication configuration (optional).
     ///
     /// When set, the connection will perform TLS upgrade and/or SASL
@@ -317,6 +384,10 @@ impl std::fmt::Debug for ConnectionConfig {
             )
             .field("max_response_size", &self.max_response_size)
             .field("max_in_flight_requests", &self.max_in_flight_requests)
+            .field(
+                "max_high_priority_bypasses_per_round",
+                &self.max_high_priority_bypasses_per_round,
+            )
             .field("auth", &self.auth)
             .field("tls_connector", &self.tls_connector.load().is_some())
             .field("tcp_keepalive", &self.tcp_keepalive)
@@ -345,6 +416,7 @@ impl Default for ConnectionConfig {
             normal_priority_channel_capacity: 256,
             max_response_size: crate::protocol::MAX_MESSAGE_SIZE,
             max_in_flight_requests: 256,
+            max_high_priority_bypasses_per_round: 4,
             auth: None,
             tls_connector: Arc::new(ArcSwap::new(Arc::new(None))),
             tcp_keepalive: Some(Duration::from_secs(60)),
@@ -358,6 +430,14 @@ impl Default for ConnectionConfig {
 }
 
 impl ConnectionConfig {
+    /// Hard cap on `connections_per_broker`.
+    ///
+    /// Values above this are silently clamped in the builder.  The limit
+    /// prevents accidental OS file-descriptor exhaustion in misconfigured
+    /// deployments: with a 10-broker cluster and the default `ulimit -n 1024`,
+    /// a user setting 1000 would exhaust descriptors during pool initialisation.
+    pub const MAX_CONNECTIONS_PER_BROKER: usize = 32;
+
     /// Create a new connection config builder.
     pub fn builder() -> ConnectionConfigBuilder {
         ConnectionConfigBuilder::default()
@@ -540,9 +620,11 @@ impl ConnectionConfigBuilder {
     /// Set the number of connections per broker.
     ///
     /// For extreme high-throughput (>100k msg/s per broker), use 2-4 connections.
-    /// Default is 1.
+    /// Default is 1.  Values are clamped to `[1, MAX_CONNECTIONS_PER_BROKER]`
+    /// (currently 32) to prevent accidental file-descriptor exhaustion.
     pub fn connections_per_broker(mut self, count: usize) -> Self {
-        self.0.connections_per_broker = count.max(1);
+        self.0.connections_per_broker =
+            count.clamp(1, ConnectionConfig::MAX_CONNECTIONS_PER_BROKER);
         self
     }
 
@@ -576,6 +658,18 @@ impl ConnectionConfigBuilder {
     /// connection. Default: 256. Use 5 for idempotent producers.
     pub fn max_in_flight_requests(mut self, max: usize) -> Self {
         self.0.max_in_flight_requests = max.max(1);
+        self
+    }
+
+    /// Set the maximum consecutive high-priority commands processed before
+    /// forcing one normal-priority drain.
+    ///
+    /// Higher values let heartbeats and metadata requests cut through
+    /// backpressure more aggressively at the cost of slightly higher
+    /// produce/fetch latency under heavy load. Must be at least 1.
+    /// Default: 4.
+    pub fn max_high_priority_bypasses_per_round(mut self, n: usize) -> Self {
+        self.0.max_high_priority_bypasses_per_round = n.max(1);
         self
     }
 
@@ -627,8 +721,29 @@ impl ConnectionConfigBuilder {
     }
 
     /// Build the config.
-    pub fn build(self) -> ConnectionConfig {
-        self.0
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `client_id` exceeds the Kafka wire limit (`i16::MAX` = 32 767 bytes).
+    /// - `request_timeout` is shorter than `connect_timeout` (requests would
+    ///   always time out before the TCP handshake completes).
+    pub fn build(self) -> crate::error::Result<ConnectionConfig> {
+        const MAX_CLIENT_ID_LEN: usize = i16::MAX as usize;
+        if self.0.client_id.len() > MAX_CLIENT_ID_LEN {
+            return Err(crate::error::KrafkaError::config(format!(
+                "client_id is {} bytes, exceeding the Kafka wire limit of {MAX_CLIENT_ID_LEN}",
+                self.0.client_id.len()
+            )));
+        }
+        if self.0.request_timeout < self.0.connect_timeout {
+            return Err(crate::error::KrafkaError::config(format!(
+                "request_timeout ({:?}) must be >= connect_timeout ({:?}); \
+                 otherwise all requests time out before the connection completes",
+                self.0.request_timeout, self.0.connect_timeout
+            )));
+        }
+        Ok(self.0)
     }
 }
 
@@ -675,7 +790,7 @@ pub struct BrokerConnection {
     /// Normal-priority command sender (produce, fetch).
     normal_priority_tx: mpsc::Sender<ConnectionCommand>,
     /// API versions supported by the broker.
-    api_versions: Arc<parking_lot::Mutex<HashMap<ApiKey, ApiVersionRange>>>,
+    api_versions: Arc<parking_lot::Mutex<AHashMap<ApiKey, ApiVersionRange>>>,
     /// Whether the connection is alive.
     alive: Arc<std::sync::atomic::AtomicBool>,
     /// When the SASL session expires (KIP-368).
@@ -776,7 +891,7 @@ impl BrokerConnection {
             correlation_id_gen: Arc::new(CorrelationIdGenerator::new()),
             high_priority_tx,
             normal_priority_tx,
-            api_versions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            api_versions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
             alive,
             session_expiry: None,
             stats,
@@ -786,6 +901,21 @@ impl BrokerConnection {
         };
 
         let request_timeout = config.request_timeout;
+
+        // Build the event-loop parameter bundle once.  The struct is moved
+        // into `spawn_connection_task` in whichever auth path executes —
+        // the channels are consumed exactly once.
+        let loop_params = ConnectionLoopParams {
+            address: address.to_string(),
+            high_priority_rx,
+            normal_priority_rx,
+            request_timeout,
+            stats: stats_clone,
+            metrics: config.connection_metrics.clone(),
+            max_response_size: config.max_response_size,
+            max_in_flight_requests: config.max_in_flight_requests,
+            max_high_priority_bypasses: config.max_high_priority_bypasses_per_round,
+        };
 
         // Determine auth requirements and dispatch to the appropriate path.
         // Using `filter` means `auth` is already in scope — no secondary
@@ -846,63 +976,13 @@ impl BrokerConnection {
 
                 // Spawn the connection task with TLS stream
                 let (reader, writer) = tokio::io::split(tls_stream);
-                let loop_address = address.to_string();
-                let loop_metrics = config.connection_metrics.clone();
-                let close_metrics = loop_metrics.clone();
-                let max_response_size = config.max_response_size;
-                let max_in_flight_requests = config.max_in_flight_requests;
                 config.connection_metrics.record_connect();
-                tokio::spawn(async move {
-                    if let Err(e) = Self::run_connection_loop(
-                        loop_address,
-                        reader,
-                        writer,
-                        high_priority_rx,
-                        normal_priority_rx,
-                        request_timeout,
-                        stats_clone,
-                        loop_metrics,
-                        max_response_size,
-                        max_in_flight_requests,
-                    )
-                    .await
-                    {
-                        close_metrics.record_error();
-                        error!("Connection error: {e}");
-                    }
-                    close_metrics.record_close();
-                    alive_clone.store(false, std::sync::atomic::Ordering::SeqCst);
-                });
+                Self::spawn_connection_task(reader, writer, loop_params, alive_clone);
             } else {
                 // TLS only, no SASL
                 let (reader, writer) = tokio::io::split(tls_stream);
-                let loop_address = address.to_string();
-                let loop_metrics = config.connection_metrics.clone();
-                let close_metrics = loop_metrics.clone();
-                let max_response_size = config.max_response_size;
-                let max_in_flight_requests = config.max_in_flight_requests;
                 config.connection_metrics.record_connect();
-                tokio::spawn(async move {
-                    if let Err(e) = Self::run_connection_loop(
-                        loop_address,
-                        reader,
-                        writer,
-                        high_priority_rx,
-                        normal_priority_rx,
-                        request_timeout,
-                        stats_clone,
-                        loop_metrics,
-                        max_response_size,
-                        max_in_flight_requests,
-                    )
-                    .await
-                    {
-                        close_metrics.record_error();
-                        error!("Connection error: {e}");
-                    }
-                    close_metrics.record_close();
-                    alive_clone.store(false, std::sync::atomic::Ordering::SeqCst);
-                });
+                Self::spawn_connection_task(reader, writer, loop_params, alive_clone);
             }
         } else if let Some(auth) = config.auth.as_ref().filter(|a| a.requires_sasl()) {
             // SASL without TLS
@@ -922,63 +1002,13 @@ impl BrokerConnection {
             connection.session_expiry = Self::effective_session_expiry(session_lifetime_ms, auth);
 
             let (reader, writer) = stream.into_split();
-            let loop_address = address.to_string();
-            let loop_metrics = config.connection_metrics.clone();
-            let close_metrics = loop_metrics.clone();
-            let max_response_size = config.max_response_size;
-            let max_in_flight_requests = config.max_in_flight_requests;
             config.connection_metrics.record_connect();
-            tokio::spawn(async move {
-                if let Err(e) = Self::run_connection_loop(
-                    loop_address,
-                    reader,
-                    writer,
-                    high_priority_rx,
-                    normal_priority_rx,
-                    request_timeout,
-                    stats_clone,
-                    loop_metrics,
-                    max_response_size,
-                    max_in_flight_requests,
-                )
-                .await
-                {
-                    close_metrics.record_error();
-                    error!("Connection error: {e}");
-                }
-                close_metrics.record_close();
-                alive_clone.store(false, std::sync::atomic::Ordering::SeqCst);
-            });
+            Self::spawn_connection_task(reader, writer, loop_params, alive_clone);
         } else {
             // Plain TCP — fast path (most common for local dev)
             let (reader, writer) = stream.into_split();
-            let loop_address = address.to_string();
-            let loop_metrics = config.connection_metrics.clone();
-            let close_metrics = loop_metrics.clone();
-            let max_response_size = config.max_response_size;
-            let max_in_flight_requests = config.max_in_flight_requests;
             config.connection_metrics.record_connect();
-            tokio::spawn(async move {
-                if let Err(e) = Self::run_connection_loop(
-                    loop_address,
-                    reader,
-                    writer,
-                    high_priority_rx,
-                    normal_priority_rx,
-                    request_timeout,
-                    stats_clone,
-                    loop_metrics,
-                    max_response_size,
-                    max_in_flight_requests,
-                )
-                .await
-                {
-                    close_metrics.record_error();
-                    error!("Connection error: {e}");
-                }
-                close_metrics.record_close();
-                alive_clone.store(false, std::sync::atomic::Ordering::SeqCst);
-            });
+            Self::spawn_connection_task(reader, writer, loop_params, alive_clone);
         }
 
         // Fetch API versions
@@ -1155,7 +1185,7 @@ impl BrokerConnection {
             auth
         };
 
-        let mut authenticator = SaslAuthenticator::new(auth, channel_binding)
+        let mut authenticator = SaslAuthenticator::new(auth, channel_binding)?
             .ok_or_else(|| KrafkaError::auth("Failed to create SASL authenticator"))?;
 
         // Warn about SASL PLAIN over cleartext — credentials sent unencrypted
@@ -1380,9 +1410,10 @@ impl BrokerConnection {
         let len_i32 = i32::from_be_bytes(len_buf);
 
         if len_i32 <= 0 || (len_i32 as usize) > max_response_size {
-            return Err(KrafkaError::protocol(format!(
-                "Invalid response length: {len_i32} (max: {max_response_size})"
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                format!("Invalid response length: {len_i32} (max: {max_response_size})"),
+            ));
         }
 
         let len = len_i32 as usize;
@@ -1445,31 +1476,73 @@ impl BrokerConnection {
         offset.clamp(-MAX_SIGV4_CLOCK_SKEW_SECS, MAX_SIGV4_CLOCK_SKEW_SECS)
     }
 
+    /// Spawn a connection event-loop task.
+    ///
+    /// Wraps `run_connection_loop` with panic catching and close/error
+    /// recording, then stores `false` in `alive` when the loop exits for
+    /// any reason (clean, error, or panic).
+    fn spawn_connection_task<R, W>(
+        reader: R,
+        writer: W,
+        params: ConnectionLoopParams,
+        alive: Arc<std::sync::atomic::AtomicBool>,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        // Clone metrics for the close/error path — the original moves into
+        // run_connection_loop via `params`.
+        let close_metrics = params.metrics.clone();
+        tokio::spawn(async move {
+            let result =
+                std::panic::AssertUnwindSafe(Self::run_connection_loop(reader, writer, params))
+                    .catch_unwind()
+                    .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    close_metrics.record_error();
+                    error!("Connection error: {e}");
+                }
+                Err(_panic_payload) => {
+                    close_metrics.record_error();
+                    error!("Connection event loop panicked; all in-flight requests failed");
+                }
+            }
+            close_metrics.record_close();
+            alive.store(false, std::sync::atomic::Ordering::Release);
+        })
+    }
+
     /// Run the connection event loop with priority handling.
     ///
     /// This is generic over the stream type, supporting both plain TCP and TLS.
     /// High-priority requests are always checked first using try_recv,
     /// ensuring heartbeats are never starved by backpressure on data requests.
-    #[allow(clippy::too_many_arguments)]
     async fn run_connection_loop<R, W>(
-        broker_address: String,
         mut reader: R,
         mut writer: W,
-        mut high_priority_rx: mpsc::Receiver<ConnectionCommand>,
-        mut normal_priority_rx: mpsc::Receiver<ConnectionCommand>,
-        request_timeout: Duration,
-        stats: Arc<ConnectionStats>,
-        metrics: Arc<ConnectionMetrics>,
-        max_response_size: usize,
-        max_in_flight_requests: usize,
+        params: ConnectionLoopParams,
     ) -> Result<()>
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        let ConnectionLoopParams {
+            address: broker_address,
+            mut high_priority_rx,
+            mut normal_priority_rx,
+            request_timeout,
+            stats,
+            metrics,
+            max_response_size,
+            max_in_flight_requests,
+            max_high_priority_bypasses: max_high_priority_bypasses_per_round,
+        } = params;
         // All pending request state is owned exclusively by this task.
         // No Arc<Mutex> needed — all access is single-threaded on this event loop.
-        let mut pending: HashMap<CorrelationId, PendingRequest> = HashMap::new();
+        let mut pending: AHashMap<CorrelationId, PendingRequest> = AHashMap::new();
 
         // Per-request timeout via timer-wheel (tokio_util::time::DelayQueue).
         // Cost: O(log n) per insertion/expiration vs O(n × connections) for the
@@ -1477,7 +1550,7 @@ impl BrokerConnection {
         // `enqueue_time + request_timeout`.
         let mut delay_queue: DelayQueue<CorrelationId> = DelayQueue::new();
         // Maps correlation_id → queue key for O(1) cancellation on response receipt.
-        let mut delay_keys: HashMap<CorrelationId, delay_queue::Key> = HashMap::new();
+        let mut delay_keys: AHashMap<CorrelationId, delay_queue::Key> = AHashMap::new();
 
         // Reader task sends decoded response frames to this loop via a bounded
         // channel.  The capacity matches max_in_flight_requests: the broker
@@ -1530,7 +1603,7 @@ impl BrokerConnection {
 
         // Main event loop — lock-free on the hot path.
         loop {
-            if consecutive_high_priority_commands >= MAX_HIGH_PRIORITY_BYPASSES_PER_ROUND {
+            if consecutive_high_priority_commands >= max_high_priority_bypasses_per_round {
                 if deferred_high_priority_cmd.is_none() {
                     match high_priority_rx.try_recv() {
                         Ok(ConnectionCommand::Close) => {
@@ -1778,9 +1851,9 @@ impl BrokerConnection {
 
     async fn process_loop_command<W: AsyncWrite + Unpin>(
         writer: &mut W,
-        pending: &mut HashMap<CorrelationId, PendingRequest>,
+        pending: &mut AHashMap<CorrelationId, PendingRequest>,
         delay_queue: &mut DelayQueue<CorrelationId>,
-        delay_keys: &mut HashMap<CorrelationId, delay_queue::Key>,
+        delay_keys: &mut AHashMap<CorrelationId, delay_queue::Key>,
         cmd: ConnectionCommand,
         max_in_flight_requests: usize,
         request_timeout: Duration,
@@ -1807,9 +1880,9 @@ impl BrokerConnection {
     /// and removals are O(1) HashMap operations with no synchronization overhead.
     async fn handle_command_direct<W: AsyncWrite + Unpin>(
         writer: &mut W,
-        pending: &mut HashMap<CorrelationId, PendingRequest>,
+        pending: &mut AHashMap<CorrelationId, PendingRequest>,
         delay_queue: &mut DelayQueue<CorrelationId>,
-        delay_keys: &mut HashMap<CorrelationId, delay_queue::Key>,
+        delay_keys: &mut AHashMap<CorrelationId, delay_queue::Key>,
         cmd: ConnectionCommand,
         max_in_flight_requests: usize,
         request_timeout: Duration,
@@ -1937,17 +2010,20 @@ impl BrokerConnection {
     /// correlation ID or undecodable response header) — both indicate a corrupt
     /// stream and require the connection to be closed.
     fn dispatch_response(
-        pending: &mut HashMap<CorrelationId, PendingRequest>,
+        pending: &mut AHashMap<CorrelationId, PendingRequest>,
         delay_queue: &mut DelayQueue<CorrelationId>,
-        delay_keys: &mut HashMap<CorrelationId, delay_queue::Key>,
+        delay_keys: &mut AHashMap<CorrelationId, delay_queue::Key>,
         response: Bytes,
         broker_address: &str,
     ) -> Result<()> {
         if response.len() < 4 {
-            return Err(KrafkaError::protocol(format!(
-                "response too short from broker {broker_address}: frame_bytes={}",
-                response.len()
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
+                format!(
+                    "response too short from broker {broker_address}: frame_bytes={}",
+                    response.len()
+                ),
+            ));
         }
 
         let correlation_id =
@@ -1992,20 +2068,25 @@ impl BrokerConnection {
                         error = %e,
                         "Failed to decode response header; closing connection"
                     );
-                    let _ = req
-                        .response_tx
-                        .send(Err(KrafkaError::protocol(context.clone())));
-                    return Err(KrafkaError::protocol(format!(
-                        "{context}; stream desynchronized"
+                    let _ = req.response_tx.send(Err(KrafkaError::protocol_kind(
+                        ProtocolErrorKind::Malformed,
+                        context.clone(),
                     )));
+                    return Err(KrafkaError::protocol_kind(
+                        ProtocolErrorKind::Malformed,
+                        format!("{context}; stream desynchronized"),
+                    ));
                 }
             }
         } else {
             // Unknown correlation ID indicates a protocol desync.
-            return Err(KrafkaError::protocol(format!(
-                "Received response for unknown correlation_id={correlation_id} from broker {broker_address}; frame_bytes={}, pending_requests={pending_before_remove}; closing connection",
-                response.len()
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::Malformed,
+                format!(
+                    "Received response for unknown correlation_id={correlation_id} from broker {broker_address}; frame_bytes={}, pending_requests={pending_before_remove}; closing connection",
+                    response.len()
+                ),
+            ));
         }
 
         Ok(())
@@ -2058,10 +2139,10 @@ impl BrokerConnection {
         let api_versions_response = ApiVersionsResponse::decode_v0(&mut buf)?;
 
         if api_versions_response.error_code != 0 {
-            return Err(KrafkaError::protocol(format!(
-                "ApiVersions error: {}",
-                api_versions_response.error_code
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::Other,
+                format!("ApiVersions error: {}", api_versions_response.error_code),
+            ));
         }
 
         // Store API versions
@@ -2102,6 +2183,18 @@ impl BrokerConnection {
                 *deadline = new_deadline;
             }
         }
+    }
+
+    /// Return the remaining throttle delay for this connection, if any.
+    ///
+    /// Returns `Some(duration)` if the broker's throttle window has not yet
+    /// elapsed, `None` otherwise.  Callers can use this to delay dispatching
+    /// new work before acquiring expensive resources (e.g. in-flight permits).
+    #[inline]
+    pub fn throttle_remaining(&self) -> Option<Duration> {
+        self.throttle_until
+            .lock()
+            .checked_duration_since(Instant::now())
     }
 
     /// Send a request with automatic priority based on API key.
@@ -2375,7 +2468,7 @@ impl BrokerConnection {
     /// Check if the connection is alive.
     #[inline]
     pub fn is_alive(&self) -> bool {
-        self.alive.load(std::sync::atomic::Ordering::SeqCst)
+        self.alive.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Whether the connection is alive and its SASL session has not expired.
@@ -2434,7 +2527,7 @@ impl BrokerConnection {
             correlation_id_gen: Arc::new(CorrelationIdGenerator::new()),
             high_priority_tx,
             normal_priority_tx,
-            api_versions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            api_versions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
             alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             session_expiry: None,
             stats: Arc::new(ConnectionStats::default()),
@@ -2502,7 +2595,8 @@ mod tests {
             .request_timeout(Duration::from_secs(15))
             .client_id("test-client")
             .nodelay(false)
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(config.connect_timeout, Duration::from_secs(5));
         assert_eq!(config.request_timeout, Duration::from_secs(15));
@@ -2528,7 +2622,8 @@ mod tests {
         let metrics = Arc::new(ConnectionMetrics::default());
         let config = ConnectionConfig::builder()
             .connection_metrics(metrics.clone())
-            .build();
+            .build()
+            .unwrap();
 
         config.connection_metrics.record_high_priority_request();
         assert_eq!(metrics.high_priority_requests.get(), 1);
@@ -2541,7 +2636,8 @@ mod tests {
         let config = ConnectionConfig::builder()
             .client_id("test")
             .auth(AuthConfig::sasl_plain("user", "pass").unwrap())
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(config.client_id, "test");
         let auth = config.auth.as_ref().unwrap();
@@ -2555,7 +2651,8 @@ mod tests {
             .connections_per_broker(4)
             .high_priority_channel_capacity(32)
             .normal_priority_channel_capacity(512)
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(config.connections_per_broker, 4);
         assert_eq!(config.high_priority_channel_capacity, 32);
@@ -2569,11 +2666,24 @@ mod tests {
             .connections_per_broker(0) // Should become 1
             .high_priority_channel_capacity(0) // Should become 16
             .normal_priority_channel_capacity(0) // Should become 64
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(config.connections_per_broker, 1);
         assert_eq!(config.high_priority_channel_capacity, 16);
         assert_eq!(config.normal_priority_channel_capacity, 64);
+    }
+
+    #[test]
+    fn test_connections_per_broker_clamped_to_max() {
+        let config = ConnectionConfig::builder()
+            .connections_per_broker(usize::MAX)
+            .build()
+            .unwrap();
+        assert_eq!(
+            config.connections_per_broker,
+            ConnectionConfig::MAX_CONNECTIONS_PER_BROKER
+        );
     }
 
     #[test]
@@ -2595,6 +2705,23 @@ mod tests {
             RequestPriority::for_api_key(ApiKey::ApiVersions),
             RequestPriority::High
         );
+        // Group coordination and offset commit are time-sensitive (rebalance / session timeout).
+        assert_eq!(
+            RequestPriority::for_api_key(ApiKey::JoinGroup),
+            RequestPriority::High
+        );
+        assert_eq!(
+            RequestPriority::for_api_key(ApiKey::SyncGroup),
+            RequestPriority::High
+        );
+        assert_eq!(
+            RequestPriority::for_api_key(ApiKey::LeaveGroup),
+            RequestPriority::High
+        );
+        assert_eq!(
+            RequestPriority::for_api_key(ApiKey::OffsetCommit),
+            RequestPriority::High
+        );
 
         // Normal priority APIs
         assert_eq!(
@@ -2603,10 +2730,6 @@ mod tests {
         );
         assert_eq!(
             RequestPriority::for_api_key(ApiKey::Fetch),
-            RequestPriority::Normal
-        );
-        assert_eq!(
-            RequestPriority::for_api_key(ApiKey::OffsetCommit),
             RequestPriority::Normal
         );
         assert_eq!(
@@ -2646,7 +2769,7 @@ mod tests {
     fn test_dispatch_response_header_decode_error_includes_context() {
         let correlation_id = 7;
         let (response_tx, mut response_rx) = oneshot::channel();
-        let mut pending = HashMap::new();
+        let mut pending = AHashMap::new();
         pending.insert(
             correlation_id,
             PendingRequest {
@@ -2656,7 +2779,7 @@ mod tests {
             },
         );
         let mut delay_queue = DelayQueue::new();
-        let mut delay_keys = HashMap::new();
+        let mut delay_keys = AHashMap::new();
 
         let err = BrokerConnection::dispatch_response(
             &mut pending,
@@ -2804,7 +2927,8 @@ mod tests {
         let config = ConnectionConfig::builder()
             .client_id("test-client")
             .auth(crate::auth::AuthConfig::sasl_plain("testuser", "testpassword").unwrap())
-            .build();
+            .build()
+            .unwrap();
 
         let conn = BrokerConnection::connect(&addr_str, config).await;
         assert!(
@@ -2846,7 +2970,8 @@ mod tests {
             .auth(crate::auth::AuthConfig::sasl_oauthbearer_provider(
                 || async { Ok(OAuthBearerToken::new("provider-jwt-token")) },
             ))
-            .build();
+            .build()
+            .unwrap();
 
         let conn = BrokerConnection::connect(&addr_str, config).await;
         assert!(
@@ -2875,6 +3000,7 @@ mod tests {
         // Provider that hangs forever
         let config = ConnectionConfig::builder()
             .client_id("test-client")
+            .connect_timeout(Duration::from_millis(50))
             .request_timeout(Duration::from_millis(100))
             .auth(crate::auth::AuthConfig::sasl_oauthbearer_provider(
                 || async {
@@ -2883,7 +3009,8 @@ mod tests {
                     Ok(crate::auth::OAuthBearerToken::new("never"))
                 },
             ))
-            .build();
+            .build()
+            .unwrap();
 
         // We need a listening socket so TCP connect succeeds before the handshake
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2950,7 +3077,10 @@ mod tests {
         });
 
         // Connect without auth
-        let config = ConnectionConfig::builder().client_id("test-client").build();
+        let config = ConnectionConfig::builder()
+            .client_id("test-client")
+            .build()
+            .unwrap();
 
         let conn = BrokerConnection::connect(&addr_str, config).await;
         assert!(conn.is_ok());
@@ -3002,7 +3132,8 @@ mod tests {
         let config = ConnectionConfig::builder()
             .client_id("test-client")
             .auth(crate::auth::AuthConfig::sasl_plain("user", "pass").unwrap())
-            .build();
+            .build()
+            .unwrap();
 
         let result = BrokerConnection::connect(&addr_str, config).await;
         assert!(
@@ -3078,7 +3209,8 @@ mod tests {
         let config = ConnectionConfig::builder()
             .client_id("test-client")
             .auth(crate::auth::AuthConfig::sasl_plain("user", "wrongpass").unwrap())
-            .build();
+            .build()
+            .unwrap();
 
         let result = BrokerConnection::connect(&addr_str, config).await;
         assert!(
@@ -3152,16 +3284,19 @@ mod tests {
         let metrics = Arc::new(ConnectionMetrics::default());
 
         let loop_task = tokio::spawn(BrokerConnection::run_connection_loop(
-            "test-broker".to_string(),
             reader,
             writer,
-            high_rx,
-            normal_rx,
-            Duration::from_secs(30),
-            stats,
-            metrics,
-            16,
-            256,
+            ConnectionLoopParams {
+                address: "test-broker".to_string(),
+                high_priority_rx: high_rx,
+                normal_priority_rx: normal_rx,
+                request_timeout: Duration::from_secs(30),
+                stats,
+                metrics,
+                max_response_size: 16,
+                max_in_flight_requests: 256,
+                max_high_priority_bypasses: 4,
+            },
         ));
 
         let (response_tx, response_rx) = oneshot::channel();
@@ -3251,16 +3386,19 @@ mod tests {
             .unwrap();
 
         let loop_task = tokio::spawn(BrokerConnection::run_connection_loop(
-            "test-broker".to_string(),
             reader,
             writer,
-            high_rx,
-            normal_rx,
-            Duration::from_secs(30),
-            stats.clone(),
-            metrics.clone(),
-            crate::protocol::MAX_MESSAGE_SIZE,
-            32,
+            ConnectionLoopParams {
+                address: "test-broker".to_string(),
+                high_priority_rx: high_rx,
+                normal_priority_rx: normal_rx,
+                request_timeout: Duration::from_secs(30),
+                stats: stats.clone(),
+                metrics: metrics.clone(),
+                max_response_size: crate::protocol::MAX_MESSAGE_SIZE,
+                max_in_flight_requests: 32,
+                max_high_priority_bypasses: 4,
+            },
         ));
 
         let mut writes = Vec::new();
@@ -3293,16 +3431,19 @@ mod tests {
         let metrics = Arc::new(ConnectionMetrics::default());
 
         let loop_task = tokio::spawn(BrokerConnection::run_connection_loop(
-            "test-broker".to_string(),
             reader,
             writer,
-            high_rx,
-            normal_rx,
-            Duration::from_secs(30),
-            stats,
-            metrics,
-            crate::protocol::MAX_MESSAGE_SIZE,
-            32,
+            ConnectionLoopParams {
+                address: "test-broker".to_string(),
+                high_priority_rx: high_rx,
+                normal_priority_rx: normal_rx,
+                request_timeout: Duration::from_secs(30),
+                stats,
+                metrics,
+                max_response_size: crate::protocol::MAX_MESSAGE_SIZE,
+                max_in_flight_requests: 32,
+                max_high_priority_bypasses: 4,
+            },
         ));
 
         let (first_response_tx, first_response_rx) = oneshot::channel();
@@ -3347,7 +3488,8 @@ mod tests {
     fn test_connection_config_builder_max_response_size() {
         let config = ConnectionConfig::builder()
             .max_response_size(50 * 1024 * 1024)
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             config.max_response_size,
             50 * 1024 * 1024,
@@ -3358,13 +3500,19 @@ mod tests {
     #[test]
     fn test_connection_config_builder_max_response_size_minimum() {
         // Setting a value below 1024 should be clamped to 1024
-        let config = ConnectionConfig::builder().max_response_size(100).build();
+        let config = ConnectionConfig::builder()
+            .max_response_size(100)
+            .build()
+            .unwrap();
         assert_eq!(
             config.max_response_size, 1024,
             "max_response_size should be clamped to minimum of 1024 bytes"
         );
 
-        let config_zero = ConnectionConfig::builder().max_response_size(0).build();
+        let config_zero = ConnectionConfig::builder()
+            .max_response_size(0)
+            .build()
+            .unwrap();
         assert_eq!(
             config_zero.max_response_size, 1024,
             "max_response_size(0) should clamp to 1024"
@@ -3382,7 +3530,8 @@ mod tests {
         let config = ConnectionConfig::builder()
             .connect_timeout(Duration::from_secs(2))
             .request_timeout(Duration::from_secs(2))
-            .build();
+            .build()
+            .unwrap();
 
         // The connect will resolve "localhost" via lookup_host, establish TCP,
         // then fail on the ApiVersions handshake because our listener doesn't
@@ -3405,7 +3554,8 @@ mod tests {
     async fn test_connect_dns_failure_is_retriable() {
         let config = ConnectionConfig::builder()
             .connect_timeout(Duration::from_secs(5))
-            .build();
+            .build()
+            .unwrap();
         let result =
             BrokerConnection::connect("this-host-does-not-exist.invalid:9092", config).await;
         match result {
@@ -3479,7 +3629,8 @@ mod tests {
         let config = ConnectionConfig::builder()
             .client_id("proxy-test")
             .proxy(proxy)
-            .build();
+            .build()
+            .unwrap();
 
         assert!(config.proxy.is_some());
         assert_eq!(
@@ -3495,7 +3646,8 @@ mod tests {
         let config = ConnectionConfig::builder()
             .connect_timeout(Duration::from_secs(5))
             .proxy(proxy)
-            .build();
+            .build()
+            .unwrap();
         let result = BrokerConnection::connect("broker:9092", config).await;
         match result {
             Ok(_) => panic!("connect through non-existent proxy should fail"),
@@ -3516,7 +3668,8 @@ mod tests {
         let config = ConnectionConfig::builder()
             .connect_timeout(Duration::from_millis(75))
             .proxy(proxy.clone())
-            .build();
+            .build()
+            .unwrap();
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let mock_proxy = tokio::spawn(async move {
@@ -3553,7 +3706,7 @@ mod tests {
             correlation_id_gen: Arc::new(CorrelationIdGenerator::new()),
             high_priority_tx,
             normal_priority_tx,
-            api_versions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            api_versions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
             alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             session_expiry: None,
             stats: Arc::new(ConnectionStats::default()),
@@ -3652,7 +3805,8 @@ mod tests {
         let config = ConnectionConfig::builder()
             .client_id("test-client")
             .auth(crate::auth::AuthConfig::sasl_plain("user", "pass").unwrap())
-            .build();
+            .build()
+            .unwrap();
 
         let conn = BrokerConnection::connect(&addr, config).await.unwrap();
 
@@ -3697,7 +3851,8 @@ mod tests {
         let config = ConnectionConfig::builder()
             .client_id("test-client")
             .auth(crate::auth::AuthConfig::sasl_plain("user", "pass").unwrap())
-            .build();
+            .build()
+            .unwrap();
 
         let conn = BrokerConnection::connect(&addr, config).await.unwrap();
 
@@ -3845,16 +4000,19 @@ mod tests {
         let request_timeout = Duration::from_millis(50);
 
         tokio::spawn(BrokerConnection::run_connection_loop(
-            "test-broker".to_string(),
             reader,
             writer,
-            high_rx,
-            normal_rx,
-            request_timeout,
-            stats,
-            metrics,
-            crate::protocol::MAX_MESSAGE_SIZE,
-            256,
+            ConnectionLoopParams {
+                address: "test-broker".to_string(),
+                high_priority_rx: high_rx,
+                normal_priority_rx: normal_rx,
+                request_timeout,
+                stats,
+                metrics,
+                max_response_size: crate::protocol::MAX_MESSAGE_SIZE,
+                max_in_flight_requests: 256,
+                max_high_priority_bypasses: 4,
+            },
         ));
 
         let (response_tx, response_rx) = oneshot::channel();
@@ -3895,16 +4053,19 @@ mod tests {
         let correlation_id: i32 = 99;
 
         tokio::spawn(BrokerConnection::run_connection_loop(
-            "test-broker".to_string(),
             reader,
             writer,
-            high_rx,
-            normal_rx,
-            request_timeout,
-            stats,
-            metrics,
-            crate::protocol::MAX_MESSAGE_SIZE,
-            256,
+            ConnectionLoopParams {
+                address: "test-broker".to_string(),
+                high_priority_rx: high_rx,
+                normal_priority_rx: normal_rx,
+                request_timeout,
+                stats,
+                metrics,
+                max_response_size: crate::protocol::MAX_MESSAGE_SIZE,
+                max_in_flight_requests: 256,
+                max_high_priority_bypasses: 4,
+            },
         ));
 
         let (response_tx, response_rx) = oneshot::channel();

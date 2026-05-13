@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_string};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{check_compact_array_len, encode_compact_array_len};
@@ -161,7 +161,8 @@ impl FindCoordinatorResponse {
         let count = check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
         if count == 0 {
             let _ = TaggedFields::decode(buf)?;
-            return Err(KrafkaError::protocol(
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::Malformed,
                 "FindCoordinator v4: empty coordinators array",
             ));
         }

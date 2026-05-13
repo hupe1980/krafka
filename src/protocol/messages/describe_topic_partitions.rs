@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_string};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{check_compact_array_len, encode_compact_array_len};
 
@@ -142,7 +142,10 @@ impl DescribeTopicPartitionsResponse {
             let name = KafkaString::decode_compact(buf)?.0;
             let mut topic_id = [0u8; 16];
             if buf.remaining() < 16 {
-                return Err(KrafkaError::protocol("short buf for topic_id"));
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::TruncatedFrame,
+                    "short buf for topic_id",
+                ));
             }
             buf.copy_to_slice(&mut topic_id);
             let is_internal = i8::decode(buf)? != 0;

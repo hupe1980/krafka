@@ -95,7 +95,7 @@ let producer = Producer::builder()
 | `fetch_max_bytes` | i32 | `52428800` | Max bytes per fetch response |
 | `max_partition_fetch_bytes` | i32 | `1048576` | Max bytes per partition |
 | `fetch_max_wait` | Duration | `500ms` | Max time to wait for fetch |
-| `max_poll_records` | i32 | `500` | Max records per poll (strictly enforced) |
+| `max_poll_records` | i32 | `500` | Max records per poll; `-1` = unlimited; `0` and other negative values rejected |
 | `session_timeout` | Duration | `10s` | Group session timeout |
 | `heartbeat_interval` | Duration | `3s` | Heartbeat interval |
 | `max_poll_interval` | Duration | `5m` | Max time between polls (also used as the rebalance timeout) |

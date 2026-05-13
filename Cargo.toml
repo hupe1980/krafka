@@ -26,11 +26,14 @@ thiserror = "2"
 # Stream trait for async iteration
 futures-core = "0.3"
 
+# FutureExt::catch_unwind for panic-safe event loop tasks
+futures = { version = "0.3", default-features = false, features = ["async-await", "std"] }
+
 # Logging and tracing
 tracing = "0.1"
 
-# Compression (`flate2` is always compiled; the remaining codecs are individually feature-gated)
-flate2 = "1"                                          # unconditional: used for record-batch gzip and Glue ZLIB
+# Compression (each codec is individually feature-gated)
+flate2 = { version = "1", optional = true }            # gzip record-batch compression + Glue ZLIB
 snap = { version = "1", optional = true }             # snappy
 lz4_flex = { version = "0.11", optional = true }      # lz4
 zstd = { version = "0.13", optional = true }          # zstd (requires C toolchain via zstd-sys)
@@ -43,6 +46,9 @@ rand = "0.9"
 
 # Synchronization (non-poisoning RwLock)
 parking_lot = "0.12"
+
+# Fast non-cryptographic hasher for hot-path HashMap lookups.
+ahash = "0.8"
 
 # TCP keepalive configuration
 socket2 = "0.5"
@@ -88,10 +94,10 @@ default = ["compression"]
 compression = ["gzip", "snappy", "lz4"]
 # Enable all compression codecs, including zstd.
 compression-all = ["compression", "zstd"]
-# Enable gzip record-batch compression/decompression codepaths.
-# NOTE: `flate2` is always compiled (required for Glue ZLIB); this feature
-# gates the gzip *codec selection* at runtime, not the dependency itself.
-gzip = []
+# Enable gzip record-batch compression/decompression.
+# Also activates the `flate2` crate for Glue ZLIB when combined with
+# `aws-glue-schema-registry`.
+gzip = ["dep:flate2"]
 # Enable Snappy compression.
 snappy = ["dep:snap"]
 # Enable LZ4 compression.
@@ -109,8 +115,9 @@ aws-msk = ["dep:aws-config", "dep:aws-credential-types"]
 schema-registry = ["dep:reqwest", "dep:serde", "dep:serde_json"]
 # Enable the AWS Glue Schema Registry SDK client.
 # The core glue module (wire format, trait, caching) is always available.
-# This feature adds the aws-sdk-glue dependency for direct Glue API calls.
-aws-glue-schema-registry = ["dep:aws-sdk-glue", "dep:aws-config"]
+# This feature adds the aws-sdk-glue dependency for direct Glue API calls
+# and activates flate2 for Glue ZLIB compression.
+aws-glue-schema-registry = ["dep:aws-sdk-glue", "dep:aws-config", "dep:flate2"]
 # Allow disabling TLS certificate verification (MITM risk!).
 # Only enable for local development or testing with self-signed certificates.
 # Requires calling `TlsConfig::insecure()`.

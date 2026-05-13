@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut, Bytes};
 
 use super::{VersionedDecode, VersionedEncode};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::primitives::{
     Decode, Encode, KafkaBytes, KafkaString, TaggedFields, TryEncode,
 };
@@ -36,8 +36,12 @@ impl ShareGroupHeartbeatRequest {
         KafkaString(self.rack_id.clone()).try_encode_compact(buf)?;
         // SubscribedTopicNames: nullable compact array of compact strings
         if let Some(ref topics) = self.subscribed_topic_names {
-            let len = u32::try_from(topics.len().saturating_add(1))
-                .map_err(|_| KrafkaError::protocol("subscribed topics array too large"))?;
+            let len = u32::try_from(topics.len().saturating_add(1)).map_err(|_| {
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidLength,
+                    "subscribed topics array too large",
+                )
+            })?;
             crate::util::varint::encode_unsigned_varint(len, buf);
             for topic in topics {
                 KafkaString::new(topic).try_encode_compact(buf)?;
@@ -111,7 +115,8 @@ impl ShareGroupHeartbeatResponse {
     /// Decode the nullable Assignment struct.
     fn decode_assignment(buf: &mut impl Buf) -> Result<Option<Vec<ShareGroupTopicPartitions>>> {
         if buf.remaining() < 1 {
-            return Err(KrafkaError::protocol(
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
                 "not enough bytes for assignment presence tag",
             ));
         }
@@ -120,9 +125,12 @@ impl ShareGroupHeartbeatResponse {
             return Ok(None);
         }
         if presence != 1 {
-            return Err(KrafkaError::protocol(format!(
-                "invalid assignment presence tag: expected negative for null or 1 for present, got {presence}"
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::Malformed,
+                format!(
+                    "invalid assignment presence tag: expected negative for null or 1 for present, got {presence}"
+                ),
+            ));
         }
 
         // Struct is present — decode TopicPartitions compact array.
@@ -131,7 +139,10 @@ impl ShareGroupHeartbeatResponse {
         for _ in 0..tp_count {
             let mut topic_id = [0u8; 16];
             if buf.remaining() < 16 {
-                return Err(KrafkaError::protocol("not enough bytes for topic_id UUID"));
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::TruncatedFrame,
+                    "not enough bytes for topic_id UUID",
+                ));
             }
             buf.copy_to_slice(&mut topic_id);
             let p_count =
@@ -167,8 +178,12 @@ pub struct ShareGroupDescribeRequest {
 impl ShareGroupDescribeRequest {
     /// Encode for version 1 (stable, KIP-932).
     pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
-        let len = u32::try_from(self.group_ids.len().saturating_add(1))
-            .map_err(|_| KrafkaError::protocol("group_ids array too large"))?;
+        let len = u32::try_from(self.group_ids.len().saturating_add(1)).map_err(|_| {
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                "group_ids array too large",
+            )
+        })?;
         crate::util::varint::encode_unsigned_varint(len, buf);
         for gid in &self.group_ids {
             KafkaString::new(gid).try_encode_compact(buf)?;
@@ -293,7 +308,10 @@ impl ShareGroupDescribeResponse {
                 for _ in 0..tp_count {
                     let mut topic_id = [0u8; 16];
                     if buf.remaining() < 16 {
-                        return Err(KrafkaError::protocol("not enough bytes for topic_id"));
+                        return Err(KrafkaError::protocol_kind(
+                            ProtocolErrorKind::TruncatedFrame,
+                            "not enough bytes for topic_id",
+                        ));
                     }
                     buf.copy_to_slice(&mut topic_id);
                     let topic_name = super::non_nullable_string(
@@ -584,7 +602,10 @@ impl ShareFetchResponse {
         for _ in 0..topic_count {
             let mut topic_id = [0u8; 16];
             if buf.remaining() < 16 {
-                return Err(KrafkaError::protocol("not enough bytes for topic_id UUID"));
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::TruncatedFrame,
+                    "not enough bytes for topic_id UUID",
+                ));
             }
             buf.copy_to_slice(&mut topic_id);
             let part_count =
@@ -799,7 +820,10 @@ impl ShareAcknowledgeResponse {
         for _ in 0..topic_count {
             let mut topic_id = [0u8; 16];
             if buf.remaining() < 16 {
-                return Err(KrafkaError::protocol("not enough bytes for topic_id UUID"));
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::TruncatedFrame,
+                    "not enough bytes for topic_id UUID",
+                ));
             }
             buf.copy_to_slice(&mut topic_id);
             let part_count =

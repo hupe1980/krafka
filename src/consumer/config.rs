@@ -137,6 +137,12 @@ pub struct ConsumerConfig {
     pub(crate) fetch_max_bytes: i32,
     /// Maximum bytes per partition.
     pub(crate) max_partition_fetch_bytes: i32,
+    /// Per-topic override for the per-partition fetch byte limit.
+    ///
+    /// When a topic is present in this map, its partitions use the specified
+    /// limit instead of [`max_partition_fetch_bytes`](Self::max_partition_fetch_bytes).
+    /// Useful for mixing high-throughput and low-throughput topics in one consumer.
+    pub(crate) topic_fetch_max_bytes: HashMap<String, i32>,
     /// Maximum records returned by a single [`poll()`](super::Consumer::poll) call.
     ///
     /// `0` means unlimited (no truncation). Positive values cap the batch.
@@ -218,6 +224,26 @@ pub struct ConsumerConfig {
     /// Keyed by `(topic, partition)`.  Build via
     /// [`ConsumerConfigBuilder::initial_offsets`].
     pub(crate) initial_offsets: HashMap<(String, PartitionId), Offset>,
+    /// Maximum number of cooperative-rebalance rejoin rounds per poll cycle.
+    ///
+    /// Each round handles one additional wave of partition revocations from
+    /// cascading membership changes. When the cap is reached without
+    /// convergence, the remaining revocations are deferred to the next
+    /// poll call and a heartbeat is sent to avoid session expiry.
+    ///
+    /// Increasing this value speeds up convergence in large, rapidly-changing
+    /// groups at the cost of holding the poll lock longer. The default of 10
+    /// is sufficient for all but the most extreme churning groups.
+    pub(crate) max_cooperative_rebalance_rounds: usize,
+    /// Duration after which a partition's cached high watermark is considered
+    /// stale by [`Consumer::lag`].
+    ///
+    /// If a partition's watermark has not been refreshed within this window it
+    /// appears in [`LagResult::stale_partitions`]. The lag value is still
+    /// returned but may be inaccurate.
+    ///
+    /// Default: 60 s. Set to `Duration::MAX` to disable staleness reporting.
+    pub(crate) lag_staleness_threshold: Duration,
 }
 
 impl Default for ConsumerConfig {
@@ -232,6 +258,7 @@ impl Default for ConsumerConfig {
             fetch_min_bytes: 1,
             fetch_max_bytes: 52428800,          // 50 MB
             max_partition_fetch_bytes: 1048576, // 1 MB
+            topic_fetch_max_bytes: HashMap::new(),
             max_poll_records: 500,
             max_buffered_records: 500,
             max_poll_interval: Duration::from_secs(300),
@@ -252,6 +279,8 @@ impl Default for ConsumerConfig {
             #[cfg(feature = "socks5")]
             proxy: None,
             initial_offsets: HashMap::new(),
+            max_cooperative_rebalance_rounds: 10,
+            lag_staleness_threshold: Duration::from_secs(60),
         }
     }
 }
@@ -542,11 +571,23 @@ impl ConsumerConfigBuilder {
         self
     }
 
+    /// Override the per-partition fetch byte limit for a specific topic.
+    ///
+    /// When set, partitions of `topic` use `bytes` instead of
+    /// [`max_partition_fetch_bytes`](ConsumerConfigBuilder::max_partition_fetch_bytes).
+    /// Can be called multiple times to configure multiple topics.
+    pub fn topic_fetch_max_bytes(mut self, topic: impl Into<String>, bytes: i32) -> Self {
+        self.config
+            .topic_fetch_max_bytes
+            .insert(topic.into(), bytes);
+        self
+    }
+
     /// Set maximum records per [`poll()`](super::Consumer::poll) call.
     ///
-    /// - `0` means unlimited — no truncation. This is the recommended mode.
+    /// - `-1` means unlimited — no truncation.
     /// - Positive values cap each poll batch at that many records.
-    /// - Negative values are rejected at build time.
+    /// - `0` and other negative values are rejected at build time.
     ///
     /// Default: 500.
     pub fn max_poll_records(mut self, max: i32) -> Self {
@@ -663,16 +704,48 @@ impl ConsumerConfigBuilder {
         self
     }
 
+    /// Set the maximum number of cooperative-rebalance rejoin rounds per poll.
+    ///
+    /// Default: 10. Values below 1 are clamped to 1.
+    pub fn max_cooperative_rebalance_rounds(mut self, rounds: usize) -> Self {
+        self.config.max_cooperative_rebalance_rounds = rounds.max(1);
+        self
+    }
+
+    /// Set the staleness threshold for high-watermark freshness in `lag()`.
+    ///
+    /// Partitions whose cached watermark is older than this threshold appear in
+    /// [`LagResult::stale_partitions`]. Pass `Duration::MAX` to disable
+    /// staleness reporting.
+    ///
+    /// Default: 60 s.
+    pub fn lag_staleness_threshold(mut self, threshold: Duration) -> Self {
+        self.config.lag_staleness_threshold = threshold;
+        self
+    }
+
     /// Build the config.
     ///
     /// # Errors
     ///
     /// Returns an error if timing or value constraints are violated:
     /// - `heartbeat_interval` must be less than `session_timeout`
+    /// - `bootstrap_servers` must be non-empty
+    /// - `group_id`, when provided, must be non-empty
     /// - `session_timeout` must be less than or equal to `max_poll_interval`
     /// - `max_buffered_records` must be >= 0 (0 disables the cap)
     /// - `fetch_min_bytes` must be <= `fetch_max_bytes`
     pub fn build(self) -> crate::Result<ConsumerConfig> {
+        if self.config.bootstrap_servers.is_empty() {
+            return Err(crate::error::KrafkaError::config(
+                "bootstrap_servers must not be empty",
+            ));
+        }
+        if self.config.group_id.as_deref() == Some("") {
+            return Err(crate::error::KrafkaError::config(
+                "group_id must not be an empty string; omit it entirely to disable group coordination",
+            ));
+        }
         if self.config.heartbeat_interval >= self.config.session_timeout {
             return Err(crate::error::KrafkaError::config(format!(
                 "heartbeat_interval ({:?}) must be less than session_timeout ({:?})",
@@ -697,9 +770,9 @@ impl ConsumerConfigBuilder {
                 self.config.fetch_min_bytes, self.config.fetch_max_bytes,
             )));
         }
-        if self.config.max_poll_records < 0 {
+        if self.config.max_poll_records == 0 || self.config.max_poll_records < -1 {
             return Err(crate::error::KrafkaError::config(format!(
-                "max_poll_records ({}) must be >= 0 (use 0 for unlimited)",
+                "max_poll_records ({}) must be -1 (unlimited) or a positive integer",
                 self.config.max_poll_records,
             )));
         }
@@ -777,6 +850,7 @@ mod tests {
     #[test]
     fn test_config_builder_fetch_min_bytes() {
         let config = ConsumerConfig::builder()
+            .bootstrap_servers("localhost:9092")
             .fetch_min_bytes(1024)
             .build()
             .unwrap();
@@ -789,6 +863,7 @@ mod tests {
     #[test]
     fn test_config_builder_fetch_max_bytes() {
         let config = ConsumerConfig::builder()
+            .bootstrap_servers("localhost:9092")
             .fetch_max_bytes(10 * 1024 * 1024)
             .build()
             .unwrap();
@@ -802,6 +877,7 @@ mod tests {
     #[test]
     fn test_config_builder_metadata_max_age() {
         let config = ConsumerConfig::builder()
+            .bootstrap_servers("localhost:9092")
             .metadata_max_age(Duration::from_secs(60))
             .build()
             .unwrap();
@@ -824,6 +900,7 @@ mod tests {
     #[test]
     fn test_config_builder_group_instance_id() {
         let config = ConsumerConfig::builder()
+            .bootstrap_servers("localhost:9092")
             .group_id("my-group")
             .group_instance_id("instance-1")
             .build()
@@ -847,6 +924,7 @@ mod tests {
     #[test]
     fn test_config_builder_client_rack() {
         let config = ConsumerConfig::builder()
+            .bootstrap_servers("localhost:9092")
             .client_rack("us-east-1a")
             .build()
             .unwrap();
@@ -870,6 +948,7 @@ mod tests {
     #[test]
     fn test_config_builder_group_protocol_consumer() {
         let config = ConsumerConfig::builder()
+            .bootstrap_servers("localhost:9092")
             .group_protocol(GroupProtocol::Consumer)
             .build()
             .unwrap();
@@ -907,6 +986,7 @@ mod tests {
     #[test]
     fn test_config_builder_recovery_strategy() {
         let config = ConsumerConfig::builder()
+            .bootstrap_servers("localhost:9092")
             .metadata_recovery_strategy(MetadataRecoveryStrategy::Rebootstrap)
             .metadata_recovery_rebootstrap_trigger(Duration::from_secs(60))
             .build()
@@ -923,7 +1003,10 @@ mod tests {
 
     #[test]
     fn test_config_builder_rejects_negative_max_buffered_records() {
-        let result = ConsumerConfig::builder().max_buffered_records(-1).build();
+        let result = ConsumerConfig::builder()
+            .bootstrap_servers("localhost:9092")
+            .max_buffered_records(-1)
+            .build();
         assert!(result.is_err());
         assert!(
             result
@@ -937,6 +1020,7 @@ mod tests {
     #[test]
     fn test_config_builder_accepts_zero_max_buffered_records() {
         let config = ConsumerConfig::builder()
+            .bootstrap_servers("localhost:9092")
             .max_buffered_records(0)
             .build()
             .unwrap();
@@ -944,26 +1028,69 @@ mod tests {
     }
 
     #[test]
-    fn test_config_builder_accepts_zero_max_poll_records_as_unlimited() {
-        // 0 means unlimited — poll() must not truncate any records.
+    fn test_config_builder_accepts_minus_one_max_poll_records_as_unlimited() {
+        // -1 means unlimited — poll() must not truncate any records.
         let config = ConsumerConfig::builder()
-            .max_poll_records(0)
+            .bootstrap_servers("localhost:9092")
+            .max_poll_records(-1)
             .build()
             .unwrap();
         assert_eq!(
             config.max_poll_records(),
-            0,
-            "max_poll_records=0 should be accepted as unlimited"
+            -1,
+            "max_poll_records=-1 should be accepted as unlimited"
+        );
+    }
+
+    #[test]
+    fn test_config_builder_rejects_zero_max_poll_records() {
+        let result = ConsumerConfig::builder()
+            .bootstrap_servers("localhost:9092")
+            .max_poll_records(0)
+            .build();
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("max_poll_records"),
+            "error message should mention max_poll_records"
         );
     }
 
     #[test]
     fn test_config_builder_rejects_negative_max_poll_records() {
-        let result = ConsumerConfig::builder().max_poll_records(-1).build();
+        let result = ConsumerConfig::builder()
+            .bootstrap_servers("localhost:9092")
+            .max_poll_records(-2)
+            .build();
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("max_poll_records"),
             "error message should mention max_poll_records"
+        );
+    }
+
+    #[test]
+    fn test_config_builder_rejects_empty_bootstrap_servers() {
+        let result = ConsumerConfig::builder().bootstrap_servers("").build();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("bootstrap_servers"),
+            "error message should mention bootstrap_servers"
+        );
+    }
+
+    #[test]
+    fn test_config_builder_rejects_empty_group_id() {
+        let result = ConsumerConfig::builder()
+            .bootstrap_servers("localhost:9092")
+            .group_id("")
+            .build();
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("group_id"),
+            "error message should mention group_id"
         );
     }
 }

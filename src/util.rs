@@ -6,6 +6,110 @@ use std::time::Duration;
 
 use crate::error::{KrafkaError, Result};
 
+/// Shared exponential-backoff parameters used by both [`RetryPolicy`] and
+/// [`ConnectionRetryConfig`].
+///
+/// [`RetryPolicy`]: crate::producer::RetryPolicy
+/// [`ConnectionRetryConfig`]: crate::network::ConnectionRetryConfig
+#[derive(Debug, Clone)]
+pub struct BackoffPolicy {
+    /// Initial backoff duration (first retry delay).
+    pub(crate) initial_backoff: Duration,
+    /// Maximum backoff duration (caps exponential growth).
+    pub(crate) max_backoff: Duration,
+    /// Backoff multiplier for exponential growth (typically 2.0).
+    pub(crate) backoff_multiplier: f64,
+    /// Jitter factor (0.0–1.0) to randomize backoff and prevent thundering herd.
+    pub(crate) jitter_factor: f64,
+}
+
+impl Default for BackoffPolicy {
+    fn default() -> Self {
+        Self {
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(10),
+            backoff_multiplier: 2.0,
+            jitter_factor: 0.1,
+        }
+    }
+}
+
+impl BackoffPolicy {
+    /// Calculate the backoff duration for a given attempt number.
+    ///
+    /// Attempt 0 returns `Duration::ZERO` (no delay before first attempt).
+    /// Attempt 1 = first retry = `initial_backoff`. Subsequent attempts grow
+    /// exponentially up to `max_backoff`, with optional ±jitter.
+    ///
+    /// # Constraint
+    ///
+    /// `max_backoff` must be >= `initial_backoff`. If not, `max_backoff` is
+    /// silently clamped up to `initial_backoff` so the contract that
+    /// `initial_backoff <= result <= max_backoff` holds.
+    #[inline]
+    pub fn calculate_backoff(&self, attempt: u32) -> Duration {
+        if attempt == 0 {
+            return Duration::ZERO;
+        }
+
+        // Clamp max_backoff to at least initial_backoff.
+        // If the caller configured max_backoff < initial_backoff the floor
+        // below would silently ignore max_backoff, so we canonicalize first.
+        let effective_max = self.max_backoff.max(self.initial_backoff);
+
+        // Exponential backoff: initial * multiplier^(attempt-1)
+        let exponent = attempt.saturating_sub(1).min(i32::MAX as u32) as i32;
+        let base_backoff =
+            self.initial_backoff.as_secs_f64() * self.backoff_multiplier.powi(exponent);
+
+        // Cap at max backoff.
+        let capped_backoff = base_backoff.min(effective_max.as_secs_f64());
+
+        // Add ±jitter to prevent thundering herd.
+        let jitter_range = capped_backoff * self.jitter_factor;
+        let jitter = if self.jitter_factor > 0.0 {
+            rand::random_range(-jitter_range..=jitter_range)
+        } else {
+            0.0
+        };
+
+        let final_backoff = (capped_backoff + jitter).max(self.initial_backoff.as_secs_f64());
+
+        if !final_backoff.is_finite() {
+            tracing::warn!(
+                "BackoffPolicy::calculate_backoff produced non-finite value ({final_backoff}); capping at max_backoff"
+            );
+            return effective_max;
+        }
+
+        Duration::from_secs_f64(final_backoff)
+    }
+
+    /// Initial backoff duration.
+    #[inline]
+    pub fn initial_backoff(&self) -> Duration {
+        self.initial_backoff
+    }
+
+    /// Maximum backoff duration.
+    #[inline]
+    pub fn max_backoff(&self) -> Duration {
+        self.max_backoff
+    }
+
+    /// Backoff multiplier.
+    #[inline]
+    pub fn backoff_multiplier(&self) -> f64 {
+        self.backoff_multiplier
+    }
+
+    /// Jitter factor (0.0–1.0).
+    #[inline]
+    pub fn jitter_factor(&self) -> f64 {
+        self.jitter_factor
+    }
+}
+
 /// Reserved correlation ID for requests that intentionally expect no response.
 ///
 /// The normal request generator skips this value so fire-and-forget paths can
@@ -49,15 +153,19 @@ pub fn duration_to_millis_i64(d: Duration) -> i64 {
 /// Generate a random UUID v4 string (KIP-1082 client-generated member ID).
 ///
 /// Format: `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx` where `y` is one of
-/// `{8, 9, a, b}`. Uses `rand::random` (non-cryptographic PRNG) for the
-/// 122 random bits. This is suitable for uniqueness (member IDs, client
-/// IDs) but **not** for security-sensitive tokens.
+/// `{8, 9, a, b}`. Uses `rand::ThreadRng` (ChaCha12, OS-seeded CSPRNG) for the
+/// 122 random bits. Suitable for both uniqueness (member IDs, client IDs)
+/// and non-predictability — UUIDs generated here are not guessable.
+///
+/// A single heap allocation of exactly 36 bytes is made.
 pub fn random_uuid_v4() -> String {
     let bytes: [u8; 16] = rand::random();
     // Set version (4) and variant (RFC 4122).
     let b6 = (bytes[6] & 0x0F) | 0x40;
     let b8 = (bytes[8] & 0x3F) | 0x80;
-    format!(
+    // `format!` for a fixed-width hex string reserves exactly the right
+    // capacity via the format machinery — no reallocation needed.
+    let s = format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         bytes[0],
         bytes[1],
@@ -75,7 +183,9 @@ pub fn random_uuid_v4() -> String {
         bytes[13],
         bytes[14],
         bytes[15],
-    )
+    );
+    debug_assert_eq!(s.len(), 36, "UUID must be exactly 36 chars");
+    s
 }
 
 /// Thread-safe correlation ID generator.
@@ -129,7 +239,43 @@ pub fn crc32c(data: &[u8]) -> u32 {
 pub mod varint {
     use bytes::{Buf, BufMut};
 
-    use crate::error::{KrafkaError, Result};
+    use crate::error::{KrafkaError, ProtocolErrorKind, Result};
+
+    /// Return the encoded byte length of an unsigned varint.
+    #[inline]
+    pub const fn unsigned_varint_size(mut value: u32) -> usize {
+        let mut len = 1usize;
+        while value >= 0x80 {
+            value >>= 7;
+            len += 1;
+        }
+        len
+    }
+
+    /// Return the encoded byte length of a signed varint (zigzag encoded).
+    #[inline]
+    pub const fn signed_varint_size(value: i32) -> usize {
+        let unsigned = ((value << 1) ^ (value >> 31)) as u32;
+        unsigned_varint_size(unsigned)
+    }
+
+    /// Return the encoded byte length of an unsigned varlong.
+    #[inline]
+    pub const fn unsigned_varlong_size(mut value: u64) -> usize {
+        let mut len = 1usize;
+        while value >= 0x80 {
+            value >>= 7;
+            len += 1;
+        }
+        len
+    }
+
+    /// Return the encoded byte length of a signed varlong (zigzag encoded).
+    #[inline]
+    pub const fn signed_varlong_size(value: i64) -> usize {
+        let unsigned = ((value << 1) ^ (value >> 63)) as u64;
+        unsigned_varlong_size(unsigned)
+    }
 
     /// Encode a signed 32-bit integer as a varint.
     #[inline]
@@ -180,7 +326,10 @@ pub mod varint {
 
         loop {
             if !buf.has_remaining() {
-                return Err(KrafkaError::protocol("unexpected end of varint"));
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::TruncatedFrame,
+                    "unexpected end of varint",
+                ));
             }
 
             let byte = buf.get_u8();
@@ -192,7 +341,10 @@ pub mod varint {
 
             shift += 7;
             if shift >= 35 {
-                return Err(KrafkaError::protocol("varint too long"));
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidLength,
+                    "varint too long",
+                ));
             }
         }
 
@@ -214,7 +366,10 @@ pub mod varint {
 
         loop {
             if !buf.has_remaining() {
-                return Err(KrafkaError::protocol("unexpected end of varlong"));
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::TruncatedFrame,
+                    "unexpected end of varlong",
+                ));
             }
 
             let byte = buf.get_u8();
@@ -226,7 +381,10 @@ pub mod varint {
 
             shift += 7;
             if shift >= 70 {
-                return Err(KrafkaError::protocol("varlong too long"));
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidLength,
+                    "varlong too long",
+                ));
             }
         }
 

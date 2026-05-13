@@ -6,7 +6,7 @@
 //! - **Automatic reconnection**: Exponential backoff retry on connection failures
 //! - **Round-robin selection**: Load balance requests across connection bundles
 
-use std::collections::HashMap;
+use ahash::AHashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -20,6 +20,7 @@ use super::connection::{BrokerConnection, ConnectionConfig};
 use crate::BrokerId;
 use crate::error::{KrafkaError, Result};
 use crate::metrics::ConnectionMetrics;
+use crate::util::BackoffPolicy;
 
 /// Configuration for connection retry with exponential backoff.
 ///
@@ -28,24 +29,18 @@ use crate::metrics::ConnectionMetrics;
 pub struct ConnectionRetryConfig {
     /// Maximum number of retries (0 = no retries).
     pub(crate) max_retries: u32,
-    /// Initial backoff duration.
-    pub(crate) initial_backoff: Duration,
-    /// Maximum backoff duration (caps exponential growth).
-    pub(crate) max_backoff: Duration,
-    /// Backoff multiplier for exponential growth.
-    pub(crate) backoff_multiplier: f64,
-    /// Jitter factor (0.0–1.0) to randomize backoff and prevent thundering herd.
-    pub(crate) jitter_factor: f64,
+    /// Shared exponential-backoff parameters.
+    pub(crate) backoff: BackoffPolicy,
 }
 
 impl Default for ConnectionRetryConfig {
     fn default() -> Self {
         Self {
             max_retries: 3,
-            initial_backoff: Duration::from_millis(100),
-            max_backoff: Duration::from_secs(10),
-            backoff_multiplier: 2.0,
-            jitter_factor: 0.2,
+            backoff: BackoffPolicy {
+                jitter_factor: 0.2, // slightly more jitter than producer default
+                ..BackoffPolicy::default()
+            },
         }
     }
 }
@@ -65,65 +60,31 @@ impl ConnectionRetryConfig {
     /// Returns the initial backoff duration.
     #[inline]
     pub fn initial_backoff(&self) -> Duration {
-        self.initial_backoff
+        self.backoff.initial_backoff
     }
 
     /// Returns the maximum backoff duration.
     #[inline]
     pub fn max_backoff(&self) -> Duration {
-        self.max_backoff
+        self.backoff.max_backoff
     }
 
     /// Returns the backoff multiplier.
     #[inline]
     pub fn backoff_multiplier(&self) -> f64 {
-        self.backoff_multiplier
+        self.backoff.backoff_multiplier
     }
 
     /// Returns the jitter factor (0.0–1.0).
     #[inline]
     pub fn jitter_factor(&self) -> f64 {
-        self.jitter_factor
+        self.backoff.jitter_factor
     }
 
     /// Calculate the backoff duration for a given attempt number (1-indexed).
     #[inline]
     fn calculate_backoff(&self, attempt: u32) -> Duration {
-        if attempt == 0 {
-            return Duration::ZERO;
-        }
-
-        // Exponential backoff: initial * multiplier^(attempt-1)
-        let exponent = attempt.saturating_sub(1).min(i32::MAX as u32) as i32;
-        let base_backoff =
-            self.initial_backoff.as_secs_f64() * self.backoff_multiplier.powi(exponent);
-
-        // Cap at max backoff
-        let capped_backoff = base_backoff.min(self.max_backoff.as_secs_f64());
-
-        // Add jitter: ±jitter_factor * backoff (randomized to prevent thundering herd)
-        let jitter_range = capped_backoff * self.jitter_factor;
-        let jitter = if self.jitter_factor > 0.0 {
-            use rand::Rng;
-            let mut rng = rand::rng();
-            rng.random_range(-jitter_range..=jitter_range)
-        } else {
-            0.0
-        };
-
-        let final_backoff = (capped_backoff + jitter).max(0.0);
-
-        // Defensive: Duration::from_secs_f64 panics on NaN/Inf
-        if !final_backoff.is_finite() {
-            warn!(
-                attempt,
-                final_backoff,
-                "Backoff calculation produced non-finite value, falling back to max_backoff"
-            );
-            return self.max_backoff;
-        }
-
-        Duration::from_secs_f64(final_backoff)
+        self.backoff.calculate_backoff(attempt)
     }
 }
 
@@ -143,19 +104,19 @@ impl ConnectionRetryConfigBuilder {
 
     /// Set initial backoff duration.
     pub fn initial_backoff(mut self, duration: Duration) -> Self {
-        self.config.initial_backoff = duration;
+        self.config.backoff.initial_backoff = duration;
         self
     }
 
     /// Set maximum backoff duration.
     pub fn max_backoff(mut self, duration: Duration) -> Self {
-        self.config.max_backoff = duration;
+        self.config.backoff.max_backoff = duration;
         self
     }
 
     /// Set backoff multiplier (must be finite and > 0; clamped to 1.0 otherwise).
     pub fn backoff_multiplier(mut self, multiplier: f64) -> Self {
-        self.config.backoff_multiplier = if multiplier.is_finite() && multiplier > 0.0 {
+        self.config.backoff.backoff_multiplier = if multiplier.is_finite() && multiplier > 0.0 {
             multiplier
         } else {
             1.0
@@ -165,7 +126,7 @@ impl ConnectionRetryConfigBuilder {
 
     /// Set jitter factor (0.0–1.0) to randomize backoff and prevent thundering herd.
     pub fn jitter_factor(mut self, factor: f64) -> Self {
-        self.config.jitter_factor = if factor.is_finite() {
+        self.config.backoff.jitter_factor = if factor.is_finite() {
             factor.clamp(0.0, 1.0)
         } else {
             0.0
@@ -237,13 +198,24 @@ impl BrokerConnectionBundle {
             }));
         }
 
-        // Collect results
+        // Collect results — on any error, close already-established connections
+        // before returning so their event-loop tasks exit promptly instead of
+        // idling until the last Arc clone is dropped.
         let mut connections = Vec::with_capacity(num_connections);
         for handle in handles {
-            let conn = handle.await.map_err(|e| {
-                KrafkaError::invalid_state(format!("Connection task failed: {e}"))
-            })??;
-            connections.push(Arc::new(conn));
+            let result = handle
+                .await
+                .map_err(|e| KrafkaError::invalid_state(format!("Connection task failed: {e}")))?;
+            match result {
+                Ok(conn) => connections.push(Arc::new(conn)),
+                Err(e) => {
+                    // Gracefully close the connections established so far.
+                    for already_connected in connections {
+                        already_connected.close().await;
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         debug!(
@@ -371,7 +343,7 @@ impl BrokerConnectionBundle {
 pub const DEFAULT_MAX_IDLE: Duration = Duration::from_secs(9 * 60);
 
 /// Waiters for coalesced reconnection attempts, keyed by address.
-type ConnectingWaiters = HashMap<String, Vec<oneshot::Sender<Result<Arc<BrokerConnection>>>>>;
+type ConnectingWaiters = AHashMap<String, Vec<oneshot::Sender<Result<Arc<BrokerConnection>>>>>;
 
 /// Guard that ensures the `connecting` map entry is cleaned up if the
 /// reconnecting task's future is cancelled (dropped).  Without this,
@@ -417,19 +389,45 @@ impl Drop for ReconnectGuard {
 
 /// A pool of connections to Kafka brokers.
 ///
-/// Uses `parking_lot::RwLock` (writer-fair, non-async) for connection
-/// maps so that the hot `get_connection*` read path stays fast and avoids
-/// async lock overhead when there are no concurrent writers.  Reconnection attempts to the same address are coalesced
-/// via a `parking_lot::Mutex`: only the first caller performs the
-/// TCP/TLS/SASL handshake while subsequent callers wait on oneshot channels,
-/// preventing thundering-herd reconnection storms.  The sync mutex ensures
-/// deterministic cleanup in `ReconnectGuard`'s `Drop` impl without
+/// Combined index for the two connection lookup maps.
+///
+/// Wrapping both maps in a single `RwLock<PoolState>` ensures that
+/// `evict_idle`, `close_all`, and any write that touches both indexes are
+/// **atomic** — a reader that acquires the lock never observes one map
+/// updated and the other not.
+struct PoolState {
+    /// Connections keyed by broker ID (`-1` is never a valid broker ID so
+    /// it is never inserted; all entries carry a positive ID assigned by the
+    /// cluster metadata).
+    by_id: AHashMap<BrokerId, Arc<BrokerConnection>>,
+    /// Connections keyed by address string (used for bootstrap lookups
+    /// before a broker ID is known).
+    by_addr: AHashMap<String, Arc<BrokerConnection>>,
+}
+
+impl PoolState {
+    fn new() -> Self {
+        Self {
+            by_id: AHashMap::new(),
+            by_addr: AHashMap::new(),
+        }
+    }
+}
+
+/// A pool of connections to Kafka brokers.
+///
+/// Uses `parking_lot::RwLock` (writer-fair, non-async) for connection maps so
+/// that the hot `get_connection*` read path stays fast and avoids async lock
+/// overhead when there are no concurrent writers. Reconnection attempts to the
+/// same address are coalesced via a `parking_lot::Mutex`: only the first caller
+/// performs the TCP/TLS/SASL handshake while subsequent callers wait on oneshot
+/// channels, preventing thundering-herd reconnection storms. The sync mutex
+/// ensures deterministic cleanup in `ReconnectGuard`'s `Drop` impl without
 /// requiring a `tokio::spawn` fallback.
 pub struct ConnectionPool {
-    /// Connections by broker ID.
-    connections: RwLock<HashMap<BrokerId, Arc<BrokerConnection>>>,
-    /// Connections by address (for bootstrap).
-    connections_by_addr: RwLock<HashMap<String, Arc<BrokerConnection>>>,
+    /// Unified connection state — both indexes under one lock so writes
+    /// to either map are always seen together.
+    state: RwLock<PoolState>,
     /// Coalesces concurrent reconnection attempts to the same address.
     /// Only the first task to discover a dead connection performs the
     /// handshake; subsequent tasks push a oneshot sender and wait.
@@ -443,11 +441,24 @@ pub struct ConnectionPool {
     /// eviction. Default: 9 min, matching the Java client's
     /// `connections.max.idle.ms`.
     max_idle: Option<Duration>,
+    /// Maximum number of live connections across all brokers.
+    ///
+    /// When set, new connection attempts that would exceed this cap are
+    /// rejected with [`KrafkaError::Config`] instead of opening a new
+    /// socket. Prevents file-descriptor exhaustion during metadata storms
+    /// (e.g., a cluster that suddenly reports hundreds of brokers).
+    ///
+    /// `None` (default) means unlimited.
+    max_total_connections: Option<usize>,
     /// Handle of the background idle-eviction task, if one was spawned.
     /// Aborted by `close_all`. A `parking_lot::Mutex` is sufficient because
     /// the handle is only taken/replaced in non-hot paths (startup,
     /// shutdown).
     evictor_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Handle of the background OAUTHBEARER proactive-refresh task.
+    /// `None` when the pool is not configured with an OAUTHBEARER provider.
+    /// Aborted by `close_all` alongside the idle-evictor.
+    oauth_refresh_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl ConnectionPool {
@@ -460,13 +471,14 @@ impl ConnectionPool {
     /// manually, regardless of [`Self::with_max_idle`]).
     pub fn new(config: ConnectionConfig) -> Self {
         Self {
-            connections: RwLock::new(HashMap::new()),
-            connections_by_addr: RwLock::new(HashMap::new()),
-            connecting: Arc::new(Mutex::new(HashMap::new())),
+            state: RwLock::new(PoolState::new()),
+            connecting: Arc::new(Mutex::new(AHashMap::new())),
             config,
             retry_config: ConnectionRetryConfig::default(),
             max_idle: Some(DEFAULT_MAX_IDLE),
+            max_total_connections: None,
             evictor_handle: Mutex::new(None),
+            oauth_refresh_handle: Mutex::new(None),
         }
     }
 
@@ -480,13 +492,14 @@ impl ConnectionPool {
         retry_config: ConnectionRetryConfig,
     ) -> Self {
         Self {
-            connections: RwLock::new(HashMap::new()),
-            connections_by_addr: RwLock::new(HashMap::new()),
-            connecting: Arc::new(Mutex::new(HashMap::new())),
+            state: RwLock::new(PoolState::new()),
+            connecting: Arc::new(Mutex::new(AHashMap::new())),
             config,
             retry_config,
             max_idle: Some(DEFAULT_MAX_IDLE),
+            max_total_connections: None,
             evictor_handle: Mutex::new(None),
+            oauth_refresh_handle: Mutex::new(None),
         }
     }
 
@@ -534,6 +547,26 @@ impl ConnectionPool {
     #[inline]
     pub fn max_idle(&self) -> Option<Duration> {
         self.max_idle
+    }
+
+    /// Set a cap on the total number of live connections across all brokers.
+    ///
+    /// A new connection attempt that would exceed `limit` is rejected with
+    /// [`KrafkaError::Config`] rather than opening an additional socket. This
+    /// prevents file-descriptor exhaustion during topology changes that
+    /// introduce many new brokers simultaneously.
+    ///
+    /// `None` (default) removes the cap.
+    #[must_use]
+    pub fn with_max_total_connections(mut self, limit: impl Into<Option<usize>>) -> Self {
+        self.max_total_connections = limit.into();
+        self
+    }
+
+    /// Returns the configured total-connection cap, if any.
+    #[inline]
+    pub fn max_total_connections(&self) -> Option<usize> {
+        self.max_total_connections
     }
 
     /// Re-read TLS certificate files from disk and atomically update the
@@ -626,8 +659,8 @@ impl ConnectionPool {
     async fn get_or_reconnect(&self, address: &str) -> Result<Arc<BrokerConnection>> {
         // Log reauth hint (sync read lock, tiny critical section)
         {
-            let conns = self.connections_by_addr.read();
-            if conns
+            let s = self.state.read();
+            if s.by_addr
                 .get(address)
                 .is_some_and(|c| c.is_alive() && c.needs_reauthentication())
             {
@@ -648,12 +681,9 @@ impl ConnectionPool {
 
         // Double-check before acquiring the coalescing lock: another task
         // may have finished reconnecting between our fast-path miss and now.
-        // This read is done *outside* the `connecting` critical section so
-        // the two locks are never held simultaneously (see the no-nested-lock
-        // invariant documented in the reconnector completion path below).
         let existing = {
-            let conns = self.connections_by_addr.read();
-            conns.get(address).filter(|c| c.is_usable()).cloned()
+            let s = self.state.read();
+            s.by_addr.get(address).filter(|c| c.is_usable()).cloned()
         };
 
         let action = {
@@ -692,32 +722,82 @@ impl ConnectionPool {
         // removed and all waiters are notified with an error.
         let mut guard = ReconnectGuard::new(&self.connecting, addr_owned.clone());
 
+        // Early-exit optimisation: fail fast if we are clearly over the cap so
+        // we do not waste a full TCP/TLS handshake only to discard the connection.
+        //
+        // This check is *not* definitive — two concurrent reconnections to
+        // *different* addresses can both pass here (TOCTOU window).  The
+        // authoritative cap enforcement happens under the write lock after the
+        // connection is established; see the insertion block below.
+        if let Some(limit) = self.max_total_connections {
+            let current = self.state.read().by_addr.len();
+            if current >= limit {
+                // Notify waiters with the error so they don't hang.
+                let err = KrafkaError::config(format!(
+                    "connection pool limit reached: {current}/{limit} connections open \
+                     (address={address}); raise `max_total_connections` or reduce broker count"
+                ));
+                let waiters = self
+                    .connecting
+                    .lock()
+                    .remove(&addr_owned)
+                    .unwrap_or_default();
+                for waiter in waiters {
+                    let _ = waiter.send(Err(err.clone()));
+                }
+                guard.defuse();
+                return Err(err);
+            }
+        }
+
         // Reconnect WITHOUT holding any lock
         let result = self.reconnect_with_backoff(address).await;
 
         // Notify waiting tasks and store the connection.
-        // Safety invariant: this path must not hold `connecting` and
-        // `connections_by_addr` at the same time.  We remove the waiters
-        // from `connecting`, drop that lock immediately, and only then
-        // update `connections_by_addr`.  Future changes must preserve this
-        // no-nested-lock invariant; if code ever needs to hold both locks
-        // simultaneously, it must define and follow a single global order.
+        // The `connecting` lock is dropped before acquiring `state` write
+        // to preserve the invariant that these two locks are never held
+        // simultaneously.
         let waiters = self.connecting.lock().remove(address).unwrap_or_default();
 
-        if let Ok(conn) = &result {
-            self.connections_by_addr
-                .write()
-                .insert(addr_owned, conn.clone());
-        }
+        let final_result = match result {
+            Ok(conn) => {
+                let mut s = self.state.write();
+                // Re-check the cap under the write lock to close the TOCTOU
+                // window.  Two concurrent reconnections to *different* addresses
+                // can both pass the pre-check above (read lock, released) and
+                // both reach this point.  The definitive check here ensures
+                // `by_addr.len()` never exceeds `max_total_connections`.
+                if let Some(limit) = self.max_total_connections {
+                    if s.by_addr.len() >= limit {
+                        drop(s);
+                        // Close the just-established connection gracefully so
+                        // its event-loop task exits promptly.
+                        let overflow = conn.clone();
+                        tokio::spawn(async move { overflow.close().await });
+                        Err(KrafkaError::config(format!(
+                            "connection pool limit reached: {limit} connections open \
+                             (address={addr_owned}); raise `max_total_connections` or reduce broker count"
+                        )))
+                    } else {
+                        s.by_addr.insert(addr_owned, conn.clone());
+                        Ok(conn)
+                    }
+                } else {
+                    s.by_addr.insert(addr_owned, conn.clone());
+                    Ok(conn)
+                }
+            }
+            Err(e) => Err(e),
+        };
 
         for waiter in waiters {
-            let _ = waiter.send(result.clone());
+            let _ = waiter.send(final_result.clone());
         }
 
         // Reconnection completed — prevent guard cleanup.
         guard.defuse();
 
-        result
+        final_result
     }
 
     /// Get or create a connection to a broker by address.
@@ -728,8 +808,8 @@ impl ConnectionPool {
     pub async fn get_connection(&self, address: &str) -> Result<Arc<BrokerConnection>> {
         // Fast path: sync read lock (nanosecond-scale critical section)
         {
-            let conns = self.connections_by_addr.read();
-            if let Some(conn) = conns.get(address)
+            let s = self.state.read();
+            if let Some(conn) = s.by_addr.get(address)
                 && conn.is_usable()
             {
                 return Ok(conn.clone());
@@ -751,8 +831,8 @@ impl ConnectionPool {
     ) -> Result<Arc<BrokerConnection>> {
         // Fast path: sync read lock
         {
-            let conns = self.connections.read();
-            if let Some(conn) = conns.get(&broker_id)
+            let s = self.state.read();
+            if let Some(conn) = s.by_id.get(&broker_id)
                 && conn.is_usable()
             {
                 return Ok(conn.clone());
@@ -763,9 +843,9 @@ impl ConnectionPool {
 
         // Register under this broker ID so future fast-path lookups hit.
         {
-            let mut by_id = self.connections.write();
-            if !by_id.get(&broker_id).is_some_and(|c| c.is_usable()) {
-                by_id.insert(broker_id, conn.clone());
+            let mut s = self.state.write();
+            if !s.by_id.get(&broker_id).is_some_and(|c| c.is_usable()) {
+                s.by_id.insert(broker_id, conn.clone());
             }
         }
 
@@ -799,60 +879,51 @@ impl ConnectionPool {
             return 0;
         };
 
-        // Snapshot candidate keys under read locks; defer mutation so
-        // critical sections stay short.
-        let stale_ids: Vec<BrokerId> = {
-            let conns = self.connections.read();
-            conns
+        // Single write lock covers both maps atomically.
+        // Re-check each candidate under the lock: another task may have
+        // refreshed `last_used_nanos` (or replaced the entry) between the
+        // idle check and here — `remove` + re-insert on miss preserves
+        // freshly-used connections.
+        let mut removed: Vec<Arc<BrokerConnection>> = Vec::new();
+        {
+            let mut s = self.state.write();
+
+            // Collect stale IDs first to avoid borrow conflicts.
+            let stale_ids: Vec<BrokerId> = s
+                .by_id
                 .iter()
                 .filter(|(_, c)| c.idle_duration() >= max_idle)
                 .map(|(id, _)| *id)
-                .collect()
-        };
-        let stale_addrs: Vec<String> = {
-            let conns = self.connections_by_addr.read();
-            conns
+                .collect();
+            for id in stale_ids {
+                if let Some(c) = s.by_id.remove(&id) {
+                    if c.idle_duration() >= max_idle {
+                        removed.push(c);
+                    } else {
+                        s.by_id.insert(id, c);
+                    }
+                }
+            }
+
+            let stale_addrs: Vec<String> = s
+                .by_addr
                 .iter()
                 .filter(|(_, c)| c.idle_duration() >= max_idle)
                 .map(|(addr, _)| addr.clone())
-                .collect()
-        };
+                .collect();
+            for addr in stale_addrs {
+                if let Some(c) = s.by_addr.remove(&addr) {
+                    if c.idle_duration() >= max_idle {
+                        removed.push(c);
+                    } else {
+                        s.by_addr.insert(addr, c);
+                    }
+                }
+            }
+        }
 
-        if stale_ids.is_empty() && stale_addrs.is_empty() {
+        if removed.is_empty() {
             return 0;
-        }
-
-        let mut removed: Vec<Arc<BrokerConnection>> =
-            Vec::with_capacity(stale_ids.len() + stale_addrs.len());
-
-        if !stale_ids.is_empty() {
-            let mut conns = self.connections.write();
-            for id in &stale_ids {
-                // Re-check under the write lock: another task may have
-                // refreshed `last_used_nanos` (or replaced the entry)
-                // between the snapshot and here. `remove` + re-insert on
-                // miss avoids a second hashmap lookup on the hot path.
-                if let Some(c) = conns.remove(id) {
-                    if c.idle_duration() >= max_idle {
-                        removed.push(c);
-                    } else {
-                        conns.insert(*id, c);
-                    }
-                }
-            }
-        }
-
-        if !stale_addrs.is_empty() {
-            let mut conns = self.connections_by_addr.write();
-            for addr in &stale_addrs {
-                if let Some(c) = conns.remove(addr) {
-                    if c.idle_duration() >= max_idle {
-                        removed.push(c);
-                    } else {
-                        conns.insert(addr.clone(), c);
-                    }
-                }
-            }
         }
 
         // A single connection typically lives in both maps (same `Arc`
@@ -863,26 +934,18 @@ impl ConnectionPool {
         removed.dedup_by(|a, b| Arc::ptr_eq(a, b));
 
         let count = removed.len();
-        if count > 0 {
-            debug!(
-                evicted = count,
-                max_idle_ms = max_idle.as_millis(),
-                "Evicted idle connections"
-            );
-        }
+        debug!(
+            evicted = count,
+            max_idle_ms = max_idle.as_millis(),
+            "Evicted idle connections"
+        );
         // Explicitly close each evicted connection by signalling its internal
-        // task via the high-priority channel. This is important when other
-        // `Arc` clones are held elsewhere (e.g. in-flight requests, coordinator
-        // references): merely dropping the pool's `Arc` would leave the socket
-        // open until those callers also drop their clone. Spawning the close
-        // mirrors the pattern used in `close_all` and in `BrokerConnection::Drop`.
+        // task via the high-priority channel.
         if tokio::runtime::Handle::try_current().is_ok() {
             for conn in removed {
                 tokio::spawn(async move { conn.close().await });
             }
         }
-        // If no runtime is available (tests, process exit) fall back to Drop-
-        // based teardown — the same guard used by BrokerConnection::Drop.
         count
     }
 
@@ -941,6 +1004,20 @@ impl ConnectionPool {
         if let Some(prev) = self.evictor_handle.lock().replace(handle) {
             prev.abort();
         }
+
+        // If the pool's auth config has an OAUTHBEARER provider, start the
+        // proactive token-refresh background task as well.
+        if let Some(provider) = self
+            .config
+            .auth
+            .as_ref()
+            .and_then(|a| a.oauthbearer_provider())
+        {
+            let refresh_handle = provider.start_refresh_task();
+            if let Some(prev) = self.oauth_refresh_handle.lock().replace(refresh_handle) {
+                prev.abort();
+            }
+        }
     }
 
     /// Close all connections and drain both maps.
@@ -952,24 +1029,26 @@ impl ConnectionPool {
     /// `connecting` map are notified with an error so they do not hang
     /// during shutdown.
     pub async fn close_all(&self) {
-        // Stop the idle-evictor before tearing down state so it does not
-        // race with the drain below.
+        // Stop the idle-evictor and the OAUTHBEARER refresh task before
+        // tearing down state so neither races with the drain below.
         if let Some(handle) = self.evictor_handle.lock().take() {
             handle.abort();
         }
+        if let Some(handle) = self.oauth_refresh_handle.lock().take() {
+            handle.abort();
+        }
 
-        // Drain both maps, acquiring each write lock independently.
-        let by_id: Vec<Arc<BrokerConnection>> =
-            self.connections.write().drain().map(|(_, c)| c).collect();
-        let by_addr: Vec<Arc<BrokerConnection>> = self
-            .connections_by_addr
-            .write()
-            .drain()
-            .map(|(_, c)| c)
-            .collect();
+        // Drain both maps atomically under a single write lock.
+        let (by_id, by_addr) = {
+            let mut s = self.state.write();
+            (
+                s.by_id.drain().map(|(_, c)| c).collect::<Vec<_>>(),
+                s.by_addr.drain().map(|(_, c)| c).collect::<Vec<_>>(),
+            )
+        };
 
         // Dedup: same Arc may appear in both maps.
-        let mut seen = HashMap::with_capacity(by_id.len() + by_addr.len());
+        let mut seen = AHashMap::with_capacity(by_id.len() + by_addr.len());
         for conn in by_id.into_iter().chain(by_addr) {
             seen.entry(Arc::as_ptr(&conn) as usize).or_insert(conn);
         }
@@ -999,8 +1078,8 @@ impl ConnectionPool {
     /// Bootstrap connections that have not yet been associated with a broker
     /// ID (i.e. only in the address map) are **not** counted.
     pub fn len(&self) -> usize {
-        let connections = self.connections.read();
-        connections.values().filter(|c| c.is_usable()).count()
+        let s = self.state.read();
+        s.by_id.values().filter(|c| c.is_usable()).count()
     }
 
     /// Returns `true` if no usable connections known by broker ID exist.
@@ -1025,17 +1104,14 @@ mod tests {
     fn test_connection_retry_config_default() {
         let config = ConnectionRetryConfig::default();
         assert_eq!(config.max_retries, 3);
-        assert_eq!(config.initial_backoff, Duration::from_millis(100));
-        assert_eq!(config.max_backoff, Duration::from_secs(10));
-        assert_eq!(config.backoff_multiplier, 2.0);
+        assert_eq!(config.initial_backoff(), Duration::from_millis(100));
+        assert_eq!(config.max_backoff(), Duration::from_secs(10));
+        assert_eq!(config.backoff_multiplier(), 2.0);
     }
 
     #[test]
     fn test_calculate_backoff() {
-        let config = ConnectionRetryConfig {
-            jitter_factor: 0.0, // disable jitter for deterministic test
-            ..ConnectionRetryConfig::default()
-        };
+        let config = ConnectionRetryConfig::builder().jitter_factor(0.0).build();
 
         // Attempt 0 = no backoff
         assert_eq!(config.calculate_backoff(0), Duration::ZERO);
@@ -1052,13 +1128,13 @@ mod tests {
 
     #[test]
     fn test_calculate_backoff_capped() {
-        let config = ConnectionRetryConfig {
-            max_retries: 10,
-            initial_backoff: Duration::from_secs(1),
-            max_backoff: Duration::from_secs(5),
-            backoff_multiplier: 10.0,
-            jitter_factor: 0.0, // disable jitter for deterministic test
-        };
+        let config = ConnectionRetryConfig::builder()
+            .max_retries(10)
+            .initial_backoff(Duration::from_secs(1))
+            .max_backoff(Duration::from_secs(5))
+            .backoff_multiplier(10.0)
+            .jitter_factor(0.0)
+            .build();
 
         // Attempt 2 would be 10 seconds, but capped at 5
         assert_eq!(config.calculate_backoff(2), Duration::from_secs(5));
@@ -1066,27 +1142,29 @@ mod tests {
 
     #[test]
     fn test_calculate_backoff_handles_max_attempt() {
-        let config = ConnectionRetryConfig {
-            max_retries: u32::MAX,
-            jitter_factor: 0.0,
-            ..ConnectionRetryConfig::default()
-        };
+        let config = ConnectionRetryConfig::builder()
+            .max_retries(u32::MAX)
+            .jitter_factor(0.0)
+            .build();
 
-        assert_eq!(config.calculate_backoff(u32::MAX), config.max_backoff);
+        assert_eq!(config.calculate_backoff(u32::MAX), config.max_backoff());
     }
 
     #[test]
     fn test_connection_pool_with_retry_config() {
-        let retry_config = ConnectionRetryConfig {
-            max_retries: 5,
-            initial_backoff: Duration::from_millis(50),
-            max_backoff: Duration::from_secs(5),
-            backoff_multiplier: 3.0,
-            jitter_factor: 0.2,
-        };
+        let retry_config = ConnectionRetryConfig::builder()
+            .max_retries(5)
+            .initial_backoff(Duration::from_millis(50))
+            .max_backoff(Duration::from_secs(5))
+            .backoff_multiplier(3.0)
+            .jitter_factor(0.2)
+            .build();
         let pool = ConnectionPool::with_retry_config(ConnectionConfig::default(), retry_config);
         assert_eq!(pool.retry_config.max_retries, 5);
-        assert_eq!(pool.retry_config.initial_backoff, Duration::from_millis(50));
+        assert_eq!(
+            pool.retry_config.initial_backoff(),
+            Duration::from_millis(50)
+        );
     }
 
     #[test]
@@ -1098,13 +1176,15 @@ mod tests {
         // Custom value
         let config = ConnectionConfig::builder()
             .connections_per_broker(4)
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(config.connections_per_broker, 4);
 
         // Zero becomes 1 (minimum)
         let config = ConnectionConfig::builder()
             .connections_per_broker(0)
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(config.connections_per_broker, 1);
     }
 
@@ -1113,8 +1193,11 @@ mod tests {
         // Verify close_all operates on both connections and connections_by_addr maps
         let pool = ConnectionPool::new(ConnectionConfig::default());
         // Both maps start empty
-        assert!(pool.connections.read().is_empty());
-        assert!(pool.connections_by_addr.read().is_empty());
+        {
+            let s = pool.state.read();
+            assert!(s.by_id.is_empty());
+            assert!(s.by_addr.is_empty());
+        }
         // close_all on empty pool should not panic
         pool.close_all().await;
     }
@@ -1189,16 +1272,20 @@ mod tests {
             "b1:9092",
             Duration::from_secs(10),
         ));
-        pool.connections.write().insert(1, stale.clone());
-        pool.connections_by_addr
-            .write()
-            .insert("b1:9092".to_string(), stale);
+        {
+            let mut s = pool.state.write();
+            s.by_id.insert(1, stale.clone());
+            s.by_addr.insert("b1:9092".to_string(), stale);
+        }
 
         // Same socket shared across both maps must dedup to a single
         // eviction.
         assert_eq!(pool.evict_idle(), 1);
-        assert!(pool.connections.read().is_empty());
-        assert!(pool.connections_by_addr.read().is_empty());
+        {
+            let s = pool.state.read();
+            assert!(s.by_id.is_empty());
+            assert!(s.by_addr.is_empty());
+        }
     }
 
     #[test]
@@ -1214,15 +1301,15 @@ mod tests {
             Duration::from_millis(10),
         ));
         {
-            let mut w = pool.connections.write();
-            w.insert(1, stale);
-            w.insert(2, fresh);
+            let mut s = pool.state.write();
+            s.by_id.insert(1, stale);
+            s.by_id.insert(2, fresh);
         }
 
         assert_eq!(pool.evict_idle(), 1);
-        let kept = pool.connections.read();
-        assert!(!kept.contains_key(&1));
-        assert!(kept.contains_key(&2));
+        let s = pool.state.read();
+        assert!(!s.by_id.contains_key(&1));
+        assert!(s.by_id.contains_key(&2));
     }
 
     #[test]
@@ -1238,9 +1325,30 @@ mod tests {
             Duration::from_secs(10),
         ));
         conn.test_mark_fresh();
-        pool.connections.write().insert(1, conn);
+        pool.state.write().by_id.insert(1, conn);
 
         assert_eq!(pool.evict_idle(), 0);
-        assert!(pool.connections.read().contains_key(&1));
+        assert!(pool.state.read().by_id.contains_key(&1));
+    }
+
+    #[test]
+    fn test_max_total_connections_default_is_none() {
+        let pool = ConnectionPool::new(ConnectionConfig::default());
+        assert_eq!(pool.max_total_connections(), None);
+    }
+
+    #[test]
+    fn test_with_max_total_connections_sets_limit() {
+        let pool =
+            ConnectionPool::new(ConnectionConfig::default()).with_max_total_connections(10usize);
+        assert_eq!(pool.max_total_connections(), Some(10));
+    }
+
+    #[test]
+    fn test_with_max_total_connections_none_removes_limit() {
+        let pool = ConnectionPool::new(ConnectionConfig::default())
+            .with_max_total_connections(5usize)
+            .with_max_total_connections(None);
+        assert_eq!(pool.max_total_connections(), None);
     }
 }

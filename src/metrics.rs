@@ -64,7 +64,7 @@
 
 use std::fmt::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Atomic counter for tracking counts.
@@ -107,6 +107,10 @@ impl Counter {
 #[derive(Debug, Default)]
 pub struct Gauge {
     value: AtomicU64,
+    /// Fires a warning at most once *per gauge instance* when `dec()` underflows.
+    /// Per-instance tracking means a systematic mismatch in gauge B does not
+    /// get silenced by a single prior underflow in gauge A.
+    underflow_warned: AtomicBool,
 }
 
 impl Gauge {
@@ -135,19 +139,25 @@ impl Gauge {
 
     /// Decrement the gauge by 1 (saturates at 0 to prevent underflow).
     ///
-    /// Logs a warning if the gauge was already zero, which typically indicates
-    /// a mismatched `inc()`/`dec()` pair. The warning fires in both debug and
-    /// release builds so lifecycle bugs are visible in production logs.
+    /// Logs a warning **once per gauge instance** if the gauge was already zero,
+    /// which typically indicates a mismatched `inc()`/`dec()` pair.  Using a
+    /// per-instance flag (rather than a process-wide static) ensures that an
+    /// underflow in one gauge does not silence warnings from other gauges.
+    ///
+    /// Uses a CAS loop to atomically prevent underflow. Two concurrent `dec()`
+    /// calls on a gauge at value 1 are guaranteed: exactly one succeeds and one
+    /// warns — never silently wrapping to `u64::MAX`.
     #[inline]
     pub fn dec(&self) {
-        let prev = self
+        let result = self
             .value
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
+                if v == 0 { None } else { Some(v - 1) }
             });
-        if let Ok(0) = prev {
+        if result.is_err() && !self.underflow_warned.swap(true, Ordering::AcqRel) {
             tracing::warn!(
-                "Gauge::dec() called when value was already 0 — possible inc/dec mismatch"
+                "Gauge::dec() called when value was already 0 — possible inc/dec mismatch \
+                 (this warning fires once per gauge instance)"
             );
         }
     }
@@ -160,10 +170,26 @@ impl Gauge {
 ///
 /// Bucket `i` counts samples whose nanosecond value satisfies `2^i ≤ ns < 2^(i+1)`.
 /// Bucket 0 contains both `0 ns` and the range `[1 ns, 2 ns)`.
-/// The relative error is at most ~100 % within any single bucket (i.e., the
-/// reported percentile may be up to 2× the true value), which is acceptable
-/// for production SLO alerting where the important distinction is between
-/// "under 1 ms" and "over 10 ms".
+///
+/// # Accuracy
+///
+/// Each bucket reports the **arithmetic midpoint** (`1.5 × 2^i`) as the
+/// percentile estimate.  This produces a **relative error of up to ±50 %**
+/// within a bucket:
+///
+/// | Bucket range     | Reported estimate | Max relative error |
+/// |------------------|-------------------|--------------------|
+/// | 1 ms – 2 ms      | 1.5 ms            | 33 %               |
+/// | 8 ms – 16 ms     | 12 ms             | 50 %               |
+/// | 16 ms – 32 ms    | 24 ms             | up to 33–50 %      |
+/// | 64 ms – 128 ms   | 96 ms             | 50 %               |
+///
+/// **For tight SLO contracts** (e.g. p99 < 50 ms alerts), the ±50 % error
+/// means a bucket boundary misalignment can mask a real latency regression.
+/// In those cases, replace or supplement with a T-Digest or HDR histogram.
+///
+/// For capacity-planning and order-of-magnitude alerting ("are we above 1 s?")
+/// the precision is adequate and comes at zero allocation cost.
 ///
 /// This approach requires no external dependencies and no heap allocation.
 #[derive(Debug)]
@@ -263,10 +289,19 @@ impl LatencyTracker {
     /// Estimate the p-th percentile latency from the histogram.
     ///
     /// `percentile` must be in `[0.0, 100.0]`. Returns `None` if no samples
-    /// have been recorded. The estimate is derived from power-of-2 buckets
-    /// so the relative error is at most ~100 % within any bucket (i.e., the
-    /// reported value is within 2× of the true percentile). This is suitable
-    /// for production alerting and SLO dashboards.
+    /// have been recorded.
+    ///
+    /// # Accuracy caveat
+    ///
+    /// The estimate is derived from power-of-2 buckets by returning the
+    /// midpoint of the bucket that contains the target rank.  The **relative
+    /// error is up to ±50 %** within a bucket — a true p99 of 31 ms is
+    /// reported as 24 ms; a true p99 of 127 ms is reported as 96 ms.
+    ///
+    /// This is suitable for order-of-magnitude alerting ("above 1 s?") and
+    /// capacity planning dashboards.  For tight SLO contracts with narrow
+    /// thresholds (e.g. p99 < 50 ms), use a T-Digest or HDR histogram
+    /// instead of, or in addition to, this tracker.
     pub fn percentile(&self, percentile: f64) -> Option<Duration> {
         let total = self.count();
         if total == 0 {
@@ -313,6 +348,15 @@ impl LatencyTracker {
     }
 
     /// Reset all statistics.
+    ///
+    /// # Consistency note
+    ///
+    /// This reset is **best-effort and not snapshot-consistent**. A concurrent
+    /// [`snapshot()`](Self::snapshot) may observe any mix of pre- and
+    /// post-reset values (e.g., `count = 0` with `sum_nanos > 0`). For most
+    /// production use cases — periodic metric reporting windows — this is
+    /// acceptable. If consistency is required, quiesce all recorders before
+    /// calling `reset()`.
     pub fn reset(&self) {
         self.count.store(0, Ordering::Relaxed);
         self.sum_nanos.store(0, Ordering::Relaxed);
@@ -1526,6 +1570,31 @@ mod tests {
         assert_eq!(gauge.get(), 0);
         gauge.dec();
         assert_eq!(gauge.get(), 0, "Gauge should not wrap around u64::MAX");
+    }
+
+    #[test]
+    fn test_gauge_dec_concurrent_no_underflow() {
+        use std::sync::Arc;
+        // Two threads both dec a gauge starting at 1. Exactly one should
+        // succeed and bring the value to 0; the other should warn and leave
+        // it at 0. The invariant is that the gauge never wraps to u64::MAX.
+        let gauge = Arc::new(Gauge::new());
+        gauge.set(1);
+
+        let g1 = Arc::clone(&gauge);
+        let g2 = Arc::clone(&gauge);
+
+        let t1 = std::thread::spawn(move || g1.dec());
+        let t2 = std::thread::spawn(move || g2.dec());
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        assert_eq!(
+            gauge.get(),
+            0,
+            "concurrent dec() must not underflow to u64::MAX"
+        );
     }
 
     #[test]

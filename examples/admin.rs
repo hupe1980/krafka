@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for info in topic_infos {
             println!("Topic: {}", info.name);
             println!("  Partitions: {}", info.partition_count());
-            for partition in &info.partitions {
+            for partition in info.partitions_iter() {
                 println!(
                     "    Partition {}: leader={}, replicas={:?}, isr={:?}",
                     partition.partition, partition.leader, partition.replicas, partition.isr

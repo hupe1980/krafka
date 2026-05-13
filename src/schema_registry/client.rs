@@ -3,13 +3,10 @@
 //! Available when the `schema-registry` feature is enabled.
 
 use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 
 use super::{Schema, SchemaId, SchemaReference, SchemaRegistryClient, SchemaType, SchemaVersion};
 use crate::error::{KrafkaError, Result};
@@ -112,33 +109,17 @@ fn sanitized_error_body_preview(body: &str) -> String {
 ///
 /// Credentials are zeroized on drop to reduce the window during which
 /// plaintext secrets remain in process memory.
-#[derive(Clone, Default)]
+#[derive(Default)]
 enum RegistryAuth {
     #[default]
     None,
     Basic {
-        username: String,
-        password: String,
+        username: zeroize::Zeroizing<String>,
+        password: zeroize::Zeroizing<String>,
     },
     Bearer {
-        token: String,
+        token: zeroize::Zeroizing<String>,
     },
-}
-
-impl Drop for RegistryAuth {
-    fn drop(&mut self) {
-        use zeroize::Zeroize;
-        match self {
-            Self::Basic { username, password } => {
-                username.zeroize();
-                password.zeroize();
-            }
-            Self::Bearer { token } => {
-                token.zeroize();
-            }
-            Self::None => {}
-        }
-    }
 }
 
 // ── Client ───────────────────────────────────────────────────────────────
@@ -182,15 +163,17 @@ pub struct ConfluentSchemaRegistry {
 impl ConfluentSchemaRegistry {
     /// Create a client with the given registry URL and no authentication.
     ///
-    /// If the URL contains embedded credentials (`https://user:pass@host/`),
-    /// they are stripped and a warning is logged. Use [`builder()`](Self::builder)
-    /// with [`basic_auth()`](ConfluentSchemaRegistryBuilder::basic_auth) instead.
-    pub fn new(url: impl Into<String>) -> Self {
-        Self {
+    /// Returns an error if the URL contains embedded credentials
+    /// (`https://user:pass@host/`). Use [`builder()`](Self::builder) with
+    /// [`basic_auth()`](ConfluentSchemaRegistryBuilder::basic_auth) instead.
+    pub fn new(url: impl Into<String>) -> Result<Self> {
+        let url = normalize_url(url.into());
+        reject_embedded_credentials(&url)?;
+        Ok(Self {
             client: reqwest::Client::new(),
-            base_url: sanitize_url(url.into()),
+            base_url: url,
             auth: RegistryAuth::None,
-        }
+        })
     }
 
     /// Create a builder for advanced configuration.
@@ -372,174 +355,128 @@ impl fmt::Debug for ConfluentSchemaRegistry {
 }
 
 impl SchemaRegistryClient for ConfluentSchemaRegistry {
-    fn get_schema_by_id(
-        &self,
-        id: SchemaId,
-    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
-        Box::pin(async move {
-            let url = format!("{}/schemas/ids/{id}", self.base_url);
-            let body: SchemaByIdResponse = self
-                .send_request(
-                    self.client
-                        .get(&url)
-                        .header(ACCEPT, SCHEMA_REGISTRY_CONTENT_TYPE),
-                )
-                .await?;
-            let schema_type: SchemaType = body.schema_type.parse()?;
-
-            Ok(Schema {
-                id,
-                schema_type,
-                schema: body.schema,
-                version: None,
-                subject: None,
-                references: Self::parse_references(body.references),
-            })
-        })
-    }
-
-    fn get_latest_schema(
-        &self,
-        subject: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
-        let subject = subject.to_string();
-        Box::pin(async move {
-            let url = format!(
-                "{}/subjects/{}/versions/latest",
-                self.base_url,
-                percent_encode(&subject)
-            );
-            let body: SchemaBySubjectResponse = self
-                .send_request(
-                    self.client
-                        .get(&url)
-                        .header(ACCEPT, SCHEMA_REGISTRY_CONTENT_TYPE),
-                )
-                .await?;
-            Self::schema_from_subject_response(body)
-        })
-    }
-
-    fn get_schema_by_version(
-        &self,
-        subject: &str,
-        version: SchemaVersion,
-    ) -> Pin<Box<dyn Future<Output = Result<Schema>> + Send + '_>> {
-        let subject = subject.to_string();
-        Box::pin(async move {
-            let url = format!(
-                "{}/subjects/{}/versions/{version}",
-                self.base_url,
-                percent_encode(&subject)
-            );
-            let body: SchemaBySubjectResponse = self
-                .send_request(
-                    self.client
-                        .get(&url)
-                        .header(ACCEPT, SCHEMA_REGISTRY_CONTENT_TYPE),
-                )
-                .await?;
-            Self::schema_from_subject_response(body)
-        })
-    }
-
-    fn register_schema(
-        &self,
-        subject: &str,
-        schema: &str,
-        schema_type: SchemaType,
-        references: &[SchemaReference],
-    ) -> Pin<Box<dyn Future<Output = Result<SchemaId>> + Send + '_>> {
-        let subject = subject.to_string();
-        let schema = schema.to_string();
-        let refs = Self::to_reference_json(references);
-        Box::pin(async move {
-            let url = format!(
-                "{}/subjects/{}/versions",
-                self.base_url,
-                percent_encode(&subject)
-            );
-            let body = RegisterSchemaRequest {
-                schema: &schema,
-                schema_type: schema_type.as_str(),
-                references: refs,
-            };
-            let result: RegisterSchemaResponse = self
-                .send_request(
-                    self.client
-                        .post(&url)
-                        .header(CONTENT_TYPE, SCHEMA_REGISTRY_CONTENT_TYPE)
-                        .json(&body),
-                )
-                .await?;
-            Ok(result.id)
-        })
-    }
-
-    fn check_compatibility(
-        &self,
-        subject: &str,
-        schema: &str,
-        schema_type: SchemaType,
-        references: &[SchemaReference],
-    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + '_>> {
-        let subject = subject.to_string();
-        let schema = schema.to_string();
-        let references = references.to_vec();
-        Box::pin(async move {
-            ConfluentSchemaRegistry::check_compatibility(
-                self,
-                &subject,
-                &schema,
-                schema_type,
-                &references,
+    async fn get_schema_by_id(&self, id: SchemaId) -> Result<Schema> {
+        let url = format!("{}/schemas/ids/{id}", self.base_url);
+        let body: SchemaByIdResponse = self
+            .send_request(
+                self.client
+                    .get(&url)
+                    .header(ACCEPT, SCHEMA_REGISTRY_CONTENT_TYPE),
             )
-            .await
+            .await?;
+        let schema_type: SchemaType = body.schema_type.parse()?;
+
+        Ok(Schema {
+            id,
+            schema_type,
+            schema: body.schema,
+            version: None,
+            subject: None,
+            references: Self::parse_references(body.references),
         })
     }
 
-    fn delete_subject(
-        &self,
-        subject: &str,
-        permanent: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaVersion>>> + Send + '_>> {
-        let subject = subject.to_string();
-        Box::pin(
-            async move { ConfluentSchemaRegistry::delete_subject(self, &subject, permanent).await },
-        )
+    async fn get_latest_schema(&self, subject: &str) -> Result<Schema> {
+        let url = format!(
+            "{}/subjects/{}/versions/latest",
+            self.base_url,
+            percent_encode(subject)
+        );
+        let body: SchemaBySubjectResponse = self
+            .send_request(
+                self.client
+                    .get(&url)
+                    .header(ACCEPT, SCHEMA_REGISTRY_CONTENT_TYPE),
+            )
+            .await?;
+        Self::schema_from_subject_response(body)
     }
 
-    fn get_subjects(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
-        Box::pin(async move { ConfluentSchemaRegistry::get_subjects(self).await })
+    async fn get_schema_by_version(&self, subject: &str, version: SchemaVersion) -> Result<Schema> {
+        let url = format!(
+            "{}/subjects/{}/versions/{version}",
+            self.base_url,
+            percent_encode(subject)
+        );
+        let body: SchemaBySubjectResponse = self
+            .send_request(
+                self.client
+                    .get(&url)
+                    .header(ACCEPT, SCHEMA_REGISTRY_CONTENT_TYPE),
+            )
+            .await?;
+        Self::schema_from_subject_response(body)
     }
 
-    fn get_versions(
+    async fn register_schema(
         &self,
         subject: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaVersion>>> + Send + '_>> {
-        let subject = subject.to_string();
-        Box::pin(async move { ConfluentSchemaRegistry::get_versions(self, &subject).await })
+        schema: &str,
+        schema_type: SchemaType,
+        references: &[SchemaReference],
+    ) -> Result<SchemaId> {
+        let refs = Self::to_reference_json(references);
+        let url = format!(
+            "{}/subjects/{}/versions",
+            self.base_url,
+            percent_encode(subject)
+        );
+        let body = RegisterSchemaRequest {
+            schema,
+            schema_type: schema_type.as_str(),
+            references: refs,
+        };
+        let result: RegisterSchemaResponse = self
+            .send_request(
+                self.client
+                    .post(&url)
+                    .header(CONTENT_TYPE, SCHEMA_REGISTRY_CONTENT_TYPE)
+                    .json(&body),
+            )
+            .await?;
+        Ok(result.id)
+    }
+
+    async fn check_compatibility(
+        &self,
+        subject: &str,
+        schema: &str,
+        schema_type: SchemaType,
+        references: &[SchemaReference],
+    ) -> Result<bool> {
+        ConfluentSchemaRegistry::check_compatibility(self, subject, schema, schema_type, references)
+            .await
+    }
+
+    async fn delete_subject(&self, subject: &str, permanent: bool) -> Result<Vec<SchemaVersion>> {
+        ConfluentSchemaRegistry::delete_subject(self, subject, permanent).await
+    }
+
+    async fn get_subjects(&self) -> Result<Vec<String>> {
+        ConfluentSchemaRegistry::get_subjects(self).await
+    }
+
+    async fn get_versions(&self, subject: &str) -> Result<Vec<SchemaVersion>> {
+        ConfluentSchemaRegistry::get_versions(self, subject).await
     }
 }
 
-/// Normalize a base URL for storage: strip trailing slashes and remove
-/// userinfo (`user:pass@`) to prevent credential leakage through `Debug`
-/// output or logs.
-///
-/// If userinfo is detected, a warning is logged with a fully redacted marker
-/// and host, advising the caller to use `basic_auth()` instead.
-fn masked_userinfo_indicator(_userinfo: &str) -> &'static str {
-    "<***@>"
-}
-
-fn sanitize_url(mut url: String) -> String {
-    // Trim trailing slashes in-place (avoids a second allocation).
+/// Normalize a base URL for storage: strip trailing slashes.
+fn normalize_url(mut url: String) -> String {
     let trimmed_len = url.trim_end_matches('/').len();
     url.truncate(trimmed_len);
+    url
+}
 
+/// Reject any URL that contains embedded credentials (`user:pass@host`).
+///
+/// Returns a descriptive `KrafkaError::Config` so callers receive an
+/// actionable error at construction time rather than a silently-stripped
+/// credential that leaves the user confused about which auth is in effect.
+fn reject_embedded_credentials(url: &str) -> Result<()> {
     // Find the scheme separator "://"
     let Some(scheme_end) = url.find("://") else {
-        return url;
+        return Ok(());
     };
     let authority_start = scheme_end + 3;
     let authority = &url[authority_start..];
@@ -548,24 +485,25 @@ fn sanitize_url(mut url: String) -> String {
     let authority_end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
     let authority_slice = &authority[..authority_end];
 
-    // Check for `@` indicating userinfo.
-    if let Some(at_pos) = authority_slice.find('@') {
-        let userinfo = &authority_slice[..at_pos];
-        let host = &authority_slice[at_pos + 1..];
-        warn!(
-            userinfo = %masked_userinfo_indicator(userinfo),
-            host = %host,
-            "schema registry URL contains embedded credentials — \
-             stripping userinfo; use basic_auth() instead"
-        );
-        // Rebuild: scheme + "://" + host_and_rest (skip userinfo@).
-        let mut sanitized = String::with_capacity(url.len());
-        sanitized.push_str(&url[..authority_start]);
-        sanitized.push_str(&authority[at_pos + 1..]);
-        sanitized
-    } else {
-        url
+    if authority_slice.contains('@') {
+        return Err(KrafkaError::config(
+            "schema registry URL must not contain embedded credentials (user:pass@host); \
+             use ConfluentSchemaRegistryBuilder::basic_auth() instead",
+        ));
     }
+    Ok(())
+}
+
+fn masked_userinfo_indicator(_userinfo: &str) -> &'static str {
+    "<***@>"
+}
+
+/// Kept for backward-compat with existing private call sites that need the
+/// old strip-and-normalize behaviour (builder `build()` path validates first,
+/// then normalizes; this is only used in tests now).
+#[cfg(test)]
+fn sanitize_url(url: String) -> String {
+    normalize_url(url)
 }
 
 /// Minimal percent-encoding for subject names in URL path segments.
@@ -587,11 +525,25 @@ fn percent_encode(input: &str) -> String {
 // ── Builder ──────────────────────────────────────────────────────────────
 
 /// Builder for [`ConfluentSchemaRegistry`].
-#[derive(Default)]
+///
+/// The default builder applies a 30-second request timeout.
+/// Use [`clear_request_timeout()`](Self::clear_request_timeout) to disable it.
 pub struct ConfluentSchemaRegistryBuilder {
     url: Option<String>,
     auth: RegistryAuth,
     request_timeout: Option<Duration>,
+}
+
+impl Default for ConfluentSchemaRegistryBuilder {
+    fn default() -> Self {
+        Self {
+            url: None,
+            auth: RegistryAuth::None,
+            // Default 30 s matches comparable clients (Confluent Python, schema-registry-converter).
+            // An unresponsive registry otherwise blocks every encode/decode indefinitely.
+            request_timeout: Some(Duration::from_secs(30)),
+        }
+    }
 }
 
 impl ConfluentSchemaRegistryBuilder {
@@ -604,8 +556,8 @@ impl ConfluentSchemaRegistryBuilder {
     /// Set basic authentication credentials.
     pub fn basic_auth(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
         self.auth = RegistryAuth::Basic {
-            username: username.into(),
-            password: password.into(),
+            username: zeroize::Zeroizing::new(username.into()),
+            password: zeroize::Zeroizing::new(password.into()),
         };
         self
     }
@@ -613,7 +565,7 @@ impl ConfluentSchemaRegistryBuilder {
     /// Set a bearer token for authentication.
     pub fn bearer_token(mut self, token: impl Into<String>) -> Self {
         self.auth = RegistryAuth::Bearer {
-            token: token.into(),
+            token: zeroize::Zeroizing::new(token.into()),
         };
         self
     }
@@ -638,13 +590,19 @@ impl ConfluentSchemaRegistryBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the URL is not set, credentialed auth is used
-    /// over plain HTTP (credential exposure risk), or the HTTP client
-    /// cannot be constructed.
+    /// Returns an error if:
+    /// - The URL is not set.
+    /// - The URL contains embedded credentials (`user:pass@host`) — use
+    ///   [`basic_auth()`](Self::basic_auth) instead.
+    /// - Credentialed auth is used over plain HTTP (credential exposure risk).
+    /// - The HTTP client cannot be constructed.
     pub fn build(self) -> Result<ConfluentSchemaRegistry> {
         let url = self
             .url
             .ok_or_else(|| KrafkaError::config("schema registry URL is required"))?;
+
+        // Reject embedded credentials in the URL — hard error, not a silent strip.
+        reject_embedded_credentials(&url)?;
 
         // Reject credentialed auth over plain HTTP to prevent token exposure.
         if matches!(
@@ -668,7 +626,7 @@ impl ConfluentSchemaRegistryBuilder {
 
         Ok(ConfluentSchemaRegistry {
             client,
-            base_url: sanitize_url(url),
+            base_url: normalize_url(url),
             auth: self.auth,
         })
     }
@@ -785,7 +743,7 @@ mod tests {
 
     #[test]
     fn test_new_strips_trailing_slash() {
-        let client = ConfluentSchemaRegistry::new("http://localhost:8081/");
+        let client = ConfluentSchemaRegistry::new("http://localhost:8081/").unwrap();
         assert_eq!(client.base_url, "http://localhost:8081");
     }
 
@@ -830,49 +788,76 @@ mod tests {
 
     #[test]
     fn test_debug_no_auth() {
-        let client = ConfluentSchemaRegistry::new("http://localhost:8081");
+        let client = ConfluentSchemaRegistry::new("http://localhost:8081").unwrap();
         let debug = format!("{client:?}");
         assert!(debug.contains("none"));
     }
 
     #[test]
-    fn test_sanitize_url_strips_userinfo() {
-        let url = sanitize_url("https://admin:s3cret@registry.example.com:8081/path".to_string());
-        assert_eq!(url, "https://registry.example.com:8081/path");
-        assert!(!url.contains("admin"));
-        assert!(!url.contains("s3cret"));
-    }
-
-    #[test]
-    fn test_sanitize_url_no_userinfo() {
-        let url = sanitize_url("https://registry.example.com:8081".to_string());
+    fn test_normalize_url_no_userinfo() {
+        let url = normalize_url("https://registry.example.com:8081".to_string());
         assert_eq!(url, "https://registry.example.com:8081");
     }
 
     #[test]
-    fn test_sanitize_url_user_only() {
-        let url = sanitize_url("https://admin@registry.example.com".to_string());
-        assert_eq!(url, "https://registry.example.com");
-    }
-
-    #[test]
-    fn test_sanitize_url_no_scheme() {
-        let url = sanitize_url("localhost:8081".to_string());
+    fn test_normalize_url_no_scheme() {
+        let url = normalize_url("localhost:8081".to_string());
         assert_eq!(url, "localhost:8081");
     }
 
     #[test]
-    fn test_sanitize_url_strips_trailing_slashes() {
-        let url = sanitize_url("https://registry.example.com:8081/".to_string());
+    fn test_normalize_url_strips_trailing_slashes() {
+        let url = normalize_url("https://registry.example.com:8081/".to_string());
         assert_eq!(url, "https://registry.example.com:8081");
     }
 
     #[test]
-    fn test_sanitize_url_strips_userinfo_and_trailing_slash() {
-        let url = sanitize_url("https://user:pass@host:8081/".to_string());
-        assert_eq!(url, "https://host:8081");
+    fn test_reject_embedded_credentials_errors_on_user_pass() {
+        let err =
+            reject_embedded_credentials("https://admin:s3cret@registry.example.com:8081/path")
+                .unwrap_err();
+        assert!(err.to_string().contains("embedded credentials"));
     }
 
+    #[test]
+    fn test_reject_embedded_credentials_errors_on_user_only() {
+        let err = reject_embedded_credentials("https://admin@registry.example.com").unwrap_err();
+        assert!(err.to_string().contains("embedded credentials"));
+    }
+
+    #[test]
+    fn test_reject_embedded_credentials_ok_no_userinfo() {
+        assert!(reject_embedded_credentials("https://registry.example.com:8081").is_ok());
+    }
+
+    #[test]
+    fn test_reject_embedded_credentials_ok_no_scheme() {
+        assert!(reject_embedded_credentials("localhost:8081").is_ok());
+    }
+
+    #[test]
+    fn test_new_rejects_embedded_credentials() {
+        let err = ConfluentSchemaRegistry::new("https://user:pass@host:8081").unwrap_err();
+        assert!(err.to_string().contains("embedded credentials"));
+    }
+
+    #[test]
+    fn test_new_accepts_clean_url() {
+        let client = ConfluentSchemaRegistry::new("https://host:8081").unwrap();
+        assert_eq!(client.base_url, "https://host:8081");
+    }
+
+    #[test]
+    fn test_builder_rejects_embedded_credentials() {
+        let err = ConfluentSchemaRegistryBuilder::default()
+            .url("https://user:pass@host:8081/")
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("embedded credentials"));
+    }
+
+    // masked_userinfo_indicator is still used by external callers or future
+    // log contexts, keep its correctness test.
     #[test]
     fn test_masked_userinfo_indicator_never_reveals_userinfo() {
         assert_eq!(masked_userinfo_indicator("admin:s3cret"), "<***@>");
@@ -881,22 +866,11 @@ mod tests {
         assert_eq!(masked_userinfo_indicator(":s3cret"), "<***@>");
     }
 
+    // Keep the cfg(test)-only sanitize_url shim test for coverage.
     #[test]
-    fn test_new_strips_userinfo_from_url() {
-        let client = ConfluentSchemaRegistry::new("https://user:pass@host:8081");
-        assert_eq!(client.base_url, "https://host:8081");
-        let debug = format!("{client:?}");
-        assert!(!debug.contains("user"));
-        assert!(!debug.contains("pass"));
-    }
-
-    #[test]
-    fn test_builder_strips_userinfo_from_url() {
-        let client = ConfluentSchemaRegistryBuilder::default()
-            .url("https://user:pass@host:8081/")
-            .build()
-            .unwrap();
-        assert_eq!(client.base_url, "https://host:8081");
+    fn test_sanitize_url_strips_trailing_slashes() {
+        let url = sanitize_url("https://registry.example.com:8081/".to_string());
+        assert_eq!(url, "https://registry.example.com:8081");
     }
 
     #[test]

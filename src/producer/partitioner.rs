@@ -1,8 +1,9 @@
 //! Partitioning strategies for producers.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use parking_lot::Mutex;
 
 use crate::PartitionId;
 
@@ -71,7 +72,7 @@ fn partition_for_key(key: &[u8], partition_count: usize) -> PartitionId {
 #[inline]
 fn random_partition(partition_count: usize) -> i32 {
     debug_assert!(partition_count > 0);
-    (rand::random::<u32>() % partition_count as u32) as i32
+    rand::random_range(0..partition_count as u32) as i32
 }
 
 /// Trait for partitioning records across topic partitions.
@@ -118,19 +119,27 @@ pub trait Partitioner: Send + Sync {
     fn on_new_batch(&self, _topic: &str, _prev_partition: PartitionId, _partition_count: usize) {}
 }
 
-/// Default partitioner using murmur2 hash for keys, round-robin for null keys.
+/// Default partitioner using murmur2 hash for keys, per-topic round-robin for null keys.
 ///
 /// This matches the behavior of the Java Kafka client's default partitioner.
+/// The round-robin counter is maintained per-topic so that null-keyed records
+/// for different topics do not interfere with each other's distribution.
 #[derive(Debug)]
 pub struct DefaultPartitioner {
-    counter: AtomicUsize,
+    /// Per-topic round-robin counter for keyless records.
+    ///
+    /// Using a `Mutex<HashMap>` rather than a single global `AtomicUsize` so
+    /// that each topic distributes keyless records independently.  The lock is
+    /// only acquired for keyless records; keyed records use a lock-free
+    /// murmur2 hash path.
+    per_topic_counter: Mutex<HashMap<String, usize>>,
 }
 
 impl DefaultPartitioner {
     /// Create a new default partitioner.
     pub fn new() -> Self {
         Self {
-            counter: AtomicUsize::new(0),
+            per_topic_counter: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -143,7 +152,7 @@ impl Default for DefaultPartitioner {
 
 impl Partitioner for DefaultPartitioner {
     #[inline]
-    fn partition(&self, _topic: &str, key: Option<&[u8]>, partition_count: usize) -> PartitionId {
+    fn partition(&self, topic: &str, key: Option<&[u8]>, partition_count: usize) -> PartitionId {
         if partition_count == 0 {
             return 0;
         }
@@ -154,8 +163,11 @@ impl Partitioner for DefaultPartitioner {
                 partition_for_key(k, partition_count)
             }
             _ => {
-                // Round-robin for records without keys
-                let idx = self.counter.fetch_add(1, Ordering::Relaxed);
+                // Per-topic round-robin for records without keys.
+                let mut counters = self.per_topic_counter.lock();
+                let counter = counters.entry(topic.to_owned()).or_insert(0);
+                let idx = *counter;
+                *counter = counter.wrapping_add(1);
                 (idx % partition_count) as PartitionId
             }
         }
@@ -357,6 +369,15 @@ impl Partitioner for HashPartitioner {
 /// of record count, which yields truly batch-sized sticky windows and matches
 /// the Java 3.3+ behaviour exactly.
 ///
+/// # Memory footprint
+///
+/// The per-topic sticky map is capped at [`UniformStickyPartitioner::MAX_TRACKED_TOPICS`]
+/// entries (default: 10 000). When the cap is reached, an existing entry is
+/// evicted pseudo-randomly (first key in iteration order, which is randomised by
+/// `HashMap`'s hash seed) before inserting the new topic.  This bounds memory
+/// usage in multi-tenant and CDC pipelines that produce to many short-lived
+/// topics while keeping eviction cost O(1).
+///
 /// # Thread safety
 ///
 /// All methods are safe to call concurrently. A single `Mutex` guards the
@@ -369,6 +390,13 @@ pub struct UniformStickyPartitioner {
 }
 
 impl UniformStickyPartitioner {
+    /// Maximum number of per-topic sticky entries retained in memory.
+    ///
+    /// When the map reaches this size a single entry is evicted (pseudo-random
+    /// via HashMap iteration order) before the new topic is inserted.  This
+    /// prevents unbounded memory growth in multi-tenant or CDC workloads.
+    pub const MAX_TRACKED_TOPICS: usize = 10_000;
+
     /// Create a new `UniformStickyPartitioner`.
     pub fn new() -> Self {
         Self::default()
@@ -409,10 +437,18 @@ impl Partitioner for UniformStickyPartitioner {
         }
 
         // Unkeyed: return (or initialise) the sticky partition under the lock.
-        let mut map = self.sticky.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.sticky.lock();
         let mut partition = if let Some(existing) = map.get_mut(topic) {
             *existing
         } else {
+            // Enforce the per-partitioner memory cap before inserting.
+            if map.len() >= Self::MAX_TRACKED_TOPICS {
+                // Evict one entry pseudo-randomly (first key in iteration order,
+                // which is randomised by HashMap's hash seed). O(1) cost.
+                if let Some(evict_key) = map.keys().next().map(|k| k.to_owned()) {
+                    map.remove(&evict_key);
+                }
+            }
             let fresh = random_partition(partition_count);
             map.insert(topic.to_string(), fresh);
             fresh
@@ -441,7 +477,7 @@ impl Partitioner for UniformStickyPartitioner {
             return;
         }
         let next = Self::pick_new_partition(partition_count, prev_partition);
-        let mut map = self.sticky.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.sticky.lock();
         if let Some(current) = map.get_mut(topic) {
             // Only advance if no other concurrent `on_new_batch` already moved on.
             if *current == prev_partition {
@@ -715,5 +751,30 @@ mod tests {
         for h in handles {
             h.join().expect("thread panicked");
         }
+    }
+
+    /// Cross-validate murmur2 against the Java Kafka client's `Utils.murmur2` test vectors.
+    ///
+    /// The Java implementation is subtly different from canonical MurmurHash2
+    /// (specific seed 0x9747b28c, little-endian 4-byte chunks, specific final XOR).
+    /// These vectors are taken from the Apache Kafka source tree (`UtilsTest.java`)
+    /// and verified against franz-go and sarama, both of which carry the same vectors.
+    #[test]
+    fn murmur2_java_compatibility() {
+        // From Apache Kafka UtilsTest.java: murmur2("abc") == 479470107
+        assert_eq!(murmur2(b"abc"), 0x1c94_221b, "murmur2(b\"abc\") mismatch");
+        // Additional cross-validated vectors (Python reference impl + Rust match):
+        assert_eq!(murmur2(b""), 0x106e_08d9, "murmur2(b\"\") mismatch");
+        assert_eq!(murmur2(b"21"), 0xc5f2_f8ec, "murmur2(b\"21\") mismatch");
+        assert_eq!(
+            murmur2(b"foobar"),
+            0xd0e4_7bbe,
+            "murmur2(b\"foobar\") mismatch"
+        );
+        assert_eq!(
+            murmur2(b"a-little-bit-of-whatever"),
+            0x5795_e613,
+            "murmur2(b\"a-little-bit-of-whatever\") mismatch",
+        );
     }
 }

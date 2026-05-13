@@ -321,6 +321,14 @@ impl AwsMskIamCredentials {
     /// - `AWS_SESSION_TOKEN` - Optional (for temporary credentials)
     /// - `AWS_REGION` or `AWS_DEFAULT_REGION` - Required
     ///
+    /// # No feature flag required
+    ///
+    /// This method works **without** the `aws-msk` feature. The `aws-msk`
+    /// feature is only needed for [`AwsMskIamCredentials::from_default_chain`],
+    /// which pulls in the full AWS SDK credential provider chain (~100 crates).
+    /// Use this method when you have static credentials available in the
+    /// environment to keep your dependency footprint small.
+    ///
     /// # Errors
     ///
     /// Returns error if required environment variables are not set.

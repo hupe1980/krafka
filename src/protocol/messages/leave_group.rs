@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_string};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{array_len_i32, check_compact_array_len, check_decode_array_len};
@@ -55,8 +55,9 @@ impl LeaveGroupRequest {
     /// Encode for version 4 (flexible: compact strings/arrays + tagged fields).
     pub fn encode_v4(&self, buf: &mut impl BufMut) -> Result<()> {
         KafkaString::new(&self.group_id).try_encode_compact(buf)?;
-        let len = u32::try_from(self.members.len().saturating_add(1))
-            .map_err(|_| KrafkaError::protocol("members array too large"))?;
+        let len = u32::try_from(self.members.len().saturating_add(1)).map_err(|_| {
+            KrafkaError::protocol_kind(ProtocolErrorKind::InvalidLength, "members array too large")
+        })?;
         crate::util::varint::encode_unsigned_varint(len, buf);
         for member in &self.members {
             KafkaString::new(&member.member_id).try_encode_compact(buf)?;
@@ -73,8 +74,9 @@ impl LeaveGroupRequest {
     /// Encode for version 5 (v4 + reason field per member, KIP-800).
     pub fn encode_v5(&self, buf: &mut impl BufMut) -> Result<()> {
         KafkaString::new(&self.group_id).try_encode_compact(buf)?;
-        let len = u32::try_from(self.members.len().saturating_add(1))
-            .map_err(|_| KrafkaError::protocol("members array too large"))?;
+        let len = u32::try_from(self.members.len().saturating_add(1)).map_err(|_| {
+            KrafkaError::protocol_kind(ProtocolErrorKind::InvalidLength, "members array too large")
+        })?;
         crate::util::varint::encode_unsigned_varint(len, buf);
         for member in &self.members {
             KafkaString::new(&member.member_id).try_encode_compact(buf)?;

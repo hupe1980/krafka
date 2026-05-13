@@ -128,6 +128,30 @@ or `compression-all` feature.
 
 ## Network Layer
 
+### Shared Transport: `KrafkaClient`
+
+By default every `Producer`, `Consumer`, and `AdminClient` creates its own `ConnectionPool`
+and `ClusterMetadata`. An application with one producer and two consumers against a 5-broker
+cluster therefore opens **15** TCP connections (3 clients × 5 brokers).
+
+`KrafkaClient` solves this by wrapping a single `Arc<ConnectionPool>` + `Arc<ClusterMetadata>`
+that is shared across all clients:
+
+```rust
+// One pool + one metadata cache for the whole process.
+let client = KrafkaClient::builder("broker1:9092,broker2:9092")
+    .build()
+    .await?;
+
+let producer = Producer::builder().with_client(&client).build().await?;
+let consumer = Consumer::builder().with_client(&client).group_id("g1").build().await?;
+let admin    = AdminClient::builder().with_client(&client).build().await?;
+// Connection count: 2 brokers × 1 pool = 2 connections, not 6.
+```
+
+The idle-connection evictor and (when configured) the OAUTHBEARER proactive-refresh task are
+started once inside `KrafkaClient::build()` and shared by all attached clients.
+
 ### Connection Architecture
 
 ```

@@ -3,8 +3,6 @@
 //! Available when the `aws-glue-schema-registry` feature is enabled.
 
 use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 use super::{GlueDataFormat, GlueSchema, GlueSchemaRegistryClient, GlueSchemaVersionId};
@@ -196,158 +194,159 @@ impl fmt::Debug for AwsGlueSchemaRegistry {
 }
 
 impl GlueSchemaRegistryClient for AwsGlueSchemaRegistry {
-    fn get_schema_by_version_id(
+    async fn get_schema_by_version_id(
         &self,
         id: GlueSchemaVersionId,
-    ) -> Pin<Box<dyn Future<Output = Result<GlueSchema>> + Send + '_>> {
-        Box::pin(async move {
-            let id_str = id.to_string();
-            let response = self
-                .client
-                .get_schema_version()
-                .schema_version_id(&id_str)
-                .send()
-                .await
-                .map_err(|e| {
-                    KrafkaError::schema_registry_with_source("failed to get schema version", e)
-                })?;
+    ) -> crate::error::Result<GlueSchema> {
+        let id_str = id.to_string();
+        let response = self
+            .client
+            .get_schema_version()
+            .schema_version_id(&id_str)
+            .send()
+            .await
+            .map_err(|e| {
+                crate::error::KrafkaError::schema_registry_with_source(
+                    "failed to get schema version",
+                    e,
+                )
+            })?;
 
-            let data_format = response
-                .data_format()
-                .ok_or_else(|| {
-                    KrafkaError::schema_registry("schema version response missing data_format")
-                })
-                .and_then(Self::convert_data_format)?;
+        let data_format = response
+            .data_format()
+            .ok_or_else(|| {
+                crate::error::KrafkaError::schema_registry(
+                    "schema version response missing data_format",
+                )
+            })
+            .and_then(Self::convert_data_format)?;
 
-            let schema_definition = response
-                .schema_definition()
-                .ok_or_else(|| {
-                    KrafkaError::schema_registry(
-                        "schema version response missing schema_definition",
-                    )
-                })?
-                .to_string();
+        let schema_definition = response
+            .schema_definition()
+            .ok_or_else(|| {
+                crate::error::KrafkaError::schema_registry(
+                    "schema version response missing schema_definition",
+                )
+            })?
+            .to_string();
 
-            let mut schema = GlueSchema::new(id, data_format, schema_definition);
-            if let Some(arn) = response.schema_arn()
-                && let Some(version) = response.version_number()
-            {
-                schema = schema.with_metadata(arn, version);
-            }
-            Ok(schema)
-        })
+        let mut schema = GlueSchema::new(id, data_format, schema_definition);
+        if let Some(arn) = response.schema_arn()
+            && let Some(version) = response.version_number()
+        {
+            schema = schema.with_metadata(arn, version);
+        }
+        Ok(schema)
     }
 
-    fn register_schema(
+    async fn register_schema(
         &self,
         schema_name: &str,
         schema: &str,
         data_format: GlueDataFormat,
-    ) -> Pin<Box<dyn Future<Output = Result<GlueSchemaVersionId>> + Send + '_>> {
-        let schema_name = schema_name.to_string();
-        let schema = schema.to_string();
-        Box::pin(async move {
-            let sdk_format = Self::to_sdk_data_format(data_format);
-            let schema_id = aws_sdk_glue::types::SchemaId::builder()
-                .schema_name(&schema_name)
-                .registry_name(&self.registry_name)
-                .build();
+    ) -> crate::error::Result<GlueSchemaVersionId> {
+        let sdk_format = Self::to_sdk_data_format(data_format);
+        let schema_id = aws_sdk_glue::types::SchemaId::builder()
+            .schema_name(schema_name)
+            .registry_name(&self.registry_name)
+            .build();
 
-            // Step 1: Check if schema definition already registered.
-            let existing = self
-                .client
-                .get_schema_by_definition()
-                .schema_id(schema_id.clone())
-                .schema_definition(&schema)
-                .send()
-                .await;
+        // Step 1: Check if schema definition already registered.
+        let existing = self
+            .client
+            .get_schema_by_definition()
+            .schema_id(schema_id.clone())
+            .schema_definition(schema)
+            .send()
+            .await;
 
-            if let Ok(response) = existing
-                && let Some(status) = response.status()
-                && *status == aws_sdk_glue::types::SchemaVersionStatus::Available
-                && let Some(version_id_str) = response.schema_version_id()
-            {
-                return Self::parse_version_id(version_id_str);
+        if let Ok(response) = existing
+            && let Some(status) = response.status()
+            && *status == aws_sdk_glue::types::SchemaVersionStatus::Available
+            && let Some(version_id_str) = response.schema_version_id()
+        {
+            return Self::parse_version_id(version_id_str);
+        }
+
+        // Step 2: Try registering a new version.
+        let register_result = self
+            .client
+            .register_schema_version()
+            .schema_id(schema_id.clone())
+            .schema_definition(schema)
+            .send()
+            .await;
+
+        match register_result {
+            Ok(response) => {
+                let version_id_str = response.schema_version_id().ok_or_else(|| {
+                    crate::error::KrafkaError::schema_registry(
+                        "register response missing schema_version_id",
+                    )
+                })?;
+                self.wait_and_parse_version_id(version_id_str).await
             }
-
-            // Step 2: Try registering a new version.
-            let register_result = self
-                .client
-                .register_schema_version()
-                .schema_id(schema_id.clone())
-                .schema_definition(&schema)
-                .send()
-                .await;
-
-            match register_result {
-                Ok(response) => {
-                    let version_id_str = response.schema_version_id().ok_or_else(|| {
-                        KrafkaError::schema_registry("register response missing schema_version_id")
-                    })?;
-                    self.wait_and_parse_version_id(version_id_str).await
+            Err(register_err) => {
+                if !self.auto_register {
+                    return Err(crate::error::KrafkaError::schema_registry_with_source(
+                        "failed to register schema version (schema may not exist, \
+                         enable auto_register to create it)",
+                        register_err,
+                    ));
                 }
-                Err(register_err) => {
-                    if !self.auto_register {
-                        return Err(KrafkaError::schema_registry_with_source(
-                            "failed to register schema version (schema may not exist, \
-                             enable auto_register to create it)",
-                            register_err,
-                        ));
+
+                // Step 3: Auto-register — create the schema (first version).
+                let create_result = self
+                    .client
+                    .create_schema()
+                    .registry_id(
+                        aws_sdk_glue::types::RegistryId::builder()
+                            .registry_name(&self.registry_name)
+                            .build(),
+                    )
+                    .schema_name(schema_name)
+                    .data_format(sdk_format)
+                    .compatibility(aws_sdk_glue::types::Compatibility::Backward)
+                    .schema_definition(schema)
+                    .send()
+                    .await;
+
+                match create_result {
+                    Ok(response) => {
+                        let version_id_str = response.schema_version_id().ok_or_else(|| {
+                            crate::error::KrafkaError::schema_registry(
+                                "create schema response missing schema_version_id",
+                            )
+                        })?;
+                        self.wait_and_parse_version_id(version_id_str).await
                     }
-
-                    // Step 3: Auto-register — create the schema (first version).
-                    let create_result = self
-                        .client
-                        .create_schema()
-                        .registry_id(
-                            aws_sdk_glue::types::RegistryId::builder()
-                                .registry_name(&self.registry_name)
-                                .build(),
-                        )
-                        .schema_name(&schema_name)
-                        .data_format(sdk_format)
-                        .compatibility(aws_sdk_glue::types::Compatibility::Backward)
-                        .schema_definition(&schema)
-                        .send()
-                        .await;
-
-                    match create_result {
-                        Ok(response) => {
-                            let version_id_str = response.schema_version_id().ok_or_else(|| {
-                                KrafkaError::schema_registry(
-                                    "create schema response missing schema_version_id",
-                                )
+                    Err(create_err) => {
+                        // Step 4: Race condition — schema was created between
+                        // our check and create. Fall back to register_schema_version.
+                        let fallback = self
+                            .client
+                            .register_schema_version()
+                            .schema_id(schema_id)
+                            .schema_definition(schema)
+                            .send()
+                            .await
+                            .map_err(|e| {
+                                crate::error::KrafkaError::schema_registry(format!(
+                                    "failed to register schema version \
+                                     (create also failed: {create_err}): {e}"
+                                ))
                             })?;
-                            self.wait_and_parse_version_id(version_id_str).await
-                        }
-                        Err(create_err) => {
-                            // Step 4: Race condition — schema was created between
-                            // our check and create. Fall back to register_schema_version.
-                            let fallback = self
-                                .client
-                                .register_schema_version()
-                                .schema_id(schema_id)
-                                .schema_definition(&schema)
-                                .send()
-                                .await
-                                .map_err(|e| {
-                                    KrafkaError::schema_registry(format!(
-                                        "failed to register schema version \
-                                         (create also failed: {create_err}): {e}"
-                                    ))
-                                })?;
 
-                            let version_id_str = fallback.schema_version_id().ok_or_else(|| {
-                                KrafkaError::schema_registry(
-                                    "register response missing schema_version_id",
-                                )
-                            })?;
-                            self.wait_and_parse_version_id(version_id_str).await
-                        }
+                        let version_id_str = fallback.schema_version_id().ok_or_else(|| {
+                            crate::error::KrafkaError::schema_registry(
+                                "register response missing schema_version_id",
+                            )
+                        })?;
+                        self.wait_and_parse_version_id(version_id_str).await
                     }
                 }
             }
-        })
+        }
     }
 }
 

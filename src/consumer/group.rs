@@ -16,7 +16,7 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::PartitionId;
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::metadata::ClusterMetadata;
 use crate::network::{BrokerConnection, ConnectionPool};
 use crate::protocol::{
@@ -106,20 +106,32 @@ use crate::protocol::{
 ///     }
 /// }
 /// ```
+///
+/// # See also
+///
+/// [`AsyncConsumerRebalanceListener`] — the async variant of this trait.
+/// Prefer it when rebalance callbacks need to await async operations
+/// (e.g., offset commits, cache flushes) without blocking a Tokio worker.
 pub trait ConsumerRebalanceListener: Send + Sync {
     /// Called after partitions have been assigned to this consumer.
     ///
-    /// The `partitions` parameter contains the **full set** of partitions now
-    /// owned by this consumer after the rebalance — not just newly added ones.
-    /// It may include partitions that were already assigned before the rebalance.
+    /// The `partitions` slice contains the **newly added** partitions for this
+    /// rebalance round.  The semantics match the Java client:
+    ///
+    /// | Rebalance protocol | `partitions` contains |
+    /// |---|---|
+    /// | Initial join (first poll after subscribe) | all assigned partitions |
+    /// | Eager rebalance (classic protocol) | all assigned partitions (entire set is new after revoke-all) |
+    /// | Cooperative rebalance (KIP-429) | **only newly added** partitions (delta vs previous round) |
+    /// | KIP-848 / new consumer protocol | **only newly added** partitions (diff-based) |
+    ///
+    /// For the cooperative and KIP-848 paths the slice may be empty if
+    /// the rebalance left this consumer's assignment unchanged.  To obtain
+    /// the **full** post-rebalance assignment call [`Consumer::assignment`]
+    /// from inside the callback.
     ///
     /// **Must complete synchronously** — see the [trait-level docs](ConsumerRebalanceListener)
     /// for the execution contract.
-    ///
-    /// > **Note:** The Java `ConsumerRebalanceListener.onPartitionsAssigned`
-    /// > passes only *newly added* partitions for cooperative rebalances.
-    /// > This crate always passes the full set for simplicity and to avoid
-    /// > protocol-dependent callback semantics.
     fn on_partitions_assigned(&self, partitions: &[crate::consumer::TopicPartition]);
 
     /// Called before partitions are revoked from this consumer.
@@ -136,13 +148,25 @@ pub trait ConsumerRebalanceListener: Send + Sync {
     ///
     /// This is called when the consumer unexpectedly loses its partition
     /// assignment (e.g., session timeout). Unlike `on_partitions_revoked`,
-    /// offsets may already be committed by another consumer.
+    /// **the consumer has likely already been fenced** and another consumer
+    /// may have taken ownership of these partitions. Committing offsets here
+    /// may silently overwrite offsets already committed by the new owner.
+    ///
+    /// **Do not commit offsets** inside `on_partitions_lost`. The default
+    /// implementation is a no-op for this reason. Override it to add
+    /// loss-specific cleanup logic (e.g., invalidating local caches).
     ///
     /// **Must complete synchronously** — see the [trait-level docs](ConsumerRebalanceListener)
     /// for the execution contract.
-    fn on_partitions_lost(&self, partitions: &[crate::consumer::TopicPartition]) {
-        // Default implementation delegates to revoked
-        self.on_partitions_revoked(partitions);
+    fn on_partitions_lost(&self, _partitions: &[crate::consumer::TopicPartition]) {
+        // Default: no-op.
+        //
+        // Deliberately does NOT call `on_partitions_revoked`.  Lost partitions
+        // mean the coordinator has already fenced this consumer; any offset
+        // commit at this point will either fail with `UNKNOWN_MEMBER_ID` /
+        // `ILLEGAL_GENERATION` or silently overwrite offsets committed by the
+        // new partition owner.  Implementations that need loss-specific cleanup
+        // should override this method directly.
     }
 }
 
@@ -153,6 +177,70 @@ pub struct NoOpRebalanceListener;
 impl ConsumerRebalanceListener for NoOpRebalanceListener {
     fn on_partitions_assigned(&self, _partitions: &[crate::consumer::TopicPartition]) {}
     fn on_partitions_revoked(&self, _partitions: &[crate::consumer::TopicPartition]) {}
+}
+
+/// Async variant of [`ConsumerRebalanceListener`].
+///
+/// Implementations may perform async I/O (offset commits, cache flushes, …)
+/// directly inside the callbacks without blocking a thread.
+///
+/// A blanket implementation is provided for every `T: ConsumerRebalanceListener`,
+/// so existing sync listeners work wherever an `AsyncConsumerRebalanceListener`
+/// is expected.
+///
+/// # Example
+///
+/// ```ignore
+/// use krafka::consumer::{AsyncConsumerRebalanceListener, TopicPartition};
+///
+/// struct FlushingListener;
+///
+/// impl AsyncConsumerRebalanceListener for FlushingListener {
+///     async fn on_partitions_assigned(&self, partitions: &[TopicPartition]) { /* … */ }
+///     async fn on_partitions_revoked(&self, partitions: &[TopicPartition]) { /* flush */ }
+///     async fn on_partitions_lost(&self, partitions: &[TopicPartition]) { /* … */ }
+/// }
+/// ```
+pub trait AsyncConsumerRebalanceListener: Send + Sync {
+    /// Called after partitions have been assigned to this consumer.
+    ///
+    /// Contains only **newly added** partitions for cooperative and KIP-848 rebalances.
+    /// See [`ConsumerRebalanceListener::on_partitions_assigned`] for full semantics.
+    fn on_partitions_assigned(
+        &self,
+        partitions: &[crate::consumer::TopicPartition],
+    ) -> impl std::future::Future<Output = ()> + Send;
+
+    /// Called before partitions are revoked from this consumer.
+    fn on_partitions_revoked(
+        &self,
+        partitions: &[crate::consumer::TopicPartition],
+    ) -> impl std::future::Future<Output = ()> + Send;
+
+    /// Called when partitions are lost due to an unclean shutdown.
+    ///
+    /// Default implementation is a no-op. **Do not commit offsets** here —
+    /// the consumer has likely been fenced already.
+    fn on_partitions_lost(
+        &self,
+        _partitions: &[crate::consumer::TopicPartition],
+    ) -> impl std::future::Future<Output = ()> + Send {
+        std::future::ready(())
+    }
+}
+
+impl<T: ConsumerRebalanceListener> AsyncConsumerRebalanceListener for T {
+    async fn on_partitions_assigned(&self, partitions: &[crate::consumer::TopicPartition]) {
+        ConsumerRebalanceListener::on_partitions_assigned(self, partitions);
+    }
+
+    async fn on_partitions_revoked(&self, partitions: &[crate::consumer::TopicPartition]) {
+        ConsumerRebalanceListener::on_partitions_revoked(self, partitions);
+    }
+
+    async fn on_partitions_lost(&self, partitions: &[crate::consumer::TopicPartition]) {
+        ConsumerRebalanceListener::on_partitions_lost(self, partitions);
+    }
 }
 
 /// Consumer group state.
@@ -176,7 +264,22 @@ pub enum GroupState {
     Dead,
 }
 
+impl std::fmt::Display for GroupState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Unjoined => "Unjoined",
+            Self::Joining => "Joining",
+            Self::AwaitingSync => "AwaitingSync",
+            Self::Stable => "Stable",
+            Self::PreparingRebalance => "PreparingRebalance",
+            Self::Leaving => "Leaving",
+            Self::Dead => "Dead",
+        })
+    }
+}
+
 /// Member assignment in a consumer group.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct MemberAssignment {
     /// Assigned partitions per topic.
@@ -200,14 +303,10 @@ impl MemberAssignment {
     }
 
     /// Get all assigned topic-partitions.
-    pub fn all_partitions(&self) -> Vec<(&str, PartitionId)> {
-        let mut result = Vec::new();
-        for (topic, partitions) in &self.partitions {
-            for &partition in partitions {
-                result.push((topic.as_str(), partition));
-            }
-        }
-        result
+    pub fn all_partitions(&self) -> impl Iterator<Item = (&str, PartitionId)> + '_ {
+        self.partitions
+            .iter()
+            .flat_map(|(topic, partitions)| partitions.iter().map(move |&p| (topic.as_str(), p)))
     }
 
     /// Check if empty.
@@ -218,6 +317,7 @@ impl MemberAssignment {
 }
 
 /// A consumer group member.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct GroupMember {
     /// Member ID assigned by the coordinator.
@@ -227,9 +327,9 @@ pub struct GroupMember {
     /// Client host.
     pub client_host: String,
     /// Member metadata.
-    pub metadata: Vec<u8>,
+    pub metadata: Bytes,
     /// Member assignment.
-    pub assignment: Vec<u8>,
+    pub assignment: Bytes,
 }
 
 /// Consumer group coordinator.
@@ -787,8 +887,8 @@ pub struct HeartbeatController {
     interval: Duration,
     /// Session timeout.
     session_timeout: Duration,
-    /// Last successful heartbeat time.
-    last_heartbeat: Arc<RwLock<Option<std::time::Instant>>>,
+    /// Last successful heartbeat time (nanos-level precision, sync access).
+    last_heartbeat: Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
     /// Whether the controller is running.
     running: Arc<std::sync::atomic::AtomicBool>,
     /// Whether a rebalance has been detected by the heartbeat task.
@@ -806,7 +906,7 @@ impl HeartbeatController {
         Self {
             interval,
             session_timeout,
-            last_heartbeat: Arc::new(RwLock::new(None)),
+            last_heartbeat: Arc::new(parking_lot::Mutex::new(None)),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rebalance_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             member_invalidated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -828,19 +928,19 @@ impl HeartbeatController {
     /// Check if the controller is running.
     #[inline]
     pub fn is_running(&self) -> bool {
-        self.running.load(std::sync::atomic::Ordering::Relaxed)
+        self.running.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Start the heartbeat controller.
     pub fn start(&self) {
         self.running
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Stop the heartbeat controller.
     pub fn stop(&self) {
         self.running
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// Signal that a rebalance is needed (called from heartbeat task).
@@ -872,22 +972,19 @@ impl HeartbeatController {
     }
 
     /// Record a successful heartbeat.
-    pub async fn heartbeat_success(&self) {
-        *self.last_heartbeat.write().await = Some(std::time::Instant::now());
+    pub fn heartbeat_success(&self) {
+        *self.last_heartbeat.lock() = Some(std::time::Instant::now());
     }
 
     /// Get the time since the last heartbeat.
-    pub async fn time_since_last_heartbeat(&self) -> Option<Duration> {
-        self.last_heartbeat.read().await.map(|t| t.elapsed())
+    pub fn time_since_last_heartbeat(&self) -> Option<Duration> {
+        (*self.last_heartbeat.lock()).map(|t| t.elapsed())
     }
 
     /// Check if the session may have timed out.
-    pub async fn may_have_timed_out(&self) -> bool {
-        if let Some(elapsed) = self.time_since_last_heartbeat().await {
-            elapsed > self.session_timeout
-        } else {
-            false
-        }
+    pub fn may_have_timed_out(&self) -> bool {
+        self.time_since_last_heartbeat()
+            .is_some_and(|elapsed| elapsed > self.session_timeout)
     }
 
     /// Wait for the next heartbeat interval.
@@ -1006,6 +1103,40 @@ pub enum HeartbeatCommand {
 /// // Commit offsets
 /// coordinator.commit_offsets(&offsets).await?;
 /// ```
+/// Rebalance-coordinated state for the group.
+///
+/// All four fields are updated atomically so readers can never observe a
+/// mismatched generation: `state == Stable` with an empty `assignment`, or
+/// `generation_id` from one epoch with `member_id` from another.
+#[derive(Debug)]
+struct GroupInner {
+    /// Member ID assigned by the coordinator.  Empty string before join.
+    member_id: String,
+    /// Generation ID (-1 before first join).
+    generation_id: i32,
+    /// Current group state.
+    state: GroupState,
+    /// Current partition assignment.
+    assignment: MemberAssignment,
+}
+
+impl GroupInner {
+    fn initial() -> Self {
+        Self {
+            member_id: String::new(),
+            generation_id: -1,
+            state: GroupState::Unjoined,
+            assignment: MemberAssignment::empty(),
+        }
+    }
+}
+
+/// Manages the consumer group lifecycle: join, sync, heartbeat, and leave.
+///
+/// Communicates with the group coordinator broker via the Kafka group management
+/// protocol (KIP-848 new consumer protocol when supported, classic protocol as
+/// fallback). Drives membership, partition assignment, and offset commit/fetch
+/// on behalf of a [`Consumer`](super::Consumer).
 pub struct GroupCoordinator {
     /// Group ID.
     group_id: String,
@@ -1023,14 +1154,9 @@ pub struct GroupCoordinator {
     coordinator_conn: Arc<RwLock<Option<Arc<BrokerConnection>>>>,
     /// Coordinator node ID.
     coordinator_id: RwLock<Option<i32>>,
-    /// Member ID assigned by coordinator.
-    member_id: Arc<RwLock<String>>,
-    /// Generation ID.
-    generation_id: Arc<RwLock<i32>>,
-    /// Current group state.
-    state: Arc<RwLock<GroupState>>,
-    /// Current partition assignment.
-    assignment: Arc<RwLock<MemberAssignment>>,
+    /// Rebalance-coordinated state (member_id, generation_id, state, assignment)
+    /// consolidated under a single lock for atomic updates across rebalances.
+    inner: Arc<RwLock<GroupInner>>,
     /// Heartbeat controller.
     heartbeat_controller: Arc<HeartbeatController>,
     /// Channel to control heartbeat task.
@@ -1045,6 +1171,10 @@ pub struct GroupCoordinator {
     assignor_name: String,
     /// Static group membership instance ID (KIP-345).
     group_instance_id: Option<String>,
+    /// Client rack ID for closest-replica fetching and server-side rack-aware
+    /// assignment (KIP-392 / KIP-848). Sent in every ConsumerGroupHeartbeat
+    /// request so the coordinator can place the member on a rack-local replica.
+    client_rack: Option<String>,
     /// Persistent sticky assignor (retains previous assignments across rebalances).
     sticky_assignor: CooperativeStickyAssignor,
     /// Transaction isolation level (0 = read_uncommitted, 1 = read_committed).
@@ -1086,10 +1216,7 @@ impl GroupCoordinator {
             rebalance_timeout,
             coordinator_conn: Arc::new(RwLock::new(None)),
             coordinator_id: RwLock::new(None),
-            member_id: Arc::new(RwLock::new(String::new())),
-            generation_id: Arc::new(RwLock::new(-1)),
-            state: Arc::new(RwLock::new(GroupState::Unjoined)),
-            assignment: Arc::new(RwLock::new(MemberAssignment::empty())),
+            inner: Arc::new(RwLock::new(GroupInner::initial())),
             heartbeat_controller: Arc::new(HeartbeatController::new(
                 heartbeat_interval,
                 session_timeout,
@@ -1100,6 +1227,7 @@ impl GroupCoordinator {
             assignment_strategy: crate::consumer::config::PartitionAssignmentStrategy::Range,
             assignor_name: "range".to_string(),
             group_instance_id: None,
+            client_rack: None,
             sticky_assignor: CooperativeStickyAssignor::new(),
             isolation_level: 0,
             group_protocol: crate::consumer::config::GroupProtocol::Classic,
@@ -1122,6 +1250,16 @@ impl GroupCoordinator {
     /// Set the static group membership instance ID (KIP-345, builder pattern).
     pub fn with_group_instance_id(mut self, id: Option<String>) -> Self {
         self.group_instance_id = id;
+        self
+    }
+
+    /// Set the client rack ID for KIP-392 rack-aware assignment (builder pattern).
+    ///
+    /// When set, the value is sent in every `ConsumerGroupHeartbeat` request
+    /// so that the KIP-848 coordinator can place the member on a rack-local
+    /// replica, reducing cross-rack traffic in multi-AZ deployments.
+    pub fn with_client_rack(mut self, rack: Option<String>) -> Self {
+        self.client_rack = rack;
         self
     }
 
@@ -1159,22 +1297,22 @@ impl GroupCoordinator {
 
     /// Get the current state.
     pub async fn state(&self) -> GroupState {
-        *self.state.read().await
+        self.inner.read().await.state
     }
 
     /// Get the member ID.
     pub async fn member_id(&self) -> String {
-        self.member_id.read().await.clone()
+        self.inner.read().await.member_id.clone()
     }
 
     /// Get the generation ID.
     pub async fn generation_id(&self) -> i32 {
-        *self.generation_id.read().await
+        self.inner.read().await.generation_id
     }
 
     /// Get the current assignment.
     pub async fn assignment(&self) -> MemberAssignment {
-        self.assignment.read().await.clone()
+        self.inner.read().await.assignment.clone()
     }
 
     /// Get the current subscribed topics.
@@ -1212,14 +1350,14 @@ impl GroupCoordinator {
             // downgrade Stable → PreparingRebalance — the consumer just
             // needs to process the assignment diff without re-joining.
             if !(self.is_consumer_protocol()
-                && matches!(*self.state.read().await, GroupState::Stable))
+                && matches!(self.inner.read().await.state, GroupState::Stable))
             {
-                *self.state.write().await = GroupState::PreparingRebalance;
+                self.inner.write().await.state = GroupState::PreparingRebalance;
             }
             return true;
         }
         matches!(
-            *self.state.read().await,
+            self.inner.read().await.state,
             GroupState::Unjoined | GroupState::PreparingRebalance
         )
     }
@@ -1243,10 +1381,13 @@ impl GroupCoordinator {
             )
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol(format!(
-                    "broker does not support FindCoordinator v{}-v{}",
-                    FIND_COORDINATOR_MIN, FIND_COORDINATOR_MAX,
-                ))
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    format!(
+                        "broker does not support FindCoordinator v{}-v{}",
+                        FIND_COORDINATOR_MIN, FIND_COORDINATOR_MAX,
+                    ),
+                )
             })?;
         let response = conn
             .send_request(ApiKey::FindCoordinator, fc_version, |buf| {
@@ -1329,10 +1470,8 @@ impl GroupCoordinator {
     pub async fn join_group(&self) -> Result<JoinGroupResponse> {
         let conn = self.get_coordinator_connection().await?;
 
-        let member_id = self.member_id.read().await.clone();
+        let member_id = self.inner.read().await.member_id.clone();
         let topics = self.subscribed_topics.read().await.clone();
-
-        // Get owned partitions for cooperative metadata
         let owned_partitions = if self.is_cooperative() {
             self.sticky_assignor
                 .previous_assignments
@@ -1366,7 +1505,7 @@ impl GroupCoordinator {
             self.group_id, member_id
         );
 
-        *self.state.write().await = GroupState::Joining;
+        self.inner.write().await.state = GroupState::Joining;
 
         // Negotiate JoinGroup version. Static membership (group_instance_id)
         // requires v5+ where the GroupInstanceId field is available.
@@ -1379,10 +1518,13 @@ impl GroupCoordinator {
             .negotiate_api_version(ApiKey::JoinGroup, JOIN_GROUP_MAX, join_group_min)
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol(format!(
-                    "broker does not support JoinGroup v{}-v{}",
-                    join_group_min, JOIN_GROUP_MAX,
-                ))
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    format!(
+                        "broker does not support JoinGroup v{}-v{}",
+                        join_group_min, JOIN_GROUP_MAX,
+                    ),
+                )
             })?;
 
         let response = conn
@@ -1404,7 +1546,7 @@ impl GroupCoordinator {
             );
 
             // Persist the broker-assigned member_id.
-            *self.member_id.write().await = join_response.member_id.clone();
+            self.inner.write().await.member_id = join_response.member_id.clone();
 
             // Rebuild the request with the assigned member_id.
             let retry_request = JoinGroupRequest {
@@ -1432,7 +1574,7 @@ impl GroupCoordinator {
             {
                 self.reset_member_identity().await;
             }
-            *self.state.write().await = GroupState::Unjoined;
+            self.inner.write().await.state = GroupState::Unjoined;
             return Err(KrafkaError::broker(
                 join_response.error_code,
                 "Failed to join group",
@@ -1445,14 +1587,17 @@ impl GroupCoordinator {
         // entry from sticky_assignor to prevent unbounded accumulation
         // of orphaned previous_assignments keyed by stale member IDs.
         {
-            let old_member_id = self.member_id.read().await.clone();
+            let old_member_id = self.inner.read().await.member_id.clone();
             if !old_member_id.is_empty() && old_member_id != join_response.member_id {
                 self.sticky_assignor.clear_member(&old_member_id);
             }
         }
-        *self.member_id.write().await = join_response.member_id.clone();
-        *self.generation_id.write().await = join_response.generation_id;
-        *self.state.write().await = GroupState::AwaitingSync;
+        {
+            let mut inner = self.inner.write().await;
+            inner.member_id = join_response.member_id.clone();
+            inner.generation_id = join_response.generation_id;
+            inner.state = GroupState::AwaitingSync;
+        }
 
         info!(
             "Joined group '{}': member_id='{}', generation={}, is_leader={}",
@@ -1469,8 +1614,10 @@ impl GroupCoordinator {
     pub async fn sync_group(&self, join_response: &JoinGroupResponse) -> Result<MemberAssignment> {
         let conn = self.get_coordinator_connection().await?;
 
-        let member_id = self.member_id.read().await.clone();
-        let generation_id = *self.generation_id.read().await;
+        let (member_id, generation_id) = {
+            let inner = self.inner.read().await;
+            (inner.member_id.clone(), inner.generation_id)
+        };
         let topics = self.subscribed_topics.read().await.clone();
 
         // If we're the leader, compute assignments
@@ -1503,10 +1650,13 @@ impl GroupCoordinator {
             .negotiate_api_version(ApiKey::SyncGroup, SYNC_GROUP_MAX, SYNC_GROUP_MIN)
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol(format!(
-                    "broker does not support SyncGroup v{}-v{}",
-                    SYNC_GROUP_MIN, SYNC_GROUP_MAX,
-                ))
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    format!(
+                        "broker does not support SyncGroup v{}-v{}",
+                        SYNC_GROUP_MIN, SYNC_GROUP_MAX,
+                    ),
+                )
             })?;
 
         let response = conn
@@ -1531,7 +1681,7 @@ impl GroupCoordinator {
             {
                 self.reset_member_identity().await;
             }
-            *self.state.write().await = GroupState::Unjoined;
+            self.inner.write().await.state = GroupState::Unjoined;
             return Err(KrafkaError::broker(
                 sync_response.error_code,
                 "Failed to sync group",
@@ -1546,8 +1696,11 @@ impl GroupCoordinator {
         // compared old vs new, so the previous-assignment baseline stays intact.
 
         // Update state
-        *self.assignment.write().await = assignment.clone();
-        *self.state.write().await = GroupState::Stable;
+        {
+            let mut inner = self.inner.write().await;
+            inner.assignment = assignment.clone();
+            inner.state = GroupState::Stable;
+        }
 
         info!(
             "Synced group '{}': received {} topic assignments",
@@ -1586,7 +1739,7 @@ impl GroupCoordinator {
         // force a rejoin so the broker learns the new subscription.
         let new_topics = topics.to_vec();
         {
-            let state = *self.state.read().await;
+            let state = self.inner.read().await.state;
             if state == GroupState::Stable {
                 let old_topics = self.subscribed_topics.read().await;
                 let mut old_sorted = old_topics.clone();
@@ -1607,11 +1760,12 @@ impl GroupCoordinator {
         // Update subscribed topics
         self.set_subscribed_topics(new_topics).await;
 
-        let state = *self.state.read().await;
-        if state == GroupState::Stable {
+        let inner = self.inner.read().await;
+        if inner.state == GroupState::Stable {
             // Already stable with same topics, return current assignment
-            Ok((self.assignment.read().await.clone(), false))
+            Ok((inner.assignment.clone(), false))
         } else {
+            drop(inner);
             // Need to join/rejoin
             let assignment = self.perform_join_and_sync().await?;
             Ok((assignment, true))
@@ -1664,7 +1818,7 @@ impl GroupCoordinator {
         let new_assignment = self.sync_group(&join_response).await?;
 
         // Compute what needs to be revoked
-        let member_id = self.member_id.read().await.clone();
+        let member_id = self.inner.read().await.member_id.clone();
         let to_revoke = self
             .sticky_assignor
             .get_partitions_to_revoke(&member_id, &new_assignment);
@@ -1706,8 +1860,7 @@ impl GroupCoordinator {
         let heartbeat_controller = self.heartbeat_controller.clone();
 
         // Clone Arc references so the task reads current values on each heartbeat
-        let member_id_ref = self.member_id.clone();
-        let generation_id_ref = self.generation_id.clone();
+        let inner_ref = self.inner.clone();
         let coordinator_conn_ref = self.coordinator_conn.clone();
         let group_instance_id = self.group_instance_id.clone();
 
@@ -1738,8 +1891,10 @@ impl GroupCoordinator {
 
                         // Read current values on each heartbeat (not stale copies)
                         let coordinator_conn = coordinator_conn_ref.read().await.clone();
-                        let member_id = member_id_ref.read().await.clone();
-                        let generation_id = *generation_id_ref.read().await;
+                        let inner = inner_ref.read().await;
+                        let member_id = inner.member_id.clone();
+                        let generation_id = inner.generation_id;
+                        drop(inner);
 
                         // Send heartbeat
                         if let Some(ref conn) = coordinator_conn {
@@ -1793,7 +1948,7 @@ impl GroupCoordinator {
                                         let status = HeartbeatStatus::from_error_code(hb_response.error_code);
                                         match status {
                                             HeartbeatStatus::Ok => {
-                                                heartbeat_controller.heartbeat_success().await;
+                                                heartbeat_controller.heartbeat_success();
                                                 debug!("Heartbeat successful for group '{}'", group_id);
                                             }
                                             HeartbeatStatus::RebalanceNeeded => {
@@ -1874,7 +2029,7 @@ impl GroupCoordinator {
 
     /// Trigger a rejoin.
     pub async fn trigger_rejoin(&self) {
-        *self.state.write().await = GroupState::PreparingRebalance;
+        self.inner.write().await.state = GroupState::PreparingRebalance;
         let tx = self.heartbeat_cmd_tx.read().await.clone();
         if let Some(tx) = tx {
             let _ = tx.send(HeartbeatCommand::Rejoin).await;
@@ -1894,7 +2049,7 @@ impl GroupCoordinator {
     /// Used when we want the next poll to re-enter rebalance but need the
     /// background heartbeat to keep running (e.g., round-limit deferral).
     pub async fn set_preparing_rebalance(&self) {
-        *self.state.write().await = GroupState::PreparingRebalance;
+        self.inner.write().await.state = GroupState::PreparingRebalance;
     }
 
     /// Record owned partitions in the sticky assignor for the next rebalance.
@@ -1928,13 +2083,13 @@ impl GroupCoordinator {
         // UUID on the first heartbeat and persist it for the member lifetime.
         // Use a single write lock to avoid a TOCTOU race where two concurrent
         // callers could both see an empty ID and both generate a UUID.
-        {
-            let mut id = self.member_id.write().await;
-            if id.is_empty() {
-                *id = crate::util::random_uuid_v4();
+        let member_id = {
+            let mut inner = self.inner.write().await;
+            if inner.member_id.is_empty() {
+                inner.member_id = crate::util::random_uuid_v4();
             }
-        }
-        let member_id = self.member_id.read().await.clone();
+            inner.member_id.clone()
+        };
         let member_epoch = *self.member_epoch.read().await;
 
         let request = ConsumerGroupHeartbeatRequest {
@@ -1942,7 +2097,7 @@ impl GroupCoordinator {
             member_id: member_id.clone(),
             member_epoch,
             instance_id: self.group_instance_id.clone(),
-            rack_id: None,
+            rack_id: self.client_rack.clone(),
             rebalance_timeout_ms: crate::util::duration_to_millis_i32(self.rebalance_timeout),
             subscribed_topic_names,
             subscribed_topic_regex: None,
@@ -1963,7 +2118,8 @@ impl GroupCoordinator {
             )
             .await
         else {
-            return Err(KrafkaError::protocol(
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::UnknownApiVersion,
                 "ConsumerGroupHeartbeat is unsupported by the broker; \
                  KIP-848/GroupProtocol::Consumer cannot be used on this cluster",
             ));
@@ -2024,12 +2180,12 @@ impl GroupCoordinator {
 
         // Update member state from the response
         if let Some(ref new_member_id) = hb_response.member_id {
-            let old = self.member_id.read().await.clone();
-            if old != *new_member_id {
-                if !old.is_empty() {
-                    self.sticky_assignor.clear_member(&old);
+            let mut inner = self.inner.write().await;
+            if inner.member_id != *new_member_id {
+                if !inner.member_id.is_empty() {
+                    self.sticky_assignor.clear_member(&inner.member_id);
                 }
-                *self.member_id.write().await = new_member_id.clone();
+                inner.member_id = new_member_id.clone();
             }
         }
         *self.member_epoch.write().await = hb_response.member_epoch;
@@ -2045,8 +2201,11 @@ impl GroupCoordinator {
                 &assignment.topic_partitions,
             )
             .await;
-            *self.assignment.write().await = new_assignment;
-            *self.state.write().await = GroupState::Stable;
+            {
+                let mut inner = self.inner.write().await;
+                inner.assignment = new_assignment;
+                inner.state = GroupState::Stable;
+            }
 
             if has_unresolved {
                 debug!(
@@ -2072,10 +2231,11 @@ impl GroupCoordinator {
                 let (resolved, still_unresolved) =
                     Self::resolve_assignment(&self.metadata, &self.topic_names_cache, &target)
                         .await;
-                *self.assignment.write().await = resolved;
+                self.inner.write().await.assignment = resolved;
 
                 if still_unresolved {
-                    return Err(KrafkaError::protocol(
+                    return Err(KrafkaError::protocol_kind(
+                        ProtocolErrorKind::Malformed,
                         "ConsumerGroupHeartbeat assignment contains topic UUIDs that could not \
                          be resolved after metadata refresh. KIP-848 requires Metadata v10+ \
                          to map topic IDs to names.",
@@ -2144,9 +2304,8 @@ impl GroupCoordinator {
         &self,
         topics: &[String],
     ) -> Result<(MemberAssignment, bool)> {
-        let state = *self.state.read().await;
-
         let new_topics = topics.to_vec();
+        let state = self.inner.read().await.state;
         match state {
             GroupState::Stable => {
                 // Already stable — check if topics changed
@@ -2156,7 +2315,7 @@ impl GroupCoordinator {
                 let mut new_sorted = new_topics.clone();
                 new_sorted.sort();
                 if old_sorted == new_sorted {
-                    return Ok((self.assignment.read().await.clone(), false));
+                    return Ok((self.inner.read().await.assignment.clone(), false));
                 }
                 // Topics changed — send heartbeat with new subscription
             }
@@ -2185,8 +2344,9 @@ impl GroupCoordinator {
         self.start_consumer_heartbeat_task(resp.heartbeat_interval_ms)
             .await;
 
-        let joined = matches!(*self.state.read().await, GroupState::Stable);
-        let assignment = self.assignment.read().await.clone();
+        let inner = self.inner.read().await;
+        let joined = matches!(inner.state, GroupState::Stable);
+        let assignment = inner.assignment.clone();
         Ok((assignment, joined))
     }
 
@@ -2206,12 +2366,11 @@ impl GroupCoordinator {
         let group_id = self.group_id.clone();
         let interval = Duration::from_millis(interval_ms.max(1000) as u64);
         let heartbeat_controller = self.heartbeat_controller.clone();
-        let member_id_ref = self.member_id.clone();
+        let inner_ref = self.inner.clone();
         let member_epoch_ref = self.member_epoch.clone();
         let coordinator_conn_ref = self.coordinator_conn.clone();
         let group_instance_id = self.group_instance_id.clone();
-        let assignment_ref = self.assignment.clone();
-        let state_ref = self.state.clone();
+        let client_rack = self.client_rack.clone();
         let metadata_ref = self.metadata.clone();
         let target_assignment_ref = self.target_assignment.clone();
         let topic_names_cache_ref = self.topic_names_cache.clone();
@@ -2261,7 +2420,9 @@ impl GroupCoordinator {
 
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            let mut current_interval_ms = interval.as_millis() as i32;
+            // Track the current interval in ms so we can compare against broker-provided
+            // updates. Use the clamped value derived from interval_ms to stay consistent.
+            let mut current_interval_ms = interval_ms.max(1000);
             // KIP-848 spec: "The member must set all (top-level) fields when
             // it joins for the first time or when an error/timeout occurs."
             // Start `true` so the very first tick sends a full heartbeat.
@@ -2275,7 +2436,7 @@ impl GroupCoordinator {
                         }
 
                         let coordinator_conn = coordinator_conn_ref.read().await.clone();
-                        let member_id = member_id_ref.read().await.clone();
+                        let member_id = inner_ref.read().await.member_id.clone();
                         let epoch = *member_epoch_ref.read().await;
 
                         if let Some(ref conn) = coordinator_conn {
@@ -2301,7 +2462,7 @@ impl GroupCoordinator {
                                 member_id,
                                 member_epoch: epoch,
                                 instance_id: group_instance_id.clone(),
-                                rack_id: None,
+                                rack_id: client_rack.clone(),
                                 rebalance_timeout_ms: rebal_timeout_ms,
                                 subscribed_topic_names: sub_names,
                                 subscribed_topic_regex: None,
@@ -2332,8 +2493,11 @@ impl GroupCoordinator {
                                                             &new_assign.topic_partitions,
                                                         )
                                                         .await;
-                                                    *assignment_ref.write().await = resolved;
-                                                    *state_ref.write().await = GroupState::Stable;
+                                                    {
+                                                        let mut inner = inner_ref.write().await;
+                                                        inner.assignment = resolved;
+                                                        inner.state = GroupState::Stable;
+                                                    }
 
                                                     // Signal rebalance so the Consumer layer
                                                     // picks up the new assignment, fires
@@ -2360,7 +2524,7 @@ impl GroupCoordinator {
                                                                 &target,
                                                             )
                                                             .await;
-                                                        *assignment_ref.write().await = re_resolved;
+                                                        inner_ref.write().await.assignment = re_resolved;
 
                                                         if still_unresolved {
                                                             warn!(
@@ -2383,7 +2547,7 @@ impl GroupCoordinator {
                                                                 &target,
                                                             )
                                                             .await;
-                                                        *assignment_ref.write().await = resolved;
+                                                        inner_ref.write().await.assignment = resolved;
 
                                                         if still_unresolved {
                                                             warn!(
@@ -2396,7 +2560,7 @@ impl GroupCoordinator {
                                                     }
                                                 }
 
-                                                heartbeat_controller.heartbeat_success().await;
+                                                heartbeat_controller.heartbeat_success();
                                                 send_full_heartbeat = false;
 
                                                 // Update interval if the coordinator changed it.
@@ -2432,7 +2596,7 @@ impl GroupCoordinator {
                                                     group_id, resp.member_epoch
                                                 );
                                                 send_full_heartbeat = true;
-                                                heartbeat_controller.heartbeat_success().await;
+                                                heartbeat_controller.heartbeat_success();
                                             } else if resp.error_code == ErrorCode::UnknownMemberId
                                                 || resp.error_code == ErrorCode::FencedMemberEpoch
                                                 || resp.error_code == ErrorCode::UnreleasedInstanceId
@@ -2557,8 +2721,10 @@ impl GroupCoordinator {
     /// Send a single heartbeat (for inline heartbeat during poll).
     pub async fn send_heartbeat(&self) -> Result<HeartbeatStatus> {
         let conn = self.get_coordinator_connection().await?;
-        let member_id = self.member_id.read().await.clone();
-        let generation_id = *self.generation_id.read().await;
+        let (member_id, generation_id) = {
+            let inner = self.inner.read().await;
+            (inner.member_id.clone(), inner.generation_id)
+        };
 
         let request = HeartbeatRequest {
             group_id: self.group_id.clone(),
@@ -2572,10 +2738,13 @@ impl GroupCoordinator {
             .negotiate_api_version(ApiKey::Heartbeat, HEARTBEAT_MAX, HEARTBEAT_MIN)
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol(format!(
-                    "broker does not support Heartbeat v{}-v{}",
-                    HEARTBEAT_MIN, HEARTBEAT_MAX,
-                ))
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    format!(
+                        "broker does not support Heartbeat v{}-v{}",
+                        HEARTBEAT_MIN, HEARTBEAT_MAX,
+                    ),
+                )
             })?;
         let response = conn
             .send_request(ApiKey::Heartbeat, hb_version, |buf| {
@@ -2588,7 +2757,7 @@ impl GroupCoordinator {
 
         let status = HeartbeatStatus::from_error_code(hb_response.error_code);
         if status == HeartbeatStatus::Ok {
-            self.heartbeat_controller.heartbeat_success().await;
+            self.heartbeat_controller.heartbeat_success();
         }
 
         Ok(status)
@@ -2621,7 +2790,7 @@ impl GroupCoordinator {
         }
 
         // Validate state
-        let state = *self.state.read().await;
+        let state = self.inner.read().await.state;
         if state != GroupState::Stable {
             return Err(KrafkaError::invalid_state(format!(
                 "cannot commit offsets: group state is {:?}",
@@ -2635,14 +2804,16 @@ impl GroupCoordinator {
             .negotiate_api_version(ApiKey::OffsetCommit, OFFSET_COMMIT_MAX, OFFSET_COMMIT_MIN)
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol(format!(
-                    "broker does not support OffsetCommit v{}-v{}",
-                    OFFSET_COMMIT_MIN, OFFSET_COMMIT_MAX,
-                ))
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    format!(
+                        "broker does not support OffsetCommit v{}-v{}",
+                        OFFSET_COMMIT_MIN, OFFSET_COMMIT_MAX,
+                    ),
+                )
             })?;
 
-        let member_id = self.member_id.read().await.clone();
-        // For KIP-848 (consumer protocol), the "generation ID" wire field
+        let member_id = self.inner.read().await.member_id.clone();
         // carries the member epoch instead of the classic generation ID.
         // This semantic overload is only valid from v9+ — at earlier versions
         // the broker strictly validates against the classic group generation,
@@ -2650,7 +2821,7 @@ impl GroupCoordinator {
         let generation_id = if self.is_consumer_protocol() && oc_version >= 9 {
             *self.member_epoch.read().await
         } else {
-            *self.generation_id.read().await
+            self.inner.read().await.generation_id
         };
 
         // Group offsets by topic
@@ -2668,7 +2839,7 @@ impl GroupCoordinator {
                 });
         }
 
-        let topics: Vec<OffsetCommitRequestTopic> = topics_map
+        let mut topics: Vec<OffsetCommitRequestTopic> = topics_map
             .into_iter()
             .map(|(name, partitions)| OffsetCommitRequestTopic {
                 name,
@@ -2676,6 +2847,22 @@ impl GroupCoordinator {
                 partitions,
             })
             .collect();
+
+        // KIP-848 v10+: replace topic name with topic_id on the wire.
+        // Fall back to v9 if any UUID is missing from the metadata cache.
+        let oc_version = if oc_version >= 10 {
+            let all_known = topics.iter_mut().all(|t| {
+                if let Some(id) = self.metadata.topic_id_for_name(&t.name) {
+                    t.topic_id = Some(id);
+                    true
+                } else {
+                    false
+                }
+            });
+            if all_known { oc_version } else { 9 }
+        } else {
+            oc_version
+        };
 
         let request = OffsetCommitRequest {
             group_id: self.group_id.clone(),
@@ -2699,7 +2886,20 @@ impl GroupCoordinator {
             .await?;
 
         let mut buf = response;
-        let commit_response = OffsetCommitResponse::decode_versioned(oc_version, &mut buf)?;
+        let mut commit_response = OffsetCommitResponse::decode_versioned(oc_version, &mut buf)?;
+
+        // KIP-848 v10: response topics carry topic_id instead of name —
+        // resolve back to name for downstream error messages.
+        if oc_version >= 10 {
+            for t in &mut commit_response.topics {
+                if t.name.is_empty()
+                    && let Some(id) = t.topic_id
+                    && let Some(name) = self.metadata.topic_name_for_id(&id)
+                {
+                    t.name = name;
+                }
+            }
+        }
 
         // Check for errors
         for topic in &commit_response.topics {
@@ -2726,7 +2926,7 @@ impl GroupCoordinator {
                         || partition.error_code == ErrorCode::FencedMemberEpoch
                         || partition.error_code == ErrorCode::StaleMemberEpoch
                     {
-                        *self.state.write().await = GroupState::PreparingRebalance;
+                        self.inner.write().await.state = GroupState::PreparingRebalance;
                         return Err(KrafkaError::broker(
                             partition.error_code,
                             format!(
@@ -2774,7 +2974,7 @@ impl GroupCoordinator {
 
         let conn = self.get_coordinator_connection().await?;
 
-        let topics: Vec<OffsetFetchRequestTopic> = partitions
+        let mut topics: Vec<OffsetFetchRequestTopic> = partitions
             .iter()
             .map(|(topic, parts)| OffsetFetchRequestTopic {
                 name: topic.clone(),
@@ -2786,16 +2986,36 @@ impl GroupCoordinator {
         // Negotiate version: v0 returns UNKNOWN_TOPIC_OR_PARTITION on modern
         // brokers, so we floor at v1. At v6+ the wire switches to flexible
         // encoding, v8+ uses the batched Groups format (KIP-709), and v9
-        // adds MemberId/MemberEpoch for KIP-848 epoch validation.
+        // adds MemberId/MemberEpoch for KIP-848 epoch validation,
+        // v10 KIP-848 topic_id replaces topic name on the wire.
         let of_version = conn
             .negotiate_api_version(ApiKey::OffsetFetch, OFFSET_FETCH_MAX, OFFSET_FETCH_MIN)
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol(format!(
-                    "broker does not support OffsetFetch v{}-v{}",
-                    OFFSET_FETCH_MIN, OFFSET_FETCH_MAX,
-                ))
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    format!(
+                        "broker does not support OffsetFetch v{}-v{}",
+                        OFFSET_FETCH_MIN, OFFSET_FETCH_MAX,
+                    ),
+                )
             })?;
+
+        // KIP-848 v10+: replace topic name with topic_id on the wire.
+        // Fall back to v9 if any UUID is missing from the metadata cache.
+        let of_version = if of_version >= 10 {
+            let all_known = topics.iter_mut().all(|t| {
+                if let Some(id) = self.metadata.topic_id_for_name(&t.name) {
+                    t.topic_id = Some(id);
+                    true
+                } else {
+                    false
+                }
+            });
+            if all_known { of_version } else { 9 }
+        } else {
+            of_version
+        };
 
         // For KIP-848, populate MemberId/MemberEpoch so the broker can validate
         // membership and surface STALE_MEMBER_EPOCH when appropriate.
@@ -2804,7 +3024,7 @@ impl GroupCoordinator {
         let (offset_fetch_member_id, offset_fetch_member_epoch) =
             if self.is_consumer_protocol() && of_version >= 9 {
                 (
-                    Some(self.member_id.read().await.clone()),
+                    Some(self.inner.read().await.member_id.clone()),
                     *self.member_epoch.read().await,
                 )
             } else {
@@ -2832,7 +3052,20 @@ impl GroupCoordinator {
             .await?;
 
         let mut buf = response;
-        let offset_response = OffsetFetchResponse::decode_versioned(of_version, &mut buf)?;
+        let mut offset_response = OffsetFetchResponse::decode_versioned(of_version, &mut buf)?;
+
+        // KIP-848 v10: response topics carry topic_id instead of name —
+        // resolve back to name for downstream result map keys.
+        if of_version >= 10 {
+            for t in &mut offset_response.topics {
+                if t.name.is_empty()
+                    && let Some(id) = t.topic_id
+                    && let Some(name) = self.metadata.topic_name_for_id(&id)
+                {
+                    t.name = name;
+                }
+            }
+        }
 
         // Check group-level error (v2+ top-level ErrorCode, v8+ per-group ErrorCode).
         // Errors like NOT_COORDINATOR, STALE_MEMBER_EPOCH, or UNKNOWN_MEMBER_ID
@@ -2842,7 +3075,7 @@ impl GroupCoordinator {
                 || offset_response.error_code == ErrorCode::UnknownMemberId
                 || offset_response.error_code == ErrorCode::FencedMemberEpoch
             {
-                *self.state.write().await = GroupState::PreparingRebalance;
+                self.inner.write().await.state = GroupState::PreparingRebalance;
             } else if offset_response.error_code == ErrorCode::NotCoordinator
                 || offset_response.error_code == ErrorCode::CoordinatorNotAvailable
             {
@@ -2972,10 +3205,13 @@ impl GroupCoordinator {
                 .negotiate_api_version(ApiKey::ListOffsets, LIST_OFFSETS_MAX, LIST_OFFSETS_MIN)
                 .await
                 .ok_or_else(|| {
-                    KrafkaError::protocol(format!(
-                        "broker does not support ListOffsets v{}-v{}",
-                        LIST_OFFSETS_MIN, LIST_OFFSETS_MAX,
-                    ))
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::UnknownApiVersion,
+                        format!(
+                            "broker does not support ListOffsets v{}-v{}",
+                            LIST_OFFSETS_MIN, LIST_OFFSETS_MAX,
+                        ),
+                    )
                 })?;
             let response = conn
                 .send_request(ApiKey::ListOffsets, lo_version, |buf| {
@@ -3010,7 +3246,7 @@ impl GroupCoordinator {
 
     /// Leave the consumer group.
     pub async fn leave_group(&self) -> Result<()> {
-        let state = *self.state.read().await;
+        let state = self.inner.read().await.state;
         if state == GroupState::Unjoined || state == GroupState::Dead {
             return Ok(());
         }
@@ -3034,9 +3270,9 @@ impl GroupCoordinator {
             }
         };
 
-        let member_id = self.member_id.read().await.clone();
+        let member_id = self.inner.read().await.member_id.clone();
 
-        *self.state.write().await = GroupState::Leaving;
+        self.inner.write().await.state = GroupState::Leaving;
 
         // v3+ uses only the `members` array; the top-level `member_id`
         // must be empty to avoid ambiguous single-vs-batch leave semantics.
@@ -3061,10 +3297,13 @@ impl GroupCoordinator {
             .negotiate_api_version(ApiKey::LeaveGroup, LEAVE_GROUP_MAX, LEAVE_GROUP_MIN)
             .await
             .ok_or_else(|| {
-                KrafkaError::protocol(format!(
-                    "broker does not support LeaveGroup v{}-v{}",
-                    LEAVE_GROUP_MIN, LEAVE_GROUP_MAX,
-                ))
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    format!(
+                        "broker does not support LeaveGroup v{}-v{}",
+                        LEAVE_GROUP_MIN, LEAVE_GROUP_MAX,
+                    ),
+                )
             })?;
         let result = tokio::time::timeout(
             Duration::from_secs(5),
@@ -3144,8 +3383,8 @@ impl GroupCoordinator {
             -1
         };
 
-        let member_id = self.member_id.read().await.clone();
-        *self.state.write().await = GroupState::Leaving;
+        let member_id = self.inner.read().await.member_id.clone();
+        self.inner.write().await.state = GroupState::Leaving;
         *self.member_epoch.write().await = leave_epoch;
 
         let request = ConsumerGroupHeartbeatRequest {
@@ -3153,7 +3392,7 @@ impl GroupCoordinator {
             member_id: member_id.clone(),
             member_epoch: leave_epoch,
             instance_id: self.group_instance_id.clone(),
-            rack_id: None,
+            rack_id: self.client_rack.clone(),
             rebalance_timeout_ms: -1,
             subscribed_topic_names: None,
             subscribed_topic_regex: None,
@@ -3228,8 +3467,11 @@ impl GroupCoordinator {
     /// Reset coordinator state.
     async fn reset(&self) {
         self.reset_member_identity().await;
-        *self.state.write().await = GroupState::Unjoined;
-        *self.assignment.write().await = MemberAssignment::empty();
+        {
+            let mut inner = self.inner.write().await;
+            inner.state = GroupState::Unjoined;
+            inner.assignment = MemberAssignment::empty();
+        }
         self.target_assignment.write().await.clear();
         self.topic_names_cache.write().await.clear();
         *self.coordinator_conn.write().await = None;
@@ -3244,14 +3486,17 @@ impl GroupCoordinator {
     /// and epoch 0". Sticky assignor, assignment, and target state are
     /// cleared because the coordinator revoked all partitions on fencing.
     async fn reset_for_kip848_fencing(&self) {
-        let member_id = self.member_id.read().await.clone();
+        let member_id = self.inner.read().await.member_id.clone();
         if !member_id.is_empty() {
             self.sticky_assignor.clear_member(&member_id);
         }
         *self.member_epoch.write().await = 0;
-        *self.generation_id.write().await = -1;
-        *self.state.write().await = GroupState::Unjoined;
-        *self.assignment.write().await = MemberAssignment::empty();
+        {
+            let mut inner = self.inner.write().await;
+            inner.generation_id = -1;
+            inner.state = GroupState::Unjoined;
+            inner.assignment = MemberAssignment::empty();
+        }
         self.target_assignment.write().await.clear();
         self.topic_names_cache.write().await.clear();
     }
@@ -3264,12 +3509,13 @@ impl GroupCoordinator {
     /// a fresh empty member_id for re-registration.  Also called by reset()
     /// during leave_group/close to prevent orphaned previous_assignments.
     async fn reset_member_identity(&self) {
-        let old = self.member_id.read().await.clone();
-        if !old.is_empty() {
-            self.sticky_assignor.clear_member(&old);
+        let mut inner = self.inner.write().await;
+        if !inner.member_id.is_empty() {
+            self.sticky_assignor.clear_member(&inner.member_id);
         }
-        *self.member_id.write().await = String::new();
-        *self.generation_id.write().await = -1;
+        inner.member_id.clear();
+        inner.generation_id = -1;
+        drop(inner);
         *self.member_epoch.write().await = 0;
     }
 
@@ -3300,11 +3546,14 @@ impl GroupCoordinator {
         buf.put_i32(crate::protocol::array_len_i32(sorted_topics.len())?);
         for topic in &sorted_topics {
             let topic_len = i16::try_from(topic.len()).map_err(|_| {
-                KrafkaError::protocol(format!(
-                    "topic name '{}' exceeds Kafka i16 length limit ({} bytes)",
-                    topic,
-                    topic.len()
-                ))
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidLength,
+                    format!(
+                        "topic name '{}' exceeds Kafka i16 length limit ({} bytes)",
+                        topic,
+                        topic.len()
+                    ),
+                )
             })?;
             buf.put_i16(topic_len);
             buf.put_slice(topic.as_bytes());
@@ -3320,10 +3569,10 @@ impl GroupCoordinator {
             buf.put_i32(crate::protocol::array_len_i32(sorted_owned.len())?);
             for (topic, partitions) in &sorted_owned {
                 let topic_len = i16::try_from(topic.len()).map_err(|_| {
-                    KrafkaError::protocol(format!(
-                        "topic name '{}' exceeds Kafka i16 length limit",
-                        topic
-                    ))
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        format!("topic name '{}' exceeds Kafka i16 length limit", topic),
+                    )
                 })?;
                 buf.put_i16(topic_len);
                 buf.put_slice(topic.as_bytes());
@@ -3371,7 +3620,13 @@ impl GroupCoordinator {
                 if len < 0 || buf.remaining() < len as usize {
                     return (topics, HashMap::new());
                 }
-                topics.push(String::from_utf8_lossy(&buf.copy_to_bytes(len as usize)).into_owned());
+                match String::from_utf8(buf.copy_to_bytes(len as usize).to_vec()) {
+                    Ok(t) => topics.push(t),
+                    Err(e) => {
+                        warn!("decode_consumer_metadata: invalid UTF-8 in topic name: {e}");
+                        return (topics, HashMap::new());
+                    }
+                }
             }
         }
 
@@ -3407,7 +3662,13 @@ impl GroupCoordinator {
                 if len < 0 || buf.remaining() < len as usize {
                     return (topics, owned);
                 }
-                let topic = String::from_utf8_lossy(&buf.copy_to_bytes(len as usize)).into_owned();
+                let topic = match String::from_utf8(buf.copy_to_bytes(len as usize).to_vec()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!("decode_consumer_metadata: invalid UTF-8 in owned topic name: {e}");
+                        return (topics, owned);
+                    }
+                };
                 if buf.remaining() < 4 {
                     return (topics, owned);
                 }
@@ -3482,7 +3743,12 @@ impl GroupCoordinator {
             if buf.remaining() < topic_len {
                 break;
             }
-            let topic = String::from_utf8_lossy(&buf.copy_to_bytes(topic_len)).into_owned();
+            let topic = String::from_utf8(buf.copy_to_bytes(topic_len).to_vec()).map_err(|e| {
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidUtf8,
+                    format!("invalid UTF-8 in assignment topic name: {e}"),
+                )
+            })?;
 
             if buf.remaining() < 4 {
                 break;
@@ -3525,8 +3791,11 @@ impl GroupCoordinator {
         let mut topic_partitions: HashMap<String, Vec<PartitionId>> = HashMap::new();
         for topic in topics {
             if let Some(topic_info) = self.metadata.topic(topic) {
-                let partitions: Vec<_> =
-                    topic_info.partitions.iter().map(|p| p.partition).collect();
+                let partitions: Vec<_> = topic_info
+                    .partitions
+                    .values()
+                    .map(|p| p.partition)
+                    .collect();
                 topic_partitions.insert(topic.clone(), partitions);
             }
         }
@@ -3553,8 +3822,8 @@ impl GroupCoordinator {
                 member_id: m.member_id.clone(),
                 client_id: String::new(),
                 client_host: String::new(),
-                metadata: m.metadata.to_vec(),
-                assignment: vec![],
+                metadata: m.metadata.clone(),
+                assignment: Bytes::new(),
             })
             .collect();
 
@@ -3601,11 +3870,14 @@ impl GroupCoordinator {
         buf.put_i32(crate::protocol::array_len_i32(assignment.partitions.len())?);
         for (topic, partitions) in &assignment.partitions {
             let topic_len = i16::try_from(topic.len()).map_err(|_| {
-                KrafkaError::protocol(format!(
-                    "topic name '{}' exceeds Kafka i16 length limit ({} bytes)",
-                    topic,
-                    topic.len()
-                ))
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidLength,
+                    format!(
+                        "topic name '{}' exceeds Kafka i16 length limit ({} bytes)",
+                        topic,
+                        topic.len()
+                    ),
+                )
             })?;
             buf.put_i16(topic_len);
             buf.put_slice(topic.as_bytes());
@@ -3621,11 +3893,11 @@ impl GroupCoordinator {
 
     /// Check if heartbeat is overdue (for inline heartbeat during poll).
     pub async fn is_heartbeat_overdue(&self) -> bool {
-        if let Some(elapsed) = self.heartbeat_controller.time_since_last_heartbeat().await {
+        if let Some(elapsed) = self.heartbeat_controller.time_since_last_heartbeat() {
             elapsed > self.heartbeat_interval
         } else {
             // No heartbeat recorded yet, should send one
-            *self.state.read().await == GroupState::Stable
+            self.inner.read().await.state == GroupState::Stable
         }
     }
 }
@@ -3676,7 +3948,7 @@ mod tests {
 
         assert!(!assignment.is_empty());
         assert_eq!(assignment.get("topic1"), Some(vec![0, 1, 2].as_slice()));
-        assert_eq!(assignment.all_partitions().len(), 5);
+        assert_eq!(assignment.all_partitions().count(), 5);
     }
 
     #[tokio::test]
@@ -3719,14 +3991,17 @@ mod tests {
         )
         .with_group_protocol(crate::consumer::config::GroupProtocol::Consumer);
 
-        *coordinator.member_id.write().await = "member-1".to_string();
+        {
+            let mut inner = coordinator.inner.write().await;
+            inner.member_id = "member-1".to_string();
+            inner.generation_id = 42;
+            inner.state = GroupState::Stable;
+        }
         *coordinator.member_epoch.write().await = 7;
-        *coordinator.generation_id.write().await = 42;
-        *coordinator.state.write().await = GroupState::Stable;
 
         let mut assignment = MemberAssignment::empty();
         assignment.add("topic-a", vec![0, 1]);
-        *coordinator.assignment.write().await = assignment.clone();
+        coordinator.inner.write().await.assignment = assignment.clone();
         coordinator
             .sticky_assignor
             .record_assignment("member-1", &assignment);
@@ -3747,11 +4022,11 @@ mod tests {
 
         coordinator.reset_for_kip848_fencing().await;
 
-        assert_eq!(*coordinator.member_id.read().await, "member-1");
+        assert_eq!(coordinator.inner.read().await.member_id, "member-1");
         assert_eq!(*coordinator.member_epoch.read().await, 0);
-        assert_eq!(*coordinator.generation_id.read().await, -1);
-        assert_eq!(*coordinator.state.read().await, GroupState::Unjoined);
-        assert!(coordinator.assignment.read().await.is_empty());
+        assert_eq!(coordinator.inner.read().await.generation_id, -1);
+        assert_eq!(coordinator.inner.read().await.state, GroupState::Unjoined);
+        assert!(coordinator.inner.read().await.assignment.is_empty());
         assert!(coordinator.target_assignment.read().await.is_empty());
         assert!(coordinator.topic_names_cache.read().await.is_empty());
         assert!(
@@ -3783,15 +4058,15 @@ mod tests {
                 member_id: "m1".to_string(),
                 client_id: "c1".to_string(),
                 client_host: "host1".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
             GroupMember {
                 member_id: "m2".to_string(),
                 client_id: "c2".to_string(),
                 client_host: "host2".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
         ];
 
@@ -3818,15 +4093,15 @@ mod tests {
                 member_id: "m1".to_string(),
                 client_id: "c1".to_string(),
                 client_host: "host1".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
             GroupMember {
                 member_id: "m2".to_string(),
                 client_id: "c2".to_string(),
                 client_host: "host2".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
         ];
 
@@ -3853,9 +4128,9 @@ mod tests {
         ];
 
         // These should all be no-ops and not panic
-        listener.on_partitions_assigned(&partitions);
-        listener.on_partitions_revoked(&partitions);
-        listener.on_partitions_lost(&partitions);
+        ConsumerRebalanceListener::on_partitions_assigned(&listener, &partitions);
+        ConsumerRebalanceListener::on_partitions_revoked(&listener, &partitions);
+        ConsumerRebalanceListener::on_partitions_lost(&listener, &partitions);
     }
 
     #[test]
@@ -3906,13 +4181,13 @@ mod tests {
             TopicPartition::new("topic2", 0),
         ];
 
-        listener.on_partitions_assigned(&partitions);
+        ConsumerRebalanceListener::on_partitions_assigned(&*listener, &partitions);
         assert_eq!(listener.assigned_count.load(Ordering::Relaxed), 3);
 
-        listener.on_partitions_revoked(&partitions[..2]);
+        ConsumerRebalanceListener::on_partitions_revoked(&*listener, &partitions[..2]);
         assert_eq!(listener.revoked_count.load(Ordering::Relaxed), 2);
 
-        listener.on_partitions_lost(&partitions[..1]);
+        ConsumerRebalanceListener::on_partitions_lost(&*listener, &partitions[..1]);
         assert_eq!(listener.lost_count.load(Ordering::Relaxed), 1);
     }
 
@@ -3936,21 +4211,21 @@ mod tests {
         assert!(!controller.is_running());
     }
 
-    #[tokio::test]
-    async fn test_heartbeat_controller_success() {
+    #[test]
+    fn test_heartbeat_controller_success() {
         let controller = HeartbeatController::new(Duration::from_secs(3), Duration::from_secs(30));
 
         // Initially, no heartbeat recorded
-        assert!(controller.time_since_last_heartbeat().await.is_none());
-        assert!(!controller.may_have_timed_out().await);
+        assert!(controller.time_since_last_heartbeat().is_none());
+        assert!(!controller.may_have_timed_out());
 
         // Record a heartbeat
-        controller.heartbeat_success().await;
+        controller.heartbeat_success();
 
         // Now we should have a recent heartbeat
-        let elapsed = controller.time_since_last_heartbeat().await.unwrap();
+        let elapsed = controller.time_since_last_heartbeat().unwrap();
         assert!(elapsed < Duration::from_secs(1));
-        assert!(!controller.may_have_timed_out().await);
+        assert!(!controller.may_have_timed_out());
     }
 
     #[test]
@@ -3994,23 +4269,31 @@ mod tests {
                 member_id: "member-1".to_string(),
                 client_id: "client-1".to_string(),
                 client_host: "host-1".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
             GroupMember {
                 member_id: "member-2".to_string(),
                 client_id: "client-2".to_string(),
                 client_host: "host-2".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
         ];
 
         let assignments = assignor.assign(&topics, &partitions, &members);
 
         assert_eq!(assignments.len(), 2);
-        let member1_parts: Vec<_> = assignments.get("member-1").unwrap().all_partitions();
-        let member2_parts: Vec<_> = assignments.get("member-2").unwrap().all_partitions();
+        let member1_parts: Vec<_> = assignments
+            .get("member-1")
+            .unwrap()
+            .all_partitions()
+            .collect();
+        let member2_parts: Vec<_> = assignments
+            .get("member-2")
+            .unwrap()
+            .all_partitions()
+            .collect();
 
         // Each member should have 2 partitions (4 total / 2 members)
         assert_eq!(member1_parts.len(), 2);
@@ -4030,15 +4313,15 @@ mod tests {
                 member_id: "member-1".to_string(),
                 client_id: "client-1".to_string(),
                 client_host: "host-1".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
             GroupMember {
                 member_id: "member-2".to_string(),
                 client_id: "client-2".to_string(),
                 client_host: "host-2".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
         ];
 
@@ -4075,15 +4358,15 @@ mod tests {
                 member_id: "member-1".to_string(),
                 client_id: "client-1".to_string(),
                 client_host: "host-1".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
             GroupMember {
                 member_id: "member-2".to_string(),
                 client_id: "client-2".to_string(),
                 client_host: "host-2".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
         ];
 
@@ -4100,22 +4383,22 @@ mod tests {
                 member_id: "member-1".to_string(),
                 client_id: "client-1".to_string(),
                 client_host: "host-1".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
             GroupMember {
                 member_id: "member-2".to_string(),
                 client_id: "client-2".to_string(),
                 client_host: "host-2".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
             GroupMember {
                 member_id: "member-3".to_string(),
                 client_id: "client-3".to_string(),
                 client_host: "host-3".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
         ];
 
@@ -4123,12 +4406,12 @@ mod tests {
 
         // All 3 members should get 2 partitions each (6 / 3 = 2)
         for member_id in ["member-1", "member-2", "member-3"] {
-            let parts = new_assignments.get(member_id).unwrap().all_partitions();
-            assert_eq!(
-                parts.len(),
-                2,
-                "Member {member_id} should have 2 partitions"
-            );
+            let part_count = new_assignments
+                .get(member_id)
+                .unwrap()
+                .all_partitions()
+                .count();
+            assert_eq!(part_count, 2, "Member {member_id} should have 2 partitions");
         }
     }
 
@@ -4215,22 +4498,22 @@ mod tests {
                 member_id: "m1".to_string(),
                 client_id: "c1".to_string(),
                 client_host: "h1".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
             GroupMember {
                 member_id: "m2".to_string(),
                 client_id: "c2".to_string(),
                 client_host: "h2".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
             GroupMember {
                 member_id: "m3".to_string(),
                 client_id: "c3".to_string(),
                 client_host: "h3".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
         ];
 
@@ -4252,7 +4535,7 @@ mod tests {
 
         // With fix, no member should have more than ceil(5/3) = 2 partitions
         for member_id in ["m1", "m2", "m3"] {
-            let count = assignments.get(member_id).unwrap().all_partitions().len();
+            let count = assignments.get(member_id).unwrap().all_partitions().count();
             assert!(
                 count <= 2,
                 "Member {member_id} has {count} partitions, max should be 2"
@@ -4262,7 +4545,7 @@ mod tests {
         // Total partitions should still be 5
         let total: usize = ["m1", "m2", "m3"]
             .iter()
-            .map(|m| assignments.get(*m).unwrap().all_partitions().len())
+            .map(|m| assignments.get(*m).unwrap().all_partitions().count())
             .sum();
         assert_eq!(total, 5, "Total partitions should be 5");
     }
@@ -4281,22 +4564,22 @@ mod tests {
                 member_id: "m1".to_string(),
                 client_id: "c1".to_string(),
                 client_host: "h1".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
             GroupMember {
                 member_id: "m2".to_string(),
                 client_id: "c2".to_string(),
                 client_host: "h2".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
             GroupMember {
                 member_id: "m3".to_string(),
                 client_id: "c3".to_string(),
                 client_host: "h3".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
         ];
 
@@ -4304,7 +4587,7 @@ mod tests {
 
         // Each member should have exactly 2 partitions (6/3 = 2)
         for member_id in ["m1", "m2", "m3"] {
-            let count = assignments.get(member_id).unwrap().all_partitions().len();
+            let count = assignments.get(member_id).unwrap().all_partitions().count();
             assert_eq!(
                 count, 2,
                 "Member {member_id} should have exactly 2 partitions"
@@ -4400,15 +4683,15 @@ mod tests {
                 member_id: "m1".to_string(),
                 client_id: "c1".to_string(),
                 client_host: "h1".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
             GroupMember {
                 member_id: "m2".to_string(),
                 client_id: "c2".to_string(),
                 client_host: "h2".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
         ];
 
@@ -4418,8 +4701,8 @@ mod tests {
         }
 
         // Each member gets 3 partitions
-        assert_eq!(round1.get("m1").unwrap().all_partitions().len(), 3);
-        assert_eq!(round1.get("m2").unwrap().all_partitions().len(), 3);
+        assert_eq!(round1.get("m1").unwrap().all_partitions().count(), 3);
+        assert_eq!(round1.get("m2").unwrap().all_partitions().count(), 3);
 
         // Round 2: 3 members (m3 joins)
         let members3 = vec![
@@ -4427,22 +4710,22 @@ mod tests {
                 member_id: "m1".to_string(),
                 client_id: "c1".to_string(),
                 client_host: "h1".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
             GroupMember {
                 member_id: "m2".to_string(),
                 client_id: "c2".to_string(),
                 client_host: "h2".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
             GroupMember {
                 member_id: "m3".to_string(),
                 client_id: "c3".to_string(),
                 client_host: "h3".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
         ];
 
@@ -4451,7 +4734,7 @@ mod tests {
         // Each member gets 2 partitions (6/3)
         for mid in ["m1", "m2", "m3"] {
             assert_eq!(
-                round2.get(mid).unwrap().all_partitions().len(),
+                round2.get(mid).unwrap().all_partitions().count(),
                 2,
                 "Member {mid} should have 2 partitions after rebalance"
             );
@@ -4479,22 +4762,22 @@ mod tests {
                 member_id: "m1".to_string(),
                 client_id: "c1".to_string(),
                 client_host: "h1".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
             GroupMember {
                 member_id: "m2".to_string(),
                 client_id: "c2".to_string(),
                 client_host: "h2".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
             GroupMember {
                 member_id: "m3".to_string(),
                 client_id: "c3".to_string(),
                 client_host: "h3".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
         ];
 
@@ -4504,7 +4787,7 @@ mod tests {
         }
         // 2 each
         for mid in ["m1", "m2", "m3"] {
-            assert_eq!(round1.get(mid).unwrap().all_partitions().len(), 2);
+            assert_eq!(round1.get(mid).unwrap().all_partitions().count(), 2);
         }
 
         // m3 leaves
@@ -4515,23 +4798,23 @@ mod tests {
                 member_id: "m1".to_string(),
                 client_id: "c1".to_string(),
                 client_host: "h1".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
             GroupMember {
                 member_id: "m2".to_string(),
                 client_id: "c2".to_string(),
                 client_host: "h2".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
         ];
 
         let round2 = assignor.assign(&topics, &partitions, &members2);
 
         // Each remaining member gets 3 (6/2)
-        assert_eq!(round2.get("m1").unwrap().all_partitions().len(), 3);
-        assert_eq!(round2.get("m2").unwrap().all_partitions().len(), 3);
+        assert_eq!(round2.get("m1").unwrap().all_partitions().count(), 3);
+        assert_eq!(round2.get("m2").unwrap().all_partitions().count(), 3);
 
         // m1 should NOT have any revocations (only gains)
         let m1_revoke = assignor.get_partitions_to_revoke("m1", round2.get("m1").unwrap());
@@ -4588,23 +4871,23 @@ mod tests {
                 member_id: "m1".to_string(),
                 client_id: "c1".to_string(),
                 client_host: "h1".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
             GroupMember {
                 member_id: "m2".to_string(),
                 client_id: "c2".to_string(),
                 client_host: "h2".to_string(),
-                metadata: vec![],
-                assignment: vec![],
+                metadata: bytes::Bytes::new(),
+                assignment: bytes::Bytes::new(),
             },
         ];
 
         let assignments = assignor.assign(&topics, &partitions, &members);
 
         // 6 total partitions / 2 members = 3 each
-        let m1_total = assignments.get("m1").unwrap().all_partitions().len();
-        let m2_total = assignments.get("m2").unwrap().all_partitions().len();
+        let m1_total = assignments.get("m1").unwrap().all_partitions().count();
+        let m2_total = assignments.get("m2").unwrap().all_partitions().count();
         assert_eq!(m1_total, 3);
         assert_eq!(m2_total, 3);
         assert_eq!(m1_total + m2_total, 6);
@@ -4642,14 +4925,14 @@ mod tests {
         buf.put_i16(1); // version 1
         buf.put_i32(1); // 1 subscribed topic
         let topic = b"sub";
-        buf.put_i16(topic.len() as i16);
+        buf.put_i16(i16::try_from(topic.len()).unwrap());
         buf.put_slice(topic);
         buf.put_i32(-1); // no user data
 
         // Owned partitions section
         buf.put_i32(1); // 1 owned topic
         let owned_topic = b"test";
-        buf.put_i16(owned_topic.len() as i16);
+        buf.put_i16(i16::try_from(owned_topic.len()).unwrap());
         buf.put_slice(owned_topic);
         buf.put_i32(5_000); // claim 5000 partitions
         buf.put_i32(0); // only 3 actual partition values

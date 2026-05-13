@@ -847,10 +847,13 @@ async fn test_message_headers() {
         .await
         .expect("Failed to create producer");
 
-    // Create headers as Vec<(String, Vec<u8>)>
+    // Create headers as Vec<(String, Bytes)>
     let headers = vec![
-        ("trace-id".to_string(), b"abc123".to_vec()),
-        ("content-type".to_string(), b"application/json".to_vec()),
+        ("trace-id".to_string(), bytes::Bytes::from_static(b"abc123")),
+        (
+            "content-type".to_string(),
+            bytes::Bytes::from_static(b"application/json"),
+        ),
     ];
 
     // Send message with headers
@@ -881,7 +884,7 @@ async fn test_message_headers() {
     let record = &records[0];
 
     // Verify headers are present
-    assert!(record.header("trace-id").is_some());
+    assert!(record.header(b"trace-id").is_some());
     consumer.close().await.expect("consumer close");
 }
 
@@ -2449,7 +2452,7 @@ async fn test_offsets_for_times_and_watermarks_and_metadata() {
     // fetch_watermarks: low should be 0, high should be > 0 and the two
     // partitions together should account for all N messages.
     let mut total_high = 0i64;
-    for p in &topic_info.partitions {
+    for p in topic_info.partitions_iter() {
         let (low, high) = consumer
             .fetch_watermarks(topic, p.partition)
             .await
@@ -2493,8 +2496,7 @@ async fn test_offsets_for_times_and_watermarks_and_metadata() {
 
     // Lower-level offsets_for_times with an explicit pair list.
     let pairs: Vec<(&str, i32)> = topic_info
-        .partitions
-        .iter()
+        .partitions_iter()
         .map(|p| (topic, p.partition))
         .collect();
     let offsets_pairs = consumer.offsets_for_times(&pairs, 0).await;
@@ -2505,4 +2507,622 @@ async fn test_offsets_for_times_and_watermarks_and_metadata() {
     }
 
     consumer.close().await.expect("consumer close");
+}
+
+// ---------------------------------------------------------------------------
+// Transactional Producer Tests
+// ---------------------------------------------------------------------------
+
+/// Committed transactions are visible to read-committed consumers.
+///
+/// Flow: init → begin → send → commit → consume (read_committed) → assert message present.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_transactional_producer_commit() {
+    use krafka::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
+    use krafka::producer::TransactionalProducer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "txn-commit-topic";
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    let producer = TransactionalProducer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .transactional_id("txn-commit-test")
+        .build()
+        .await
+        .expect("Failed to create transactional producer");
+
+    producer
+        .init_transactions()
+        .await
+        .expect("init_transactions failed");
+    producer
+        .begin_transaction()
+        .expect("begin_transaction failed");
+
+    let metadata = producer
+        .send(topic, Some(b"key"), b"committed-value")
+        .await
+        .expect("send failed");
+    assert!(
+        metadata.offset >= 0,
+        "Expected a valid offset, got {}",
+        metadata.offset
+    );
+
+    producer
+        .commit_transaction()
+        .await
+        .expect("commit_transaction failed");
+    producer.close().await;
+
+    // Read with read_committed isolation — should see the committed message.
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id("txn-commit-consumer")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .isolation_level(IsolationLevel::ReadCommitted)
+        .build()
+        .await
+        .expect("Failed to create consumer");
+
+    subscribe_with_retry(&consumer, &[topic], 5)
+        .await
+        .expect("subscribe failed");
+
+    let records = poll_for_records(&consumer, 1, Duration::from_secs(5), 10).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "Should receive exactly one committed message"
+    );
+    assert_eq!(
+        records[0].value.as_deref(),
+        Some(b"committed-value" as &[u8]),
+        "Value mismatch"
+    );
+    consumer.close().await.expect("consumer close");
+}
+
+/// Aborted transactions are hidden from read-committed consumers.
+///
+/// Flow: init → begin → send → abort → begin → send → commit.
+/// The read-committed consumer should receive only the committed message.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_transactional_producer_abort() {
+    use krafka::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
+    use krafka::producer::TransactionalProducer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "txn-abort-topic";
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    let producer = TransactionalProducer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .transactional_id("txn-abort-test")
+        .build()
+        .await
+        .expect("Failed to create transactional producer");
+
+    producer
+        .init_transactions()
+        .await
+        .expect("init_transactions failed");
+
+    // First transaction: send and ABORT.
+    producer
+        .begin_transaction()
+        .expect("begin_transaction failed");
+    let _ = producer
+        .send(topic, Some(b"key-aborted"), b"aborted-value")
+        .await
+        .expect("send (to-be-aborted) failed");
+    producer
+        .abort_transaction()
+        .await
+        .expect("abort_transaction failed");
+
+    // Second transaction: send and COMMIT.
+    producer
+        .begin_transaction()
+        .expect("begin_transaction failed");
+    let _ = producer
+        .send(topic, Some(b"key-committed"), b"committed-value")
+        .await
+        .expect("send failed");
+    producer
+        .commit_transaction()
+        .await
+        .expect("commit_transaction failed");
+
+    producer.close().await;
+
+    // Read with read_committed — should see ONLY the committed message.
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id("txn-abort-consumer")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .isolation_level(IsolationLevel::ReadCommitted)
+        .build()
+        .await
+        .expect("Failed to create consumer");
+
+    subscribe_with_retry(&consumer, &[topic], 5)
+        .await
+        .expect("subscribe failed");
+
+    // Poll enough times to drain — if the aborted message leaks we'll catch it.
+    let mut all_records = Vec::new();
+    for _ in 0..10 {
+        let records = consumer
+            .poll(Duration::from_secs(2))
+            .await
+            .expect("poll failed");
+        all_records.extend(records);
+        if !all_records.is_empty() {
+            break;
+        }
+    }
+
+    assert_eq!(
+        all_records.len(),
+        1,
+        "read_committed consumer should see exactly one message (the committed one)"
+    );
+    assert_eq!(
+        all_records[0].value.as_deref(),
+        Some(b"committed-value" as &[u8]),
+        "Only the committed message should be visible"
+    );
+    consumer.close().await.expect("consumer close");
+}
+
+/// Transactions spanning multiple partitions are committed atomically.
+///
+/// Sends two messages with keys that hash to different partitions within one
+/// transaction. Both messages should appear in a read-committed consumer.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_transactional_producer_multi_partition() {
+    use krafka::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
+    use krafka::producer::TransactionalProducer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "txn-multi-part-topic";
+    create_topic(&bootstrap_servers, topic, 2).await;
+
+    let producer = TransactionalProducer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .transactional_id("txn-multi-part-test")
+        .build()
+        .await
+        .expect("Failed to create transactional producer");
+
+    producer
+        .init_transactions()
+        .await
+        .expect("init_transactions failed");
+    producer
+        .begin_transaction()
+        .expect("begin_transaction failed");
+
+    let _ = producer
+        .send(topic, Some(b"key-alpha"), b"value-alpha")
+        .await
+        .expect("send alpha failed");
+    let _ = producer
+        .send(topic, Some(b"key-beta"), b"value-beta")
+        .await
+        .expect("send beta failed");
+
+    producer
+        .commit_transaction()
+        .await
+        .expect("commit_transaction failed");
+    producer.close().await;
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id("txn-multi-part-consumer")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .isolation_level(IsolationLevel::ReadCommitted)
+        .build()
+        .await
+        .expect("Failed to create consumer");
+
+    subscribe_with_retry(&consumer, &[topic], 5)
+        .await
+        .expect("subscribe failed");
+
+    let records = poll_for_records(&consumer, 2, Duration::from_secs(5), 10).await;
+    assert_eq!(
+        records.len(),
+        2,
+        "Should receive both messages from the transaction"
+    );
+
+    let values: std::collections::HashSet<String> = records
+        .iter()
+        .filter_map(|r| {
+            r.value
+                .as_ref()
+                .map(|v| String::from_utf8_lossy(v).into_owned())
+        })
+        .collect();
+    assert!(values.contains("value-alpha"), "value-alpha missing");
+    assert!(values.contains("value-beta"), "value-beta missing");
+
+    consumer.close().await.expect("consumer close");
+}
+
+/// Multiple transactions in sequence: commit, abort, commit.
+///
+/// Verifies the producer can cycle through multiple transactions correctly and
+/// that only committed messages are visible.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_transactional_producer_multiple_transactions() {
+    use krafka::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
+    use krafka::producer::TransactionalProducer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "txn-multi-txn-topic";
+    create_topic(&bootstrap_servers, topic, 1).await;
+
+    let producer = TransactionalProducer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .transactional_id("txn-multi-txn-test")
+        .build()
+        .await
+        .expect("Failed to create transactional producer");
+
+    producer
+        .init_transactions()
+        .await
+        .expect("init_transactions failed");
+
+    // Txn 1: commit.
+    producer.begin_transaction().expect("begin 1 failed");
+    let _ = producer
+        .send(topic, Some(b"k1"), b"v1")
+        .await
+        .expect("send 1 failed");
+    producer
+        .commit_transaction()
+        .await
+        .expect("commit 1 failed");
+
+    // Txn 2: abort.
+    producer.begin_transaction().expect("begin 2 failed");
+    let _ = producer
+        .send(topic, Some(b"k2"), b"v2-aborted")
+        .await
+        .expect("send 2 failed");
+    producer.abort_transaction().await.expect("abort 2 failed");
+
+    // Txn 3: commit.
+    producer.begin_transaction().expect("begin 3 failed");
+    let _ = producer
+        .send(topic, Some(b"k3"), b"v3")
+        .await
+        .expect("send 3 failed");
+    producer
+        .commit_transaction()
+        .await
+        .expect("commit 3 failed");
+
+    producer.close().await;
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id("txn-multi-txn-consumer")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .isolation_level(IsolationLevel::ReadCommitted)
+        .build()
+        .await
+        .expect("Failed to create consumer");
+
+    subscribe_with_retry(&consumer, &[topic], 5)
+        .await
+        .expect("subscribe failed");
+
+    let records = poll_for_records(&consumer, 2, Duration::from_secs(5), 10).await;
+    assert_eq!(
+        records.len(),
+        2,
+        "Only committed messages should be visible"
+    );
+
+    let values: Vec<String> = records
+        .iter()
+        .filter_map(|r| {
+            r.value
+                .as_ref()
+                .map(|v| String::from_utf8_lossy(v).into_owned())
+        })
+        .collect();
+    assert!(values.contains(&"v1".to_string()), "v1 missing");
+    assert!(values.contains(&"v3".to_string()), "v3 missing");
+    assert!(
+        !values.contains(&"v2-aborted".to_string()),
+        "aborted message v2 leaked"
+    );
+
+    consumer.close().await.expect("consumer close");
+}
+
+/// Producer epoch fencing: a new producer with the same transactional ID bumps
+/// the epoch, fencing any zombie producers.
+///
+/// Verifies that `init_transactions()` with the same `transactional_id` assigns
+/// a higher epoch, and the new producer can commit successfully.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_transactional_producer_epoch_fencing() {
+    use krafka::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
+    use krafka::producer::TransactionalProducer;
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let topic = "txn-fencing-topic";
+    create_topic(&bootstrap_servers, topic, 1).await;
+    let txn_id = "txn-fencing-test";
+
+    // Producer 1: init and commit one message.
+    let producer1 = TransactionalProducer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .transactional_id(txn_id)
+        .build()
+        .await
+        .expect("Failed to create producer 1");
+
+    producer1.init_transactions().await.expect("init 1 failed");
+    let epoch1 = producer1.producer_epoch();
+
+    producer1.begin_transaction().expect("begin 1 failed");
+    let _ = producer1
+        .send(topic, Some(b"k1"), b"v1")
+        .await
+        .expect("send 1 failed");
+    producer1
+        .commit_transaction()
+        .await
+        .expect("commit 1 failed");
+    producer1.close().await;
+
+    // Producer 2: same transactional_id → broker bumps epoch.
+    let producer2 = TransactionalProducer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .transactional_id(txn_id)
+        .build()
+        .await
+        .expect("Failed to create producer 2");
+
+    producer2.init_transactions().await.expect("init 2 failed");
+    let epoch2 = producer2.producer_epoch();
+
+    assert!(
+        epoch2 > epoch1,
+        "Producer 2 should have a higher epoch ({epoch2}) than producer 1 ({epoch1})"
+    );
+
+    producer2.begin_transaction().expect("begin 2 failed");
+    let _ = producer2
+        .send(topic, Some(b"k2"), b"v2")
+        .await
+        .expect("send 2 failed");
+    producer2
+        .commit_transaction()
+        .await
+        .expect("commit 2 failed");
+    producer2.close().await;
+
+    // Both committed messages should be readable.
+    let consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id("txn-fencing-consumer")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .isolation_level(IsolationLevel::ReadCommitted)
+        .build()
+        .await
+        .expect("Failed to create consumer");
+
+    subscribe_with_retry(&consumer, &[topic], 5)
+        .await
+        .expect("subscribe failed");
+
+    let records = poll_for_records(&consumer, 2, Duration::from_secs(5), 10).await;
+    assert_eq!(
+        records.len(),
+        2,
+        "Both committed messages should be readable after fencing"
+    );
+
+    consumer.close().await.expect("consumer close");
+}
+
+/// `send_offsets_to_transaction`: Consume-Transform-Produce (EOS / read-process-write).
+///
+/// 1. Write source messages to `src-topic` with a regular producer.
+/// 2. Transactional consumer reads messages and commits offset + result
+///    atomically via `send_offsets_to_transaction`.
+/// 3. Verify the destination topic contains the transformed messages and the
+///    committed consumer offset allows resumption without reprocessing.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn test_transactional_send_offsets_to_transaction() {
+    use krafka::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
+    use krafka::producer::{Producer, TopicPartitionOffset, TransactionalProducer};
+
+    let (_container, bootstrap_servers) = kafka_container().await;
+
+    let src_topic = "txn-eos-src-topic";
+    let dst_topic = "txn-eos-dst-topic";
+    let group_id = "txn-eos-group";
+    create_topic(&bootstrap_servers, src_topic, 1).await;
+    create_topic(&bootstrap_servers, dst_topic, 1).await;
+
+    // Step 1: Write source messages with a regular producer.
+    let regular_producer = Producer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .build()
+        .await
+        .expect("Failed to create regular producer");
+
+    for i in 0..3u32 {
+        let _ = regular_producer
+            .send(
+                src_topic,
+                Some(format!("k{i}").as_bytes()),
+                format!("src-{i}").as_bytes(),
+            )
+            .await
+            .expect("send to src failed");
+    }
+    regular_producer.close().await;
+
+    // Step 2: Create the read-committed source consumer (no group auto-commit).
+    let src_consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id(group_id)
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .enable_auto_commit(false)
+        .isolation_level(IsolationLevel::ReadCommitted)
+        .build()
+        .await
+        .expect("Failed to create source consumer");
+
+    subscribe_with_retry(&src_consumer, &[src_topic], 5)
+        .await
+        .expect("subscribe failed");
+
+    let src_records = poll_for_records(&src_consumer, 3, Duration::from_secs(5), 10).await;
+    assert_eq!(src_records.len(), 3, "Should read 3 source messages");
+
+    // Step 3: Process each message transactionally.
+    let txn_producer = TransactionalProducer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .transactional_id("txn-eos-producer")
+        .build()
+        .await
+        .expect("Failed to create transactional producer");
+
+    txn_producer
+        .init_transactions()
+        .await
+        .expect("init_transactions failed");
+
+    for record in &src_records {
+        let transformed_value = record
+            .value
+            .as_ref()
+            .map(|v| format!("processed:{}", String::from_utf8_lossy(v)))
+            .unwrap_or_default();
+
+        txn_producer
+            .begin_transaction()
+            .expect("begin_transaction failed");
+
+        let _ = txn_producer
+            .send(
+                dst_topic,
+                record.key.as_deref(),
+                transformed_value.as_bytes(),
+            )
+            .await
+            .expect("send to dst failed");
+
+        // Commit the consumer offset atomically with the output message.
+        let offsets = [TopicPartitionOffset::new(
+            src_topic,
+            record.partition,
+            record.offset + 1, // next offset to consume
+        )];
+        txn_producer
+            .send_offsets_to_transaction(&offsets, group_id)
+            .await
+            .expect("send_offsets_to_transaction failed");
+
+        txn_producer
+            .commit_transaction()
+            .await
+            .expect("commit_transaction failed");
+    }
+
+    txn_producer.close().await;
+
+    // Step 4: Verify destination contains the transformed messages.
+    let dst_consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id("txn-eos-dst-consumer")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .isolation_level(IsolationLevel::ReadCommitted)
+        .build()
+        .await
+        .expect("Failed to create dst consumer");
+
+    subscribe_with_retry(&dst_consumer, &[dst_topic], 5)
+        .await
+        .expect("subscribe failed");
+
+    let dst_records = poll_for_records(&dst_consumer, 3, Duration::from_secs(5), 10).await;
+    assert_eq!(
+        dst_records.len(),
+        3,
+        "All 3 transformed messages should be in dst topic"
+    );
+    for r in &dst_records {
+        let val = r
+            .value
+            .as_deref()
+            .map(String::from_utf8_lossy)
+            .unwrap_or_default();
+        assert!(
+            val.starts_with("processed:src-"),
+            "Expected transformed value, got: {val}"
+        );
+    }
+
+    dst_consumer.close().await.expect("consumer close");
+
+    // Step 5: Verify committed offsets — restarting the src consumer should
+    // not reprocess messages (offsets were committed transactionally).
+    let resumed_consumer = Consumer::builder()
+        .bootstrap_servers(&bootstrap_servers)
+        .group_id(group_id)
+        .auto_offset_reset(AutoOffsetReset::Latest)
+        .enable_auto_commit(false)
+        .isolation_level(IsolationLevel::ReadCommitted)
+        .build()
+        .await
+        .expect("Failed to create resumed consumer");
+
+    subscribe_with_retry(&resumed_consumer, &[src_topic], 5)
+        .await
+        .expect("subscribe failed");
+
+    // A short poll — if the offsets are committed, no messages should appear.
+    let mut leftover: Vec<krafka::consumer::ConsumerRecord> = Vec::new();
+    for _ in 0..3 {
+        leftover.extend(
+            resumed_consumer
+                .poll(Duration::from_secs(1))
+                .await
+                .expect("poll failed"),
+        );
+    }
+    assert!(
+        leftover.is_empty(),
+        "Transactionally committed offsets should prevent re-delivery; got {} leftover records",
+        leftover.len()
+    );
+
+    resumed_consumer.close().await.expect("consumer close");
+    src_consumer.close().await.expect("consumer close");
 }

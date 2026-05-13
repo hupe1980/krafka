@@ -47,7 +47,10 @@ const MAX_PUSH_INTERVAL_MS: i32 = 60 * 60 * 1000;
 
 fn retry_backoff(attempt: u32) -> Duration {
     debug_assert!(attempt > 0, "retry_backoff expects attempts starting at 1");
-    RETRY_BACKOFF_BASE * 2u32.saturating_pow(attempt.saturating_sub(1))
+    let base = RETRY_BACKOFF_BASE * 2u32.saturating_pow(attempt.saturating_sub(1));
+    // Add ±25% jitter to prevent thundering herd on concurrent reconnects.
+    let jitter = rand::random_range(0.75..1.25);
+    base.mul_f64(jitter)
 }
 
 fn clamp_push_interval_ms(raw_ms: i32) -> i32 {
@@ -322,7 +325,7 @@ impl TelemetryReporter {
         );
 
         // KIP-714: First push randomised between 0.5 × interval … 1.5 × interval.
-        let jitter_factor: f64 = rand::rng().random_range(0.5..1.5);
+        let jitter_factor: f64 = rand::random_range(0.5..1.5);
         let first_delay = subscription.push_interval.mul_f64(jitter_factor);
         let collection_start = Self::nanos_since_epoch();
 
@@ -1689,9 +1692,13 @@ mod tests {
 
     #[test]
     fn test_retry_backoff_exponential() {
-        assert_eq!(retry_backoff(1), Duration::from_secs(1));
-        assert_eq!(retry_backoff(2), Duration::from_secs(2));
-        assert_eq!(retry_backoff(3), Duration::from_secs(4));
+        // With ±25% jitter the actual duration falls within [0.75×base, 1.25×base].
+        let b1 = retry_backoff(1);
+        assert!(b1 >= Duration::from_millis(750) && b1 <= Duration::from_millis(1250));
+        let b2 = retry_backoff(2);
+        assert!(b2 >= Duration::from_millis(1500) && b2 <= Duration::from_millis(2500));
+        let b3 = retry_backoff(3);
+        assert!(b3 >= Duration::from_millis(3000) && b3 <= Duration::from_millis(5000));
     }
 
     #[test]
@@ -1823,7 +1830,7 @@ mod tests {
             push_interval: Duration::from_secs(1),
             delta_temporality: false,
             accepted_compression_types: vec![Compression::None],
-            telemetry_max_bytes: max_bytes as i32,
+            telemetry_max_bytes: i32::try_from(max_bytes).unwrap(),
             requested_metrics: vec!["*".to_string()],
         };
         let mut unsupported = HashSet::new();
@@ -1891,7 +1898,7 @@ mod tests {
             push_interval: Duration::from_secs(1),
             delta_temporality: false,
             accepted_compression_types: vec![Compression::None],
-            telemetry_max_bytes: max_bytes as i32,
+            telemetry_max_bytes: i32::try_from(max_bytes).unwrap(),
             requested_metrics: vec!["*".to_string()],
         };
         let mut unsupported = HashSet::new();
@@ -1964,7 +1971,7 @@ mod tests {
             push_interval: Duration::from_secs(1),
             delta_temporality: false,
             accepted_compression_types: vec![Compression::Gzip, Compression::None],
-            telemetry_max_bytes: max_bytes as i32,
+            telemetry_max_bytes: i32::try_from(max_bytes).unwrap(),
             requested_metrics: vec!["*".to_string()],
         };
         let mut unsupported = HashSet::new();
@@ -2061,7 +2068,7 @@ mod tests {
             push_interval: Duration::from_secs(1),
             delta_temporality: true,
             accepted_compression_types: vec![Compression::None],
-            telemetry_max_bytes: max_bytes as i32,
+            telemetry_max_bytes: i32::try_from(max_bytes).unwrap(),
             requested_metrics: vec!["*".to_string()],
         };
         let mut unsupported = HashSet::new();

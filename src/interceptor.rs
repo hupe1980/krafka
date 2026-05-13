@@ -595,9 +595,10 @@ mod tests {
             self.send_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Add a tracing header
-            record
-                .headers
-                .push(("x-intercepted".to_string(), b"true".to_vec()));
+            record.headers.push((
+                "x-intercepted".to_string(),
+                bytes::Bytes::from_static(b"true"),
+            ));
             Ok(())
         }
 
@@ -666,7 +667,7 @@ mod tests {
         assert_eq!(interceptor.send_count(), 1);
         assert_eq!(record.headers.len(), 1);
         assert_eq!(record.headers[0].0, "x-intercepted");
-        assert_eq!(record.headers[0].1, b"true");
+        assert_eq!(record.headers[0].1, bytes::Bytes::from_static(b"true"));
     }
 
     #[test]
@@ -914,9 +915,10 @@ mod tests {
 
         impl ProducerInterceptor for HeaderAdder {
             fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
-                record
-                    .headers
-                    .push((self.0.to_string(), self.0.as_bytes().to_vec()));
+                record.headers.push((
+                    self.0.to_string(),
+                    bytes::Bytes::copy_from_slice(self.0.as_bytes()),
+                ));
                 Ok(())
             }
         }

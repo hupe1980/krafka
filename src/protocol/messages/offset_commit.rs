@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_string};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{array_len_i32, check_compact_array_len, check_decode_array_len};
@@ -166,13 +166,19 @@ impl OffsetCommitRequest {
             None => KafkaString::null().try_encode_compact(buf)?,
         }
 
-        let topics_len = u32::try_from(self.topics.len().saturating_add(1))
-            .map_err(|_| KrafkaError::protocol("topics array too large"))?;
+        let topics_len = u32::try_from(self.topics.len().saturating_add(1)).map_err(|_| {
+            KrafkaError::protocol_kind(ProtocolErrorKind::InvalidLength, "topics array too large")
+        })?;
         crate::util::varint::encode_unsigned_varint(topics_len, buf);
         for topic in &self.topics {
             KafkaString::new(&topic.name).try_encode_compact(buf)?;
-            let parts_len = u32::try_from(topic.partitions.len().saturating_add(1))
-                .map_err(|_| KrafkaError::protocol("partitions array too large"))?;
+            let parts_len =
+                u32::try_from(topic.partitions.len().saturating_add(1)).map_err(|_| {
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        "partitions array too large",
+                    )
+                })?;
             crate::util::varint::encode_unsigned_varint(parts_len, buf);
             for partition in &topic.partitions {
                 partition.partition_index.encode(buf);
@@ -200,13 +206,19 @@ impl OffsetCommitRequest {
             None => KafkaString::null().try_encode_compact(buf)?,
         }
 
-        let topics_len = u32::try_from(self.topics.len().saturating_add(1))
-            .map_err(|_| KrafkaError::protocol("topics array too large"))?;
+        let topics_len = u32::try_from(self.topics.len().saturating_add(1)).map_err(|_| {
+            KrafkaError::protocol_kind(ProtocolErrorKind::InvalidLength, "topics array too large")
+        })?;
         crate::util::varint::encode_unsigned_varint(topics_len, buf);
         for topic in &self.topics {
             buf.put_slice(&topic.topic_id.unwrap_or([0u8; 16]));
-            let parts_len = u32::try_from(topic.partitions.len().saturating_add(1))
-                .map_err(|_| KrafkaError::protocol("partitions array too large"))?;
+            let parts_len =
+                u32::try_from(topic.partitions.len().saturating_add(1)).map_err(|_| {
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        "partitions array too large",
+                    )
+                })?;
             crate::util::varint::encode_unsigned_varint(parts_len, buf);
             for partition in &topic.partitions {
                 partition.partition_index.encode(buf);
@@ -293,7 +305,10 @@ impl OffsetCommitResponse {
 
         for _ in 0..topic_count {
             if buf.remaining() < 16 {
-                return Err(KrafkaError::protocol("not enough bytes for topic_id UUID"));
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::TruncatedFrame,
+                    "not enough bytes for topic_id UUID",
+                ));
             }
             let mut topic_id = [0u8; 16];
             buf.copy_to_slice(&mut topic_id);

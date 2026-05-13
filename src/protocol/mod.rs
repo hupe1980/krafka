@@ -104,7 +104,7 @@ pub use record::{
     RecordHeader,
 };
 
-use crate::error::{KrafkaError, Result};
+use crate::error::{KrafkaError, ProtocolErrorKind, Result};
 
 /// Maximum number of elements allowed in a single decoded array or loop.
 ///
@@ -115,6 +115,13 @@ use crate::error::{KrafkaError, Result};
 ///
 /// The limit of 100,000 is generous for any realistic Kafka response while
 /// preventing CPU-based denial-of-service amplification.
+///
+/// # Operator override
+///
+/// This constant is intentionally `pub`. Deployments with many partitions (e.g.
+/// `ListOffsets` across >100 000 partitions) can raise the limit by patching
+/// the constant at compile time via a build script, or by filing a feature
+/// request to thread a per-connection limit through `ConnectionConfig`.
 pub const MAX_DECODE_ARRAY_LEN: usize = 100_000;
 
 /// Maximum number of headers allowed on a single producer record.
@@ -140,23 +147,45 @@ pub const MAX_RECORD_HEADERS: usize = 10_000;
 ///
 /// Checks:
 /// - Non-empty.
-/// - Length fits in an `i16` length prefix (the `KafkaString` wire limit of
-///   32 767 bytes).
+/// - Non-empty.
+/// - At most 249 characters (Kafka broker limit, matches the Java client's
+///   `Topic.MAX_NAME_LENGTH`).
+/// - Contains only `[a-zA-Z0-9._-]` — the strict Kafka topic name character
+///   set. Topics with illegal characters (null bytes, `/`, Unicode, etc.) are
+///   rejected by the broker with `INVALID_TOPIC_EXCEPTION`; krafka rejects
+///   them at the API boundary to give a clearer error message.
 ///
 /// Use at every public ingress where a user-supplied topic name reaches a
 /// request encoder (see call sites in [`crate::admin`] and
 /// [`crate::producer::ProducerRecord::validate`]).
 #[inline]
 pub fn validate_topic_name(name: &str) -> Result<()> {
+    const MAX_TOPIC_NAME_LEN: usize = 249;
     if name.is_empty() {
-        return Err(KrafkaError::protocol("topic name cannot be empty"));
+        return Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidValue,
+            "topic name cannot be empty",
+        ));
     }
-    if name.len() > i16::MAX as usize {
-        return Err(KrafkaError::protocol(format!(
-            "topic name length {} exceeds protocol limit of {}",
-            name.len(),
-            i16::MAX
-        )));
+    if name.len() > MAX_TOPIC_NAME_LEN {
+        return Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidLength,
+            format!(
+                "topic name length {} exceeds maximum of {MAX_TOPIC_NAME_LEN}",
+                name.len(),
+            ),
+        ));
+    }
+    if let Some(bad) = name
+        .bytes()
+        .find(|b| !matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+    {
+        return Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidValue,
+            format!(
+                "topic name contains illegal character 0x{bad:02X}; only [a-zA-Z0-9._-] is allowed"
+            ),
+        ));
     }
     Ok(())
 }
@@ -183,20 +212,29 @@ where
 /// Convert a collection length to i32, returning an error if it overflows.
 #[inline]
 pub(crate) fn array_len_i32(len: usize) -> Result<i32> {
-    i32::try_from(len)
-        .map_err(|_| KrafkaError::protocol(format!("array length {len} exceeds i32::MAX")))
+    i32::try_from(len).map_err(|_| {
+        KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidLength,
+            format!("array length {len} exceeds i32::MAX"),
+        )
+    })
 }
 
 /// Encode a compact array length (Kafka flexible versions: `count + 1` as unsigned varint).
 #[inline]
 pub(crate) fn encode_compact_array_len(len: usize, buf: &mut impl bytes::BufMut) -> Result<()> {
-    let wire =
-        u32::try_from(len.checked_add(1).ok_or_else(|| {
-            KrafkaError::protocol(format!("compact array length {len} overflows"))
-        })?)
-        .map_err(|_| {
-            KrafkaError::protocol(format!("compact array length {len} exceeds u32::MAX"))
-        })?;
+    let wire = u32::try_from(len.checked_add(1).ok_or_else(|| {
+        KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidLength,
+            format!("compact array length {len} overflows"),
+        )
+    })?)
+    .map_err(|_| {
+        KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidLength,
+            format!("compact array length {len} exceeds u32::MAX"),
+        )
+    })?;
     crate::util::varint::encode_unsigned_varint(wire, buf);
     Ok(())
 }
@@ -208,15 +246,19 @@ pub(crate) fn encode_compact_array_len(len: usize, buf: &mut impl bytes::BufMut)
 #[inline]
 pub(crate) fn check_decode_array_len(len: i32) -> Result<usize> {
     if len < 0 {
-        return Err(KrafkaError::protocol(format!(
-            "negative array length {len} in decode (use check_decode_nullable_array_len for fields where -1 means null)"
-        )));
+        return Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::Malformed,
+            format!(
+                "negative array length {len} in decode (use check_decode_nullable_array_len for fields where -1 means null)"
+            ),
+        ));
     }
     let len = len as usize;
     if len > MAX_DECODE_ARRAY_LEN {
-        return Err(KrafkaError::protocol(format!(
-            "array length {len} exceeds safety limit {MAX_DECODE_ARRAY_LEN}"
-        )));
+        return Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidLength,
+            format!("array length {len} exceeds safety limit {MAX_DECODE_ARRAY_LEN}"),
+        ));
     }
     Ok(len)
 }
@@ -247,16 +289,18 @@ pub(crate) fn check_decode_nullable_array_len(len: i32) -> Result<usize> {
 #[inline]
 pub(crate) fn check_compact_array_len(raw: u32) -> Result<usize> {
     if raw == 0 {
-        return Err(KrafkaError::protocol(
+        return Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::Malformed,
             "compact array raw value 0 (null) is invalid for a non-nullable field; \
              use check_compact_nullable_array_len for nullable arrays",
         ));
     }
     let len = (raw - 1) as usize;
     if len > MAX_DECODE_ARRAY_LEN {
-        return Err(KrafkaError::protocol(format!(
-            "compact array length {len} exceeds safety limit {MAX_DECODE_ARRAY_LEN}"
-        )));
+        return Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidLength,
+            format!("compact array length {len} exceeds safety limit {MAX_DECODE_ARRAY_LEN}"),
+        ));
     }
     Ok(len)
 }
@@ -274,9 +318,10 @@ pub(crate) fn check_compact_nullable_array_len(raw: u32) -> Result<usize> {
     }
     let len = (raw - 1) as usize;
     if len > MAX_DECODE_ARRAY_LEN {
-        return Err(KrafkaError::protocol(format!(
-            "compact array length {len} exceeds safety limit {MAX_DECODE_ARRAY_LEN}"
-        )));
+        return Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidLength,
+            format!("compact array length {len} exceeds safety limit {MAX_DECODE_ARRAY_LEN}"),
+        ));
     }
     Ok(len)
 }
@@ -298,30 +343,32 @@ pub mod versions {
     // ── Produce (API key 0) ──────────────────────────────────────────────
     /// Minimum supported Produce version. Kafka 4.0 removed v0–v2.
     pub const PRODUCE_MIN: i16 = 3;
-    /// Maximum supported Produce version (v11 ZStd compression).
+    /// Maximum supported Produce version (v13 topic-ID, KIP-516).
     ///
-    /// v9 introduces flexible encoding, v11 adds ZStd compression support.
-    /// Encode/decode for v12-v13 exists but is not yet activated (topic-UUID
-    /// based producing needs end-to-end integration testing).
-    pub const PRODUCE_MAX: i16 = 11;
+    /// v9 flexible encoding, v11 ZStd compression, v12 implicit AddPartitionsToTxn
+    /// (broker handles partition registration automatically), v13 topic-UUID
+    /// replaces topic name in both request and response (KIP-516).
+    pub const PRODUCE_MAX: i16 = 13;
 
     // ── Fetch (API key 1) ────────────────────────────────────────────────
     /// Minimum supported Fetch version. Kafka 4.0 removed v0–v3.
     pub const FETCH_MIN: i16 = 4;
-    /// Maximum supported Fetch version (v12 flexible encoding).
+    /// Maximum supported Fetch version (v16 node_endpoints, KIP-951).
     ///
-    /// v12 adds flexible encoding. Encode/decode for v13+ exists but uses
-    /// topic-UUID-based fetching which needs end-to-end integration testing.
-    pub const FETCH_MAX: i16 = 12;
+    /// v12 flexible encoding, v13–v14 topic-UUID replaces topic name (KIP-516),
+    /// v15–v16 ReplicaId removed + ReplicaState tagged field (KIP-903/KIP-951).
+    /// v17–v18 (KIP-853/KIP-1166) are feature-gated behind `unstable-protocol`.
+    pub const FETCH_MAX: i16 = 16;
 
     // ── ListOffsets (API key 2) ──────────────────────────────────────────
     /// Minimum supported ListOffsets version. Kafka 4.0 removed v0.
     pub const LIST_OFFSETS_MIN: i16 = 1;
-    /// Maximum supported ListOffsets version (v8 tiered-storage awareness).
+    /// Maximum supported ListOffsets version (v11 KIP-1023 earliest-pending-upload offset).
     ///
-    /// v4 adds leader epoch validation, v6 flexible encoding, v7 max_timestamp,
-    /// v8 tiered-storage. Encode/decode for v9+ exists but is not yet activated.
-    pub const LIST_OFFSETS_MAX: i16 = 8;
+    /// v4 leader epoch validation, v6 flexible encoding, v7 max_timestamp (KIP-734),
+    /// v8 local log-start offset (KIP-405), v9 last tiered offset (KIP-1005),
+    /// v10 async remote list with TimeoutMs (KIP-1075), v11 earliest pending upload (KIP-1023).
+    pub const LIST_OFFSETS_MAX: i16 = 11;
 
     // ── Metadata (API key 3) ─────────────────────────────────────────────
     /// Minimum supported Metadata version. v0 lacks essential fields.
@@ -335,21 +382,21 @@ pub mod versions {
     // ── OffsetCommit (API key 8) ─────────────────────────────────────────
     /// Minimum supported OffsetCommit version. Kafka 4.0 removed v0–v1.
     pub const OFFSET_COMMIT_MIN: i16 = 2;
-    /// Maximum supported OffsetCommit version (v9 KIP-848 member_epoch).
+    /// Maximum supported OffsetCommit version (v10 KIP-848 topic UUID).
     ///
     /// v5 drops retention_time, v6 leader epoch, v7 group_instance_id,
-    /// v8 flexible encoding, v9 KIP-848 member_epoch.
-    /// Encode/decode for v10 exists but is not yet activated.
-    pub const OFFSET_COMMIT_MAX: i16 = 9;
+    /// v8 flexible encoding, v9 KIP-848 member_epoch,
+    /// v10 KIP-848 topic_id replaces topic name on the wire.
+    pub const OFFSET_COMMIT_MAX: i16 = 10;
 
     // ── OffsetFetch (API key 9) ──────────────────────────────────────────
     /// Minimum supported OffsetFetch version. Kafka 4.0 removed v0.
     pub const OFFSET_FETCH_MIN: i16 = 1;
-    /// Maximum supported OffsetFetch version (v9 KIP-848 member_epoch).
+    /// Maximum supported OffsetFetch version (v10 KIP-848 topic UUID).
     ///
-    /// v2 top-level error, v6 flexible, v8 batched groups, v9 KIP-848.
-    /// Encode/decode for v10 exists but is not yet activated.
-    pub const OFFSET_FETCH_MAX: i16 = 9;
+    /// v2 top-level error, v6 flexible, v8 batched groups, v9 KIP-848,
+    /// v10 KIP-848 topic_id replaces topic name on the wire.
+    pub const OFFSET_FETCH_MAX: i16 = 10;
 
     // ── FindCoordinator (API key 10) ─────────────────────────────────────
     /// Minimum supported FindCoordinator version.
@@ -483,48 +530,46 @@ pub mod versions {
     // ── InitProducerId (API key 22) ──────────────────────────────────────
     /// Minimum supported InitProducerId version.
     pub const INIT_PRODUCER_ID_MIN: i16 = 0;
-    /// Maximum supported InitProducerId version (v4 producer_id/epoch recovery).
+    /// Maximum supported InitProducerId version (v5 KIP-890 txn_state).
     ///
     /// v2 flexible, v3 epoch recovery (producer_id + epoch for fencing),
-    /// v4 latest stable. Encode/decode for v5-v6 (KIP-890) exists but is
-    /// not yet activated.
-    pub const INIT_PRODUCER_ID_MAX: i16 = 4;
+    /// v4 latest stable, v5 txn_state field (KIP-890 abortable transactions).
+    pub const INIT_PRODUCER_ID_MAX: i16 = 5;
 
     // ── AddPartitionsToTxn (API key 24) ──────────────────────────────────
     /// Minimum supported AddPartitionsToTxn version.
     pub const ADD_PARTITIONS_TO_TXN_MIN: i16 = 0;
-    /// Maximum supported AddPartitionsToTxn version (v3 flexible encoding).
+    /// Maximum supported AddPartitionsToTxn version (v5 KIP-890 transactions array).
     ///
-    /// v3 flexible. Encode/decode for v4-v5 (broker batched, KIP-890)
-    /// exists but is not yet activated.
-    pub const ADD_PARTITIONS_TO_TXN_MAX: i16 = 3;
+    /// v3 flexible, v4+ wraps transaction in a `Transactions` compact array
+    /// (KIP-890 broker-batched format), v5 same wire format as v4.
+    pub const ADD_PARTITIONS_TO_TXN_MAX: i16 = 5;
 
     // ── AddOffsetsToTxn (API key 25) ─────────────────────────────────────
     /// Minimum supported AddOffsetsToTxn version.
     pub const ADD_OFFSETS_TO_TXN_MIN: i16 = 0;
-    /// Maximum supported AddOffsetsToTxn version (v3 flexible encoding).
+    /// Maximum supported AddOffsetsToTxn version (v4 KIP-890 error codes).
     ///
-    /// v3 flexible. Encode/decode for v4 (KIP-890) exists but is not yet
-    /// activated.
-    pub const ADD_OFFSETS_TO_TXN_MAX: i16 = 3;
+    /// v3 flexible, v4 adds TRANSACTION_ABORTABLE / ABORTABLE_TRANSACTION error codes (KIP-890).
+    pub const ADD_OFFSETS_TO_TXN_MAX: i16 = 4;
 
     // ── EndTxn (API key 26) ──────────────────────────────────────────────
     /// Minimum supported EndTxn version.
     pub const END_TXN_MIN: i16 = 0;
-    /// Maximum supported EndTxn version (v3 flexible encoding).
+    /// Maximum supported EndTxn version (v5 KIP-890 epoch bump on commit).
     ///
-    /// v3 flexible. Encode/decode for v4-v5 (KIP-890 epoch bump) exists
-    /// but is not yet activated.
-    pub const END_TXN_MAX: i16 = 3;
+    /// v3 flexible, v4 automatic producer epoch bump on successful commit (KIP-890),
+    /// v5 new txn_state field indicating coordinator's view of transaction outcome.
+    pub const END_TXN_MAX: i16 = 5;
 
     // ── TxnOffsetCommit (API key 28) ─────────────────────────────────────
     /// Minimum supported TxnOffsetCommit version.
     pub const TXN_OFFSET_COMMIT_MIN: i16 = 0;
-    /// Maximum supported TxnOffsetCommit version (v3 flexible + consumer fields).
+    /// Maximum supported TxnOffsetCommit version (v5 KIP-890).
     ///
-    /// v2 leader epoch, v3 flexible + group_instance_id + generation_id.
-    /// Encode/decode for v4-v5 (KIP-890) exists but is not yet activated.
-    pub const TXN_OFFSET_COMMIT_MAX: i16 = 3;
+    /// v2 leader epoch, v3 flexible + group_instance_id + generation_id,
+    /// v4-v5 KIP-890 abortable transaction error codes.
+    pub const TXN_OFFSET_COMMIT_MAX: i16 = 5;
 
     // ── Delegation Token APIs (38–41) ────────────────────────────────────
     /// Minimum supported CreateDelegationToken version. Kafka 4.0 removed v0.
@@ -755,8 +800,9 @@ mod tests {
     fn validate_topic_name_accepts_valid() {
         assert!(validate_topic_name("t").is_ok());
         assert!(validate_topic_name("my.topic-0_1").is_ok());
-        // Boundary: exactly i16::MAX bytes is accepted.
-        let max_ok = "x".repeat(i16::MAX as usize);
+        assert!(validate_topic_name("UPPER_lower-123").is_ok());
+        // Boundary: exactly 249 bytes is accepted.
+        let max_ok = "x".repeat(249);
         assert!(validate_topic_name(&max_ok).is_ok());
     }
 
@@ -768,9 +814,20 @@ mod tests {
 
     #[test]
     fn validate_topic_name_rejects_oversize() {
-        let too_big = "x".repeat(i16::MAX as usize + 1);
+        let too_big = "x".repeat(250);
         let err = validate_topic_name(&too_big).unwrap_err().to_string();
-        assert!(err.contains("exceeds protocol limit"), "got: {err}");
+        assert!(err.contains("exceeds maximum"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_topic_name_rejects_illegal_chars() {
+        for bad in ["/", "\0", "topic/name", "topic name", "tópic", "topic!"] {
+            let err = validate_topic_name(bad).unwrap_err().to_string();
+            assert!(
+                err.contains("illegal character"),
+                "expected rejection for {bad:?}, got: {err}"
+            );
+        }
     }
 
     #[test]

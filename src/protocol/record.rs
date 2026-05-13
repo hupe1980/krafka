@@ -5,7 +5,7 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::error::{KrafkaError, Result};
+use crate::error::{KrafkaError, ProtocolErrorKind, Result};
 use crate::util::{crc32c, varint};
 
 /// Compression codec.
@@ -141,6 +141,11 @@ impl Compression {
             )),
             #[cfg(feature = "snappy")]
             Self::Snappy => {
+                // Kafka RecordBatch v2 uses *raw* Snappy (RFC-defined stream format),
+                // NOT the older "framed Snappy" that Kafka message format v0/v1 used.
+                // `snap::raw::Encoder` produces the correct raw format for v2 batches.
+                // Do NOT switch to `snap::write::FrameEncoder`, which would produce
+                // framed Snappy and cause broker decode failures on v2 batches.
                 let mut encoder = snap::raw::Encoder::new();
                 let compressed = encoder
                     .compress_vec(payload)
@@ -210,32 +215,49 @@ impl TimestampType {
 /// A Kafka record header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordHeader {
-    /// Header key.
-    pub key: String,
+    /// Header key — raw bytes, not necessarily UTF-8.
+    ///
+    /// Kafka does not mandate UTF-8 for header keys at the wire level.
+    /// Storing as `Bytes` avoids an unnecessary UTF-8 validation on every
+    /// fetch response. Use [`key_str()`](Self::key_str) when you need a `&str`.
+    pub key: Bytes,
     /// Header value.
     pub value: Option<Bytes>,
 }
 
 impl RecordHeader {
     /// Create a new record header.
-    pub fn new(key: impl Into<String>, value: impl Into<Bytes>) -> Self {
+    pub fn new(key: impl Into<Bytes>, value: impl Into<Bytes>) -> Self {
         Self {
             key: key.into(),
             value: Some(value.into()),
         }
     }
 
+    /// Return the key as a `&str` if it is valid UTF-8.
+    #[inline]
+    pub fn key_str(&self) -> Option<&str> {
+        std::str::from_utf8(&self.key).ok()
+    }
+
     /// Encode the header.
     #[inline]
     pub fn encode(&self, buf: &mut impl BufMut) -> Result<()> {
-        let key_len = i32::try_from(self.key.len())
-            .map_err(|_| KrafkaError::protocol("record header key too large for i32 length"))?;
+        let key_len = i32::try_from(self.key.len()).map_err(|_| {
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                "record header key too large for i32 length",
+            )
+        })?;
         varint::encode_signed_varint(key_len, buf);
-        buf.put_slice(self.key.as_bytes());
+        buf.put_slice(&self.key);
         match &self.value {
             Some(v) => {
                 let val_len = i32::try_from(v.len()).map_err(|_| {
-                    KrafkaError::protocol("record header value too large for i32 length")
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        "record header value too large for i32 length",
+                    )
                 })?;
                 varint::encode_signed_varint(val_len, buf);
                 buf.put_slice(v);
@@ -250,17 +272,22 @@ impl RecordHeader {
     pub fn decode(buf: &mut impl Buf) -> Result<Self> {
         let key_len = varint::decode_signed_varint(buf)?;
         if key_len < 0 || buf.remaining() < key_len as usize {
-            return Err(KrafkaError::protocol("invalid header key length"));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidValue,
+                "invalid header key length",
+            ));
         }
-        let key = String::from_utf8(buf.copy_to_bytes(key_len as usize).to_vec())
-            .map_err(|e| KrafkaError::protocol(format!("invalid header key: {e}")))?;
+        let key = buf.copy_to_bytes(key_len as usize);
 
         let value_len = varint::decode_signed_varint(buf)?;
         let value = if value_len < 0 {
             None
         } else {
             if buf.remaining() < value_len as usize {
-                return Err(KrafkaError::protocol("invalid header value length"));
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidValue,
+                    "invalid header value length",
+                ));
             }
             Some(buf.copy_to_bytes(value_len as usize))
         };
@@ -301,7 +328,7 @@ impl Record {
     }
 
     /// Add a header to the record.
-    pub fn with_header(mut self, key: impl Into<String>, value: impl Into<Bytes>) -> Self {
+    pub fn with_header(mut self, key: impl Into<Bytes>, value: impl Into<Bytes>) -> Self {
         self.headers.push(RecordHeader::new(key, value));
         self
     }
@@ -319,18 +346,102 @@ impl Record {
     }
 
     /// Encode the record to a buffer.
+    ///
+    /// Pre-computes the body size analytically so no intermediate allocation
+    /// is needed — the length varint is written first, then the body is
+    /// encoded directly into the output buffer.
     #[inline]
     pub fn encode(&self, buf: &mut impl BufMut) -> Result<()> {
-        // First encode to a temporary buffer to get the size
-        let mut record_buf = BytesMut::new();
-        self.encode_body(&mut record_buf)?;
-
-        // Write length + body
-        let record_len = i32::try_from(record_buf.len())
-            .map_err(|_| KrafkaError::protocol("record too large for i32 length prefix"))?;
+        let body_size = self.record_body_size()?;
+        let record_len = i32::try_from(body_size).map_err(|_| {
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                "record too large for i32 length prefix",
+            )
+        })?;
         varint::encode_signed_varint(record_len, buf);
-        buf.put_slice(&record_buf);
+        self.encode_body(buf)?;
         Ok(())
+    }
+
+    /// Compute the wire-encoded size of the record body (everything after the
+    /// length prefix). Used by [`encode`](Self::encode) to avoid a temporary
+    /// allocation.
+    #[inline]
+    pub fn record_body_size(&self) -> Result<usize> {
+        let mut size: usize = 0;
+        // attributes: i8
+        size += 1;
+        // timestamp_delta: signed varlong
+        size += varint::signed_varlong_size(self.timestamp_delta);
+        // offset_delta: signed varint
+        size += varint::signed_varint_size(self.offset_delta);
+        // key: length varint + bytes
+        match &self.key {
+            Some(k) => {
+                let key_len = i32::try_from(k.len()).map_err(|_| {
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        "record key too large for i32 length",
+                    )
+                })?;
+                size += varint::signed_varint_size(key_len);
+                size += k.len();
+            }
+            None => {
+                size += varint::signed_varint_size(-1);
+            }
+        }
+        // value: length varint + bytes
+        match &self.value {
+            Some(v) => {
+                let val_len = i32::try_from(v.len()).map_err(|_| {
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        "record value too large for i32 length",
+                    )
+                })?;
+                size += varint::signed_varint_size(val_len);
+                size += v.len();
+            }
+            None => {
+                size += varint::signed_varint_size(-1);
+            }
+        }
+        // headers: count varint + each header
+        let headers_len = i32::try_from(self.headers.len()).map_err(|_| {
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                "record headers count exceeds i32 limit",
+            )
+        })?;
+        size += varint::signed_varint_size(headers_len);
+        for header in &self.headers {
+            let key_len = i32::try_from(header.key.len()).map_err(|_| {
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidLength,
+                    "record header key too large for i32 length",
+                )
+            })?;
+            size += varint::signed_varint_size(key_len);
+            size += header.key.len();
+            match &header.value {
+                Some(v) => {
+                    let val_len = i32::try_from(v.len()).map_err(|_| {
+                        KrafkaError::protocol_kind(
+                            ProtocolErrorKind::InvalidLength,
+                            "record header value too large for i32 length",
+                        )
+                    })?;
+                    size += varint::signed_varint_size(val_len);
+                    size += v.len();
+                }
+                None => {
+                    size += varint::signed_varint_size(-1);
+                }
+            }
+        }
+        Ok(size)
     }
 
     #[inline]
@@ -342,8 +453,12 @@ impl Record {
         // Key
         match &self.key {
             Some(k) => {
-                let key_len = i32::try_from(k.len())
-                    .map_err(|_| KrafkaError::protocol("record key too large for i32 length"))?;
+                let key_len = i32::try_from(k.len()).map_err(|_| {
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        "record key too large for i32 length",
+                    )
+                })?;
                 varint::encode_signed_varint(key_len, buf);
                 buf.put_slice(k);
             }
@@ -353,8 +468,12 @@ impl Record {
         // Value
         match &self.value {
             Some(v) => {
-                let val_len = i32::try_from(v.len())
-                    .map_err(|_| KrafkaError::protocol("record value too large for i32 length"))?;
+                let val_len = i32::try_from(v.len()).map_err(|_| {
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        "record value too large for i32 length",
+                    )
+                })?;
                 varint::encode_signed_varint(val_len, buf);
                 buf.put_slice(v);
             }
@@ -362,8 +481,12 @@ impl Record {
         }
 
         // Headers
-        let headers_len = i32::try_from(self.headers.len())
-            .map_err(|_| KrafkaError::protocol("record headers count exceeds i32 limit"))?;
+        let headers_len = i32::try_from(self.headers.len()).map_err(|_| {
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                "record headers count exceeds i32 limit",
+            )
+        })?;
         varint::encode_signed_varint(headers_len, buf);
         for header in &self.headers {
             header.encode(buf)?;
@@ -397,54 +520,73 @@ impl Record {
             ));
         }
 
-        let attributes = if buf.has_remaining() {
-            buf.get_i8()
+        // Slice the buffer to exactly `length` bytes so that fields can never
+        // read past the declared record boundary into the next record's bytes.
+        // This matches the Java client's ByteBuffer.slice() approach and
+        // prevents silent data corruption when `length` < actual field payload.
+        let mut rbuf = buf.copy_to_bytes(length);
+
+        let attributes = if rbuf.has_remaining() {
+            rbuf.get_i8()
         } else {
-            return Err(KrafkaError::protocol("missing record attributes"));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::Malformed,
+                "missing record attributes",
+            ));
         };
 
-        let timestamp_delta = varint::decode_signed_varlong(buf)?;
-        let offset_delta = varint::decode_signed_varint(buf)?;
+        let timestamp_delta = varint::decode_signed_varlong(&mut rbuf)?;
+        let offset_delta = varint::decode_signed_varint(&mut rbuf)?;
 
         // Key
-        let key_len = varint::decode_signed_varint(buf)?;
+        let key_len = varint::decode_signed_varint(&mut rbuf)?;
         let key = if key_len < 0 {
             None
         } else {
-            if buf.remaining() < key_len as usize {
-                return Err(KrafkaError::protocol("invalid record key length"));
+            if rbuf.remaining() < key_len as usize {
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidValue,
+                    "invalid record key length",
+                ));
             }
-            Some(buf.copy_to_bytes(key_len as usize))
+            Some(rbuf.copy_to_bytes(key_len as usize))
         };
 
         // Value
-        let value_len = varint::decode_signed_varint(buf)?;
+        let value_len = varint::decode_signed_varint(&mut rbuf)?;
         let value = if value_len < 0 {
             None
         } else {
-            if buf.remaining() < value_len as usize {
-                return Err(KrafkaError::protocol("invalid record value length"));
+            if rbuf.remaining() < value_len as usize {
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidValue,
+                    "invalid record value length",
+                ));
             }
-            Some(buf.copy_to_bytes(value_len as usize))
+            Some(rbuf.copy_to_bytes(value_len as usize))
         };
 
         // Headers
-        let header_count = varint::decode_signed_varint(buf)?;
+        let header_count = varint::decode_signed_varint(&mut rbuf)?;
         if header_count < 0 {
-            return Err(KrafkaError::protocol(format!(
-                "negative header count {header_count} in record"
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidValue,
+                format!("negative header count {header_count} in record"),
+            ));
         }
         let header_count = header_count as usize;
         if header_count > super::MAX_DECODE_ARRAY_LEN {
-            return Err(KrafkaError::protocol(format!(
-                "header count {header_count} exceeds safety limit {}",
-                super::MAX_DECODE_ARRAY_LEN
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                format!(
+                    "header count {header_count} exceeds safety limit {}",
+                    super::MAX_DECODE_ARRAY_LEN
+                ),
+            ));
         }
         let mut headers = Vec::with_capacity(header_count);
         for _ in 0..header_count {
-            headers.push(RecordHeader::decode(buf)?);
+            headers.push(RecordHeader::decode(&mut rbuf)?);
         }
 
         Ok(Self {
@@ -588,7 +730,10 @@ impl RecordBatch {
         let batch_length =
             i32::try_from(4 + 1 + 4 + 2 + 4 + 8 + 8 + 8 + 2 + 4 + 4 + compressed_records.len())
                 .map_err(|_| {
-                    KrafkaError::protocol("record batch too large for i32 length prefix")
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::InvalidLength,
+                        "record batch too large for i32 length prefix",
+                    )
                 })?;
 
         // Write header
@@ -610,11 +755,12 @@ impl RecordBatch {
         buf.put_i64(self.producer_id);
         buf.put_i16(self.producer_epoch);
         buf.put_i32(self.base_sequence);
-        buf.put_i32(
-            i32::try_from(self.records.len()).map_err(|_| {
-                KrafkaError::protocol("record batch record count exceeds i32 limit")
-            })?,
-        );
+        buf.put_i32(i32::try_from(self.records.len()).map_err(|_| {
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                "record batch record count exceeds i32 limit",
+            )
+        })?);
         buf.put_slice(&compressed_records);
 
         // Calculate and write CRC
@@ -643,7 +789,8 @@ impl RecordBatch {
     /// are rejected as potential compression bombs.
     pub fn decode_with_limit(buf: &mut impl Buf, max_decompressed_size: usize) -> Result<Self> {
         if buf.remaining() < 12 {
-            return Err(KrafkaError::protocol(
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
                 "not enough bytes for record batch header",
             ));
         }
@@ -652,70 +799,81 @@ impl RecordBatch {
         let batch_length_i32 = buf.get_i32();
 
         if batch_length_i32 < 49 {
-            return Err(KrafkaError::protocol(format!(
-                "invalid record batch length: {batch_length_i32}"
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidValue,
+                format!("invalid record batch length: {batch_length_i32}"),
+            ));
         }
 
         let batch_length = batch_length_i32 as usize;
 
         if buf.remaining() < batch_length {
-            return Err(KrafkaError::protocol("not enough bytes for record batch"));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
+                "not enough bytes for record batch",
+            ));
         }
 
         let partition_leader_epoch = buf.get_i32();
         let magic = buf.get_i8();
 
         if magic != 2 {
-            return Err(KrafkaError::protocol(format!(
-                "unsupported record batch magic: {}",
-                magic
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::UnsupportedMagic,
+                format!("unsupported record batch magic: {magic}"),
+            ));
         }
 
         let crc = buf.get_u32();
-        let attributes = RecordBatchAttributes::from_i16(buf.get_i16())?;
-        let last_offset_delta = buf.get_i32();
-        let base_timestamp = buf.get_i64();
-        let max_timestamp = buf.get_i64();
-        let producer_id = buf.get_i64();
-        let producer_epoch = buf.get_i16();
-        let base_sequence = buf.get_i32();
-        let records_count = buf.get_i32();
+
+        // Capture the CRC-covered region as raw wire bytes BEFORE decoding
+        // individual fields.  The CRC covers everything after the 4-byte CRC
+        // field itself; within `batch_length` we have already consumed:
+        //   partition_leader_epoch (4) + magic (1) + crc (4) = 9 bytes.
+        // So the CRC-covered region is `batch_length - 9` bytes.
+        //
+        // Computing the CRC over raw bytes (rather than re-encoding decoded
+        // fields) is semantically correct: it preserves reserved attribute
+        // bits 6–13 that `to_i16()` would silently drop, making the check
+        // immune to future broker extensions that set those bits.
+        //
+        // This also eliminates the per-batch `BytesMut` allocation of the
+        // previous implementation.  `buf.remaining() >= batch_length` was
+        // verified above; after consuming 9 bytes we have at least
+        // `batch_length - 9` bytes remaining.
+        let crc_covered_len = batch_length - 9;
+        let crc_covered = buf.copy_to_bytes(crc_covered_len);
+
+        let computed_crc = crc32c(&crc_covered);
+        if computed_crc != crc {
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::CrcMismatch,
+                format!("CRC mismatch: expected {crc:08x}, got {computed_crc:08x}"),
+            ));
+        }
+
+        // Decode the fixed header fields from the CRC-covered slice.
+        // We consume `crc_covered` in place — no clone needed.
+        let mut cbuf = crc_covered;
+        let attributes = RecordBatchAttributes::from_i16(cbuf.get_i16())?;
+        let last_offset_delta = cbuf.get_i32();
+        let base_timestamp = cbuf.get_i64();
+        let max_timestamp = cbuf.get_i64();
+        let producer_id = cbuf.get_i64();
+        let producer_epoch = cbuf.get_i16();
+        let base_sequence = cbuf.get_i32();
+        let records_count = cbuf.get_i32();
 
         if records_count < 0 {
-            return Err(KrafkaError::protocol(format!(
-                "invalid negative records count: {records_count}"
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidValue,
+                format!("invalid negative records count: {records_count}"),
+            ));
         }
 
-        // Remaining bytes are the (possibly compressed) records
-        let records_len = batch_length - 49; // 49 bytes for fixed fields after batch_length
-        if buf.remaining() < records_len {
-            return Err(KrafkaError::protocol("not enough bytes for records"));
-        }
-
-        let compressed_records = buf.copy_to_bytes(records_len);
-
-        // Verify CRC
-        let mut crc_data = BytesMut::new();
-        crc_data.put_i16(attributes.to_i16());
-        crc_data.put_i32(last_offset_delta);
-        crc_data.put_i64(base_timestamp);
-        crc_data.put_i64(max_timestamp);
-        crc_data.put_i64(producer_id);
-        crc_data.put_i16(producer_epoch);
-        crc_data.put_i32(base_sequence);
-        crc_data.put_i32(records_count);
-        crc_data.put_slice(&compressed_records);
-
-        let computed_crc = crc32c(&crc_data);
-        if computed_crc != crc {
-            return Err(KrafkaError::protocol(format!(
-                "CRC mismatch: expected {:08x}, got {:08x}",
-                crc, computed_crc
-            )));
-        }
+        // The remaining bytes in `cbuf` are the (possibly compressed) records.
+        // records_len = (batch_length - 9) - 40 fixed-field bytes = batch_length - 49.
+        let compressed_records = cbuf;
 
         // Decompress records
         let decompressed = Self::decompress_records(
@@ -729,10 +887,13 @@ impl RecordBatch {
         // apply upper-bound check before looping.
         let records_len = records_count as usize;
         if records_len > super::MAX_DECODE_ARRAY_LEN {
-            return Err(KrafkaError::protocol(format!(
-                "records count {records_len} exceeds safety limit {}",
-                super::MAX_DECODE_ARRAY_LEN
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                format!(
+                    "records count {records_len} exceeds safety limit {}",
+                    super::MAX_DECODE_ARRAY_LEN
+                ),
+            ));
         }
         let mut records = Vec::with_capacity(records_len);
         for _ in 0..records_len {
@@ -947,7 +1108,7 @@ impl RecordBatchBuilder {
         mut self,
         key: Option<impl Into<Bytes>>,
         value: Option<impl Into<Bytes>>,
-        headers: Vec<(impl Into<String>, impl Into<Bytes>)>,
+        headers: Vec<(impl Into<Bytes>, impl Into<Bytes>)>,
     ) -> Self {
         let offset_delta = self.records.len() as i32;
         let mut record =
@@ -1049,7 +1210,8 @@ impl LazyRecordBatch {
     /// are rejected as potential compression bombs.
     pub fn decode_with_limit(buf: &mut impl Buf, max_decompressed_size: usize) -> Result<Self> {
         if buf.remaining() < 12 {
-            return Err(KrafkaError::protocol(
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
                 "not enough bytes for record batch header",
             ));
         }
@@ -1058,77 +1220,76 @@ impl LazyRecordBatch {
         let batch_length_i32 = buf.get_i32();
 
         if batch_length_i32 < 49 {
-            return Err(KrafkaError::protocol(format!(
-                "invalid record batch length: {batch_length_i32}"
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidValue,
+                format!("invalid record batch length: {batch_length_i32}"),
+            ));
         }
 
         let batch_length = batch_length_i32 as usize;
 
         if buf.remaining() < batch_length {
-            return Err(KrafkaError::protocol("not enough bytes for record batch"));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
+                "not enough bytes for record batch",
+            ));
         }
 
         let partition_leader_epoch = buf.get_i32();
         let magic = buf.get_i8();
 
         if magic != 2 {
-            return Err(KrafkaError::protocol(format!(
-                "unsupported record batch magic: {}",
-                magic
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::UnsupportedMagic,
+                format!("unsupported record batch magic: {magic}"),
+            ));
         }
 
         let crc = buf.get_u32();
-        let attributes = RecordBatchAttributes::from_i16(buf.get_i16())?;
-        let last_offset_delta = buf.get_i32();
-        let base_timestamp = buf.get_i64();
-        let max_timestamp = buf.get_i64();
-        let producer_id = buf.get_i64();
-        let producer_epoch = buf.get_i16();
-        let base_sequence = buf.get_i32();
-        let records_count = buf.get_i32();
+
+        // Same raw-bytes CRC strategy as `RecordBatch::decode_with_limit`:
+        // capture the CRC-covered region before decoding fields to avoid
+        // re-encoding lossy and to eliminate the per-batch BytesMut allocation.
+        let crc_covered_len = batch_length - 9;
+        let crc_covered = buf.copy_to_bytes(crc_covered_len);
+
+        let computed_crc = crc32c(&crc_covered);
+        if computed_crc != crc {
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::CrcMismatch,
+                format!("CRC mismatch: expected {crc:08x}, got {computed_crc:08x}"),
+            ));
+        }
+
+        let mut cbuf = crc_covered;
+        let attributes = RecordBatchAttributes::from_i16(cbuf.get_i16())?;
+        let last_offset_delta = cbuf.get_i32();
+        let base_timestamp = cbuf.get_i64();
+        let max_timestamp = cbuf.get_i64();
+        let producer_id = cbuf.get_i64();
+        let producer_epoch = cbuf.get_i16();
+        let base_sequence = cbuf.get_i32();
+        let records_count = cbuf.get_i32();
 
         if records_count < 0 {
-            return Err(KrafkaError::protocol(format!(
-                "invalid negative records count: {records_count}"
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidValue,
+                format!("invalid negative records count: {records_count}"),
+            ));
         }
         if records_count as usize > super::MAX_DECODE_ARRAY_LEN {
-            return Err(KrafkaError::protocol(format!(
-                "records count {} exceeds safety limit {}",
-                records_count,
-                super::MAX_DECODE_ARRAY_LEN
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                format!(
+                    "records count {} exceeds safety limit {}",
+                    records_count,
+                    super::MAX_DECODE_ARRAY_LEN
+                ),
+            ));
         }
 
-        // Remaining bytes are the (possibly compressed) records
-        let records_len = batch_length - 49;
-        if buf.remaining() < records_len {
-            return Err(KrafkaError::protocol("not enough bytes for records"));
-        }
-
-        let compressed_records = buf.copy_to_bytes(records_len);
-
-        // Verify CRC
-        let mut crc_data = BytesMut::new();
-        crc_data.put_i16(attributes.to_i16());
-        crc_data.put_i32(last_offset_delta);
-        crc_data.put_i64(base_timestamp);
-        crc_data.put_i64(max_timestamp);
-        crc_data.put_i64(producer_id);
-        crc_data.put_i16(producer_epoch);
-        crc_data.put_i32(base_sequence);
-        crc_data.put_i32(records_count);
-        crc_data.put_slice(&compressed_records);
-
-        let computed_crc = crc32c(&crc_data);
-        if computed_crc != crc {
-            return Err(KrafkaError::protocol(format!(
-                "CRC mismatch: expected {:08x}, got {:08x}",
-                crc, computed_crc
-            )));
-        }
+        // Remaining bytes in cbuf are the (possibly compressed) records.
+        let compressed_records = cbuf;
 
         // Decompress but don't parse records
         let raw_records = RecordBatch::decompress_records(

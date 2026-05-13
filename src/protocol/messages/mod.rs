@@ -60,7 +60,7 @@
 
 use bytes::{Buf, BufMut, Bytes};
 
-use crate::error::Result;
+use crate::error::{ProtocolErrorKind, Result};
 
 /// Trait for encoding a request/response at a specific protocol version.
 ///
@@ -88,14 +88,24 @@ pub trait VersionedDecode: Sized {
 /// non-nullable but the compact encoding still allows null.  This helper
 /// turns `None` into a protocol error.
 pub(crate) fn non_nullable_string(field: &str, opt: Option<String>) -> Result<String> {
-    opt.ok_or_else(|| crate::error::KrafkaError::protocol(format!("{field} must not be null")))
+    opt.ok_or_else(|| {
+        crate::error::KrafkaError::protocol_kind(
+            ProtocolErrorKind::Malformed,
+            format!("{field} must not be null"),
+        )
+    })
 }
 
 /// Reject a null value for a non-nullable bytes field.
 ///
 /// Same rationale as [`non_nullable_string`] but for `Bytes` payloads.
 pub(crate) fn non_nullable_bytes(field: &str, opt: Option<Bytes>) -> Result<Bytes> {
-    opt.ok_or_else(|| crate::error::KrafkaError::protocol(format!("{field} must not be null")))
+    opt.ok_or_else(|| {
+        crate::error::KrafkaError::protocol_kind(
+            ProtocolErrorKind::Malformed,
+            format!("{field} must not be null"),
+        )
+    })
 }
 
 /// Generate a protocol error for an unsupported encode version.
@@ -104,10 +114,10 @@ pub(crate) fn non_nullable_bytes(field: &str, opt: Option<Bytes>) -> Result<Byte
 /// outside the implemented range.
 macro_rules! unsupported_encode {
     ($type:expr, $version:expr) => {
-        Err($crate::error::KrafkaError::protocol(format!(
-            "unsupported {} encode version {}",
-            $type, $version
-        )))
+        Err($crate::error::KrafkaError::protocol_kind(
+            $crate::error::ProtocolErrorKind::UnknownApiVersion,
+            format!("unsupported {} encode version {}", $type, $version),
+        ))
     };
 }
 
@@ -117,10 +127,10 @@ macro_rules! unsupported_encode {
 /// outside the implemented range.
 macro_rules! unsupported_decode {
     ($type:expr, $version:expr) => {
-        Err($crate::error::KrafkaError::protocol(format!(
-            "unsupported {} decode version {}",
-            $type, $version
-        )))
+        Err($crate::error::KrafkaError::protocol_kind(
+            $crate::error::ProtocolErrorKind::UnknownApiVersion,
+            format!("unsupported {} decode version {}", $type, $version),
+        ))
     };
 }
 

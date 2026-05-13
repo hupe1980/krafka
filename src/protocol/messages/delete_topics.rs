@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{
@@ -174,7 +174,10 @@ impl DeleteTopicsResponse {
             let name = KafkaString::decode_compact(buf)?.0;
 
             if buf.remaining() < 16 {
-                return Err(KrafkaError::protocol("not enough bytes for topic_id UUID"));
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::TruncatedFrame,
+                    "not enough bytes for topic_id UUID",
+                ));
             }
             let mut id = [0u8; 16];
             buf.copy_to_slice(&mut id);

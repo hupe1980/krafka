@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use super::record::ProducerRecord;
 use crate::PartitionId;
+use crate::error::{KrafkaError, Result};
 use crate::protocol::{Compression, RecordBatch, RecordBatchBuilder};
 
 /// A batch of records to be sent together.
@@ -53,7 +54,7 @@ impl ProducerBatch {
     /// giving back ownership of the record so callers avoid a clone.
     #[inline]
     #[allow(clippy::result_large_err)]
-    pub fn try_add(&mut self, record: ProducerRecord) -> Result<(), ProducerRecord> {
+    pub fn try_add(&mut self, record: ProducerRecord) -> std::result::Result<(), ProducerRecord> {
         let record_size = record.estimated_size();
 
         if !self.is_empty() && self.size + record_size > self.max_size {
@@ -81,6 +82,13 @@ impl ProducerBatch {
     /// Use with [`Self::would_fit`] when the caller manages record storage
     /// separately (e.g., in `PendingRecord`). Increments `len()`, `size()`,
     /// and `is_full()` as if the record were added.
+    ///
+    /// # Warning
+    ///
+    /// When `track()` is used, `self.records` is **not** populated. Calling
+    /// [`Self::build()`] on a track-only batch will produce an **empty**
+    /// `RecordBatch` regardless of `len()`. Only call `build()` on batches
+    /// where all records were added via [`Self::try_add()`].
     #[inline]
     pub(crate) fn track(&mut self, record_size: usize) {
         self.size += record_size;
@@ -118,27 +126,44 @@ impl ProducerBatch {
     }
 
     /// Build the record batch for sending.
-    pub fn build(&self) -> RecordBatch {
+    ///
+    /// Returns an error if `track()` was used instead of `try_add()` for any
+    /// records — calling `build()` on a track-only batch would silently return
+    /// an empty `RecordBatch`. This is detectable in both debug and release
+    /// builds, unlike the previous `debug_assert!`-only guard.
+    pub fn try_build(&self) -> Result<RecordBatch> {
+        if self.tracked_count > 0 && self.records.is_empty() {
+            return Err(KrafkaError::invalid_state(format!(
+                "ProducerBatch::try_build() called on a track-only batch \
+                 (tracked_count={} but records is empty); use try_add() for \
+                 records that should appear in the built RecordBatch",
+                self.tracked_count
+            )));
+        }
+        if self.records.len() != self.tracked_count {
+            return Err(KrafkaError::invalid_state(format!(
+                "ProducerBatch::try_build() called on a mixed track()/try_add() batch: \
+                 records.len()={} but tracked_count={}",
+                self.records.len(),
+                self.tracked_count,
+            )));
+        }
+
         let mut builder = RecordBatchBuilder::new().compression(self.compression);
 
         for record in &self.records {
             if record.headers.is_empty() {
                 builder = builder.add_record(record.key.clone(), Some(record.value.clone()));
             } else {
-                let hdrs: Vec<(String, Vec<u8>)> = record
-                    .headers
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
                 builder = builder.add_record_with_headers(
                     record.key.clone(),
                     Some(record.value.clone()),
-                    hdrs,
+                    record.headers.clone(),
                 );
             }
         }
 
-        builder.build()
+        Ok(builder.build())
     }
 
     /// Drain all records from the batch.
@@ -211,7 +236,7 @@ mod tests {
         let _ =
             batch.try_add(ProducerRecord::new("test", b"value".to_vec()).with_key(b"key".to_vec()));
 
-        let record_batch = batch.build();
+        let record_batch = batch.try_build().unwrap();
         assert_eq!(record_batch.records.len(), 1);
     }
 
@@ -221,11 +246,14 @@ mod tests {
 
         let record = ProducerRecord::new("test", b"value".to_vec())
             .with_key(b"key".to_vec())
-            .with_header("trace-id", b"abc123")
-            .with_header("content-type", b"application/json");
+            .with_header("trace-id", bytes::Bytes::from_static(b"abc123"))
+            .with_header(
+                "content-type",
+                bytes::Bytes::from_static(b"application/json"),
+            );
         let _ = batch.try_add(record);
 
-        let record_batch = batch.build();
+        let record_batch = batch.try_build().unwrap();
         assert_eq!(record_batch.records.len(), 1);
         assert_eq!(
             record_batch.records[0].headers.len(),
@@ -234,6 +262,17 @@ mod tests {
         );
         assert_eq!(record_batch.records[0].headers[0].key, "trace-id");
         assert_eq!(record_batch.records[0].headers[1].key, "content-type");
+    }
+
+    #[test]
+    fn test_batch_try_build_rejects_track_only() {
+        let mut batch = ProducerBatch::new("test".to_string(), 0, 4096, Compression::None);
+        batch.track(100);
+        let err = batch.try_build().unwrap_err();
+        assert!(
+            err.to_string().contains("track-only"),
+            "expected track-only error, got: {err}"
+        );
     }
 
     #[test]

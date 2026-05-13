@@ -6,7 +6,7 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::error::{KrafkaError, Result};
+use crate::error::{KrafkaError, ProtocolErrorKind, Result};
 
 /// Maximum message size (default 100MB, configurable).
 pub const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
@@ -71,8 +71,12 @@ impl Encoder {
     /// Finish encoding a size-prefixed message.
     /// Updates the size at the given position.
     pub fn finish_message(&mut self, size_pos: usize) -> Result<()> {
-        let message_size = i32::try_from(self.buffer.len() - size_pos - 4)
-            .map_err(|_| KrafkaError::protocol("message size exceeds i32::MAX"))?;
+        let message_size = i32::try_from(self.buffer.len() - size_pos - 4).map_err(|_| {
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                "message size exceeds i32::MAX",
+            )
+        })?;
         let size_bytes = message_size.to_be_bytes();
         self.buffer[size_pos..size_pos + 4].copy_from_slice(&size_bytes);
         Ok(())
@@ -134,19 +138,20 @@ impl Decoder {
         ]);
 
         if size_i32 < 0 {
-            return Err(KrafkaError::protocol(format!(
-                "negative message size: {size_i32}"
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::Malformed,
+                format!("negative message size: {size_i32}"),
+            ));
         }
 
         let size = size_i32 as usize;
 
         // Validate the size
         if size > self.max_size {
-            return Err(KrafkaError::protocol(format!(
-                "message size {} exceeds maximum {}",
-                size, self.max_size
-            )));
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                format!("message size {} exceeds maximum {}", size, self.max_size),
+            ));
         }
 
         // Check if we have the complete message

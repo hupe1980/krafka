@@ -51,16 +51,20 @@ use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
-use std::io::{Read, Write};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::{BufMut, Bytes, BytesMut};
+#[cfg(any(feature = "gzip", feature = "aws-glue-schema-registry"))]
 use flate2::Compression;
+#[cfg(any(feature = "gzip", feature = "aws-glue-schema-registry"))]
 use flate2::read::ZlibDecoder;
+#[cfg(any(feature = "gzip", feature = "aws-glue-schema-registry"))]
 use flate2::write::ZlibEncoder;
 use parking_lot::{Mutex, RwLock};
+#[cfg(any(feature = "gzip", feature = "aws-glue-schema-registry"))]
+use std::io::{Read, Write};
 use tokio::sync::oneshot;
 
 use tracing::debug;
@@ -528,6 +532,7 @@ fn validate_glue_wire_header(data: &[u8]) -> Result<(GlueSchemaVersionId, GlueCo
 }
 
 /// ZLIB-compress data.
+#[cfg(any(feature = "gzip", feature = "aws-glue-schema-registry"))]
 fn compress_zlib(data: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder
@@ -538,12 +543,20 @@ fn compress_zlib(data: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| KrafkaError::serialization(format!("ZLIB compression failed: {e}")))
 }
 
+#[cfg(not(any(feature = "gzip", feature = "aws-glue-schema-registry")))]
+fn compress_zlib(_data: &[u8]) -> Result<Vec<u8>> {
+    Err(KrafkaError::serialization(
+        "Glue ZLIB compression requires the `gzip` or `aws-glue-schema-registry` Cargo feature",
+    ))
+}
+
 /// Maximum decompressed size (128 MiB) to protect against decompression bombs.
 ///
 /// Matches the limit used by record-batch decompression in `protocol::record`.
 const MAX_DECOMPRESSED_SIZE: usize = 128 * 1024 * 1024;
 
 /// ZLIB-decompress data with a size limit to prevent decompression bombs.
+#[cfg(any(feature = "gzip", feature = "aws-glue-schema-registry"))]
 fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>> {
     let decoder = ZlibDecoder::new(data);
     let mut limited = decoder.take(MAX_DECOMPRESSED_SIZE as u64 + 1);
@@ -561,6 +574,13 @@ fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>> {
     Ok(decompressed)
 }
 
+#[cfg(not(any(feature = "gzip", feature = "aws-glue-schema-registry")))]
+fn decompress_zlib(_data: &[u8]) -> Result<Vec<u8>> {
+    Err(KrafkaError::serialization(
+        "Glue ZLIB decompression requires the `gzip` or `aws-glue-schema-registry` Cargo feature",
+    ))
+}
+
 // ── Trait ─────────────────────────────────────────────────────────────────
 
 /// Async client interface for the AWS Glue Schema Registry.
@@ -569,8 +589,10 @@ fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>> {
 /// `aws-glue-schema-registry` feature is enabled,
 /// `AwsGlueSchemaRegistry` provides a ready-made AWS SDK implementation.
 ///
-/// All methods return boxed futures for object safety, following the same
-/// pattern as [`SchemaRegistryClient`](super::SchemaRegistryClient).
+/// All methods use `async fn` (RPITIT), allowing zero-cost monomorphization at
+/// generic call sites. Use the internal `ErasedGlueSchemaRegistryClient` trait
+/// (via [`WireFormatDecoder`](super::WireFormatDecoder)) where dynamic dispatch
+/// is needed.
 pub trait GlueSchemaRegistryClient: Send + Sync {
     /// Retrieve a schema by its version ID (the UUID from the wire format).
     ///
@@ -579,18 +601,18 @@ pub trait GlueSchemaRegistryClient: Send + Sync {
     fn get_schema_by_version_id(
         &self,
         id: GlueSchemaVersionId,
-    ) -> Pin<Box<dyn Future<Output = Result<GlueSchema>> + Send + '_>>;
+    ) -> impl Future<Output = Result<GlueSchema>> + Send + '_;
 
     /// Register a schema version (idempotent).
     ///
     /// If the same schema definition is already registered under
     /// `schema_name`, the existing version ID is returned.
-    fn register_schema(
-        &self,
-        schema_name: &str,
-        schema: &str,
+    fn register_schema<'a>(
+        &'a self,
+        schema_name: &'a str,
+        schema: &'a str,
         data_format: GlueDataFormat,
-    ) -> Pin<Box<dyn Future<Output = Result<GlueSchemaVersionId>> + Send + '_>>;
+    ) -> impl Future<Output = Result<GlueSchemaVersionId>> + Send + 'a;
 }
 
 // ── CachedGlueSchemaRegistry ─────────────────────────────────────────────
@@ -930,25 +952,18 @@ impl<C> fmt::Debug for CachedGlueSchemaRegistry<C> {
 }
 
 impl<C: GlueSchemaRegistryClient> GlueSchemaRegistryClient for CachedGlueSchemaRegistry<C> {
-    fn get_schema_by_version_id(
-        &self,
-        id: GlueSchemaVersionId,
-    ) -> Pin<Box<dyn Future<Output = Result<GlueSchema>> + Send + '_>> {
-        Box::pin(async move { self.get_schema_by_version_id_impl(id).await })
+    async fn get_schema_by_version_id(&self, id: GlueSchemaVersionId) -> Result<GlueSchema> {
+        self.get_schema_by_version_id_impl(id).await
     }
 
-    fn register_schema(
+    async fn register_schema(
         &self,
         schema_name: &str,
         schema: &str,
         data_format: GlueDataFormat,
-    ) -> Pin<Box<dyn Future<Output = Result<GlueSchemaVersionId>> + Send + '_>> {
-        let schema_name = schema_name.to_string();
-        let schema = schema.to_string();
-        Box::pin(async move {
-            self.register_schema_impl(&schema_name, &schema, data_format)
-                .await
-        })
+    ) -> Result<GlueSchemaVersionId> {
+        self.register_schema_impl(schema_name, schema, data_format)
+            .await
     }
 }
 
@@ -1367,27 +1382,22 @@ mod tests {
     }
 
     impl GlueSchemaRegistryClient for MockGlueRegistry {
-        fn get_schema_by_version_id(
-            &self,
-            id: GlueSchemaVersionId,
-        ) -> Pin<Box<dyn Future<Output = Result<GlueSchema>> + Send + '_>> {
+        async fn get_schema_by_version_id(&self, id: GlueSchemaVersionId) -> Result<GlueSchema> {
             self.get_calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move {
-                Ok(GlueSchema::new(
-                    id,
-                    GlueDataFormat::Avro,
-                    r#"{"type":"string"}"#,
-                ))
-            })
+            Ok(GlueSchema::new(
+                id,
+                GlueDataFormat::Avro,
+                r#"{"type":"string"}"#,
+            ))
         }
 
-        fn register_schema(
+        async fn register_schema(
             &self,
             _schema_name: &str,
             _schema: &str,
             _data_format: GlueDataFormat,
-        ) -> Pin<Box<dyn Future<Output = Result<GlueSchemaVersionId>> + Send + '_>> {
-            Box::pin(async { Ok(TEST_UUID_STR.parse().unwrap()) })
+        ) -> Result<GlueSchemaVersionId> {
+            Ok(TEST_UUID_STR.parse().unwrap())
         }
     }
 
@@ -1420,29 +1430,24 @@ mod tests {
     }
 
     impl GlueSchemaRegistryClient for BlockingMockGlueRegistry {
-        fn get_schema_by_version_id(
-            &self,
-            id: GlueSchemaVersionId,
-        ) -> Pin<Box<dyn Future<Output = Result<GlueSchema>> + Send + '_>> {
+        async fn get_schema_by_version_id(&self, id: GlueSchemaVersionId) -> Result<GlueSchema> {
             self.get_calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move {
-                self.started.notify_waiters();
-                self.release.notified().await;
-                Ok(GlueSchema::new(
-                    id,
-                    GlueDataFormat::Avro,
-                    r#"{"type":"string"}"#,
-                ))
-            })
+            self.started.notify_waiters();
+            self.release.notified().await;
+            Ok(GlueSchema::new(
+                id,
+                GlueDataFormat::Avro,
+                r#"{"type":"string"}"#,
+            ))
         }
 
-        fn register_schema(
+        async fn register_schema(
             &self,
             _schema_name: &str,
             _schema: &str,
             _data_format: GlueDataFormat,
-        ) -> Pin<Box<dyn Future<Output = Result<GlueSchemaVersionId>> + Send + '_>> {
-            Box::pin(async { Ok(TEST_UUID_STR.parse().unwrap()) })
+        ) -> Result<GlueSchemaVersionId> {
+            Ok(TEST_UUID_STR.parse().unwrap())
         }
     }
 
@@ -1807,10 +1812,15 @@ mod tests {
         assert_send_sync::<CachedGlueSchemaRegistry<MockGlueRegistry>>();
     }
 
-    /// Verify that [`GlueSchemaRegistryClient`] is object-safe.
+    /// `GlueSchemaRegistryClient` is no longer object-safe (RPITIT).
+    /// The `ErasedGlueSchemaRegistryClient` bridge in the parent module
+    /// maintains object-safety for [`WireFormatDecoder`](super::super::WireFormatDecoder).
     #[test]
-    fn test_object_safe() {
-        fn _assert_object_safe(_: &dyn GlueSchemaRegistryClient) {}
+    fn test_erased_bridge_exists() {
+        // Compile-time check: `WireFormatDecoder::glue()` accepts any `GlueSchemaRegistryClient`
+        // by coercing via the private blanket `ErasedGlueSchemaRegistryClient` impl.
+        // If the blanket impl is missing this test will fail to compile.
+        fn _accepts_registry<G: GlueSchemaRegistryClient>(_: &G) {}
     }
 
     #[test]
@@ -1821,9 +1831,6 @@ mod tests {
     }
 
     mod inherent_api_tests {
-        use std::future::Future;
-        use std::pin::Pin;
-
         use crate::Result;
         use crate::schema_registry::glue::{
             CachedGlueSchemaRegistry, GlueDataFormat, GlueSchema, GlueSchemaVersionId,
@@ -1832,28 +1839,24 @@ mod tests {
         struct InherentMockGlueRegistry;
 
         impl crate::schema_registry::glue::GlueSchemaRegistryClient for InherentMockGlueRegistry {
-            fn get_schema_by_version_id(
+            async fn get_schema_by_version_id(
                 &self,
                 id: GlueSchemaVersionId,
-            ) -> Pin<Box<dyn Future<Output = Result<GlueSchema>> + Send + '_>> {
-                Box::pin(async move {
-                    Ok(GlueSchema::new(
-                        id,
-                        GlueDataFormat::Avro,
-                        r#"{"type":"string"}"#,
-                    ))
-                })
+            ) -> Result<GlueSchema> {
+                Ok(GlueSchema::new(
+                    id,
+                    GlueDataFormat::Avro,
+                    r#"{"type":"string"}"#,
+                ))
             }
 
-            fn register_schema(
+            async fn register_schema(
                 &self,
                 _schema_name: &str,
                 _schema: &str,
                 _data_format: GlueDataFormat,
-            ) -> Pin<Box<dyn Future<Output = Result<GlueSchemaVersionId>> + Send + '_>>
-            {
-                let id = "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
-                Box::pin(async move { Ok(id) })
+            ) -> Result<GlueSchemaVersionId> {
+                Ok("550e8400-e29b-41d4-a716-446655440000".parse().unwrap())
             }
         }
 

@@ -570,7 +570,8 @@ mod tests {
     async fn connect_to_unreachable_fails() {
         let config = ConnectionConfig::builder()
             .connect_timeout(Duration::from_millis(200))
-            .build();
+            .build()
+            .unwrap();
         // RFC 5737 TEST-NET — guaranteed non-routable.
         let result = connect_happy_eyeballs("198.51.100.1:9092", &config).await;
         assert!(result.is_err());

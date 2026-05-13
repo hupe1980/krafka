@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_string};
-use crate::error::{ErrorCode, KrafkaError, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{check_compact_array_len, check_decode_array_len};
@@ -39,8 +39,12 @@ impl ListGroupsRequest {
 
     /// Encode for version 4 (flexible, adds states_filter).
     pub fn encode_v4(&self, buf: &mut impl BufMut) -> Result<()> {
-        let len = u32::try_from(self.states_filter.len().saturating_add(1))
-            .map_err(|_| KrafkaError::protocol("states_filter array too large"))?;
+        let len = u32::try_from(self.states_filter.len().saturating_add(1)).map_err(|_| {
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                "states_filter array too large",
+            )
+        })?;
         crate::util::varint::encode_unsigned_varint(len, buf);
         for state in &self.states_filter {
             KafkaString::new(state).try_encode_compact(buf)?;
@@ -51,14 +55,23 @@ impl ListGroupsRequest {
 
     /// Encode for version 5 (flexible, adds types_filter).
     pub fn encode_v5(&self, buf: &mut impl BufMut) -> Result<()> {
-        let states_len = u32::try_from(self.states_filter.len().saturating_add(1))
-            .map_err(|_| KrafkaError::protocol("states_filter array too large"))?;
+        let states_len =
+            u32::try_from(self.states_filter.len().saturating_add(1)).map_err(|_| {
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidLength,
+                    "states_filter array too large",
+                )
+            })?;
         crate::util::varint::encode_unsigned_varint(states_len, buf);
         for state in &self.states_filter {
             KafkaString::new(state).try_encode_compact(buf)?;
         }
-        let types_len = u32::try_from(self.types_filter.len().saturating_add(1))
-            .map_err(|_| KrafkaError::protocol("types_filter array too large"))?;
+        let types_len = u32::try_from(self.types_filter.len().saturating_add(1)).map_err(|_| {
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                "types_filter array too large",
+            )
+        })?;
         crate::util::varint::encode_unsigned_varint(types_len, buf);
         for t in &self.types_filter {
             KafkaString::new(t).try_encode_compact(buf)?;

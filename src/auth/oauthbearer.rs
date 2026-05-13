@@ -44,8 +44,11 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
+use tracing::{debug, warn};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::{KrafkaError, Result};
@@ -111,23 +114,151 @@ where
     }
 }
 
-/// Handle wrapping an [`Arc<dyn OAuthBearerTokenProvider>`].
+/// Internal state shared across all clones of [`OAuthBearerTokenProviderHandle`].
 ///
-/// This wrapper provides `Clone` and `Debug` so it can be stored in
-/// [`AuthConfig`](super::AuthConfig) without requiring implementors to
-/// derive those traits.
+/// Wrapped in `Arc` so cloning the handle shares the cache and the coalescing
+/// mutex rather than creating independent instances.
+struct OAuthTokenStoreInner {
+    provider: Arc<dyn OAuthBearerTokenProvider>,
+    /// Most recently fetched token. `None` until the first call to `provide_token`.
+    cached: RwLock<Option<OAuthBearerToken>>,
+    /// At most one refresh in flight at a time. Concurrent callers that find
+    /// the cached token stale queue behind this lock; the first winner fetches
+    /// while the rest get the result on unlock.
+    refreshing: Mutex<()>,
+}
+
+/// Handle wrapping a cached, coalescing [`OAuthBearerTokenProvider`].
+///
+/// All clones of a handle share the same internal [`Arc`], so they all read
+/// from and write to the same token cache. A background proactive-refresh
+/// task (started by [`Self::start_refresh_task`]) wakes before the token
+/// expires and pre-warms the cache, ensuring that broker reconnects never
+/// need to wait for a provider call.
+///
+/// # Token lifecycle
+///
+/// 1. First call to [`provide_token`](Self::provide_token) fetches and caches a token.
+/// 2. Subsequent calls return the cached token until it enters the 30-second
+///    expiry window (controlled by `OAUTHBEARER_EXPIRY_SKEW_MARGIN_MS`).
+/// 3. The first caller that finds the token stale acquires the coalescing lock
+///    and refreshes. Concurrent callers wait and receive the same new token.
+/// 4. The proactive refresh task wakes at step (2) so that (3) rarely happens
+///    on a connection path.
 #[derive(Clone)]
-pub struct OAuthBearerTokenProviderHandle(Arc<dyn OAuthBearerTokenProvider>);
+pub struct OAuthBearerTokenProviderHandle(Arc<OAuthTokenStoreInner>);
 
 impl OAuthBearerTokenProviderHandle {
     /// Create a new handle wrapping the given provider.
     pub fn new(provider: impl OAuthBearerTokenProvider + 'static) -> Self {
-        Self(Arc::new(provider))
+        Self(Arc::new(OAuthTokenStoreInner {
+            provider: Arc::new(provider),
+            cached: RwLock::new(None),
+            refreshing: Mutex::new(()),
+        }))
     }
 
-    /// Fetch a fresh token from the wrapped provider.
+    /// Return a fresh token, using the cache when available.
+    ///
+    /// Returns the cached token if it is not within the expiry skew margin.
+    /// Otherwise acquires the coalescing refresh lock, re-checks (another task
+    /// may have just refreshed), and calls the provider exactly once while
+    /// concurrent callers wait.
     pub async fn provide_token(&self) -> Result<OAuthBearerToken> {
-        self.0.provide_token().await
+        // Fast path: cached token is still fresh.
+        {
+            let guard = self.0.cached.read().await;
+            if let Some(token) = guard.as_ref()
+                && !token.needs_refresh()
+            {
+                return Ok(token.clone());
+            }
+        }
+
+        // Slow path: coalesce concurrent refreshes under one lock.
+        let _coalesce = self.0.refreshing.lock().await;
+
+        // Re-check after acquiring the lock — another task may have already refreshed.
+        {
+            let guard = self.0.cached.read().await;
+            if let Some(token) = guard.as_ref()
+                && !token.needs_refresh()
+            {
+                return Ok(token.clone());
+            }
+        }
+
+        // Fetch a fresh token and update the cache.
+        let token = self.0.provider.provide_token().await?;
+        *self.0.cached.write().await = Some(token.clone());
+        Ok(token)
+    }
+
+    /// Start a background task that proactively refreshes the token before expiry.
+    ///
+    /// The task wakes when the cached token enters the 30-second expiry skew
+    /// window and calls the provider to pre-warm the cache. This ensures that
+    /// broker connections and reconnects always find a ready token without
+    /// blocking on a provider call.
+    ///
+    /// When no token has been fetched yet, or the token has no `lifetime_ms`,
+    /// the task retries every 30 seconds until a token with a known lifetime
+    /// is cached.
+    ///
+    /// Returns the [`JoinHandle`] so the caller can abort the task on shutdown.
+    /// Must be called from within a Tokio runtime.
+    pub fn start_refresh_task(&self) -> JoinHandle<()> {
+        let inner = self.0.clone();
+        tokio::spawn(async move {
+            loop {
+                // Compute how long to sleep before the next refresh window.
+                let sleep_duration = {
+                    let guard = inner.cached.read().await;
+                    match guard.as_ref().and_then(|t| t.lifetime_ms()) {
+                        Some(lifetime_ms) => {
+                            // Wake at `lifetime_ms - OAUTHBEARER_EXPIRY_SKEW_MARGIN_MS`.
+                            let wake_at_ms =
+                                lifetime_ms.saturating_sub(OAUTHBEARER_EXPIRY_SKEW_MARGIN_MS);
+                            let now_ms = current_epoch_ms().unwrap_or(i64::MAX);
+                            let remaining_ms = wake_at_ms.saturating_sub(now_ms).max(0);
+                            Duration::from_millis(remaining_ms as u64)
+                        }
+                        None => {
+                            // No token yet or token has no expiry.
+                            // Retry every 30 s until we get one with a lifetime.
+                            Duration::from_secs(30)
+                        }
+                    }
+                };
+
+                if !sleep_duration.is_zero() {
+                    tokio::time::sleep(sleep_duration).await;
+                }
+
+                // Proactively refresh under the coalescing lock.
+                let _coalesce = inner.refreshing.lock().await;
+                match inner.provider.provide_token().await {
+                    Ok(token) => {
+                        debug!(
+                            lifetime_ms = token.lifetime_ms(),
+                            "OAuthBearer token proactively refreshed"
+                        );
+                        *inner.cached.write().await = Some(token);
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "OAuthBearer proactive token refresh failed; \
+                             will retry on next refresh window"
+                        );
+                        // Back off briefly before restarting the sleep loop
+                        // so a transient provider failure doesn't busy-spin.
+                        drop(_coalesce);
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        })
     }
 }
 

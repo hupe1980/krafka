@@ -180,10 +180,11 @@ impl KrafkaError {
         Self::Network(Arc::new(err))
     }
 
-    /// Create a new protocol error.
+    /// Create a new protocol error, inferring the [`ProtocolErrorKind`] from the message.
     ///
-    /// The [`ProtocolErrorKind`] is inferred automatically from the message.
-    /// Use [`KrafkaError::protocol_kind`] when the kind is known at the call site.
+    /// Prefer [`KrafkaError::protocol_kind`] when the kind is known at the call site:
+    /// it avoids the substring scan in `from_message` and documents intent explicitly.
+    /// Use this only in contexts where no explicit kind is available.
     #[cold]
     pub fn protocol(message: impl Into<String>) -> Self {
         let message = message.into();
@@ -392,56 +393,69 @@ impl ProtocolErrorKind {
     /// and are not a stable public contract.  External callers should use
     /// [`KrafkaError::protocol_error_kind`] on errors they receive.
     pub(crate) fn from_message(message: &str) -> Self {
-        // Match on ASCII-lowercase to be tolerant of capitalization drift.
-        // The patterns are keyed on stable substrings emitted by the
-        // crate's own `KrafkaError::protocol(...)` call sites — see
-        // `src/protocol/**`, `src/consumer/**`, `src/producer/**`,
-        // `src/admin.rs` for the vocabulary.
-        let ml = message.to_ascii_lowercase();
+        // Zero-allocation ASCII-case-insensitive substring search.
+        // Avoids `to_ascii_lowercase()` allocation on every (cold) error path.
+        #[inline]
+        fn contains_ci(haystack: &str, needle: &str) -> bool {
+            let needle = needle.as_bytes();
+            let n = needle.len();
+            if n == 0 {
+                return true;
+            }
+            haystack
+                .as_bytes()
+                .windows(n)
+                .any(|w| w.eq_ignore_ascii_case(needle))
+        }
 
-        if ml.contains("not enough bytes")
-            || ml.contains("unexpected end of")
-            || ml.contains("response too short")
-            || ml.contains("short buf")
-            || ml.contains("varint too long")
-            || ml.contains("varint overflowed")
+        if contains_ci(message, "not enough bytes")
+            || contains_ci(message, "unexpected end of")
+            || contains_ci(message, "response too short")
+            || contains_ci(message, "short buf")
+            || contains_ci(message, "varint too long")
+            || contains_ci(message, "varint overflowed")
         {
             return Self::TruncatedFrame;
         }
-        if ml.contains("crc mismatch") {
+        if contains_ci(message, "crc mismatch") {
             return Self::CrcMismatch;
         }
-        if ml.contains("no mutually supported") || ml.contains("broker does not support") {
+        if contains_ci(message, "no mutually supported")
+            || contains_ci(message, "broker does not support")
+        {
             return Self::UnknownApiVersion;
         }
-        if ml.contains("unsupported record batch magic") {
+        if contains_ci(message, "unsupported record batch magic") {
             return Self::UnsupportedMagic;
         }
-        if ml.contains("invalid utf-8") {
+        if contains_ci(message, "invalid utf-8") {
             return Self::InvalidUtf8;
         }
-        if ml.contains("too large")
-            || ml.contains("too long")
-            || ml.contains("exceeds")
-            || ml.contains("overflow")
+        if contains_ci(message, "too large")
+            || contains_ci(message, "too long")
+            || contains_ci(message, "exceeds")
+            || contains_ci(message, "overflow")
         {
             return Self::InvalidLength;
         }
-        if ml.contains("not found")
-            || ml.contains("no offset returned")
-            || ml.contains("no transaction description")
-            || ml.contains("no brokers available")
-            || ml.contains("missing ")
-            || ml.contains("must not be null")
-            || ml.contains("non-null")
-            || ml.contains("non-nullable")
-            || ml.contains("unexpected partition")
-            || ml.contains("unexpected topic")
-            || ml.contains("unexpected broker")
+        if contains_ci(message, "not found")
+            || contains_ci(message, "no offset returned")
+            || contains_ci(message, "no transaction description")
+            || contains_ci(message, "no brokers available")
+            || contains_ci(message, "missing ")
+            || contains_ci(message, "must not be null")
+            || contains_ci(message, "non-null")
+            || contains_ci(message, "non-nullable")
+            || contains_ci(message, "unexpected partition")
+            || contains_ci(message, "unexpected topic")
+            || contains_ci(message, "unexpected broker")
         {
             return Self::Malformed;
         }
-        if ml.contains("invalid") || ml.contains("unknown") || ml.contains("unexpected") {
+        if contains_ci(message, "invalid")
+            || contains_ci(message, "unknown")
+            || contains_ci(message, "unexpected")
+        {
             return Self::InvalidValue;
         }
         Self::Other
@@ -1447,13 +1461,12 @@ mod tests {
 
     #[test]
     fn test_krafka_error_protocol_constructor_classifies_message() {
-        let err = KrafkaError::protocol("not enough bytes for i32");
-        match err {
-            KrafkaError::Protocol { kind, .. } => {
-                assert_eq!(kind, ProtocolErrorKind::TruncatedFrame);
-            }
-            _ => panic!("expected Protocol variant"),
-        }
+        // Verify that from_message infers TruncatedFrame from the sentinel
+        // phrase used in i32::decode's error message.
+        assert_eq!(
+            ProtocolErrorKind::from_message("not enough bytes for i32"),
+            ProtocolErrorKind::TruncatedFrame,
+        );
     }
 
     #[test]
@@ -1473,10 +1486,28 @@ mod tests {
 
     #[test]
     fn test_krafka_error_protocol_retriable_via_kind() {
-        assert!(KrafkaError::protocol("CRC mismatch: a vs b").is_retriable());
-        assert!(KrafkaError::protocol("not enough bytes for header").is_retriable());
-        assert!(!KrafkaError::protocol("no mutually supported Produce API version").is_retriable());
-        assert!(!KrafkaError::protocol("invalid UTF-8 string").is_retriable());
+        assert!(
+            KrafkaError::protocol_kind(ProtocolErrorKind::CrcMismatch, "CRC mismatch: a vs b")
+                .is_retriable()
+        );
+        assert!(
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
+                "not enough bytes for header"
+            )
+            .is_retriable()
+        );
+        assert!(
+            !KrafkaError::protocol_kind(
+                ProtocolErrorKind::UnknownApiVersion,
+                "no mutually supported Produce API version"
+            )
+            .is_retriable()
+        );
+        assert!(
+            !KrafkaError::protocol_kind(ProtocolErrorKind::InvalidUtf8, "invalid UTF-8 string")
+                .is_retriable()
+        );
     }
 
     #[test]

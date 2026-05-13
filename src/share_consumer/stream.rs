@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures_core::Stream;
+use futures_core::stream::FusedStream;
 
 use super::ShareConsumer;
 use crate::consumer::ConsumerRecord;
@@ -17,9 +18,14 @@ type RecvFuture<'a> = Pin<Box<dyn Future<Output = Result<Option<ConsumerRecord>>
 /// Created by [`ShareConsumer::stream()`]. Each call to `poll_next` drives
 /// the consumer's `recv()` method, which internally calls `poll()` when the
 /// internal buffer is empty.
+///
+/// This type also implements [`FusedStream`], so stream combinators such as
+/// `futures::stream::select` can detect termination without an extra poll.
 pub struct ShareConsumerStream<'a> {
     consumer: &'a ShareConsumer,
     fut: Option<RecvFuture<'a>>,
+    /// Set to `true` once `recv()` returns `Ok(None)` (consumer closed).
+    done: bool,
 }
 
 impl<'a> ShareConsumerStream<'a> {
@@ -27,6 +33,7 @@ impl<'a> ShareConsumerStream<'a> {
         Self {
             consumer,
             fut: None,
+            done: false,
         }
     }
 }
@@ -36,6 +43,10 @@ impl Stream for ShareConsumerStream<'_> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+
+        if this.done {
+            return Poll::Ready(None);
+        }
 
         let fut = this
             .fut
@@ -47,10 +58,23 @@ impl Stream for ShareConsumerStream<'_> {
                 this.fut = None;
                 match result {
                     Ok(Some(record)) => Poll::Ready(Some(Ok(record))),
-                    Ok(None) => Poll::Ready(None),
+                    Ok(None) => {
+                        this.done = true;
+                        Poll::Ready(None)
+                    }
                     Err(e) => Poll::Ready(Some(Err(e))),
                 }
             }
         }
+    }
+}
+
+impl FusedStream for ShareConsumerStream<'_> {
+    /// Returns `true` after the share consumer has been closed.
+    ///
+    /// Stream combinators (e.g. `select`, `merge`) use this to short-circuit
+    /// polling after the consumer shuts down.
+    fn is_terminated(&self) -> bool {
+        self.done
     }
 }
