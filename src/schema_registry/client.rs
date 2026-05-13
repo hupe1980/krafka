@@ -494,6 +494,11 @@ fn reject_embedded_credentials(url: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+fn masked_userinfo_indicator(_userinfo: &str) -> &'static str {
+    "<***@>"
+}
+
 /// Kept for backward-compat with existing private call sites that need the
 /// old strip-and-normalize behaviour (builder `build()` path validates first,
 /// then normalizes; this is only used in tests now).
@@ -852,8 +857,7 @@ mod tests {
         assert!(err.to_string().contains("embedded credentials"));
     }
 
-    // masked_userinfo_indicator is still used by external callers or future
-    // log contexts, keep its correctness test.
+    // Keep this test-only helper's behavior stable.
     #[test]
     fn test_masked_userinfo_indicator_never_reveals_userinfo() {
         assert_eq!(masked_userinfo_indicator("admin:s3cret"), "<***@>");
