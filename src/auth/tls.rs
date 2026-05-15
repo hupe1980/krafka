@@ -30,7 +30,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
-#[cfg(feature = "danger-insecure-tls")]
+#[cfg(any(feature = "danger-insecure-tls", feature = "native-tls-roots"))]
 use tracing::warn;
 
 use crate::auth::TlsConfig;

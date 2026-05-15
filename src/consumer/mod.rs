@@ -4520,6 +4520,19 @@ impl ConsumerBuilder {
         self
     }
 
+    /// Set the high-watermark staleness threshold used by [`Consumer::lag`].
+    ///
+    /// A partition's high watermark is considered stale when it has not been
+    /// refreshed within this duration. Stale partitions are reported in
+    /// [`LagResult::stale_partitions`] so callers can decide whether to trust
+    /// the lag value.
+    ///
+    /// Default: 60 seconds.
+    pub fn lag_staleness_threshold(mut self, threshold: Duration) -> Self {
+        self.config.lag_staleness_threshold = threshold;
+        self
+    }
+
     /// Set the client rack ID for closest-replica fetching (KIP-392).
     ///
     /// When configured, the consumer includes its rack in fetch requests.
