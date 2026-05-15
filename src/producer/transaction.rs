@@ -1887,7 +1887,7 @@ impl TransactionalProducerBuilder {
     ///
     /// Default: 3.
     pub fn retries(mut self, retries: u32) -> Self {
-        self.retry_policy.max_retries = retries;
+        self.retry_policy = self.retry_policy.with_max_retries(retries);
         self
     }
 
@@ -1896,7 +1896,7 @@ impl TransactionalProducerBuilder {
     /// Used as the base interval for exponential back-off between retries.
     /// Default: 100 ms.
     pub fn retry_backoff(mut self, backoff: Duration) -> Self {
-        self.retry_policy.backoff.initial_backoff = backoff;
+        self.retry_policy = self.retry_policy.with_initial_backoff(backoff);
         self
     }
 
