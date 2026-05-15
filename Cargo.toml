@@ -1,6 +1,6 @@
 [package]
 name = "krafka"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 rust-version = "1.88"
 authors = ["hupe1980"]
@@ -67,7 +67,6 @@ subtle = "2"
 # TLS/SSL support
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
-rustls-pemfile = "2"
 webpki-roots = "0.26"
 rustls-native-certs = { version = "0.8", optional = true }
 
@@ -75,9 +74,13 @@ rustls-native-certs = { version = "0.8", optional = true }
 # Note: The aws-config crate adds ~2-3 MB to binary size (release build).
 # For smaller binaries, use AwsMskIamCredentials::from_env() which
 # works without the aws-msk feature (manual credential loading).
-aws-config = { version = "1", optional = true }
+# Keep aws-config focused on the credential providers CLI/client apps expect
+# (credentials-process, sso) and opt both AWS crates into the modern HTTPS
+# client explicitly; aws-sdk-glue disables default features so it cannot pull
+# in the legacy Smithy Rustls transport path.
+aws-config = { version = "1", optional = true, default-features = false, features = ["credentials-process", "default-https-client", "rt-tokio", "sso"] }
 aws-credential-types = { version = "1", optional = true }
-aws-sdk-glue = { version = "1", optional = true }
+aws-sdk-glue = { version = "1", optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 arc-swap = "1.9.0"
 
 # SOCKS5 proxy support (optional)

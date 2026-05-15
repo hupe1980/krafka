@@ -110,7 +110,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! krafka = { version = "0.9.0", default-features = false, features = ["lz4"] }
+//! krafka = { version = "0.9.1", default-features = false, features = ["lz4"] }
 //! ```
 
 #![cfg_attr(docsrs, feature(doc_cfg))]

@@ -9,7 +9,6 @@
 //! async API in a single `spawn_blocking` call per operation.
 
 use std::fs::File;
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -20,13 +19,13 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::CryptoProvider;
 #[cfg(feature = "danger-insecure-tls")]
 use rustls::pki_types::UnixTime;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ConfigBuilder, RootCertStore};
 #[cfg(feature = "danger-insecure-tls")]
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 #[cfg(feature = "native-tls-roots")]
 use rustls_native_certs::load_native_certs;
-use rustls_pemfile::{certs, private_key};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -242,13 +241,10 @@ fn finish_with_client_auth(
 
 /// Load certificates from a PEM file.
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let file = File::open(Path::new(path))
-        .map_err(|e| KrafkaError::config(format!("Failed to open cert file {path}: {e}")))?;
-    let mut reader = BufReader::new(file);
-
-    certs(&mut reader)
-        .map(|c| c.map_err(|e| KrafkaError::config(format!("Failed to parse cert: {e}"))))
-        .collect()
+    CertificateDer::pem_file_iter(Path::new(path))
+        .map_err(|e| KrafkaError::config(format!("Failed to open cert file {path}: {e}")))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| KrafkaError::config(format!("Failed to parse cert file {path}: {e}")))
 }
 
 /// Load a private key from a PEM file.
@@ -273,11 +269,8 @@ fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
         }
     }
 
-    let mut reader = BufReader::new(file);
-
-    private_key(&mut reader)
-        .map_err(|e| KrafkaError::config(format!("Failed to read private key: {e}")))?
-        .ok_or_else(|| KrafkaError::config("No private key found in file"))
+    PrivateKeyDer::from_pem_file(Path::new(path))
+        .map_err(|e| KrafkaError::config(format!("Failed to read private key file {path}: {e}")))
 }
 
 /// Load root certificate store.
