@@ -1775,6 +1775,7 @@ fn should_refresh_metadata_after_txn_send_error(error: &KrafkaError) -> bool {
 #[must_use = "builders do nothing until .build() is called"]
 pub struct TransactionalProducerBuilder {
     config: TransactionalProducerConfig,
+    retry_policy: RetryPolicy,
     partitioner: Option<Arc<dyn Partitioner>>,
     key_encoder: Option<Arc<dyn SchemaEncoder>>,
     value_encoder: Option<Arc<dyn SchemaEncoder>>,
@@ -1882,6 +1883,23 @@ impl TransactionalProducerBuilder {
         self
     }
 
+    /// Set the maximum number of retries for retriable errors.
+    ///
+    /// Default: 3.
+    pub fn retries(mut self, retries: u32) -> Self {
+        self.retry_policy = self.retry_policy.with_max_retries(retries);
+        self
+    }
+
+    /// Set the initial retry backoff duration.
+    ///
+    /// Used as the base interval for exponential back-off between retries.
+    /// Default: 100 ms.
+    pub fn retry_backoff(mut self, backoff: Duration) -> Self {
+        self.retry_policy = self.retry_policy.with_initial_backoff(backoff);
+        self
+    }
+
     /// Build the transactional producer.
     pub async fn build(self) -> Result<TransactionalProducer> {
         if self.config.bootstrap_servers.is_empty() {
@@ -1958,7 +1976,7 @@ impl TransactionalProducerBuilder {
             coordinator_id: RwLock::new(None),
             txn_partitions: Arc::new(RwLock::new(TransactionPartitions::default())),
             identity: ProducerIdentity::new(),
-            retry_policy: RetryPolicy::default(),
+            retry_policy: self.retry_policy,
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
             key_encoder: self.key_encoder,
             value_encoder: self.value_encoder,
