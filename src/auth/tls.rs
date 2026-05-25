@@ -192,6 +192,21 @@ fn build_tls_config_sync(config: &TlsConfig) -> Result<ClientConfig> {
     if !config.verify_server_cert {
         #[cfg(feature = "danger-insecure-tls")]
         {
+            // In production builds, require an explicit opt-in env var so that
+            // accidentally-enabled insecure TLS fails loudly at runtime rather
+            // than silently.  Test builds skip this check: they can't safely
+            // mutate env vars (unsafe in edition 2024) and the compile-time
+            // feature flag is sufficient protection in a test context.
+            #[cfg(not(test))]
+            if std::env::var("KRAFKA_I_ACCEPT_DANGER_TLS").as_deref() != Ok("1") {
+                return Err(KrafkaError::config(
+                    "The 'danger-insecure-tls' feature is active but the required \
+                     acknowledgement env var is not set. \
+                     Set KRAFKA_I_ACCEPT_DANGER_TLS=1 to confirm you accept the security risk \
+                     of disabled TLS certificate verification. \
+                     Do NOT use in production.",
+                ));
+            }
             use std::sync::Once;
             static WARN_ONCE: Once = Once::new();
             WARN_ONCE.call_once(|| {
@@ -363,12 +378,20 @@ fn load_client_auth(
 }
 
 /// Resolve the crypto provider: prefer the globally-installed default,
-/// fall back to the ring provider.
+/// fall back to the compiled-in backend (ring by default, aws-lc-rs when
+/// the `rustls-aws-lc-rs` feature is enabled).
 #[cfg(feature = "danger-insecure-tls")]
 fn resolve_crypto_provider() -> Arc<CryptoProvider> {
-    CryptoProvider::get_default()
-        .cloned()
-        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()))
+    CryptoProvider::get_default().cloned().unwrap_or_else(|| {
+        #[cfg(feature = "rustls-aws-lc-rs")]
+        {
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+        }
+        #[cfg(not(feature = "rustls-aws-lc-rs"))]
+        {
+            Arc::new(rustls::crypto::ring::default_provider())
+        }
+    })
 }
 
 /// Create the insecure builder that skips certificate verification.
@@ -463,7 +486,10 @@ mod tests {
     use super::*;
 
     fn setup_crypto_provider() {
-        // Install the ring crypto provider for tests
+        // Install the default crypto provider for tests.
+        #[cfg(feature = "rustls-aws-lc-rs")]
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        #[cfg(not(feature = "rustls-aws-lc-rs"))]
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
 
@@ -494,6 +520,8 @@ mod tests {
     #[cfg(feature = "danger-insecure-tls")]
     fn test_build_tls_config_insecure_succeeds() {
         setup_crypto_provider();
+        // The env-var check is skipped in #[cfg(test)] builds; the feature
+        // flag is the sufficient compile-time guard.
         let config = TlsConfig::insecure();
         let result = build_tls_config_sync(&config);
         assert!(

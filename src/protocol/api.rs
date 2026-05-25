@@ -6,6 +6,7 @@ use bytes::{Buf, BufMut};
 
 use super::primitives::{Decode, Encode, KafkaArray, KafkaString, TaggedFields, TryEncode};
 use crate::error::Result;
+use crate::util::varint;
 
 /// Maximum number of supported features we'll accept from a broker.
 const MAX_SUPPORTED_FEATURES: usize = 256;
@@ -557,8 +558,8 @@ impl Encode for ApiVersionRange {
 
     fn encode_compact(&self, buf: &mut impl BufMut) {
         self.encode(buf);
-        // Empty tagged fields for flexible versions.
-        TaggedFields::default().encode(buf);
+        // Empty tagged fields for flexible versions (count=0 as unsigned varint).
+        varint::encode_unsigned_varint(0, buf);
     }
 }
 

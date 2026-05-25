@@ -62,6 +62,12 @@ struct TopicSession {
     /// Topic name — always stored so wire requests can be built correctly
     /// even when the primary session key is a UUID.
     name: String,
+    /// Non-zero UUID when the session is keyed by UUID (Fetch v13+, KIP-516).
+    ///
+    /// Stored here so that `FetchForgottenTopic` entries for removed topics
+    /// can carry the correct `topic_id` even after the topic is no longer in
+    /// the `desired` list.
+    uuid: Option<[u8; 16]>,
     /// Per-partition fetch state.
     partitions: HashMap<PartitionId, PartitionState>,
 }
@@ -176,10 +182,11 @@ impl FetchSessionState {
         // it is bumped by update_from_response() after a successful response.
         let epoch = self.epoch;
 
-        // Build a keyed map of the desired partitions for O(1) lookup.
-        // Key matches the scheme used to store session state: UUID when
-        // available, topic name otherwise.
-        let total: usize = desired.iter().map(|t| t.partitions.len()).sum();
+        // Build a keyed map of the desired partitions for O(1) diff lookups
+        // and removed-partition detection.  Keyed the same way session state
+        // is stored (UUID when available, topic name otherwise) to ensure
+        // correct matching.  This single map replaces both the `changed`
+        // HashMap and the `desired_keys` HashSet used in a previous version.
         let mut desired_map: HashMap<SessionKey, HashMap<PartitionId, &FetchPartitionRequest>> =
             HashMap::with_capacity(desired.len());
         for topic in desired {
@@ -190,93 +197,71 @@ impl FetchSessionState {
                 part_map.insert(part.partition, part);
             }
         }
-        let _ = total; // capacity hint used above
 
         // 1. Find new or changed partitions.
-        let mut changed: HashMap<&str, Vec<FetchPartitionRequest>> = HashMap::new();
+        // Builds the output Vec<FetchTopicRequest> directly — no intermediate
+        // HashMap allocation.
+        let mut topics: Vec<FetchTopicRequest> = Vec::new();
         for topic in desired {
             let key = SessionKey::from_request(topic);
             let session_topic = self.topics.get(&key);
-            for part in &topic.partitions {
-                let is_new_or_changed =
+            let changed_partitions: Vec<FetchPartitionRequest> = topic
+                .partitions
+                .iter()
+                .filter(|part| {
                     match session_topic.and_then(|t| t.partitions.get(&part.partition)) {
                         None => true,
                         Some(prev) => {
                             prev.fetch_offset != part.fetch_offset
                                 || prev.partition_max_bytes != part.partition_max_bytes
                         }
-                    };
-                if is_new_or_changed {
-                    changed
-                        .entry(topic.topic.as_str())
-                        .or_default()
-                        .push(part.clone());
-                }
+                    }
+                })
+                .cloned()
+                .collect();
+            if !changed_partitions.is_empty() {
+                topics.push(FetchTopicRequest {
+                    topic: topic.topic.clone(),
+                    topic_id: topic.topic_id,
+                    partitions: changed_partitions,
+                });
             }
         }
 
         // 2. Find removed topics/partitions.
-        let desired_keys: HashSet<SessionKey> =
-            desired.iter().map(SessionKey::from_request).collect();
-        let mut forgotten_map: HashMap<&str, Vec<i32>> = HashMap::new();
+        // Uses desired_map for O(1) lookup — eliminates a separate HashSet
+        // allocation.  Uses session_topic.uuid for the forgotten-topic entry
+        // so that UUID-keyed sessions (Fetch v13+, KIP-516) send the correct
+        // topic_id to the broker even when the topic is no longer in `desired`.
+        let mut forgotten_topics: Vec<FetchForgottenTopic> = Vec::new();
         for (key, session_topic) in &self.topics {
-            if desired_keys.contains(key) {
+            if let Some(desired_parts) = desired_map.get(key) {
                 // Topic still present — check for removed partitions.
-                let desired_parts = desired_map.get(key);
-                for &partition in session_topic.partitions.keys() {
-                    let still_wanted = desired_parts.and_then(|m| m.get(&partition)).is_some();
-                    if !still_wanted {
-                        forgotten_map
-                            .entry(session_topic.name.as_str())
-                            .or_default()
-                            .push(partition);
-                    }
+                let removed: Vec<i32> = session_topic
+                    .partitions
+                    .keys()
+                    .copied()
+                    .filter(|p| !desired_parts.contains_key(p))
+                    .collect();
+                if !removed.is_empty() {
+                    forgotten_topics.push(FetchForgottenTopic {
+                        topic: session_topic.name.clone(),
+                        topic_id: session_topic.uuid,
+                        partitions: removed,
+                    });
                 }
             } else {
                 // Entire topic removed.
                 let parts: Vec<i32> = session_topic.partitions.keys().copied().collect();
                 if !parts.is_empty() {
-                    forgotten_map
-                        .entry(session_topic.name.as_str())
-                        .or_default()
-                        .extend(parts);
+                    forgotten_topics.push(FetchForgottenTopic {
+                        topic: session_topic.name.clone(),
+                        topic_id: session_topic.uuid,
+                        partitions: parts,
+                    });
                 }
             }
         }
-
-        // Build a name → UUID lookup so we can set `topic_id` correctly in both
-        // the changed-topics and forgotten-topics lists.
-        //
-        // KIP-516: when Fetch v13+ sessions are keyed by UUID the broker uses
-        // `topic_id` as the primary key; sending `topic_id: None` in incremental
-        // or forgotten-topic entries causes the broker to treat those entries as
-        // name-keyed, silently mismatching the UUID-keyed session state.
-        let name_to_uuid: HashMap<&str, [u8; 16]> = desired
-            .iter()
-            .filter_map(|t| {
-                t.topic_id
-                    .filter(|id| *id != ZERO_UUID)
-                    .map(|id| (t.topic.as_str(), id))
-            })
-            .collect();
-
-        let topics: Vec<FetchTopicRequest> = changed
-            .into_iter()
-            .map(|(name, partitions)| FetchTopicRequest {
-                topic: name.to_string(),
-                topic_id: name_to_uuid.get(name).copied(),
-                partitions,
-            })
-            .collect();
-
-        let forgotten_topics: Vec<FetchForgottenTopic> = forgotten_map
-            .into_iter()
-            .map(|(name, partitions)| FetchForgottenTopic {
-                topic: name.to_string(),
-                topic_id: name_to_uuid.get(name).copied(),
-                partitions,
-            })
-            .collect();
 
         FetchSessionRequest {
             session_id: self.session_id,
@@ -329,6 +314,7 @@ impl FetchSessionState {
                 key,
                 TopicSession {
                     name: topic.topic.clone(),
+                    uuid: topic.topic_id.filter(|id| *id != ZERO_UUID),
                     partitions,
                 },
             );

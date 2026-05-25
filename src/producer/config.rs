@@ -1,8 +1,10 @@
 //! Producer configuration.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::auth::AuthConfig;
+use crate::dlq::DeadLetterQueue;
 use crate::error::{KrafkaError, Result};
 use crate::metadata::MetadataRecoveryStrategy;
 use crate::protocol::Compression;
@@ -116,6 +118,12 @@ pub struct ProducerConfig {
     /// SOCKS5 proxy configuration (optional).
     #[cfg(feature = "socks5")]
     pub(crate) proxy: Option<crate::network::ProxyConfig>,
+    /// Optional dead-letter queue for permanently-failed records.
+    ///
+    /// When set, records that exhaust all retries (or encounter a
+    /// non-retriable error) on the direct-send path are routed to this DLQ
+    /// before the error is returned to the caller.
+    pub(crate) dead_letter_queue: Option<Arc<dyn DeadLetterQueue>>,
 }
 
 impl Default for ProducerConfig {
@@ -143,6 +151,7 @@ impl Default for ProducerConfig {
             auth: None,
             #[cfg(feature = "socks5")]
             proxy: None,
+            dead_letter_queue: None,
         }
     }
 }
@@ -475,6 +484,22 @@ impl ProducerConfigBuilder {
     /// Only effective when [`MetadataRecoveryStrategy::Rebootstrap`] is set.
     pub fn metadata_recovery_rebootstrap_trigger(mut self, duration: Duration) -> Self {
         self.config.metadata_recovery_rebootstrap_trigger = duration;
+        self
+    }
+
+    /// Set a dead-letter queue for permanently-failed records.
+    ///
+    /// When set, records that exhaust all retries (or encounter a non-retriable
+    /// error) on the direct-send path are routed to `dlq` before the error is
+    /// returned to the caller. The DLQ call is fire-and-forget: errors during
+    /// routing are handled by the implementation.
+    ///
+    /// The DLQ is **not** invoked for accumulator-path failures (linger > 0)
+    /// because batched records are not individually available after batching.
+    /// For accumulator-path DLQ integration, use the `on_acknowledgement`
+    /// interceptor hook together with a `DeadLetterQueue` implementation.
+    pub fn dead_letter_queue(mut self, dlq: Arc<dyn DeadLetterQueue>) -> Self {
+        self.config.dead_letter_queue = Some(dlq);
         self
     }
 

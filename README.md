@@ -10,7 +10,7 @@ A pure Rust, async-native Apache Kafka client designed for high performance, saf
 
 ## ✨ Features
 
-- 🦀 **Pure Rust**: No librdkafka or C dependencies
+- 🦀 **Pure Rust by default**: No librdkafka or C dependencies; the optional `zstd` compression feature requires a C toolchain via `zstd-sys`
 - ⚡ **Async-native**: Built on Tokio for true async I/O
 - 🔒 **Zero unsafe**: Safe Rust by default
 - 🚀 **High performance**: Zero-copy buffers, inline hot paths, efficient batching, concurrent batch flushing

@@ -320,22 +320,6 @@ impl From<Option<String>> for KafkaString {
     }
 }
 
-// NOTE: Internal call sites use `TryEncode::try_encode()` instead.
-// This `Encode` impl exists for trait-bound compatibility.
-// PANIC: The `.expect()` triggers if `.encode()` is called on an oversized string.
-#[allow(clippy::expect_used)]
-impl Encode for KafkaString {
-    fn encode(&self, buf: &mut impl BufMut) {
-        self.try_encode(buf)
-            .expect("KafkaString exceeds protocol size limit; validate before encoding")
-    }
-
-    fn encode_compact(&self, buf: &mut impl BufMut) {
-        self.try_encode_compact(buf)
-            .expect("compact KafkaString exceeds protocol size limit; validate before encoding")
-    }
-}
-
 impl TryEncode for KafkaString {
     fn try_encode(&self, buf: &mut impl BufMut) -> Result<()> {
         match &self.0 {
@@ -479,22 +463,6 @@ impl From<&[u8]> for KafkaBytes {
     }
 }
 
-// NOTE: Internal call sites use `TryEncode::try_encode()` instead.
-// This `Encode` impl exists for trait-bound compatibility.
-// PANIC: The `.expect()` triggers if `.encode()` is called on an oversized byte buffer.
-#[allow(clippy::expect_used)]
-impl Encode for KafkaBytes {
-    fn encode(&self, buf: &mut impl BufMut) {
-        self.try_encode(buf)
-            .expect("KafkaBytes exceeds protocol size limit; validate before encoding")
-    }
-
-    fn encode_compact(&self, buf: &mut impl BufMut) {
-        self.try_encode_compact(buf)
-            .expect("compact KafkaBytes exceeds protocol size limit; validate before encoding")
-    }
-}
-
 impl TryEncode for KafkaBytes {
     fn try_encode(&self, buf: &mut impl BufMut) -> Result<()> {
         match &self.0 {
@@ -627,41 +595,6 @@ impl<T> From<Vec<T>> for KafkaArray<T> {
     }
 }
 
-// NOTE: Internal call sites use `TryEncode::try_encode()` instead.
-// This `Encode` impl exists for trait-bound compatibility.
-// PANIC: The `.expect()` triggers if `.encode()` is called on an oversized array.
-#[allow(clippy::expect_used)]
-impl<T: Encode> Encode for KafkaArray<T> {
-    fn encode(&self, buf: &mut impl BufMut) {
-        match &self.0 {
-            None => buf.put_i32(-1),
-            Some(items) => {
-                let len = i32::try_from(items.len())
-                    .expect("KafkaArray exceeds protocol size limit; validate before encoding");
-                buf.put_i32(len);
-                for item in items {
-                    item.encode(buf);
-                }
-            }
-        }
-    }
-
-    fn encode_compact(&self, buf: &mut impl BufMut) {
-        match &self.0 {
-            None => varint::encode_unsigned_varint(0, buf),
-            Some(items) => {
-                let len_plus_one = u32::try_from(items.len().saturating_add(1)).expect(
-                    "compact KafkaArray exceeds protocol size limit; validate before encoding",
-                );
-                varint::encode_unsigned_varint(len_plus_one, buf);
-                for item in items {
-                    item.encode_compact(buf);
-                }
-            }
-        }
-    }
-}
-
 impl<T: TryEncode> TryEncode for KafkaArray<T> {
     fn try_encode(&self, buf: &mut impl BufMut) -> Result<()> {
         match &self.0 {
@@ -776,17 +709,6 @@ pub struct TaggedField {
     pub data: Bytes,
 }
 
-// NOTE: Internal call sites use `TryEncode::try_encode()` instead.
-// This `Encode` impl exists for trait-bound compatibility.
-// PANIC: The `.expect()` triggers if `.encode()` is called on oversized tagged fields.
-#[allow(clippy::expect_used)]
-impl Encode for TaggedFields {
-    fn encode(&self, buf: &mut impl BufMut) {
-        self.try_encode(buf)
-            .expect("TaggedFields exceeds protocol size limit; validate before encoding")
-    }
-}
-
 impl TryEncode for TaggedFields {
     fn try_encode(&self, buf: &mut impl BufMut) -> Result<()> {
         let count = u32::try_from(self.0.len()).map_err(|_| {
@@ -896,14 +818,14 @@ mod tests {
         // Non-null string
         let mut buf = BytesMut::new();
         let s = KafkaString::new("hello");
-        s.encode(&mut buf);
+        s.try_encode(&mut buf).unwrap();
         let decoded = KafkaString::decode(&mut buf.freeze()).unwrap();
         assert_eq!(decoded.as_str(), Some("hello"));
 
         // Null string
         let mut buf = BytesMut::new();
         let s = KafkaString::null();
-        s.encode(&mut buf);
+        s.try_encode(&mut buf).unwrap();
         let decoded = KafkaString::decode(&mut buf.freeze()).unwrap();
         assert!(decoded.is_null());
     }
@@ -913,14 +835,14 @@ mod tests {
         // Non-null string
         let mut buf = BytesMut::new();
         let s = KafkaString::new("hello");
-        s.encode_compact(&mut buf);
+        s.try_encode_compact(&mut buf).unwrap();
         let decoded = KafkaString::decode_compact(&mut buf.freeze()).unwrap();
         assert_eq!(decoded.as_str(), Some("hello"));
 
         // Null string
         let mut buf = BytesMut::new();
         let s = KafkaString::null();
-        s.encode_compact(&mut buf);
+        s.try_encode_compact(&mut buf).unwrap();
         let decoded = KafkaString::decode_compact(&mut buf.freeze()).unwrap();
         assert!(decoded.is_null());
     }
@@ -930,14 +852,14 @@ mod tests {
         // Non-null bytes
         let mut buf = BytesMut::new();
         let b = KafkaBytes::new(vec![1, 2, 3, 4]);
-        b.encode(&mut buf);
+        b.try_encode(&mut buf).unwrap();
         let decoded = KafkaBytes::decode(&mut buf.freeze()).unwrap();
         assert_eq!(decoded.as_bytes(), Some(&Bytes::from_static(&[1, 2, 3, 4])));
 
         // Null bytes
         let mut buf = BytesMut::new();
         let b = KafkaBytes::null();
-        b.encode(&mut buf);
+        b.try_encode(&mut buf).unwrap();
         let decoded = KafkaBytes::decode(&mut buf.freeze()).unwrap();
         assert!(decoded.is_null());
     }
@@ -947,14 +869,14 @@ mod tests {
         // Non-null array
         let mut buf = BytesMut::new();
         let arr = KafkaArray::new(vec![1i32, 2, 3]);
-        arr.encode(&mut buf);
+        arr.try_encode(&mut buf).unwrap();
         let decoded = KafkaArray::<i32>::decode(&mut buf.freeze()).unwrap();
         assert_eq!(decoded.items(), Some([1i32, 2, 3].as_slice()));
 
         // Null array
         let mut buf = BytesMut::new();
         let arr: KafkaArray<i32> = KafkaArray::null();
-        arr.encode(&mut buf);
+        arr.try_encode(&mut buf).unwrap();
         let decoded = KafkaArray::<i32>::decode(&mut buf.freeze()).unwrap();
         assert!(decoded.is_null());
     }
@@ -972,7 +894,7 @@ mod tests {
                 data: Bytes::from_static(b"data"),
             },
         ]);
-        fields.encode(&mut buf);
+        fields.try_encode(&mut buf).unwrap();
         let decoded = TaggedFields::decode(&mut buf.freeze()).unwrap();
         assert_eq!(decoded.0.len(), 2);
         assert_eq!(decoded.0[0].tag, 0);
@@ -980,13 +902,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "KafkaString length")]
     fn test_kafka_string_encode_rejects_oversized() {
-        // Strings > i16::MAX bytes must not silently truncate
+        // Strings > i16::MAX bytes must not silently truncate — try_encode returns Err
         let big = "x".repeat(i16::MAX as usize + 1);
         let ks = KafkaString::from(big);
         let mut buf = BytesMut::new();
-        ks.encode(&mut buf);
+        assert!(ks.try_encode(&mut buf).is_err());
     }
 
     #[test]
@@ -995,7 +916,7 @@ mod tests {
         let s = "a".repeat(i16::MAX as usize);
         let ks = KafkaString::from(s.clone());
         let mut buf = BytesMut::new();
-        ks.encode(&mut buf);
+        ks.try_encode(&mut buf).unwrap();
         // Verify: 2-byte length prefix + string bytes
         assert_eq!(buf.len(), 2 + s.len());
         let decoded = KafkaString::decode(&mut buf.freeze()).unwrap();

@@ -1,5 +1,5 @@
 ---
-applyTo: "src/admin.rs"
+applyTo: "src/admin/**"
 description: "Use when editing admin client: API version constraints, result error handling, and destructive operation awareness."
 ---
 

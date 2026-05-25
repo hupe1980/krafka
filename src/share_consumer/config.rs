@@ -35,6 +35,8 @@ pub enum AcknowledgeType {
     Release = 2,
     /// Reject the record (move to dead-letter topic or discard). Wire value: 3.
     Reject = 3,
+    /// Archive the record (move to archive storage, no redelivery). Wire value: 4.
+    Archive = 4,
 }
 
 impl AcknowledgeType {

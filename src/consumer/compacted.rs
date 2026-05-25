@@ -53,13 +53,15 @@
 
 use ahash::AHashMap as HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 use tracing::{debug, info};
 
 use super::record::ConsumerRecord;
-use super::{AutoOffsetReset, Consumer};
+use super::{AutoOffsetReset, Consumer, ConsumerRebalanceListener, TopicPartition};
 use crate::auth::AuthConfig;
 use crate::error::{KrafkaError, Result};
 use crate::{Offset, PartitionId, Timestamp};
@@ -126,6 +128,65 @@ pub struct CompactedTableSnapshot {
     /// attached); use [`CompactedTopicConsumer::metrics_snapshot()`] to
     /// obtain an accurate `caught_up` value.
     pub caught_up: bool,
+}
+
+/// A [`ConsumerRebalanceListener`] that automatically clears a shared
+/// [`CompactedTable`] whenever partitions are revoked or lost.
+///
+/// This is the recommended way to integrate a [`CompactedTable`] with a
+/// group-coordinated [`Consumer`]: wrap the table in an
+/// `Arc<Mutex<CompactedTable>>`, share a clone with this listener, and
+/// register the listener on the consumer before subscribing.
+///
+/// When partitions are revoked, the table is cleared so that keys loaded
+/// from the revoked partitions do not persist into the next assignment.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use std::sync::Arc;
+/// use parking_lot::Mutex;
+/// use krafka::consumer::{Consumer, CompactedTable, CompactedTableClearListener};
+///
+/// let table = Arc::new(Mutex::new(CompactedTable::new()));
+/// let listener = CompactedTableClearListener::new(Arc::clone(&table));
+///
+/// let consumer = Consumer::builder()
+///     .bootstrap_servers("localhost:9092")
+///     .group_id("my-group")
+///     .rebalance_listener(listener)
+///     .build()
+///     .await?;
+/// consumer.subscribe(&["config-topic"]).await?;
+///
+/// loop {
+///     let records = consumer.poll(Duration::from_secs(1)).await?;
+///     let mut t = table.lock();
+///     t.ingest(&records);
+/// }
+/// ```
+#[derive(Clone, Debug)]
+pub struct CompactedTableClearListener {
+    table: Arc<Mutex<CompactedTable>>,
+}
+
+impl CompactedTableClearListener {
+    /// Create a new listener that will clear `table` on partition revocation.
+    pub fn new(table: Arc<Mutex<CompactedTable>>) -> Self {
+        Self { table }
+    }
+}
+
+impl ConsumerRebalanceListener for CompactedTableClearListener {
+    async fn on_partitions_assigned(&self, _partitions: &[TopicPartition]) {}
+
+    async fn on_partitions_revoked(&self, _partitions: &[TopicPartition]) {
+        self.table.lock().clear();
+    }
+
+    async fn on_partitions_lost(&self, _partitions: &[TopicPartition]) {
+        self.table.lock().clear();
+    }
 }
 
 /// In-memory key→value table built from log-compacted Kafka records.

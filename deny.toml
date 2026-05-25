@@ -1,0 +1,86 @@
+# cargo-deny configuration for krafka.
+# Run: `cargo deny check` to audit licenses, bans, and advisories.
+# Install: `cargo install cargo-deny`
+
+[graph]
+# Resolve the dependency graph with all features enabled so we audit every
+# possible dependency, not just the default-feature subset.
+all-features = true
+
+# ---------------------------------------------------------------------------
+# License checks
+# ---------------------------------------------------------------------------
+[licenses]
+# Minimum confidence required to accept a license identified via SPDX
+# expression scanning (0.0–1.0).
+confidence-threshold = 0.8
+
+# List of explicitly allowed SPDX identifiers.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "MPL-2.0",        # ring uses OpenSSL + ISC; rustls uses same — kept for completeness
+    "Zlib",
+    "OpenSSL",        # ring's OpenSSL-licensed portions
+]
+
+# Copyleft licenses that must never appear in the dependency graph.
+deny = [
+    "GPL-1.0",
+    "GPL-2.0",
+    "GPL-3.0",
+    "LGPL-2.0",
+    "LGPL-2.1",
+    "LGPL-3.0",
+    "AGPL-1.0",
+    "AGPL-3.0",
+    "SSPL-1.0",
+    "BUSL-1.1",
+]
+
+# ---------------------------------------------------------------------------
+# Dependency bans
+# ---------------------------------------------------------------------------
+[bans]
+# Forbid multiple versions of the same crate (use skip/skip-tree for known ok).
+multiple-versions = "warn"
+
+# Crates that must never be included for security / correctness reasons.
+deny = [
+    # Unmaintained OpenSSL binding; prefer rustls.
+    { name = "openssl" },
+    # Old ring fork with a known soundness hole.
+    { name = "ring", wrappers = [] },
+]
+
+# Known acceptable duplicate crate versions introduced by the dependency tree
+# (e.g., transitive deps that haven't been updated yet).
+skip = []
+
+# ---------------------------------------------------------------------------
+# Security advisories
+# ---------------------------------------------------------------------------
+[advisories]
+# Fail on any unignored security vulnerability.
+version = 2
+# Path to a local advisory database clone (optional; omit to use GitHub fetch).
+# db-path = "~/.cargo/advisory-db"
+
+# Treat yanked crates as an error.
+yanked = "deny"
+
+# ---------------------------------------------------------------------------
+# Source allowlist
+# ---------------------------------------------------------------------------
+[sources]
+# Only allow crates from crates.io and the workspace itself.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -450,7 +450,7 @@ impl SaslAuthenticator {
     /// - [`AckThenFail`](ChallengeResponse::AckThenFail) — send the ack bytes, then
     ///   return the error **without** reading a response (the server may close immediately).
     /// - [`Done`](ChallengeResponse::Done) — handshake complete, nothing to send.
-    pub fn process_challenge(&mut self, challenge: &[u8]) -> Result<ChallengeResponse> {
+    pub async fn process_challenge(&mut self, challenge: &[u8]) -> Result<ChallengeResponse> {
         match self.mechanism {
             SaslMechanism::Plain => {
                 // PLAIN has no challenge-response, just initial auth
@@ -465,7 +465,7 @@ impl SaslAuthenticator {
                 // Process based on current state
                 match scram.state() {
                     crate::auth::ScramState::WaitingServerFirst => {
-                        let response = scram.process_server_first(challenge)?;
+                        let response = scram.process_server_first(challenge).await?;
                         Ok(ChallengeResponse::Continue(Zeroizing::new(response)))
                     }
                     crate::auth::ScramState::WaitingServerFinal => {
@@ -590,8 +590,8 @@ mod tests {
         assert!(!authenticator.is_complete());
     }
 
-    #[test]
-    fn test_sasl_authenticator_msk_iam() {
+    #[tokio::test]
+    async fn test_sasl_authenticator_msk_iam() {
         let auth = AuthConfig::aws_msk_iam("AKIAIOSFODNN7EXAMPLE", "secret", "us-east-1");
         let mut authenticator =
             SaslAuthenticator::new_msk_iam(&auth, "broker.kafka.us-east-1.amazonaws.com", 0)
@@ -613,7 +613,7 @@ mod tests {
         assert!(!authenticator.is_complete());
 
         // Process empty challenge (server acceptance)
-        authenticator.process_challenge(&[]).unwrap();
+        authenticator.process_challenge(&[]).await.unwrap();
         assert!(authenticator.is_complete());
     }
 
@@ -628,8 +628,8 @@ mod tests {
         assert_eq!(config.auth.sasl_mechanism, Some(SaslMechanism::AwsMskIam));
     }
 
-    #[test]
-    fn test_sasl_authenticator_oauthbearer() {
+    #[tokio::test]
+    async fn test_sasl_authenticator_oauthbearer() {
         let auth = AuthConfig::sasl_oauthbearer("my-jwt-token");
         let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None)
             .unwrap()
@@ -644,7 +644,7 @@ mod tests {
         assert!(!authenticator.is_complete());
 
         // Process empty challenge (server acceptance)
-        authenticator.process_challenge(&[]).unwrap();
+        authenticator.process_challenge(&[]).await.unwrap();
         assert!(authenticator.is_complete());
     }
 
@@ -663,8 +663,8 @@ mod tests {
         assert!(initial_str.ends_with("\x01\x01"));
     }
 
-    #[test]
-    fn test_sasl_authenticator_oauthbearer_server_error() {
+    #[tokio::test]
+    async fn test_sasl_authenticator_oauthbearer_server_error() {
         let auth = AuthConfig::sasl_oauthbearer("bad-token");
         let mut authenticator = SaslAuthenticator::new(&auth, ChannelBinding::None)
             .unwrap()
@@ -674,6 +674,7 @@ mod tests {
         // Server error returns AckThenFail: the \x01 byte and the auth error together.
         let result = authenticator
             .process_challenge(br#"{"status":"invalid_token"}"#)
+            .await
             .unwrap();
         match result {
             ChallengeResponse::AckThenFail { ack, error } => {

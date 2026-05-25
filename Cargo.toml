@@ -53,9 +53,6 @@ ahash = "0.8"
 # TCP keepalive configuration
 socket2 = "0.5"
 
-# Date/time parsing for AWS SigV4 clock-skew extraction from broker errors.
-time = { version = "0.3", default-features = false, features = ["std", "parsing", "macros"] }
-
 # Cryptography for SASL/SCRAM
 sha2 = "0.10"
 hmac = "0.12"
@@ -65,8 +62,8 @@ zeroize = { version = "1.8", features = ["derive"] }
 subtle = "2"
 
 # TLS/SSL support
-tokio-rustls = "0.26"
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 webpki-roots = "0.26"
 rustls-native-certs = { version = "0.8", optional = true }
 
@@ -86,13 +83,12 @@ arc-swap = "1.9.0"
 # SOCKS5 proxy support (optional)
 tokio-socks = { version = "0.5", optional = true }
 
-# Schema Registry HTTP client (optional)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+# JSON serialisation for schema registry (optional)
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 
 [features]
-default = ["compression"]
+default = ["compression", "ring"]
 # Enable pure-Rust compression codecs.
 compression = ["gzip", "snappy", "lz4"]
 # Enable all compression codecs, including zstd.
@@ -115,7 +111,7 @@ zstd = ["dep:zstd"]
 aws-msk = ["dep:aws-config", "dep:aws-credential-types"]
 # Enable the built-in Confluent Schema Registry HTTP client.
 # The core schema_registry module (wire format, trait, caching) is always available.
-schema-registry = ["dep:reqwest", "dep:serde", "dep:serde_json"]
+schema-registry = ["dep:serde", "dep:serde_json"]
 # Enable the AWS Glue Schema Registry SDK client.
 # The core glue module (wire format, trait, caching) is always available.
 # This feature adds the aws-sdk-glue dependency for direct Glue API calls
@@ -136,6 +132,13 @@ telemetry = []
 # Enable SOCKS5 proxy support for connecting to brokers through a proxy.
 # Useful for VPN/bastion host setups where brokers are not directly reachable.
 socks5 = ["dep:tokio-socks"]
+# Use the ring cryptography backend for TLS (default).
+# Mutually exclusive with `rustls-aws-lc-rs`.
+ring = ["rustls/ring", "tokio-rustls/ring"]
+# Use the aws-lc-rs cryptography backend for TLS instead of ring.
+# Prefer this on AWS Graviton / FIPS-compliant deployments.
+# Mutually exclusive with `ring`.
+rustls-aws-lc-rs = ["rustls/aws_lc_rs", "tokio-rustls/aws-lc-rs"]
 
 [dev-dependencies]
 tokio-test = "0.4"

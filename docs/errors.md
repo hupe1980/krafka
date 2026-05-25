@@ -533,3 +533,101 @@ impl CircuitBreaker {
 
 - [Configuration Reference](configuration.md) - Timeout and retry settings
 - [Architecture Overview](architecture.md) - How errors flow through the system
+
+---
+
+## Dead Letter Queue
+
+A _dead-letter queue_ (DLQ) receives records that cannot be processed or delivered. Krafka provides the `DeadLetterQueue` trait in the `krafka::dlq` module to plug in custom routing logic.
+
+### Producer-side DLQ
+
+Configure a DLQ on the producer to automatically route records to an error topic when all retry attempts are exhausted:
+
+```rust
+use std::pin::Pin;
+use std::future::Future;
+use std::sync::Arc;
+use krafka::dlq::DeadLetterQueue;
+use krafka::producer::{Producer, ProducerRecord};
+
+#[derive(Debug)]
+struct KafkaDlq {
+    producer: Producer,
+    dlq_topic: String,
+}
+
+impl DeadLetterQueue for KafkaDlq {
+    fn send(
+        &self,
+        mut record: ProducerRecord,
+        error: String,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        record.topic = self.dlq_topic.clone();
+        record.headers.push((
+            "__krafka.dlq.exception.message".to_string(),
+            bytes::Bytes::from(error),
+        ));
+        Box::pin(async move {
+            if let Err(e) = self.producer.send_record(record).await {
+                tracing::error!(error = %e, "Failed to route record to DLQ");
+            }
+        })
+    }
+}
+
+let dlq_producer = Producer::builder()
+    .bootstrap_servers("localhost:9092")
+    .build()
+    .await?;
+
+let producer = Producer::builder()
+    .bootstrap_servers("localhost:9092")
+    .dead_letter_queue(Arc::new(KafkaDlq {
+        producer: dlq_producer,
+        dlq_topic: "my-topic.DLQ".to_string(),
+    }))
+    .build()
+    .await?;
+```
+
+> **Note:** The producer DLQ is only invoked on the direct-send path (linger = 0). For the accumulator path (linger > 0), use the `on_acknowledgement` interceptor hook.
+
+### Consumer-side DLQ (poison pills)
+
+Use `build_dlq_record` to convert a failed consumer record into a producer record ready for DLQ routing. The helper attaches standard provenance headers:
+
+| Header | Value |
+|--------|-------|
+| `__krafka.dlq.original.topic` | original topic name |
+| `__krafka.dlq.original.partition` | partition number |
+| `__krafka.dlq.original.offset` | record offset |
+| `__krafka.dlq.exception.message` | error description |
+
+```rust
+use krafka::dlq::{DeadLetterQueue, build_dlq_record};
+use krafka::consumer::ConsumerRecord;
+use krafka::error::KrafkaError;
+
+async fn process_record(
+    record: ConsumerRecord,
+    dlq: &dyn DeadLetterQueue,
+) -> Result<(), KrafkaError> {
+    match decode_record(&record) {
+        Ok(decoded) => {
+            // normal processing
+            Ok(())
+        }
+        Err(e) => {
+            // Route to DLQ instead of blocking the consumer.
+            let dlq_record = build_dlq_record("my-topic.DLQ", &record, &e);
+            dlq.send(dlq_record, e.to_string()).await;
+            Ok(())  // continue consuming
+        }
+    }
+}
+```
+
+### Header Convention
+
+Krafka follows the [Kafka Streams DLQ header convention](https://kafka.apache.org/documentation/streams/) for provenance headers, using the `__krafka.dlq.*` prefix. The `build_dlq_record` helper populates these automatically.

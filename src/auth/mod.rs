@@ -475,7 +475,11 @@ impl TlsConfig {
     /// use with self-signed certs, prefer [`with_ca_cert()`](Self::with_ca_cert)
     /// to supply the CA certificate explicitly.
     ///
-    /// Requires the `danger-insecure-tls` crate feature.
+    /// Requires the `danger-insecure-tls` crate feature **and** the env var
+    /// `KRAFKA_I_ACCEPT_DANGER_TLS=1` must be set at runtime, otherwise
+    /// connection setup will return a config error.  This double opt-in
+    /// prevents accidental use of insecure TLS in production builds where the
+    /// feature flag was inadvertently left enabled.
     #[cfg(feature = "danger-insecure-tls")]
     #[cfg_attr(docsrs, doc(cfg(feature = "danger-insecure-tls")))]
     pub fn insecure() -> Self {

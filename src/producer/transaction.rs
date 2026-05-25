@@ -647,12 +647,17 @@ impl TransactionalProducer {
         expected: TransactionState,
         new: TransactionState,
     ) -> std::result::Result<(), TransactionState> {
+        // AcqRel on success: the stored new state is Released (visible to
+        // readers), and we Acquire the current state (see any prior writes).
+        // Acquire on failure: we Acquire the actual current state so callers
+        // can act on it without a separate load.  All downstream transaction
+        // data is behind an async Mutex, so no stronger ordering is needed.
         self.state
             .compare_exchange(
                 expected as u8,
                 new as u8,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
+                Ordering::AcqRel,
+                Ordering::Acquire,
             )
             .map(|_| ())
             .map_err(TransactionState::from)

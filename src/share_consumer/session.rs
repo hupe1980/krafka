@@ -21,9 +21,8 @@ pub const INITIAL_EPOCH: i32 = 0;
 
 /// Epoch value for closing a share session.
 ///
-/// Used when sending the final `ShareFetch` to a broker to tear down
-/// the session (not yet wired into `close()`).
-#[allow(dead_code)]
+/// Sent in the `share_session_epoch` field of a `ShareFetch` request to
+/// signal that the broker should release the server-side session immediately.
 pub(crate) const FINAL_EPOCH: i32 = -1;
 
 /// Per-broker share session state.
@@ -107,6 +106,18 @@ impl ShareSessionCache {
             session.reset();
         }
     }
+
+    /// Return the IDs of all brokers with an established session.
+    ///
+    /// Used during close to send FINAL_EPOCH ShareFetch requests that
+    /// allow brokers to release server-side session state promptly.
+    pub fn established_broker_ids(&self) -> Vec<BrokerId> {
+        self.sessions
+            .iter()
+            .filter(|(_, s)| s.established)
+            .map(|(&id, _)| id)
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -186,5 +197,21 @@ mod tests {
         cache.reset_all();
         assert_eq!(cache.get(1).unwrap().epoch(), INITIAL_EPOCH);
         assert_eq!(cache.get(2).unwrap().epoch(), INITIAL_EPOCH);
+    }
+
+    #[test]
+    fn established_broker_ids_returns_only_established() {
+        let mut cache = ShareSessionCache::new();
+        // Broker 1: established (on_success called).
+        cache.get_or_create(1).on_success();
+        // Broker 2: NOT established (just created, no success yet).
+        cache.get_or_create(2);
+        // Broker 3: was established, then reset.
+        cache.get_or_create(3).on_success();
+        cache.reset_broker(3);
+
+        let mut ids = cache.established_broker_ids();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1], "only broker 1 should be established");
     }
 }

@@ -844,6 +844,7 @@ let producer = Producer::builder()
 
 ## Next Steps
 
+- [Dead Letter Queue](errors.md#dead-letter-queue) - Route permanently-failed records to an error topic
 - [Interceptors Guide](interceptors.md) - Producer and consumer interceptor hooks
 - [Consumer Guide](consumer.md) - Learn about consuming messages
 - [Configuration Reference](configuration.md) - All producer options

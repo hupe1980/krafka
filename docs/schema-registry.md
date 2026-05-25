@@ -131,13 +131,13 @@ impl SchemaRegistryClient for MyRegistry {
     }
 
     async fn get_latest_schema(&self, subject: &str) -> Result<Schema> {
-        // ...
-        # todo!()
+        // Fetch the schema for the latest version of `subject`
+        todo!()
     }
 
     async fn get_schema_by_version(&self, subject: &str, version: SchemaVersion) -> Result<Schema> {
-        // ...
-        # todo!()
+        // Fetch the schema for a specific version of `subject`
+        todo!()
     }
 
     async fn register_schema(
@@ -147,8 +147,8 @@ impl SchemaRegistryClient for MyRegistry {
         schema_type: SchemaType,
         references: &[SchemaReference],
     ) -> Result<SchemaId> {
-        // ...
-        # todo!()
+        // Register the schema and return its assigned ID
+        todo!()
     }
 }
 ```
