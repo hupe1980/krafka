@@ -49,6 +49,7 @@
 //! ```
 
 use ahash::AHashMap;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::RwLock;
@@ -560,6 +561,84 @@ impl ProducerIdentity {
         }
     }
 
+    /// Remove sequence tracking for a single partition.
+    ///
+    /// Call when a partition is decommissioned or its topic is deleted, to
+    /// prevent unbounded growth of the in-memory sequence map.
+    pub fn remove_partition(&self, topic: &str, partition: PartitionId) {
+        let mut inner = self.inner.write();
+        if let Some(parts) = inner.sequences.get_mut(topic) {
+            parts.remove(&partition);
+            if parts.is_empty() {
+                inner.sequences.remove(topic);
+            }
+        }
+    }
+
+    /// Remove all sequence tracking for a topic.
+    ///
+    /// Removes every partition entry for the given topic. Useful when a topic
+    /// is deleted or the producer stops writing to it entirely.
+    pub fn remove_topic(&self, topic: &str) {
+        self.inner.write().sequences.remove(topic);
+    }
+
+    /// Retain only the partitions listed in `active`; drop all others.
+    ///
+    /// `active` maps topic name to the set of active partition IDs. Any
+    /// topic not present in the map, or any partition not listed under its
+    /// topic, is removed from the sequence state. Use this after a metadata
+    /// refresh to prune stale entries.
+    pub fn retain_partitions(&self, active: &ahash::AHashMap<String, Vec<PartitionId>>) {
+        let mut inner = self.inner.write();
+        inner.sequences.retain(|topic, parts| {
+            if let Some(active_parts) = active.get(topic.as_str()) {
+                parts.retain(|pid, _| active_parts.contains(pid));
+                !parts.is_empty()
+            } else {
+                false
+            }
+        });
+    }
+
+    /// Initialize identity from a previously persisted snapshot.
+    ///
+    /// Atomically replaces the current `producer_id`, `producer_epoch`, and
+    /// all per-partition sequence numbers with the values in `snapshot`.
+    ///
+    /// # Safety
+    ///
+    /// Only call this when the snapshot's `producer_id` and `producer_epoch`
+    /// match what the broker returned from `InitProducerId`. This typically
+    /// only happens with a transactional producer that uses a stable
+    /// `transactional.id` — the broker uses the transactional ID to fence
+    /// zombie producers and may return the same PID with a bumped epoch.
+    ///
+    /// For plain idempotent producers, the broker returns a fresh PID with
+    /// epoch 0 on every call; do **not** call this method in that case as the
+    /// sequences would be invalid for the new PID.
+    ///
+    /// The [`ProducerBuilder::state_store`](super::ProducerBuilder::state_store)
+    /// integration only restores the snapshot when `producer_id` and
+    /// `producer_epoch` match the broker response; manual callers are
+    /// responsible for the same check.
+    pub fn restore_from_snapshot(&self, snapshot: &ProducerIdentitySnapshot) {
+        let mut inner = self.inner.write();
+        inner.producer_id = snapshot.producer_id;
+        inner.producer_epoch = snapshot.producer_epoch;
+        inner.sequences.clear();
+        for ps in &snapshot.partition_sequences {
+            inner.sequences.entry(ps.topic.clone()).or_default().insert(
+                ps.partition,
+                SequenceState {
+                    next_sequence: ps.next_sequence,
+                    last_acked_sequence: ps.last_acked_sequence,
+                },
+            );
+        }
+        self.poisoned.store(false, Ordering::Release);
+    }
+
     /// Directly set sequence state for a partition.
     ///
     /// Used in tests to seed specific sequence states without going through
@@ -617,6 +696,122 @@ pub struct PartitionSequenceSnapshot {
     pub next_sequence: i32,
     /// Last acknowledged sequence number.
     pub last_acked_sequence: i32,
+}
+
+/// Pluggable persistence hook for producer identity state.
+///
+/// Implement this trait to save and restore [`ProducerIdentitySnapshot`]s
+/// across producer restarts, enabling recovery of sequence state for
+/// transactional producers.
+///
+/// # Safety — sequence restoration
+///
+/// Restoring sequence numbers into a producer is only safe when **all** of
+/// the following hold:
+///
+/// 1. The stored `producer_id` **and** `producer_epoch` exactly match what
+///    the broker returned from `InitProducerId`.
+/// 2. The producer uses a stable `transactional.id` so the broker can fence
+///    zombie producers from prior sessions.
+///
+/// For plain idempotent producers (no `transactional.id`), `InitProducerId`
+/// always returns a fresh PID with epoch 0, so restored sequences can never
+/// match and will be ignored. The store is still useful for observability in
+/// this case.
+///
+/// # Example
+///
+/// ```ignore
+/// use krafka::producer::{ProducerStateStore, ProducerIdentitySnapshot};
+///
+/// struct FileStateStore { path: std::path::PathBuf }
+///
+/// impl ProducerStateStore for FileStateStore {
+///     async fn load(&self) -> krafka::Result<Option<ProducerIdentitySnapshot>> {
+///         // read from disk …
+///         Ok(None)
+///     }
+///     async fn store(&self, snapshot: &ProducerIdentitySnapshot) -> krafka::Result<()> {
+///         // write to disk …
+///         Ok(())
+///     }
+/// }
+/// ```
+pub trait ProducerStateStore: Send + Sync {
+    /// Load a previously persisted snapshot, if any.
+    ///
+    /// Called once during [`Producer::build()`](super::Producer). Return
+    /// `Ok(None)` if no snapshot exists (first run).
+    fn load(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Option<ProducerIdentitySnapshot>>> + Send;
+
+    /// Persist the current snapshot.
+    ///
+    /// Called asynchronously after each successful batch acknowledgement.
+    /// Errors are logged at `warn!` level and do not fail the produce
+    /// operation.
+    fn store(
+        &self,
+        snapshot: &ProducerIdentitySnapshot,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+}
+
+// ── Object-safe erased trait for `Arc<dyn …>` storage ─────────────────────
+//
+// `ProducerStateStore` uses `async fn` / RPITIT returns which are not
+// dyn-compatible.  `ErasedProducerStateStore` mirrors it with
+// `Pin<Box<dyn Future>>` returns so `Producer` can store
+// `Arc<dyn ErasedProducerStateStore>` without generic parameters.
+// A blanket impl converts any `ProducerStateStore` transparently.
+pub(crate) trait ErasedProducerStateStore: Send + Sync {
+    fn load_erased(
+        &self,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = Result<Option<ProducerIdentitySnapshot>>> + Send + '_>,
+    >;
+
+    fn store_erased<'a>(
+        &'a self,
+        snapshot: &'a ProducerIdentitySnapshot,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+}
+
+impl<T: ProducerStateStore> ErasedProducerStateStore for T {
+    fn load_erased(
+        &self,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = Result<Option<ProducerIdentitySnapshot>>> + Send + '_>,
+    > {
+        Box::pin(self.load())
+    }
+
+    fn store_erased<'a>(
+        &'a self,
+        snapshot: &'a ProducerIdentitySnapshot,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.store(snapshot))
+    }
+}
+
+/// Allow sharing a state store instance behind an `Arc`.
+///
+/// Enables `Arc<MyStore>` to be passed to
+/// [`ProducerBuilder::state_store()`](super::ProducerBuilder::state_store)
+/// when the same store is shared across multiple producers.
+impl<T: ProducerStateStore> ProducerStateStore for std::sync::Arc<T> {
+    fn load(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Option<ProducerIdentitySnapshot>>> + Send {
+        T::load(self)
+    }
+
+    fn store(
+        &self,
+        snapshot: &ProducerIdentitySnapshot,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        T::store(self, snapshot)
+    }
 }
 
 #[cfg(test)]
@@ -940,5 +1135,54 @@ mod tests {
         let base = identity.reset_and_allocate("topic", 99, 3).unwrap();
         assert_eq!(base, 0);
         assert_eq!(identity.peek_sequence("topic", 99), 3);
+    }
+
+    #[test]
+    fn test_restore_from_snapshot_replaces_state() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(100, 2);
+        identity.next_sequence("topic1", 0).unwrap();
+        identity.next_sequence("topic1", 0).unwrap();
+
+        // Build a snapshot with different sequences
+        let snapshot = ProducerIdentitySnapshot {
+            producer_id: 100,
+            producer_epoch: 2,
+            partition_sequences: vec![
+                PartitionSequenceSnapshot {
+                    topic: "topic1".to_string(),
+                    partition: 0,
+                    next_sequence: 6,
+                    last_acked_sequence: 5,
+                },
+                PartitionSequenceSnapshot {
+                    topic: "topic2".to_string(),
+                    partition: 1,
+                    next_sequence: 10,
+                    last_acked_sequence: 9,
+                },
+            ],
+        };
+
+        identity.restore_from_snapshot(&snapshot);
+
+        assert_eq!(identity.peek_sequence("topic1", 0), 6);
+        assert_eq!(identity.peek_sequence("topic2", 1), 10);
+    }
+
+    #[test]
+    fn test_restore_from_snapshot_clears_poisoned() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(50, 0);
+        identity.poison();
+        assert!(identity.is_poisoned());
+
+        let snapshot = ProducerIdentitySnapshot {
+            producer_id: 50,
+            producer_epoch: 0,
+            partition_sequences: vec![],
+        };
+        identity.restore_from_snapshot(&snapshot);
+        assert!(!identity.is_poisoned());
     }
 }

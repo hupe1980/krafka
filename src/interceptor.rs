@@ -89,7 +89,7 @@
 //!     .await?;
 //! ```
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;

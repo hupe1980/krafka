@@ -7,7 +7,8 @@
 //!
 //! ## Features
 //!
-//! - **Pure Rust**: No librdkafka or C bindings
+//! - **Pure Rust by default**: No librdkafka or C bindings; the optional `zstd`
+//!   compression feature links against `zstd-sys` and requires a C toolchain
 //! - **Async-native**: Built on Tokio for non-blocking I/O
 //! - **High-performance**: Zero-copy buffers, minimal allocations
 //! - **Safe**: No unsafe code by default
@@ -104,7 +105,7 @@
 //! | `socks5` | no | SOCKS5 proxy support via `tokio-socks`. |
 //! | `danger-insecure-tls` | no | Allow disabling TLS certificate verification (MITM risk!). |
 //! | `telemetry` | no | OpenTelemetry exporter for producer/consumer metrics. |
-//! | `unstable-protocol` | no | Reserved for future experimental protocol APIs. APIs under this feature may change without semver notice. |
+//! | `unstable-protocol` | no | Enables experimental protocol APIs (Share Consumer, KIP-932). APIs under this feature may change without semver notice. |
 //!
 //! To disable the default compression codecs and pick only what you need:
 //!
@@ -114,11 +115,23 @@
 //! ```
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![deny(unsafe_code)]
+
+// krafka's metrics layer relies on 64-bit atomic operations (AtomicU64).
+// 32-bit targets without hardware AtomicU64 support (e.g. Cortex-M3) are not
+// supported.  Fail fast with a clear diagnostic rather than a confusing link
+// error or silent correctness bug.
+#[cfg(not(target_has_atomic = "64"))]
+compile_error!(
+    "krafka requires 64-bit atomic support (`target_has_atomic = \"64\"`). \
+     32-bit targets without AtomicU64 (e.g. ARMv6-M, Cortex-M3) are not supported."
+);
 
 pub mod admin;
 pub mod auth;
 pub mod client;
 pub mod consumer;
+pub mod dlq;
 pub mod error;
 pub mod interceptor;
 pub mod metadata;
@@ -127,6 +140,8 @@ pub mod network;
 pub mod producer;
 pub mod protocol;
 pub mod schema_registry;
+#[cfg(feature = "unstable-protocol")]
+#[cfg_attr(docsrs, doc(cfg(feature = "unstable-protocol")))]
 pub mod share_consumer;
 #[cfg(feature = "telemetry")]
 #[cfg_attr(docsrs, doc(cfg(feature = "telemetry")))]

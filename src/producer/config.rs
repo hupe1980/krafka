@@ -1,8 +1,10 @@
 //! Producer configuration.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::auth::AuthConfig;
+use crate::dlq::DeadLetterQueue;
 use crate::error::{KrafkaError, Result};
 use crate::metadata::MetadataRecoveryStrategy;
 use crate::protocol::Compression;
@@ -116,6 +118,12 @@ pub struct ProducerConfig {
     /// SOCKS5 proxy configuration (optional).
     #[cfg(feature = "socks5")]
     pub(crate) proxy: Option<crate::network::ProxyConfig>,
+    /// Optional dead-letter queue for permanently-failed records.
+    ///
+    /// When set, records that exhaust all retries (or encounter a
+    /// non-retriable error) on the direct-send path are routed to this DLQ
+    /// before the error is returned to the caller.
+    pub(crate) dead_letter_queue: Option<Arc<dyn DeadLetterQueue>>,
 }
 
 impl Default for ProducerConfig {
@@ -143,6 +151,7 @@ impl Default for ProducerConfig {
             auth: None,
             #[cfg(feature = "socks5")]
             proxy: None,
+            dead_letter_queue: None,
         }
     }
 }
@@ -320,6 +329,19 @@ impl ProducerConfigBuilder {
     }
 
     /// Set linger time.
+    ///
+    /// The accumulator waits up to `duration` before sealing a batch, giving
+    /// more records time to join and improving throughput at the cost of
+    /// additional latency. The default is [`Duration::ZERO`] (no linger —
+    /// send immediately). For sustained high-throughput workloads, values in
+    /// the range of 1–100 ms are typical.
+    ///
+    /// # Trade-off
+    ///
+    /// Larger linger values reduce the number of Produce RPCs and increase
+    /// batch fill rate, but add a fixed latency floor to every record.  Do not
+    /// set linger without also tuning [`delivery_timeout`](Self::delivery_timeout)
+    /// to be significantly larger than the linger value.
     pub fn linger(mut self, duration: Duration) -> Self {
         self.config.linger = duration;
         self
@@ -360,9 +382,16 @@ impl ProducerConfigBuilder {
     /// Set number of retries.
     ///
     /// The default is `u32::MAX` (effectively unlimited), which is safe
-    /// because the retry loop is always bounded by `delivery_timeout`.
+    /// because the retry loop is always bounded by [`delivery_timeout`](Self::delivery_timeout).
     /// Use a finite value when you want to limit retries independently of
     /// the delivery timeout.
+    ///
+    /// # Note on idempotent producers
+    ///
+    /// When idempotent production is enabled, in-order retries are guaranteed
+    /// by sequence numbers, so `retries > 0` is the expected setting.
+    /// Setting `retries = 0` disables retries entirely — combine with a short
+    /// `delivery_timeout` for fire-and-forget semantics.
     pub fn retries(mut self, retries: u32) -> Self {
         self.config.retries = retries;
         self
@@ -455,6 +484,22 @@ impl ProducerConfigBuilder {
     /// Only effective when [`MetadataRecoveryStrategy::Rebootstrap`] is set.
     pub fn metadata_recovery_rebootstrap_trigger(mut self, duration: Duration) -> Self {
         self.config.metadata_recovery_rebootstrap_trigger = duration;
+        self
+    }
+
+    /// Set a dead-letter queue for permanently-failed records.
+    ///
+    /// When set, records that exhaust all retries (or encounter a non-retriable
+    /// error) on the direct-send path are routed to `dlq` before the error is
+    /// returned to the caller. The DLQ call is fire-and-forget: errors during
+    /// routing are handled by the implementation.
+    ///
+    /// The DLQ is **not** invoked for accumulator-path failures (linger > 0)
+    /// because batched records are not individually available after batching.
+    /// For accumulator-path DLQ integration, use the `on_acknowledgement`
+    /// interceptor hook together with a `DeadLetterQueue` implementation.
+    pub fn dead_letter_queue(mut self, dlq: Arc<dyn DeadLetterQueue>) -> Self {
+        self.config.dead_letter_queue = Some(dlq);
         self
     }
 

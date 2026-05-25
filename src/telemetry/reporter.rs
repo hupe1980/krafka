@@ -120,48 +120,74 @@ impl Subscription {
 #[derive(Debug, Clone)]
 enum CollectedMetricEntry {
     Counter {
-        name: String,
-        help: String,
+        /// Interned metric name — `Arc<str>` avoids repeated allocation across
+        /// 100 ms push intervals; `Arc::clone` is a single atomic increment.
+        name: Arc<str>,
+        help: Arc<str>,
         value: u64,
     },
     Gauge {
-        name: String,
-        help: String,
+        name: Arc<str>,
+        help: Arc<str>,
         value: u64,
     },
     Latency {
-        name: String,
-        help: String,
+        name: Arc<str>,
+        help: Arc<str>,
         snapshot: LatencySnapshot,
     },
 }
 
-#[derive(Debug, Default)]
+/// Weak-reference intern table for metric names and help strings.
+///
+/// The telemetry push loop calls `export_counter` / `export_gauge` /
+/// `export_latency` at 100 ms intervals with the same static name and
+/// help strings every time. Interning means each unique string is
+/// allocated exactly once per exporter lifetime and subsequent pushes
+/// only pay an atomic increment for the `Arc::clone`.
+#[derive(Default)]
+struct MetricStringInterner {
+    cache: HashMap<String, Arc<str>>,
+}
+
+impl MetricStringInterner {
+    fn intern(&mut self, s: &str) -> Arc<str> {
+        if let Some(arc) = self.cache.get(s) {
+            return arc.clone();
+        }
+        let arc: Arc<str> = s.into();
+        self.cache.insert(s.to_owned(), arc.clone());
+        arc
+    }
+}
+
+#[derive(Default)]
 struct CollectingExporter {
     entries: Vec<CollectedMetricEntry>,
+    interner: MetricStringInterner,
 }
 
 impl MetricsExporter for CollectingExporter {
     fn export_counter(&mut self, name: &str, help: &str, value: u64) {
-        self.entries.push(CollectedMetricEntry::Counter {
-            name: name.to_string(),
-            help: help.to_string(),
-            value,
-        });
+        let name = self.interner.intern(name);
+        let help = self.interner.intern(help);
+        self.entries
+            .push(CollectedMetricEntry::Counter { name, help, value });
     }
 
     fn export_gauge(&mut self, name: &str, help: &str, value: u64) {
-        self.entries.push(CollectedMetricEntry::Gauge {
-            name: name.to_string(),
-            help: help.to_string(),
-            value,
-        });
+        let name = self.interner.intern(name);
+        let help = self.interner.intern(help);
+        self.entries
+            .push(CollectedMetricEntry::Gauge { name, help, value });
     }
 
     fn export_latency(&mut self, name: &str, help: &str, snapshot: &LatencySnapshot) {
+        let name = self.interner.intern(name);
+        let help = self.interner.intern(help);
         self.entries.push(CollectedMetricEntry::Latency {
-            name: name.to_string(),
-            help: help.to_string(),
+            name,
+            help,
             snapshot: snapshot.clone(),
         });
     }
@@ -1437,7 +1463,7 @@ impl CollectedMetricEntry {
                     .into_iter()
                     .map(|bytes| PreparedMetric {
                         bytes,
-                        counter_update: Some((name.clone(), *value)),
+                        counter_update: Some((name.to_string(), *value)),
                     })
                     .collect()
             }
@@ -1807,13 +1833,13 @@ mod tests {
         let tracker = DeltaTracker::new();
         let entries = vec![
             CollectedMetricEntry::Counter {
-                name: "org.apache.kafka.producer.records_sent_total".to_string(),
-                help: "help".to_string(),
+                name: "org.apache.kafka.producer.records_sent_total".into(),
+                help: "help".into(),
                 value: 10,
             },
             CollectedMetricEntry::Gauge {
-                name: "org.apache.kafka.consumer.lag".to_string(),
-                help: "help".to_string(),
+                name: "org.apache.kafka.consumer.lag".into(),
+                help: "help".into(),
                 value: 5,
             },
         ];
@@ -1863,18 +1889,18 @@ mod tests {
         let tracker = DeltaTracker::new();
         let entries = vec![
             CollectedMetricEntry::Gauge {
-                name: "small_metric_a".to_string(),
-                help: "help".to_string(),
+                name: "small_metric_a".into(),
+                help: "help".into(),
                 value: 1,
             },
             CollectedMetricEntry::Gauge {
-                name: "oversized_metric".to_string(),
-                help: "x".repeat(8_192),
+                name: "oversized_metric".into(),
+                help: "x".repeat(8_192).into(),
                 value: 2,
             },
             CollectedMetricEntry::Gauge {
-                name: "small_metric_b".to_string(),
-                help: "help".to_string(),
+                name: "small_metric_b".into(),
+                help: "help".into(),
                 value: 3,
             },
         ];
@@ -1937,13 +1963,13 @@ mod tests {
         let repeated_help = "compressible".repeat(512);
         let entries = vec![
             CollectedMetricEntry::Gauge {
-                name: "metric_a".to_string(),
-                help: repeated_help.clone(),
+                name: "metric_a".into(),
+                help: repeated_help.clone().into(),
                 value: 1,
             },
             CollectedMetricEntry::Gauge {
-                name: "metric_b".to_string(),
-                help: repeated_help,
+                name: "metric_b".into(),
+                help: repeated_help.into(),
                 value: 2,
             },
         ];
@@ -2004,8 +2030,8 @@ mod tests {
         let time_nanos = 2;
         let tracker = DeltaTracker::new();
         let entries = vec![CollectedMetricEntry::Gauge {
-            name: "metric_a".to_string(),
-            help: "help".to_string(),
+            name: "metric_a".into(),
+            help: "help".into(),
             value: 1,
         }];
         let subscription = Subscription {
@@ -2045,13 +2071,13 @@ mod tests {
         };
         let entries = vec![
             CollectedMetricEntry::Counter {
-                name: "counter_a".to_string(),
-                help: "help".to_string(),
+                name: "counter_a".into(),
+                help: "help".into(),
                 value: 15,
             },
             CollectedMetricEntry::Counter {
-                name: "counter_b".to_string(),
-                help: "help".to_string(),
+                name: "counter_b".into(),
+                help: "help".into(),
                 value: 30,
             },
         ];
@@ -2103,13 +2129,13 @@ mod tests {
         let tracker = DeltaTracker::new();
         let entries = vec![
             CollectedMetricEntry::Counter {
-                name: "counter_a".to_string(),
-                help: "help".to_string(),
+                name: "counter_a".into(),
+                help: "help".into(),
                 value: 15,
             },
             CollectedMetricEntry::Gauge {
-                name: "gauge_b".to_string(),
-                help: "help".to_string(),
+                name: "gauge_b".into(),
+                help: "help".into(),
                 value: 2,
             },
         ];

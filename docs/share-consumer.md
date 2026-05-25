@@ -78,6 +78,18 @@ for record in &records {
 consumer.commit_sync().await?;
 ```
 
+To acknowledge by topic/partition/offset directly — useful when a record fails to deserialize and you have no `ConsumerRecord` to pass:
+
+```rust
+consumer.acknowledge_by_offset("events", partition, offset, AcknowledgeType::Reject).await?;
+```
+
+For a timeout-bounded flush:
+
+```rust
+consumer.commit_sync_with_timeout(Duration::from_secs(5)).await?;
+```
+
 ### Acknowledge Types
 
 | Type | Value | Meaning |
@@ -225,6 +237,22 @@ consumer.close().await?;
 2. **Explicit mode**: pending acks (accept/release/reject) are flushed as-is.
 3. Sends and validates a leave-group heartbeat.
 4. Clears all local state and closes connections.
+
+Use `close_with_timeout(duration)` to bound each cleanup phase. If a phase exceeds `duration / 2`, it returns `Err(KrafkaError::Timeout)` but still closes local state and connections.
+
+### Wakeup & Cancellation
+
+Call `wakeup()` from any thread or task to interrupt an in-progress `poll()` call:
+
+```rust
+// In another task:
+consumer.wakeup();
+
+// poll() returns Err with "wakeup() was called"
+// The consumer remains fully usable for subsequent poll() calls.
+```
+
+`wakeup()` is safe to call concurrently with any other consumer method.
 
 ### Unsubscribe Semantics
 

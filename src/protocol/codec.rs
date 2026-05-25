@@ -18,11 +18,13 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    /// Create a new encoder.
+    /// Create a new encoder with no pre-allocated capacity.
+    ///
+    /// The underlying `BytesMut` will grow on demand.  When the expected
+    /// message size is known in advance, prefer [`Encoder::with_capacity`]
+    /// to avoid reallocations.
     pub fn new() -> Self {
-        Self {
-            buffer: BytesMut::with_capacity(1024),
-        }
+        Self::default()
     }
 
     /// Create a new encoder with a specific capacity.

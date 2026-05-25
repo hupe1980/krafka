@@ -4,13 +4,13 @@
 [![Crates.io](https://img.shields.io/crates/v/krafka.svg)](https://crates.io/crates/krafka)
 [![Documentation](https://docs.rs/krafka/badge.svg)](https://docs.rs/krafka)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://github.com/rust-lang/rust/releases/tag/1.88.0)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
 A pure Rust, async-native Apache Kafka client designed for high performance, safety, and ease of use.
 
 ## ✨ Features
 
-- 🦀 **Pure Rust**: No librdkafka or C dependencies
+- 🦀 **Pure Rust by default**: No librdkafka or C dependencies; the optional `zstd` compression feature requires a C toolchain via `zstd-sys`
 - ⚡ **Async-native**: Built on Tokio for true async I/O
 - 🔒 **Zero unsafe**: Safe Rust by default
 - 🚀 **High performance**: Zero-copy buffers, inline hot paths, efficient batching, concurrent batch flushing
@@ -33,11 +33,11 @@ Add Krafka to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-krafka = "0.9.2"
+krafka = "0.10.0"
 tokio = { version = "1", features = ["full"] }
 
 # For AWS MSK IAM authentication with full SDK support:
-# krafka = { version = "0.9.2", features = ["aws-msk"] }
+# krafka = { version = "0.10.0", features = ["aws-msk"] }
 ```
 
 ### Producer
@@ -240,10 +240,10 @@ To select only what you need:
 
 ```toml
 # Option 1: enable only the codecs you need
-krafka = { version = "0.9.2", default-features = false, features = ["lz4", "snappy"] }
+krafka = { version = "0.10.0", default-features = false, features = ["lz4", "snappy"] }
 
 # Option 2: enable all compression codecs, including zstd
-# krafka = { version = "0.9.2", features = ["compression-all"] }
+# krafka = { version = "0.10.0", features = ["compression-all"] }
 ```
 
 ## ⚡ Performance Tuning
@@ -344,4 +344,4 @@ Contributions are welcome!
 
 ## 📄 License
 
-Licensed under the [MIT License](LICENSE).
+Licensed under either the [MIT License](LICENSE-MIT) or the [Apache License 2.0](LICENSE-APACHE), at your option.

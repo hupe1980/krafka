@@ -183,7 +183,9 @@ Each connection maintains two request channels to prevent consumer group ejectio
   │                   BrokerConnection                   │
   │  ┌───────────────────┐  ┌─────────────────────────┐ │
   │  │ High-Priority Ch  │  │   Normal-Priority Ch    │ │
-  │  │ (Heartbeat, Meta) │  │ (Produce, Fetch, etc.)  │ │
+  │  │ (Heartbeat, Meta, │  │ (Produce, Fetch, etc.)  │ │
+  │  │  GroupHeartbeat,  │  │                         │ │
+  │  │  JoinGroup, etc.) │  │                         │ │
   │  └─────────┬─────────┘  └───────────┬─────────────┘ │
   │            │   biased select!       │               │
   │            └─────────►◄─────────────┘               │
@@ -193,7 +195,9 @@ Each connection maintains two request channels to prevent consumer group ejectio
   └─────────────────────────────────────────────────────┘
 ```
 
-High-priority requests (Heartbeat, Metadata, FindCoordinator, ApiVersions) are always processed
+High-priority requests (Heartbeat, ConsumerGroupHeartbeat, ShareGroupHeartbeat,
+JoinGroup, SyncGroup, LeaveGroup, OffsetCommit, Metadata, FindCoordinator,
+LeaderAndIsr, ApiVersions) are always processed
 first, ensuring consumer group membership is maintained even under heavy produce/fetch load.
 
 ### KIP-219: Client-Side Throttle Compliance

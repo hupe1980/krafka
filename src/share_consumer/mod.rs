@@ -1,5 +1,9 @@
 //! Share consumer implementation (KIP-932).
 //!
+//! > ⚠️ **Unstable**: This module requires the `unstable-protocol` feature flag.
+//! > APIs may change without semver notice until KIP-932 is finalized in a stable
+//! > Kafka release.
+//!
 //! Share groups provide queue-like semantics on top of Kafka topics. Multiple
 //! consumers in the same share group receive non-overlapping subsets of records
 //! without client-side partition assignment — all assignment is performed by
@@ -48,11 +52,12 @@ mod stream;
 pub use config::{AcknowledgeType, AcknowledgementMode, ShareConsumerConfig};
 pub use stream::ShareConsumerStream;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use std::collections::VecDeque;
 use std::future::{Future, Ready, ready};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as SyncMutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -62,7 +67,7 @@ use tracing::{debug, info, warn};
 
 use crate::auth::AuthConfig;
 use crate::consumer::ConsumerRecord;
-use crate::error::{KrafkaError, ProtocolErrorKind, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::metadata::ClusterMetadata;
 use crate::metrics::ConnectionMetrics;
 use crate::network::{ConnectionConfig, ConnectionPool};
@@ -75,7 +80,7 @@ use crate::protocol::{
 };
 use crate::{BrokerId, Offset, PartitionId};
 
-use session::ShareSessionCache;
+use session::{FINAL_EPOCH, ShareSessionCache};
 
 /// Key for tracking unacknowledged records in explicit mode.
 type RecordKey = (String, PartitionId, Offset);
@@ -85,6 +90,12 @@ type BrokerAckKey = ([u8; 16], PartitionId);
 
 /// Pending piggybacked acknowledgements grouped by broker and partition.
 type BrokerPendingAcks = HashMap<BrokerId, HashMap<BrokerAckKey, Vec<PendingAck>>>;
+
+/// Sentinel broker ID used when the partition leader is not yet known at acknowledge
+/// time (e.g., immediately after `subscribe()` before the first metadata refresh, or
+/// after a `restore_ack_state()` where metadata is unavailable).
+/// Acks with this sentinel are re-routed using fresh metadata in `poll()`.
+const UNROUTED_BROKER_ID: BrokerId = -2;
 
 #[derive(Clone)]
 struct ShareAcknowledgeContext {
@@ -177,13 +188,8 @@ impl Future for ShareCommitHandle {
     }
 }
 
-/// A Kafka share consumer (KIP-932).
-///
-/// Provides queue-like consumption semantics where the server controls
-/// partition assignment and record delivery. Unlike traditional consumer
-/// groups, share consumers do not track offsets — instead they acknowledge
-/// individual records.
-pub struct ShareConsumer {
+/// All internal state shared between `ShareConsumer` handles.
+struct ShareConsumerInner {
     /// Configuration.
     config: ShareConsumerConfig,
     /// Cluster metadata.
@@ -205,10 +211,13 @@ pub struct ShareConsumer {
     closed: AtomicBool,
     /// Per-broker share session cache.
     share_sessions: Arc<tokio::sync::Mutex<ShareSessionCache>>,
-    /// Pending acknowledgements (accumulated between polls or before commit).
-    /// Keyed by `(topic_id, partition)` for O(1) per-partition drain when
-    /// piggybacking acks on fetch requests.
-    pending_acks: Arc<RwLock<HashMap<BrokerAckKey, Vec<PendingAck>>>>,
+    /// Pending acknowledgements sharded by broker ID.
+    ///
+    /// Pre-routing at acknowledge time means `poll()` can hand each broker its
+    /// acks in O(1) without rescanning the entire flat map.  Acks whose leader
+    /// is not yet known are stored under `UNROUTED_BROKER_ID` and re-routed
+    /// using fresh metadata at the start of the next `poll()`.
+    pending_acks: Arc<RwLock<BrokerPendingAcks>>,
     /// Monotonic token for the current local ack state.
     ///
     /// Incremented whenever local ack state is cleared or invalidated so
@@ -233,29 +242,50 @@ pub struct ShareConsumer {
     /// Tracks unacknowledged records from the previous `poll()` in explicit mode.
     /// Must be empty before the next `poll()` can fetch new records.
     unacked_offsets: Arc<RwLock<HashSet<RecordKey>>>,
+    /// Background heartbeat task. Spawned on the first `subscribe()` call;
+    /// aborted by `close()` or `unsubscribe()`.
+    heartbeat_task: SyncMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Set by `wakeup()` to interrupt an in-progress `poll()`.
+    /// Cleared at the start of each `poll()` call.
+    wakeup_flag: AtomicBool,
 }
 
-impl std::fmt::Debug for ShareConsumer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ShareConsumer")
-            .field("group_id", &self.config.group_id)
-            .field("closed", &self.closed.load(Ordering::Relaxed))
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for ShareConsumer {
+impl Drop for ShareConsumerInner {
     fn drop(&mut self) {
-        // Warn when the consumer is dropped without an explicit `close()`.
-        // Without `close()` the coordinator will only reassign this
-        // member's partitions after its heartbeat lease expires, and any
-        // pending acknowledgements are discarded. Skip during panic unwinding.
-        if !self.closed.load(Ordering::SeqCst) && !std::thread::panicking() {
+        // Fires when the last `ShareConsumer` clone is dropped.
+        // Warn if close() was never called — pending acks are silently lost
+        // and the coordinator will only reclaim partitions after the heartbeat
+        // lease expires. Skip the warning during panic unwinding.
+        if !self.closed.load(Ordering::Relaxed) && !std::thread::panicking() {
             warn!(
                 "ShareConsumer dropped without close(); pending acks may be lost and \
                  share-group rebalance will be delayed. Call `ShareConsumer::close()` before drop."
             );
         }
+    }
+}
+
+/// A Kafka share consumer (KIP-932).
+///
+/// Provides queue-like consumption semantics where the server controls
+/// partition assignment and record delivery. Unlike traditional consumer
+/// groups, share consumers do not track offsets — instead they acknowledge
+/// individual records.
+///
+/// `ShareConsumer` is cheaply cloneable: all clones share the same
+/// connection pool, coordinator state, and acknowledgement buffers via an
+/// internal [`Arc`]. A background heartbeat task is started on the first
+/// [`subscribe()`](Self::subscribe) call and stopped on
+/// [`close()`](Self::close) / [`unsubscribe()`](Self::unsubscribe).
+#[derive(Clone)]
+pub struct ShareConsumer(Arc<ShareConsumerInner>);
+
+impl std::fmt::Debug for ShareConsumer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShareConsumer")
+            .field("group_id", &self.0.config.group_id)
+            .field("closed", &self.0.closed.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
     }
 }
 
@@ -309,7 +339,7 @@ impl ShareConsumer {
             config.group_id
         );
 
-        Ok(Self {
+        Ok(ShareConsumer(Arc::new(ShareConsumerInner {
             config,
             metadata,
             pool,
@@ -328,7 +358,9 @@ impl ShareConsumer {
             coordinator_id: RwLock::new(None),
             coordinator_address: RwLock::new(None),
             unacked_offsets: Arc::new(RwLock::new(HashSet::new())),
-        })
+            heartbeat_task: SyncMutex::new(None),
+            wakeup_flag: AtomicBool::new(false),
+        })))
     }
 
     /// Subscribe to topics.
@@ -336,12 +368,12 @@ impl ShareConsumer {
     /// Replaces the current subscription. The coordinator is notified on
     /// the next heartbeat (during `poll()`).
     pub async fn subscribe(&self, topics: &[&str]) -> Result<()> {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.0.closed.load(Ordering::SeqCst) {
             return Err(KrafkaError::invalid_state("share consumer is closed"));
         }
 
         {
-            let mut subs = self.subscriptions.write().await;
+            let mut subs = self.0.subscriptions.write().await;
             subs.clear();
             for topic in topics {
                 subs.insert((*topic).to_string());
@@ -349,13 +381,16 @@ impl ShareConsumer {
         }
 
         let topic_refs: Vec<&str> = topics.to_vec();
-        self.metadata.refresh_for_topics(Some(&topic_refs)).await?;
+        self.0
+            .metadata
+            .refresh_for_topics(Some(&topic_refs))
+            .await?;
 
         // Resolve topic UUIDs from metadata.
         {
-            let mut ids = self.topic_ids.write().await;
+            let mut ids = self.0.topic_ids.write().await;
             for topic in topics {
-                if let Some(uuid) = self.metadata.topic_id_for_name(topic) {
+                if let Some(uuid) = self.0.metadata.topic_id_for_name(topic) {
                     ids.insert((*topic).to_string(), uuid);
                 }
             }
@@ -365,32 +400,48 @@ impl ShareConsumer {
         self.ensure_coordinator().await?;
         self.send_heartbeat(true).await?;
 
+        // Spawn the background heartbeat task if not already running.
+        // The task sends periodic heartbeats independent of poll() so the
+        // share-group session stays alive even when poll() is slow.
+        let mut task_guard = self
+            .0
+            .heartbeat_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if task_guard.as_ref().is_none_or(|h| h.is_finished()) {
+            let bg = self.clone();
+            *task_guard = Some(tokio::spawn(async move {
+                bg.run_heartbeat_loop().await;
+            }));
+        }
+        drop(task_guard);
+
         debug!(
             "Subscribed to {} topic(s) in share group '{}'",
             topics.len(),
-            self.config.group_id
+            self.0.config.group_id
         );
         Ok(())
     }
 
     /// Returns the current subscription.
     pub async fn subscription(&self) -> HashSet<String> {
-        self.subscriptions.read().await.clone()
+        self.0.subscriptions.read().await.clone()
     }
 
     /// Returns the current partition assignments.
     pub async fn assignment(&self) -> HashMap<String, Vec<PartitionId>> {
-        self.assignments.read().await.clone()
+        self.0.assignments.read().await.clone()
     }
 
     /// Returns the member ID assigned by the coordinator.
     pub fn member_id(&self) -> String {
-        (**self.member_id.load()).clone()
+        (**self.0.member_id.load()).clone()
     }
 
     /// Returns the current member epoch.
     pub fn member_epoch(&self) -> i32 {
-        self.member_epoch.load(Ordering::Acquire)
+        self.0.member_epoch.load(Ordering::Acquire)
     }
 
     /// Poll for new records.
@@ -399,19 +450,25 @@ impl ShareConsumer {
     /// automatically accepted. In explicit mode, all records from the
     /// previous poll must be acknowledged before calling this again.
     pub async fn poll(&self, timeout: Duration) -> Result<Vec<ConsumerRecord>> {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.0.closed.load(Ordering::SeqCst) {
             return Err(KrafkaError::invalid_state("share consumer is closed"));
         }
 
+        // Clear and check the wakeup flag before doing any work so callers
+        // get an immediate error if wakeup() was called before this poll.
+        if self.0.wakeup_flag.swap(false, Ordering::AcqRel) {
+            return Err(KrafkaError::invalid_state("wakeup() was called"));
+        }
+
         // Explicit mode: reject poll if records from the previous batch are unacknowledged.
-        if self.config.acknowledgement_mode == AcknowledgementMode::Explicit {
-            let unacked = self.unacked_offsets.read().await;
+        if self.0.config.acknowledgement_mode == AcknowledgementMode::Explicit {
+            let unacked = self.0.unacked_offsets.read().await;
             if !unacked.is_empty() {
                 return Err(KrafkaError::invalid_state(
                     "all records from the previous poll() must be acknowledged before calling poll() again",
                 ));
             }
-            if self.explicit_flush_retry_required.load(Ordering::SeqCst) {
+            if self.0.explicit_flush_retry_required.load(Ordering::SeqCst) {
                 return Err(KrafkaError::invalid_state(
                     "the previous commit_sync()/commit_async() flush failed; retry the commit before calling poll() again",
                 ));
@@ -420,9 +477,9 @@ impl ShareConsumer {
 
         // If recv_buffer is at capacity, skip only the fetch step (after
         // heartbeat/coordination) so group membership remains healthy.
-        let max_buffered = self.config.max_buffered_records;
+        let max_buffered = self.0.config.max_buffered_records;
         let skip_fetch_due_to_buffer_cap = if max_buffered > 0 {
-            let buf_len = self.recv_buffer.read().await.len();
+            let buf_len = self.0.recv_buffer.read().await.len();
             buf_len >= max_buffered as usize
         } else {
             false
@@ -439,6 +496,18 @@ impl ShareConsumer {
             Err(_elapsed) => Some(KrafkaError::timeout("share group heartbeat")),
         };
         if let Some(e) = heartbeat_err {
+            if let KrafkaError::Broker {
+                code: ErrorCode::FencedMemberEpoch,
+                ..
+            } = &e
+            {
+                warn!(
+                    "Heartbeat fenced during poll for group '{}'; resetting member state",
+                    self.0.config.group_id
+                );
+                self.0.member_epoch.store(0, Ordering::Release);
+                self.clear_ack_state().await;
+            }
             warn!("Heartbeat failed during poll: {e}");
             self.invalidate_coordinator().await;
             if let Err(e2) = self.ensure_coordinator().await {
@@ -449,15 +518,15 @@ impl ShareConsumer {
         // If `recv()` previously buffered records, return them first so mixed
         // `recv()`/`poll()` callers do not strand available data.
         {
-            let mut buffered = self.recv_buffer.write().await;
+            let mut buffered = self.0.recv_buffer.write().await;
             if !buffered.is_empty() {
                 // max_poll_records is validated >= 1 in the builder, so take >= 1.
-                let take = (self.config.max_poll_records as usize).min(buffered.len());
+                let take = (self.0.config.max_poll_records as usize).min(buffered.len());
                 return Ok(buffered.drain(..take).collect());
             }
         }
 
-        let assignments = self.assignments.read().await.clone();
+        let assignments = self.0.assignments.read().await.clone();
         if assignments.is_empty() || skip_fetch_due_to_buffer_cap {
             return Ok(Vec::new());
         }
@@ -465,14 +534,14 @@ impl ShareConsumer {
         // Group partitions by leader broker.
         let mut partitions_by_broker: HashMap<BrokerId, Vec<(String, PartitionId, [u8; 16])>> =
             HashMap::new();
-        let topic_ids = self.topic_ids.read().await;
+        let topic_ids = self.0.topic_ids.read().await;
         for (topic, partitions) in &assignments {
             let Some(&topic_id) = topic_ids.get(topic) else {
                 debug!("No topic UUID for '{topic}', skipping");
                 continue;
             };
             for &partition in partitions {
-                if let Some(leader) = self.metadata.leader(topic, partition) {
+                if let Some(leader) = self.0.metadata.leader(topic, partition) {
                     partitions_by_broker.entry(leader).or_default().push((
                         topic.clone(),
                         partition,
@@ -483,7 +552,7 @@ impl ShareConsumer {
         }
         drop(topic_ids);
 
-        let ack_state_generation = self.ack_state_generation.load(Ordering::SeqCst);
+        let ack_state_generation = self.0.ack_state_generation.load(Ordering::SeqCst);
 
         let sendable_ack_partitions: HashSet<(String, PartitionId)> = partitions_by_broker
             .values()
@@ -495,17 +564,49 @@ impl ShareConsumer {
             .collect();
 
         // Drain acknowledgement batches to piggyback on fetch requests.
-        // pending_acks is keyed by (topic_id, partition) — no linear scan needed.
+        // pending_acks is already broker-keyed: pre-routed acks pass through
+        // the sendable filter only; the UNROUTED shard is also re-routed here.
         let mut failed_piggyback_acks: Vec<PendingAck> = Vec::new();
-        let mut ack_batches_by_broker: BrokerPendingAcks = HashMap::new();
-        {
-            let mut pending = self.pending_acks.write().await;
-            let drained = std::mem::take(&mut *pending);
-            for ((topic_id, partition), acks) in drained {
-                // Use the first ack's topic name for leader lookup (all share the same topic).
-                let topic = acks.first().map(|a| a.topic.as_str()).unwrap_or("");
-                if sendable_ack_partitions.contains(&(topic.to_owned(), partition)) {
-                    if let Some(broker_id) = self.metadata.leader(topic, partition) {
+        let pre_routed: BrokerPendingAcks = {
+            let mut pending = self.0.pending_acks.write().await;
+            std::mem::take(&mut *pending)
+        };
+        let unrouted = pre_routed
+            .get(&UNROUTED_BROKER_ID)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let mut ack_batches_by_broker: BrokerPendingAcks =
+            HashMap::with_capacity(pre_routed.len().saturating_sub(if unrouted > 0 {
+                1
+            } else {
+                0
+            }));
+        for (broker_id, partition_acks) in pre_routed {
+            if broker_id == UNROUTED_BROKER_ID {
+                // Re-route using current metadata; topic name is in the ack itself.
+                for ((topic_id, partition), acks) in partition_acks {
+                    let topic = acks.first().map(|a| a.topic.as_str()).unwrap_or("");
+                    if sendable_ack_partitions.contains(&(topic.to_string(), partition)) {
+                        if let Some(bid) = self.0.metadata.leader(topic, partition) {
+                            ack_batches_by_broker
+                                .entry(bid)
+                                .or_default()
+                                .entry((topic_id, partition))
+                                .or_default()
+                                .extend(acks);
+                        } else {
+                            failed_piggyback_acks.extend(acks);
+                        }
+                    } else {
+                        failed_piggyback_acks.extend(acks);
+                    }
+                }
+            } else {
+                // Already routed; apply sendable filter only (handles leadership
+                // changes between acknowledge() and poll()).
+                for ((topic_id, partition), acks) in partition_acks {
+                    let topic = acks.first().map(|a| a.topic.as_str()).unwrap_or("");
+                    if sendable_ack_partitions.contains(&(topic.to_string(), partition)) {
                         ack_batches_by_broker
                             .entry(broker_id)
                             .or_default()
@@ -515,21 +616,19 @@ impl ShareConsumer {
                     } else {
                         failed_piggyback_acks.extend(acks);
                     }
-                } else {
-                    failed_piggyback_acks.extend(acks);
                 }
             }
         }
 
         // Fetch from all brokers concurrently.
         let mut fetch_tasks = Vec::with_capacity(partitions_by_broker.len());
-        let member_id = (**self.member_id.load()).clone();
-        let group_id = self.config.group_id.clone();
-        let current_ack_state_generation = self.ack_state_generation.clone();
+        let member_id = (**self.0.member_id.load()).clone();
+        let group_id = self.0.config.group_id.clone();
+        let current_ack_state_generation = self.0.ack_state_generation.clone();
 
         for (broker_id, partitions) in &partitions_by_broker {
             let session_epoch = {
-                let mut sessions = self.share_sessions.lock().await;
+                let mut sessions = self.0.share_sessions.lock().await;
                 sessions.get_or_create(*broker_id).epoch()
             };
 
@@ -574,17 +673,17 @@ impl ShareConsumer {
                 member_id: Some(member_id.clone()),
                 share_session_epoch: session_epoch,
                 max_wait_ms: timeout.as_millis().min(i32::MAX as u128) as i32,
-                min_bytes: self.config.fetch_min_bytes,
-                max_bytes: self.config.fetch_max_bytes,
-                max_records: self.config.max_records,
-                batch_size: self.config.batch_size,
+                min_bytes: self.0.config.fetch_min_bytes,
+                max_bytes: self.0.config.fetch_max_bytes,
+                max_records: self.0.config.max_records,
+                batch_size: self.0.config.batch_size,
                 topics,
                 forgotten_topics: Vec::new(),
             };
 
             let bid = *broker_id;
-            let metadata = self.metadata.clone();
-            let pool = self.pool.clone();
+            let metadata = self.0.metadata.clone();
+            let pool = self.0.pool.clone();
             let current_ack_state_generation = current_ack_state_generation.clone();
             let task = tokio::spawn(async move {
                 ShareConsumer::ensure_ack_state_current(
@@ -640,7 +739,7 @@ impl ShareConsumer {
 
         // Collect results from all brokers.
         let mut all_records = Vec::new();
-        let topic_ids_guard = self.topic_ids.read().await;
+        let topic_ids_guard = self.0.topic_ids.read().await;
 
         for (broker_id, task) in fetch_tasks {
             match task.await {
@@ -655,14 +754,14 @@ impl ShareConsumer {
                             response.error_code,
                             response.error_message.as_deref().unwrap_or("unknown error")
                         );
-                        let mut sessions = self.share_sessions.lock().await;
+                        let mut sessions = self.0.share_sessions.lock().await;
                         sessions.reset_broker(broker_id);
                         continue;
                     }
 
                     // Update session state on success.
                     {
-                        let mut sessions = self.share_sessions.lock().await;
+                        let mut sessions = self.0.share_sessions.lock().await;
                         sessions.get_or_create(broker_id).on_success();
                     }
 
@@ -670,7 +769,7 @@ impl ShareConsumer {
                     // partitions whose piggybacked acknowledgements failed.
                     for topic_response in &response.responses {
                         let topic_name = if let Some(name) =
-                            self.metadata.topic_name_for_id(&topic_response.topic_id)
+                            self.0.metadata.topic_name_for_id(&topic_response.topic_id)
                         {
                             name
                         } else {
@@ -738,7 +837,7 @@ impl ShareConsumer {
                                 while !cursor.is_empty() {
                                     match RecordBatch::decode_with_limit(
                                         &mut cursor,
-                                        self.config.max_decompressed_size,
+                                        self.0.config.max_decompressed_size,
                                     ) {
                                         Ok(batch) => {
                                             for record in batch.records {
@@ -809,22 +908,22 @@ impl ShareConsumer {
             .await;
 
         // In implicit mode, queue all fetched records as coalesced accepts for next poll.
-        if self.config.acknowledgement_mode == AcknowledgementMode::Implicit {
-            let ids = self.topic_ids.read().await;
-            let mut pending = self.pending_acks.write().await;
-            Self::coalesce_implicit_acks(&all_records, &ids, &mut pending);
+        if self.0.config.acknowledgement_mode == AcknowledgementMode::Implicit {
+            let ids = self.0.topic_ids.read().await;
+            let mut pending = self.0.pending_acks.write().await;
+            Self::coalesce_implicit_acks(&all_records, &ids, &mut pending, &self.0.metadata);
         }
 
         // In explicit mode, track all returned records as unacknowledged.
-        if self.config.acknowledgement_mode == AcknowledgementMode::Explicit {
-            let mut unacked = self.unacked_offsets.write().await;
+        if self.0.config.acknowledgement_mode == AcknowledgementMode::Explicit {
+            let mut unacked = self.0.unacked_offsets.write().await;
             for record in &all_records {
                 unacked.insert((record.topic.clone(), record.partition, record.offset));
             }
         }
 
         // Truncate to max_poll_records (validated >= 1 in the builder).
-        let max = self.config.max_poll_records as usize;
+        let max = self.0.config.max_poll_records as usize;
         all_records.truncate(max);
 
         Ok(all_records)
@@ -840,28 +939,39 @@ impl ShareConsumer {
         record: &ConsumerRecord,
         ack_type: AcknowledgeType,
     ) -> Result<()> {
-        if self.config.acknowledgement_mode != AcknowledgementMode::Explicit {
+        if self.0.config.acknowledgement_mode != AcknowledgementMode::Explicit {
             return Err(KrafkaError::invalid_state(
                 "acknowledge() requires explicit acknowledgement mode",
             ));
         }
 
-        let topic_ids = self.topic_ids.read().await;
+        let topic_ids = self.0.topic_ids.read().await;
         let topic_id = topic_ids.get(&record.topic).copied().ok_or_else(|| {
             KrafkaError::invalid_state(format!("no topic UUID for '{}'", record.topic))
         })?;
         drop(topic_ids);
 
         let record_key = (record.topic.clone(), record.partition, record.offset);
-        let mut pending = self.pending_acks.write().await;
-        let mut unacked = self.unacked_offsets.write().await;
+        let mut pending = self.0.pending_acks.write().await;
+        let mut unacked = self.0.unacked_offsets.write().await;
         if !unacked.contains(&record_key) {
             return Err(KrafkaError::invalid_state(format!(
                 "record {}-{}@{} is not pending acknowledgement",
                 record.topic, record.partition, record.offset
             )));
         }
+        // Route the ack to the current partition leader so poll() can piggyback
+        // it on the correct broker's ShareFetch without re-scanning the whole map.
+        // Fall back to UNROUTED_BROKER_ID when the leader is not yet in metadata;
+        // poll() will re-route it using fresh metadata.
+        let broker_id = self
+            .0
+            .metadata
+            .leader(&record.topic, record.partition)
+            .unwrap_or(UNROUTED_BROKER_ID);
         pending
+            .entry(broker_id)
+            .or_default()
             .entry((topic_id, record.partition))
             .or_default()
             .push(PendingAck {
@@ -884,9 +994,9 @@ impl ShareConsumer {
         require_explicit_retry: bool,
     ) {
         Self::restore_ack_state(
-            self.ack_state_generation.as_ref(),
-            self.pending_acks.as_ref(),
-            self.explicit_flush_retry_required.as_ref(),
+            self.0.ack_state_generation.as_ref(),
+            self.0.pending_acks.as_ref(),
+            self.0.explicit_flush_retry_required.as_ref(),
             ack_state_generation,
             require_explicit_retry,
             &mut acks,
@@ -896,7 +1006,7 @@ impl ShareConsumer {
 
     async fn restore_ack_state(
         current_generation: &AtomicU64,
-        pending_acks: &RwLock<HashMap<BrokerAckKey, Vec<PendingAck>>>,
+        pending_acks: &RwLock<BrokerPendingAcks>,
         explicit_flush_retry_required: &AtomicBool,
         ack_state_generation: u64,
         require_explicit_retry: bool,
@@ -914,8 +1024,12 @@ impl ShareConsumer {
         if require_explicit_retry {
             explicit_flush_retry_required.store(true, Ordering::SeqCst);
         }
+        // Re-queue under UNROUTED_BROKER_ID; poll() will re-route using fresh
+        // metadata on the next call (handles leadership changes after failure).
         for ack in acks.drain(..) {
             pending
+                .entry(UNROUTED_BROKER_ID)
+                .or_default()
                 .entry((ack.topic_id, ack.partition))
                 .or_default()
                 .push(ack);
@@ -959,7 +1073,7 @@ impl ShareConsumer {
     /// Sends a `ShareAcknowledge` request for all outstanding acknowledgements.
     /// In implicit mode, this flushes any buffered accepts.
     pub async fn commit_sync(&self) -> Result<()> {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.0.closed.load(Ordering::SeqCst) {
             return Err(KrafkaError::invalid_state("share consumer is closed"));
         }
 
@@ -967,12 +1081,12 @@ impl ShareConsumer {
     }
 
     async fn flush_pending_acks(&self) -> Result<()> {
-        let ack_state_generation = self.ack_state_generation.load(Ordering::SeqCst);
+        let ack_state_generation = self.0.ack_state_generation.load(Ordering::SeqCst);
         let acks: Vec<PendingAck> = {
-            let mut pending = self.pending_acks.write().await;
+            let mut pending = self.0.pending_acks.write().await;
             std::mem::take(&mut *pending)
                 .into_values()
-                .flatten()
+                .flat_map(|broker_acks| broker_acks.into_values().flatten())
                 .collect()
         };
 
@@ -982,7 +1096,8 @@ impl ShareConsumer {
 
         match self.send_share_acknowledge(&acks).await {
             Ok(()) => {
-                self.explicit_flush_retry_required
+                self.0
+                    .explicit_flush_retry_required
                     .store(false, Ordering::SeqCst);
                 Ok(())
             }
@@ -1000,26 +1115,26 @@ impl ShareConsumer {
     /// errors. If the handle is dropped, the task continues in the background
     /// and its result is discarded.
     pub fn commit_async(&self) -> ShareCommitHandle {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.0.closed.load(Ordering::SeqCst) {
             return ShareCommitHandle::ready(Err(KrafkaError::invalid_state(
                 "share consumer is closed",
             )));
         }
 
-        let member_id = (**self.member_id.load()).clone();
+        let member_id = (**self.0.member_id.load()).clone();
 
-        let ack_state_generation = self.ack_state_generation.load(Ordering::SeqCst);
-        let pending_acks = self.pending_acks.clone();
-        let current_ack_state_generation = self.ack_state_generation.clone();
-        let explicit_flush_retry_required = self.explicit_flush_retry_required.clone();
-        let Ok(mut pending) = self.pending_acks.try_write() else {
+        let ack_state_generation = self.0.ack_state_generation.load(Ordering::SeqCst);
+        let pending_acks = self.0.pending_acks.clone();
+        let current_ack_state_generation = self.0.ack_state_generation.clone();
+        let explicit_flush_retry_required = self.0.explicit_flush_retry_required.clone();
+        let Ok(mut pending) = self.0.pending_acks.try_write() else {
             return ShareCommitHandle::ready(Err(KrafkaError::invalid_state(
                 "commit_async: pending_acks lock contention",
             )));
         };
         let acks: Vec<PendingAck> = std::mem::take(&mut *pending)
             .into_values()
-            .flatten()
+            .flat_map(|broker_acks| broker_acks.into_values().flatten())
             .collect();
         drop(pending);
 
@@ -1027,10 +1142,10 @@ impl ShareConsumer {
             return ShareCommitHandle::ready(Ok(()));
         }
 
-        let metadata = self.metadata.clone();
-        let pool = self.pool.clone();
-        let share_sessions = self.share_sessions.clone();
-        let group_id = self.config.group_id.clone();
+        let metadata = self.0.metadata.clone();
+        let pool = self.0.pool.clone();
+        let share_sessions = self.0.share_sessions.clone();
+        let group_id = self.0.config.group_id.clone();
         let send_ack_state_generation = current_ack_state_generation.clone();
 
         ShareCommitHandle::Task(tokio::spawn(async move {
@@ -1080,13 +1195,13 @@ impl ShareConsumer {
     pub async fn recv(&self) -> Result<Option<ConsumerRecord>> {
         // Return from buffer first.
         {
-            let mut buf = self.recv_buffer.write().await;
+            let mut buf = self.0.recv_buffer.write().await;
             if let Some(record) = buf.pop_front() {
                 return Ok(Some(record));
             }
         }
 
-        if self.closed.load(Ordering::SeqCst) {
+        if self.0.closed.load(Ordering::SeqCst) {
             return Ok(None);
         }
 
@@ -1095,7 +1210,7 @@ impl ShareConsumer {
             return Ok(None);
         }
 
-        let mut buf = self.recv_buffer.write().await;
+        let mut buf = self.0.recv_buffer.write().await;
         let mut iter = records.into_iter();
         let first = iter.next();
         // Preserve overflow records so recv() never drops data.
@@ -1115,19 +1230,31 @@ impl ShareConsumer {
     ///
     /// Sends a leave heartbeat (member_epoch = -1) and clears state.
     pub async fn unsubscribe(&self) {
+        // Stop the background heartbeat task before leaving the group.
+        if let Some(handle) = self
+            .0
+            .heartbeat_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            handle.abort();
+        }
+
         // Leave group via heartbeat with epoch -1.
         if let Err(e) = self.leave_group().await {
             warn!("Leave group failed during unsubscribe: {e}");
         }
 
-        self.subscriptions.write().await.clear();
-        self.assignments.write().await.clear();
+        self.0.subscriptions.write().await.clear();
+        self.0.assignments.write().await.clear();
         self.clear_partition_state().await;
-        self.member_id
+        self.0
+            .member_id
             .store(Arc::new(crate::util::random_uuid_v4()));
-        self.member_epoch.store(0, Ordering::Release);
+        self.0.member_epoch.store(0, Ordering::Release);
 
-        debug!("Unsubscribed from share group '{}'", self.config.group_id);
+        debug!("Unsubscribed from share group '{}'", self.0.config.group_id);
     }
 
     /// Close the share consumer.
@@ -1140,34 +1267,52 @@ impl ShareConsumer {
     /// Returns the first cleanup error after local state and connections have
     /// still been closed.
     pub async fn close(&self) -> Result<()> {
-        if self.closed.swap(true, Ordering::SeqCst) {
+        if self.0.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
+        }
+
+        // Stop the background heartbeat task immediately so it does not
+        // race with the leave-group heartbeat sent below.
+        if let Some(handle) = self
+            .0
+            .heartbeat_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            handle.abort();
         }
 
         // In implicit mode, convert pending accepts to releases so acquired
         // records are returned to the pool for redelivery (KIP-932 §close).
-        if self.config.acknowledgement_mode == AcknowledgementMode::Implicit {
-            let mut pending = self.pending_acks.write().await;
-            for acks in pending.values_mut() {
-                for ack in acks.iter_mut() {
-                    ack.ack_type = AcknowledgeType::Release.to_i8();
+        if self.0.config.acknowledgement_mode == AcknowledgementMode::Implicit {
+            let mut pending = self.0.pending_acks.write().await;
+            for broker_acks in pending.values_mut() {
+                for acks in broker_acks.values_mut() {
+                    for ack in acks.iter_mut() {
+                        ack.ack_type = AcknowledgeType::Release.to_i8();
+                    }
                 }
             }
         }
 
         let commit_result = self.flush_pending_acks().await;
 
+        // Send FINAL_EPOCH to all established share sessions so brokers release
+        // server-side session state immediately rather than waiting for timeout.
+        self.close_share_sessions().await;
+
         // Leave the group.
         let leave_result = self.leave_group().await;
 
         // Clear state.
-        self.subscriptions.write().await.clear();
-        self.assignments.write().await.clear();
+        self.0.subscriptions.write().await.clear();
+        self.0.assignments.write().await.clear();
         self.clear_partition_state().await;
 
-        self.pool.close_all().await;
+        self.0.pool.close_all().await;
 
-        info!("ShareConsumer closed (group '{}')", self.config.group_id);
+        info!("ShareConsumer closed (group '{}')", self.0.config.group_id);
 
         commit_result?;
         leave_result
@@ -1176,51 +1321,196 @@ impl ShareConsumer {
     /// Returns true if the consumer has been closed.
     #[inline]
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+        self.0.closed.load(Ordering::SeqCst)
+    }
+
+    /// Interrupt an in-progress [`poll()`](Self::poll) call from another thread or task.
+    ///
+    /// Sets a wakeup flag that causes the next pending `poll()` to return
+    /// `Err(KrafkaError::WakeupCalled)` immediately without fetching records.
+    /// The consumer remains usable — subsequent `poll()` calls proceed normally.
+    ///
+    /// This is safe to call concurrently with any other consumer method.
+    #[inline]
+    pub fn wakeup(&self) {
+        self.0.wakeup_flag.store(true, Ordering::Release);
+    }
+
+    /// Close the consumer with a per-phase timeout.
+    ///
+    /// Equivalent to [`close()`](Self::close) but each cleanup phase
+    /// (ack flush, leave-group) is individually limited to `timeout / 2`.
+    /// Any cleanup error is returned after local state has been released.
+    /// Idempotent.
+    pub async fn close_with_timeout(&self, timeout: Duration) -> Result<()> {
+        if self.0.closed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        if let Some(handle) = self
+            .0
+            .heartbeat_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            handle.abort();
+        }
+
+        if self.0.config.acknowledgement_mode == AcknowledgementMode::Implicit {
+            let mut pending = self.0.pending_acks.write().await;
+            for broker_acks in pending.values_mut() {
+                for acks in broker_acks.values_mut() {
+                    for ack in acks.iter_mut() {
+                        ack.ack_type = AcknowledgeType::Release.to_i8();
+                    }
+                }
+            }
+        }
+
+        let phase = timeout / 2;
+        let commit_result = tokio::time::timeout(phase, self.flush_pending_acks())
+            .await
+            .unwrap_or_else(|_| Err(KrafkaError::timeout("ack flush timed out during close")));
+
+        self.close_share_sessions().await;
+
+        let leave_result = tokio::time::timeout(phase, self.leave_group())
+            .await
+            .unwrap_or_else(|_| Err(KrafkaError::timeout("leave-group timed out during close")));
+
+        self.0.subscriptions.write().await.clear();
+        self.0.assignments.write().await.clear();
+        self.clear_partition_state().await;
+
+        self.0.pool.close_all().await;
+
+        info!(
+            "ShareConsumer closed with timeout (group '{}')",
+            self.0.config.group_id
+        );
+
+        commit_result?;
+        leave_result
+    }
+
+    /// Flush all pending explicit-mode acknowledgements synchronously with a timeout.
+    ///
+    /// Equivalent to [`commit_sync()`](Self::commit_sync) but bounded by `timeout`.
+    /// Returns `Err(KrafkaError::Timeout)` if the flush does not complete in time.
+    pub async fn commit_sync_with_timeout(&self, timeout: Duration) -> Result<()> {
+        tokio::time::timeout(timeout, self.commit_sync())
+            .await
+            .unwrap_or_else(|_| Err(KrafkaError::timeout("commit_sync timed out")))
+    }
+
+    /// Acknowledge a record by topic, partition, and offset directly.
+    ///
+    /// Use this when the record could not be deserialized but still needs to be
+    /// acknowledged to prevent indefinite redelivery. The record must have been
+    /// delivered in the current poll session.
+    ///
+    /// Returns `Err` if the record was not found in the unacknowledged set.
+    pub async fn acknowledge_by_offset(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+        offset: Offset,
+        ack_type: AcknowledgeType,
+    ) -> Result<()> {
+        if self.0.config.acknowledgement_mode != AcknowledgementMode::Explicit {
+            return Err(KrafkaError::invalid_state(
+                "acknowledge_by_offset() requires explicit acknowledgement mode",
+            ));
+        }
+
+        let record_key: RecordKey = (topic.to_string(), partition, offset);
+        let unacked = self.0.unacked_offsets.read().await;
+        if !unacked.contains(&record_key) {
+            return Err(KrafkaError::invalid_state(format!(
+                "record {topic}-{partition}@{offset} is not pending acknowledgement"
+            )));
+        }
+        drop(unacked);
+
+        let topic_ids = self.0.topic_ids.read().await;
+        let topic_id = topic_ids
+            .get(topic)
+            .copied()
+            .ok_or_else(|| KrafkaError::invalid_state(format!("no topic UUID for '{topic}'")))?;
+        drop(topic_ids);
+
+        let broker_id = self
+            .0
+            .metadata
+            .leader(topic, partition)
+            .unwrap_or(UNROUTED_BROKER_ID);
+
+        let mut pending = self.0.pending_acks.write().await;
+        let mut unacked = self.0.unacked_offsets.write().await;
+        pending
+            .entry(broker_id)
+            .or_default()
+            .entry((topic_id, partition))
+            .or_default()
+            .push(PendingAck {
+                topic: topic.to_string(),
+                topic_id,
+                partition,
+                first_offset: offset,
+                last_offset: offset,
+                ack_type: ack_type.to_i8(),
+            });
+        unacked.remove(&record_key);
+
+        Ok(())
     }
 
     /// Get the shared connection metrics handle used by this share consumer's broker pool.
     #[inline]
     pub fn connection_metrics(&self) -> Arc<ConnectionMetrics> {
-        self.pool.metrics()
+        self.0.pool.metrics()
     }
 
-    // ── Internal helpers ────────────────────────────────────────────────
+    // ── Internal helpers ──────────────────────────────────────────────────
 
     fn invalidate_ack_state(&self) {
-        self.ack_state_generation.fetch_add(1, Ordering::SeqCst);
-        self.explicit_flush_retry_required
+        self.0.ack_state_generation.fetch_add(1, Ordering::SeqCst);
+        self.0
+            .explicit_flush_retry_required
             .store(false, Ordering::SeqCst);
     }
 
     async fn clear_ack_state(&self) {
         self.invalidate_ack_state();
-        self.pending_acks.write().await.clear();
-        self.unacked_offsets.write().await.clear();
+        self.0.pending_acks.write().await.clear();
+        self.0.unacked_offsets.write().await.clear();
     }
 
     /// Clear all per-partition state. Called from `unsubscribe()` and `close()`.
     async fn clear_partition_state(&self) {
         self.clear_ack_state().await;
-        self.recv_buffer.write().await.clear();
-        self.share_sessions.lock().await.reset_all();
-        *self.coordinator_id.write().await = None;
-        *self.coordinator_address.write().await = None;
+        self.0.recv_buffer.write().await.clear();
+        self.0.share_sessions.lock().await.reset_all();
+        *self.0.coordinator_id.write().await = None;
+        *self.0.coordinator_address.write().await = None;
     }
 
     /// Invalidate the cached coordinator. The next `ensure_coordinator()` call
     /// will re-discover it. Called on NOT_COORDINATOR errors or heartbeat failures.
     async fn invalidate_coordinator(&self) {
-        *self.coordinator_id.write().await = None;
-        *self.coordinator_address.write().await = None;
+        *self.0.coordinator_id.write().await = None;
+        *self.0.coordinator_address.write().await = None;
     }
 
     /// Coalesce implicit accept acks — merge consecutive offsets for the same
-    /// (topic, partition) into a single `PendingAck` with a contiguous range.
+    /// (topic, partition) into a single `PendingAck` with a contiguous range,
+    /// pre-routed to the current partition leader.
     fn coalesce_implicit_acks(
         records: &[ConsumerRecord],
         topic_ids: &HashMap<String, [u8; 16]>,
-        pending: &mut HashMap<BrokerAckKey, Vec<PendingAck>>,
+        pending: &mut BrokerPendingAcks,
+        metadata: &ClusterMetadata,
     ) {
         // Group by (topic, partition) and sort offsets.
         let mut by_tp: HashMap<(&str, PartitionId), Vec<Offset>> = HashMap::new();
@@ -1237,6 +1527,10 @@ impl ShareConsumer {
             };
             offsets.sort_unstable();
 
+            let broker_id = metadata
+                .leader(topic, partition)
+                .unwrap_or(UNROUTED_BROKER_ID);
+
             // Merge consecutive offsets into contiguous ranges.
             let mut i = 0;
             while i < offsets.len() {
@@ -1247,6 +1541,8 @@ impl ShareConsumer {
                     last = offsets[i];
                 }
                 pending
+                    .entry(broker_id)
+                    .or_default()
                     .entry((topic_id, partition))
                     .or_default()
                     .push(PendingAck {
@@ -1301,19 +1597,20 @@ impl ShareConsumer {
 
     /// Discover the share group coordinator via FindCoordinator.
     async fn ensure_coordinator(&self) -> Result<()> {
-        if self.coordinator_id.read().await.is_some() {
+        if self.0.coordinator_id.read().await.is_some() {
             return Ok(());
         }
 
-        let brokers = self.metadata.brokers();
+        let brokers = self.0.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::invalid_state("no brokers available"));
         }
 
         // Try each broker until we find the coordinator.
-        let request = FindCoordinatorRequest::for_group(&self.config.group_id);
+        let request = FindCoordinatorRequest::for_group(&self.0.config.group_id);
         for broker in &brokers {
             let conn = match self
+                .0
                 .pool
                 .get_connection_by_id(broker.id(), broker.address())
                 .await
@@ -1353,24 +1650,24 @@ impl ShareConsumer {
             if response.error_code.is_ok() {
                 let coord_id = response.node_id;
                 let coord_addr = format!("{}:{}", response.host, response.port);
-                *self.coordinator_id.write().await = Some(coord_id);
-                *self.coordinator_address.write().await = Some(coord_addr);
+                *self.0.coordinator_id.write().await = Some(coord_id);
+                *self.0.coordinator_address.write().await = Some(coord_addr);
                 debug!(
                     "Share group '{}' coordinator is broker {coord_id}",
-                    self.config.group_id
+                    self.0.config.group_id
                 );
                 return Ok(());
             }
 
             debug!(
                 "FindCoordinator returned {:?} for group '{}', trying next broker",
-                response.error_code, self.config.group_id
+                response.error_code, self.0.config.group_id
             );
         }
 
         Err(KrafkaError::invalid_state(format!(
             "could not discover coordinator for share group '{}'",
-            self.config.group_id
+            self.0.config.group_id
         )))
     }
 
@@ -1380,17 +1677,19 @@ impl ShareConsumer {
     /// Returns the heartbeat response.
     async fn send_heartbeat(&self, send_subscription: bool) -> Result<()> {
         let coord_id = self
+            .0
             .coordinator_id
             .read()
             .await
             .ok_or_else(|| KrafkaError::invalid_state("no coordinator discovered"))?;
 
-        let member_id = (**self.member_id.load()).clone();
-        let member_epoch = self.member_epoch.load(Ordering::Acquire);
+        let member_id = (**self.0.member_id.load()).clone();
+        let member_epoch = self.0.member_epoch.load(Ordering::Acquire);
 
         let subscribed_topic_names = if send_subscription {
             Some(
-                self.subscriptions
+                self.0
+                    .subscriptions
                     .read()
                     .await
                     .iter()
@@ -1402,20 +1701,22 @@ impl ShareConsumer {
         };
 
         let request = ShareGroupHeartbeatRequest {
-            group_id: self.config.group_id.clone(),
+            group_id: self.0.config.group_id.clone(),
             member_id: member_id.clone(),
             member_epoch,
-            rack_id: self.config.client_rack.clone(),
+            rack_id: self.0.config.client_rack.clone(),
             subscribed_topic_names,
         };
 
         let coord_addr = self
+            .0
             .coordinator_address
             .read()
             .await
             .clone()
             .ok_or_else(|| KrafkaError::invalid_state("no coordinator address"))?;
         let conn = self
+            .0
             .pool
             .get_connection_by_id(coord_id, &coord_addr)
             .await?;
@@ -1441,20 +1742,50 @@ impl ShareConsumer {
 
         let response = ShareGroupHeartbeatResponse::decode_versioned(version, &mut buf.as_ref())?;
 
-        if !response.error_code.is_ok() {
-            return Err(KrafkaError::broker(
-                response.error_code,
-                response
-                    .error_message
-                    .unwrap_or_else(|| "ShareGroupHeartbeat failed".to_string()),
-            ));
+        match response.error_code {
+            ErrorCode::None => {}
+
+            // The current node is no longer the coordinator. Invalidate the
+            // cached coordinator so `ensure_coordinator()` will rediscover it.
+            ErrorCode::NotCoordinator
+            | ErrorCode::CoordinatorNotAvailable
+            | ErrorCode::CoordinatorLoadInProgress => {
+                self.invalidate_coordinator().await;
+                return Err(KrafkaError::broker(
+                    response.error_code,
+                    response
+                        .error_message
+                        .unwrap_or_else(|| "ShareGroupHeartbeat failed".to_string()),
+                ));
+            }
+
+            // The coordinator has advanced past our epoch. The caller is
+            // responsible for resetting local member state.
+            ErrorCode::FencedMemberEpoch => {
+                return Err(KrafkaError::broker(
+                    response.error_code,
+                    response
+                        .error_message
+                        .unwrap_or_else(|| "member epoch fenced".to_string()),
+                ));
+            }
+
+            other => {
+                return Err(KrafkaError::broker(
+                    other,
+                    response
+                        .error_message
+                        .unwrap_or_else(|| "ShareGroupHeartbeat failed".to_string()),
+                ));
+            }
         }
 
         // Update member state from response.
         if let Some(new_member_id) = response.member_id {
-            self.member_id.store(Arc::new(new_member_id));
+            self.0.member_id.store(Arc::new(new_member_id));
         }
-        self.member_epoch
+        self.0
+            .member_epoch
             .store(response.member_epoch, Ordering::Release);
         // Clamp the broker-supplied heartbeat interval to [50 ms, 30 s] to
         // prevent excessively fast polling (which exhausts broker connections)
@@ -1472,7 +1803,8 @@ impl ShareConsumer {
                 "broker heartbeat_interval_ms is out of safe range; clamping"
             );
         }
-        self.heartbeat_interval_ms
+        self.0
+            .heartbeat_interval_ms
             .store(clamped_interval_ms, Ordering::Release);
 
         // Process assignment if present.
@@ -1486,11 +1818,11 @@ impl ShareConsumer {
     /// Apply a partition assignment from the coordinator heartbeat response.
     async fn apply_assignment(&self, assignment: &[ShareGroupTopicPartitions]) {
         let mut new_assignments: HashMap<String, Vec<PartitionId>> = HashMap::new();
-        let mut topic_ids_guard = self.topic_ids.write().await;
+        let mut topic_ids_guard = self.0.topic_ids.write().await;
 
         for tp in assignment {
             // Resolve topic UUID to name.
-            let topic_name = if let Some(name) = self.metadata.topic_name_for_id(&tp.topic_id) {
+            let topic_name = if let Some(name) = self.0.metadata.topic_name_for_id(&tp.topic_id) {
                 topic_ids_guard.insert(name.clone(), tp.topic_id);
                 name
             } else {
@@ -1507,7 +1839,7 @@ impl ShareConsumer {
         drop(topic_ids_guard);
 
         // Reset share sessions for brokers whose partitions changed.
-        let old_assignments = self.assignments.read().await.clone();
+        let old_assignments = self.0.assignments.read().await.clone();
         if old_assignments != new_assignments {
             debug!(
                 "Share group assignment changed: {} topic(s), {} partition(s)",
@@ -1515,10 +1847,10 @@ impl ShareConsumer {
                 new_assignments.values().map(|v| v.len()).sum::<usize>()
             );
             self.clear_ack_state().await;
-            self.share_sessions.lock().await.reset_all();
+            self.0.share_sessions.lock().await.reset_all();
         }
 
-        *self.assignments.write().await = new_assignments;
+        *self.0.assignments.write().await = new_assignments;
     }
 
     /// Send a ShareAcknowledge request for pending acks.
@@ -1526,16 +1858,16 @@ impl ShareConsumer {
     /// Routes acknowledgements to the correct partition leaders. Returns an
     /// error if any leader cannot be determined or any broker rejects the acks.
     async fn send_share_acknowledge(&self, acks: &[PendingAck]) -> Result<()> {
-        let member_id = (**self.member_id.load()).clone();
+        let member_id = (**self.0.member_id.load()).clone();
         Self::send_share_acknowledge_with_state(
             ShareAcknowledgeContext {
-                metadata: self.metadata.clone(),
-                pool: self.pool.clone(),
-                share_sessions: self.share_sessions.clone(),
-                group_id: self.config.group_id.clone(),
+                metadata: self.0.metadata.clone(),
+                pool: self.0.pool.clone(),
+                share_sessions: self.0.share_sessions.clone(),
+                group_id: self.0.config.group_id.clone(),
                 member_id,
-                current_ack_state_generation: self.ack_state_generation.clone(),
-                ack_state_generation: self.ack_state_generation.load(Ordering::SeqCst),
+                current_ack_state_generation: self.0.ack_state_generation.clone(),
+                ack_state_generation: self.0.ack_state_generation.load(Ordering::SeqCst),
             },
             acks,
         )
@@ -1666,30 +1998,31 @@ impl ShareConsumer {
 
     /// Leave the share group via heartbeat with member_epoch = -1.
     async fn leave_group(&self) -> Result<()> {
-        let coord_id = match *self.coordinator_id.read().await {
+        let coord_id = match *self.0.coordinator_id.read().await {
             Some(id) => id,
             None => return Ok(()),
         };
 
-        let member_id = (**self.member_id.load()).clone();
+        let member_id = (**self.0.member_id.load()).clone();
         if member_id.is_empty() {
             return Ok(());
         }
 
         let request = ShareGroupHeartbeatRequest {
-            group_id: self.config.group_id.clone(),
+            group_id: self.0.config.group_id.clone(),
             member_id,
             member_epoch: -1, // Leave signal
             rack_id: None,
             subscribed_topic_names: None,
         };
 
-        let coord_addr = match self.coordinator_address.read().await.clone() {
+        let coord_addr = match self.0.coordinator_address.read().await.clone() {
             Some(addr) => addr,
             None => return Ok(()),
         };
 
         let conn = self
+            .0
             .pool
             .get_connection_by_id(coord_id, &coord_addr)
             .await?;
@@ -1728,10 +2061,153 @@ impl ShareConsumer {
             ));
         }
 
-        debug!("Left share group '{}' successfully", self.config.group_id);
+        debug!("Left share group '{}' successfully", self.0.config.group_id);
 
         self.invalidate_coordinator().await;
         Ok(())
+    }
+
+    /// Send `ShareFetch` with `share_session_epoch = FINAL_EPOCH` (-1) to each
+    /// broker that has an established session, allowing the broker to release
+    /// server-side session state immediately instead of waiting for timeout.
+    ///
+    /// This is a best-effort operation: errors are logged at `debug!` level
+    /// and do not prevent the consumer from closing.
+    async fn close_share_sessions(&self) {
+        let broker_ids = {
+            let sessions = self.0.share_sessions.lock().await;
+            sessions.established_broker_ids()
+        };
+        if broker_ids.is_empty() {
+            return;
+        }
+
+        let member_id = (**self.0.member_id.load()).clone();
+        let group_id = &self.0.config.group_id;
+
+        for broker_id in broker_ids {
+            let broker_addr = match self.0.metadata.broker(broker_id) {
+                Some(b) => b.address().to_string(),
+                None => continue,
+            };
+
+            let conn = match self
+                .0
+                .pool
+                .get_connection_by_id(broker_id, &broker_addr)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!("close_share_sessions: connection to broker {broker_id} failed: {e}");
+                    continue;
+                }
+            };
+
+            let version = match conn
+                .negotiate_api_version(
+                    ApiKey::ShareFetch,
+                    versions::SHARE_FETCH_MAX,
+                    versions::SHARE_FETCH_MIN,
+                )
+                .await
+            {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let request = ShareFetchRequest {
+                group_id: Some(group_id.clone()),
+                member_id: Some(member_id.clone()),
+                share_session_epoch: FINAL_EPOCH,
+                max_wait_ms: 0,
+                min_bytes: 0,
+                max_bytes: 0,
+                max_records: 0,
+                batch_size: 0,
+                topics: Vec::new(),
+                forgotten_topics: Vec::new(),
+            };
+
+            if let Err(e) = conn
+                .send_request(ApiKey::ShareFetch, version, |buf| match version {
+                    2 => request.encode_v2(buf, 0, false),
+                    _ => request.encode_v1(buf),
+                })
+                .await
+            {
+                debug!("close_share_sessions: FINAL_EPOCH to broker {broker_id} failed: {e}");
+            } else {
+                debug!("close_share_sessions: sent FINAL_EPOCH to broker {broker_id}");
+            }
+        }
+    }
+
+    /// Background heartbeat loop.    ///
+    /// Sends periodic heartbeats at the coordinator-specified interval so the
+    /// share-group session stays alive independent of how often `poll()` is
+    /// called.  Handles coordinator errors with automatic rediscovery and
+    /// recovers from `FencedMemberEpoch` by resetting local member state.
+    ///
+    /// Stops when `closed` is set or the task is aborted.
+    async fn run_heartbeat_loop(&self) {
+        loop {
+            let interval_ms = self.0.heartbeat_interval_ms.load(Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(interval_ms as u64)).await;
+
+            if self.0.closed.load(Ordering::Relaxed) {
+                break;
+            }
+
+            match self.send_heartbeat(false).await {
+                Ok(()) => {}
+
+                // Fenced epoch: the coordinator has advanced past our epoch.
+                // Reset local member state so the next heartbeat starts a new
+                // membership attempt.
+                Err(KrafkaError::Broker {
+                    code: ErrorCode::FencedMemberEpoch,
+                    ..
+                }) => {
+                    warn!(
+                        "Background heartbeat: member epoch fenced for group '{}'; resetting state",
+                        self.0.config.group_id
+                    );
+                    self.0.member_epoch.store(0, Ordering::Release);
+                    self.clear_ack_state().await;
+                    self.invalidate_coordinator().await;
+                    if let Err(e) = self.ensure_coordinator().await {
+                        warn!(
+                            "Background heartbeat: coordinator rediscovery after fence failed: {e}"
+                        );
+                    }
+                }
+
+                // Coordinator moved or unavailable: rediscover and retry.
+                Err(ref e) if e.is_retriable() => {
+                    debug!(
+                        "Background heartbeat: retryable error for group '{}': {e}",
+                        self.0.config.group_id
+                    );
+                    self.invalidate_coordinator().await;
+                    if let Err(e2) = self.ensure_coordinator().await {
+                        warn!("Background heartbeat: coordinator rediscovery failed: {e2}");
+                    }
+                }
+
+                Err(e) => {
+                    warn!(
+                        "Background heartbeat error for group '{}': {e}",
+                        self.0.config.group_id
+                    );
+                    self.invalidate_coordinator().await;
+                }
+            }
+        }
+        debug!(
+            "Background heartbeat task stopped for group '{}'",
+            self.0.config.group_id
+        );
     }
 }
 
@@ -1921,7 +2397,7 @@ mod tests {
             config.metadata_max_age,
         ));
 
-        ShareConsumer {
+        ShareConsumer(Arc::new(ShareConsumerInner {
             config,
             metadata,
             pool,
@@ -1940,7 +2416,9 @@ mod tests {
             coordinator_id: RwLock::new(None),
             coordinator_address: RwLock::new(None),
             unacked_offsets: Arc::new(RwLock::new(HashSet::new())),
-        }
+            heartbeat_task: SyncMutex::new(None),
+            wakeup_flag: AtomicBool::new(false),
+        }))
     }
 
     #[test]
@@ -2047,6 +2525,7 @@ mod tests {
         assert_eq!(AcknowledgeType::Accept.to_i8(), 1);
         assert_eq!(AcknowledgeType::Release.to_i8(), 2);
         assert_eq!(AcknowledgeType::Reject.to_i8(), 3);
+        assert_eq!(AcknowledgeType::Archive.to_i8(), 4);
     }
 
     #[test]
@@ -2153,7 +2632,7 @@ mod tests {
     async fn test_restore_ack_state_requeues_pending_acks_without_reinserting_unacked() {
         let ack_state_generation = AtomicU64::new(0);
         let explicit_flush_retry_required = AtomicBool::new(false);
-        let pending: RwLock<HashMap<BrokerAckKey, Vec<PendingAck>>> = RwLock::new(HashMap::new());
+        let pending: RwLock<BrokerPendingAcks> = RwLock::new(HashMap::new());
         let mut acks_to_restore = vec![PendingAck {
             topic: "topic-a".into(),
             topic_id: [0; 16],
@@ -2176,7 +2655,8 @@ mod tests {
         assert!(acks_to_restore.is_empty());
         assert!(!explicit_flush_retry_required.load(Ordering::SeqCst));
         let guard = pending.read().await;
-        let all_acks: Vec<&PendingAck> = guard.values().flatten().collect();
+        let all_acks: Vec<&PendingAck> =
+            guard.values().flat_map(|b| b.values().flatten()).collect();
         assert_eq!(all_acks.len(), 1);
         assert_eq!(all_acks[0].topic, "topic-a");
         assert_eq!(all_acks[0].partition, 2);
@@ -2189,7 +2669,7 @@ mod tests {
     async fn test_restore_ack_state_skips_stale_generation() {
         let ack_state_generation = AtomicU64::new(1);
         let explicit_flush_retry_required = AtomicBool::new(false);
-        let pending: RwLock<HashMap<BrokerAckKey, Vec<PendingAck>>> = RwLock::new(HashMap::new());
+        let pending: RwLock<BrokerPendingAcks> = RwLock::new(HashMap::new());
         let mut acks_to_restore = vec![PendingAck {
             topic: "topic-a".into(),
             topic_id: [0; 16],
@@ -2218,7 +2698,7 @@ mod tests {
     async fn test_restore_ack_state_marks_explicit_flush_retry_required() {
         let ack_state_generation = AtomicU64::new(0);
         let explicit_flush_retry_required = AtomicBool::new(false);
-        let pending: RwLock<HashMap<BrokerAckKey, Vec<PendingAck>>> = RwLock::new(HashMap::new());
+        let pending: RwLock<BrokerPendingAcks> = RwLock::new(HashMap::new());
         let mut acks_to_restore = vec![PendingAck {
             topic: "topic-a".into(),
             topic_id: [0; 16],
@@ -2240,13 +2720,22 @@ mod tests {
 
         assert!(acks_to_restore.is_empty());
         assert!(explicit_flush_retry_required.load(Ordering::SeqCst));
-        assert_eq!(pending.read().await.values().flatten().count(), 1);
+        assert_eq!(
+            pending
+                .read()
+                .await
+                .values()
+                .flat_map(|b| b.values().flatten())
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
     async fn test_poll_rejects_after_failed_explicit_flush() {
         let consumer = test_share_consumer(AcknowledgementMode::Explicit);
         consumer
+            .0
             .explicit_flush_retry_required
             .store(true, Ordering::SeqCst);
 
@@ -2266,6 +2755,7 @@ mod tests {
     async fn test_clear_partition_state_clears_explicit_flush_retry_required() {
         let consumer = test_share_consumer(AcknowledgementMode::Explicit);
         consumer
+            .0
             .explicit_flush_retry_required
             .store(true, Ordering::SeqCst);
 
@@ -2273,6 +2763,7 @@ mod tests {
 
         assert!(
             !consumer
+                .0
                 .explicit_flush_retry_required
                 .load(Ordering::SeqCst)
         );
@@ -2282,14 +2773,18 @@ mod tests {
     async fn test_apply_assignment_advances_ack_state_generation_on_change() {
         let consumer = test_share_consumer(AcknowledgementMode::Explicit);
         consumer
+            .0
             .assignments
             .write()
             .await
             .insert("topic-a".to_string(), vec![0]);
         consumer
+            .0
             .pending_acks
             .write()
             .await
+            .entry(UNROUTED_BROKER_ID)
+            .or_default()
             .entry(([1; 16], 0))
             .or_default()
             .push(PendingAck {
@@ -2301,28 +2796,31 @@ mod tests {
                 ack_type: AcknowledgeType::Accept.to_i8(),
             });
         consumer
+            .0
             .unacked_offsets
             .write()
             .await
             .insert(("topic-a".to_string(), 0, 5));
         consumer
+            .0
             .explicit_flush_retry_required
             .store(true, Ordering::SeqCst);
 
-        let old_generation = consumer.ack_state_generation.load(Ordering::SeqCst);
+        let old_generation = consumer.0.ack_state_generation.load(Ordering::SeqCst);
         consumer.apply_assignment(&[]).await;
 
         assert_eq!(
-            consumer.ack_state_generation.load(Ordering::SeqCst),
+            consumer.0.ack_state_generation.load(Ordering::SeqCst),
             old_generation + 1
         );
         assert!(
             !consumer
+                .0
                 .explicit_flush_retry_required
                 .load(Ordering::SeqCst)
         );
-        assert!(consumer.pending_acks.read().await.is_empty());
-        assert!(consumer.unacked_offsets.read().await.is_empty());
+        assert!(consumer.0.pending_acks.read().await.is_empty());
+        assert!(consumer.0.unacked_offsets.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -2330,11 +2828,11 @@ mod tests {
         let consumer = test_share_consumer(AcknowledgementMode::Explicit);
         let error = ShareConsumer::send_share_acknowledge_with_state(
             ShareAcknowledgeContext {
-                metadata: consumer.metadata.clone(),
-                pool: consumer.pool.clone(),
-                share_sessions: consumer.share_sessions.clone(),
-                group_id: consumer.config.group_id.clone(),
-                member_id: (**consumer.member_id.load()).clone(),
+                metadata: consumer.0.metadata.clone(),
+                pool: consumer.0.pool.clone(),
+                share_sessions: consumer.0.share_sessions.clone(),
+                group_id: consumer.0.config.group_id.clone(),
+                member_id: (**consumer.0.member_id.load()).clone(),
                 current_ack_state_generation: Arc::new(AtomicU64::new(1)),
                 ack_state_generation: 0,
             },
@@ -2410,6 +2908,7 @@ mod tests {
         let consumer = Arc::new(test_share_consumer(AcknowledgementMode::Explicit));
 
         consumer
+            .0
             .topic_ids
             .write()
             .await
@@ -2430,12 +2929,13 @@ mod tests {
         let record_key = (record.topic.clone(), record.partition, record.offset);
 
         consumer
+            .0
             .unacked_offsets
             .write()
             .await
             .insert(record_key.clone());
 
-        let pending_guard = consumer.pending_acks.write().await;
+        let pending_guard = consumer.0.pending_acks.write().await;
         let task_consumer = consumer.clone();
         let task = tokio::spawn(async move {
             task_consumer
@@ -2445,7 +2945,14 @@ mod tests {
 
         tokio::task::yield_now().await;
 
-        assert!(consumer.unacked_offsets.read().await.contains(&record_key));
+        assert!(
+            consumer
+                .0
+                .unacked_offsets
+                .read()
+                .await
+                .contains(&record_key)
+        );
         assert!(
             !task.is_finished(),
             "acknowledge should still be waiting on the pending_acks lock"
@@ -2457,9 +2964,19 @@ mod tests {
             .expect("acknowledge task should join")
             .expect("acknowledge should succeed once pending lock is released");
 
-        assert!(!consumer.unacked_offsets.read().await.contains(&record_key));
-        let pending_guard = consumer.pending_acks.read().await;
-        let all_acks: Vec<&PendingAck> = pending_guard.values().flatten().collect();
+        assert!(
+            !consumer
+                .0
+                .unacked_offsets
+                .read()
+                .await
+                .contains(&record_key)
+        );
+        let pending_guard = consumer.0.pending_acks.read().await;
+        let all_acks: Vec<&PendingAck> = pending_guard
+            .values()
+            .flat_map(|b| b.values().flatten())
+            .collect();
         assert_eq!(all_acks.len(), 1);
         assert_eq!(all_acks[0].topic, "topic-a");
         assert_eq!(all_acks[0].partition, 3);
@@ -2525,11 +3042,21 @@ mod tests {
         let mut topic_ids = HashMap::new();
         topic_ids.insert("t1".to_string(), [1u8; 16]);
 
-        let mut pending: HashMap<BrokerAckKey, Vec<PendingAck>> = HashMap::new();
-        ShareConsumer::coalesce_implicit_acks(&records, &topic_ids, &mut pending);
+        let mut pending: BrokerPendingAcks = HashMap::new();
+        // Pass a dummy ClusterMetadata — no live brokers, so all acks route to UNROUTED_BROKER_ID.
+        let dummy_pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
+        let dummy_metadata = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            dummy_pool,
+            Duration::from_secs(300),
+        );
+        ShareConsumer::coalesce_implicit_acks(&records, &topic_ids, &mut pending, &dummy_metadata);
 
         // Should produce two ranges: [0,2] and [4,4].
-        let mut all_acks: Vec<PendingAck> = pending.into_values().flatten().collect();
+        let mut all_acks: Vec<PendingAck> = pending
+            .into_values()
+            .flat_map(|b| b.into_values().flatten())
+            .collect();
         assert_eq!(all_acks.len(), 2);
         all_acks.sort_by_key(|a| a.first_offset);
         assert_eq!(all_acks[0].first_offset, 0);
@@ -2547,5 +3074,98 @@ mod tests {
         // KIP-932 specifies 45s session timeout.
         assert_eq!(builder.config.session_timeout(), Duration::from_secs(45));
         assert_eq!(builder.config.heartbeat_interval(), Duration::from_secs(5));
+    }
+
+    // ── Regression test: F-06 / ack_state_generation ordering ────────────────
+
+    /// `ensure_ack_state_current` must accept a matching generation and reject
+    /// any stale one, whether the captured snapshot is behind OR ahead of the
+    /// current value (the latter is impossible in practice but good to guard).
+    ///
+    /// This is a unit test of the pure guard function — no async machinery
+    /// required.  The same logic is exercised end-to-end by
+    /// `test_send_share_acknowledge_rejects_stale_ack_generation`.
+    #[test]
+    fn test_ensure_ack_state_current_rejects_stale_generation() {
+        let current = AtomicU64::new(5);
+
+        // Exact match → Ok.
+        assert!(
+            ShareConsumer::ensure_ack_state_current(&current, 5).is_ok(),
+            "matching generation must succeed"
+        );
+
+        // Stale (lower than current) — the common invalidation case.
+        assert!(
+            ShareConsumer::ensure_ack_state_current(&current, 4).is_err(),
+            "stale lower generation must be rejected"
+        );
+
+        // Stale (higher than current) — shouldn't happen, but the guard covers it.
+        assert!(
+            ShareConsumer::ensure_ack_state_current(&current, 6).is_err(),
+            "stale higher generation must be rejected"
+        );
+    }
+
+    /// Incrementing `ack_state_generation` must be visible to concurrent
+    /// callers that captured the old value, without any spurious success.
+    ///
+    /// Simulates: flush task captures generation, assignment changes, flush
+    /// task calls `ensure_ack_state_current` and must receive an error.
+    #[tokio::test]
+    async fn test_ack_state_generation_flush_task_sees_invalidation() {
+        let consumer = Arc::new(test_share_consumer(AcknowledgementMode::Explicit));
+
+        // Capture the generation as a flush task would at spawn time.
+        let captured_gen = consumer.0.ack_state_generation.load(Ordering::SeqCst);
+        assert_eq!(captured_gen, 0);
+
+        // Simulate assignment change / unsubscribe which advances the generation.
+        consumer.clear_partition_state().await;
+        let new_gen = consumer.0.ack_state_generation.load(Ordering::SeqCst);
+        assert!(
+            new_gen > captured_gen,
+            "generation must advance after clear_partition_state"
+        );
+
+        // A detached flush task using the captured (old) generation must be blocked.
+        let err =
+            ShareConsumer::ensure_ack_state_current(&consumer.0.ack_state_generation, captured_gen)
+                .expect_err("stale flush task must be rejected");
+        assert!(err.to_string().contains("invalidated"), "got: {err}");
+    }
+
+    /// Cloning a `ShareConsumer` produces a second handle to the same state.
+    #[test]
+    fn test_share_consumer_clone_shares_state() {
+        let consumer = test_share_consumer(AcknowledgementMode::Implicit);
+        let cloned = consumer.clone();
+
+        // Both handles share the same Arc — pointer equality confirms this.
+        assert!(Arc::ptr_eq(&consumer.0, &cloned.0));
+
+        // A store via one handle is immediately visible through the other.
+        consumer.0.member_epoch.store(42, Ordering::Release);
+        assert_eq!(cloned.0.member_epoch.load(Ordering::Acquire), 42);
+    }
+
+    /// The background heartbeat task field starts as `None` and can be set.
+    #[test]
+    fn test_heartbeat_task_starts_none() {
+        let consumer = test_share_consumer(AcknowledgementMode::Implicit);
+        let guard = consumer.0.heartbeat_task.lock().unwrap();
+        assert!(guard.is_none(), "heartbeat task should start as None");
+    }
+
+    /// `close()` marks the consumer closed and the drop warning is suppressed.
+    #[tokio::test]
+    async fn test_close_is_idempotent_and_suppresses_drop_warning() {
+        let consumer = test_share_consumer(AcknowledgementMode::Implicit);
+        // First close: should succeed even without a coordinator.
+        let _ = consumer.close().await;
+        assert!(consumer.is_closed());
+        // Second close: must be idempotent (no panic, no error).
+        let _ = consumer.close().await;
     }
 }

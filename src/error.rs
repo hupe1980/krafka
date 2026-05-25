@@ -180,18 +180,6 @@ impl KrafkaError {
         Self::Network(Arc::new(err))
     }
 
-    /// Create a new protocol error, inferring the [`ProtocolErrorKind`] from the message.
-    ///
-    /// Prefer [`KrafkaError::protocol_kind`] when the kind is known at the call site:
-    /// it avoids the substring scan in `from_message` and documents intent explicitly.
-    /// Use this only in contexts where no explicit kind is available.
-    #[cold]
-    pub fn protocol(message: impl Into<String>) -> Self {
-        let message = message.into();
-        let kind = ProtocolErrorKind::from_message(&message);
-        Self::Protocol { kind, message }
-    }
-
     /// Create a new protocol error with an explicit [`ProtocolErrorKind`].
     #[cold]
     pub fn protocol_kind(kind: ProtocolErrorKind, message: impl Into<String>) -> Self {
@@ -378,87 +366,6 @@ impl ProtocolErrorKind {
             self,
             Self::TruncatedFrame | Self::CrcMismatch | Self::Malformed
         )
-    }
-
-    /// Classify an error message into a [`ProtocolErrorKind`] by inspecting
-    /// well-known substrings.
-    ///
-    /// This is the central point where internal call sites using the generic
-    /// [`KrafkaError::protocol`] constructor gain structural information.
-    /// Prefer [`KrafkaError::protocol_kind`] when the kind is known at the
-    /// call site.
-    ///
-    /// This method is intentionally `pub(crate)`: the patterns are keyed on
-    /// substrings emitted by krafka's own internal `protocol(...)` call sites
-    /// and are not a stable public contract.  External callers should use
-    /// [`KrafkaError::protocol_error_kind`] on errors they receive.
-    pub(crate) fn from_message(message: &str) -> Self {
-        // Zero-allocation ASCII-case-insensitive substring search.
-        // Avoids `to_ascii_lowercase()` allocation on every (cold) error path.
-        #[inline]
-        fn contains_ci(haystack: &str, needle: &str) -> bool {
-            let needle = needle.as_bytes();
-            let n = needle.len();
-            if n == 0 {
-                return true;
-            }
-            haystack
-                .as_bytes()
-                .windows(n)
-                .any(|w| w.eq_ignore_ascii_case(needle))
-        }
-
-        if contains_ci(message, "not enough bytes")
-            || contains_ci(message, "unexpected end of")
-            || contains_ci(message, "response too short")
-            || contains_ci(message, "short buf")
-            || contains_ci(message, "varint too long")
-            || contains_ci(message, "varint overflowed")
-        {
-            return Self::TruncatedFrame;
-        }
-        if contains_ci(message, "crc mismatch") {
-            return Self::CrcMismatch;
-        }
-        if contains_ci(message, "no mutually supported")
-            || contains_ci(message, "broker does not support")
-        {
-            return Self::UnknownApiVersion;
-        }
-        if contains_ci(message, "unsupported record batch magic") {
-            return Self::UnsupportedMagic;
-        }
-        if contains_ci(message, "invalid utf-8") {
-            return Self::InvalidUtf8;
-        }
-        if contains_ci(message, "too large")
-            || contains_ci(message, "too long")
-            || contains_ci(message, "exceeds")
-            || contains_ci(message, "overflow")
-        {
-            return Self::InvalidLength;
-        }
-        if contains_ci(message, "not found")
-            || contains_ci(message, "no offset returned")
-            || contains_ci(message, "no transaction description")
-            || contains_ci(message, "no brokers available")
-            || contains_ci(message, "missing ")
-            || contains_ci(message, "must not be null")
-            || contains_ci(message, "non-null")
-            || contains_ci(message, "non-nullable")
-            || contains_ci(message, "unexpected partition")
-            || contains_ci(message, "unexpected topic")
-            || contains_ci(message, "unexpected broker")
-        {
-            return Self::Malformed;
-        }
-        if contains_ci(message, "invalid")
-            || contains_ci(message, "unknown")
-            || contains_ci(message, "unexpected")
-        {
-            return Self::InvalidValue;
-        }
-        Self::Other
     }
 }
 
@@ -718,8 +625,16 @@ pub enum ErrorCode {
     InvalidRegistration = 119,
     /// The server encountered an error with the transaction. The client can abort the transaction to continue (KIP-890).
     TransactionAbortable = 120,
+    /// The record state is invalid (KIP-932).
+    InvalidRecordState = 121,
+    /// The share session was not found (KIP-932).
+    ShareSessionNotFound = 122,
+    /// The share session epoch is invalid (KIP-932).
+    InvalidShareSessionEpoch = 123,
     /// The client should rebootstrap to connect to the appropriate seed broker (KIP-899).
     RebootstrapRequired = 124,
+    /// The share session limit has been reached on the broker (KIP-932).
+    ShareSessionLimitReached = 133,
     /// The regular expression is not valid (KIP-848 v1+).
     InvalidRegularExpression = 128,
     /// Unknown error code.
@@ -853,8 +768,12 @@ impl ErrorCode {
             118 => Self::TelemetryTooLarge,
             119 => Self::InvalidRegistration,
             120 => Self::TransactionAbortable,
+            121 => Self::InvalidRecordState,
+            122 => Self::ShareSessionNotFound,
+            123 => Self::InvalidShareSessionEpoch,
             124 => Self::RebootstrapRequired,
             128 => Self::InvalidRegularExpression,
+            133 => Self::ShareSessionLimitReached,
             other => Self::Unknown(other),
         }
     }
@@ -985,8 +904,12 @@ impl ErrorCode {
             Self::TelemetryTooLarge => 118,
             Self::InvalidRegistration => 119,
             Self::TransactionAbortable => 120,
+            Self::InvalidRecordState => 121,
+            Self::ShareSessionNotFound => 122,
+            Self::InvalidShareSessionEpoch => 123,
             Self::RebootstrapRequired => 124,
             Self::InvalidRegularExpression => 128,
+            Self::ShareSessionLimitReached => 133,
             Self::Unknown(code) => code,
         }
     }
@@ -1115,6 +1038,9 @@ mod tests {
         assert!(ErrorCode::NetworkException.is_retriable());
         assert!(!ErrorCode::None.is_retriable());
         assert!(!ErrorCode::InvalidTopic.is_retriable());
+        // RebootstrapRequired must NOT be retriable: metadata.rs handles it via
+        // a dedicated rebootstrap path, not via the generic retry loop.
+        assert!(!ErrorCode::RebootstrapRequired.is_retriable());
     }
 
     #[test]
@@ -1315,136 +1241,7 @@ mod tests {
         }
     }
 
-    // ── L10: ProtocolErrorKind classification and retry policy ──
-
-    #[test]
-    fn test_protocol_error_kind_classifies_truncated_frame() {
-        for msg in [
-            "not enough bytes for i32",
-            "not enough bytes for record batch",
-            "unexpected end of varint",
-            "response too short",
-            "short buf for topic_id",
-        ] {
-            assert_eq!(
-                ProtocolErrorKind::from_message(msg),
-                ProtocolErrorKind::TruncatedFrame,
-                "{msg}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_protocol_error_kind_classifies_crc_mismatch() {
-        assert_eq!(
-            ProtocolErrorKind::from_message("CRC mismatch: expected deadbeef, got cafebabe"),
-            ProtocolErrorKind::CrcMismatch,
-        );
-    }
-
-    #[test]
-    fn test_protocol_error_kind_classifies_unknown_api_version() {
-        for msg in [
-            "no mutually supported Produce API version",
-            "no mutually supported CreateTopics API version",
-            "broker does not support ShareFetch",
-        ] {
-            assert_eq!(
-                ProtocolErrorKind::from_message(msg),
-                ProtocolErrorKind::UnknownApiVersion,
-                "{msg}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_protocol_error_kind_classifies_invalid_length() {
-        for msg in [
-            "record header key too large for i32 length",
-            "message size exceeds i32::MAX",
-            "compact bytes length overflow",
-            "array length 200000 exceeds i32::MAX",
-        ] {
-            assert_eq!(
-                ProtocolErrorKind::from_message(msg),
-                ProtocolErrorKind::InvalidLength,
-                "{msg}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_protocol_error_kind_classifies_varint_as_truncated() {
-        // "varint too long" and "varint overflowed" indicate a truncated byte
-        // stream, not a fixed-size overflow, so they map to TruncatedFrame
-        // (retriable) rather than InvalidLength.
-        for msg in ["varint too long", "varint overflowed something"] {
-            assert_eq!(
-                ProtocolErrorKind::from_message(msg),
-                ProtocolErrorKind::TruncatedFrame,
-                "{msg}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_protocol_error_kind_classifies_invalid_utf8() {
-        assert_eq!(
-            ProtocolErrorKind::from_message("invalid UTF-8 string: bad byte"),
-            ProtocolErrorKind::InvalidUtf8,
-        );
-    }
-
-    #[test]
-    fn test_protocol_error_kind_classifies_unsupported_magic() {
-        assert_eq!(
-            ProtocolErrorKind::from_message("unsupported record batch magic: 1"),
-            ProtocolErrorKind::UnsupportedMagic,
-        );
-    }
-
-    #[test]
-    fn test_protocol_error_kind_classifies_invalid_value() {
-        for msg in [
-            "invalid negative records count: -1",
-            "unknown header version: 3",
-        ] {
-            assert_eq!(
-                ProtocolErrorKind::from_message(msg),
-                ProtocolErrorKind::InvalidValue,
-                "{msg}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_protocol_error_kind_classifies_malformed() {
-        for msg in [
-            "partition not found in response",
-            "no offset returned for topic-0",
-            "missing record attributes",
-            "coordinator host must not be null",
-            "coordinator key must not be null",
-            // These contain "unexpected" but must still be Malformed (retriable),
-            // not InvalidValue, because Malformed is checked first.
-            "unexpected partition in response",
-            "unexpected topic in metadata response",
-            "unexpected broker id in response",
-            // Null-in-required-field messages must be Malformed (retriable server error).
-            "metadata broker host must be a non-null string",
-            "metadata broker host must be a non-null compact string",
-            "compact string length 0 is null but field is non-nullable",
-            "compact array raw value 0 (null) is invalid for a non-nullable field",
-            // "no brokers available" must be Malformed so retry loops can retry it.
-            "no brokers available",
-        ] {
-            assert_eq!(
-                ProtocolErrorKind::from_message(msg),
-                ProtocolErrorKind::Malformed,
-                "{msg}"
-            );
-        }
-    }
+    // ── L10: ProtocolErrorKind retry policy ──
 
     #[test]
     fn test_protocol_error_kind_is_retriable() {
@@ -1457,16 +1254,6 @@ mod tests {
         assert!(!ProtocolErrorKind::UnsupportedMagic.is_retriable());
         assert!(!ProtocolErrorKind::InvalidValue.is_retriable());
         assert!(!ProtocolErrorKind::Other.is_retriable());
-    }
-
-    #[test]
-    fn test_krafka_error_protocol_constructor_classifies_message() {
-        // Verify that from_message infers TruncatedFrame from the sentinel
-        // phrase used in i32::decode's error message.
-        assert_eq!(
-            ProtocolErrorKind::from_message("not enough bytes for i32"),
-            ProtocolErrorKind::TruncatedFrame,
-        );
     }
 
     #[test]

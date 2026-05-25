@@ -1,7 +1,8 @@
 //! Consumer configuration.
 
-use std::collections::HashMap;
 use std::time::Duration;
+
+use ahash::AHashMap as HashMap;
 
 use crate::auth::AuthConfig;
 use crate::metadata::MetadataRecoveryStrategy;
@@ -244,6 +245,15 @@ pub struct ConsumerConfig {
     ///
     /// Default: 60 s. Set to `Duration::MAX` to disable staleness reporting.
     pub(crate) lag_staleness_threshold: Duration,
+    /// Maximum sleep duration in [`batch_recv`](super::Consumer::batch_recv) and
+    /// [`recv`](super::Consumer::recv) when a poll cycle returns no new records
+    /// (e.g., no assignment, rebalance in progress, or broker backpressure).
+    ///
+    /// A small backoff here prevents a tight busy-loop while still draining
+    /// the consumer within the caller's timeout window. Default: 10 ms,
+    /// which limits the no-data retry rate to ~100 iterations/second.
+    /// Latency-sensitive callers may reduce this toward `Duration::ZERO`.
+    pub(crate) idle_poll_backoff: Duration,
 }
 
 impl Default for ConsumerConfig {
@@ -281,6 +291,7 @@ impl Default for ConsumerConfig {
             initial_offsets: HashMap::new(),
             max_cooperative_rebalance_rounds: 10,
             lag_staleness_threshold: Duration::from_secs(60),
+            idle_poll_backoff: Duration::from_millis(10),
         }
     }
 }
@@ -446,6 +457,12 @@ impl ConsumerConfig {
     #[inline]
     pub fn proxy(&self) -> Option<&crate::network::ProxyConfig> {
         self.proxy.as_ref()
+    }
+
+    /// Returns the maximum idle-poll backoff duration.
+    #[inline]
+    pub fn idle_poll_backoff(&self) -> Duration {
+        self.idle_poll_backoff
     }
 }
 
@@ -689,18 +706,19 @@ impl ConsumerConfigBuilder {
     /// # Example
     ///
     /// ```ignore
-    /// use std::collections::HashMap;
-    ///
     /// ConsumerConfig::builder()
     ///     .bootstrap_servers("localhost:9092")
-    ///     .initial_offsets(HashMap::from([
+    ///     .initial_offsets([
     ///         (("my-topic".to_string(), 0), 1_000),
     ///         (("my-topic".to_string(), 1), 2_000),
-    ///     ]))
+    ///     ])
     ///     .build()?;
     /// ```
-    pub fn initial_offsets(mut self, offsets: HashMap<(String, PartitionId), Offset>) -> Self {
-        self.config.initial_offsets = offsets;
+    pub fn initial_offsets(
+        mut self,
+        offsets: impl IntoIterator<Item = ((String, PartitionId), Offset)>,
+    ) -> Self {
+        self.config.initial_offsets = offsets.into_iter().collect();
         self
     }
 
@@ -722,6 +740,21 @@ impl ConsumerConfigBuilder {
     /// Default: 60 s.
     pub fn lag_staleness_threshold(mut self, threshold: Duration) -> Self {
         self.config.lag_staleness_threshold = threshold;
+        self
+    }
+
+    /// Set the maximum backoff sleep when a poll cycle returns no new records.
+    ///
+    /// In [`batch_recv`](super::Consumer::batch_recv) and
+    /// [`recv`](super::Consumer::recv), if an internal `poll()` returns with
+    /// no new records (e.g., no assignment, rebalance, or backpressure), the
+    /// consumer sleeps for up to this duration before retrying. Smaller values
+    /// reduce the response latency when records arrive during the sleep window
+    /// at the cost of higher CPU usage under sustained idle conditions.
+    ///
+    /// Default: 10 ms.
+    pub fn idle_poll_backoff(mut self, backoff: Duration) -> Self {
+        self.config.idle_poll_backoff = backoff;
         self
     }
 

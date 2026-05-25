@@ -241,33 +241,26 @@ async fn main() {
 | `throttle_delay_ms_total` | Counter | Total broker-throttle delay applied to normal-priority requests, in milliseconds |
 | `active_connections` | Gauge | Current active connections |
 | `connect_latency_seconds` | Summary | Connection establishment latency |
+| `tls_handshake_latency_seconds` | Summary | TLS handshake latency (populated for TLS connections only) |
 
 ## Latency Tracking
 
 The `LatencyTracker` provides detailed latency statistics:
 
-> **Accuracy note — percentile estimates:** `LatencyTracker` uses a 64-bucket
-> power-of-2 histogram. Each bucket covers one doubling of latency
-> (e.g., 1 ms – 2 ms, 2 ms – 4 ms). The percentile estimate is the
-> **arithmetic midpoint** of the matching bucket (`1.5 × lower_bound`),
-> giving a **relative error of up to ±50 %** within any bucket. In practice:
+> **Accuracy note — percentile estimates:** `LatencyTracker` uses a 256-sub-bucket
+> histogram (4 equal sub-buckets per power-of-2 band). The percentile estimate is
+> the midpoint of the matching sub-bucket, giving a **maximum relative error of
+> ≤ 12.5 %** per sub-bucket. In practice:
 >
-> | True p99      | Reported as | Max error |
-> |---------------|-------------|-----------|
-> | 31 ms – 64 ms | 48 ms       | ±33 %     |
-> | 64 ms – 128 ms| 96 ms       | ±50 %     |
-> | 128 ms – 256 ms | 192 ms    | ±50 %     |
+> | True p99        | Sub-bucket width | Max error |
+> |-----------------|-----------------|-----------|
+> | 1 ms – 2 ms     | 250 µs          | 12.5 %    |
+> | 8 ms – 16 ms    | 2 ms            | 12.5 %    |
+> | 64 ms – 128 ms  | 16 ms           | 12.5 %    |
 >
-> For an alert threshold like "p99 > 50 ms", a true p99 of 47 ms can appear
-> as 48 ms (false-positive) and a true p99 of 65 ms can appear as 48 ms
-> (false-negative), depending on which side of a bucket boundary the samples
-> fall.
->
-> This precision is adequate for order-of-magnitude capacity planning and
-> "are we above 1 s?" alerting at zero allocation cost.  For tight SLO
-> contracts (alert thresholds closer than 2× apart), use the OTLP exporter
-> and aggregate into a proper HDR histogram or T-Digest in your observability
-> backend.
+> This is suitable for p99 SLO alerting with a threshold tolerance of ≥ 15 %.
+> For sub-millisecond or tighter requirements, use the OTLP exporter
+> and aggregate into an HDR histogram or T-Digest in your observability backend.
 
 ```rust
 use krafka::metrics::LatencyTracker;

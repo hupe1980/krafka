@@ -160,6 +160,12 @@ impl Compression {
             Self::Lz4 => {
                 use std::io::Write;
 
+                // Kafka RecordBatch v2 requires LZ4 **Frame Format** (magic
+                // 0x184D2204), which is what `lz4_flex::frame::FrameEncoder`
+                // produces. Do NOT switch to block-level encoding
+                // (`lz4_flex::block`); that would produce an incompatible wire
+                // format and cause decoding failures on any Kafka broker or
+                // Java client.
                 let mut compressed = Vec::new();
                 let mut encoder = lz4_flex::frame::FrameEncoder::new(&mut compressed);
                 encoder
@@ -710,64 +716,137 @@ impl RecordBatch {
     }
 
     /// Encode the batch to bytes.
+    ///
+    /// # Layout
+    ///
+    /// ```text
+    /// [0..8)   base_offset              (i64)
+    /// [8..12)  batch_length             (i32)  — total bytes from offset 12 to end
+    /// [12..16) partition_leader_epoch   (i32)
+    /// [16..17) magic                    (i8)
+    /// [17..21) crc                      (u32)  — CRC32C of buf[21..]
+    /// [21..)   CRC-covered region:
+    ///            attributes             (i16)
+    ///            last_offset_delta      (i32)
+    ///            base_timestamp         (i64)
+    ///            max_timestamp          (i64)
+    ///            producer_id            (i64)
+    ///            producer_epoch         (i16)
+    ///            base_sequence          (i32)
+    ///            records_count          (i32)
+    ///            records                (variable)
+    /// ```
     pub fn encode(&self) -> Result<Bytes> {
-        let mut buf = BytesMut::new();
+        // Fixed header offsets used for in-place patching.
+        const BATCH_LENGTH_POS: usize = 8;
+        const CRC_POS: usize = 17;
+        const CRC_REGION_START: usize = 21;
+        // Fixed-field bytes that count toward batch_length (everything after the
+        // batch_length field itself, up to but not including the records payload).
+        const FIXED_OVERHEAD: usize = 49; // 4+1+4+2+4+8+8+8+2+4+4
 
-        // First, encode the records
-        let mut records_buf = BytesMut::new();
-        for record in &self.records {
-            record.encode(&mut records_buf)?;
-        }
+        let records_count = i32::try_from(self.records.len()).map_err(|_| {
+            KrafkaError::protocol_kind(
+                ProtocolErrorKind::InvalidLength,
+                "record batch record count exceeds i32 limit",
+            )
+        })?;
 
-        // Compress if needed
-        let compressed_records = self.compress_records(&records_buf)?;
+        // Estimated payload size: key + value bytes plus a conservative per-record
+        // overhead for varint framing, attributes, and timestamp/offset deltas.
+        let estimated_records_size: usize = self
+            .records
+            .iter()
+            .map(|r| {
+                r.key.as_ref().map_or(0, Bytes::len) + r.value.as_ref().map_or(0, Bytes::len) + 25
+            })
+            .sum();
 
-        // Calculate batch length (everything after batch_length field)
-        // 4 (partition_leader_epoch) + 1 (magic) + 4 (crc) + 2 (attributes) +
-        // 4 (last_offset_delta) + 8 (base_timestamp) + 8 (max_timestamp) +
-        // 8 (producer_id) + 2 (producer_epoch) + 4 (base_sequence) +
-        // 4 (records_count) + records
-        let batch_length =
-            i32::try_from(4 + 1 + 4 + 2 + 4 + 8 + 8 + 8 + 2 + 4 + 4 + compressed_records.len())
-                .map_err(|_| {
+        if matches!(self.attributes.compression, Compression::None) {
+            // Fast path: write records directly into the output buffer, eliminating
+            // the intermediate `records_buf` and the extra copy used by the general
+            // path.  `batch_length` and CRC are unknown until after the records are
+            // written, so they are written as zero and patched in place at the end.
+            // base_offset(8) + batch_length(4) + FIXED_OVERHEAD(49) = 61 bytes
+            const HEADER_SIZE: usize = 12 + FIXED_OVERHEAD;
+
+            let mut buf = BytesMut::with_capacity(HEADER_SIZE + estimated_records_size);
+
+            buf.put_i64(self.base_offset);
+            buf.put_i32(0); // batch_length — patched below
+            buf.put_i32(self.partition_leader_epoch);
+            buf.put_i8(self.magic);
+            buf.put_u32(0); // CRC — patched below
+            // CRC-covered region starts here (offset 21).
+            buf.put_i16(self.attributes.to_i16());
+            buf.put_i32(self.last_offset_delta);
+            buf.put_i64(self.base_timestamp);
+            buf.put_i64(self.max_timestamp);
+            buf.put_i64(self.producer_id);
+            buf.put_i16(self.producer_epoch);
+            buf.put_i32(self.base_sequence);
+            buf.put_i32(records_count);
+
+            for record in &self.records {
+                record.encode(&mut buf)?;
+            }
+
+            // Patch batch_length: every byte after the batch_length field (offset 12).
+            let batch_length = i32::try_from(buf.len() - 12).map_err(|_| {
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidLength,
+                    "record batch too large for i32 length prefix",
+                )
+            })?;
+            buf[BATCH_LENGTH_POS..BATCH_LENGTH_POS + 4]
+                .copy_from_slice(&batch_length.to_be_bytes());
+
+            // Patch CRC: CRC32C of everything from the attributes field to the end.
+            let crc = crc32c(&buf[CRC_REGION_START..]);
+            buf[CRC_POS..CRC_POS + 4].copy_from_slice(&crc.to_be_bytes());
+
+            Ok(buf.freeze())
+        } else {
+            // Compressed path: encode records into a staging buffer, compress, then
+            // write the complete batch (header + compressed payload) in one pass.
+            let mut records_buf = BytesMut::with_capacity(estimated_records_size);
+            for record in &self.records {
+                record.encode(&mut records_buf)?;
+            }
+
+            let compressed_records = self.compress_records(&records_buf)?;
+
+            let batch_length =
+                i32::try_from(FIXED_OVERHEAD + compressed_records.len()).map_err(|_| {
                     KrafkaError::protocol_kind(
                         ProtocolErrorKind::InvalidLength,
                         "record batch too large for i32 length prefix",
                     )
                 })?;
 
-        // Write header
-        buf.put_i64(self.base_offset);
-        buf.put_i32(batch_length);
-        buf.put_i32(self.partition_leader_epoch);
-        buf.put_i8(self.magic);
+            let mut buf = BytesMut::with_capacity(12 + batch_length as usize);
 
-        // Calculate CRC position
-        let crc_pos = buf.len();
-        buf.put_u32(0); // Placeholder for CRC
+            buf.put_i64(self.base_offset);
+            buf.put_i32(batch_length);
+            buf.put_i32(self.partition_leader_epoch);
+            buf.put_i8(self.magic);
+            buf.put_u32(0); // CRC placeholder
+            // CRC-covered region starts here (offset 21).
+            buf.put_i16(self.attributes.to_i16());
+            buf.put_i32(self.last_offset_delta);
+            buf.put_i64(self.base_timestamp);
+            buf.put_i64(self.max_timestamp);
+            buf.put_i64(self.producer_id);
+            buf.put_i16(self.producer_epoch);
+            buf.put_i32(self.base_sequence);
+            buf.put_i32(records_count);
+            buf.put_slice(&compressed_records);
 
-        // Write everything that goes into the CRC calculation
-        let crc_start = buf.len();
-        buf.put_i16(self.attributes.to_i16());
-        buf.put_i32(self.last_offset_delta);
-        buf.put_i64(self.base_timestamp);
-        buf.put_i64(self.max_timestamp);
-        buf.put_i64(self.producer_id);
-        buf.put_i16(self.producer_epoch);
-        buf.put_i32(self.base_sequence);
-        buf.put_i32(i32::try_from(self.records.len()).map_err(|_| {
-            KrafkaError::protocol_kind(
-                ProtocolErrorKind::InvalidLength,
-                "record batch record count exceeds i32 limit",
-            )
-        })?);
-        buf.put_slice(&compressed_records);
+            let crc = crc32c(&buf[CRC_REGION_START..]);
+            buf[CRC_POS..CRC_POS + 4].copy_from_slice(&crc.to_be_bytes());
 
-        // Calculate and write CRC
-        let crc = crc32c(&buf[crc_start..]);
-        buf[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_be_bytes());
-
-        Ok(buf.freeze())
+            Ok(buf.freeze())
+        }
     }
 
     fn compress_records(&self, records: &[u8]) -> Result<Bytes> {
@@ -925,7 +1004,7 @@ impl RecordBatch {
     fn decompress_records(
         compression: Compression,
         data: &[u8],
-        max_decompressed_size: usize,
+        _max_decompressed_size: usize,
     ) -> Result<Bytes> {
         #[allow(unused_variables)]
         let result: Vec<u8> = match compression {
@@ -936,8 +1015,9 @@ impl RecordBatch {
                 use std::io::Read;
 
                 let decoder = GzDecoder::new(data);
-                let mut limited = decoder.take(max_decompressed_size as u64 + 1);
-                let mut decompressed = Vec::new();
+                let mut limited = decoder.take(_max_decompressed_size as u64 + 1);
+                let capacity = data.len().saturating_mul(3).min(_max_decompressed_size);
+                let mut decompressed = Vec::with_capacity(capacity);
                 limited
                     .read_to_end(&mut decompressed)
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
@@ -955,10 +1035,10 @@ impl RecordBatch {
                 // snap::raw::decompress_len reads the varint length prefix without decompressing.
                 let declared_len = snap::raw::decompress_len(data)
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
-                if declared_len > max_decompressed_size {
+                if declared_len > _max_decompressed_size {
                     return Err(KrafkaError::compression(format!(
                         "snappy declared decompressed size {} exceeds maximum {} bytes (possible compression bomb)",
-                        declared_len, max_decompressed_size
+                        declared_len, _max_decompressed_size
                     )));
                 }
                 let mut decoder = snap::raw::Decoder::new();
@@ -976,8 +1056,9 @@ impl RecordBatch {
             Compression::Lz4 => {
                 use std::io::Read;
                 let decoder = lz4_flex::frame::FrameDecoder::new(data);
-                let mut limited = decoder.take(max_decompressed_size as u64 + 1);
-                let mut decompressed = Vec::new();
+                let mut limited = decoder.take(_max_decompressed_size as u64 + 1);
+                let capacity = data.len().saturating_mul(4).min(_max_decompressed_size);
+                let mut decompressed = Vec::with_capacity(capacity);
                 limited
                     .read_to_end(&mut decompressed)
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
@@ -996,8 +1077,9 @@ impl RecordBatch {
                 use std::io::Read;
                 let decoder = zstd::Decoder::new(data)
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
-                let mut limited = decoder.take(max_decompressed_size as u64 + 1);
-                let mut decompressed = Vec::new();
+                let mut limited = decoder.take(_max_decompressed_size as u64 + 1);
+                let capacity = data.len().saturating_mul(3).min(_max_decompressed_size);
+                let mut decompressed = Vec::with_capacity(capacity);
                 limited
                     .read_to_end(&mut decompressed)
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
@@ -1015,11 +1097,11 @@ impl RecordBatch {
         // diverges via `return Err(...)`, making this code unreachable.
         #[allow(unreachable_code)]
         {
-            if result.len() > max_decompressed_size {
+            if result.len() > _max_decompressed_size {
                 return Err(KrafkaError::compression(format!(
                     "decompressed size {} exceeds maximum {} bytes (possible compression bomb)",
                     result.len(),
-                    max_decompressed_size
+                    _max_decompressed_size
                 )));
             }
 
@@ -1096,6 +1178,10 @@ impl RecordBatchBuilder {
         key: Option<impl Into<Bytes>>,
         value: Option<impl Into<Bytes>>,
     ) -> Self {
+        debug_assert!(
+            self.records.len() < i32::MAX as usize,
+            "batch record count would overflow i32"
+        );
         let offset_delta = self.records.len() as i32;
         let record =
             Record::new(key.map(Into::into), value.map(Into::into)).with_offset_delta(offset_delta);
@@ -1110,6 +1196,10 @@ impl RecordBatchBuilder {
         value: Option<impl Into<Bytes>>,
         headers: Vec<(impl Into<Bytes>, impl Into<Bytes>)>,
     ) -> Self {
+        debug_assert!(
+            self.records.len() < i32::MAX as usize,
+            "batch record count would overflow i32"
+        );
         let offset_delta = self.records.len() as i32;
         let mut record =
             Record::new(key.map(Into::into), value.map(Into::into)).with_offset_delta(offset_delta);
@@ -1929,11 +2019,10 @@ mod tests {
     #[test]
     fn test_kafka_bytes_encode_normal_size() {
         // F-55: Verify KafkaBytes encode works for normal-sized values
-        // (the overflow guard panics for >i32::MAX, which can't be tested due to memory limits)
-        use crate::protocol::primitives::{Encode, KafkaBytes};
+        use crate::protocol::primitives::{KafkaBytes, TryEncode};
         let b = KafkaBytes::new(vec![1, 2, 3]);
         let mut buf = BytesMut::new();
-        b.encode(&mut buf);
+        b.try_encode(&mut buf).unwrap();
         assert_eq!(buf.len(), 4 + 3); // 4-byte i32 length + 3 bytes data
     }
 }

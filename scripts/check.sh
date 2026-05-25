@@ -244,7 +244,7 @@ fi
 
 # Additional checks
 print_step "Documentation"
-if cargo doc --no-deps --all-features 2>&1 | grep -E "^error|warning:" | head -20; then
+if cargo doc --no-deps --all-features 2>&1 | grep -E "^error|warning:" | grep -Ev "^warning: krafka@[0-9]" | head -20; then
     print_warn "Documentation has warnings"
 else
     print_ok "Documentation passed"

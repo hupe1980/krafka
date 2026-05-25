@@ -7,7 +7,8 @@
 //! - [`PartitionAssignor`] trait and implementations for partition assignment strategies
 //! - [`ConsumerRebalanceListener`] trait for rebalance callbacks
 
-use std::collections::{HashMap, HashSet};
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,55 +39,23 @@ use crate::protocol::{
 };
 
 /// Callback interface for partition rebalance events.
+/// Async callback interface for partition rebalance events.
 ///
 /// Implement this trait to receive notifications when the consumer's
-/// partition assignment changes during a rebalance.
+/// partition assignment changes during a rebalance.  All methods are
+/// `async` and are **awaited on the consumer's poll/rebalance task**;
+/// the consumer blocks rebalance progress until each future resolves.
 ///
-/// # Synchronous execution contract
+/// # Execution contract
 ///
-/// All methods are **synchronous** and are invoked on the consumer's
-/// poll/rebalance task.  The consumer **blocks** until the callback
-/// returns, so:
-///
-/// - Do **not** spawn detached async tasks that race with the
-///   rebalance (e.g., committing offsets in a `tokio::spawn`).  The
-///   consumer will continue reassigning partitions immediately after
-///   the callback returns, and the spawned task may see stale state.
-/// - Blocking I/O (e.g., offset commits) is safe to issue here when
-///   wrapped in `tokio::task::block_in_place` or by using a
-///   synchronous Kafka commit helper.
-/// - Keep callbacks fast.  Long-running work should be deferred to a
-///   separate channel that the application drains at its own pace.
-///
-/// If you need **async** work inside a callback, block on it using
-/// `tokio::task::block_in_place` so it completes before the callback
-/// returns. `block_in_place` requires Tokio's multi-thread runtime;
-/// on a current-thread runtime, use a dedicated thread and a channel
-/// to synchronously bridge async work. Do **not** call
-/// `Handle::current().block_on(...)` directly — that panics when called
-/// from inside a Tokio worker thread.
-///
-/// ```rust,ignore
-/// use tokio::runtime::Handle;
-///
-/// fn on_partitions_revoked(&self, partitions: &[TopicPartition]) {
-///     // Multi-thread runtime only:
-///     tokio::task::block_in_place(|| {
-///         Handle::current().block_on(async {
-///             // e.g., commit offsets synchronously
-///         });
-///     });
-///
-///     // Current-thread runtime alternative:
-///     // let handle = Handle::current();
-///     // let (tx, rx) = std::sync::mpsc::channel();
-///     // std::thread::spawn(move || {
-///     //     let result = handle.block_on(async { Ok::<_, ()>(()) });
-///     //     let _ = tx.send(result);
-///     // });
-///     // let _ = rx.recv();
-/// }
-/// ```
+/// - Async I/O (offset commits, cache flushes, …) can be `await`-ed
+///   directly — no `block_in_place` or auxiliary threads needed.
+/// - Keep callbacks fast; long-running work should be delegated to a
+///   dedicated channel or background task.
+/// - **Do not acquire consumer locks from inside a callback** — the
+///   consumer may already hold them, which would deadlock.
+/// - Panics inside callbacks propagate to the consumer task and
+///   terminate it. Handle expected errors with `Result` internally.
 ///
 /// # Example
 ///
@@ -96,22 +65,16 @@ use crate::protocol::{
 /// struct MyListener;
 ///
 /// impl ConsumerRebalanceListener for MyListener {
-///     fn on_partitions_assigned(&self, partitions: &[TopicPartition]) {
+///     async fn on_partitions_assigned(&self, partitions: &[TopicPartition]) {
 ///         println!("Assigned: {:?}", partitions);
 ///     }
 ///
-///     fn on_partitions_revoked(&self, partitions: &[TopicPartition]) {
+///     async fn on_partitions_revoked(&self, partitions: &[TopicPartition]) {
+///         // commit offsets directly — fully async, no blocking needed
 ///         println!("Revoked: {:?}", partitions);
-///         // Commit offsets before losing partitions
 ///     }
 /// }
 /// ```
-///
-/// # See also
-///
-/// [`AsyncConsumerRebalanceListener`] — the async variant of this trait.
-/// Prefer it when rebalance callbacks need to await async operations
-/// (e.g., offset commits, cache flushes) without blocking a Tokio worker.
 pub trait ConsumerRebalanceListener: Send + Sync {
     /// Called after partitions have been assigned to this consumer.
     ///
@@ -125,49 +88,35 @@ pub trait ConsumerRebalanceListener: Send + Sync {
     /// | Cooperative rebalance (KIP-429) | **only newly added** partitions (delta vs previous round) |
     /// | KIP-848 / new consumer protocol | **only newly added** partitions (diff-based) |
     ///
-    /// For the cooperative and KIP-848 paths the slice may be empty if
-    /// the rebalance left this consumer's assignment unchanged.  To obtain
-    /// the **full** post-rebalance assignment call
-    /// [`crate::consumer::Consumer::assignment`]
-    /// from inside the callback.
-    ///
-    /// **Must complete synchronously** — see the [trait-level docs](ConsumerRebalanceListener)
-    /// for the execution contract.
-    fn on_partitions_assigned(&self, partitions: &[crate::consumer::TopicPartition]);
+    /// For cooperative and KIP-848 rebalances the slice may be empty if the
+    /// rebalance left this consumer's assignment unchanged.  To obtain the
+    /// **full** post-rebalance assignment call
+    /// [`crate::consumer::Consumer::assignment`] from inside the callback.
+    fn on_partitions_assigned<'a>(
+        &'a self,
+        partitions: &'a [crate::consumer::TopicPartition],
+    ) -> impl std::future::Future<Output = ()> + Send + 'a;
 
     /// Called before partitions are revoked from this consumer.
     ///
-    /// This is triggered during a rebalance before the consumer loses
-    /// its current partitions. Use this to commit offsets synchronously
-    /// if needed.
-    ///
-    /// **Must complete synchronously** — see the [trait-level docs](ConsumerRebalanceListener)
-    /// for the execution contract.
-    fn on_partitions_revoked(&self, partitions: &[crate::consumer::TopicPartition]);
+    /// Triggered before the consumer loses its current partitions during a
+    /// rebalance. Commit offsets here if needed.
+    fn on_partitions_revoked<'a>(
+        &'a self,
+        partitions: &'a [crate::consumer::TopicPartition],
+    ) -> impl std::future::Future<Output = ()> + Send + 'a;
 
-    /// Called when partitions are lost due to an unclean shutdown.
+    /// Called when partitions are lost due to an unclean shutdown (default: no-op).
     ///
-    /// This is called when the consumer unexpectedly loses its partition
-    /// assignment (e.g., session timeout). Unlike `on_partitions_revoked`,
-    /// **the consumer has likely already been fenced** and another consumer
-    /// may have taken ownership of these partitions. Committing offsets here
-    /// may silently overwrite offsets already committed by the new owner.
-    ///
-    /// **Do not commit offsets** inside `on_partitions_lost`. The default
-    /// implementation is a no-op for this reason. Override it to add
-    /// loss-specific cleanup logic (e.g., invalidating local caches).
-    ///
-    /// **Must complete synchronously** — see the [trait-level docs](ConsumerRebalanceListener)
-    /// for the execution contract.
-    fn on_partitions_lost(&self, _partitions: &[crate::consumer::TopicPartition]) {
-        // Default: no-op.
-        //
-        // Deliberately does NOT call `on_partitions_revoked`.  Lost partitions
-        // mean the coordinator has already fenced this consumer; any offset
-        // commit at this point will either fail with `UNKNOWN_MEMBER_ID` /
-        // `ILLEGAL_GENERATION` or silently overwrite offsets committed by the
-        // new partition owner.  Implementations that need loss-specific cleanup
-        // should override this method directly.
+    /// Unlike `on_partitions_revoked`, **the consumer has likely already been
+    /// fenced**. Do **not** commit offsets here — another consumer may already
+    /// own these partitions and a commit would silently overwrite their progress.
+    /// Override to add loss-specific cleanup (e.g., invalidating local caches).
+    fn on_partitions_lost<'a>(
+        &'a self,
+        _partitions: &'a [crate::consumer::TopicPartition],
+    ) -> impl std::future::Future<Output = ()> + Send + 'a {
+        async {}
     }
 }
 
@@ -176,71 +125,80 @@ pub trait ConsumerRebalanceListener: Send + Sync {
 pub struct NoOpRebalanceListener;
 
 impl ConsumerRebalanceListener for NoOpRebalanceListener {
-    fn on_partitions_assigned(&self, _partitions: &[crate::consumer::TopicPartition]) {}
-    fn on_partitions_revoked(&self, _partitions: &[crate::consumer::TopicPartition]) {}
+    async fn on_partitions_assigned(&self, _partitions: &[crate::consumer::TopicPartition]) {}
+    async fn on_partitions_revoked(&self, _partitions: &[crate::consumer::TopicPartition]) {}
 }
 
-/// Async variant of [`ConsumerRebalanceListener`].
-///
-/// Implementations may perform async I/O (offset commits, cache flushes, …)
-/// directly inside the callbacks without blocking a thread.
-///
-/// A blanket implementation is provided for every `T: ConsumerRebalanceListener`,
-/// so existing sync listeners work wherever an `AsyncConsumerRebalanceListener`
-/// is expected.
-///
-/// # Example
-///
-/// ```ignore
-/// use krafka::consumer::{AsyncConsumerRebalanceListener, TopicPartition};
-///
-/// struct FlushingListener;
-///
-/// impl AsyncConsumerRebalanceListener for FlushingListener {
-///     async fn on_partitions_assigned(&self, partitions: &[TopicPartition]) { /* … */ }
-///     async fn on_partitions_revoked(&self, partitions: &[TopicPartition]) { /* flush */ }
-///     async fn on_partitions_lost(&self, partitions: &[TopicPartition]) { /* … */ }
-/// }
-/// ```
-pub trait AsyncConsumerRebalanceListener: Send + Sync {
-    /// Called after partitions have been assigned to this consumer.
-    ///
-    /// Contains only **newly added** partitions for cooperative and KIP-848 rebalances.
-    /// See [`ConsumerRebalanceListener::on_partitions_assigned`] for full semantics.
-    fn on_partitions_assigned(
-        &self,
-        partitions: &[crate::consumer::TopicPartition],
-    ) -> impl std::future::Future<Output = ()> + Send;
+/// Blanket impl so callers can share a listener via `Arc` while still passing
+/// `listener.clone()` directly (i.e. `Arc<T>`) to `ConsumerBuilder::rebalance_listener`.
+impl<T: ConsumerRebalanceListener + Send + Sync> ConsumerRebalanceListener for std::sync::Arc<T> {
+    fn on_partitions_assigned<'a>(
+        &'a self,
+        partitions: &'a [crate::consumer::TopicPartition],
+    ) -> impl std::future::Future<Output = ()> + Send + 'a {
+        (**self).on_partitions_assigned(partitions)
+    }
 
-    /// Called before partitions are revoked from this consumer.
-    fn on_partitions_revoked(
-        &self,
-        partitions: &[crate::consumer::TopicPartition],
-    ) -> impl std::future::Future<Output = ()> + Send;
+    fn on_partitions_revoked<'a>(
+        &'a self,
+        partitions: &'a [crate::consumer::TopicPartition],
+    ) -> impl std::future::Future<Output = ()> + Send + 'a {
+        (**self).on_partitions_revoked(partitions)
+    }
 
-    /// Called when partitions are lost due to an unclean shutdown.
-    ///
-    /// Default implementation is a no-op. **Do not commit offsets** here —
-    /// the consumer has likely been fenced already.
-    fn on_partitions_lost(
-        &self,
-        _partitions: &[crate::consumer::TopicPartition],
-    ) -> impl std::future::Future<Output = ()> + Send {
-        std::future::ready(())
+    fn on_partitions_lost<'a>(
+        &'a self,
+        partitions: &'a [crate::consumer::TopicPartition],
+    ) -> impl std::future::Future<Output = ()> + Send + 'a {
+        (**self).on_partitions_lost(partitions)
     }
 }
 
-impl<T: ConsumerRebalanceListener> AsyncConsumerRebalanceListener for T {
-    async fn on_partitions_assigned(&self, partitions: &[crate::consumer::TopicPartition]) {
-        ConsumerRebalanceListener::on_partitions_assigned(self, partitions);
+// ── Object-safe erased trait for Arc<dyn …> storage ──────────────────────
+//
+// `ConsumerRebalanceListener` uses `async fn` (RPITIT) which is not
+// dyn-compatible.  `ErasedRebalanceListener` mirrors it with
+// `Pin<Box<dyn Future>>` returns so the Consumer can store
+// `Arc<dyn ErasedRebalanceListener>` without generic parameters.
+// A blanket impl converts any `ConsumerRebalanceListener` transparently.
+// This is the same pattern used for `SchemaRegistryClient`.
+pub(crate) trait ErasedRebalanceListener: Send + Sync {
+    fn on_partitions_assigned_erased<'a>(
+        &'a self,
+        partitions: &'a [crate::consumer::TopicPartition],
+    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+
+    fn on_partitions_revoked_erased<'a>(
+        &'a self,
+        partitions: &'a [crate::consumer::TopicPartition],
+    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+
+    fn on_partitions_lost_erased<'a>(
+        &'a self,
+        partitions: &'a [crate::consumer::TopicPartition],
+    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+}
+
+impl<T: ConsumerRebalanceListener> ErasedRebalanceListener for T {
+    fn on_partitions_assigned_erased<'a>(
+        &'a self,
+        partitions: &'a [crate::consumer::TopicPartition],
+    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(self.on_partitions_assigned(partitions))
     }
 
-    async fn on_partitions_revoked(&self, partitions: &[crate::consumer::TopicPartition]) {
-        ConsumerRebalanceListener::on_partitions_revoked(self, partitions);
+    fn on_partitions_revoked_erased<'a>(
+        &'a self,
+        partitions: &'a [crate::consumer::TopicPartition],
+    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(self.on_partitions_revoked(partitions))
     }
 
-    async fn on_partitions_lost(&self, partitions: &[crate::consumer::TopicPartition]) {
-        ConsumerRebalanceListener::on_partitions_lost(self, partitions);
+    fn on_partitions_lost_erased<'a>(
+        &'a self,
+        partitions: &'a [crate::consumer::TopicPartition],
+    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(self.on_partitions_lost(partitions))
     }
 }
 
@@ -449,6 +407,7 @@ impl ConsumerGroup {
         *self.generation_id.write().await = -1;
         *self.state.write().await = GroupState::Unjoined;
         *self.assignment.write().await = MemberAssignment::empty();
+        *self.coordinator_id.write().await = None;
     }
 
     /// Check if a rebalance is needed.
@@ -1413,8 +1372,29 @@ impl GroupCoordinator {
         let coordinator_addr = format!("{}:{}", find_response.host, find_response.port);
         let coordinator_conn = self.pool.get_connection(&coordinator_addr).await?;
 
+        // Snapshot the previous coordinator node ID before overwriting it.
+        // Used below to detect a coordinator change vs. a simple reconnect.
+        let old_coordinator_id = *self.coordinator_id.read().await;
+
         *self.coordinator_conn.write().await = Some(coordinator_conn);
         *self.coordinator_id.write().await = Some(find_response.node_id);
+
+        // If the coordinator broker changed, the previous generation_id /
+        // member_epoch are unknown to the new coordinator.  Reset membership
+        // state immediately so that the next ensure_active_membership() call
+        // triggers a fresh rejoin rather than sending fetches or commits with
+        // a stale generation.  Skipped on first discovery (old_coordinator_id
+        // is None) because the consumer hasn't joined yet.
+        if let Some(old_id) = old_coordinator_id
+            && old_id != find_response.node_id
+        {
+            info!(
+                "Group coordinator for '{}' changed from node {} to node {} — resetting membership state to force rejoin",
+                self.group_id, old_id, find_response.node_id
+            );
+            self.reset_member_identity().await;
+            self.inner.write().await.state = GroupState::PreparingRebalance;
+        }
 
         info!(
             "Found coordinator for group '{}': node {} at {}",
@@ -4116,8 +4096,8 @@ mod tests {
         assert_eq!(m2_partitions.len(), 2);
     }
 
-    #[test]
-    fn test_noop_rebalance_listener() {
+    #[tokio::test]
+    async fn test_noop_rebalance_listener() {
         use crate::consumer::TopicPartition;
 
         let listener = NoOpRebalanceListener;
@@ -4129,9 +4109,9 @@ mod tests {
         ];
 
         // These should all be no-ops and not panic
-        ConsumerRebalanceListener::on_partitions_assigned(&listener, &partitions);
-        ConsumerRebalanceListener::on_partitions_revoked(&listener, &partitions);
-        ConsumerRebalanceListener::on_partitions_lost(&listener, &partitions);
+        ConsumerRebalanceListener::on_partitions_assigned(&listener, &partitions).await;
+        ConsumerRebalanceListener::on_partitions_revoked(&listener, &partitions).await;
+        ConsumerRebalanceListener::on_partitions_lost(&listener, &partitions).await;
     }
 
     #[test]
@@ -4141,8 +4121,8 @@ mod tests {
         assert_send_sync::<NoOpRebalanceListener>();
     }
 
-    #[test]
-    fn test_custom_rebalance_listener() {
+    #[tokio::test]
+    async fn test_custom_rebalance_listener() {
         use crate::consumer::TopicPartition;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4154,17 +4134,17 @@ mod tests {
         }
 
         impl ConsumerRebalanceListener for CountingListener {
-            fn on_partitions_assigned(&self, partitions: &[TopicPartition]) {
+            async fn on_partitions_assigned(&self, partitions: &[TopicPartition]) {
                 self.assigned_count
                     .fetch_add(partitions.len(), Ordering::Relaxed);
             }
 
-            fn on_partitions_revoked(&self, partitions: &[TopicPartition]) {
+            async fn on_partitions_revoked(&self, partitions: &[TopicPartition]) {
                 self.revoked_count
                     .fetch_add(partitions.len(), Ordering::Relaxed);
             }
 
-            fn on_partitions_lost(&self, partitions: &[TopicPartition]) {
+            async fn on_partitions_lost(&self, partitions: &[TopicPartition]) {
                 self.lost_count
                     .fetch_add(partitions.len(), Ordering::Relaxed);
             }
@@ -4182,13 +4162,13 @@ mod tests {
             TopicPartition::new("topic2", 0),
         ];
 
-        ConsumerRebalanceListener::on_partitions_assigned(&*listener, &partitions);
+        ConsumerRebalanceListener::on_partitions_assigned(&*listener, &partitions).await;
         assert_eq!(listener.assigned_count.load(Ordering::Relaxed), 3);
 
-        ConsumerRebalanceListener::on_partitions_revoked(&*listener, &partitions[..2]);
+        ConsumerRebalanceListener::on_partitions_revoked(&*listener, &partitions[..2]).await;
         assert_eq!(listener.revoked_count.load(Ordering::Relaxed), 2);
 
-        ConsumerRebalanceListener::on_partitions_lost(&*listener, &partitions[..1]);
+        ConsumerRebalanceListener::on_partitions_lost(&*listener, &partitions[..1]).await;
         assert_eq!(listener.lost_count.load(Ordering::Relaxed), 1);
     }
 

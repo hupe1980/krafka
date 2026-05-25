@@ -22,7 +22,9 @@ mod transaction;
 pub use accumulator::{AccumulatorConfig, RecordAccumulator, RecordAccumulatorHandle};
 pub use batch::ProducerBatch;
 pub use config::{Acks, ProducerConfig, ProducerConfigBuilder};
-pub use idempotent::{PartitionSequenceSnapshot, ProducerIdentity, ProducerIdentitySnapshot};
+pub use idempotent::{
+    PartitionSequenceSnapshot, ProducerIdentity, ProducerIdentitySnapshot, ProducerStateStore,
+};
 pub use partitioner::{
     DefaultPartitioner, HashPartitioner, Partitioner, RoundRobinPartitioner, StickyPartitioner,
     UniformStickyPartitioner, murmur2,
@@ -56,6 +58,7 @@ use crate::protocol::{
 use crate::schema_registry::SchemaEncoder;
 
 use self::barrier::{InFlightBarrier, InFlightOpGuard};
+use self::idempotent::ErasedProducerStateStore;
 use self::record::{RoutedRecord, TopicHandle};
 
 struct SendMemoryReservation {
@@ -103,6 +106,12 @@ pub struct Producer {
     interceptor: Arc<dyn crate::interceptor::ProducerInterceptor>,
     /// Producer identity for idempotent production (PID, epoch, sequences).
     identity: Option<Arc<ProducerIdentity>>,
+    /// Optional pluggable persistence hook for producer identity state.
+    ///
+    /// When set, a snapshot is persisted (fire-and-forget) after each
+    /// successful batch acknowledgement and loaded once during `build()` to
+    /// restore sequence state for transactional producers.
+    state_store: Option<Arc<dyn ErasedProducerStateStore>>,
     /// Optional key encoder applied transparently in `send_record`.
     ///
     /// When set, the record key is passed through this encoder (schema
@@ -116,6 +125,12 @@ pub struct Producer {
     /// `send_record` call.  Equivalent to `value.serializer` in the Java
     /// `KafkaProducer`.
     value_encoder: Option<Arc<dyn SchemaEncoder>>,
+    /// Optional dead-letter queue for permanently-failed records.
+    ///
+    /// When set, records on the direct-send path (linger = 0) that exhaust
+    /// all retries or hit a non-retriable error are routed here before the
+    /// error is returned to the caller.
+    dlq: Option<Arc<dyn crate::dlq::DeadLetterQueue>>,
 }
 
 fn is_unknown_producer_id_error(error: &KrafkaError) -> bool {
@@ -601,6 +616,7 @@ impl Producer {
         key_encoder: Option<Arc<dyn SchemaEncoder>>,
         value_encoder: Option<Arc<dyn SchemaEncoder>>,
         shared: Option<(Arc<ConnectionPool>, Arc<crate::metadata::ClusterMetadata>)>,
+        state_store: Option<Arc<dyn ErasedProducerStateStore>>,
     ) -> Result<Self> {
         let (pool, metadata) = if let Some((pool, metadata)) = shared {
             // Use the pre-built shared pool and metadata from a KrafkaClient.
@@ -664,6 +680,41 @@ impl Producer {
         let identity = if config.idempotent {
             let identity = Arc::new(ProducerIdentity::new());
             init_idempotent_producer_id(&identity, &metadata, &init_retry_policy).await?;
+
+            // If a state store is configured, attempt to load and restore a
+            // previous snapshot.  Restoration only succeeds when both
+            // `producer_id` and `producer_epoch` in the snapshot match the
+            // broker-assigned values — this occurs exclusively for transactional
+            // producers whose `transactional.id` the broker recognises.
+            if let Some(ref store) = state_store {
+                match store.load_erased().await {
+                    Ok(Some(snapshot))
+                        if snapshot.producer_id == identity.producer_id()
+                            && snapshot.producer_epoch == identity.producer_epoch() =>
+                    {
+                        identity.restore_from_snapshot(&snapshot);
+                        info!(
+                            pid = identity.producer_id(),
+                            epoch = identity.producer_epoch(),
+                            partitions = snapshot.partition_sequences.len(),
+                            "Producer identity restored from state store"
+                        );
+                    }
+                    Ok(Some(_)) => {
+                        debug!(
+                            "State store snapshot PID/epoch mismatch — sequences not restored \
+                             (expected for new transactional sessions or plain idempotent producers)"
+                        );
+                    }
+                    Ok(None) => {
+                        debug!("No previous producer state found in state store");
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "Failed to load producer state from store; continuing with fresh state");
+                    }
+                }
+            }
+
             Some(identity)
         } else {
             None
@@ -724,6 +775,7 @@ impl Producer {
                 interceptor: interceptor.clone(),
                 identity: identity.clone(),
                 partitioner: partitioner.clone(),
+                state_store: state_store.clone(),
             };
             Some(accumulator::RecordAccumulator::spawn(
                 acc_config,
@@ -752,8 +804,10 @@ impl Producer {
             in_flight_semaphore,
             interceptor,
             identity,
+            state_store,
             key_encoder,
             value_encoder,
+            dlq: config.dead_letter_queue,
         })
     }
 
@@ -978,9 +1032,21 @@ impl Producer {
                 Ok(metadata) => {
                     retry_ctx.record_success();
 
-                    // Acknowledge sequence on success
+                    // Acknowledge sequence on success and persist state.
                     if let (Some(identity), Some(seq)) = (&self.identity, sequence) {
                         identity.acknowledge(topic.as_ref(), partition, seq);
+
+                        // Fire-and-forget snapshot persistence.  Errors are
+                        // logged and do not fail the produce operation.
+                        if let Some(ref store) = self.state_store {
+                            let snapshot = identity.snapshot();
+                            let store = Arc::clone(store);
+                            tokio::spawn(async move {
+                                if let Err(err) = store.store_erased(&snapshot).await {
+                                    warn!(error = %err, "Failed to persist producer state snapshot");
+                                }
+                            });
+                        }
                     }
 
                     self.metrics.record_send(record.payload_size_bytes());
@@ -1138,6 +1204,19 @@ impl Producer {
                         &dummy_metadata,
                         Some(&e),
                     );
+                    // Route to dead-letter queue if configured.
+                    if let Some(ref dlq) = self.dlq {
+                        let dlq_record = ProducerRecord {
+                            topic: topic_owned.clone(),
+                            partition: Some(partition),
+                            key: record.key.clone(),
+                            value: record.value.clone(),
+                            timestamp: record.timestamp,
+                            headers: record.headers.clone(),
+                            record_name: None,
+                        };
+                        dlq.send(dlq_record, e.to_string()).await;
+                    }
                     return Err(e);
                 }
             }
@@ -1451,6 +1530,8 @@ pub struct ProducerBuilder {
     value_encoder: Option<Arc<dyn SchemaEncoder>>,
     /// Pre-built pool and metadata from a [`KrafkaClient`](crate::client::KrafkaClient).
     shared: Option<(Arc<ConnectionPool>, Arc<crate::metadata::ClusterMetadata>)>,
+    /// Optional pluggable persistence hook for producer identity state.
+    state_store: Option<Arc<dyn ErasedProducerStateStore>>,
 }
 
 impl ProducerBuilder {
@@ -1745,6 +1826,44 @@ impl ProducerBuilder {
         self
     }
 
+    /// Attach a pluggable state store for producer identity persistence.
+    ///
+    /// When set:
+    /// - `load()` is called once during [`build()`](Self::build). If the
+    ///   stored snapshot's `producer_id` and `producer_epoch` match what the
+    ///   broker returns from `InitProducerId`, per-partition sequences are
+    ///   restored (only meaningful for transactional producers with a stable
+    ///   `transactional.id`).
+    /// - `store()` is called asynchronously (fire-and-forget) after each
+    ///   successful batch acknowledgement. Errors are logged at `warn!` and
+    ///   do not fail the produce operation.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use krafka::producer::{Producer, ProducerStateStore, ProducerIdentitySnapshot};
+    ///
+    /// struct MyStore;
+    /// impl ProducerStateStore for MyStore {
+    ///     async fn load(&self) -> krafka::Result<Option<ProducerIdentitySnapshot>> { Ok(None) }
+    ///     async fn store(&self, _: &ProducerIdentitySnapshot) -> krafka::Result<()> { Ok(()) }
+    /// }
+    ///
+    /// let producer = Producer::builder()
+    ///     .bootstrap_servers("localhost:9092")
+    ///     .state_store(Arc::new(MyStore))
+    ///     .build()
+    ///     .await?;
+    /// ```
+    pub fn state_store(
+        mut self,
+        store: impl crate::producer::ProducerStateStore + 'static,
+    ) -> Self {
+        self.state_store = Some(Arc::new(store));
+        self
+    }
+
     /// Build the producer.
     pub async fn build(mut self) -> Result<Producer> {
         if self.shared.is_none() && self.config.bootstrap_servers.is_empty() {
@@ -1826,6 +1945,7 @@ impl ProducerBuilder {
             self.key_encoder,
             self.value_encoder,
             self.shared,
+            self.state_store,
         )
         .await?;
         Ok(producer)
@@ -2106,8 +2226,10 @@ mod tests {
             in_flight_semaphore: Arc::new(Semaphore::new(1)),
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             identity: None,
+            state_store: None,
             key_encoder: None,
             value_encoder: None,
+            dlq: None,
         };
 
         let record = RoutedRecord {

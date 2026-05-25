@@ -220,9 +220,13 @@ enum PartitionAddState {
     Pending(Arc<Notify>),
     /// Successfully registered with the transaction coordinator.
     Added,
+    /// RPC failed with a non-retriable error.  Waiters should propagate this
+    /// error immediately rather than making a redundant retry RPC.
+    Failed(Arc<KrafkaError>),
 }
 
 /// Result of attempting to begin adding a partition to the transaction.
+#[cfg_attr(test, derive(Debug))]
 enum BeginAddResult {
     /// Partition already registered — nothing to do.
     AlreadyAdded,
@@ -230,6 +234,9 @@ enum BeginAddResult {
     Wait(Arc<Notify>),
     /// This caller must perform the RPC. Notify to signal waiters afterwards.
     NeedAdd(Arc<Notify>),
+    /// A previous non-retriable RPC failure was recorded for this partition.
+    /// The caller should return this error without attempting the RPC again.
+    Fatal(Arc<KrafkaError>),
 }
 
 /// Partitions added to the current transaction.
@@ -251,6 +258,9 @@ impl TransactionPartitions {
                 Some(PartitionAddState::Pending(notify)) => {
                     return BeginAddResult::Wait(notify.clone());
                 }
+                Some(PartitionAddState::Failed(err)) => {
+                    return BeginAddResult::Fatal(err.clone());
+                }
                 None => {}
             }
         }
@@ -271,7 +281,10 @@ impl TransactionPartitions {
         notify.notify_waiters();
     }
 
-    /// Cancel a pending add (RPC failed). Removes the entry and wakes waiters.
+    /// Cancel a pending add due to a retriable / transient error.
+    ///
+    /// Removes the partition entry so that waiters can retry the RPC
+    /// themselves on the next loop iteration.
     fn cancel_add(&mut self, topic: &str, partition: PartitionId, notify: &Notify) {
         if let Some(topic_map) = self.partitions.get_mut(topic) {
             topic_map.remove(&partition);
@@ -279,6 +292,25 @@ impl TransactionPartitions {
                 self.partitions.remove(topic);
             }
         }
+        notify.notify_waiters();
+    }
+
+    /// Record a non-retriable RPC failure for this partition.
+    ///
+    /// Stores a `Failed` sentinel so that concurrent waiters receive the
+    /// error immediately via [`BeginAddResult::Fatal`] rather than making
+    /// a redundant retry RPC that will also fail.
+    fn fail_add(
+        &mut self,
+        topic: &str,
+        partition: PartitionId,
+        error: Arc<KrafkaError>,
+        notify: &Notify,
+    ) {
+        self.partitions
+            .entry(topic.to_string())
+            .or_default()
+            .insert(partition, PartitionAddState::Failed(error));
         notify.notify_waiters();
     }
 
@@ -296,7 +328,8 @@ impl TransactionPartitions {
 ///
 /// When the task performing the `AddPartitionsToTxn` RPC is cancelled (e.g.,
 /// via `select!` or `timeout`), this guard ensures the partition is rolled back
-/// from `Pending` to absent so that future callers aren't stuck waiting forever.
+/// from `Pending` to absent so that future callers can retry rather than
+/// waiting on a `Notify` that will never fire.
 struct PendingAddGuard {
     txn_partitions: Arc<RwLock<TransactionPartitions>>,
     topic: TopicHandle,
@@ -315,11 +348,24 @@ impl PendingAddGuard {
         txn_partitions.confirm_add(topic, partition, &self.notify);
     }
 
-    /// Explicitly cancel the add (RPC failed). Consumes the guard.
+    /// Explicitly cancel the add after a **retriable** error.
+    ///
+    /// Removes the partition entry so that concurrent waiters can retry the
+    /// RPC on the next loop iteration.
     async fn cancel(mut self, topic: &str, partition: PartitionId) {
         self.defused = true;
         let mut txn_partitions = self.txn_partitions.write().await;
         txn_partitions.cancel_add(topic, partition, &self.notify);
+    }
+
+    /// Record a **non-retriable** failure for this partition.
+    ///
+    /// Stores a `Failed` sentinel so that concurrent waiters receive the
+    /// error immediately instead of making an extra RPC that will also fail.
+    async fn fail(mut self, topic: &str, partition: PartitionId, error: Arc<KrafkaError>) {
+        self.defused = true;
+        let mut txn_partitions = self.txn_partitions.write().await;
+        txn_partitions.fail_add(topic, partition, error, &self.notify);
     }
 }
 
@@ -601,12 +647,17 @@ impl TransactionalProducer {
         expected: TransactionState,
         new: TransactionState,
     ) -> std::result::Result<(), TransactionState> {
+        // AcqRel on success: the stored new state is Released (visible to
+        // readers), and we Acquire the current state (see any prior writes).
+        // Acquire on failure: we Acquire the actual current state so callers
+        // can act on it without a separate load.  All downstream transaction
+        // data is behind an async Mutex, so no stronger ordering is needed.
         self.state
             .compare_exchange(
                 expected as u8,
                 new as u8,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
+                Ordering::AcqRel,
+                Ordering::Acquire,
             )
             .map(|_| ())
             .map_err(TransactionState::from)
@@ -868,16 +919,23 @@ impl TransactionalProducer {
             let mut txn_partitions = self.txn_partitions.write().await;
             match txn_partitions.begin_add(topic.as_ref(), partition) {
                 BeginAddResult::AlreadyAdded => break,
+                BeginAddResult::Fatal(err) => {
+                    // A previous non-retriable RPC failure was stored for this
+                    // partition. Return it immediately — no retry RPC.
+                    return Err((*err).clone());
+                }
                 BeginAddResult::Wait(notify) => {
                     // Register interest in the Notify BEFORE releasing the
-                    // write lock so that confirm_add/cancel_add (which use
-                    // notify_waiters) cannot be missed.
+                    // write lock so that confirm_add/cancel_add/fail_add
+                    // (which use notify_waiters) cannot be missed.
                     let notified = notify.notified();
                     tokio::pin!(notified);
                     notified.as_mut().enable();
                     drop(txn_partitions);
                     notified.await;
-                    // Re-check state on next iteration.
+                    // Re-check state on next iteration: either AlreadyAdded
+                    // (RPC succeeded), Fatal (RPC failed non-retriably), or
+                    // NeedAdd (RPC failed retriably — this caller retries).
                 }
                 BeginAddResult::NeedAdd(notify) => {
                     // Drop the lock before the RPC. The guard ensures that
@@ -895,8 +953,18 @@ impl TransactionalProducer {
                         Ok(()) => {
                             guard.confirm(topic.as_ref(), partition).await;
                         }
-                        Err(e) => {
+                        Err(e) if e.is_retriable() => {
+                            // Retriable error: remove the entry so that
+                            // concurrent waiters can retry the RPC themselves.
                             guard.cancel(topic.as_ref(), partition).await;
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            // Non-retriable error: store it so that any
+                            // concurrent waiters receive it immediately.
+                            guard
+                                .fail(topic.as_ref(), partition, Arc::new(e.clone()))
+                                .await;
                             return Err(e);
                         }
                     }
@@ -2609,6 +2677,42 @@ mod tests {
         // Clear empties everything
         tp.clear();
         assert!(tp.is_empty());
+    }
+
+    #[test]
+    fn test_transaction_partitions_fail_add_propagates_as_fatal() {
+        // Regression test for F-01/F-07: a non-retriable AddPartitionsToTxn
+        // failure must be stored as Failed so that any concurrent waiter
+        // receives Fatal immediately instead of making a redundant RPC or
+        // silently continuing with an unregistered partition.
+        let mut tp = TransactionPartitions::default();
+
+        // First caller gets NeedAdd and performs the RPC (which fails).
+        let notify = match tp.begin_add("t", 0) {
+            BeginAddResult::NeedAdd(n) => n,
+            other => panic!("expected NeedAdd, got {other:?}"),
+        };
+
+        // Second concurrent caller should be told to Wait.
+        assert!(matches!(tp.begin_add("t", 0), BeginAddResult::Wait(_)));
+
+        // RPC failed with a non-retriable error — store the sentinel.
+        let err = Arc::new(KrafkaError::invalid_state("fatal"));
+        tp.fail_add("t", 0, err.clone(), &notify);
+
+        // After fail_add, any new caller must get Fatal immediately.
+        assert!(
+            matches!(tp.begin_add("t", 0), BeginAddResult::Fatal(_)),
+            "expected Fatal after fail_add"
+        );
+
+        // The error stored in Failed is the same as the one passed in.
+        match tp.begin_add("t", 0) {
+            BeginAddResult::Fatal(stored) => {
+                assert_eq!(stored.to_string(), err.to_string());
+            }
+            other => panic!("expected Fatal, got {other:?}"),
+        }
     }
 
     #[test]

@@ -224,8 +224,12 @@ impl RequestPriority {
             // rebalances; JoinGroup/SyncGroup delays stall the entire group;
             // LeaveGroup delays leave stale entries in the coordinator;
             // OffsetCommit delays risk duplicate delivery on restart.
+            // ShareGroupHeartbeat (KIP-932) has the same session-timeout
+            // sensitivity as ConsumerGroupHeartbeat — missing it here would
+            // cause share group evictions under produce/fetch backpressure.
             ApiKey::Heartbeat
             | ApiKey::ConsumerGroupHeartbeat
+            | ApiKey::ShareGroupHeartbeat
             | ApiKey::JoinGroup
             | ApiKey::SyncGroup
             | ApiKey::LeaveGroup
@@ -353,6 +357,12 @@ pub struct ConnectionConfig {
     /// offset here.  Subsequent reconnection attempts apply this offset to
     /// `SystemTime::now()` so the SigV4 timestamp matches the broker's
     /// clock.  Default: 0 (no adjustment).
+    ///
+    /// Relaxed ordering is correct: the offset is a single best-effort
+    /// correction value; there is no dependent data that must be synchronised
+    /// with it, and the only adverse consequence of a torn read is re-sending
+    /// one slightly-off signature (which the broker will reject with another
+    /// clock-skew error, triggering another update).
     pub(crate) msk_iam_clock_offset_secs: Arc<AtomicI64>,
     /// Shared connection metrics recorded by broker connections created from this config.
     pub(crate) connection_metrics: Arc<ConnectionMetrics>,
@@ -655,7 +665,16 @@ impl ConnectionConfigBuilder {
     /// Set the maximum number of in-flight requests per connection.
     ///
     /// Limits the number of requests waiting for a response on a single
-    /// connection. Default: 256. Use 5 for idempotent producers.
+    /// connection. Default: 256.
+    ///
+    /// # Idempotent / transactional producers
+    ///
+    /// The Kafka protocol guarantees exactly-once ordering only when
+    /// `max.in.flight.requests.per.connection ≤ 5`. Setting a higher value
+    /// disables the sequence-number ordering guarantee. The producer builder
+    /// ([`crate::producer::ProducerConfigBuilder::max_in_flight`]) automatically enforces this
+    /// cap when idempotent mode is active; if you configure the connection
+    /// config separately, ensure this value is ≤ 5 for idempotent producers.
     pub fn max_in_flight_requests(mut self, max: usize) -> Self {
         self.0.max_in_flight_requests = max.max(1);
         self
@@ -743,6 +762,28 @@ impl ConnectionConfigBuilder {
                 self.0.request_timeout, self.0.connect_timeout
             )));
         }
+
+        // Warn when the theoretical per-connection memory ceiling exceeds 1 GiB.
+        // The ceiling is max_response_size × max_in_flight_requests; it is rarely
+        // reached in practice but can be surprising in high-concurrency setups.
+        const WARN_CEILING_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
+        let ceiling = self
+            .0
+            .max_response_size
+            .saturating_mul(self.0.max_in_flight_requests);
+        if ceiling > WARN_CEILING_BYTES {
+            tracing::warn!(
+                max_response_size = self.0.max_response_size,
+                max_in_flight_requests = self.0.max_in_flight_requests,
+                ceiling_bytes = ceiling,
+                "ConnectionConfig memory ceiling ({} × {} = {} bytes) exceeds 1 GiB; \
+                 consider lowering max_response_size or max_in_flight_requests",
+                self.0.max_response_size,
+                self.0.max_in_flight_requests,
+                ceiling,
+            );
+        }
+
         Ok(self.0)
     }
 }
@@ -818,6 +859,10 @@ pub struct BrokerConnection {
 }
 
 /// Connection statistics for monitoring.
+///
+/// All counters are updated and read with [`Ordering::Relaxed`] — they are
+/// monotonically incrementing metrics used only for observability (not for
+/// synchronising other state), so no happens-before relationship is required.
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct ConnectionStats {
@@ -938,6 +983,7 @@ impl BrokerConnection {
             // Extract hostname (without port) for TLS SNI.
             // Handle IPv6 bracket notation like [::1]:9092.
             let hostname = extract_sni_hostname(address)?;
+            let tls_start = std::time::Instant::now();
             let tls_stream = connect_tls(
                 stream,
                 hostname,
@@ -945,6 +991,9 @@ impl BrokerConnection {
                 &connector,
             )
             .await?;
+            config
+                .connection_metrics
+                .record_tls_handshake(tls_start.elapsed());
 
             info!("TLS handshake completed for {address}");
 
@@ -1188,7 +1237,9 @@ impl BrokerConnection {
         let mut authenticator = SaslAuthenticator::new(auth, channel_binding)?
             .ok_or_else(|| KrafkaError::auth("Failed to create SASL authenticator"))?;
 
-        // Warn about SASL PLAIN over cleartext — credentials sent unencrypted
+        // Warn about SASL PLAIN over cleartext — credentials sent unencrypted.
+        // Emitted on every connect so misconfigurations are visible in logs
+        // regardless of reconnect history.
         if auth.security_protocol == SecurityProtocol::SaslPlaintext
             && auth.sasl_mechanism == Some(SaslMechanism::Plain)
         {
@@ -1210,7 +1261,7 @@ impl BrokerConnection {
 
         // Step 1: SaslHandshake request
         let handshake_request = SaslHandshakeRequest::new(&mechanism_name);
-        let mut encoder = Encoder::new();
+        let mut encoder = Encoder::with_capacity(64);
         let pos = encoder.start_message();
         let header = RequestHeader::new(ApiKey::SaslHandshake, 1, 0).with_client_id(client_id);
         header.encode_v1(encoder.buffer_mut())?;
@@ -1303,7 +1354,7 @@ impl BrokerConnection {
             let mut rounds = 0;
 
             loop {
-                match authenticator.process_challenge(&challenge)? {
+                match authenticator.process_challenge(&challenge).await? {
                     ChallengeResponse::Done => break,
                     ChallengeResponse::AckThenFail { ack, error } => {
                         // Send the protocol-required ack (e.g., OAuthBearer \x01)
@@ -1366,7 +1417,7 @@ impl BrokerConnection {
         S: AsyncWrite + Unpin,
     {
         let request = SaslAuthenticateRequest::new(auth_bytes.to_vec());
-        let mut encoder = Encoder::new();
+        let mut encoder = Encoder::with_capacity(64 + auth_bytes.len());
         let pos = encoder.start_message();
         let header = RequestHeader::new(ApiKey::SaslAuthenticate, 1, 1).with_client_id(client_id);
         header.encode(encoder.buffer_mut())?;
@@ -1434,14 +1485,14 @@ impl BrokerConnection {
     /// (e.g. `20250413T120000Z`) that represents the server's view of "now".
     /// If such a timestamp is found, returns `server_unix - local_unix` in seconds.
     /// Returns `0` if no parseable timestamp is present.
+    ///
+    /// When the error contains multiple timestamps (e.g., "Signature not yet
+    /// current: `<request_ts>` is not yet valid, not before `<validity_start>`"),
+    /// the **last** parseable timestamp is used. AWS validity-window messages
+    /// place the closest approximation to server-current-time last, so this
+    /// yields a more accurate offset than returning the first match.
     fn extract_clock_skew_secs(error_msg: &str) -> i64 {
-        use time::PrimitiveDateTime;
-        use time::format_description::BorrowedFormatItem;
-        use time::macros::format_description;
-
         // AWS SigV4 basic-format: YYYYMMDDTHHMMSSZ (16 bytes, ASCII-only).
-        const AWS_TS_FMT: &[BorrowedFormatItem<'_>] =
-            format_description!("[year][month][day]T[hour][minute][second]Z");
         const AWS_TS_LEN: usize = 16;
 
         let bytes = error_msg.as_bytes();
@@ -1451,18 +1502,21 @@ impl BrokerConnection {
         // Scan every byte-aligned window of AWS_TS_LEN bytes. The grammar is
         // ASCII-only, so indexing into `error_msg` at these offsets is safe
         // (no UTF-8 split risk — a successful parse guarantees ASCII content).
+        //
+        // We collect the LAST valid timestamp: AWS "not yet current" errors
+        // embed both the request timestamp and the validity-window start; the
+        // latter (last) is the better approximation of server-current-time.
+        let mut last_server_unix: Option<i64> = None;
         for i in 0..=bytes.len() - AWS_TS_LEN {
             // Cheap pre-filter: byte 8 must be 'T', byte 15 must be 'Z'.
             if bytes[i + 8] != b'T' || bytes[i + 15] != b'Z' {
                 continue;
             }
-            let Ok(candidate) = std::str::from_utf8(&bytes[i..i + AWS_TS_LEN]) else {
-                continue;
-            };
-            let Ok(dt) = PrimitiveDateTime::parse(candidate, AWS_TS_FMT) else {
-                continue;
-            };
-            let server_unix = dt.assume_utc().unix_timestamp();
+            if let Some(unix_secs) = Self::parse_aws_ts_unix(&bytes[i..i + AWS_TS_LEN]) {
+                last_server_unix = Some(unix_secs);
+            }
+        }
+        if let Some(server_unix) = last_server_unix {
             let local_unix = SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
@@ -1474,6 +1528,75 @@ impl BrokerConnection {
 
     fn clamp_msk_iam_clock_offset_secs(offset: i64) -> i64 {
         offset.clamp(-MAX_SIGV4_CLOCK_SKEW_SECS, MAX_SIGV4_CLOCK_SKEW_SECS)
+    }
+
+    /// Parse an AWS SigV4 compact timestamp `YYYYMMDDTHHMMSSZ` (exactly 16 ASCII
+    /// bytes, pre-validated for `T` at byte 8 and `Z` at byte 15) into Unix
+    /// seconds since 1970-01-01T00:00:00Z.
+    ///
+    /// Returns `None` if any field is out of range, non-ASCII-decimal, or the
+    /// calendar date is invalid (e.g. Feb 29 in a non-leap year).
+    fn parse_aws_ts_unix(s: &[u8]) -> Option<i64> {
+        debug_assert_eq!(s.len(), 16);
+        debug_assert_eq!(s[8], b'T');
+        debug_assert_eq!(s[15], b'Z');
+
+        /// Parse two ASCII decimal digits into a `u32`. Returns `None` if any
+        /// byte is not in `b'0'..=b'9'`.
+        fn d2(hi: u8, lo: u8) -> Option<u32> {
+            let h = hi.wrapping_sub(b'0');
+            let l = lo.wrapping_sub(b'0');
+            if h > 9 || l > 9 {
+                return None;
+            }
+            Some(h as u32 * 10 + l as u32)
+        }
+
+        let year = {
+            let [a, b, c, d] = [s[0], s[1], s[2], s[3]].map(|x| x.wrapping_sub(b'0'));
+            if a > 9 || b > 9 || c > 9 || d > 9 {
+                return None;
+            }
+            a as i64 * 1000 + b as i64 * 100 + c as i64 * 10 + d as i64
+        };
+        let month = d2(s[4], s[5])? as i64;
+        let day = d2(s[6], s[7])? as i64;
+        let hour = d2(s[9], s[10])? as i64;
+        let min = d2(s[11], s[12])? as i64;
+        let sec = d2(s[13], s[14])? as i64;
+
+        if !(1..=12).contains(&month) {
+            return None;
+        }
+        if hour > 23 || min > 59 || sec > 59 {
+            return None;
+        }
+
+        // Validate day against the actual number of days in the month,
+        // accounting for Gregorian leap years.
+        let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        const DAYS: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let max_day = if month == 2 && is_leap {
+            29
+        } else {
+            DAYS[month as usize]
+        };
+        if !(1..=max_day).contains(&day) {
+            return None;
+        }
+
+        // Convert Gregorian calendar date to days since Unix epoch (1970-01-01)
+        // using the proleptic Julian Day Number algorithm.
+        //   JDN = day + (153m+2)/5 + 365y + y/4 - y/100 + y/400 - 32045
+        // where  a = (14-month)/12,  y = year+4800-a,  m = month+12a-3
+        let a = (14 - month) / 12;
+        let y = year + 4800 - a;
+        let m = month + 12 * a - 3;
+        let jdn = day + (153 * m + 2) / 5 + 365 * y + y / 4 - y / 100 + y / 400 - 32045;
+        // Unix epoch = JDN 2440588 (1970-01-01).
+        let days_since_epoch = jdn - 2_440_588;
+
+        Some(days_since_epoch * 86_400 + hour * 3_600 + min * 60 + sec)
     }
 
     /// Spawn a connection event-loop task.
@@ -2098,7 +2221,7 @@ impl BrokerConnection {
             ApiVersionsRequest::new().with_client_software("krafka", env!("CARGO_PKG_VERSION"));
 
         let correlation_id = self.correlation_id_gen.next();
-        let mut encoder = Encoder::new();
+        let mut encoder = Encoder::with_capacity(128);
 
         // Build request
         let pos = encoder.start_message();
@@ -2247,7 +2370,7 @@ impl BrokerConnection {
         }
 
         let correlation_id = self.correlation_id_gen.next();
-        let mut encoder = Encoder::new();
+        let mut encoder = Encoder::with_capacity(256);
 
         // Build request
         let pos = encoder.start_message();
@@ -2316,7 +2439,7 @@ impl BrokerConnection {
         // M1: refresh the idle timestamp on every submission.
         self.mark_used();
 
-        let mut encoder = Encoder::new();
+        let mut encoder = Encoder::with_capacity(256);
 
         // Build request
         let pos = encoder.start_message();
@@ -2706,6 +2829,16 @@ mod tests {
             RequestPriority::High
         );
         // Group coordination and offset commit are time-sensitive (rebalance / session timeout).
+        assert_eq!(
+            RequestPriority::for_api_key(ApiKey::ConsumerGroupHeartbeat),
+            RequestPriority::High,
+            "ConsumerGroupHeartbeat must be High to prevent KIP-848 rebalances"
+        );
+        assert_eq!(
+            RequestPriority::for_api_key(ApiKey::ShareGroupHeartbeat),
+            RequestPriority::High,
+            "ShareGroupHeartbeat must be High to prevent KIP-932 share group evictions"
+        );
         assert_eq!(
             RequestPriority::for_api_key(ApiKey::JoinGroup),
             RequestPriority::High
@@ -3969,9 +4102,88 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_clock_skew_secs_multiple_timestamps_uses_last() {
+        // AWS "Signature not yet current" errors embed both the request
+        // timestamp and the validity-window start. The last timestamp
+        // (validity-window start) is the closer approximation of server time
+        // and should be used.
+        //
+        // Use two timestamps far apart so the choice is unambiguous:
+        //  - first:  2020-01-01 (far past → large negative skew)
+        //  - second: 2099-01-01 (far future → large positive skew)
+        // If we get a positive skew, the function used the LAST timestamp.
+        let msg = "Signature not yet current: 20200101T000000Z is not yet valid, \
+                   not before 20990101T000000Z; check your system clock";
+        let skew = BrokerConnection::extract_clock_skew_secs(msg);
+        assert!(
+            skew > 0,
+            "expected positive skew (last timestamp used), got {skew}"
+        );
+    }
+
+    #[test]
     fn test_msk_iam_clock_offset_default() {
         let config = ConnectionConfig::default();
         assert_eq!(config.msk_iam_clock_offset_secs.load(Ordering::Relaxed), 0);
+    }
+
+    // ── parse_aws_ts_unix ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_aws_ts_unix_epoch() {
+        // 1970-01-01T00:00:00Z == Unix timestamp 0.
+        let ts = BrokerConnection::parse_aws_ts_unix(b"19700101T000000Z");
+        assert_eq!(ts, Some(0));
+    }
+
+    #[test]
+    fn test_parse_aws_ts_unix_known_date() {
+        // 2020-01-01T00:00:00Z == 1577836800  (verified with date -d).
+        let ts = BrokerConnection::parse_aws_ts_unix(b"20200101T000000Z");
+        assert_eq!(ts, Some(1_577_836_800));
+    }
+
+    #[test]
+    fn test_parse_aws_ts_unix_leap_day_valid() {
+        // 2020-02-29 is valid (2020 is a leap year).
+        assert!(BrokerConnection::parse_aws_ts_unix(b"20200229T000000Z").is_some());
+    }
+
+    #[test]
+    fn test_parse_aws_ts_unix_leap_day_invalid() {
+        // 2021-02-29 does not exist.
+        assert_eq!(
+            BrokerConnection::parse_aws_ts_unix(b"20210229T000000Z"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_aws_ts_unix_invalid_month() {
+        assert_eq!(
+            BrokerConnection::parse_aws_ts_unix(b"20201301T000000Z"),
+            None
+        );
+        assert_eq!(
+            BrokerConnection::parse_aws_ts_unix(b"20200001T000000Z"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_aws_ts_unix_invalid_hour() {
+        assert_eq!(
+            BrokerConnection::parse_aws_ts_unix(b"20200101T250000Z"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_aws_ts_unix_non_digit_chars() {
+        assert_eq!(
+            BrokerConnection::parse_aws_ts_unix(b"2020XXYYT000000Z"),
+            None
+        );
     }
 
     #[test]

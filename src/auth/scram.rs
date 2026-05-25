@@ -243,7 +243,7 @@ impl ScramClient {
     /// # Returns
     ///
     /// The client-final message bytes to send.
-    pub fn process_server_first(&mut self, server_first: &[u8]) -> Result<Vec<u8>> {
+    pub async fn process_server_first(&mut self, server_first: &[u8]) -> Result<Vec<u8>> {
         if self.state != ScramState::WaitingServerFirst {
             self.state = ScramState::Failed;
             return Err(KrafkaError::auth(
@@ -304,8 +304,18 @@ impl ScramClient {
             ));
         }
 
-        // Calculate salted password
-        let salted_password = Zeroizing::new(self.compute_salted_password(&salt, iteration_count));
+        // Calculate salted password — offloaded to a blocking thread pool to
+        // avoid stalling the Tokio executor during the CPU-intensive PBKDF2
+        // computation (up to MAX_PBKDF2_ITERATIONS iterations).
+        let password_bytes = Zeroizing::new(self.password.as_bytes().to_vec());
+        let salted_password =
+            match compute_pbkdf2(self.mechanism, password_bytes, salt, iteration_count).await {
+                Ok(sp) => sp,
+                Err(e) => {
+                    self.state = ScramState::Failed;
+                    return Err(e);
+                }
+            };
 
         // Calculate client proof
         let client_key = self.compute_client_key(&salted_password);
@@ -408,20 +418,6 @@ impl ScramClient {
         self.state == ScramState::Complete
     }
 
-    /// Compute salted password using PBKDF2.
-    fn compute_salted_password(&self, salt: &[u8], iterations: u32) -> Vec<u8> {
-        let mut output = vec![0u8; self.mechanism.hash_length()];
-        match self.mechanism {
-            ScramMechanism::Sha256 => {
-                pbkdf2_hmac::<Sha256>(self.password.as_bytes(), salt, iterations, &mut output);
-            }
-            ScramMechanism::Sha512 => {
-                pbkdf2_hmac::<Sha512>(self.password.as_bytes(), salt, iterations, &mut output);
-            }
-        }
-        output
-    }
-
     /// Compute HMAC with the appropriate hash function.
     fn compute_hmac(&self, key: &[u8], data: &[u8]) -> Vec<u8> {
         match self.mechanism {
@@ -488,6 +484,36 @@ fn escape_username(username: &str) -> String {
 /// XOR two byte slices.
 fn xor_bytes(a: &[u8], b: &[u8]) -> Vec<u8> {
     a.iter().zip(b.iter()).map(|(x, y)| x ^ y).collect()
+}
+
+/// Run PBKDF2 on a dedicated blocking thread to avoid stalling the Tokio executor.
+///
+/// PBKDF2 with high iteration counts (up to [`MAX_PBKDF2_ITERATIONS`] = 1,000,000)
+/// can take tens of milliseconds on a single CPU core. Running it directly on a
+/// Tokio worker thread would block the executor from processing other tasks during
+/// that time. `tokio::task::spawn_blocking` moves the computation to a dedicated
+/// blocking-thread pool, keeping async tasks responsive.
+async fn compute_pbkdf2(
+    mechanism: ScramMechanism,
+    password: Zeroizing<Vec<u8>>,
+    salt: Vec<u8>,
+    iterations: u32,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let output_len = mechanism.hash_length();
+    tokio::task::spawn_blocking(move || {
+        let mut output = Zeroizing::new(vec![0u8; output_len]);
+        match mechanism {
+            ScramMechanism::Sha256 => {
+                pbkdf2_hmac::<Sha256>(&password, &salt, iterations, &mut output);
+            }
+            ScramMechanism::Sha512 => {
+                pbkdf2_hmac::<Sha512>(&password, &salt, iterations, &mut output);
+            }
+        }
+        output
+    })
+    .await
+    .map_err(|e| KrafkaError::auth(format!("PBKDF2 computation failed: {e}")))
 }
 
 /// Constant-time comparison to prevent timing attacks.
@@ -587,8 +613,8 @@ mod tests {
         assert!(msg_str.contains("n=user=3Dname"));
     }
 
-    #[test]
-    fn test_scram_client_invalid_server_first() {
+    #[tokio::test]
+    async fn test_scram_client_invalid_server_first() {
         let mut client = ScramClient::new(
             "user",
             "password",
@@ -598,12 +624,12 @@ mod tests {
         client.client_first_message();
 
         // Missing fields
-        let result = client.process_server_first(b"invalid");
+        let result = client.process_server_first(b"invalid").await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_scram_client_wrong_nonce() {
+    #[tokio::test]
+    async fn test_scram_client_wrong_nonce() {
         let mut client = ScramClient::new(
             "user",
             "password",
@@ -614,7 +640,7 @@ mod tests {
 
         // Server nonce doesn't start with client nonce
         let server_first = "r=wrongnonce,s=c2FsdA==,i=4096";
-        let result = client.process_server_first(server_first.as_bytes());
+        let result = client.process_server_first(server_first.as_bytes()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("client nonce"));
     }
@@ -666,8 +692,8 @@ mod tests {
 
     // ── Security fix tests ──
 
-    #[test]
-    fn test_pbkdf2_iteration_too_low() {
+    #[tokio::test]
+    async fn test_pbkdf2_iteration_too_low() {
         let mut client = ScramClient::new(
             "user",
             "password",
@@ -678,7 +704,7 @@ mod tests {
 
         // Server sends iteration count below minimum (4096)
         let server_first = format!("r={}extra,s=c2FsdA==,i=100", client.client_nonce);
-        let result = client.process_server_first(server_first.as_bytes());
+        let result = client.process_server_first(server_first.as_bytes()).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -688,8 +714,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_pbkdf2_iteration_too_high() {
+    #[tokio::test]
+    async fn test_pbkdf2_iteration_too_high() {
         let mut client = ScramClient::new(
             "user",
             "password",
@@ -700,7 +726,7 @@ mod tests {
 
         // Server sends iteration count above maximum (1_000_000)
         let server_first = format!("r={}extra,s=c2FsdA==,i=2000000", client.client_nonce);
-        let result = client.process_server_first(server_first.as_bytes());
+        let result = client.process_server_first(server_first.as_bytes()).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -710,8 +736,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_pbkdf2_iteration_at_boundaries() {
+    #[tokio::test]
+    async fn test_pbkdf2_iteration_at_boundaries() {
         // Minimum allowed (4096) should succeed
         let mut client = ScramClient::new(
             "user",
@@ -721,7 +747,7 @@ mod tests {
         );
         client.client_first_message();
         let server_first = format!("r={}extra,s=c2FsdA==,i=4096", client.client_nonce);
-        let result = client.process_server_first(server_first.as_bytes());
+        let result = client.process_server_first(server_first.as_bytes()).await;
         assert!(result.is_ok());
 
         // Maximum allowed (1_000_000) should succeed
@@ -733,7 +759,7 @@ mod tests {
         );
         client.client_first_message();
         let server_first = format!("r={}extra,s=c2FsdA==,i=1000000", client.client_nonce);
-        let result = client.process_server_first(server_first.as_bytes());
+        let result = client.process_server_first(server_first.as_bytes()).await;
         assert!(result.is_ok());
     }
 
@@ -753,8 +779,8 @@ mod tests {
         assert!(debug_output.contains("[REDACTED]"));
     }
 
-    #[test]
-    fn test_scram_zeroize_on_drop() {
+    #[tokio::test]
+    async fn test_scram_zeroize_on_drop() {
         // Create a client, do partial auth, then drop it
         // Verifies that Drop is implemented (no panic)
         let mut client = ScramClient::new(
@@ -765,7 +791,7 @@ mod tests {
         );
         client.client_first_message();
         let server_first = format!("r={}extra,s=c2FsdA==,i=4096", client.client_nonce);
-        let _ = client.process_server_first(server_first.as_bytes());
+        let _ = client.process_server_first(server_first.as_bytes()).await;
         // Drop should zeroize password and salted_password
         drop(client);
     }
@@ -805,8 +831,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_channel_binding_tls_server_end_point_c_field() {
+    #[tokio::test]
+    async fn test_channel_binding_tls_server_end_point_c_field() {
         // Verify the c= field in client-final includes the GS2 header + binding data
         let cb_data = vec![0x01, 0x02, 0x03, 0x04];
         let mut client = ScramClient::new(
@@ -820,6 +846,7 @@ mod tests {
         let server_first = format!("r={}extra,s=c2FsdA==,i=4096", client.client_nonce);
         let client_final = client
             .process_server_first(server_first.as_bytes())
+            .await
             .unwrap();
         let client_final_str = String::from_utf8(client_final).unwrap();
 
@@ -845,8 +872,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_channel_binding_none_c_field() {
+    #[tokio::test]
+    async fn test_channel_binding_none_c_field() {
         // Verify the c= field without channel binding is just base64("n,,")
         let mut client = ScramClient::new(
             "user",
@@ -859,6 +886,7 @@ mod tests {
         let server_first = format!("r={}extra,s=c2FsdA==,i=4096", client.client_nonce);
         let client_final = client
             .process_server_first(server_first.as_bytes())
+            .await
             .unwrap();
         let client_final_str = String::from_utf8(client_final).unwrap();
 
@@ -871,5 +899,242 @@ mod tests {
 
         let decoded = BASE64.decode(c_value).unwrap();
         assert_eq!(decoded, b"n,,");
+    }
+
+    /// Full SCRAM-SHA-256 round-trip with `TlsServerEndPoint` channel binding.
+    ///
+    /// Simulates both sides of the SCRAM exchange:
+    /// - Client side: `ScramClient` state machine.
+    /// - Server side: RFC 5802 §3 computations done inline to produce the
+    ///   `v=` verifier that a real broker would return.
+    ///
+    /// This exercises the end-to-end path that was previously only partially
+    /// covered by the `c=` field check.
+    #[tokio::test]
+    async fn test_scram_tls_server_end_point_full_round_trip_sha256() {
+        // Known inputs — deterministic nonces and salt for reproducibility.
+        let password = "pencil";
+        let salt = BASE64.decode("W22ZaJ0SNY7soEsUEjb6gQ==").unwrap();
+        let iterations = 4096u32;
+        // Simulated SHA-256(DER end-entity cert) — 32 arbitrary bytes.
+        let cb_data: Vec<u8> = (0u8..32).collect();
+        let server_nonce_suffix = "RK+9hXF4Mg";
+
+        let mut client = ScramClient::new(
+            "user",
+            password,
+            ScramMechanism::Sha256,
+            ChannelBinding::TlsServerEndPoint(cb_data.clone()),
+        );
+        // Fix client nonce for deterministic output.
+        client.client_nonce = "rOprNGfwEbeRWgbNEkqO".to_string();
+        let combined_nonce = format!("rOprNGfwEbeRWgbNEkqO{server_nonce_suffix}");
+
+        // ── Step 1: client-first ────────────────────────────────────────────
+        let first_bytes = client.client_first_message();
+        let first_str = String::from_utf8(first_bytes).unwrap();
+        assert!(
+            first_str.starts_with("p=tls-server-end-point,,n=user,r=rOprNGfwEbeRWgbNEkqO"),
+            "unexpected client-first: {first_str}"
+        );
+        assert_eq!(client.state(), &ScramState::WaitingServerFirst);
+
+        // ── Step 2: server-first → client-final ─────────────────────────────
+        let server_first = format!(
+            "r={combined_nonce},s={},i={iterations}",
+            BASE64.encode(&salt)
+        );
+        let client_final_bytes = client
+            .process_server_first(server_first.as_bytes())
+            .await
+            .expect("process_server_first must succeed");
+        let client_final = String::from_utf8(client_final_bytes).unwrap();
+
+        // Verify the c= field embeds the GS2 header + binding data.
+        let c_field = client_final
+            .split(',')
+            .find(|p| p.starts_with("c="))
+            .unwrap()
+            .strip_prefix("c=")
+            .unwrap();
+        let decoded_cbind = BASE64.decode(c_field).unwrap();
+        assert!(
+            decoded_cbind.starts_with(b"p=tls-server-end-point,,"),
+            "c= must start with GS2 header"
+        );
+        assert_eq!(
+            &decoded_cbind[b"p=tls-server-end-point,,".len()..],
+            cb_data.as_slice(),
+            "c= must end with channel binding data"
+        );
+        assert_eq!(client.state(), &ScramState::WaitingServerFinal);
+
+        // ── Step 3: server computes verifier (RFC 5802 §3) ──────────────────
+        //   SaltedPassword = PBKDF2-HMAC-SHA256(password, salt, i)
+        //   ServerKey      = HMAC-SHA256(SaltedPassword, "Server Key")
+        //   AuthMessage    = client-first-bare "," server-first "," client-final-without-proof
+        //   ServerSignature = HMAC-SHA256(ServerKey, AuthMessage)
+        let mut salted_password = vec![0u8; 32];
+        pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, iterations, &mut salted_password);
+
+        let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&salted_password) else {
+            unreachable!("HMAC accepts any key length per RFC 2104");
+        };
+        mac.update(b"Server Key");
+        let server_key = mac.finalize().into_bytes();
+
+        // Reconstruct client-final-without-proof (everything before ",p=…").
+        let client_final_without_proof = client_final
+            .rsplit_once(",p=")
+            .map(|(prefix, _)| prefix)
+            .expect("client-final must contain ,p=");
+
+        let client_first_bare = "n=user,r=rOprNGfwEbeRWgbNEkqO";
+        let auth_message =
+            format!("{client_first_bare},{server_first},{client_final_without_proof}");
+
+        let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&server_key) else {
+            unreachable!("HMAC accepts any key length per RFC 2104");
+        };
+        mac.update(auth_message.as_bytes());
+        let server_sig = mac.finalize().into_bytes();
+
+        let server_final = format!("v={}", BASE64.encode(server_sig.as_slice()));
+
+        // ── Step 4: client verifies server-final ─────────────────────────────
+        client
+            .verify_server_final(server_final.as_bytes())
+            .expect("verify_server_final must succeed");
+        assert_eq!(client.state(), &ScramState::Complete);
+        assert!(client.is_complete());
+    }
+
+    /// Same as above but with SCRAM-SHA-512 and `ChannelBinding::None`,
+    /// confirming the non-binding path also completes correctly.
+    #[tokio::test]
+    async fn test_scram_sha512_full_round_trip_no_binding() {
+        let password = "hunter2";
+        let salt = BASE64
+            .decode("QSXCR+Q6sek8bf92")
+            .unwrap_or_else(|_| b"deadbeef".to_vec());
+        let iterations = 4096u32;
+
+        let mut client = ScramClient::new(
+            "admin",
+            password,
+            ScramMechanism::Sha512,
+            ChannelBinding::None,
+        );
+        client.client_nonce = "clientnonce512".to_string();
+        let combined_nonce = "clientnonce512serversuffix";
+
+        let first_bytes = client.client_first_message();
+        assert!(
+            String::from_utf8(first_bytes)
+                .unwrap()
+                .starts_with("n,,n=admin,")
+        );
+
+        let server_first = format!(
+            "r={combined_nonce},s={},i={iterations}",
+            BASE64.encode(&salt)
+        );
+        let client_final_bytes = client
+            .process_server_first(server_first.as_bytes())
+            .await
+            .expect("process_server_first");
+        let client_final = String::from_utf8(client_final_bytes).unwrap();
+
+        // Compute server verifier for SHA-512.
+        let mut salted_password = vec![0u8; 64];
+        pbkdf2_hmac::<Sha512>(password.as_bytes(), &salt, iterations, &mut salted_password);
+
+        let Ok(mut mac) = Hmac::<Sha512>::new_from_slice(&salted_password) else {
+            unreachable!();
+        };
+        mac.update(b"Server Key");
+        let server_key = mac.finalize().into_bytes();
+
+        let client_final_without_proof = client_final
+            .rsplit_once(",p=")
+            .map(|(prefix, _)| prefix)
+            .expect("client-final must contain ,p=");
+
+        let auth_message =
+            format!("n=admin,r=clientnonce512,{server_first},{client_final_without_proof}");
+
+        let Ok(mut mac) = Hmac::<Sha512>::new_from_slice(&server_key) else {
+            unreachable!();
+        };
+        mac.update(auth_message.as_bytes());
+        let server_sig = mac.finalize().into_bytes();
+        let server_final = format!("v={}", BASE64.encode(server_sig.as_slice()));
+
+        client
+            .verify_server_final(server_final.as_bytes())
+            .expect("SHA-512 verify_server_final must succeed");
+        assert!(client.is_complete());
+    }
+
+    /// Pinned test vector from RFC 7677 §3 / Appendix B.
+    ///
+    /// Verifies the exact client-proof bytes against the published
+    /// reference value `dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=`.
+    #[tokio::test]
+    async fn test_scram_sha256_rfc7677_pinned_vector() {
+        // RFC 7677 test vector parameters
+        let username = "user";
+        let password = "pencil";
+        let client_nonce = "rOprNGfwEbeRWgbNEkqO";
+        let server_nonce_suffix = "%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
+        let salt_b64 = "W22ZaJ0SNY7soEsUEjb6gQ==";
+        let iterations = 4096u32;
+
+        // Expected values from RFC 7677
+        let expected_client_proof = "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=";
+        let expected_server_sig = "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=";
+
+        let mut client = ScramClient::new(
+            username,
+            password,
+            ScramMechanism::Sha256,
+            ChannelBinding::None,
+        );
+        // Inject the fixed client nonce so the output is deterministic.
+        client.client_nonce = client_nonce.to_string();
+
+        // client-first-message must be "n,,n=user,r=rOprNGfwEbeRWgbNEkqO"
+        let first_bytes = client.client_first_message();
+        assert_eq!(
+            String::from_utf8(first_bytes).unwrap(),
+            format!("n,,n={username},r={client_nonce}"),
+            "client-first-message does not match RFC 7677"
+        );
+
+        let combined_nonce = format!("{client_nonce}{server_nonce_suffix}");
+        let server_first = format!("r={combined_nonce},s={salt_b64},i={iterations}");
+
+        let client_final_bytes = client
+            .process_server_first(server_first.as_bytes())
+            .await
+            .expect("process_server_first must succeed");
+        let client_final = String::from_utf8(client_final_bytes).unwrap();
+
+        // Extract the proof from "c=biws,r=...,p=<proof>"
+        let proof = client_final
+            .rsplit_once(",p=")
+            .map(|(_, p)| p)
+            .expect("client-final must contain ,p=");
+        assert_eq!(
+            proof, expected_client_proof,
+            "client-proof does not match RFC 7677 test vector"
+        );
+
+        // Also validate that the server signature verifies correctly.
+        let server_final = format!("v={expected_server_sig}");
+        client
+            .verify_server_final(server_final.as_bytes())
+            .expect("verify_server_final must succeed for RFC 7677 vector");
+        assert!(client.is_complete());
     }
 }

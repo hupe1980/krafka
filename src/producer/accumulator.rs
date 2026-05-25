@@ -20,7 +20,7 @@ use tokio::time::interval;
 use tracing::{debug, trace, warn};
 
 use super::barrier::{InFlightBarrier, InFlightOpGuard};
-use super::batch::ProducerBatch;
+
 use super::record::{ProducerRecord, RecordMetadata, RoutedRecord, TopicHandle};
 use super::retry::{RetryContext, RetryPolicy};
 use crate::PartitionId;
@@ -464,6 +464,11 @@ pub struct AccumulatorConfig {
     ///
     /// [`UniformStickyPartitioner`]: super::partitioner::UniformStickyPartitioner
     pub partitioner: Arc<dyn super::partitioner::Partitioner>,
+    /// Optional pluggable persistence hook for producer identity state.
+    ///
+    /// When set, a snapshot is persisted (fire-and-forget) after each
+    /// successful batch acknowledgement.
+    pub(crate) state_store: Option<Arc<dyn super::idempotent::ErasedProducerStateStore>>,
 }
 
 impl Clone for AccumulatorConfig {
@@ -482,6 +487,7 @@ impl Clone for AccumulatorConfig {
             interceptor: self.interceptor.clone(),
             identity: self.identity.clone(),
             partitioner: self.partitioner.clone(),
+            state_store: self.state_store.clone(),
         }
     }
 }
@@ -520,6 +526,7 @@ impl Default for AccumulatorConfig {
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             identity: None,
             partitioner: Arc::new(super::partitioner::DefaultPartitioner::new()),
+            state_store: None,
         }
     }
 }
@@ -562,23 +569,56 @@ impl Drop for InFlightGuard {
 
 /// A batch with its pending records.
 struct AccumulatorBatch {
-    batch: ProducerBatch,
+    /// Current byte-size estimate of all tracked records.
+    current_size: usize,
+    /// Maximum batch size in bytes.
+    max_size: usize,
+    /// Pending records waiting to be sent.
     pending: Vec<PendingRecord>,
+    /// When the batch was created (for linger expiry).
     created_at: Instant,
 }
 
 impl AccumulatorBatch {
-    fn new(
-        topic: TopicHandle,
-        partition: PartitionId,
-        max_size: usize,
-        compression: Compression,
-    ) -> Self {
+    fn new(max_size: usize) -> Self {
         Self {
-            batch: ProducerBatch::new(topic.to_string(), partition, max_size, compression),
+            current_size: 0,
+            max_size,
             pending: Vec::new(),
             created_at: Instant::now(),
         }
+    }
+
+    /// Return `true` if the batch contains no records.
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// Number of records currently tracked.
+    #[inline]
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Return `true` when the batch has reached its maximum size.
+    #[inline]
+    fn is_full(&self) -> bool {
+        self.current_size >= self.max_size
+    }
+
+    /// Return `true` if a record of `record_size` bytes would fit.
+    ///
+    /// An empty batch always accepts the first record.
+    #[inline]
+    fn would_fit(&self, record_size: usize) -> bool {
+        self.is_empty() || self.current_size + record_size <= self.max_size
+    }
+
+    /// Increment the running byte-size tracker.
+    #[inline]
+    fn track(&mut self, record_size: usize) {
+        self.current_size += record_size;
     }
 
     fn age(&self) -> Duration {
@@ -764,17 +804,17 @@ impl RecordAccumulator {
         // Get or create batch. `or_insert_with` closure needs an owned
         // topic string; `key.0.clone()` happens only on the first insert.
         let batch_size = self.config.batch_size;
-        let compression = self.config.compression;
-        let accumulator_batch = self.batches.entry(key.clone()).or_insert_with(|| {
-            AccumulatorBatch::new(key.0.clone(), partition, batch_size, compression)
-        });
+        let accumulator_batch = self
+            .batches
+            .entry(key.clone())
+            .or_insert_with(|| AccumulatorBatch::new(batch_size));
 
         // Check if the record fits in the current batch. If so, move it
         // directly into PendingRecord (zero clones). The batch only tracks
         // size; PendingRecord owns the record data for send_extracted_batch.
-        let offset = accumulator_batch.batch.len() as i64;
-        if accumulator_batch.batch.would_fit(record_size) {
-            accumulator_batch.batch.track(record_size);
+        let offset = accumulator_batch.len() as i64;
+        if accumulator_batch.would_fit(record_size) {
+            accumulator_batch.track(record_size);
             accumulator_batch.pending.push(PendingRecord {
                 record,
                 response_tx,
@@ -787,7 +827,7 @@ impl RecordAccumulator {
             permit_reservation.forget();
 
             // Check if batch is full
-            if accumulator_batch.batch.is_full() {
+            if accumulator_batch.is_full() {
                 trace!("Batch full for {}-{}, flushing", key.0, partition);
                 let partition_count = self
                     .metadata
@@ -813,11 +853,10 @@ impl RecordAccumulator {
             self.flush_batch(&key);
 
             // Create new batch and add record
-            let mut new_batch =
-                AccumulatorBatch::new(key.0.clone(), partition, batch_size, compression);
+            let mut new_batch = AccumulatorBatch::new(batch_size);
 
-            if new_batch.batch.would_fit(record_size) {
-                new_batch.batch.track(record_size);
+            if new_batch.would_fit(record_size) {
+                new_batch.track(record_size);
                 new_batch.pending.push(PendingRecord {
                     record,
                     response_tx,
@@ -856,7 +895,7 @@ impl RecordAccumulator {
         let keys_to_flush: Vec<_> = self
             .batches
             .iter()
-            .filter(|(_, batch)| !batch.batch.is_empty() && batch.age() >= self.config.linger)
+            .filter(|(_, batch)| !batch.is_empty() && batch.age() >= self.config.linger)
             .map(|(key, _)| key.clone())
             .collect();
 
@@ -892,7 +931,7 @@ impl RecordAccumulator {
         let keys_to_flush: Vec<_> = self
             .batches
             .iter()
-            .filter(|(_, batch)| !batch.batch.is_empty())
+            .filter(|(_, batch)| !batch.is_empty())
             .map(|(key, _)| key.clone())
             .collect();
 
@@ -1046,7 +1085,7 @@ impl RecordAccumulator {
         key: &(TopicHandle, PartitionId),
     ) -> Option<(AccumulatorBatch, InFlightGuard)> {
         let batch = self.batches.remove(key)?;
-        if batch.batch.is_empty() {
+        if batch.is_empty() {
             return None;
         }
         let batch_memory: usize = batch.pending.iter().map(|p| p.estimated_size).sum();
@@ -1516,6 +1555,17 @@ impl RecordAccumulator {
                         super::idempotent::last_sequence_of_batch(seq, record_count)
                 {
                     identity.acknowledge(topic.as_ref(), partition, last_seq);
+
+                    // Fire-and-forget snapshot persistence.
+                    if let Some(ref store) = config.state_store {
+                        let snapshot = identity.snapshot();
+                        let store = Arc::clone(store);
+                        tokio::spawn(async move {
+                            if let Err(err) = store.store_erased(&snapshot).await {
+                                tracing::warn!(error = %err, "Failed to persist producer state snapshot");
+                            }
+                        });
+                    }
                 }
 
                 let batch_bytes_total: u64 = pending.iter().map(|p| p.estimated_size as u64).sum();
@@ -1578,7 +1628,7 @@ impl RecordAccumulator {
         let keys: Vec<_> = self
             .batches
             .iter()
-            .filter(|(_, batch)| !batch.batch.is_empty())
+            .filter(|(_, batch)| !batch.is_empty())
             .map(|(key, _)| key.clone())
             .collect();
 
@@ -1617,16 +1667,15 @@ mod tests {
 
     #[test]
     fn test_accumulator_batch_age() {
-        let batch = AccumulatorBatch::new("test".to_string().into(), 0, 16384, Compression::None);
+        let batch = AccumulatorBatch::new(16384);
         std::thread::sleep(Duration::from_millis(10));
         assert!(batch.age() >= Duration::from_millis(10));
     }
 
     #[test]
     fn test_accumulator_batch_new() {
-        let batch =
-            AccumulatorBatch::new("test-topic".to_string().into(), 1, 32768, Compression::Gzip);
-        assert!(batch.batch.is_empty());
+        let batch = AccumulatorBatch::new(32768);
+        assert!(batch.is_empty());
         assert!(batch.pending.is_empty());
     }
 
@@ -1646,6 +1695,7 @@ mod tests {
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             identity: None,
             partitioner: Arc::new(crate::producer::partitioner::DefaultPartitioner::new()),
+            state_store: None,
         };
         assert_eq!(config.batch_size, 65536);
         assert_eq!(config.linger, Duration::from_millis(50));
@@ -1692,15 +1742,14 @@ mod tests {
     /// Verify `send_extracted_batch` is `'static + Send`.
     ///
     /// All detached flush paths (`spawn_batches_detached`, `flush_batch`,
-    /// etc.) ultimately call `tokio::spawn(Self::send_extracted_batch(...))`;
-    /// this compile-time assertion ensures the future stays `Send` so
-    /// `tokio::spawn` can schedule it across threads.
+    /// Compile-time assertion that the handle types used with `tokio::spawn`
+    /// are `Send + Sync`. A regression here would prevent spawning the
+    /// accumulator task on the multi-thread runtime.
     #[test]
-    fn test_send_extracted_batch_is_send() {
-        fn assert_send<T: Send>() {}
-        // This compiles only if the future returned by send_extracted_batch is Send,
-        // which is required for tokio::spawn to work.
-        assert_send::<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>();
+    fn test_accumulator_handle_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<RecordAccumulatorHandle>();
+        assert_send_sync::<RecordAccumulator>();
     }
 
     // ── Backpressure tests ──────────────────────────────────────
@@ -1926,5 +1975,28 @@ mod tests {
         }
 
         assert_eq!(metrics.buffered_records.get(), 0);
+    }
+
+    /// `effective_memory_capacity(0)` defaults to `Semaphore::MAX_PERMITS`.
+    #[test]
+    fn test_effective_memory_capacity_zero_returns_max() {
+        assert_eq!(effective_memory_capacity(0), Semaphore::MAX_PERMITS);
+    }
+
+    /// `effective_memory_capacity` clamps values above `Semaphore::MAX_PERMITS`.
+    ///
+    /// This exercises the warning-and-clamp branch that prevents an illegal
+    /// semaphore permit count from being passed to `Semaphore::new`.
+    #[test]
+    fn test_effective_memory_capacity_clamps_over_limit() {
+        let over = Semaphore::MAX_PERMITS + 1;
+        assert_eq!(effective_memory_capacity(over), Semaphore::MAX_PERMITS);
+    }
+
+    /// Values within the valid range are returned unchanged.
+    #[test]
+    fn test_effective_memory_capacity_passthrough() {
+        let within = Semaphore::MAX_PERMITS / 2;
+        assert_eq!(effective_memory_capacity(within), within);
     }
 }

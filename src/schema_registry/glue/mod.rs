@@ -553,6 +553,7 @@ fn compress_zlib(_data: &[u8]) -> Result<Vec<u8>> {
 /// Maximum decompressed size (128 MiB) to protect against decompression bombs.
 ///
 /// Matches the limit used by record-batch decompression in `protocol::record`.
+#[cfg(any(feature = "gzip", feature = "aws-glue-schema-registry"))]
 const MAX_DECOMPRESSED_SIZE: usize = 128 * 1024 * 1024;
 
 /// ZLIB-decompress data with a size limit to prevent decompression bombs.

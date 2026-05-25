@@ -110,6 +110,8 @@
 #[cfg(feature = "schema-registry")]
 mod client;
 pub mod glue;
+#[cfg(feature = "schema-registry")]
+mod http;
 
 #[cfg(feature = "schema-registry")]
 #[cfg_attr(docsrs, doc(cfg(feature = "schema-registry")))]

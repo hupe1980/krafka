@@ -1,10 +1,21 @@
 //! Utility functions for Krafka.\n//!\n//! This module provides low-level utilities used throughout the crate:\n//!\n//! - **Correlation ID generation**: Thread-safe ID generation for request/response matching\n//! - **CRC32C**: Checksum calculation for Kafka record validation\n//! - **Varint encoding**: Variable-length integer encoding for compact protocols\n//! - **SNI hostname extraction**: Parse hostnames from address strings for TLS SNI
 
-use std::sync::Once;
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::Duration;
+use std::cell::RefCell;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 
 use crate::error::{KrafkaError, Result};
+
+// Thread-local fast PRNG for non-security uses (backoff jitter).
+// SmallRng is not cryptographically secure; UUIDs and other security-sensitive
+// values continue to use the global CSPRNG via `rand::random()`.
+thread_local! {
+    static JITTER_RNG: RefCell<SmallRng> = RefCell::new(SmallRng::from_os_rng());
+}
 
 /// Shared exponential-backoff parameters used by both [`RetryPolicy`] and
 /// [`ConnectionRetryConfig`].
@@ -57,23 +68,33 @@ impl BackoffPolicy {
         // below would silently ignore max_backoff, so we canonicalize first.
         let effective_max = self.max_backoff.max(self.initial_backoff);
 
-        // Exponential backoff: initial * multiplier^(attempt-1)
+        // Early-exit once the exponential would already exceed the ceiling.
+        // This avoids evaluating powi() with a potentially large exponent on
+        // every poll in a retry storm.  The threshold is conservative: once
+        // `attempt` is large enough that even a single step would exceed
+        // `effective_max`, all future attempts land at the clamped value.
+        let initial_secs = self.initial_backoff.as_secs_f64();
+        let effective_max_secs = effective_max.as_secs_f64();
         let exponent = attempt.saturating_sub(1).min(i32::MAX as u32) as i32;
-        let base_backoff =
-            self.initial_backoff.as_secs_f64() * self.backoff_multiplier.powi(exponent);
-
-        // Cap at max backoff.
-        let capped_backoff = base_backoff.min(effective_max.as_secs_f64());
+        // If the initial value already equals the ceiling, or if the exponent
+        // is large enough that floating-point will overflow to infinity, skip
+        // powi entirely and go straight to jitter application at the cap.
+        let base_backoff = if initial_secs >= effective_max_secs || exponent >= 1024 {
+            effective_max_secs
+        } else {
+            // Exponential backoff: initial * multiplier^(attempt-1)
+            (initial_secs * self.backoff_multiplier.powi(exponent)).min(effective_max_secs)
+        };
 
         // Add ±jitter to prevent thundering herd.
-        let jitter_range = capped_backoff * self.jitter_factor;
+        let jitter_range = base_backoff * self.jitter_factor;
         let jitter = if self.jitter_factor > 0.0 {
-            rand::random_range(-jitter_range..=jitter_range)
+            JITTER_RNG.with(|rng| rng.borrow_mut().random_range(-jitter_range..=jitter_range))
         } else {
             0.0
         };
 
-        let final_backoff = (capped_backoff + jitter).max(self.initial_backoff.as_secs_f64());
+        let final_backoff = (base_backoff + jitter).max(self.initial_backoff.as_secs_f64());
 
         if !final_backoff.is_finite() {
             tracing::warn!(
@@ -125,17 +146,38 @@ pub(crate) const NO_RESPONSE_CORRELATION_ID: i32 = i32::MIN;
 /// becoming a much smaller value.
 #[inline]
 pub fn duration_to_millis_i32(d: Duration) -> i32 {
-    static WARN_ONCE_DURATION_TO_I32_CLAMP: Once = Once::new();
+    /// Minimum interval between clamp warnings. Fires at most once per hour so
+    /// persistent misconfiguration remains visible after restarts without
+    /// flooding logs under high call rates.
+    const WARN_INTERVAL_NANOS: u64 = 3600 * 1_000_000_000;
+    static BASELINE: OnceLock<Instant> = OnceLock::new();
+    static NEXT_WARN_NANOS: AtomicU64 = AtomicU64::new(0);
 
     let ms = d.as_millis();
     if ms > i32::MAX as u128 {
-        WARN_ONCE_DURATION_TO_I32_CLAMP.call_once(|| {
+        let now_nanos = BASELINE
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
+        let next = NEXT_WARN_NANOS.load(Ordering::Relaxed);
+        if now_nanos >= next
+            && NEXT_WARN_NANOS
+                .compare_exchange(
+                    next,
+                    now_nanos + WARN_INTERVAL_NANOS,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
             tracing::warn!(
                 duration_ms = %ms,
                 capped_at = i32::MAX,
-                "duration exceeds i32::MAX (~24.8 days); clamping to i32::MAX (further clamp events suppressed)"
+                "duration exceeds i32::MAX (~24.8 days); clamping to i32::MAX. \
+                 Check timeout/deadline configuration. (repeats at most once per hour)"
             );
-        });
+        }
     }
     ms.min(i32::MAX as u128) as i32
 }
@@ -159,31 +201,22 @@ pub fn duration_to_millis_i64(d: Duration) -> i64 {
 ///
 /// A single heap allocation of exactly 36 bytes is made.
 pub fn random_uuid_v4() -> String {
-    let bytes: [u8; 16] = rand::random();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut bytes: [u8; 16] = rand::random();
     // Set version (4) and variant (RFC 4122).
-    let b6 = (bytes[6] & 0x0F) | 0x40;
-    let b8 = (bytes[8] & 0x3F) | 0x80;
-    // `format!` for a fixed-width hex string reserves exactly the right
-    // capacity via the format machinery — no reallocation needed.
-    let s = format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0],
-        bytes[1],
-        bytes[2],
-        bytes[3],
-        bytes[4],
-        bytes[5],
-        b6,
-        bytes[7],
-        b8,
-        bytes[9],
-        bytes[10],
-        bytes[11],
-        bytes[12],
-        bytes[13],
-        bytes[14],
-        bytes[15],
-    );
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+
+    // Encode into a 36-byte UUID string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
+    // Dashes fall after byte groups 4, 6, 8, 10 (byte indices 4, 6, 8, 10).
+    let mut s = String::with_capacity(36);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i == 4 || i == 6 || i == 8 || i == 10 {
+            s.push('-');
+        }
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0xF) as usize] as char);
+    }
     debug_assert_eq!(s.len(), 36, "UUID must be exactly 36 chars");
     s
 }

@@ -5,9 +5,9 @@
 use std::fmt;
 use std::time::Duration;
 
-use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 
+use super::http::{HttpClient, base64_encode};
 use super::{Schema, SchemaId, SchemaReference, SchemaRegistryClient, SchemaType, SchemaVersion};
 use crate::error::{KrafkaError, Result};
 
@@ -15,6 +15,9 @@ use crate::error::{KrafkaError, Result};
 const SCHEMA_REGISTRY_CONTENT_TYPE: &str = "application/vnd.schemaregistry.v1+json";
 /// Maximum non-standard error body preview included in returned errors.
 const ERROR_BODY_PREVIEW_LIMIT: usize = 512;
+/// Default HTTP request timeout applied by both `new()` and the builder.
+/// An unresponsive registry would otherwise block schema encode/decode indefinitely.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ── API JSON types ───────────────────────────────────────────────────────
 
@@ -155,7 +158,7 @@ enum RegistryAuth {
 /// ).await?;
 /// ```
 pub struct ConfluentSchemaRegistry {
-    client: reqwest::Client,
+    client: HttpClient,
     base_url: String,
     auth: RegistryAuth,
 }
@@ -163,14 +166,19 @@ pub struct ConfluentSchemaRegistry {
 impl ConfluentSchemaRegistry {
     /// Create a client with the given registry URL and no authentication.
     ///
+    /// A 30-second request timeout is applied by default. Use
+    /// [`builder()`](Self::builder) to customise the timeout or add
+    /// authentication.
+    ///
     /// Returns an error if the URL contains embedded credentials
     /// (`https://user:pass@host/`). Use [`builder()`](Self::builder) with
     /// [`basic_auth()`](ConfluentSchemaRegistryBuilder::basic_auth) instead.
     pub fn new(url: impl Into<String>) -> Result<Self> {
         let url = normalize_url(url.into());
         reject_embedded_credentials(&url)?;
+        let client = HttpClient::with_webpki_roots(Some(DEFAULT_REQUEST_TIMEOUT))?;
         Ok(Self {
-            client: reqwest::Client::new(),
+            client,
             base_url: url,
             auth: RegistryAuth::None,
         })
@@ -199,26 +207,17 @@ impl ConfluentSchemaRegistry {
             schema_type: schema_type.as_str(),
             references: Self::to_reference_json(references),
         };
-        let result: CompatibilityResponse = self
-            .send_request(
-                self.client
-                    .post(&url)
-                    .header(CONTENT_TYPE, SCHEMA_REGISTRY_CONTENT_TYPE)
-                    .json(&body),
-            )
-            .await?;
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| {
+            KrafkaError::schema_registry_with_source("failed to serialise request", e)
+        })?;
+        let result: CompatibilityResponse = self.http_post(&url, &body_bytes).await?;
         Ok(result.is_compatible)
     }
 
     /// List all subjects in the registry.
     pub async fn get_subjects(&self) -> Result<Vec<String>> {
         let url = format!("{}/subjects", self.base_url);
-        self.send_request(
-            self.client
-                .get(&url)
-                .header(ACCEPT, SCHEMA_REGISTRY_CONTENT_TYPE),
-        )
-        .await
+        self.http_get(&url).await
     }
 
     /// List all versions registered under a subject.
@@ -228,12 +227,7 @@ impl ConfluentSchemaRegistry {
             self.base_url,
             percent_encode(subject)
         );
-        self.send_request(
-            self.client
-                .get(&url)
-                .header(ACCEPT, SCHEMA_REGISTRY_CONTENT_TYPE),
-        )
-        .await
+        self.http_get(&url).await
     }
 
     /// Delete a subject and all its versions.
@@ -248,61 +242,94 @@ impl ConfluentSchemaRegistry {
         if permanent {
             url.push_str("?permanent=true");
         }
-        self.send_request(
-            self.client
-                .delete(&url)
-                .header(ACCEPT, SCHEMA_REGISTRY_CONTENT_TYPE),
-        )
-        .await
+        self.http_delete(&url).await
     }
 
-    /// Apply authentication to a request builder.
-    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    /// Format an `Authorization` header value for the configured auth method.
+    fn auth_header_value(&self) -> Option<String> {
         match &self.auth {
-            RegistryAuth::None => builder,
+            RegistryAuth::None => None,
             RegistryAuth::Basic { username, password } => {
-                builder.basic_auth(username.as_str(), Some(password.as_str()))
+                let creds = format!("{}:{}", username.as_str(), password.as_str());
+                Some(format!("Basic {}", base64_encode(creds.as_bytes())))
             }
-            RegistryAuth::Bearer { token } => builder.bearer_auth(token.as_str()),
+            RegistryAuth::Bearer { token } => Some(format!("Bearer {}", token.as_str())),
         }
     }
 
-    /// Handle an HTTP response, converting error responses to `KrafkaError`.
-    async fn handle_response<T: serde::de::DeserializeOwned>(
-        response: reqwest::Response,
-    ) -> Result<T> {
-        let status = response.status();
-        if status.is_success() {
-            response.json::<T>().await.map_err(|e| {
-                KrafkaError::schema_registry_with_source("failed to parse response", e)
+    /// Deserialise and handle an HTTP response, converting error responses
+    /// to [`KrafkaError`].
+    fn handle_response<T: serde::de::DeserializeOwned>(status: u16, body: &[u8]) -> Result<T> {
+        if (200..300).contains(&status) {
+            serde_json::from_slice(body).map_err(|e| {
+                KrafkaError::schema_registry_with_source(
+                    "failed to parse schema registry response",
+                    e,
+                )
             })
+        } else if let Ok(err) = serde_json::from_slice::<ErrorResponse>(body) {
+            Err(KrafkaError::schema_registry(format!(
+                "{} (error code {})",
+                err.message, err.error_code
+            )))
         } else {
-            let body = response.text().await.unwrap_or_default();
-            if let Ok(err) = serde_json::from_str::<ErrorResponse>(&body) {
-                Err(KrafkaError::schema_registry(format!(
-                    "{} (error code {})",
-                    err.message, err.error_code
-                )))
-            } else {
-                let body = sanitized_error_body_preview(&body);
-                Err(KrafkaError::schema_registry(format!(
-                    "HTTP {status}: {body}"
-                )))
-            }
+            let body_str = String::from_utf8_lossy(body);
+            let preview = sanitized_error_body_preview(&body_str);
+            Err(KrafkaError::schema_registry(format!(
+                "HTTP {status}: {preview}"
+            )))
         }
     }
 
-    /// Send an authenticated request and parse the JSON response.
-    async fn send_request<T: serde::de::DeserializeOwned>(
-        &self,
-        request: reqwest::RequestBuilder,
-    ) -> Result<T> {
-        let response = self
-            .apply_auth(request)
-            .send()
-            .await
-            .map_err(|e| KrafkaError::schema_registry_with_source("request failed", e))?;
-        Self::handle_response(response).await
+    /// Send an authenticated GET request and parse the JSON response.
+    async fn http_get<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
+        let auth = self.auth_header_value();
+        let resp = self
+            .client
+            .request(
+                "GET",
+                url,
+                &[("Accept", SCHEMA_REGISTRY_CONTENT_TYPE)],
+                None,
+                auth.as_deref(),
+            )
+            .await?;
+        Self::handle_response(resp.status, &resp.body)
+    }
+
+    /// Send an authenticated POST request with a JSON body and parse the response.
+    async fn http_post<T: serde::de::DeserializeOwned>(&self, url: &str, body: &[u8]) -> Result<T> {
+        let auth = self.auth_header_value();
+        let resp = self
+            .client
+            .request(
+                "POST",
+                url,
+                &[
+                    ("Accept", SCHEMA_REGISTRY_CONTENT_TYPE),
+                    ("Content-Type", SCHEMA_REGISTRY_CONTENT_TYPE),
+                ],
+                Some(body),
+                auth.as_deref(),
+            )
+            .await?;
+        Self::handle_response(resp.status, &resp.body)
+    }
+
+    /// Send an authenticated DELETE request and parse the JSON response.
+    async fn http_delete<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
+        let auth = self.auth_header_value();
+        let resp = self
+            .client
+            .request(
+                "DELETE",
+                url,
+                &[("Accept", SCHEMA_REGISTRY_CONTENT_TYPE)],
+                None,
+                auth.as_deref(),
+            )
+            .await?;
+        Self::handle_response(resp.status, &resp.body)
     }
 
     fn to_reference_json(refs: &[SchemaReference]) -> Vec<ReferenceJson> {
@@ -357,13 +384,7 @@ impl fmt::Debug for ConfluentSchemaRegistry {
 impl SchemaRegistryClient for ConfluentSchemaRegistry {
     async fn get_schema_by_id(&self, id: SchemaId) -> Result<Schema> {
         let url = format!("{}/schemas/ids/{id}", self.base_url);
-        let body: SchemaByIdResponse = self
-            .send_request(
-                self.client
-                    .get(&url)
-                    .header(ACCEPT, SCHEMA_REGISTRY_CONTENT_TYPE),
-            )
-            .await?;
+        let body: SchemaByIdResponse = self.http_get(&url).await?;
         let schema_type: SchemaType = body.schema_type.parse()?;
 
         Ok(Schema {
@@ -382,13 +403,7 @@ impl SchemaRegistryClient for ConfluentSchemaRegistry {
             self.base_url,
             percent_encode(subject)
         );
-        let body: SchemaBySubjectResponse = self
-            .send_request(
-                self.client
-                    .get(&url)
-                    .header(ACCEPT, SCHEMA_REGISTRY_CONTENT_TYPE),
-            )
-            .await?;
+        let body: SchemaBySubjectResponse = self.http_get(&url).await?;
         Self::schema_from_subject_response(body)
     }
 
@@ -398,13 +413,7 @@ impl SchemaRegistryClient for ConfluentSchemaRegistry {
             self.base_url,
             percent_encode(subject)
         );
-        let body: SchemaBySubjectResponse = self
-            .send_request(
-                self.client
-                    .get(&url)
-                    .header(ACCEPT, SCHEMA_REGISTRY_CONTENT_TYPE),
-            )
-            .await?;
+        let body: SchemaBySubjectResponse = self.http_get(&url).await?;
         Self::schema_from_subject_response(body)
     }
 
@@ -426,14 +435,10 @@ impl SchemaRegistryClient for ConfluentSchemaRegistry {
             schema_type: schema_type.as_str(),
             references: refs,
         };
-        let result: RegisterSchemaResponse = self
-            .send_request(
-                self.client
-                    .post(&url)
-                    .header(CONTENT_TYPE, SCHEMA_REGISTRY_CONTENT_TYPE)
-                    .json(&body),
-            )
-            .await?;
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| {
+            KrafkaError::schema_registry_with_source("failed to serialise request", e)
+        })?;
+        let result: RegisterSchemaResponse = self.http_post(&url, &body_bytes).await?;
         Ok(result.id)
     }
 
@@ -542,7 +547,7 @@ impl Default for ConfluentSchemaRegistryBuilder {
             auth: RegistryAuth::None,
             // Default 30 s matches comparable clients (Confluent Python, schema-registry-converter).
             // An unresponsive registry otherwise blocks every encode/decode indefinitely.
-            request_timeout: Some(Duration::from_secs(30)),
+            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
         }
     }
 }
@@ -616,14 +621,7 @@ impl ConfluentSchemaRegistryBuilder {
             ));
         }
 
-        let mut http_builder = reqwest::Client::builder();
-        if let Some(timeout) = self.request_timeout {
-            http_builder = http_builder.timeout(timeout);
-        }
-
-        let client = http_builder.build().map_err(|e| {
-            KrafkaError::schema_registry(format!("failed to build HTTP client: {e}"))
-        })?;
+        let client = HttpClient::with_webpki_roots(self.request_timeout)?;
 
         Ok(ConfluentSchemaRegistry {
             client,
@@ -701,7 +699,7 @@ mod tests {
             .expect("request_timeout should complete the request with an error");
         let err = timed.unwrap_err();
 
-        assert!(err.to_string().contains("request failed"));
+        assert!(err.to_string().contains("timed out"));
 
         server.abort();
     }
