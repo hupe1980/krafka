@@ -1,6 +1,6 @@
 //! Offset management for consumers.
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 
 use crate::{Offset, PartitionId};
 
@@ -70,10 +70,15 @@ impl OffsetStore {
     /// Set the committed offset for a topic-partition.
     #[inline]
     pub fn commit(&mut self, topic: &str, partition: PartitionId, offset: OffsetAndMetadata) {
-        self.committed
-            .entry(topic.to_owned())
-            .or_default()
-            .insert(partition, offset);
+        match self.committed.get_mut(topic) {
+            Some(inner) => {
+                inner.insert(partition, offset);
+            }
+            None => {
+                self.committed
+                    .insert(topic.to_owned(), HashMap::from([(partition, offset)]));
+            }
+        }
     }
 
     /// Get the committed offset for a topic-partition.
@@ -85,10 +90,15 @@ impl OffsetStore {
     /// Set the current position for a topic-partition.
     #[inline]
     pub fn set_position(&mut self, topic: &str, partition: PartitionId, offset: Offset) {
-        self.position
-            .entry(topic.to_owned())
-            .or_default()
-            .insert(partition, offset);
+        match self.position.get_mut(topic) {
+            Some(inner) => {
+                inner.insert(partition, offset);
+            }
+            None => {
+                self.position
+                    .insert(topic.to_owned(), HashMap::from([(partition, offset)]));
+            }
+        }
     }
 
     /// Get the current position for a topic-partition.

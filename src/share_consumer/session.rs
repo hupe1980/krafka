@@ -12,7 +12,7 @@
 //! reports accepted/released/rejected offsets alongside the next fetch
 //! request, reducing round trips.
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 
 use crate::BrokerId;
 

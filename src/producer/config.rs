@@ -320,6 +320,19 @@ impl ProducerConfigBuilder {
     }
 
     /// Set linger time.
+    ///
+    /// The accumulator waits up to `duration` before sealing a batch, giving
+    /// more records time to join and improving throughput at the cost of
+    /// additional latency. The default is [`Duration::ZERO`] (no linger —
+    /// send immediately). For sustained high-throughput workloads, values in
+    /// the range of 1–100 ms are typical.
+    ///
+    /// # Trade-off
+    ///
+    /// Larger linger values reduce the number of Produce RPCs and increase
+    /// batch fill rate, but add a fixed latency floor to every record.  Do not
+    /// set linger without also tuning [`delivery_timeout`](Self::delivery_timeout)
+    /// to be significantly larger than the linger value.
     pub fn linger(mut self, duration: Duration) -> Self {
         self.config.linger = duration;
         self
@@ -360,9 +373,16 @@ impl ProducerConfigBuilder {
     /// Set number of retries.
     ///
     /// The default is `u32::MAX` (effectively unlimited), which is safe
-    /// because the retry loop is always bounded by `delivery_timeout`.
+    /// because the retry loop is always bounded by [`delivery_timeout`](Self::delivery_timeout).
     /// Use a finite value when you want to limit retries independently of
     /// the delivery timeout.
+    ///
+    /// # Note on idempotent producers
+    ///
+    /// When idempotent production is enabled, in-order retries are guaranteed
+    /// by sequence numbers, so `retries > 0` is the expected setting.
+    /// Setting `retries = 0` disables retries entirely — combine with a short
+    /// `delivery_timeout` for fire-and-forget semantics.
     pub fn retries(mut self, retries: u32) -> Self {
         self.config.retries = retries;
         self

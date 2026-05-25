@@ -173,23 +173,22 @@ impl Gauge {
 ///
 /// # Accuracy
 ///
-/// Each bucket reports the **arithmetic midpoint** (`1.5 × 2^i`) as the
-/// percentile estimate.  This produces a **relative error of up to ±50 %**
-/// within a bucket:
+/// Each power-of-2 band is divided into 4 equal sub-buckets of width
+/// `2^(i-2)`, giving a **relative error of ≤ 12.5 %** (overestimate of
+/// at most one sub-bucket width from the lower bound):
 ///
-/// | Bucket range     | Reported estimate | Max relative error |
-/// |------------------|-------------------|--------------------|
-/// | 1 ms – 2 ms      | 1.5 ms            | 33 %               |
-/// | 8 ms – 16 ms     | 12 ms             | 50 %               |
-/// | 16 ms – 32 ms    | 24 ms             | up to 33–50 %      |
-/// | 64 ms – 128 ms   | 96 ms             | 50 %               |
+/// | Sample range     | Sub-bucket width | Max relative error |
+/// |------------------|------------------|--------------------|
+/// | 1 ms – 2 ms      | 250 μs           | 12.5 %             |
+/// | 8 ms – 16 ms     | 2 ms             | 12.5 %             |
+/// | 64 ms – 128 ms   | 16 ms            | 12.5 %             |
 ///
-/// **For tight SLO contracts** (e.g. p99 < 50 ms alerts), the ±50 % error
-/// means a bucket boundary misalignment can mask a real latency regression.
-/// In those cases, replace or supplement with a T-Digest or HDR histogram.
+/// **For tight SLO contracts** (p99 < 50 ms alerts), ±12.5 % gives
+/// approximately one sub-bucket slack.  For zero-error requirements,
+/// replace or supplement with a T-Digest or HDR histogram.
 ///
 /// For capacity-planning and order-of-magnitude alerting ("are we above 1 s?")
-/// the precision is adequate and comes at zero allocation cost.
+/// the precision is more than adequate and comes at zero allocation cost.
 ///
 /// This approach requires no external dependencies and no heap allocation.
 #[derive(Debug)]
@@ -198,9 +197,10 @@ pub struct LatencyTracker {
     sum_nanos: AtomicU64,
     min_nanos: AtomicU64,
     max_nanos: AtomicU64,
-    /// Power-of-2 histogram: 64 buckets, bucket[i] = count of samples
-    /// where floor(log2(nanos)) == i (bucket[0] also captures nanos == 0).
-    histogram: [AtomicU64; 64],
+    /// Sub-divided power-of-2 histogram: 256 buckets.
+    /// See [`Self::bucket_for`] and [`Self::estimate_nanos_for_bucket`]
+    /// for the encoding details.
+    histogram: [AtomicU64; 256],
 }
 
 impl Default for LatencyTracker {
@@ -221,6 +221,58 @@ impl LatencyTracker {
         }
     }
 
+    /// Map a nanosecond value to a histogram bucket index (0–255).
+    ///
+    /// Encoding:
+    /// - Bucket 0  : `nanos == 0`
+    /// - Bucket 1  : `nanos ∈ [1, 4)` (sub-nanosecond resolution, merged)
+    /// - Bucket `(i-2)*4 + 2 + j` : band `i` (i ≥ 2), sub-bucket `j` (0–3),
+    ///   where `j = (nanos >> (i-2)) & 3`.
+    ///
+    /// Each of the 62 bands `[2^i, 2^(i+1))` for `i ∈ [2, 63]` is split into
+    /// 4 equal sub-buckets of width `2^(i-2)`, giving ≤ 12.5 % relative error.
+    #[inline]
+    fn bucket_for(nanos: u64) -> usize {
+        if nanos == 0 {
+            return 0;
+        }
+        let i = (63 - nanos.leading_zeros()) as usize; // floor(log2(nanos))
+        if i < 2 {
+            // nanos ∈ {1,2,3}: merge into a single low-resolution bucket.
+            return 1;
+        }
+        let sub = ((nanos >> (i - 2)) & 3) as usize;
+        ((i - 2) * 4 + 2 + sub).min(255)
+    }
+
+    /// Return the midpoint nanosecond estimate for a bucket index.
+    ///
+    /// For band `i ≥ 3` and sub-bucket `j`:
+    ///   midpoint = `2^i + j × 2^(i-2) + 2^(i-3)`
+    ///
+    /// The maximum relative error of this estimate is ≤ 12.5 %.
+    #[inline]
+    fn estimate_nanos_for_bucket(bucket: usize) -> u64 {
+        match bucket {
+            0 => 0,
+            1 => 2, // midpoint of integer range [1, 4)
+            _ => {
+                let idx = bucket - 2;
+                let band = idx / 4 + 2;
+                let sub = idx % 4;
+                if band == 2 {
+                    // Width = 1 ns per sub-bucket → exact integer value.
+                    4u64 + sub as u64
+                } else {
+                    let lower = 1u64 << band;
+                    let sub_width = 1u64 << (band - 2);
+                    let half_sub = 1u64 << (band - 3);
+                    lower + sub as u64 * sub_width + half_sub
+                }
+            }
+        }
+    }
+
     /// Record a latency value.
     #[inline]
     pub fn record(&self, duration: Duration) {
@@ -228,13 +280,7 @@ impl LatencyTracker {
         self.sum_nanos.fetch_add(nanos, Ordering::Relaxed);
         self.min_nanos.fetch_min(nanos, Ordering::Relaxed);
         self.max_nanos.fetch_max(nanos, Ordering::Relaxed);
-        // Map to bucket: bucket[0] for 0 ns, otherwise floor(log2(nanos)).
-        let bucket = if nanos == 0 {
-            0
-        } else {
-            (63 - nanos.leading_zeros()) as usize
-        };
-        self.histogram[bucket].fetch_add(1, Ordering::Relaxed);
+        self.histogram[Self::bucket_for(nanos)].fetch_add(1, Ordering::Relaxed);
         // Increment count last so snapshots never observe count > histogram sum.
         self.count.fetch_add(1, Ordering::Relaxed);
     }
@@ -270,12 +316,16 @@ impl LatencyTracker {
     }
 
     /// Get the maximum recorded latency.
+    ///
+    /// Returns `None` if no samples have been recorded.
+    ///
+    /// Note: `Some(Duration::ZERO)` is a valid return value when the maximum
+    /// observed latency was zero (e.g. all samples were sub-nanosecond).
     pub fn max(&self) -> Option<Duration> {
-        let max = self.max_nanos.load(Ordering::Relaxed);
-        if max == 0 && self.count() == 0 {
+        if self.count() == 0 {
             None
         } else {
-            Some(Duration::from_nanos(max))
+            Some(Duration::from_nanos(self.max_nanos.load(Ordering::Relaxed)))
         }
     }
 
@@ -291,17 +341,11 @@ impl LatencyTracker {
     /// `percentile` must be in `[0.0, 100.0]`. Returns `None` if no samples
     /// have been recorded.
     ///
-    /// # Accuracy caveat
+    /// # Accuracy
     ///
-    /// The estimate is derived from power-of-2 buckets by returning the
-    /// midpoint of the bucket that contains the target rank.  The **relative
-    /// error is up to ±50 %** within a bucket — a true p99 of 31 ms is
-    /// reported as 24 ms; a true p99 of 127 ms is reported as 96 ms.
-    ///
-    /// This is suitable for order-of-magnitude alerting ("above 1 s?") and
-    /// capacity planning dashboards.  For tight SLO contracts with narrow
-    /// thresholds (e.g. p99 < 50 ms), use a T-Digest or HDR histogram
-    /// instead of, or in addition to, this tracker.
+    /// The estimate uses the sub-bucket midpoint for the bucket containing the
+    /// target rank.  The **maximum relative error is ≤ 12.5 %** — suitable
+    /// for tight SLO alerting (e.g. p99 < 50 ms thresholds).
     pub fn percentile(&self, percentile: f64) -> Option<Duration> {
         let total = self.count();
         if total == 0 {
@@ -316,17 +360,7 @@ impl LatencyTracker {
         for (i, bucket) in self.histogram.iter().enumerate() {
             cumulative += bucket.load(Ordering::Relaxed);
             if cumulative >= target {
-                // Represent this bucket by an arithmetic midpoint estimate.
-                // For i=0 we return 0.
-                let nanos = if i == 0 {
-                    0u64
-                } else {
-                    // Lower bound of bucket i is 2^i; use the midpoint 2^i * 1.5
-                    // as a representative estimate.
-                    let lower = 1u64 << i;
-                    lower + lower / 2
-                };
-                return Some(Duration::from_nanos(nanos));
+                return Some(Duration::from_nanos(Self::estimate_nanos_for_bucket(i)));
             }
         }
         // All counts are in the histogram; return max as fallback.
@@ -396,13 +430,14 @@ pub struct LatencySnapshot {
     pub avg: Option<Duration>,
     /// 50th-percentile (median) latency estimate.
     ///
-    /// Derived from a 64-bucket power-of-2 histogram; the relative error is
-    /// at most ~100 % within any single bucket (i.e., the estimate may be up
-    /// to 2× the true p50). Returns `None` when no samples have been recorded.
+    /// Derived from a 256-bucket sub-divided power-of-2 histogram.  The
+    /// relative error is **at most 12.5 %** (overestimate when the true value
+    /// falls at the lower bound of a sub-bucket).  Returns `None` when no
+    /// samples have been recorded.
     pub p50: Option<Duration>,
-    /// 95th-percentile latency estimate (same accuracy caveat as `p50`).
+    /// 95th-percentile latency estimate (same accuracy as `p50`, ≤ 12.5 %).
     pub p95: Option<Duration>,
-    /// 99th-percentile latency estimate (same accuracy caveat as `p50`).
+    /// 99th-percentile latency estimate (same accuracy as `p50`, ≤ 12.5 %).
     pub p99: Option<Duration>,
 }
 
@@ -542,7 +577,11 @@ impl MetricsExporter for PrometheusExporter {
 
     fn export_latency(&mut self, name: &str, help: &str, snapshot: &LatencySnapshot) {
         let name = sanitize_prometheus_name(name);
-        let _ = writeln!(self.output, "# HELP {}_seconds {}", name, help);
+        let _ = writeln!(
+            self.output,
+            "# HELP {}_seconds {} (quantiles estimated from power-of-2 histogram; relative error ≤50% per bucket)",
+            name, help
+        );
         let _ = writeln!(self.output, "# TYPE {}_seconds summary", name);
         let _ = writeln!(self.output, "{}_seconds_count {}", name, snapshot.count);
         let _ = writeln!(
@@ -925,6 +964,11 @@ impl MetricsVisitable for ConnectionMetrics {
             "Connection establishment latency",
             &self.connect_latency.snapshot(),
         );
+        exporter.export_latency(
+            &format!("{prefix}_tls_handshake_latency"),
+            "TLS handshake latency (TLS connections only)",
+            &self.tls_handshake_latency.snapshot(),
+        );
     }
 }
 
@@ -1089,6 +1133,7 @@ impl KrafkaMetrics {
         self.connection.throttle_delay_ms.reset();
         self.connection.active_connections.set(0);
         self.connection.connect_latency.reset();
+        self.connection.tls_handshake_latency.reset();
     }
 }
 
@@ -1405,6 +1450,8 @@ pub struct ConnectionMetrics {
     pub active_connections: Gauge,
     /// Connection establishment latency.
     pub connect_latency: LatencyTracker,
+    /// TLS handshake latency (only populated for TLS-secured connections).
+    pub tls_handshake_latency: LatencyTracker,
 }
 
 impl ConnectionMetrics {
@@ -1465,6 +1512,12 @@ impl ConnectionMetrics {
         self.throttle_delay_ms.add(millis);
     }
 
+    /// Record a completed TLS handshake duration.
+    #[inline]
+    pub fn record_tls_handshake(&self, duration: Duration) {
+        self.tls_handshake_latency.record(duration);
+    }
+
     /// Get a snapshot of all metrics.
     pub fn snapshot(&self) -> ConnectionMetricsSnapshot {
         ConnectionMetricsSnapshot {
@@ -1479,6 +1532,7 @@ impl ConnectionMetrics {
             throttle_delay_ms: self.throttle_delay_ms.get(),
             active_connections: self.active_connections.get(),
             connect_latency: self.connect_latency.snapshot(),
+            tls_handshake_latency: self.tls_handshake_latency.snapshot(),
         }
     }
 }
@@ -1509,6 +1563,8 @@ pub struct ConnectionMetricsSnapshot {
     pub active_connections: u64,
     /// Connection latency statistics.
     pub connect_latency: LatencySnapshot,
+    /// TLS handshake latency statistics (only populated for TLS connections).
+    pub tls_handshake_latency: LatencySnapshot,
 }
 
 #[cfg(test)]
@@ -1613,6 +1669,26 @@ mod tests {
         assert_eq!(tracker.min(), Some(Duration::from_millis(100)));
         assert_eq!(tracker.max(), Some(Duration::from_millis(300)));
         assert_eq!(tracker.avg(), Some(Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn test_latency_tracker_zero_duration_sample() {
+        // Recording a zero-duration sample must produce Some(ZERO) from max(),
+        // not None.  The previous implementation returned None when max == 0,
+        // conflating "no samples" with "all zero-duration samples".
+        let tracker = LatencyTracker::new();
+        tracker.record(Duration::ZERO);
+        assert_eq!(tracker.count(), 1);
+        assert_eq!(
+            tracker.max(),
+            Some(Duration::ZERO),
+            "max() must return Some(ZERO) for a zero-duration sample, not None"
+        );
+        assert_eq!(
+            tracker.min(),
+            Some(Duration::ZERO),
+            "min() must return Some(ZERO) for a zero-duration sample, not None"
+        );
     }
 
     #[test]
@@ -2022,5 +2098,113 @@ mod tests {
         assert_eq!(snapshot.count, 3);
         assert_eq!(snapshot.min, Some(Duration::from_millis(50)));
         assert_eq!(snapshot.max, Some(Duration::from_millis(200)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-bucket histogram accuracy tests (F-26)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bucket_for_zero_and_small() {
+        assert_eq!(LatencyTracker::bucket_for(0), 0);
+        assert_eq!(LatencyTracker::bucket_for(1), 1);
+        assert_eq!(LatencyTracker::bucket_for(2), 1);
+        assert_eq!(LatencyTracker::bucket_for(3), 1);
+        // Band i=2: [4,8), sub = nanos & 3 → (i-2)*4+2+sub = 0+2+sub
+        assert_eq!(LatencyTracker::bucket_for(4), 2);
+        assert_eq!(LatencyTracker::bucket_for(5), 3);
+        assert_eq!(LatencyTracker::bucket_for(6), 4);
+        assert_eq!(LatencyTracker::bucket_for(7), 5);
+        // Band i=3: [8,16), sub = (nanos>>1)&3 → 1*4+2+sub = 6+sub
+        assert_eq!(LatencyTracker::bucket_for(8), 6); // sub=0
+        assert_eq!(LatencyTracker::bucket_for(9), 6); // sub=0
+        assert_eq!(LatencyTracker::bucket_for(10), 7); // sub=1
+        assert_eq!(LatencyTracker::bucket_for(14), 9); // sub=3
+        assert_eq!(LatencyTracker::bucket_for(15), 9); // sub=3
+        // Band i=4: [16,32), sub = (nanos>>2)&3 → 2*4+2+sub = 10+sub
+        assert_eq!(LatencyTracker::bucket_for(16), 10);
+        assert_eq!(LatencyTracker::bucket_for(20), 11);
+        assert_eq!(LatencyTracker::bucket_for(24), 12);
+        assert_eq!(LatencyTracker::bucket_for(28), 13);
+        assert_eq!(LatencyTracker::bucket_for(31), 13);
+    }
+
+    #[test]
+    fn test_estimate_nanos_for_bucket_correctness() {
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(0), 0);
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(1), 2);
+        // Band i=2, exact integers
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(2), 4);
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(3), 5);
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(4), 6);
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(5), 7);
+        // Band i=3: lower=8, sub_width=2, half_sub=1 → 8 + sub*2 + 1
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(6), 9); // [8,10) midpoint=9
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(7), 11); // [10,12) midpoint=11
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(8), 13); // [12,14) midpoint=13
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(9), 15); // [14,16) midpoint=15
+        // Band i=4: lower=16, sub_width=4, half_sub=2 → 16 + sub*4 + 2
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(10), 18); // [16,20) midpoint=18
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(11), 22); // [20,24) midpoint=22
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(12), 26); // [24,28) midpoint=26
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(13), 30); // [28,32) midpoint=30
+    }
+
+    #[test]
+    fn test_sub_bucket_relative_error_within_12_5_percent() {
+        // For each bucket: verify the estimate is within 12.5% of the true lower bound.
+        // The worst case is always at the lower bound (max overestimate = 12.5%).
+        // We test a representative set of bands covering μs to ms range.
+        let test_nanos: &[u64] = &[
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256,
+            512,
+            1_000,
+            2_000,
+            4_000,
+            8_000,
+            16_000,
+            32_000,
+            64_000,
+            100_000,
+            1_000_000,
+            10_000_000,
+            50_000_000,
+            100_000_000,
+        ];
+        for &nanos in test_nanos {
+            let bucket = LatencyTracker::bucket_for(nanos);
+            let estimate = LatencyTracker::estimate_nanos_for_bucket(bucket) as f64;
+            let relative_error = (estimate - nanos as f64) / nanos as f64;
+            assert!(
+                (-0.125 - 1e-9..=0.125 + 1e-9).contains(&relative_error),
+                "nanos={nanos}: estimate={estimate}, relative_error={relative_error:.4} > 12.5%"
+            );
+        }
+    }
+
+    #[test]
+    fn test_percentile_accuracy_for_known_values() {
+        // Record exactly 100 samples at 10 ms (= 10_000_000 ns).
+        // p50, p95, p99 should all land in the same sub-bucket.
+        // Verify the estimate is within 12.5% of 10 ms.
+        let tracker = LatencyTracker::new();
+        for _ in 0..100 {
+            tracker.record(Duration::from_millis(10));
+        }
+        let exact_nanos = 10_000_000u64;
+        for pct in [50.0_f64, 95.0, 99.0] {
+            let est = tracker.percentile(pct).unwrap().as_nanos() as u64;
+            let err = (est as f64 - exact_nanos as f64) / exact_nanos as f64;
+            assert!(
+                err.abs() <= 0.125 + 1e-9,
+                "p{pct}: estimate {est} ns, true {exact_nanos} ns, err={err:.4}"
+            );
+        }
     }
 }

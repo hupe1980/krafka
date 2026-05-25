@@ -48,7 +48,8 @@ mod stream;
 pub use config::{AcknowledgeType, AcknowledgementMode, ShareConsumerConfig};
 pub use stream::ShareConsumerStream;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use std::collections::VecDeque;
 use std::future::{Future, Ready, ready};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -85,6 +86,12 @@ type BrokerAckKey = ([u8; 16], PartitionId);
 
 /// Pending piggybacked acknowledgements grouped by broker and partition.
 type BrokerPendingAcks = HashMap<BrokerId, HashMap<BrokerAckKey, Vec<PendingAck>>>;
+
+/// Sentinel broker ID used when the partition leader is not yet known at acknowledge
+/// time (e.g., immediately after `subscribe()` before the first metadata refresh, or
+/// after a `restore_ack_state()` where metadata is unavailable).
+/// Acks with this sentinel are re-routed using fresh metadata in `poll()`.
+const UNROUTED_BROKER_ID: BrokerId = -2;
 
 #[derive(Clone)]
 struct ShareAcknowledgeContext {
@@ -205,10 +212,13 @@ pub struct ShareConsumer {
     closed: AtomicBool,
     /// Per-broker share session cache.
     share_sessions: Arc<tokio::sync::Mutex<ShareSessionCache>>,
-    /// Pending acknowledgements (accumulated between polls or before commit).
-    /// Keyed by `(topic_id, partition)` for O(1) per-partition drain when
-    /// piggybacking acks on fetch requests.
-    pending_acks: Arc<RwLock<HashMap<BrokerAckKey, Vec<PendingAck>>>>,
+    /// Pending acknowledgements sharded by broker ID.
+    ///
+    /// Pre-routing at acknowledge time means `poll()` can hand each broker its
+    /// acks in O(1) without rescanning the entire flat map.  Acks whose leader
+    /// is not yet known are stored under `UNROUTED_BROKER_ID` and re-routed
+    /// using fresh metadata at the start of the next `poll()`.
+    pending_acks: Arc<RwLock<BrokerPendingAcks>>,
     /// Monotonic token for the current local ack state.
     ///
     /// Incremented whenever local ack state is cleared or invalidated so
@@ -495,17 +505,49 @@ impl ShareConsumer {
             .collect();
 
         // Drain acknowledgement batches to piggyback on fetch requests.
-        // pending_acks is keyed by (topic_id, partition) — no linear scan needed.
+        // pending_acks is already broker-keyed: pre-routed acks pass through
+        // the sendable filter only; the UNROUTED shard is also re-routed here.
         let mut failed_piggyback_acks: Vec<PendingAck> = Vec::new();
-        let mut ack_batches_by_broker: BrokerPendingAcks = HashMap::new();
-        {
+        let pre_routed: BrokerPendingAcks = {
             let mut pending = self.pending_acks.write().await;
-            let drained = std::mem::take(&mut *pending);
-            for ((topic_id, partition), acks) in drained {
-                // Use the first ack's topic name for leader lookup (all share the same topic).
-                let topic = acks.first().map(|a| a.topic.as_str()).unwrap_or("");
-                if sendable_ack_partitions.contains(&(topic.to_owned(), partition)) {
-                    if let Some(broker_id) = self.metadata.leader(topic, partition) {
+            std::mem::take(&mut *pending)
+        };
+        let unrouted = pre_routed
+            .get(&UNROUTED_BROKER_ID)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let mut ack_batches_by_broker: BrokerPendingAcks =
+            HashMap::with_capacity(pre_routed.len().saturating_sub(if unrouted > 0 {
+                1
+            } else {
+                0
+            }));
+        for (broker_id, partition_acks) in pre_routed {
+            if broker_id == UNROUTED_BROKER_ID {
+                // Re-route using current metadata; topic name is in the ack itself.
+                for ((topic_id, partition), acks) in partition_acks {
+                    let topic = acks.first().map(|a| a.topic.as_str()).unwrap_or("");
+                    if sendable_ack_partitions.contains(&(topic.to_string(), partition)) {
+                        if let Some(bid) = self.metadata.leader(topic, partition) {
+                            ack_batches_by_broker
+                                .entry(bid)
+                                .or_default()
+                                .entry((topic_id, partition))
+                                .or_default()
+                                .extend(acks);
+                        } else {
+                            failed_piggyback_acks.extend(acks);
+                        }
+                    } else {
+                        failed_piggyback_acks.extend(acks);
+                    }
+                }
+            } else {
+                // Already routed; apply sendable filter only (handles leadership
+                // changes between acknowledge() and poll()).
+                for ((topic_id, partition), acks) in partition_acks {
+                    let topic = acks.first().map(|a| a.topic.as_str()).unwrap_or("");
+                    if sendable_ack_partitions.contains(&(topic.to_string(), partition)) {
                         ack_batches_by_broker
                             .entry(broker_id)
                             .or_default()
@@ -515,8 +557,6 @@ impl ShareConsumer {
                     } else {
                         failed_piggyback_acks.extend(acks);
                     }
-                } else {
-                    failed_piggyback_acks.extend(acks);
                 }
             }
         }
@@ -812,7 +852,7 @@ impl ShareConsumer {
         if self.config.acknowledgement_mode == AcknowledgementMode::Implicit {
             let ids = self.topic_ids.read().await;
             let mut pending = self.pending_acks.write().await;
-            Self::coalesce_implicit_acks(&all_records, &ids, &mut pending);
+            Self::coalesce_implicit_acks(&all_records, &ids, &mut pending, &self.metadata);
         }
 
         // In explicit mode, track all returned records as unacknowledged.
@@ -861,7 +901,17 @@ impl ShareConsumer {
                 record.topic, record.partition, record.offset
             )));
         }
+        // Route the ack to the current partition leader so poll() can piggyback
+        // it on the correct broker's ShareFetch without re-scanning the whole map.
+        // Fall back to UNROUTED_BROKER_ID when the leader is not yet in metadata;
+        // poll() will re-route it using fresh metadata.
+        let broker_id = self
+            .metadata
+            .leader(&record.topic, record.partition)
+            .unwrap_or(UNROUTED_BROKER_ID);
         pending
+            .entry(broker_id)
+            .or_default()
             .entry((topic_id, record.partition))
             .or_default()
             .push(PendingAck {
@@ -896,7 +946,7 @@ impl ShareConsumer {
 
     async fn restore_ack_state(
         current_generation: &AtomicU64,
-        pending_acks: &RwLock<HashMap<BrokerAckKey, Vec<PendingAck>>>,
+        pending_acks: &RwLock<BrokerPendingAcks>,
         explicit_flush_retry_required: &AtomicBool,
         ack_state_generation: u64,
         require_explicit_retry: bool,
@@ -914,8 +964,12 @@ impl ShareConsumer {
         if require_explicit_retry {
             explicit_flush_retry_required.store(true, Ordering::SeqCst);
         }
+        // Re-queue under UNROUTED_BROKER_ID; poll() will re-route using fresh
+        // metadata on the next call (handles leadership changes after failure).
         for ack in acks.drain(..) {
             pending
+                .entry(UNROUTED_BROKER_ID)
+                .or_default()
                 .entry((ack.topic_id, ack.partition))
                 .or_default()
                 .push(ack);
@@ -972,7 +1026,7 @@ impl ShareConsumer {
             let mut pending = self.pending_acks.write().await;
             std::mem::take(&mut *pending)
                 .into_values()
-                .flatten()
+                .flat_map(|broker_acks| broker_acks.into_values().flatten())
                 .collect()
         };
 
@@ -1019,7 +1073,7 @@ impl ShareConsumer {
         };
         let acks: Vec<PendingAck> = std::mem::take(&mut *pending)
             .into_values()
-            .flatten()
+            .flat_map(|broker_acks| broker_acks.into_values().flatten())
             .collect();
         drop(pending);
 
@@ -1148,9 +1202,11 @@ impl ShareConsumer {
         // records are returned to the pool for redelivery (KIP-932 §close).
         if self.config.acknowledgement_mode == AcknowledgementMode::Implicit {
             let mut pending = self.pending_acks.write().await;
-            for acks in pending.values_mut() {
-                for ack in acks.iter_mut() {
-                    ack.ack_type = AcknowledgeType::Release.to_i8();
+            for broker_acks in pending.values_mut() {
+                for acks in broker_acks.values_mut() {
+                    for ack in acks.iter_mut() {
+                        ack.ack_type = AcknowledgeType::Release.to_i8();
+                    }
                 }
             }
         }
@@ -1216,11 +1272,13 @@ impl ShareConsumer {
     }
 
     /// Coalesce implicit accept acks — merge consecutive offsets for the same
-    /// (topic, partition) into a single `PendingAck` with a contiguous range.
+    /// (topic, partition) into a single `PendingAck` with a contiguous range,
+    /// pre-routed to the current partition leader.
     fn coalesce_implicit_acks(
         records: &[ConsumerRecord],
         topic_ids: &HashMap<String, [u8; 16]>,
-        pending: &mut HashMap<BrokerAckKey, Vec<PendingAck>>,
+        pending: &mut BrokerPendingAcks,
+        metadata: &ClusterMetadata,
     ) {
         // Group by (topic, partition) and sort offsets.
         let mut by_tp: HashMap<(&str, PartitionId), Vec<Offset>> = HashMap::new();
@@ -1237,6 +1295,10 @@ impl ShareConsumer {
             };
             offsets.sort_unstable();
 
+            let broker_id = metadata
+                .leader(topic, partition)
+                .unwrap_or(UNROUTED_BROKER_ID);
+
             // Merge consecutive offsets into contiguous ranges.
             let mut i = 0;
             while i < offsets.len() {
@@ -1247,6 +1309,8 @@ impl ShareConsumer {
                     last = offsets[i];
                 }
                 pending
+                    .entry(broker_id)
+                    .or_default()
                     .entry((topic_id, partition))
                     .or_default()
                     .push(PendingAck {
@@ -2153,7 +2217,7 @@ mod tests {
     async fn test_restore_ack_state_requeues_pending_acks_without_reinserting_unacked() {
         let ack_state_generation = AtomicU64::new(0);
         let explicit_flush_retry_required = AtomicBool::new(false);
-        let pending: RwLock<HashMap<BrokerAckKey, Vec<PendingAck>>> = RwLock::new(HashMap::new());
+        let pending: RwLock<BrokerPendingAcks> = RwLock::new(HashMap::new());
         let mut acks_to_restore = vec![PendingAck {
             topic: "topic-a".into(),
             topic_id: [0; 16],
@@ -2176,7 +2240,8 @@ mod tests {
         assert!(acks_to_restore.is_empty());
         assert!(!explicit_flush_retry_required.load(Ordering::SeqCst));
         let guard = pending.read().await;
-        let all_acks: Vec<&PendingAck> = guard.values().flatten().collect();
+        let all_acks: Vec<&PendingAck> =
+            guard.values().flat_map(|b| b.values().flatten()).collect();
         assert_eq!(all_acks.len(), 1);
         assert_eq!(all_acks[0].topic, "topic-a");
         assert_eq!(all_acks[0].partition, 2);
@@ -2189,7 +2254,7 @@ mod tests {
     async fn test_restore_ack_state_skips_stale_generation() {
         let ack_state_generation = AtomicU64::new(1);
         let explicit_flush_retry_required = AtomicBool::new(false);
-        let pending: RwLock<HashMap<BrokerAckKey, Vec<PendingAck>>> = RwLock::new(HashMap::new());
+        let pending: RwLock<BrokerPendingAcks> = RwLock::new(HashMap::new());
         let mut acks_to_restore = vec![PendingAck {
             topic: "topic-a".into(),
             topic_id: [0; 16],
@@ -2218,7 +2283,7 @@ mod tests {
     async fn test_restore_ack_state_marks_explicit_flush_retry_required() {
         let ack_state_generation = AtomicU64::new(0);
         let explicit_flush_retry_required = AtomicBool::new(false);
-        let pending: RwLock<HashMap<BrokerAckKey, Vec<PendingAck>>> = RwLock::new(HashMap::new());
+        let pending: RwLock<BrokerPendingAcks> = RwLock::new(HashMap::new());
         let mut acks_to_restore = vec![PendingAck {
             topic: "topic-a".into(),
             topic_id: [0; 16],
@@ -2240,7 +2305,15 @@ mod tests {
 
         assert!(acks_to_restore.is_empty());
         assert!(explicit_flush_retry_required.load(Ordering::SeqCst));
-        assert_eq!(pending.read().await.values().flatten().count(), 1);
+        assert_eq!(
+            pending
+                .read()
+                .await
+                .values()
+                .flat_map(|b| b.values().flatten())
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2290,6 +2363,8 @@ mod tests {
             .pending_acks
             .write()
             .await
+            .entry(UNROUTED_BROKER_ID)
+            .or_default()
             .entry(([1; 16], 0))
             .or_default()
             .push(PendingAck {
@@ -2459,7 +2534,10 @@ mod tests {
 
         assert!(!consumer.unacked_offsets.read().await.contains(&record_key));
         let pending_guard = consumer.pending_acks.read().await;
-        let all_acks: Vec<&PendingAck> = pending_guard.values().flatten().collect();
+        let all_acks: Vec<&PendingAck> = pending_guard
+            .values()
+            .flat_map(|b| b.values().flatten())
+            .collect();
         assert_eq!(all_acks.len(), 1);
         assert_eq!(all_acks[0].topic, "topic-a");
         assert_eq!(all_acks[0].partition, 3);
@@ -2525,11 +2603,21 @@ mod tests {
         let mut topic_ids = HashMap::new();
         topic_ids.insert("t1".to_string(), [1u8; 16]);
 
-        let mut pending: HashMap<BrokerAckKey, Vec<PendingAck>> = HashMap::new();
-        ShareConsumer::coalesce_implicit_acks(&records, &topic_ids, &mut pending);
+        let mut pending: BrokerPendingAcks = HashMap::new();
+        // Pass a dummy ClusterMetadata — no live brokers, so all acks route to UNROUTED_BROKER_ID.
+        let dummy_pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
+        let dummy_metadata = ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            dummy_pool,
+            Duration::from_secs(300),
+        );
+        ShareConsumer::coalesce_implicit_acks(&records, &topic_ids, &mut pending, &dummy_metadata);
 
         // Should produce two ranges: [0,2] and [4,4].
-        let mut all_acks: Vec<PendingAck> = pending.into_values().flatten().collect();
+        let mut all_acks: Vec<PendingAck> = pending
+            .into_values()
+            .flat_map(|b| b.into_values().flatten())
+            .collect();
         assert_eq!(all_acks.len(), 2);
         all_acks.sort_by_key(|a| a.first_offset);
         assert_eq!(all_acks[0].first_offset, 0);
@@ -2547,5 +2635,65 @@ mod tests {
         // KIP-932 specifies 45s session timeout.
         assert_eq!(builder.config.session_timeout(), Duration::from_secs(45));
         assert_eq!(builder.config.heartbeat_interval(), Duration::from_secs(5));
+    }
+
+    // ── Regression test: F-06 / ack_state_generation ordering ────────────────
+
+    /// `ensure_ack_state_current` must accept a matching generation and reject
+    /// any stale one, whether the captured snapshot is behind OR ahead of the
+    /// current value (the latter is impossible in practice but good to guard).
+    ///
+    /// This is a unit test of the pure guard function — no async machinery
+    /// required.  The same logic is exercised end-to-end by
+    /// `test_send_share_acknowledge_rejects_stale_ack_generation`.
+    #[test]
+    fn test_ensure_ack_state_current_rejects_stale_generation() {
+        let current = AtomicU64::new(5);
+
+        // Exact match → Ok.
+        assert!(
+            ShareConsumer::ensure_ack_state_current(&current, 5).is_ok(),
+            "matching generation must succeed"
+        );
+
+        // Stale (lower than current) — the common invalidation case.
+        assert!(
+            ShareConsumer::ensure_ack_state_current(&current, 4).is_err(),
+            "stale lower generation must be rejected"
+        );
+
+        // Stale (higher than current) — shouldn't happen, but the guard covers it.
+        assert!(
+            ShareConsumer::ensure_ack_state_current(&current, 6).is_err(),
+            "stale higher generation must be rejected"
+        );
+    }
+
+    /// Incrementing `ack_state_generation` must be visible to concurrent
+    /// callers that captured the old value, without any spurious success.
+    ///
+    /// Simulates: flush task captures generation, assignment changes, flush
+    /// task calls `ensure_ack_state_current` and must receive an error.
+    #[tokio::test]
+    async fn test_ack_state_generation_flush_task_sees_invalidation() {
+        let consumer = Arc::new(test_share_consumer(AcknowledgementMode::Explicit));
+
+        // Capture the generation as a flush task would at spawn time.
+        let captured_gen = consumer.ack_state_generation.load(Ordering::SeqCst);
+        assert_eq!(captured_gen, 0);
+
+        // Simulate assignment change / unsubscribe which advances the generation.
+        consumer.clear_partition_state().await;
+        let new_gen = consumer.ack_state_generation.load(Ordering::SeqCst);
+        assert!(
+            new_gen > captured_gen,
+            "generation must advance after clear_partition_state"
+        );
+
+        // A detached flush task using the captured (old) generation must be blocked.
+        let err =
+            ShareConsumer::ensure_ack_state_current(&consumer.ack_state_generation, captured_gen)
+                .expect_err("stale flush task must be rejected");
+        assert!(err.to_string().contains("invalidated"), "got: {err}");
     }
 }

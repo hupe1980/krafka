@@ -1,8 +1,7 @@
 //! Utility functions for Krafka.\n//!\n//! This module provides low-level utilities used throughout the crate:\n//!\n//! - **Correlation ID generation**: Thread-safe ID generation for request/response matching\n//! - **CRC32C**: Checksum calculation for Kafka record validation\n//! - **Varint encoding**: Variable-length integer encoding for compact protocols\n//! - **SNI hostname extraction**: Parse hostnames from address strings for TLS SNI
 
-use std::sync::Once;
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{KrafkaError, Result};
 
@@ -125,17 +124,30 @@ pub(crate) const NO_RESPONSE_CORRELATION_ID: i32 = i32::MIN;
 /// becoming a much smaller value.
 #[inline]
 pub fn duration_to_millis_i32(d: Duration) -> i32 {
-    static WARN_ONCE_DURATION_TO_I32_CLAMP: Once = Once::new();
+    /// Minimum interval between clamp warnings. Fires at most once per hour so
+    /// persistent misconfiguration remains visible after restarts without
+    /// flooding logs under high call rates.
+    const WARN_INTERVAL_SECS: u64 = 3600;
+    static LAST_CLAMP_WARN_SECS: AtomicU64 = AtomicU64::new(0);
 
     let ms = d.as_millis();
     if ms > i32::MAX as u128 {
-        WARN_ONCE_DURATION_TO_I32_CLAMP.call_once(|| {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last = LAST_CLAMP_WARN_SECS.load(Ordering::Relaxed);
+        if (last == 0 || now.saturating_sub(last) >= WARN_INTERVAL_SECS)
+            && LAST_CLAMP_WARN_SECS
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
             tracing::warn!(
                 duration_ms = %ms,
                 capped_at = i32::MAX,
-                "duration exceeds i32::MAX (~24.8 days); clamping to i32::MAX (further clamp events suppressed)"
+                "duration exceeds i32::MAX (~24.8 days); clamping to i32::MAX (warning repeats at most once per hour)"
             );
-        });
+        }
     }
     ms.min(i32::MAX as u128) as i32
 }

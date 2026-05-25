@@ -20,8 +20,8 @@ Priority is automatically assigned based on API key:
 
 | Priority | API Keys |
 |----------|----------|
-| High | `Heartbeat`, `Metadata`, `FindCoordinator`, `ApiVersions`, `LeaderAndIsr` |
-| Normal | `Produce`, `Fetch`, `OffsetCommit`, `OffsetFetch`, and all others |
+| High | `Heartbeat`, `ConsumerGroupHeartbeat`, `ShareGroupHeartbeat`, `JoinGroup`, `SyncGroup`, `LeaveGroup`, `OffsetCommit`, `Metadata`, `FindCoordinator`, `LeaderAndIsr`, `ApiVersions` |
+| Normal | `Produce`, `Fetch`, and all others |
 
 ### Configuration
 

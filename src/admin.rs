@@ -967,6 +967,10 @@ impl AdminClient {
 
     /// Create topics.
     ///
+    /// Returns `Ok(results)` when the RPC succeeds.  **An `Ok` return does not
+    /// mean every topic was created** — inspect each
+    /// [`CreateTopicResult::error`] for per-topic failures.
+    ///
     /// # Parameters
     ///
     /// * `topics` — Descriptions of the topics to create.
@@ -1052,6 +1056,10 @@ impl AdminClient {
     }
 
     /// Delete topics.
+    ///
+    /// Returns `Ok(results)` when the RPC succeeds.  **An `Ok` return does not
+    /// mean every topic was deleted** — inspect each
+    /// [`DeleteTopicResult::error`] for per-topic failures.
     pub async fn delete_topics(
         &self,
         topics: Vec<String>,
@@ -1524,6 +1532,10 @@ impl AdminClient {
 
     /// Create ACLs.
     ///
+    /// Returns `Ok(result)` when the RPC succeeds.  **An `Ok` return does not
+    /// mean every ACL was created** — inspect each element of
+    /// [`CreateAclsResult::results`] for per-ACL failures.
+    ///
     /// # Arguments
     /// * `acls` - List of ACL bindings to create
     ///
@@ -1581,6 +1593,10 @@ impl AdminClient {
     }
 
     /// Delete ACLs matching the specified filters.
+    ///
+    /// Returns `Ok(result)` when the RPC succeeds.  **An `Ok` return does not
+    /// mean every filter matched or every ACL was deleted** — inspect each
+    /// element of [`DeleteAclsResult`] for per-filter failures.
     ///
     /// # Arguments
     /// * `filters` - List of ACL binding filters to match for deletion

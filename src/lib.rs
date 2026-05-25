@@ -115,6 +115,16 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+// krafka's metrics layer relies on 64-bit atomic operations (AtomicU64).
+// 32-bit targets without hardware AtomicU64 support (e.g. Cortex-M3) are not
+// supported.  Fail fast with a clear diagnostic rather than a confusing link
+// error or silent correctness bug.
+#[cfg(not(target_has_atomic = "64"))]
+compile_error!(
+    "krafka requires 64-bit atomic support (`target_has_atomic = \"64\"`). \
+     32-bit targets without AtomicU64 (e.g. ARMv6-M, Cortex-M3) are not supported."
+);
+
 pub mod admin;
 pub mod auth;
 pub mod client;

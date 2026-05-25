@@ -872,4 +872,238 @@ mod tests {
         let decoded = BASE64.decode(c_value).unwrap();
         assert_eq!(decoded, b"n,,");
     }
+
+    /// Full SCRAM-SHA-256 round-trip with `TlsServerEndPoint` channel binding.
+    ///
+    /// Simulates both sides of the SCRAM exchange:
+    /// - Client side: `ScramClient` state machine.
+    /// - Server side: RFC 5802 §3 computations done inline to produce the
+    ///   `v=` verifier that a real broker would return.
+    ///
+    /// This exercises the end-to-end path that was previously only partially
+    /// covered by the `c=` field check.
+    #[test]
+    fn test_scram_tls_server_end_point_full_round_trip_sha256() {
+        // Known inputs — deterministic nonces and salt for reproducibility.
+        let password = "pencil";
+        let salt = BASE64.decode("W22ZaJ0SNY7soEsUEjb6gQ==").unwrap();
+        let iterations = 4096u32;
+        // Simulated SHA-256(DER end-entity cert) — 32 arbitrary bytes.
+        let cb_data: Vec<u8> = (0u8..32).collect();
+        let server_nonce_suffix = "RK+9hXF4Mg";
+
+        let mut client = ScramClient::new(
+            "user",
+            password,
+            ScramMechanism::Sha256,
+            ChannelBinding::TlsServerEndPoint(cb_data.clone()),
+        );
+        // Fix client nonce for deterministic output.
+        client.client_nonce = "rOprNGfwEbeRWgbNEkqO".to_string();
+        let combined_nonce = format!("rOprNGfwEbeRWgbNEkqO{server_nonce_suffix}");
+
+        // ── Step 1: client-first ────────────────────────────────────────────
+        let first_bytes = client.client_first_message();
+        let first_str = String::from_utf8(first_bytes).unwrap();
+        assert!(
+            first_str.starts_with("p=tls-server-end-point,,n=user,r=rOprNGfwEbeRWgbNEkqO"),
+            "unexpected client-first: {first_str}"
+        );
+        assert_eq!(client.state(), &ScramState::WaitingServerFirst);
+
+        // ── Step 2: server-first → client-final ─────────────────────────────
+        let server_first = format!(
+            "r={combined_nonce},s={},i={iterations}",
+            BASE64.encode(&salt)
+        );
+        let client_final_bytes = client
+            .process_server_first(server_first.as_bytes())
+            .expect("process_server_first must succeed");
+        let client_final = String::from_utf8(client_final_bytes).unwrap();
+
+        // Verify the c= field embeds the GS2 header + binding data.
+        let c_field = client_final
+            .split(',')
+            .find(|p| p.starts_with("c="))
+            .unwrap()
+            .strip_prefix("c=")
+            .unwrap();
+        let decoded_cbind = BASE64.decode(c_field).unwrap();
+        assert!(
+            decoded_cbind.starts_with(b"p=tls-server-end-point,,"),
+            "c= must start with GS2 header"
+        );
+        assert_eq!(
+            &decoded_cbind[b"p=tls-server-end-point,,".len()..],
+            cb_data.as_slice(),
+            "c= must end with channel binding data"
+        );
+        assert_eq!(client.state(), &ScramState::WaitingServerFinal);
+
+        // ── Step 3: server computes verifier (RFC 5802 §3) ──────────────────
+        //   SaltedPassword = PBKDF2-HMAC-SHA256(password, salt, i)
+        //   ServerKey      = HMAC-SHA256(SaltedPassword, "Server Key")
+        //   AuthMessage    = client-first-bare "," server-first "," client-final-without-proof
+        //   ServerSignature = HMAC-SHA256(ServerKey, AuthMessage)
+        let mut salted_password = vec![0u8; 32];
+        pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, iterations, &mut salted_password);
+
+        let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&salted_password) else {
+            unreachable!("HMAC accepts any key length per RFC 2104");
+        };
+        mac.update(b"Server Key");
+        let server_key = mac.finalize().into_bytes();
+
+        // Reconstruct client-final-without-proof (everything before ",p=…").
+        let client_final_without_proof = client_final
+            .rsplit_once(",p=")
+            .map(|(prefix, _)| prefix)
+            .expect("client-final must contain ,p=");
+
+        let client_first_bare = "n=user,r=rOprNGfwEbeRWgbNEkqO";
+        let auth_message =
+            format!("{client_first_bare},{server_first},{client_final_without_proof}");
+
+        let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&server_key) else {
+            unreachable!("HMAC accepts any key length per RFC 2104");
+        };
+        mac.update(auth_message.as_bytes());
+        let server_sig = mac.finalize().into_bytes();
+
+        let server_final = format!("v={}", BASE64.encode(server_sig.as_slice()));
+
+        // ── Step 4: client verifies server-final ─────────────────────────────
+        client
+            .verify_server_final(server_final.as_bytes())
+            .expect("verify_server_final must succeed");
+        assert_eq!(client.state(), &ScramState::Complete);
+        assert!(client.is_complete());
+    }
+
+    /// Same as above but with SCRAM-SHA-512 and `ChannelBinding::None`,
+    /// confirming the non-binding path also completes correctly.
+    #[test]
+    fn test_scram_sha512_full_round_trip_no_binding() {
+        let password = "hunter2";
+        let salt = BASE64
+            .decode("QSXCR+Q6sek8bf92")
+            .unwrap_or_else(|_| b"deadbeef".to_vec());
+        let iterations = 4096u32;
+
+        let mut client = ScramClient::new(
+            "admin",
+            password,
+            ScramMechanism::Sha512,
+            ChannelBinding::None,
+        );
+        client.client_nonce = "clientnonce512".to_string();
+        let combined_nonce = "clientnonce512serversuffix";
+
+        let first_bytes = client.client_first_message();
+        assert!(
+            String::from_utf8(first_bytes)
+                .unwrap()
+                .starts_with("n,,n=admin,")
+        );
+
+        let server_first = format!(
+            "r={combined_nonce},s={},i={iterations}",
+            BASE64.encode(&salt)
+        );
+        let client_final_bytes = client
+            .process_server_first(server_first.as_bytes())
+            .expect("process_server_first");
+        let client_final = String::from_utf8(client_final_bytes).unwrap();
+
+        // Compute server verifier for SHA-512.
+        let mut salted_password = vec![0u8; 64];
+        pbkdf2_hmac::<Sha512>(password.as_bytes(), &salt, iterations, &mut salted_password);
+
+        let Ok(mut mac) = Hmac::<Sha512>::new_from_slice(&salted_password) else {
+            unreachable!();
+        };
+        mac.update(b"Server Key");
+        let server_key = mac.finalize().into_bytes();
+
+        let client_final_without_proof = client_final
+            .rsplit_once(",p=")
+            .map(|(prefix, _)| prefix)
+            .expect("client-final must contain ,p=");
+
+        let auth_message =
+            format!("n=admin,r=clientnonce512,{server_first},{client_final_without_proof}");
+
+        let Ok(mut mac) = Hmac::<Sha512>::new_from_slice(&server_key) else {
+            unreachable!();
+        };
+        mac.update(auth_message.as_bytes());
+        let server_sig = mac.finalize().into_bytes();
+        let server_final = format!("v={}", BASE64.encode(server_sig.as_slice()));
+
+        client
+            .verify_server_final(server_final.as_bytes())
+            .expect("SHA-512 verify_server_final must succeed");
+        assert!(client.is_complete());
+    }
+
+    /// Pinned test vector from RFC 7677 §3 / Appendix B.
+    ///
+    /// Verifies the exact client-proof bytes against the published
+    /// reference value `dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz9AndVQ=`.
+    #[test]
+    fn test_scram_sha256_rfc7677_pinned_vector() {
+        // RFC 7677 test vector parameters
+        let username = "user";
+        let password = "pencil";
+        let client_nonce = "rOprNGfwEbeRWgbNEkqO";
+        let server_nonce_suffix = "%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
+        let salt_b64 = "W22ZaJ0SNY7soEsUEjb6gQ==";
+        let iterations = 4096u32;
+
+        // Expected values from RFC 7677
+        let expected_client_proof = "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=";
+        let expected_server_sig = "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=";
+
+        let mut client = ScramClient::new(
+            username,
+            password,
+            ScramMechanism::Sha256,
+            ChannelBinding::None,
+        );
+        // Inject the fixed client nonce so the output is deterministic.
+        client.client_nonce = client_nonce.to_string();
+
+        // client-first-message must be "n,,n=user,r=rOprNGfwEbeRWgbNEkqO"
+        let first_bytes = client.client_first_message();
+        assert_eq!(
+            String::from_utf8(first_bytes).unwrap(),
+            format!("n,,n={username},r={client_nonce}"),
+            "client-first-message does not match RFC 7677"
+        );
+
+        let combined_nonce = format!("{client_nonce}{server_nonce_suffix}");
+        let server_first = format!("r={combined_nonce},s={salt_b64},i={iterations}");
+
+        let client_final_bytes = client
+            .process_server_first(server_first.as_bytes())
+            .expect("process_server_first must succeed");
+        let client_final = String::from_utf8(client_final_bytes).unwrap();
+
+        // Extract the proof from "c=biws,r=...,p=<proof>"
+        let proof = client_final
+            .rsplit_once(",p=")
+            .map(|(_, p)| p)
+            .expect("client-final must contain ,p=");
+        assert_eq!(
+            proof, expected_client_proof,
+            "client-proof does not match RFC 7677 test vector"
+        );
+
+        // Also validate that the server signature verifies correctly.
+        let server_final = format!("v={expected_server_sig}");
+        client
+            .verify_server_final(server_final.as_bytes())
+            .expect("verify_server_final must succeed for RFC 7677 vector");
+        assert!(client.is_complete());
+    }
 }

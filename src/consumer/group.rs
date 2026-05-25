@@ -7,7 +7,7 @@
 //! - [`PartitionAssignor`] trait and implementations for partition assignment strategies
 //! - [`ConsumerRebalanceListener`] trait for rebalance callbacks
 
-use std::collections::{HashMap, HashSet};
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -449,6 +449,7 @@ impl ConsumerGroup {
         *self.generation_id.write().await = -1;
         *self.state.write().await = GroupState::Unjoined;
         *self.assignment.write().await = MemberAssignment::empty();
+        *self.coordinator_id.write().await = None;
     }
 
     /// Check if a rebalance is needed.

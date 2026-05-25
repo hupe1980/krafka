@@ -160,6 +160,12 @@ impl Compression {
             Self::Lz4 => {
                 use std::io::Write;
 
+                // Kafka RecordBatch v2 requires LZ4 **Frame Format** (magic
+                // 0x184D2204), which is what `lz4_flex::frame::FrameEncoder`
+                // produces. Do NOT switch to block-level encoding
+                // (`lz4_flex::block`); that would produce an incompatible wire
+                // format and cause decoding failures on any Kafka broker or
+                // Java client.
                 let mut compressed = Vec::new();
                 let mut encoder = lz4_flex::frame::FrameEncoder::new(&mut compressed);
                 encoder
@@ -937,7 +943,8 @@ impl RecordBatch {
 
                 let decoder = GzDecoder::new(data);
                 let mut limited = decoder.take(max_decompressed_size as u64 + 1);
-                let mut decompressed = Vec::new();
+                let capacity = data.len().saturating_mul(3).min(max_decompressed_size);
+                let mut decompressed = Vec::with_capacity(capacity);
                 limited
                     .read_to_end(&mut decompressed)
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
@@ -977,7 +984,8 @@ impl RecordBatch {
                 use std::io::Read;
                 let decoder = lz4_flex::frame::FrameDecoder::new(data);
                 let mut limited = decoder.take(max_decompressed_size as u64 + 1);
-                let mut decompressed = Vec::new();
+                let capacity = data.len().saturating_mul(4).min(max_decompressed_size);
+                let mut decompressed = Vec::with_capacity(capacity);
                 limited
                     .read_to_end(&mut decompressed)
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
@@ -997,7 +1005,8 @@ impl RecordBatch {
                 let decoder = zstd::Decoder::new(data)
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
                 let mut limited = decoder.take(max_decompressed_size as u64 + 1);
-                let mut decompressed = Vec::new();
+                let capacity = data.len().saturating_mul(3).min(max_decompressed_size);
+                let mut decompressed = Vec::with_capacity(capacity);
                 limited
                     .read_to_end(&mut decompressed)
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
@@ -1096,6 +1105,10 @@ impl RecordBatchBuilder {
         key: Option<impl Into<Bytes>>,
         value: Option<impl Into<Bytes>>,
     ) -> Self {
+        debug_assert!(
+            self.records.len() < i32::MAX as usize,
+            "batch record count would overflow i32"
+        );
         let offset_delta = self.records.len() as i32;
         let record =
             Record::new(key.map(Into::into), value.map(Into::into)).with_offset_delta(offset_delta);
@@ -1110,6 +1123,10 @@ impl RecordBatchBuilder {
         value: Option<impl Into<Bytes>>,
         headers: Vec<(impl Into<Bytes>, impl Into<Bytes>)>,
     ) -> Self {
+        debug_assert!(
+            self.records.len() < i32::MAX as usize,
+            "batch record count would overflow i32"
+        );
         let offset_delta = self.records.len() as i32;
         let mut record =
             Record::new(key.map(Into::into), value.map(Into::into)).with_offset_delta(offset_delta);

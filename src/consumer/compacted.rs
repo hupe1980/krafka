@@ -51,7 +51,7 @@
 //! }
 //! ```
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use std::fmt;
 use std::time::Duration;
 

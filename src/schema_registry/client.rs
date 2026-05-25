@@ -15,6 +15,9 @@ use crate::error::{KrafkaError, Result};
 const SCHEMA_REGISTRY_CONTENT_TYPE: &str = "application/vnd.schemaregistry.v1+json";
 /// Maximum non-standard error body preview included in returned errors.
 const ERROR_BODY_PREVIEW_LIMIT: usize = 512;
+/// Default HTTP request timeout applied by both `new()` and the builder.
+/// An unresponsive registry would otherwise block schema encode/decode indefinitely.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ── API JSON types ───────────────────────────────────────────────────────
 
@@ -163,14 +166,24 @@ pub struct ConfluentSchemaRegistry {
 impl ConfluentSchemaRegistry {
     /// Create a client with the given registry URL and no authentication.
     ///
+    /// A 30-second request timeout is applied by default. Use
+    /// [`builder()`](Self::builder) to customise the timeout or add
+    /// authentication.
+    ///
     /// Returns an error if the URL contains embedded credentials
     /// (`https://user:pass@host/`). Use [`builder()`](Self::builder) with
     /// [`basic_auth()`](ConfluentSchemaRegistryBuilder::basic_auth) instead.
     pub fn new(url: impl Into<String>) -> Result<Self> {
         let url = normalize_url(url.into());
         reject_embedded_credentials(&url)?;
+        let client = reqwest::Client::builder()
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
+            .build()
+            .map_err(|e| {
+                KrafkaError::schema_registry(format!("failed to build HTTP client: {e}"))
+            })?;
         Ok(Self {
-            client: reqwest::Client::new(),
+            client,
             base_url: url,
             auth: RegistryAuth::None,
         })
@@ -542,7 +555,7 @@ impl Default for ConfluentSchemaRegistryBuilder {
             auth: RegistryAuth::None,
             // Default 30 s matches comparable clients (Confluent Python, schema-registry-converter).
             // An unresponsive registry otherwise blocks every encode/decode indefinitely.
-            request_timeout: Some(Duration::from_secs(30)),
+            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
         }
     }
 }

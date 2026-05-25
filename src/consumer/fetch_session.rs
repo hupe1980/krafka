@@ -23,7 +23,7 @@
 //! Fallback to name-based keys is automatic when UUIDs are unavailable
 //! (Fetch ≤ v12 or zero UUID).
 
-use std::collections::{HashMap, HashSet};
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 
 use crate::protocol::{FetchForgottenTopic, FetchPartitionRequest, FetchTopicRequest};
 use crate::{BrokerId, PartitionId};

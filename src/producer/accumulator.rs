@@ -1692,15 +1692,14 @@ mod tests {
     /// Verify `send_extracted_batch` is `'static + Send`.
     ///
     /// All detached flush paths (`spawn_batches_detached`, `flush_batch`,
-    /// etc.) ultimately call `tokio::spawn(Self::send_extracted_batch(...))`;
-    /// this compile-time assertion ensures the future stays `Send` so
-    /// `tokio::spawn` can schedule it across threads.
+    /// Compile-time assertion that the handle types used with `tokio::spawn`
+    /// are `Send + Sync`. A regression here would prevent spawning the
+    /// accumulator task on the multi-thread runtime.
     #[test]
-    fn test_send_extracted_batch_is_send() {
-        fn assert_send<T: Send>() {}
-        // This compiles only if the future returned by send_extracted_batch is Send,
-        // which is required for tokio::spawn to work.
-        assert_send::<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>();
+    fn test_accumulator_handle_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<RecordAccumulatorHandle>();
+        assert_send_sync::<RecordAccumulator>();
     }
 
     // ── Backpressure tests ──────────────────────────────────────
@@ -1926,5 +1925,28 @@ mod tests {
         }
 
         assert_eq!(metrics.buffered_records.get(), 0);
+    }
+
+    /// `effective_memory_capacity(0)` defaults to `Semaphore::MAX_PERMITS`.
+    #[test]
+    fn test_effective_memory_capacity_zero_returns_max() {
+        assert_eq!(effective_memory_capacity(0), Semaphore::MAX_PERMITS);
+    }
+
+    /// `effective_memory_capacity` clamps values above `Semaphore::MAX_PERMITS`.
+    ///
+    /// This exercises the warning-and-clamp branch that prevents an illegal
+    /// semaphore permit count from being passed to `Semaphore::new`.
+    #[test]
+    fn test_effective_memory_capacity_clamps_over_limit() {
+        let over = Semaphore::MAX_PERMITS + 1;
+        assert_eq!(effective_memory_capacity(over), Semaphore::MAX_PERMITS);
+    }
+
+    /// Values within the valid range are returned unchanged.
+    #[test]
+    fn test_effective_memory_capacity_passthrough() {
+        let within = Semaphore::MAX_PERMITS / 2;
+        assert_eq!(effective_memory_capacity(within), within);
     }
 }

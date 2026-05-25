@@ -1115,6 +1115,9 @@ mod tests {
         assert!(ErrorCode::NetworkException.is_retriable());
         assert!(!ErrorCode::None.is_retriable());
         assert!(!ErrorCode::InvalidTopic.is_retriable());
+        // RebootstrapRequired must NOT be retriable: metadata.rs handles it via
+        // a dedicated rebootstrap path, not via the generic retry loop.
+        assert!(!ErrorCode::RebootstrapRequired.is_retriable());
     }
 
     #[test]

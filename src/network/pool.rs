@@ -373,8 +373,12 @@ impl Drop for ReconnectGuard {
         let Some(address) = self.address.take() else {
             return;
         };
-        // parking_lot::Mutex::lock() is always available in Drop — no
-        // need for try_lock/spawn fallback.
+        // Lock ordering safety: `self.connecting` (Mutex, level 1) is always
+        // acquired *without* holding `PoolState` (RwLock, level 2).  This Drop
+        // runs either when the reconnect task is cancelled or when `defuse()`
+        // was NOT called; neither caller holds the `PoolState` write lock at
+        // that point.  `parking_lot::Mutex` never panics on lock, so there is
+        // no poisoning concern here.
         let mut guard = self.connecting.lock();
         let waiters = guard.remove(&address).unwrap_or_default();
         let err = KrafkaError::network(std::io::Error::new(

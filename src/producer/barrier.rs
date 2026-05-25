@@ -238,8 +238,57 @@ mod tests {
         assert!(barrier.begin_close().is_none());
     }
 
-    /// Multiple tasks racing to close — exactly one gets `Some(target)`,
-    /// the rest get `None`.
+    /// Concurrent `flush()` + `close()` can wait on distinct targets simultaneously.
+    ///
+    /// `flush()` captures `snapshot()` (current `started` count) as its target.
+    /// `close()` captures `begin_close()` as its target (same count or higher).
+    /// After all in-flight ops complete, `notify_waiters()` is broadcast and
+    /// both waiters must wake, not just one.
+    #[tokio::test]
+    async fn test_concurrent_flush_and_close_both_wake() {
+        let barrier = Arc::new(InFlightBarrier::new());
+
+        // Start two in-flight ops.
+        let op1 = barrier.start("producer").unwrap();
+        let op2 = barrier.start("producer").unwrap();
+
+        // `flush()` snapshot — targets the current started count (2).
+        let flush_target = barrier.snapshot();
+
+        // `close()` — also targets the current started count.
+        let close_target = barrier.begin_close().unwrap();
+
+        // Both targets should be the same (2) since nothing extra was started.
+        assert_eq!(flush_target, close_target);
+
+        let b_flush = Arc::clone(&barrier);
+        let b_close = Arc::clone(&barrier);
+
+        // Spawn both waiters concurrently.
+        let flush_handle = tokio::spawn(async move { b_flush.wait_for(flush_target).await });
+        let close_handle = tokio::spawn(async move { b_close.wait_for(close_target).await });
+
+        // Neither should finish yet.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // Complete the first op — still below target.
+        drop(op1);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // Complete the second op — both waiters should now wake.
+        drop(op2);
+
+        let timeout = std::time::Duration::from_secs(1);
+        tokio::time::timeout(timeout, flush_handle)
+            .await
+            .expect("flush waiter should complete")
+            .expect("flush task should not panic");
+        tokio::time::timeout(timeout, close_handle)
+            .await
+            .expect("close waiter should complete")
+            .expect("close task should not panic");
+    }
+
     #[tokio::test]
     async fn test_concurrent_begin_close_exactly_one_wins() {
         let barrier = Arc::new(InFlightBarrier::new());

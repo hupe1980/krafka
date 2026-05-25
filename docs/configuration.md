@@ -101,6 +101,7 @@ let producer = Producer::builder()
 | `max_poll_interval` | Duration | `5m` | Max time between polls (also used as the rebalance timeout) |
 | `isolation_level` | IsolationLevel | `ReadUncommitted` | Transaction isolation |
 | `group_protocol` | GroupProtocol | `Classic` | Group protocol: `Classic` or `Consumer` (KIP-848) |
+| `idle_poll_backoff` | Duration | `10ms` | Backoff between polls when no partition assignment is active. Set to `Duration::ZERO` for minimum latency. |
 | `request_timeout` | Duration | `30s` | Timeout for broker requests |
 | `metadata_max_age` | Duration | `5m` | Max age before metadata refresh |
 | `metadata_topic_cache_ttl` | `Option<Duration>` | `Some(5m)` | TTL for topic entries in the partial-refresh cache. `None` disables eviction. |
@@ -195,7 +196,7 @@ DNS resolution, so broker hostnames are sent as-is (not pre-resolved).
 Enable the `socks5` feature:
 
 ```toml
-krafka = { version = "0.9.2", features = ["socks5"] }
+krafka = { version = "0.10.0", features = ["socks5"] }
 ```
 
 ### Proxy Without Authentication

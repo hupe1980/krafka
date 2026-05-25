@@ -63,7 +63,7 @@ pub use offset::{OffsetAndMetadata, OffsetStore, ResetOffset};
 pub use record::{ConsumerRecord, ConsumerRecords, TopicPartition};
 pub use stream::ConsumerStream;
 
-use std::collections::{HashMap, HashSet};
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use std::future::{Future, Ready, ready};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -435,6 +435,7 @@ async fn batch_recv_with<FClosed, FPoll, FPollFut, FSetBuffered>(
     mut set_buffered_records: FSetBuffered,
     max_records: usize,
     timeout: Duration,
+    max_idle_backoff: Duration,
     is_closed: FClosed,
     mut poll: FPoll,
 ) -> Result<BatchRecvOutcome>
@@ -524,7 +525,7 @@ where
                         };
                     }
                     let remaining_after_poll = deadline - now_after_poll;
-                    let backoff = remaining_after_poll.min(Duration::from_millis(10));
+                    let backoff = remaining_after_poll.min(max_idle_backoff);
                     tokio::time::sleep(backoff).await;
                 }
             }
@@ -3151,8 +3152,7 @@ impl Consumer {
                 aborted_txns.sort_unstable_by_key(|at| at.first_offset);
                 let mut aborted_txns_iter = aborted_txns.iter().peekable();
                 // Producer IDs currently inside an open aborted transaction.
-                let mut aborted_producers: std::collections::HashSet<i64> =
-                    std::collections::HashSet::new();
+                let mut aborted_producers: HashSet<i64> = HashSet::new();
 
                 if let Some(record_bytes) = partition_response.records {
                     let mut batch_buf = record_bytes;
@@ -3615,6 +3615,7 @@ impl Consumer {
             |len| self.metrics.buffered_records.set(len),
             max_records,
             timeout,
+            self.config.idle_poll_backoff(),
             || self.closed.load(std::sync::atomic::Ordering::SeqCst),
             |remaining| self.poll(remaining),
         )
@@ -6801,6 +6802,7 @@ mod tests {
             |_| {},
             0,
             Duration::from_millis(10),
+            Duration::from_millis(10),
             || false,
             |_| async { Ok(vec![]) },
         )
@@ -6818,6 +6820,7 @@ mod tests {
             |_| {},
             10,
             Duration::from_millis(20),
+            Duration::from_millis(10),
             || true,
             |_| async { Ok(vec![]) },
         )
@@ -6839,6 +6842,7 @@ mod tests {
             |_| {},
             10,
             Duration::from_millis(20),
+            Duration::from_millis(10),
             || false,
             |_| async {
                 Err(KrafkaError::network(std::io::Error::other(
@@ -6865,6 +6869,7 @@ mod tests {
             |_| {},
             10,
             Duration::from_millis(15),
+            Duration::from_millis(10),
             || false,
             |_| async { Ok(vec![]) },
         )
@@ -6889,6 +6894,7 @@ mod tests {
             |_| {},
             2,
             Duration::from_millis(50),
+            Duration::from_millis(10),
             || false,
             |_| async { Ok(poll_records.lock().take().unwrap_or_default()) },
         )

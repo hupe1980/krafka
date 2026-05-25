@@ -7,10 +7,10 @@
 //! - **TLS/SSL encryption**: Automatic TLS upgrade when configured.
 //! - **SASL authentication**: PLAIN, SCRAM-SHA-256/512, AWS MSK IAM handshake on connect.
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use futures::FutureExt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use arc_swap::ArcSwap;
@@ -35,6 +35,12 @@ use crate::auth::{
 };
 use crate::error::{KrafkaError, ProtocolErrorKind, Result};
 use crate::metrics::ConnectionMetrics;
+
+/// Broker addresses for which the SASL PLAIN cleartext warning has already
+/// been emitted. Prevents log spam on every reconnect without adding any
+/// per-connection state.
+static SASL_PLAIN_WARNED: LazyLock<Mutex<AHashSet<String>>> =
+    LazyLock::new(|| Mutex::new(AHashSet::new()));
 
 /// Named parameter bundle for a connection event-loop task.
 ///
@@ -224,8 +230,12 @@ impl RequestPriority {
             // rebalances; JoinGroup/SyncGroup delays stall the entire group;
             // LeaveGroup delays leave stale entries in the coordinator;
             // OffsetCommit delays risk duplicate delivery on restart.
+            // ShareGroupHeartbeat (KIP-932) has the same session-timeout
+            // sensitivity as ConsumerGroupHeartbeat — missing it here would
+            // cause share group evictions under produce/fetch backpressure.
             ApiKey::Heartbeat
             | ApiKey::ConsumerGroupHeartbeat
+            | ApiKey::ShareGroupHeartbeat
             | ApiKey::JoinGroup
             | ApiKey::SyncGroup
             | ApiKey::LeaveGroup
@@ -655,7 +665,16 @@ impl ConnectionConfigBuilder {
     /// Set the maximum number of in-flight requests per connection.
     ///
     /// Limits the number of requests waiting for a response on a single
-    /// connection. Default: 256. Use 5 for idempotent producers.
+    /// connection. Default: 256.
+    ///
+    /// # Idempotent / transactional producers
+    ///
+    /// The Kafka protocol guarantees exactly-once ordering only when
+    /// `max.in.flight.requests.per.connection ≤ 5`. Setting a higher value
+    /// disables the sequence-number ordering guarantee. The producer builder
+    /// ([`ProducerConfigBuilder::max_in_flight`]) automatically enforces this
+    /// cap when idempotent mode is active; if you configure the connection
+    /// config separately, ensure this value is ≤ 5 for idempotent producers.
     pub fn max_in_flight_requests(mut self, max: usize) -> Self {
         self.0.max_in_flight_requests = max.max(1);
         self
@@ -938,6 +957,7 @@ impl BrokerConnection {
             // Extract hostname (without port) for TLS SNI.
             // Handle IPv6 bracket notation like [::1]:9092.
             let hostname = extract_sni_hostname(address)?;
+            let tls_start = std::time::Instant::now();
             let tls_stream = connect_tls(
                 stream,
                 hostname,
@@ -945,6 +965,9 @@ impl BrokerConnection {
                 &connector,
             )
             .await?;
+            config
+                .connection_metrics
+                .record_tls_handshake(tls_start.elapsed());
 
             info!("TLS handshake completed for {address}");
 
@@ -1188,15 +1211,23 @@ impl BrokerConnection {
         let mut authenticator = SaslAuthenticator::new(auth, channel_binding)?
             .ok_or_else(|| KrafkaError::auth("Failed to create SASL authenticator"))?;
 
-        // Warn about SASL PLAIN over cleartext — credentials sent unencrypted
+        // Warn about SASL PLAIN over cleartext — credentials sent unencrypted.
+        // Rate-limited to once per unique broker address to avoid log spam on
+        // every reconnect.
         if auth.security_protocol == SecurityProtocol::SaslPlaintext
             && auth.sasl_mechanism == Some(SaslMechanism::Plain)
         {
-            warn!(
-                "SASL PLAIN credentials will be sent in cleartext to {}. \
-                 Use SASL_SSL (sasl_plain_ssl) for production environments.",
-                address
-            );
+            let is_new = SASL_PLAIN_WARNED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(address.to_string());
+            if is_new {
+                warn!(
+                    "SASL PLAIN credentials will be sent in cleartext to {}. \
+                     Use SASL_SSL (sasl_plain_ssl) for production environments.",
+                    address
+                );
+            }
         }
 
         // For MSK IAM, set the broker host (handles IPv6 brackets like [::1]:9092)
@@ -1434,6 +1465,12 @@ impl BrokerConnection {
     /// (e.g. `20250413T120000Z`) that represents the server's view of "now".
     /// If such a timestamp is found, returns `server_unix - local_unix` in seconds.
     /// Returns `0` if no parseable timestamp is present.
+    ///
+    /// When the error contains multiple timestamps (e.g., "Signature not yet
+    /// current: `<request_ts>` is not yet valid, not before `<validity_start>`"),
+    /// the **last** parseable timestamp is used. AWS validity-window messages
+    /// place the closest approximation to server-current-time last, so this
+    /// yields a more accurate offset than returning the first match.
     fn extract_clock_skew_secs(error_msg: &str) -> i64 {
         use time::PrimitiveDateTime;
         use time::format_description::BorrowedFormatItem;
@@ -1451,6 +1488,11 @@ impl BrokerConnection {
         // Scan every byte-aligned window of AWS_TS_LEN bytes. The grammar is
         // ASCII-only, so indexing into `error_msg` at these offsets is safe
         // (no UTF-8 split risk — a successful parse guarantees ASCII content).
+        //
+        // We collect the LAST valid timestamp: AWS "not yet current" errors
+        // embed both the request timestamp and the validity-window start; the
+        // latter (last) is the better approximation of server-current-time.
+        let mut last_server_unix: Option<i64> = None;
         for i in 0..=bytes.len() - AWS_TS_LEN {
             // Cheap pre-filter: byte 8 must be 'T', byte 15 must be 'Z'.
             if bytes[i + 8] != b'T' || bytes[i + 15] != b'Z' {
@@ -1462,7 +1504,9 @@ impl BrokerConnection {
             let Ok(dt) = PrimitiveDateTime::parse(candidate, AWS_TS_FMT) else {
                 continue;
             };
-            let server_unix = dt.assume_utc().unix_timestamp();
+            last_server_unix = Some(dt.assume_utc().unix_timestamp());
+        }
+        if let Some(server_unix) = last_server_unix {
             let local_unix = SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
@@ -2706,6 +2750,16 @@ mod tests {
             RequestPriority::High
         );
         // Group coordination and offset commit are time-sensitive (rebalance / session timeout).
+        assert_eq!(
+            RequestPriority::for_api_key(ApiKey::ConsumerGroupHeartbeat),
+            RequestPriority::High,
+            "ConsumerGroupHeartbeat must be High to prevent KIP-848 rebalances"
+        );
+        assert_eq!(
+            RequestPriority::for_api_key(ApiKey::ShareGroupHeartbeat),
+            RequestPriority::High,
+            "ShareGroupHeartbeat must be High to prevent KIP-932 share group evictions"
+        );
         assert_eq!(
             RequestPriority::for_api_key(ApiKey::JoinGroup),
             RequestPriority::High
@@ -3966,6 +4020,26 @@ mod tests {
         let msg = "RequestTime=THIS IS TEXT; expired; server 20200101T000000Z -- request rejected";
         let skew = BrokerConnection::extract_clock_skew_secs(msg);
         assert!(skew < 0);
+    }
+
+    #[test]
+    fn test_extract_clock_skew_secs_multiple_timestamps_uses_last() {
+        // AWS "Signature not yet current" errors embed both the request
+        // timestamp and the validity-window start. The last timestamp
+        // (validity-window start) is the closer approximation of server time
+        // and should be used.
+        //
+        // Use two timestamps far apart so the choice is unambiguous:
+        //  - first:  2020-01-01 (far past → large negative skew)
+        //  - second: 2099-01-01 (far future → large positive skew)
+        // If we get a positive skew, the function used the LAST timestamp.
+        let msg = "Signature not yet current: 20200101T000000Z is not yet valid, \
+                   not before 20990101T000000Z; check your system clock";
+        let skew = BrokerConnection::extract_clock_skew_secs(msg);
+        assert!(
+            skew > 0,
+            "expected positive skew (last timestamp used), got {skew}"
+        );
     }
 
     #[test]
