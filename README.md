@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/krafka.svg)](https://crates.io/crates/krafka)
 [![Documentation](https://docs.rs/krafka/badge.svg)](https://docs.rs/krafka)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://github.com/rust-lang/rust/releases/tag/1.88.0)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
 A pure Rust, async-native Apache Kafka client designed for high performance, safety, and ease of use.
 
@@ -344,4 +344,4 @@ Contributions are welcome!
 
 ## 📄 License
 
-Licensed under the [MIT License](LICENSE).
+Licensed under either the [MIT License](LICENSE-MIT) or the [Apache License 2.0](LICENSE-APACHE), at your option.
