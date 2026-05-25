@@ -672,7 +672,7 @@ impl ConnectionConfigBuilder {
     /// The Kafka protocol guarantees exactly-once ordering only when
     /// `max.in.flight.requests.per.connection ≤ 5`. Setting a higher value
     /// disables the sequence-number ordering guarantee. The producer builder
-    /// ([`ProducerConfigBuilder::max_in_flight`]) automatically enforces this
+    /// ([`crate::producer::ProducerConfigBuilder::max_in_flight`]) automatically enforces this
     /// cap when idempotent mode is active; if you configure the connection
     /// config separately, ensure this value is ≤ 5 for idempotent producers.
     pub fn max_in_flight_requests(mut self, max: usize) -> Self {
