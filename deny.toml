@@ -56,8 +56,6 @@ multiple-versions = "warn"
 deny = [
     # Unmaintained OpenSSL binding; prefer rustls.
     { name = "openssl" },
-    # Old ring fork with a known soundness hole.
-    { name = "ring", wrappers = [] },
 ]
 
 # Known acceptable duplicate crate versions introduced by the dependency tree

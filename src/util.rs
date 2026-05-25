@@ -1,8 +1,9 @@
 //! Utility functions for Krafka.\n//!\n//! This module provides low-level utilities used throughout the crate:\n//!\n//! - **Correlation ID generation**: Thread-safe ID generation for request/response matching\n//! - **CRC32C**: Checksum calculation for Kafka record validation\n//! - **Varint encoding**: Variable-length integer encoding for compact protocols\n//! - **SNI hostname extraction**: Parse hostnames from address strings for TLS SNI
 
 use std::cell::RefCell;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -148,22 +149,29 @@ pub fn duration_to_millis_i32(d: Duration) -> i32 {
     /// Minimum interval between clamp warnings. Fires at most once per hour so
     /// persistent misconfiguration remains visible after restarts without
     /// flooding logs under high call rates.
-    const WARN_INTERVAL_SECS: u64 = 3600;
-    static LAST_CLAMP_WARN_SECS: AtomicU64 = AtomicU64::new(0);
+    const WARN_INTERVAL_NANOS: u64 = 3600 * 1_000_000_000;
+    static BASELINE: OnceLock<Instant> = OnceLock::new();
+    static NEXT_WARN_NANOS: AtomicU64 = AtomicU64::new(0);
 
     let ms = d.as_millis();
     if ms > i32::MAX as u128 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let last = LAST_CLAMP_WARN_SECS.load(Ordering::Relaxed);
-        if (last == 0 || now.saturating_sub(last) >= WARN_INTERVAL_SECS)
-            && LAST_CLAMP_WARN_SECS
-                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        let now_nanos = BASELINE
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
+        let next = NEXT_WARN_NANOS.load(Ordering::Relaxed);
+        if now_nanos >= next
+            && NEXT_WARN_NANOS
+                .compare_exchange(
+                    next,
+                    now_nanos + WARN_INTERVAL_NANOS,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
                 .is_ok()
         {
-            tracing::error!(
+            tracing::warn!(
                 duration_ms = %ms,
                 capped_at = i32::MAX,
                 "duration exceeds i32::MAX (~24.8 days); clamping to i32::MAX. \
