@@ -579,7 +579,7 @@ impl MetricsExporter for PrometheusExporter {
         let name = sanitize_prometheus_name(name);
         let _ = writeln!(
             self.output,
-            "# HELP {}_seconds {} (quantiles estimated from power-of-2 histogram; relative error ≤50% per bucket)",
+            "# HELP {}_seconds {} (quantiles estimated from 256-sub-bucket histogram; relative error ≤12.5% per sub-bucket)",
             name, help
         );
         let _ = writeln!(self.output, "# TYPE {}_seconds summary", name);

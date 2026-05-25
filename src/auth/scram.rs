@@ -1049,7 +1049,7 @@ mod tests {
     /// Pinned test vector from RFC 7677 §3 / Appendix B.
     ///
     /// Verifies the exact client-proof bytes against the published
-    /// reference value `dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz9AndVQ=`.
+    /// reference value `dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=`.
     #[test]
     fn test_scram_sha256_rfc7677_pinned_vector() {
         // RFC 7677 test vector parameters

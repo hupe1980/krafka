@@ -706,18 +706,19 @@ impl ConsumerConfigBuilder {
     /// # Example
     ///
     /// ```ignore
-    /// use ahash::AHashMap;
-    ///
     /// ConsumerConfig::builder()
     ///     .bootstrap_servers("localhost:9092")
-    ///     .initial_offsets(AHashMap::from_iter([
+    ///     .initial_offsets([
     ///         (("my-topic".to_string(), 0), 1_000),
     ///         (("my-topic".to_string(), 1), 2_000),
-    ///     ]))
+    ///     ])
     ///     .build()?;
     /// ```
-    pub fn initial_offsets(mut self, offsets: HashMap<(String, PartitionId), Offset>) -> Self {
-        self.config.initial_offsets = offsets;
+    pub fn initial_offsets(
+        mut self,
+        offsets: impl IntoIterator<Item = ((String, PartitionId), Offset)>,
+    ) -> Self {
+        self.config.initial_offsets = offsets.into_iter().collect();
         self
     }
 
