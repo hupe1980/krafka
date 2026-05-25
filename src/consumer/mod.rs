@@ -1897,10 +1897,10 @@ impl Consumer {
     /// # Example
     ///
     /// ```ignore
-    /// use std::collections::HashMap;
+    /// use ahash::AHashMap;
     ///
     /// consumer
-    ///     .seek_many(&HashMap::from([
+    ///     .seek_many(&AHashMap::from_iter([
     ///         (("orders".to_string(), 0), 1_000),
     ///         (("orders".to_string(), 1), 2_000),
     ///     ]))
@@ -3911,12 +3911,12 @@ impl Consumer {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use std::collections::HashMap;
+    /// use ahash::AHashMap;
     /// use krafka::consumer::{Consumer, OffsetAndMetadata, TopicPartition};
     ///
     /// # async fn example() -> Result<(), krafka::error::KrafkaError> {
     /// # let consumer: Consumer = todo!();
-    /// let mut offsets = HashMap::new();
+    /// let mut offsets = AHashMap::new();
     /// offsets.insert(
     ///     TopicPartition::new("my-topic", 0),
     ///     OffsetAndMetadata::with_metadata(100, "checkpoint-abc123"),
@@ -4702,11 +4702,11 @@ impl ConsumerBuilder {
     /// # Example
     ///
     /// ```ignore
-    /// use std::collections::HashMap;
+    /// use ahash::AHashMap;
     ///
     /// Consumer::builder()
     ///     .bootstrap_servers("localhost:9092")
-    ///     .initial_offsets(HashMap::from([
+    ///     .initial_offsets(AHashMap::from_iter([
     ///         (("orders".to_string(), 0), 1_000),
     ///         (("orders".to_string(), 1), 2_000),
     ///     ]))
