@@ -1,6 +1,6 @@
 [package]
 name = "krafka"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["hupe1980"]
@@ -117,10 +117,6 @@ schema-registry = ["dep:serde", "dep:serde_json"]
 # This feature adds the aws-sdk-glue dependency for direct Glue API calls
 # and activates flate2 for Glue ZLIB compression.
 aws-glue-schema-registry = ["dep:aws-sdk-glue", "dep:aws-config", "dep:flate2"]
-# Allow disabling TLS certificate verification (MITM risk!).
-# Only enable for local development or testing with self-signed certificates.
-# Requires calling `TlsConfig::insecure()`.
-danger-insecure-tls = []
 # Enable loading platform-native root certificates for TLS client verification.
 # When enabled, `TlsConfig::with_native_roots()` can use the OS trust store.
 native-tls-roots = ["dep:rustls-native-certs"]

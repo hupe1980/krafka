@@ -259,8 +259,34 @@ impl ConfluentSchemaRegistry {
 
     /// Deserialise and handle an HTTP response, converting error responses
     /// to [`KrafkaError`].
-    fn handle_response<T: serde::de::DeserializeOwned>(status: u16, body: &[u8]) -> Result<T> {
+    ///
+    /// For successful (2xx) responses, requires that `content_type` is present
+    /// and contains `"json"`. A missing or non-JSON `Content-Type` is rejected
+    /// early to surface proxy / misconfiguration errors before a confusing JSON
+    /// parse failure.
+    fn handle_response<T: serde::de::DeserializeOwned>(
+        status: u16,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> Result<T> {
         if (200..300).contains(&status) {
+            // Require a JSON content type on success paths to surface proxy /
+            // misconfiguration errors early (SEC-05).  A missing header is
+            // treated as a configuration error — legitimate schema registries
+            // always set Content-Type.
+            match content_type {
+                Some(ct) if ct.contains("json") => {}
+                Some(ct) => {
+                    return Err(KrafkaError::schema_registry(format!(
+                        "unexpected Content-Type '{ct}' from schema registry (expected JSON)"
+                    )));
+                }
+                None => {
+                    return Err(KrafkaError::schema_registry(
+                        "missing Content-Type header from schema registry (expected JSON)",
+                    ));
+                }
+            }
             serde_json::from_slice(body).map_err(|e| {
                 KrafkaError::schema_registry_with_source(
                     "failed to parse schema registry response",
@@ -294,7 +320,7 @@ impl ConfluentSchemaRegistry {
                 auth.as_deref(),
             )
             .await?;
-        Self::handle_response(resp.status, &resp.body)
+        Self::handle_response(resp.status, resp.content_type.as_deref(), &resp.body)
     }
 
     /// Send an authenticated POST request with a JSON body and parse the response.
@@ -313,7 +339,7 @@ impl ConfluentSchemaRegistry {
                 auth.as_deref(),
             )
             .await?;
-        Self::handle_response(resp.status, &resp.body)
+        Self::handle_response(resp.status, resp.content_type.as_deref(), &resp.body)
     }
 
     /// Send an authenticated DELETE request and parse the JSON response.
@@ -329,7 +355,7 @@ impl ConfluentSchemaRegistry {
                 auth.as_deref(),
             )
             .await?;
-        Self::handle_response(resp.status, &resp.body)
+        Self::handle_response(resp.status, resp.content_type.as_deref(), &resp.body)
     }
 
     fn to_reference_json(refs: &[SchemaReference]) -> Vec<ReferenceJson> {

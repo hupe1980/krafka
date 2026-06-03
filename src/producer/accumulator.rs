@@ -10,6 +10,7 @@
 //! providing low latency through the linger timer mechanism.
 
 use ahash::AHashMap;
+use bytes::BufMut as _;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -30,7 +31,7 @@ use crate::metadata::ClusterMetadata;
 use crate::metrics::ProducerMetrics;
 use crate::protocol::{
     ApiKey, Compression, ProducePartitionData, ProduceRequest, ProduceResponse, ProduceTopicData,
-    RecordBatchBuilder, VersionedDecode, VersionedEncode, versions,
+    RecordBatchBuilder, VersionedDecode, versions,
 };
 
 /// Maximum number of concurrent `send_extracted_batch` tasks across **all**
@@ -433,6 +434,11 @@ pub struct AccumulatorConfig {
     pub linger: Duration,
     /// Compression type for batches.
     pub compression: Compression,
+    /// Per-topic compression overrides.
+    ///
+    /// When a topic is present in this map, its compression type takes
+    /// precedence over the global [`compression`](Self::compression) field.
+    pub topic_compression: AHashMap<String, Compression>,
     /// Acknowledgment level.
     pub acks: i16,
     /// Client ID used for request frame sizing.
@@ -477,6 +483,7 @@ impl Clone for AccumulatorConfig {
             batch_size: self.batch_size,
             linger: self.linger,
             compression: self.compression,
+            topic_compression: self.topic_compression.clone(),
             acks: self.acks,
             client_id: self.client_id.clone(),
             request_timeout: self.request_timeout,
@@ -516,6 +523,7 @@ impl Default for AccumulatorConfig {
             batch_size: 16384,
             linger: Duration::ZERO,
             compression: Compression::None,
+            topic_compression: AHashMap::new(),
             acks: -1,
             client_id: "krafka".to_string(),
             request_timeout: Duration::from_secs(30),
@@ -1141,7 +1149,7 @@ impl RecordAccumulator {
                 super::ensure_idempotent_producer_id_initialized(identity, &metadata, &retry_policy)
                     .await
         {
-            metrics.record_error();
+            metrics.record_error_for_topic(topic.as_ref());
             for pending_record in pending {
                 let _ = pending_record
                     .response_tx
@@ -1179,7 +1187,12 @@ impl RecordAccumulator {
         let build_batch = |seq: Option<i32>,
                            cfg: &AccumulatorConfig|
          -> crate::error::Result<(ProduceRequest, u64, u64)> {
-            let mut batch_builder = RecordBatchBuilder::new().compression(cfg.compression);
+            let effective_compression = cfg
+                .topic_compression
+                .get(topic.as_ref())
+                .copied()
+                .unwrap_or(cfg.compression);
+            let mut batch_builder = RecordBatchBuilder::new().compression(effective_compression);
 
             // Tag with idempotent producer identity
             if let (Some(identity), Some(s)) = (&cfg.identity, seq) {
@@ -1335,30 +1348,37 @@ impl RecordAccumulator {
                 produce_version = 12;
             }
 
-            if let Err(error) = super::validate_produce_request_size(
+            let encoded_body = match super::encode_and_validate_produce_request(
                 &config.client_id,
                 config.max_request_size,
                 produce_version,
                 &request,
             ) {
-                if let (Some(identity), Some(_)) = (config.identity.as_ref(), sequence) {
-                    let _ =
-                        identity.rollback_sequence_range(topic.as_ref(), partition, record_count);
+                Ok(b) => b,
+                Err(error) => {
+                    if let (Some(identity), Some(_)) = (config.identity.as_ref(), sequence) {
+                        let _ = identity.rollback_sequence_range(
+                            topic.as_ref(),
+                            partition,
+                            record_count,
+                        );
+                    }
+                    metrics.record_error_for_topic(topic.as_ref());
+                    for pending_record in pending {
+                        let _ = pending_record
+                            .response_tx
+                            .send(AppendResponse::Done(Err(error.clone())));
+                    }
+                    return;
                 }
-                metrics.record_error();
-                for pending_record in pending {
-                    let _ = pending_record
-                        .response_tx
-                        .send(AppendResponse::Done(Err(error.clone())));
-                }
-                return;
-            }
+            };
 
             // acks=0 (fire-and-forget): Kafka sends no response (R6.1 fix)
             if config.acks == 0 {
                 match conn
                     .send_fire_and_forget(ApiKey::Produce, produce_version, |buf| {
-                        request.encode_versioned(produce_version, buf)
+                        buf.put_slice(&encoded_body);
+                        Ok(())
                     })
                     .await
                 {
@@ -1379,7 +1399,8 @@ impl RecordAccumulator {
 
             let response_result = conn
                 .send_request(ApiKey::Produce, produce_version, |buf| {
-                    request.encode_versioned(produce_version, buf)
+                    buf.put_slice(&encoded_body);
+                    Ok(())
                 })
                 .await;
 
@@ -1569,8 +1590,11 @@ impl RecordAccumulator {
                 }
 
                 let batch_bytes_total: u64 = pending.iter().map(|p| p.estimated_size as u64).sum();
-                metrics.record_batch(pending.len() as u64);
-                metrics.bytes_sent.add(batch_bytes_total);
+                metrics.record_batch_for_topic(
+                    topic.as_ref(),
+                    pending.len() as u64,
+                    batch_bytes_total,
+                );
                 let topic_owned = topic.to_string();
                 for p in pending {
                     let meta = RecordMetadata {
@@ -1594,7 +1618,7 @@ impl RecordAccumulator {
                     let _ =
                         identity.rollback_sequence_range(topic.as_ref(), partition, record_count);
                 }
-                metrics.record_error();
+                metrics.record_error_for_topic(topic.as_ref());
                 let topic_owned = topic.to_string();
                 for p in pending {
                     let meta = RecordMetadata {
@@ -1696,6 +1720,7 @@ mod tests {
             identity: None,
             partitioner: Arc::new(crate::producer::partitioner::DefaultPartitioner::new()),
             state_store: None,
+            topic_compression: AHashMap::new(),
         };
         assert_eq!(config.batch_size, 65536);
         assert_eq!(config.linger, Duration::from_millis(50));

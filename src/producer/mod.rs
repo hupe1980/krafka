@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use bytes::{BufMut as _, Bytes};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
@@ -322,101 +322,22 @@ async fn recover_unknown_producer_id(
     identity.allocate_sequence(topic, partition, record_count)
 }
 
-fn unsigned_varint_size(mut value: u32) -> usize {
-    let mut size = 1;
-    while value >= 0x80 {
-        size += 1;
-        value >>= 7;
-    }
-    size
-}
-
-fn kafka_string_size(value: Option<&str>) -> Result<usize> {
-    match value {
-        Some(value) => {
-            i16::try_from(value.len()).map_err(|_| {
-                KrafkaError::protocol_kind(
-                    ProtocolErrorKind::InvalidLength,
-                    format!(
-                        "KafkaString length {} exceeds protocol limit of {}",
-                        value.len(),
-                        i16::MAX
-                    ),
-                )
-            })?;
-            Ok(2 + value.len())
-        }
-        None => Ok(2),
-    }
-}
-
-fn compact_kafka_string_size(value: Option<&str>) -> Result<usize> {
-    match value {
-        Some(value) => {
-            let len_plus_one = u32::try_from(value.len().saturating_add(1)).map_err(|_| {
-                KrafkaError::protocol_kind(
-                    ProtocolErrorKind::InvalidLength,
-                    format!(
-                        "compact KafkaString length {} exceeds u32 limit",
-                        value.len()
-                    ),
-                )
-            })?;
-            Ok(unsigned_varint_size(len_plus_one) + value.len())
-        }
-        None => Ok(unsigned_varint_size(0)),
-    }
-}
-
-fn kafka_bytes_size(len: usize) -> Result<usize> {
-    i32::try_from(len).map_err(|_| {
-        KrafkaError::protocol_kind(
+fn request_header_size(api_key: ApiKey, api_version: i16, client_id: &str) -> Result<usize> {
+    // 2 (api_key) + 2 (api_version) + 4 (correlation_id) + 2+len (client_id standard string)
+    if client_id.len() > i16::MAX as usize {
+        return Err(KrafkaError::protocol_kind(
             ProtocolErrorKind::InvalidLength,
             format!(
-                "KafkaBytes length {} exceeds protocol limit of {}",
-                len,
-                i32::MAX
+                "client_id length {} exceeds protocol limit of {}",
+                client_id.len(),
+                i16::MAX
             ),
-        )
-    })?;
-    Ok(4 + len)
-}
-
-fn compact_kafka_bytes_size(len: usize) -> Result<usize> {
-    let len_plus_one = u32::try_from(len.saturating_add(1)).map_err(|_| {
-        KrafkaError::protocol_kind(
-            ProtocolErrorKind::InvalidLength,
-            format!("compact KafkaBytes length {} exceeds u32 limit", len),
-        )
-    })?;
-    Ok(unsigned_varint_size(len_plus_one) + len)
-}
-
-fn array_len_size(len: usize) -> Result<usize> {
-    i32::try_from(len).map_err(|_| {
-        KrafkaError::protocol_kind(
-            ProtocolErrorKind::InvalidLength,
-            format!("Kafka array length {len} exceeds protocol limit"),
-        )
-    })?;
-    Ok(4)
-}
-
-fn compact_array_len_size(len: usize) -> Result<usize> {
-    let len_plus_one = u32::try_from(len.saturating_add(1)).map_err(|_| {
-        KrafkaError::protocol_kind(
-            ProtocolErrorKind::InvalidLength,
-            format!("compact Kafka array length {len} exceeds u32 limit"),
-        )
-    })?;
-    Ok(unsigned_varint_size(len_plus_one))
-}
-
-fn request_header_size(api_key: ApiKey, api_version: i16, client_id: &str) -> Result<usize> {
-    let base = 2 + 2 + 4 + kafka_string_size(Some(client_id))?;
+        ));
+    }
+    let base = 2 + 2 + 4 + 2 + client_id.len();
     match crate::protocol::RequestHeader::header_version(api_key, api_version) {
         1 => Ok(base),
-        2 => Ok(base + 1),
+        2 => Ok(base + 1), // +1 for empty tagged-fields byte
         version => Err(KrafkaError::protocol_kind(
             ProtocolErrorKind::UnknownApiVersion,
             format!("unsupported request header version {version}"),
@@ -424,105 +345,33 @@ fn request_header_size(api_key: ApiKey, api_version: i16, client_id: &str) -> Re
     }
 }
 
-fn produce_request_body_size(api_version: i16, request: &ProduceRequest) -> Result<usize> {
-    let mut size = match api_version {
-        3..=8 => kafka_string_size(request.transactional_id.as_deref())? + 2 + 4,
-        9..=13 | 14.. => compact_kafka_string_size(request.transactional_id.as_deref())? + 2 + 4,
-        _ => {
-            return Err(KrafkaError::protocol_kind(
-                ProtocolErrorKind::UnknownApiVersion,
-                format!("unsupported ProduceRequest version {api_version}"),
-            ));
-        }
-    };
-
-    match api_version {
-        3..=8 => {
-            size += array_len_size(request.topic_data.len())?;
-            for topic in &request.topic_data {
-                size += kafka_string_size(Some(&topic.name))?;
-                size += array_len_size(topic.partition_data.len())?;
-                for partition in &topic.partition_data {
-                    size += 4 + kafka_bytes_size(partition.records.len())?;
-                }
-            }
-        }
-        9..=12 => {
-            size += compact_array_len_size(request.topic_data.len())?;
-            for topic in &request.topic_data {
-                size += compact_kafka_string_size(Some(&topic.name))?;
-                size += compact_array_len_size(topic.partition_data.len())?;
-                for partition in &topic.partition_data {
-                    size += 4 + compact_kafka_bytes_size(partition.records.len())? + 1;
-                }
-                size += 1;
-            }
-            size += 1;
-        }
-        13 => {
-            size += compact_array_len_size(request.topic_data.len())?;
-            for topic in &request.topic_data {
-                if topic.topic_id.is_none() {
-                    return Err(KrafkaError::protocol_kind(
-                        ProtocolErrorKind::InvalidValue,
-                        "topic_id is required for Produce v13+ (KIP-516)",
-                    ));
-                }
-                size += 16;
-                size += compact_array_len_size(topic.partition_data.len())?;
-                for partition in &topic.partition_data {
-                    size += 4 + compact_kafka_bytes_size(partition.records.len())? + 1;
-                }
-                size += 1;
-            }
-            size += 1;
-        }
-        v @ 14.. => {
-            // Forward-compat: assume the same compact encoding as v13 (topic-id based).
-            // Emit a one-time warning so operator logs reveal the mismatch when a newer
-            // broker requests a version we have not yet implemented.
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static WARNED: AtomicBool = AtomicBool::new(false);
-            if !WARNED.swap(true, Ordering::AcqRel) {
-                tracing::warn!(
-                    api_version = v,
-                    "ProduceRequest version {v} exceeds max known version 13; \
-                     using v13 compact encoding as a best-effort fallback. \
-                     Update produce_request_body_size() to add explicit v{v}+ support."
-                );
-            }
-            size += compact_array_len_size(request.topic_data.len())?;
-            for topic in &request.topic_data {
-                if topic.topic_id.is_none() {
-                    return Err(KrafkaError::protocol_kind(
-                        ProtocolErrorKind::InvalidValue,
-                        "topic_id is required for Produce v14+ (KIP-516)",
-                    ));
-                }
-                size += 16;
-                size += compact_array_len_size(topic.partition_data.len())?;
-                for partition in &topic.partition_data {
-                    size += 4 + compact_kafka_bytes_size(partition.records.len())? + 1;
-                }
-                size += 1;
-            }
-            size += 1;
-        }
-        _ => unreachable!("validated above"),
-    }
-
-    Ok(size)
-}
-
-fn produce_request_frame_size(
+/// Encode the request body, validate the total wire frame size, and return
+/// the encoded body bytes.
+///
+/// Returning the bytes avoids a second encode in the send path — callers
+/// write the pre-encoded body directly into the connection's I/O buffer.
+///
+/// This is the single source of truth for produce frame sizing — it uses the
+/// real encoder rather than a separate analytical size-computation path,
+/// which would otherwise need to be kept in sync with every encoding change.
+fn encode_and_validate_produce_request(
     client_id: &str,
+    max_request_size: usize,
     api_version: i16,
     request: &ProduceRequest,
-) -> Result<usize> {
-    Ok(
-        4 + request_header_size(ApiKey::Produce, api_version, client_id)?
-            + produce_request_body_size(api_version, request)?,
-    )
+) -> Result<Bytes> {
+    let mut body = bytes::BytesMut::new();
+    request.encode_versioned(api_version, &mut body)?;
+    let frame_size = 4 + request_header_size(ApiKey::Produce, api_version, client_id)? + body.len();
+    if frame_size > max_request_size {
+        return Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidLength,
+            format!(
+                "produce request size {frame_size} exceeds max_request_size {max_request_size}"
+            ),
+        ));
+    }
+    Ok(body.freeze())
 }
 
 /// Populate `topic_id` fields for Produce v13+ (KIP-516).
@@ -546,25 +395,6 @@ pub(crate) fn fill_produce_topic_ids(
         }
     }
     all_resolved
-}
-
-fn validate_produce_request_size(
-    client_id: &str,
-    max_request_size: usize,
-    api_version: i16,
-    request: &ProduceRequest,
-) -> Result<()> {
-    let frame_size = produce_request_frame_size(client_id, api_version, request)?;
-    if frame_size > max_request_size {
-        return Err(KrafkaError::protocol_kind(
-            ProtocolErrorKind::InvalidLength,
-            format!(
-                "produce request size {frame_size} exceeds max_request_size {max_request_size}"
-            ),
-        ));
-    }
-
-    Ok(())
 }
 
 impl Producer {
@@ -765,6 +595,7 @@ impl Producer {
                 batch_size: config.batch_size,
                 linger: config.linger,
                 compression: config.compression,
+                topic_compression: config.topic_compression.clone().into_iter().collect(),
                 acks: config.acks.to_i16(),
                 client_id: config.client_id.clone(),
                 request_timeout: config.request_timeout,
@@ -1049,7 +880,8 @@ impl Producer {
                         }
                     }
 
-                    self.metrics.record_send(record.payload_size_bytes());
+                    self.metrics
+                        .record_send_for_topic(topic.as_ref(), record.payload_size_bytes());
                     self.metrics.connections.set(self.pool.len() as u64);
                     crate::interceptor::safe_on_acknowledgement(
                         &*self.interceptor,
@@ -1081,7 +913,7 @@ impl Producer {
                         {
                             Ok(new_sequence) => new_sequence,
                             Err(recovery_error) => {
-                                self.metrics.record_error();
+                                self.metrics.record_error_for_topic(topic.as_ref());
                                 let dummy_metadata = RecordMetadata {
                                     topic: topic_owned.clone(),
                                     partition,
@@ -1106,7 +938,7 @@ impl Producer {
                             Ok(new_request) => request = new_request,
                             Err(build_error) => {
                                 let _ = identity.rollback_sequence(topic.as_ref(), partition);
-                                self.metrics.record_error();
+                                self.metrics.record_error_for_topic(topic.as_ref());
                                 let dummy_metadata = RecordMetadata {
                                     topic: topic_owned.clone(),
                                     partition,
@@ -1134,7 +966,7 @@ impl Producer {
                             match identity.reset_and_allocate(topic.as_ref(), partition, 1) {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    self.metrics.record_error();
+                                    self.metrics.record_error_for_topic(topic.as_ref());
                                     return Err(e);
                                 }
                             };
@@ -1149,7 +981,7 @@ impl Producer {
                             Err(build_err) => {
                                 // Rollback the freshly allocated sequence
                                 let _ = identity.rollback_sequence(topic.as_ref(), partition);
-                                self.metrics.record_error();
+                                self.metrics.record_error_for_topic(topic.as_ref());
                                 let dummy_metadata = RecordMetadata {
                                     topic: topic_owned.clone(),
                                     partition,
@@ -1192,7 +1024,7 @@ impl Producer {
                     if let Some(ref identity) = self.identity {
                         let _ = identity.rollback_sequence(topic.as_ref(), partition);
                     }
-                    self.metrics.record_error();
+                    self.metrics.record_error_for_topic(topic.as_ref());
                     let dummy_metadata = RecordMetadata {
                         topic: topic_owned.clone(),
                         partition,
@@ -1234,7 +1066,8 @@ impl Producer {
         record: &RoutedRecord,
         sequence: Option<i32>,
     ) -> Result<ProduceRequest> {
-        let mut batch_builder = RecordBatchBuilder::new().compression(self.config.compression);
+        let mut batch_builder =
+            RecordBatchBuilder::new().compression(self.config.compression_for(topic));
 
         // Propagate user-supplied timestamp to the batch
         if let Some(ts) = record.timestamp {
@@ -1313,7 +1146,9 @@ impl Producer {
             request
         };
 
-        validate_produce_request_size(
+        // Encode once and validate frame size.  The encoded body is reused in
+        // the I/O path below, eliminating a second encode on the hot path.
+        let encoded_body = encode_and_validate_produce_request(
             &self.config.client_id,
             self.config.max_request_size,
             version,
@@ -1323,7 +1158,8 @@ impl Producer {
         // acks=0 (fire-and-forget): Kafka sends no response, so don't wait for one (R6.1 fix)
         if self.config.acks == Acks::None {
             conn.send_fire_and_forget(ApiKey::Produce, version, |buf| {
-                effective_request.encode_versioned(version, buf)
+                buf.put_slice(&encoded_body);
+                Ok(())
             })
             .await?;
 
@@ -1338,7 +1174,8 @@ impl Producer {
         // Send request and wait for response (acks=1 or acks=-1/all)
         let response = conn
             .send_request(ApiKey::Produce, version, |buf| {
-                effective_request.encode_versioned(version, buf)
+                buf.put_slice(&encoded_body);
+                Ok(())
             })
             .await?;
 
@@ -2086,8 +1923,9 @@ mod tests {
             }],
         };
 
-        let error = validate_produce_request_size("client", 128, versions::PRODUCE_MIN, &request)
-            .expect_err("oversized frame should be rejected");
+        let error =
+            encode_and_validate_produce_request("client", 128, versions::PRODUCE_MIN, &request)
+                .expect_err("oversized frame should be rejected");
 
         assert!(error.to_string().contains("max_request_size"));
     }
@@ -2109,13 +1947,22 @@ mod tests {
             }],
         };
 
-        let exact_size =
-            produce_request_frame_size("client", versions::PRODUCE_MAX, &request).unwrap();
+        // Encode with a permissive limit to recover the actual frame size.
+        let encoded = encode_and_validate_produce_request(
+            "client",
+            usize::MAX,
+            versions::PRODUCE_MAX,
+            &request,
+        )
+        .unwrap();
+        let exact_size = 4
+            + request_header_size(ApiKey::Produce, versions::PRODUCE_MAX, "client").unwrap()
+            + encoded.len();
 
-        validate_produce_request_size("client", exact_size, versions::PRODUCE_MAX, &request)
+        encode_and_validate_produce_request("client", exact_size, versions::PRODUCE_MAX, &request)
             .unwrap();
 
-        let error = validate_produce_request_size(
+        let error = encode_and_validate_produce_request(
             "client",
             exact_size.saturating_sub(1),
             versions::PRODUCE_MAX,
@@ -2142,7 +1989,7 @@ mod tests {
             }],
         };
 
-        let error = validate_produce_request_size("client", 1024, 13, &request).unwrap_err();
+        let error = encode_and_validate_produce_request("client", 1024, 13, &request).unwrap_err();
         assert!(error.to_string().contains("topic_id is required"));
     }
 

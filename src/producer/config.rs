@@ -1,6 +1,7 @@
 //! Producer configuration.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::auth::AuthConfig;
@@ -64,6 +65,12 @@ pub struct ProducerConfig {
     pub(crate) acks: Acks,
     /// Compression type.
     pub(crate) compression: Compression,
+    /// Per-topic compression overrides.
+    ///
+    /// When a topic name is present in this map, its compression type takes
+    /// precedence over the global [`compression`](Self::compression) setting.
+    /// Use [`ProducerConfigBuilder::topic_compression`] to populate this map.
+    pub(crate) topic_compression: HashMap<String, Compression>,
     /// Batch size in bytes.
     pub(crate) batch_size: usize,
     /// Time to wait before sending a batch.
@@ -133,6 +140,7 @@ impl Default for ProducerConfig {
             client_id: "krafka".to_string(),
             acks: Acks::All,
             compression: Compression::None,
+            topic_compression: HashMap::new(),
             batch_size: 16384,
             linger: Duration::ZERO,
             request_timeout: Duration::from_secs(30),
@@ -184,6 +192,19 @@ impl ProducerConfig {
     #[inline]
     pub fn compression(&self) -> Compression {
         self.compression
+    }
+
+    /// Returns the effective compression for a given topic.
+    ///
+    /// If a per-topic override was configured via
+    /// [`ProducerConfigBuilder::topic_compression`], that value is returned;
+    /// otherwise the global [`compression()`](Self::compression) setting is used.
+    #[inline]
+    pub fn compression_for(&self, topic: &str) -> Compression {
+        self.topic_compression
+            .get(topic)
+            .copied()
+            .unwrap_or(self.compression)
     }
 
     /// Returns the batch size in bytes.
@@ -319,6 +340,31 @@ impl ProducerConfigBuilder {
     /// Set compression.
     pub fn compression(mut self, compression: Compression) -> Self {
         self.config.compression = compression;
+        self
+    }
+
+    /// Set a per-topic compression override.
+    ///
+    /// Records destined for `topic` will be compressed with `compression`
+    /// regardless of the global [`compression`](Self::compression) setting.
+    /// Call this method multiple times to configure different codecs per topic.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use krafka::producer::{Producer, ProducerConfig};
+    /// use krafka::protocol::Compression;
+    ///
+    /// let config = ProducerConfig::builder()
+    ///     .bootstrap_servers("localhost:9092")
+    ///     .compression(Compression::Gzip)         // default for all topics
+    ///     .topic_compression("high-volume", Compression::Lz4)  // override for one topic
+    ///     .build()?;
+    /// ```
+    pub fn topic_compression(mut self, topic: impl Into<String>, compression: Compression) -> Self {
+        self.config
+            .topic_compression
+            .insert(topic.into(), compression);
         self
     }
 
@@ -573,6 +619,21 @@ impl ProducerConfigBuilder {
                 );
                 self.config.max_in_flight = 5;
             }
+            // Warn when idempotency is enabled without a transactional_id:
+            // idempotent producers prevent duplicates within a session but do NOT
+            // fence zombie producers after a crash/restart. Only a TransactionalProducer
+            // with a stable transactional_id provides full zombie fencing (KIP-360).
+            // Emitted at warn! via a OnceLock so it fires once per process and is
+            // visible to operators without spamming logs.
+            static IDEMPOTENT_NO_TXN_WARNED: OnceLock<()> = OnceLock::new();
+            IDEMPOTENT_NO_TXN_WARNED.get_or_init(|| {
+                tracing::warn!(
+                    "Idempotent producer enabled without a transactional_id. \
+                     This provides per-session duplicate detection (KIP-679) but not zombie \
+                     fencing. Use TransactionalProducer with a stable transactional_id for \
+                     exactly-once end-to-end guarantees across producer restarts (KIP-360)."
+                );
+            });
         }
         if self.config.buffer_memory > 0 && self.config.batch_size > self.config.buffer_memory {
             return Err(KrafkaError::config(format!(

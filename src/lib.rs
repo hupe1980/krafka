@@ -103,7 +103,6 @@
 //! | `schema-registry` | no | Confluent Schema Registry HTTP client. |
 //! | `aws-glue-schema-registry` | no | AWS Glue Schema Registry SDK client. |
 //! | `socks5` | no | SOCKS5 proxy support via `tokio-socks`. |
-//! | `danger-insecure-tls` | no | Allow disabling TLS certificate verification (MITM risk!). |
 //! | `telemetry` | no | OpenTelemetry exporter for producer/consumer metrics. |
 //! | `unstable-protocol` | no | Enables experimental protocol APIs (Share Consumer, KIP-932). APIs under this feature may change without semver notice. |
 //!
@@ -111,7 +110,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! krafka = { version = "0.9.1", default-features = false, features = ["lz4"] }
+//! krafka = { version = "0.11.0", default-features = false, features = ["lz4"] }
 //! ```
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -134,10 +133,26 @@ pub mod consumer;
 pub mod dlq;
 pub mod error;
 pub mod interceptor;
+/// Cluster metadata cache and refresh logic.
+///
+/// This is an implementation detail of the consumer and producer. Types are
+/// accessible for advanced use but are **not** part of the stable public API.
+#[doc(hidden)]
 pub mod metadata;
 pub mod metrics;
+/// Network connection pool and transport layer.
+///
+/// This is an implementation detail. Types are accessible for advanced use
+/// (e.g. custom authentication) but are **not** part of the stable public API.
+#[doc(hidden)]
 pub mod network;
 pub mod producer;
+/// Kafka wire-protocol encode/decode layer.
+///
+/// This is an implementation detail. Types are accessible for advanced use
+/// (e.g. benchmarks, raw record batch construction) but are **not** part of
+/// the stable public API.
+#[doc(hidden)]
 pub mod protocol;
 pub mod schema_registry;
 #[cfg(feature = "unstable-protocol")]
@@ -151,6 +166,17 @@ pub mod util;
 
 pub use error::{KrafkaError, ProtocolErrorKind, RecvError, Result};
 pub use metadata::MetadataRecoveryStrategy;
+// Re-export user-facing protocol types at a stable path so callers do not
+// need to reach into the hidden `protocol` module.
+pub use protocol::{
+    Compression, LazyRecordBatch, LazyRecordIterator, Record, RecordBatch, RecordBatchBuilder,
+    RecordHeader,
+};
+// Re-export user-facing network/auth types at a stable path so callers do
+// not need to reach into the hidden `network` module.
+pub use network::{
+    ChallengeResponse, SaslAuthenticator, SecureConnectionConfig, SecureConnectionConfigBuilder,
+};
 
 /// Kafka protocol API version.
 pub type ApiVersion = i16;

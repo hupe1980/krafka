@@ -9,7 +9,7 @@ on:
       dry-run:
         description: 'Perform a dry run (do not actually publish)'
         required: false
-        default: 'true'
+        default: true
         type: boolean
 
 permissions:

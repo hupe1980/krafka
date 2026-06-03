@@ -196,7 +196,7 @@ DNS resolution, so broker hostnames are sent as-is (not pre-resolved).
 Enable the `socks5` feature:
 
 ```toml
-krafka = { version = "0.10.0", features = ["socks5"] }
+krafka = { version = "0.11.0", features = ["socks5"] }
 ```
 
 ### Proxy Without Authentication

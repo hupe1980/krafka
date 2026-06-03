@@ -156,6 +156,11 @@ impl AsyncWrite for HttpStream {
 pub(crate) struct HttpResponse {
     /// HTTP status code (e.g. `200`, `404`).
     pub status: u16,
+    /// Value of the `Content-Type` response header, if present.
+    ///
+    /// Callers should validate this before attempting to parse the body as JSON
+    /// to avoid confusing parse errors from HTML error pages or proxy responses.
+    pub content_type: Option<String>,
     /// Raw response body bytes.
     pub body: Vec<u8>,
 }
@@ -309,6 +314,7 @@ async fn read_response<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Resul
     // Headers
     let mut content_length: Option<usize> = None;
     let mut is_chunked = false;
+    let mut content_type: Option<String> = None;
     loop {
         line.clear();
         reader.read_line(&mut line).await.map_err(|e| {
@@ -322,6 +328,16 @@ async fn read_response<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Resul
             content_length = rest.trim().parse().ok();
         } else if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
             is_chunked = true;
+        } else if let Some(rest) = lower.strip_prefix("content-type:") {
+            // Store the lowercased media-type only (strip parameters like `;charset=utf-8`).
+            let media_type = rest
+                .trim()
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            content_type = Some(media_type);
         }
     }
 
@@ -353,7 +369,11 @@ async fn read_response<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Resul
         buf
     };
 
-    Ok(HttpResponse { status, body })
+    Ok(HttpResponse {
+        status,
+        content_type,
+        body,
+    })
 }
 
 fn parse_status_line(line: &str) -> Result<u16> {
@@ -551,19 +571,24 @@ mod tests {
     #[tokio::test]
     async fn test_read_response_chunked() {
         // Build a minimal chunked HTTP/1.1 response in memory.
-        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
         let mut reader = BufReader::new(&raw[..]);
         let resp = read_response(&mut reader).await.unwrap();
         assert_eq!(resp.status, 200);
+        assert_eq!(resp.content_type.as_deref(), Some("application/json"));
         assert_eq!(resp.body, b"hello world");
     }
 
     #[tokio::test]
     async fn test_read_response_content_length() {
-        let raw = b"HTTP/1.1 201 Created\r\nContent-Length: 7\r\n\r\npayload";
+        let raw = b"HTTP/1.1 201 Created\r\nContent-Length: 7\r\nContent-Type: application/vnd.schemaregistry.v1+json\r\n\r\npayload";
         let mut reader = BufReader::new(&raw[..]);
         let resp = read_response(&mut reader).await.unwrap();
         assert_eq!(resp.status, 201);
+        assert_eq!(
+            resp.content_type.as_deref(),
+            Some("application/vnd.schemaregistry.v1+json")
+        );
         assert_eq!(resp.body, b"payload");
     }
 

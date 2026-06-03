@@ -55,7 +55,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{BufMut as _, Bytes};
 use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, warn};
 
@@ -1117,7 +1117,7 @@ impl TransactionalProducer {
                     version = 12;
                 }
 
-                super::validate_produce_request_size(
+                let encoded_body = super::encode_and_validate_produce_request(
                     &self.config.client_id,
                     self.config.max_request_size,
                     version,
@@ -1126,7 +1126,8 @@ impl TransactionalProducer {
 
                 let response = conn
                     .send_request(ApiKey::Produce, version, |buf| {
-                        request.encode_versioned(version, buf)
+                        buf.put_slice(&encoded_body);
+                        Ok(())
                     })
                     .await?;
 

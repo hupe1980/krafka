@@ -1183,10 +1183,26 @@ impl Consumer {
     }
 
     /// Await `on_partitions_revoked` on the rebalance listener.
+    ///
+    /// The callback is bounded by [`ConsumerConfig::revocation_timeout`].
+    /// If it does not complete in time, a warning is logged and the consumer
+    /// proceeds with the rebalance to avoid group coordinator session expiry.
     async fn safe_on_partitions_revoked(&self, partitions: &[TopicPartition]) {
-        self.rebalance_listener
-            .on_partitions_revoked_erased(partitions)
-            .await;
+        let timeout = self.config.revocation_timeout();
+        if tokio::time::timeout(
+            timeout,
+            self.rebalance_listener
+                .on_partitions_revoked_erased(partitions),
+        )
+        .await
+        .is_err()
+        {
+            warn!(
+                timeout_secs = timeout.as_secs_f64(),
+                "on_partitions_revoked timed out; proceeding with revocation. \
+                 A hung rebalance listener can cause group coordinator session expiry."
+            );
+        }
     }
 
     /// Await `on_partitions_lost` on the rebalance listener.
@@ -1942,6 +1958,43 @@ impl Consumer {
     pub async fn seek_to_end(&self, topic: &str, partition: PartitionId) -> Result<()> {
         // Resolve the actual latest offset via ListOffsets (timestamp=-1 means latest)
         let offset = self.resolve_list_offset(topic, partition, -1).await?;
+        self.seek(topic, partition, offset).await
+    }
+
+    /// Seek to the first message whose timestamp is greater than or equal to
+    /// `timestamp_ms` (milliseconds since Unix epoch).
+    ///
+    /// Uses the Kafka `ListOffsets` API to resolve the offset, then calls
+    /// [`seek`](Self::seek) on the resolved position. The seek takes effect on the next
+    /// [`recv`](Self::recv) / `poll` call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the partition has no leader, the broker is
+    /// unreachable, or no message exists at or after the given timestamp (the
+    /// broker returns offset `-1` in that case).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Start consuming from messages produced on or after 2024-01-01 00:00 UTC
+    /// let ts = 1_704_067_200_000_i64; // ms
+    /// consumer.seek_to_timestamp("orders", 0, ts).await?;
+    /// ```
+    pub async fn seek_to_timestamp(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+        timestamp_ms: i64,
+    ) -> Result<()> {
+        let offset = self
+            .resolve_list_offset(topic, partition, timestamp_ms)
+            .await?;
+        if offset < 0 {
+            return Err(KrafkaError::invalid_state(format!(
+                "no message with timestamp >= {timestamp_ms} ms found in {topic}-{partition}"
+            )));
+        }
         self.seek(topic, partition, offset).await
     }
 

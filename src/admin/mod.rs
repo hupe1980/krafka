@@ -66,7 +66,9 @@ use crate::protocol::{
 };
 
 // Re-export for use by callers of `describe_configs`.
-pub use crate::protocol::DescribeConfigsRequest;
+// All three types are required to build a `DescribeConfigsRequest` and are
+// co-located here so callers can import exclusively from `krafka::admin`.
+pub use crate::protocol::{ConfigResourceType, DescribeConfigsRequest, DescribeConfigsResource};
 mod acls;
 mod builder;
 mod configs;

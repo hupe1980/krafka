@@ -7,17 +7,24 @@ description: "Use when editing metadata: cache refresh coalescing, lock ordering
 
 ## Cache Refresh Coalescing
 
-- A `Mutex` (`refresh_lock`) serializes concurrent refresh requests.
-- After acquiring the lock, check if cache was updated within 100 ms by another task — if so, skip **only** partial refreshes where all requested topics are already present. Full refreshes (`topics: None`) are never skipped because a recent partial refresh does not guarantee a full-cluster snapshot.
-- Never remove this check; it prevents thundering-herd on stale cache.
+- Concurrent refresh calls are coalesced via a `parking_lot::Mutex<RefreshCoalescingState>` subscriber list.
+- The first caller claims the `Idle → InFlight` transition and becomes the refresher.
+- Subsequent callers register a `oneshot::Sender` in the `InFlight` list and `await` its receiver; they never acquire the lock after registration.
+- The `RefreshGuard` RAII type ensures that all subscribers are notified and the state is reset to `Idle` even if the refresher task is cancelled or panics.
+- The `parking_lot::Mutex` is held for at most a few microseconds (just long enough to push/drain the subscriber list) and is **never** held across an `.await` point.
+- If the refresher is cancelled or panics (`Ok(Err(_))`), subscribers receive `KrafkaError::invalid_state` and propagate the error to their caller — no internal retry.
+- If the subscriber wait times out (`Err(_elapsed)` from `tokio::time::timeout`), subscribers receive `KrafkaError::timeout` and propagate the error — no internal retry.
+- In both error cases the caller is responsible for deciding whether to retry `refresh_for_topics`.
+- After acquiring the refresher role, check the staleness/backoff guards (retry_backoff + max_age) before issuing any RPCs — subsequent callers that were coalesced get the refresher's result directly.
 
 ## Lock Ordering
 
-1. `refresh_lock` (Mutex) — held only during the refresh RPC
+1. `refresh_state` (`parking_lot::Mutex<RefreshCoalescingState>`) — held for microseconds only, never across await
 2. `cache` (ArcSwap) — lock-free reads via `load()`, atomic writes via `store()`
+3. `last_refresh_completed` / `metadata_attempt_start` (`parking_lot::Mutex<Option<...>>`) — held briefly for reads/writes
 
 `ArcSwap` eliminates lock-ordering concerns: readers never block writers and
-vice-versa. `refresh_lock` serializes RPC calls; the cache swap is a single
+vice-versa. `refresh_state` gates the refresher role; the cache swap is a single
 atomic pointer store at the end.
 
 ## Error Filtering

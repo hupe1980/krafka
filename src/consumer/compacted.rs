@@ -599,18 +599,22 @@ impl CompactedTopicConsumer {
     /// [`from_consumer()`](Self::from_consumer), however, scanning starts from
     /// whatever position that consumer already has.
     ///
-    /// Because the high watermark is refreshed on each fetch, it can keep
-    /// advancing while this scan is in progress. On actively written topics,
-    /// `scan()` may therefore block indefinitely and should be treated as a
-    /// best-effort catch-up operation rather than a bounded snapshot scan.
+    /// `scan()` takes a **point-in-time snapshot** of the latest offsets
+    /// (high-water marks) for all assigned partitions at the moment it is
+    /// called, then reads until the consumer's position on every partition
+    /// reaches or exceeds those snapshot offsets. Records written to the
+    /// topic *after* the snapshot is taken are not counted towards the
+    /// caught-up condition — this bounds the scan to a deterministic target
+    /// rather than chasing a continuously advancing watermark.
     ///
     /// If this call returns, [`is_caught_up()`](Self::is_caught_up) is `true`
     /// and the table contains the latest value for every live key observed up
-    /// to the point where the consumer determined it had caught up.
+    /// to the snapshot watermark.
     ///
     /// # Errors
     ///
-    /// Returns an error if any poll fails unrecoverably.
+    /// Returns an error if any poll fails unrecoverably or if the initial
+    /// watermark snapshot cannot be obtained.
     pub async fn scan(&mut self, poll_timeout: Duration) -> Result<()> {
         // Fail fast if no partitions are assigned — avoids an infinite loop
         // of empty polls (especially when using from_consumer() without assign()).
@@ -623,7 +627,50 @@ impl CompactedTopicConsumer {
             )));
         }
 
-        info!("Starting compacted topic scan for '{}'", self.topic);
+        // Snapshot the latest offsets (high-water marks) **before** starting
+        // the poll loop.  Comparing against a fixed snapshot means the scan
+        // terminates even when new records arrive during the scan, avoiding
+        // the HWM-chasing race that makes scans on active topics non-terminating.
+        let topic = self.topic.clone();
+        let hwm_results = self
+            .consumer
+            .offsets_for_times_for_topic(&topic, -1)
+            .await?;
+
+        // Fail fast on any per-partition error: a missing partition in the
+        // target map causes `check_caught_up_at` to silently skip it, which
+        // would prematurely declare the scan complete without having consumed
+        // that partition's data.
+        let mut scan_target_hwms: HashMap<PartitionId, Offset> =
+            HashMap::with_capacity(hwm_results.len());
+        for (partition, result) in hwm_results {
+            let offset = result.map_err(|e| {
+                KrafkaError::invalid_state(format!(
+                    "failed to fetch high-watermark for '{topic}' partition {partition}: {e}"
+                ))
+            })?;
+            scan_target_hwms.insert(partition, offset);
+        }
+
+        if scan_target_hwms.values().all(|&hwm| hwm <= 0) {
+            // All partitions are empty (HWM = 0) — nothing to scan.
+            self.caught_up = true;
+            info!(
+                "Compacted topic '{}' has no data yet (all partition HWMs = 0); scan complete",
+                self.topic
+            );
+            return Ok(());
+        }
+
+        // Keep only non-empty partitions in the target map; empty partitions
+        // are satisfied immediately and don't need to be polled.
+        scan_target_hwms.retain(|_, &mut hwm| hwm > 0);
+
+        info!(
+            topic = %self.topic,
+            partitions = scan_target_hwms.len(),
+            "Starting compacted topic scan (HWM snapshot taken)"
+        );
 
         loop {
             let mut records = self.consumer.poll(poll_timeout).await?;
@@ -638,7 +685,7 @@ impl CompactedTopicConsumer {
             }
             self.table.ingest(&records);
 
-            if self.check_caught_up().await {
+            if self.check_caught_up_at(&scan_target_hwms).await {
                 self.caught_up = true;
                 info!(
                     "Compacted topic scan complete for '{}': {} keys, {} records processed, \
@@ -743,7 +790,13 @@ impl CompactedTopicConsumer {
         self.consumer.close().await
     }
 
-    /// Check if all assigned partitions have reached their high watermarks.
+    /// Check if all assigned partitions have reached their live cached high
+    /// watermarks.
+    ///
+    /// This is used by [`poll()`](Self::poll) for best-effort post-scan
+    /// caught-up detection. For the bounded `scan()` operation, use
+    /// [`check_caught_up_at`](Self::check_caught_up_at) with a pre-scan
+    /// HWM snapshot instead.
     async fn check_caught_up(&self) -> bool {
         let assignments = self.consumer.assignment().await;
         let Some(partitions) = assignments.get(&self.topic) else {
@@ -763,6 +816,40 @@ impl CompactedTopicConsumer {
                 // High watermark is 0 — empty partition, nothing to consume.
                 (_, Some(0)) => continue,
                 // Position or high watermark not yet known, or still behind.
+                _ => return false,
+            }
+        }
+
+        true
+    }
+
+    /// Check if all assigned partitions have reached the given target
+    /// high-water marks.
+    ///
+    /// `target_hwms` is a snapshot of the latest offsets taken **before**
+    /// the scan loop started. Comparing against a fixed snapshot rather than
+    /// the live cached watermarks prevents the scan from chasing an
+    /// ever-advancing HWM on actively written topics.
+    async fn check_caught_up_at(&self, target_hwms: &HashMap<PartitionId, Offset>) -> bool {
+        let assignments = self.consumer.assignment().await;
+        let Some(partitions) = assignments.get(&self.topic) else {
+            return false;
+        };
+
+        for &partition in partitions {
+            let Some(&target_hw) = target_hwms.get(&partition) else {
+                // Partition not in the snapshot (e.g. added after scan started) — skip.
+                continue;
+            };
+
+            // target_hw == -1 (or <= 0) means the partition is empty; nothing to consume.
+            if target_hw <= 0 {
+                continue;
+            }
+
+            let position = self.consumer.position(&self.topic, partition).await;
+            match position {
+                Some(pos) if pos >= target_hw => continue,
                 _ => return false,
             }
         }

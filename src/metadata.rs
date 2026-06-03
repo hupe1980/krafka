@@ -6,14 +6,22 @@
 //! - Broker discovery
 //! - Leader election tracking
 
+// `AHashMap` is used throughout this module for all internal maps (broker IDs,
+// topic names, partition IDs). `ahash` is a non-cryptographic hash function.
+// Hash-flooding is not a concern here because all map keys are sourced from
+// authenticated Kafka cluster metadata responses — an attacker who controls
+// topic names must already have the ability to inject arbitrary cluster
+// metadata, at which point hash-flooding is the least of the client's problems.
+// Key lengths are also bounded by Kafka's own validation (topic names ≤ 249
+// characters, broker IDs are i32).
 use ahash::AHashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use parking_lot::Mutex as SyncMutex;
-use tokio::sync::Mutex;
-use tokio::time::timeout as tokio_timeout;
+use tokio::sync::oneshot;
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::error::{ErrorCode, KrafkaError, Result};
@@ -167,6 +175,47 @@ impl TopicInfo {
     }
 }
 
+/// Coalescing state for concurrent metadata refresh calls.
+///
+/// Replaces `tokio::sync::Mutex<()>` (which was held across the entire
+/// refresh network round-trip) with a subscriber list:
+///
+/// - `Idle`: no refresh in flight; the first caller becomes the refresher.
+/// - `InFlight`: a refresh is in progress; subsequent callers subscribe via a
+///   oneshot and are woken when the refresh completes.
+///
+/// The `parking_lot::Mutex` wrapping this state is held for at most a few
+/// microseconds (just long enough to push/drain the subscriber list) and is
+/// **never** held across an `.await` point.
+enum RefreshCoalescingState {
+    Idle,
+    InFlight(Vec<oneshot::Sender<Result<()>>>),
+}
+
+/// RAII guard that resets the coalescing state to `Idle` and notifies all
+/// waiting subscribers when the refresher completes or is cancelled.
+struct RefreshGuard<'a> {
+    state: &'a SyncMutex<RefreshCoalescingState>,
+    result: Option<Result<()>>,
+}
+
+impl Drop for RefreshGuard<'_> {
+    fn drop(&mut self) {
+        let result = self.result.take().unwrap_or_else(|| {
+            Err(KrafkaError::invalid_state(
+                "metadata refresh was cancelled or panicked",
+            ))
+        });
+        let mut st = self.state.lock();
+        if let RefreshCoalescingState::InFlight(ref mut senders) = *st {
+            for tx in senders.drain(..) {
+                let _ = tx.send(result.clone());
+            }
+        }
+        *st = RefreshCoalescingState::Idle;
+    }
+}
+
 /// Cached cluster metadata.
 #[derive(Debug, Clone)]
 struct MetadataCache {
@@ -231,9 +280,12 @@ pub struct ClusterMetadata {
     cache: ArcSwap<MetadataCache>,
     /// Metadata max age before refresh.
     max_age: Duration,
-    /// Coalescing lock: prevents concurrent metadata refreshes.
-    /// Multiple callers wait on the same in-flight refresh instead of stampeding.
-    refresh_lock: Mutex<()>,
+    /// Coalescing state for concurrent metadata refresh calls (DS-06).
+    ///
+    /// The `parking_lot::Mutex` is held only for microseconds (to push/drain
+    /// the subscriber list). The actual network I/O happens outside the lock,
+    /// preventing slow brokers from serialising all metadata callers.
+    refresh_state: SyncMutex<RefreshCoalescingState>,
     /// Minimum interval between successive refresh *attempts*, enforced on the
     /// error path to prevent a metadata-refresh storm when a partition is
     /// unavailable.  Mirrors `retry.backoff.ms` in the Java client.
@@ -273,7 +325,7 @@ impl ClusterMetadata {
             pool,
             cache: ArcSwap::from_pointee(MetadataCache::new()),
             max_age,
-            refresh_lock: Mutex::new(()),
+            refresh_state: SyncMutex::new(RefreshCoalescingState::Idle),
             retry_backoff: Some(Duration::from_millis(100)),
             last_refresh_completed: SyncMutex::new(None),
             recovery_strategy: MetadataRecoveryStrategy::None,
@@ -358,12 +410,17 @@ impl ClusterMetadata {
 
     /// Refresh metadata for specific topics.
     ///
-    /// Uses a coalescing lock to prevent concurrent metadata stampedes.
-    /// If a refresh is already in-flight, callers wait for it to complete.
-    /// The lock acquisition itself is bounded by `max_age` — if the lock
-    /// cannot be acquired within that window, a timeout error is returned.
-    /// This prevents indefinite blocking when a broker stalls mid-refresh
-    /// (e.g., dead broker, network partition, repeated reconnection retries).
+    /// Concurrent callers are coalesced: the first caller claims the refresher
+    /// role while subsequent callers subscribe to the in-flight result via a
+    /// oneshot channel. The `parking_lot::Mutex` used for coalescing is held
+    /// only for microseconds to read/update the subscriber list and is **never**
+    /// held across any `.await` point.
+    ///
+    /// Subscriber waits are bounded by `max_age`. If the in-flight refresh does
+    /// not complete within that window, a [`KrafkaError::Timeout`] is returned
+    /// immediately so the caller is never blocked indefinitely — even if a
+    /// broker is stalled mid-refresh (dead broker, network partition, repeated
+    /// reconnection retries).
     ///
     /// The Metadata API version is negotiated with the broker (v1–v13).
     /// Versions are cumulative: rack v1, cluster_id v2, offline replicas v5,
@@ -378,18 +435,90 @@ impl ClusterMetadata {
     /// all connections are closed and the client falls back to bootstrap
     /// servers (KIP-899).
     pub async fn refresh_for_topics(&self, topics: Option<&[&str]>) -> Result<()> {
-        // Coalesce concurrent calls: only one refresh in-flight at a time.
-        // Cap the wait so callers don't block indefinitely when the in-flight
-        // refresh is stuck on a dead broker (network partition, repeated
-        // reconnection retries can hold the lock for retry_count × request_timeout).
-        let _guard = tokio_timeout(self.max_age, self.refresh_lock.lock())
-            .await
-            .map_err(|_| KrafkaError::timeout("timed out waiting for metadata refresh lock"))?;
+        // Coalesce concurrent calls without holding a mutex across network I/O.
+        //
+        // First, we atomically claim the "refresher" role or subscribe to the
+        // in-flight refresh. The parking_lot lock is released before any await.
+        let subscriber_rx = {
+            let mut state = self.refresh_state.lock();
+            match *state {
+                RefreshCoalescingState::Idle => {
+                    // We are the refresher; claim the in-flight slot.
+                    *state = RefreshCoalescingState::InFlight(Vec::new());
+                    None
+                }
+                RefreshCoalescingState::InFlight(ref mut senders) => {
+                    // A refresh is already in progress — subscribe to be woken
+                    // when it completes. The lock is released before the await.
+                    //
+                    // Prune senders whose receivers have already been dropped
+                    // (timed-out or cancelled callers) to prevent unbounded
+                    // memory growth during a prolonged stall.
+                    senders.retain(|tx| !tx.is_closed());
+                    let (tx, rx) = oneshot::channel();
+                    senders.push(tx);
+                    Some(rx)
+                }
+            }
+        }; // ← parking_lot lock released here, before any .await
 
+        if let Some(rx) = subscriber_rx {
+            // Bound the wait by `max_age` so that a stalled refresher (dead
+            // broker + long reconnection retries) cannot block subscribers
+            // indefinitely.
+            return match timeout(self.max_age, rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => {
+                    // The refresher task was cancelled or panicked.
+                    // `RefreshGuard::drop` resets state to `Idle` and notifies
+                    // all subscribers before dropping, so `rx` returning
+                    // `Err(RecvError)` is the signal that the state is already
+                    // `Idle`.  However, the refresher's result was not
+                    // propagated (it errored/panicked), so we return an error
+                    // here.  Recursing would retry with no bound; instead we
+                    // propagate the failure and let the caller decide.
+                    warn!("in-flight metadata refresh was cancelled or panicked");
+                    Err(KrafkaError::invalid_state(
+                        "metadata refresh was cancelled or panicked",
+                    ))
+                }
+                Err(_elapsed) => {
+                    // The original refresher is still running (state is still
+                    // `InFlight`).  Recursing here would re-subscribe and time
+                    // out again — unbounded recursion.  Return an error
+                    // directly; the caller decides whether to retry.
+                    warn!(
+                        timeout_ms = self.max_age.as_millis(),
+                        "timed out waiting for in-flight metadata refresh"
+                    );
+                    Err(KrafkaError::timeout(
+                        "metadata refresh timed out waiting for in-flight refresh",
+                    ))
+                }
+            };
+        }
+
+        // We are the refresher. The `RefreshGuard` ensures that all subscribers
+        // are notified and the state is reset to `Idle` even if this task is
+        // cancelled or the inner function panics.
+        let mut guard = RefreshGuard {
+            state: &self.refresh_state,
+            result: None,
+        };
+
+        let result = self.refresh_for_topics_inner(topics).await;
+        guard.result = Some(result.clone());
+        drop(guard); // drain subscribers and reset to Idle
+        result
+    }
+
+    /// Core metadata refresh logic.  Called only by `refresh_for_topics` once
+    /// the caller has claimed the refresher role; never called directly.
+    async fn refresh_for_topics_inner(&self, topics: Option<&[&str]>) -> Result<()> {
         // Enforce the minimum inter-refresh interval (mirrors `retry.backoff.ms`
-        // in the Java client). After acquiring the coalescing lock the previous
-        // holder may have just completed, so the interval is checked *inside* the
-        // lock to guarantee a single gate.
+        // in the Java client). The previous refresher may have just completed,
+        // so the interval is checked here (outside the coalescing gate) to
+        // guarantee a single gate.
         if let Some(backoff) = self.retry_backoff {
             let last = self.last_refresh_completed.lock();
             if let Some(last_ts) = *last {
@@ -405,7 +534,7 @@ impl ClusterMetadata {
             }
         }
 
-        // After acquiring the lock, check if the requested data is already fresh.
+        // Check if the requested data is already fresh.
         //
         // For partial refreshes: skip if every requested topic is present in the
         // cache and was refreshed within `max_age`. This deduplicates work when
@@ -572,10 +701,25 @@ impl ClusterMetadata {
     /// After rebootstrap, the failure-tracking timer is set to **now** (not
     /// cleared) so that the next refresh cycle starts timing immediately —
     /// matching the Java client's `metadataAttemptStartMs = Optional.of(now)`.
+    ///
+    /// # Warning: In-Flight Requests Are Cancelled
+    ///
+    /// `close_all()` closes every broker connection immediately. Any `Produce`,
+    /// `Fetch`, or `OffsetCommit` requests that are in flight at the time of
+    /// rebootstrap will be cancelled and return errors to their callers. Callers
+    /// that perform retries will retry after the pool reconnects; callers with
+    /// `acks=0` (fire-and-forget) or non-retryable errors may lose data.
+    ///
+    /// This is an inherent limitation of the connection-drop recovery strategy.
+    /// For zero-data-loss recovery, use `acks=all` with retries and a
+    /// [`TransactionalProducer`](crate::producer::TransactionalProducer).
     pub async fn rebootstrap(&self) {
-        info!("Rebootstrapping: closing all connections and resetting metadata (KIP-899)");
+        warn!(
+            "Rebootstrapping: closing all connections and cancelling in-flight requests (KIP-899). \
+             In-flight Produce/Fetch/Commit requests will return errors; retries will recover."
+        );
 
-        // Close all pooled connections.
+        // Close all pooled connections — this cancels all in-flight requests.
         self.pool.close_all().await;
 
         // Reset metadata cache to empty so `get_any_connection` goes straight

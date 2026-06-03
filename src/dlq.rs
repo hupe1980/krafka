@@ -120,7 +120,7 @@ pub trait DeadLetterQueue: Send + Sync + fmt::Debug {
 /// Build a [`ProducerRecord`] for routing a failed consumer record to a DLQ topic.
 ///
 /// The returned record carries the original record's key, value, and headers
-/// (translated to UTF-8 key strings via [`String::from_utf8_lossy`]), plus
+/// (translated to UTF-8 key strings; non-UTF-8 keys are hex-encoded with a `hex:` prefix), plus
 /// four provenance headers that make the origin of the failure traceable:
 ///
 /// | Header | Value |
@@ -145,14 +145,27 @@ pub fn build_dlq_record(
     error: &dyn fmt::Display,
 ) -> ProducerRecord {
     // Translate original headers: Kafka header keys are raw bytes, but
-    // ProducerRecord headers use String keys. Non-UTF-8 keys are lossily
-    // decoded — this preserves legibility without panicking.
+    // ProducerRecord headers use String keys. Non-UTF-8 keys are hex-encoded
+    // (prefixed with "hex:") so all bytes are preserved losslessly.
     let mut headers: Vec<(String, Bytes)> = original
         .headers
         .iter()
         .map(|(k, v)| {
             (
-                String::from_utf8_lossy(k).into_owned(),
+                // Validate UTF-8 in-place (zero-copy) before allocating;
+                // only call to_owned() once validity is confirmed.
+                match std::str::from_utf8(k) {
+                    Ok(s) => s.to_owned(),
+                    Err(_) => {
+                        use std::fmt::Write;
+                        let mut s = String::with_capacity(4 + k.len() * 2);
+                        s.push_str("hex:");
+                        for byte in k.iter() {
+                            let _ = write!(s, "{byte:02x}");
+                        }
+                        s
+                    }
+                },
                 v.clone().unwrap_or_default(),
             )
         })

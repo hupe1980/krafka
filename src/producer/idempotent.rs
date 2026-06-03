@@ -24,6 +24,26 @@
 //!
 //! > Within a single producer session (single PID), messages will not be duplicated.
 //!
+//! # Zombie Producer Fencing — Limitation
+//!
+//! Plain idempotent producers (without a `transactional.id`) do **not** provide
+//! zombie fencing. If a producer crashes and restarts, both the old instance (the
+//! "zombie") and the new instance may produce to the same partition simultaneously.
+//! The broker cannot distinguish between them because each obtains a new PID.
+//!
+//! This is a known limitation documented in KIP-360. The zombie scenario:
+//!
+//! 1. Producer A (epoch N) stalls due to a long GC pause.
+//! 2. Producer A restarts, obtains a new PID (epoch 0 on the new PID).
+//! 3. Original A wakes up and retries an old batch — broker accepts it
+//!    because the old PID+epoch+sequence are valid.
+//! 4. Both producers may now write to the same partition.
+//!
+//! For exactly-once semantics across producer restarts, use
+//! [`TransactionalProducer`](super::transaction::TransactionalProducer) with a
+//! stable `transactional.id`. The broker fences the old producer epoch when a new
+//! producer initialises with the same transactional ID (KIP-360).
+//!
 //! For exactly-once guarantees across producer restarts, use **transactions** with
 //! a stable `transactional.id`, which the broker uses to fence zombie producers.
 //!

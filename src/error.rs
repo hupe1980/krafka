@@ -173,6 +173,14 @@ impl From<io::Error> for KrafkaError {
     }
 }
 
+impl From<tokio::time::error::Elapsed> for KrafkaError {
+    fn from(_: tokio::time::error::Elapsed) -> Self {
+        Self::Timeout {
+            operation: "operation timed out".to_string(),
+        }
+    }
+}
+
 impl KrafkaError {
     /// Create a new network error from an I/O error.
     #[cold]

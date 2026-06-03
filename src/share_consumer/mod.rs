@@ -1082,6 +1082,38 @@ impl ShareConsumer {
 
     async fn flush_pending_acks(&self) -> Result<()> {
         let ack_state_generation = self.0.ack_state_generation.load(Ordering::SeqCst);
+
+        // If there are acks in the UNROUTED shard (no leader known at
+        // acknowledge() time), refresh metadata first so that
+        // `send_share_acknowledge_with_state` can resolve their leaders.
+        // This avoids an immediate "no leader for topic-partition" error on
+        // the very first `commit_sync()` call after a fetch that piggybacked
+        // the acks but hadn't yet routed them.
+        //
+        // IMPORTANT: collect the topic names while holding the read lock, then
+        // drop the lock *before* the async metadata refresh.  Holding an async
+        // RwLock guard across an await point stalls every writer that needs
+        // `pending_acks.write()` (including the `std::mem::take` below).
+        let unrouted_topics: HashSet<String> = {
+            let pending = self.0.pending_acks.read().await;
+            pending
+                .get(&UNROUTED_BROKER_ID)
+                .into_iter()
+                .flat_map(|m| m.values().flatten())
+                .map(|ack| ack.topic.clone())
+                .collect()
+        }; // read lock released here
+        if !unrouted_topics.is_empty() {
+            let topic_refs: Vec<&str> = unrouted_topics.iter().map(String::as_str).collect();
+            if let Err(err) = self.0.metadata.refresh_for_topics(Some(&topic_refs)).await {
+                warn!(
+                    error = %err,
+                    "commit_sync: metadata refresh for unrouted acks failed; \
+                     commit may fail with a leader-not-found error"
+                );
+            }
+        }
+
         let acks: Vec<PendingAck> = {
             let mut pending = self.0.pending_acks.write().await;
             std::mem::take(&mut *pending)
