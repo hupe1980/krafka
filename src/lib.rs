@@ -103,7 +103,6 @@
 //! | `schema-registry` | no | Confluent Schema Registry HTTP client. |
 //! | `aws-glue-schema-registry` | no | AWS Glue Schema Registry SDK client. |
 //! | `socks5` | no | SOCKS5 proxy support via `tokio-socks`. |
-//! | `danger-insecure-tls` | no | Allow disabling TLS certificate verification (MITM risk!). |
 //! | `telemetry` | no | OpenTelemetry exporter for producer/consumer metrics. |
 //! | `unstable-protocol` | no | Enables experimental protocol APIs (Share Consumer, KIP-932). APIs under this feature may change without semver notice. |
 //!
@@ -111,7 +110,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! krafka = { version = "0.9.1", default-features = false, features = ["lz4"] }
+//! krafka = { version = "0.11.0", default-features = false, features = ["lz4"] }
 //! ```
 
 #![cfg_attr(docsrs, feature(doc_cfg))]

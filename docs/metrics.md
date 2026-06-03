@@ -202,9 +202,19 @@ async fn main() {
 | `connections` | Gauge | Current active connections |
 | `buffered_records` | Gauge | Producer records currently admitted under the memory budget |
 | `send_latency_seconds` | Summary | Send latency statistics |
-| `topic_{name}_records_sent_total` | Counter | Records sent to a specific topic (per-topic) |
-| `topic_{name}_bytes_sent_total` | Counter | Bytes sent to a specific topic (per-topic) |
-| `topic_{name}_errors_total` | Counter | Send errors for a specific topic (per-topic) |
+| `topic_records_sent_total{topic="<name>"}` | Counter | Records sent to a specific topic (per-topic label) |
+| `topic_bytes_sent_total{topic="<name>"}` | Counter | Bytes sent to a specific topic (per-topic label) |
+| `topic_errors_total{topic="<name>"}` | Counter | Send errors for a specific topic (per-topic label) |
+
+Per-topic metrics use Prometheus labels. Example PromQL queries:
+
+```promql
+# Records sent per topic (rate over 5 min)
+rate(krafka_producer_topic_records_sent_total[5m])
+
+# Errors for a specific topic
+krafka_producer_topic_errors_total{topic="orders"}
+```
 
 `compression_ratio_avg` is available as a derived field in `ProducerMetricsSnapshot` (computed as `compressed_bytes / uncompressed_bytes`). A value of 0.3 means the codec reduced data to 30% of original size. The field is `None` when no compressed batches have been sent.
 

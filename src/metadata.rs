@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use parking_lot::Mutex as SyncMutex;
 use tokio::sync::oneshot;
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::error::{ErrorCode, KrafkaError, Result};
@@ -452,12 +453,22 @@ impl ClusterMetadata {
         }; // ← parking_lot lock released here, before any .await
 
         if let Some(rx) = subscriber_rx {
-            return match rx.await {
-                Ok(result) => result,
-                Err(_) => {
-                    // The refresher task was cancelled or panicked. Retry as a
-                    // new refresher rather than propagating a generic error.
+            // Bound the wait by `max_age` so that a stalled refresher (dead
+            // broker + long reconnection retries) cannot block subscribers
+            // indefinitely.  On timeout we fall through and retry as a new
+            // refresher — same behaviour as a cancelled refresher.
+            return match timeout(self.max_age, rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => {
+                    // The refresher task was cancelled or panicked.
                     warn!("in-flight metadata refresh was cancelled; retrying");
+                    Box::pin(self.refresh_for_topics(topics)).await
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        timeout_ms = self.max_age.as_millis(),
+                        "timed out waiting for in-flight metadata refresh; retrying as new refresher"
+                    );
                     Box::pin(self.refresh_for_topics(topics)).await
                 }
             };

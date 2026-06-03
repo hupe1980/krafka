@@ -636,20 +636,35 @@ impl CompactedTopicConsumer {
             .consumer
             .offsets_for_times_for_topic(&topic, -1)
             .await?;
-        let scan_target_hwms: HashMap<PartitionId, Offset> = hwm_results
-            .into_iter()
-            .filter_map(|(partition, result)| result.ok().map(|offset| (partition, offset)))
-            .collect();
 
-        if scan_target_hwms.is_empty() {
-            // All partitions are empty (no messages yet) — nothing to scan.
+        // Fail fast on any per-partition error: a missing partition in the
+        // target map causes `check_caught_up_at` to silently skip it, which
+        // would prematurely declare the scan complete without having consumed
+        // that partition's data.
+        let mut scan_target_hwms: HashMap<PartitionId, Offset> =
+            HashMap::with_capacity(hwm_results.len());
+        for (partition, result) in hwm_results {
+            let offset = result.map_err(|e| {
+                KrafkaError::invalid_state(format!(
+                    "failed to fetch high-watermark for '{topic}' partition {partition}: {e}"
+                ))
+            })?;
+            scan_target_hwms.insert(partition, offset);
+        }
+
+        if scan_target_hwms.values().all(|&hwm| hwm <= 0) {
+            // All partitions are empty (HWM = 0) — nothing to scan.
             self.caught_up = true;
             info!(
-                "Compacted topic '{}' is empty (all partitions at offset 0); scan complete",
+                "Compacted topic '{}' has no data yet (all partition HWMs = 0); scan complete",
                 self.topic
             );
             return Ok(());
         }
+
+        // Keep only non-empty partitions in the target map; empty partitions
+        // are satisfied immediately and don't need to be polled.
+        scan_target_hwms.retain(|_, &mut hwm| hwm > 0);
 
         info!(
             topic = %self.topic,
