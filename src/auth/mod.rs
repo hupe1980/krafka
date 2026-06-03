@@ -422,8 +422,8 @@ impl fmt::Debug for AwsMskIamCredentials {
 /// TLS configuration.
 ///
 /// Use [`TlsConfig::new()`] or [`Default::default()`] to construct.
-/// For insecure mode, enable the `danger-insecure-tls` feature and use
-/// `TlsConfig::insecure()`.
+/// For insecure mode (local development / self-signed certificates without a
+/// CA bundle), use [`TlsConfig::insecure()`].
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
     /// Path to CA certificate file.
@@ -470,18 +470,13 @@ impl TlsConfig {
     ///
     /// Create a TLS config that skips server certificate verification.
     ///
-    /// **Warning:** This disables TLS security entirely. Use only for local
-    /// development or testing with self-signed certificates. For production
-    /// use with self-signed certs, prefer [`with_ca_cert()`](Self::with_ca_cert)
-    /// to supply the CA certificate explicitly.
+    /// **Warning:** This disables TLS certificate verification entirely. Only
+    /// use for local development or testing. For production use with
+    /// self-signed certs, prefer [`with_ca_cert()`](Self::with_ca_cert) to
+    /// supply the CA certificate explicitly.
     ///
-    /// Requires the `danger-insecure-tls` crate feature **and** the env var
-    /// `KRAFKA_I_ACCEPT_DANGER_TLS=1` must be set at runtime, otherwise
-    /// connection setup will return a config error.  This double opt-in
-    /// prevents accidental use of insecure TLS in production builds where the
-    /// feature flag was inadvertently left enabled.
-    #[cfg(feature = "danger-insecure-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "danger-insecure-tls")))]
+    /// Setting this option emits a one-time `warn!` log at connection time so
+    /// the configuration is visible in production logs.
     pub fn insecure() -> Self {
         Self {
             verify_server_cert: false,

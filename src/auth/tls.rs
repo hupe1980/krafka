@@ -13,16 +13,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rustls::client::WantsClientCert;
-#[cfg(feature = "danger-insecure-tls")]
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-#[cfg(feature = "danger-insecure-tls")]
 use rustls::crypto::CryptoProvider;
-#[cfg(feature = "danger-insecure-tls")]
 use rustls::pki_types::UnixTime;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ConfigBuilder, RootCertStore};
-#[cfg(feature = "danger-insecure-tls")]
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 #[cfg(feature = "native-tls-roots")]
 use rustls_native_certs::load_native_certs;
@@ -30,7 +26,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
-#[cfg(any(feature = "danger-insecure-tls", feature = "native-tls-roots"))]
 use tracing::warn;
 
 use crate::auth::TlsConfig;
@@ -190,41 +185,19 @@ pub fn extract_tls_server_end_point(stream: &TlsStream<TcpStream>) -> Option<Vec
 /// in `spawn_blocking`.
 fn build_tls_config_sync(config: &TlsConfig) -> Result<ClientConfig> {
     if !config.verify_server_cert {
-        #[cfg(feature = "danger-insecure-tls")]
-        {
-            // In production builds, require an explicit opt-in env var so that
-            // accidentally-enabled insecure TLS fails loudly at runtime rather
-            // than silently.  Test builds skip this check: they can't safely
-            // mutate env vars (unsafe in edition 2024) and the compile-time
-            // feature flag is sufficient protection in a test context.
-            #[cfg(not(test))]
-            if std::env::var("KRAFKA_I_ACCEPT_DANGER_TLS").as_deref() != Ok("1") {
-                return Err(KrafkaError::config(
-                    "The 'danger-insecure-tls' feature is active but the required \
-                     acknowledgement env var is not set. \
-                     Set KRAFKA_I_ACCEPT_DANGER_TLS=1 to confirm you accept the security risk \
-                     of disabled TLS certificate verification. \
-                     Do NOT use in production.",
-                ));
-            }
-            use std::sync::Once;
-            static WARN_ONCE: Once = Once::new();
-            WARN_ONCE.call_once(|| {
-                warn!(
-                    "TLS certificate verification is disabled (verify_server_cert=false). \
-                     This is insecure and should only be used for local development."
-                );
-            });
-            return build_insecure_tls_config(config);
-        }
-        #[cfg(not(feature = "danger-insecure-tls"))]
-        {
-            return Err(KrafkaError::config(
-                "Insecure TLS mode (verify_server_cert=false) requires the \
-                 'danger-insecure-tls' crate feature. If you need self-signed certificates, \
-                 provide the CA certificate via TlsConfig::with_ca_cert() instead.",
-            ));
-        }
+        // Warn once so operators have log evidence that insecure TLS is active.
+        // Setting verify_server_cert=false is itself the explicit opt-in; no
+        // feature flag or env var is required (matching franz-go, sarama, librdkafka).
+        use std::sync::Once;
+        static WARN_ONCE: Once = Once::new();
+        WARN_ONCE.call_once(|| {
+            warn!(
+                "TLS certificate verification is disabled (verify_server_cert=false). \
+                 This is insecure and must only be used for local development or testing \
+                 with self-signed certificates. Never use in production."
+            );
+        });
+        return build_insecure_tls_config(config);
     }
 
     let root_store = load_root_store(config)?;
@@ -380,7 +353,6 @@ fn load_client_auth(
 /// Resolve the crypto provider: prefer the globally-installed default,
 /// fall back to the compiled-in backend (ring by default, aws-lc-rs when
 /// the `rustls-aws-lc-rs` feature is enabled).
-#[cfg(feature = "danger-insecure-tls")]
 fn resolve_crypto_provider() -> Arc<CryptoProvider> {
     CryptoProvider::get_default().cloned().unwrap_or_else(|| {
         #[cfg(feature = "rustls-aws-lc-rs")]
@@ -395,7 +367,6 @@ fn resolve_crypto_provider() -> Arc<CryptoProvider> {
 }
 
 /// Create the insecure builder that skips certificate verification.
-#[cfg(feature = "danger-insecure-tls")]
 fn insecure_builder(
     provider: Arc<CryptoProvider>,
 ) -> Result<ConfigBuilder<ClientConfig, WantsClientCert>> {
@@ -411,7 +382,6 @@ fn insecure_builder(
 ///
 /// **Warning:** This disables TLS security and must only be used for local
 /// development or testing. A `warn!` log is emitted by callers.
-#[cfg(feature = "danger-insecure-tls")]
 fn build_insecure_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
     let builder = insecure_builder(resolve_crypto_provider())?;
     let client_auth = load_client_auth(config)?;
@@ -429,20 +399,17 @@ fn build_insecure_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
 /// Carries a reference to the [`CryptoProvider`] used when building the
 /// [`ClientConfig`] so that [`supported_verify_schemes`] always returns schemes
 /// consistent with that provider (instead of relying on the global default).
-#[cfg(feature = "danger-insecure-tls")]
 #[derive(Debug)]
 struct NoServerCertVerifier {
     provider: Arc<CryptoProvider>,
 }
 
-#[cfg(feature = "danger-insecure-tls")]
 impl NoServerCertVerifier {
     fn new(provider: Arc<CryptoProvider>) -> Self {
         Self { provider }
     }
 }
 
-#[cfg(feature = "danger-insecure-tls")]
 impl ServerCertVerifier for NoServerCertVerifier {
     fn verify_server_cert(
         &self,
@@ -479,6 +446,11 @@ impl ServerCertVerifier for NoServerCertVerifier {
             .supported_schemes()
     }
 }
+
+// The `danger-insecure-tls` feature flag is retained in Cargo.toml as a no-op
+// for backwards compatibility. All insecure TLS code is now compiled
+// unconditionally — `TlsConfig::insecure()` / `verify_server_cert=false` is
+// the sole runtime opt-in. See FINDING-SEC-01 for rationale.
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -517,11 +489,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "danger-insecure-tls")]
     fn test_build_tls_config_insecure_succeeds() {
         setup_crypto_provider();
-        // The env-var check is skipped in #[cfg(test)] builds; the feature
-        // flag is the sufficient compile-time guard.
         let config = TlsConfig::insecure();
         let result = build_tls_config_sync(&config);
         assert!(

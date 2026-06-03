@@ -469,7 +469,12 @@ impl fmt::Debug for ScramClient {
     }
 }
 
-/// Generate a random nonce for SCRAM.
+/// Generate a cryptographically random nonce for SCRAM (RFC 5802 §5.1).
+///
+/// Uses [`rand::rng()`] which is backed by ChaCha12 seeded from the OS CSPRNG
+/// (`getrandom`), satisfying the RFC 5802 requirement that nonces use a
+/// cryptographically random source. The 24-byte nonce encodes to 32 base64
+/// characters, well above the minimum entropy recommended by RFC 5802.
 fn generate_nonce() -> String {
     let mut rng = rand::rng();
     let bytes: [u8; 24] = rng.random();

@@ -254,6 +254,15 @@ pub struct ConsumerConfig {
     /// which limits the no-data retry rate to ~100 iterations/second.
     /// Latency-sensitive callers may reduce this toward `Duration::ZERO`.
     pub(crate) idle_poll_backoff: Duration,
+    /// Maximum time allowed for the [`RebalanceListener::on_partitions_revoked`]
+    /// callback to complete before the consumer proceeds with revocation.
+    ///
+    /// If the callback exceeds this duration, the consumer logs a warning and
+    /// continues with the rebalance. A hung listener can otherwise cause
+    /// group coordinator session expiry and a forced rebalance loop.
+    ///
+    /// Default: 5 s, which is half the default `session_timeout` (10 s).
+    pub(crate) revocation_timeout: Duration,
 }
 
 impl Default for ConsumerConfig {
@@ -292,6 +301,7 @@ impl Default for ConsumerConfig {
             max_cooperative_rebalance_rounds: 10,
             lag_staleness_threshold: Duration::from_secs(60),
             idle_poll_backoff: Duration::from_millis(10),
+            revocation_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -463,6 +473,12 @@ impl ConsumerConfig {
     #[inline]
     pub fn idle_poll_backoff(&self) -> Duration {
         self.idle_poll_backoff
+    }
+
+    /// Returns the revocation callback timeout.
+    #[inline]
+    pub fn revocation_timeout(&self) -> Duration {
+        self.revocation_timeout
     }
 }
 
@@ -755,6 +771,15 @@ impl ConsumerConfigBuilder {
     /// Default: 10 ms.
     pub fn idle_poll_backoff(mut self, backoff: Duration) -> Self {
         self.config.idle_poll_backoff = backoff;
+        self
+    }
+
+    /// Set the maximum time allowed for the `on_partitions_revoked` callback.
+    ///
+    /// If the callback exceeds this duration, the consumer logs a warning and
+    /// proceeds with the rebalance. Default: 5 s.
+    pub fn revocation_timeout(mut self, timeout: Duration) -> Self {
+        self.config.revocation_timeout = timeout;
         self
     }
 

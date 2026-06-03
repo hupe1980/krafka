@@ -313,8 +313,10 @@ pub struct ConnectionConfig {
     /// until existing requests complete or time out. This prevents unbounded
     /// memory growth from a stalled broker or runaway producer.
     ///
-    /// Default: 256. Use 5 for idempotent producers to match Kafka's
-    /// `max.in.flight.requests.per.connection` guarantee.
+    /// Default: 10. This matches the Kafka Java client default and common Go
+    /// client defaults (franz-go). Use 5 for idempotent producers to match
+    /// Kafka's `max.in.flight.requests.per.connection` safety guarantee.
+    /// Use 1 for strictly-ordered partitions.
     pub(crate) max_in_flight_requests: usize,
     /// Maximum consecutive high-priority commands the event loop processes
     /// before forcing one normal-priority drain.
@@ -414,28 +416,9 @@ impl std::fmt::Debug for ConnectionConfig {
 
 impl Default for ConnectionConfig {
     fn default() -> Self {
-        Self {
-            connect_timeout: Duration::from_secs(10),
-            request_timeout: Duration::from_secs(30),
-            send_buffer_size: None,
-            recv_buffer_size: None,
-            nodelay: true,
-            client_id: "krafka".to_string(),
-            connections_per_broker: 1,
-            high_priority_channel_capacity: 64,
-            normal_priority_channel_capacity: 256,
-            max_response_size: crate::protocol::MAX_MESSAGE_SIZE,
-            max_in_flight_requests: 256,
-            max_high_priority_bypasses_per_round: 4,
-            auth: None,
-            tls_connector: Arc::new(ArcSwap::new(Arc::new(None))),
-            tcp_keepalive: Some(Duration::from_secs(60)),
-            connection_attempt_delay: Duration::from_millis(250),
-            msk_iam_clock_offset_secs: Arc::new(AtomicI64::new(0)),
-            connection_metrics: Arc::new(ConnectionMetrics::default()),
-            #[cfg(feature = "socks5")]
-            proxy: None,
-        }
+        ConnectionConfigBuilder::default()
+            .build()
+            .expect("default ConnectionConfig values are always valid")
     }
 }
 
@@ -599,8 +582,40 @@ impl ConnectionConfig {
 
 /// Builder for ConnectionConfig.
 #[must_use = "builders do nothing until .build() is called"]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ConnectionConfigBuilder(ConnectionConfig);
+
+impl Default for ConnectionConfigBuilder {
+    /// Creates a builder pre-populated with production-safe defaults.
+    ///
+    /// These are the **sole** authoritative default values for every field.
+    /// `ConnectionConfig::default()` delegates here and runs `build()`, so
+    /// all defaults are validated by the same rules as user-supplied configs.
+    fn default() -> Self {
+        ConnectionConfigBuilder(ConnectionConfig {
+            connect_timeout: Duration::from_secs(10),
+            request_timeout: Duration::from_secs(30),
+            send_buffer_size: None,
+            recv_buffer_size: None,
+            nodelay: true,
+            client_id: "krafka".to_string(),
+            connections_per_broker: 1,
+            high_priority_channel_capacity: 64,
+            normal_priority_channel_capacity: 256,
+            max_response_size: crate::protocol::MAX_MESSAGE_SIZE,
+            max_in_flight_requests: 10,
+            max_high_priority_bypasses_per_round: 4,
+            auth: None,
+            tls_connector: Arc::new(ArcSwap::new(Arc::new(None))),
+            tcp_keepalive: Some(Duration::from_secs(60)),
+            connection_attempt_delay: Duration::from_millis(250),
+            msk_iam_clock_offset_secs: Arc::new(AtomicI64::new(0)),
+            connection_metrics: Arc::new(ConnectionMetrics::default()),
+            #[cfg(feature = "socks5")]
+            proxy: None,
+        })
+    }
+}
 
 impl ConnectionConfigBuilder {
     /// Set the connect timeout.

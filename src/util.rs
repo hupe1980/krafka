@@ -25,13 +25,13 @@ thread_local! {
 #[derive(Debug, Clone)]
 pub struct BackoffPolicy {
     /// Initial backoff duration (first retry delay).
-    pub(crate) initial_backoff: Duration,
+    pub initial_backoff: Duration,
     /// Maximum backoff duration (caps exponential growth).
-    pub(crate) max_backoff: Duration,
+    pub max_backoff: Duration,
     /// Backoff multiplier for exponential growth (typically 2.0).
-    pub(crate) backoff_multiplier: f64,
+    pub backoff_multiplier: f64,
     /// Jitter factor (0.0–1.0) to randomize backoff and prevent thundering herd.
-    pub(crate) jitter_factor: f64,
+    pub jitter_factor: f64,
 }
 
 impl Default for BackoffPolicy {
