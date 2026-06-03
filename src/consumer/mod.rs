@@ -1965,8 +1965,8 @@ impl Consumer {
     /// `timestamp_ms` (milliseconds since Unix epoch).
     ///
     /// Uses the Kafka `ListOffsets` API to resolve the offset, then calls
-    /// [`seek`] on the resolved position. The seek takes effect on the next
-    /// [`recv`] / `poll` call.
+    /// [`seek`](Self::seek) on the resolved position. The seek takes effect on the next
+    /// [`recv`](Self::recv) / `poll` call.
     ///
     /// # Errors
     ///
