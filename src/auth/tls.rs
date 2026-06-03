@@ -447,11 +447,6 @@ impl ServerCertVerifier for NoServerCertVerifier {
     }
 }
 
-// The `danger-insecure-tls` feature flag is retained in Cargo.toml as a no-op
-// for backwards compatibility. All insecure TLS code is now compiled
-// unconditionally — `TlsConfig::insecure()` / `verify_server_cert=false` is
-// the sole runtime opt-in. See FINDING-SEC-01 for rationale.
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {

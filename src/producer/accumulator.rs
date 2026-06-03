@@ -10,6 +10,7 @@
 //! providing low latency through the linger timer mechanism.
 
 use ahash::AHashMap;
+use bytes::BufMut as _;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -30,7 +31,7 @@ use crate::metadata::ClusterMetadata;
 use crate::metrics::ProducerMetrics;
 use crate::protocol::{
     ApiKey, Compression, ProducePartitionData, ProduceRequest, ProduceResponse, ProduceTopicData,
-    RecordBatchBuilder, VersionedDecode, VersionedEncode, versions,
+    RecordBatchBuilder, VersionedDecode, versions,
 };
 
 /// Maximum number of concurrent `send_extracted_batch` tasks across **all**
@@ -1347,30 +1348,37 @@ impl RecordAccumulator {
                 produce_version = 12;
             }
 
-            if let Err(error) = super::validate_produce_request_size(
+            let encoded_body = match super::encode_and_validate_produce_request(
                 &config.client_id,
                 config.max_request_size,
                 produce_version,
                 &request,
             ) {
-                if let (Some(identity), Some(_)) = (config.identity.as_ref(), sequence) {
-                    let _ =
-                        identity.rollback_sequence_range(topic.as_ref(), partition, record_count);
+                Ok(b) => b,
+                Err(error) => {
+                    if let (Some(identity), Some(_)) = (config.identity.as_ref(), sequence) {
+                        let _ = identity.rollback_sequence_range(
+                            topic.as_ref(),
+                            partition,
+                            record_count,
+                        );
+                    }
+                    metrics.record_error();
+                    for pending_record in pending {
+                        let _ = pending_record
+                            .response_tx
+                            .send(AppendResponse::Done(Err(error.clone())));
+                    }
+                    return;
                 }
-                metrics.record_error();
-                for pending_record in pending {
-                    let _ = pending_record
-                        .response_tx
-                        .send(AppendResponse::Done(Err(error.clone())));
-                }
-                return;
-            }
+            };
 
             // acks=0 (fire-and-forget): Kafka sends no response (R6.1 fix)
             if config.acks == 0 {
                 match conn
                     .send_fire_and_forget(ApiKey::Produce, produce_version, |buf| {
-                        request.encode_versioned(produce_version, buf)
+                        buf.put_slice(&encoded_body);
+                        Ok(())
                     })
                     .await
                 {
@@ -1391,7 +1399,8 @@ impl RecordAccumulator {
 
             let response_result = conn
                 .send_request(ApiKey::Produce, produce_version, |buf| {
-                    request.encode_versioned(produce_version, buf)
+                    buf.put_slice(&encoded_body);
+                    Ok(())
                 })
                 .await;
 

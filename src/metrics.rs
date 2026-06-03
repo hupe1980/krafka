@@ -488,6 +488,32 @@ pub trait MetricsExporter {
 
     /// Export a latency tracker metric with count, sum, min, max, and avg.
     fn export_latency(&mut self, name: &str, help: &str, snapshot: &LatencySnapshot);
+
+    /// Export a counter with attached key-value labels.
+    ///
+    /// The canonical form in Prometheus is:
+    /// `metric_name_total{label_key="label_value"} <value>`.
+    ///
+    /// The default implementation embeds label values in the metric name
+    /// (e.g. `name_<value>`) for exporters that do not natively support
+    /// labels. Override this to emit proper labeled output.
+    fn export_labeled_counter(
+        &mut self,
+        name: &str,
+        help: &str,
+        labels: &[(&str, &str)],
+        value: u64,
+    ) {
+        // Fallback: embed label values in the metric name so the metric is
+        // still visible in exporters that don't support labels.
+        let suffix = labels.iter().map(|(_, v)| *v).collect::<Vec<_>>().join("_");
+        let full_name = if suffix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name}_{suffix}")
+        };
+        self.export_counter(&full_name, help, value);
+    }
 }
 
 /// Trait for types that can export their metrics through a [`MetricsExporter`].
@@ -527,8 +553,15 @@ pub trait MetricsVisitable {
 ///
 /// Each counter is emitted with a `_total` suffix, latency trackers emit
 /// `_seconds_count`, `_seconds_sum`, `_seconds_min`, and `_seconds_max`.
+///
+/// Labeled counters (e.g. per-topic metrics) are emitted as:
+/// `metric_name_total{label_key="label_value"} <value>`.
 pub struct PrometheusExporter {
     output: String,
+    /// Tracks metric family names for which the `# HELP` / `# TYPE` header
+    /// has already been emitted, ensuring each family header appears exactly
+    /// once per scrape per the Prometheus text format specification.
+    declared_families: std::collections::HashSet<String>,
 }
 
 impl PrometheusExporter {
@@ -536,6 +569,7 @@ impl PrometheusExporter {
     pub fn new() -> Self {
         Self {
             output: String::with_capacity(4096),
+            declared_families: std::collections::HashSet::new(),
         }
     }
 
@@ -571,6 +605,20 @@ fn sanitize_prometheus_name(name: &str) -> String {
     out
 }
 
+/// Escape a Prometheus label value: backslash and double-quote must be escaped.
+fn escape_prometheus_label_value(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for ch in v.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 impl MetricsExporter for PrometheusExporter {
     fn export_counter(&mut self, name: &str, help: &str, value: u64) {
         let name = sanitize_prometheus_name(name);
@@ -584,6 +632,40 @@ impl MetricsExporter for PrometheusExporter {
         let _ = writeln!(self.output, "# HELP {} {}", name, help);
         let _ = writeln!(self.output, "# TYPE {} gauge", name);
         let _ = writeln!(self.output, "{} {}", name, value);
+    }
+
+    /// Export a labeled counter in proper Prometheus text format.
+    ///
+    /// Emits `# HELP` and `# TYPE` exactly once per metric family name
+    /// (across all calls to this exporter instance), then emits one sample
+    /// line per call:
+    /// ```text
+    /// krafka_producer_topic_records_sent_total{topic="orders"} 42
+    /// ```
+    fn export_labeled_counter(
+        &mut self,
+        name: &str,
+        help: &str,
+        labels: &[(&str, &str)],
+        value: u64,
+    ) {
+        let name = sanitize_prometheus_name(name);
+        let full_name = format!("{name}_total");
+        if !self.declared_families.contains(&full_name) {
+            let _ = writeln!(self.output, "# HELP {} {}", full_name, help);
+            let _ = writeln!(self.output, "# TYPE {} counter", full_name);
+            self.declared_families.insert(full_name.clone());
+        }
+        if labels.is_empty() {
+            let _ = writeln!(self.output, "{} {}", full_name, value);
+        } else {
+            let label_str = labels
+                .iter()
+                .map(|(k, v)| format!("{}=\"{}\"", k, escape_prometheus_label_value(v)))
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = writeln!(self.output, "{}{{{}}} {}", full_name, label_str, value);
+        }
     }
 
     fn export_latency(&mut self, name: &str, help: &str, snapshot: &LatencySnapshot) {
@@ -724,6 +806,27 @@ impl MetricsExporter for JsonExporter {
         ));
     }
 
+    fn export_labeled_counter(
+        &mut self,
+        name: &str,
+        help: &str,
+        labels: &[(&str, &str)],
+        value: u64,
+    ) {
+        let labels_json = labels
+            .iter()
+            .map(|(k, v)| format!("\"{}\":\"{}\"", json_escape(k), json_escape(v)))
+            .collect::<Vec<_>>()
+            .join(",");
+        self.entries.push(format!(
+            "{{\"name\":\"{}\",\"type\":\"counter\",\"help\":\"{}\",\"labels\":{{{}}},\"value\":{}}}",
+            json_escape(name),
+            json_escape(help),
+            labels_json,
+            value,
+        ));
+    }
+
     fn export_latency(&mut self, name: &str, help: &str, snapshot: &LatencySnapshot) {
         let min_str = snapshot
             .min
@@ -822,28 +925,46 @@ impl MetricsVisitable for ProducerMetrics {
             "Send latency",
             &self.send_latency.snapshot(),
         );
-        // Per-topic counters
-        let topic_map = self.topic_metrics.lock();
-        let mut topics: Vec<&str> = topic_map.keys().map(String::as_str).collect();
-        topics.sort_unstable();
-        for topic in topics {
-            if let Some(m) = topic_map.get(topic) {
-                exporter.export_counter(
-                    &format!("{prefix}_topic_{topic}_records_sent"),
-                    "Records sent to this topic",
-                    m.records_sent.get(),
-                );
-                exporter.export_counter(
-                    &format!("{prefix}_topic_{topic}_bytes_sent"),
-                    "Bytes sent to this topic",
-                    m.bytes_sent.get(),
-                );
-                exporter.export_counter(
-                    &format!("{prefix}_topic_{topic}_errors"),
-                    "Send errors for this topic",
-                    m.errors.get(),
-                );
-            }
+        // Per-topic counters: snapshot the map while locked, then release the
+        // lock before calling the exporter.  This avoids holding the mutex
+        // across potentially slow exporter I/O and unblocks hot-path calls to
+        // `record_send_for_topic` / `record_error_for_topic`.
+        // Topics are sorted so Prometheus output is deterministic.
+        let topic_snapshots: Vec<(String, u64, u64, u64)> = {
+            let map = self.topic_metrics.lock();
+            let mut snapshots: Vec<(String, u64, u64, u64)> = map
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        v.records_sent.get(),
+                        v.bytes_sent.get(),
+                        v.errors.get(),
+                    )
+                })
+                .collect();
+            snapshots.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            snapshots
+        }; // lock released here
+        for (topic, records, bytes, errors) in &topic_snapshots {
+            exporter.export_labeled_counter(
+                &format!("{prefix}_topic_records_sent"),
+                "Records sent to this topic",
+                &[("topic", topic.as_str())],
+                *records,
+            );
+            exporter.export_labeled_counter(
+                &format!("{prefix}_topic_bytes_sent"),
+                "Bytes sent to this topic",
+                &[("topic", topic.as_str())],
+                *bytes,
+            );
+            exporter.export_labeled_counter(
+                &format!("{prefix}_topic_errors"),
+                "Send errors for this topic",
+                &[("topic", topic.as_str())],
+                *errors,
+            );
         }
     }
 }

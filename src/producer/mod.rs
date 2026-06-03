@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use bytes::{BufMut as _, Bytes};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
@@ -345,20 +345,33 @@ fn request_header_size(api_key: ApiKey, api_version: i16, client_id: &str) -> Re
     }
 }
 
-/// Measure the total wire frame size of a `ProduceRequest` by encoding the
-/// body into a scratch buffer and summing the header and length prefix.
+/// Encode the request body, validate the total wire frame size, and return
+/// the encoded body bytes.
 ///
-/// This is the single source of truth for produce frame size — it uses the
+/// Returning the bytes avoids a second encode in the send path — callers
+/// write the pre-encoded body directly into the connection's I/O buffer.
+///
+/// This is the single source of truth for produce frame sizing — it uses the
 /// real encoder rather than a separate analytical size-computation path,
 /// which would otherwise need to be kept in sync with every encoding change.
-fn measure_produce_request_frame_size(
+fn encode_and_validate_produce_request(
     client_id: &str,
+    max_request_size: usize,
     api_version: i16,
     request: &ProduceRequest,
-) -> Result<usize> {
+) -> Result<Bytes> {
     let mut body = bytes::BytesMut::new();
     request.encode_versioned(api_version, &mut body)?;
-    Ok(4 + request_header_size(ApiKey::Produce, api_version, client_id)? + body.len())
+    let frame_size = 4 + request_header_size(ApiKey::Produce, api_version, client_id)? + body.len();
+    if frame_size > max_request_size {
+        return Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidLength,
+            format!(
+                "produce request size {frame_size} exceeds max_request_size {max_request_size}"
+            ),
+        ));
+    }
+    Ok(body.freeze())
 }
 
 /// Populate `topic_id` fields for Produce v13+ (KIP-516).
@@ -382,25 +395,6 @@ pub(crate) fn fill_produce_topic_ids(
         }
     }
     all_resolved
-}
-
-fn validate_produce_request_size(
-    client_id: &str,
-    max_request_size: usize,
-    api_version: i16,
-    request: &ProduceRequest,
-) -> Result<()> {
-    let frame_size = measure_produce_request_frame_size(client_id, api_version, request)?;
-    if frame_size > max_request_size {
-        return Err(KrafkaError::protocol_kind(
-            ProtocolErrorKind::InvalidLength,
-            format!(
-                "produce request size {frame_size} exceeds max_request_size {max_request_size}"
-            ),
-        ));
-    }
-
-    Ok(())
 }
 
 impl Producer {
@@ -1151,7 +1145,9 @@ impl Producer {
             request
         };
 
-        validate_produce_request_size(
+        // Encode once and validate frame size.  The encoded body is reused in
+        // the I/O path below, eliminating a second encode on the hot path.
+        let encoded_body = encode_and_validate_produce_request(
             &self.config.client_id,
             self.config.max_request_size,
             version,
@@ -1161,7 +1157,8 @@ impl Producer {
         // acks=0 (fire-and-forget): Kafka sends no response, so don't wait for one (R6.1 fix)
         if self.config.acks == Acks::None {
             conn.send_fire_and_forget(ApiKey::Produce, version, |buf| {
-                effective_request.encode_versioned(version, buf)
+                buf.put_slice(&encoded_body);
+                Ok(())
             })
             .await?;
 
@@ -1176,7 +1173,8 @@ impl Producer {
         // Send request and wait for response (acks=1 or acks=-1/all)
         let response = conn
             .send_request(ApiKey::Produce, version, |buf| {
-                effective_request.encode_versioned(version, buf)
+                buf.put_slice(&encoded_body);
+                Ok(())
             })
             .await?;
 
@@ -1924,8 +1922,9 @@ mod tests {
             }],
         };
 
-        let error = validate_produce_request_size("client", 128, versions::PRODUCE_MIN, &request)
-            .expect_err("oversized frame should be rejected");
+        let error =
+            encode_and_validate_produce_request("client", 128, versions::PRODUCE_MIN, &request)
+                .expect_err("oversized frame should be rejected");
 
         assert!(error.to_string().contains("max_request_size"));
     }
@@ -1947,13 +1946,22 @@ mod tests {
             }],
         };
 
-        let exact_size =
-            measure_produce_request_frame_size("client", versions::PRODUCE_MAX, &request).unwrap();
+        // Encode with a permissive limit to recover the actual frame size.
+        let encoded = encode_and_validate_produce_request(
+            "client",
+            usize::MAX,
+            versions::PRODUCE_MAX,
+            &request,
+        )
+        .unwrap();
+        let exact_size = 4
+            + request_header_size(ApiKey::Produce, versions::PRODUCE_MAX, "client").unwrap()
+            + encoded.len();
 
-        validate_produce_request_size("client", exact_size, versions::PRODUCE_MAX, &request)
+        encode_and_validate_produce_request("client", exact_size, versions::PRODUCE_MAX, &request)
             .unwrap();
 
-        let error = validate_produce_request_size(
+        let error = encode_and_validate_produce_request(
             "client",
             exact_size.saturating_sub(1),
             versions::PRODUCE_MAX,
@@ -1980,7 +1988,7 @@ mod tests {
             }],
         };
 
-        let error = validate_produce_request_size("client", 1024, 13, &request).unwrap_err();
+        let error = encode_and_validate_produce_request("client", 1024, 13, &request).unwrap_err();
         assert!(error.to_string().contains("topic_id is required"));
     }
 
