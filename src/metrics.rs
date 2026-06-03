@@ -62,6 +62,7 @@
 //! let all_metrics = krafka_metrics.to_prometheus_text();
 //! ```
 
+use ahash::AHashMap;
 use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -197,10 +198,10 @@ pub struct LatencyTracker {
     sum_nanos: AtomicU64,
     min_nanos: AtomicU64,
     max_nanos: AtomicU64,
-    /// Sub-divided power-of-2 histogram: 256 buckets.
+    /// Sub-divided power-of-2 histogram: 512 buckets.
     /// See [`Self::bucket_for`] and [`Self::estimate_nanos_for_bucket`]
     /// for the encoding details.
-    histogram: [AtomicU64; 256],
+    histogram: [AtomicU64; 512],
 }
 
 impl Default for LatencyTracker {
@@ -221,54 +222,62 @@ impl LatencyTracker {
         }
     }
 
-    /// Map a nanosecond value to a histogram bucket index (0–255).
+    /// Map a nanosecond value to a histogram bucket index (0–511).
     ///
     /// Encoding:
     /// - Bucket 0  : `nanos == 0`
-    /// - Bucket 1  : `nanos ∈ [1, 4)` (sub-nanosecond resolution, merged)
-    /// - Bucket `(i-2)*4 + 2 + j` : band `i` (i ≥ 2), sub-bucket `j` (0–3),
-    ///   where `j = (nanos >> (i-2)) & 3`.
+    /// - Bucket 1  : `nanos == 1`
+    /// - Bucket 2  : `nanos ∈ [2, 4)` (nanos ∈ {2, 3})
+    /// - Bucket 3  : `nanos ∈ [4, 8)` (nanos ∈ {4, 5, 6, 7})
+    /// - Bucket `(i-3)*8 + 4 + j` : band `i` (i ≥ 3), sub-bucket `j` (0–7),
+    ///   where `j = (nanos >> (i-3)) & 7`.
     ///
-    /// Each of the 62 bands `[2^i, 2^(i+1))` for `i ∈ [2, 63]` is split into
-    /// 4 equal sub-buckets of width `2^(i-2)`, giving ≤ 12.5 % relative error.
+    /// Each of the 61 bands `[2^i, 2^(i+1))` for `i ∈ [3, 63]` is split into
+    /// 8 equal sub-buckets of width `2^(i-3)`, giving ≤ 6.25 % relative error.
     #[inline]
     fn bucket_for(nanos: u64) -> usize {
         if nanos == 0 {
             return 0;
         }
         let i = (63 - nanos.leading_zeros()) as usize; // floor(log2(nanos))
-        if i < 2 {
-            // nanos ∈ {1,2,3}: merge into a single low-resolution bucket.
-            return 1;
+        match i {
+            0 => 1, // nanos == 1
+            1 => 2, // nanos ∈ {2, 3}
+            2 => 3, // nanos ∈ {4, 5, 6, 7}
+            _ => {
+                // i >= 3: split band [2^i, 2^(i+1)) into 8 sub-buckets.
+                let sub = ((nanos >> (i - 3)) & 7) as usize;
+                ((i - 3) * 8 + 4 + sub).min(511)
+            }
         }
-        let sub = ((nanos >> (i - 2)) & 3) as usize;
-        ((i - 2) * 4 + 2 + sub).min(255)
     }
 
     /// Return the midpoint nanosecond estimate for a bucket index.
     ///
     /// For band `i ≥ 3` and sub-bucket `j`:
-    ///   midpoint = `2^i + j × 2^(i-2) + 2^(i-3)`
+    ///   midpoint = `2^i + j × 2^(i-3) + 2^(i-4)` (half a sub-bucket width)
     ///
-    /// The maximum relative error of this estimate is ≤ 12.5 %.
+    /// For `i == 3` (sub-bucket width = 1 ns) the midpoint equals the lower
+    /// bound exactly (no fractional ns).
+    ///
+    /// The maximum relative error of this estimate is ≤ 6.25 %.
     #[inline]
     fn estimate_nanos_for_bucket(bucket: usize) -> u64 {
         match bucket {
             0 => 0,
-            1 => 2, // midpoint of integer range [1, 4)
+            1 => 1, // exact: only nanos == 1 maps here
+            2 => 3, // midpoint of [2, 4): (2 + 3) / 2 = 2.5 → round up to 3
+            3 => 6, // midpoint of [4, 8): (4 + 7) / 2 = 5.5 → round up to 6
             _ => {
-                let idx = bucket - 2;
-                let band = idx / 4 + 2;
-                let sub = idx % 4;
-                if band == 2 {
-                    // Width = 1 ns per sub-bucket → exact integer value.
-                    4u64 + sub as u64
-                } else {
-                    let lower = 1u64 << band;
-                    let sub_width = 1u64 << (band - 2);
-                    let half_sub = 1u64 << (band - 3);
-                    lower + sub as u64 * sub_width + half_sub
-                }
+                let idx = bucket - 4;
+                let band = idx / 8 + 3; // i ≥ 3
+                let sub = idx % 8;
+                let lower = 1u64 << band;
+                let sub_width = 1u64 << (band - 3);
+                // half_sub_width: 0 for i==3 (width=1, no fractional midpoint),
+                // 2^(i-4) for i>=4.
+                let half_sub = if band >= 4 { 1u64 << (band - 4) } else { 0 };
+                lower + sub as u64 * sub_width + half_sub
             }
         }
     }
@@ -344,8 +353,10 @@ impl LatencyTracker {
     /// # Accuracy
     ///
     /// The estimate uses the sub-bucket midpoint for the bucket containing the
-    /// target rank.  The **maximum relative error is ≤ 12.5 %** — suitable
-    /// for tight SLO alerting (e.g. p99 < 50 ms thresholds).
+    /// target rank.  The **maximum relative error is ≤ 6.25 %** — each
+    /// power-of-2 band is split into 8 equal sub-buckets, so the worst-case
+    /// bucket spans at most 12.5 % of its band, and the midpoint estimate
+    /// falls within 6.25 % of the true value.
     pub fn percentile(&self, percentile: f64) -> Option<Duration> {
         let total = self.count();
         if total == 0 {
@@ -811,6 +822,29 @@ impl MetricsVisitable for ProducerMetrics {
             "Send latency",
             &self.send_latency.snapshot(),
         );
+        // Per-topic counters
+        let topic_map = self.topic_metrics.lock();
+        let mut topics: Vec<&str> = topic_map.keys().map(String::as_str).collect();
+        topics.sort_unstable();
+        for topic in topics {
+            if let Some(m) = topic_map.get(topic) {
+                exporter.export_counter(
+                    &format!("{prefix}_topic_{topic}_records_sent"),
+                    "Records sent to this topic",
+                    m.records_sent.get(),
+                );
+                exporter.export_counter(
+                    &format!("{prefix}_topic_{topic}_bytes_sent"),
+                    "Bytes sent to this topic",
+                    m.bytes_sent.get(),
+                );
+                exporter.export_counter(
+                    &format!("{prefix}_topic_{topic}_errors"),
+                    "Send errors for this topic",
+                    m.errors.get(),
+                );
+            }
+        }
     }
 }
 
@@ -1121,6 +1155,7 @@ impl KrafkaMetrics {
         self.producer.buffered_records.set(0);
         self.producer.compressed_bytes.reset();
         self.producer.uncompressed_bytes.reset();
+        self.producer.topic_metrics.lock().clear();
 
         self.connection.connections_created.reset();
         self.connection.connections_closed.reset();
@@ -1135,6 +1170,33 @@ impl KrafkaMetrics {
         self.connection.connect_latency.reset();
         self.connection.tls_handshake_latency.reset();
     }
+}
+
+/// Per-topic counters tracked inside [`ProducerMetrics`].
+///
+/// Accessed via [`ProducerMetrics::topic_snapshot`].
+#[derive(Debug, Default)]
+pub struct TopicProducerMetrics {
+    /// Number of records sent successfully to this topic.
+    pub records_sent: Counter,
+    /// Number of bytes sent to this topic.
+    pub bytes_sent: Counter,
+    /// Number of send errors for this topic.
+    pub errors: Counter,
+}
+
+/// Snapshot of per-topic producer metrics.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct TopicProducerMetricsSnapshot {
+    /// Topic name.
+    pub topic: String,
+    /// Number of records sent successfully.
+    pub records_sent: u64,
+    /// Number of bytes sent.
+    pub bytes_sent: u64,
+    /// Number of send errors.
+    pub errors: u64,
 }
 
 /// Producer metrics.
@@ -1168,6 +1230,13 @@ pub struct ProducerMetrics {
     /// These values are derived from batch-size estimates and are best-effort
     /// rather than exact protocol-frame byte counts.
     pub uncompressed_bytes: Counter,
+    /// Per-topic counters (records_sent, bytes_sent, errors).
+    ///
+    /// Populated by [`record_send_for_topic`](Self::record_send_for_topic) and
+    /// [`record_error_for_topic`](Self::record_error_for_topic).
+    /// Exported via [`export_metrics`](MetricsVisitable::export_metrics) with
+    /// prefix `{prefix}_topic_{name}_*`.
+    topic_metrics: parking_lot::Mutex<AHashMap<String, TopicProducerMetrics>>,
 }
 
 impl ProducerMetrics {
@@ -1194,6 +1263,46 @@ impl ProducerMetrics {
     #[inline]
     pub fn record_error(&self) {
         self.errors.inc();
+    }
+
+    /// Record a send error for a specific topic.
+    ///
+    /// Updates both the global error counter and the per-topic error counter.
+    #[inline]
+    pub fn record_error_for_topic(&self, topic: &str) {
+        self.errors.inc();
+        let mut map = self.topic_metrics.lock();
+        map.entry(topic.to_string()).or_default().errors.inc();
+    }
+
+    /// Record a successful send and update per-topic counters.
+    ///
+    /// This method updates both the global counters and the per-topic
+    /// `records_sent` and `bytes_sent` for the given topic name.
+    #[inline]
+    pub fn record_send_for_topic(&self, topic: &str, bytes: u64) {
+        self.records_sent.inc();
+        self.bytes_sent.add(bytes);
+        let mut map = self.topic_metrics.lock();
+        let entry = map.entry(topic.to_string()).or_default();
+        entry.records_sent.inc();
+        entry.bytes_sent.add(bytes);
+    }
+
+    /// Return per-topic metric snapshots sorted by topic name.
+    pub fn topic_snapshot(&self) -> Vec<TopicProducerMetricsSnapshot> {
+        let map = self.topic_metrics.lock();
+        let mut out: Vec<TopicProducerMetricsSnapshot> = map
+            .iter()
+            .map(|(topic, m)| TopicProducerMetricsSnapshot {
+                topic: topic.clone(),
+                records_sent: m.records_sent.get(),
+                bytes_sent: m.bytes_sent.get(),
+                errors: m.errors.get(),
+            })
+            .collect();
+        out.sort_unstable_by(|a, b| a.topic.cmp(&b.topic));
+        out
     }
 
     /// Record a retry.
@@ -1236,6 +1345,7 @@ impl ProducerMetrics {
             compressed_bytes: compressed,
             uncompressed_bytes: uncompressed,
             compression_ratio_avg,
+            topic_metrics: self.topic_snapshot(),
         }
     }
 }
@@ -1270,6 +1380,12 @@ pub struct ProducerMetricsSnapshot {
     /// expansion (possible for incompressible or already-compressed inputs).
     /// `None` when no compressed batches have been sent yet.
     pub compression_ratio_avg: Option<f64>,
+    /// Per-topic metric snapshots sorted by topic name.
+    ///
+    /// Populated from [`ProducerMetrics::topic_snapshot`]. Empty until at least
+    /// one call to [`record_send_for_topic`](ProducerMetrics::record_send_for_topic)
+    /// or [`record_error_for_topic`](ProducerMetrics::record_error_for_topic).
+    pub topic_metrics: Vec<TopicProducerMetricsSnapshot>,
 }
 
 /// Consumer metrics.
@@ -2108,55 +2224,54 @@ mod tests {
     fn test_bucket_for_zero_and_small() {
         assert_eq!(LatencyTracker::bucket_for(0), 0);
         assert_eq!(LatencyTracker::bucket_for(1), 1);
-        assert_eq!(LatencyTracker::bucket_for(2), 1);
-        assert_eq!(LatencyTracker::bucket_for(3), 1);
-        // Band i=2: [4,8), sub = nanos & 3 → (i-2)*4+2+sub = 0+2+sub
-        assert_eq!(LatencyTracker::bucket_for(4), 2);
+        // i=1: nanos ∈ {2, 3} → bucket 2
+        assert_eq!(LatencyTracker::bucket_for(2), 2);
+        assert_eq!(LatencyTracker::bucket_for(3), 2);
+        // i=2: nanos ∈ [4, 8) → bucket 3
+        assert_eq!(LatencyTracker::bucket_for(4), 3);
         assert_eq!(LatencyTracker::bucket_for(5), 3);
-        assert_eq!(LatencyTracker::bucket_for(6), 4);
-        assert_eq!(LatencyTracker::bucket_for(7), 5);
-        // Band i=3: [8,16), sub = (nanos>>1)&3 → 1*4+2+sub = 6+sub
-        assert_eq!(LatencyTracker::bucket_for(8), 6); // sub=0
-        assert_eq!(LatencyTracker::bucket_for(9), 6); // sub=0
-        assert_eq!(LatencyTracker::bucket_for(10), 7); // sub=1
-        assert_eq!(LatencyTracker::bucket_for(14), 9); // sub=3
-        assert_eq!(LatencyTracker::bucket_for(15), 9); // sub=3
-        // Band i=4: [16,32), sub = (nanos>>2)&3 → 2*4+2+sub = 10+sub
-        assert_eq!(LatencyTracker::bucket_for(16), 10);
-        assert_eq!(LatencyTracker::bucket_for(20), 11);
-        assert_eq!(LatencyTracker::bucket_for(24), 12);
-        assert_eq!(LatencyTracker::bucket_for(28), 13);
-        assert_eq!(LatencyTracker::bucket_for(31), 13);
+        assert_eq!(LatencyTracker::bucket_for(6), 3);
+        assert_eq!(LatencyTracker::bucket_for(7), 3);
+        // i=3: [8, 16) → 8 sub-buckets, sub = (nanos >> 0) & 7 = nanos-8
+        // bucket = (3-3)*8+4+sub = 4+sub
+        assert_eq!(LatencyTracker::bucket_for(8), 4); // sub=0
+        assert_eq!(LatencyTracker::bucket_for(9), 5); // sub=1
+        assert_eq!(LatencyTracker::bucket_for(10), 6); // sub=2
+        assert_eq!(LatencyTracker::bucket_for(14), 10); // sub=6
+        assert_eq!(LatencyTracker::bucket_for(15), 11); // sub=7
+        // i=4: [16, 32) → sub = (nanos >> 1) & 7 → bucket = 1*8+4+sub = 12+sub
+        assert_eq!(LatencyTracker::bucket_for(16), 12); // sub=0
+        assert_eq!(LatencyTracker::bucket_for(18), 13); // sub=1
+        assert_eq!(LatencyTracker::bucket_for(24), 16); // sub=4
+        assert_eq!(LatencyTracker::bucket_for(28), 18); // sub=6
+        assert_eq!(LatencyTracker::bucket_for(31), 19); // sub=7
     }
 
     #[test]
     fn test_estimate_nanos_for_bucket_correctness() {
         assert_eq!(LatencyTracker::estimate_nanos_for_bucket(0), 0);
-        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(1), 2);
-        // Band i=2, exact integers
-        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(2), 4);
-        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(3), 5);
-        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(4), 6);
-        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(5), 7);
-        // Band i=3: lower=8, sub_width=2, half_sub=1 → 8 + sub*2 + 1
-        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(6), 9); // [8,10) midpoint=9
-        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(7), 11); // [10,12) midpoint=11
-        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(8), 13); // [12,14) midpoint=13
-        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(9), 15); // [14,16) midpoint=15
-        // Band i=4: lower=16, sub_width=4, half_sub=2 → 16 + sub*4 + 2
-        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(10), 18); // [16,20) midpoint=18
-        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(11), 22); // [20,24) midpoint=22
-        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(12), 26); // [24,28) midpoint=26
-        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(13), 30); // [28,32) midpoint=30
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(1), 1);
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(2), 3); // midpoint of [2,4)
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(3), 6); // midpoint of [4,8)
+        // Band i=3 (width=1 ns, half_sub=0): lower=8 + sub*1
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(4), 8); // [8,9)
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(5), 9); // [9,10)
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(6), 10); // [10,11)
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(11), 15); // [15,16)
+        // Band i=4 (width=2 ns, half_sub=1): lower=16 + sub*2 + 1
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(12), 17); // [16,18) midpoint=17
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(13), 19); // [18,20) midpoint=19
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(14), 21); // [20,22) midpoint=21
+        assert_eq!(LatencyTracker::estimate_nanos_for_bucket(19), 31); // [30,32) midpoint=31
     }
 
     #[test]
     fn test_sub_bucket_relative_error_within_12_5_percent() {
-        // For each bucket: verify the estimate is within 12.5% of the true lower bound.
-        // The worst case is always at the lower bound (max overestimate = 12.5%).
-        // We test a representative set of bands covering μs to ms range.
+        // For values in the 8-sub-bucket range (nanos >= 8), verify the estimate
+        // is within 6.25% of the true value. Values < 8 use coarser single-bucket
+        // coverage (exact for 0, 1; [2,4) and [4,8) as single buckets) and are
+        // tested separately via test_bucket_for_zero_and_small.
         let test_nanos: &[u64] = &[
-            4,
             8,
             16,
             32,
@@ -2182,8 +2297,8 @@ mod tests {
             let estimate = LatencyTracker::estimate_nanos_for_bucket(bucket) as f64;
             let relative_error = (estimate - nanos as f64) / nanos as f64;
             assert!(
-                (-0.125 - 1e-9..=0.125 + 1e-9).contains(&relative_error),
-                "nanos={nanos}: estimate={estimate}, relative_error={relative_error:.4} > 12.5%"
+                (-0.0625 - 1e-9..=0.0625 + 1e-9).contains(&relative_error),
+                "nanos={nanos}: estimate={estimate}, relative_error={relative_error:.4} > 6.25%"
             );
         }
     }
@@ -2202,7 +2317,7 @@ mod tests {
             let est = tracker.percentile(pct).unwrap().as_nanos() as u64;
             let err = (est as f64 - exact_nanos as f64) / exact_nanos as f64;
             assert!(
-                err.abs() <= 0.125 + 1e-9,
+                err.abs() <= 0.0625 + 1e-9,
                 "p{pct}: estimate {est} ns, true {exact_nanos} ns, err={err:.4}"
             );
         }

@@ -666,10 +666,25 @@ impl ClusterMetadata {
     /// After rebootstrap, the failure-tracking timer is set to **now** (not
     /// cleared) so that the next refresh cycle starts timing immediately —
     /// matching the Java client's `metadataAttemptStartMs = Optional.of(now)`.
+    ///
+    /// # Warning: In-Flight Requests Are Cancelled
+    ///
+    /// `close_all()` closes every broker connection immediately. Any `Produce`,
+    /// `Fetch`, or `OffsetCommit` requests that are in flight at the time of
+    /// rebootstrap will be cancelled and return errors to their callers. Callers
+    /// that perform retries will retry after the pool reconnects; callers with
+    /// `acks=0` (fire-and-forget) or non-retryable errors may lose data.
+    ///
+    /// This is an inherent limitation of the connection-drop recovery strategy.
+    /// For zero-data-loss recovery, use `acks=all` with retries and a
+    /// [`TransactionalProducer`](crate::producer::TransactionalProducer).
     pub async fn rebootstrap(&self) {
-        info!("Rebootstrapping: closing all connections and resetting metadata (KIP-899)");
+        warn!(
+            "Rebootstrapping: closing all connections and cancelling in-flight requests (KIP-899). \
+             In-flight Produce/Fetch/Commit requests will return errors; retries will recover."
+        );
 
-        // Close all pooled connections.
+        // Close all pooled connections — this cancels all in-flight requests.
         self.pool.close_all().await;
 
         // Reset metadata cache to empty so `get_any_connection` goes straight

@@ -433,6 +433,11 @@ pub struct AccumulatorConfig {
     pub linger: Duration,
     /// Compression type for batches.
     pub compression: Compression,
+    /// Per-topic compression overrides.
+    ///
+    /// When a topic is present in this map, its compression type takes
+    /// precedence over the global [`compression`](Self::compression) field.
+    pub topic_compression: AHashMap<String, Compression>,
     /// Acknowledgment level.
     pub acks: i16,
     /// Client ID used for request frame sizing.
@@ -477,6 +482,7 @@ impl Clone for AccumulatorConfig {
             batch_size: self.batch_size,
             linger: self.linger,
             compression: self.compression,
+            topic_compression: self.topic_compression.clone(),
             acks: self.acks,
             client_id: self.client_id.clone(),
             request_timeout: self.request_timeout,
@@ -516,6 +522,7 @@ impl Default for AccumulatorConfig {
             batch_size: 16384,
             linger: Duration::ZERO,
             compression: Compression::None,
+            topic_compression: AHashMap::new(),
             acks: -1,
             client_id: "krafka".to_string(),
             request_timeout: Duration::from_secs(30),
@@ -1179,7 +1186,12 @@ impl RecordAccumulator {
         let build_batch = |seq: Option<i32>,
                            cfg: &AccumulatorConfig|
          -> crate::error::Result<(ProduceRequest, u64, u64)> {
-            let mut batch_builder = RecordBatchBuilder::new().compression(cfg.compression);
+            let effective_compression = cfg
+                .topic_compression
+                .get(topic.as_ref())
+                .copied()
+                .unwrap_or(cfg.compression);
+            let mut batch_builder = RecordBatchBuilder::new().compression(effective_compression);
 
             // Tag with idempotent producer identity
             if let (Some(identity), Some(s)) = (&cfg.identity, seq) {
@@ -1696,6 +1708,7 @@ mod tests {
             identity: None,
             partitioner: Arc::new(crate::producer::partitioner::DefaultPartitioner::new()),
             state_store: None,
+            topic_compression: AHashMap::new(),
         };
         assert_eq!(config.batch_size, 65536);
         assert_eq!(config.linger, Duration::from_millis(50));

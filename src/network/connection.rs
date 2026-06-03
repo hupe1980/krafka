@@ -416,6 +416,8 @@ impl std::fmt::Debug for ConnectionConfig {
 
 impl Default for ConnectionConfig {
     fn default() -> Self {
+        // SAFETY: the default builder values satisfy all validation invariants.
+        #[allow(clippy::expect_used)]
         ConnectionConfigBuilder::default()
             .build()
             .expect("default ConnectionConfig values are always valid")

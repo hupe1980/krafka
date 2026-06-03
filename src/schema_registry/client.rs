@@ -272,12 +272,12 @@ impl ConfluentSchemaRegistry {
         if (200..300).contains(&status) {
             // Reject non-JSON content types on success paths to surface proxy /
             // misconfiguration errors early (SEC-05).
-            if let Some(ct) = content_type {
-                if !ct.contains("json") {
-                    return Err(KrafkaError::schema_registry(format!(
-                        "unexpected Content-Type '{ct}' from schema registry (expected JSON)"
-                    )));
-                }
+            if let Some(ct) = content_type
+                && !ct.contains("json")
+            {
+                return Err(KrafkaError::schema_registry(format!(
+                    "unexpected Content-Type '{ct}' from schema registry (expected JSON)"
+                )));
             }
             serde_json::from_slice(body).map_err(|e| {
                 KrafkaError::schema_registry_with_source(

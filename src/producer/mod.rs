@@ -322,101 +322,22 @@ async fn recover_unknown_producer_id(
     identity.allocate_sequence(topic, partition, record_count)
 }
 
-fn unsigned_varint_size(mut value: u32) -> usize {
-    let mut size = 1;
-    while value >= 0x80 {
-        size += 1;
-        value >>= 7;
-    }
-    size
-}
-
-fn kafka_string_size(value: Option<&str>) -> Result<usize> {
-    match value {
-        Some(value) => {
-            i16::try_from(value.len()).map_err(|_| {
-                KrafkaError::protocol_kind(
-                    ProtocolErrorKind::InvalidLength,
-                    format!(
-                        "KafkaString length {} exceeds protocol limit of {}",
-                        value.len(),
-                        i16::MAX
-                    ),
-                )
-            })?;
-            Ok(2 + value.len())
-        }
-        None => Ok(2),
-    }
-}
-
-fn compact_kafka_string_size(value: Option<&str>) -> Result<usize> {
-    match value {
-        Some(value) => {
-            let len_plus_one = u32::try_from(value.len().saturating_add(1)).map_err(|_| {
-                KrafkaError::protocol_kind(
-                    ProtocolErrorKind::InvalidLength,
-                    format!(
-                        "compact KafkaString length {} exceeds u32 limit",
-                        value.len()
-                    ),
-                )
-            })?;
-            Ok(unsigned_varint_size(len_plus_one) + value.len())
-        }
-        None => Ok(unsigned_varint_size(0)),
-    }
-}
-
-fn kafka_bytes_size(len: usize) -> Result<usize> {
-    i32::try_from(len).map_err(|_| {
-        KrafkaError::protocol_kind(
+fn request_header_size(api_key: ApiKey, api_version: i16, client_id: &str) -> Result<usize> {
+    // 2 (api_key) + 2 (api_version) + 4 (correlation_id) + 2+len (client_id standard string)
+    if client_id.len() > i16::MAX as usize {
+        return Err(KrafkaError::protocol_kind(
             ProtocolErrorKind::InvalidLength,
             format!(
-                "KafkaBytes length {} exceeds protocol limit of {}",
-                len,
-                i32::MAX
+                "client_id length {} exceeds protocol limit of {}",
+                client_id.len(),
+                i16::MAX
             ),
-        )
-    })?;
-    Ok(4 + len)
-}
-
-fn compact_kafka_bytes_size(len: usize) -> Result<usize> {
-    let len_plus_one = u32::try_from(len.saturating_add(1)).map_err(|_| {
-        KrafkaError::protocol_kind(
-            ProtocolErrorKind::InvalidLength,
-            format!("compact KafkaBytes length {} exceeds u32 limit", len),
-        )
-    })?;
-    Ok(unsigned_varint_size(len_plus_one) + len)
-}
-
-fn array_len_size(len: usize) -> Result<usize> {
-    i32::try_from(len).map_err(|_| {
-        KrafkaError::protocol_kind(
-            ProtocolErrorKind::InvalidLength,
-            format!("Kafka array length {len} exceeds protocol limit"),
-        )
-    })?;
-    Ok(4)
-}
-
-fn compact_array_len_size(len: usize) -> Result<usize> {
-    let len_plus_one = u32::try_from(len.saturating_add(1)).map_err(|_| {
-        KrafkaError::protocol_kind(
-            ProtocolErrorKind::InvalidLength,
-            format!("compact Kafka array length {len} exceeds u32 limit"),
-        )
-    })?;
-    Ok(unsigned_varint_size(len_plus_one))
-}
-
-fn request_header_size(api_key: ApiKey, api_version: i16, client_id: &str) -> Result<usize> {
-    let base = 2 + 2 + 4 + kafka_string_size(Some(client_id))?;
+        ));
+    }
+    let base = 2 + 2 + 4 + 2 + client_id.len();
     match crate::protocol::RequestHeader::header_version(api_key, api_version) {
         1 => Ok(base),
-        2 => Ok(base + 1),
+        2 => Ok(base + 1), // +1 for empty tagged-fields byte
         version => Err(KrafkaError::protocol_kind(
             ProtocolErrorKind::UnknownApiVersion,
             format!("unsupported request header version {version}"),
@@ -424,105 +345,20 @@ fn request_header_size(api_key: ApiKey, api_version: i16, client_id: &str) -> Re
     }
 }
 
-fn produce_request_body_size(api_version: i16, request: &ProduceRequest) -> Result<usize> {
-    let mut size = match api_version {
-        3..=8 => kafka_string_size(request.transactional_id.as_deref())? + 2 + 4,
-        9..=13 | 14.. => compact_kafka_string_size(request.transactional_id.as_deref())? + 2 + 4,
-        _ => {
-            return Err(KrafkaError::protocol_kind(
-                ProtocolErrorKind::UnknownApiVersion,
-                format!("unsupported ProduceRequest version {api_version}"),
-            ));
-        }
-    };
-
-    match api_version {
-        3..=8 => {
-            size += array_len_size(request.topic_data.len())?;
-            for topic in &request.topic_data {
-                size += kafka_string_size(Some(&topic.name))?;
-                size += array_len_size(topic.partition_data.len())?;
-                for partition in &topic.partition_data {
-                    size += 4 + kafka_bytes_size(partition.records.len())?;
-                }
-            }
-        }
-        9..=12 => {
-            size += compact_array_len_size(request.topic_data.len())?;
-            for topic in &request.topic_data {
-                size += compact_kafka_string_size(Some(&topic.name))?;
-                size += compact_array_len_size(topic.partition_data.len())?;
-                for partition in &topic.partition_data {
-                    size += 4 + compact_kafka_bytes_size(partition.records.len())? + 1;
-                }
-                size += 1;
-            }
-            size += 1;
-        }
-        13 => {
-            size += compact_array_len_size(request.topic_data.len())?;
-            for topic in &request.topic_data {
-                if topic.topic_id.is_none() {
-                    return Err(KrafkaError::protocol_kind(
-                        ProtocolErrorKind::InvalidValue,
-                        "topic_id is required for Produce v13+ (KIP-516)",
-                    ));
-                }
-                size += 16;
-                size += compact_array_len_size(topic.partition_data.len())?;
-                for partition in &topic.partition_data {
-                    size += 4 + compact_kafka_bytes_size(partition.records.len())? + 1;
-                }
-                size += 1;
-            }
-            size += 1;
-        }
-        v @ 14.. => {
-            // Forward-compat: assume the same compact encoding as v13 (topic-id based).
-            // Emit a one-time warning so operator logs reveal the mismatch when a newer
-            // broker requests a version we have not yet implemented.
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static WARNED: AtomicBool = AtomicBool::new(false);
-            if !WARNED.swap(true, Ordering::AcqRel) {
-                tracing::warn!(
-                    api_version = v,
-                    "ProduceRequest version {v} exceeds max known version 13; \
-                     using v13 compact encoding as a best-effort fallback. \
-                     Update produce_request_body_size() to add explicit v{v}+ support."
-                );
-            }
-            size += compact_array_len_size(request.topic_data.len())?;
-            for topic in &request.topic_data {
-                if topic.topic_id.is_none() {
-                    return Err(KrafkaError::protocol_kind(
-                        ProtocolErrorKind::InvalidValue,
-                        "topic_id is required for Produce v14+ (KIP-516)",
-                    ));
-                }
-                size += 16;
-                size += compact_array_len_size(topic.partition_data.len())?;
-                for partition in &topic.partition_data {
-                    size += 4 + compact_kafka_bytes_size(partition.records.len())? + 1;
-                }
-                size += 1;
-            }
-            size += 1;
-        }
-        _ => unreachable!("validated above"),
-    }
-
-    Ok(size)
-}
-
-fn produce_request_frame_size(
+/// Measure the total wire frame size of a `ProduceRequest` by encoding the
+/// body into a scratch buffer and summing the header and length prefix.
+///
+/// This is the single source of truth for produce frame size — it uses the
+/// real encoder rather than a separate analytical size-computation path,
+/// which would otherwise need to be kept in sync with every encoding change.
+fn measure_produce_request_frame_size(
     client_id: &str,
     api_version: i16,
     request: &ProduceRequest,
 ) -> Result<usize> {
-    Ok(
-        4 + request_header_size(ApiKey::Produce, api_version, client_id)?
-            + produce_request_body_size(api_version, request)?,
-    )
+    let mut body = bytes::BytesMut::new();
+    request.encode_versioned(api_version, &mut body)?;
+    Ok(4 + request_header_size(ApiKey::Produce, api_version, client_id)? + body.len())
 }
 
 /// Populate `topic_id` fields for Produce v13+ (KIP-516).
@@ -554,7 +390,7 @@ fn validate_produce_request_size(
     api_version: i16,
     request: &ProduceRequest,
 ) -> Result<()> {
-    let frame_size = produce_request_frame_size(client_id, api_version, request)?;
+    let frame_size = measure_produce_request_frame_size(client_id, api_version, request)?;
     if frame_size > max_request_size {
         return Err(KrafkaError::protocol_kind(
             ProtocolErrorKind::InvalidLength,
@@ -765,6 +601,7 @@ impl Producer {
                 batch_size: config.batch_size,
                 linger: config.linger,
                 compression: config.compression,
+                topic_compression: config.topic_compression.clone().into_iter().collect(),
                 acks: config.acks.to_i16(),
                 client_id: config.client_id.clone(),
                 request_timeout: config.request_timeout,
@@ -1234,7 +1071,8 @@ impl Producer {
         record: &RoutedRecord,
         sequence: Option<i32>,
     ) -> Result<ProduceRequest> {
-        let mut batch_builder = RecordBatchBuilder::new().compression(self.config.compression);
+        let mut batch_builder =
+            RecordBatchBuilder::new().compression(self.config.compression_for(topic));
 
         // Propagate user-supplied timestamp to the batch
         if let Some(ts) = record.timestamp {
@@ -2110,7 +1948,7 @@ mod tests {
         };
 
         let exact_size =
-            produce_request_frame_size("client", versions::PRODUCE_MAX, &request).unwrap();
+            measure_produce_request_frame_size("client", versions::PRODUCE_MAX, &request).unwrap();
 
         validate_produce_request_size("client", exact_size, versions::PRODUCE_MAX, &request)
             .unwrap();

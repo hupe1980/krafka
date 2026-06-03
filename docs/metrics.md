@@ -202,6 +202,9 @@ async fn main() {
 | `connections` | Gauge | Current active connections |
 | `buffered_records` | Gauge | Producer records currently admitted under the memory budget |
 | `send_latency_seconds` | Summary | Send latency statistics |
+| `topic_{name}_records_sent_total` | Counter | Records sent to a specific topic (per-topic) |
+| `topic_{name}_bytes_sent_total` | Counter | Bytes sent to a specific topic (per-topic) |
+| `topic_{name}_errors_total` | Counter | Send errors for a specific topic (per-topic) |
 
 `compression_ratio_avg` is available as a derived field in `ProducerMetricsSnapshot` (computed as `compressed_bytes / uncompressed_bytes`). A value of 0.3 means the codec reduced data to 30% of original size. The field is `None` when no compressed batches have been sent.
 
@@ -247,18 +250,18 @@ async fn main() {
 
 The `LatencyTracker` provides detailed latency statistics:
 
-> **Accuracy note — percentile estimates:** `LatencyTracker` uses a 256-sub-bucket
-> histogram (4 equal sub-buckets per power-of-2 band). The percentile estimate is
+> **Accuracy note — percentile estimates:** `LatencyTracker` uses a 512-bucket
+> histogram (8 equal sub-buckets per power-of-2 band). The percentile estimate is
 > the midpoint of the matching sub-bucket, giving a **maximum relative error of
-> ≤ 12.5 %** per sub-bucket. In practice:
+> ≤ 6.25 %** per sub-bucket. In practice:
 >
 > | True p99        | Sub-bucket width | Max error |
-> |-----------------|-----------------|-----------|
-> | 1 ms – 2 ms     | 250 µs          | 12.5 %    |
-> | 8 ms – 16 ms    | 2 ms            | 12.5 %    |
-> | 64 ms – 128 ms  | 16 ms           | 12.5 %    |
+> |-----------------|-----------------|----------|
+> | 1 ms – 2 ms     | 125 µs          | 6.25 %   |
+> | 8 ms – 16 ms    | 1 ms            | 6.25 %   |
+> | 64 ms – 128 ms  | 8 ms            | 6.25 %   |
 >
-> This is suitable for p99 SLO alerting with a threshold tolerance of ≥ 15 %.
+> This is suitable for p99 SLO alerting with a threshold tolerance of ≥ 8 %.
 > For sub-millisecond or tighter requirements, use the OTLP exporter
 > and aggregate into an HDR histogram or T-Digest in your observability backend.
 
