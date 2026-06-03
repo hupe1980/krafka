@@ -880,7 +880,8 @@ impl Producer {
                         }
                     }
 
-                    self.metrics.record_send(record.payload_size_bytes());
+                    self.metrics
+                        .record_send_for_topic(topic.as_ref(), record.payload_size_bytes());
                     self.metrics.connections.set(self.pool.len() as u64);
                     crate::interceptor::safe_on_acknowledgement(
                         &*self.interceptor,
@@ -912,7 +913,7 @@ impl Producer {
                         {
                             Ok(new_sequence) => new_sequence,
                             Err(recovery_error) => {
-                                self.metrics.record_error();
+                                self.metrics.record_error_for_topic(topic.as_ref());
                                 let dummy_metadata = RecordMetadata {
                                     topic: topic_owned.clone(),
                                     partition,
@@ -937,7 +938,7 @@ impl Producer {
                             Ok(new_request) => request = new_request,
                             Err(build_error) => {
                                 let _ = identity.rollback_sequence(topic.as_ref(), partition);
-                                self.metrics.record_error();
+                                self.metrics.record_error_for_topic(topic.as_ref());
                                 let dummy_metadata = RecordMetadata {
                                     topic: topic_owned.clone(),
                                     partition,
@@ -965,7 +966,7 @@ impl Producer {
                             match identity.reset_and_allocate(topic.as_ref(), partition, 1) {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    self.metrics.record_error();
+                                    self.metrics.record_error_for_topic(topic.as_ref());
                                     return Err(e);
                                 }
                             };
@@ -980,7 +981,7 @@ impl Producer {
                             Err(build_err) => {
                                 // Rollback the freshly allocated sequence
                                 let _ = identity.rollback_sequence(topic.as_ref(), partition);
-                                self.metrics.record_error();
+                                self.metrics.record_error_for_topic(topic.as_ref());
                                 let dummy_metadata = RecordMetadata {
                                     topic: topic_owned.clone(),
                                     partition,
@@ -1023,7 +1024,7 @@ impl Producer {
                     if let Some(ref identity) = self.identity {
                         let _ = identity.rollback_sequence(topic.as_ref(), partition);
                     }
-                    self.metrics.record_error();
+                    self.metrics.record_error_for_topic(topic.as_ref());
                     let dummy_metadata = RecordMetadata {
                         topic: topic_owned.clone(),
                         partition,

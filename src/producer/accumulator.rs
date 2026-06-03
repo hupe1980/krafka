@@ -1149,7 +1149,7 @@ impl RecordAccumulator {
                 super::ensure_idempotent_producer_id_initialized(identity, &metadata, &retry_policy)
                     .await
         {
-            metrics.record_error();
+            metrics.record_error_for_topic(topic.as_ref());
             for pending_record in pending {
                 let _ = pending_record
                     .response_tx
@@ -1363,7 +1363,7 @@ impl RecordAccumulator {
                             record_count,
                         );
                     }
-                    metrics.record_error();
+                    metrics.record_error_for_topic(topic.as_ref());
                     for pending_record in pending {
                         let _ = pending_record
                             .response_tx
@@ -1590,8 +1590,11 @@ impl RecordAccumulator {
                 }
 
                 let batch_bytes_total: u64 = pending.iter().map(|p| p.estimated_size as u64).sum();
-                metrics.record_batch(pending.len() as u64);
-                metrics.bytes_sent.add(batch_bytes_total);
+                metrics.record_batch_for_topic(
+                    topic.as_ref(),
+                    pending.len() as u64,
+                    batch_bytes_total,
+                );
                 let topic_owned = topic.to_string();
                 for p in pending {
                     let meta = RecordMetadata {
@@ -1615,7 +1618,7 @@ impl RecordAccumulator {
                     let _ =
                         identity.rollback_sequence_range(topic.as_ref(), partition, record_count);
                 }
-                metrics.record_error();
+                metrics.record_error_for_topic(topic.as_ref());
                 let topic_owned = topic.to_string();
                 for p in pending {
                     let meta = RecordMetadata {

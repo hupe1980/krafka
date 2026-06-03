@@ -12,7 +12,9 @@ description: "Use when editing metadata: cache refresh coalescing, lock ordering
 - Subsequent callers register a `oneshot::Sender` in the `InFlight` list and `await` its receiver; they never acquire the lock after registration.
 - The `RefreshGuard` RAII type ensures that all subscribers are notified and the state is reset to `Idle` even if the refresher task is cancelled or panics.
 - The `parking_lot::Mutex` is held for at most a few microseconds (just long enough to push/drain the subscriber list) and is **never** held across an `.await` point.
-- If the refresher is cancelled, subscribers receive `Err(RecvError)` and retry as a new refresher via `Box::pin(self.refresh_for_topics(topics)).await`.
+- If the refresher is cancelled or panics (`Ok(Err(_))`), subscribers receive `KrafkaError::invalid_state` and propagate the error to their caller — no internal retry.
+- If the subscriber wait times out (`Err(_elapsed)` from `tokio::time::timeout`), subscribers receive `KrafkaError::timeout` and propagate the error — no internal retry.
+- In both error cases the caller is responsible for deciding whether to retry `refresh_for_topics`.
 - After acquiring the refresher role, check the staleness/backoff guards (retry_backoff + max_age) before issuing any RPCs — subsequent callers that were coalesced get the refresher's result directly.
 
 ## Lock Ordering

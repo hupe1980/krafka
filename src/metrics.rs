@@ -1355,8 +1355,10 @@ pub struct ProducerMetrics {
     ///
     /// Populated by [`record_send_for_topic`](Self::record_send_for_topic) and
     /// [`record_error_for_topic`](Self::record_error_for_topic).
-    /// Exported via [`export_metrics`](MetricsVisitable::export_metrics) with
-    /// prefix `{prefix}_topic_{name}_*`.
+    /// Exported via [`export_metrics`](MetricsVisitable::export_metrics) as
+    /// `{prefix}_topic_records_sent_total{topic="<name>"}`,
+    /// `{prefix}_topic_bytes_sent_total{topic="<name>"}`, and
+    /// `{prefix}_topic_errors_total{topic="<name>"}`.
     topic_metrics: parking_lot::Mutex<AHashMap<String, TopicProducerMetrics>>,
 }
 
@@ -1421,6 +1423,30 @@ impl ProducerMetrics {
             // Slow path (first send for this topic): allocate the key once.
             let m = TopicProducerMetrics::default();
             m.records_sent.inc();
+            m.bytes_sent.add(bytes);
+            map.insert(topic.to_string(), m);
+        }
+    }
+
+    /// Record a successful batch send and update per-topic counters.
+    ///
+    /// Increments the global `batches_sent`, `records_sent` (by `records`), and
+    /// `bytes_sent` (by `bytes`) counters, and mirrors `records_sent` and
+    /// `bytes_sent` into the per-topic entry for `topic`.
+    #[inline]
+    pub fn record_batch_for_topic(&self, topic: &str, records: u64, bytes: u64) {
+        self.batches_sent.inc();
+        self.records_sent.add(records);
+        self.bytes_sent.add(bytes);
+        let mut map = self.topic_metrics.lock();
+        // Fast path: topic already exists — no allocation.
+        if let Some(m) = map.get_mut(topic) {
+            m.records_sent.add(records);
+            m.bytes_sent.add(bytes);
+        } else {
+            // Slow path (first send for this topic): allocate the key once.
+            let m = TopicProducerMetrics::default();
+            m.records_sent.add(records);
             m.bytes_sent.add(bytes);
             map.insert(topic.to_string(), m);
         }
