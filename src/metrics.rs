@@ -1393,7 +1393,15 @@ impl ProducerMetrics {
     pub fn record_error_for_topic(&self, topic: &str) {
         self.errors.inc();
         let mut map = self.topic_metrics.lock();
-        map.entry(topic.to_string()).or_default().errors.inc();
+        // Fast path: topic already exists — no allocation.
+        if let Some(m) = map.get_mut(topic) {
+            m.errors.inc();
+        } else {
+            // Slow path (first send for this topic): allocate the key once.
+            let m = TopicProducerMetrics::default();
+            m.errors.inc();
+            map.insert(topic.to_string(), m);
+        }
     }
 
     /// Record a successful send and update per-topic counters.
@@ -1405,9 +1413,17 @@ impl ProducerMetrics {
         self.records_sent.inc();
         self.bytes_sent.add(bytes);
         let mut map = self.topic_metrics.lock();
-        let entry = map.entry(topic.to_string()).or_default();
-        entry.records_sent.inc();
-        entry.bytes_sent.add(bytes);
+        // Fast path: topic already exists — no allocation.
+        if let Some(m) = map.get_mut(topic) {
+            m.records_sent.inc();
+            m.bytes_sent.add(bytes);
+        } else {
+            // Slow path (first send for this topic): allocate the key once.
+            let m = TopicProducerMetrics::default();
+            m.records_sent.inc();
+            m.bytes_sent.add(bytes);
+            map.insert(topic.to_string(), m);
+        }
     }
 
     /// Return per-topic metric snapshots sorted by topic name.

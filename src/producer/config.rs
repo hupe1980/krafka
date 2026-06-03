@@ -1,7 +1,7 @@
 //! Producer configuration.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::auth::AuthConfig;
@@ -623,13 +623,17 @@ impl ProducerConfigBuilder {
             // idempotent producers prevent duplicates within a session but do NOT
             // fence zombie producers after a crash/restart. Only a TransactionalProducer
             // with a stable transactional_id provides full zombie fencing (KIP-360).
-            // This is intentional — log a reminder so operators are aware.
-            tracing::debug!(
-                "Idempotent producer enabled without a transactional_id. \
-                 This provides per-session duplicate detection (KIP-679) but not zombie \
-                 fencing. Use TransactionalProducer with a stable transactional_id for \
-                 exactly-once end-to-end guarantees across producer restarts (KIP-360)."
-            );
+            // Emitted at warn! via a OnceLock so it fires once per process and is
+            // visible to operators without spamming logs.
+            static IDEMPOTENT_NO_TXN_WARNED: OnceLock<()> = OnceLock::new();
+            IDEMPOTENT_NO_TXN_WARNED.get_or_init(|| {
+                tracing::warn!(
+                    "Idempotent producer enabled without a transactional_id. \
+                     This provides per-session duplicate detection (KIP-679) but not zombie \
+                     fencing. Use TransactionalProducer with a stable transactional_id for \
+                     exactly-once end-to-end guarantees across producer restarts (KIP-360)."
+                );
+            });
         }
         if self.config.buffer_memory > 0 && self.config.batch_size > self.config.buffer_memory {
             return Err(KrafkaError::config(format!(

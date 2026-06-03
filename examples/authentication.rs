@@ -132,9 +132,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   ca_cert_path: {:?}", tls.ca_cert_path());
 
     println!("\nInsecure (skip verification - NOT for production):");
-    println!(
-        "   TlsConfig::insecure() is available via TlsConfig::builder().verify_server_cert(false).build()"
-    );
+    let tls = TlsConfig::insecure();
+    println!("   verify_server_cert: {}", tls.verify_server_cert());
 
     println!("\nWith custom CA:");
     let tls = TlsConfig::new().with_ca_cert("/etc/kafka/ca.pem");

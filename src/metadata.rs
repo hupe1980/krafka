@@ -460,11 +460,17 @@ impl ClusterMetadata {
                 Ok(Ok(result)) => result,
                 Ok(Err(_)) => {
                     // The refresher task was cancelled or panicked.
-                    // `RefreshGuard::drop` has already reset state to `Idle`
-                    // and notified all subscribers, so the next call will
-                    // claim the refresher role (depth 1 only).
-                    warn!("in-flight metadata refresh was cancelled; retrying");
-                    Box::pin(self.refresh_for_topics(topics)).await
+                    // `RefreshGuard::drop` resets state to `Idle` and notifies
+                    // all subscribers before dropping, so `rx` returning
+                    // `Err(RecvError)` is the signal that the state is already
+                    // `Idle`.  However, the refresher's result was not
+                    // propagated (it errored/panicked), so we return an error
+                    // here.  Recursing would retry with no bound; instead we
+                    // propagate the failure and let the caller decide.
+                    warn!("in-flight metadata refresh was cancelled or panicked");
+                    Err(KrafkaError::invalid_state(
+                        "metadata refresh was cancelled or panicked",
+                    ))
                 }
                 Err(_elapsed) => {
                     // The original refresher is still running (state is still
