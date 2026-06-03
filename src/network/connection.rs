@@ -263,14 +263,14 @@ impl RequestPriority {
 /// max_response_size × max_in_flight_requests
 /// ```
 ///
-/// With the defaults (100 MB × 256 = **25.6 GB**) that ceiling is rarely
+/// With the defaults (100 MB × 10 = **1 GB**) that ceiling is rarely
 /// approached in practice because the broker limits outstanding fetches via
 /// `fetch.max.bytes`; however, for high-throughput consumer deployments you
 /// should size these values intentionally:
 ///
 /// | Workload | `max_response_size` | `max_in_flight_requests` | Ceiling |
 /// |----------|--------------------|--------------------------|---------||
-/// | Default  | 100 MB             | 256                      | 25.6 GB |
+/// | Default  | 100 MB             | 10                       | 1 GB    |
 /// | Consumer | 50 MB              | 16                       | 800 MB  |
 /// | Producer | 10 MB              | 5 (idempotent)           | 50 MB   |
 ///
@@ -682,7 +682,7 @@ impl ConnectionConfigBuilder {
     /// Set the maximum number of in-flight requests per connection.
     ///
     /// Limits the number of requests waiting for a response on a single
-    /// connection. Default: 256.
+    /// connection. Default: 10. This matches the Kafka Java client default.
     ///
     /// # Idempotent / transactional producers
     ///

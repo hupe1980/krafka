@@ -410,12 +410,17 @@ impl ClusterMetadata {
 
     /// Refresh metadata for specific topics.
     ///
-    /// Uses a coalescing lock to prevent concurrent metadata stampedes.
-    /// If a refresh is already in-flight, callers wait for it to complete.
-    /// The lock acquisition itself is bounded by `max_age` — if the lock
-    /// cannot be acquired within that window, a timeout error is returned.
-    /// This prevents indefinite blocking when a broker stalls mid-refresh
-    /// (e.g., dead broker, network partition, repeated reconnection retries).
+    /// Concurrent callers are coalesced: the first caller claims the refresher
+    /// role while subsequent callers subscribe to the in-flight result via a
+    /// oneshot channel. The `parking_lot::Mutex` used for coalescing is held
+    /// only for microseconds to read/update the subscriber list and is **never**
+    /// held across any `.await` point.
+    ///
+    /// Subscriber waits are bounded by `max_age`. If the in-flight refresh does
+    /// not complete within that window, a [`KrafkaError::Timeout`] is returned
+    /// immediately so the caller is never blocked indefinitely — even if a
+    /// broker is stalled mid-refresh (dead broker, network partition, repeated
+    /// reconnection retries).
     ///
     /// The Metadata API version is negotiated with the broker (v1–v13).
     /// Versions are cumulative: rack v1, cluster_id v2, offline replicas v5,
@@ -445,6 +450,11 @@ impl ClusterMetadata {
                 RefreshCoalescingState::InFlight(ref mut senders) => {
                     // A refresh is already in progress — subscribe to be woken
                     // when it completes. The lock is released before the await.
+                    //
+                    // Prune senders whose receivers have already been dropped
+                    // (timed-out or cancelled callers) to prevent unbounded
+                    // memory growth during a prolonged stall.
+                    senders.retain(|tx| !tx.is_closed());
                     let (tx, rx) = oneshot::channel();
                     senders.push(tx);
                     Some(rx)
