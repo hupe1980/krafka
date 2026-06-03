@@ -455,21 +455,29 @@ impl ClusterMetadata {
         if let Some(rx) = subscriber_rx {
             // Bound the wait by `max_age` so that a stalled refresher (dead
             // broker + long reconnection retries) cannot block subscribers
-            // indefinitely.  On timeout we fall through and retry as a new
-            // refresher — same behaviour as a cancelled refresher.
+            // indefinitely.
             return match timeout(self.max_age, rx).await {
                 Ok(Ok(result)) => result,
                 Ok(Err(_)) => {
                     // The refresher task was cancelled or panicked.
+                    // `RefreshGuard::drop` has already reset state to `Idle`
+                    // and notified all subscribers, so the next call will
+                    // claim the refresher role (depth 1 only).
                     warn!("in-flight metadata refresh was cancelled; retrying");
                     Box::pin(self.refresh_for_topics(topics)).await
                 }
                 Err(_elapsed) => {
+                    // The original refresher is still running (state is still
+                    // `InFlight`).  Recursing here would re-subscribe and time
+                    // out again — unbounded recursion.  Return an error
+                    // directly; the caller decides whether to retry.
                     warn!(
                         timeout_ms = self.max_age.as_millis(),
-                        "timed out waiting for in-flight metadata refresh; retrying as new refresher"
+                        "timed out waiting for in-flight metadata refresh"
                     );
-                    Box::pin(self.refresh_for_topics(topics)).await
+                    Err(KrafkaError::timeout(
+                        "metadata refresh timed out waiting for in-flight refresh",
+                    ))
                 }
             };
         }

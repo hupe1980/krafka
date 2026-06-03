@@ -152,15 +152,20 @@ pub fn build_dlq_record(
         .iter()
         .map(|(k, v)| {
             (
-                String::from_utf8(k.to_vec()).unwrap_or_else(|_| {
-                    use std::fmt::Write;
-                    let mut s = String::with_capacity(4 + k.len() * 2);
-                    s.push_str("hex:");
-                    for byte in k.iter() {
-                        let _ = write!(s, "{byte:02x}");
+                // Validate UTF-8 in-place (zero-copy) before allocating;
+                // only call to_owned() once validity is confirmed.
+                match std::str::from_utf8(k) {
+                    Ok(s) => s.to_owned(),
+                    Err(_) => {
+                        use std::fmt::Write;
+                        let mut s = String::with_capacity(4 + k.len() * 2);
+                        s.push_str("hex:");
+                        for byte in k.iter() {
+                            let _ = write!(s, "{byte:02x}");
+                        }
+                        s
                     }
-                    s
-                }),
+                },
                 v.clone().unwrap_or_default(),
             )
         })

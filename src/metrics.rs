@@ -174,19 +174,19 @@ impl Gauge {
 ///
 /// # Accuracy
 ///
-/// Each power-of-2 band is divided into 4 equal sub-buckets of width
-/// `2^(i-2)`, giving a **relative error of ≤ 12.5 %** (overestimate of
-/// at most one sub-bucket width from the lower bound):
+/// Each power-of-2 band is divided into 8 equal sub-buckets of width
+/// `2^(i-3)`, giving a **relative error of ≤ 6.25 %** (midpoint of the
+/// containing sub-bucket is at most half a sub-bucket from the true value):
 ///
 /// | Sample range     | Sub-bucket width | Max relative error |
 /// |------------------|------------------|--------------------|
-/// | 1 ms – 2 ms      | 250 μs           | 12.5 %             |
-/// | 8 ms – 16 ms     | 2 ms             | 12.5 %             |
-/// | 64 ms – 128 ms   | 16 ms            | 12.5 %             |
+/// | 1 ms – 2 ms      | ~131 μs          | 6.25 %             |
+/// | 8 ms – 16 ms     | ~1 ms            | 6.25 %             |
+/// | 64 ms – 128 ms   | ~8 ms            | 6.25 %             |
 ///
-/// **For tight SLO contracts** (p99 < 50 ms alerts), ±12.5 % gives
-/// approximately one sub-bucket slack.  For zero-error requirements,
-/// replace or supplement with a T-Digest or HDR histogram.
+/// **For tight SLO contracts** (p99 < 50 ms alerts), ±6.25 % gives
+/// sub-millisecond slack at typical latency ranges.  For zero-error
+/// requirements, replace or supplement with a T-Digest or HDR histogram.
 ///
 /// For capacity-planning and order-of-magnitude alerting ("are we above 1 s?")
 /// the precision is more than adequate and comes at zero allocation cost.
@@ -354,9 +354,9 @@ impl LatencyTracker {
     ///
     /// The estimate uses the sub-bucket midpoint for the bucket containing the
     /// target rank.  The **maximum relative error is ≤ 6.25 %** — each
-    /// power-of-2 band is split into 8 equal sub-buckets, so the worst-case
-    /// bucket spans at most 12.5 % of its band, and the midpoint estimate
-    /// falls within 6.25 % of the true value.
+    /// power-of-2 band is split into 8 equal sub-buckets of width `2^(i-3)`,
+    /// so the midpoint of the containing sub-bucket is at most 6.25 % above
+    /// the true value.
     pub fn percentile(&self, percentile: f64) -> Option<Duration> {
         let total = self.count();
         if total == 0 {
@@ -441,14 +441,14 @@ pub struct LatencySnapshot {
     pub avg: Option<Duration>,
     /// 50th-percentile (median) latency estimate.
     ///
-    /// Derived from a 256-bucket sub-divided power-of-2 histogram.  The
-    /// relative error is **at most 12.5 %** (overestimate when the true value
-    /// falls at the lower bound of a sub-bucket).  Returns `None` when no
-    /// samples have been recorded.
+    /// Derived from a 512-bucket sub-divided power-of-2 histogram.  The
+    /// relative error is **at most 6.25 %** (midpoint of the containing
+    /// sub-bucket is at most half a sub-bucket above the true value).  Returns
+    /// `None` when no samples have been recorded.
     pub p50: Option<Duration>,
-    /// 95th-percentile latency estimate (same accuracy as `p50`, ≤ 12.5 %).
+    /// 95th-percentile latency estimate (same accuracy as `p50`, ≤ 6.25 %).
     pub p95: Option<Duration>,
-    /// 99th-percentile latency estimate (same accuracy as `p50`, ≤ 12.5 %).
+    /// 99th-percentile latency estimate (same accuracy as `p50`, ≤ 6.25 %).
     pub p99: Option<Duration>,
 }
 
@@ -672,7 +672,7 @@ impl MetricsExporter for PrometheusExporter {
         let name = sanitize_prometheus_name(name);
         let _ = writeln!(
             self.output,
-            "# HELP {}_seconds {} (quantiles estimated from 256-sub-bucket histogram; relative error ≤12.5% per sub-bucket)",
+            "# HELP {}_seconds {} (quantiles estimated from 512-bucket histogram, 8 sub-buckets per band; relative error ≤6.25%)",
             name, help
         );
         let _ = writeln!(self.output, "# TYPE {}_seconds summary", name);
@@ -2428,7 +2428,7 @@ mod tests {
     fn test_percentile_accuracy_for_known_values() {
         // Record exactly 100 samples at 10 ms (= 10_000_000 ns).
         // p50, p95, p99 should all land in the same sub-bucket.
-        // Verify the estimate is within 12.5% of 10 ms.
+        // Verify the estimate is within 6.25% of 10 ms.
         let tracker = LatencyTracker::new();
         for _ in 0..100 {
             tracker.record(Duration::from_millis(10));
