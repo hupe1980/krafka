@@ -36,18 +36,16 @@ impl Acks {
 
     /// Create from i16 value.
     ///
-    /// Known values: 0 = None, 1 = Leader, -1 = All.
-    /// Unknown values default to `All` (safest default — requires full ISR ack).
+    /// Known values: `0` = `None`, `1` = `Leader`, `-1` = `All`.
+    /// Returns `None` for unknown values instead of silently falling back to a
+    /// default — callers must decide how to handle invalid wire values.
     #[inline]
-    pub fn from_i16(value: i16) -> Self {
+    pub fn from_i16(value: i16) -> Option<Self> {
         match value {
-            0 => Acks::None,
-            1 => Acks::Leader,
-            -1 => Acks::All,
-            other => {
-                tracing::warn!(acks = other, "Unknown acks value, defaulting to All");
-                Acks::All
-            }
+            0 => Some(Acks::None),
+            1 => Some(Acks::Leader),
+            -1 => Some(Acks::All),
+            _ => None,
         }
     }
 }
@@ -382,12 +380,26 @@ impl ProducerConfigBuilder {
     /// send immediately). For sustained high-throughput workloads, values in
     /// the range of 1–100 ms are typical.
     ///
-    /// # Trade-off
+    /// # Trade-off: linger vs. delivery_timeout
     ///
     /// Larger linger values reduce the number of Produce RPCs and increase
     /// batch fill rate, but add a fixed latency floor to every record.  Do not
     /// set linger without also tuning [`delivery_timeout`](Self::delivery_timeout)
     /// to be significantly larger than the linger value.
+    ///
+    /// # Interaction with `max_in_flight` (idempotent mode)
+    ///
+    /// With `idempotent = true` (the default), `max_in_flight` is capped to 5.
+    /// If the linger timer fires while all 5 in-flight slots are occupied, the
+    /// batch waits for a slot to free up.  If the wait exceeds `delivery_timeout`,
+    /// records in that batch receive a [`DeliveryTimeout`] error — not because
+    /// the broker was slow, but because the producer was capacity-limited.
+    ///
+    /// To avoid surprises in high-partition, high-throughput workloads:
+    /// - Set `delivery_timeout` ≥ `linger + request_timeout × (max_in_flight + 1)`.
+    /// - Monitor `producer_records_timed_out` for unexpected `DeliveryTimeout` spikes.
+    ///
+    /// [`DeliveryTimeout`]: crate::error::KrafkaError
     pub fn linger(mut self, duration: Duration) -> Self {
         self.config.linger = duration;
         self
@@ -559,6 +571,8 @@ impl ProducerConfigBuilder {
     /// - `max_in_flight` must be >= 1
     /// - `max_request_size` must be >= 1
     /// - `delivery_timeout` must be greater than zero
+    /// - `delivery_timeout = Duration::MAX` combined with `retries = u32::MAX` is rejected
+    /// - `compression` (and per-topic overrides) must be available (feature must be compiled in)
     /// - Idempotent mode requires `acks = All`; `max_in_flight` is auto-capped to 5
     /// - `batch_size` must not exceed `buffer_memory` (when `buffer_memory > 0`)
     /// - `batch_size` must not exceed `max_request_size`
@@ -593,6 +607,63 @@ impl ProducerConfigBuilder {
             return Err(KrafkaError::config(
                 "delivery_timeout must be greater than zero",
             ));
+        }
+        // Reject the combination of delivery_timeout = Duration::MAX and retries = u32::MAX.
+        // Both individually have well-defined semantics (MAX delivery window / unlimited retries),
+        // but together they create an infinite retry loop: the delivery deadline never expires
+        // so the retry counter is the only termination condition — but that counter also never
+        // expires. This combination is almost certainly a misconfiguration. If you genuinely
+        // want unlimited retries, set a finite delivery_timeout.
+        if self.config.delivery_timeout == Duration::MAX && self.config.retries == u32::MAX {
+            return Err(KrafkaError::config(
+                "delivery_timeout = Duration::MAX combined with retries = u32::MAX creates \
+                 an infinite retry loop; set a finite delivery_timeout or reduce retries",
+            ));
+        }
+        // Reject a compression codec that was not compiled in. This gives a clear
+        // build-time-equivalent error at producer construction rather than waiting
+        // until the first message is sent to discover the feature is missing.
+        if !self.config.compression.is_available() {
+            let feature = self
+                .config
+                .compression
+                .required_feature()
+                .unwrap_or("unknown");
+            return Err(KrafkaError::config(format!(
+                "compression codec {:?} requires the `{feature}` Cargo feature; \
+                 either enable the feature or choose a different compression codec",
+                self.config.compression
+            )));
+        }
+        // Same check for per-topic compression overrides.
+        for (topic, codec) in &self.config.topic_compression {
+            if !codec.is_available() {
+                let feature = codec.required_feature().unwrap_or("unknown");
+                return Err(KrafkaError::config(format!(
+                    "per-topic compression codec {:?} for topic {topic:?} requires the \
+                     `{feature}` Cargo feature",
+                    codec
+                )));
+            }
+        }
+        // Warn when delivery_timeout is shorter than a single full retry cycle.
+        // In this case some retry attempts can never complete before the deadline,
+        // causing premature delivery failures without exhausting all retries.
+        if self.config.retries > 0 {
+            let min_budget = self
+                .config
+                .request_timeout
+                .saturating_mul(self.config.retries.saturating_add(1));
+            if self.config.delivery_timeout < min_budget {
+                tracing::warn!(
+                    delivery_timeout_secs = self.config.delivery_timeout.as_secs_f64(),
+                    request_timeout_secs = self.config.request_timeout.as_secs_f64(),
+                    retries = self.config.retries,
+                    minimum_budget_secs = min_budget.as_secs_f64(),
+                    "delivery_timeout is shorter than request_timeout × (retries + 1); \
+                     some retry attempts will be cut short by the delivery deadline"
+                );
+            }
         }
         if self.config.idempotent {
             if self.config.retries == 0 {
@@ -683,9 +754,9 @@ mod tests {
 
     #[test]
     fn test_acks_from_i16() {
-        assert_eq!(Acks::from_i16(0), Acks::None);
-        assert_eq!(Acks::from_i16(1), Acks::Leader);
-        assert_eq!(Acks::from_i16(-1), Acks::All);
+        assert_eq!(Acks::from_i16(0), Some(Acks::None));
+        assert_eq!(Acks::from_i16(1), Some(Acks::Leader));
+        assert_eq!(Acks::from_i16(-1), Some(Acks::All));
     }
 
     #[test]
@@ -749,6 +820,23 @@ mod tests {
     }
 
     #[test]
+    fn test_config_builder_infinite_retry_loop_is_err() {
+        // Duration::MAX + retries=u32::MAX = infinite retry loop — must be rejected
+        let err = ProducerConfig::builder()
+            .bootstrap_servers("localhost:9092")
+            .idempotent(false)
+            .delivery_timeout(Duration::MAX)
+            .retries(u32::MAX)
+            .build()
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("infinite retry loop"),
+            "expected 'infinite retry loop' in error, got: {msg}"
+        );
+    }
+
+    #[test]
     fn test_config_builder_max_in_flight() {
         // max_in_flight=10 requires idempotent=false
         let config = ProducerConfig::builder()
@@ -804,24 +892,24 @@ mod tests {
 
     #[test]
     fn test_acks_from_i16_known_values() {
-        assert_eq!(Acks::from_i16(0), Acks::None);
-        assert_eq!(Acks::from_i16(1), Acks::Leader);
-        assert_eq!(Acks::from_i16(-1), Acks::All);
+        assert_eq!(Acks::from_i16(0), Some(Acks::None));
+        assert_eq!(Acks::from_i16(1), Some(Acks::Leader));
+        assert_eq!(Acks::from_i16(-1), Some(Acks::All));
     }
 
     #[test]
-    fn test_acks_from_i16_unknown_defaults_to_all() {
-        // Unknown values should default to All (safest default)
-        assert_eq!(Acks::from_i16(2), Acks::All);
-        assert_eq!(Acks::from_i16(99), Acks::All);
-        assert_eq!(Acks::from_i16(-2), Acks::All);
+    fn test_acks_from_i16_unknown_returns_none() {
+        // Unknown values return None — callers decide how to handle them
+        assert_eq!(Acks::from_i16(2), None);
+        assert_eq!(Acks::from_i16(99), None);
+        assert_eq!(Acks::from_i16(-2), None);
     }
 
     #[test]
     fn test_acks_roundtrip() {
-        assert_eq!(Acks::from_i16(Acks::None.to_i16()), Acks::None);
-        assert_eq!(Acks::from_i16(Acks::Leader.to_i16()), Acks::Leader);
-        assert_eq!(Acks::from_i16(Acks::All.to_i16()), Acks::All);
+        assert_eq!(Acks::from_i16(Acks::None.to_i16()), Some(Acks::None));
+        assert_eq!(Acks::from_i16(Acks::Leader.to_i16()), Some(Acks::Leader));
+        assert_eq!(Acks::from_i16(Acks::All.to_i16()), Some(Acks::All));
     }
 
     #[cfg(feature = "socks5")]

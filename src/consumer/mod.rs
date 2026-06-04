@@ -48,8 +48,8 @@ pub mod compacted;
 
 pub use builder::ConsumerBuilder;
 pub use compacted::{
-    CompactedTable, CompactedTableClearListener, CompactedTableSnapshot, CompactedTopicConsumer,
-    CompactedTopicConsumerBuilder, TableChange,
+    CompactedEntry, CompactedTable, CompactedTableClearListener, CompactedTableSnapshot,
+    CompactedTopicConsumer, CompactedTopicConsumerBuilder, TableChange,
 };
 pub use config::{
     AutoOffsetReset, ConsumerConfig, ConsumerConfigBuilder, GroupProtocol, IsolationLevel,

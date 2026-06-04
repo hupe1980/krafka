@@ -12,6 +12,7 @@ use crate::protocol::{
 };
 
 /// Produce request.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ProduceRequest {
     /// Transactional ID (v3+).
@@ -37,6 +38,7 @@ pub struct ProduceTopicData {
 }
 
 /// Partition data in produce request.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ProducePartitionData {
     /// Partition index.
@@ -151,6 +153,7 @@ impl ProduceRequest {
 }
 
 /// Produce response.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct ProduceResponse {
     /// Topic responses.
@@ -172,6 +175,7 @@ pub struct ProduceTopicResponse {
 }
 
 /// Partition response in produce response.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ProducePartitionResponse {
     /// Partition index.

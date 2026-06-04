@@ -1483,7 +1483,20 @@ impl ProducerBuilder {
     /// Idempotent production is enabled by default (matching KIP-679 / Kafka 3.0+).
     /// When enabled, the producer obtains a Producer ID from the broker and
     /// attaches sequence numbers to every batch, allowing the broker to
-    /// de-duplicate retries.
+    /// de-duplicate retries **within a single producer session**.
+    ///
+    /// # Zombie fencing limitation
+    ///
+    /// Idempotent producers do **not** fence zombie producers. If this producer
+    /// crashes and a new instance starts, both may produce to the same partition
+    /// concurrently — the broker cannot distinguish them because plain idempotent
+    /// producers get a fresh PID on every init (no stable identity across restarts).
+    ///
+    /// For true zombie fencing and exactly-once semantics across process restarts,
+    /// use [`TransactionalProducer`](crate::producer::TransactionalProducer) with
+    /// a stable `transactional_id`. The broker uses the `transactional_id` to bump
+    /// the producer epoch on each new init, fencing any previous instance with the
+    /// same ID. (KIP-360 / Kafka 2.5+)
     ///
     /// Requires `acks = All`. If `max_in_flight` is set above 5, it is
     /// automatically capped to 5 at build time (with an `info!` log).

@@ -138,17 +138,41 @@ impl<const L: usize, T> LeveledRwLock<L, T> {
 
     /// Non-blocking shared read attempt. Returns `Err` if the lock is
     /// currently held exclusively (matches `tokio::sync::RwLock::try_read`).
+    ///
+    /// In `debug_assertions` builds this also checks the lock-ordering
+    /// invariant, ensuring the same guarantee as the async `read()` path.
     #[inline]
-    pub(crate) fn try_read(&self) -> Result<RwLockReadGuard<'_, T>, tokio::sync::TryLockError> {
-        self.0.try_read()
+    pub(crate) fn try_read(&self) -> Result<LeveledReadGuard<'_, L, T>, tokio::sync::TryLockError> {
+        #[cfg(debug_assertions)]
+        let _level_guard = LevelGuard::acquire(L);
+
+        let guard = self.0.try_read()?;
+        Ok(LeveledReadGuard {
+            guard,
+            #[cfg(debug_assertions)]
+            _level_guard,
+        })
     }
 
     /// Non-blocking exclusive write attempt. Returns `Err` if any guard
     /// is currently held (matches `tokio::sync::RwLock::try_write`).
+    ///
+    /// In `debug_assertions` builds this also checks the lock-ordering
+    /// invariant, ensuring the same guarantee as the async `write()` path.
     #[allow(dead_code)] // part of the API; not every caller uses it today
     #[inline]
-    pub(crate) fn try_write(&self) -> Result<RwLockWriteGuard<'_, T>, tokio::sync::TryLockError> {
-        self.0.try_write()
+    pub(crate) fn try_write(
+        &self,
+    ) -> Result<LeveledWriteGuard<'_, L, T>, tokio::sync::TryLockError> {
+        #[cfg(debug_assertions)]
+        let _level_guard = LevelGuard::acquire(L);
+
+        let guard = self.0.try_write()?;
+        Ok(LeveledWriteGuard {
+            guard,
+            #[cfg(debug_assertions)]
+            _level_guard,
+        })
     }
 }
 

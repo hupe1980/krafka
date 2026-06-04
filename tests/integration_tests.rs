@@ -1433,11 +1433,13 @@ async fn test_admin_describe_topics() {
 
     let t1 = topics
         .iter()
-        .find(|t| t.name == topic1)
+        .find(|(name, _)| name.as_str() == topic1)
+        .map(|(_, info)| info)
         .expect("topic1 not found");
     let t2 = topics
         .iter()
-        .find(|t| t.name == topic2)
+        .find(|(name, _)| name.as_str() == topic2)
+        .map(|(_, info)| info)
         .expect("topic2 not found");
 
     assert_eq!(t1.partitions.len(), 2, "topic1 should have 2 partitions");

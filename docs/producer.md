@@ -132,10 +132,10 @@ To trim binary size further, disable defaults and select only the codecs you nee
 
 ```toml
 # Option 1: enable only the codecs you need
-krafka = { version = "0.11.0", default-features = false, features = ["lz4"] }
+krafka = { version = "0.12.0", default-features = false, features = ["lz4"] }
 
 # Option 2: enable all compression codecs, including zstd
-# krafka = { version = "0.11.0", features = ["compression-all"] }
+# krafka = { version = "0.12.0", features = ["compression-all"] }
 ```
 
 ### Batching
@@ -633,7 +633,7 @@ let producer = TransactionalProducer::builder()
     .bootstrap_servers("localhost:9092")
     .transactional_id("order-processor-1")
     .client_id("my-app")
-    .transaction_timeout_ms(60000)          // 60 second timeout
+    .transaction_timeout(Duration::from_secs(60))          // 60 second timeout
     .request_timeout(Duration::from_secs(30))
     .compression(Compression::Lz4)
     .build()

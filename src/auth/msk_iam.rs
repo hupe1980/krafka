@@ -87,8 +87,15 @@ pub struct MskIamAuthenticator {
 
 impl std::fmt::Debug for MskIamAuthenticator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Show only the last 4 chars of access_key_id (sufficient for identification,
+        // insufficient for impersonation). Full key IDs should not appear in logs.
+        let akid_tail = if self.access_key_id.len() > 4 {
+            format!("***{}", &self.access_key_id[self.access_key_id.len() - 4..])
+        } else {
+            "***".to_string()
+        };
         f.debug_struct("MskIamAuthenticator")
-            .field("access_key_id", &self.access_key_id)
+            .field("access_key_id", &akid_tail)
             .field("secret_access_key", &"[REDACTED]")
             .field(
                 "session_token",
@@ -648,8 +655,15 @@ mod tests {
         );
         // Must contain [REDACTED] markers
         assert!(debug_output.contains("[REDACTED]"));
-        // Access key ID is OK to show (it's not secret)
-        assert!(debug_output.contains("AKIAIOSFODNN7EXAMPLE"));
+        // Access key ID must be truncated — only last 4 chars visible
+        assert!(
+            debug_output.contains("MPLE"),
+            "should show last 4 chars of access key ID"
+        );
+        assert!(
+            !debug_output.contains("AKIAIOSFODNN7EXAMPLE"),
+            "full access key ID must not appear in Debug output"
+        );
     }
 
     #[test]

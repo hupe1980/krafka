@@ -434,6 +434,7 @@ impl SaslAuthenticator {
                             "OAuthBearer token is expired or too close to expiry; obtain a fresh token before connecting",
                         ));
                     }
+                    token.validate()?;
                     Ok(Zeroizing::new(token.to_gs2_initial_response()))
                 } else {
                     Ok(Zeroizing::new(Vec::new()))

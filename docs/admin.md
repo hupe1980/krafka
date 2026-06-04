@@ -186,15 +186,17 @@ for topic in topics {
 
 ### Describing Topics
 
+`describe_topics()` returns a `HashMap<String, TopicInfo>` keyed by topic name for O(1) look-ups:
+
 ```rust
 let descriptions = admin
-    .describe_topics(&["topic1".to_string(), "topic2".to_string()])
+    .describe_topics(&["topic1", "topic2"])
     .await?;
 
-for topic in descriptions {
-    println!("Topic: {}", topic.name);
-    println!("  Partitions: {}", topic.partitions.len());
-    for partition in &topic.partitions {
+for (name, info) in &descriptions {
+    println!("Topic: {}", name);
+    println!("  Partitions: {}", info.partition_count());
+    for partition in info.partitions_iter() {
         println!(
             "    Partition {}: leader={}, replicas={:?}, isr={:?}",
             partition.partition,
@@ -203,6 +205,19 @@ for topic in descriptions {
             partition.isr
         );
     }
+}
+
+// Or look up a single topic
+if let Some(info) = descriptions.get("topic1") {
+    println!("topic1 has {} partitions", info.partition_count());
+}
+```
+
+For a single-topic look-up, prefer the convenience shortcut:
+
+```rust
+if let Some(info) = admin.describe_topic("my-topic").await? {
+    println!("Partitions: {}", info.partition_count());
 }
 ```
 
@@ -227,21 +242,29 @@ match result.error {
 
 ### Describing Configuration
 
+`ConfigEntry::config_value()` returns a `ConfigValue` enum that distinguishes
+between an explicit value, a sensitive/redacted value, the broker default, and
+an unavailable entry:
+
 ```rust
-use krafka::admin::DescribeConfigsRequest;
+use krafka::admin::{DescribeConfigsRequest, ConfigValue};
 
 let configs = admin.describe_configs(DescribeConfigsRequest::for_topic("my-topic")).await?;
 
 println!("Topic configuration:");
 for config in configs {
-    let value = config.value.as_deref().unwrap_or("(null)");
     let flags = format!(
         "{}{}{}",
         if config.read_only { "R" } else { "" },
         if config.is_default { "D" } else { "" },
         if config.is_sensitive { "S" } else { "" }
     );
-    println!("  {}: {} [{}]", config.name, value, flags);
+    match config.config_value() {
+        ConfigValue::Value(v) => println!("  {}: {} [{}]", config.name, v, flags),
+        ConfigValue::Sensitive   => println!("  {}: <sensitive> [{}]", config.name, flags),
+        ConfigValue::Default     => println!("  {}: <default> [{}]", config.name, flags),
+        ConfigValue::Unavailable => println!("  {}: <unavailable> [{}]", config.name, flags),
+    }
 }
 ```
 
@@ -252,7 +275,9 @@ let configs = admin.describe_configs(DescribeConfigsRequest::for_broker(0)).awai
 
 println!("Broker 0 configuration:");
 for config in configs.iter().filter(|c| !c.is_default) {
-    println!("  {}: {:?}", config.name, config.value);
+    if let Some(v) = config.config_value().as_str() {
+        println!("  {}: {}", config.name, v);
+    }
 }
 ```
 

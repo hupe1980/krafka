@@ -532,6 +532,51 @@ mod tests {
         assert_ne!(hash1, hash3);
     }
 
+    /// Java-compatibility test vectors for murmur2.
+    ///
+    /// These values are derived from the Java Kafka client's `UtilsTest`:
+    /// `org.apache.kafka.common.utils.UtilsTest#testMurmur2`.
+    /// Java returns a signed `int`; we compare the same bit pattern as `u32`.
+    #[test]
+    fn test_murmur2_java_compat_vectors() {
+        let vectors: &[(&[u8], u32)] = &[
+            // "21" → Java: -973932308
+            (b"21", 0xC5F2F8ECu32),
+            // "foobar" → Java: -790332482
+            (b"foobar", 0xD0E47BBEu32),
+            // "a-little-bit-long-string" → Java: -985981536
+            (b"a-little-bit-long-string", 0xC53B1DA0u32),
+            // "a-little-bit-longer-string" → Java: -1486304829
+            (b"a-little-bit-longer-string", 0xA768C9C3u32),
+        ];
+        for (input, expected) in vectors {
+            let got = murmur2(input);
+            assert_eq!(
+                got,
+                *expected,
+                "murmur2({:?}) = 0x{:08X}, want 0x{:08X}",
+                std::str::from_utf8(input).unwrap_or("<binary>"),
+                got,
+                expected,
+            );
+        }
+    }
+
+    /// Java partition-assignment vectors.
+    ///
+    /// Verifies that `partition_for_key(key, n)` returns the same partition
+    /// as Java's `DefaultPartitioner` for the same inputs.
+    #[test]
+    fn test_murmur2_partition_for_key_java_compat() {
+        // Java: Utils.toPositive(Utils.murmur2(key)) % numPartitions
+        // "test" → murmur2 = 0x2AB0E07F → toPositive (& 0x7FFFFFFF) = 0x2AB0E07F
+        // 0x2AB0E07F = 716234879, 716234879 % 10 = 9
+        assert_eq!(partition_for_key(b"test", 10), 9);
+        // "kafka" → murmur2 = 0xD067CF64 → toPositive (& 0x7FFFFFFF) = 0x5067CF64
+        // 0x5067CF64 = 1348980580, 1348980580 % 10 = 0
+        assert_eq!(partition_for_key(b"kafka", 10), 0);
+    }
+
     #[test]
     fn test_round_robin_partitioner() {
         let partitioner = RoundRobinPartitioner::new();

@@ -178,6 +178,78 @@ pub struct CreatePartitionsResult {
     pub error: Option<String>,
 }
 
+/// The semantic value of a configuration entry.
+///
+/// Distinguishes between an explicit value, a broker-redacted sensitive value,
+/// a key that uses the broker default, and a key that is not available at the
+/// requested config source.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigValue {
+    /// The config key has this explicit string value.
+    Value(String),
+    /// The broker redacted the value because it is sensitive (e.g. passwords).
+    Sensitive,
+    /// The config key has no explicitly set value; the broker default applies.
+    Default,
+    /// The config key is not available at the requested source.
+    Unavailable,
+}
+
+impl ConfigValue {
+    /// Returns the value as `&str` if it is [`ConfigValue::Value`], otherwise `None`.
+    pub fn as_str(&self) -> Option<&str> {
+        if let ConfigValue::Value(v) = self {
+            Some(v.as_str())
+        } else {
+            None
+        }
+    }
+
+    /// Returns `true` if this is an explicit [`ConfigValue::Value`].
+    pub fn is_set(&self) -> bool {
+        matches!(self, ConfigValue::Value(_))
+    }
+
+    /// Parse the value as type `T`.
+    ///
+    /// Returns `Err` if the value is not [`ConfigValue::Value`] or parsing fails.
+    pub fn parse<T: std::str::FromStr>(&self) -> std::result::Result<T, ConfigParseError>
+    where
+        T::Err: std::fmt::Display,
+    {
+        match self {
+            ConfigValue::Value(v) => v.parse::<T>().map_err(|e| ConfigParseError {
+                message: e.to_string(),
+            }),
+            ConfigValue::Sensitive => Err(ConfigParseError {
+                message: "config value is sensitive and cannot be parsed".to_string(),
+            }),
+            ConfigValue::Default => Err(ConfigParseError {
+                message: "config value is the broker default and has no explicit value".to_string(),
+            }),
+            ConfigValue::Unavailable => Err(ConfigParseError {
+                message: "config value is not available at the requested source".to_string(),
+            }),
+        }
+    }
+}
+
+/// Error returned when [`ConfigValue::parse`] fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigParseError {
+    /// Human-readable description of the parse failure.
+    pub message: String,
+}
+
+impl std::fmt::Display for ConfigParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ConfigParseError {}
+
 /// A configuration entry.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -200,6 +272,26 @@ pub struct ConfigEntry {
     pub config_type: i8,
     /// Configuration documentation (v3+).
     pub documentation: Option<String>,
+}
+
+impl ConfigEntry {
+    /// Return the semantic [`ConfigValue`] for this entry.
+    ///
+    /// Interpretation priority:
+    /// 1. If `is_sensitive` → [`ConfigValue::Sensitive`]
+    /// 2. If `value` is `None` and `is_default` → [`ConfigValue::Default`]
+    /// 3. If `value` is `Some` → [`ConfigValue::Value`]
+    /// 4. Otherwise → [`ConfigValue::Unavailable`]
+    pub fn config_value(&self) -> ConfigValue {
+        if self.is_sensitive {
+            return ConfigValue::Sensitive;
+        }
+        match &self.value {
+            Some(v) => ConfigValue::Value(v.clone()),
+            None if self.is_default => ConfigValue::Default,
+            None => ConfigValue::Unavailable,
+        }
+    }
 }
 
 /// A synonym for a configuration key.

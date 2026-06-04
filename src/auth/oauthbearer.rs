@@ -388,6 +388,46 @@ impl OAuthBearerToken {
         })
     }
 
+    /// Validate the token value and extension key/value pairs for GS2-frame safety.
+    ///
+    /// The GS2 framing format (RFC 7628) uses `\x01` as a separator and requires
+    /// the token value to consist of printable ASCII characters only (0x21–0x7E
+    /// plus 0x20 SPACE, excluding the `\x01` control character used as a
+    /// field separator). Null bytes and other control characters would silently
+    /// corrupt the handshake payload and cause broker authentication failures
+    /// that are difficult to diagnose.
+    ///
+    /// Returns `Err` if the token value or any extension key/value contains
+    /// a `\x01` byte, a null byte, or any non-printable/non-ASCII character.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.token_value.is_empty() {
+            return Err(crate::error::KrafkaError::auth(
+                "OAuthBearer token value must not be empty",
+            ));
+        }
+        if let Some(bad) = self
+            .token_value
+            .bytes()
+            .find(|&b| !(0x20..=0x7E).contains(&b))
+        {
+            return Err(crate::error::KrafkaError::auth(format!(
+                "OAuthBearer token value contains an invalid byte 0x{bad:02X}; \
+                 token must consist of printable ASCII characters (0x20–0x7E) only"
+            )));
+        }
+        for (key, value) in &self.extensions {
+            for s in [key.as_str(), value.as_str()] {
+                if let Some(bad) = s.bytes().find(|&b| !(0x20..=0x7E).contains(&b)) {
+                    return Err(crate::error::KrafkaError::auth(format!(
+                        "OAuthBearer extension key/value contains an invalid byte 0x{bad:02X}; \
+                         extension strings must consist of printable ASCII characters only"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Build the initial client response in GS2 framing format (RFC 7628).
     ///
     /// Format: `n,,\x01auth=Bearer <token>[\x01key=value]*\x01\x01`
@@ -541,6 +581,73 @@ mod tests {
         let token = OAuthBearerToken::new("");
         let response = token.to_gs2_initial_response();
         assert_eq!(response, b"n,,\x01auth=Bearer \x01\x01");
+    }
+
+    // ── OAuthBearerToken::validate() ──
+
+    #[test]
+    fn test_oauthbearer_validate_valid_token() {
+        let token = OAuthBearerToken::new("eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.sig");
+        assert!(token.validate().is_ok());
+    }
+
+    #[test]
+    fn test_oauthbearer_validate_empty_token_is_err() {
+        let token = OAuthBearerToken::new("");
+        assert!(token.validate().is_err());
+    }
+
+    #[test]
+    fn test_oauthbearer_validate_null_byte_is_err() {
+        let token = OAuthBearerToken::new("tok\x00en");
+        assert!(token.validate().is_err(), "null byte must be rejected");
+    }
+
+    #[test]
+    fn test_oauthbearer_validate_gs2_separator_is_err() {
+        let token = OAuthBearerToken::new("tok\x01en");
+        assert!(
+            token.validate().is_err(),
+            "0x01 (GS2 separator) must be rejected in token value"
+        );
+    }
+
+    #[test]
+    fn test_oauthbearer_validate_non_ascii_is_err() {
+        // Construct a token containing a high byte (0x80) that is valid UTF-8
+        // in a 2-byte sequence (U+0080, encoded as 0xC2 0x80).
+        // Our validator rejects any byte > 0x7E, so this must be rejected.
+        let token = OAuthBearerToken::new("\u{0080}");
+        assert!(
+            token.validate().is_err(),
+            "non-ASCII (multi-byte UTF-8) byte must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_oauthbearer_validate_extension_null_byte_is_err() {
+        let token = OAuthBearerToken::new("valid-token").with_extension("key\x00", "value");
+        assert!(
+            token.validate().is_err(),
+            "null byte in extension key must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_oauthbearer_validate_extension_gs2_separator_in_value_is_err() {
+        let token = OAuthBearerToken::new("valid-token").with_extension("key", "val\x01ue");
+        assert!(
+            token.validate().is_err(),
+            "0x01 in extension value must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_oauthbearer_validate_valid_extension() {
+        let token = OAuthBearerToken::new("valid-token")
+            .with_extension("logicalCluster", "lkc-abc123")
+            .with_extension("identityPoolId", "pool-xyz789");
+        assert!(token.validate().is_ok());
     }
 
     #[test]

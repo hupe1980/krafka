@@ -57,7 +57,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use parking_lot::Mutex;
+use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use super::record::ConsumerRecord;
@@ -65,6 +65,40 @@ use super::{AutoOffsetReset, Consumer, ConsumerRebalanceListener, TopicPartition
 use crate::auth::AuthConfig;
 use crate::error::{KrafkaError, Result};
 use crate::{Offset, PartitionId, Timestamp};
+
+/// A single entry in a [`CompactedTable`], carrying the value together with
+/// the provenance metadata (offset and broker timestamp) of the most recent
+/// record that wrote it.
+///
+/// Accessing the timestamp lets callers implement freshness policies such as
+/// "reject state older than 24 h" without coupling to a separate metadata
+/// store.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactedEntry {
+    /// The current value for the key.
+    pub value: Bytes,
+    /// Broker-assigned append timestamp (milliseconds since epoch) of the
+    /// record that last wrote this key.  Matches the `timestamp` field of
+    /// the originating [`ConsumerRecord`].
+    pub timestamp_ms: Timestamp,
+    /// Log offset of the record that last wrote this key.
+    pub offset: Offset,
+    /// Partition the record came from.
+    pub partition: PartitionId,
+}
+
+impl CompactedEntry {
+    /// Returns `true` if the entry's timestamp is older than `max_age`.
+    #[inline]
+    pub fn is_stale(&self, max_age: std::time::Duration) -> bool {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(i64::MAX);
+        now_ms.saturating_sub(self.timestamp_ms) > max_age.as_millis() as i64
+    }
+}
 
 /// A change to a [`CompactedTable`].
 ///
@@ -145,7 +179,7 @@ pub struct CompactedTableSnapshot {
 ///
 /// ```rust,ignore
 /// use std::sync::Arc;
-/// use parking_lot::Mutex;
+/// use tokio::sync::Mutex;
 /// use krafka::consumer::{Consumer, CompactedTable, CompactedTableClearListener};
 ///
 /// let table = Arc::new(Mutex::new(CompactedTable::new()));
@@ -161,7 +195,7 @@ pub struct CompactedTableSnapshot {
 ///
 /// loop {
 ///     let records = consumer.poll(Duration::from_secs(1)).await?;
-///     let mut t = table.lock();
+///     let mut t = table.lock().await;
 ///     t.ingest(&records);
 /// }
 /// ```
@@ -181,11 +215,11 @@ impl ConsumerRebalanceListener for CompactedTableClearListener {
     async fn on_partitions_assigned(&self, _partitions: &[TopicPartition]) {}
 
     async fn on_partitions_revoked(&self, _partitions: &[TopicPartition]) {
-        self.table.lock().clear();
+        self.table.lock().await.clear();
     }
 
     async fn on_partitions_lost(&self, _partitions: &[TopicPartition]) {
-        self.table.lock().clear();
+        self.table.lock().await.clear();
     }
 }
 
@@ -242,8 +276,8 @@ impl ConsumerRebalanceListener for CompactedTableClearListener {
 /// collection equality reflects contents, not metadata.
 #[derive(Default, Clone)]
 pub struct CompactedTable {
-    /// The key→value entries.
-    entries: HashMap<Bytes, Bytes>,
+    /// The key→entry map (value + provenance metadata).
+    entries: HashMap<Bytes, CompactedEntry>,
     /// Total records processed (including tombstones and keyless records).
     records_processed: u64,
     /// Total tombstones processed.
@@ -293,12 +327,20 @@ impl CompactedTable {
         changes
     }
 
-    /// Get the current value for a key.
+    /// Get the current entry for a key, including value, timestamp, and offset.
     ///
     /// Returns `None` if the key is not in the table (never seen or deleted
     /// by a tombstone).
-    pub fn get(&self, key: &[u8]) -> Option<&Bytes> {
+    pub fn get(&self, key: &[u8]) -> Option<&CompactedEntry> {
         self.entries.get(key)
+    }
+
+    /// Get just the value bytes for a key, without provenance metadata.
+    ///
+    /// Equivalent to `get(key).map(|e| &e.value)`. Use [`get`](Self::get)
+    /// when you also need the timestamp or offset.
+    pub fn get_value(&self, key: &[u8]) -> Option<&Bytes> {
+        self.entries.get(key).map(|e| &e.value)
     }
 
     /// Check if the table contains the given key.
@@ -318,8 +360,8 @@ impl CompactedTable {
         self.entries.is_empty()
     }
 
-    /// Iterate over all key→value pairs.
-    pub fn iter(&self) -> impl Iterator<Item = (&Bytes, &Bytes)> {
+    /// Iterate over all key→entry pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (&Bytes, &CompactedEntry)> {
         self.entries.iter()
     }
 
@@ -328,18 +370,17 @@ impl CompactedTable {
         self.entries.keys()
     }
 
-    /// Iterate over all values in the table.
-    pub fn values(&self) -> impl Iterator<Item = &Bytes> {
+    /// Iterate over all entries in the table.
+    pub fn values(&self) -> impl Iterator<Item = &CompactedEntry> {
         self.entries.values()
     }
 
-    /// Get a snapshot (clone) of the key→value entries.
+    /// Get a snapshot (clone) of the key→entry map.
     ///
-    /// Returns only the entries, without counters. Use
-    /// [`Clone::clone()`] if you need a full copy including
-    /// `records_processed` and `tombstones_processed`.
+    /// Returns all entries including provenance metadata. Use
+    /// [`Clone::clone()`] if you need a full copy including counters.
     #[must_use]
-    pub fn snapshot(&self) -> HashMap<Bytes, Bytes> {
+    pub fn snapshot(&self) -> HashMap<Bytes, CompactedEntry> {
         self.entries.clone()
     }
 
@@ -391,10 +432,10 @@ impl CompactedTable {
     fn apply_keyed_record(&mut self, key: &Bytes, record: &ConsumerRecord) -> TableChange {
         if record.is_tombstone() {
             self.tombstones_processed += 1;
-            let old_value = self.entries.remove(key.as_ref());
+            let old_entry = self.entries.remove(key.as_ref());
             TableChange {
                 key: key.clone(),
-                old_value,
+                old_value: old_entry.map(|e| e.value),
                 new_value: None,
                 partition: record.partition,
                 offset: record.offset,
@@ -406,10 +447,29 @@ impl CompactedTable {
                 unreachable!("non-tombstone compacted record must have a value");
             };
             let key_owned = key.clone();
-            let old_value = self.entries.insert(key_owned.clone(), value.clone());
+            let new_entry = CompactedEntry {
+                value: value.clone(),
+                timestamp_ms: record.timestamp,
+                offset: record.offset,
+                partition: record.partition,
+            };
+            // Warn if the same key arrives from a different partition.
+            if let Some(existing) = self.entries.get(key_owned.as_ref())
+                && existing.partition != record.partition
+            {
+                tracing::warn!(
+                    existing_partition = existing.partition,
+                    new_partition = record.partition,
+                    "CompactedTable: key appears in multiple partitions; \
+                     entries will be conflated with last-write-wins semantics. \
+                     If partition-scoped dedup is required, encode the partition \
+                     into the key before ingesting records."
+                );
+            }
+            let old_entry = self.entries.insert(key_owned.clone(), new_entry);
             TableChange {
                 key: key_owned,
-                old_value,
+                old_value: old_entry.map(|e| e.value),
                 new_value: Some(value),
                 partition: record.partition,
                 offset: record.offset,
@@ -429,7 +489,30 @@ impl CompactedTable {
             let Some(value) = record.value.clone() else {
                 unreachable!("non-tombstone compacted record must have a value");
             };
-            self.entries.insert(key.clone(), value);
+            // Warn once if the same key arrives from a different partition — this is
+            // almost always a producer misconfiguration or unexpected custom partitioner
+            // and will silently produce last-write-wins semantics across partitions.
+            if let Some(existing) = self.entries.get(key.as_ref())
+                && existing.partition != record.partition
+            {
+                tracing::warn!(
+                    existing_partition = existing.partition,
+                    new_partition = record.partition,
+                    "CompactedTable: key appears in multiple partitions; \
+                     entries will be conflated with last-write-wins semantics. \
+                     If partition-scoped dedup is required, encode the partition \
+                     into the key before ingesting records."
+                );
+            }
+            self.entries.insert(
+                key.clone(),
+                CompactedEntry {
+                    value,
+                    timestamp_ms: record.timestamp,
+                    offset: record.offset,
+                    partition: record.partition,
+                },
+            );
         }
     }
 
@@ -445,8 +528,8 @@ impl CompactedTable {
 }
 
 impl<'a> IntoIterator for &'a CompactedTable {
-    type Item = (&'a Bytes, &'a Bytes);
-    type IntoIter = std::collections::hash_map::Iter<'a, Bytes, Bytes>;
+    type Item = (&'a Bytes, &'a CompactedEntry);
+    type IntoIter = std::collections::hash_map::Iter<'a, Bytes, CompactedEntry>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.entries.iter()
@@ -454,8 +537,8 @@ impl<'a> IntoIterator for &'a CompactedTable {
 }
 
 impl IntoIterator for CompactedTable {
-    type Item = (Bytes, Bytes);
-    type IntoIter = std::collections::hash_map::IntoIter<Bytes, Bytes>;
+    type Item = (Bytes, CompactedEntry);
+    type IntoIter = std::collections::hash_map::IntoIter<Bytes, CompactedEntry>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.entries.into_iter()
@@ -474,6 +557,8 @@ impl fmt::Debug for CompactedTable {
 
 impl PartialEq for CompactedTable {
     /// Compares entries only — processing counters are ignored.
+    /// Two tables with the same key→entry content are equal regardless
+    /// of how many records were processed to reach that state.
     fn eq(&self, other: &Self) -> bool {
         self.entries == other.entries
     }
@@ -1051,8 +1136,8 @@ mod tests {
         let changes = table.apply(&records);
 
         assert_eq!(table.len(), 2);
-        assert_eq!(table.get(b"k1"), Some(&Bytes::from("v1")));
-        assert_eq!(table.get(b"k2"), Some(&Bytes::from("v2")));
+        assert_eq!(table.get_value(b"k1"), Some(&Bytes::from("v1")));
+        assert_eq!(table.get_value(b"k2"), Some(&Bytes::from("v2")));
         assert_eq!(changes.len(), 2);
         assert!(changes[0].is_insert());
         assert!(changes[1].is_insert());
@@ -1068,7 +1153,7 @@ mod tests {
         let changes = table.apply(&[make_record(Some("k1"), Some("new"), 0, 5)]);
 
         assert_eq!(table.len(), 1);
-        assert_eq!(table.get(b"k1"), Some(&Bytes::from("new")));
+        assert_eq!(table.get_value(b"k1"), Some(&Bytes::from("new")));
         assert_eq!(changes.len(), 1);
         assert!(changes[0].is_update());
         assert_eq!(changes[0].old_value, Some(Bytes::from("old")));
@@ -1087,7 +1172,7 @@ mod tests {
 
         assert_eq!(table.len(), 1);
         assert!(!table.contains_key(b"k1"));
-        assert_eq!(table.get(b"k2"), Some(&Bytes::from("v2")));
+        assert_eq!(table.get_value(b"k2"), Some(&Bytes::from("v2")));
         assert_eq!(changes.len(), 1);
         assert!(changes[0].is_delete());
         assert_eq!(changes[0].old_value, Some(Bytes::from("v1")));
@@ -1136,7 +1221,7 @@ mod tests {
 
         // Update
         let changes = table.apply(&[make_record(Some("user-1"), Some("Alice V2"), 0, 2)]);
-        assert_eq!(table.get(b"user-1"), Some(&Bytes::from("Alice V2")));
+        assert_eq!(table.get_value(b"user-1"), Some(&Bytes::from("Alice V2")));
         assert!(changes[0].is_update());
 
         // Delete
@@ -1173,7 +1258,7 @@ mod tests {
         let changes = table.apply(&records);
 
         assert_eq!(table.len(), 2);
-        assert_eq!(table.get(b"k1"), Some(&Bytes::from("v1-updated")));
+        assert_eq!(table.get_value(b"k1"), Some(&Bytes::from("v1-updated")));
         assert_eq!(changes.len(), 3);
         assert!(changes[0].is_insert());
         assert!(changes[1].is_insert());
@@ -1197,7 +1282,7 @@ mod tests {
             make_record(Some("b"), Some("2"), 0, 1),
         ]);
 
-        let items: HashMap<&Bytes, &Bytes> = table.iter().collect();
+        let items: HashMap<&Bytes, &Bytes> = table.iter().map(|(k, e)| (k, &e.value)).collect();
         assert_eq!(items.len(), 2);
         assert_eq!(items[&Bytes::from("a")], &Bytes::from("1"));
         assert_eq!(items[&Bytes::from("b")], &Bytes::from("2"));
@@ -1213,7 +1298,10 @@ mod tests {
 
         let snap = table.snapshot();
         assert_eq!(snap.len(), 2);
-        assert_eq!(snap.get(&Bytes::from("k1")), Some(&Bytes::from("v1")));
+        assert_eq!(
+            snap.get(&Bytes::from("k1")).map(|e| &e.value),
+            Some(&Bytes::from("v1"))
+        );
     }
 
     #[test]
@@ -1255,7 +1343,8 @@ mod tests {
             make_record(Some("b"), Some("2"), 0, 1),
         ]);
 
-        let items: HashMap<&Bytes, &Bytes> = (&table).into_iter().collect();
+        let items: HashMap<&Bytes, &Bytes> =
+            (&table).into_iter().map(|(k, e)| (k, &e.value)).collect();
         assert_eq!(items.len(), 2);
         assert_eq!(items[&Bytes::from("a")], &Bytes::from("1"));
     }
@@ -1323,7 +1412,7 @@ mod tests {
             make_record(Some("b"), Some("2"), 0, 1),
         ]);
 
-        let mut values: Vec<&Bytes> = table.values().collect();
+        let mut values: Vec<&Bytes> = table.values().map(|e| &e.value).collect();
         values.sort();
         assert_eq!(values, vec![&Bytes::from("1"), &Bytes::from("2")]);
     }
@@ -1336,7 +1425,7 @@ mod tests {
             make_record(Some("b"), Some("2"), 0, 1),
         ]);
 
-        let items: HashMap<Bytes, Bytes> = table.into_iter().collect();
+        let items: HashMap<Bytes, Bytes> = table.into_iter().map(|(k, e)| (k, e.value)).collect();
         assert_eq!(items.len(), 2);
         assert_eq!(items.get(&Bytes::from("a")), Some(&Bytes::from("1")));
         assert_eq!(items.get(&Bytes::from("b")), Some(&Bytes::from("2")));
@@ -1374,7 +1463,7 @@ mod tests {
 
         assert_eq!(table.len(), 1);
         assert!(!table.contains_key(b"k1"));
-        assert_eq!(table.get(b"k2"), Some(&Bytes::from("v2")));
+        assert_eq!(table.get_value(b"k2"), Some(&Bytes::from("v2")));
         assert_eq!(table.records_processed(), 4);
         assert_eq!(table.tombstones_processed(), 1);
     }
@@ -1408,13 +1497,16 @@ mod tests {
 
     #[test]
     fn test_table_equality_ignores_counters() {
+        // Two tables built from different batches but with identical final entries
+        // (same key, value, offset, timestamp) must compare equal regardless of
+        // how many total records were processed.
         let mut t1 = CompactedTable::new();
-        t1.ingest(&[make_record(Some("k"), Some("v"), 0, 0)]);
+        t1.ingest(&[make_record(Some("k"), Some("v"), 0, 5)]);
 
         let mut t2 = CompactedTable::new();
         t2.ingest(&[
             make_record(None, Some("noise"), 0, 0), // keyless — skipped, but counted
-            make_record(Some("k"), Some("v"), 0, 1),
+            make_record(Some("k"), Some("v"), 0, 5), // same key/value/offset/ts
         ]);
 
         // Same entries, different counters.
@@ -1435,7 +1527,7 @@ mod tests {
         let changes = table.apply(&records);
 
         assert_eq!(table.len(), 1);
-        assert_eq!(table.get(b"x"), Some(&Bytes::from("v3")));
+        assert_eq!(table.get_value(b"x"), Some(&Bytes::from("v3")));
         assert_eq!(changes.len(), 4);
 
         // Insert: no previous value

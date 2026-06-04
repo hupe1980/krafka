@@ -8,6 +8,7 @@
 //! ```
 
 use krafka::producer::TransactionalProducer;
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bootstrap_servers("localhost:9092")
         .transactional_id("krafka-example-txn-1")
         .client_id("krafka-transactional-producer")
-        .transaction_timeout_ms(60000) // 60 seconds
+        .transaction_timeout(Duration::from_secs(60))
         .build()
         .await?;
 

@@ -110,11 +110,22 @@
 //!
 //! ```toml
 //! [dependencies]
-//! krafka = { version = "0.11.0", default-features = false, features = ["lz4"] }
+//! krafka = { version = "0.12.0", default-features = false, features = ["lz4"] }
 //! ```
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(unsafe_code)]
+
+// `ring` and `rustls-aws-lc-rs` are mutually exclusive rustls crypto backends.
+// Activating both simultaneously causes a runtime "no default crypto provider"
+// panic and links against both C libraries unnecessarily.  Fail at compile time
+// with a clear message rather than a mysterious runtime error.
+#[cfg(all(feature = "ring", feature = "rustls-aws-lc-rs"))]
+compile_error!(
+    "features `ring` and `rustls-aws-lc-rs` are mutually exclusive — \
+     select exactly one rustls crypto backend. \
+     Add `default-features = false` to your krafka dependency and pick one."
+);
 
 // krafka's metrics layer relies on 64-bit atomic operations (AtomicU64).
 // 32-bit targets without hardware AtomicU64 support (e.g. Cortex-M3) are not
