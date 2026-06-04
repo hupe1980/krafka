@@ -213,17 +213,19 @@ impl AdminClient {
     ///
     /// Topics not found in cluster metadata are absent from the returned map;
     /// callers can detect missing topics by comparing request and response key sets.
-    pub async fn describe_topics(&self, topics: &[String]) -> Result<HashMap<String, TopicInfo>> {
+    pub async fn describe_topics<S: AsRef<str>>(
+        &self,
+        topics: &[S],
+    ) -> Result<HashMap<String, TopicInfo>> {
         self.check_not_closed()?;
         self.metadata.refresh().await?;
-        let all_topics = self.metadata.topics();
+        // Use O(1) per-topic metadata look-up instead of a full Vec scan.
         let result = topics
             .iter()
             .filter_map(|name| {
-                all_topics
-                    .iter()
-                    .find(|t| &t.name == name)
-                    .map(|info| (name.clone(), info.clone()))
+                self.metadata
+                    .topic(name.as_ref())
+                    .map(|info| (name.as_ref().to_owned(), info))
             })
             .collect();
         Ok(result)
@@ -235,7 +237,7 @@ impl AdminClient {
     pub async fn describe_topic(&self, topic: &str) -> Result<Option<TopicInfo>> {
         self.check_not_closed()?;
         self.metadata.refresh().await?;
-        Ok(self.metadata.topics().into_iter().find(|t| t.name == topic))
+        Ok(self.metadata.topic(topic))
     }
 
     /// Describe the cluster using the DescribeCluster API (Key 60).

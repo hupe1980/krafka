@@ -1493,7 +1493,7 @@ impl ProducerBuilder {
     /// producers get a fresh PID on every init (no stable identity across restarts).
     ///
     /// For true zombie fencing and exactly-once semantics across process restarts,
-    /// use [`TransactionalProducer`](crate::producer::TransactionalProducer) with
+    /// use [`TransactionalProducer`] with
     /// a stable `transactional_id`. The broker uses the `transactional_id` to bump
     /// the producer epoch on each new init, fencing any previous instance with the
     /// same ID. (KIP-360 / Kafka 2.5+)

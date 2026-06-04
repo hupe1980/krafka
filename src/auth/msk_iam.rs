@@ -89,10 +89,22 @@ impl std::fmt::Debug for MskIamAuthenticator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Show only the last 4 chars of access_key_id (sufficient for identification,
         // insufficient for impersonation). Full key IDs should not appear in logs.
-        let akid_tail = if self.access_key_id.len() > 4 {
-            format!("***{}", &self.access_key_id[self.access_key_id.len() - 4..])
-        } else {
-            "***".to_string()
+        // Use char-boundary-safe extraction so Debug never panics on non-ASCII input.
+        let akid_tail = {
+            let s = &self.access_key_id;
+            let tail: String = s
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            if tail.len() < s.chars().count() {
+                format!("***{tail}")
+            } else {
+                "***".to_string()
+            }
         };
         f.debug_struct("MskIamAuthenticator")
             .field("access_key_id", &akid_tail)

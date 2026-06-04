@@ -428,10 +428,22 @@ impl fmt::Debug for AwsMskIamCredentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Show only the last 4 chars of access_key_id (sufficient for identification,
         // insufficient for impersonation). Full key IDs should not appear in logs.
-        let akid_tail = if self.access_key_id.len() > 4 {
-            format!("***{}", &self.access_key_id[self.access_key_id.len() - 4..])
-        } else {
-            "***".to_string()
+        // Use char-boundary-safe extraction so Debug never panics on non-ASCII input.
+        let akid_tail = {
+            let s = &self.access_key_id;
+            let tail: String = s
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            if tail.len() < s.chars().count() {
+                format!("***{tail}")
+            } else {
+                "***".to_string()
+            }
         };
         f.debug_struct("AwsMskIamCredentials")
             .field("access_key_id", &akid_tail)
@@ -1036,9 +1048,15 @@ impl AuthConfig {
                         }
                         Ok(cfg)
                     }
-                    other => Err(crate::error::KrafkaError::config(format!(
-                        "unknown SASL mechanism in KAFKA_SASL_MECHANISM: {other}"
-                    ))),
+                    other => {
+                        // Zeroize the password before returning so it does not
+                        // linger on the heap after an unknown-mechanism error.
+                        let mut password = password;
+                        password.zeroize();
+                        Err(crate::error::KrafkaError::config(format!(
+                            "unknown SASL mechanism in KAFKA_SASL_MECHANISM: {other}"
+                        )))
+                    }
                 }
             }
             other => Err(crate::error::KrafkaError::config(format!(

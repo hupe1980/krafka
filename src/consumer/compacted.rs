@@ -453,7 +453,9 @@ impl CompactedTable {
                 offset: record.offset,
                 partition: record.partition,
             };
-            // Warn if the same key arrives from a different partition.
+            // Warn if the same key arrives from a different partition — this is
+            // almost always a producer misconfiguration or unexpected custom partitioner
+            // and will silently produce last-write-wins semantics across partitions.
             if let Some(existing) = self.entries.get(key_owned.as_ref())
                 && existing.partition != record.partition
             {
@@ -489,7 +491,7 @@ impl CompactedTable {
             let Some(value) = record.value.clone() else {
                 unreachable!("non-tombstone compacted record must have a value");
             };
-            // Warn once if the same key arrives from a different partition — this is
+            // Warn if the same key arrives from a different partition — this is
             // almost always a producer misconfiguration or unexpected custom partitioner
             // and will silently produce last-write-wins semantics across partitions.
             if let Some(existing) = self.entries.get(key.as_ref())
