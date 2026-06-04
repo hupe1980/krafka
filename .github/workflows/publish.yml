@@ -17,6 +17,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # All features except `ring` (mutually exclusive with `rustls-aws-lc-rs`).
+  # Mirrors the ALL_FEATURES_NO_RING set used in ci.yml.
+  ALL_FEATURES_NO_RING: >-
+    compression-all,aws-msk,schema-registry,aws-glue-schema-registry,
+    native-tls-roots,unstable-protocol,telemetry,socks5,rustls-aws-lc-rs
 
 jobs:
   publish:
@@ -46,7 +51,7 @@ jobs:
           echo "Version verified: $CARGO_VERSION"
 
       - name: Run tests
-        run: cargo test --all-features
+        run: cargo test --no-default-features --features "$ALL_FEATURES_NO_RING"
 
       - name: Dry run publish
         if: github.event_name == 'workflow_dispatch' && inputs.dry-run == true
