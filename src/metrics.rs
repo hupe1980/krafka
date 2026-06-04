@@ -65,7 +65,7 @@
 use ahash::AHashMap;
 use std::fmt::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Atomic counter for tracking counts.
@@ -108,10 +108,14 @@ impl Counter {
 #[derive(Debug, Default)]
 pub struct Gauge {
     value: AtomicU64,
-    /// Fires a warning at most once *per gauge instance* when `dec()` underflows.
-    /// Per-instance tracking means a systematic mismatch in gauge B does not
-    /// get silenced by a single prior underflow in gauge A.
-    underflow_warned: AtomicBool,
+    /// Counts how many times `dec()` has been called when the gauge was already
+    /// 0.  Every underflow emits a `warn!` log that includes the cumulative
+    /// count, so repeated underflows in a buggy dec-loop remain visible rather
+    /// than being silenced after the first occurrence.  The count itself is
+    /// also a diagnostic signal: `underflow_count == 1` suggests a one-off
+    /// timing edge-case, while `underflow_count == 10_000` clearly signals a
+    /// systematic inc/dec imbalance.
+    underflow_count: AtomicU64,
 }
 
 impl Gauge {
@@ -132,6 +136,15 @@ impl Gauge {
         self.value.load(Ordering::Relaxed)
     }
 
+    /// Returns the cumulative number of times `dec()` has underflowed.
+    ///
+    /// A non-zero value indicates a mismatched `inc()`/`dec()` pair somewhere
+    /// in the call path for this gauge.
+    #[inline]
+    pub fn underflow_count(&self) -> u64 {
+        self.underflow_count.load(Ordering::Relaxed)
+    }
+
     /// Increment the gauge by 1.
     #[inline]
     pub fn inc(&self) {
@@ -140,14 +153,11 @@ impl Gauge {
 
     /// Decrement the gauge by 1 (saturates at 0 to prevent underflow).
     ///
-    /// Logs a warning **once per gauge instance** if the gauge was already zero,
-    /// which typically indicates a mismatched `inc()`/`dec()` pair.  Using a
-    /// per-instance flag (rather than a process-wide static) ensures that an
-    /// underflow in one gauge does not silence warnings from other gauges.
-    ///
-    /// Uses a CAS loop to atomically prevent underflow. Two concurrent `dec()`
-    /// calls on a gauge at value 1 are guaranteed: exactly one succeeds and one
-    /// warns — never silently wrapping to `u64::MAX`.
+    /// Logs a `warn!` **on every underflow** including the cumulative underflow
+    /// count so repeated bugs remain visible — not silenced after the first
+    /// occurrence.  Uses a CAS loop to atomically prevent underflow: two
+    /// concurrent `dec()` calls on a gauge at value 1 are guaranteed to have
+    /// exactly one succeed and one warn — never silently wrapping to `u64::MAX`.
     #[inline]
     pub fn dec(&self) {
         let result = self
@@ -155,10 +165,11 @@ impl Gauge {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 if v == 0 { None } else { Some(v - 1) }
             });
-        if result.is_err() && !self.underflow_warned.swap(true, Ordering::AcqRel) {
+        if result.is_err() {
+            let count = self.underflow_count.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::warn!(
-                "Gauge::dec() called when value was already 0 — possible inc/dec mismatch \
-                 (this warning fires once per gauge instance)"
+                underflow_count = count,
+                "Gauge::dec() called when value was already 0 — possible inc/dec mismatch"
             );
         }
     }
@@ -1885,6 +1896,7 @@ mod tests {
     fn test_gauge_dec_saturates_at_zero() {
         let gauge = Gauge::new();
         assert_eq!(gauge.get(), 0);
+        assert_eq!(gauge.underflow_count(), 0);
 
         // Decrementing from 0 should not underflow
         gauge.dec();
@@ -1893,11 +1905,21 @@ mod tests {
             0,
             "Gauge::dec() should saturate at 0, not underflow"
         );
+        assert_eq!(
+            gauge.underflow_count(),
+            1,
+            "first underflow must be counted"
+        );
 
-        // Multiple decrements from 0 should all stay at 0
+        // Each subsequent underflow increments the count
         gauge.dec();
         gauge.dec();
         assert_eq!(gauge.get(), 0);
+        assert_eq!(
+            gauge.underflow_count(),
+            3,
+            "all underflows must be counted, not silenced after the first"
+        );
 
         // Set to 1, dec to 0, then dec again
         gauge.set(1);
@@ -1905,6 +1927,7 @@ mod tests {
         assert_eq!(gauge.get(), 0);
         gauge.dec();
         assert_eq!(gauge.get(), 0, "Gauge should not wrap around u64::MAX");
+        assert_eq!(gauge.underflow_count(), 4);
     }
 
     #[test]

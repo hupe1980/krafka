@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let topic_infos = admin
             .describe_topics(&topics[..1.min(topics.len())])
             .await?;
-        for info in topic_infos {
+        for (_, info) in topic_infos {
             println!("Topic: {}", info.name);
             println!("  Partitions: {}", info.partition_count());
             for partition in info.partitions_iter() {

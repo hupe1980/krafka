@@ -165,19 +165,79 @@ impl AdminClient {
         Ok(self.metadata.topics().into_iter().map(|t| t.name).collect())
     }
 
-    /// Describe topics.
-    pub async fn describe_topics(&self, topics: &[String]) -> Result<Vec<TopicInfo>> {
+    /// Fetch specific config keys for a topic.
+    ///
+    /// A convenience wrapper around [`describe_configs`](Self::describe_configs)
+    /// for the common case of reading a small set of well-known topic-level keys.
+    /// Pass an empty `keys` slice to fetch all config entries for the topic.
+    ///
+    /// Returns a map of config key → [`ConfigValue`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let cfg = admin.topic_config("my-topic", &["retention.ms", "cleanup.policy"]).await?;
+    /// if let Some(krafka::admin::ConfigValue::Value(v)) = cfg.get("retention.ms") {
+    ///     println!("retention.ms = {v}");
+    /// }
+    /// ```
+    pub async fn topic_config(
+        &self,
+        topic: &str,
+        keys: &[&str],
+    ) -> Result<HashMap<String, super::ConfigValue>> {
+        let request = DescribeConfigsRequest {
+            resources: vec![super::DescribeConfigsResource {
+                resource_type: super::ConfigResourceType::Topic,
+                resource_name: topic.to_string(),
+                config_names: if keys.is_empty() {
+                    None
+                } else {
+                    Some(keys.iter().map(|k| k.to_string()).collect())
+                },
+            }],
+            include_synonyms: false,
+            include_documentation: false,
+        };
+        let entries = self.describe_configs(request).await?;
+        Ok(entries
+            .into_iter()
+            .map(|e| {
+                let cv = e.config_value();
+                (e.name, cv)
+            })
+            .collect())
+    }
+
+    /// Describe topics by name, returning a map of topic name → [`TopicInfo`].
+    ///
+    /// Topics not found in cluster metadata are absent from the returned map;
+    /// callers can detect missing topics by comparing request and response key sets.
+    pub async fn describe_topics<S: AsRef<str>>(
+        &self,
+        topics: &[S],
+    ) -> Result<HashMap<String, TopicInfo>> {
         self.check_not_closed()?;
         self.metadata.refresh().await?;
-        let all_topics = self.metadata.topics();
-
-        let mut result = Vec::new();
-        for topic_name in topics {
-            if let Some(info) = all_topics.iter().find(|t| &t.name == topic_name) {
-                result.push(info.clone());
-            }
-        }
+        // Use O(1) per-topic metadata look-up instead of a full Vec scan.
+        let result = topics
+            .iter()
+            .filter_map(|name| {
+                self.metadata
+                    .topic(name.as_ref())
+                    .map(|info| (name.as_ref().to_owned(), info))
+            })
+            .collect();
         Ok(result)
+    }
+
+    /// Describe a single topic by name.
+    ///
+    /// Returns `None` if the topic does not exist or is not visible in cluster metadata.
+    pub async fn describe_topic(&self, topic: &str) -> Result<Option<TopicInfo>> {
+        self.check_not_closed()?;
+        self.metadata.refresh().await?;
+        Ok(self.metadata.topic(topic))
     }
 
     /// Describe the cluster using the DescribeCluster API (Key 60).

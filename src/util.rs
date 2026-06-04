@@ -52,11 +52,18 @@ impl BackoffPolicy {
     /// Attempt 1 = first retry = `initial_backoff`. Subsequent attempts grow
     /// exponentially up to `max_backoff`, with optional ±jitter.
     ///
+    /// The jitter is sampled uniformly from `[-jitter_range, +jitter_range]`
+    /// where `jitter_range = base_backoff × jitter_factor`. The result is then
+    /// clamped from below to `initial_backoff`, so the **minimum** delay is
+    /// always `initial_backoff` even when jitter would otherwise push it lower.
+    /// In other words, negative jitter cannot reduce the backoff below the
+    /// configured floor — jitter only increases scatter above `initial_backoff`.
+    ///
     /// # Constraint
     ///
     /// `max_backoff` must be >= `initial_backoff`. If not, `max_backoff` is
     /// silently clamped up to `initial_backoff` so the contract that
-    /// `initial_backoff <= result <= max_backoff` holds.
+    /// `initial_backoff <= result <= max_backoff + jitter_range` holds.
     #[inline]
     pub fn calculate_backoff(&self, attempt: u32) -> Duration {
         if attempt == 0 {
@@ -87,6 +94,8 @@ impl BackoffPolicy {
         };
 
         // Add ±jitter to prevent thundering herd.
+        // The final .max(initial_backoff) clamps the floor so negative jitter
+        // cannot reduce the delay below the configured initial_backoff.
         let jitter_range = base_backoff * self.jitter_factor;
         let jitter = if self.jitter_factor > 0.0 {
             JITTER_RNG.with(|rng| rng.borrow_mut().random_range(-jitter_range..=jitter_range))

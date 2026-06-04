@@ -1869,9 +1869,11 @@ impl TransactionalProducerBuilder {
         self
     }
 
-    /// Set the transaction timeout in milliseconds.
-    pub fn transaction_timeout_ms(mut self, timeout: i32) -> Self {
-        self.config.transaction_timeout_ms = timeout;
+    /// Set the transaction timeout.
+    ///
+    /// Defaults to 60 seconds. Must be greater than zero.
+    pub fn transaction_timeout(mut self, timeout: Duration) -> Self {
+        self.config.transaction_timeout_ms = crate::util::duration_to_millis_i32(timeout);
         self
     }
 
@@ -1992,7 +1994,7 @@ impl TransactionalProducerBuilder {
             )));
         }
         if self.config.transaction_timeout_ms <= 0 {
-            return Err(KrafkaError::config("transaction_timeout_ms must be > 0"));
+            return Err(KrafkaError::config("transaction_timeout must be > 0"));
         }
         if self.config.max_request_size == 0 {
             return Err(KrafkaError::config("max_request_size must be >= 1"));
@@ -2463,13 +2465,13 @@ mod tests {
         let result = TransactionalProducer::builder()
             .bootstrap_servers("localhost:9092")
             .transactional_id("txn-1")
-            .transaction_timeout_ms(0)
+            .transaction_timeout(Duration::ZERO)
             .build()
             .await;
 
         match result {
-            Err(e) => assert!(e.to_string().contains("transaction_timeout_ms")),
-            Ok(_) => panic!("expected error for transaction_timeout_ms=0"),
+            Err(e) => assert!(e.to_string().contains("transaction_timeout")),
+            Ok(_) => panic!("expected error for transaction_timeout=0"),
         }
     }
 
@@ -2490,10 +2492,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_txn_builder_rejects_negative_timeout() {
+        // Duration cannot be negative, so use Duration::ZERO as the smallest
+        // invalid value (0 ms converts to 0 i32 which the validator rejects).
         let result = TransactionalProducer::builder()
             .bootstrap_servers("localhost:9092")
             .transactional_id("txn-1")
-            .transaction_timeout_ms(-1)
+            .transaction_timeout(Duration::ZERO)
             .build()
             .await;
 

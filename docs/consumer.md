@@ -1296,12 +1296,12 @@ Key behaviors:
 - **Tombstone handling** — keys are removed from the table when a null-valued record arrives
 - **Keyless records** — silently skipped (compacted topics require keys)
 - **Metrics** — `records_processed()` and `tombstones_processed()` are available for monitoring
-- **Read access** — `get()`, `contains_key()`, `keys()`, `values()`, `iter()`, `snapshot()`, `len()`, `is_empty()`
+- **Read access** — `get()` → `Option<&CompactedEntry>` (value + offset + timestamp + partition), `get_value()` → `Option<&Bytes>` (value only), `contains_key()`, `keys()`, `values()`, `iter()`, `snapshot()`, `len()`, `is_empty()`
 - **Bulk load** — `ingest()` applies records without building a change list (ideal for initial scans)
 - **Reset** — `clear()` removes all entries and resets counters (useful during rebalances)
 - **Clone** — `table.clone()` produces a full copy including counters; `table.snapshot()` clones only the entries
 - **Equality** — two tables are equal (`PartialEq`/`Eq`) when they contain the same entries; processing counters are ignored
-- **IntoIterator** — `for (key, value) in &table { ... }` or `for (key, value) in table { ... }` (consuming)
+- **IntoIterator** — `for (key, entry) in &table { ... }` or `for (key, entry) in table { ... }` (consuming); yields `(&Bytes, &CompactedEntry)` / `(Bytes, CompactedEntry)`
 
 `TableChange` derives `PartialEq` and `Eq`, so changes can be compared directly with `assert_eq!` in tests.
 
@@ -1323,9 +1323,15 @@ let mut ctc = CompactedTopicConsumer::builder()
 ctc.scan(Duration::from_secs(1)).await?;
 assert!(ctc.is_caught_up());
 
-// Read individual keys via the table
-if let Some(value) = ctc.table().get(b"user-123") {
-    println!("User profile: {:?}", value);
+// Read a single key — get() returns Option<&CompactedEntry> with full provenance
+if let Some(entry) = ctc.table().get(b"user-123") {
+    println!("User profile value: {:?}", entry.value);
+    println!("  at offset {} partition {} ts {}ms", entry.offset, entry.partition, entry.timestamp_ms);
+}
+
+// Use get_value() when you only need the raw bytes
+if let Some(bytes) = ctc.table().get_value(b"user-123") {
+    println!("User profile: {:?}", bytes);
 }
 
 // Get the full snapshot

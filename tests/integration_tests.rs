@@ -1425,20 +1425,14 @@ async fn test_admin_describe_topics() {
 
     // Describe the topics
     let topics = admin
-        .describe_topics(&[topic1.to_string(), topic2.to_string()])
+        .describe_topics(&[topic1, topic2])
         .await
         .expect("Failed to describe topics");
 
     assert_eq!(topics.len(), 2, "Should describe 2 topics");
 
-    let t1 = topics
-        .iter()
-        .find(|t| t.name == topic1)
-        .expect("topic1 not found");
-    let t2 = topics
-        .iter()
-        .find(|t| t.name == topic2)
-        .expect("topic2 not found");
+    let t1 = topics.get(topic1).expect("topic1 not found");
+    let t2 = topics.get(topic2).expect("topic2 not found");
 
     assert_eq!(t1.partitions.len(), 2, "topic1 should have 2 partitions");
     assert_eq!(t2.partitions.len(), 3, "topic2 should have 3 partitions");

@@ -379,7 +379,7 @@ fn export_to_otel(snapshot: &ProducerMetricsSnapshot) {
 - Counter increments use `Ordering::Relaxed` for minimal overhead
 - Latency tracking uses compare-and-swap for min/max updates
 - Gauge updates are immediate (no aggregation)
-- Gauge `dec()` saturates at zero (will not underflow below 0), ensuring correctness for connection and partition counting
+- Gauge `dec()` saturates at zero (will not underflow below 0), ensuring correctness for connection and partition counting. Every underflow emits a `warn!` log with a cumulative `underflow_count` field so that miscounted inc/dec pairs surface immediately rather than silently inflating counters
 - Prometheus and JSON export only happen on request (pull-based)
 - OTLP protobuf encoding is zero-copy where possible; no external protobuf dependency
 - KIP-714 telemetry push runs on a background task with broker-controlled intervals

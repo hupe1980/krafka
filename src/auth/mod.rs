@@ -270,17 +270,21 @@ impl fmt::Debug for ScramCredentials {
 /// AWS MSK IAM credentials.
 ///
 /// Secret access key and session token are automatically zeroized on drop for security.
+/// Use the accessor methods ([`access_key_id`](Self::access_key_id),
+/// [`region`](Self::region), [`has_session_token`](Self::has_session_token)) to read
+/// fields rather than accessing them directly — `secret_access_key` and `session_token`
+/// are intentionally not exposed to prevent accidental logging.
 #[non_exhaustive]
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct AwsMskIamCredentials {
     /// AWS access key ID.
-    pub access_key_id: String,
+    pub(super) access_key_id: String,
     /// AWS secret access key (zeroized on drop).
-    pub secret_access_key: String,
+    pub(super) secret_access_key: String,
     /// AWS session token (for temporary credentials, zeroized on drop).
-    pub session_token: Option<String>,
+    pub(super) session_token: Option<String>,
     /// AWS region.
-    pub region: String,
+    pub(super) region: String,
 }
 
 impl AwsMskIamCredentials {
@@ -311,6 +315,21 @@ impl AwsMskIamCredentials {
             session_token: Some(session_token.into()),
             region: region.into(),
         }
+    }
+
+    /// Returns the AWS access key ID.
+    pub fn access_key_id(&self) -> &str {
+        &self.access_key_id
+    }
+
+    /// Returns the AWS region.
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+
+    /// Returns `true` if a session token is present (temporary credentials).
+    pub fn has_session_token(&self) -> bool {
+        self.session_token.is_some()
     }
 
     /// Create credentials from environment variables.
@@ -407,8 +426,27 @@ impl AwsMskIamCredentials {
 
 impl fmt::Debug for AwsMskIamCredentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Show only the last 4 chars of access_key_id (sufficient for identification,
+        // insufficient for impersonation). Full key IDs should not appear in logs.
+        // Use char-boundary-safe extraction so Debug never panics on non-ASCII input.
+        let akid_tail = {
+            let s = &self.access_key_id;
+            let tail: String = s
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            if tail.len() < s.chars().count() {
+                format!("***{tail}")
+            } else {
+                "***".to_string()
+            }
+        };
         f.debug_struct("AwsMskIamCredentials")
-            .field("access_key_id", &self.access_key_id)
+            .field("access_key_id", &akid_tail)
             .field("secret_access_key", &"[REDACTED]")
             .field(
                 "session_token",
@@ -947,6 +985,85 @@ impl AuthConfig {
     pub fn tls_config(&self) -> Option<&TlsConfig> {
         self.tls_config.as_ref()
     }
+
+    /// Construct an `AuthConfig` from standard Kafka environment variables.
+    ///
+    /// | Variable | Values |
+    /// |---|---|
+    /// | `KAFKA_SECURITY_PROTOCOL` | `PLAINTEXT` *(default)*, `SSL`, `SASL_PLAINTEXT`, `SASL_SSL` |
+    /// | `KAFKA_SASL_MECHANISM` | `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512` |
+    /// | `KAFKA_SASL_USERNAME` | any string |
+    /// | `KAFKA_SASL_PASSWORD` | any string |
+    ///
+    /// Returns `AuthConfig::plaintext()` when `KAFKA_SECURITY_PROTOCOL` is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a required variable is missing or an unrecognised
+    /// value is supplied for `KAFKA_SECURITY_PROTOCOL` or `KAFKA_SASL_MECHANISM`.
+    ///
+    /// # Security
+    ///
+    /// Credentials are read directly from the environment and stored in
+    /// memory-zeroizing types. They are never logged.
+    pub fn from_env() -> crate::Result<Self> {
+        let protocol =
+            std::env::var("KAFKA_SECURITY_PROTOCOL").unwrap_or_else(|_| "PLAINTEXT".to_string());
+
+        match protocol.to_uppercase().as_str() {
+            "PLAINTEXT" => Ok(Self::plaintext()),
+            "SSL" => Ok(Self::ssl(TlsConfig::new())),
+            "SASL_PLAINTEXT" | "SASL_SSL" => {
+                let mechanism = std::env::var("KAFKA_SASL_MECHANISM").map_err(|_| {
+                    crate::error::KrafkaError::config("KAFKA_SASL_MECHANISM not set")
+                })?;
+                let username = std::env::var("KAFKA_SASL_USERNAME").map_err(|_| {
+                    crate::error::KrafkaError::config("KAFKA_SASL_USERNAME not set")
+                })?;
+                let password = std::env::var("KAFKA_SASL_PASSWORD").map_err(|_| {
+                    crate::error::KrafkaError::config("KAFKA_SASL_PASSWORD not set")
+                })?;
+                let use_tls = protocol.to_uppercase() == "SASL_SSL";
+                match mechanism.to_uppercase().as_str() {
+                    "PLAIN" => {
+                        if use_tls {
+                            Self::sasl_plain_ssl(username, password, TlsConfig::new())
+                        } else {
+                            Self::sasl_plain(username, password)
+                        }
+                    }
+                    "SCRAM-SHA-256" => {
+                        let mut cfg = Self::sasl_scram_sha256(username, password);
+                        if use_tls {
+                            cfg.security_protocol = SecurityProtocol::SaslSsl;
+                            cfg.tls_config = Some(TlsConfig::new());
+                        }
+                        Ok(cfg)
+                    }
+                    "SCRAM-SHA-512" => {
+                        let mut cfg = Self::sasl_scram_sha512(username, password);
+                        if use_tls {
+                            cfg.security_protocol = SecurityProtocol::SaslSsl;
+                            cfg.tls_config = Some(TlsConfig::new());
+                        }
+                        Ok(cfg)
+                    }
+                    other => {
+                        // Zeroize the password before returning so it does not
+                        // linger on the heap after an unknown-mechanism error.
+                        let mut password = password;
+                        password.zeroize();
+                        Err(crate::error::KrafkaError::config(format!(
+                            "unknown SASL mechanism in KAFKA_SASL_MECHANISM: {other}"
+                        )))
+                    }
+                }
+            }
+            other => Err(crate::error::KrafkaError::config(format!(
+                "unknown security protocol in KAFKA_SECURITY_PROTOCOL: {other}"
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1036,9 +1153,9 @@ mod tests {
     #[test]
     fn test_aws_msk_credentials_manual_creation() {
         let creds = AwsMskIamCredentials::new("AKID123", "secret123", "us-west-2");
-        assert_eq!(creds.access_key_id, "AKID123");
-        assert_eq!(creds.region, "us-west-2");
-        assert!(creds.session_token.is_none());
+        assert_eq!(creds.access_key_id(), "AKID123");
+        assert_eq!(creds.region(), "us-west-2");
+        assert!(!creds.has_session_token());
     }
 
     #[test]
@@ -1049,15 +1166,23 @@ mod tests {
             "token123",
             "us-east-1",
         );
-        assert_eq!(creds.access_key_id, "AKID123");
-        assert_eq!(creds.session_token, Some("token123".to_string()));
+        assert_eq!(creds.access_key_id(), "AKID123");
+        assert!(creds.has_session_token());
     }
 
     #[test]
     fn test_aws_msk_credentials_debug_redacts() {
         let creds = AwsMskIamCredentials::new("AKID123", "supersecret", "us-east-1");
         let debug_str = format!("{creds:?}");
-        assert!(debug_str.contains("AKID123"));
+        // access_key_id should be truncated (last 4 chars only)
+        assert!(
+            debug_str.contains("D123"),
+            "should show last 4 chars of AKID"
+        );
+        assert!(
+            !debug_str.contains("AKID123"),
+            "should not show full access key ID"
+        );
         assert!(debug_str.contains("[REDACTED]"));
         assert!(!debug_str.contains("supersecret"));
     }

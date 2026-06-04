@@ -67,13 +67,32 @@ impl IsolationLevel {
 /// `Consumer` uses the new ConsumerGroupHeartbeat flow (API key 68)
 /// introduced in KIP-848, where the server performs assignment and
 /// members communicate exclusively via heartbeats.
+///
+/// # Stability
+///
+/// `GroupProtocol::Consumer` (KIP-848) requires **Kafka 3.7 or later** with
+/// the new consumer group protocol enabled on the broker
+/// (`group.coordinator.new.enable=true`). The implementation is functional
+/// but not yet validated against the full KIP-848 specification in all
+/// edge cases (incremental rebalance, epoch fencing, mixed-version clusters).
+///
+/// For production workloads, use `GroupProtocol::Classic` (the default)
+/// unless you are specifically targeting Kafka 3.7+ and have validated
+/// the KIP-848 behaviour for your workload.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GroupProtocol {
     /// Classic group protocol (JoinGroup/SyncGroup/Heartbeat).
+    ///
+    /// Supported on all Kafka broker versions. This is the default and
+    /// recommended choice for production workloads.
     #[default]
     Classic,
     /// KIP-848 consumer group protocol (ConsumerGroupHeartbeat).
+    ///
+    /// **Requires Kafka 3.7+ with `group.coordinator.new.enable=true`.**
+    /// Not yet fully validated for all rebalance edge cases. Prefer
+    /// `Classic` for production use until this note is removed.
     Consumer,
 }
 
@@ -571,6 +590,9 @@ impl ConsumerConfigBuilder {
     ///
     /// `Classic` uses the traditional JoinGroup/SyncGroup/Heartbeat flow.
     /// `Consumer` uses the new server-side assignment via ConsumerGroupHeartbeat.
+    ///
+    /// **`GroupProtocol::Consumer` requires Kafka 3.7+ and is not yet
+    /// recommended for production.** See [`GroupProtocol`] for details.
     pub fn group_protocol(mut self, protocol: GroupProtocol) -> Self {
         self.config.group_protocol = protocol;
         self
