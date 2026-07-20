@@ -377,7 +377,13 @@ async fn a_group_coordinator_move_is_rediscovered_on_the_new_broker() {
     let rediscovered = broker
         .wait_for_requests(ApiKey::FindCoordinator, 1, SETTLE)
         .await;
-    let reached_new_node = broker.wait_for_requests(ApiKey::JoinGroup, 1, SETTLE).await;
+    // Wait for a join *on node 1* specifically. A join that was already in
+    // flight against node 0 when the coordinator moved can land after
+    // `clear_requests`, and counting joins on any node would let that stale
+    // one end the wait before the real one arrives.
+    let reached_new_node = broker
+        .wait_for_request_on_node(ApiKey::JoinGroup, 1, SETTLE)
+        .await;
     poller.abort();
 
     assert!(

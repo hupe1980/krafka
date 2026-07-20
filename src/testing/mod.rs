@@ -446,6 +446,32 @@ impl FakeBroker {
         }
     }
 
+    /// Wait until `api_key` has been served by `node_id` at least once, or the
+    /// timeout expires.
+    ///
+    /// Use this instead of [`wait_for_requests`](Self::wait_for_requests) when
+    /// the point of the test is *which broker* a request reached. Counting a
+    /// request on any node lets a request that was already in flight against
+    /// the old node satisfy the wait, so the test stops watching before the
+    /// interesting one arrives — a race that only shows up on a loaded machine.
+    pub async fn wait_for_request_on_node(
+        &self,
+        api_key: ApiKey,
+        node_id: i32,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.request_nodes(api_key).contains(&node_id) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     // -- cluster manipulation ----------------------------------------------
 
     /// Read or mutate the cluster state directly.
