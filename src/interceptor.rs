@@ -90,6 +90,7 @@
 //! ```
 
 use ahash::AHashMap as HashMap;
+use bytes::Bytes;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -97,7 +98,7 @@ use std::sync::Arc;
 use crate::consumer::ConsumerRecord;
 use crate::error::KrafkaError;
 use crate::producer::{ProducerRecord, RecordMetadata};
-use crate::{Offset, PartitionId};
+use crate::{Offset, PartitionId, Timestamp};
 
 /// Result type for interceptor callbacks.
 ///
@@ -201,6 +202,50 @@ pub(crate) struct NoOpConsumerInterceptor;
 
 impl ConsumerInterceptor for NoOpConsumerInterceptor {}
 
+/// An O(1), allocation-free snapshot of the parts of a [`ProducerRecord`] that
+/// can be cheaply rolled back after a panicking interceptor.
+///
+/// Capturing this costs two `Bytes` refcount bumps and a few `Copy`s — no
+/// `String` or `Vec` allocation — which is what makes it viable on the
+/// producer's per-record hot path. See [`ProducerInterceptorChain`] for the
+/// resulting panic semantics.
+struct CheapRecordSnapshot {
+    partition: Option<PartitionId>,
+    key: Option<Bytes>,
+    value: Bytes,
+    timestamp: Option<Timestamp>,
+    /// Number of headers present before the interceptor ran.
+    header_len: usize,
+}
+
+impl CheapRecordSnapshot {
+    /// Capture the cheaply-restorable fields of `record`.
+    #[inline]
+    fn capture(record: &ProducerRecord) -> Self {
+        Self {
+            partition: record.partition,
+            key: record.key.clone(),
+            value: record.value.clone(),
+            timestamp: record.timestamp,
+            header_len: record.headers.len(),
+        }
+    }
+
+    /// Restore the captured fields onto `record`.
+    ///
+    /// `topic`, `record_name`, in-place edits to pre-existing header values,
+    /// and removed headers are **not** restored — they were never captured.
+    #[inline]
+    fn restore(self, record: &mut ProducerRecord) {
+        record.partition = self.partition;
+        record.key = self.key;
+        record.value = self.value;
+        record.timestamp = self.timestamp;
+        // Drop any headers the interceptor appended before panicking.
+        record.headers.truncate(self.header_len);
+    }
+}
+
 /// An ordered chain of producer interceptors.
 ///
 /// Executes each interceptor in registration order. Each interceptor is
@@ -211,12 +256,31 @@ impl ConsumerInterceptor for NoOpConsumerInterceptor {}
 /// For `on_send`, each interceptor sees the record as modified by the
 /// previous interceptors in the chain.
 ///
-/// **Panic semantics vs Java:** In Java, `onSend` returns a new record;
-/// if interceptor N throws, interceptor N+1 receives the record from the
-/// last *successful* interceptor. In Rust, `on_send` mutates in-place
-/// (`&mut`); if interceptor N panics mid-mutation, interceptor N+1 sees
-/// a partially-mutated record. Avoid building chains where later
-/// interceptors depend on invariants set by earlier ones.
+/// # Panic semantics
+///
+/// In Java, `onSend` returns a new record; if interceptor N throws,
+/// interceptor N+1 receives the record from the last *successful* interceptor.
+/// In Rust, `on_send` mutates in-place (`&mut`), so a full rollback would
+/// require cloning the record before *every* interceptor call. That clone is
+/// deep (`topic: String`, `headers: Vec<(String, Bytes)>`) and sits on the
+/// producer's per-record hot path, so it is deliberately **not** taken.
+///
+/// Instead, a panic triggers a cheap, allocation-free rollback of exactly the
+/// fields that can be restored in O(1) (see [`CheapRecordSnapshot`]):
+///
+/// - `partition`, `timestamp` — `Copy`, restored exactly.
+/// - `key`, `value` — `Bytes`, restored via refcount bump (no data copy).
+/// - `headers` — truncated back to its pre-call length, undoing any headers
+///   the panicking interceptor appended. Values it mutated *in place*, and any
+///   headers it removed, are **not** restored.
+/// - `topic`, `record_name` — `String`; **not** restored. A panicking
+///   interceptor that had already reassigned the topic leaves the new value in
+///   place.
+///
+/// The panic itself is caught, logged at `error!` with the chain index, and the
+/// remaining interceptors still execute — unchanged from previous behaviour.
+/// Avoid building chains where later interceptors depend on invariants set by
+/// earlier ones.
 pub(crate) struct ProducerInterceptorChain {
     interceptors: Vec<Arc<dyn ProducerInterceptor>>,
 }
@@ -239,9 +303,11 @@ impl ProducerInterceptorChain {
 impl ProducerInterceptor for ProducerInterceptorChain {
     fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
         for (i, interceptor) in self.interceptors.iter().enumerate() {
-            // Snapshot before mutation so a panic mid-`on_send` doesn't leave
-            // the record in a partially-mutated state for subsequent interceptors.
-            let snapshot = record.clone();
+            // O(1) snapshot of the cheaply-restorable fields. Deliberately not
+            // a full `record.clone()`: that deep-copies `topic` and every
+            // header key on the producer's per-record hot path. See the type
+            // docs for exactly what a panic does and does not roll back.
+            let snapshot = CheapRecordSnapshot::capture(record);
             match catch_unwind(AssertUnwindSafe(|| interceptor.on_send(record))) {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
@@ -254,14 +320,14 @@ impl ProducerInterceptor for ProducerInterceptorChain {
                     );
                 }
                 Err(_) => {
-                    // Restore the pre-panic snapshot so the next interceptor
-                    // sees a consistent record (matches Java's behavior).
-                    *record = snapshot;
+                    // Partial, allocation-free rollback so the next interceptor
+                    // sees a mostly-consistent record.
+                    snapshot.restore(record);
                     tracing::error!(
                         chain_index = i,
                         chain_len = self.interceptors.len(),
                         topic = record.topic.as_str(),
-                        "ProducerInterceptor.on_send panicked — record restored (payload redacted)",
+                        "ProducerInterceptor.on_send panicked — record partially restored (payload redacted)",
                     );
                 }
             }
@@ -678,6 +744,7 @@ mod tests {
             partition: 0,
             offset: 42,
             timestamp: 1000,
+            delivery: crate::producer::DeliveryConfirmation::Offset,
         };
 
         interceptor.on_acknowledgement(&metadata, None).unwrap();
@@ -782,6 +849,7 @@ mod tests {
             partition: 0,
             offset: 0,
             timestamp: 0,
+            delivery: crate::producer::DeliveryConfirmation::Offset,
         };
         safe_on_acknowledgement(&interceptor, &metadata, None);
     }
@@ -886,6 +954,7 @@ mod tests {
             partition: 0,
             offset: 0,
             timestamp: 0,
+            delivery: crate::producer::DeliveryConfirmation::Offset,
         };
         chain.on_acknowledgement(&metadata, None).unwrap();
         chain.close().unwrap();
@@ -960,6 +1029,7 @@ mod tests {
             partition: 0,
             offset: 0,
             timestamp: 0,
+            delivery: crate::producer::DeliveryConfirmation::Offset,
         };
         chain.on_acknowledgement(&metadata, None).unwrap();
         chain.close().unwrap();
@@ -977,6 +1047,145 @@ mod tests {
                 "after.close",
             ]
         );
+    }
+
+    // --- Cheap-snapshot rollback semantics (no per-record deep clone) ---
+
+    /// Mutates every field of the record, then panics.
+    #[derive(Debug)]
+    struct MutateThenPanicInterceptor;
+
+    impl ProducerInterceptor for MutateThenPanicInterceptor {
+        fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
+            record.partition = Some(99);
+            record.timestamp = Some(1234);
+            record.key = Some(bytes::Bytes::from_static(b"clobbered-key"));
+            record.value = bytes::Bytes::from_static(b"clobbered-value");
+            record
+                .headers
+                .push(("added-before-panic".to_string(), bytes::Bytes::new()));
+            record.topic = "clobbered-topic".to_string();
+            panic!("mutate then panic");
+        }
+    }
+
+    #[test]
+    fn test_producer_chain_panic_restores_cheap_fields() {
+        let chain = ProducerInterceptorChain::new(vec![Arc::new(MutateThenPanicInterceptor)]);
+
+        let mut record = ProducerRecord::new("original-topic", b"original-value".to_vec());
+        record.key = Some(bytes::Bytes::from_static(b"original-key"));
+        record.partition = Some(1);
+        record.timestamp = Some(7);
+        record
+            .headers
+            .push(("pre-existing".to_string(), bytes::Bytes::from_static(b"h")));
+
+        chain.on_send(&mut record).unwrap();
+
+        // Cheaply-restorable fields are rolled back exactly.
+        assert_eq!(record.partition, Some(1));
+        assert_eq!(record.timestamp, Some(7));
+        assert_eq!(record.key, Some(bytes::Bytes::from_static(b"original-key")));
+        assert_eq!(record.value, bytes::Bytes::from("original-value"));
+        // Headers appended by the panicking interceptor are dropped; the
+        // pre-existing header survives.
+        assert_eq!(record.headers.len(), 1);
+        assert_eq!(record.headers[0].0, "pre-existing");
+    }
+
+    #[test]
+    fn test_producer_chain_panic_does_not_deep_clone_topic() {
+        // Documents the new semantics: because no deep clone is taken, a topic
+        // reassigned by an interceptor that then panics is NOT rolled back.
+        // If a deep snapshot were reintroduced this assertion would fail.
+        let chain = ProducerInterceptorChain::new(vec![Arc::new(MutateThenPanicInterceptor)]);
+
+        let mut record = ProducerRecord::new("original-topic", b"v".to_vec());
+        chain.on_send(&mut record).unwrap();
+
+        assert_eq!(record.topic, "clobbered-topic");
+    }
+
+    #[test]
+    fn test_producer_chain_panic_still_surfaced_and_chain_continues() {
+        // The panic is caught (not propagated), the chain still returns Ok,
+        // and later interceptors observe the partially-restored record.
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        /// Records what the record looked like when it was invoked.
+        #[derive(Debug)]
+        struct Observer(Arc<std::sync::Mutex<Vec<String>>>);
+
+        impl ProducerInterceptor for Observer {
+            fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
+                self.0.lock().unwrap().push(format!(
+                    "value={} headers={}",
+                    String::from_utf8_lossy(&record.value),
+                    record.headers.len()
+                ));
+                Ok(())
+            }
+        }
+
+        let chain = ProducerInterceptorChain::new(vec![
+            Arc::new(MutateThenPanicInterceptor),
+            Arc::new(Observer(Arc::clone(&log))),
+        ]);
+
+        let mut record = ProducerRecord::new("t", b"v".to_vec());
+        // Returns Ok — the panic is caught and logged, exactly as before.
+        chain.on_send(&mut record).unwrap();
+
+        let log = log.lock().unwrap();
+        assert_eq!(*log, vec!["value=v headers=0"]);
+    }
+
+    #[test]
+    fn test_producer_chain_no_panic_keeps_mutations() {
+        // The snapshot must never be applied on the success path.
+        #[derive(Debug)]
+        struct Mutator;
+
+        impl ProducerInterceptor for Mutator {
+            fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
+                record.partition = Some(5);
+                record.value = bytes::Bytes::from_static(b"new");
+                record
+                    .headers
+                    .push(("added".to_string(), bytes::Bytes::new()));
+                Ok(())
+            }
+        }
+
+        let chain = ProducerInterceptorChain::new(vec![Arc::new(Mutator)]);
+        let mut record = ProducerRecord::new("t", b"old".to_vec());
+        chain.on_send(&mut record).unwrap();
+
+        assert_eq!(record.partition, Some(5));
+        assert_eq!(record.value, bytes::Bytes::from_static(b"new"));
+        assert_eq!(record.headers.len(), 1);
+    }
+
+    #[test]
+    fn test_producer_chain_error_return_does_not_roll_back() {
+        // An `Err` return is not a panic: mutations made before returning Err
+        // are kept (unchanged behaviour).
+        #[derive(Debug)]
+        struct MutateThenErr;
+
+        impl ProducerInterceptor for MutateThenErr {
+            fn on_send(&self, record: &mut ProducerRecord) -> InterceptorResult {
+                record.partition = Some(3);
+                Err("boom".into())
+            }
+        }
+
+        let chain = ProducerInterceptorChain::new(vec![Arc::new(MutateThenErr)]);
+        let mut record = ProducerRecord::new("t", b"v".to_vec());
+        chain.on_send(&mut record).unwrap();
+
+        assert_eq!(record.partition, Some(3));
     }
 
     #[test]

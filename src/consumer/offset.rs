@@ -47,17 +47,64 @@ impl OffsetAndMetadata {
 
 /// Tracks committed and fetched offsets.
 ///
+/// # Offset convention — read this before using [`commit`]
+///
+/// Kafka offsets are **next-to-read** positions, never last-processed ones.
+/// Both [`commit`] and [`set_position`] take a value with that meaning:
+///
+/// > the offset of the next record the consumer should read
+///
+/// So after successfully processing the record at offset `N`, the value to
+/// store is `N + 1`. Storing `N` itself makes the broker hand record `N` back
+/// on the next restart, silently re-delivering the last record of every
+/// partition forever. Because this is off-by-one rather than obviously broken,
+/// it usually survives testing and shows up as mysterious duplicates in
+/// production.
+///
+/// Use [`commit_processed`] to avoid doing the arithmetic by hand:
+///
+/// ```
+/// use krafka::consumer::OffsetStore;
+///
+/// let mut store = OffsetStore::new();
+///
+/// // Just finished processing the record at offset 99.
+/// store.commit_processed("orders", 0, 99);
+///
+/// // The stored value is the *next* offset to read, not 99.
+/// assert_eq!(store.committed("orders", 0).unwrap().offset, 100);
+/// ```
+///
+/// The same convention applies to [`position`]: a partition whose records up
+/// to and including offset 99 have been fetched has position `100`. It is
+/// therefore normal and correct for `position` to exceed `committed` — the
+/// difference is exactly the records that have been fetched but not yet
+/// committed.
+///
+/// # Layout
+///
 /// Keyed as `topic → partition → value` using two-level `HashMap` nesting.
 /// This gives zero-allocation reads (the inner `HashMap::get` takes `&PartitionId`
 /// which is `Copy`, and the outer takes `&str` via `String: Borrow<str>`).
 ///
-/// The previous flat `(String, PartitionId)` key required calling `.to_owned()`
+/// A flat `(String, PartitionId)` key would require calling `.to_owned()`
 /// on every read path because Rust's `Borrow` trait does not extend to tuples.
+///
+/// [`commit`]: OffsetStore::commit
+/// [`commit_processed`]: OffsetStore::commit_processed
+/// [`set_position`]: OffsetStore::set_position
+/// [`position`]: OffsetStore::position
 #[derive(Debug, Default)]
 pub struct OffsetStore {
     /// Committed offsets: topic → partition → metadata.
+    ///
+    /// The stored offset is the next offset to read, i.e.
+    /// `last_processed_offset + 1`.
     committed: HashMap<String, HashMap<PartitionId, OffsetAndMetadata>>,
     /// Current fetch position: topic → partition → offset.
+    ///
+    /// The stored offset is the next offset to fetch, i.e.
+    /// `last_fetched_offset + 1`.
     position: HashMap<String, HashMap<PartitionId, Offset>>,
 }
 
@@ -68,6 +115,11 @@ impl OffsetStore {
     }
 
     /// Set the committed offset for a topic-partition.
+    ///
+    /// `offset.offset` must be the **next offset to read**, not the offset of
+    /// the last record processed. See the [type-level convention][OffsetStore]
+    /// for why. If you have the last processed offset in hand, prefer
+    /// [`commit_processed`](OffsetStore::commit_processed).
     #[inline]
     pub fn commit(&mut self, topic: &str, partition: PartitionId, offset: OffsetAndMetadata) {
         match self.committed.get_mut(topic) {
@@ -87,7 +139,38 @@ impl OffsetStore {
         self.committed.get(topic)?.get(&partition)
     }
 
+    /// Record that the record at `processed_offset` has been fully processed,
+    /// committing `processed_offset + 1` as the next offset to read.
+    ///
+    /// This is the arithmetic-free counterpart to [`commit`](OffsetStore::commit)
+    /// and the method to reach for in a normal consume loop, where what you
+    /// naturally have is the offset of the record you just handled:
+    ///
+    /// ```
+    /// # use krafka::consumer::OffsetStore;
+    /// # let mut store = OffsetStore::new();
+    /// # let record_topic = "t";
+    /// # let record_partition = 0;
+    /// # let record_offset = 41;
+    /// // ... process(record) ...
+    /// store.commit_processed(record_topic, record_partition, record_offset);
+    /// assert_eq!(store.committed("t", 0).unwrap().offset, 42);
+    /// ```
+    ///
+    /// Saturates rather than overflowing at `Offset::MAX`.
+    #[inline]
+    pub fn commit_processed(&mut self, topic: &str, partition: PartitionId, processed: Offset) {
+        self.commit(
+            topic,
+            partition,
+            OffsetAndMetadata::new(processed.saturating_add(1)),
+        );
+    }
+
     /// Set the current position for a topic-partition.
+    ///
+    /// `offset` must be the **next offset to fetch**, not the offset of the
+    /// last record fetched. See the [type-level convention][OffsetStore].
     #[inline]
     pub fn set_position(&mut self, topic: &str, partition: PartitionId, offset: Offset) {
         match self.position.get_mut(topic) {
@@ -183,8 +266,12 @@ mod tests {
     fn test_offset_store() {
         let mut store = OffsetStore::new();
 
+        // Records up to offset 99 fetched -> position is the next offset, 100.
         store.set_position("topic1", 0, 100);
         store.set_position("topic1", 1, 200);
+        // Records up to offset 49 processed and committed -> committed is 50.
+        // Position ahead of committed is the normal steady state: the gap is
+        // exactly the records fetched but not yet committed.
         store.commit("topic1", 0, OffsetAndMetadata::new(50));
 
         assert_eq!(store.position("topic1", 0), Some(100));
@@ -193,6 +280,41 @@ mod tests {
 
         assert_eq!(store.committed("topic1", 0).unwrap().offset, 50);
         assert!(store.committed("topic1", 1).is_none());
+    }
+
+    #[test]
+    fn test_commit_processed_stores_next_offset_to_read() {
+        let mut store = OffsetStore::new();
+
+        // Having processed the record at offset 99, the next read starts at 100.
+        // Storing 99 here would re-deliver record 99 on every restart.
+        store.commit_processed("topic1", 0, 99);
+        assert_eq!(store.committed("topic1", 0).unwrap().offset, 100);
+
+        // Processing the very first record of a partition commits 1, not 0.
+        store.commit_processed("topic1", 1, 0);
+        assert_eq!(store.committed("topic1", 1).unwrap().offset, 1);
+    }
+
+    #[test]
+    fn test_commit_processed_saturates_at_max() {
+        let mut store = OffsetStore::new();
+        store.commit_processed("topic1", 0, Offset::MAX);
+        assert_eq!(store.committed("topic1", 0).unwrap().offset, Offset::MAX);
+    }
+
+    #[test]
+    fn test_commit_processed_matches_manual_commit() {
+        let mut a = OffsetStore::new();
+        let mut b = OffsetStore::new();
+
+        a.commit_processed("t", 0, 41);
+        b.commit("t", 0, OffsetAndMetadata::new(42));
+
+        assert_eq!(
+            a.committed("t", 0).unwrap().offset,
+            b.committed("t", 0).unwrap().offset
+        );
     }
 
     #[test]

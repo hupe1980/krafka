@@ -248,8 +248,20 @@ async fn staggered_connect(
                         }
                     }
                     Err(join_err) => {
-                        // Task panicked or was cancelled — treat as failure.
+                        // Task panicked or was cancelled — treat it exactly
+                        // like a failed attempt and launch the next address
+                        // immediately. Only logging here (the previous
+                        // behaviour) made a panicked attempt cost a full
+                        // connection_attempt_delay before the next address
+                        // was even tried.
                         debug!(error = %join_err, "Happy Eyeballs: task join error");
+
+                        if next_idx < total {
+                            spawn_attempt(&mut tasks, addrs[next_idx], config, deadline);
+                            next_idx += 1;
+                            // Reset stagger for the *next* unlaunched address.
+                            stagger.as_mut().reset(Instant::now() + delay);
+                        }
                     }
                 }
 
@@ -376,7 +388,56 @@ fn create_socket_raw(
 
     if let Some(interval) = tcp_keepalive {
         let sock_ref = socket2::SockRef::from(&socket);
-        let keepalive = socket2::TcpKeepalive::new().with_time(interval);
+        // `with_time` (TCP_KEEPIDLE) only sets how long the connection may sit
+        // idle before the *first* probe. Without `with_interval`
+        // (TCP_KEEPINTVL) the spacing of subsequent probes falls back to the
+        // OS default — 75 s × 9 retries ≈ 11 more minutes on Linux before a
+        // half-open connection is detected, long after the configured idle
+        // window has elapsed. Probe at a quarter of the idle time (min 5 s) so
+        // detection completes on roughly the same timescale.
+        let probe_interval = (interval / 4).max(Duration::from_secs(5));
+        #[allow(unused_mut)]
+        let mut keepalive = socket2::TcpKeepalive::new().with_time(interval);
+        // `with_interval` is gated per-platform by socket2.
+        #[cfg(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "visionos",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "windows",
+        ))]
+        {
+            keepalive = keepalive.with_interval(probe_interval);
+        }
+        #[cfg(not(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "visionos",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "windows",
+        )))]
+        let _ = probe_interval;
+        // NOTE: `TcpKeepalive::with_retries` (TCP_KEEPCNT) additionally
+        // requires socket2's `all` feature, which this crate does not enable,
+        // so the probe *count* still follows the OS default. With the interval
+        // set, that default (9 probes on Linux) detects a half-open connection
+        // in ~9 × probe_interval rather than ~11 minutes.
         sock_ref
             .set_tcp_keepalive(&keepalive)
             .map_err(KrafkaError::network)?;

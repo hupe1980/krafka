@@ -1279,7 +1279,7 @@ async fn test_admin_create_partitions() {
 
     // Increase to 4 partitions
     admin
-        .create_partitions(topic_name, 4, Duration::from_secs(10))
+        .create_partitions(topic_name, 4, Duration::from_secs(10), false)
         .await
         .expect("Failed to create partitions");
 
@@ -3080,8 +3080,20 @@ async fn test_transactional_send_offsets_to_transaction() {
             record.partition,
             record.offset + 1, // next offset to consume
         )];
+        // KIP-447: the commit must carry the consumer's live group identity so
+        // the group coordinator can fence a zombie committer. Re-read it every
+        // transaction — the generation changes on every rebalance, and a cached
+        // value defeats the fencing.
+        let group_metadata = src_consumer
+            .group_metadata()
+            .await
+            .expect("consumer must have joined the group before committing offsets");
+        assert!(
+            group_metadata.is_fenceable(),
+            "consumer group metadata must carry a real generation for EOS"
+        );
         txn_producer
-            .send_offsets_to_transaction(&offsets, group_id)
+            .send_offsets_to_transaction(&offsets, &group_metadata)
             .await
             .expect("send_offsets_to_transaction failed");
 

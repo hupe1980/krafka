@@ -44,7 +44,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -54,6 +54,21 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::error::{KrafkaError, Result};
 
 const OAUTHBEARER_EXPIRY_SKEW_MARGIN_MS: i64 = 30_000;
+
+/// Maximum time a token with an *unknown* expiry may be served from cache.
+///
+/// A token without `lifetime_ms` carries no expiry the client can reason
+/// about, but it is not immortal: the real `exp` claim inside the JWT still
+/// applies and the provider may rotate the credential at any time. Caching
+/// such a token for the lifetime of the process means every reconnect after
+/// the true expiry re-sends a dead credential — the client locks itself out
+/// permanently and no amount of retrying recovers it.
+///
+/// Bounding the entry by wall-clock age turns that permanent failure into at
+/// most one stale-token window. Five minutes is well under any realistic
+/// OAuth access-token lifetime (typically 15 min – 1 h), so it costs only a
+/// handful of extra provider calls per hour.
+pub(crate) const OAUTHBEARER_UNKNOWN_EXPIRY_MAX_AGE: Duration = Duration::from_secs(300);
 
 fn current_epoch_ms() -> Result<i64> {
     let d = SystemTime::now()
@@ -121,11 +136,50 @@ where
 struct OAuthTokenStoreInner {
     provider: Arc<dyn OAuthBearerTokenProvider>,
     /// Most recently fetched token. `None` until the first call to `provide_token`.
-    cached: RwLock<Option<OAuthBearerToken>>,
+    cached: RwLock<Option<CachedToken>>,
     /// At most one refresh in flight at a time. Concurrent callers that find
     /// the cached token stale queue behind this lock; the first winner fetches
     /// while the rest get the result on unlock.
     refreshing: Mutex<()>,
+}
+
+/// A cached token together with the instant it was fetched.
+///
+/// The fetch instant is what makes [`OAUTHBEARER_UNKNOWN_EXPIRY_MAX_AGE`]
+/// enforceable for tokens that carry no `lifetime_ms`.
+#[derive(Clone)]
+struct CachedToken {
+    token: OAuthBearerToken,
+    fetched_at: Instant,
+}
+
+impl CachedToken {
+    fn new(token: OAuthBearerToken) -> Self {
+        Self {
+            token,
+            fetched_at: Instant::now(),
+        }
+    }
+
+    /// Whether this entry must be replaced before use.
+    ///
+    /// Two independent conditions, either of which disqualifies the entry:
+    ///
+    /// - the token declares an expiry and is inside the 30 s skew window
+    ///   ([`OAuthBearerToken::needs_refresh`]); or
+    /// - the token declares **no** expiry and the entry is older than
+    ///   [`OAUTHBEARER_UNKNOWN_EXPIRY_MAX_AGE`].
+    ///
+    /// The second condition is the load-bearing one. `needs_refresh()` is
+    /// `lifetime_ms.is_some_and(..)`, which is `false` when `lifetime_ms` is
+    /// `None` — exactly how `OAuthBearerToken::new(jwt)` builds a token. On
+    /// that path alone the cache would hold one JWT forever.
+    fn is_stale(&self) -> bool {
+        if self.token.lifetime_ms().is_none() {
+            return self.fetched_at.elapsed() >= OAUTHBEARER_UNKNOWN_EXPIRY_MAX_AGE;
+        }
+        self.token.needs_refresh()
+    }
 }
 
 /// Handle wrapping a cached, coalescing [`OAuthBearerTokenProvider`].
@@ -160,18 +214,23 @@ impl OAuthBearerTokenProviderHandle {
 
     /// Return a fresh token, using the cache when available.
     ///
-    /// Returns the cached token if it is not within the expiry skew margin.
-    /// Otherwise acquires the coalescing refresh lock, re-checks (another task
-    /// may have just refreshed), and calls the provider exactly once while
-    /// concurrent callers wait.
+    /// Returns the cached token if it is neither inside the expiry skew margin
+    /// nor — for a token with no declared expiry — older than
+    /// a fixed maximum age. Otherwise acquires the
+    /// coalescing refresh lock, re-checks (another task may have just
+    /// refreshed), and calls the provider exactly once while concurrent
+    /// callers wait.
+    ///
+    /// A token with no `lifetime_ms` is **never** cached indefinitely; see
+    /// the cache staleness check.
     pub async fn provide_token(&self) -> Result<OAuthBearerToken> {
         // Fast path: cached token is still fresh.
         {
             let guard = self.0.cached.read().await;
-            if let Some(token) = guard.as_ref()
-                && !token.needs_refresh()
+            if let Some(entry) = guard.as_ref()
+                && !entry.is_stale()
             {
-                return Ok(token.clone());
+                return Ok(entry.token.clone());
             }
         }
 
@@ -181,17 +240,26 @@ impl OAuthBearerTokenProviderHandle {
         // Re-check after acquiring the lock — another task may have already refreshed.
         {
             let guard = self.0.cached.read().await;
-            if let Some(token) = guard.as_ref()
-                && !token.needs_refresh()
+            if let Some(entry) = guard.as_ref()
+                && !entry.is_stale()
             {
-                return Ok(token.clone());
+                return Ok(entry.token.clone());
             }
         }
 
         // Fetch a fresh token and update the cache.
         let token = self.0.provider.provide_token().await?;
-        *self.0.cached.write().await = Some(token.clone());
+        *self.0.cached.write().await = Some(CachedToken::new(token.clone()));
         Ok(token)
+    }
+
+    /// Test-only: seed the cache with a token whose fetch instant is
+    /// backdated by `age`, so staleness can be exercised without a clock mock
+    /// (tokio's `test-util` time control is not enabled for this crate).
+    #[cfg(test)]
+    pub(crate) async fn test_seed_cache(&self, token: OAuthBearerToken, age: Duration) {
+        let fetched_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        *self.0.cached.write().await = Some(CachedToken { token, fetched_at });
     }
 
     /// Start a background task that proactively refreshes the token before expiry.
@@ -201,9 +269,10 @@ impl OAuthBearerTokenProviderHandle {
     /// broker connections and reconnects always find a ready token without
     /// blocking on a provider call.
     ///
-    /// When no token has been fetched yet, or the token has no `lifetime_ms`,
-    /// the task retries every 30 seconds until a token with a known lifetime
-    /// is cached.
+    /// When no token has been fetched yet, or the cached token has no
+    /// `lifetime_ms`, the task re-fetches every
+    /// the unknown-expiry maximum age — the same cadence on which
+    /// [`Self::provide_token`] considers such an entry stale.
     ///
     /// Returns the [`JoinHandle`] so the caller can abort the task on shutdown.
     /// Must be called from within a Tokio runtime.
@@ -214,7 +283,7 @@ impl OAuthBearerTokenProviderHandle {
                 // Compute how long to sleep before the next refresh window.
                 let sleep_duration = {
                     let guard = inner.cached.read().await;
-                    match guard.as_ref().and_then(|t| t.lifetime_ms()) {
+                    match guard.as_ref().and_then(|e| e.token.lifetime_ms()) {
                         Some(lifetime_ms) => {
                             // Wake at `lifetime_ms - OAUTHBEARER_EXPIRY_SKEW_MARGIN_MS`.
                             let wake_at_ms =
@@ -224,9 +293,11 @@ impl OAuthBearerTokenProviderHandle {
                             Duration::from_millis(remaining_ms as u64)
                         }
                         None => {
-                            // No token yet or token has no expiry.
-                            // Retry every 30 s until we get one with a lifetime.
-                            Duration::from_secs(30)
+                            // No token yet, or the cached token declares no
+                            // expiry. Re-fetch on the same cadence that makes
+                            // an unknown-expiry entry stale, so the cache can
+                            // never serve a token older than that.
+                            OAUTHBEARER_UNKNOWN_EXPIRY_MAX_AGE
                         }
                     }
                 };
@@ -243,7 +314,7 @@ impl OAuthBearerTokenProviderHandle {
                             lifetime_ms = token.lifetime_ms(),
                             "OAuthBearer token proactively refreshed"
                         );
-                        *inner.cached.write().await = Some(token);
+                        *inner.cached.write().await = Some(CachedToken::new(token));
                     }
                     Err(e) => {
                         warn!(
@@ -783,5 +854,97 @@ mod tests {
         let token = OAuthBearerToken::new("tok").with_lifetime_ms(future_ms);
 
         assert!(!token.needs_refresh());
+    }
+
+    // ── An unknown-expiry token must never be cached forever ───────────
+
+    #[test]
+    fn test_cached_token_without_lifetime_is_fresh_when_new() {
+        let entry = CachedToken::new(OAuthBearerToken::new("jwt"));
+        assert!(
+            !entry.is_stale(),
+            "a just-fetched token must be served from cache"
+        );
+    }
+
+    #[test]
+    fn test_cached_token_without_lifetime_goes_stale_with_age() {
+        // `needs_refresh()` is `lifetime_ms.is_some_and(..)`,
+        // so it is FALSE forever when lifetime_ms is None — which is exactly
+        // how `OAuthBearerToken::new(jwt)` (and the crate's own doc examples)
+        // build a token. Without an age bound, one JWT is cached for the whole
+        // process lifetime and every reconnect after the real `exp` re-sends a
+        // dead credential.
+        let token = OAuthBearerToken::new("jwt");
+        assert!(
+            !token.needs_refresh(),
+            "precondition: an unknown-expiry token never reports needs_refresh"
+        );
+        let entry = CachedToken {
+            token,
+            fetched_at: Instant::now()
+                .checked_sub(OAUTHBEARER_UNKNOWN_EXPIRY_MAX_AGE + Duration::from_secs(1))
+                .expect("test backdate within system uptime"),
+        };
+        assert!(
+            entry.is_stale(),
+            "an unknown-expiry token older than the max age must be refetched"
+        );
+    }
+
+    #[test]
+    fn test_cached_token_with_lifetime_still_uses_skew_margin() {
+        // The age bound must not weaken the existing expiry logic.
+        let near = current_epoch_ms().unwrap() + 10_000;
+        let entry = CachedToken::new(OAuthBearerToken::new("jwt").with_lifetime_ms(near));
+        assert!(entry.is_stale(), "inside the 30s skew window");
+
+        let far = current_epoch_ms().unwrap() + 3_600_000;
+        let entry = CachedToken::new(OAuthBearerToken::new("jwt").with_lifetime_ms(far));
+        assert!(!entry.is_stale(), "well outside the skew window");
+    }
+
+    #[tokio::test]
+    async fn test_provide_token_refetches_after_max_age() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let handle = OAuthBearerTokenProviderHandle::new(move || {
+            let c = c.clone();
+            async move {
+                let n = c.fetch_add(1, Ordering::SeqCst);
+                Ok(OAuthBearerToken::new(format!("jwt-{n}")))
+            }
+        });
+
+        // First call populates the cache.
+        let first = handle.provide_token().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Second call is served from cache (no provider call).
+        let _ = handle.provide_token().await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "fresh entry must be cached"
+        );
+
+        // Backdate the entry past the max age — the next call must refetch.
+        handle
+            .test_seed_cache(
+                first,
+                OAUTHBEARER_UNKNOWN_EXPIRY_MAX_AGE + Duration::from_secs(1),
+            )
+            .await;
+        let refreshed = handle.provide_token().await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a token past the unknown-expiry max age must be refetched"
+        );
+        assert_eq!(
+            refreshed.to_gs2_initial_response(),
+            OAuthBearerToken::new("jwt-1").to_gs2_initial_response()
+        );
     }
 }

@@ -134,6 +134,27 @@ pub trait DeadLetterQueue: Send + Sync + fmt::Debug {
 /// appended *after* the original headers so existing header-based routing is
 /// not disturbed.
 ///
+/// # Null values are collapsed to empty (lossy)
+///
+/// The Kafka wire protocol distinguishes a **null** record value (a tombstone)
+/// and a **null** header value from a zero-length one.
+/// [`ConsumerRecord`] preserves that distinction (`value: Option<Bytes>`,
+/// headers `Vec<(Bytes, Option<Bytes>)>`), but [`ProducerRecord`] cannot
+/// express it: its `value` is `Bytes` and its header values are `Bytes`, with
+/// no null representation.
+///
+/// This function therefore **collapses null to empty**:
+///
+/// - A tombstone (`original.value == None`) becomes a zero-length value.
+/// - A null header value becomes a zero-length header value.
+///
+/// The consequence is semantic: a tombstone routed to a **compacted** DLQ topic
+/// arrives as an ordinary zero-length record and will *not* trigger compaction
+/// deletion of its key. If your DLQ topic is compacted and tombstones matter,
+/// detect `original.value.is_none()` at the call site and handle it explicitly
+/// rather than relying on this helper. Fixing this properly requires
+/// `ProducerRecord::value` to become `Option<Bytes>`.
+///
 /// # Arguments
 ///
 /// - `dlq_topic` — the destination topic for failed records.
@@ -166,6 +187,8 @@ pub fn build_dlq_record(
                         s
                     }
                 },
+                // Lossy: ProducerRecord header values are `Bytes`, so a null
+                // header value collapses to zero-length. See the fn docs.
                 v.clone().unwrap_or_default(),
             )
         })
@@ -193,6 +216,8 @@ pub fn build_dlq_record(
         topic: dlq_topic.to_string(),
         partition: None,
         key: original.key.clone(),
+        // Lossy: ProducerRecord::value is `Bytes`, so a tombstone (null value)
+        // collapses to zero-length. See the fn docs.
         value: original.value.clone().unwrap_or_default(),
         timestamp: None,
         headers,
@@ -266,9 +291,40 @@ mod tests {
     }
 
     #[test]
-    fn test_build_dlq_record_no_value() {
-        let original = ConsumerRecord::new("t", 0, 0, None, None);
-        let record = build_dlq_record("t.DLQ", &original, &"tombstone");
-        assert_eq!(record.value, Bytes::new());
+    fn test_build_dlq_record_tombstone_collapses_to_empty() {
+        // Documented lossy behaviour: ProducerRecord::value is `Bytes` and has
+        // no null representation, so a tombstone (None) becomes zero-length.
+        // A tombstone and a genuinely-empty value are indistinguishable in the
+        // resulting DLQ record.
+        let tombstone = ConsumerRecord::new("t", 0, 0, None, None);
+        let from_tombstone = build_dlq_record("t.DLQ", &tombstone, &"tombstone");
+        assert_eq!(from_tombstone.value, Bytes::new());
+
+        let empty = ConsumerRecord::new("t", 0, 0, None, Some(Bytes::new()));
+        let from_empty = build_dlq_record("t.DLQ", &empty, &"tombstone");
+        assert_eq!(from_empty.value, Bytes::new());
+
+        // The two are identical — this is the information loss being pinned.
+        assert_eq!(from_tombstone.value, from_empty.value);
+    }
+
+    #[test]
+    fn test_build_dlq_record_null_header_value_collapses_to_empty() {
+        // Same collapse applies to header values, whose ProducerRecord type is
+        // `Bytes` rather than `Option<Bytes>`.
+        let mut original = ConsumerRecord::new("t", 0, 0, None, Some(Bytes::from("v")));
+        original.headers.push((Bytes::from("null-hdr"), None));
+        original
+            .headers
+            .push((Bytes::from("empty-hdr"), Some(Bytes::new())));
+
+        let record = build_dlq_record("t.DLQ", &original, &"error");
+
+        assert_eq!(record.headers[0].0, "null-hdr");
+        assert_eq!(record.headers[0].1, Bytes::new());
+        assert_eq!(record.headers[1].0, "empty-hdr");
+        assert_eq!(record.headers[1].1, Bytes::new());
+        // Null and empty are indistinguishable after translation.
+        assert_eq!(record.headers[0].1, record.headers[1].1);
     }
 }

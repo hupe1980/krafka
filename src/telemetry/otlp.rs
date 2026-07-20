@@ -105,11 +105,15 @@ fn encode_bool_field(field: u32, value: bool, buf: &mut Vec<u8>) {
 // ---------------------------------------------------------------------------
 
 /// Current wall-clock time as nanoseconds since Unix epoch.
+///
+/// Saturates at `u64::MAX` rather than wrapping, so a clock set absurdly far
+/// into the future cannot produce a timestamp that reads as the distant past.
 fn now_nanos() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos() as u64
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
 }
 
 /// `AnyValue { string_value = 1 }`
@@ -141,30 +145,67 @@ fn encode_instrumentation_scope(name: &str, version: &str, buf: &mut Vec<u8>) {
     encode_string_field(2, version, buf);
 }
 
+/// The timestamp pair every `NumberDataPoint` carries.
+///
+/// Bundled into one value so the encoders stay within a readable argument
+/// count and cannot accidentally transpose the two `u64`s.
+#[derive(Clone, Copy)]
+struct DataPointTimes {
+    /// `NumberDataPoint.start_time_unix_nano` (field 2) — start of the window.
+    start_nanos: u64,
+    /// `NumberDataPoint.time_unix_nano` (field 3) — the collection instant.
+    time_nanos: u64,
+}
+
+/// Convert a `u64` metric value to the `i64` required by `NumberDataPoint.as_int`,
+/// saturating at [`i64::MAX`] instead of wrapping into a negative value.
+///
+/// A wrapped (negative) value on a monotonic `Sum` is interpreted by collectors
+/// as a counter reset, which corrupts rate calculations.
+#[inline]
+fn saturating_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// Encode the repeated `NumberDataPoint.attributes` field (field 7, LEN).
+///
+/// Each label becomes a `KeyValue { key = 1, value = AnyValue { string_value = 1 } }`.
+/// An empty `labels` slice encodes nothing, so unlabeled data points are
+/// byte-identical to what they were before attribute support was added.
+fn encode_data_point_attributes(labels: &[(&str, &str)], buf: &mut Vec<u8>) {
+    for &(k, v) in labels {
+        let mut kv_buf = Vec::new();
+        encode_key_value_string(k, v, &mut kv_buf);
+        encode_len_field(7, &kv_buf, buf);
+    }
+}
+
 /// A `NumberDataPoint` with an `as_int` (sfixed64) value.
 fn encode_number_data_point_int(
     value: i64,
-    time_nanos: u64,
-    start_time_nanos: u64,
+    times: DataPointTimes,
+    labels: &[(&str, &str)],
     buf: &mut Vec<u8>,
 ) {
-    encode_fixed64_field(2, start_time_nanos, buf);
-    encode_fixed64_field(3, time_nanos, buf);
+    encode_fixed64_field(2, times.start_nanos, buf);
+    encode_fixed64_field(3, times.time_nanos, buf);
     // as_int = field 6, wire type 1 (sfixed64)
     encode_fixed64_field(6, value as u64, buf);
+    encode_data_point_attributes(labels, buf);
 }
 
 /// A `NumberDataPoint` with an `as_double` value.
 fn encode_number_data_point_double(
     value: f64,
-    time_nanos: u64,
-    start_time_nanos: u64,
+    times: DataPointTimes,
+    labels: &[(&str, &str)],
     buf: &mut Vec<u8>,
 ) {
-    encode_fixed64_field(2, start_time_nanos, buf);
-    encode_fixed64_field(3, time_nanos, buf);
+    encode_fixed64_field(2, times.start_nanos, buf);
+    encode_fixed64_field(3, times.time_nanos, buf);
     // as_double = field 4, wire type 1
     encode_fixed64_field(4, value.to_bits(), buf);
+    encode_data_point_attributes(labels, buf);
 }
 
 /// AggregationTemporality enum values.
@@ -172,13 +213,16 @@ const AGGREGATION_TEMPORALITY_DELTA: u64 = 1;
 const AGGREGATION_TEMPORALITY_CUMULATIVE: u64 = 2;
 
 /// Encode a complete `Metric` message for a counter (Sum, monotonic).
+///
+/// `labels` are encoded as `NumberDataPoint.attributes` — the metric `name` is
+/// never mangled with label values.
 fn encode_metric_counter(
     name: &str,
     description: &str,
     value: i64,
     delta: bool,
-    time_nanos: u64,
-    start_time_nanos: u64,
+    times: DataPointTimes,
+    labels: &[(&str, &str)],
     buf: &mut Vec<u8>,
 ) {
     encode_string_field(1, name, buf); // name
@@ -188,7 +232,7 @@ fn encode_metric_counter(
     let mut sum = Vec::new();
     // data_points = field 1
     let mut dp = Vec::new();
-    encode_number_data_point_int(value, time_nanos, start_time_nanos, &mut dp);
+    encode_number_data_point_int(value, times, labels, &mut dp);
     encode_len_field(1, &dp, &mut sum);
     // aggregation_temporality = field 2
     let temporality = if delta {
@@ -204,12 +248,15 @@ fn encode_metric_counter(
 }
 
 /// Encode a complete `Metric` message for a gauge (int value).
+///
+/// `labels` are encoded as `NumberDataPoint.attributes` — the metric `name` is
+/// never mangled with label values.
 fn encode_metric_gauge_int(
     name: &str,
     description: &str,
     value: i64,
-    time_nanos: u64,
-    start_time_nanos: u64,
+    times: DataPointTimes,
+    labels: &[(&str, &str)],
     buf: &mut Vec<u8>,
 ) {
     encode_string_field(1, name, buf);
@@ -218,7 +265,7 @@ fn encode_metric_gauge_int(
     // Gauge message at field 5
     let mut gauge = Vec::new();
     let mut dp = Vec::new();
-    encode_number_data_point_int(value, time_nanos, start_time_nanos, &mut dp);
+    encode_number_data_point_int(value, times, labels, &mut dp);
     encode_len_field(1, &dp, &mut gauge);
 
     encode_len_field(5, &gauge, buf);
@@ -229,8 +276,8 @@ fn encode_metric_gauge_double(
     name: &str,
     description: &str,
     value: f64,
-    time_nanos: u64,
-    start_time_nanos: u64,
+    times: DataPointTimes,
+    labels: &[(&str, &str)],
     buf: &mut Vec<u8>,
 ) {
     encode_string_field(1, name, buf);
@@ -238,7 +285,7 @@ fn encode_metric_gauge_double(
 
     let mut gauge = Vec::new();
     let mut dp = Vec::new();
-    encode_number_data_point_double(value, time_nanos, start_time_nanos, &mut dp);
+    encode_number_data_point_double(value, times, labels, &mut dp);
     encode_len_field(1, &dp, &mut gauge);
 
     encode_len_field(5, &gauge, buf);
@@ -301,6 +348,14 @@ impl OtlpExporter {
         self.resource_attrs.push((key.into(), value.into()));
     }
 
+    /// The timestamp pair applied to every data point this exporter emits.
+    fn times(&self) -> DataPointTimes {
+        DataPointTimes {
+            start_nanos: self.start_time_nanos,
+            time_nanos: self.time_nanos,
+        }
+    }
+
     pub(crate) fn push_metric_bytes(&mut self, metric: Vec<u8>) {
         self.metrics.push(metric);
     }
@@ -355,27 +410,58 @@ impl OtlpExporter {
 
 impl MetricsExporter for OtlpExporter {
     fn export_counter(&mut self, name: &str, help: &str, value: u64) {
+        self.export_labeled_counter(name, help, &[], value);
+    }
+
+    fn export_gauge(&mut self, name: &str, help: &str, value: u64) {
+        self.export_labeled_gauge(name, help, &[], value);
+    }
+
+    /// Encode a labeled counter as a monotonic `Sum` whose single
+    /// `NumberDataPoint` carries the labels in `attributes` (field 7).
+    ///
+    /// The metric name is emitted verbatim — label values are **never** folded
+    /// into it — so a broker (KIP-714) or collector can aggregate across topics
+    /// and the metric-name cardinality stays constant.
+    fn export_labeled_counter(
+        &mut self,
+        name: &str,
+        help: &str,
+        labels: &[(&str, &str)],
+        value: u64,
+    ) {
         let mut buf = Vec::new();
         encode_metric_counter(
             name,
             help,
-            value as i64,
+            saturating_i64(value),
             self.delta,
-            self.time_nanos,
-            self.start_time_nanos,
+            self.times(),
+            labels,
             &mut buf,
         );
         self.metrics.push(buf);
     }
 
-    fn export_gauge(&mut self, name: &str, help: &str, value: u64) {
+    /// Encode a labeled gauge as a `Gauge` whose single `NumberDataPoint`
+    /// carries the labels in `attributes` (field 7).
+    ///
+    /// As with [`export_labeled_counter`](Self::export_labeled_counter), the
+    /// metric name is emitted verbatim.
+    fn export_labeled_gauge(
+        &mut self,
+        name: &str,
+        help: &str,
+        labels: &[(&str, &str)],
+        value: u64,
+    ) {
         let mut buf = Vec::new();
         encode_metric_gauge_int(
             name,
             help,
-            value as i64,
-            self.time_nanos,
-            self.start_time_nanos,
+            saturating_i64(value),
+            self.times(),
+            labels,
             &mut buf,
         );
         self.metrics.push(buf);
@@ -390,9 +476,9 @@ impl MetricsExporter for OtlpExporter {
         encode_metric_gauge_int(
             &name_count,
             help,
-            snapshot.count as i64,
-            self.time_nanos,
-            self.start_time_nanos,
+            saturating_i64(snapshot.count),
+            self.times(),
+            &[],
             &mut buf,
         );
         self.metrics.push(buf);
@@ -402,8 +488,8 @@ impl MetricsExporter for OtlpExporter {
             &name_sum,
             help,
             snapshot.sum.as_secs_f64(),
-            self.time_nanos,
-            self.start_time_nanos,
+            self.times(),
+            &[],
             &mut buf,
         );
         self.metrics.push(buf);
@@ -414,8 +500,8 @@ impl MetricsExporter for OtlpExporter {
                 &format!("{name}_min_seconds"),
                 help,
                 min.as_secs_f64(),
-                self.time_nanos,
-                self.start_time_nanos,
+                self.times(),
+                &[],
                 &mut buf,
             );
             self.metrics.push(buf);
@@ -426,8 +512,8 @@ impl MetricsExporter for OtlpExporter {
                 &format!("{name}_max_seconds"),
                 help,
                 max.as_secs_f64(),
-                self.time_nanos,
-                self.start_time_nanos,
+                self.times(),
+                &[],
                 &mut buf,
             );
             self.metrics.push(buf);
@@ -438,8 +524,8 @@ impl MetricsExporter for OtlpExporter {
                 &format!("{name}_avg_seconds"),
                 help,
                 avg.as_secs_f64(),
-                self.time_nanos,
-                self.start_time_nanos,
+                self.times(),
+                &[],
                 &mut buf,
             );
             self.metrics.push(buf);
@@ -450,8 +536,8 @@ impl MetricsExporter for OtlpExporter {
                 &format!("{name}_p50_seconds"),
                 help,
                 p50.as_secs_f64(),
-                self.time_nanos,
-                self.start_time_nanos,
+                self.times(),
+                &[],
                 &mut buf,
             );
             self.metrics.push(buf);
@@ -462,8 +548,8 @@ impl MetricsExporter for OtlpExporter {
                 &format!("{name}_p95_seconds"),
                 help,
                 p95.as_secs_f64(),
-                self.time_nanos,
-                self.start_time_nanos,
+                self.times(),
+                &[],
                 &mut buf,
             );
             self.metrics.push(buf);
@@ -474,8 +560,8 @@ impl MetricsExporter for OtlpExporter {
                 &format!("{name}_p99_seconds"),
                 help,
                 p99.as_secs_f64(),
-                self.time_nanos,
-                self.start_time_nanos,
+                self.times(),
+                &[],
                 &mut buf,
             );
             self.metrics.push(buf);
@@ -618,5 +704,166 @@ mod tests {
 
         // With no samples, only count and sum are emitted (min/max/avg are None)
         assert_eq!(exporter.finish_metric_count(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Labeled metrics encode NumberDataPoint.attributes (field 7)
+    // -----------------------------------------------------------------------
+
+    /// Return true if `haystack` contains `needle` as a contiguous subslice.
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// The exact wire bytes for `attributes { key: "topic", value: "orders" }`
+    /// inside a `NumberDataPoint`, spelled out by hand rather than via the
+    /// encoder helpers so the test pins the wire format independently.
+    ///
+    /// * `0x3A` = tag for field 7, wire type 2 (LEN)
+    /// * `0x11` = 17 = length of the `KeyValue` message
+    /// * `0x0A 0x05 "topic"` = KeyValue.key (field 1, LEN)
+    /// * `0x12 0x08` = KeyValue.value (field 2, LEN), an 8-byte `AnyValue`
+    /// * `0x0A 0x06 "orders"` = AnyValue.string_value (field 1, LEN)
+    const TOPIC_ORDERS_ATTRIBUTE: &[u8] = &[
+        0x3A, 0x11, 0x0A, 0x05, b't', b'o', b'p', b'i', b'c', 0x12, 0x08, 0x0A, 0x06, b'o', b'r',
+        b'd', b'e', b'r', b's',
+    ];
+
+    #[test]
+    fn test_labeled_counter_encodes_attributes_and_keeps_name() {
+        let start = now_nanos();
+        let mut exporter = OtlpExporter::new(true, start);
+        exporter.export_labeled_counter(
+            "krafka_producer_topic_records_sent",
+            "Records sent to this topic",
+            &[("topic", "orders")],
+            42,
+        );
+        let data = exporter.finish();
+
+        // The label rides in NumberDataPoint.attributes (field 7).
+        assert!(
+            contains_bytes(&data, TOPIC_ORDERS_ATTRIBUTE),
+            "encoded payload is missing the field-7 KeyValue for topic=orders"
+        );
+        // The metric name is intact...
+        assert!(contains_bytes(&data, b"krafka_producer_topic_records_sent"));
+        // ...and is NOT mangled with the label value.
+        assert!(
+            !contains_bytes(&data, b"krafka_producer_topic_records_sent_orders"),
+            "metric name was mangled with the label value"
+        );
+    }
+
+    #[test]
+    fn test_labeled_gauge_encodes_attributes_and_keeps_name() {
+        let start = now_nanos();
+        let mut exporter = OtlpExporter::new(false, start);
+        exporter.export_labeled_gauge(
+            "krafka_producer_topic_buffered",
+            "Buffered records for this topic",
+            &[("topic", "orders")],
+            7,
+        );
+        let data = exporter.finish();
+
+        assert!(
+            contains_bytes(&data, TOPIC_ORDERS_ATTRIBUTE),
+            "encoded gauge is missing the field-7 KeyValue for topic=orders"
+        );
+        assert!(contains_bytes(&data, b"krafka_producer_topic_buffered"));
+        assert!(!contains_bytes(
+            &data,
+            b"krafka_producer_topic_buffered_orders"
+        ));
+    }
+
+    #[test]
+    fn test_multiple_labels_are_all_encoded() {
+        let start = now_nanos();
+        let mut exporter = OtlpExporter::new(true, start);
+        exporter.export_labeled_counter("m", "help", &[("topic", "orders"), ("broker", "1")], 1);
+        let data = exporter.finish();
+
+        assert!(contains_bytes(&data, TOPIC_ORDERS_ATTRIBUTE));
+        // broker="1": KeyValue is 6 + 5 = 11 bytes.
+        let broker_attr: &[u8] = &[
+            0x3A, 0x0D, 0x0A, 0x06, b'b', b'r', b'o', b'k', b'e', b'r', 0x12, 0x03, 0x0A, 0x01,
+            b'1',
+        ];
+        assert!(contains_bytes(&data, broker_attr));
+    }
+
+    #[test]
+    fn test_unlabeled_metrics_encode_no_attributes() {
+        let start = 1_000;
+        let mut labeled = OtlpExporter::with_timestamps(true, start, 2_000);
+        labeled.export_labeled_counter("m", "help", &[], 5);
+        let mut plain = OtlpExporter::with_timestamps(true, start, 2_000);
+        plain.export_counter("m", "help", 5);
+
+        // An empty label slice must be byte-identical to the unlabeled form.
+        assert_eq!(labeled.finish(), plain.finish());
+    }
+
+    // -----------------------------------------------------------------------
+    // i64 saturation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_saturating_i64() {
+        assert_eq!(saturating_i64(0), 0);
+        assert_eq!(saturating_i64(42), 42);
+        assert_eq!(saturating_i64(i64::MAX as u64), i64::MAX);
+        assert_eq!(saturating_i64(i64::MAX as u64 + 1), i64::MAX);
+        assert_eq!(saturating_i64(u64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn test_counter_above_i64_max_saturates_on_the_wire() {
+        let start = now_nanos();
+        let mut exporter = OtlpExporter::new(true, start);
+        exporter.export_counter("big", "huge counter", u64::MAX);
+        let data = exporter.finish();
+
+        // as_int is field 6, wire type 1 → tag 0x31, followed by i64::MAX
+        // little-endian. A wrapping `as i64` would encode -1 (all 0xFF bytes)
+        // and read as a counter reset.
+        let saturated: &[u8] = &[0x31, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F];
+        let wrapped: &[u8] = &[0x31, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        assert!(contains_bytes(&data, saturated), "value did not saturate");
+        assert!(!contains_bytes(&data, wrapped), "value wrapped negative");
+    }
+
+    #[test]
+    fn test_gauge_above_i64_max_saturates_on_the_wire() {
+        let start = now_nanos();
+        let mut exporter = OtlpExporter::new(false, start);
+        exporter.export_gauge("big", "huge gauge", u64::MAX);
+        let data = exporter.finish();
+
+        let saturated: &[u8] = &[0x31, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F];
+        assert!(contains_bytes(&data, saturated));
+    }
+
+    #[test]
+    fn test_latency_count_above_i64_max_saturates() {
+        let start = now_nanos();
+        let mut exporter = OtlpExporter::new(false, start);
+        let snapshot = LatencySnapshot {
+            count: u64::MAX,
+            sum: Duration::from_millis(1),
+            min: None,
+            max: None,
+            avg: None,
+            p50: None,
+            p95: None,
+            p99: None,
+        };
+        exporter.export_latency("lat", "latency", &snapshot);
+        let data = exporter.finish();
+
+        let saturated: &[u8] = &[0x31, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F];
+        assert!(contains_bytes(&data, saturated));
     }
 }

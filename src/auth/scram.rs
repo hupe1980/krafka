@@ -228,7 +228,7 @@ impl ScramClient {
             Zeroizing::new(format!("n={},r={}", escaped_username, self.client_nonce));
 
         // Full client-first-message
-        let message = format!("{}{}", gs2_header, &*self.client_first_bare);
+        let message = format!("{}{}", gs2_header, *self.client_first_bare);
 
         self.state = ScramState::WaitingServerFirst;
         message.into_bytes()
@@ -251,8 +251,28 @@ impl ScramClient {
             ));
         }
 
-        let server_first_str = std::str::from_utf8(server_first)
-            .map_err(|_| KrafkaError::auth("Invalid UTF-8 in server-first message"))?;
+        // Every failure below marks the exchange `Failed` before returning.
+        // Leaving the state at `WaitingServerFirst` after a parse error would
+        // let a caller drive another round on half-parsed state, which no
+        // other error path in this function permits.
+        let Ok(server_first_str) = std::str::from_utf8(server_first) else {
+            self.state = ScramState::Failed;
+            return Err(KrafkaError::auth("Invalid UTF-8 in server-first message"));
+        };
+
+        // RFC 5802 §5.1: the server may answer server-first with an `e=`
+        // error attribute in place of the r=/s=/i= triple. Parsing it here
+        // turns an opaque "Missing nonce in server-first" into the server's
+        // actual reason (`unknown-user`, `invalid-encoding`, ...).
+        // `verify_server_final` already does the same for server-final.
+        if let Some(error) = server_first_str.strip_prefix("e=").or_else(|| {
+            server_first_str
+                .split(',')
+                .find_map(|p| p.strip_prefix("e="))
+        }) {
+            self.state = ScramState::Failed;
+            return Err(KrafkaError::auth(format!("SCRAM server error: {error}")));
+        }
 
         // Parse server-first-message
         let mut server_nonce = None;
@@ -263,24 +283,32 @@ impl ScramClient {
             if let Some(value) = part.strip_prefix("r=") {
                 server_nonce = Some(value.to_string());
             } else if let Some(value) = part.strip_prefix("s=") {
-                salt = Some(
-                    BASE64
-                        .decode(value)
-                        .map_err(|_| KrafkaError::auth("Invalid base64 salt in server-first"))?,
-                );
+                let Ok(decoded) = BASE64.decode(value) else {
+                    self.state = ScramState::Failed;
+                    return Err(KrafkaError::auth("Invalid base64 salt in server-first"));
+                };
+                salt = Some(decoded);
             } else if let Some(value) = part.strip_prefix("i=") {
-                iteration_count =
-                    Some(value.parse::<u32>().map_err(|_| {
-                        KrafkaError::auth("Invalid iteration count in server-first")
-                    })?);
+                let Ok(parsed) = value.parse::<u32>() else {
+                    self.state = ScramState::Failed;
+                    return Err(KrafkaError::auth("Invalid iteration count in server-first"));
+                };
+                iteration_count = Some(parsed);
             }
         }
 
-        let server_nonce =
-            server_nonce.ok_or_else(|| KrafkaError::auth("Missing nonce in server-first"))?;
-        let salt = salt.ok_or_else(|| KrafkaError::auth("Missing salt in server-first"))?;
-        let iteration_count = iteration_count
-            .ok_or_else(|| KrafkaError::auth("Missing iteration count in server-first"))?;
+        let Some(server_nonce) = server_nonce else {
+            self.state = ScramState::Failed;
+            return Err(KrafkaError::auth("Missing nonce in server-first"));
+        };
+        let Some(salt) = salt else {
+            self.state = ScramState::Failed;
+            return Err(KrafkaError::auth("Missing salt in server-first"));
+        };
+        let Some(iteration_count) = iteration_count else {
+            self.state = ScramState::Failed;
+            return Err(KrafkaError::auth("Missing iteration count in server-first"));
+        };
 
         // Validate PBKDF2 iteration count to prevent downgrade and DoS attacks
         if iteration_count < MIN_PBKDF2_ITERATIONS {
@@ -296,11 +324,29 @@ impl ScramClient {
             )));
         }
 
-        // Verify server nonce starts with our client nonce
+        // RFC 5802 §5.1: the server nonce is "the client nonce with the
+        // server nonce appended". Two things must hold:
+        //
+        // 1. it starts with our client nonce — proves the server saw
+        //    client-first and is not replaying another session; and
+        // 2. it is strictly longer — proves the server contributed entropy of
+        //    its own.
+        //
+        // Checking only (1) accepts `server_nonce == client_nonce`, i.e. a
+        // server that contributes nothing, which makes the combined nonce
+        // fully client-predictable and defeats the replay protection the
+        // nonce exists to provide.
         if !server_nonce.starts_with(&self.client_nonce) {
             self.state = ScramState::Failed;
             return Err(KrafkaError::auth(
                 "Server nonce doesn't contain client nonce",
+            ));
+        }
+        if server_nonce.len() <= self.client_nonce.len() {
+            self.state = ScramState::Failed;
+            return Err(KrafkaError::auth(
+                "Server nonce adds no server entropy: RFC 5802 §5.1 requires \
+                 the server to append its own nonce to the client nonce",
             ));
         }
 
@@ -339,7 +385,7 @@ impl ScramClient {
         // AuthMessage
         let auth_message = format!(
             "{},{},{}",
-            &*self.client_first_bare, server_first_str, client_final_without_proof
+            *self.client_first_bare, server_first_str, client_final_without_proof
         );
 
         let client_signature = self.compute_hmac(&stored_key, auth_message.as_bytes());
@@ -1141,5 +1187,128 @@ mod tests {
             .verify_server_final(server_final.as_bytes())
             .expect("verify_server_final must succeed for RFC 7677 vector");
         assert!(client.is_complete());
+    }
+
+    // ── The server must contribute its own nonce (RFC 5802 §5.1) ───────
+
+    #[tokio::test]
+    async fn test_server_nonce_equal_to_client_nonce_is_rejected() {
+        // `starts_with` alone accepts server_nonce == client_nonce, i.e. a
+        // server that contributes zero entropy. The combined nonce is then
+        // fully client-predictable and the replay protection the nonce exists
+        // to provide is gone.
+        let mut client =
+            ScramClient::new("user", "pass", ScramMechanism::Sha256, ChannelBinding::None);
+        let _ = client.client_first_message();
+        let nonce = client.client_nonce.clone();
+        let server_first = format!("r={nonce},s={},i=4096", BASE64.encode(b"saltsalt"));
+
+        let err = client
+            .process_server_first(server_first.as_bytes())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no server entropy"), "got: {err}");
+        assert_eq!(*client.state(), ScramState::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_server_nonce_with_appended_entropy_is_accepted() {
+        let mut client =
+            ScramClient::new("user", "pass", ScramMechanism::Sha256, ChannelBinding::None);
+        let _ = client.client_first_message();
+        let nonce = client.client_nonce.clone();
+        let server_first = format!(
+            "r={nonce}SERVERPART,s={},i=4096",
+            BASE64.encode(b"saltsalt")
+        );
+
+        let out = client.process_server_first(server_first.as_bytes()).await;
+        assert!(out.is_ok(), "valid server-first rejected: {out:?}");
+        assert_eq!(*client.state(), ScramState::WaitingServerFinal);
+    }
+
+    #[tokio::test]
+    async fn test_server_nonce_not_prefixed_by_client_nonce_is_rejected() {
+        let mut client =
+            ScramClient::new("user", "pass", ScramMechanism::Sha256, ChannelBinding::None);
+        let _ = client.client_first_message();
+        let server_first = format!("r=totallyunrelated,s={},i=4096", BASE64.encode(b"saltsalt"));
+
+        let err = client
+            .process_server_first(server_first.as_bytes())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("doesn't contain client nonce"));
+        assert_eq!(*client.state(), ScramState::Failed);
+    }
+
+    // ── Server-first `e=` and Failed-state consistency ─────────────────
+
+    #[tokio::test]
+    async fn test_server_first_error_attribute_is_surfaced() {
+        // RFC 5802 §5.1 permits `e=` in place of the r=/s=/i= triple.
+        // Previously this produced a misleading "Missing nonce in server-first".
+        let mut client =
+            ScramClient::new("user", "pass", ScramMechanism::Sha256, ChannelBinding::None);
+        let _ = client.client_first_message();
+
+        let err = client
+            .process_server_first(b"e=unknown-user")
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("SCRAM server error"), "got: {text}");
+        assert!(text.contains("unknown-user"), "got: {text}");
+        assert!(
+            !text.contains("Missing nonce"),
+            "must not report the misleading missing-nonce error: {text}"
+        );
+        assert_eq!(*client.state(), ScramState::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_server_first_error_attribute_mid_message_is_surfaced() {
+        let mut client =
+            ScramClient::new("user", "pass", ScramMechanism::Sha256, ChannelBinding::None);
+        let _ = client.client_first_message();
+        let err = client
+            .process_server_first(b"x=y,e=invalid-encoding")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid-encoding"));
+        assert_eq!(*client.state(), ScramState::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_server_first_parse_failures_set_failed_state() {
+        // Every parse failure must land in `Failed`, matching the rest of the
+        // function; leaving `WaitingServerFirst` would let a caller drive
+        // another round on half-parsed state.
+        for msg in [
+            &b"s=c2FsdHNhbHQ=,i=4096"[..], // no nonce
+            &b"r=abc,i=4096"[..],          // no salt
+            &b"r=abc,s=c2FsdHNhbHQ="[..],  // no iteration count
+            &b"r=abc,s=!!!notbase64!!!,i=4096"[..],
+            &b"r=abc,s=c2FsdHNhbHQ=,i=notanumber"[..],
+        ] {
+            let mut client =
+                ScramClient::new("user", "pass", ScramMechanism::Sha256, ChannelBinding::None);
+            let _ = client.client_first_message();
+            assert!(client.process_server_first(msg).await.is_err());
+            assert_eq!(
+                *client.state(),
+                ScramState::Failed,
+                "state must be Failed after rejecting {msg:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_invalid_utf8_server_first_sets_failed_state() {
+        let mut client =
+            ScramClient::new("user", "pass", ScramMechanism::Sha256, ChannelBinding::None);
+        let _ = client.client_first_message();
+        assert!(client.process_server_first(&[0xff, 0xfe]).await.is_err());
+        assert_eq!(*client.state(), ScramState::Failed);
     }
 }

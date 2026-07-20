@@ -4,7 +4,9 @@ use super::{VersionedDecode, VersionedEncode, non_nullable_string};
 use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, KafkaString, TaggedFields, TryEncode};
-use crate::protocol::{array_len_i32, check_compact_array_len, check_decode_array_len};
+use crate::protocol::{
+    array_len_i32, check_compact_array_len, check_decode_array_len, decode_capacity,
+};
 
 // ============================================================================
 // LeaveGroup request/response
@@ -123,7 +125,7 @@ impl LeaveGroupResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let member_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut members = Vec::with_capacity(member_count);
+        let mut members = Vec::with_capacity(decode_capacity(member_count, buf.remaining()));
         for _ in 0..member_count {
             let member_id = non_nullable_string("member_id", KafkaString::decode(buf)?.0)?;
             let group_instance_id = KafkaString::decode(buf)?.0;
@@ -147,7 +149,7 @@ impl LeaveGroupResponse {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let member_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut members = Vec::with_capacity(member_count);
+        let mut members = Vec::with_capacity(decode_capacity(member_count, buf.remaining()));
         for _ in 0..member_count {
             let member_id = non_nullable_string("member_id", KafkaString::decode_compact(buf)?.0)?;
             let group_instance_id = KafkaString::decode_compact(buf)?.0;

@@ -38,3 +38,17 @@ doc = false
 name = "fuzz_scram"
 path = "fuzz_targets/fuzz_scram.rs"
 doc = false
+
+# Request *encode* paths: encoding must never panic on any constructible
+# request at any advertised version.
+[[bin]]
+name = "fuzz_request_encode"
+path = "fuzz_targets/fuzz_request_encode.rs"
+doc = false
+
+# Framing header plus standalone primitives (KafkaString/KafkaBytes/
+# KafkaArray/TaggedFields), which message decoders only reach indirectly.
+[[bin]]
+name = "fuzz_header_primitives"
+path = "fuzz_targets/fuzz_header_primitives.rs"
+doc = false

@@ -329,14 +329,43 @@ pub(crate) struct RoutedRecordParts {
     pub record: RoutedRecord,
 }
 
+/// How the broker confirmed (or did not confirm) a record.
+///
+/// # Why this is not derived from `offset`
+///
+/// `offset == -1` is ambiguous: it is produced both when the broker
+/// deduplicated an idempotent batch (**the data is durably in Kafka**) and when
+/// `acks = 0` was configured (**the broker never confirmed anything**). A
+/// caller that treated `-1` as "deduplicated" would get the exact opposite of
+/// the durability guarantee it believed it had. This enum is the explicit
+/// discriminator; `offset` is only meaningful for
+/// [`DeliveryConfirmation::Offset`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryConfirmation {
+    /// The broker acknowledged the record and returned a real log offset.
+    Offset,
+    /// The broker answered `DuplicateSequenceNumber`: an earlier attempt of
+    /// this idempotent batch was already committed. The data **is** in Kafka,
+    /// but the original offset is no longer recoverable.
+    Deduplicated,
+    /// `acks = 0` — the request was written to the socket and the broker sends
+    /// no response. There is **no** durability guarantee whatsoever; the record
+    /// may never have been stored.
+    Unacknowledged,
+    /// The send failed permanently. Present only on the metadata handed to
+    /// [`ProducerInterceptor::on_acknowledgement`](crate::interceptor::ProducerInterceptor::on_acknowledgement)
+    /// alongside the error; it is never returned as `Ok`.
+    Failed,
+}
+
 /// Metadata returned after successfully sending a record.
 ///
-/// When an idempotent producer detects a `DuplicateSequenceNumber` response,
-/// it means the broker already committed the batch from a previous attempt.
-/// The record is returned as `Ok(RecordMetadata)` with `offset = -1` and
-/// `timestamp = -1` to signal deduplication.  Use [`is_deduplicated()`](Self::is_deduplicated)
-/// to distinguish this from a normal commit, and [`is_success()`](Self::is_success) to check
-/// whether a valid log offset is available.
+/// Always check [`delivery`](Self::delivery) (or the
+/// [`is_success`](Self::is_success) / [`is_deduplicated`](Self::is_deduplicated)
+/// / [`is_unacknowledged`](Self::is_unacknowledged) helpers) before relying on
+/// [`offset`](Self::offset): a `-1` offset alone does not tell you whether the
+/// record is durably stored.
 #[non_exhaustive]
 #[must_use = "contains the result of a send operation"]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -345,33 +374,62 @@ pub struct RecordMetadata {
     pub topic: String,
     /// Partition the record was sent to.
     pub partition: PartitionId,
-    /// Log offset of the committed record, or `-1` when the broker deduplicated
-    /// the batch (idempotent `DuplicateSequenceNumber`).  Check
-    /// [`is_deduplicated()`](Self::is_deduplicated) before relying on this value.
+    /// Log offset of the committed record, or `-1` when no offset is available.
+    ///
+    /// Only meaningful when [`delivery`](Self::delivery) is
+    /// [`DeliveryConfirmation::Offset`].
     pub offset: i64,
-    /// Broker-assigned timestamp of the record, or `-1` when deduplicated.
+    /// Broker-assigned timestamp of the record, or `-1`/`0` when unavailable.
     pub timestamp: Timestamp,
+    /// What the broker actually confirmed. See [`DeliveryConfirmation`].
+    pub delivery: DeliveryConfirmation,
 }
 
 impl RecordMetadata {
     /// Returns `true` if the record was committed with a known log offset.
     ///
-    /// Returns `false` for deduplicated records (`offset == -1`).  Use
-    /// [`is_deduplicated()`](Self::is_deduplicated) to tell those apart.
+    /// Deduplicated records return `false` even though their data *is* in
+    /// Kafka — use [`is_deduplicated`](Self::is_deduplicated) to tell those
+    /// apart, or match on [`delivery`](Self::delivery) directly.
     #[inline]
     pub fn is_success(&self) -> bool {
-        self.offset >= 0
+        self.delivery == DeliveryConfirmation::Offset
     }
 
     /// Returns `true` when the broker deduplicated this record.
     ///
     /// An idempotent producer receives `DuplicateSequenceNumber` when the
-    /// broker has already committed the batch from an earlier attempt.  The
-    /// data **is** in Kafka, but the original log offset is not available;
-    /// both `offset` and `timestamp` are set to `-1`.
+    /// broker has already committed the batch from an earlier attempt. The data
+    /// **is** in Kafka, but the original log offset is not available.
+    ///
+    /// This is now driven by an explicit discriminator rather than
+    /// `offset == -1`, which also matched the `acks = 0` path and therefore
+    /// reported "deduplicated" for records with no durability guarantee at all.
     #[inline]
     pub fn is_deduplicated(&self) -> bool {
-        self.offset == -1
+        self.delivery == DeliveryConfirmation::Deduplicated
+    }
+
+    /// Returns `true` when the producer is configured with `acks = 0` and the
+    /// broker never confirmed the write.
+    ///
+    /// There is no durability guarantee for such a record.
+    #[inline]
+    pub fn is_unacknowledged(&self) -> bool {
+        self.delivery == DeliveryConfirmation::Unacknowledged
+    }
+
+    /// Returns `true` when the record is durably stored in Kafka, whether or
+    /// not its offset is known.
+    ///
+    /// True for [`DeliveryConfirmation::Offset`] and
+    /// [`DeliveryConfirmation::Deduplicated`].
+    #[inline]
+    pub fn is_persisted(&self) -> bool {
+        matches!(
+            self.delivery,
+            DeliveryConfirmation::Offset | DeliveryConfirmation::Deduplicated
+        )
     }
 }
 
@@ -471,10 +529,73 @@ mod tests {
             partition: 0,
             offset: 42,
             timestamp: 1234567890000,
+            delivery: DeliveryConfirmation::Offset,
         };
 
         assert!(metadata.is_success());
+        assert!(metadata.is_persisted());
+        assert!(!metadata.is_deduplicated());
+        assert!(!metadata.is_unacknowledged());
         assert_eq!(metadata.offset, 42);
+    }
+
+    // ── `offset == -1` is not a durability discriminator ──────────
+
+    fn meta_with(delivery: DeliveryConfirmation, offset: i64) -> RecordMetadata {
+        RecordMetadata {
+            topic: "t".to_string(),
+            partition: 0,
+            offset,
+            timestamp: -1,
+            delivery,
+        }
+    }
+
+    /// A deduplicated record carries no offset but **is** durably stored.
+    #[test]
+    fn test_deduplicated_metadata_is_persisted_without_offset() {
+        let m = meta_with(DeliveryConfirmation::Deduplicated, -1);
+        assert!(m.is_deduplicated());
+        assert!(m.is_persisted(), "deduplicated data is in Kafka");
+        assert!(!m.is_success(), "no log offset is available");
+        assert!(!m.is_unacknowledged());
+    }
+
+    /// The `acks = 0` path also returns `offset == -1`, but has **no**
+    /// durability guarantee. Under the old `offset == -1` definition it was
+    /// reported as deduplicated — the exact opposite of the truth.
+    #[test]
+    fn test_acks_none_metadata_is_not_reported_as_deduplicated() {
+        let m = meta_with(DeliveryConfirmation::Unacknowledged, -1);
+        assert!(m.is_unacknowledged());
+        assert!(
+            !m.is_deduplicated(),
+            "acks=0 must never be reported as broker-deduplicated"
+        );
+        assert!(
+            !m.is_persisted(),
+            "acks=0 gives no durability guarantee whatsoever"
+        );
+        assert!(!m.is_success());
+    }
+
+    /// Both `-1` cases are distinguishable despite the identical offset.
+    #[test]
+    fn test_minus_one_offset_is_disambiguated_by_delivery() {
+        let dedup = meta_with(DeliveryConfirmation::Deduplicated, -1);
+        let unacked = meta_with(DeliveryConfirmation::Unacknowledged, -1);
+        assert_eq!(dedup.offset, unacked.offset);
+        assert_ne!(dedup.delivery, unacked.delivery);
+        assert_ne!(dedup.is_persisted(), unacked.is_persisted());
+    }
+
+    #[test]
+    fn test_failed_metadata_is_neither_persisted_nor_successful() {
+        let m = meta_with(DeliveryConfirmation::Failed, -1);
+        assert!(!m.is_success());
+        assert!(!m.is_persisted());
+        assert!(!m.is_deduplicated());
+        assert!(!m.is_unacknowledged());
     }
 
     #[test]
@@ -530,12 +651,14 @@ mod tests {
             partition: 0,
             offset: 1,
             timestamp: 100,
+            delivery: DeliveryConfirmation::Offset,
         };
         let b = RecordMetadata {
             topic: "t".to_string(),
             partition: 0,
             offset: 1,
             timestamp: 100,
+            delivery: DeliveryConfirmation::Offset,
         };
         assert_eq!(a, b);
     }

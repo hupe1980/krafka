@@ -62,74 +62,29 @@ println!("Normal-priority requests: {}", stats.normal_priority_count());
 println!("Priority bypasses: {}", stats.bypass_count()); // Direct non-blocking sends
 ```
 
-## Multi-Connection Bundles
+## Connection Model
 
-For extreme high-throughput scenarios (>100k messages/second per broker), multiple TCP connections can parallelize I/O operations.
+Krafka opens **one TCP connection per broker**, matching the Apache Kafka Java
+client. Request concurrency comes from pipelining rather than from extra
+sockets: up to `max_in_flight_requests` requests are outstanding on a single
+connection at any time, and responses are demultiplexed by correlation ID.
 
-### When to Use
+A previous `connections_per_broker` setting and its `BrokerConnectionBundle`
+type have been **removed**. They were never wired into the connection pool, so
+setting them had no effect. They are not coming back in that form, because
+spreading one partition's produce traffic across several sockets would break
+the idempotent producer's ordering guarantee — `max.in.flight.requests` bounds
+reordering *per connection*, so a partition's batches must stay on one socket.
 
-- Single connection saturates at ~50-100k msg/s depending on message size
-- You're CPU-bound on serialization/deserialization
-- Network latency is variable and you want to pipeline more requests
-- You have multiple producer/consumer threads targeting the same broker
+If you need more parallelism to one broker today, run more clients: each
+`Producer`/`Consumer` built without `.with_client(...)` owns its own pool. Use
+`KrafkaClient` when you want the opposite — several clients sharing one pool
+and one connection per broker.
 
-### Configuration
-
-```rust
-use krafka::network::ConnectionConfig;
-
-let config = ConnectionConfig::builder()
-    .connections_per_broker(4)  // 4 parallel connections
-    .build();
-```
-
-### Recommended Values
-
-| Scenario | Connections | Notes |
-|----------|-------------|-------|
-| Standard workloads | 1 (default) | Sufficient for most use cases |
-| High throughput | 2-4 | Good for >50k msg/s per broker |
-| Extreme throughput | 4-8 | For >100k msg/s per broker |
-| Latency-sensitive | 2 | Reduces head-of-line blocking |
-
-### Using Connection Bundles
-
-The `BrokerConnectionBundle` provides round-robin connection selection:
-
-```rust
-use krafka::network::BrokerConnectionBundle;
-
-// Create a bundle with the configured number of connections
-let bundle = BrokerConnectionBundle::connect("broker:9092", config).await?;
-
-// Get a connection using round-robin selection
-let conn = bundle.select();
-
-// Or select by specific index for request affinity
-let conn = bundle.get(0).unwrap();
-
-// Check bundle health
-println!("Usable connections: {}/{}", bundle.usable_count(), bundle.len());
-```
-
-### Automatic Selection
-
-When using the connection pool, bundles are managed automatically:
-
-```rust
-use krafka::network::ConnectionPool;
-
-let config = ConnectionConfig::builder()
-    .connections_per_broker(4)
-    .build();
-
-let pool = ConnectionPool::new(config);
-
-// Pool internally uses bundles, returns connections transparently
-let conn = pool.get_connection("broker:9092").await?;
-```
-
-> **Note:** The connection pool uses a read-lock fast path for hot-path lookups. During reconnection, all locks are dropped before performing network I/O, preventing deadlocks and enabling concurrent access to other brokers while one broker is being reconnected.
+> **Note:** The connection pool uses a read-lock fast path for hot-path lookups.
+> During reconnection, all locks are dropped before performing network I/O,
+> preventing deadlocks and enabling concurrent access to other brokers while one
+> broker is being reconnected.
 
 ## Zero-Copy Message Handling
 

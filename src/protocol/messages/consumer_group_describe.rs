@@ -3,7 +3,7 @@ use bytes::{Buf, BufMut};
 use super::{VersionedDecode, VersionedEncode, non_nullable_string};
 use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::primitives::{Decode, KafkaString, TaggedFields, TryEncode};
-use crate::protocol::{check_compact_array_len, encode_compact_array_len};
+use crate::protocol::{check_compact_array_len, decode_capacity, encode_compact_array_len};
 
 // ============================================================================
 // ConsumerGroupDescribe API (Key 69)
@@ -120,7 +120,7 @@ impl ConsumerGroupDescribeResponse {
     /// Decode assignment (shared between current and target).
     fn decode_assignment(buf: &mut impl Buf) -> Result<DescribeGroupAssignment> {
         let tp_count = check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut topic_partitions = Vec::with_capacity(tp_count);
+        let mut topic_partitions = Vec::with_capacity(decode_capacity(tp_count, buf.remaining()));
         for _ in 0..tp_count {
             let mut topic_id = [0u8; 16];
             if buf.remaining() < 16 {
@@ -134,7 +134,8 @@ impl ConsumerGroupDescribeResponse {
                 non_nullable_string("topic_name", KafkaString::decode_compact(buf)?.0)?;
             let partition_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut partitions = Vec::with_capacity(partition_count);
+            let mut partitions =
+                Vec::with_capacity(decode_capacity(partition_count, buf.remaining()));
             for _ in 0..partition_count {
                 partitions.push(i32::decode(buf)?);
             }
@@ -154,7 +155,7 @@ impl ConsumerGroupDescribeResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let group_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut groups = Vec::with_capacity(group_count);
+        let mut groups = Vec::with_capacity(decode_capacity(group_count, buf.remaining()));
 
         for _ in 0..group_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -169,7 +170,7 @@ impl ConsumerGroupDescribeResponse {
 
             let member_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut members = Vec::with_capacity(member_count);
+            let mut members = Vec::with_capacity(decode_capacity(member_count, buf.remaining()));
             for _ in 0..member_count {
                 let member_id =
                     non_nullable_string("member_id", KafkaString::decode_compact(buf)?.0)?;
@@ -183,7 +184,8 @@ impl ConsumerGroupDescribeResponse {
 
                 let sub_count =
                     check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-                let mut subscribed_topic_names = Vec::with_capacity(sub_count);
+                let mut subscribed_topic_names =
+                    Vec::with_capacity(decode_capacity(sub_count, buf.remaining()));
                 for _ in 0..sub_count {
                     subscribed_topic_names.push(non_nullable_string(
                         "subscribed_topic",
@@ -239,7 +241,7 @@ impl ConsumerGroupDescribeResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let group_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut groups = Vec::with_capacity(group_count);
+        let mut groups = Vec::with_capacity(decode_capacity(group_count, buf.remaining()));
 
         for _ in 0..group_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -254,7 +256,7 @@ impl ConsumerGroupDescribeResponse {
 
             let member_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut members = Vec::with_capacity(member_count);
+            let mut members = Vec::with_capacity(decode_capacity(member_count, buf.remaining()));
             for _ in 0..member_count {
                 let member_id =
                     non_nullable_string("member_id", KafkaString::decode_compact(buf)?.0)?;
@@ -268,7 +270,8 @@ impl ConsumerGroupDescribeResponse {
 
                 let sub_count =
                     check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-                let mut subscribed_topic_names = Vec::with_capacity(sub_count);
+                let mut subscribed_topic_names =
+                    Vec::with_capacity(decode_capacity(sub_count, buf.remaining()));
                 for _ in 0..sub_count {
                     subscribed_topic_names.push(non_nullable_string(
                         "subscribed_topic",

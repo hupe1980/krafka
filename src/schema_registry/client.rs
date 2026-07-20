@@ -246,14 +246,27 @@ impl ConfluentSchemaRegistry {
     }
 
     /// Format an `Authorization` header value for the configured auth method.
-    fn auth_header_value(&self) -> Option<String> {
+    ///
+    /// The result is [`Zeroizing`](zeroize::Zeroizing) because it materialises
+    /// the credential in plaintext on every request: `Basic` is a reversible
+    /// base64 of `user:pass`, and `Bearer` embeds the token verbatim.
+    /// Returning a plain `String` would leave a copy of the secret in the
+    /// allocator's free list after each call, defeating the `Zeroizing`
+    /// storage in [`RegistryAuth`]. The intermediate `user:pass` and base64
+    /// buffers are `Zeroizing` for the same reason.
+    fn auth_header_value(&self) -> Option<zeroize::Zeroizing<String>> {
         match &self.auth {
             RegistryAuth::None => None,
             RegistryAuth::Basic { username, password } => {
-                let creds = format!("{}:{}", username.as_str(), password.as_str());
-                Some(format!("Basic {}", base64_encode(creds.as_bytes())))
+                let creds =
+                    zeroize::Zeroizing::new(format!("{}:{}", username.as_str(), password.as_str()));
+                let encoded = zeroize::Zeroizing::new(base64_encode(creds.as_bytes()));
+                Some(zeroize::Zeroizing::new(format!("Basic {}", *encoded)))
             }
-            RegistryAuth::Bearer { token } => Some(format!("Bearer {}", token.as_str())),
+            RegistryAuth::Bearer { token } => Some(zeroize::Zeroizing::new(format!(
+                "Bearer {}",
+                token.as_str()
+            ))),
         }
     }
 
@@ -317,7 +330,7 @@ impl ConfluentSchemaRegistry {
                 url,
                 &[("Accept", SCHEMA_REGISTRY_CONTENT_TYPE)],
                 None,
-                auth.as_deref(),
+                auth.as_ref().map(|s| s.as_str()),
             )
             .await?;
         Self::handle_response(resp.status, resp.content_type.as_deref(), &resp.body)
@@ -336,7 +349,7 @@ impl ConfluentSchemaRegistry {
                     ("Content-Type", SCHEMA_REGISTRY_CONTENT_TYPE),
                 ],
                 Some(body),
-                auth.as_deref(),
+                auth.as_ref().map(|s| s.as_str()),
             )
             .await?;
         Self::handle_response(resp.status, resp.content_type.as_deref(), &resp.body)
@@ -352,7 +365,7 @@ impl ConfluentSchemaRegistry {
                 url,
                 &[("Accept", SCHEMA_REGISTRY_CONTENT_TYPE)],
                 None,
-                auth.as_deref(),
+                auth.as_ref().map(|s| s.as_str()),
             )
             .await?;
         Self::handle_response(resp.status, resp.content_type.as_deref(), &resp.body)
@@ -604,15 +617,21 @@ impl ConfluentSchemaRegistryBuilder {
 
     /// Set the HTTP request timeout.
     ///
-    /// To remove a previously set timeout, call [`clear_request_timeout()`](Self::clear_request_timeout).
+    /// Defaults to 30 s. To fall back to the transport's own 60 s default,
+    /// call [`clear_request_timeout()`](Self::clear_request_timeout).
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = Some(timeout);
         self
     }
 
-    /// Clear any explicit HTTP request timeout override.
+    /// Clear the builder's explicit HTTP request timeout override.
     ///
-    /// Equivalent to removing a timeout set via [`request_timeout()`](Self::request_timeout).
+    /// This does **not** make requests unbounded. The underlying HTTP client
+    /// always applies a deadline; with no override it uses its own 60 s
+    /// default. An unbounded HTTP client is a slowloris amplifier — a peer
+    /// that accepts the connection and then trickles bytes would pin the
+    /// calling task (and, via `CachedSchemaRegistry`, every task waiting on
+    /// the same schema lookup) indefinitely.
     pub fn clear_request_timeout(mut self) -> Self {
         self.request_timeout = None;
         self
@@ -731,7 +750,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_clear_request_timeout_removes_client_deadline() {
+    async fn test_builder_clear_request_timeout_drops_override_not_the_deadline() {
+        // Clearing removes the builder's 20 ms override, so a slow peer is no
+        // longer cut off at 20 ms. It does **not** make the request
+        // unbounded — the transport still applies DEFAULT_HTTP_TIMEOUT, which
+        // is simply far longer than this test's own 150 ms observation window.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -751,10 +774,26 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(150), client.get_schema_by_id(1)).await;
         assert!(
             result.is_err(),
-            "request unexpectedly completed with cleared timeout"
+            "the 20 ms override must no longer apply after clearing"
         );
 
         server.abort();
+    }
+
+    #[test]
+    fn test_cleared_request_timeout_still_bounds_the_transport() {
+        // The security property: no configuration path yields an unbounded
+        // HTTP client. `clear_request_timeout` produces `None`, which
+        // `HttpClient` resolves to `DEFAULT_HTTP_TIMEOUT` rather than "no
+        // deadline" — see `http::tests::test_default_timeout_applied_when_none`,
+        // which asserts the resolution itself (the field is module-private).
+        let builder = ConfluentSchemaRegistryBuilder::default()
+            .url("http://localhost:8081")
+            .request_timeout(Duration::from_secs(5))
+            .clear_request_timeout();
+        assert_eq!(builder.request_timeout, None, "override is cleared");
+        // Building still succeeds and yields a client with the transport default.
+        assert!(builder.build().is_ok());
     }
 
     #[test]

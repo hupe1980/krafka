@@ -5,7 +5,7 @@ use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::primitives::{
     Decode, Encode, KafkaBytes, KafkaString, TaggedFields, TryEncode,
 };
-use crate::protocol::{check_compact_array_len, encode_compact_array_len};
+use crate::protocol::{check_compact_array_len, decode_capacity, encode_compact_array_len};
 
 // ============================================================================
 // ShareGroupHeartbeat (API Key 76) — KIP-932
@@ -135,7 +135,7 @@ impl ShareGroupHeartbeatResponse {
 
         // Struct is present — decode TopicPartitions compact array.
         let tp_count = check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut topic_partitions = Vec::with_capacity(tp_count);
+        let mut topic_partitions = Vec::with_capacity(decode_capacity(tp_count, buf.remaining()));
         for _ in 0..tp_count {
             let mut topic_id = [0u8; 16];
             if buf.remaining() < 16 {
@@ -147,7 +147,7 @@ impl ShareGroupHeartbeatResponse {
             buf.copy_to_slice(&mut topic_id);
             let p_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut partitions = Vec::with_capacity(p_count);
+            let mut partitions = Vec::with_capacity(decode_capacity(p_count, buf.remaining()));
             for _ in 0..p_count {
                 partitions.push(i32::decode(buf)?);
             }
@@ -266,7 +266,7 @@ impl ShareGroupDescribeResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let group_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut groups = Vec::with_capacity(group_count);
+        let mut groups = Vec::with_capacity(decode_capacity(group_count, buf.remaining()));
         for _ in 0..group_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
             let error_message = KafkaString::decode_compact(buf)?.0;
@@ -281,7 +281,7 @@ impl ShareGroupDescribeResponse {
             // Members
             let member_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut members = Vec::with_capacity(member_count);
+            let mut members = Vec::with_capacity(decode_capacity(member_count, buf.remaining()));
             for _ in 0..member_count {
                 let member_id =
                     super::non_nullable_string("member_id", KafkaString::decode_compact(buf)?.0)?;
@@ -294,7 +294,8 @@ impl ShareGroupDescribeResponse {
                 // SubscribedTopicNames
                 let stn_count =
                     check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-                let mut subscribed_topic_names = Vec::with_capacity(stn_count);
+                let mut subscribed_topic_names =
+                    Vec::with_capacity(decode_capacity(stn_count, buf.remaining()));
                 for _ in 0..stn_count {
                     subscribed_topic_names.push(super::non_nullable_string(
                         "subscribed_topic_name",
@@ -304,7 +305,7 @@ impl ShareGroupDescribeResponse {
                 // Assignment struct (non-nullable)
                 let tp_count =
                     check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-                let mut assignment = Vec::with_capacity(tp_count);
+                let mut assignment = Vec::with_capacity(decode_capacity(tp_count, buf.remaining()));
                 for _ in 0..tp_count {
                     let mut topic_id = [0u8; 16];
                     if buf.remaining() < 16 {
@@ -320,7 +321,8 @@ impl ShareGroupDescribeResponse {
                     )?;
                     let p_count =
                         check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-                    let mut partitions = Vec::with_capacity(p_count);
+                    let mut partitions =
+                        Vec::with_capacity(decode_capacity(p_count, buf.remaining()));
                     for _ in 0..p_count {
                         partitions.push(i32::decode(buf)?);
                     }
@@ -598,7 +600,7 @@ impl ShareFetchResponse {
         // Responses compact array
         let topic_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut responses = Vec::with_capacity(topic_count);
+        let mut responses = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
         for _ in 0..topic_count {
             let mut topic_id = [0u8; 16];
             if buf.remaining() < 16 {
@@ -610,7 +612,7 @@ impl ShareFetchResponse {
             buf.copy_to_slice(&mut topic_id);
             let part_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut partitions = Vec::with_capacity(part_count);
+            let mut partitions = Vec::with_capacity(decode_capacity(part_count, buf.remaining()));
             for _ in 0..part_count {
                 let partition_index = i32::decode(buf)?;
                 let part_error = ErrorCode::from_i16(i16::decode(buf)?);
@@ -624,7 +626,8 @@ impl ShareFetchResponse {
                 // AcquiredRecords compact array
                 let ar_count =
                     check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-                let mut acquired_records = Vec::with_capacity(ar_count);
+                let mut acquired_records =
+                    Vec::with_capacity(decode_capacity(ar_count, buf.remaining()));
                 for _ in 0..ar_count {
                     acquired_records.push(ShareAcquiredRecords {
                         first_offset: i64::decode(buf)?,
@@ -656,7 +659,7 @@ impl ShareFetchResponse {
         }
         // NodeEndpoints compact array
         let ne_count = check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut node_endpoints = Vec::with_capacity(ne_count);
+        let mut node_endpoints = Vec::with_capacity(decode_capacity(ne_count, buf.remaining()));
         for _ in 0..ne_count {
             let node_id = i32::decode(buf)?;
             let host = super::non_nullable_string("host", KafkaString::decode_compact(buf)?.0)?;
@@ -816,7 +819,7 @@ impl ShareAcknowledgeResponse {
         // Responses compact array
         let topic_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut responses = Vec::with_capacity(topic_count);
+        let mut responses = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
         for _ in 0..topic_count {
             let mut topic_id = [0u8; 16];
             if buf.remaining() < 16 {
@@ -828,7 +831,7 @@ impl ShareAcknowledgeResponse {
             buf.copy_to_slice(&mut topic_id);
             let part_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut partitions = Vec::with_capacity(part_count);
+            let mut partitions = Vec::with_capacity(decode_capacity(part_count, buf.remaining()));
             for _ in 0..part_count {
                 let partition_index = i32::decode(buf)?;
                 let part_error = ErrorCode::from_i16(i16::decode(buf)?);
@@ -855,7 +858,7 @@ impl ShareAcknowledgeResponse {
         }
         // NodeEndpoints compact array
         let ne_count = check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut node_endpoints = Vec::with_capacity(ne_count);
+        let mut node_endpoints = Vec::with_capacity(decode_capacity(ne_count, buf.remaining()));
         for _ in 0..ne_count {
             let node_id = i32::decode(buf)?;
             let host = super::non_nullable_string("host", KafkaString::decode_compact(buf)?.0)?;

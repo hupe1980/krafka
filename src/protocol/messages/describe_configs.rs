@@ -4,7 +4,8 @@ use super::{VersionedDecode, VersionedEncode, non_nullable_string};
 use crate::error::{ErrorCode, Result};
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{
-    array_len_i32, check_compact_array_len, check_decode_array_len, encode_compact_array_len,
+    array_len_i32, check_compact_array_len, check_decode_array_len, decode_capacity,
+    encode_compact_array_len,
 };
 
 // ============================================================================
@@ -12,10 +13,17 @@ use crate::protocol::{
 // ============================================================================
 
 /// Resource type for config operations.
+///
+/// Mirrors Kafka's `ConfigResource.Type`. The wire values are sparse rather
+/// than sequential, so never assume a dense range when converting.
+///
+/// Used by `DescribeConfigs` / `IncrementalAlterConfigs` and by
+/// `ListConfigResources` (API key 74, KIP-1142).
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigResourceType {
-    /// Unknown resource type.
+    /// Unknown resource type. Also the fallback for a wire value this client
+    /// does not recognise.
     Unknown = 0,
     /// Topic resource.
     Topic = 2,
@@ -23,16 +31,24 @@ pub enum ConfigResourceType {
     Broker = 4,
     /// Broker logger resource.
     BrokerLogger = 8,
+    /// Client metrics subscription resource (KIP-714).
+    ClientMetrics = 16,
+    /// Consumer/share group resource (KIP-1142).
+    Group = 32,
 }
 
 impl ConfigResourceType {
-    /// Convert from i8.
+    /// Convert from i8. Unrecognised values become
+    /// [`ConfigResourceType::Unknown`] rather than an error, so a newer broker
+    /// never turns a response into a decode failure.
     #[inline]
     pub fn from_i8(value: i8) -> Self {
         match value {
             2 => Self::Topic,
             4 => Self::Broker,
             8 => Self::BrokerLogger,
+            16 => Self::ClientMetrics,
+            32 => Self::Group,
             _ => Self::Unknown,
         }
     }
@@ -247,7 +263,7 @@ impl DescribeConfigsResponse {
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let result_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut results = Vec::with_capacity(result_count);
+        let mut results = Vec::with_capacity(decode_capacity(result_count, buf.remaining()));
 
         for _ in 0..result_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -256,7 +272,7 @@ impl DescribeConfigsResponse {
             let resource_name = non_nullable_string("resource name", KafkaString::decode(buf)?.0)?;
 
             let config_count = check_decode_array_len(i32::decode(buf)?)?;
-            let mut configs = Vec::with_capacity(config_count);
+            let mut configs = Vec::with_capacity(decode_capacity(config_count, buf.remaining()));
 
             for _ in 0..config_count {
                 let name = non_nullable_string("config entry name", KafkaString::decode(buf)?.0)?;
@@ -297,7 +313,7 @@ impl DescribeConfigsResponse {
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let result_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut results = Vec::with_capacity(result_count);
+        let mut results = Vec::with_capacity(decode_capacity(result_count, buf.remaining()));
 
         for _ in 0..result_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -306,7 +322,7 @@ impl DescribeConfigsResponse {
             let resource_name = non_nullable_string("resource name", KafkaString::decode(buf)?.0)?;
 
             let config_count = check_decode_array_len(i32::decode(buf)?)?;
-            let mut configs = Vec::with_capacity(config_count);
+            let mut configs = Vec::with_capacity(decode_capacity(config_count, buf.remaining()));
 
             for _ in 0..config_count {
                 let name = non_nullable_string("config entry name", KafkaString::decode(buf)?.0)?;
@@ -317,7 +333,8 @@ impl DescribeConfigsResponse {
 
                 // Decode synonyms array
                 let synonym_count = check_decode_array_len(i32::decode(buf)?)?;
-                let mut synonyms = Vec::with_capacity(synonym_count);
+                let mut synonyms =
+                    Vec::with_capacity(decode_capacity(synonym_count, buf.remaining()));
                 for _ in 0..synonym_count {
                     let syn_name =
                         non_nullable_string("synonym name", KafkaString::decode(buf)?.0)?;
@@ -362,7 +379,7 @@ impl DescribeConfigsResponse {
     pub fn decode_v3(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let result_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut results = Vec::with_capacity(result_count);
+        let mut results = Vec::with_capacity(decode_capacity(result_count, buf.remaining()));
 
         for _ in 0..result_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -371,7 +388,7 @@ impl DescribeConfigsResponse {
             let resource_name = non_nullable_string("resource name", KafkaString::decode(buf)?.0)?;
 
             let config_count = check_decode_array_len(i32::decode(buf)?)?;
-            let mut configs = Vec::with_capacity(config_count);
+            let mut configs = Vec::with_capacity(decode_capacity(config_count, buf.remaining()));
 
             for _ in 0..config_count {
                 let name = non_nullable_string("config entry name", KafkaString::decode(buf)?.0)?;
@@ -381,7 +398,8 @@ impl DescribeConfigsResponse {
                 let is_sensitive = i8::decode(buf)? != 0;
 
                 let synonym_count = check_decode_array_len(i32::decode(buf)?)?;
-                let mut synonyms = Vec::with_capacity(synonym_count);
+                let mut synonyms =
+                    Vec::with_capacity(decode_capacity(synonym_count, buf.remaining()));
                 for _ in 0..synonym_count {
                     let syn_name =
                         non_nullable_string("synonym name", KafkaString::decode(buf)?.0)?;
@@ -430,7 +448,7 @@ impl DescribeConfigsResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let result_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut results = Vec::with_capacity(result_count);
+        let mut results = Vec::with_capacity(decode_capacity(result_count, buf.remaining()));
 
         for _ in 0..result_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -441,7 +459,7 @@ impl DescribeConfigsResponse {
 
             let config_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut configs = Vec::with_capacity(config_count);
+            let mut configs = Vec::with_capacity(decode_capacity(config_count, buf.remaining()));
 
             for _ in 0..config_count {
                 let name =
@@ -453,7 +471,8 @@ impl DescribeConfigsResponse {
 
                 let synonym_count =
                     check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-                let mut synonyms = Vec::with_capacity(synonym_count);
+                let mut synonyms =
+                    Vec::with_capacity(decode_capacity(synonym_count, buf.remaining()));
                 for _ in 0..synonym_count {
                     let syn_name =
                         non_nullable_string("synonym name", KafkaString::decode_compact(buf)?.0)?;
@@ -723,5 +742,68 @@ mod tests {
         assert_eq!(c.synonyms.len(), 1);
         assert_eq!(c.config_type, 1);
         assert_eq!(c.documentation.as_deref(), Some("doc"));
+    }
+
+    // ── Regression: allocation amplification ───────────────────────────
+
+    /// A tiny hostile body must not drive a large pre-allocation.
+    ///
+    /// This body is ~34 bytes and declares three nested counts at the
+    /// `MAX_DECODE_ARRAY_LEN` ceiling. The length checks all pass — the counts
+    /// are individually "legal" — but no element could possibly fit. Before the
+    /// `decode_capacity` clamp, the three `Vec::with_capacity` calls reserved
+    /// roughly 25 MB (~7e5 amplification) before the first inner decode failed,
+    /// repeatable once per response per connection.
+    ///
+    /// The clamp bounds each reservation by the bytes remaining, so total
+    /// allocation is now proportional to the response size. The observable
+    /// assertion is that decoding fails promptly and returns an error rather
+    /// than consuming memory.
+    #[test]
+    fn decode_v3_hostile_nested_counts_do_not_over_allocate() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_i32(100_000); // result_count — at the safety ceiling
+        // First result: enough header bytes to reach the nested counts.
+        buf.put_i16(0); // error_code
+        buf.put_i16(-1); // error_message: null
+        buf.put_i8(2); // resource_type: topic
+        buf.put_i16(0); // resource_name: ""
+        buf.put_i32(100_000); // config_count — at the ceiling
+        // First config entry, up to the synonyms count.
+        buf.put_i16(0); // name: ""
+        buf.put_i16(-1); // value: null
+        buf.put_i8(0); // read_only
+        buf.put_i8(0); // config_source
+        buf.put_i8(0); // is_sensitive
+        buf.put_i32(100_000); // synonym_count — at the ceiling
+        // ...and the body simply ends here.
+
+        let len = buf.len();
+        assert!(len < 64, "hostile body should be tiny, was {len} bytes");
+
+        let result = DescribeConfigsResponse::decode_v3(&mut buf.freeze());
+        assert!(
+            result.is_err(),
+            "a body that ends mid-element must be rejected"
+        );
+    }
+
+    /// The same shape in the flexible (v4) encoding.
+    #[test]
+    fn decode_v4_hostile_nested_counts_do_not_over_allocate() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        varint::encode_unsigned_varint(100_001, &mut buf); // result_count + 1
+        buf.put_i16(0); // error_code
+        varint::encode_unsigned_varint(0, &mut buf); // error_message: null
+        buf.put_i8(2); // resource_type
+        varint::encode_unsigned_varint(1, &mut buf); // resource_name: ""
+        varint::encode_unsigned_varint(100_001, &mut buf); // config_count + 1
+
+        let len = buf.len();
+        assert!(len < 64, "hostile body should be tiny, was {len} bytes");
+
+        assert!(DescribeConfigsResponse::decode_v4(&mut buf.freeze()).is_err());
     }
 }

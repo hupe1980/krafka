@@ -37,3 +37,12 @@ docs/vendor/
 # Added by cargo
 
 /target
+
+# cargo-fuzz working state. Generated corpora are large and machine-specific;
+# a curated seed corpus should be added deliberately, not accumulated here.
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+
+# Agent worktrees and local tooling state.
+.claude/

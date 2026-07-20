@@ -5,7 +5,8 @@ use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{
-    array_len_i32, check_compact_array_len, check_decode_array_len, encode_compact_array_len,
+    array_len_i32, check_compact_array_len, check_decode_array_len, decode_capacity,
+    encode_compact_array_len,
 };
 
 // ============================================================================
@@ -131,11 +132,11 @@ impl DescribeClientQuotasResponse {
             None
         } else {
             let entry_count = check_decode_array_len(entry_count_raw)?;
-            let mut entries = Vec::with_capacity(entry_count);
+            let mut entries = Vec::with_capacity(decode_capacity(entry_count, buf.remaining()));
 
             for _ in 0..entry_count {
                 let entity_count = check_decode_array_len(i32::decode(buf)?)?;
-                let mut entity = Vec::with_capacity(entity_count);
+                let mut entity = Vec::with_capacity(decode_capacity(entity_count, buf.remaining()));
                 for _ in 0..entity_count {
                     let entity_type =
                         non_nullable_string("entity_type", KafkaString::decode(buf)?.0)?;
@@ -147,7 +148,7 @@ impl DescribeClientQuotasResponse {
                 }
 
                 let value_count = check_decode_array_len(i32::decode(buf)?)?;
-                let mut values = Vec::with_capacity(value_count);
+                let mut values = Vec::with_capacity(decode_capacity(value_count, buf.remaining()));
                 for _ in 0..value_count {
                     let key = non_nullable_string("quota key", KafkaString::decode(buf)?.0)?;
                     if buf.remaining() < 8 {
@@ -185,12 +186,12 @@ impl DescribeClientQuotasResponse {
             None
         } else {
             let entry_count = check_compact_array_len(entry_count_raw)?;
-            let mut entries = Vec::with_capacity(entry_count);
+            let mut entries = Vec::with_capacity(decode_capacity(entry_count, buf.remaining()));
 
             for _ in 0..entry_count {
                 let entity_count =
                     check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-                let mut entity = Vec::with_capacity(entity_count);
+                let mut entity = Vec::with_capacity(decode_capacity(entity_count, buf.remaining()));
                 for _ in 0..entity_count {
                     let entity_type =
                         non_nullable_string("entity_type", KafkaString::decode_compact(buf)?.0)?;
@@ -204,7 +205,7 @@ impl DescribeClientQuotasResponse {
 
                 let value_count =
                     check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-                let mut values = Vec::with_capacity(value_count);
+                let mut values = Vec::with_capacity(decode_capacity(value_count, buf.remaining()));
                 for _ in 0..value_count {
                     let key =
                         non_nullable_string("quota key", KafkaString::decode_compact(buf)?.0)?;

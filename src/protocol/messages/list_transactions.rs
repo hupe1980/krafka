@@ -4,13 +4,14 @@ use super::{VersionedDecode, VersionedEncode, non_nullable_string};
 use crate::error::{ErrorCode, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
-use crate::protocol::{check_compact_array_len, encode_compact_array_len};
+use crate::protocol::{check_compact_array_len, decode_capacity, encode_compact_array_len};
 
 // ============================================================================
 // ListTransactions API (Key 66)
 //
 // v0 baseline. All versions use flexible encoding.
 // v1 adds DurationFilter (KIP-994).
+// v2 adds TransactionalIdPattern (KIP-1152).
 // ============================================================================
 
 /// ListTransactions request.
@@ -22,6 +23,13 @@ pub struct ListTransactionsRequest {
     pub producer_id_filters: Vec<i64>,
     /// Filter by minimum duration in millis (v1+). `-1` for no filter.
     pub duration_filter: i64,
+    /// Filter by a transactional-ID regular expression (v2+, KIP-1152).
+    ///
+    /// `None` (or an empty string) returns every transaction. The pattern is
+    /// evaluated by the coordinator, not the client: an invalid expression
+    /// comes back as `INVALID_REGULAR_EXPRESSION` in the response error code
+    /// rather than as an empty result set.
+    pub transactional_id_pattern: Option<String>,
 }
 
 impl ListTransactionsRequest {
@@ -36,6 +44,7 @@ impl ListTransactionsRequest {
             state_filters: Vec::new(),
             producer_id_filters: Vec::new(),
             duration_filter: -1,
+            transactional_id_pattern: None,
         }
     }
 
@@ -67,6 +76,28 @@ impl ListTransactionsRequest {
         TaggedFields::default().try_encode(buf)?;
         Ok(())
     }
+
+    /// Encode for version 2 (adds the transactional-ID pattern, KIP-1152).
+    ///
+    /// The pattern is a nullable compact string; `None` encodes as null, which
+    /// the coordinator reads as "no filter".
+    pub fn encode_v2(&self, buf: &mut impl BufMut) -> Result<()> {
+        encode_compact_array_len(self.state_filters.len(), buf)?;
+        for s in &self.state_filters {
+            KafkaString::new(s).try_encode_compact(buf)?;
+        }
+        encode_compact_array_len(self.producer_id_filters.len(), buf)?;
+        for &pid in &self.producer_id_filters {
+            pid.encode(buf);
+        }
+        self.duration_filter.encode(buf);
+        match self.transactional_id_pattern {
+            Some(ref pattern) => KafkaString::new(pattern).try_encode_compact(buf)?,
+            None => KafkaString::null().try_encode_compact(buf)?,
+        }
+        TaggedFields::default().try_encode(buf)?;
+        Ok(())
+    }
 }
 
 impl VersionedEncode for ListTransactionsRequest {
@@ -74,6 +105,7 @@ impl VersionedEncode for ListTransactionsRequest {
         match version {
             0 => self.encode_v0(buf),
             1 => self.encode_v1(buf),
+            2 => self.encode_v2(buf),
             _ => unsupported_encode!("ListTransactionsRequest", version),
         }
     }
@@ -106,14 +138,19 @@ pub struct ListTransactionsResponse {
 }
 
 impl ListTransactionsResponse {
-    /// Decode from version 0–1 (both have the same response wire format).
+    /// Decode from version 0–2.
+    ///
+    /// The response wire format is unchanged across all three versions; v2 only
+    /// widens the request (KIP-1152) and adds `INVALID_REGULAR_EXPRESSION` to
+    /// the error codes the coordinator may return.
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
 
         let unknown_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut unknown_state_filters = Vec::with_capacity(unknown_count);
+        let mut unknown_state_filters =
+            Vec::with_capacity(decode_capacity(unknown_count, buf.remaining()));
         for _ in 0..unknown_count {
             unknown_state_filters.push(non_nullable_string(
                 "unknown_state_filter",
@@ -123,7 +160,8 @@ impl ListTransactionsResponse {
 
         let state_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut transaction_states = Vec::with_capacity(state_count);
+        let mut transaction_states =
+            Vec::with_capacity(decode_capacity(state_count, buf.remaining()));
         for _ in 0..state_count {
             let transactional_id =
                 non_nullable_string("transactional_id", KafkaString::decode_compact(buf)?.0)?;
@@ -151,7 +189,7 @@ impl ListTransactionsResponse {
 impl VersionedDecode for ListTransactionsResponse {
     fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
         match version {
-            0..=1 => Self::decode_v0(buf),
+            0..=2 => Self::decode_v0(buf),
             _ => unsupported_decode!("ListTransactionsResponse", version),
         }
     }
@@ -196,6 +234,7 @@ mod tests {
             state_filters: vec!["Ongoing".to_string()],
             producer_id_filters: vec![1000],
             duration_filter: -1,
+            transactional_id_pattern: None,
         };
         let mut buf = BytesMut::new();
         request.encode_v0(&mut buf).unwrap();
@@ -208,6 +247,7 @@ mod tests {
             state_filters: Vec::new(),
             producer_id_filters: Vec::new(),
             duration_filter: 60_000,
+            transactional_id_pattern: None,
         };
         let mut buf = BytesMut::new();
         request.encode_v1(&mut buf).unwrap();
@@ -218,7 +258,71 @@ mod tests {
     fn test_list_transactions_versioned_unsupported() {
         let request = ListTransactionsRequest::all();
         let mut buf = BytesMut::new();
-        assert!(request.encode_versioned(2, &mut buf).is_err());
+        assert!(request.encode_versioned(3, &mut buf).is_err());
+    }
+
+    /// v2 appends the pattern as a nullable compact string after the duration
+    /// filter, and encodes `None` as null rather than as an empty string —
+    /// an empty string would be a legal (match-nothing-special) pattern.
+    #[test]
+    fn test_list_transactions_request_encode_v2_pattern() {
+        let request = ListTransactionsRequest {
+            state_filters: Vec::new(),
+            producer_id_filters: Vec::new(),
+            duration_filter: -1,
+            transactional_id_pattern: Some("app-.*".to_string()),
+        };
+        let mut buf = BytesMut::new();
+        request.encode_v2(&mut buf).unwrap();
+
+        let mut cur = &buf[..];
+        assert_eq!(
+            crate::util::varint::decode_unsigned_varint(&mut cur).unwrap(),
+            1
+        ); // no state filters
+        assert_eq!(
+            crate::util::varint::decode_unsigned_varint(&mut cur).unwrap(),
+            1
+        ); // no pid filters
+        assert_eq!(cur.get_i64(), -1);
+        let len = crate::util::varint::decode_unsigned_varint(&mut cur).unwrap() as usize - 1;
+        assert_eq!(&cur[..len], b"app-.*");
+        cur.advance(len);
+        assert_eq!(cur.get_u8(), 0); // tagged fields
+        assert!(cur.is_empty());
+    }
+
+    #[test]
+    fn test_list_transactions_request_encode_v2_null_pattern() {
+        let request = ListTransactionsRequest::all();
+        let mut buf_v1 = BytesMut::new();
+        request.encode_v1(&mut buf_v1).unwrap();
+        let mut buf_v2 = BytesMut::new();
+        request.encode_v2(&mut buf_v2).unwrap();
+
+        // A null pattern costs exactly one varint byte (0) over the v1 body.
+        assert_eq!(buf_v2.len(), buf_v1.len() + 1);
+        assert_eq!(buf_v2[buf_v1.len() - 1], 0); // null compact string
+    }
+
+    /// The response format is identical at v0, v1 and v2 (KIP-1152 is
+    /// request-only), so the v0 decoder must be reachable from all three.
+    #[test]
+    fn test_list_transactions_response_decode_v2_uses_v0_format() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_i16(0); // error_code
+        put_compact_array_len(&mut buf, 0); // unknown_state_filters
+        put_compact_array_len(&mut buf, 1); // transaction_states
+        put_compact_string(&mut buf, "app-1");
+        buf.put_i64(7);
+        put_compact_string(&mut buf, "Ongoing");
+        put_empty_tagged_fields(&mut buf);
+        put_empty_tagged_fields(&mut buf); // top-level
+
+        let resp = ListTransactionsResponse::decode_versioned(2, &mut buf.freeze()).unwrap();
+        assert_eq!(resp.transaction_states.len(), 1);
+        assert_eq!(resp.transaction_states[0].transactional_id, "app-1");
     }
 
     #[test]
@@ -272,13 +376,13 @@ mod tests {
     #[test]
     fn test_list_transactions_versioned_decode_unsupported() {
         let buf = BytesMut::new();
-        assert!(ListTransactionsResponse::decode_versioned(2, &mut buf.freeze()).is_err());
+        assert!(ListTransactionsResponse::decode_versioned(3, &mut buf.freeze()).is_err());
     }
 
     #[test]
     fn test_list_transactions_versioned_encode_dispatches() {
         let request = ListTransactionsRequest::all();
-        for v in 0..=1 {
+        for v in 0..=2 {
             let mut buf = BytesMut::new();
             request.encode_versioned(v, &mut buf).unwrap();
             assert!(!buf.is_empty(), "v{v} should produce non-empty output");

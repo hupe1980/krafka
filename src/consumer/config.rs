@@ -101,23 +101,75 @@ pub enum GroupProtocol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PartitionAssignmentStrategy {
     /// Range assignor (default) — assigns contiguous partition ranges per topic.
+    ///
+    /// Eager protocol: every member revokes its entire assignment before the
+    /// new one is computed.
     #[default]
     Range,
     /// Round-robin assignor — distributes partitions evenly across consumers.
+    ///
+    /// Eager protocol.
     RoundRobin,
+    /// Sticky assignor — balanced assignment that preserves as much of the
+    /// previous assignment as possible.
+    ///
+    /// Eager protocol: like [`Range`](Self::Range) and
+    /// [`RoundRobin`](Self::RoundRobin), all partitions are revoked before the
+    /// new assignment is applied. The stickiness is in *which* partitions come
+    /// back — a member that keeps its partitions across a rebalance avoids
+    /// re-seeking and re-warming local state, even though it briefly gave them
+    /// up.
+    ///
+    /// Prefer [`CooperativeSticky`](Self::CooperativeSticky) for new
+    /// deployments: it gives the same stickiness *without* the stop-the-world
+    /// revocation. This variant exists for parity with the Java client and for
+    /// groups that cannot yet run the cooperative protocol.
+    Sticky,
     /// Cooperative sticky assignor — minimizes partition movements during rebalance.
+    ///
+    /// Cooperative protocol: members only revoke the partitions that are
+    /// actually being reassigned, so partitions that stay put are never
+    /// interrupted.
     CooperativeSticky,
 }
 
 impl PartitionAssignmentStrategy {
     /// Get the Kafka protocol name for this strategy.
+    ///
+    /// This is the name sent in the JoinGroup request and matched against
+    /// `JoinGroupResponse.protocol_name`, so it must stay byte-identical to
+    /// the Java client's names — a mismatch makes the group unable to find a
+    /// common protocol and the coordinator rejects the join.
     #[inline]
     pub fn protocol_name(&self) -> &'static str {
         match self {
             Self::Range => "range",
             Self::RoundRobin => "roundrobin",
+            Self::Sticky => "sticky",
             Self::CooperativeSticky => "cooperative-sticky",
         }
+    }
+
+    /// Resolve a protocol name received from the coordinator back into a
+    /// strategy.
+    ///
+    /// Returns `None` for names this client does not implement.
+    #[inline]
+    pub fn from_protocol_name(name: &str) -> Option<Self> {
+        match name {
+            "range" => Some(Self::Range),
+            "roundrobin" => Some(Self::RoundRobin),
+            "sticky" => Some(Self::Sticky),
+            "cooperative-sticky" => Some(Self::CooperativeSticky),
+            _ => None,
+        }
+    }
+
+    /// Whether this strategy uses the cooperative (incremental) rebalance
+    /// protocol rather than the eager stop-the-world one.
+    #[inline]
+    pub fn is_cooperative(&self) -> bool {
+        matches!(self, Self::CooperativeSticky)
     }
 }
 
@@ -153,6 +205,27 @@ pub struct ConsumerConfig {
     pub(crate) auto_commit_interval: Duration,
     /// Minimum bytes to fetch.
     pub(crate) fetch_min_bytes: i32,
+    /// Maximum time the **broker** will hold a fetch request open waiting for
+    /// [`fetch_min_bytes`](Self::fetch_min_bytes) to accumulate.
+    ///
+    /// This is the wire-level `max_wait_ms` field and is deliberately
+    /// independent of the timeout passed to [`poll()`](super::Consumer::poll).
+    /// The two serve different purposes: this one bounds how long a *single*
+    /// fetch request parks on the broker, while the `poll()` timeout bounds
+    /// how long the *client* keeps trying. `poll()` issues fetches in a loop
+    /// until its own deadline, so a long poll timeout still behaves as a long
+    /// poll.
+    ///
+    /// Keeping them separate matters because the connection layer aborts any
+    /// request that outlives `request_timeout`. Sending the caller's poll
+    /// timeout as `max_wait_ms` would mean `poll(60s)` asks the broker to hold
+    /// the request for 60 s while the client tears the request down at 30 s,
+    /// turning an ordinary "no data available" poll into a timeout error.
+    ///
+    /// Effective value is `min(fetch_max_wait, remaining poll budget)`.
+    ///
+    /// Default: 500 ms, matching the Java client's `fetch.max.wait.ms`.
+    pub(crate) fetch_max_wait: Duration,
     /// Maximum bytes to fetch.
     pub(crate) fetch_max_bytes: i32,
     /// Maximum bytes per partition.
@@ -165,8 +238,12 @@ pub struct ConsumerConfig {
     pub(crate) topic_fetch_max_bytes: HashMap<String, i32>,
     /// Maximum records returned by a single [`poll()`](super::Consumer::poll) call.
     ///
-    /// `0` means unlimited (no truncation). Positive values cap the batch.
-    /// Must be >= 0; negative values are rejected by the builder.
+    /// `-1` means unlimited (no truncation); any positive value caps the
+    /// batch. `0` and values below `-1` are rejected by the builder — `0`
+    /// would produce a consumer that fetches records and then truncates every
+    /// batch to nothing, silently returning no data forever.
+    ///
+    /// Defaults to 500.
     pub(crate) max_poll_records: i32,
     /// Maximum records buffered internally by [`recv()`](super::Consumer::recv).
     ///
@@ -188,7 +265,19 @@ pub struct ConsumerConfig {
     pub(crate) max_poll_interval: Duration,
     /// Request timeout.
     pub(crate) request_timeout: Duration,
+    /// Time allowed for TCP establishment to one broker.
+    pub(crate) connect_timeout: Duration,
     /// Session timeout for consumer groups.
+    ///
+    /// How long the coordinator waits without a heartbeat before declaring
+    /// this member dead and rebalancing the group.
+    ///
+    /// Default: 45 s, matching Java and librdkafka since Kafka 3.0. The older
+    /// 10 s default was raised because it sat inside the range of an ordinary
+    /// GC pause or scheduler stall, so healthy consumers were regularly
+    /// evicted and the group churned through spurious rebalances. 10 s is also
+    /// below the `group.min.session.timeout.ms` configured on many brokers,
+    /// which rejects the JoinGroup outright.
     pub(crate) session_timeout: Duration,
     /// Heartbeat interval.
     pub(crate) heartbeat_interval: Duration,
@@ -196,8 +285,23 @@ pub struct ConsumerConfig {
     pub(crate) isolation_level: IsolationLevel,
     /// Metadata max age.
     pub(crate) metadata_max_age: Duration,
-    /// Partition assignment strategy.
-    pub(crate) partition_assignment_strategy: PartitionAssignmentStrategy,
+    /// Partition assignment strategies, in order of preference.
+    ///
+    /// All of these are advertised in the JoinGroup request. The coordinator
+    /// picks the most-preferred protocol that *every* member of the group
+    /// supports, and reports it back in `JoinGroupResponse.protocol_name`.
+    ///
+    /// Advertising more than one is what makes a rolling upgrade between
+    /// rebalance protocols possible. To move a group from eager `range` to
+    /// `cooperative-sticky`, the default `[Range, CooperativeSticky]` lets
+    /// old and new members coexist: while any member still supports only
+    /// `range`, the whole group stays on `range`; the moment the last old
+    /// member is replaced, the coordinator upgrades the group to
+    /// `cooperative-sticky` on the next rebalance. Configuring a single
+    /// strategy instead forces a full group outage to switch protocols.
+    ///
+    /// Must not be empty.
+    pub(crate) partition_assignment_strategies: Vec<PartitionAssignmentStrategy>,
     /// Group protocol selection (KIP-848).
     pub(crate) group_protocol: GroupProtocol,
     /// Static group membership instance ID (KIP-345).
@@ -280,7 +384,10 @@ pub struct ConsumerConfig {
     /// continues with the rebalance. A hung listener can otherwise cause
     /// group coordinator session expiry and a forced rebalance loop.
     ///
-    /// Default: 5 s, which is half the default `session_timeout` (10 s).
+    /// Default: 5 s. This is well inside the default `session_timeout` (45 s),
+    /// so a listener that hits this bound still leaves ample margin for the
+    /// rebalance to complete before the coordinator would consider the member
+    /// dead.
     pub(crate) revocation_timeout: Duration,
 }
 
@@ -294,6 +401,7 @@ impl Default for ConsumerConfig {
             enable_auto_commit: true,
             auto_commit_interval: Duration::from_secs(5),
             fetch_min_bytes: 1,
+            fetch_max_wait: Duration::from_millis(500),
             fetch_max_bytes: 52428800,          // 50 MB
             max_partition_fetch_bytes: 1048576, // 1 MB
             topic_fetch_max_bytes: HashMap::new(),
@@ -301,11 +409,18 @@ impl Default for ConsumerConfig {
             max_buffered_records: 500,
             max_poll_interval: Duration::from_secs(300),
             request_timeout: Duration::from_secs(30),
-            session_timeout: Duration::from_secs(10),
+            connect_timeout: crate::network::DEFAULT_CONNECT_TIMEOUT,
+            session_timeout: Duration::from_secs(45),
             heartbeat_interval: Duration::from_secs(3),
             isolation_level: IsolationLevel::ReadUncommitted,
             metadata_max_age: Duration::from_secs(300),
-            partition_assignment_strategy: PartitionAssignmentStrategy::Range,
+            // Matches the Java client's default. Advertising both lets a group
+            // migrate from the eager to the cooperative protocol in a single
+            // rolling bounce; see the field docs.
+            partition_assignment_strategies: vec![
+                PartitionAssignmentStrategy::Range,
+                PartitionAssignmentStrategy::CooperativeSticky,
+            ],
             group_protocol: GroupProtocol::Classic,
             group_instance_id: None,
             client_rack: None,
@@ -373,6 +488,18 @@ impl ConsumerConfig {
         self.fetch_min_bytes
     }
 
+    /// Returns the maximum time the broker may hold a fetch request open.
+    #[inline]
+    pub fn fetch_max_wait(&self) -> Duration {
+        self.fetch_max_wait
+    }
+
+    /// Returns the partition assignment strategies in preference order.
+    #[inline]
+    pub fn partition_assignment_strategies(&self) -> &[PartitionAssignmentStrategy] {
+        &self.partition_assignment_strategies
+    }
+
     /// Returns the maximum bytes to fetch.
     #[inline]
     pub fn fetch_max_bytes(&self) -> i32 {
@@ -409,6 +536,12 @@ impl ConsumerConfig {
         self.request_timeout
     }
 
+    /// Returns the connect timeout.
+    #[inline]
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
     /// Returns the session timeout.
     #[inline]
     pub fn session_timeout(&self) -> Duration {
@@ -433,10 +566,18 @@ impl ConsumerConfig {
         self.metadata_max_age
     }
 
-    /// Returns the partition assignment strategy.
+    /// Returns the most-preferred partition assignment strategy.
+    ///
+    /// This is the first entry of
+    /// [`partition_assignment_strategies`](Self::partition_assignment_strategies).
+    /// Note that the group may negotiate a different protocol if another
+    /// member does not support this one.
     #[inline]
     pub fn partition_assignment_strategy(&self) -> PartitionAssignmentStrategy {
-        self.partition_assignment_strategy
+        self.partition_assignment_strategies
+            .first()
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Returns the group protocol (KIP-848).
@@ -580,9 +721,31 @@ impl ConsumerConfigBuilder {
         self
     }
 
-    /// Set partition assignment strategy.
+    /// Set a single partition assignment strategy, replacing the default
+    /// preference list.
+    ///
+    /// Note that pinning the group to exactly one protocol removes the ability
+    /// to migrate between rebalance protocols without a full group outage. Use
+    /// [`partition_assignment_strategies`](Self::partition_assignment_strategies)
+    /// to advertise several.
     pub fn partition_assignment_strategy(mut self, strategy: PartitionAssignmentStrategy) -> Self {
-        self.config.partition_assignment_strategy = strategy;
+        self.config.partition_assignment_strategies = vec![strategy];
+        self
+    }
+
+    /// Set the partition assignment strategies in order of preference.
+    ///
+    /// All are advertised in JoinGroup; the coordinator selects the
+    /// most-preferred protocol supported by every member of the group. See
+    /// [`ConsumerConfig::partition_assignment_strategies`] for how this
+    /// enables rolling protocol migrations.
+    ///
+    /// An empty list is rejected at build time.
+    pub fn partition_assignment_strategies(
+        mut self,
+        strategies: impl IntoIterator<Item = PartitionAssignmentStrategy>,
+    ) -> Self {
+        self.config.partition_assignment_strategies = strategies.into_iter().collect();
         self
     }
 
@@ -611,6 +774,17 @@ impl ConsumerConfigBuilder {
     /// Set minimum bytes to fetch per request.
     pub fn fetch_min_bytes(mut self, bytes: i32) -> Self {
         self.config.fetch_min_bytes = bytes;
+        self
+    }
+
+    /// Set how long the broker may hold a fetch request waiting for
+    /// [`fetch_min_bytes`](Self::fetch_min_bytes) to accumulate.
+    ///
+    /// This is independent of the [`poll()`](super::Consumer::poll) timeout;
+    /// see [`ConsumerConfig::fetch_max_wait`]. Should be kept comfortably
+    /// below `request_timeout`.
+    pub fn fetch_max_wait(mut self, wait: Duration) -> Self {
+        self.config.fetch_max_wait = wait;
         self
     }
 
@@ -669,9 +843,27 @@ impl ConsumerConfigBuilder {
         self
     }
 
-    /// Set request timeout.
+    /// Set request timeout: how long one in-flight request may wait for its
+    /// response. Default: 30 s.
+    ///
+    /// Must be at least [`connect_timeout`](Self::connect_timeout), whose
+    /// default is 10 s — a request's clock covers establishing the connection
+    /// it is sent over, so a shorter value would expire every request before
+    /// the handshake could finish. To go below 10 s, lower `connect_timeout`
+    /// as well; `build()` returns a config error otherwise.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.config.request_timeout = timeout;
+        self
+    }
+
+    /// Set the connect timeout: how long TCP establishment to one broker may
+    /// take. Default: 10 s.
+    ///
+    /// This also acts as the floor on
+    /// [`request_timeout`](Self::request_timeout), so lowering it is what makes
+    /// a sub-10-second request timeout possible.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.config.connect_timeout = timeout;
         self
     }
 
@@ -809,56 +1001,93 @@ impl ConsumerConfigBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if timing or value constraints are violated:
-    /// - `heartbeat_interval` must be less than `session_timeout`
-    /// - `bootstrap_servers` must be non-empty
-    /// - `group_id`, when provided, must be non-empty
-    /// - `session_timeout` must be less than or equal to `max_poll_interval`
-    /// - `max_buffered_records` must be >= 0 (0 disables the cap)
-    /// - `fetch_min_bytes` must be <= `fetch_max_bytes`
+    /// See the crate-internal `validate` helper for the full list of constraints.
     pub fn build(self) -> crate::Result<ConsumerConfig> {
-        if self.config.bootstrap_servers.is_empty() {
-            return Err(crate::error::KrafkaError::config(
-                "bootstrap_servers must not be empty",
-            ));
-        }
-        if self.config.group_id.as_deref() == Some("") {
-            return Err(crate::error::KrafkaError::config(
-                "group_id must not be an empty string; omit it entirely to disable group coordination",
-            ));
-        }
-        if self.config.heartbeat_interval >= self.config.session_timeout {
-            return Err(crate::error::KrafkaError::config(format!(
-                "heartbeat_interval ({:?}) must be less than session_timeout ({:?})",
-                self.config.heartbeat_interval, self.config.session_timeout,
-            )));
-        }
-        if self.config.session_timeout > self.config.max_poll_interval {
-            return Err(crate::error::KrafkaError::config(format!(
-                "session_timeout ({:?}) must be <= max_poll_interval ({:?})",
-                self.config.session_timeout, self.config.max_poll_interval,
-            )));
-        }
-        if self.config.max_buffered_records < 0 {
-            return Err(crate::error::KrafkaError::config(format!(
-                "max_buffered_records ({}) must be >= 0",
-                self.config.max_buffered_records,
-            )));
-        }
-        if self.config.fetch_min_bytes > self.config.fetch_max_bytes {
-            return Err(crate::error::KrafkaError::config(format!(
-                "fetch_min_bytes ({}) must be <= fetch_max_bytes ({})",
-                self.config.fetch_min_bytes, self.config.fetch_max_bytes,
-            )));
-        }
-        if self.config.max_poll_records == 0 || self.config.max_poll_records < -1 {
-            return Err(crate::error::KrafkaError::config(format!(
-                "max_poll_records ({}) must be -1 (unlimited) or a positive integer",
-                self.config.max_poll_records,
-            )));
-        }
+        validate(&self.config)?;
         Ok(self.config)
     }
+}
+
+/// Validate a fully-populated [`ConsumerConfig`].
+///
+/// This is the single source of truth for consumer configuration constraints.
+/// Both [`ConsumerConfigBuilder::build`] and
+/// [`ConsumerBuilder::build`](super::ConsumerBuilder::build) route through it,
+/// so a config can never reach a live [`Consumer`](super::Consumer) without
+/// having been checked — regardless of which builder the caller used.
+///
+/// # Errors
+///
+/// Returns an error if any of the following is violated:
+/// - `bootstrap_servers` must be non-empty
+/// - `group_id`, when provided, must be non-empty
+/// - `heartbeat_interval` must be less than `session_timeout`
+/// - `request_timeout` must be greater than `session_timeout`
+/// - `max_buffered_records` must be >= 0 (0 disables the cap)
+/// - `fetch_min_bytes` must be <= `fetch_max_bytes`
+/// - `max_poll_records` must be -1 (unlimited) or positive
+/// - `partition_assignment_strategies` must be non-empty
+pub(crate) fn validate(config: &ConsumerConfig) -> crate::Result<()> {
+    if config.bootstrap_servers.is_empty() {
+        return Err(crate::error::KrafkaError::config(
+            "bootstrap_servers must not be empty",
+        ));
+    }
+    if config.group_id.as_deref() == Some("") {
+        return Err(crate::error::KrafkaError::config(
+            "group_id must not be an empty string; omit it entirely to disable group coordination",
+        ));
+    }
+    if config.heartbeat_interval >= config.session_timeout {
+        return Err(crate::error::KrafkaError::config(format!(
+            "heartbeat_interval ({:?}) must be less than session_timeout ({:?})",
+            config.heartbeat_interval, config.session_timeout,
+        )));
+    }
+    // A request timeout shorter than the session timeout is worth flagging:
+    // requests that legitimately park on the coordinator for close to a
+    // session's length can be aborted client-side, producing rejoin churn
+    // that is hard to attribute.
+    //
+    // It is only a warning, not an error, because the defaults themselves sit
+    // in that configuration — request_timeout is 30 s and session_timeout is
+    // 45 s, matching Java, which likewise dropped this as a hard constraint
+    // when the session default was raised. Rejecting it would make the default
+    // config unbuildable.
+    if config.request_timeout <= config.session_timeout {
+        tracing::warn!(
+            request_timeout = ?config.request_timeout,
+            session_timeout = ?config.session_timeout,
+            "request_timeout does not exceed session_timeout; long-parked coordinator \
+             requests may be aborted client-side"
+        );
+    }
+    if config.max_buffered_records < 0 {
+        return Err(crate::error::KrafkaError::config(format!(
+            "max_buffered_records ({}) must be >= 0",
+            config.max_buffered_records,
+        )));
+    }
+    if config.fetch_min_bytes > config.fetch_max_bytes {
+        return Err(crate::error::KrafkaError::config(format!(
+            "fetch_min_bytes ({}) must be <= fetch_max_bytes ({})",
+            config.fetch_min_bytes, config.fetch_max_bytes,
+        )));
+    }
+    // 0 would truncate every fetched batch to nothing, producing a consumer
+    // that reads from the broker and returns no records forever.
+    if config.max_poll_records == 0 || config.max_poll_records < -1 {
+        return Err(crate::error::KrafkaError::config(format!(
+            "max_poll_records ({}) must be -1 (unlimited) or a positive integer",
+            config.max_poll_records,
+        )));
+    }
+    if config.partition_assignment_strategies.is_empty() {
+        return Err(crate::error::KrafkaError::config(
+            "partition_assignment_strategies must not be empty",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -886,7 +1115,7 @@ mod tests {
         assert!(config.enable_auto_commit);
         assert_eq!(config.fetch_min_bytes, 1);
         assert_eq!(
-            config.partition_assignment_strategy,
+            config.partition_assignment_strategy(),
             PartitionAssignmentStrategy::Range
         );
         assert_eq!(config.group_protocol, GroupProtocol::Classic);
@@ -910,7 +1139,7 @@ mod tests {
         assert!(!config.enable_auto_commit);
         assert_eq!(config.isolation_level, IsolationLevel::ReadCommitted);
         assert_eq!(
-            config.partition_assignment_strategy,
+            config.partition_assignment_strategy(),
             PartitionAssignmentStrategy::CooperativeSticky
         );
     }

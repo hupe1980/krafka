@@ -2,7 +2,7 @@
 //!
 //! This module provides:
 //! - TCP connection handling with priority-based request scheduling
-//! - Connection pooling with multi-connection bundles for high throughput
+//! - Connection pooling with coalesced, deadline-bounded reconnection
 //! - Automatic reconnection with exponential backoff
 //! - Request/response correlation
 //! - TLS/SSL encrypted connections
@@ -16,16 +16,14 @@
 //!
 //! This prevents consumer group ejection during backpressure.
 //!
-//! # Multi-Connection Bundles
+//! # One connection per broker
 //!
-//! For extreme high-throughput scenarios (>100k msg/s per broker), configure
-//! multiple connections per broker:
-//!
-//! ```rust,ignore
-//! let config = ConnectionConfig::builder()
-//!     .connections_per_broker(4)  // 4 parallel connections
-//!     .build();
-//! ```
+//! The pool holds exactly one multiplexed socket per broker, matching the
+//! Apache Kafka Java client. The former `connections_per_broker` knob and its
+//! `BrokerConnectionBundle` type were removed: nothing ever constructed a
+//! bundle, so the knob was silently a no-op, and round-robining a partition's
+//! produce requests across sockets would have broken the idempotent
+//! producer's ordering guarantee — which holds per *connection*.
 
 mod connection;
 mod happy_eyeballs;
@@ -33,12 +31,13 @@ mod pool;
 mod secure;
 
 pub use connection::{
-    BrokerConnection, ConnectionConfig, ConnectionConfigBuilder, ConnectionStats, RequestPriority,
+    BrokerConnection, ConnectionConfig, ConnectionConfigBuilder, ConnectionStats,
+    DEFAULT_CONNECT_TIMEOUT, RequestPriority,
 };
 #[cfg(feature = "socks5")]
 #[cfg_attr(docsrs, doc(cfg(feature = "socks5")))]
 pub use connection::{ProxyConfig, ProxyCredentials};
-pub use pool::{BrokerConnectionBundle, ConnectionPool, ConnectionRetryConfig, DEFAULT_MAX_IDLE};
+pub use pool::{ConnectionPool, ConnectionRetryConfig, DEFAULT_MAX_IDLE};
 pub use secure::{
     ChallengeResponse, SaslAuthenticator, SecureConnectionConfig, SecureConnectionConfigBuilder,
 };

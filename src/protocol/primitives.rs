@@ -8,6 +8,7 @@
 //! - Arrays (nullable and non-nullable)
 //! - Compact variants (varint-encoded lengths)
 
+use super::decode_capacity;
 use bytes::{Buf, BufMut, Bytes};
 
 use crate::error::{KrafkaError, ProtocolErrorKind, Result};
@@ -665,7 +666,7 @@ impl<T: Decode> Decode for KafkaArray<T> {
                 ),
             ));
         }
-        let mut items = Vec::with_capacity(len);
+        let mut items = Vec::with_capacity(decode_capacity(len, buf.remaining()));
         for _ in 0..len {
             items.push(T::decode(buf)?);
         }
@@ -688,7 +689,7 @@ impl<T: Decode> Decode for KafkaArray<T> {
                 ),
             ));
         }
-        let mut items = Vec::with_capacity(len);
+        let mut items = Vec::with_capacity(decode_capacity(len, buf.remaining()));
         for _ in 0..len {
             items.push(T::decode_compact(buf)?);
         }
@@ -748,7 +749,7 @@ impl Decode for TaggedFields {
                 ),
             ));
         }
-        let mut fields = Vec::with_capacity(count);
+        let mut fields = Vec::with_capacity(decode_capacity(count, buf.remaining()));
 
         for _ in 0..count {
             let tag = varint::decode_unsigned_varint(buf)?;

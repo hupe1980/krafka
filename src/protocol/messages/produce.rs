@@ -1,5 +1,6 @@
 use bytes::{Buf, BufMut, Bytes};
 
+use super::fetch::{LeaderIdAndEpoch, NodeEndpoint, parse_current_leader, parse_node_endpoints};
 use super::{VersionedDecode, VersionedEncode, non_nullable_string};
 use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
@@ -7,8 +8,7 @@ use crate::protocol::primitives::{
     Decode, Encode, KafkaBytes, KafkaString, TaggedFields, TryEncode,
 };
 use crate::protocol::{
-    array_len_i32, check_compact_array_len, check_compact_nullable_array_len,
-    check_decode_array_len, check_decode_nullable_array_len,
+    array_len_i32, check_compact_array_len, check_decode_array_len, decode_capacity,
 };
 
 /// Produce request.
@@ -160,6 +160,14 @@ pub struct ProduceResponse {
     pub responses: Vec<ProduceTopicResponse>,
     /// Throttle time in milliseconds.
     pub throttle_time_ms: i32,
+    /// Endpoints of the brokers named by any partition's
+    /// [`ProducePartitionResponse::current_leader`] (v10+, KIP-951).
+    ///
+    /// The broker sends these alongside `NOT_LEADER_OR_FOLLOWER` so the
+    /// producer can retry against the new leader without first waiting for a
+    /// metadata refresh. Empty on versions below 10 and whenever no leader
+    /// change was reported.
+    pub node_endpoints: Vec<NodeEndpoint>,
 }
 
 /// Topic response in produce response.
@@ -188,18 +196,26 @@ pub struct ProducePartitionResponse {
     pub log_append_time_ms: i64,
     /// Log start offset (v5+).
     pub log_start_offset: i64,
+    /// Leader the client should be sending to for this partition
+    /// (v10+, KIP-951). Partition-level tagged field, tag 0.
+    ///
+    /// Accompanies `NOT_LEADER_OR_FOLLOWER`. Resolve
+    /// [`LeaderIdAndEpoch::leader_id`] against
+    /// [`ProduceResponse::node_endpoints`] to get the address.
+    pub current_leader: Option<LeaderIdAndEpoch>,
 }
 
 impl ProduceResponse {
     /// Decode from version 3-4.
     pub fn decode_v3(buf: &mut impl Buf) -> Result<Self> {
         let topic_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut responses = Vec::with_capacity(topic_count);
+        let mut responses = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
 
         for _ in 0..topic_count {
             let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
-            let mut partition_responses = Vec::with_capacity(partition_count);
+            let mut partition_responses =
+                Vec::with_capacity(decode_capacity(partition_count, buf.remaining()));
 
             for _ in 0..partition_count {
                 let index = i32::decode(buf)?;
@@ -213,6 +229,7 @@ impl ProduceResponse {
                     base_offset,
                     log_append_time_ms,
                     log_start_offset: -1,
+                    current_leader: None,
                 });
             }
 
@@ -228,18 +245,20 @@ impl ProduceResponse {
         Ok(Self {
             responses,
             throttle_time_ms,
+            node_endpoints: Vec::new(),
         })
     }
 
     /// Decode from version 5-7 (v2 + log_start_offset per partition).
     pub fn decode_v5(buf: &mut impl Buf) -> Result<Self> {
         let topic_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut responses = Vec::with_capacity(topic_count);
+        let mut responses = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
 
         for _ in 0..topic_count {
             let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
-            let mut partition_responses = Vec::with_capacity(partition_count);
+            let mut partition_responses =
+                Vec::with_capacity(decode_capacity(partition_count, buf.remaining()));
 
             for _ in 0..partition_count {
                 let index = i32::decode(buf)?;
@@ -254,6 +273,7 @@ impl ProduceResponse {
                     base_offset,
                     log_append_time_ms,
                     log_start_offset,
+                    current_leader: None,
                 });
             }
 
@@ -269,6 +289,7 @@ impl ProduceResponse {
         Ok(Self {
             responses,
             throttle_time_ms,
+            node_endpoints: Vec::new(),
         })
     }
 
@@ -278,12 +299,13 @@ impl ProduceResponse {
     /// appear for idempotent/transactional edge cases.
     pub fn decode_v8(buf: &mut impl Buf) -> Result<Self> {
         let topic_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut responses = Vec::with_capacity(topic_count);
+        let mut responses = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
 
         for _ in 0..topic_count {
             let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
-            let mut partition_responses = Vec::with_capacity(partition_count);
+            let mut partition_responses =
+                Vec::with_capacity(decode_capacity(partition_count, buf.remaining()));
 
             for _ in 0..partition_count {
                 let index = i32::decode(buf)?;
@@ -291,8 +313,10 @@ impl ProduceResponse {
                 let base_offset = i64::decode(buf)?;
                 let log_append_time_ms = i64::decode(buf)?;
                 let log_start_offset = i64::decode(buf)?;
-                // RecordErrors array — read and discard
-                let record_errors_count = check_decode_nullable_array_len(i32::decode(buf)?)?;
+                // RecordErrors array — read and discard.
+                // ProduceResponse.json declares RecordErrors from v8 with no
+                // nullableVersions, so `-1` is malformed, not an empty array.
+                let record_errors_count = check_decode_array_len(i32::decode(buf)?)?;
                 for _ in 0..record_errors_count {
                     let _ = i32::decode(buf)?; // batch_index
                     let _ = KafkaString::decode(buf)?; // batch_index_error_message
@@ -306,6 +330,7 @@ impl ProduceResponse {
                     base_offset,
                     log_append_time_ms,
                     log_start_offset,
+                    current_leader: None,
                 });
             }
 
@@ -321,6 +346,7 @@ impl ProduceResponse {
         Ok(Self {
             responses,
             throttle_time_ms,
+            node_endpoints: Vec::new(),
         })
     }
 
@@ -328,13 +354,14 @@ impl ProduceResponse {
     pub fn decode_v9(buf: &mut impl Buf) -> Result<Self> {
         let topic_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut responses = Vec::with_capacity(topic_count);
+        let mut responses = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
 
         for _ in 0..topic_count {
             let name = non_nullable_string("topic name", KafkaString::decode_compact(buf)?.0)?;
             let part_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut partition_responses = Vec::with_capacity(part_count);
+            let mut partition_responses =
+                Vec::with_capacity(decode_capacity(part_count, buf.remaining()));
 
             for _ in 0..part_count {
                 let index = i32::decode(buf)?;
@@ -342,10 +369,11 @@ impl ProduceResponse {
                 let base_offset = i64::decode(buf)?;
                 let log_append_time_ms = i64::decode(buf)?;
                 let log_start_offset = i64::decode(buf)?;
-                // RecordErrors compact nullable array — read and discard
-                let re_count = check_compact_nullable_array_len(
-                    crate::util::varint::decode_unsigned_varint(buf)?,
-                )?;
+                // RecordErrors compact array — read and discard.
+                // Non-nullable per ProduceResponse.json (v8+, no
+                // nullableVersions), so a raw 0 (null) is malformed.
+                let re_count =
+                    check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
                 if re_count > 0 {
                     for _ in 0..re_count {
                         let _ = i32::decode(buf)?;
@@ -355,7 +383,9 @@ impl ProduceResponse {
                 }
                 // ErrorMessage — read and discard
                 let _ = KafkaString::decode_compact(buf)?;
-                let _ = TaggedFields::decode(buf)?;
+                // Partition tagged fields: tag 0 CurrentLeader (KIP-951).
+                let partition_tags = TaggedFields::decode(buf)?;
+                let current_leader = parse_current_leader(&partition_tags, 0)?;
 
                 partition_responses.push(ProducePartitionResponse {
                     index,
@@ -363,6 +393,7 @@ impl ProduceResponse {
                     base_offset,
                     log_append_time_ms,
                     log_start_offset,
+                    current_leader,
                 });
             }
             let _ = TaggedFields::decode(buf)?;
@@ -374,11 +405,14 @@ impl ProduceResponse {
         }
 
         let throttle_time_ms = i32::decode(buf)?;
-        let _ = TaggedFields::decode(buf)?;
+        // Top-level tagged fields: tag 0 NodeEndpoints (KIP-951).
+        let response_tags = TaggedFields::decode(buf)?;
+        let node_endpoints = parse_node_endpoints(&response_tags)?;
 
         Ok(Self {
             responses,
             throttle_time_ms,
+            node_endpoints,
         })
     }
 
@@ -386,7 +420,7 @@ impl ProduceResponse {
     pub fn decode_v13(buf: &mut impl Buf) -> Result<Self> {
         let topic_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut responses = Vec::with_capacity(topic_count);
+        let mut responses = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
 
         for _ in 0..topic_count {
             if buf.remaining() < 16 {
@@ -400,7 +434,8 @@ impl ProduceResponse {
 
             let part_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut partition_responses = Vec::with_capacity(part_count);
+            let mut partition_responses =
+                Vec::with_capacity(decode_capacity(part_count, buf.remaining()));
 
             for _ in 0..part_count {
                 let index = i32::decode(buf)?;
@@ -408,10 +443,11 @@ impl ProduceResponse {
                 let base_offset = i64::decode(buf)?;
                 let log_append_time_ms = i64::decode(buf)?;
                 let log_start_offset = i64::decode(buf)?;
-                // RecordErrors compact nullable array — read and discard
-                let re_count = check_compact_nullable_array_len(
-                    crate::util::varint::decode_unsigned_varint(buf)?,
-                )?;
+                // RecordErrors compact array — read and discard.
+                // Non-nullable per ProduceResponse.json (v8+, no
+                // nullableVersions), so a raw 0 (null) is malformed.
+                let re_count =
+                    check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
                 if re_count > 0 {
                     for _ in 0..re_count {
                         let _ = i32::decode(buf)?;
@@ -421,7 +457,9 @@ impl ProduceResponse {
                 }
                 // ErrorMessage — read and discard
                 let _ = KafkaString::decode_compact(buf)?;
-                let _ = TaggedFields::decode(buf)?;
+                // Partition tagged fields: tag 0 CurrentLeader (KIP-951).
+                let partition_tags = TaggedFields::decode(buf)?;
+                let current_leader = parse_current_leader(&partition_tags, 0)?;
 
                 partition_responses.push(ProducePartitionResponse {
                     index,
@@ -429,6 +467,7 @@ impl ProduceResponse {
                     base_offset,
                     log_append_time_ms,
                     log_start_offset,
+                    current_leader,
                 });
             }
             let _ = TaggedFields::decode(buf)?;
@@ -440,11 +479,14 @@ impl ProduceResponse {
         }
 
         let throttle_time_ms = i32::decode(buf)?;
-        let _ = TaggedFields::decode(buf)?;
+        // Top-level tagged fields: tag 0 NodeEndpoints (KIP-951).
+        let response_tags = TaggedFields::decode(buf)?;
+        let node_endpoints = parse_node_endpoints(&response_tags)?;
 
         Ok(Self {
             responses,
             throttle_time_ms,
+            node_endpoints,
         })
     }
 }
@@ -958,5 +1000,115 @@ mod tests {
         let mut read_id = [0u8; 16];
         cur.copy_to_slice(&mut read_id);
         assert_eq!(read_id, topic_id);
+    }
+
+    /// Encode a tagged-field section: unsigned-varint count, then each field
+    /// as tag, length, payload.
+    fn encode_tags(fields: &[(u32, Vec<u8>)], out: &mut BytesMut) {
+        varint::encode_unsigned_varint(fields.len() as u32, out);
+        for (tag, data) in fields {
+            varint::encode_unsigned_varint(*tag, out);
+            varint::encode_unsigned_varint(data.len() as u32, out);
+            out.put_slice(data);
+        }
+    }
+
+    /// Build a single-topic, single-partition flexible produce response.
+    fn flexible_produce_response(
+        partition_tags: &[(u32, Vec<u8>)],
+        response_tags: &[(u32, Vec<u8>)],
+    ) -> BytesMut {
+        let mut raw = BytesMut::new();
+        varint::encode_unsigned_varint(2, &mut raw); // 1 topic
+        KafkaString::new("orders")
+            .try_encode_compact(&mut raw)
+            .unwrap();
+        varint::encode_unsigned_varint(2, &mut raw); // 1 partition
+        raw.put_i32(2); // index
+        raw.put_i16(6); // NotLeaderForPartition
+        raw.put_i64(-1); // base_offset
+        raw.put_i64(-1); // log_append_time_ms
+        raw.put_i64(-1); // log_start_offset
+        varint::encode_unsigned_varint(1, &mut raw); // 0 record errors
+        KafkaString::null().try_encode_compact(&mut raw).unwrap(); // error_message
+        encode_tags(partition_tags, &mut raw);
+        varint::encode_unsigned_varint(0, &mut raw); // topic tagged fields
+        raw.put_i32(0); // throttle_time_ms
+        encode_tags(response_tags, &mut raw);
+        raw
+    }
+
+    #[test]
+    fn test_produce_response_v10_decodes_current_leader_and_node_endpoints() {
+        let mut leader = BytesMut::new();
+        leader.put_i32(4); // leader_id
+        leader.put_i32(31); // leader_epoch
+        leader.put_u8(0); // the struct's own (empty) tagged fields
+
+        let mut endpoints = BytesMut::new();
+        varint::encode_unsigned_varint(2, &mut endpoints); // 1 endpoint
+        endpoints.put_i32(4);
+        KafkaString::new("broker-4.internal")
+            .try_encode_compact(&mut endpoints)
+            .unwrap();
+        endpoints.put_i32(9094);
+        KafkaString::null()
+            .try_encode_compact(&mut endpoints)
+            .unwrap();
+        endpoints.put_u8(0);
+
+        let raw = flexible_produce_response(&[(0, leader.to_vec())], &[(0, endpoints.to_vec())]);
+        let resp = ProduceResponse::decode_versioned(10, &mut raw.freeze()).unwrap();
+
+        let part = &resp.responses[0].partition_responses[0];
+        assert_eq!(part.error_code, ErrorCode::NotLeaderForPartition);
+        assert_eq!(
+            part.current_leader,
+            Some(LeaderIdAndEpoch {
+                leader_id: 4,
+                leader_epoch: 31
+            })
+        );
+
+        assert_eq!(resp.node_endpoints.len(), 1);
+        assert_eq!(resp.node_endpoints[0].node_id, 4);
+        assert_eq!(resp.node_endpoints[0].host, "broker-4.internal");
+        assert_eq!(resp.node_endpoints[0].port, 9094);
+        assert_eq!(resp.node_endpoints[0].rack, None);
+    }
+
+    #[test]
+    fn test_produce_response_v9_without_kip951_fields() {
+        let raw = flexible_produce_response(&[], &[]);
+        let resp = ProduceResponse::decode_versioned(9, &mut raw.freeze()).unwrap();
+        assert!(
+            resp.responses[0].partition_responses[0]
+                .current_leader
+                .is_none()
+        );
+        assert!(resp.node_endpoints.is_empty());
+    }
+
+    #[test]
+    fn test_produce_response_non_flexible_has_no_leader_info() {
+        let mut raw = BytesMut::new();
+        raw.put_i32(1); // 1 topic
+        raw.put_i16(6);
+        raw.put_slice(b"orders");
+        raw.put_i32(1); // 1 partition
+        raw.put_i32(0); // index
+        raw.put_i16(0); // error_code
+        raw.put_i64(10); // base_offset
+        raw.put_i64(-1); // log_append_time_ms
+        raw.put_i64(0); // log_start_offset
+        raw.put_i32(0); // throttle_time_ms
+
+        let resp = ProduceResponse::decode_v5(&mut raw.freeze()).unwrap();
+        assert!(
+            resp.responses[0].partition_responses[0]
+                .current_leader
+                .is_none()
+        );
+        assert!(resp.node_endpoints.is_empty());
     }
 }

@@ -8,7 +8,7 @@ use crate::auth::scram::{MAX_PBKDF2_ITERATIONS, MIN_PBKDF2_ITERATIONS, ScramMech
 use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, KafkaString, TaggedFields, TryEncode};
-use crate::protocol::{check_compact_array_len, encode_compact_array_len};
+use crate::protocol::{check_compact_array_len, decode_capacity, encode_compact_array_len};
 
 // ============================================================================
 // AlterUserScramCredentials API (Key 51)
@@ -162,7 +162,7 @@ impl AlterUserScramCredentialsResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let result_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut results = Vec::with_capacity(result_count);
+        let mut results = Vec::with_capacity(decode_capacity(result_count, buf.remaining()));
         for _ in 0..result_count {
             let user = non_nullable_string("user", KafkaString::decode_compact(buf)?.0)?;
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);

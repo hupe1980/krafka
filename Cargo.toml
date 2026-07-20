@@ -64,7 +64,7 @@ subtle = "2"
 # TLS/SSL support
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
-webpki-roots = "0.26"
+webpki-roots = "1"
 rustls-native-certs = { version = "0.8", optional = true }
 
 # AWS SDK for MSK IAM authentication (optional)
@@ -125,6 +125,12 @@ native-tls-roots = ["dep:rustls-native-certs"]
 unstable-protocol = []
 # Enable KIP-714 client telemetry APIs (GetTelemetrySubscriptions, PushTelemetry).
 telemetry = []
+# Enable the in-process fake Kafka broker in `krafka::testing`.
+#
+# A real TCP listener speaking the real wire protocol, with hooks to inject
+# specific errors, delays and cluster changes. Intended for client tests that
+# would otherwise need Docker; it is not compiled into production builds.
+test-broker = []
 # Enable SOCKS5 proxy support for connecting to brokers through a proxy.
 # Useful for VPN/bastion host setups where brokers are not directly reachable.
 socks5 = ["dep:tokio-socks"]
@@ -142,6 +148,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 rstest = "0.25"
 testcontainers = "0.27"
+# Property-based testing for wire-protocol encode/decode round-trip invariants.
+proptest = "1"
 
 [[bench]]
 name = "producer"
@@ -166,9 +174,17 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
 rust_2018_idioms = { level = "warn", priority = -1 }
 
 [lints.clippy]
-unwrap_used = "warn"
-expect_used = "warn"
-panic = "warn"
+# The crate advertises a no-panic posture on every non-test path: broker
+# responses are untrusted input, so a malformed frame must surface as a
+# `KrafkaError`, never abort the caller's process. Denying (rather than warning)
+# means the guarantee holds for anyone building the crate, not just for PRs that
+# go through CI's `RUSTFLAGS: -Dwarnings`.
+#
+# Test modules opt out with a module-level
+# `#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]`.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
 undocumented_unsafe_blocks = "warn"
 
 [profile.release]

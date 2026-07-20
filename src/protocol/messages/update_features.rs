@@ -3,7 +3,7 @@ use bytes::{Buf, BufMut};
 use super::{VersionedDecode, VersionedEncode, non_nullable_string};
 use crate::error::{ErrorCode, Result};
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
-use crate::protocol::{check_compact_array_len, encode_compact_array_len};
+use crate::protocol::{check_compact_array_len, decode_capacity, encode_compact_array_len};
 
 // ============================================================================
 // UpdateFeatures API (Key 57) — KIP-584
@@ -205,7 +205,7 @@ impl UpdateFeaturesResponse {
         let error_message = KafkaString::decode_compact(buf)?.0;
         let raw_count = crate::util::varint::decode_unsigned_varint(buf)?;
         let items = check_compact_array_len(raw_count)?;
-        let mut results = Vec::with_capacity(items);
+        let mut results = Vec::with_capacity(decode_capacity(items, buf.remaining()));
         for _ in 0..items {
             let feature = non_nullable_string("feature", KafkaString::decode_compact(buf)?.0)?;
             let feature_error = ErrorCode::from(i16::decode(buf)?);

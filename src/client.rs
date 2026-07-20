@@ -76,6 +76,7 @@ impl KrafkaClient {
             client_id: "krafka".to_string(),
             auth: None,
             request_timeout: Duration::from_secs(30),
+            connect_timeout: crate::network::DEFAULT_CONNECT_TIMEOUT,
             metadata_max_age: Duration::from_secs(300),
             metadata_recovery_strategy: MetadataRecoveryStrategy::Rebootstrap,
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
@@ -111,6 +112,7 @@ pub struct KrafkaClientBuilder {
     client_id: String,
     auth: Option<AuthConfig>,
     request_timeout: Duration,
+    connect_timeout: Duration,
     metadata_max_age: Duration,
     metadata_recovery_strategy: MetadataRecoveryStrategy,
     metadata_recovery_rebootstrap_trigger: Duration,
@@ -150,9 +152,24 @@ impl KrafkaClientBuilder {
 
     /// Set the per-request timeout for metadata and API-version checks.
     ///
-    /// Default: 30 s.
+    /// Default: 30 s. Must be at least
+    /// [`connect_timeout`](Self::connect_timeout), whose default is 10 s — a
+    /// request's clock covers establishing the connection it is sent over, so a
+    /// shorter value would expire every request before the handshake could
+    /// finish. To go below 10 s, lower `connect_timeout` as well; `build()`
+    /// returns a config error otherwise.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    /// Set how long TCP establishment to one broker may take.
+    ///
+    /// Default: 10 s. This also acts as the floor on
+    /// [`request_timeout`](Self::request_timeout), so lowering it is what makes
+    /// a sub-10-second request timeout possible.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
         self
     }
 
@@ -222,7 +239,8 @@ impl KrafkaClientBuilder {
 
         let mut pool_config_builder: ConnectionConfigBuilder = ConnectionConfig::builder()
             .client_id(&self.client_id)
-            .request_timeout(self.request_timeout);
+            .request_timeout(self.request_timeout)
+            .connect_timeout(self.connect_timeout);
 
         if let Some(ref auth) = self.auth {
             pool_config_builder = pool_config_builder.auth(auth.clone());

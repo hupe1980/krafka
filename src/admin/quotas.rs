@@ -134,6 +134,10 @@ impl AdminClient {
     /// * `entries` - Quota alterations. Each entry has an entity and operations.
     /// * `validate_only` - If `true`, validate the request without applying changes.
     ///
+    /// `AlterClientQuotas` is a **controller-only** API: the request is routed
+    /// to the current controller and re-issued against a freshly resolved
+    /// controller on `NOT_CONTROLLER`.
+    ///
     /// # Example
     ///
     /// ```rust,ignore
@@ -153,59 +157,80 @@ impl AdminClient {
         entries: &[QuotaAlteration<'_>],
         validate_only: bool,
     ) -> Result<Vec<AlterClientQuotaResult>> {
-        let conn = self.get_any_broker_connection().await?;
+        self.check_not_closed()?;
 
-        let request = AlterClientQuotasRequest {
-            entries: entries
-                .iter()
-                .map(|e| AlterQuotaEntry {
-                    entity: e
-                        .entity
-                        .iter()
-                        .map(|(t, n)| AlterQuotaEntity {
-                            entity_type: t.to_string(),
-                            entity_name: n.map(|v| v.to_string()),
+        // Build the wire entries once; the closure may run several times if the
+        // controller moves mid-flight.
+        let wire_entries: Vec<AlterQuotaEntry> = entries
+            .iter()
+            .map(|e| AlterQuotaEntry {
+                entity: e
+                    .entity
+                    .iter()
+                    .map(|(t, n)| AlterQuotaEntity {
+                        entity_type: t.to_string(),
+                        entity_name: n.map(|v| v.to_string()),
+                    })
+                    .collect(),
+                ops: e
+                    .ops
+                    .iter()
+                    .map(|(key, value)| AlterQuotaOp {
+                        key: key.to_string(),
+                        value: value.unwrap_or(0.0),
+                        remove: value.is_none(),
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        // `AlterClientQuotas` is controller-only.
+        let response_entries = self
+            .with_controller("AlterClientQuotas", |conn| {
+                let wire_entries = &wire_entries;
+                async move {
+                    let request = AlterClientQuotasRequest {
+                        entries: wire_entries.clone(),
+                        validate_only,
+                    };
+
+                    let version = conn
+                        .negotiate_api_version(
+                            ApiKey::AlterClientQuotas,
+                            versions::ALTER_CLIENT_QUOTAS_MAX,
+                            versions::ALTER_CLIENT_QUOTAS_MIN,
+                        )
+                        .await
+                        .ok_or_else(|| {
+                            KrafkaError::protocol_kind(
+                                ProtocolErrorKind::UnknownApiVersion,
+                                "no mutually supported AlterClientQuotas API version",
+                            )
+                        })?;
+
+                    let response_bytes = conn
+                        .send_request(ApiKey::AlterClientQuotas, version, |buf| {
+                            request.encode_versioned(version, buf)
                         })
-                        .collect(),
-                    ops: e
-                        .ops
+                        .await?;
+
+                    let mut buf = response_bytes;
+                    let response = AlterClientQuotasResponse::decode_versioned(version, &mut buf)?;
+
+                    if let Some(e) = response
+                        .entries
                         .iter()
-                        .map(|(key, value)| AlterQuotaOp {
-                            key: key.to_string(),
-                            value: value.unwrap_or(0.0),
-                            remove: value.is_none(),
-                        })
-                        .collect(),
-                })
-                .collect(),
-            validate_only,
-        };
+                        .find(|e| super::is_controller_moved(e.error_code))
+                    {
+                        return Ok(ControllerAttempt::NotController(e.error_code));
+                    }
 
-        let version = conn
-            .negotiate_api_version(
-                ApiKey::AlterClientQuotas,
-                versions::ALTER_CLIENT_QUOTAS_MAX,
-                versions::ALTER_CLIENT_QUOTAS_MIN,
-            )
-            .await
-            .ok_or_else(|| {
-                KrafkaError::protocol_kind(
-                    ProtocolErrorKind::UnknownApiVersion,
-                    "no mutually supported AlterClientQuotas API version",
-                )
-            })?;
-
-        let response_bytes = conn
-            .send_request(ApiKey::AlterClientQuotas, version, |buf| {
-                request.encode_versioned(version, buf)
+                    Ok(ControllerAttempt::Done(response.entries))
+                }
             })
             .await?;
 
-        let mut buf = response_bytes;
-        let response = AlterClientQuotasResponse::decode_versioned(version, &mut buf)?;
-
-        let results: Vec<AlterClientQuotaResult> = response
-            .entries
+        let results: Vec<AlterClientQuotaResult> = response_entries
             .into_iter()
             .map(|entry| AlterClientQuotaResult {
                 entity: entry
@@ -229,5 +254,122 @@ impl AdminClient {
 
         info!("Altered {} client quota entry(ies)", results.len());
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_describe_client_quotas_request_maps_components() {
+        let components = [("user", 0i8, Some("alice")), ("client-id", 1i8, None)];
+        let request = DescribeClientQuotasRequest {
+            components: components
+                .iter()
+                .map(|(t, m, v)| QuotaFilterComponent {
+                    entity_type: (*t).to_string(),
+                    match_type: *m,
+                    match_value: v.map(str::to_string),
+                })
+                .collect(),
+            strict: true,
+        };
+
+        assert_eq!(request.components.len(), 2);
+        assert_eq!(request.components[0].entity_type, "user");
+        assert_eq!(request.components[0].match_type, 0);
+        assert_eq!(request.components[0].match_value.as_deref(), Some("alice"));
+        // match_type 1 = "default entity", which carries no name.
+        assert_eq!(request.components[1].match_type, 1);
+        assert!(request.components[1].match_value.is_none());
+        assert!(request.strict);
+
+        let mut buf = Vec::new();
+        request
+            .encode_versioned(versions::DESCRIBE_CLIENT_QUOTAS_MAX, &mut buf)
+            .expect("DescribeClientQuotas must encode");
+        assert!(!buf.is_empty());
+    }
+
+    /// `Some(value)` sets a quota; `None` removes it. Getting the `remove`
+    /// flag backwards would silently delete quotas the caller meant to set.
+    #[test]
+    fn test_alter_quota_ops_distinguish_set_from_remove() {
+        let alteration = QuotaAlteration {
+            entity: vec![("user", Some("alice"))],
+            ops: vec![
+                ("producer_byte_rate", Some(1_048_576.0)),
+                ("consumer_byte_rate", None),
+            ],
+        };
+
+        let entry = AlterQuotaEntry {
+            entity: alteration
+                .entity
+                .iter()
+                .map(|(t, n)| AlterQuotaEntity {
+                    entity_type: (*t).to_string(),
+                    entity_name: n.map(str::to_string),
+                })
+                .collect(),
+            ops: alteration
+                .ops
+                .iter()
+                .map(|(key, value)| AlterQuotaOp {
+                    key: (*key).to_string(),
+                    value: value.unwrap_or(0.0),
+                    remove: value.is_none(),
+                })
+                .collect(),
+        };
+
+        assert_eq!(entry.entity[0].entity_type, "user");
+        assert_eq!(entry.entity[0].entity_name.as_deref(), Some("alice"));
+
+        let set = &entry.ops[0];
+        assert_eq!(set.key, "producer_byte_rate");
+        assert!(!set.remove, "Some(value) must SET, not remove");
+        assert!((set.value - 1_048_576.0).abs() < f64::EPSILON);
+
+        let remove = &entry.ops[1];
+        assert!(remove.remove, "None must remove the quota");
+
+        let request = AlterClientQuotasRequest {
+            entries: vec![entry],
+            validate_only: false,
+        };
+        let mut buf = Vec::new();
+        request
+            .encode_versioned(versions::ALTER_CLIENT_QUOTAS_MAX, &mut buf)
+            .expect("AlterClientQuotas must encode");
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_alter_quota_default_entity_has_no_name() {
+        let entry = AlterQuotaEntry {
+            entity: vec![AlterQuotaEntity {
+                entity_type: "client-id".to_string(),
+                entity_name: None,
+            }],
+            ops: vec![],
+        };
+        assert!(
+            entry.entity[0].entity_name.is_none(),
+            "a None entity name targets the default entity for that type"
+        );
+    }
+
+    #[test]
+    fn test_alter_client_quotas_validate_only_is_honoured() {
+        for validate_only in [false, true] {
+            let request = AlterClientQuotasRequest {
+                entries: vec![],
+                validate_only,
+            };
+            assert_eq!(request.validate_only, validate_only);
+        }
     }
 }

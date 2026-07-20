@@ -4,7 +4,7 @@ use super::{VersionedDecode, VersionedEncode, non_nullable_string};
 use crate::error::{ErrorCode, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
-use crate::protocol::{check_compact_array_len, encode_compact_array_len};
+use crate::protocol::{check_compact_array_len, decode_capacity, encode_compact_array_len};
 
 // ============================================================================
 // DescribeProducers API (Key 61)
@@ -115,19 +115,21 @@ impl DescribeProducersResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let topic_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut topics = Vec::with_capacity(topic_count);
+        let mut topics = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
         for _ in 0..topic_count {
             let name = non_nullable_string("topic", KafkaString::decode_compact(buf)?.0)?;
             let partition_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut partitions = Vec::with_capacity(partition_count);
+            let mut partitions =
+                Vec::with_capacity(decode_capacity(partition_count, buf.remaining()));
             for _ in 0..partition_count {
                 let partition_index = i32::decode(buf)?;
                 let error_code = ErrorCode::from_i16(i16::decode(buf)?);
                 let error_message = KafkaString::decode_compact(buf)?.0;
                 let producer_count =
                     check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-                let mut active_producers = Vec::with_capacity(producer_count);
+                let mut active_producers =
+                    Vec::with_capacity(decode_capacity(producer_count, buf.remaining()));
                 for _ in 0..producer_count {
                     let producer_id = i64::decode(buf)?;
                     let producer_epoch = i32::decode(buf)?;

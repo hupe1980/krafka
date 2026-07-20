@@ -325,7 +325,8 @@ pub enum ProtocolErrorKind {
     TruncatedFrame,
     /// Record batch CRC32C did not match the computed checksum.
     ///
-    /// Indicates on-wire corruption. Retriable.
+    /// Indicates corruption of the batch as stored or transmitted. **Not**
+    /// retriable: re-fetching the same offset returns the same bytes.
     CrcMismatch,
     /// No mutually supported API version, or the broker does not advertise
     /// the required API at all.
@@ -369,11 +370,13 @@ pub enum ProtocolErrorKind {
 impl ProtocolErrorKind {
     /// Returns true if this protocol error kind is typically transient and
     /// safe to retry after a reconnect or metadata refresh.
+    ///
+    /// [`CrcMismatch`](Self::CrcMismatch) is deliberately **not** retriable: a
+    /// CRC failure means the batch as stored or transmitted is corrupt, and
+    /// re-fetching the same offset returns the same bytes. Retrying spins
+    /// forever instead of surfacing the corruption to the caller.
     pub fn is_retriable(self) -> bool {
-        matches!(
-            self,
-            Self::TruncatedFrame | Self::CrcMismatch | Self::Malformed
-        )
+        matches!(self, Self::TruncatedFrame | Self::Malformed)
     }
 }
 
@@ -639,12 +642,28 @@ pub enum ErrorCode {
     ShareSessionNotFound = 122,
     /// The share session epoch is invalid (KIP-932).
     InvalidShareSessionEpoch = 123,
-    /// The client should rebootstrap to connect to the appropriate seed broker (KIP-899).
-    RebootstrapRequired = 124,
-    /// The share session limit has been reached on the broker (KIP-932).
-    ShareSessionLimitReached = 133,
+    /// The share coordinator rejected the request because the share-state epoch
+    /// is fenced by a newer one (KIP-932).
+    FencedStateEpoch = 124,
+    /// The voter key in the request does not match the receiving replica's key
+    /// (KIP-853).
+    InvalidVoterKey = 125,
+    /// The voter is already part of the set of voters (KIP-853).
+    DuplicateVoter = 126,
+    /// The voter is not part of the set of voters (KIP-853).
+    VoterNotFound = 127,
     /// The regular expression is not valid (KIP-848 v1+).
     InvalidRegularExpression = 128,
+    /// The client should rebootstrap to connect to the appropriate seed broker (KIP-899).
+    RebootstrapRequired = 129,
+    /// The supplied Kafka Streams topology is invalid (KIP-1071).
+    StreamsInvalidTopology = 130,
+    /// The supplied Kafka Streams topology epoch is invalid (KIP-1071).
+    StreamsInvalidTopologyEpoch = 131,
+    /// The Kafka Streams topology was fenced by a newer one (KIP-1071).
+    StreamsTopologyFenced = 132,
+    /// The share session limit has been reached on the broker (KIP-932).
+    ShareSessionLimitReached = 133,
     /// Unknown error code.
     Unknown(i16),
 }
@@ -779,8 +798,15 @@ impl ErrorCode {
             121 => Self::InvalidRecordState,
             122 => Self::ShareSessionNotFound,
             123 => Self::InvalidShareSessionEpoch,
-            124 => Self::RebootstrapRequired,
+            124 => Self::FencedStateEpoch,
+            125 => Self::InvalidVoterKey,
+            126 => Self::DuplicateVoter,
+            127 => Self::VoterNotFound,
             128 => Self::InvalidRegularExpression,
+            129 => Self::RebootstrapRequired,
+            130 => Self::StreamsInvalidTopology,
+            131 => Self::StreamsInvalidTopologyEpoch,
+            132 => Self::StreamsTopologyFenced,
             133 => Self::ShareSessionLimitReached,
             other => Self::Unknown(other),
         }
@@ -915,48 +941,107 @@ impl ErrorCode {
             Self::InvalidRecordState => 121,
             Self::ShareSessionNotFound => 122,
             Self::InvalidShareSessionEpoch => 123,
-            Self::RebootstrapRequired => 124,
+            Self::FencedStateEpoch => 124,
+            Self::InvalidVoterKey => 125,
+            Self::DuplicateVoter => 126,
+            Self::VoterNotFound => 127,
             Self::InvalidRegularExpression => 128,
+            Self::RebootstrapRequired => 129,
+            Self::StreamsInvalidTopology => 130,
+            Self::StreamsInvalidTopologyEpoch => 131,
+            Self::StreamsTopologyFenced => 132,
             Self::ShareSessionLimitReached => 133,
             Self::Unknown(code) => code,
         }
     }
 
     /// Returns true if this error is retriable.
+    ///
+    /// # Reconciliation with Kafka's `Errors.java`
+    ///
+    /// This classification was audited code-by-code over the range `0..=133`
+    /// against Apache Kafka trunk's
+    /// `org.apache.kafka.common.protocol.Errors`, resolving each entry's
+    /// exception superclass chain. An error is retriable in Java when its
+    /// exception extends `RetriableException`, either directly or via
+    /// `InvalidMetadataException` / `RefreshRetriableException`.
+    ///
+    /// Every code Java considers retriable is retriable here — the Java set is
+    /// a strict subset, enforced by a unit test. krafka additionally treats the
+    /// following as retriable, deliberately, because its own state machines
+    /// recover from them by retrying rather than by failing the caller:
+    ///
+    /// | Code | Name | Java superclass | Why krafka retries |
+    /// |-----:|------|-----------------|--------------------|
+    /// | 8   | `BROKER_NOT_AVAILABLE`          | `ApiException` | Transient by definition; resolves once the broker re-registers. |
+    /// | 27  | `REBALANCE_IN_PROGRESS`         | `ApiException` | Resolved by completing the rejoin; failing the caller aborts a healthy rebalance. |
+    /// | 45  | `OUT_OF_ORDER_SEQUENCE_NUMBER`  | `ApiException` | The idempotent producer recovers by bumping the epoch and re-sending. |
+    /// | 55  | `OPERATION_NOT_ATTEMPTED`       | `ApiException` | The broker explicitly did not attempt the operation; re-issuing is safe. |
+    /// | 59  | `UNKNOWN_PRODUCER_ID`           | `OutOfOrderSequenceException` | Recovered by re-initialising the producer ID. |
+    /// | 108 | `NEW_LEADER_ELECTED`            | `ApiException` | State was applied but leadership moved; a refresh + retry converges. |
+    /// | 110 | `FENCED_MEMBER_EPOCH`           | `ApiException` | KIP-848: recovered by rejoining with the epoch from the next heartbeat. |
+    /// | 113 | `STALE_MEMBER_EPOCH`            | `ApiException` | KIP-848: same as above — explicitly documented as "retry with a new epoch". |
+    ///
+    /// Note that [`Self::RebootstrapRequired`] (129) is **not** retriable in
+    /// either model despite its name: it is handled by the dedicated
+    /// rebootstrap path in
+    /// [`ClusterMetadata`](crate::metadata::ClusterMetadata), not by a generic
+    /// retry loop. Likewise [`Self::UnknownControllerId`] (116) is not
+    /// retriable in general; the admin client's controller-routing loop handles
+    /// it specifically.
     #[inline]
     pub fn is_retriable(&self) -> bool {
         matches!(
             self,
-            Self::CorruptMessage
-                | Self::UnknownTopicOrPartition
-                | Self::LeaderNotAvailable
-                | Self::NotLeaderForPartition
-                | Self::RequestTimedOut
-                | Self::BrokerNotAvailable
-                | Self::ReplicaNotAvailable
-                | Self::NetworkException
-                | Self::CoordinatorLoadInProgress
-                | Self::CoordinatorNotAvailable
-                | Self::NotCoordinator
-                | Self::NotEnoughReplicas
-                | Self::NotEnoughReplicasAfterAppend
-                | Self::OutOfOrderSequenceNumber
-                | Self::ConcurrentTransactions
-                | Self::OperationNotAttempted
-                | Self::KafkaStorageException
-                | Self::UnknownProducerId
-                | Self::FetchSessionIdNotFound
-                | Self::InvalidFetchSessionEpoch
-                | Self::FencedLeaderEpoch
-                | Self::UnknownLeaderEpoch
-                | Self::OffsetNotAvailable
-                | Self::PreferredLeaderNotAvailable
-                | Self::EligibleLeadersNotAvailable
-                | Self::UnstableOffsetCommit
-                | Self::ThrottlingQuotaExceeded
-                | Self::FencedMemberEpoch
-                | Self::StaleMemberEpoch
-                | Self::NewLeaderElected
+            // ── Direct `RetriableException` subclasses ──
+            Self::CorruptMessage                 // 2
+                | Self::RequestTimedOut          // 7
+                | Self::CoordinatorLoadInProgress // 14
+                | Self::NotEnoughReplicas        // 19
+                | Self::NotEnoughReplicasAfterAppend // 20
+                | Self::NotController            // 41
+                | Self::ConcurrentTransactions   // 51
+                | Self::FetchSessionIdNotFound   // 70
+                | Self::InvalidFetchSessionEpoch // 71
+                | Self::UnknownLeaderEpoch       // 75
+                | Self::OffsetNotAvailable       // 78
+                | Self::UnstableOffsetCommit     // 88
+                | Self::ThrottlingQuotaExceeded  // 89
+                | Self::FetchSessionTopicIdError // 106
+                // KIP-932 share-session errors: recovered by re-establishing
+                // the share session against the broker.
+                | Self::ShareSessionNotFound     // 122
+                | Self::InvalidShareSessionEpoch // 123
+                | Self::ShareSessionLimitReached // 133
+
+                // ── Via `RefreshRetriableException` (coordinator discovery) ──
+                | Self::CoordinatorNotAvailable  // 15
+                | Self::NotCoordinator           // 16
+
+                // ── Via `InvalidMetadataException` (resolved by a refresh) ──
+                | Self::UnknownTopicOrPartition  // 3
+                | Self::LeaderNotAvailable       // 5
+                | Self::NotLeaderForPartition    // 6
+                | Self::ReplicaNotAvailable      // 9
+                | Self::NetworkException         // 13
+                | Self::KafkaStorageException    // 56
+                | Self::ListenerNotFound         // 72
+                | Self::FencedLeaderEpoch        // 74
+                | Self::PreferredLeaderNotAvailable // 80
+                | Self::EligibleLeadersNotAvailable // 83
+                | Self::ElectionNotNeeded        // 84
+                | Self::UnknownTopicId           // 100
+                | Self::InconsistentTopicId      // 103
+
+                // ── Deliberate krafka deviations; see the table above ──
+                | Self::BrokerNotAvailable       // 8
+                | Self::RebalanceInProgress      // 27
+                | Self::OutOfOrderSequenceNumber // 45
+                | Self::OperationNotAttempted    // 55
+                | Self::UnknownProducerId        // 59
+                | Self::NewLeaderElected         // 108
+                | Self::FencedMemberEpoch        // 110
+                | Self::StaleMemberEpoch // 113
         )
     }
 
@@ -1225,17 +1310,129 @@ mod tests {
         assert!(!ErrorCode::InvalidPrincipalType.is_retriable());
         assert!(!ErrorCode::NonEmptyGroup.is_retriable());
         assert!(!ErrorCode::GroupIdNotFound.is_retriable());
-        assert!(!ErrorCode::ListenerNotFound.is_retriable());
         assert!(!ErrorCode::TopicDeletionDisabled.is_retriable());
         assert!(!ErrorCode::UnsupportedCompressionType.is_retriable());
         assert!(!ErrorCode::StaleBrokerEpoch.is_retriable());
         assert!(!ErrorCode::MemberIdRequired.is_retriable());
         assert!(!ErrorCode::GroupMaxSizeReached.is_retriable());
         assert!(!ErrorCode::FencedInstanceId.is_retriable());
-        assert!(!ErrorCode::ElectionNotNeeded.is_retriable());
         assert!(!ErrorCode::NoReassignmentInProgress.is_retriable());
         assert!(!ErrorCode::GroupSubscribedToTopic.is_retriable());
         assert!(!ErrorCode::InvalidRecord.is_retriable());
+
+        // LISTENER_NOT_FOUND (72) and ELECTION_NOT_NEEDED (84) are deliberately
+        // absent from the list above: `ListenerNotFoundException` and
+        // `ElectionNotNeededException` both extend `InvalidMetadataException`
+        // -> `RetriableException`, so they resolve after a metadata refresh.
+        assert!(ErrorCode::ListenerNotFound.is_retriable());
+        assert!(ErrorCode::ElectionNotNeeded.is_retriable());
+    }
+
+    // ── Reconciliation with Kafka's `Errors.java` (codes 0..=133) ──
+
+    /// Codes whose exception class extends `RetriableException` in Apache Kafka
+    /// trunk — directly, or via `InvalidMetadataException` /
+    /// `RefreshRetriableException`. Derived by resolving the superclass chain
+    /// of every entry in `org.apache.kafka.common.protocol.Errors`.
+    const JAVA_RETRIABLE: &[i16] = &[
+        2, 3, 5, 6, 7, 9, 13, 14, 15, 16, 19, 20, 41, 51, 56, 70, 71, 72, 74, 75, 78, 80, 83, 84,
+        88, 89, 100, 103, 106, 122, 123, 133,
+    ];
+
+    /// Codes krafka deliberately treats as retriable even though Java does not.
+    /// Each is justified in the `ErrorCode::is_retriable` rustdoc table.
+    const KRAFKA_EXTRA_RETRIABLE: &[i16] = &[8, 27, 45, 55, 59, 108, 110, 113];
+
+    /// Every code Java retries must be retriable here. Under-retrying wedges
+    /// the client on errors the broker expects it to recover from.
+    #[test]
+    fn test_java_retriable_codes_are_all_retriable() {
+        for &code in JAVA_RETRIABLE {
+            let ec = ErrorCode::from_i16(code);
+            assert!(
+                ec.is_retriable(),
+                "code {code} ({ec:?}) is retriable in Kafka's Errors.java but not here"
+            );
+        }
+    }
+
+    /// The retriable set is exactly the Java set plus the documented
+    /// deviations — nothing else in 0..=133 may creep in unnoticed.
+    #[test]
+    fn test_retriable_classification_over_full_range() {
+        for code in 0i16..=133 {
+            let ec = ErrorCode::from_i16(code);
+            let expected = JAVA_RETRIABLE.contains(&code) || KRAFKA_EXTRA_RETRIABLE.contains(&code);
+            assert_eq!(
+                ec.is_retriable(),
+                expected,
+                "retriable mismatch for code {code} ({ec:?}): expected {expected}"
+            );
+        }
+        // UNKNOWN_SERVER_ERROR is never retriable.
+        assert!(!ErrorCode::UnknownServerError.is_retriable());
+    }
+
+    /// Every code in -1..=133 must round-trip through `from_i16`/`to_i16`.
+    /// Codes with no named variant fall through to `Unknown`, which still
+    /// round-trips.
+    #[test]
+    fn test_error_code_round_trip_full_range() {
+        for code in -1i16..=133 {
+            let ec = ErrorCode::from_i16(code);
+            assert_eq!(ec.to_i16(), code, "round-trip failed for code {code}");
+        }
+    }
+
+    /// Codes 120..=133 must match Apache Kafka trunk exactly. The historical
+    /// bug here mapped 124 to `REBOOTSTRAP_REQUIRED`; upstream assigns 124 to
+    /// `FENCED_STATE_EPOCH` and `REBOOTSTRAP_REQUIRED` to 129. Because
+    /// `ClusterMetadata` triggers its KIP-899 rebootstrap path from
+    /// `RebootstrapRequired`, the wrong mapping made a share-coordinator
+    /// fencing error tear down every connection in the client.
+    #[test]
+    fn test_error_codes_120_to_133_match_upstream() {
+        assert_eq!(ErrorCode::from_i16(120), ErrorCode::TransactionAbortable);
+        assert_eq!(ErrorCode::from_i16(121), ErrorCode::InvalidRecordState);
+        assert_eq!(ErrorCode::from_i16(122), ErrorCode::ShareSessionNotFound);
+        assert_eq!(
+            ErrorCode::from_i16(123),
+            ErrorCode::InvalidShareSessionEpoch
+        );
+        assert_eq!(ErrorCode::from_i16(124), ErrorCode::FencedStateEpoch);
+        assert_eq!(ErrorCode::from_i16(125), ErrorCode::InvalidVoterKey);
+        assert_eq!(ErrorCode::from_i16(126), ErrorCode::DuplicateVoter);
+        assert_eq!(ErrorCode::from_i16(127), ErrorCode::VoterNotFound);
+        assert_eq!(
+            ErrorCode::from_i16(128),
+            ErrorCode::InvalidRegularExpression
+        );
+        assert_eq!(ErrorCode::from_i16(129), ErrorCode::RebootstrapRequired);
+        assert_eq!(ErrorCode::from_i16(130), ErrorCode::StreamsInvalidTopology);
+        assert_eq!(
+            ErrorCode::from_i16(131),
+            ErrorCode::StreamsInvalidTopologyEpoch
+        );
+        assert_eq!(ErrorCode::from_i16(132), ErrorCode::StreamsTopologyFenced);
+        assert_eq!(
+            ErrorCode::from_i16(133),
+            ErrorCode::ShareSessionLimitReached
+        );
+
+        // The rebootstrap trigger must be 129, never 124.
+        assert_eq!(ErrorCode::RebootstrapRequired.to_i16(), 129);
+        assert_ne!(ErrorCode::from_i16(124), ErrorCode::RebootstrapRequired);
+    }
+
+    /// `NOT_CONTROLLER` drives the admin client's controller-routing retry, so
+    /// it must be classified retriable (Java: direct `RetriableException`).
+    #[test]
+    fn test_not_controller_is_retriable() {
+        assert!(ErrorCode::NotController.is_retriable());
+        assert_eq!(ErrorCode::NotController.to_i16(), 41);
+        // UnknownControllerId is handled explicitly by the controller loop, not
+        // by the generic retry classifier.
+        assert!(!ErrorCode::UnknownControllerId.is_retriable());
     }
 
     // ── R9.10: round-trip through From<i16> / From<ErrorCode> traits ──
@@ -1254,8 +1451,11 @@ mod tests {
     #[test]
     fn test_protocol_error_kind_is_retriable() {
         assert!(ProtocolErrorKind::TruncatedFrame.is_retriable());
-        assert!(ProtocolErrorKind::CrcMismatch.is_retriable());
         assert!(ProtocolErrorKind::Malformed.is_retriable());
+        // A CRC failure means the bytes are corrupt as stored or transmitted.
+        // Re-fetching the same offset returns the same bytes, so retrying
+        // spins forever instead of surfacing the corruption.
+        assert!(!ProtocolErrorKind::CrcMismatch.is_retriable());
         assert!(!ProtocolErrorKind::UnknownApiVersion.is_retriable());
         assert!(!ProtocolErrorKind::InvalidLength.is_retriable());
         assert!(!ProtocolErrorKind::InvalidUtf8.is_retriable());
@@ -1282,7 +1482,7 @@ mod tests {
     #[test]
     fn test_krafka_error_protocol_retriable_via_kind() {
         assert!(
-            KrafkaError::protocol_kind(ProtocolErrorKind::CrcMismatch, "CRC mismatch: a vs b")
+            !KrafkaError::protocol_kind(ProtocolErrorKind::CrcMismatch, "CRC mismatch: a vs b")
                 .is_retriable()
         );
         assert!(

@@ -113,6 +113,10 @@ impl AdminClient {
     /// **This is a destructive operation** — deleting a SCRAM credential
     /// removes the user's ability to authenticate with that mechanism.
     ///
+    /// `AlterUserScramCredentials` is a **controller-only** API: the request is
+    /// routed to the current controller and re-issued against a freshly
+    /// resolved controller on `NOT_CONTROLLER`.
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -139,38 +143,60 @@ impl AdminClient {
         deletions: Vec<ScramCredentialDeletion>,
         upsertions: Vec<ScramCredentialUpsertion>,
     ) -> Result<Vec<AlterScramCredentialResult>> {
-        let conn = self.get_any_broker_connection().await?;
+        self.check_not_closed()?;
 
-        let request = AlterUserScramCredentialsRequest {
-            deletions,
-            upsertions,
-        };
+        // `AlterUserScramCredentials` is controller-only. Routing it to an
+        // arbitrary broker means a controller failover reports NOT_CONTROLLER
+        // per user while the RPC itself returns Ok — i.e. credentials silently
+        // not rotated.
+        let responses = self
+            .with_controller("AlterUserScramCredentials", |conn| {
+                let deletions = &deletions;
+                let upsertions = &upsertions;
+                async move {
+                    let request = AlterUserScramCredentialsRequest {
+                        deletions: deletions.clone(),
+                        upsertions: upsertions.clone(),
+                    };
 
-        let version = conn
-            .negotiate_api_version(
-                ApiKey::AlterUserScramCredentials,
-                versions::ALTER_USER_SCRAM_CREDENTIALS_MAX,
-                versions::ALTER_USER_SCRAM_CREDENTIALS_MIN,
-            )
-            .await
-            .ok_or_else(|| {
-                KrafkaError::protocol_kind(
-                    ProtocolErrorKind::UnknownApiVersion,
-                    "no mutually supported AlterUserScramCredentials API version",
-                )
-            })?;
+                    let version = conn
+                        .negotiate_api_version(
+                            ApiKey::AlterUserScramCredentials,
+                            versions::ALTER_USER_SCRAM_CREDENTIALS_MAX,
+                            versions::ALTER_USER_SCRAM_CREDENTIALS_MIN,
+                        )
+                        .await
+                        .ok_or_else(|| {
+                            KrafkaError::protocol_kind(
+                                ProtocolErrorKind::UnknownApiVersion,
+                                "no mutually supported AlterUserScramCredentials API version",
+                            )
+                        })?;
 
-        let response_bytes = conn
-            .send_request(ApiKey::AlterUserScramCredentials, version, |buf| {
-                request.encode_versioned(version, buf)
+                    let response_bytes = conn
+                        .send_request(ApiKey::AlterUserScramCredentials, version, |buf| {
+                            request.encode_versioned(version, buf)
+                        })
+                        .await?;
+
+                    let mut buf = response_bytes;
+                    let response =
+                        AlterUserScramCredentialsResponse::decode_versioned(version, &mut buf)?;
+
+                    if let Some(r) = response
+                        .results
+                        .iter()
+                        .find(|r| super::is_controller_moved(r.error_code))
+                    {
+                        return Ok(ControllerAttempt::NotController(r.error_code));
+                    }
+
+                    Ok(ControllerAttempt::Done(response.results))
+                }
             })
             .await?;
 
-        let mut buf = response_bytes;
-        let response = AlterUserScramCredentialsResponse::decode_versioned(version, &mut buf)?;
-
-        let results = response
-            .results
+        let results = responses
             .into_iter()
             .map(|r| AlterScramCredentialResult {
                 user: r.user,
@@ -183,8 +209,10 @@ impl AdminClient {
             })
             .collect::<Vec<_>>();
 
+        let failed = results.iter().filter(|r| r.error.is_some()).count();
         info!(
-            "AlterUserScramCredentials completed for {} user(s)",
+            "AlterUserScramCredentials: {}/{} user(s) updated ({failed} failed)",
+            results.len() - failed,
             results.len()
         );
         Ok(results)
@@ -193,4 +221,97 @@ impl AdminClient {
     // ════════════════════════════════════════════════════════════════════
     // DescribeProducers (API key 61)
     // ════════════════════════════════════════════════════════════════════
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use zeroize::Zeroizing;
+
+    #[test]
+    fn test_describe_user_scram_credentials_request_encodes_named_and_all_users() {
+        // Specific users.
+        let request = DescribeUserScramCredentialsRequest {
+            users: Some(vec!["alice".into(), "bob".into()]),
+        };
+        assert_eq!(request.users.as_ref().unwrap().len(), 2);
+        let mut buf = Vec::new();
+        request
+            .encode_versioned(versions::DESCRIBE_USER_SCRAM_CREDENTIALS_MAX, &mut buf)
+            .expect("DescribeUserScramCredentials must encode");
+        assert!(!buf.is_empty());
+
+        // None means "describe all credentials" — a null array on the wire,
+        // which is distinct from an empty one.
+        let all = DescribeUserScramCredentialsRequest { users: None };
+        assert!(all.users.is_none());
+        let mut buf = Vec::new();
+        all.encode_versioned(versions::DESCRIBE_USER_SCRAM_CREDENTIALS_MAX, &mut buf)
+            .expect("DescribeUserScramCredentials(all) must encode");
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_alter_user_scram_credentials_request_carries_both_lists() {
+        let request = AlterUserScramCredentialsRequest {
+            deletions: vec![ScramCredentialDeletion {
+                name: "alice".into(),
+                mechanism: crate::auth::ScramMechanism::Sha512,
+            }],
+            upsertions: vec![ScramCredentialUpsertion {
+                name: "bob".into(),
+                mechanism: crate::auth::ScramMechanism::Sha256,
+                iterations: 8192,
+                salt: Zeroizing::new(vec![1, 2, 3, 4]),
+                salted_password: Zeroizing::new(vec![5, 6, 7, 8]),
+            }],
+        };
+
+        assert_eq!(request.deletions.len(), 1);
+        assert_eq!(request.deletions[0].name, "alice");
+        assert_eq!(request.upsertions.len(), 1);
+        assert_eq!(request.upsertions[0].iterations, 8192);
+
+        let mut buf = Vec::new();
+        request
+            .encode_versioned(versions::ALTER_USER_SCRAM_CREDENTIALS_MAX, &mut buf)
+            .expect("AlterUserScramCredentials must encode");
+        assert!(!buf.is_empty());
+    }
+
+    /// Deletions and upsertions must stay in separate lists: collapsing them
+    /// would silently turn a credential rotation into a credential removal.
+    #[test]
+    fn test_deletion_only_request_has_no_upsertions() {
+        let request = AlterUserScramCredentialsRequest {
+            deletions: vec![ScramCredentialDeletion {
+                name: "alice".into(),
+                mechanism: crate::auth::ScramMechanism::Sha256,
+            }],
+            upsertions: vec![],
+        };
+        assert_eq!(request.deletions.len(), 1);
+        assert!(request.upsertions.is_empty());
+    }
+
+    #[test]
+    fn test_scram_credential_result_shapes() {
+        let user = ScramCredentialUserResult {
+            name: "alice".into(),
+            error: None,
+            credential_infos: vec![ScramCredentialInfoResult {
+                mechanism: crate::auth::ScramMechanism::Sha512,
+                iterations: 4096,
+            }],
+        };
+        assert!(user.error.is_none());
+        assert_eq!(user.credential_infos[0].iterations, 4096);
+
+        let failed = AlterScramCredentialResult {
+            user: "bob".into(),
+            error: Some("UnacceptableCredential".into()),
+        };
+        assert!(failed.error.is_some());
+    }
 }

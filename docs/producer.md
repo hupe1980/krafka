@@ -779,10 +779,14 @@ for record in consumer_records {
     producer.send("output-topic", record.key, &output).await?;
 }
 
-// Commit offsets as part of transaction
-let mut offsets = HashMap::new();
-offsets.insert(topic_partition, offset_and_metadata);
-producer.send_offsets_to_transaction(&offsets, "consumer-group").await?;
+// Commit offsets as part of the transaction.
+//
+// KIP-447: pass the consumer's live group metadata so the group coordinator
+// can fence a zombie committer. Re-read it every transaction — the generation
+// changes on every rebalance, and a cached value defeats the fencing.
+let offsets = [TopicPartitionOffset::new(topic, partition, next_offset)];
+let group_metadata = consumer.group_metadata().await?;
+producer.send_offsets_to_transaction(&offsets, &group_metadata).await?;
 
 // Atomic commit of messages and offsets
 producer.commit_transaction().await?;

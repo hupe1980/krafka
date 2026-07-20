@@ -27,7 +27,7 @@
 //! - [`delete_groups`] — DeleteGroups (Key 42)
 //! - [`describe_cluster`] — DescribeCluster (Key 60)
 //! - [`describe_groups`] — DescribeGroups (Key 15)
-//! - [`list_client_metrics_resources`] — ListClientMetricsResources (Key 74)
+//! - [`list_config_resources`] — ListConfigResources (Key 74, KIP-1142)
 //! - [`list_groups`] — ListGroups (Key 16)
 //! - [`update_features`] — UpdateFeatures (Key 57, KIP-584)
 //! - [`sasl`] — SaslHandshake, SaslAuthenticate
@@ -149,8 +149,8 @@ pub use describe_cluster::*;
 mod describe_groups;
 pub use describe_groups::*;
 
-mod list_client_metrics_resources;
-pub use list_client_metrics_resources::*;
+mod list_config_resources;
+pub use list_config_resources::*;
 
 mod list_groups;
 pub use list_groups::*;

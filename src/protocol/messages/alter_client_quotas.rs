@@ -5,7 +5,8 @@ use crate::error::{ErrorCode, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{
-    array_len_i32, check_compact_array_len, check_decode_array_len, encode_compact_array_len,
+    array_len_i32, check_compact_array_len, check_decode_array_len, decode_capacity,
+    encode_compact_array_len,
 };
 
 // ============================================================================
@@ -149,14 +150,14 @@ impl AlterClientQuotasResponse {
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let entry_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut entries = Vec::with_capacity(entry_count);
+        let mut entries = Vec::with_capacity(decode_capacity(entry_count, buf.remaining()));
 
         for _ in 0..entry_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
             let error_message = KafkaString::decode(buf)?.0;
 
             let entity_count = check_decode_array_len(i32::decode(buf)?)?;
-            let mut entity = Vec::with_capacity(entity_count);
+            let mut entity = Vec::with_capacity(decode_capacity(entity_count, buf.remaining()));
             for _ in 0..entity_count {
                 let entity_type = non_nullable_string("entity_type", KafkaString::decode(buf)?.0)?;
                 let entity_name = KafkaString::decode(buf)?.0;
@@ -184,7 +185,7 @@ impl AlterClientQuotasResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let entry_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut entries = Vec::with_capacity(entry_count);
+        let mut entries = Vec::with_capacity(decode_capacity(entry_count, buf.remaining()));
 
         for _ in 0..entry_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -192,7 +193,7 @@ impl AlterClientQuotasResponse {
 
             let entity_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut entity = Vec::with_capacity(entity_count);
+            let mut entity = Vec::with_capacity(decode_capacity(entity_count, buf.remaining()));
             for _ in 0..entity_count {
                 let entity_type =
                     non_nullable_string("entity_type", KafkaString::decode_compact(buf)?.0)?;

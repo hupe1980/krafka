@@ -5,7 +5,8 @@ use crate::error::{ErrorCode, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{
-    array_len_i32, check_compact_array_len, check_decode_array_len, encode_compact_array_len,
+    array_len_i32, check_compact_array_len, check_decode_array_len, decode_capacity,
+    encode_compact_array_len,
 };
 
 // ============================================================================
@@ -128,11 +129,12 @@ impl AlterReplicaLogDirsResponse {
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let topic_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut results = Vec::with_capacity(topic_count);
+        let mut results = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
         for _ in 0..topic_count {
             let topic_name = non_nullable_string("topic_name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
-            let mut partitions = Vec::with_capacity(partition_count);
+            let mut partitions =
+                Vec::with_capacity(decode_capacity(partition_count, buf.remaining()));
             for _ in 0..partition_count {
                 let partition_index = i32::decode(buf)?;
                 let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -157,13 +159,14 @@ impl AlterReplicaLogDirsResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let topic_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut results = Vec::with_capacity(topic_count);
+        let mut results = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
         for _ in 0..topic_count {
             let topic_name =
                 non_nullable_string("topic_name", KafkaString::decode_compact(buf)?.0)?;
             let partition_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut partitions = Vec::with_capacity(partition_count);
+            let mut partitions =
+                Vec::with_capacity(decode_capacity(partition_count, buf.remaining()));
             for _ in 0..partition_count {
                 let partition_index = i32::decode(buf)?;
                 let error_code = ErrorCode::from_i16(i16::decode(buf)?);

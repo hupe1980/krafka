@@ -237,12 +237,21 @@ fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
 
 /// Load a private key from a PEM file.
 ///
-/// On Unix, warns if the file is world-readable (permissions `& 0o077 != 0`).
+/// The file is opened once and its bytes parsed in memory, rather than opened
+/// for a permissions check and then reopened by the parser. That closes the
+/// window in which the file could be swapped between the two operations, and
+/// guarantees the warning below describes the bytes actually loaded.
+///
+/// On Unix, warns if the file is group- or world-accessible
+/// (permissions `& 0o077 != 0`).
 fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
-    let file = File::open(Path::new(path))
+    use std::io::Read as _;
+
+    let mut file = File::open(Path::new(path))
         .map_err(|e| KrafkaError::config(format!("Failed to open key file {path}: {e}")))?;
 
-    // Warn on overly permissive file permissions (Unix only).
+    // Warn on overly permissive file permissions. Unix-only: Windows uses ACLs,
+    // which have no meaningful equivalent to a mode bitmask.
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -257,8 +266,14 @@ fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
         }
     }
 
-    PrivateKeyDer::from_pem_file(Path::new(path))
-        .map_err(|e| KrafkaError::config(format!("Failed to read private key file {path}: {e}")))
+    // Zeroized on drop: the PEM text holds the private key in cleartext, and
+    // the parsed `PrivateKeyDer` does not take ownership of this buffer.
+    let mut pem = zeroize::Zeroizing::new(Vec::new());
+    file.read_to_end(&mut pem)
+        .map_err(|e| KrafkaError::config(format!("Failed to read key file {path}: {e}")))?;
+
+    PrivateKeyDer::from_pem_slice(&pem)
+        .map_err(|e| KrafkaError::config(format!("Failed to parse private key file {path}: {e}")))
 }
 
 /// Load root certificate store.
@@ -359,9 +374,17 @@ fn resolve_crypto_provider() -> Arc<CryptoProvider> {
         {
             Arc::new(rustls::crypto::aws_lc_rs::default_provider())
         }
-        #[cfg(not(feature = "rustls-aws-lc-rs"))]
+        #[cfg(all(feature = "ring", not(feature = "rustls-aws-lc-rs")))]
         {
             Arc::new(rustls::crypto::ring::default_provider())
+        }
+        // Only reachable when no backend feature is set, which the
+        // `compile_error!` in `lib.rs` already rejects. Present so that the
+        // build fails with that message alone rather than a confusing
+        // type-mismatch alongside it.
+        #[cfg(not(any(feature = "ring", feature = "rustls-aws-lc-rs")))]
+        {
+            unreachable!("lib.rs compile_error! guarantees a crypto backend")
         }
     })
 }
@@ -456,7 +479,7 @@ mod tests {
         // Install the default crypto provider for tests.
         #[cfg(feature = "rustls-aws-lc-rs")]
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        #[cfg(not(feature = "rustls-aws-lc-rs"))]
+        #[cfg(all(feature = "ring", not(feature = "rustls-aws-lc-rs")))]
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
 

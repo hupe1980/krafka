@@ -5,7 +5,8 @@ use crate::error::{ErrorCode, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{
-    check_compact_array_len, check_compact_nullable_array_len, encode_compact_array_len,
+    check_compact_array_len, check_compact_nullable_array_len, decode_capacity,
+    encode_compact_array_len,
 };
 
 // ============================================================================
@@ -128,12 +129,13 @@ impl ListPartitionReassignmentsResponse {
 
         let topic_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut topics = Vec::with_capacity(topic_count);
+        let mut topics = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
         for _ in 0..topic_count {
             let name = non_nullable_string("topic name", KafkaString::decode_compact(buf)?.0)?;
             let partition_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut partitions = Vec::with_capacity(partition_count);
+            let mut partitions =
+                Vec::with_capacity(decode_capacity(partition_count, buf.remaining()));
             for _ in 0..partition_count {
                 let partition_index = i32::decode(buf)?;
                 let replicas = Self::decode_broker_id_array(buf)?;
@@ -164,7 +166,7 @@ impl ListPartitionReassignmentsResponse {
     fn decode_broker_id_array(buf: &mut impl Buf) -> Result<Vec<i32>> {
         let count =
             check_compact_nullable_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut ids = Vec::with_capacity(count);
+        let mut ids = Vec::with_capacity(decode_capacity(count, buf.remaining()));
         for _ in 0..count {
             ids.push(i32::decode(buf)?);
         }

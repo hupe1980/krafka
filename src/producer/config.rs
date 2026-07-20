@@ -75,6 +75,8 @@ pub struct ProducerConfig {
     pub(crate) linger: Duration,
     /// Request timeout.
     pub(crate) request_timeout: Duration,
+    /// Time allowed for TCP establishment to one broker.
+    pub(crate) connect_timeout: Duration,
     /// Total delivery timeout for a record, including retries and time spent queued.
     pub(crate) delivery_timeout: Duration,
     /// Number of retries.
@@ -142,6 +144,7 @@ impl Default for ProducerConfig {
             batch_size: 16384,
             linger: Duration::ZERO,
             request_timeout: Duration::from_secs(30),
+            connect_timeout: crate::network::DEFAULT_CONNECT_TIMEOUT,
             delivery_timeout: Duration::from_secs(120),
             retries: u32::MAX,
             retry_backoff: Duration::from_millis(100),
@@ -221,6 +224,12 @@ impl ProducerConfig {
     #[inline]
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
+    }
+
+    /// Returns the connect timeout.
+    #[inline]
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
     }
 
     /// Returns the total delivery timeout.
@@ -422,9 +431,27 @@ impl ProducerConfigBuilder {
         self
     }
 
-    /// Set request timeout.
+    /// Set request timeout: how long one in-flight request may wait for its
+    /// response. Default: 30 s.
+    ///
+    /// Must be at least [`connect_timeout`](Self::connect_timeout), whose
+    /// default is 10 s — a request's clock covers establishing the connection
+    /// it is sent over, so a shorter value would expire every request before
+    /// the handshake could finish. To go below 10 s, lower `connect_timeout`
+    /// as well; `build()` returns a config error otherwise.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.config.request_timeout = timeout;
+        self
+    }
+
+    /// Set the connect timeout: how long TCP establishment to one broker may
+    /// take. Default: 10 s.
+    ///
+    /// This also acts as the floor on
+    /// [`request_timeout`](Self::request_timeout), so lowering it is what makes
+    /// a sub-10-second request timeout possible.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.config.connect_timeout = timeout;
         self
     }
 

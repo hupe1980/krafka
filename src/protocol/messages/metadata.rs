@@ -1,3 +1,4 @@
+use crate::protocol::decode_capacity;
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode};
@@ -712,18 +713,19 @@ impl Decode for MetadataPartitionResponseV9 {
         // decode_compact().unwrap_or_default() which silently coerces null.
         let replica_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut replica_nodes = Vec::with_capacity(replica_count);
+        let mut replica_nodes = Vec::with_capacity(decode_capacity(replica_count, buf.remaining()));
         for _ in 0..replica_count {
             replica_nodes.push(i32::decode(buf)?);
         }
         let isr_count = check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut isr_nodes = Vec::with_capacity(isr_count);
+        let mut isr_nodes = Vec::with_capacity(decode_capacity(isr_count, buf.remaining()));
         for _ in 0..isr_count {
             isr_nodes.push(i32::decode(buf)?);
         }
         let offline_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut offline_replicas = Vec::with_capacity(offline_count);
+        let mut offline_replicas =
+            Vec::with_capacity(decode_capacity(offline_count, buf.remaining()));
         for _ in 0..offline_count {
             offline_replicas.push(i32::decode(buf)?);
         }

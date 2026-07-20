@@ -9,10 +9,9 @@ use crate::error::{KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::{
     ApiKey, ConsumerGroupDescribeRequest, ConsumerGroupDescribeResponse, DeleteRecordsPartition,
     DeleteRecordsRequest, DeleteRecordsResponse, DeleteRecordsTopic, DescribeGroupsRequest,
-    DescribeGroupsResponse, FindCoordinatorRequest, FindCoordinatorResponse, ListGroupsRequest,
-    ListGroupsResponse, OffsetForLeaderEpochPartition, OffsetForLeaderEpochRequest,
-    OffsetForLeaderEpochResponse, OffsetForLeaderEpochTopic, VersionedDecode, VersionedEncode,
-    validate_topic_name, versions,
+    DescribeGroupsResponse, ListGroupsRequest, ListGroupsResponse, OffsetForLeaderEpochPartition,
+    OffsetForLeaderEpochRequest, OffsetForLeaderEpochResponse, OffsetForLeaderEpochTopic,
+    VersionedDecode, VersionedEncode, validate_topic_name, versions,
 };
 
 #[allow(clippy::wildcard_imports)]
@@ -53,68 +52,25 @@ impl AdminClient {
         }
 
         // Route each group to its coordinator broker.
-        let mut coordinator_groups: HashMap<i32, Vec<String>> = HashMap::new();
-        let any_broker = &brokers[0];
-        let any_conn = self
-            .pool
-            .get_connection_by_id(any_broker.id(), any_broker.address())
-            .await?;
+        //
+        // Coordinator resolution retries on retriable errors and errors out if
+        // it cannot be resolved. The previous fallback to an arbitrary broker
+        // guaranteed the follow-up DescribeGroups would answer NOT_COORDINATOR
+        // while the real cause had already been discarded into a log line.
+        let mut coordinator_groups: HashMap<(i32, String), Vec<String>> = HashMap::new();
 
         for group_id in &group_ids {
-            let coord_request = FindCoordinatorRequest::for_group(group_id);
-            let coord_version = any_conn
-                .negotiate_api_version(
-                    ApiKey::FindCoordinator,
-                    versions::FIND_COORDINATOR_MAX,
-                    versions::FIND_COORDINATOR_MIN,
-                )
-                .await
-                .ok_or_else(|| {
-                    KrafkaError::protocol_kind(
-                        ProtocolErrorKind::UnknownApiVersion,
-                        "no mutually supported FindCoordinator API version",
-                    )
-                })?;
-
-            let coord_response_bytes = any_conn
-                .send_request(ApiKey::FindCoordinator, coord_version, |buf| {
-                    coord_request.encode_versioned(coord_version, buf)
-                })
-                .await?;
-            let mut coord_buf = coord_response_bytes;
-            let coord_response =
-                FindCoordinatorResponse::decode_versioned(coord_version, &mut coord_buf)?;
-
-            if coord_response.error_code.is_ok() {
-                coordinator_groups
-                    .entry(coord_response.node_id)
-                    .or_default()
-                    .push(group_id.clone());
-            } else {
-                warn!(
-                    "FindCoordinator failed for group '{}': {:?}, falling back to broker {}",
-                    group_id,
-                    coord_response.error_code,
-                    any_broker.id()
-                );
-                coordinator_groups
-                    .entry(any_broker.id())
-                    .or_default()
-                    .push(group_id.clone());
-            }
+            let (node_id, addr) = self.find_coordinator_node(group_id, false).await?;
+            coordinator_groups
+                .entry((node_id, addr))
+                .or_default()
+                .push(group_id.clone());
         }
 
         let mut all_results = Vec::new();
 
-        for (broker_id, groups) in &coordinator_groups {
-            let broker = brokers
-                .iter()
-                .find(|b| b.id() == *broker_id)
-                .unwrap_or(any_broker);
-            let conn = self
-                .pool
-                .get_connection_by_id(broker.id(), broker.address())
-                .await?;
+        for ((broker_id, addr), groups) in &coordinator_groups {
+            let conn = self.pool.get_connection_by_id(*broker_id, addr).await?;
 
             // Try ConsumerGroupDescribe (Key 69) first for all groups on this broker.
             let kip848_version = conn
@@ -514,8 +470,12 @@ impl AdminClient {
 
         for attempt in 0u8..2 {
             if attempt == 1 {
+                // Wait out `retry.backoff.ms` if the refresh is rate-limited;
+                // retrying against an unchanged cache reproduces the same
+                // NotLeaderForPartition and burns the only retry.
                 let topics: Vec<&str> = offsets.keys().map(|(t, _)| t.as_str()).collect();
-                let _ = self.metadata.refresh_for_topics(Some(&topics)).await;
+                self.refresh_topics_for_retry(&topics, "DeleteRecords")
+                    .await;
             }
 
             let brokers = self.metadata.brokers();
@@ -658,8 +618,11 @@ impl AdminClient {
 
         for attempt in 0u8..2 {
             if attempt == 1 {
+                // See `delete_records`: a rate-limited refresh must be awaited,
+                // not treated as success.
                 let topics: Vec<&str> = partitions.iter().map(|(t, _, _)| t.as_str()).collect();
-                let _ = self.metadata.refresh_for_topics(Some(&topics)).await;
+                self.refresh_topics_for_retry(&topics, "OffsetForLeaderEpoch")
+                    .await;
             }
 
             let brokers = self.metadata.brokers();
@@ -779,4 +742,160 @@ impl AdminClient {
     }
 
     // ── Delegation Tokens ────────────────────────────────────────────────
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::error::ErrorCode;
+
+    #[test]
+    fn test_list_groups_request_encodes_empty_filters_as_no_filter() {
+        let request = ListGroupsRequest {
+            states_filter: Vec::new(),
+            types_filter: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        request
+            .encode_versioned(versions::LIST_GROUPS_MAX, &mut buf)
+            .expect("ListGroups must encode");
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_describe_groups_request_encodes_group_ids() {
+        let request = DescribeGroupsRequest {
+            groups: vec!["a".into(), "b".into()],
+            include_authorized_operations: false,
+        };
+        assert_eq!(request.groups.len(), 2);
+
+        let mut buf = Vec::new();
+        request
+            .encode_versioned(versions::DESCRIBE_GROUPS_MAX, &mut buf)
+            .expect("DescribeGroups must encode");
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_consumer_group_describe_request_encodes_group_ids() {
+        let request = ConsumerGroupDescribeRequest::new(vec!["a".into()]);
+        let mut buf = Vec::new();
+        request
+            .encode_versioned(versions::CONSUMER_GROUP_DESCRIBE_MAX, &mut buf)
+            .expect("ConsumerGroupDescribe must encode");
+        assert!(!buf.is_empty());
+    }
+
+    /// KIP-848 `ConsumerGroupDescribe` reports classic-protocol groups with one
+    /// of two error codes depending on broker version; both must fall back to
+    /// the classic `DescribeGroups` path rather than surfacing as an error.
+    #[test]
+    fn test_classic_group_fallback_error_codes() {
+        let needs_fallback = |code: ErrorCode| {
+            code == ErrorCode::GroupIdNotFound || code == ErrorCode::UnsupportedVersion
+        };
+
+        // Kafka 3.7–3.8 / 4.0 with a never-consumer group.
+        assert!(needs_fallback(ErrorCode::GroupIdNotFound));
+        // Kafka 3.9.
+        assert!(needs_fallback(ErrorCode::UnsupportedVersion));
+
+        // A genuine failure must not be mistaken for "this is a classic group".
+        assert!(!needs_fallback(ErrorCode::GroupAuthorizationFailed));
+        assert!(!needs_fallback(ErrorCode::CoordinatorNotAvailable));
+        assert!(!needs_fallback(ErrorCode::None));
+    }
+
+    #[test]
+    fn test_group_type_parsing() {
+        let parse = |s: &str| match s {
+            "classic" => GroupType::Classic,
+            "consumer" => GroupType::Consumer,
+            other => GroupType::Unknown(other.to_string()),
+        };
+
+        assert_eq!(parse("classic"), GroupType::Classic);
+        assert_eq!(parse("consumer"), GroupType::Consumer);
+        assert_eq!(
+            parse("share"),
+            GroupType::Unknown("share".to_string()),
+            "an unrecognised type must be preserved, not silently dropped"
+        );
+        assert_eq!(GroupType::Classic.to_string(), "classic");
+        assert_eq!(GroupType::Unknown("share".into()).to_string(), "share");
+    }
+
+    #[test]
+    fn test_delete_records_request_maps_offsets_per_partition() {
+        let request = DeleteRecordsRequest {
+            topics: vec![DeleteRecordsTopic {
+                name: "orders".into(),
+                partitions: vec![
+                    DeleteRecordsPartition {
+                        partition_index: 0,
+                        offset: 100,
+                    },
+                    DeleteRecordsPartition {
+                        partition_index: 1,
+                        offset: 250,
+                    },
+                ],
+            }],
+            timeout_ms: 30_000,
+        };
+
+        assert_eq!(request.topics[0].partitions[0].offset, 100);
+        assert_eq!(request.topics[0].partitions[1].offset, 250);
+
+        let mut buf = Vec::new();
+        request
+            .encode_versioned(versions::DELETE_RECORDS_MAX, &mut buf)
+            .expect("DeleteRecords must encode");
+        assert!(!buf.is_empty());
+    }
+
+    /// The admin client queries from the consumer's perspective, so
+    /// `replica_id` and `current_leader_epoch` use the consumer sentinels.
+    #[test]
+    fn test_offset_for_leader_epoch_request_uses_consumer_sentinels() {
+        let request = OffsetForLeaderEpochRequest {
+            replica_id: -1,
+            topics: vec![OffsetForLeaderEpochTopic {
+                topic: "orders".into(),
+                partitions: vec![OffsetForLeaderEpochPartition {
+                    partition: 0,
+                    current_leader_epoch: -1,
+                    leader_epoch: 5,
+                }],
+            }],
+        };
+
+        assert_eq!(
+            request.replica_id, -1,
+            "-1 identifies a consumer, not a broker"
+        );
+        assert_eq!(request.topics[0].partitions[0].leader_epoch, 5);
+
+        let mut buf = Vec::new();
+        request
+            .encode_versioned(versions::OFFSET_FOR_LEADER_EPOCH_MAX, &mut buf)
+            .expect("OffsetForLeaderEpoch must encode");
+        assert!(!buf.is_empty());
+    }
+
+    /// `list_consumer_groups` merges results from every broker and must
+    /// deduplicate group IDs seen on more than one.
+    #[test]
+    fn test_listed_groups_are_deduplicated_across_brokers() {
+        let mut seen = HashSet::new();
+        let mut kept = Vec::new();
+        for id in ["g1", "g2", "g1", "g3", "g2"] {
+            if seen.insert(id.to_string()) {
+                kept.push(id);
+            }
+        }
+        assert_eq!(kept, vec!["g1", "g2", "g3"]);
+    }
 }

@@ -622,7 +622,7 @@ impl TlsConfig {
 ///
 /// Use factory methods like [`AuthConfig::plaintext()`], [`AuthConfig::ssl()`],
 /// [`AuthConfig::sasl_plain()`], etc. to construct.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AuthConfig {
     /// Security protocol.
     pub(crate) security_protocol: SecurityProtocol,
@@ -642,6 +642,33 @@ pub struct AuthConfig {
     pub(crate) oauthbearer_provider: Option<OAuthBearerTokenProviderHandle>,
     /// TLS configuration.
     pub(crate) tls_config: Option<TlsConfig>,
+    /// Whether SCRAM-over-TLS may use `tls-server-end-point` channel binding.
+    ///
+    /// `true` (the default) preserves the strongest behaviour: when the broker
+    /// presents a certificate, the SCRAM exchange is bound to that TLS session
+    /// per RFC 5929 §4.1, so a stolen password is useless against a
+    /// man-in-the-middle. See [`AuthConfig::with_scram_channel_binding`] for
+    /// when to turn it off.
+    pub(crate) scram_channel_binding: bool,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            security_protocol: SecurityProtocol::default(),
+            sasl_mechanism: None,
+            plain_credentials: None,
+            scram_credentials: None,
+            aws_msk_iam_credentials: None,
+            aws_msk_iam_credential_provider: None,
+            oauthbearer_token: None,
+            oauthbearer_provider: None,
+            tls_config: None,
+            // Secure by default: bind SCRAM to the TLS session whenever the
+            // peer presents a certificate.
+            scram_channel_binding: true,
+        }
+    }
 }
 
 impl AuthConfig {
@@ -984,6 +1011,42 @@ impl AuthConfig {
     /// Returns the TLS configuration, if set.
     pub fn tls_config(&self) -> Option<&TlsConfig> {
         self.tls_config.as_ref()
+    }
+
+    /// Enable or disable `tls-server-end-point` channel binding for SCRAM.
+    ///
+    /// Default: **enabled**. When SCRAM runs over TLS and the broker presents
+    /// a certificate, the client sends a `p=tls-server-end-point` GS2 header
+    /// and binds the exchange to that TLS session (RFC 5802 §6, RFC 5929
+    /// §4.1). This is strictly stronger — it stops an attacker who has the
+    /// password from relaying the exchange through a MITM proxy.
+    ///
+    /// Pass `false` only when the broker does not implement RFC 5929. Such a
+    /// broker rejects the bound exchange with an opaque SASL failure and there
+    /// is no in-band way to detect it, so the escape hatch has to be explicit.
+    /// Turning this off downgrades SCRAM-over-TLS to unbound `n,,` framing.
+    ///
+    /// No effect on SASL_PLAINTEXT, where channel binding is never used.
+    ///
+    /// ```rust
+    /// use krafka::auth::AuthConfig;
+    /// // Broker predates RFC 5929 support:
+    /// let config = AuthConfig::sasl_scram_sha256("user", "pass")
+    ///     .with_scram_channel_binding(false);
+    /// assert!(!config.scram_channel_binding());
+    /// ```
+    #[must_use]
+    pub fn with_scram_channel_binding(mut self, enabled: bool) -> Self {
+        self.scram_channel_binding = enabled;
+        self
+    }
+
+    /// Whether `tls-server-end-point` channel binding is enabled for SCRAM.
+    ///
+    /// See [`Self::with_scram_channel_binding`]. Default: `true`.
+    #[inline]
+    pub fn scram_channel_binding(&self) -> bool {
+        self.scram_channel_binding
     }
 
     /// Construct an `AuthConfig` from standard Kafka environment variables.

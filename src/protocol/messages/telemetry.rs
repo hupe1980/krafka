@@ -1,3 +1,4 @@
+use crate::protocol::decode_capacity;
 use bytes::{Buf, BufMut, Bytes};
 
 use super::{VersionedDecode, VersionedEncode};
@@ -66,7 +67,8 @@ impl GetTelemetrySubscriptionsResponse {
 
         // AcceptedCompressionTypes — compact array of i8
         let ct_count = check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut accepted_compression_types = Vec::with_capacity(ct_count);
+        let mut accepted_compression_types =
+            Vec::with_capacity(decode_capacity(ct_count, buf.remaining()));
         for _ in 0..ct_count {
             accepted_compression_types.push(i8::decode(buf)?);
         }
@@ -85,7 +87,7 @@ impl GetTelemetrySubscriptionsResponse {
 
         // RequestedMetrics — compact array of compact strings
         let rm_count = check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut requested_metrics = Vec::with_capacity(rm_count);
+        let mut requested_metrics = Vec::with_capacity(decode_capacity(rm_count, buf.remaining()));
         for _ in 0..rm_count {
             let s = super::non_nullable_string(
                 "requested metric",

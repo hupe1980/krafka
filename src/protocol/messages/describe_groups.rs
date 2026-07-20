@@ -6,7 +6,9 @@ use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{
     Decode, Encode, KafkaBytes, KafkaString, TaggedFields, TryEncode,
 };
-use crate::protocol::{array_len_i32, check_compact_array_len, check_decode_array_len};
+use crate::protocol::{
+    array_len_i32, check_compact_array_len, check_decode_array_len, decode_capacity,
+};
 
 // ============================================================================
 // DescribeGroups API (Key 15)
@@ -113,7 +115,7 @@ impl DescribeGroupsResponse {
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let group_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut groups = Vec::with_capacity(group_count);
+        let mut groups = Vec::with_capacity(decode_capacity(group_count, buf.remaining()));
 
         for _ in 0..group_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -123,7 +125,7 @@ impl DescribeGroupsResponse {
             let protocol_data = non_nullable_string("protocol_data", KafkaString::decode(buf)?.0)?;
 
             let member_count = check_decode_array_len(i32::decode(buf)?)?;
-            let mut members = Vec::with_capacity(member_count);
+            let mut members = Vec::with_capacity(decode_capacity(member_count, buf.remaining()));
             for _ in 0..member_count {
                 let member_id = non_nullable_string("member_id", KafkaString::decode(buf)?.0)?;
                 let client_id = non_nullable_string("client_id", KafkaString::decode(buf)?.0)?;
@@ -164,7 +166,7 @@ impl DescribeGroupsResponse {
     pub fn decode_v3(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let group_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut groups = Vec::with_capacity(group_count);
+        let mut groups = Vec::with_capacity(decode_capacity(group_count, buf.remaining()));
 
         for _ in 0..group_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -174,7 +176,7 @@ impl DescribeGroupsResponse {
             let protocol_data = non_nullable_string("protocol_data", KafkaString::decode(buf)?.0)?;
 
             let member_count = check_decode_array_len(i32::decode(buf)?)?;
-            let mut members = Vec::with_capacity(member_count);
+            let mut members = Vec::with_capacity(decode_capacity(member_count, buf.remaining()));
             for _ in 0..member_count {
                 let member_id = non_nullable_string("member_id", KafkaString::decode(buf)?.0)?;
                 let client_id = non_nullable_string("client_id", KafkaString::decode(buf)?.0)?;
@@ -217,7 +219,7 @@ impl DescribeGroupsResponse {
     pub fn decode_v4(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let group_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut groups = Vec::with_capacity(group_count);
+        let mut groups = Vec::with_capacity(decode_capacity(group_count, buf.remaining()));
 
         for _ in 0..group_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -227,7 +229,7 @@ impl DescribeGroupsResponse {
             let protocol_data = non_nullable_string("protocol_data", KafkaString::decode(buf)?.0)?;
 
             let member_count = check_decode_array_len(i32::decode(buf)?)?;
-            let mut members = Vec::with_capacity(member_count);
+            let mut members = Vec::with_capacity(decode_capacity(member_count, buf.remaining()));
             for _ in 0..member_count {
                 let member_id = non_nullable_string("member_id", KafkaString::decode(buf)?.0)?;
                 let group_instance_id = KafkaString::decode(buf)?.0;
@@ -272,7 +274,7 @@ impl DescribeGroupsResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let group_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut groups = Vec::with_capacity(group_count);
+        let mut groups = Vec::with_capacity(decode_capacity(group_count, buf.remaining()));
 
         for _ in 0..group_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -286,7 +288,7 @@ impl DescribeGroupsResponse {
 
             let member_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut members = Vec::with_capacity(member_count);
+            let mut members = Vec::with_capacity(decode_capacity(member_count, buf.remaining()));
             for _ in 0..member_count {
                 let member_id =
                     non_nullable_string("member_id", KafkaString::decode_compact(buf)?.0)?;
@@ -338,7 +340,7 @@ impl DescribeGroupsResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let group_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut groups = Vec::with_capacity(group_count);
+        let mut groups = Vec::with_capacity(decode_capacity(group_count, buf.remaining()));
 
         for _ in 0..group_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -353,7 +355,7 @@ impl DescribeGroupsResponse {
 
             let member_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut members = Vec::with_capacity(member_count);
+            let mut members = Vec::with_capacity(decode_capacity(member_count, buf.remaining()));
             for _ in 0..member_count {
                 let member_id =
                     non_nullable_string("member_id", KafkaString::decode_compact(buf)?.0)?;

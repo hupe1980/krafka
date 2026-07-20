@@ -26,6 +26,12 @@ pub enum AcknowledgementMode {
 ///
 /// Used with [`ShareConsumer::acknowledge`](super::ShareConsumer::acknowledge)
 /// in explicit acknowledgement mode.
+///
+/// The discriminants are the wire values from KIP-932 (extended by KIP-1222):
+/// `1 = Accept`, `2 = Release`, `3 = Reject`, `4 = Renew`. Wire value `0` is
+/// "gap", which applications never choose — the client emits it on their behalf
+/// for offsets it acquired but could not decode, so the broker archives them
+/// instead of redelivering them forever.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcknowledgeType {
@@ -35,8 +41,20 @@ pub enum AcknowledgeType {
     Release = 2,
     /// Reject the record (move to dead-letter topic or discard). Wire value: 3.
     Reject = 3,
-    /// Archive the record (move to archive storage, no redelivery). Wire value: 4.
-    Archive = 4,
+    /// Renew the acquisition lock, extending the delivery deadline without
+    /// completing the record (KIP-1222, Kafka 4.2+). Wire value: 4.
+    ///
+    /// Use this for long-running processing that would otherwise exceed
+    /// `group.share.record.lock.duration.ms` and have the record redelivered
+    /// to another consumer.
+    ///
+    /// Brokers older than Kafka 4.2 do not understand this type and reject the
+    /// **entire** acknowledgement batch with `INVALID_REQUEST`. The client
+    /// therefore drops `Renew` acknowledgements when the negotiated
+    /// `ShareFetch`/`ShareAcknowledge` version is below 2, logging a warning;
+    /// the acquisition lock then simply expires, which is the same outcome as
+    /// not renewing at all.
+    Renew = 4,
 }
 
 impl AcknowledgeType {

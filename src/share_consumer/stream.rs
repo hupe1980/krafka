@@ -19,12 +19,21 @@ type RecvFuture<'a> = Pin<Box<dyn Future<Output = Result<Option<ConsumerRecord>>
 /// the consumer's `recv()` method, which internally calls `poll()` when the
 /// internal buffer is empty.
 ///
+/// The stream ends **only** when the consumer is closed. An idle topic makes
+/// the stream pend rather than terminate, so a
+/// `while let Some(record) = stream.next().await` loop keeps running across
+/// quiet periods.
+///
+/// Dropping the stream mid-poll is safe: acknowledgements drained by the
+/// in-flight `poll()` are re-queued rather than lost.
+///
 /// This type also implements [`FusedStream`], so stream combinators such as
 /// `futures::stream::select` can detect termination without an extra poll.
 pub struct ShareConsumerStream<'a> {
     consumer: &'a ShareConsumer,
     fut: Option<RecvFuture<'a>>,
-    /// Set to `true` once `recv()` returns `Ok(None)` (consumer closed).
+    /// Set to `true` once `recv()` returns `Ok(None)`, which happens only when
+    /// the consumer has been closed.
     done: bool,
 }
 
@@ -58,6 +67,8 @@ impl Stream for ShareConsumerStream<'_> {
                 this.fut = None;
                 match result {
                     Ok(Some(record)) => Poll::Ready(Some(Ok(record))),
+                    // `recv()` returns `Ok(None)` only on close, so latching
+                    // termination here cannot end the stream on an idle topic.
                     Ok(None) => {
                         this.done = true;
                         Poll::Ready(None)

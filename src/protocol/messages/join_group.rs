@@ -6,7 +6,9 @@ use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{
     Decode, Encode, KafkaBytes, KafkaString, TaggedFields, TryEncode,
 };
-use crate::protocol::{array_len_i32, check_compact_array_len, check_decode_array_len};
+use crate::protocol::{
+    array_len_i32, check_compact_array_len, check_decode_array_len, decode_capacity,
+};
 
 // ============================================================================
 // JoinGroup request/response
@@ -190,7 +192,7 @@ impl JoinGroupResponse {
         let member_id = non_nullable_string("member_id", KafkaString::decode(buf)?.0)?;
 
         let member_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut members = Vec::with_capacity(member_count);
+        let mut members = Vec::with_capacity(decode_capacity(member_count, buf.remaining()));
         for _ in 0..member_count {
             let m_id = non_nullable_string("member_id", KafkaString::decode(buf)?.0)?;
             let metadata = non_nullable_bytes("member metadata", KafkaBytes::decode(buf)?.0)?;
@@ -224,7 +226,7 @@ impl JoinGroupResponse {
         let member_id = non_nullable_string("member_id", KafkaString::decode(buf)?.0)?;
 
         let member_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut members = Vec::with_capacity(member_count);
+        let mut members = Vec::with_capacity(decode_capacity(member_count, buf.remaining()));
         for _ in 0..member_count {
             let m_id = non_nullable_string("member_id", KafkaString::decode(buf)?.0)?;
             let group_instance_id = KafkaString::decode(buf)?.0;
@@ -260,7 +262,7 @@ impl JoinGroupResponse {
 
         let member_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut members = Vec::with_capacity(member_count);
+        let mut members = Vec::with_capacity(decode_capacity(member_count, buf.remaining()));
         for _ in 0..member_count {
             let m_id = non_nullable_string("member_id", KafkaString::decode_compact(buf)?.0)?;
             let group_instance_id = KafkaString::decode_compact(buf)?.0;
@@ -300,7 +302,7 @@ impl JoinGroupResponse {
 
         let member_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut members = Vec::with_capacity(member_count);
+        let mut members = Vec::with_capacity(decode_capacity(member_count, buf.remaining()));
         for _ in 0..member_count {
             let m_id = non_nullable_string("member_id", KafkaString::decode_compact(buf)?.0)?;
             let group_instance_id = KafkaString::decode_compact(buf)?.0;
@@ -341,7 +343,7 @@ impl JoinGroupResponse {
 
         let member_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut members = Vec::with_capacity(member_count);
+        let mut members = Vec::with_capacity(decode_capacity(member_count, buf.remaining()));
         for _ in 0..member_count {
             let m_id = non_nullable_string("member_id", KafkaString::decode_compact(buf)?.0)?;
             let group_instance_id = KafkaString::decode_compact(buf)?.0;

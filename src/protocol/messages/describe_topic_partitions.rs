@@ -3,7 +3,7 @@ use bytes::{Buf, BufMut};
 use super::{VersionedDecode, VersionedEncode, non_nullable_string};
 use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
-use crate::protocol::{check_compact_array_len, encode_compact_array_len};
+use crate::protocol::{check_compact_array_len, decode_capacity, encode_compact_array_len};
 
 // ============================================================================
 // DescribeTopicPartitions API (Key 75)
@@ -47,13 +47,16 @@ impl DescribeTopicPartitionsRequest {
             TaggedFields::default().try_encode(buf)?;
         }
         self.response_partition_limit.encode(buf);
+        // Nullable struct in a flexible version: a single signed presence byte
+        // precedes the struct. `-1` means null; `1` means the struct fields
+        // follow. The presence byte is written in *both* branches — omitting it
+        // for the present case desynchronises the broker's reader.
         match &self.cursor {
             None => {
-                // Nullable struct: tag byte 0xFF means null for tagged structs… actually
-                // for nullable structs in flexible, 0xFF = null
-                buf.put_u8(0xFF);
+                buf.put_i8(-1);
             }
             Some(c) => {
+                buf.put_i8(1);
                 KafkaString::new(&c.topic_name).try_encode_compact(buf)?;
                 c.partition_index.encode(buf);
                 TaggedFields::default().try_encode(buf)?;
@@ -116,6 +119,50 @@ pub struct DescribeTopicPartitionsResponse {
 }
 
 impl DescribeTopicPartitionsResponse {
+    /// Decode the trailing nullable `next_cursor` struct and the response-level
+    /// tagged fields.
+    ///
+    /// Non-tagged nullable structs in flexible versions use a single signed
+    /// byte as a presence marker: a negative value (the broker writes `-1`)
+    /// means null, `1` means the struct fields follow. This mirrors the Kafka
+    /// generator's reader:
+    /// `if (_readable.readByte() < 0) { … null … } else { … read struct … }`.
+    ///
+    /// An exhausted buffer is a truncated frame, not a well-formed final page:
+    /// the marker is mandatory, so a response that ends before it is malformed.
+    fn decode_next_cursor(buf: &mut impl Buf) -> Result<Option<DescribeTopicPartitionsCursor>> {
+        if buf.remaining() < 1 {
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
+                "not enough bytes for next_cursor presence tag",
+            ));
+        }
+        let presence = buf.get_i8();
+        if presence < 0 {
+            // Null cursor — only the response-level tagged fields remain.
+            let _ = TaggedFields::decode(buf)?;
+            return Ok(None);
+        }
+        if presence != 1 {
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::Malformed,
+                format!(
+                    "invalid next_cursor presence tag: expected negative for null or 1 for present, got {presence}"
+                ),
+            ));
+        }
+
+        let topic_name = non_nullable_string("cursor topic", KafkaString::decode_compact(buf)?.0)?;
+        let partition_index = i32::decode(buf)?;
+        // Cursor struct tagged fields, then response-level tagged fields.
+        let _ = TaggedFields::decode(buf)?;
+        let _ = TaggedFields::decode(buf)?;
+        Ok(Some(DescribeTopicPartitionsCursor {
+            topic_name,
+            partition_index,
+        }))
+    }
+
     /// Helper: decode compact nullable i32 array.
     fn decode_compact_nullable_i32_array(buf: &mut impl Buf) -> Result<Option<Vec<i32>>> {
         let raw = crate::util::varint::decode_unsigned_varint(buf)?;
@@ -123,7 +170,7 @@ impl DescribeTopicPartitionsResponse {
             return Ok(None);
         }
         let count = check_compact_array_len(raw)?;
-        let mut arr = Vec::with_capacity(count);
+        let mut arr = Vec::with_capacity(decode_capacity(count, buf.remaining()));
         for _ in 0..count {
             arr.push(i32::decode(buf)?);
         }
@@ -135,7 +182,7 @@ impl DescribeTopicPartitionsResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let topic_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut topics = Vec::with_capacity(topic_count);
+        let mut topics = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
 
         for _ in 0..topic_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -152,7 +199,7 @@ impl DescribeTopicPartitionsResponse {
 
             let part_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut partitions = Vec::with_capacity(part_count);
+            let mut partitions = Vec::with_capacity(decode_capacity(part_count, buf.remaining()));
             for _ in 0..part_count {
                 let p_error_code = ErrorCode::from_i16(i16::decode(buf)?);
                 let partition_index = i32::decode(buf)?;
@@ -161,14 +208,15 @@ impl DescribeTopicPartitionsResponse {
 
                 let replica_count =
                     check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-                let mut replica_nodes = Vec::with_capacity(replica_count);
+                let mut replica_nodes =
+                    Vec::with_capacity(decode_capacity(replica_count, buf.remaining()));
                 for _ in 0..replica_count {
                     replica_nodes.push(i32::decode(buf)?);
                 }
 
                 let isr_count =
                     check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-                let mut isr_nodes = Vec::with_capacity(isr_count);
+                let mut isr_nodes = Vec::with_capacity(decode_capacity(isr_count, buf.remaining()));
                 for _ in 0..isr_count {
                     isr_nodes.push(i32::decode(buf)?);
                 }
@@ -178,7 +226,8 @@ impl DescribeTopicPartitionsResponse {
 
                 let offline_count =
                     check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-                let mut offline_replicas = Vec::with_capacity(offline_count);
+                let mut offline_replicas =
+                    Vec::with_capacity(decode_capacity(offline_count, buf.remaining()));
                 for _ in 0..offline_count {
                     offline_replicas.push(i32::decode(buf)?);
                 }
@@ -210,28 +259,15 @@ impl DescribeTopicPartitionsResponse {
             });
         }
 
-        // Decode next_cursor (nullable struct)
-        // For nullable structs in flexible encoding, 0xFF byte means null
-        let next_cursor = if buf.remaining() > 0 {
-            let marker = buf.chunk()[0];
-            if marker == 0xFF {
-                buf.advance(1);
-                let _ = TaggedFields::decode(buf)?;
-                None
-            } else {
-                let topic_name =
-                    non_nullable_string("cursor topic", KafkaString::decode_compact(buf)?.0)?;
-                let partition_index = i32::decode(buf)?;
-                let _ = TaggedFields::decode(buf)?;
-                let _ = TaggedFields::decode(buf)?;
-                Some(DescribeTopicPartitionsCursor {
-                    topic_name,
-                    partition_index,
-                })
-            }
-        } else {
-            None
-        };
+        // Decode next_cursor (nullable struct).
+        //
+        // Non-tagged nullable structs in flexible versions are prefixed with a
+        // single signed presence byte: negative (the broker writes `-1`) means
+        // null, `1` means the struct fields follow. The presence byte must be
+        // consumed in *both* branches — reading the struct starting at the
+        // marker would parse `0x01` as a compact-string length and shift every
+        // subsequent field.
+        let next_cursor = Self::decode_next_cursor(buf)?;
 
         Ok(Self {
             throttle_time_ms,
@@ -309,7 +345,7 @@ mod tests {
         assert_eq!(name, b"t1");
         assert_eq!(cur.get_u8(), 0); // topic tagged fields
         assert_eq!(cur.get_i32(), 500); // response_partition_limit
-        assert_eq!(cur.get_u8(), 0xFF); // null cursor
+        assert_eq!(cur.get_i8(), -1); // null cursor presence byte
         assert_eq!(cur.get_u8(), 0); // top-level tagged fields
         assert!(cur.is_empty());
     }
@@ -333,7 +369,8 @@ mod tests {
         cur.advance(2); // "t1"
         assert_eq!(cur.get_u8(), 0); // topic tagged fields
         assert_eq!(cur.get_i32(), 100); // limit
-        // cursor present: compact string then i32 then tagged fields
+        // Nullable struct: presence byte 1, then compact string, i32, tagged fields.
+        assert_eq!(cur.get_i8(), 1, "present cursor must be prefixed with 1");
         let cursor_name_v = varint::decode_unsigned_varint(&mut cur).unwrap();
         assert_eq!(cursor_name_v, 3); // len("t1") + 1
         cur.advance(2); // "t1"
@@ -368,7 +405,7 @@ mod tests {
         put_tagged_fields(&mut buf); // partition tagged fields
         buf.put_i32(0); // topic_authorized_operations
         put_tagged_fields(&mut buf); // topic tagged fields
-        buf.put_u8(0xFF); // null cursor
+        buf.put_i8(-1); // null cursor presence byte
         put_tagged_fields(&mut buf); // top-level tagged fields
 
         let resp = DescribeTopicPartitionsResponse::decode_v0(&mut buf.freeze()).unwrap();
@@ -396,7 +433,8 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.put_i32(0); // throttle_time_ms
         varint::encode_unsigned_varint(1, &mut buf); // 0 topics
-        // cursor present
+        // cursor present: presence byte 1, then the struct fields
+        buf.put_i8(1);
         put_compact_string(&mut buf, Some("next")); // cursor topic_name
         buf.put_i32(10); // cursor partition_index
         put_tagged_fields(&mut buf); // cursor tagged fields
@@ -408,5 +446,100 @@ mod tests {
         let cursor = resp.next_cursor.as_ref().unwrap();
         assert_eq!(cursor.topic_name, "next");
         assert_eq!(cursor.partition_index, 10);
+    }
+
+    // ── Regression: nullable-struct presence byte ──────────────────────
+
+    /// The presence byte must be consumed before the struct fields.
+    ///
+    /// Previously the non-null branch began decoding `topic_name` *at* the
+    /// marker, so `0x01` was read as a compact-string length (yielding an empty
+    /// name) and `partition_index` then consumed the first four bytes of the
+    /// real topic name. Pagination silently walked the wrong cursor.
+    #[test]
+    fn decode_v0_cursor_does_not_consume_presence_byte_as_string_len() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        varint::encode_unsigned_varint(1, &mut buf); // 0 topics
+        buf.put_i8(1); // cursor present
+        put_compact_string(&mut buf, Some("orders"));
+        buf.put_i32(7);
+        put_tagged_fields(&mut buf); // cursor tagged fields
+        put_tagged_fields(&mut buf); // top-level tagged fields
+
+        let resp = DescribeTopicPartitionsResponse::decode_v0(&mut buf.freeze()).unwrap();
+        let cursor = resp.next_cursor.expect("cursor must be present");
+        assert_eq!(cursor.topic_name, "orders");
+        assert_eq!(cursor.partition_index, 7);
+    }
+
+    /// Encode and decode must agree on the wire format for a present cursor.
+    ///
+    /// The request encoder's trailing bytes (the nullable cursor struct plus
+    /// the message-level tagged fields) are byte-for-byte what the response
+    /// decoder expects in the same position, so feeding one to the other is a
+    /// true round trip through both encode and decode.
+    #[test]
+    fn cursor_encode_decode_agree_on_presence_byte() {
+        let req = DescribeTopicPartitionsRequest {
+            topics: vec![],
+            response_partition_limit: 0,
+            cursor: Some(DescribeTopicPartitionsCursor {
+                topic_name: "events".to_string(),
+                partition_index: 42,
+            }),
+        };
+        let mut enc = BytesMut::new();
+        req.encode_v0(&mut enc).unwrap();
+
+        // Skip the request-only prefix: the empty topics compact array (one
+        // varint byte) and `response_partition_limit` (four bytes).
+        let mut cur = &enc[..];
+        assert_eq!(varint::decode_unsigned_varint(&mut cur).unwrap(), 1);
+        assert_eq!(cur.get_i32(), 0);
+        let cursor_and_tail = cur.to_vec();
+
+        // The first of those bytes must be the presence marker.
+        assert_eq!(
+            cursor_and_tail[0], 1,
+            "present cursor must be prefixed with 1"
+        );
+
+        let mut resp_buf = BytesMut::new();
+        resp_buf.put_i32(0); // throttle_time_ms
+        varint::encode_unsigned_varint(1, &mut resp_buf); // 0 topics
+        resp_buf.put_slice(&cursor_and_tail);
+
+        let resp = DescribeTopicPartitionsResponse::decode_v0(&mut resp_buf.freeze()).unwrap();
+        let cursor = resp
+            .next_cursor
+            .expect("cursor must survive the round trip");
+        assert_eq!(cursor.topic_name, "events");
+        assert_eq!(cursor.partition_index, 42);
+    }
+
+    /// An exhausted buffer is a truncated frame, not a well-formed final page.
+    #[test]
+    fn decode_v0_missing_cursor_marker_is_truncated_frame() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        varint::encode_unsigned_varint(1, &mut buf); // 0 topics
+        // ...and nothing else: the presence byte is missing.
+
+        let err = DescribeTopicPartitionsResponse::decode_v0(&mut buf.freeze()).unwrap_err();
+        assert!(
+            format!("{err}").contains("presence tag"),
+            "expected a truncated-frame error, got: {err}"
+        );
+    }
+
+    /// A presence byte that is neither negative nor exactly 1 is malformed.
+    #[test]
+    fn decode_v0_rejects_bogus_cursor_marker() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0);
+        varint::encode_unsigned_varint(1, &mut buf); // 0 topics
+        buf.put_i8(7); // neither -1 nor 1
+        assert!(DescribeTopicPartitionsResponse::decode_v0(&mut buf.freeze()).is_err());
     }
 }

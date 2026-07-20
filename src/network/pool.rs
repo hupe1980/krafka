@@ -2,13 +2,12 @@
 //!
 //! This module provides:
 //! - **Connection pooling**: Reuse connections across requests
-//! - **Multi-connection bundles**: Multiple connections per broker for extreme throughput
 //! - **Automatic reconnection**: Exponential backoff retry on connection failures
-//! - **Round-robin selection**: Load balance requests across connection bundles
+//! - **One connection per broker**: a single multiplexed socket per broker,
+//!   matching the Apache Kafka Java client
 
 use ahash::AHashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
@@ -141,195 +140,6 @@ impl ConnectionRetryConfigBuilder {
 }
 
 // ============================================================================
-// Connection Bundle
-// ============================================================================
-
-/// A bundle of connections to a single broker.
-///
-/// For extreme high-throughput scenarios (>100k msg/s per broker), multiple
-/// TCP connections can parallelize I/O operations. This bundle manages
-/// multiple connections and distributes requests using round-robin selection.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// // Create a bundle with 4 connections for high-throughput
-/// let config = ConnectionConfig::builder()
-///     .connections_per_broker(4)
-///     .build();
-///
-/// let bundle = BrokerConnectionBundle::connect("broker-1:9092", config).await?;
-/// let conn = bundle.select(); // Round-robin selection
-/// ```
-pub struct BrokerConnectionBundle {
-    /// Address of the broker.
-    address: String,
-    /// Connections in the bundle.
-    connections: Vec<Arc<BrokerConnection>>,
-    /// Round-robin counter for connection selection.
-    counter: AtomicUsize,
-}
-
-impl BrokerConnectionBundle {
-    /// Create a new connection bundle with the configured number of connections.
-    ///
-    /// Connections are established in parallel for faster startup.
-    pub async fn connect(address: &str, config: ConnectionConfig) -> Result<Self> {
-        let num_connections = config.connections_per_broker.max(1);
-
-        if num_connections == 1 {
-            // Fast path for single connection (most common case)
-            let conn = BrokerConnection::connect(address, config).await?;
-            return Ok(Self {
-                address: address.to_string(),
-                connections: vec![Arc::new(conn)],
-                counter: AtomicUsize::new(0),
-            });
-        }
-
-        // Establish multiple connections in parallel
-        let addr_owned = address.to_string();
-        let mut handles = Vec::with_capacity(num_connections);
-        for _ in 0..num_connections {
-            let addr = addr_owned.clone();
-            let cfg = config.clone();
-            handles.push(tokio::spawn(async move {
-                BrokerConnection::connect(&addr, cfg).await
-            }));
-        }
-
-        // Collect results — on any error, close already-established connections
-        // before returning so their event-loop tasks exit promptly instead of
-        // idling until the last Arc clone is dropped.
-        let mut connections = Vec::with_capacity(num_connections);
-        for handle in handles {
-            let result = handle
-                .await
-                .map_err(|e| KrafkaError::invalid_state(format!("Connection task failed: {e}")))?;
-            match result {
-                Ok(conn) => connections.push(Arc::new(conn)),
-                Err(e) => {
-                    // Gracefully close the connections established so far.
-                    for already_connected in connections {
-                        already_connected.close().await;
-                    }
-                    return Err(e);
-                }
-            }
-        }
-
-        debug!(
-            "Created connection bundle with {} connections to {}",
-            connections.len(),
-            addr_owned
-        );
-
-        Ok(Self {
-            address: addr_owned,
-            connections,
-            counter: AtomicUsize::new(0),
-        })
-    }
-
-    /// Get a connection using round-robin selection.
-    ///
-    /// This is the primary way to get a connection for sending requests.
-    /// For single-connection bundles, this always returns the same connection.
-    #[inline]
-    pub fn select(&self) -> Arc<BrokerConnection> {
-        if self.connections.len() == 1 {
-            return self.connections[0].clone();
-        }
-
-        let index = self.counter.fetch_add(1, Ordering::Relaxed) % self.connections.len();
-        self.connections[index].clone()
-    }
-
-    /// Get a specific connection by index.
-    ///
-    /// Useful for request affinity scenarios where you want to ensure
-    /// related requests go to the same connection.
-    #[inline]
-    pub fn get(&self, index: usize) -> Option<Arc<BrokerConnection>> {
-        self.connections
-            .get(index % self.connections.len())
-            .cloned()
-    }
-
-    /// Get the first connection (useful for single-connection bundles).
-    #[inline]
-    pub fn first(&self) -> Arc<BrokerConnection> {
-        self.connections[0].clone()
-    }
-
-    /// Get the address of the broker.
-    #[inline]
-    pub fn address(&self) -> &str {
-        &self.address
-    }
-
-    /// Get the number of connections in the bundle.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.connections.len()
-    }
-
-    /// Check if the bundle is empty (should never be true).
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.connections.is_empty()
-    }
-
-    /// Check if all connections in the bundle are usable (alive and
-    /// not past their SASL session expiry).
-    #[inline]
-    pub fn all_usable(&self) -> bool {
-        self.connections.iter().all(|c| c.is_usable())
-    }
-
-    /// Check if any connection in the bundle is usable.
-    #[inline]
-    pub fn any_usable(&self) -> bool {
-        self.connections.iter().any(|c| c.is_usable())
-    }
-
-    /// Get the number of usable connections.
-    #[inline]
-    pub fn usable_count(&self) -> usize {
-        self.connections.iter().filter(|c| c.is_usable()).count()
-    }
-
-    /// Select a usable connection.
-    ///
-    /// Uses round-robin selection but skips dead or session-expired connections.
-    /// Returns None if no usable connection exists.
-    pub fn select_usable(&self) -> Option<Arc<BrokerConnection>> {
-        let len = self.connections.len();
-        if len == 0 {
-            return None;
-        }
-        let start = self.counter.fetch_add(1, Ordering::Relaxed) % len;
-
-        // Check up to len connections starting from the round-robin position
-        for i in 0..len {
-            let index = (start + i) % len;
-            if self.connections[index].is_usable() {
-                return Some(self.connections[index].clone());
-            }
-        }
-
-        None
-    }
-
-    /// Close all connections in the bundle.
-    pub async fn close_all(&self) {
-        for conn in &self.connections {
-            conn.close().await;
-        }
-    }
-}
-
-// ============================================================================
 // Connection Pool
 // ============================================================================
 
@@ -341,6 +151,12 @@ impl BrokerConnectionBundle {
 /// accumulating sockets to rotated-out brokers on long-lived clients whose
 /// metadata churns (broker scale-up/down, topic drift).
 pub const DEFAULT_MAX_IDLE: Duration = Duration::from_secs(9 * 60);
+
+/// Total budget for [`ConnectionPool::close_all`] to drain every connection.
+///
+/// Shutdown must make progress even when a broker has stopped reading and an
+/// event loop is stuck mid-write.
+const CLOSE_ALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Waiters for coalesced reconnection attempts, keyed by address.
 type ConnectingWaiters = AHashMap<String, Vec<oneshot::Sender<Result<Arc<BrokerConnection>>>>>;
@@ -582,14 +398,54 @@ impl ConnectionPool {
         self.config.refresh_tls().await
     }
 
+    /// Wall-clock budget for a single `BrokerConnection::connect` attempt.
+    ///
+    /// `connect_timeout` bounds TCP establishment only; TLS and the SASL
+    /// handshake each get their own budget of the same size inside `connect`.
+    /// Three times `connect_timeout` therefore covers the whole attempt with
+    /// margin, and guarantees that a peer which completes TCP and then stalls
+    /// cannot hold the pool's per-address `connecting` slot open forever.
+    fn connect_attempt_budget(&self) -> Duration {
+        self.config
+            .connect_timeout
+            .saturating_mul(3)
+            .max(Duration::from_secs(1))
+    }
+
+    /// Wall-clock budget for a full `reconnect_with_backoff` call.
+    ///
+    /// Every attempt plus every inter-attempt backoff, so waiters can derive a
+    /// timeout of their own instead of parking on a bare `rx.await`.
+    fn total_reconnect_budget(&self) -> Duration {
+        let attempts = self.retry_config.max_retries.saturating_add(1);
+        let attempt_cost = self.connect_attempt_budget().saturating_mul(attempts);
+        let backoff_cost = self
+            .retry_config
+            .max_backoff()
+            .saturating_mul(self.retry_config.max_retries);
+        attempt_cost.saturating_add(backoff_cost)
+    }
+
     /// Attempt to connect with exponential backoff retry logic.
     ///
-    /// This method will retry connection attempts up to `max_retries` times,
-    /// with exponential backoff between attempts.
+    /// Retries up to `max_retries` times with exponential backoff. Each
+    /// attempt is bounded by [`Self::connect_attempt_budget`] and the loop as
+    /// a whole by [`Self::total_reconnect_budget`], so a hostile or hung
+    /// broker cannot pin the caller — or, through the coalescing `connecting`
+    /// map, every other task waiting on the same address — indefinitely.
     async fn reconnect_with_backoff(&self, address: &str) -> Result<Arc<BrokerConnection>> {
         let mut last_error: Option<KrafkaError> = None;
+        let overall_deadline = tokio::time::Instant::now() + self.total_reconnect_budget();
 
         for attempt in 0..=self.retry_config.max_retries {
+            if tokio::time::Instant::now() >= overall_deadline {
+                warn!(
+                    address = %address,
+                    attempt = attempt,
+                    "Reconnect budget exhausted; giving up"
+                );
+                break;
+            }
             // Apply backoff delay for retry attempts (not the first attempt)
             if attempt > 0 {
                 let backoff = self.retry_config.calculate_backoff(attempt);
@@ -603,7 +459,23 @@ impl ConnectionPool {
                 tokio::time::sleep(backoff).await;
             }
 
-            match BrokerConnection::connect(address, self.config.clone()).await {
+            let attempt_deadline =
+                (tokio::time::Instant::now() + self.connect_attempt_budget()).min(overall_deadline);
+            let attempt_result = match tokio::time::timeout_at(
+                attempt_deadline,
+                BrokerConnection::connect(address, self.config.clone()),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => Err(KrafkaError::timeout(format!(
+                    "connection to {address} did not complete within {:?} \
+                     (TCP established but handshake stalled?)",
+                    self.connect_attempt_budget()
+                ))),
+            };
+
+            match attempt_result {
                 Ok(conn) => {
                     if attempt > 0 {
                         info!(
@@ -712,12 +584,30 @@ impl ConnectionPool {
         let addr_owned = match action {
             CoalesceAction::AlreadyConnected(conn) => return Ok(conn),
             CoalesceAction::WaitForPeer(rx) => {
-                return rx.await.map_err(|_| {
-                    KrafkaError::network(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionReset,
-                        format!("reconnection to {address} was cancelled"),
-                    ))
-                })?;
+                // Never park on a bare `rx.await`. The peer performing the
+                // handshake is bounded by `total_reconnect_budget`, but if
+                // that task is cancelled in a way that skips `ReconnectGuard`
+                // (or simply overruns), an unbounded wait here would wedge
+                // every caller for this address permanently. Allow the peer
+                // its full budget plus a grace period, then fail retriably.
+                let waiter_budget = self.total_reconnect_budget() + Duration::from_secs(1);
+                return tokio::time::timeout(waiter_budget, rx)
+                    .await
+                    .map_err(|_| {
+                        KrafkaError::network(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "timed out after {waiter_budget:?} waiting for an in-flight \
+                                 reconnection to {address}"
+                            ),
+                        ))
+                    })?
+                    .map_err(|_| {
+                        KrafkaError::network(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            format!("reconnection to {address} was cancelled"),
+                        ))
+                    })?;
             }
             CoalesceAction::Reconnect(addr_owned) => addr_owned,
         };
@@ -972,6 +862,13 @@ impl ConnectionPool {
     /// callers simply lose the background sweep and can call
     /// [`Self::evict_idle`] explicitly instead.
     pub fn start_idle_evictor(self: &Arc<Self>) {
+        // Started unconditionally and *first*: OAUTHBEARER refresh is not part
+        // of idle eviction and must survive both early returns below
+        // (`max_idle == None` is a supported configuration). Coupling the two
+        // meant the cached token was never refreshed, so every reconnect after
+        // the real `exp` re-sent a dead JWT and locked the client out.
+        self.start_token_refresh();
+
         let Some(max_idle) = self.max_idle else {
             return;
         };
@@ -1008,19 +905,41 @@ impl ConnectionPool {
         if let Some(prev) = self.evictor_handle.lock().replace(handle) {
             prev.abort();
         }
+    }
 
-        // If the pool's auth config has an OAUTHBEARER provider, start the
-        // proactive token-refresh background task as well.
-        if let Some(provider) = self
+    /// Start the background OAUTHBEARER proactive token-refresh task.
+    ///
+    /// No-op unless the pool's [`AuthConfig`](crate::auth::AuthConfig) carries
+    /// an OAUTHBEARER *provider* (a static token has nothing to refresh), and
+    /// no-op outside a Tokio runtime.
+    ///
+    /// Idempotent: a second call aborts the previous task before installing
+    /// the new one. [`Self::close_all`] aborts it.
+    ///
+    /// Deliberately **independent of idle eviction**. Token refresh is a
+    /// credential-lifetime concern, not a connection-hygiene one, and must run
+    /// even when `max_idle` is `None`. [`Self::start_idle_evictor`] and
+    /// [`Self::start`] both call it, so most callers never need it directly.
+    pub fn start_token_refresh(self: &Arc<Self>) {
+        let Some(provider) = self
             .config
             .auth
             .as_ref()
             .and_then(|a| a.oauthbearer_provider())
-        {
-            let refresh_handle = provider.start_refresh_task();
-            if let Some(prev) = self.oauth_refresh_handle.lock().replace(refresh_handle) {
-                prev.abort();
-            }
+        else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            warn!(
+                "start_token_refresh called outside a Tokio runtime; OAUTHBEARER \
+                 proactive refresh disabled. Tokens are still refreshed lazily on \
+                 the connection path."
+            );
+            return;
+        }
+        let refresh_handle = provider.start_refresh_task();
+        if let Some(prev) = self.oauth_refresh_handle.lock().replace(refresh_handle) {
+            prev.abort();
         }
     }
 
@@ -1071,9 +990,23 @@ impl ConnectionPool {
             }
         }
 
-        // Close connections outside any lock.
-        for conn in seen.into_values() {
-            conn.close().await;
+        // Close connections outside any lock, concurrently and under a total
+        // deadline. Sequential `close().await` meant one connection whose
+        // event loop was wedged in `write_all` blocked shutdown of every
+        // other connection behind it. `BrokerConnection::close` is itself
+        // bounded, but joining concurrently also keeps total shutdown time at
+        // O(slowest) rather than O(sum).
+        let closes = seen
+            .into_values()
+            .map(|conn| async move { conn.close().await });
+        if tokio::time::timeout(CLOSE_ALL_TIMEOUT, futures::future::join_all(closes))
+            .await
+            .is_err()
+        {
+            warn!(
+                "close_all timed out after {CLOSE_ALL_TIMEOUT:?}; remaining sockets \
+                 will be torn down when their last Arc drops"
+            );
         }
     }
 
@@ -1169,27 +1102,6 @@ mod tests {
             pool.retry_config.initial_backoff(),
             Duration::from_millis(50)
         );
-    }
-
-    #[test]
-    fn test_connections_per_broker_config() {
-        // Default is 1
-        let config = ConnectionConfig::default();
-        assert_eq!(config.connections_per_broker, 1);
-
-        // Custom value
-        let config = ConnectionConfig::builder()
-            .connections_per_broker(4)
-            .build()
-            .unwrap();
-        assert_eq!(config.connections_per_broker, 4);
-
-        // Zero becomes 1 (minimum)
-        let config = ConnectionConfig::builder()
-            .connections_per_broker(0)
-            .build()
-            .unwrap();
-        assert_eq!(config.connections_per_broker, 1);
     }
 
     #[tokio::test]
@@ -1354,5 +1266,81 @@ mod tests {
             .with_max_total_connections(5usize)
             .with_max_total_connections(None);
         assert_eq!(pool.max_total_connections(), None);
+    }
+
+    // ── OAUTHBEARER refresh must not be coupled to idle eviction ───────
+
+    fn oauth_pool_config() -> ConnectionConfig {
+        ConnectionConfig::builder()
+            .auth(crate::auth::AuthConfig::sasl_oauthbearer_provider(
+                || async { Ok(crate::auth::OAuthBearerToken::new("jwt")) },
+            ))
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_token_refresh_starts_even_when_idle_eviction_disabled() {
+        // `with_max_idle(None)` is a documented, supported configuration. It
+        // used to take an early return that also skipped `start_refresh_task`,
+        // leaving one JWT cached for the whole process lifetime.
+        let pool = Arc::new(ConnectionPool::new(oauth_pool_config()).with_max_idle(None));
+        pool.start_idle_evictor();
+
+        assert!(
+            pool.evictor_handle.lock().is_none(),
+            "eviction is disabled, as configured"
+        );
+        assert!(
+            pool.oauth_refresh_handle.lock().is_some(),
+            "token refresh must run regardless of max_idle"
+        );
+        pool.close_all().await;
+    }
+
+    #[tokio::test]
+    async fn test_token_refresh_starts_alongside_idle_evictor() {
+        let pool = Arc::new(ConnectionPool::new(oauth_pool_config()));
+        pool.start_idle_evictor();
+        assert!(pool.evictor_handle.lock().is_some());
+        assert!(pool.oauth_refresh_handle.lock().is_some());
+        pool.close_all().await;
+        assert!(
+            pool.oauth_refresh_handle.lock().is_none(),
+            "aborted on close"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_token_refresh_is_noop_without_provider() {
+        // A static token has nothing to refresh.
+        let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
+        pool.start_token_refresh();
+        assert!(pool.oauth_refresh_handle.lock().is_none());
+    }
+
+    #[test]
+    fn test_start_token_refresh_is_noop_outside_runtime() {
+        let pool = Arc::new(ConnectionPool::new(oauth_pool_config()));
+        pool.start_token_refresh();
+        assert!(
+            pool.oauth_refresh_handle.lock().is_none(),
+            "must not panic in tokio::spawn without a runtime"
+        );
+    }
+
+    // ── Reconnection is bounded so waiters cannot wedge forever ────────
+
+    #[test]
+    fn test_reconnect_budgets_are_finite_and_ordered() {
+        let pool = ConnectionPool::new(ConnectionConfig::default());
+        let attempt = pool.connect_attempt_budget();
+        let total = pool.total_reconnect_budget();
+        assert!(attempt >= pool.config.connect_timeout);
+        assert!(
+            total > attempt,
+            "the total budget must cover every attempt plus backoff"
+        );
+        assert!(total < Duration::from_secs(600), "budget must stay sane");
     }
 }

@@ -1,3 +1,5 @@
+use std::fmt;
+
 use bytes::{Buf, BufMut, Bytes};
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_bytes, non_nullable_string};
@@ -7,7 +9,8 @@ use crate::protocol::primitives::{
     Decode, Encode, KafkaBytes, KafkaString, TaggedFields, TryEncode,
 };
 use crate::protocol::{
-    array_len_i32, check_compact_array_len, check_decode_array_len, encode_compact_array_len,
+    array_len_i32, check_compact_array_len, check_decode_array_len, decode_capacity,
+    encode_compact_array_len,
 };
 
 // ============================================================================
@@ -95,7 +98,7 @@ impl VersionedEncode for CreateDelegationTokenRequest {
 }
 
 /// CreateDelegationToken response.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CreateDelegationTokenResponse {
     /// Error code.
     pub error_code: ErrorCode,
@@ -227,7 +230,7 @@ impl VersionedDecode for CreateDelegationTokenResponse {
 // ============================================================================
 
 /// RenewDelegationToken request.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RenewDelegationTokenRequest {
     /// HMAC of the delegation token to renew.
     pub hmac: Bytes,
@@ -321,7 +324,7 @@ impl VersionedDecode for RenewDelegationTokenResponse {
 // ============================================================================
 
 /// ExpireDelegationToken request.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExpireDelegationTokenRequest {
     /// HMAC of the delegation token to expire.
     pub hmac: Bytes,
@@ -490,7 +493,7 @@ pub struct DelegationTokenRenewer {
 }
 
 /// A delegation token returned by DescribeDelegationToken.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DelegationTokenInfo {
     /// Token owner principal type.
     pub principal_type: String,
@@ -530,7 +533,7 @@ impl DescribeDelegationTokenResponse {
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let token_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut tokens = Vec::with_capacity(token_count);
+        let mut tokens = Vec::with_capacity(decode_capacity(token_count, buf.remaining()));
 
         for _ in 0..token_count {
             let principal_type =
@@ -544,7 +547,7 @@ impl DescribeDelegationTokenResponse {
             let hmac = non_nullable_bytes("hmac", KafkaBytes::decode(buf)?.0)?;
 
             let renewer_count = check_decode_array_len(i32::decode(buf)?)?;
-            let mut renewers = Vec::with_capacity(renewer_count);
+            let mut renewers = Vec::with_capacity(decode_capacity(renewer_count, buf.remaining()));
             for _ in 0..renewer_count {
                 let renewer_type =
                     non_nullable_string("renewer_type", KafkaString::decode(buf)?.0)?;
@@ -583,7 +586,7 @@ impl DescribeDelegationTokenResponse {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let token_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut tokens = Vec::with_capacity(token_count);
+        let mut tokens = Vec::with_capacity(decode_capacity(token_count, buf.remaining()));
 
         for _ in 0..token_count {
             let principal_type =
@@ -598,7 +601,7 @@ impl DescribeDelegationTokenResponse {
 
             let renewer_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut renewers = Vec::with_capacity(renewer_count);
+            let mut renewers = Vec::with_capacity(decode_capacity(renewer_count, buf.remaining()));
             for _ in 0..renewer_count {
                 let renewer_type =
                     non_nullable_string("renewer_type", KafkaString::decode_compact(buf)?.0)?;
@@ -641,7 +644,7 @@ impl DescribeDelegationTokenResponse {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let token_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut tokens = Vec::with_capacity(token_count);
+        let mut tokens = Vec::with_capacity(decode_capacity(token_count, buf.remaining()));
 
         for _ in 0..token_count {
             let principal_type =
@@ -660,7 +663,7 @@ impl DescribeDelegationTokenResponse {
 
             let renewer_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut renewers = Vec::with_capacity(renewer_count);
+            let mut renewers = Vec::with_capacity(decode_capacity(renewer_count, buf.remaining()));
             for _ in 0..renewer_count {
                 let renewer_type =
                     non_nullable_string("renewer_type", KafkaString::decode_compact(buf)?.0)?;
@@ -707,6 +710,66 @@ impl VersionedDecode for DescribeDelegationTokenResponse {
             3 => Self::decode_v3(buf),
             _ => unsupported_decode!("DescribeDelegationTokenResponse", version),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Redacted `Debug` impls for delegation-token types.
+//
+// The delegation-token HMAC *is* the bearer credential used for SASL
+// authentication -- it is exactly as sensitive as a password. A derived
+// `Debug` would write it into any log line, panic backtrace, or error report
+// that formats the struct. The rest of the crate already hand-writes redacting
+// `Debug` for `PlainCredentials`, `ScramCredentials`, `AwsMskIamCredentials`
+// and `OAuthBearerToken`; these types were the remaining gap.
+// ---------------------------------------------------------------------------
+
+impl fmt::Debug for CreateDelegationTokenResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreateDelegationTokenResponse")
+            .field("error_code", &self.error_code)
+            .field("principal_type", &self.principal_type)
+            .field("principal_name", &self.principal_name)
+            .field("issue_timestamp_ms", &self.issue_timestamp_ms)
+            .field("expiry_timestamp_ms", &self.expiry_timestamp_ms)
+            .field("max_timestamp_ms", &self.max_timestamp_ms)
+            .field("token_id", &self.token_id)
+            .field("hmac", &"[REDACTED]")
+            .field("throttle_time_ms", &self.throttle_time_ms)
+            .finish()
+    }
+}
+
+impl fmt::Debug for RenewDelegationTokenRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RenewDelegationTokenRequest")
+            .field("hmac", &"[REDACTED]")
+            .field("renew_period_ms", &self.renew_period_ms)
+            .finish()
+    }
+}
+
+impl fmt::Debug for ExpireDelegationTokenRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExpireDelegationTokenRequest")
+            .field("hmac", &"[REDACTED]")
+            .field("expiry_period_ms", &self.expiry_period_ms)
+            .finish()
+    }
+}
+
+impl fmt::Debug for DelegationTokenInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DelegationTokenInfo")
+            .field("principal_type", &self.principal_type)
+            .field("principal_name", &self.principal_name)
+            .field("issue_timestamp_ms", &self.issue_timestamp_ms)
+            .field("expiry_timestamp_ms", &self.expiry_timestamp_ms)
+            .field("max_timestamp_ms", &self.max_timestamp_ms)
+            .field("token_id", &self.token_id)
+            .field("hmac", &"[REDACTED]")
+            .field("renewers", &self.renewers)
+            .finish()
     }
 }
 

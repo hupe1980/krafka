@@ -5,7 +5,8 @@ use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{
-    array_len_i32, check_compact_array_len, check_decode_array_len, encode_compact_array_len,
+    array_len_i32, check_compact_array_len, check_decode_array_len, decode_capacity,
+    encode_compact_array_len,
 };
 
 // ============================================================================
@@ -113,7 +114,7 @@ impl DeleteTopicsResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let raw = crate::util::varint::decode_unsigned_varint(buf)?;
         let count = check_compact_array_len(raw)?;
-        let mut responses = Vec::with_capacity(count);
+        let mut responses = Vec::with_capacity(decode_capacity(count, buf.remaining()));
 
         for _ in 0..count {
             let name = KafkaString::decode_compact(buf)?.0;
@@ -140,7 +141,7 @@ impl DeleteTopicsResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let raw = crate::util::varint::decode_unsigned_varint(buf)?;
         let count = check_compact_array_len(raw)?;
-        let mut responses = Vec::with_capacity(count);
+        let mut responses = Vec::with_capacity(decode_capacity(count, buf.remaining()));
 
         for _ in 0..count {
             let name = KafkaString::decode_compact(buf)?.0;
@@ -168,7 +169,7 @@ impl DeleteTopicsResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let raw = crate::util::varint::decode_unsigned_varint(buf)?;
         let count = check_compact_array_len(raw)?;
-        let mut responses = Vec::with_capacity(count);
+        let mut responses = Vec::with_capacity(decode_capacity(count, buf.remaining()));
 
         for _ in 0..count {
             let name = KafkaString::decode_compact(buf)?.0;
@@ -205,7 +206,7 @@ impl DeleteTopicsResponse {
     /// Shared responses array decoder for v1–v3 (non-flexible).
     fn decode_responses_v1(buf: &mut impl Buf) -> Result<Vec<DeletableTopicResult>> {
         let response_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut responses = Vec::with_capacity(response_count);
+        let mut responses = Vec::with_capacity(decode_capacity(response_count, buf.remaining()));
 
         for _ in 0..response_count {
             let name = KafkaString::decode(buf)?.0;

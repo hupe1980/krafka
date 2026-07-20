@@ -1,3 +1,4 @@
+use crate::protocol::decode_capacity;
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_bytes};
@@ -53,7 +54,7 @@ impl SaslHandshakeResponse {
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut enabled_mechanisms = Vec::with_capacity(count);
+        let mut enabled_mechanisms = Vec::with_capacity(decode_capacity(count, buf.remaining()));
 
         for _ in 0..count {
             if let Some(mech) = KafkaString::decode(buf)?.0 {

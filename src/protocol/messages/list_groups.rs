@@ -4,7 +4,7 @@ use super::{VersionedDecode, VersionedEncode, non_nullable_string};
 use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, KafkaString, TaggedFields, TryEncode};
-use crate::protocol::{check_compact_array_len, check_decode_array_len};
+use crate::protocol::{check_compact_array_len, check_decode_array_len, decode_capacity};
 
 // ============================================================================
 // ListGroups API (Key 16)
@@ -111,7 +111,7 @@ impl ListGroupsResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let group_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut groups = Vec::with_capacity(group_count);
+        let mut groups = Vec::with_capacity(decode_capacity(group_count, buf.remaining()));
         for _ in 0..group_count {
             let group_id = non_nullable_string("group_id", KafkaString::decode(buf)?.0)?;
             let protocol_type = non_nullable_string("protocol_type", KafkaString::decode(buf)?.0)?;
@@ -135,7 +135,7 @@ impl ListGroupsResponse {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let group_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut groups = Vec::with_capacity(group_count);
+        let mut groups = Vec::with_capacity(decode_capacity(group_count, buf.remaining()));
         for _ in 0..group_count {
             let group_id = non_nullable_string("group_id", KafkaString::decode_compact(buf)?.0)?;
             let protocol_type =
@@ -162,7 +162,7 @@ impl ListGroupsResponse {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let group_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut groups = Vec::with_capacity(group_count);
+        let mut groups = Vec::with_capacity(decode_capacity(group_count, buf.remaining()));
         for _ in 0..group_count {
             let group_id = non_nullable_string("group_id", KafkaString::decode_compact(buf)?.0)?;
             let protocol_type =
@@ -191,7 +191,7 @@ impl ListGroupsResponse {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let group_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut groups = Vec::with_capacity(group_count);
+        let mut groups = Vec::with_capacity(decode_capacity(group_count, buf.remaining()));
         for _ in 0..group_count {
             let group_id = non_nullable_string("group_id", KafkaString::decode_compact(buf)?.0)?;
             let protocol_type =

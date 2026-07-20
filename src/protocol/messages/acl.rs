@@ -4,7 +4,8 @@ use super::{VersionedDecode, VersionedEncode, non_nullable_string};
 use crate::error::{ErrorCode, Result};
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{
-    array_len_i32, check_compact_array_len, check_decode_array_len, encode_compact_array_len,
+    array_len_i32, check_compact_array_len, check_decode_array_len, decode_capacity,
+    encode_compact_array_len,
 };
 
 // ============================================================================
@@ -385,7 +386,7 @@ impl DescribeAclsResponse {
         let error_message = KafkaString::decode(buf)?.0;
 
         let resource_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut resources = Vec::with_capacity(resource_count);
+        let mut resources = Vec::with_capacity(decode_capacity(resource_count, buf.remaining()));
 
         for _ in 0..resource_count {
             let resource_type = AclResourceType::from_i8(i8::decode(buf)?);
@@ -393,7 +394,7 @@ impl DescribeAclsResponse {
             let pattern_type = AclPatternType::from_i8(i8::decode(buf)?);
 
             let acl_count = check_decode_array_len(i32::decode(buf)?)?;
-            let mut acls = Vec::with_capacity(acl_count);
+            let mut acls = Vec::with_capacity(decode_capacity(acl_count, buf.remaining()));
 
             for _ in 0..acl_count {
                 let principal = non_nullable_string("principal", KafkaString::decode(buf)?.0)?;
@@ -433,7 +434,7 @@ impl DescribeAclsResponse {
 
         let resource_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut resources = Vec::with_capacity(resource_count);
+        let mut resources = Vec::with_capacity(decode_capacity(resource_count, buf.remaining()));
 
         for _ in 0..resource_count {
             let resource_type = AclResourceType::from_i8(i8::decode(buf)?);
@@ -443,7 +444,7 @@ impl DescribeAclsResponse {
 
             let acl_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut acls = Vec::with_capacity(acl_count);
+            let mut acls = Vec::with_capacity(decode_capacity(acl_count, buf.remaining()));
 
             for _ in 0..acl_count {
                 let principal =
@@ -551,7 +552,7 @@ impl CreateAclsResponse {
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let result_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut results = Vec::with_capacity(result_count);
+        let mut results = Vec::with_capacity(decode_capacity(result_count, buf.remaining()));
 
         for _ in 0..result_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -573,7 +574,7 @@ impl CreateAclsResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let result_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut results = Vec::with_capacity(result_count);
+        let mut results = Vec::with_capacity(decode_capacity(result_count, buf.remaining()));
 
         for _ in 0..result_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -740,14 +741,15 @@ impl DeleteAclsResponse {
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let filter_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut filter_results = Vec::with_capacity(filter_count);
+        let mut filter_results = Vec::with_capacity(decode_capacity(filter_count, buf.remaining()));
 
         for _ in 0..filter_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
             let error_message = KafkaString::decode(buf)?.0;
 
             let matching_count = check_decode_array_len(i32::decode(buf)?)?;
-            let mut matching_acls = Vec::with_capacity(matching_count);
+            let mut matching_acls =
+                Vec::with_capacity(decode_capacity(matching_count, buf.remaining()));
 
             for _ in 0..matching_count {
                 let acl_error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -792,7 +794,7 @@ impl DeleteAclsResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let filter_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut filter_results = Vec::with_capacity(filter_count);
+        let mut filter_results = Vec::with_capacity(decode_capacity(filter_count, buf.remaining()));
 
         for _ in 0..filter_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -800,7 +802,8 @@ impl DeleteAclsResponse {
 
             let matching_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut matching_acls = Vec::with_capacity(matching_count);
+            let mut matching_acls =
+                Vec::with_capacity(decode_capacity(matching_count, buf.remaining()));
 
             for _ in 0..matching_count {
                 let acl_error_code = ErrorCode::from_i16(i16::decode(buf)?);

@@ -164,16 +164,58 @@ pub struct CompactedTableSnapshot {
     pub caught_up: bool,
 }
 
-/// A [`ConsumerRebalanceListener`] that automatically clears a shared
-/// [`CompactedTable`] whenever partitions are revoked or lost.
+/// Rewinds a partition to the start of its log.
+///
+/// Exists so the rebalance listener can be exercised without a live broker
+/// connection; [`Consumer`] is the only production implementation.
+trait PartitionRewinder: Send + Sync {
+    fn rewind_to_beginning<'a>(
+        &'a self,
+        topic: &'a str,
+        partition: PartitionId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+}
+
+impl PartitionRewinder for Consumer {
+    fn rewind_to_beginning<'a>(
+        &'a self,
+        topic: &'a str,
+        partition: PartitionId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.seek_to_beginning(topic, partition))
+    }
+}
+
+/// A [`ConsumerRebalanceListener`] that keeps a shared [`CompactedTable`] in
+/// sync with the consumer's assignment across rebalances.
 ///
 /// This is the recommended way to integrate a [`CompactedTable`] with a
 /// group-coordinated [`Consumer`]: wrap the table in an
 /// `Arc<Mutex<CompactedTable>>`, share a clone with this listener, and
 /// register the listener on the consumer before subscribing.
 ///
-/// When partitions are revoked, the table is cleared so that keys loaded
-/// from the revoked partitions do not persist into the next assignment.
+/// # Behaviour
+///
+/// - **Revoked / lost partitions** — only the entries that came from those
+///   partitions are removed. Entries from partitions this consumer kept are
+///   preserved, because their committed position has already moved past the
+///   records that produced them and they would otherwise never be re-read.
+/// - **Assigned partitions** — the entries of each newly assigned partition
+///   are dropped and the partition is rewound to the beginning of the log.
+///   A compacted-topic table is only correct if every owned partition is
+///   replayed from its start; resuming from a committed offset would surface
+///   just the keys written after the rebalance and report `None` for every
+///   other live key.
+///
+/// Rewinding requires a handle to the consumer, which does not exist yet when
+/// the listener is registered on the builder. Call
+/// [`attach_consumer()`](Self::attach_consumer) once the consumer is built —
+/// until then, assignments are pruned but not rewound, and a warning is
+/// logged.
+///
+/// Because [`CompactedTable`] entries record a partition but not a topic,
+/// pruning matches on partition id across all topics. Use one table per topic
+/// with multi-topic consumers.
 ///
 /// # Example
 ///
@@ -185,12 +227,16 @@ pub struct CompactedTableSnapshot {
 /// let table = Arc::new(Mutex::new(CompactedTable::new()));
 /// let listener = CompactedTableClearListener::new(Arc::clone(&table));
 ///
-/// let consumer = Consumer::builder()
-///     .bootstrap_servers("localhost:9092")
-///     .group_id("my-group")
-///     .rebalance_listener(listener)
-///     .build()
-///     .await?;
+/// let consumer = Arc::new(
+///     Consumer::builder()
+///         .bootstrap_servers("localhost:9092")
+///         .group_id("my-group")
+///         .rebalance_listener(listener.clone())
+///         .build()
+///         .await?,
+/// );
+/// // Lets the listener seek newly assigned partitions to the beginning.
+/// listener.attach_consumer(Arc::clone(&consumer));
 /// consumer.subscribe(&["config-topic"]).await?;
 ///
 /// loop {
@@ -199,27 +245,131 @@ pub struct CompactedTableSnapshot {
 ///     t.ingest(&records);
 /// }
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CompactedTableClearListener {
     table: Arc<Mutex<CompactedTable>>,
+    /// Set once via `attach_consumer()`; shared by every clone of the listener
+    /// so attaching after registration is visible to the registered copy.
+    rewinder: Arc<std::sync::OnceLock<Arc<dyn PartitionRewinder>>>,
+}
+
+impl fmt::Debug for CompactedTableClearListener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompactedTableClearListener")
+            .field("consumer_attached", &self.rewinder.get().is_some())
+            .finish()
+    }
 }
 
 impl CompactedTableClearListener {
-    /// Create a new listener that will clear `table` on partition revocation.
+    /// Create a new listener that prunes `table` as partitions change owner.
+    ///
+    /// Attach the consumer with
+    /// [`attach_consumer()`](Self::attach_consumer) so newly assigned
+    /// partitions can be replayed from the beginning of the log.
     pub fn new(table: Arc<Mutex<CompactedTable>>) -> Self {
-        Self { table }
+        Self {
+            table,
+            rewinder: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    /// Give the listener the consumer it belongs to, enabling it to seek
+    /// newly assigned partitions to the beginning of the log.
+    ///
+    /// Call this once, right after the consumer is built and before
+    /// subscribing. The handle is shared by every clone of this listener, so
+    /// it takes effect for the copy already registered on the consumer.
+    /// Subsequent calls are ignored.
+    pub fn attach_consumer(&self, consumer: Arc<Consumer>) {
+        if self.rewinder.set(consumer).is_err() {
+            tracing::warn!(
+                "CompactedTableClearListener: consumer already attached; ignoring repeat call"
+            );
+        }
+    }
+
+    /// Create a listener with an arbitrary rewind target (test seam).
+    #[cfg(test)]
+    fn with_rewinder(
+        table: Arc<Mutex<CompactedTable>>,
+        rewinder: Arc<dyn PartitionRewinder>,
+    ) -> Self {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set(rewinder);
+        Self {
+            table,
+            rewinder: Arc::new(cell),
+        }
+    }
+
+    /// Drop the entries produced by `partitions` from the shared table.
+    async fn prune(&self, partitions: &[TopicPartition], reason: &str) {
+        if partitions.is_empty() {
+            return;
+        }
+        let ids: Vec<PartitionId> = partitions.iter().map(|tp| tp.partition).collect();
+        let removed = self.table.lock().await.remove_partitions(&ids);
+        debug!(
+            partitions = ?ids,
+            removed,
+            reason,
+            "CompactedTableClearListener pruned table entries"
+        );
     }
 }
 
 impl ConsumerRebalanceListener for CompactedTableClearListener {
-    async fn on_partitions_assigned(&self, _partitions: &[TopicPartition]) {}
+    /// Drops any stale state for the newly assigned partitions and rewinds
+    /// each of them to the beginning of the log, so the table is rebuilt from
+    /// the partition's full history rather than from the committed offset.
+    async fn on_partitions_assigned(&self, partitions: &[TopicPartition]) {
+        if partitions.is_empty() {
+            return;
+        }
 
-    async fn on_partitions_revoked(&self, _partitions: &[TopicPartition]) {
-        self.table.lock().await.clear();
+        // A gained partition is replayed in full, so any leftover entries for
+        // it would only be duplicated work at best and stale at worst.
+        self.prune(partitions, "assigned").await;
+
+        let Some(rewinder) = self.rewinder.get() else {
+            tracing::warn!(
+                partitions = partitions.len(),
+                "CompactedTableClearListener: no consumer attached, cannot rewind newly \
+                 assigned partitions; the table will only observe keys written after this \
+                 rebalance. Call attach_consumer() after building the consumer."
+            );
+            return;
+        };
+
+        for tp in partitions {
+            match rewinder.rewind_to_beginning(&tp.topic, tp.partition).await {
+                Ok(()) => debug!(
+                    topic = %tp.topic,
+                    partition = tp.partition,
+                    "CompactedTableClearListener rewound newly assigned partition"
+                ),
+                Err(e) => tracing::warn!(
+                    topic = %tp.topic,
+                    partition = tp.partition,
+                    error = %e,
+                    "CompactedTableClearListener failed to rewind newly assigned partition; \
+                     the table may be missing keys for it"
+                ),
+            }
+        }
     }
 
-    async fn on_partitions_lost(&self, _partitions: &[TopicPartition]) {
-        self.table.lock().await.clear();
+    /// Removes only the entries belonging to the revoked partitions, leaving
+    /// the state of retained partitions intact.
+    async fn on_partitions_revoked(&self, partitions: &[TopicPartition]) {
+        self.prune(partitions, "revoked").await;
+    }
+
+    /// Removes only the entries belonging to the lost partitions, leaving the
+    /// state of retained partitions intact.
+    async fn on_partitions_lost(&self, partitions: &[TopicPartition]) {
+        self.prune(partitions, "lost").await;
     }
 }
 
@@ -520,12 +670,44 @@ impl CompactedTable {
 
     /// Clear the table, removing all entries and resetting counters.
     ///
-    /// Useful when partitions are revoked during a consumer group rebalance
-    /// and the table needs to be rebuilt from scratch.
+    /// Useful when the table needs to be rebuilt from scratch. When only some
+    /// partitions change ownership during a rebalance, prefer
+    /// [`remove_partitions()`](Self::remove_partitions), which keeps the state
+    /// of the partitions that are still owned.
     pub fn clear(&mut self) {
         self.entries.clear();
         self.records_processed = 0;
         self.tombstones_processed = 0;
+    }
+
+    /// Remove every entry that was last written by one of `partitions`,
+    /// leaving entries from all other partitions untouched.
+    ///
+    /// Returns the number of entries removed.
+    ///
+    /// This is the correct reaction to a partial rebalance: dropping only the
+    /// partitions this consumer no longer owns preserves the state of the
+    /// partitions it kept. Clearing the whole table instead would discard
+    /// retained state that the consumer will never re-read, because its
+    /// committed position on those partitions has already advanced past the
+    /// records that built it.
+    ///
+    /// Entries are matched on partition id alone — the table does not record
+    /// the topic a key came from — so with a multi-topic consumer this also
+    /// removes same-numbered partitions of other topics. Use one table per
+    /// topic if that matters.
+    ///
+    /// The `records_processed` and `tombstones_processed` counters are
+    /// deliberately left unchanged: they are lifetime totals of ingest work
+    /// performed, not a description of current table contents.
+    pub fn remove_partitions(&mut self, partitions: &[PartitionId]) -> usize {
+        if partitions.is_empty() {
+            return 0;
+        }
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, entry| !partitions.contains(&entry.partition));
+        before - self.entries.len()
     }
 }
 
@@ -571,6 +753,246 @@ impl Eq for CompactedTable {}
 // ---------------------------------------------------------------------------
 // CompactedTopicConsumer — convenience wrapper
 // ---------------------------------------------------------------------------
+
+/// Default upper bound on how long [`CompactedTopicConsumer::scan()`] waits
+/// for every partition to reach its target offset before giving up.
+const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The operations `scan()` needs from a consumer.
+///
+/// Abstracting them keeps the scan loop — including its deadline handling —
+/// testable without a live broker. [`Consumer`] is the only production
+/// implementation.
+trait ScanSource: Sync {
+    fn poll_records(
+        &self,
+        timeout: Duration,
+    ) -> impl std::future::Future<Output = Result<Vec<ConsumerRecord>>> + Send;
+
+    fn assigned_partitions(
+        &self,
+        topic: &str,
+    ) -> impl std::future::Future<Output = Vec<PartitionId>> + Send;
+
+    fn partition_position(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+    ) -> impl std::future::Future<Output = Option<Offset>> + Send;
+
+    fn end_offsets(
+        &self,
+        topic: &str,
+    ) -> impl std::future::Future<Output = Result<HashMap<PartitionId, Result<Offset>>>> + Send;
+}
+
+impl ScanSource for Consumer {
+    async fn poll_records(&self, timeout: Duration) -> Result<Vec<ConsumerRecord>> {
+        self.poll(timeout).await
+    }
+
+    async fn assigned_partitions(&self, topic: &str) -> Vec<PartitionId> {
+        self.assignment()
+            .await
+            .get(topic)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    async fn partition_position(&self, topic: &str, partition: PartitionId) -> Option<Offset> {
+        self.position(topic, partition).await
+    }
+
+    async fn end_offsets(&self, topic: &str) -> Result<HashMap<PartitionId, Result<Offset>>> {
+        self.offsets_for_times_for_topic(topic, -1).await
+    }
+}
+
+/// A partition that has not yet reached its scan target offset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LaggingPartition {
+    partition: PartitionId,
+    /// Consumer position, or `None` when no position is known yet (e.g. the
+    /// partition has no leader and was never fetched).
+    position: Option<Offset>,
+    target: Offset,
+}
+
+impl fmt::Display for LaggingPartition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.position {
+            Some(pos) => write!(
+                f,
+                "partition {} (position {}, target {})",
+                self.partition, pos, self.target
+            ),
+            None => write!(
+                f,
+                "partition {} (position unknown, target {})",
+                self.partition, self.target
+            ),
+        }
+    }
+}
+
+/// Build the error returned when a scan runs out of time, naming every
+/// partition that is still behind together with its position and target so
+/// the stall can be attributed to a specific partition.
+fn scan_timeout_error(topic: &str, timeout: Duration, lagging: &[LaggingPartition]) -> KrafkaError {
+    let detail = lagging
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    KrafkaError::timeout(format!(
+        "scan of compacted topic '{topic}' did not catch up within {timeout:?}; \
+         partitions still behind their target offset: [{detail}]"
+    ))
+}
+
+/// Partitions that have not yet reached their target offset.
+///
+/// Only currently assigned partitions are considered. A partition whose
+/// position is unknown counts as lagging, as does one whose target is missing
+/// from the current assignment — the latter means the assignment changed
+/// mid-scan and the snapshot can no longer be satisfied.
+async fn lagging_partitions<S: ScanSource>(
+    source: &S,
+    topic: &str,
+    targets: &HashMap<PartitionId, Offset>,
+) -> Vec<LaggingPartition> {
+    let assigned = source.assigned_partitions(topic).await;
+
+    if assigned.is_empty() {
+        // Nothing assigned means nothing can advance; report every target.
+        let mut all: Vec<LaggingPartition> = targets
+            .iter()
+            .map(|(&partition, &target)| LaggingPartition {
+                partition,
+                position: None,
+                target,
+            })
+            .collect();
+        all.sort_by_key(|l| l.partition);
+        return all;
+    }
+
+    let mut lagging = Vec::new();
+    for partition in assigned {
+        let Some(&target) = targets.get(&partition) else {
+            // Not part of the snapshot (e.g. added after the scan started).
+            continue;
+        };
+        // A target of 0 or -1 means the partition is empty; nothing to consume.
+        if target <= 0 {
+            continue;
+        }
+
+        let position = source.partition_position(topic, partition).await;
+        if position.is_none_or(|pos| pos < target) {
+            lagging.push(LaggingPartition {
+                partition,
+                position,
+                target,
+            });
+        }
+    }
+    lagging.sort_by_key(|l| l.partition);
+    lagging
+}
+
+/// Drive a bounded scan of `topic` into `table`.
+///
+/// Polls until every assigned partition reaches the high-watermark snapshot
+/// taken at the start, or until `timeout` elapses — in which case the returned
+/// error names the partitions that never got there.
+async fn run_scan<S: ScanSource>(
+    source: &S,
+    topic: &str,
+    table: &mut CompactedTable,
+    poll_timeout: Duration,
+    timeout: Duration,
+) -> Result<()> {
+    // Fail fast if no partitions are assigned — avoids a scan that can only
+    // ever time out (especially when using from_consumer() without assign()).
+    if source.assigned_partitions(topic).await.is_empty() {
+        return Err(KrafkaError::invalid_state(format!(
+            "no partitions assigned for topic '{topic}'; \
+             assign partitions before calling scan()"
+        )));
+    }
+
+    // Snapshot the latest offsets (high-water marks) **before** starting
+    // the poll loop.  Comparing against a fixed snapshot means the scan
+    // terminates even when new records arrive during the scan, avoiding
+    // the HWM-chasing race that makes scans on active topics non-terminating.
+    let hwm_results = source.end_offsets(topic).await?;
+
+    // Fail fast on any per-partition error: a missing partition in the
+    // target map causes the caught-up check to silently skip it, which
+    // would prematurely declare the scan complete without having consumed
+    // that partition's data.
+    let mut scan_target_hwms: HashMap<PartitionId, Offset> =
+        HashMap::with_capacity(hwm_results.len());
+    for (partition, result) in hwm_results {
+        let offset = result.map_err(|e| {
+            KrafkaError::invalid_state(format!(
+                "failed to fetch high-watermark for '{topic}' partition {partition}: {e}"
+            ))
+        })?;
+        scan_target_hwms.insert(partition, offset);
+    }
+
+    if scan_target_hwms.values().all(|&hwm| hwm <= 0) {
+        // All partitions are empty (HWM = 0) — nothing to scan.
+        info!("Compacted topic '{topic}' has no data yet (all partition HWMs = 0); scan complete");
+        return Ok(());
+    }
+
+    // Keep only non-empty partitions in the target map; empty partitions
+    // are satisfied immediately and don't need to be polled.
+    scan_target_hwms.retain(|_, &mut hwm| hwm > 0);
+
+    info!(
+        topic = %topic,
+        partitions = scan_target_hwms.len(),
+        timeout = ?timeout,
+        "Starting compacted topic scan (HWM snapshot taken)"
+    );
+
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        let mut records = source.poll_records(poll_timeout).await?;
+        let before_len = records.len();
+        records.retain(|r| r.topic == topic);
+        let filtered = before_len - records.len();
+        if filtered > 0 {
+            debug!("Filtered out {filtered} record(s) from other topics during scan for '{topic}'");
+        }
+        table.ingest(&records);
+
+        let lagging = lagging_partitions(source, topic, &scan_target_hwms).await;
+        if lagging.is_empty() {
+            info!(
+                "Compacted topic scan complete for '{}': {} keys, {} records processed, \
+                 {} tombstones",
+                topic,
+                table.len(),
+                table.records_processed(),
+                table.tombstones_processed(),
+            );
+            return Ok(());
+        }
+
+        // A partition can stall indefinitely (no leader, offsets that never
+        // resolve), so the loop is bounded by wall-clock time rather than
+        // trusting every partition to eventually converge.
+        if std::time::Instant::now() >= deadline {
+            return Err(scan_timeout_error(topic, timeout, &lagging));
+        }
+    }
+}
 
 /// Convenience wrapper that pairs a [`Consumer`] with a [`CompactedTable`]
 /// for the common pattern of scanning an entire compacted topic.
@@ -654,11 +1076,14 @@ impl CompactedTopicConsumer {
     ///
     /// This constructor is the best fit for consumers with stable, explicit
     /// assignments. If you wrap a group-coordinated consumer whose assignment
-    /// can change over time, note that [`CompactedTable`] is not
-    /// automatically pruned when partitions are revoked. Keys loaded from
-    /// partitions that are no longer assigned will remain in the table until
-    /// you clear or rebuild it (e.g., call [`table_mut().clear()`](CompactedTable::clear)
-    /// from a rebalance callback when assignments change).
+    /// can change over time, note that the table owned by this wrapper is not
+    /// pruned when partitions are revoked: keys loaded from partitions that
+    /// are no longer assigned remain in it. Drop them from a rebalance
+    /// callback with
+    /// [`table_mut().remove_partitions()`](CompactedTable::remove_partitions),
+    /// or share an `Arc<Mutex<CompactedTable>>` with a
+    /// [`CompactedTableClearListener`], which does that bookkeeping (and the
+    /// matching rewind of newly assigned partitions) for you.
     ///
     /// Use this when you need full control over the consumer configuration
     /// (TLS, auth, timeouts, etc.) beyond what the builder exposes.
@@ -694,97 +1119,60 @@ impl CompactedTopicConsumer {
     /// caught-up condition — this bounds the scan to a deterministic target
     /// rather than chasing a continuously advancing watermark.
     ///
-    /// If this call returns, [`is_caught_up()`](Self::is_caught_up) is `true`
-    /// and the table contains the latest value for every live key observed up
-    /// to the snapshot watermark.
+    /// The scan is bounded: if the partitions have not all reached their
+    /// target within five minutes, it returns a timeout error instead of
+    /// polling forever. Use [`scan_with_timeout()`](Self::scan_with_timeout)
+    /// to choose a different bound.
+    ///
+    /// If this call returns `Ok`, [`is_caught_up()`](Self::is_caught_up) is
+    /// `true` and the table contains the latest value for every live key
+    /// observed up to the snapshot watermark.
     ///
     /// # Errors
     ///
-    /// Returns an error if any poll fails unrecoverably or if the initial
-    /// watermark snapshot cannot be obtained.
+    /// Returns an error if any poll fails unrecoverably, if the initial
+    /// watermark snapshot cannot be obtained, or if the scan does not catch
+    /// up in time — the timeout error names each partition that is still
+    /// behind along with its position and target offset.
     pub async fn scan(&mut self, poll_timeout: Duration) -> Result<()> {
-        // Fail fast if no partitions are assigned — avoids an infinite loop
-        // of empty polls (especially when using from_consumer() without assign()).
-        let assignments = self.consumer.assignment().await;
-        if assignments.get(&self.topic).is_none_or(|p| p.is_empty()) {
-            return Err(KrafkaError::invalid_state(format!(
-                "no partitions assigned for topic '{}'; \
-                 assign partitions before calling scan()",
-                self.topic
-            )));
-        }
+        self.scan_with_timeout(poll_timeout, DEFAULT_SCAN_TIMEOUT)
+            .await
+    }
 
-        // Snapshot the latest offsets (high-water marks) **before** starting
-        // the poll loop.  Comparing against a fixed snapshot means the scan
-        // terminates even when new records arrive during the scan, avoiding
-        // the HWM-chasing race that makes scans on active topics non-terminating.
-        let topic = self.topic.clone();
-        let hwm_results = self
-            .consumer
-            .offsets_for_times_for_topic(&topic, -1)
-            .await?;
-
-        // Fail fast on any per-partition error: a missing partition in the
-        // target map causes `check_caught_up_at` to silently skip it, which
-        // would prematurely declare the scan complete without having consumed
-        // that partition's data.
-        let mut scan_target_hwms: HashMap<PartitionId, Offset> =
-            HashMap::with_capacity(hwm_results.len());
-        for (partition, result) in hwm_results {
-            let offset = result.map_err(|e| {
-                KrafkaError::invalid_state(format!(
-                    "failed to fetch high-watermark for '{topic}' partition {partition}: {e}"
-                ))
-            })?;
-            scan_target_hwms.insert(partition, offset);
-        }
-
-        if scan_target_hwms.values().all(|&hwm| hwm <= 0) {
-            // All partitions are empty (HWM = 0) — nothing to scan.
-            self.caught_up = true;
-            info!(
-                "Compacted topic '{}' has no data yet (all partition HWMs = 0); scan complete",
-                self.topic
-            );
-            return Ok(());
-        }
-
-        // Keep only non-empty partitions in the target map; empty partitions
-        // are satisfied immediately and don't need to be polled.
-        scan_target_hwms.retain(|_, &mut hwm| hwm > 0);
-
-        info!(
-            topic = %self.topic,
-            partitions = scan_target_hwms.len(),
-            "Starting compacted topic scan (HWM snapshot taken)"
-        );
-
-        loop {
-            let mut records = self.consumer.poll(poll_timeout).await?;
-            let before_len = records.len();
-            records.retain(|r| r.topic == self.topic);
-            let filtered = before_len - records.len();
-            if filtered > 0 {
-                debug!(
-                    "Filtered out {} record(s) from other topics during scan for '{}'",
-                    filtered, self.topic
-                );
-            }
-            self.table.ingest(&records);
-
-            if self.check_caught_up_at(&scan_target_hwms).await {
-                self.caught_up = true;
-                info!(
-                    "Compacted topic scan complete for '{}': {} keys, {} records processed, \
-                     {} tombstones",
-                    self.topic,
-                    self.table.len(),
-                    self.table.records_processed(),
-                    self.table.tombstones_processed(),
-                );
-                return Ok(());
-            }
-        }
+    /// Like [`scan()`](Self::scan), but with an explicit upper bound on how
+    /// long the scan may run.
+    ///
+    /// A partition can fail to make progress indefinitely — it may have no
+    /// leader, or its offsets may never resolve — so the scan loop is bounded
+    /// by wall-clock time. When `timeout` elapses with partitions still short
+    /// of their target, the returned error lists those partitions with their
+    /// last known position and the target they were expected to reach, which
+    /// identifies the stalled partition directly.
+    ///
+    /// `timeout` bounds the whole scan, not an individual poll; a single poll
+    /// may still block for up to `poll_timeout` past the deadline before the
+    /// timeout is detected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no partitions are assigned, if any poll fails
+    /// unrecoverably, if the watermark snapshot cannot be obtained, or if
+    /// `timeout` elapses before every partition reaches its target.
+    pub async fn scan_with_timeout(
+        &mut self,
+        poll_timeout: Duration,
+        timeout: Duration,
+    ) -> Result<()> {
+        run_scan(
+            &self.consumer,
+            &self.topic,
+            &mut self.table,
+            poll_timeout,
+            timeout,
+        )
+        .await?;
+        self.caught_up = true;
+        Ok(())
     }
 
     /// Poll for new records and update the table.
@@ -881,9 +1269,8 @@ impl CompactedTopicConsumer {
     /// watermarks.
     ///
     /// This is used by [`poll()`](Self::poll) for best-effort post-scan
-    /// caught-up detection. For the bounded `scan()` operation, use
-    /// [`check_caught_up_at`](Self::check_caught_up_at) with a pre-scan
-    /// HWM snapshot instead.
+    /// caught-up detection. The bounded [`scan()`](Self::scan) operation
+    /// compares against a pre-scan HWM snapshot instead.
     async fn check_caught_up(&self) -> bool {
         let assignments = self.consumer.assignment().await;
         let Some(partitions) = assignments.get(&self.topic) else {
@@ -903,40 +1290,6 @@ impl CompactedTopicConsumer {
                 // High watermark is 0 — empty partition, nothing to consume.
                 (_, Some(0)) => continue,
                 // Position or high watermark not yet known, or still behind.
-                _ => return false,
-            }
-        }
-
-        true
-    }
-
-    /// Check if all assigned partitions have reached the given target
-    /// high-water marks.
-    ///
-    /// `target_hwms` is a snapshot of the latest offsets taken **before**
-    /// the scan loop started. Comparing against a fixed snapshot rather than
-    /// the live cached watermarks prevents the scan from chasing an
-    /// ever-advancing HWM on actively written topics.
-    async fn check_caught_up_at(&self, target_hwms: &HashMap<PartitionId, Offset>) -> bool {
-        let assignments = self.consumer.assignment().await;
-        let Some(partitions) = assignments.get(&self.topic) else {
-            return false;
-        };
-
-        for &partition in partitions {
-            let Some(&target_hw) = target_hwms.get(&partition) else {
-                // Partition not in the snapshot (e.g. added after scan started) — skip.
-                continue;
-            };
-
-            // target_hw == -1 (or <= 0) means the partition is empty; nothing to consume.
-            if target_hw <= 0 {
-                continue;
-            }
-
-            let position = self.consumer.position(&self.topic, partition).await;
-            match position {
-                Some(pos) if pos >= target_hw => continue,
                 _ => return false,
             }
         }
@@ -1577,6 +1930,361 @@ mod tests {
                 .to_string()
                 .contains("bootstrap_servers")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Partition-scoped pruning
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_remove_partitions_removes_only_listed_partitions() {
+        let mut table = CompactedTable::new();
+        table.ingest(&[
+            make_record(Some("p0-a"), Some("v"), 0, 0),
+            make_record(Some("p1-a"), Some("v"), 1, 0),
+            make_record(Some("p1-b"), Some("v"), 1, 1),
+            make_record(Some("p2-a"), Some("v"), 2, 0),
+        ]);
+
+        let removed = table.remove_partitions(&[1]);
+
+        assert_eq!(removed, 2);
+        assert_eq!(table.len(), 2);
+        assert!(table.contains_key(b"p0-a"));
+        assert!(table.contains_key(b"p2-a"));
+        assert!(!table.contains_key(b"p1-a"));
+        assert!(!table.contains_key(b"p1-b"));
+        // Lifetime counters describe work done, not current contents.
+        assert_eq!(table.records_processed(), 4);
+    }
+
+    #[test]
+    fn test_remove_partitions_empty_list_is_noop() {
+        let mut table = CompactedTable::new();
+        table.ingest(&[make_record(Some("k"), Some("v"), 0, 0)]);
+
+        assert_eq!(table.remove_partitions(&[]), 0);
+        assert_eq!(table.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // CompactedTableClearListener
+    // -----------------------------------------------------------------------
+
+    #[derive(Default)]
+    struct RecordingRewinder {
+        calls: std::sync::Mutex<Vec<(String, PartitionId)>>,
+    }
+
+    impl RecordingRewinder {
+        fn calls(&self) -> Vec<(String, PartitionId)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl PartitionRewinder for RecordingRewinder {
+        fn rewind_to_beginning<'a>(
+            &'a self,
+            topic: &'a str,
+            partition: PartitionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((topic.to_string(), partition));
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn populated_table() -> Arc<Mutex<CompactedTable>> {
+        let mut table = CompactedTable::new();
+        table.ingest(&[
+            make_record(Some("p0"), Some("v"), 0, 0),
+            make_record(Some("p1"), Some("v"), 1, 0),
+            make_record(Some("p2"), Some("v"), 2, 0),
+        ]);
+        Arc::new(Mutex::new(table))
+    }
+
+    #[tokio::test]
+    async fn test_listener_revocation_prunes_only_revoked_partitions() {
+        let table = populated_table();
+        let listener = CompactedTableClearListener::new(Arc::clone(&table));
+
+        listener
+            .on_partitions_revoked(&[TopicPartition::new("test-topic", 1)])
+            .await;
+
+        let t = table.lock().await;
+        assert_eq!(t.len(), 2, "retained partitions must survive revocation");
+        assert!(t.contains_key(b"p0"));
+        assert!(t.contains_key(b"p2"));
+        assert!(!t.contains_key(b"p1"));
+    }
+
+    #[tokio::test]
+    async fn test_listener_loss_prunes_only_lost_partitions() {
+        let table = populated_table();
+        let listener = CompactedTableClearListener::new(Arc::clone(&table));
+
+        listener
+            .on_partitions_lost(&[TopicPartition::new("test-topic", 2)])
+            .await;
+
+        let t = table.lock().await;
+        assert_eq!(t.len(), 2);
+        assert!(t.contains_key(b"p0"));
+        assert!(t.contains_key(b"p1"));
+        assert!(!t.contains_key(b"p2"));
+    }
+
+    #[tokio::test]
+    async fn test_listener_assignment_rewinds_new_partitions() {
+        let table = populated_table();
+        let rewinder = Arc::new(RecordingRewinder::default());
+        let listener = CompactedTableClearListener::with_rewinder(
+            Arc::clone(&table),
+            Arc::clone(&rewinder) as Arc<dyn PartitionRewinder>,
+        );
+
+        listener
+            .on_partitions_assigned(&[
+                TopicPartition::new("test-topic", 1),
+                TopicPartition::new("test-topic", 3),
+            ])
+            .await;
+
+        assert_eq!(
+            rewinder.calls(),
+            vec![("test-topic".to_string(), 1), ("test-topic".to_string(), 3)],
+            "newly assigned partitions must be replayed from the start"
+        );
+
+        // Stale state for a re-gained partition is dropped; untouched
+        // partitions keep theirs.
+        let t = table.lock().await;
+        assert!(!t.contains_key(b"p1"));
+        assert!(t.contains_key(b"p0"));
+        assert!(t.contains_key(b"p2"));
+    }
+
+    #[tokio::test]
+    async fn test_listener_assignment_without_consumer_does_not_panic() {
+        let table = populated_table();
+        let listener = CompactedTableClearListener::new(Arc::clone(&table));
+
+        listener
+            .on_partitions_assigned(&[TopicPartition::new("test-topic", 0)])
+            .await;
+
+        let t = table.lock().await;
+        assert!(!t.contains_key(b"p0"));
+        assert_eq!(t.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_listener_empty_rebalance_is_noop() {
+        let table = populated_table();
+        let listener = CompactedTableClearListener::new(Arc::clone(&table));
+
+        listener.on_partitions_revoked(&[]).await;
+        listener.on_partitions_assigned(&[]).await;
+
+        assert_eq!(table.lock().await.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Bounded scan
+    // -----------------------------------------------------------------------
+
+    /// A `ScanSource` whose partition positions advance by a fixed amount per
+    /// poll, so a test can model both a converging and a permanently stalled
+    /// partition.
+    struct FakeScanSource {
+        assigned: Vec<PartitionId>,
+        end_offsets: HashMap<PartitionId, Offset>,
+        positions: std::sync::Mutex<HashMap<PartitionId, Offset>>,
+        /// Per-partition position increment applied on every poll.
+        advance: HashMap<PartitionId, Offset>,
+        first_poll_records: std::sync::Mutex<Vec<ConsumerRecord>>,
+    }
+
+    impl FakeScanSource {
+        fn new(
+            assigned: &[PartitionId],
+            end_offsets: &[(PartitionId, Offset)],
+            positions: &[(PartitionId, Offset)],
+            advance: &[(PartitionId, Offset)],
+        ) -> Self {
+            Self {
+                assigned: assigned.to_vec(),
+                end_offsets: end_offsets.iter().copied().collect(),
+                positions: std::sync::Mutex::new(positions.iter().copied().collect()),
+                advance: advance.iter().copied().collect(),
+                first_poll_records: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_records(self, records: Vec<ConsumerRecord>) -> Self {
+            *self.first_poll_records.lock().unwrap() = records;
+            self
+        }
+    }
+
+    impl ScanSource for FakeScanSource {
+        async fn poll_records(&self, _timeout: Duration) -> Result<Vec<ConsumerRecord>> {
+            let mut positions = self.positions.lock().unwrap();
+            for (partition, step) in &self.advance {
+                *positions.entry(*partition).or_insert(0) += *step;
+            }
+            drop(positions);
+            Ok(std::mem::take(
+                &mut *self.first_poll_records.lock().unwrap(),
+            ))
+        }
+
+        async fn assigned_partitions(&self, _topic: &str) -> Vec<PartitionId> {
+            self.assigned.clone()
+        }
+
+        async fn partition_position(&self, _topic: &str, partition: PartitionId) -> Option<Offset> {
+            self.positions.lock().unwrap().get(&partition).copied()
+        }
+
+        async fn end_offsets(&self, _topic: &str) -> Result<HashMap<PartitionId, Result<Offset>>> {
+            Ok(self.end_offsets.iter().map(|(&p, &o)| (p, Ok(o))).collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_times_out_and_names_lagging_partitions() {
+        // Partition 0 converges immediately; partition 1 never moves and
+        // partition 2 has no position at all (e.g. no leader).
+        let source = FakeScanSource::new(
+            &[0, 1, 2],
+            &[(0, 10), (1, 5), (2, 7)],
+            &[(0, 10), (1, 2)],
+            &[],
+        );
+        let mut table = CompactedTable::new();
+
+        let err = run_scan(
+            &source,
+            "test-topic",
+            &mut table,
+            Duration::from_millis(1),
+            Duration::from_millis(30),
+        )
+        .await
+        .expect_err("scan must not run forever when a partition never converges");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("partition 1 (position 2, target 5)"),
+            "error must name the stalled partition and its lag: {msg}"
+        );
+        assert!(
+            msg.contains("partition 2 (position unknown, target 7)"),
+            "error must name partitions with no known position: {msg}"
+        );
+        assert!(
+            !msg.contains("partition 0"),
+            "caught-up partitions must not be reported as lagging: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_completes_when_partitions_reach_targets() {
+        let source = FakeScanSource::new(&[0], &[(0, 3)], &[(0, 0)], &[(0, 3)])
+            .with_records(vec![make_record(Some("k1"), Some("v1"), 0, 0)]);
+        let mut table = CompactedTable::new();
+
+        run_scan(
+            &source,
+            "test-topic",
+            &mut table,
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(table.get_value(b"k1"), Some(&Bytes::from("v1")));
+    }
+
+    #[tokio::test]
+    async fn test_scan_requires_an_assignment() {
+        let source = FakeScanSource::new(&[], &[], &[], &[]);
+        let mut table = CompactedTable::new();
+
+        let err = run_scan(
+            &source,
+            "test-topic",
+            &mut table,
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("no partitions assigned"));
+    }
+
+    #[tokio::test]
+    async fn test_scan_returns_early_for_empty_topic() {
+        let source = FakeScanSource::new(&[0], &[(0, 0)], &[], &[]);
+        let mut table = CompactedTable::new();
+
+        run_scan(
+            &source,
+            "test-topic",
+            &mut table,
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+
+        assert!(table.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_lagging_partitions_ignores_empty_and_unknown_targets() {
+        // Partition 0 is empty (target 0), partition 9 is assigned but was not
+        // in the snapshot; neither may hold the scan back.
+        let source = FakeScanSource::new(&[0, 9], &[], &[], &[]);
+        let targets: HashMap<PartitionId, Offset> = [(0, 0)].into_iter().collect();
+
+        assert!(
+            lagging_partitions(&source, "test-topic", &targets)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_scan_timeout_error_lists_every_lagging_partition() {
+        let err = scan_timeout_error(
+            "cfg",
+            Duration::from_secs(2),
+            &[
+                LaggingPartition {
+                    partition: 3,
+                    position: Some(7),
+                    target: 42,
+                },
+                LaggingPartition {
+                    partition: 4,
+                    position: None,
+                    target: 1,
+                },
+            ],
+        );
+
+        let msg = err.to_string();
+        assert!(msg.contains("cfg"));
+        assert!(msg.contains("partition 3 (position 7, target 42)"));
+        assert!(msg.contains("partition 4 (position unknown, target 1)"));
     }
 
     #[tokio::test]

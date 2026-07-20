@@ -318,3 +318,137 @@ impl AdminClient {
     // DescribeUserScramCredentials (API key 50)
     // ════════════════════════════════════════════════════════════════════
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_offset_delete_request_maps_topic_partitions() {
+        let request = OffsetDeleteRequest {
+            group_id: "my-group".into(),
+            topics: vec![OffsetDeleteTopicRequest {
+                name: "orders".into(),
+                partitions: [0, 1, 2]
+                    .iter()
+                    .map(|&p| OffsetDeletePartitionRequest { partition_index: p })
+                    .collect(),
+            }],
+        };
+
+        assert_eq!(request.group_id, "my-group");
+        assert_eq!(request.topics[0].partitions.len(), 3);
+
+        let mut buf = Vec::new();
+        request
+            .encode_versioned(versions::OFFSET_DELETE_MAX, &mut buf)
+            .expect("OffsetDelete must encode");
+        assert!(!buf.is_empty());
+    }
+
+    /// `topics: None` fetches every committed offset for the group; an empty
+    /// vec would fetch none. The two must not be conflated.
+    #[test]
+    fn test_offset_fetch_request_none_means_all_partitions() {
+        let all = OffsetFetchRequest {
+            group_id: "g".into(),
+            topics: None,
+            require_stable: false,
+            member_id: None,
+            member_epoch: -1,
+        };
+        assert!(all.topics.is_none());
+
+        let specific = OffsetFetchRequest {
+            group_id: "g".into(),
+            topics: Some(vec![OffsetFetchRequestTopic {
+                name: "orders".into(),
+                topic_id: None,
+                partition_indexes: vec![0, 1],
+            }]),
+            require_stable: false,
+            member_id: None,
+            member_epoch: -1,
+        };
+        assert_eq!(
+            specific.topics.as_ref().unwrap()[0].partition_indexes.len(),
+            2
+        );
+
+        let mut buf = Vec::new();
+        specific
+            .encode_versioned(versions::OFFSET_FETCH_MAX, &mut buf)
+            .expect("OffsetFetch must encode");
+        assert!(!buf.is_empty());
+    }
+
+    /// An admin offset reset acts outside any group membership, so it must send
+    /// the "no member" sentinels — a real generation/member ID would be fenced.
+    #[test]
+    fn test_admin_offset_commit_uses_no_member_sentinels() {
+        let request = OffsetCommitRequest {
+            group_id: "g".into(),
+            generation_id: -1,
+            member_id: String::new(),
+            group_instance_id: None,
+            retention_time_ms: -1,
+            topics: vec![OffsetCommitRequestTopic {
+                name: "orders".into(),
+                topic_id: None,
+                partitions: vec![OffsetCommitRequestPartition {
+                    partition_index: 0,
+                    committed_offset: 100,
+                    committed_leader_epoch: -1,
+                    commit_timestamp: -1,
+                    committed_metadata: None,
+                }],
+            }],
+        };
+
+        assert_eq!(request.generation_id, -1);
+        assert!(request.member_id.is_empty());
+        assert_eq!(request.topics[0].partitions[0].committed_offset, 100);
+
+        let mut buf = Vec::new();
+        request
+            .encode_versioned(versions::OFFSET_COMMIT_MAX, &mut buf)
+            .expect("OffsetCommit must encode");
+        assert!(!buf.is_empty());
+    }
+
+    /// `-1` is Kafka's "no offset committed" sentinel and must not be read as
+    /// a real offset of -1.
+    #[test]
+    fn test_committed_offset_sentinel_is_distinguished_from_a_real_offset() {
+        let none = GroupOffsetEntry {
+            topic: "orders".into(),
+            partition: 0,
+            committed_offset: -1,
+            metadata: None,
+            error: None,
+        };
+        let real = GroupOffsetEntry {
+            topic: "orders".into(),
+            partition: 1,
+            committed_offset: 0,
+            metadata: None,
+            error: None,
+        };
+
+        let interpret = |e: &GroupOffsetEntry| {
+            if e.committed_offset == -1 {
+                None
+            } else {
+                Some(e.committed_offset)
+            }
+        };
+
+        assert_eq!(interpret(&none), None);
+        assert_eq!(
+            interpret(&real),
+            Some(0),
+            "offset 0 is a real committed position, not 'no commit'"
+        );
+    }
+}

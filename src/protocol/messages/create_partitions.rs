@@ -4,7 +4,8 @@ use super::{VersionedDecode, VersionedEncode, non_nullable_string};
 use crate::error::{ErrorCode, Result};
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{
-    array_len_i32, check_compact_array_len, check_decode_array_len, encode_compact_array_len,
+    array_len_i32, check_compact_array_len, check_decode_array_len, decode_capacity,
+    encode_compact_array_len,
 };
 
 // ============================================================================
@@ -138,7 +139,7 @@ impl CreatePartitionsResponse {
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let result_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut results = Vec::with_capacity(result_count);
+        let mut results = Vec::with_capacity(decode_capacity(result_count, buf.remaining()));
 
         for _ in 0..result_count {
             let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
@@ -163,7 +164,7 @@ impl CreatePartitionsResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let raw = crate::util::varint::decode_unsigned_varint(buf)?;
         let result_count = check_compact_array_len(raw)?;
-        let mut results = Vec::with_capacity(result_count);
+        let mut results = Vec::with_capacity(decode_capacity(result_count, buf.remaining()));
 
         for _ in 0..result_count {
             let name = non_nullable_string("topic name", KafkaString::decode_compact(buf)?.0)?;
