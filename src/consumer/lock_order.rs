@@ -219,10 +219,94 @@ impl<const L: usize, T> std::ops::DerefMut for LeveledWriteGuard<'_, L, T> {
     }
 }
 
+/// Run `fut` inside a lock-order tracking scope.
+///
+/// The ordering assertion in [`LevelGuard::acquire`] only fires while the
+/// task-local level tracker is set, which means it does nothing at all unless
+/// some entry point establishes the scope. Wrap the consumer's top-level
+/// operations — poll, commit, rebalance — so acquisitions inside them are
+/// actually checked in debug builds.
+///
+/// In release builds this compiles away to just awaiting `fut`.
+#[inline]
+pub(crate) async fn with_lock_tracking<F: std::future::Future>(fut: F) -> F::Output {
+    #[cfg(debug_assertions)]
+    {
+        LOCK_LEVEL.scope(Cell::new(0), fut).await
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        fut.await
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The ordering assertion is only live inside a tracking scope. This test
+    /// pins that fact down: if `with_lock_tracking` ever stops establishing
+    /// the scope, `acquire` silently returns `None` and every ordering check
+    /// in the consumer becomes dead code without any test failing.
+    #[tokio::test]
+    async fn test_level_tracking_is_active_inside_scope() {
+        let active = with_lock_tracking(async { LevelGuard::acquire(1).is_some() }).await;
+        assert!(
+            active,
+            "lock-level tracking must be active inside with_lock_tracking; \
+             otherwise the ordering assertions never run"
+        );
+    }
+
+    #[test]
+    fn test_level_tracking_is_inactive_outside_scope() {
+        // Outside a scope the guard degrades to a no-op rather than panicking.
+        assert!(LevelGuard::acquire(1).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_in_order_acquisition_is_accepted() {
+        with_lock_tracking(async {
+            let a = LeveledRwLock::<1, u32>::new(1);
+            let b = LeveledRwLock::<3, u32>::new(3);
+            let ga = a.read().await;
+            let gb = b.read().await;
+            assert_eq!((*ga, *gb), (1, 3));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_level_is_restored_after_guard_drops() {
+        with_lock_tracking(async {
+            let high = LeveledRwLock::<5, u32>::new(5);
+            {
+                let _g = high.read().await;
+            }
+            // After the level-5 guard drops, a level-2 acquisition is legal
+            // again; it would panic if the tracker had not been restored.
+            let low = LeveledRwLock::<2, u32>::new(2);
+            let g = low.read().await;
+            assert_eq!(*g, 2);
+        })
+        .await;
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "Lock ordering violation")]
+    async fn test_out_of_order_acquisition_panics() {
+        with_lock_tracking(async {
+            let high = LeveledRwLock::<5, u32>::new(5);
+            let low = LeveledRwLock::<2, u32>::new(2);
+            let _g_high = high.read().await;
+            // Acquiring a lower level while a higher one is held is the
+            // inversion that risks deadlock.
+            let _g_low = low.read().await;
+        })
+        .await;
+    }
 
     #[test]
     fn test_leveled_lock_new_and_basic_access() {

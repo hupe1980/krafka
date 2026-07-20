@@ -359,9 +359,17 @@ fn resolve_crypto_provider() -> Arc<CryptoProvider> {
         {
             Arc::new(rustls::crypto::aws_lc_rs::default_provider())
         }
-        #[cfg(not(feature = "rustls-aws-lc-rs"))]
+        #[cfg(all(feature = "ring", not(feature = "rustls-aws-lc-rs")))]
         {
             Arc::new(rustls::crypto::ring::default_provider())
+        }
+        // Only reachable when no backend feature is set, which the
+        // `compile_error!` in `lib.rs` already rejects. Present so that the
+        // build fails with that message alone rather than a confusing
+        // type-mismatch alongside it.
+        #[cfg(not(any(feature = "ring", feature = "rustls-aws-lc-rs")))]
+        {
+            unreachable!("lib.rs compile_error! guarantees a crypto backend")
         }
     })
 }
@@ -456,7 +464,7 @@ mod tests {
         // Install the default crypto provider for tests.
         #[cfg(feature = "rustls-aws-lc-rs")]
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        #[cfg(not(feature = "rustls-aws-lc-rs"))]
+        #[cfg(all(feature = "ring", not(feature = "rustls-aws-lc-rs")))]
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
 

@@ -5,7 +5,9 @@ use crate::auth::scram::ScramMechanism;
 use crate::error::{ErrorCode, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, KafkaString, TaggedFields, TryEncode};
-use crate::protocol::{check_compact_nullable_array_len, encode_compact_array_len};
+use crate::protocol::{
+    check_compact_nullable_array_len, decode_capacity, encode_compact_array_len,
+};
 
 // ============================================================================
 // DescribeUserScramCredentials API (Key 50)
@@ -103,7 +105,7 @@ impl DescribeUserScramCredentialsResponse {
 
         let result_count =
             check_compact_nullable_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut results = Vec::with_capacity(result_count);
+        let mut results = Vec::with_capacity(decode_capacity(result_count, buf.remaining()));
         for _ in 0..result_count {
             let user = non_nullable_string("user", KafkaString::decode_compact(buf)?.0)?;
             let user_error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -111,7 +113,8 @@ impl DescribeUserScramCredentialsResponse {
             let cred_count = check_compact_nullable_array_len(
                 crate::util::varint::decode_unsigned_varint(buf)?,
             )?;
-            let mut credential_infos = Vec::with_capacity(cred_count);
+            let mut credential_infos =
+                Vec::with_capacity(decode_capacity(cred_count, buf.remaining()));
             for _ in 0..cred_count {
                 let mechanism = ScramMechanism::from_wire_byte(i8::decode(buf)?)?;
                 let iterations = i32::decode(buf)?;

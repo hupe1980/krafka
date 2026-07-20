@@ -4,7 +4,7 @@ use super::{VersionedDecode, VersionedEncode};
 use crate::error::{ErrorCode, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
-use crate::protocol::{check_compact_array_len, encode_compact_array_len};
+use crate::protocol::{check_compact_array_len, decode_capacity, encode_compact_array_len};
 use crate::util::varint::decode_unsigned_varint;
 
 // ============================================================================
@@ -120,7 +120,7 @@ impl DescribeQuorumResponse {
     /// Decode replica state array for v0.
     fn decode_replica_states_v0(buf: &mut impl Buf) -> Result<Vec<QuorumReplicaState>> {
         let count = check_compact_array_len(decode_unsigned_varint(buf)?)? as usize;
-        let mut states = Vec::with_capacity(count);
+        let mut states = Vec::with_capacity(decode_capacity(count, buf.remaining()));
         for _ in 0..count {
             let replica_id = i32::decode(buf)?;
             let log_end_offset = i64::decode(buf)?;
@@ -137,7 +137,7 @@ impl DescribeQuorumResponse {
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
         let error_code = ErrorCode::from(i16::decode(buf)?);
         let topic_count = check_compact_array_len(decode_unsigned_varint(buf)?)? as usize;
-        let mut topics = Vec::with_capacity(topic_count);
+        let mut topics = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
         for _ in 0..topic_count {
             let topic_name = {
                 let len = decode_unsigned_varint(buf)? as usize;
@@ -163,7 +163,8 @@ impl DescribeQuorumResponse {
                 })?
             };
             let partition_count = check_compact_array_len(decode_unsigned_varint(buf)?)? as usize;
-            let mut partitions = Vec::with_capacity(partition_count);
+            let mut partitions =
+                Vec::with_capacity(decode_capacity(partition_count, buf.remaining()));
             for _ in 0..partition_count {
                 let partition_index = i32::decode(buf)?;
                 let partition_error_code = ErrorCode::from(i16::decode(buf)?);

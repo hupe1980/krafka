@@ -22,6 +22,19 @@
 //! from variable-length string comparisons to fixed 16-byte equality tests.
 //! Fallback to name-based keys is automatic when UUIDs are unavailable
 //! (Fetch ≤ v12 or zero UUID).
+//!
+//! ## Session lifecycle
+//!
+//! - Epoch `0` ([`INITIAL_EPOCH`]): full fetch, opens or re-opens a session
+//! - Epoch `1..=i32::MAX`: incremental fetches carrying only the diff
+//! - Epoch `-1` ([`FINAL_EPOCH`]): closes the session
+//!
+//! Brokers have a bounded number of session slots. When the client gives up a
+//! live session — rebalance, unsubscribe, close — it should send the final
+//! epoch via [`FetchSessionCache::close_all`] rather than merely dropping
+//! local state, otherwise the slot stays occupied until the broker evicts it
+//! and other clients may meanwhile be rejected with
+//! `FETCH_SESSION_ID_NOT_FOUND`.
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 
@@ -30,6 +43,15 @@ use crate::{BrokerId, PartitionId};
 
 /// Epoch value indicating the initial (full) fetch.
 pub const INITIAL_EPOCH: i32 = 0;
+
+/// Epoch value that asks the broker to close the fetch session.
+///
+/// Sent in the `session_epoch` field of a `Fetch` request (v7+) together with
+/// the established `session_id`. A broker keeps a bounded number of session
+/// slots; without an explicit close the abandoned session lingers until LRU
+/// eviction reclaims it, and in the meantime other clients can be turned away
+/// with `FETCH_SESSION_ID_NOT_FOUND`.
+pub(crate) const FINAL_EPOCH: i32 = -1;
 
 /// All-zeroes UUID sentinel — indicates "no UUID" in Kafka wire protocol.
 const ZERO_UUID: [u8; 16] = [0u8; 16];
@@ -74,10 +96,38 @@ struct TopicSession {
 
 /// Snapshot of partition fetch parameters, used to detect changes between
 /// consecutive fetches so that incremental requests only carry deltas.
+///
+/// Every field that is serialised on the wire for a partition is captured
+/// here, and the diff compares the whole struct for equality. Tracking a
+/// subset would let a changed field be silently dropped from an incremental
+/// request, leaving the broker's session with the stale value for the rest of
+/// the session's lifetime.
+///
+/// `current_leader_epoch` in particular must be tracked: it is serialised from
+/// Fetch v9 onwards and is what lets the broker fence a consumer that is still
+/// reading from a deposed leader (KIP-320). If an epoch bump were treated as
+/// "unchanged", the broker would keep validating fetches against the old
+/// epoch and the fencing check would never fire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PartitionState {
     fetch_offset: i64,
+    log_start_offset: i64,
     partition_max_bytes: i32,
+    current_leader_epoch: i32,
+    last_fetched_epoch: i32,
+}
+
+impl PartitionState {
+    /// Capture the wire-relevant fields of a partition request.
+    fn from_request(part: &FetchPartitionRequest) -> Self {
+        Self {
+            fetch_offset: part.fetch_offset,
+            log_start_offset: part.log_start_offset,
+            partition_max_bytes: part.partition_max_bytes,
+            current_leader_epoch: part.current_leader_epoch,
+            last_fetched_epoch: part.last_fetched_epoch,
+        }
+    }
 }
 
 /// Per-broker fetch session state.
@@ -116,6 +166,23 @@ pub struct FetchSessionRequest {
     pub forgotten_topics: Vec<FetchForgottenTopic>,
     /// Whether this is a full fetch (epoch 0) vs incremental.
     pub is_full_fetch: bool,
+}
+
+/// Instruction to tear down one established fetch session on its broker.
+///
+/// Produced by [`FetchSessionState::close`] / [`FetchSessionCache::close_all`].
+/// The caller sends a `Fetch` request (v7+) carrying these `session_id` and
+/// `session_epoch` values with empty `topics` and `forgotten_topics`; the
+/// broker then frees the session slot instead of holding it until eviction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FetchSessionClose {
+    /// Broker holding the session to be closed.
+    pub broker_id: BrokerId,
+    /// Session ID previously assigned by that broker.
+    pub session_id: i32,
+    /// Always [`FINAL_EPOCH`]; carried explicitly so the caller can put it
+    /// straight into the request.
+    pub session_epoch: i32,
 }
 
 impl FetchSessionState {
@@ -209,12 +276,13 @@ impl FetchSessionState {
                 .partitions
                 .iter()
                 .filter(|part| {
+                    // A partition is re-sent when it is new to the session or
+                    // when ANY tracked field differs from what the broker
+                    // currently holds — comparing only a subset would leave the
+                    // broker with stale values it can never learn about.
                     match session_topic.and_then(|t| t.partitions.get(&part.partition)) {
                         None => true,
-                        Some(prev) => {
-                            prev.fetch_offset != part.fetch_offset
-                                || prev.partition_max_bytes != part.partition_max_bytes
-                        }
+                        Some(prev) => *prev != PartitionState::from_request(part),
                     }
                 })
                 .cloned()
@@ -302,13 +370,7 @@ impl FetchSessionState {
             let key = SessionKey::from_request(topic);
             let mut partitions = HashMap::with_capacity(topic.partitions.len());
             for part in &topic.partitions {
-                partitions.insert(
-                    part.partition,
-                    PartitionState {
-                        fetch_offset: part.fetch_offset,
-                        partition_max_bytes: part.partition_max_bytes,
-                    },
-                );
+                partitions.insert(part.partition, PartitionState::from_request(part));
             }
             self.topics.insert(
                 key,
@@ -321,12 +383,44 @@ impl FetchSessionState {
         }
     }
 
-    /// Reset session state (e.g., after a session error or rebalance).
+    /// Drop local session state without telling the broker.
     /// The next fetch will be a full fetch.
+    ///
+    /// Use this when the session is already gone or unusable on the broker
+    /// side — a `FETCH_SESSION_ID_NOT_FOUND` / `INVALID_FETCH_SESSION_EPOCH`
+    /// error, or a connection failure — where a close request would be
+    /// pointless or impossible to deliver. When the session is still live and
+    /// the client is voluntarily giving it up (rebalance, unsubscribe, close),
+    /// prefer [`FetchSessionState::close`] so the broker can free the slot
+    /// immediately.
     pub fn reset(&mut self) {
         self.session_id = 0;
         self.epoch = INITIAL_EPOCH;
         self.topics.clear();
+    }
+
+    /// Give up an established session, returning the request the caller must
+    /// send so the broker releases its session slot.
+    ///
+    /// Local state is cleared unconditionally, so the next fetch is a full
+    /// fetch whether or not the returned request is delivered successfully.
+    /// Returns `None` when no session is established and there is therefore
+    /// nothing for the broker to release.
+    ///
+    /// Sending is best-effort: the broker reclaims the slot via LRU eviction
+    /// if the request never arrives, so callers may ignore transport errors.
+    pub fn close(&mut self) -> Option<FetchSessionClose> {
+        if !self.has_session() {
+            self.reset();
+            return None;
+        }
+        let close = FetchSessionClose {
+            broker_id: self.broker_id,
+            session_id: self.session_id,
+            session_epoch: FINAL_EPOCH,
+        };
+        self.reset();
+        Some(close)
     }
 
     fn next_epoch(&self) -> i32 {
@@ -367,11 +461,19 @@ impl FetchSessionCache {
         }
     }
 
-    /// Reset all sessions (e.g., on rebalance).
-    pub fn reset_all(&mut self) {
-        for session in self.sessions.values_mut() {
-            session.reset();
-        }
+    /// Clear every session and return the close requests the caller must send.
+    ///
+    /// All local state is dropped up front, so the cache is usable again
+    /// immediately and the next fetch to each broker is a full fetch. Only
+    /// brokers with an established session appear in the result.
+    ///
+    /// Sending the returned requests is best-effort — an undelivered close
+    /// merely leaves the broker to evict the session on its own schedule.
+    pub fn close_all(&mut self) -> Vec<FetchSessionClose> {
+        self.sessions
+            .values_mut()
+            .filter_map(FetchSessionState::close)
+            .collect()
     }
 
     /// Remove sessions for brokers not in the given set.
@@ -623,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn test_leader_epoch_change_not_tracked() {
+    fn test_leader_epoch_change_detected() {
         let mut state = FetchSessionState::new(1);
         let desired = vec![make_topic_request_with_epoch(
             "topic-a",
@@ -631,9 +733,10 @@ mod tests {
         )];
         state.update_from_response(42, &desired);
 
-        // Same offset, same max_bytes, but leader epoch changed.
-        // Since Fetch v7 does not serialize current_leader_epoch,
-        // the diff should NOT detect this as a change.
+        // Same offset and max_bytes, but the leader epoch advanced after a
+        // leader election. current_leader_epoch is serialised from Fetch v9
+        // on and drives KIP-320 fencing, so the partition must be re-sent —
+        // otherwise the broker keeps fencing against epoch 5 forever.
         let desired2 = vec![make_topic_request_with_epoch(
             "topic-a",
             &[(0, 100, 1048576, 6)],
@@ -641,8 +744,142 @@ mod tests {
         let req = state.build_request(&desired2);
 
         assert!(!req.is_full_fetch);
-        assert!(req.topics.is_empty()); // no changes detected
+        assert_eq!(req.topics.len(), 1);
+        assert_eq!(req.topics[0].partitions.len(), 1);
+        assert_eq!(req.topics[0].partitions[0].partition, 0);
+        assert_eq!(req.topics[0].partitions[0].current_leader_epoch, 6);
         assert!(req.forgotten_topics.is_empty());
+    }
+
+    #[test]
+    fn test_leader_epoch_unchanged_is_not_resent() {
+        let mut state = FetchSessionState::new(1);
+        let desired = vec![make_topic_request_with_epoch(
+            "topic-a",
+            &[(0, 100, 1048576, 5)],
+        )];
+        state.update_from_response(42, &desired);
+
+        // Identical request including the epoch — nothing to send.
+        let req = state.build_request(&desired);
+        assert!(!req.is_full_fetch);
+        assert!(req.topics.is_empty());
+        assert!(req.forgotten_topics.is_empty());
+    }
+
+    #[test]
+    fn test_leader_epoch_change_tracked_after_response() {
+        // After the changed epoch is acknowledged, the new value becomes the
+        // baseline and the same request no longer counts as a diff.
+        let mut state = FetchSessionState::new(1);
+        state.update_from_response(
+            42,
+            &[make_topic_request_with_epoch(
+                "topic-a",
+                &[(0, 100, 1048576, 5)],
+            )],
+        );
+
+        let desired2 = vec![make_topic_request_with_epoch(
+            "topic-a",
+            &[(0, 100, 1048576, 6)],
+        )];
+        assert_eq!(state.build_request(&desired2).topics.len(), 1);
+
+        state.update_from_response(42, &desired2);
+        assert!(state.build_request(&desired2).topics.is_empty());
+    }
+
+    #[test]
+    fn test_log_start_offset_change_detected() {
+        let mut state = FetchSessionState::new(1);
+        let mut desired = vec![make_topic_request("topic-a", &[(0, 100, 1048576)])];
+        state.update_from_response(42, &desired);
+
+        desired[0].partitions[0].log_start_offset = 50;
+        let req = state.build_request(&desired);
+
+        assert_eq!(req.topics.len(), 1);
+        assert_eq!(req.topics[0].partitions[0].log_start_offset, 50);
+    }
+
+    #[test]
+    fn test_last_fetched_epoch_change_detected() {
+        let mut state = FetchSessionState::new(1);
+        let mut desired = vec![make_topic_request("topic-a", &[(0, 100, 1048576)])];
+        state.update_from_response(42, &desired);
+
+        desired[0].partitions[0].last_fetched_epoch = 3;
+        let req = state.build_request(&desired);
+
+        assert_eq!(req.topics.len(), 1);
+        assert_eq!(req.topics[0].partitions[0].last_fetched_epoch, 3);
+    }
+
+    #[test]
+    fn test_close_returns_final_epoch_request() {
+        let mut state = FetchSessionState::new(7);
+        let desired = vec![make_topic_request("topic-a", &[(0, 100, 1048576)])];
+        state.update_from_response(42, &desired);
+
+        let close = state.close().expect("established session must be closed");
+        assert_eq!(close.broker_id, 7);
+        assert_eq!(close.session_id, 42);
+        assert_eq!(close.session_epoch, FINAL_EPOCH);
+
+        // Local state is cleared regardless of whether the request lands.
+        assert!(!state.has_session());
+        assert_eq!(state.epoch(), INITIAL_EPOCH);
+        assert_eq!(state.partition_count(), 0);
+        assert!(state.build_request(&desired).is_full_fetch);
+    }
+
+    #[test]
+    fn test_close_without_session_is_noop() {
+        let mut state = FetchSessionState::new(1);
+        assert!(state.close().is_none());
+        assert!(!state.has_session());
+    }
+
+    #[test]
+    fn test_close_is_not_repeatable() {
+        let mut state = FetchSessionState::new(1);
+        let desired = vec![make_topic_request("topic-a", &[(0, 100, 1048576)])];
+        state.update_from_response(42, &desired);
+
+        assert!(state.close().is_some());
+        // Session already relinquished — nothing left to tell the broker.
+        assert!(state.close().is_none());
+    }
+
+    #[test]
+    fn test_final_epoch_is_minus_one() {
+        assert_eq!(FINAL_EPOCH, -1);
+    }
+
+    #[test]
+    fn test_cache_close_all_returns_established_sessions() {
+        let mut cache = FetchSessionCache::new();
+        let desired = vec![make_topic_request("t", &[(0, 0, 1048576)])];
+        cache.get_or_create(1).update_from_response(42, &desired);
+        cache.get_or_create(2).update_from_response(43, &desired);
+        // Broker 3 never established a session.
+        cache.get_or_create(3);
+
+        let mut closes = cache.close_all();
+        closes.sort_unstable_by_key(|c| c.broker_id);
+
+        assert_eq!(closes.len(), 2);
+        assert_eq!(closes[0].broker_id, 1);
+        assert_eq!(closes[0].session_id, 42);
+        assert_eq!(closes[1].broker_id, 2);
+        assert_eq!(closes[1].session_id, 43);
+        assert!(closes.iter().all(|c| c.session_epoch == FINAL_EPOCH));
+
+        // Every session is cleared, so a second close has nothing to send.
+        assert!(!cache.get_or_create(1).has_session());
+        assert!(!cache.get_or_create(2).has_session());
+        assert!(cache.close_all().is_empty());
     }
 
     #[test]
@@ -675,18 +912,6 @@ mod tests {
         cache.reset_broker(1);
         assert!(!cache.get_or_create(1).has_session());
         assert!(cache.get_or_create(2).has_session());
-    }
-
-    #[test]
-    fn test_cache_reset_all() {
-        let mut cache = FetchSessionCache::new();
-        let desired = vec![make_topic_request("t", &[(0, 0, 1048576)])];
-        cache.get_or_create(1).update_from_response(42, &desired);
-        cache.get_or_create(2).update_from_response(43, &desired);
-
-        cache.reset_all();
-        assert!(!cache.get_or_create(1).has_session());
-        assert!(!cache.get_or_create(2).has_session());
     }
 
     #[test]

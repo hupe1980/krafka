@@ -88,16 +88,38 @@ use crate::error::{KrafkaError, ProtocolErrorKind, Result};
 /// `is_initialized()` read and a concurrent `initialize()` that clears
 /// sequences: callers always observe a fully consistent snapshot.
 ///
-/// The `poisoned` flag is a separate [`AtomicBool`] because it is set and
+/// The `needs_reinit` flag is a separate [`AtomicBool`] because it is set and
 /// checked on an independent code path that does not need to be coordinated
 /// with sequence state.
 #[derive(Debug)]
 pub struct ProducerIdentity {
-    /// Set when an unrecoverable `UnknownProducerId` was observed while newer
-    /// in-flight batches still depended on the current sequence state.
-    poisoned: AtomicBool,
+    /// Set when the local sequence space for this PID can no longer be trusted
+    /// (for example after a non-tail rollback) and a fresh `InitProducerId`
+    /// must be performed before the next batch is dispatched.
+    ///
+    /// This replaces the previous `poisoned` flag, which permanently bricked
+    /// the producer.  Requesting a re-init is recoverable: the next send
+    /// obtains a new PID and restarts every partition at sequence 0.
+    needs_reinit: AtomicBool,
     /// All mutable identity state behind one lock for consistency.
     inner: RwLock<IdentityInner>,
+}
+
+/// Outcome of a sequence-range rollback attempt.
+///
+/// See [`ProducerIdentity::rollback_sequence_range`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackOutcome {
+    /// The batch owned the tail of the allocated range and the partition
+    /// counter was rewound; the sequence space is intact.
+    RolledBack,
+    /// The batch did **not** own the tail — a newer range has already been
+    /// allocated for this partition, so rewinding would hand the same
+    /// sequence numbers to two different batches.  Nothing was changed and
+    /// the caller must recover by re-initialising the producer ID (or, for
+    /// a transactional producer, bumping the epoch) and resetting the
+    /// partition sequences.
+    NotTail,
 }
 
 /// Mutable state held inside [`ProducerIdentity`].
@@ -204,7 +226,7 @@ impl ProducerIdentity {
     /// Create a new uninitialized producer identity.
     pub fn new() -> Self {
         Self {
-            poisoned: AtomicBool::new(false),
+            needs_reinit: AtomicBool::new(false),
             inner: RwLock::new(IdentityInner::uninitialized()),
         }
     }
@@ -237,10 +259,53 @@ impl ProducerIdentity {
     /// or any sequence method will either see the fully-old state or the
     /// fully-new state; there is no intermediate window.
     pub fn initialize(&self, producer_id: i64, producer_epoch: i16) {
+        self.set_identity(producer_id, producer_epoch);
+    }
+
+    /// Adopt a `(producer_id, producer_epoch)` pair that the transaction
+    /// coordinator bumped on the client's behalf.
+    ///
+    /// # Transaction version
+    ///
+    /// This is the KIP-890 **transaction version 2** path. Under TV2 the
+    /// coordinator increments the producer epoch as part of writing every
+    /// commit/abort marker and returns the new pair in the `EndTxn` v4+
+    /// response. The producer must adopt it: the old epoch is fenced the
+    /// moment the marker is written, so the next transaction started with the
+    /// stale epoch fails with `InvalidProducerEpoch`.
+    ///
+    /// When the epoch would overflow `i16::MAX` the coordinator allocates a
+    /// fresh producer ID and returns epoch 0 instead, which is why the
+    /// producer ID is adopted alongside the epoch rather than assumed stable.
+    ///
+    /// Under **transaction version 1** the coordinator does not bump on
+    /// completion and this is never called.
+    ///
+    /// # Sequence reset
+    ///
+    /// A new epoch (or a new producer ID) starts a fresh sequence space: the
+    /// broker resets its expected sequence for every partition to 0, so every
+    /// local per-partition counter must be dropped in the same critical
+    /// section. Keeping a stale counter would make the first batch of the next
+    /// transaction arrive with a non-zero base sequence and be rejected as
+    /// `OutOfOrderSequenceNumber`.
+    ///
+    /// Any pending re-init request is also cleared — the bump already gave the
+    /// producer the clean sequence space that a re-init would have obtained.
+    pub fn bump_epoch(&self, producer_id: i64, producer_epoch: i16) {
+        self.set_identity(producer_id, producer_epoch);
+    }
+
+    /// Install a producer identity and drop all derived sequence state.
+    ///
+    /// Every field is written under a single write lock so concurrent readers
+    /// observe either the fully-old or the fully-new identity, never a PID
+    /// paired with the previous epoch's sequence counters.
+    fn set_identity(&self, producer_id: i64, producer_epoch: i16) {
         let mut inner = self.inner.write();
         inner.producer_id = producer_id;
         inner.producer_epoch = producer_epoch;
-        self.poisoned.store(false, Ordering::Release);
+        self.needs_reinit.store(false, Ordering::Release);
         inner.sequences.clear();
     }
 
@@ -251,16 +316,64 @@ impl ProducerIdentity {
         let mut inner = self.inner.write();
         inner.producer_id = -1;
         inner.producer_epoch = -1_i16;
-        self.poisoned.store(false, Ordering::Release);
+        self.needs_reinit.store(false, Ordering::Release);
         inner.sequences.clear();
     }
 
-    pub(crate) fn poison(&self) {
-        self.poisoned.store(true, Ordering::Release);
+    /// Request that a fresh `InitProducerId` be performed before the next
+    /// batch is dispatched.
+    ///
+    /// Used when the local sequence space can no longer be trusted — for
+    /// example when a failed batch did not own the tail of the allocated
+    /// range, so rewinding would duplicate sequence numbers.  Unlike the
+    /// previous "poison" behaviour this is fully recoverable: the next send
+    /// obtains a new PID and every partition restarts at sequence 0.
+    pub(crate) fn request_reinit(&self) {
+        self.needs_reinit.store(true, Ordering::Release);
     }
 
-    pub(crate) fn is_poisoned(&self) -> bool {
-        self.poisoned.load(Ordering::Acquire)
+    /// Whether a re-initialisation has been requested via
+    /// [`request_reinit`](Self::request_reinit).
+    pub(crate) fn needs_reinit(&self) -> bool {
+        self.needs_reinit.load(Ordering::Acquire)
+    }
+
+    /// Consume a pending re-init request, clearing the PID/epoch and all
+    /// sequences so the next `InitProducerId` starts from a clean slate.
+    ///
+    /// Returns `true` when a request was pending (and state was cleared).
+    pub(crate) fn take_reinit_request(&self) -> bool {
+        if self.needs_reinit.swap(false, Ordering::AcqRel) {
+            let mut inner = self.inner.write();
+            inner.producer_id = -1;
+            inner.producer_epoch = -1_i16;
+            inner.sequences.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drop all per-partition sequence state while keeping the current
+    /// PID/epoch.
+    ///
+    /// Used after a transactional epoch bump, where the broker resets its
+    /// expected sequence for every partition to 0 but the producer ID stays
+    /// the same.
+    pub fn reset_all_sequences(&self) {
+        self.inner.write().sequences.clear();
+    }
+
+    /// Drop the sequence state for a single partition.
+    ///
+    /// The next allocation for that partition starts again at 0 with no
+    /// acknowledged sequence.  Only safe once the broker-side expectation has
+    /// also been reset (new PID or bumped epoch).
+    pub fn reset_partition_sequences(&self, topic: &str, partition: PartitionId) {
+        let mut inner = self.inner.write();
+        if let Some(parts) = inner.sequences.get_mut(topic) {
+            parts.remove(&partition);
+        }
     }
 
     /// Get the next sequence number for a topic-partition (single-record batch).
@@ -333,20 +446,41 @@ impl ProducerIdentity {
         }
     }
 
-    /// Roll back the most recent sequence allocation for a partition.
+    /// Roll back a single-record allocation that starts at `base_sequence`.
     ///
-    /// Call this when a sequence was allocated via [`Self::next_sequence`] but the
-    /// request was never sent (e.g., encode failure). Decrements `next_sequence`
-    /// by one, wrapping from 0 back to `i32::MAX`.
-    pub fn rollback_sequence(&self, topic: &str, partition: PartitionId) -> Result<()> {
-        self.rollback_sequence_range(topic, partition, 1)
+    /// Convenience wrapper around
+    /// [`rollback_sequence_range`](Self::rollback_sequence_range) with
+    /// `count = 1`; the same tail-ownership rules apply.
+    pub fn rollback_sequence(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+        base_sequence: i32,
+    ) -> Result<RollbackOutcome> {
+        self.rollback_sequence_range(topic, partition, base_sequence, 1)
     }
 
-    /// Roll back a range of `count` sequence numbers.
+    /// Roll back the range `[base_sequence, base_sequence + count)` **only if
+    /// the caller owns the tail** of the partition's allocated sequence space.
     ///
-    /// Used when a multi-record batch was allocated a sequence range via
-    /// [`allocate_sequence`](Self::allocate_sequence) but failed before being
-    /// sent (e.g., encode failure), preventing sequence gaps.
+    /// Used when a batch was allocated a sequence range via
+    /// [`allocate_sequence`](Self::allocate_sequence) but will never reach the
+    /// broker (encode failure, exhausted retries), so that the next batch does
+    /// not open a permanent gap.
+    ///
+    /// # Why the tail check matters
+    ///
+    /// An unconditional modular subtraction corrupts the sequence space: if a
+    /// newer batch has already been allocated `[base + count, …)`, rewinding
+    /// hands the *same* sequence numbers to two different batches. The broker
+    /// then either silently deduplicates real data or wedges the partition
+    /// with `OUT_OF_ORDER_SEQUENCE_NUMBER` forever.
+    ///
+    /// This method therefore verifies that `next_sequence == base_sequence +
+    /// count` before rewinding. When that does not hold it changes nothing and
+    /// returns [`RollbackOutcome::NotTail`]; the caller must recover by
+    /// requesting a producer-ID re-init or, for a transactional producer, an
+    /// epoch bump, and then resetting the partition sequences.
     ///
     /// # Errors
     ///
@@ -355,8 +489,9 @@ impl ProducerIdentity {
         &self,
         topic: &str,
         partition: PartitionId,
+        base_sequence: i32,
         count: i32,
-    ) -> Result<()> {
+    ) -> Result<RollbackOutcome> {
         if count <= 0 {
             return Err(KrafkaError::protocol_kind(
                 ProtocolErrorKind::InvalidValue,
@@ -364,17 +499,73 @@ impl ProducerIdentity {
             ));
         }
 
+        let expected_tail =
+            ((base_sequence as u32).wrapping_add(count as u32) % SEQUENCE_SPACE) as i32;
+
         let mut inner = self.inner.write();
-        if let Some(state) = inner
+        let Some(state) = inner
             .sequences
             .get_mut(topic)
             .and_then(|parts| parts.get_mut(&partition))
-        {
-            let current = state.next_sequence as u32;
-            state.next_sequence =
-                ((current + SEQUENCE_SPACE - count as u32) % SEQUENCE_SPACE) as i32;
+        else {
+            // Nothing allocated for this partition at all — there is no tail
+            // to rewind and no newer allocation to corrupt.
+            return Ok(RollbackOutcome::RolledBack);
+        };
+
+        if state.next_sequence != expected_tail {
+            return Ok(RollbackOutcome::NotTail);
         }
-        Ok(())
+
+        state.next_sequence = base_sequence;
+        Ok(RollbackOutcome::RolledBack)
+    }
+
+    /// Whether it is safe to locally rewind after
+    /// `OUT_OF_ORDER_SEQUENCE_NUMBER` for the batch
+    /// `[base_sequence, base_sequence + count)`.
+    ///
+    /// `OUT_OF_ORDER_SEQUENCE_NUMBER` usually means an **earlier** batch never
+    /// made it into the log (log truncation, unclean leader election). Blindly
+    /// resetting `next_sequence` to `last_acked + 1` and resending writes the
+    /// current batch into that hole and reports success for a stream that is
+    /// silently missing records.
+    ///
+    /// A local reset is only defensible when this batch is head-of-line:
+    ///
+    /// * its base sequence is exactly `last_acked + 1`, so no earlier batch is
+    ///   unaccounted for, **and**
+    /// * no newer range has been allocated for the partition, so nothing else
+    ///   depends on the current counter.
+    ///
+    /// When this returns `false` the caller must surface a fatal, non-retriable
+    /// error rather than rewinding (matching librdkafka, which raises a fatal
+    /// error for a head-of-line failure).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `count <= 0`.
+    pub fn can_reset_after_out_of_order(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+        base_sequence: i32,
+        count: i32,
+    ) -> Result<bool> {
+        let last_sequence = last_sequence_of_batch(base_sequence, count)?;
+        let inner = self.inner.read();
+        let Some(state) = inner
+            .sequences
+            .get(topic)
+            .and_then(|parts| parts.get(&partition))
+        else {
+            return Ok(false);
+        };
+
+        Ok(
+            base_sequence == next_sequence_after(state.last_acked_sequence)
+                && state.next_sequence == next_sequence_after(last_sequence),
+        )
     }
 
     /// Reset sequence number for a partition (e.g., after an out-of-order error).
@@ -507,7 +698,7 @@ impl ProducerIdentity {
             inner.producer_id = -1;
             inner.producer_epoch = -1_i16;
             inner.sequences.clear();
-            self.poisoned.store(false, Ordering::Release);
+            self.needs_reinit.store(false, Ordering::Release);
         }
         Ok(retryable)
     }
@@ -656,7 +847,7 @@ impl ProducerIdentity {
                 },
             );
         }
-        self.poisoned.store(false, Ordering::Release);
+        self.needs_reinit.store(false, Ordering::Release);
     }
 
     /// Directly set sequence state for a partition.
@@ -967,6 +1158,51 @@ mod tests {
         assert_eq!(identity.peek_sequence("topic", 0), 0);
     }
 
+    /// The KIP-890 TV2 epoch bump keeps the producer initialized (unlike
+    /// `reset`) while restarting every partition's sequence space, because the
+    /// broker resets its expected sequence to 0 for the new epoch.
+    #[test]
+    fn test_bump_epoch_keeps_identity_and_resets_all_sequences() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(12345, 5);
+
+        for _ in 0..3 {
+            identity.next_sequence("topic-a", 0).unwrap();
+        }
+        identity.next_sequence("topic-b", 7).unwrap();
+        identity.acknowledge("topic-a", 0, 2);
+        assert_eq!(identity.peek_sequence("topic-a", 0), 3);
+        assert_eq!(identity.last_acked_sequence("topic-a", 0), 2);
+
+        identity.bump_epoch(12345, 6);
+
+        assert!(identity.is_initialized());
+        assert_eq!(identity.producer_id(), 12345);
+        assert_eq!(identity.producer_epoch(), 6);
+        assert_eq!(identity.peek_sequence("topic-a", 0), 0);
+        assert_eq!(identity.peek_sequence("topic-b", 7), 0);
+        assert_eq!(
+            identity.last_acked_sequence("topic-a", 0),
+            -1,
+            "acknowledgements from the previous epoch must not carry over"
+        );
+    }
+
+    /// A bump hands the producer the clean sequence space that a pending
+    /// re-init would have obtained, so the request is satisfied and cleared.
+    #[test]
+    fn test_bump_epoch_clears_pending_reinit_request() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+        identity.request_reinit();
+        assert!(identity.needs_reinit());
+
+        identity.bump_epoch(1, 1);
+
+        assert!(!identity.needs_reinit());
+        assert_eq!(identity.producer_epoch(), 1);
+    }
+
     #[test]
     fn test_snapshot() {
         let identity = ProducerIdentity::new();
@@ -1012,18 +1248,51 @@ mod tests {
     }
 
     #[test]
-    fn test_poison_flag_clears_on_reset_and_reinitialize() {
+    fn test_reinit_request_clears_on_reset_and_reinitialize() {
         let identity = ProducerIdentity::new();
         identity.initialize(1, 0);
-        identity.poison();
+        identity.request_reinit();
 
-        assert!(identity.is_poisoned());
+        assert!(identity.needs_reinit());
 
         identity.reset();
-        assert!(!identity.is_poisoned());
+        assert!(!identity.needs_reinit());
 
+        identity.request_reinit();
         identity.initialize(2, 1);
-        assert!(!identity.is_poisoned());
+        assert!(!identity.needs_reinit());
+    }
+
+    /// `take_reinit_request` consumes the flag exactly once and wipes the
+    /// PID/epoch so the next `InitProducerId` starts from a clean slate.
+    #[test]
+    fn test_take_reinit_request_clears_identity_once() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(7, 3);
+        identity.allocate_sequence("topic", 0, 4).unwrap();
+        identity.request_reinit();
+
+        assert!(identity.take_reinit_request());
+        assert!(!identity.is_initialized());
+        assert_eq!(identity.peek_sequence("topic", 0), 0);
+
+        // Second call is a no-op — the request was already consumed.
+        assert!(!identity.take_reinit_request());
+    }
+
+    /// Requesting a re-init must never brick the producer — after the
+    /// follow-up `initialize()` the identity is usable again.
+    #[test]
+    fn test_reinit_is_recoverable_not_permanent() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+        identity.request_reinit();
+        assert!(identity.take_reinit_request());
+
+        identity.initialize(99, 0);
+        assert!(identity.is_initialized());
+        assert!(!identity.needs_reinit());
+        assert_eq!(identity.allocate_sequence("topic", 0, 1).unwrap(), 0);
     }
 
     #[test]
@@ -1040,18 +1309,75 @@ mod tests {
     }
 
     #[test]
-    fn test_rollback_sequence() {
+    fn test_rollback_sequence_tail() {
         let identity = ProducerIdentity::new();
         identity.initialize(1, 0);
 
-        // Allocate sequence 0, then roll back
+        // Allocate sequence 0, then roll back — the batch owns the tail.
         assert_eq!(identity.next_sequence("topic", 0).unwrap(), 0);
         assert_eq!(identity.peek_sequence("topic", 0), 1);
-        identity.rollback_sequence("topic", 0).unwrap();
+        assert_eq!(
+            identity.rollback_sequence("topic", 0, 0).unwrap(),
+            RollbackOutcome::RolledBack
+        );
         assert_eq!(identity.peek_sequence("topic", 0), 0);
 
         // Re-allocate gives the same sequence
         assert_eq!(identity.next_sequence("topic", 0).unwrap(), 0);
+    }
+
+    /// Rolling back a range that no longer owns the tail must be refused,
+    /// otherwise two batches would be handed the same sequence numbers.
+    #[test]
+    fn test_rollback_sequence_range_refuses_non_tail() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+
+        let first = identity.allocate_sequence("topic", 0, 3).unwrap();
+        let second = identity.allocate_sequence("topic", 0, 2).unwrap();
+        assert_eq!(first, 0);
+        assert_eq!(second, 3);
+        assert_eq!(identity.peek_sequence("topic", 0), 5);
+
+        // The older batch does not own the tail — refuse and change nothing.
+        assert_eq!(
+            identity
+                .rollback_sequence_range("topic", 0, first, 3)
+                .unwrap(),
+            RollbackOutcome::NotTail
+        );
+        assert_eq!(
+            identity.peek_sequence("topic", 0),
+            5,
+            "a refused rollback must not modify the counter"
+        );
+
+        // The newest batch does own the tail.
+        assert_eq!(
+            identity
+                .rollback_sequence_range("topic", 0, second, 2)
+                .unwrap(),
+            RollbackOutcome::RolledBack
+        );
+        assert_eq!(identity.peek_sequence("topic", 0), 3);
+    }
+
+    /// A partition with no recorded state has nothing to corrupt.
+    #[test]
+    fn test_rollback_sequence_range_unknown_partition_is_noop() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+        assert_eq!(
+            identity.rollback_sequence_range("topic", 7, 0, 4).unwrap(),
+            RollbackOutcome::RolledBack
+        );
+    }
+
+    #[test]
+    fn test_rollback_sequence_range_rejects_non_positive_count() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+        assert!(identity.rollback_sequence_range("topic", 0, 0, 0).is_err());
     }
 
     #[test]
@@ -1059,12 +1385,109 @@ mod tests {
         let identity = ProducerIdentity::new();
         identity.initialize(1, 0);
 
-        // Set up state at 0 (just wrapped)
+        // Set up state at 0 (just wrapped): the batch based at i32::MAX owns
+        // the tail because i32::MAX + 1 wraps to 0.
         identity.set_sequence_state("topic", 0, 0, i32::MAX - 1);
 
-        // Rollback from 0 should wrap to i32::MAX
-        identity.rollback_sequence("topic", 0).unwrap();
+        assert_eq!(
+            identity.rollback_sequence("topic", 0, i32::MAX).unwrap(),
+            RollbackOutcome::RolledBack
+        );
         assert_eq!(identity.peek_sequence("topic", 0), i32::MAX);
+    }
+
+    // ── OUT_OF_ORDER_SEQUENCE_NUMBER reset safety ─────────────────
+
+    /// A head-of-line batch (base == last_acked + 1, nothing newer allocated)
+    /// may be locally rewound and resent.
+    #[test]
+    fn test_can_reset_after_out_of_order_head_of_line() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+
+        let base = identity.allocate_sequence("topic", 0, 3).unwrap();
+        assert_eq!(base, 0);
+
+        assert!(
+            identity
+                .can_reset_after_out_of_order("topic", 0, base, 3)
+                .unwrap()
+        );
+    }
+
+    /// When an earlier batch is still unaccounted for, the failing batch is
+    /// *not* head-of-line: rewinding would write it into the hole left by the
+    /// lost batch and silently drop data.
+    #[test]
+    fn test_cannot_reset_after_out_of_order_when_earlier_batch_missing() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+
+        // Batch A = [0,3), batch B = [3,5). Nothing acked yet, so B is not
+        // head-of-line — A may have been lost by the broker.
+        identity.allocate_sequence("topic", 0, 3).unwrap();
+        let b = identity.allocate_sequence("topic", 0, 2).unwrap();
+
+        assert!(
+            !identity
+                .can_reset_after_out_of_order("topic", 0, b, 2)
+                .unwrap()
+        );
+    }
+
+    /// Even a head-of-line batch must not rewind while a newer range has
+    /// already been allocated for the partition.
+    #[test]
+    fn test_cannot_reset_after_out_of_order_when_newer_allocation_exists() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+
+        let a = identity.allocate_sequence("topic", 0, 3).unwrap();
+        identity.allocate_sequence("topic", 0, 2).unwrap();
+
+        assert!(
+            !identity
+                .can_reset_after_out_of_order("topic", 0, a, 3)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_cannot_reset_after_out_of_order_unknown_partition() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+        assert!(
+            !identity
+                .can_reset_after_out_of_order("topic", 3, 0, 1)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_reset_partition_sequences_only_affects_that_partition() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(1, 0);
+        identity.allocate_sequence("topic", 0, 4).unwrap();
+        identity.allocate_sequence("topic", 1, 2).unwrap();
+
+        identity.reset_partition_sequences("topic", 0);
+
+        assert_eq!(identity.peek_sequence("topic", 0), 0);
+        assert_eq!(identity.last_acked_sequence("topic", 0), -1);
+        assert_eq!(identity.peek_sequence("topic", 1), 2);
+    }
+
+    #[test]
+    fn test_reset_all_sequences_keeps_pid_and_epoch() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(42, 9);
+        identity.allocate_sequence("topic", 0, 4).unwrap();
+
+        identity.reset_all_sequences();
+
+        assert_eq!(identity.producer_id(), 42);
+        assert_eq!(identity.producer_epoch(), 9);
+        assert_eq!(identity.peek_sequence("topic", 0), 0);
     }
 
     #[test]
@@ -1191,11 +1614,11 @@ mod tests {
     }
 
     #[test]
-    fn test_restore_from_snapshot_clears_poisoned() {
+    fn test_restore_from_snapshot_clears_reinit_request() {
         let identity = ProducerIdentity::new();
         identity.initialize(50, 0);
-        identity.poison();
-        assert!(identity.is_poisoned());
+        identity.request_reinit();
+        assert!(identity.needs_reinit());
 
         let snapshot = ProducerIdentitySnapshot {
             producer_id: 50,
@@ -1203,6 +1626,6 @@ mod tests {
             partition_sequences: vec![],
         };
         identity.restore_from_snapshot(&snapshot);
-        assert!(!identity.is_poisoned());
+        assert!(!identity.needs_reinit());
     }
 }

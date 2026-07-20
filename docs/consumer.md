@@ -125,7 +125,20 @@ let consumer = Consumer::builder()
 
 Control how offsets are committed. When auto-commit is enabled (the default), Krafka automatically commits offsets during each `poll()` call when the commit interval has elapsed, during `close()`, and **before partition revocations** during rebalances (so the new partition owner sees up-to-date committed positions). `close().await` still tears down local state before returning; final auto-commit failures that only indicate the member already lost the group during a rebalance are treated as best-effort shutdown races, while other close-time commit failures still surface:
 
-> **Warning — at-least-once caveat:** Auto-commit commits the offset of the last record *returned* by `poll()`, not the last record *processed* by the application. If the application crashes after `poll()` returns but before processing completes, those records may be skipped on restart. For strict at-least-once guarantees, disable auto-commit and call `commit()` explicitly after processing each batch.
+> **At-least-once caveat:** auto-commit advances to the offset of the last record
+> *delivered to your code*, not the last record your code finished *processing*.
+> Records that were delivered but not yet processed when the application crashes
+> are skipped on restart.
+>
+> Krafka does guarantee that an offset is never committed for a record that was
+> fetched but not yet handed to you: the committable position is clamped to the
+> lowest offset still sitting in the internal buffer, so buffered-but-undelivered
+> records are never committed away, including across a rebalance. `poll()` is
+> also cancellation-safe — dropping the future (a `select!` arm, an elapsed
+> `timeout`) never advances the position past records you did not receive.
+>
+> For strict at-least-once, disable auto-commit and call `commit()` after
+> processing each batch.
 
 ```rust
 use krafka::consumer::Consumer;
@@ -293,7 +306,17 @@ let consumer = Consumer::builder()
     .build()
     .await?;
 
-// Cooperative sticky for minimal partition movement during rebalances
+// Eager sticky: minimises partition movement, but still revokes everything
+// before each rebalance round.
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .partition_assignment_strategy(PartitionAssignmentStrategy::Sticky)
+    .build()
+    .await?;
+
+// Cooperative sticky: minimal partition movement AND no stop-the-world
+// revocation — members keep consuming partitions they retain.
 let consumer = Consumer::builder()
     .bootstrap_servers("localhost:9092")
     .group_id("my-group")
@@ -301,6 +324,32 @@ let consumer = Consumer::builder()
     .build()
     .await?;
 ```
+
+### Migrating from eager to cooperative
+
+The default is the preference list `[Range, CooperativeSticky]`, matching the
+Java client. Every member advertises both protocols in JoinGroup and the
+coordinator picks the first one *all* members support, so a group can move from
+eager to cooperative rebalancing in a **single rolling bounce**: as soon as the
+last `Range`-only member is replaced, the group negotiates `CooperativeSticky`
+on its own.
+
+```rust
+// Explicit preference order. The first strategy supported by every member wins.
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .partition_assignment_strategies([
+        PartitionAssignmentStrategy::CooperativeSticky,
+        PartitionAssignmentStrategy::Range,
+    ])
+    .build()
+    .await?;
+```
+
+Setting a single strategy with `partition_assignment_strategy()` is shorthand
+for a one-element list — which forces a full stop-the-world restart to change
+protocols later.
 
 The underlying assignor implementations are also available directly:
 
@@ -1184,13 +1233,15 @@ top-level fields) and starts a fresh heartbeat task.
   Kafka versions ≥ 0.10. Use `GroupProtocol::Consumer` only when you can guarantee
   all brokers in the cluster run Kafka 4.0+.
 - **Required API key**: API key 68 (`ConsumerGroupHeartbeat`), versions 0–1.
-- **Known limitations vs classic protocol**:
-  - Transactional offset commits (`TxnOffsetCommit`) are not yet implemented on
-    the KIP-848 path.
-  - Regex-based subscriptions require `ConsumerGroupHeartbeat` v1 (Kafka 4.0+).
-  - The server-side assignor name is always the Kafka broker's uniform assignor;
-    client-side assignors (`range`, `roundrobin`, `cooperative-sticky`) are
-    ignored when `GroupProtocol::Consumer` is active.
+- **Regex subscriptions** require `ConsumerGroupHeartbeat` v1 (Kafka 4.0+).
+- **Assignment is server-side.** Under KIP-848 the broker computes assignments,
+  so the client-side assignors (`range`, `roundrobin`, `sticky`,
+  `cooperative-sticky`) do not apply. Configure the assignor on the broker via
+  `group.consumer.assignors`.
+- **Transactional offset commits work on both protocols.**
+  `Consumer::group_metadata()` reports the member epoch under KIP-848 and the
+  generation ID under the classic protocol; both occupy the same wire field, so
+  `send_offsets_to_transaction` fences zombies identically either way.
 
 ### Describing KIP-848 Groups
 
@@ -1198,11 +1249,6 @@ To inspect a KIP-848 consumer group (state, epochs, member assignments), use
 the AdminClient's `describe_consumer_groups()` method which auto-detects the
 group type and dispatches to the appropriate API. See the
 [Admin Client Guide](admin.md#describing-consumer-groups) for details.
-
-### Limitations
-
-Full transactional offset support (`TxnOffsetCommit`) is not yet
-implemented.
 
 ## Consumer Interceptors
 

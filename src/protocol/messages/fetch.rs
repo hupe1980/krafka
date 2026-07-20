@@ -8,7 +8,7 @@ use crate::protocol::primitives::{
 };
 use crate::protocol::{
     array_len_i32, check_compact_array_len, check_compact_nullable_array_len,
-    check_decode_array_len, check_decode_nullable_array_len,
+    check_decode_array_len, check_decode_nullable_array_len, decode_capacity,
 };
 
 /// This struct is `#[non_exhaustive]`; use [`Default::default()`] and then
@@ -482,6 +482,14 @@ pub struct FetchResponse {
     pub session_id: i32,
     /// Topic responses.
     pub responses: Vec<FetchTopicResponse>,
+    /// Endpoints of the brokers named by any partition's
+    /// [`FetchPartitionResponse::current_leader`] (v16+, KIP-951).
+    ///
+    /// The broker sends these alongside `NOT_LEADER_OR_FOLLOWER` and
+    /// `FENCED_LEADER_EPOCH` so the client can connect to the new leader
+    /// immediately instead of waiting for the next metadata refresh. Empty on
+    /// versions below 16 and whenever no leader change was reported.
+    pub node_endpoints: Vec<NodeEndpoint>,
 }
 
 /// Topic in fetch response.
@@ -520,6 +528,22 @@ pub struct FetchPartitionResponse {
     pub preferred_read_replica: i32,
     /// Record batches.
     pub records: Option<Bytes>,
+    /// Point at which this consumer's log diverged from the leader's
+    /// (v12+, KIP-320). Partition-level tagged field, tag 0.
+    ///
+    /// Present when the `(fetch_offset, last_fetched_epoch)` pair sent in the
+    /// request does not exist in the leader's log — the hallmark of an unclean
+    /// leader election. The consumer must truncate its position to
+    /// [`DivergingEpoch::end_offset`] before fetching again; continuing from
+    /// the old position would read records the current leader never had.
+    pub diverging_epoch: Option<DivergingEpoch>,
+    /// Leader that the client should be talking to for this partition
+    /// (v16+, KIP-951). Partition-level tagged field, tag 1.
+    ///
+    /// Accompanies `NOT_LEADER_OR_FOLLOWER` / `FENCED_LEADER_EPOCH`. Resolve
+    /// [`LeaderIdAndEpoch::leader_id`] against
+    /// [`FetchResponse::node_endpoints`] to get the address.
+    pub current_leader: Option<LeaderIdAndEpoch>,
 }
 
 impl Default for FetchPartitionResponse {
@@ -533,6 +557,8 @@ impl Default for FetchPartitionResponse {
             aborted_transactions: Vec::new(),
             preferred_read_replica: -1,
             records: None,
+            diverging_epoch: None,
+            current_leader: None,
         }
     }
 }
@@ -544,6 +570,135 @@ pub struct AbortedTransaction {
     pub producer_id: i64,
     /// First offset.
     pub first_offset: i64,
+}
+
+/// The last epoch and offset the consumer's log had in common with the
+/// leader's (KIP-320).
+///
+/// `end_offset` is the first offset at which the two logs disagree, so it is
+/// also the offset the consumer must resume from after truncating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DivergingEpoch {
+    /// Last leader epoch the two logs agreed on.
+    pub epoch: i32,
+    /// First offset that is not part of the leader's log.
+    pub end_offset: i64,
+}
+
+/// Leader identity for a partition, reported by the broker so the client does
+/// not have to discover it through a metadata refresh (KIP-951).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaderIdAndEpoch {
+    /// Node ID of the current leader, or -1 if unknown.
+    pub leader_id: i32,
+    /// Leader epoch of the current leader, or -1 if unknown.
+    pub leader_epoch: i32,
+}
+
+/// Address of a broker referenced by a `CurrentLeader` field (KIP-951).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeEndpoint {
+    /// Node ID this endpoint belongs to.
+    pub node_id: i32,
+    /// Hostname.
+    pub host: String,
+    /// Port.
+    pub port: i32,
+    /// Rack the broker is in, if the cluster is rack-aware.
+    pub rack: Option<String>,
+}
+
+/// Read `DivergingEpoch` out of a partition-level tagged-field set (tag 0).
+///
+/// Wire format: i32 `Epoch`, i64 `EndOffset`, then the struct's own tagged
+/// fields. Returns `None` when the broker did not report a divergence, which
+/// is the normal case.
+pub(crate) fn parse_diverging_epoch(tagged: &TaggedFields) -> Result<Option<DivergingEpoch>> {
+    let Some(field) = tagged.0.iter().find(|f| f.tag == 0) else {
+        return Ok(None);
+    };
+    let mut buf = &field.data[..];
+    if buf.remaining() < 12 {
+        return Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidLength,
+            format!(
+                "DivergingEpoch (tag 0) has invalid length {}, expected at least 12",
+                field.data.len()
+            ),
+        ));
+    }
+    let epoch = i32::decode(&mut buf)?;
+    let end_offset = i64::decode(&mut buf)?;
+    // The struct carries its own tagged-field section; unknown entries in it
+    // are forward-compatible additions and are skipped.
+    if buf.has_remaining() {
+        let _ = TaggedFields::decode(&mut buf)?;
+    }
+    Ok(Some(DivergingEpoch { epoch, end_offset }))
+}
+
+/// Read `CurrentLeader` out of a tagged-field set at the given tag.
+///
+/// Wire format: i32 `LeaderId`, i32 `LeaderEpoch`, then the struct's own
+/// tagged fields. Fetch puts it at tag 1 of the partition response, Produce at
+/// tag 0.
+pub(crate) fn parse_current_leader(
+    tagged: &TaggedFields,
+    tag: u32,
+) -> Result<Option<LeaderIdAndEpoch>> {
+    let Some(field) = tagged.0.iter().find(|f| f.tag == tag) else {
+        return Ok(None);
+    };
+    let mut buf = &field.data[..];
+    if buf.remaining() < 8 {
+        return Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::InvalidLength,
+            format!(
+                "CurrentLeader (tag {tag}) has invalid length {}, expected at least 8",
+                field.data.len()
+            ),
+        ));
+    }
+    let leader_id = i32::decode(&mut buf)?;
+    let leader_epoch = i32::decode(&mut buf)?;
+    if buf.has_remaining() {
+        let _ = TaggedFields::decode(&mut buf)?;
+    }
+    Ok(Some(LeaderIdAndEpoch {
+        leader_id,
+        leader_epoch,
+    }))
+}
+
+/// Read `NodeEndpoints` out of a response-level tagged-field set (tag 0).
+///
+/// Wire format: compact array of \[i32 `NodeId`, compact-string `Host`,
+/// i32 `Port`, compact-nullable-string `Rack`\], each entry followed by its
+/// own tagged fields. Returns an empty vector when the field is absent.
+pub(crate) fn parse_node_endpoints(tagged: &TaggedFields) -> Result<Vec<NodeEndpoint>> {
+    let Some(field) = tagged.0.iter().find(|f| f.tag == 0) else {
+        return Ok(Vec::new());
+    };
+    let mut buf = &field.data[..];
+    let count = check_compact_array_len(crate::util::varint::decode_unsigned_varint(&mut buf)?)?;
+    let mut endpoints = Vec::with_capacity(decode_capacity(count, buf.remaining()));
+    for _ in 0..count {
+        let node_id = i32::decode(&mut buf)?;
+        let host = non_nullable_string(
+            "node endpoint host",
+            KafkaString::decode_compact(&mut buf)?.0,
+        )?;
+        let port = i32::decode(&mut buf)?;
+        let rack = KafkaString::decode_compact(&mut buf)?.0;
+        let _ = TaggedFields::decode(&mut buf)?;
+        endpoints.push(NodeEndpoint {
+            node_id,
+            host,
+            port,
+            rack,
+        });
+    }
+    Ok(endpoints)
 }
 
 impl FetchResponse {
@@ -562,12 +717,13 @@ impl FetchResponse {
     fn decode_inner_v4(buf: &mut impl Buf, include_log_start_offset: bool) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let topic_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut responses = Vec::with_capacity(topic_count);
+        let mut responses = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
 
         for _ in 0..topic_count {
             let topic = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
-            let mut partitions = Vec::with_capacity(partition_count);
+            let mut partitions =
+                Vec::with_capacity(decode_capacity(partition_count, buf.remaining()));
 
             for _ in 0..partition_count {
                 let partition = i32::decode(buf)?;
@@ -580,7 +736,8 @@ impl FetchResponse {
                     -1
                 };
                 let aborted_tx_count = check_decode_nullable_array_len(i32::decode(buf)?)?;
-                let mut aborted_transactions = Vec::with_capacity(aborted_tx_count);
+                let mut aborted_transactions =
+                    Vec::with_capacity(decode_capacity(aborted_tx_count, buf.remaining()));
                 for _ in 0..aborted_tx_count {
                     aborted_transactions.push(AbortedTransaction {
                         producer_id: i64::decode(buf)?,
@@ -598,6 +755,8 @@ impl FetchResponse {
                     aborted_transactions,
                     preferred_read_replica: -1,
                     records,
+                    diverging_epoch: None,
+                    current_leader: None,
                 });
             }
 
@@ -613,6 +772,7 @@ impl FetchResponse {
             error_code: ErrorCode::None,
             session_id: 0,
             responses,
+            node_endpoints: Vec::new(),
         })
     }
 
@@ -634,12 +794,13 @@ impl FetchResponse {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let session_id = i32::decode(buf)?;
         let topic_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut responses = Vec::with_capacity(topic_count);
+        let mut responses = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
 
         for _ in 0..topic_count {
             let topic = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
-            let mut partitions = Vec::with_capacity(partition_count);
+            let mut partitions =
+                Vec::with_capacity(decode_capacity(partition_count, buf.remaining()));
 
             for _ in 0..partition_count {
                 let partition = i32::decode(buf)?;
@@ -648,7 +809,8 @@ impl FetchResponse {
                 let last_stable_offset = i64::decode(buf)?;
                 let log_start_offset = i64::decode(buf)?;
                 let aborted_tx_count = check_decode_nullable_array_len(i32::decode(buf)?)?;
-                let mut aborted_transactions = Vec::with_capacity(aborted_tx_count);
+                let mut aborted_transactions =
+                    Vec::with_capacity(decode_capacity(aborted_tx_count, buf.remaining()));
                 for _ in 0..aborted_tx_count {
                     aborted_transactions.push(AbortedTransaction {
                         producer_id: i64::decode(buf)?,
@@ -671,6 +833,8 @@ impl FetchResponse {
                     aborted_transactions,
                     preferred_read_replica,
                     records,
+                    diverging_epoch: None,
+                    current_leader: None,
                 });
             }
 
@@ -686,6 +850,7 @@ impl FetchResponse {
             error_code,
             session_id,
             responses,
+            node_endpoints: Vec::new(),
         })
     }
 
@@ -697,13 +862,13 @@ impl FetchResponse {
 
         let topic_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut responses = Vec::with_capacity(topic_count);
+        let mut responses = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
 
         for _ in 0..topic_count {
             let topic = non_nullable_string("topic name", KafkaString::decode_compact(buf)?.0)?;
             let part_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut partitions = Vec::with_capacity(part_count);
+            let mut partitions = Vec::with_capacity(decode_capacity(part_count, buf.remaining()));
 
             for _ in 0..part_count {
                 let partition = i32::decode(buf)?;
@@ -715,7 +880,8 @@ impl FetchResponse {
                 let aborted_tx_count = check_compact_nullable_array_len(
                     crate::util::varint::decode_unsigned_varint(buf)?,
                 )?;
-                let mut aborted_transactions = Vec::with_capacity(aborted_tx_count);
+                let mut aborted_transactions =
+                    Vec::with_capacity(decode_capacity(aborted_tx_count, buf.remaining()));
                 for _ in 0..aborted_tx_count {
                     aborted_transactions.push(AbortedTransaction {
                         producer_id: i64::decode(buf)?,
@@ -725,7 +891,11 @@ impl FetchResponse {
                 }
                 let preferred_read_replica = i32::decode(buf)?;
                 let records = KafkaBytes::decode_compact(buf)?.0;
-                let _ = TaggedFields::decode(buf)?; // partition tagged fields
+                // Partition tagged fields. Tag 0 is DivergingEpoch (KIP-320),
+                // which the consumer needs in order to detect that its log no
+                // longer matches the leader's.
+                let partition_tags = TaggedFields::decode(buf)?;
+                let diverging_epoch = parse_diverging_epoch(&partition_tags)?;
 
                 partitions.push(FetchPartitionResponse {
                     partition,
@@ -736,6 +906,8 @@ impl FetchResponse {
                     aborted_transactions,
                     preferred_read_replica,
                     records,
+                    diverging_epoch,
+                    current_leader: None,
                 });
             }
             let _ = TaggedFields::decode(buf)?; // topic tagged fields
@@ -752,14 +924,18 @@ impl FetchResponse {
             error_code,
             session_id,
             responses,
+            // NodeEndpoints only exists from v16 onward.
+            node_endpoints: Vec::new(),
         })
     }
 
-    /// Decode from version 13–16 (topic ID replaces topic name, KIP-516).
+    /// Decode from version 13–18 (topic ID replaces topic name, KIP-516).
     ///
-    /// v14 adds no new wire fields. v15 is the same on the response side.
-    /// v16 adds `NodeEndpoints` as a top-level tagged field which is consumed
-    /// generically by `TaggedFields::decode`.
+    /// v14 adds no new wire fields and v15 is unchanged on the response side.
+    /// v16 adds two KIP-951 tagged fields that are interpreted here:
+    /// `CurrentLeader` (tag 1) per partition and `NodeEndpoints` (tag 0) at
+    /// the top level. `DivergingEpoch` (tag 0, per partition, KIP-320) is
+    /// interpreted on every version from 12 upward.
     pub fn decode_v13(buf: &mut impl Buf) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -767,7 +943,7 @@ impl FetchResponse {
 
         let topic_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut responses = Vec::with_capacity(topic_count);
+        let mut responses = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
 
         for _ in 0..topic_count {
             if buf.remaining() < 16 {
@@ -781,7 +957,7 @@ impl FetchResponse {
 
             let part_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut partitions = Vec::with_capacity(part_count);
+            let mut partitions = Vec::with_capacity(decode_capacity(part_count, buf.remaining()));
 
             for _ in 0..part_count {
                 let partition = i32::decode(buf)?;
@@ -793,7 +969,8 @@ impl FetchResponse {
                 let aborted_tx_count = check_compact_nullable_array_len(
                     crate::util::varint::decode_unsigned_varint(buf)?,
                 )?;
-                let mut aborted_transactions = Vec::with_capacity(aborted_tx_count);
+                let mut aborted_transactions =
+                    Vec::with_capacity(decode_capacity(aborted_tx_count, buf.remaining()));
                 for _ in 0..aborted_tx_count {
                     aborted_transactions.push(AbortedTransaction {
                         producer_id: i64::decode(buf)?,
@@ -803,7 +980,11 @@ impl FetchResponse {
                 }
                 let preferred_read_replica = i32::decode(buf)?;
                 let records = KafkaBytes::decode_compact(buf)?.0;
-                let _ = TaggedFields::decode(buf)?; // partition tagged fields
+                // Partition tagged fields: tag 0 DivergingEpoch (KIP-320),
+                // tag 1 CurrentLeader (KIP-951).
+                let partition_tags = TaggedFields::decode(buf)?;
+                let diverging_epoch = parse_diverging_epoch(&partition_tags)?;
+                let current_leader = parse_current_leader(&partition_tags, 1)?;
 
                 partitions.push(FetchPartitionResponse {
                     partition,
@@ -814,6 +995,8 @@ impl FetchResponse {
                     aborted_transactions,
                     preferred_read_replica,
                     records,
+                    diverging_epoch,
+                    current_leader,
                 });
             }
             let _ = TaggedFields::decode(buf)?; // topic tagged fields
@@ -823,13 +1006,16 @@ impl FetchResponse {
                 partitions,
             });
         }
-        let _ = TaggedFields::decode(buf)?; // top-level tagged fields
+        // Top-level tagged fields: tag 0 NodeEndpoints (KIP-951).
+        let response_tags = TaggedFields::decode(buf)?;
+        let node_endpoints = parse_node_endpoints(&response_tags)?;
 
         Ok(Self {
             throttle_time_ms,
             error_code,
             session_id,
             responses,
+            node_endpoints,
         })
     }
 }
@@ -1949,5 +2135,211 @@ mod tests {
             let resp = FetchResponse::decode_versioned(version, &mut clone.freeze()).unwrap();
             assert_eq!(resp.throttle_time_ms, 10);
         }
+    }
+
+    /// Encode a tagged-field section: unsigned-varint count, then each field
+    /// as tag, length, payload.
+    fn encode_tags(fields: &[(u32, Vec<u8>)], out: &mut BytesMut) {
+        varint::encode_unsigned_varint(fields.len() as u32, out);
+        for (tag, data) in fields {
+            varint::encode_unsigned_varint(*tag, out);
+            varint::encode_unsigned_varint(data.len() as u32, out);
+            out.put_slice(data);
+        }
+    }
+
+    /// Body of a `DivergingEpoch` tagged field (tag 0).
+    fn diverging_epoch_payload(epoch: i32, end_offset: i64) -> Vec<u8> {
+        let mut b = BytesMut::new();
+        b.put_i32(epoch);
+        b.put_i64(end_offset);
+        b.put_u8(0); // the struct's own (empty) tagged fields
+        b.to_vec()
+    }
+
+    /// Body of a `CurrentLeader` tagged field.
+    fn current_leader_payload(leader_id: i32, leader_epoch: i32) -> Vec<u8> {
+        let mut b = BytesMut::new();
+        b.put_i32(leader_id);
+        b.put_i32(leader_epoch);
+        b.put_u8(0);
+        b.to_vec()
+    }
+
+    /// Body of a `NodeEndpoints` tagged field (tag 0, response level).
+    fn node_endpoints_payload(endpoints: &[(i32, &str, i32, Option<&str>)]) -> Vec<u8> {
+        let mut b = BytesMut::new();
+        varint::encode_unsigned_varint(endpoints.len() as u32 + 1, &mut b);
+        for (node_id, host, port, rack) in endpoints {
+            b.put_i32(*node_id);
+            KafkaString::new(*host).try_encode_compact(&mut b).unwrap();
+            b.put_i32(*port);
+            match rack {
+                Some(r) => KafkaString::new(*r).try_encode_compact(&mut b).unwrap(),
+                None => KafkaString::null().try_encode_compact(&mut b).unwrap(),
+            }
+            b.put_u8(0);
+        }
+        b.to_vec()
+    }
+
+    /// Build a single-topic, single-partition v12 response body.
+    fn v12_response(partition_tags: &[(u32, Vec<u8>)]) -> BytesMut {
+        let mut raw = BytesMut::new();
+        raw.put_i32(0); // throttle_time_ms
+        raw.put_i16(0); // error_code
+        raw.put_i32(7); // session_id
+        varint::encode_unsigned_varint(2, &mut raw); // 1 topic
+        KafkaString::new("topic")
+            .try_encode_compact(&mut raw)
+            .unwrap();
+        varint::encode_unsigned_varint(2, &mut raw); // 1 partition
+        raw.put_i32(0); // partition
+        raw.put_i16(0); // error_code
+        raw.put_i64(500); // high_watermark
+        raw.put_i64(500); // last_stable_offset
+        raw.put_i64(0); // log_start_offset
+        varint::encode_unsigned_varint(1, &mut raw); // 0 aborted transactions
+        raw.put_i32(-1); // preferred_read_replica
+        varint::encode_unsigned_varint(0, &mut raw); // records: null
+        encode_tags(partition_tags, &mut raw); // partition tagged fields
+        varint::encode_unsigned_varint(0, &mut raw); // topic tagged fields
+        varint::encode_unsigned_varint(0, &mut raw); // top-level tagged fields
+        raw
+    }
+
+    /// Build a single-topic, single-partition v13+ response body.
+    fn v13_response(
+        partition_tags: &[(u32, Vec<u8>)],
+        response_tags: &[(u32, Vec<u8>)],
+    ) -> BytesMut {
+        let mut raw = BytesMut::new();
+        raw.put_i32(0); // throttle_time_ms
+        raw.put_i16(0); // error_code
+        raw.put_i32(7); // session_id
+        varint::encode_unsigned_varint(2, &mut raw); // 1 topic
+        raw.put_slice(&[9u8; 16]); // topic_id
+        varint::encode_unsigned_varint(2, &mut raw); // 1 partition
+        raw.put_i32(3); // partition
+        raw.put_i16(6); // error_code: NotLeaderForPartition
+        raw.put_i64(500);
+        raw.put_i64(500);
+        raw.put_i64(0);
+        varint::encode_unsigned_varint(1, &mut raw); // 0 aborted transactions
+        raw.put_i32(-1); // preferred_read_replica
+        varint::encode_unsigned_varint(0, &mut raw); // records: null
+        encode_tags(partition_tags, &mut raw);
+        varint::encode_unsigned_varint(0, &mut raw); // topic tagged fields
+        encode_tags(response_tags, &mut raw);
+        raw
+    }
+
+    #[test]
+    fn test_fetch_response_v12_decodes_diverging_epoch() {
+        let raw = v12_response(&[(0, diverging_epoch_payload(4, 1234))]);
+        let resp = FetchResponse::decode_v12(&mut raw.freeze()).unwrap();
+
+        let part = &resp.responses[0].partitions[0];
+        assert_eq!(
+            part.diverging_epoch,
+            Some(DivergingEpoch {
+                epoch: 4,
+                end_offset: 1234
+            })
+        );
+    }
+
+    #[test]
+    fn test_fetch_response_v12_without_diverging_epoch_is_none() {
+        let raw = v12_response(&[]);
+        let resp = FetchResponse::decode_v12(&mut raw.freeze()).unwrap();
+        assert!(resp.responses[0].partitions[0].diverging_epoch.is_none());
+        assert!(resp.node_endpoints.is_empty());
+    }
+
+    #[test]
+    fn test_fetch_response_v12_skips_unrelated_partition_tags() {
+        // Tag 42 is not one this client interprets; it must not be mistaken
+        // for a divergence report.
+        let raw = v12_response(&[(42, vec![1, 2, 3])]);
+        let resp = FetchResponse::decode_v12(&mut raw.freeze()).unwrap();
+        assert!(resp.responses[0].partitions[0].diverging_epoch.is_none());
+    }
+
+    #[test]
+    fn test_fetch_response_v16_decodes_current_leader_and_node_endpoints() {
+        let raw = v13_response(
+            &[
+                (0, diverging_epoch_payload(2, 99)),
+                (1, current_leader_payload(5, 12)),
+            ],
+            &[(
+                0,
+                node_endpoints_payload(&[
+                    (5, "broker-5.example.com", 9092, Some("us-east-1b")),
+                    (6, "broker-6.example.com", 9093, None),
+                ]),
+            )],
+        );
+        let resp = FetchResponse::decode_versioned(16, &mut raw.freeze()).unwrap();
+
+        let part = &resp.responses[0].partitions[0];
+        assert_eq!(part.error_code, ErrorCode::NotLeaderForPartition);
+        assert_eq!(
+            part.current_leader,
+            Some(LeaderIdAndEpoch {
+                leader_id: 5,
+                leader_epoch: 12
+            })
+        );
+        assert_eq!(
+            part.diverging_epoch,
+            Some(DivergingEpoch {
+                epoch: 2,
+                end_offset: 99
+            })
+        );
+
+        assert_eq!(resp.node_endpoints.len(), 2);
+        assert_eq!(
+            resp.node_endpoints[0],
+            NodeEndpoint {
+                node_id: 5,
+                host: "broker-5.example.com".to_string(),
+                port: 9092,
+                rack: Some("us-east-1b".to_string()),
+            }
+        );
+        assert_eq!(resp.node_endpoints[1].node_id, 6);
+        assert_eq!(resp.node_endpoints[1].rack, None);
+    }
+
+    #[test]
+    fn test_fetch_response_v13_without_kip951_fields() {
+        let raw = v13_response(&[], &[]);
+        let resp = FetchResponse::decode_versioned(13, &mut raw.freeze()).unwrap();
+        assert!(resp.responses[0].partitions[0].current_leader.is_none());
+        assert!(resp.node_endpoints.is_empty());
+    }
+
+    #[test]
+    fn test_diverging_epoch_rejects_truncated_payload() {
+        // 8 bytes cannot hold an i32 epoch plus an i64 end offset.
+        let raw = v12_response(&[(0, vec![0u8; 8])]);
+        let err = FetchResponse::decode_v12(&mut raw.freeze()).unwrap_err();
+        assert!(
+            err.to_string().contains("DivergingEpoch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_current_leader_rejects_truncated_payload() {
+        let raw = v13_response(&[(1, vec![0u8; 4])], &[]);
+        let err = FetchResponse::decode_versioned(16, &mut raw.freeze()).unwrap_err();
+        assert!(
+            err.to_string().contains("CurrentLeader"),
+            "unexpected error: {err}"
+        );
     }
 }

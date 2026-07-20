@@ -5,7 +5,8 @@ use crate::error::{ErrorCode, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{
-    array_len_i32, check_compact_array_len, check_decode_array_len, encode_compact_array_len,
+    array_len_i32, check_compact_array_len, check_decode_array_len, decode_capacity,
+    encode_compact_array_len,
 };
 
 // ============================================================================
@@ -228,7 +229,7 @@ impl DescribeLogDirsResponse {
     /// Non-flexible versions never carry volume info, so `total_bytes` and
     /// `usable_bytes` default to `-1`.
     fn decode_results_v1(buf: &mut impl Buf, count: usize) -> Result<Vec<DescribeLogDirsResult>> {
-        let mut results = Vec::with_capacity(count);
+        let mut results = Vec::with_capacity(decode_capacity(count, buf.remaining()));
         for _ in 0..count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
             let log_dir = non_nullable_string("log_dir", KafkaString::decode(buf)?.0)?;
@@ -252,7 +253,7 @@ impl DescribeLogDirsResponse {
         count: usize,
         has_volume_info: bool,
     ) -> Result<Vec<DescribeLogDirsResult>> {
-        let mut results = Vec::with_capacity(count);
+        let mut results = Vec::with_capacity(decode_capacity(count, buf.remaining()));
         for _ in 0..count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
             let log_dir = non_nullable_string("log_dir", KafkaString::decode_compact(buf)?.0)?;
@@ -280,7 +281,7 @@ impl DescribeLogDirsResponse {
 
     /// Decode topic entries with non-flexible encoding (v1).
     fn decode_topics_v1(buf: &mut impl Buf, count: usize) -> Result<Vec<DescribeLogDirsTopic>> {
-        let mut topics = Vec::with_capacity(count);
+        let mut topics = Vec::with_capacity(decode_capacity(count, buf.remaining()));
         for _ in 0..count {
             let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
@@ -292,7 +293,7 @@ impl DescribeLogDirsResponse {
 
     /// Decode topic entries with flexible encoding (v2+).
     fn decode_topics_v2(buf: &mut impl Buf, count: usize) -> Result<Vec<DescribeLogDirsTopic>> {
-        let mut topics = Vec::with_capacity(count);
+        let mut topics = Vec::with_capacity(decode_capacity(count, buf.remaining()));
         for _ in 0..count {
             let name = non_nullable_string("topic name", KafkaString::decode_compact(buf)?.0)?;
             let partition_count =
@@ -309,7 +310,7 @@ impl DescribeLogDirsResponse {
         buf: &mut impl Buf,
         count: usize,
     ) -> Result<Vec<DescribeLogDirsPartition>> {
-        let mut partitions = Vec::with_capacity(count);
+        let mut partitions = Vec::with_capacity(decode_capacity(count, buf.remaining()));
         for _ in 0..count {
             let partition_index = i32::decode(buf)?;
             let partition_size = i64::decode(buf)?;
@@ -330,7 +331,7 @@ impl DescribeLogDirsResponse {
         buf: &mut impl Buf,
         count: usize,
     ) -> Result<Vec<DescribeLogDirsPartition>> {
-        let mut partitions = Vec::with_capacity(count);
+        let mut partitions = Vec::with_capacity(decode_capacity(count, buf.remaining()));
         for _ in 0..count {
             let partition_index = i32::decode(buf)?;
             let partition_size = i64::decode(buf)?;

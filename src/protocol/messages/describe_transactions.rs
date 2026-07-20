@@ -4,7 +4,7 @@ use super::{VersionedDecode, VersionedEncode, non_nullable_string};
 use crate::error::{ErrorCode, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, KafkaString, TaggedFields, TryEncode};
-use crate::protocol::{check_compact_array_len, encode_compact_array_len};
+use crate::protocol::{check_compact_array_len, decode_capacity, encode_compact_array_len};
 
 // ============================================================================
 // DescribeTransactions API (Key 65)
@@ -92,7 +92,8 @@ impl DescribeTransactionsResponse {
         let throttle_time_ms = i32::decode(buf)?;
         let state_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut transaction_states = Vec::with_capacity(state_count);
+        let mut transaction_states =
+            Vec::with_capacity(decode_capacity(state_count, buf.remaining()));
         for _ in 0..state_count {
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
             let transactional_id =
@@ -106,12 +107,13 @@ impl DescribeTransactionsResponse {
 
             let topic_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut topics = Vec::with_capacity(topic_count);
+            let mut topics = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
             for _ in 0..topic_count {
                 let topic = non_nullable_string("topic", KafkaString::decode_compact(buf)?.0)?;
                 let partition_count =
                     check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-                let mut partitions = Vec::with_capacity(partition_count);
+                let mut partitions =
+                    Vec::with_capacity(decode_capacity(partition_count, buf.remaining()));
                 for _ in 0..partition_count {
                     partitions.push(i32::decode(buf)?);
                 }

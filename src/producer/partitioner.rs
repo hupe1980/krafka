@@ -158,7 +158,11 @@ impl Partitioner for DefaultPartitioner {
         }
 
         match key {
-            Some(k) if !k.is_empty() => {
+            // Java branches on `keyBytes == null` only: a zero-length key is
+            // hashed like any other. Treating it as unkeyed would route the
+            // same records to different partitions than a Java producer,
+            // breaking co-partitioning for joins.
+            Some(k) => {
                 // Java-compatible keyed routing: toPositive(murmur2(key)) % partition_count.
                 partition_for_key(k, partition_count)
             }
@@ -282,7 +286,11 @@ impl Partitioner for StickyPartitioner {
         }
 
         match key {
-            Some(k) if !k.is_empty() => {
+            // Java branches on `keyBytes == null` only: a zero-length key is
+            // hashed like any other. Treating it as unkeyed would route the
+            // same records to different partitions than a Java producer,
+            // breaking co-partitioning for joins.
+            Some(k) => {
                 // Java-compatible keyed routing: toPositive(murmur2(key)) % partition_count.
                 partition_for_key(k, partition_count)
             }
@@ -329,7 +337,11 @@ impl Partitioner for HashPartitioner {
         }
 
         match key {
-            Some(k) if !k.is_empty() => {
+            // Java branches on `keyBytes == null` only: a zero-length key is
+            // hashed like any other. Treating it as unkeyed would route the
+            // same records to different partitions than a Java producer,
+            // breaking co-partitioning for joins.
+            Some(k) => {
                 // Use murmur2 — same as Java DefaultPartitioner.
                 // Previously used DefaultHasher here which is NOT stable across
                 // Rust versions (stdlib explicitly reserves the right to change it),
@@ -430,9 +442,8 @@ impl Partitioner for UniformStickyPartitioner {
         }
 
         // Keyed records: deterministic murmur2 hash, same as Java.
-        if let Some(k) = key
-            && !k.is_empty()
-        {
+        // A zero-length key is hashed, matching Java (see above).
+        if let Some(k) = key {
             return partition_for_key(k, partition_count);
         }
 

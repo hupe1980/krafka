@@ -4,14 +4,15 @@ use super::{VersionedDecode, VersionedEncode};
 use crate::error::{ErrorCode, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
-use crate::protocol::{check_compact_array_len, encode_compact_array_len};
+use crate::protocol::{check_compact_array_len, decode_capacity, encode_compact_array_len};
 use crate::util::varint::decode_unsigned_varint;
 
 // ============================================================================
 // WriteTxnMarkers API (Key 27)
 //
 // v0 was removed in Kafka 4.0. v1 is the baseline (flexible encoding).
-// v2 adds TransactionVersion field (KIP-1228).
+// v2 adds a TransactionVersion field per marker (KIP-1228, Kafka 4.2).
+// The response wire format is unchanged at v2.
 // ============================================================================
 
 /// A topic and its partitions to write a transaction marker for.
@@ -37,6 +38,21 @@ pub struct WritableTxnMarker {
     /// Epoch associated with the transaction state partition
     /// hosted by this transaction coordinator.
     pub coordinator_epoch: i32,
+    /// Transaction version of this marker (v2+, KIP-1228).
+    ///
+    /// `0` and `1` both mean the legacy protocol (TV0/TV1), `2` means TV2.
+    /// The field is `ignorable` in the Kafka schema, so leaving it at the
+    /// default of `0` is safe and is what [`Self::legacy_transaction_version`]
+    /// documents. It is simply not written when the negotiated version is v1.
+    pub transaction_version: i8,
+}
+
+impl WritableTxnMarker {
+    /// The transaction version that means "legacy (TV0/TV1)" — the value to
+    /// use unless the coordinator is running TV2 transactions.
+    pub const fn legacy_transaction_version() -> i8 {
+        0
+    }
 }
 
 /// WriteTxnMarkers request (API key 27).
@@ -54,6 +70,18 @@ impl WriteTxnMarkersRequest {
 
     /// Encode for version 1 (flexible encoding, baseline after v0 removal).
     pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.encode(buf, false)
+    }
+
+    /// Encode for version 2 (adds `TransactionVersion` per marker, KIP-1228).
+    pub fn encode_v2(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.encode(buf, true)
+    }
+
+    /// Shared body encoder. v2 differs from v1 by exactly one `int8` appended
+    /// to each marker after `coordinator_epoch`, before the marker's tagged
+    /// fields.
+    fn encode(&self, buf: &mut impl BufMut, with_transaction_version: bool) -> Result<()> {
         encode_compact_array_len(self.markers.len(), buf)?;
         for marker in &self.markers {
             marker.producer_id.encode(buf);
@@ -70,6 +98,9 @@ impl WriteTxnMarkersRequest {
                 TaggedFields::default().try_encode(buf)?;
             }
             marker.coordinator_epoch.encode(buf);
+            if with_transaction_version {
+                marker.transaction_version.encode(buf);
+            }
             TaggedFields::default().try_encode(buf)?;
         }
         TaggedFields::default().try_encode(buf)?;
@@ -81,6 +112,7 @@ impl VersionedEncode for WriteTxnMarkersRequest {
     fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
         match version {
             1 => self.encode_v1(buf),
+            2 => self.encode_v2(buf),
             _ => unsupported_encode!("WriteTxnMarkersRequest", version),
         }
     }
@@ -121,14 +153,17 @@ pub struct WriteTxnMarkersResponse {
 }
 
 impl WriteTxnMarkersResponse {
-    /// Decode from version 1 (flexible encoding).
+    /// Decode from version 1–2 (flexible encoding).
+    ///
+    /// KIP-1228 bumped the response's `validVersions` to `1-2` without adding
+    /// or changing a field, so v2 shares this decoder.
     pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
         let marker_count = check_compact_array_len(decode_unsigned_varint(buf)?)? as usize;
-        let mut markers = Vec::with_capacity(marker_count);
+        let mut markers = Vec::with_capacity(decode_capacity(marker_count, buf.remaining()));
         for _ in 0..marker_count {
             let producer_id = i64::decode(buf)?;
             let topic_count = check_compact_array_len(decode_unsigned_varint(buf)?)? as usize;
-            let mut topics = Vec::with_capacity(topic_count);
+            let mut topics = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
             for _ in 0..topic_count {
                 let name = {
                     let len = decode_unsigned_varint(buf)? as usize;
@@ -155,7 +190,8 @@ impl WriteTxnMarkersResponse {
                 };
                 let partition_count =
                     check_compact_array_len(decode_unsigned_varint(buf)?)? as usize;
-                let mut partitions = Vec::with_capacity(partition_count);
+                let mut partitions =
+                    Vec::with_capacity(decode_capacity(partition_count, buf.remaining()));
                 for _ in 0..partition_count {
                     let partition_index = i32::decode(buf)?;
                     let error_code = ErrorCode::from(i16::decode(buf)?);
@@ -182,7 +218,7 @@ impl WriteTxnMarkersResponse {
 impl VersionedDecode for WriteTxnMarkersResponse {
     fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
         match version {
-            1 => Self::decode_v1(buf),
+            1 | 2 => Self::decode_v1(buf),
             _ => unsupported_decode!("WriteTxnMarkersResponse", version),
         }
     }
@@ -210,6 +246,7 @@ mod tests {
                     partition_indexes: vec![0, 1, 2],
                 }],
                 coordinator_epoch: 10,
+                transaction_version: 0,
             }],
         };
 
@@ -281,6 +318,7 @@ mod tests {
                     partition_indexes: vec![0],
                 }],
                 coordinator_epoch: 1,
+                transaction_version: 2,
             }],
         };
 
@@ -306,12 +344,67 @@ mod tests {
     fn write_txn_markers_versioned_encode_dispatch() {
         let request = WriteTxnMarkersRequest { markers: vec![] };
 
-        let mut buf = BytesMut::new();
-        request.encode_versioned(1, &mut buf).unwrap();
+        for v in [1, 2] {
+            let mut buf = BytesMut::new();
+            request.encode_versioned(v, &mut buf).unwrap();
+        }
 
         // Version 0 should be unsupported (removed in Kafka 4.0)
         let mut buf2 = BytesMut::new();
         assert!(request.encode_versioned(0, &mut buf2).is_err());
+        let mut buf3 = BytesMut::new();
+        assert!(request.encode_versioned(3, &mut buf3).is_err());
+    }
+
+    /// v2 appends exactly one `int8` per marker, positioned after
+    /// `coordinator_epoch` and before the marker's tagged fields.
+    #[test]
+    fn write_txn_markers_request_v2_appends_transaction_version() {
+        let request = WriteTxnMarkersRequest {
+            markers: vec![WritableTxnMarker {
+                producer_id: 42,
+                producer_epoch: 5,
+                transaction_result: true,
+                topics: vec![WritableTxnMarkerTopic {
+                    name: "t".to_string(),
+                    partition_indexes: vec![0],
+                }],
+                coordinator_epoch: 10,
+                transaction_version: 2,
+            }],
+        };
+
+        let mut v1 = BytesMut::new();
+        request.encode_v1(&mut v1).unwrap();
+        let mut v2 = BytesMut::new();
+        request.encode_v2(&mut v2).unwrap();
+
+        assert_eq!(v2.len(), v1.len() + 1);
+        // The v1 body ends with the marker's tagged fields then the top-level
+        // tagged fields; v2 splices TransactionVersion in front of both.
+        assert_eq!(v2[v1.len() - 2], 2);
+        assert_eq!(&v2[..v1.len() - 2], &v1[..v1.len() - 2]);
+    }
+
+    /// A default marker still encodes at v2: the field is `ignorable` with a
+    /// default of 0, meaning legacy TV0/TV1 semantics.
+    #[test]
+    fn write_txn_markers_request_v2_legacy_default() {
+        assert_eq!(WritableTxnMarker::legacy_transaction_version(), 0);
+
+        let request = WriteTxnMarkersRequest {
+            markers: vec![WritableTxnMarker {
+                producer_id: 1,
+                producer_epoch: 0,
+                transaction_result: false,
+                topics: Vec::new(),
+                coordinator_epoch: 0,
+                transaction_version: WritableTxnMarker::legacy_transaction_version(),
+            }],
+        };
+        let mut buf = BytesMut::new();
+        request.encode_v2(&mut buf).unwrap();
+        assert!(!buf.is_empty());
     }
 
     #[test]
@@ -323,6 +416,18 @@ mod tests {
 
         let mut read_buf = buf.freeze();
         WriteTxnMarkersResponse::decode_versioned(1, &mut read_buf).unwrap();
+
+        // v2 did not change the response wire format, so the same bytes decode.
+        let mut v2_buf = BytesMut::new();
+        v2_buf.put_u8(1);
+        v2_buf.put_u8(0);
+        let mut v2_read = v2_buf.freeze();
+        assert!(
+            WriteTxnMarkersResponse::decode_versioned(2, &mut v2_read)
+                .unwrap()
+                .markers
+                .is_empty()
+        );
 
         // Version 0 should be unsupported
         let mut empty = BytesMut::new().freeze();

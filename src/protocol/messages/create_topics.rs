@@ -5,7 +5,8 @@ use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{
-    array_len_i32, check_compact_array_len, check_decode_array_len, encode_compact_array_len,
+    array_len_i32, check_compact_array_len, check_decode_array_len, decode_capacity,
+    encode_compact_array_len,
 };
 
 // ============================================================================
@@ -190,7 +191,7 @@ impl CreateTopicsResponse {
     /// Shared topics array decoder for v1–v4 (non-flexible, includes error_message).
     fn decode_topics_v1(buf: &mut impl Buf) -> Result<Vec<CreatableTopicResult>> {
         let topic_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut topics = Vec::with_capacity(topic_count);
+        let mut topics = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
 
         for _ in 0..topic_count {
             let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
@@ -217,7 +218,7 @@ impl CreateTopicsResponse {
     ) -> Result<Vec<CreatableTopicResult>> {
         let raw = crate::util::varint::decode_unsigned_varint(buf)?;
         let topic_count = check_compact_array_len(raw)?;
-        let mut topics = Vec::with_capacity(topic_count);
+        let mut topics = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
 
         for _ in 0..topic_count {
             let name = non_nullable_string("topic name", KafkaString::decode_compact(buf)?.0)?;

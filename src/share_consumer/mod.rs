@@ -57,12 +57,12 @@ use std::collections::VecDeque;
 use std::future::{Future, Ready, ready};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as SyncMutex};
+use std::sync::{Arc, Mutex as SyncMutex, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::auth::AuthConfig;
@@ -96,6 +96,179 @@ type BrokerPendingAcks = HashMap<BrokerId, HashMap<BrokerAckKey, Vec<PendingAck>
 /// after a `restore_ack_state()` where metadata is unavailable).
 /// Acks with this sentinel are re-routed using fresh metadata in `poll()`.
 const UNROUTED_BROKER_ID: BrokerId = -2;
+
+/// Wire value for the KIP-932 "gap" acknowledgement type.
+///
+/// A gap tells the broker that the client is *not* taking delivery of an offset
+/// inside an acquired range — typically because the record could not be
+/// decoded. The broker archives the offset instead of redelivering it, which is
+/// what prevents an undecodable offset from being redelivered forever with an
+/// ever-climbing `delivery_count`.
+///
+/// Deliberately not exposed on [`AcknowledgeType`]: applications never choose
+/// it, the client emits it on their behalf.
+const GAP_ACK_TYPE: i8 = 0;
+
+/// Minimum negotiated `ShareFetch`/`ShareAcknowledge` version that understands
+/// [`AcknowledgeType::Renew`] (KIP-1222, Kafka 4.2+).
+///
+/// Older brokers reject an entire acknowledgement batch with `INVALID_REQUEST`
+/// when it contains an unknown acknowledgement type, so `Renew` acks are
+/// dropped rather than sent to a broker that negotiated a lower version.
+const RENEW_MIN_VERSION: i16 = 2;
+
+/// Maximum number of times a `ShareAcknowledge` is retried after the broker
+/// reports that the share session is stale or unavailable.
+const SHARE_SESSION_RETRY_LIMIT: usize = 2;
+
+/// Backoff applied before retrying after `SHARE_SESSION_LIMIT_REACHED` (133),
+/// which is a capacity signal rather than a stale-state signal.
+const SHARE_SESSION_LIMIT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Minimum interval between two `recv()` fetch attempts when the broker keeps
+/// returning empty responses, so an idle topic cannot spin the CPU.
+const RECV_EMPTY_POLL_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Returns `true` when a `ShareAcknowledge`/`ShareFetch` error means the
+/// per-broker share session must be torn down and re-established.
+fn is_share_session_error(code: ErrorCode) -> bool {
+    matches!(
+        code,
+        ErrorCode::ShareSessionNotFound
+            | ErrorCode::InvalidShareSessionEpoch
+            | ErrorCode::ShareSessionLimitReached
+    )
+}
+
+/// Restores in-flight acknowledgements if the future holding them is dropped.
+///
+/// `poll()` and the commit paths drain `pending_acks` into a local `Vec` before
+/// they can possibly succeed. Without this guard, dropping the future — a
+/// `select!` shutdown arm, or simply dropping the record stream — would
+/// silently discard every drained acknowledgement, including explicit
+/// `Reject`/`Release` decisions the application already made.
+///
+/// Call [`disarm`](Self::disarm) once the acknowledgements are known to have
+/// been handled; anything still armed at drop time is re-queued under
+/// [`UNROUTED_BROKER_ID`] for the next `poll()` to re-route.
+struct PendingAckGuard {
+    acks: Vec<PendingAck>,
+    pending_acks: Arc<RwLock<BrokerPendingAcks>>,
+    current_generation: Arc<AtomicU64>,
+    captured_generation: u64,
+    explicit_flush_retry_required: Arc<AtomicBool>,
+    require_explicit_retry: bool,
+}
+
+impl PendingAckGuard {
+    fn new(
+        acks: Vec<PendingAck>,
+        pending_acks: Arc<RwLock<BrokerPendingAcks>>,
+        current_generation: Arc<AtomicU64>,
+        captured_generation: u64,
+        explicit_flush_retry_required: Arc<AtomicBool>,
+        require_explicit_retry: bool,
+    ) -> Self {
+        Self {
+            acks,
+            pending_acks,
+            current_generation,
+            captured_generation,
+            explicit_flush_retry_required,
+            require_explicit_retry,
+        }
+    }
+
+    /// Borrow the protected acknowledgements.
+    fn acks(&self) -> &[PendingAck] {
+        &self.acks
+    }
+
+    /// Take the acknowledgements out of the guard, disarming it.
+    fn disarm(&mut self) -> Vec<PendingAck> {
+        std::mem::take(&mut self.acks)
+    }
+}
+
+impl Drop for PendingAckGuard {
+    fn drop(&mut self) {
+        if self.acks.is_empty() {
+            return;
+        }
+        let mut acks = std::mem::take(&mut self.acks);
+
+        // Restoring needs the async RwLock, so it cannot happen inline in
+        // `drop`. Take the uncontended path when possible and only fall back to
+        // spawning when the lock is held elsewhere.
+        if let Ok(mut pending) = self.pending_acks.try_write() {
+            if self.current_generation.load(Ordering::SeqCst) == self.captured_generation {
+                if self.require_explicit_retry {
+                    self.explicit_flush_retry_required
+                        .store(true, Ordering::SeqCst);
+                }
+                for ack in acks.drain(..) {
+                    pending
+                        .entry(UNROUTED_BROKER_ID)
+                        .or_default()
+                        .entry((ack.topic_id, ack.partition))
+                        .or_default()
+                        .push(ack);
+                }
+            }
+            return;
+        }
+
+        let pending_acks = self.pending_acks.clone();
+        let current_generation = self.current_generation.clone();
+        let explicit_flush_retry_required = self.explicit_flush_retry_required.clone();
+        let captured_generation = self.captured_generation;
+        let require_explicit_retry = self.require_explicit_retry;
+
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(async move {
+                ShareConsumer::restore_ack_state(
+                    current_generation.as_ref(),
+                    pending_acks.as_ref(),
+                    explicit_flush_retry_required.as_ref(),
+                    captured_generation,
+                    require_explicit_retry,
+                    &mut acks,
+                )
+                .await;
+            });
+        } else {
+            warn!(
+                count = acks.len(),
+                "share acknowledgements dropped outside a Tokio runtime; \
+                 the affected records will be redelivered"
+            );
+        }
+    }
+}
+
+/// Result of a multi-broker `ShareAcknowledge` round.
+///
+/// Acknowledgements are grouped by partition leader and sent per broker, so a
+/// single round can partially succeed. Only the acknowledgements in
+/// [`failed`](Self::failed) must be re-queued; re-queueing the whole batch
+/// would make the retry re-acknowledge offsets other brokers already accepted,
+/// which they reject with `INVALID_RECORD_STATE`.
+#[derive(Default)]
+struct ShareAcknowledgeOutcome {
+    /// Acknowledgements that were not accepted by their broker.
+    failed: Vec<PendingAck>,
+    /// First error observed, if any.
+    error: Option<KrafkaError>,
+}
+
+impl ShareAcknowledgeOutcome {
+    fn fail(&mut self, acks: impl IntoIterator<Item = PendingAck>, error: KrafkaError) {
+        self.failed.extend(acks);
+        if self.error.is_none() {
+            self.error = Some(error);
+        }
+    }
+}
 
 #[derive(Clone)]
 struct ShareAcknowledgeContext {
@@ -140,6 +313,127 @@ fn drain_broker_acks(broker_acks: &mut BrokerPendingAcks, broker_id: BrokerId) -
         .remove(&broker_id)
         .map(flatten_partition_acks)
         .unwrap_or_default()
+}
+
+/// Remove [`AcknowledgeType::Renew`] entries from acknowledgement batches that
+/// are about to be sent to a broker that does not support KIP-1222.
+///
+/// Returns the number of batches removed. A batch whose only acknowledgement
+/// type is `Renew` is dropped entirely; mixed batches keep their other types.
+fn strip_unsupported_renew_acks<'a, I>(batches: I) -> usize
+where
+    I: Iterator<Item = &'a mut Vec<ShareAcknowledgementBatch>>,
+{
+    let renew = AcknowledgeType::Renew.to_i8();
+    let mut dropped = 0usize;
+    for batch_list in batches {
+        let before = batch_list.len();
+        batch_list.retain_mut(|batch| {
+            batch.acknowledge_types.retain(|&t| t != renew);
+            !batch.acknowledge_types.is_empty()
+        });
+        dropped += before - batch_list.len();
+    }
+    dropped
+}
+
+/// Build the offset → delivery-count map for one partition response.
+///
+/// A malformed or desynchronised response can carry an inverted range
+/// (`last_offset < first_offset`) or an absurdly wide one such as
+/// `0..=i64::MAX`. Materialising that range would allocate until the process is
+/// killed, inside a loop that never yields to the runtime. Inverted ranges are
+/// rejected and the total number of tracked offsets is capped at `max_offsets`,
+/// which callers derive from the size of the encoded record data — each record
+/// occupies at least one byte, so the byte length is an upper bound on the
+/// number of records that can possibly be decoded.
+fn build_delivery_counts(
+    acquired: &[crate::protocol::ShareAcquiredRecords],
+    max_offsets: usize,
+) -> HashMap<Offset, i16> {
+    let mut counts: HashMap<Offset, i16> = HashMap::new();
+    if max_offsets == 0 {
+        return counts;
+    }
+
+    for range in acquired {
+        if range.last_offset < range.first_offset {
+            warn!(
+                first_offset = range.first_offset,
+                last_offset = range.last_offset,
+                "ignoring inverted acquired-record range in ShareFetch response"
+            );
+            continue;
+        }
+
+        // `last - first` cannot overflow because last >= first, but the +1 can.
+        let width = (range.last_offset - range.first_offset).saturating_add(1);
+        let remaining = max_offsets.saturating_sub(counts.len());
+        if remaining == 0 {
+            warn!("acquired-record ranges exceed the decodable record count; truncating");
+            break;
+        }
+        let take = width.min(remaining as i64);
+        if take < width {
+            warn!(
+                first_offset = range.first_offset,
+                last_offset = range.last_offset,
+                take,
+                "acquired-record range is wider than the decodable record count; truncating"
+            );
+        }
+
+        for offset in range.first_offset..range.first_offset.saturating_add(take) {
+            counts.insert(offset, range.delivery_count);
+        }
+    }
+
+    counts
+}
+
+/// Build [`GAP_ACK_TYPE`] acknowledgements for offsets the broker acquired for
+/// this client but that could not be decoded.
+///
+/// Without these, an undecodable offset is never acknowledged, so the broker
+/// redelivers it after every acquisition-lock timeout and `delivery_count`
+/// climbs without bound. Contiguous missing offsets are coalesced into ranges.
+fn build_gap_acks(
+    topic: &str,
+    topic_id: [u8; 16],
+    partition: PartitionId,
+    acquired: &HashMap<Offset, i16>,
+    decoded: &HashSet<Offset>,
+) -> Vec<PendingAck> {
+    let mut missing: Vec<Offset> = acquired
+        .keys()
+        .copied()
+        .filter(|offset| !decoded.contains(offset))
+        .collect();
+    if missing.is_empty() {
+        return Vec::new();
+    }
+    missing.sort_unstable();
+
+    let mut acks = Vec::new();
+    let mut i = 0;
+    while i < missing.len() {
+        let first = missing[i];
+        let mut last = first;
+        while i + 1 < missing.len() && missing[i + 1] == last + 1 {
+            i += 1;
+            last = missing[i];
+        }
+        acks.push(PendingAck {
+            topic: topic.to_string(),
+            topic_id,
+            partition,
+            first_offset: first,
+            last_offset: last,
+            ack_type: GAP_ACK_TYPE,
+        });
+        i += 1;
+    }
+    acks
 }
 
 fn describe_share_fetch_join_error(error: &tokio::task::JoinError) -> &'static str {
@@ -233,7 +527,14 @@ struct ShareConsumerInner {
     explicit_flush_retry_required: Arc<AtomicBool>,
     /// Topic name → UUID cache (populated from heartbeat assignments and metadata).
     topic_ids: RwLock<HashMap<String, [u8; 16]>>,
-    /// Buffer for records returned by `recv()`.
+    /// Records fetched but not yet handed to the application.
+    ///
+    /// Holds the tail of a `ShareFetch` response that exceeded
+    /// `max_poll_records`. Records in this buffer are **not** yet
+    /// acknowledgement-tracked: implicit accepts are queued and explicit
+    /// `unacked_offsets` entries are created only when a record is actually
+    /// returned to the caller, so a record can never be acknowledged without
+    /// having been delivered.
     recv_buffer: RwLock<VecDeque<ConsumerRecord>>,
     /// Coordinator broker ID (discovered via FindCoordinator).
     coordinator_id: RwLock<Option<BrokerId>>,
@@ -248,10 +549,25 @@ struct ShareConsumerInner {
     /// Set by `wakeup()` to interrupt an in-progress `poll()`.
     /// Cleared at the start of each `poll()` call.
     wakeup_flag: AtomicBool,
+    /// Signalled by `wakeup()` so a `poll()` already blocked on a `ShareFetch`
+    /// is interrupted instead of having to run to completion.
+    wakeup_notify: Notify,
 }
 
 impl Drop for ShareConsumerInner {
     fn drop(&mut self) {
+        // The background heartbeat task only holds a `Weak` reference, so it
+        // would exit on its own; aborting makes that immediate rather than
+        // waiting up to one heartbeat interval.
+        if let Some(handle) = self
+            .heartbeat_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            handle.abort();
+        }
+
         // Fires when the last `ShareConsumer` clone is dropped.
         // Warn if close() was never called — pending acks are silently lost
         // and the coordinator will only reclaim partitions after the heartbeat
@@ -360,6 +676,7 @@ impl ShareConsumer {
             unacked_offsets: Arc::new(RwLock::new(HashSet::new())),
             heartbeat_task: SyncMutex::new(None),
             wakeup_flag: AtomicBool::new(false),
+            wakeup_notify: Notify::new(),
         })))
     }
 
@@ -409,9 +726,14 @@ impl ShareConsumer {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if task_guard.as_ref().is_none_or(|h| h.is_finished()) {
-            let bg = self.clone();
+            // Hand the task a *weak* reference. A strong `Arc` would form a
+            // reference cycle (inner -> JoinHandle -> task -> inner) that keeps
+            // the consumer, its connection pool, and its group membership alive
+            // forever when the application drops every handle without calling
+            // `close()` — and would make the drop warning below unreachable.
+            let bg = Arc::downgrade(&self.0);
             *task_guard = Some(tokio::spawn(async move {
-                bg.run_heartbeat_loop().await;
+                Self::run_heartbeat_loop(bg).await;
             }));
         }
         drop(task_guard);
@@ -449,7 +771,27 @@ impl ShareConsumer {
     /// In implicit acknowledgement mode, previously fetched records are
     /// automatically accepted. In explicit mode, all records from the
     /// previous poll must be acknowledged before calling this again.
+    ///
+    /// At most `max_poll_records` records are returned. A `ShareFetch` that
+    /// acquires more than that is **not** truncated on the floor: the surplus
+    /// is buffered and returned by subsequent `poll()` calls, and only the
+    /// records actually handed to the caller are acknowledgement-tracked.
     pub async fn poll(&self, timeout: Duration) -> Result<Vec<ConsumerRecord>> {
+        let max = self.0.config.max_poll_records as usize;
+        self.poll_inner(timeout, max).await
+    }
+
+    /// Shared implementation of [`poll()`](Self::poll) and [`recv()`](Self::recv).
+    ///
+    /// `max_records` bounds how many records are returned to the caller. Every
+    /// returned record — and only a returned record — is registered for
+    /// acknowledgement before this function hands it over. Surplus records go
+    /// to `recv_buffer` untracked.
+    async fn poll_inner(
+        &self,
+        timeout: Duration,
+        max_records: usize,
+    ) -> Result<Vec<ConsumerRecord>> {
         if self.0.closed.load(Ordering::SeqCst) {
             return Err(KrafkaError::invalid_state("share consumer is closed"));
         }
@@ -459,6 +801,7 @@ impl ShareConsumer {
         if self.0.wakeup_flag.swap(false, Ordering::AcqRel) {
             return Err(KrafkaError::invalid_state("wakeup() was called"));
         }
+        let max_records = max_records.max(1);
 
         // Explicit mode: reject poll if records from the previous batch are unacknowledged.
         if self.0.config.acknowledgement_mode == AcknowledgementMode::Explicit {
@@ -515,14 +858,19 @@ impl ShareConsumer {
             }
         }
 
-        // If `recv()` previously buffered records, return them first so mixed
-        // `recv()`/`poll()` callers do not strand available data.
+        // Drain previously buffered records first so mixed `recv()`/`poll()`
+        // callers do not strand available data. These records were fetched but
+        // never delivered, so they are registered for acknowledgement here —
+        // at the moment they are actually handed to the application.
         {
-            let mut buffered = self.0.recv_buffer.write().await;
+            let buffered: Vec<ConsumerRecord> = {
+                let mut buffer = self.0.recv_buffer.write().await;
+                let take = max_records.min(buffer.len());
+                buffer.drain(..take).collect()
+            };
             if !buffered.is_empty() {
-                // max_poll_records is validated >= 1 in the builder, so take >= 1.
-                let take = (self.0.config.max_poll_records as usize).min(buffered.len());
-                return Ok(buffered.drain(..take).collect());
+                self.register_delivered_records(&buffered).await;
+                return Ok(buffered);
             }
         }
 
@@ -554,69 +902,58 @@ impl ShareConsumer {
 
         let ack_state_generation = self.0.ack_state_generation.load(Ordering::SeqCst);
 
-        let sendable_ack_partitions: HashSet<(String, PartitionId)> = partitions_by_broker
+        let sendable_ack_partitions: HashSet<(&str, PartitionId)> = partitions_by_broker
             .values()
             .flat_map(|partitions| {
                 partitions
                     .iter()
-                    .map(|(topic, partition, _)| (topic.clone(), *partition))
+                    .map(|(topic, partition, _)| (topic.as_str(), *partition))
             })
             .collect();
 
         // Drain acknowledgement batches to piggyback on fetch requests.
-        // pending_acks is already broker-keyed: pre-routed acks pass through
-        // the sendable filter only; the UNROUTED shard is also re-routed here.
-        let mut failed_piggyback_acks: Vec<PendingAck> = Vec::new();
-        let pre_routed: BrokerPendingAcks = {
+        //
+        // The drained acks are immediately handed to a `PendingAckGuard` so
+        // that dropping this future (a `select!` shutdown arm, or dropping the
+        // record stream) re-queues them instead of silently discarding explicit
+        // `Reject`/`Release` decisions.
+        let drained_acks: Vec<PendingAck> = {
             let mut pending = self.0.pending_acks.write().await;
             std::mem::take(&mut *pending)
+                .into_values()
+                .flat_map(|partition_acks| partition_acks.into_values().flatten())
+                .collect()
         };
-        let unrouted = pre_routed
-            .get(&UNROUTED_BROKER_ID)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let mut ack_batches_by_broker: BrokerPendingAcks =
-            HashMap::with_capacity(pre_routed.len().saturating_sub(if unrouted > 0 {
-                1
-            } else {
-                0
-            }));
-        for (broker_id, partition_acks) in pre_routed {
-            if broker_id == UNROUTED_BROKER_ID {
-                // Re-route using current metadata; topic name is in the ack itself.
-                for ((topic_id, partition), acks) in partition_acks {
-                    let topic = acks.first().map(|a| a.topic.as_str()).unwrap_or("");
-                    if sendable_ack_partitions.contains(&(topic.to_string(), partition)) {
-                        if let Some(bid) = self.0.metadata.leader(topic, partition) {
-                            ack_batches_by_broker
-                                .entry(bid)
-                                .or_default()
-                                .entry((topic_id, partition))
-                                .or_default()
-                                .extend(acks);
-                        } else {
-                            failed_piggyback_acks.extend(acks);
-                        }
-                    } else {
-                        failed_piggyback_acks.extend(acks);
-                    }
+        let mut ack_guard = PendingAckGuard::new(
+            drained_acks.clone(),
+            self.0.pending_acks.clone(),
+            self.0.ack_state_generation.clone(),
+            ack_state_generation,
+            self.0.explicit_flush_retry_required.clone(),
+            false,
+        );
+
+        // Route every ack to the *current* partition leader. Leadership can
+        // change between `acknowledge()` and `poll()`, so the pre-routing done
+        // at acknowledge time is treated as a hint only.
+        let mut failed_piggyback_acks: Vec<PendingAck> = Vec::new();
+        let mut ack_batches_by_broker: BrokerPendingAcks = HashMap::new();
+        for ack in drained_acks {
+            if !sendable_ack_partitions.contains(&(ack.topic.as_str(), ack.partition)) {
+                failed_piggyback_acks.push(ack);
+                continue;
+            }
+            match self.0.metadata.leader(&ack.topic, ack.partition) {
+                Some(broker_id) => {
+                    let key = (ack.topic_id, ack.partition);
+                    ack_batches_by_broker
+                        .entry(broker_id)
+                        .or_default()
+                        .entry(key)
+                        .or_default()
+                        .push(ack);
                 }
-            } else {
-                // Already routed; apply sendable filter only (handles leadership
-                // changes between acknowledge() and poll()).
-                for ((topic_id, partition), acks) in partition_acks {
-                    let topic = acks.first().map(|a| a.topic.as_str()).unwrap_or("");
-                    if sendable_ack_partitions.contains(&(topic.to_string(), partition)) {
-                        ack_batches_by_broker
-                            .entry(broker_id)
-                            .or_default()
-                            .entry((topic_id, partition))
-                            .or_default()
-                            .extend(acks);
-                    } else {
-                        failed_piggyback_acks.extend(acks);
-                    }
-                }
+                None => failed_piggyback_acks.push(ack),
             }
         }
 
@@ -668,11 +1005,17 @@ impl ShareConsumer {
                 })
                 .collect();
 
-            let request = ShareFetchRequest {
+            // Wait at most the caller's poll timeout, and never longer than the
+            // configured `fetch_max_wait_ms`, so a long poll timeout does not
+            // silently override the fetch-side setting.
+            let poll_wait_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+            let max_wait_ms = poll_wait_ms.min(self.0.config.fetch_max_wait_ms.max(0));
+
+            let mut request = ShareFetchRequest {
                 group_id: Some(group_id.clone()),
                 member_id: Some(member_id.clone()),
                 share_session_epoch: session_epoch,
-                max_wait_ms: timeout.as_millis().min(i32::MAX as u128) as i32,
+                max_wait_ms,
                 min_bytes: self.0.config.fetch_min_bytes,
                 max_bytes: self.0.config.fetch_max_bytes,
                 max_records: self.0.config.max_records,
@@ -717,6 +1060,29 @@ impl ShareConsumer {
                     ack_state_generation,
                 )?;
 
+                // KIP-1222 `Renew` is only understood by newer brokers; sending
+                // it to an older one fails the *entire* acknowledgement batch
+                // with INVALID_REQUEST. Drop those acks instead: the acquisition
+                // lock then simply expires, the same outcome as not renewing.
+                if version < RENEW_MIN_VERSION {
+                    let dropped =
+                        strip_unsupported_renew_acks(request.topics.iter_mut().flat_map(|topic| {
+                            topic
+                                .partitions
+                                .iter_mut()
+                                .map(|partition| &mut partition.acknowledgement_batches)
+                        }));
+                    if dropped > 0 {
+                        warn!(
+                            broker_id = bid,
+                            version,
+                            dropped,
+                            "broker does not support KIP-1222 Renew acknowledgements; \
+                             dropping them from the ShareFetch"
+                        );
+                    }
+                }
+
                 let buf = conn
                     .send_request(ApiKey::ShareFetch, version, |buf| match version {
                         2 => request.encode_v2(buf, 0, false),
@@ -738,165 +1104,229 @@ impl ShareConsumer {
         }
 
         // Collect results from all brokers.
-        let mut all_records = Vec::new();
-        let topic_ids_guard = self.0.topic_ids.read().await;
+        //
+        // Snapshot the UUID → name mapping instead of holding the `topic_ids`
+        // read guard across the network awaits below. tokio's `RwLock` is
+        // write-preferring, so a long-lived reader lets one slow `ShareFetch`
+        // block `apply_assignment()`'s writer, which in turn blocks the
+        // heartbeat path and can get the member evicted from the group.
+        let mut all_records: Vec<ConsumerRecord> = Vec::new();
+        let mut gap_acks: Vec<PendingAck> = Vec::new();
+        let topic_names_by_id: HashMap<[u8; 16], String> = {
+            let guard = self.0.topic_ids.read().await;
+            guard.iter().map(|(name, &id)| (id, name.clone())).collect()
+        };
 
-        for (broker_id, task) in fetch_tasks {
-            match task.await {
-                Ok(Ok((_, response))) => {
-                    let mut broker_acks =
-                        ack_batches_by_broker.remove(&broker_id).unwrap_or_default();
+        // Race the collection loop against `wakeup()` so an in-flight
+        // `ShareFetch` can be interrupted instead of having to run to
+        // completion.
+        let mut wakeup_interrupted = false;
+        {
+            let collect_fetch_results = async {
+                for (broker_id, task) in fetch_tasks {
+                    match task.await {
+                        Ok(Ok((_, response))) => {
+                            let mut broker_acks =
+                                ack_batches_by_broker.remove(&broker_id).unwrap_or_default();
 
-                    if !response.error_code.is_ok() {
-                        failed_piggyback_acks.extend(flatten_partition_acks(broker_acks));
-                        warn!(
-                            "ShareFetch to broker {broker_id} returned {:?}: {}",
-                            response.error_code,
-                            response.error_message.as_deref().unwrap_or("unknown error")
-                        );
-                        let mut sessions = self.0.share_sessions.lock().await;
-                        sessions.reset_broker(broker_id);
-                        continue;
-                    }
+                            if !response.error_code.is_ok() {
+                                failed_piggyback_acks.extend(flatten_partition_acks(broker_acks));
+                                warn!(
+                                    "ShareFetch to broker {broker_id} returned {:?}: {}",
+                                    response.error_code,
+                                    response.error_message.as_deref().unwrap_or("unknown error")
+                                );
+                                let mut sessions = self.0.share_sessions.lock().await;
+                                sessions.reset_broker(broker_id);
+                                continue;
+                            }
 
-                    // Update session state on success.
-                    {
-                        let mut sessions = self.0.share_sessions.lock().await;
-                        sessions.get_or_create(broker_id).on_success();
-                    }
+                            // Update session state on success.
+                            {
+                                let mut sessions = self.0.share_sessions.lock().await;
+                                sessions.get_or_create(broker_id).on_success();
+                            }
 
-                    // Decode records from the response and restore only the
-                    // partitions whose piggybacked acknowledgements failed.
-                    for topic_response in &response.responses {
-                        let topic_name = if let Some(name) =
-                            self.0.metadata.topic_name_for_id(&topic_response.topic_id)
-                        {
-                            name
-                        } else {
-                            let found = topic_ids_guard.iter().find_map(|(name, &id)| {
-                                if id == topic_response.topic_id {
-                                    Some(name.clone())
+                            // Decode records from the response and restore only the
+                            // partitions whose piggybacked acknowledgements failed.
+                            for topic_response in &response.responses {
+                                let topic_name = if let Some(name) =
+                                    self.0.metadata.topic_name_for_id(&topic_response.topic_id)
+                                {
+                                    name
                                 } else {
-                                    None
-                                }
-                            });
-                            match found {
-                                Some(name) => name,
-                                None => {
-                                    debug!(
-                                        "Unknown topic UUID {:?} in ShareFetch response, skipping",
-                                        topic_response.topic_id
+                                    match topic_names_by_id.get(&topic_response.topic_id) {
+                                        Some(name) => name.clone(),
+                                        None => {
+                                            debug!(
+                                                "Unknown topic UUID {:?} in ShareFetch response, skipping",
+                                                topic_response.topic_id
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                };
+
+                                for partition_response in &topic_response.partitions {
+                                    let partition_acks = drain_broker_partition_acks(
+                                        &mut broker_acks,
+                                        topic_response.topic_id,
+                                        partition_response.partition_index,
                                     );
-                                    continue;
-                                }
-                            }
-                        };
 
-                        for partition_response in &topic_response.partitions {
-                            let partition_acks = drain_broker_partition_acks(
-                                &mut broker_acks,
-                                topic_response.topic_id,
-                                partition_response.partition_index,
-                            );
+                                    if !partition_response.error_code.is_ok() {
+                                        failed_piggyback_acks.extend(partition_acks);
+                                        warn!(
+                                            "ShareFetch error for {topic_name}-{}: {:?}",
+                                            partition_response.partition_index,
+                                            partition_response.error_code
+                                        );
+                                        continue;
+                                    }
 
-                            if !partition_response.error_code.is_ok() {
-                                failed_piggyback_acks.extend(partition_acks);
-                                warn!(
-                                    "ShareFetch error for {topic_name}-{}: {:?}",
-                                    partition_response.partition_index,
-                                    partition_response.error_code
-                                );
-                                continue;
-                            }
+                                    if !partition_response.acknowledge_error_code.is_ok() {
+                                        failed_piggyback_acks.extend(partition_acks);
+                                        warn!(
+                                            "Piggybacked ShareFetch acknowledge error for {topic_name}-{}: {:?}: {}",
+                                            partition_response.partition_index,
+                                            partition_response.acknowledge_error_code,
+                                            partition_response
+                                                .acknowledge_error_message
+                                                .as_deref()
+                                                .unwrap_or("unknown error")
+                                        );
+                                        continue;
+                                    }
 
-                            if !partition_response.acknowledge_error_code.is_ok() {
-                                failed_piggyback_acks.extend(partition_acks);
-                                warn!(
-                                    "Piggybacked ShareFetch acknowledge error for {topic_name}-{}: {:?}: {}",
-                                    partition_response.partition_index,
-                                    partition_response.acknowledge_error_code,
-                                    partition_response
-                                        .acknowledge_error_message
-                                        .as_deref()
-                                        .unwrap_or("unknown error")
-                                );
-                                continue;
-                            }
+                                    // Build the delivery-count map from acquired_records.
+                                    // The encoded record bytes bound how many records
+                                    // can possibly be decoded, which caps a malformed
+                                    // range such as `0..=i64::MAX`.
+                                    let raw_len = partition_response
+                                        .records
+                                        .as_ref()
+                                        .map(|raw| raw.len())
+                                        .unwrap_or(0);
+                                    let delivery_counts = build_delivery_counts(
+                                        &partition_response.acquired_records,
+                                        raw_len,
+                                    );
 
-                            // Build delivery count map from acquired_records.
-                            let mut delivery_counts: HashMap<Offset, i16> = HashMap::new();
-                            for acquired in &partition_response.acquired_records {
-                                for offset in acquired.first_offset..=acquired.last_offset {
-                                    delivery_counts.insert(offset, acquired.delivery_count);
-                                }
-                            }
-
-                            // Decode record batches.
-                            if let Some(ref raw) = partition_response.records {
-                                let mut cursor = raw.as_ref();
-                                while !cursor.is_empty() {
-                                    match RecordBatch::decode_with_limit(
-                                        &mut cursor,
-                                        self.0.config.max_decompressed_size,
-                                    ) {
-                                        Ok(batch) => {
-                                            for record in batch.records {
-                                                let record_offset =
-                                                    batch.base_offset + record.offset_delta as i64;
-                                                let delivery_count =
-                                                    delivery_counts.get(&record_offset).copied();
-                                                all_records.push(ConsumerRecord {
-                                                    topic: topic_name.clone(),
-                                                    partition: partition_response.partition_index,
-                                                    offset: record_offset,
-                                                    timestamp: batch
-                                                        .base_timestamp
-                                                        .saturating_add(record.timestamp_delta),
-                                                    timestamp_type: batch.attributes.timestamp_type
-                                                        as i8,
-                                                    key: record.key,
-                                                    value: record.value,
-                                                    headers: record
-                                                        .headers
-                                                        .into_iter()
-                                                        .map(|h| (h.key, h.value))
-                                                        .collect(),
-                                                    leader_epoch: None,
-                                                    delivery_count,
-                                                });
+                                    // Decode record batches.
+                                    let mut decoded_offsets: HashSet<Offset> = HashSet::new();
+                                    let mut decode_failed = false;
+                                    if let Some(ref raw) = partition_response.records {
+                                        let mut cursor = raw.as_ref();
+                                        while !cursor.is_empty() {
+                                            match RecordBatch::decode_with_limit(
+                                                &mut cursor,
+                                                self.0.config.max_decompressed_size,
+                                            ) {
+                                                Ok(batch) => {
+                                                    for record in batch.records {
+                                                        let record_offset = batch.base_offset
+                                                            + record.offset_delta as i64;
+                                                        let delivery_count = delivery_counts
+                                                            .get(&record_offset)
+                                                            .copied();
+                                                        decoded_offsets.insert(record_offset);
+                                                        all_records.push(ConsumerRecord {
+                                                            topic: topic_name.clone(),
+                                                            partition: partition_response
+                                                                .partition_index,
+                                                            offset: record_offset,
+                                                            timestamp: batch
+                                                                .base_timestamp
+                                                                .saturating_add(
+                                                                    record.timestamp_delta,
+                                                                ),
+                                                            timestamp_type: batch
+                                                                .attributes
+                                                                .timestamp_type
+                                                                as i8,
+                                                            key: record.key,
+                                                            value: record.value,
+                                                            headers: record
+                                                                .headers
+                                                                .into_iter()
+                                                                .map(|h| (h.key, h.value))
+                                                                .collect(),
+                                                            leader_epoch: None,
+                                                            delivery_count,
+                                                        });
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    debug!(
+                                                        "Failed to decode record batch for {topic_name}-{}: {e}",
+                                                        partition_response.partition_index
+                                                    );
+                                                    decode_failed = true;
+                                                    break;
+                                                }
                                             }
                                         }
-                                        Err(e) => {
-                                            debug!(
-                                                "Failed to decode record batch for {topic_name}-{}: {e}",
-                                                partition_response.partition_index
-                                            );
-                                            break;
-                                        }
+                                    }
+
+                                    // Offsets the broker acquired for us but that we
+                                    // could not decode would otherwise be redelivered
+                                    // forever, with `delivery_count` climbing without
+                                    // bound. Acknowledge them as gaps so the broker
+                                    // archives them instead.
+                                    if decode_failed {
+                                        gap_acks.extend(build_gap_acks(
+                                            &topic_name,
+                                            topic_response.topic_id,
+                                            partition_response.partition_index,
+                                            &delivery_counts,
+                                            &decoded_offsets,
+                                        ));
                                     }
                                 }
                             }
+
+                            failed_piggyback_acks.extend(flatten_partition_acks(broker_acks));
+                        }
+                        Ok(Err(e)) => {
+                            failed_piggyback_acks
+                                .extend(drain_broker_acks(&mut ack_batches_by_broker, broker_id));
+                            warn!("ShareFetch to broker {broker_id} failed: {e}");
+                        }
+                        Err(e) => {
+                            failed_piggyback_acks
+                                .extend(drain_broker_acks(&mut ack_batches_by_broker, broker_id));
+                            warn!(
+                                "ShareFetch task for broker {broker_id} {}: {e}",
+                                describe_share_fetch_join_error(&e)
+                            );
                         }
                     }
-
-                    failed_piggyback_acks.extend(flatten_partition_acks(broker_acks));
                 }
-                Ok(Err(e)) => {
-                    failed_piggyback_acks
-                        .extend(drain_broker_acks(&mut ack_batches_by_broker, broker_id));
-                    warn!("ShareFetch to broker {broker_id} failed: {e}");
+            };
+            tokio::pin!(collect_fetch_results);
+            tokio::select! {
+                biased;
+                () = self.0.wakeup_notify.notified() => {
+                    wakeup_interrupted = true;
                 }
-                Err(e) => {
-                    failed_piggyback_acks
-                        .extend(drain_broker_acks(&mut ack_batches_by_broker, broker_id));
-                    warn!(
-                        "ShareFetch task for broker {broker_id} {}: {e}",
-                        describe_share_fetch_join_error(&e)
-                    );
-                }
+                () = &mut collect_fetch_results => {}
             }
         }
-        drop(topic_ids_guard);
+
+        if wakeup_interrupted {
+            // Consume the flag so the *next* poll() is not failed spuriously by
+            // the same wakeup, keep anything already decoded, and re-queue the
+            // drained acknowledgements.
+            self.0.wakeup_flag.store(false, Ordering::Release);
+            if !all_records.is_empty() {
+                let mut buffer = self.0.recv_buffer.write().await;
+                buffer.extend(std::mem::take(&mut all_records));
+            }
+            let acks = ack_guard.disarm();
+            self.restore_pending_acks(ack_state_generation, acks, false)
+                .await;
+            return Err(KrafkaError::invalid_state("wakeup() was called"));
+        }
 
         failed_piggyback_acks.extend(
             ack_batches_by_broker
@@ -904,29 +1334,64 @@ impl ShareConsumer {
                 .flat_map(|(_, acks)| flatten_partition_acks(acks))
                 .collect::<Vec<_>>(),
         );
+
+        // Everything that could be sent has been sent; the guard's copy is no
+        // longer needed and only the genuinely failed acks are re-queued.
+        let _ = ack_guard.disarm();
+        drop(ack_guard);
+
+        failed_piggyback_acks.append(&mut gap_acks);
         self.restore_pending_acks(ack_state_generation, failed_piggyback_acks, false)
             .await;
 
-        // In implicit mode, queue all fetched records as coalesced accepts for next poll.
-        if self.0.config.acknowledgement_mode == AcknowledgementMode::Implicit {
-            let ids = self.0.topic_ids.read().await;
-            let mut pending = self.0.pending_acks.write().await;
-            Self::coalesce_implicit_acks(&all_records, &ids, &mut pending, &self.0.metadata);
+        // Split *before* any acknowledgement bookkeeping. Acknowledging a
+        // record that is then discarded would consume it permanently without
+        // ever delivering it (implicit mode), or wedge `poll()` forever behind
+        // an offset the application can never acknowledge (explicit mode).
+        let overflow = if all_records.len() > max_records {
+            all_records.split_off(max_records)
+        } else {
+            Vec::new()
+        };
+        if !overflow.is_empty() {
+            let mut buffer = self.0.recv_buffer.write().await;
+            buffer.extend(overflow);
         }
 
-        // In explicit mode, track all returned records as unacknowledged.
-        if self.0.config.acknowledgement_mode == AcknowledgementMode::Explicit {
-            let mut unacked = self.0.unacked_offsets.write().await;
-            for record in &all_records {
-                unacked.insert((record.topic.clone(), record.partition, record.offset));
-            }
-        }
-
-        // Truncate to max_poll_records (validated >= 1 in the builder).
-        let max = self.0.config.max_poll_records as usize;
-        all_records.truncate(max);
+        // Only the records actually returned to the caller are tracked.
+        self.register_delivered_records(&all_records).await;
 
         Ok(all_records)
+    }
+
+    /// Register records that are about to be handed to the application.
+    ///
+    /// In implicit mode this queues coalesced `Accept` acknowledgements to be
+    /// piggybacked on the next `ShareFetch`. In explicit mode it records the
+    /// offsets in `unacked_offsets`, which `poll()` requires to be empty before
+    /// it will fetch again.
+    ///
+    /// This is deliberately called at *delivery* time rather than at fetch
+    /// time, so a record can never be acknowledged or required-to-be-acked
+    /// without the application having seen it.
+    async fn register_delivered_records(&self, records: &[ConsumerRecord]) {
+        if records.is_empty() {
+            return;
+        }
+
+        match self.0.config.acknowledgement_mode {
+            AcknowledgementMode::Implicit => {
+                let ids = self.0.topic_ids.read().await.clone();
+                let mut pending = self.0.pending_acks.write().await;
+                Self::coalesce_implicit_acks(records, &ids, &mut pending, &self.0.metadata);
+            }
+            AcknowledgementMode::Explicit => {
+                let mut unacked = self.0.unacked_offsets.write().await;
+                for record in records {
+                    unacked.insert((record.topic.clone(), record.partition, record.offset));
+                }
+            }
+        }
     }
 
     /// Acknowledge a record with the given type (explicit mode only).
@@ -1126,15 +1591,30 @@ impl ShareConsumer {
             return Ok(());
         }
 
-        match self.send_share_acknowledge(&acks).await {
-            Ok(()) => {
+        // Arm a restore guard: if this future is dropped mid-flush (a `select!`
+        // shutdown arm, a `commit_sync_with_timeout` that elapses) the drained
+        // acknowledgements are re-queued instead of silently lost.
+        let mut guard = PendingAckGuard::new(
+            acks,
+            self.0.pending_acks.clone(),
+            self.0.ack_state_generation.clone(),
+            ack_state_generation,
+            self.0.explicit_flush_retry_required.clone(),
+            true,
+        );
+
+        let outcome = self.send_share_acknowledge(guard.acks()).await;
+        let _ = guard.disarm();
+
+        match outcome.error {
+            None => {
                 self.0
                     .explicit_flush_retry_required
                     .store(false, Ordering::SeqCst);
                 Ok(())
             }
-            Err(error) => {
-                self.restore_pending_acks(ack_state_generation, acks, true)
+            Some(error) => {
+                self.restore_pending_acks(ack_state_generation, outcome.failed, true)
                     .await;
                 Err(error)
             }
@@ -1197,7 +1677,7 @@ impl ShareConsumer {
                     .await;
                 }
             };
-            if let Err(error) = ShareConsumer::send_share_acknowledge_with_state(
+            let outcome = ShareConsumer::send_share_acknowledge_with_state(
                 ShareAcknowledgeContext {
                     metadata,
                     pool,
@@ -1209,9 +1689,11 @@ impl ShareConsumer {
                 },
                 &acks,
             )
-            .await
-            {
-                restore_acks(acks).await;
+            .await;
+
+            if let Some(error) = outcome.error {
+                // Only the acks their broker did not accept are re-queued.
+                restore_acks(outcome.failed).await;
                 return Err(error);
             }
 
@@ -1221,36 +1703,39 @@ impl ShareConsumer {
         }))
     }
 
-    /// Receive a single record (convenience wrapper over `poll()`).
+    /// Receive a single record, waiting until one is available.
     ///
-    /// Buffers records internally; returns `None` when the consumer is closed.
+    /// Records fetched but not yet returned are buffered internally, so
+    /// repeated calls do not issue a `ShareFetch` per record.
+    ///
+    /// `Ok(None)` means the consumer has been **closed** — and nothing else.
+    /// An idle topic simply makes this call wait: an empty `ShareFetch` is
+    /// retried until a record arrives, the consumer is closed, or
+    /// [`wakeup()`](Self::wakeup) interrupts it (which surfaces as `Err`).
     pub async fn recv(&self) -> Result<Option<ConsumerRecord>> {
-        // Return from buffer first.
-        {
-            let mut buf = self.0.recv_buffer.write().await;
-            if let Some(record) = buf.pop_front() {
+        loop {
+            if self.0.closed.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+
+            let started = tokio::time::Instant::now();
+            let records = self.poll_inner(Duration::from_secs(1), 1).await?;
+            if let Some(record) = records.into_iter().next() {
                 return Ok(Some(record));
             }
-        }
 
-        if self.0.closed.load(Ordering::SeqCst) {
-            return Ok(None);
-        }
+            if self.0.closed.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
 
-        let records = self.poll(Duration::from_secs(1)).await?;
-        if records.is_empty() {
-            return Ok(None);
+            // A poll can return empty immediately (no assignment yet, buffer
+            // cap reached, heartbeat-only cycle). Pace the retry so an idle or
+            // unassigned consumer cannot spin the CPU.
+            let elapsed = started.elapsed();
+            if elapsed < RECV_EMPTY_POLL_BACKOFF {
+                tokio::time::sleep(RECV_EMPTY_POLL_BACKOFF - elapsed).await;
+            }
         }
-
-        let mut buf = self.0.recv_buffer.write().await;
-        let mut iter = records.into_iter();
-        let first = iter.next();
-        // Preserve overflow records so recv() never drops data.
-        for record in iter {
-            buf.push_back(record);
-        }
-
-        Ok(first)
     }
 
     /// Create an async stream of records.
@@ -1260,7 +1745,13 @@ impl ShareConsumer {
 
     /// Unsubscribe from all topics.
     ///
-    /// Sends a leave heartbeat (member_epoch = -1) and clears state.
+    /// Flushes pending acknowledgements, sends a leave heartbeat
+    /// (member_epoch = -1) and clears local state.
+    ///
+    /// The flush is best-effort: a failure is logged and unsubscribe still
+    /// proceeds. Without it, explicit `Reject`/`Release` decisions the
+    /// application already made would be discarded by the state clear below and
+    /// the affected records would be redelivered as if nothing was decided.
     pub async fn unsubscribe(&self) {
         // Stop the background heartbeat task before leaving the group.
         if let Some(handle) = self
@@ -1271,6 +1762,11 @@ impl ShareConsumer {
             .take()
         {
             handle.abort();
+        }
+
+        // Flush before clearing state (close() does the same).
+        if let Err(e) = self.flush_pending_acks().await {
+            warn!("Flushing pending acknowledgements during unsubscribe failed: {e}");
         }
 
         // Leave group via heartbeat with epoch -1.
@@ -1356,16 +1852,20 @@ impl ShareConsumer {
         self.0.closed.load(Ordering::SeqCst)
     }
 
-    /// Interrupt an in-progress [`poll()`](Self::poll) call from another thread or task.
+    /// Interrupt [`poll()`](Self::poll)/[`recv()`](Self::recv) from another
+    /// thread or task.
     ///
-    /// Sets a wakeup flag that causes the next pending `poll()` to return
-    /// `Err(KrafkaError::WakeupCalled)` immediately without fetching records.
-    /// The consumer remains usable — subsequent `poll()` calls proceed normally.
+    /// A `poll()` that is already blocked on a `ShareFetch` is interrupted and
+    /// returns an error without waiting for the broker; a `poll()` that has not
+    /// started yet returns the same error immediately. Acknowledgements drained
+    /// by the interrupted call are re-queued, not lost.
     ///
+    /// The consumer remains usable — the next `poll()` proceeds normally.
     /// This is safe to call concurrently with any other consumer method.
     #[inline]
     pub fn wakeup(&self) {
         self.0.wakeup_flag.store(true, Ordering::Release);
+        self.0.wakeup_notify.notify_waiters();
     }
 
     /// Close the consumer with a per-phase timeout.
@@ -1887,9 +2387,9 @@ impl ShareConsumer {
 
     /// Send a ShareAcknowledge request for pending acks.
     ///
-    /// Routes acknowledgements to the correct partition leaders. Returns an
-    /// error if any leader cannot be determined or any broker rejects the acks.
-    async fn send_share_acknowledge(&self, acks: &[PendingAck]) -> Result<()> {
+    /// Routes acknowledgements to the correct partition leaders and reports,
+    /// per acknowledgement, which ones the brokers did not accept.
+    async fn send_share_acknowledge(&self, acks: &[PendingAck]) -> ShareAcknowledgeOutcome {
         let member_id = (**self.0.member_id.load()).clone();
         Self::send_share_acknowledge_with_state(
             ShareAcknowledgeContext {
@@ -1909,7 +2409,7 @@ impl ShareConsumer {
     async fn send_share_acknowledge_with_state(
         context: ShareAcknowledgeContext,
         acks: &[PendingAck],
-    ) -> Result<()> {
+    ) -> ShareAcknowledgeOutcome {
         let ShareAcknowledgeContext {
             metadata,
             pool,
@@ -1920,62 +2420,97 @@ impl ShareConsumer {
             ack_state_generation,
         } = context;
 
-        Self::ensure_ack_state_current(
+        let mut outcome = ShareAcknowledgeOutcome::default();
+
+        if let Err(error) = Self::ensure_ack_state_current(
             current_ack_state_generation.as_ref(),
             ack_state_generation,
-        )?;
-
-        // Group acks by partition leader.
-        let mut broker_acks: HashMap<BrokerId, Vec<&PendingAck>> = HashMap::new();
-
-        for ack in acks {
-            let broker_id = metadata.leader(&ack.topic, ack.partition).ok_or_else(|| {
-                KrafkaError::invalid_state(format!(
-                    "no leader for {}-{} in metadata",
-                    ack.topic, ack.partition
-                ))
-            })?;
-            broker_acks.entry(broker_id).or_default().push(ack);
+        ) {
+            outcome.fail(acks.iter().cloned(), error);
+            return outcome;
         }
 
-        for (broker_id, broker_ack_list) in &broker_acks {
-            Self::ensure_ack_state_current(
+        // Group acks by partition leader.
+        let mut broker_acks: HashMap<BrokerId, Vec<PendingAck>> = HashMap::new();
+        for ack in acks {
+            match metadata.leader(&ack.topic, ack.partition) {
+                Some(broker_id) => broker_acks.entry(broker_id).or_default().push(ack.clone()),
+                None => outcome.fail(
+                    std::iter::once(ack.clone()),
+                    KrafkaError::invalid_state(format!(
+                        "no leader for {}-{} in metadata",
+                        ack.topic, ack.partition
+                    )),
+                ),
+            }
+        }
+
+        for (broker_id, broker_ack_list) in broker_acks {
+            // Track success per broker. Restoring a multi-broker batch wholesale
+            // because the last broker failed would make the retry re-acknowledge
+            // offsets the earlier brokers already accepted, which the broker
+            // rejects with INVALID_RECORD_STATE.
+            if let Err(error) = Self::ensure_ack_state_current(
                 current_ack_state_generation.as_ref(),
                 ack_state_generation,
-            )?;
+            ) {
+                outcome.fail(broker_ack_list, error);
+                continue;
+            }
 
-            let topics = Self::build_acknowledge_topics(
-                &broker_ack_list
-                    .iter()
-                    .map(|a| (*a).clone())
-                    .collect::<Vec<_>>(),
-            );
+            let result = Self::send_broker_acknowledge(
+                &metadata,
+                &pool,
+                &share_sessions,
+                &group_id,
+                &member_id,
+                broker_id,
+                &broker_ack_list,
+            )
+            .await;
 
-            let session_epoch = {
-                let sessions = share_sessions.lock().await;
-                sessions
-                    .get(*broker_id)
-                    .map(|s: &session::ShareSessionState| s.epoch())
-                    .unwrap_or(0)
-            };
+            if let Err(error) = result {
+                outcome.fail(broker_ack_list, error);
+            }
+        }
 
-            let request = ShareAcknowledgeRequest {
-                group_id: Some(group_id.clone()),
-                member_id: Some(member_id.clone()),
-                share_session_epoch: session_epoch,
-                topics,
-            };
+        outcome
+    }
 
-            let broker_addr = metadata
-                .broker(*broker_id)
-                .map(|b| b.address().to_string())
-                .ok_or_else(|| {
-                    KrafkaError::invalid_state(format!(
-                        "broker {} not found in metadata",
-                        broker_id
-                    ))
-                })?;
-            let conn = pool.get_connection_by_id(*broker_id, &broker_addr).await?;
+    /// Send a `ShareAcknowledge` to a single broker, retrying share-session
+    /// failures.
+    ///
+    /// On success the broker's share-session epoch is advanced. Skipping that
+    /// step leaves the next `ShareFetch` sending an epoch the broker has already
+    /// consumed, which it answers with `INVALID_SHARE_SESSION_EPOCH` — and since
+    /// nothing reset the session, every retry repeats the same stale epoch and
+    /// the consumer never recovers.
+    ///
+    /// `SHARE_SESSION_NOT_FOUND` (122), `INVALID_SHARE_SESSION_EPOCH` (123) and
+    /// `SHARE_SESSION_LIMIT_REACHED` (133) all mean the client's view of the
+    /// session is unusable: the session is reset so the retry opens a fresh one
+    /// at epoch 0. Code 133 is a capacity signal, so it is retried after a
+    /// short backoff.
+    async fn send_broker_acknowledge(
+        metadata: &Arc<ClusterMetadata>,
+        pool: &Arc<ConnectionPool>,
+        share_sessions: &Arc<tokio::sync::Mutex<ShareSessionCache>>,
+        group_id: &str,
+        member_id: &str,
+        broker_id: BrokerId,
+        acks: &[PendingAck],
+    ) -> Result<()> {
+        let broker_addr = metadata
+            .broker(broker_id)
+            .map(|b| b.address().to_string())
+            .ok_or_else(|| {
+                KrafkaError::invalid_state(format!("broker {broker_id} not found in metadata"))
+            })?;
+
+        let mut last_error: Option<KrafkaError> = None;
+
+        for attempt in 0..=SHARE_SESSION_RETRY_LIMIT {
+            let conn = pool.get_connection_by_id(broker_id, &broker_addr).await?;
             let version = conn
                 .negotiate_api_version(
                     ApiKey::ShareAcknowledge,
@@ -1990,10 +2525,38 @@ impl ShareConsumer {
                     )
                 })?;
 
-            Self::ensure_ack_state_current(
-                current_ack_state_generation.as_ref(),
-                ack_state_generation,
-            )?;
+            let mut topics = Self::build_acknowledge_topics(acks);
+            if version < RENEW_MIN_VERSION {
+                let dropped = strip_unsupported_renew_acks(topics.iter_mut().flat_map(|topic| {
+                    topic
+                        .partitions
+                        .iter_mut()
+                        .map(|partition| &mut partition.acknowledgement_batches)
+                }));
+                if dropped > 0 {
+                    warn!(
+                        broker_id,
+                        version,
+                        dropped,
+                        "broker does not support KIP-1222 Renew acknowledgements; dropping them"
+                    );
+                }
+            }
+
+            let session_epoch = {
+                let sessions = share_sessions.lock().await;
+                sessions
+                    .get(broker_id)
+                    .map(|s: &session::ShareSessionState| s.epoch())
+                    .unwrap_or(session::INITIAL_EPOCH)
+            };
+
+            let request = ShareAcknowledgeRequest {
+                group_id: Some(group_id.to_string()),
+                member_id: Some(member_id.to_string()),
+                share_session_epoch: session_epoch,
+                topics,
+            };
 
             let buf = conn
                 .send_request(ApiKey::ShareAcknowledge, version, |buf| match version {
@@ -2007,12 +2570,48 @@ impl ShareConsumer {
                 &mut buf.as_ref(),
             )?;
 
-            if let Some(error) = Self::share_acknowledge_response_error(&response) {
-                return Err(error);
+            match Self::share_acknowledge_response_error(&response) {
+                None => {
+                    // Advance the share-session epoch: this request consumed it.
+                    let mut sessions = share_sessions.lock().await;
+                    sessions.get_or_create(broker_id).on_success();
+                    return Ok(());
+                }
+                Some(error) => {
+                    let session_error = matches!(
+                        &error,
+                        KrafkaError::Broker { code, .. } if is_share_session_error(*code)
+                    );
+                    if !session_error || attempt == SHARE_SESSION_RETRY_LIMIT {
+                        return Err(error);
+                    }
+
+                    let limit_reached = matches!(
+                        &error,
+                        KrafkaError::Broker {
+                            code: ErrorCode::ShareSessionLimitReached,
+                            ..
+                        }
+                    );
+
+                    warn!(
+                        broker_id,
+                        attempt,
+                        "ShareAcknowledge share-session error ({error}); resetting the session and retrying"
+                    );
+                    share_sessions.lock().await.reset_broker(broker_id);
+                    last_error = Some(error);
+
+                    if limit_reached {
+                        tokio::time::sleep(SHARE_SESSION_LIMIT_BACKOFF).await;
+                    }
+                }
             }
         }
 
-        Ok(())
+        Err(last_error.unwrap_or_else(|| {
+            KrafkaError::invalid_state("ShareAcknowledge exhausted share-session retries")
+        }))
     }
 
     fn ensure_ack_state_current(
@@ -2182,16 +2781,37 @@ impl ShareConsumer {
     /// recovers from `FencedMemberEpoch` by resetting local member state.
     ///
     /// Stops when `closed` is set or the task is aborted.
-    async fn run_heartbeat_loop(&self) {
-        loop {
-            let interval_ms = self.0.heartbeat_interval_ms.load(Ordering::Relaxed);
-            tokio::time::sleep(Duration::from_millis(interval_ms as u64)).await;
+    ///
+    /// Takes a [`Weak`] reference on purpose: the loop holds a strong reference
+    /// only while a heartbeat is actually in flight, so it never keeps the
+    /// consumer alive. It stops when `closed` is set, when the task is aborted,
+    /// or as soon as the application has dropped every [`ShareConsumer`] handle.
+    async fn run_heartbeat_loop(inner: Weak<ShareConsumerInner>) {
+        let group_id = match inner.upgrade() {
+            Some(strong) => strong.config.group_id.clone(),
+            None => return,
+        };
 
-            if self.0.closed.load(Ordering::Relaxed) {
+        loop {
+            let interval_ms = match inner.upgrade() {
+                Some(strong) => strong.heartbeat_interval_ms.load(Ordering::Relaxed),
+                None => break,
+            };
+            tokio::time::sleep(Duration::from_millis(interval_ms.max(1) as u64)).await;
+
+            // Re-acquire a strong reference for this iteration only; it is
+            // dropped before the next sleep so the consumer can be reclaimed
+            // while the loop is idle.
+            let Some(strong) = inner.upgrade() else {
+                break;
+            };
+            let this = ShareConsumer(strong);
+
+            if this.0.closed.load(Ordering::Relaxed) {
                 break;
             }
 
-            match self.send_heartbeat(false).await {
+            match this.send_heartbeat(false).await {
                 Ok(()) => {}
 
                 // Fenced epoch: the coordinator has advanced past our epoch.
@@ -2202,13 +2822,12 @@ impl ShareConsumer {
                     ..
                 }) => {
                     warn!(
-                        "Background heartbeat: member epoch fenced for group '{}'; resetting state",
-                        self.0.config.group_id
+                        "Background heartbeat: member epoch fenced for group '{group_id}'; resetting state"
                     );
-                    self.0.member_epoch.store(0, Ordering::Release);
-                    self.clear_ack_state().await;
-                    self.invalidate_coordinator().await;
-                    if let Err(e) = self.ensure_coordinator().await {
+                    this.0.member_epoch.store(0, Ordering::Release);
+                    this.clear_ack_state().await;
+                    this.invalidate_coordinator().await;
+                    if let Err(e) = this.ensure_coordinator().await {
                         warn!(
                             "Background heartbeat: coordinator rediscovery after fence failed: {e}"
                         );
@@ -2217,29 +2836,23 @@ impl ShareConsumer {
 
                 // Coordinator moved or unavailable: rediscover and retry.
                 Err(ref e) if e.is_retriable() => {
-                    debug!(
-                        "Background heartbeat: retryable error for group '{}': {e}",
-                        self.0.config.group_id
-                    );
-                    self.invalidate_coordinator().await;
-                    if let Err(e2) = self.ensure_coordinator().await {
+                    debug!("Background heartbeat: retryable error for group '{group_id}': {e}");
+                    this.invalidate_coordinator().await;
+                    if let Err(e2) = this.ensure_coordinator().await {
                         warn!("Background heartbeat: coordinator rediscovery failed: {e2}");
                     }
                 }
 
                 Err(e) => {
-                    warn!(
-                        "Background heartbeat error for group '{}': {e}",
-                        self.0.config.group_id
-                    );
-                    self.invalidate_coordinator().await;
+                    warn!("Background heartbeat error for group '{group_id}': {e}");
+                    this.invalidate_coordinator().await;
                 }
             }
+
+            // Release the strong reference before sleeping again.
+            drop(this);
         }
-        debug!(
-            "Background heartbeat task stopped for group '{}'",
-            self.0.config.group_id
-        );
+        debug!("Background heartbeat task stopped for group '{group_id}'");
     }
 }
 
@@ -2412,6 +3025,7 @@ impl ShareConsumerBuilder {
 mod tests {
     use super::*;
     use crate::error::ErrorCode;
+    use crate::protocol::ShareAcquiredRecords;
 
     fn test_share_consumer(acknowledgement_mode: AcknowledgementMode) -> ShareConsumer {
         let mut config = ShareConsumer::builder()
@@ -2450,6 +3064,7 @@ mod tests {
             unacked_offsets: Arc::new(RwLock::new(HashSet::new())),
             heartbeat_task: SyncMutex::new(None),
             wakeup_flag: AtomicBool::new(false),
+            wakeup_notify: Notify::new(),
         }))
     }
 
@@ -2557,7 +3172,9 @@ mod tests {
         assert_eq!(AcknowledgeType::Accept.to_i8(), 1);
         assert_eq!(AcknowledgeType::Release.to_i8(), 2);
         assert_eq!(AcknowledgeType::Reject.to_i8(), 3);
-        assert_eq!(AcknowledgeType::Archive.to_i8(), 4);
+        // KIP-932 + KIP-1222 wire values; 0 is the client-emitted "gap".
+        assert_eq!(AcknowledgeType::Renew.to_i8(), 4);
+        assert_eq!(GAP_ACK_TYPE, 0);
     }
 
     #[test]
@@ -2858,7 +3475,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_share_acknowledge_rejects_stale_ack_generation() {
         let consumer = test_share_consumer(AcknowledgementMode::Explicit);
-        let error = ShareConsumer::send_share_acknowledge_with_state(
+        let outcome = ShareConsumer::send_share_acknowledge_with_state(
             ShareAcknowledgeContext {
                 metadata: consumer.0.metadata.clone(),
                 pool: consumer.0.pool.clone(),
@@ -2877,13 +3494,20 @@ mod tests {
                 ack_type: AcknowledgeType::Accept.to_i8(),
             }],
         )
-        .await
-        .expect_err("stale ack generation must be rejected before sending");
+        .await;
 
+        let error = outcome
+            .error
+            .expect("stale ack generation must be rejected before sending");
         assert!(
             error
                 .to_string()
                 .contains("acknowledgement state was invalidated")
+        );
+        assert_eq!(
+            outcome.failed.len(),
+            1,
+            "the un-sent acknowledgement must be reported back for restore"
         );
     }
 
@@ -3199,5 +3823,594 @@ mod tests {
         assert!(consumer.is_closed());
         // Second close: must be idempotent (no panic, no error).
         let _ = consumer.close().await;
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────
+
+    fn test_record(topic: &str, partition: PartitionId, offset: Offset) -> ConsumerRecord {
+        ConsumerRecord {
+            topic: topic.to_string(),
+            partition,
+            offset,
+            timestamp: 0,
+            timestamp_type: 0,
+            key: None,
+            value: None,
+            headers: Vec::new(),
+            leader_epoch: None,
+            delivery_count: None,
+        }
+    }
+
+    fn acquired(first: Offset, last: Offset, delivery_count: i16) -> ShareAcquiredRecords {
+        ShareAcquiredRecords {
+            first_offset: first,
+            last_offset: last,
+            delivery_count,
+        }
+    }
+
+    // ── Overflow must be buffered, never acknowledged ───────
+
+    /// Implicit mode: a fetch larger than `max_poll_records` must queue accepts
+    /// only for the records actually returned. Accepting the surplus would
+    /// consume records that were never delivered — silent, permanent data loss.
+    #[tokio::test]
+    async fn test_register_delivered_records_only_acks_delivered_records_implicit() {
+        let consumer = test_share_consumer(AcknowledgementMode::Implicit);
+        consumer
+            .0
+            .topic_ids
+            .write()
+            .await
+            .insert("t".to_string(), [9; 16]);
+
+        let delivered: Vec<ConsumerRecord> = (0..3).map(|o| test_record("t", 0, o)).collect();
+        consumer.register_delivered_records(&delivered).await;
+
+        let pending = consumer.0.pending_acks.read().await;
+        let acks: Vec<&PendingAck> = pending
+            .values()
+            .flat_map(|b| b.values().flatten())
+            .collect();
+        assert_eq!(acks.len(), 1, "contiguous offsets coalesce into one range");
+        assert_eq!(acks[0].first_offset, 0);
+        assert_eq!(
+            acks[0].last_offset, 2,
+            "only the delivered offsets 0..=2 may be accepted"
+        );
+    }
+
+    /// Explicit mode: only delivered records may enter `unacked_offsets`.
+    /// Tracking undelivered offsets wedges `poll()` forever, because the
+    /// application can never acknowledge a record it never received.
+    #[tokio::test]
+    async fn test_register_delivered_records_only_tracks_delivered_records_explicit() {
+        let consumer = test_share_consumer(AcknowledgementMode::Explicit);
+        let delivered: Vec<ConsumerRecord> = (0..2).map(|o| test_record("t", 0, o)).collect();
+
+        consumer.register_delivered_records(&delivered).await;
+
+        let unacked = consumer.0.unacked_offsets.read().await;
+        assert_eq!(unacked.len(), 2);
+        assert!(unacked.contains(&("t".to_string(), 0, 0)));
+        assert!(unacked.contains(&("t".to_string(), 0, 1)));
+        assert!(
+            !unacked.contains(&("t".to_string(), 0, 2)),
+            "an undelivered offset must never be marked unacknowledged"
+        );
+    }
+
+    /// Records buffered by an oversized fetch are handed out by the next
+    /// `poll()` and are registered at that point — not before.
+    #[tokio::test]
+    async fn test_poll_drains_buffer_and_registers_on_delivery() {
+        let consumer = test_share_consumer(AcknowledgementMode::Explicit);
+        {
+            let mut buffer = consumer.0.recv_buffer.write().await;
+            for offset in 0..5 {
+                buffer.push_back(test_record("t", 0, offset));
+            }
+        }
+
+        // Nothing is tracked while the records merely sit in the buffer.
+        assert!(consumer.0.unacked_offsets.read().await.is_empty());
+
+        let records = consumer
+            .poll_inner(Duration::from_millis(1), 2)
+            .await
+            .expect("buffered records must be returned without a fetch");
+
+        assert_eq!(records.len(), 2, "poll must respect the record limit");
+        assert_eq!(records[0].offset, 0);
+        assert_eq!(records[1].offset, 1);
+        assert_eq!(
+            consumer.0.recv_buffer.read().await.len(),
+            3,
+            "the remainder stays buffered"
+        );
+        assert_eq!(
+            consumer.0.unacked_offsets.read().await.len(),
+            2,
+            "only the two delivered records are tracked"
+        );
+    }
+
+    // ── Acquired-range validation ───────────────────────────────────
+
+    /// An inverted range (`last < first`) is malformed and must be ignored
+    /// rather than iterated.
+    #[test]
+    fn test_build_delivery_counts_rejects_inverted_range() {
+        let counts = build_delivery_counts(&[acquired(100, 5, 1)], 1024);
+        assert!(counts.is_empty(), "inverted range must be dropped");
+    }
+
+    /// A decode desync yielding `0..=i64::MAX` must not be materialised: the
+    /// range is capped by the number of records that could possibly decode.
+    #[test]
+    fn test_build_delivery_counts_caps_absurd_range() {
+        let counts = build_delivery_counts(&[acquired(0, i64::MAX, 3)], 16);
+        assert_eq!(counts.len(), 16, "range must be capped, not materialised");
+        assert_eq!(counts.get(&0).copied(), Some(3));
+        assert_eq!(counts.get(&15).copied(), Some(3));
+        assert!(counts.get(&16).is_none());
+    }
+
+    /// With no record bytes there is nothing decodable, so no offset is tracked.
+    #[test]
+    fn test_build_delivery_counts_empty_when_no_record_bytes() {
+        assert!(build_delivery_counts(&[acquired(0, 1_000, 1)], 0).is_empty());
+    }
+
+    /// Well-formed ranges are expanded exactly.
+    #[test]
+    fn test_build_delivery_counts_expands_valid_ranges() {
+        let counts = build_delivery_counts(&[acquired(10, 12, 2), acquired(20, 20, 7)], 1024);
+        assert_eq!(counts.len(), 4);
+        assert_eq!(counts.get(&10).copied(), Some(2));
+        assert_eq!(counts.get(&12).copied(), Some(2));
+        assert_eq!(counts.get(&20).copied(), Some(7));
+    }
+
+    // ── Undecodable offsets are acknowledged as gaps ──────────────────────
+
+    /// Offsets acquired but not decoded must be acknowledged as gaps, otherwise
+    /// they are redelivered forever with a climbing `delivery_count`.
+    #[test]
+    fn test_build_gap_acks_covers_undecoded_offsets() {
+        let mut acquired_counts: HashMap<Offset, i16> = HashMap::new();
+        for offset in 0..6 {
+            acquired_counts.insert(offset, 1);
+        }
+        // Offsets 0,1 decoded; 2,3,4 failed; 5 decoded.
+        let decoded: HashSet<Offset> = [0, 1, 5].into_iter().collect();
+
+        let mut acks = build_gap_acks("t", [4; 16], 3, &acquired_counts, &decoded);
+        acks.sort_by_key(|a| a.first_offset);
+
+        assert_eq!(acks.len(), 1, "contiguous gaps coalesce");
+        assert_eq!(acks[0].first_offset, 2);
+        assert_eq!(acks[0].last_offset, 4);
+        assert_eq!(acks[0].ack_type, GAP_ACK_TYPE);
+        assert_eq!(acks[0].partition, 3);
+        assert_eq!(acks[0].topic, "t");
+    }
+
+    /// When everything decoded there is nothing to report as a gap.
+    #[test]
+    fn test_build_gap_acks_empty_when_all_decoded() {
+        let mut acquired_counts: HashMap<Offset, i16> = HashMap::new();
+        acquired_counts.insert(0, 1);
+        acquired_counts.insert(1, 1);
+        let decoded: HashSet<Offset> = [0, 1].into_iter().collect();
+
+        assert!(build_gap_acks("t", [0; 16], 0, &acquired_counts, &decoded).is_empty());
+    }
+
+    // ── Share-session error classification ──────────────────────────
+
+    /// The three share-session error codes must all trigger a session reset.
+    #[test]
+    fn test_share_session_errors_are_classified() {
+        assert!(is_share_session_error(ErrorCode::ShareSessionNotFound));
+        assert!(is_share_session_error(ErrorCode::InvalidShareSessionEpoch));
+        assert!(is_share_session_error(ErrorCode::ShareSessionLimitReached));
+        assert!(!is_share_session_error(ErrorCode::None));
+        assert!(!is_share_session_error(ErrorCode::NotCoordinator));
+    }
+
+    /// A successful `ShareAcknowledge` consumes the share-session epoch, so the
+    /// client must advance it. Leaving it stale makes the next `ShareFetch`
+    /// send an epoch the broker already used, which it rejects with
+    /// `INVALID_SHARE_SESSION_EPOCH` — permanently, since nothing resets it.
+    #[tokio::test]
+    async fn test_share_session_epoch_advances_on_acknowledge_success() {
+        let sessions = Arc::new(tokio::sync::Mutex::new(ShareSessionCache::new()));
+
+        {
+            let mut guard = sessions.lock().await;
+            guard.get_or_create(1).on_success(); // ShareFetch succeeded: epoch 1
+        }
+        assert_eq!(sessions.lock().await.get(1).map(|s| s.epoch()), Some(1));
+
+        // The success arm of `send_broker_acknowledge` performs exactly this.
+        sessions.lock().await.get_or_create(1).on_success();
+
+        assert_eq!(
+            sessions.lock().await.get(1).map(|s| s.epoch()),
+            Some(2),
+            "ShareAcknowledge must advance the epoch it consumed"
+        );
+    }
+
+    /// A share-session error resets the broker back to epoch 0 so the retry
+    /// opens a fresh session instead of resending the stale epoch.
+    #[tokio::test]
+    async fn test_share_session_reset_returns_to_initial_epoch() {
+        let sessions = Arc::new(tokio::sync::Mutex::new(ShareSessionCache::new()));
+        {
+            let mut guard = sessions.lock().await;
+            guard.get_or_create(7).on_success();
+            guard.get_or_create(7).on_success();
+        }
+        assert_eq!(sessions.lock().await.get(7).map(|s| s.epoch()), Some(2));
+
+        sessions.lock().await.reset_broker(7);
+
+        assert_eq!(
+            sessions.lock().await.get(7).map(|s| s.epoch()),
+            Some(session::INITIAL_EPOCH),
+            "a stale session must restart at epoch 0"
+        );
+    }
+
+    // ── Per-broker acknowledge outcome ───────────────────────────────────
+
+    /// A multi-broker acknowledge that fails on one broker must report only
+    /// that broker's acks as failed. Restoring the whole batch would make the
+    /// retry re-acknowledge offsets other brokers already accepted, which they
+    /// reject with `INVALID_RECORD_STATE`.
+    #[test]
+    fn test_share_acknowledge_outcome_tracks_only_failed_acks() {
+        let mut outcome = ShareAcknowledgeOutcome::default();
+        assert!(outcome.error.is_none());
+        assert!(outcome.failed.is_empty());
+
+        let failed_ack = PendingAck {
+            topic: "t".into(),
+            topic_id: [1; 16],
+            partition: 3,
+            first_offset: 0,
+            last_offset: 0,
+            ack_type: AcknowledgeType::Accept.to_i8(),
+        };
+        outcome.fail(
+            std::iter::once(failed_ack),
+            KrafkaError::invalid_state("broker 3 down"),
+        );
+        outcome.fail(
+            std::iter::empty(),
+            KrafkaError::invalid_state("later error"),
+        );
+
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].partition, 3);
+        assert!(
+            outcome
+                .error
+                .expect("first error is kept")
+                .to_string()
+                .contains("broker 3 down"),
+            "the first error must be preserved"
+        );
+    }
+
+    // ── Drop guard: drained acks survive future cancellation ─────────────
+
+    /// Dropping a future that had drained `pending_acks` must re-queue them.
+    /// Otherwise a `select!` shutdown arm silently discards explicit
+    /// `Reject`/`Release` decisions the application already made.
+    #[tokio::test]
+    async fn test_pending_ack_guard_restores_on_drop() {
+        let pending: Arc<RwLock<BrokerPendingAcks>> = Arc::new(RwLock::new(HashMap::new()));
+        let generation = Arc::new(AtomicU64::new(0));
+        let retry = Arc::new(AtomicBool::new(false));
+
+        {
+            let _guard = PendingAckGuard::new(
+                vec![PendingAck {
+                    topic: "t".into(),
+                    topic_id: [2; 16],
+                    partition: 1,
+                    first_offset: 4,
+                    last_offset: 6,
+                    ack_type: AcknowledgeType::Reject.to_i8(),
+                }],
+                pending.clone(),
+                generation.clone(),
+                0,
+                retry.clone(),
+                true,
+            );
+        } // dropped without disarm
+
+        let guard = pending.read().await;
+        let acks: Vec<&PendingAck> = guard.values().flat_map(|b| b.values().flatten()).collect();
+        assert_eq!(acks.len(), 1, "the Reject decision must survive the drop");
+        assert_eq!(acks[0].ack_type, AcknowledgeType::Reject.to_i8());
+        assert_eq!(acks[0].first_offset, 4);
+        assert!(retry.load(Ordering::SeqCst));
+    }
+
+    /// A disarmed guard restores nothing — the acks were handled.
+    #[tokio::test]
+    async fn test_pending_ack_guard_disarm_suppresses_restore() {
+        let pending: Arc<RwLock<BrokerPendingAcks>> = Arc::new(RwLock::new(HashMap::new()));
+        let generation = Arc::new(AtomicU64::new(0));
+        let retry = Arc::new(AtomicBool::new(false));
+
+        {
+            let mut guard = PendingAckGuard::new(
+                vec![PendingAck {
+                    topic: "t".into(),
+                    topic_id: [2; 16],
+                    partition: 1,
+                    first_offset: 4,
+                    last_offset: 4,
+                    ack_type: AcknowledgeType::Accept.to_i8(),
+                }],
+                pending.clone(),
+                generation.clone(),
+                0,
+                retry.clone(),
+                true,
+            );
+            assert_eq!(guard.acks().len(), 1);
+            assert_eq!(guard.disarm().len(), 1);
+        }
+
+        assert!(pending.read().await.is_empty());
+        assert!(!retry.load(Ordering::SeqCst));
+    }
+
+    /// A guard whose generation was invalidated must drop its acks rather than
+    /// resurrect state from an old membership.
+    #[tokio::test]
+    async fn test_pending_ack_guard_ignores_stale_generation() {
+        let pending: Arc<RwLock<BrokerPendingAcks>> = Arc::new(RwLock::new(HashMap::new()));
+        let generation = Arc::new(AtomicU64::new(0));
+        let retry = Arc::new(AtomicBool::new(false));
+
+        {
+            let _guard = PendingAckGuard::new(
+                vec![PendingAck {
+                    topic: "t".into(),
+                    topic_id: [2; 16],
+                    partition: 1,
+                    first_offset: 4,
+                    last_offset: 4,
+                    ack_type: AcknowledgeType::Accept.to_i8(),
+                }],
+                pending.clone(),
+                generation.clone(),
+                0,
+                retry.clone(),
+                true,
+            );
+            // Assignment change / unsubscribe invalidates the ack state.
+            generation.store(1, Ordering::SeqCst);
+        }
+
+        assert!(pending.read().await.is_empty());
+        assert!(!retry.load(Ordering::SeqCst));
+    }
+
+    // ── KIP-1222 Renew is only sent to brokers that support it ───────────
+
+    /// Sending `Renew` to a pre-4.2 broker fails the whole batch with
+    /// INVALID_REQUEST, so those entries are stripped for older versions.
+    #[test]
+    fn test_strip_unsupported_renew_acks_removes_renew_only_batches() {
+        let mut batches = vec![
+            ShareAcknowledgementBatch {
+                first_offset: 0,
+                last_offset: 0,
+                acknowledge_types: vec![AcknowledgeType::Accept.to_i8()],
+            },
+            ShareAcknowledgementBatch {
+                first_offset: 1,
+                last_offset: 1,
+                acknowledge_types: vec![AcknowledgeType::Renew.to_i8()],
+            },
+            ShareAcknowledgementBatch {
+                first_offset: 2,
+                last_offset: 2,
+                acknowledge_types: vec![
+                    AcknowledgeType::Renew.to_i8(),
+                    AcknowledgeType::Reject.to_i8(),
+                ],
+            },
+        ];
+
+        let dropped = strip_unsupported_renew_acks(std::iter::once(&mut batches));
+
+        assert_eq!(dropped, 1, "only the Renew-only batch is dropped");
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].first_offset, 0);
+        assert_eq!(batches[1].first_offset, 2);
+        assert_eq!(
+            batches[1].acknowledge_types,
+            vec![AcknowledgeType::Reject.to_i8()],
+            "the mixed batch keeps its other acknowledgement types"
+        );
+    }
+
+    /// Nothing is stripped when no `Renew` is present.
+    #[test]
+    fn test_strip_unsupported_renew_acks_is_a_noop_without_renew() {
+        let mut batches = vec![ShareAcknowledgementBatch {
+            first_offset: 0,
+            last_offset: 5,
+            acknowledge_types: vec![AcknowledgeType::Accept.to_i8()],
+        }];
+
+        assert_eq!(
+            strip_unsupported_renew_acks(std::iter::once(&mut batches)),
+            0
+        );
+        assert_eq!(batches.len(), 1);
+    }
+
+    // ── Lifecycle ─────────────────────────────────────────────
+
+    /// `recv()` reports `Ok(None)` for a closed consumer — the only case that
+    /// terminates the record stream.
+    #[tokio::test]
+    async fn test_recv_returns_none_only_when_closed() {
+        let consumer = test_share_consumer(AcknowledgementMode::Implicit);
+        consumer.0.closed.store(true, Ordering::SeqCst);
+
+        assert!(
+            consumer
+                .recv()
+                .await
+                .expect("closed recv is not an error")
+                .is_none(),
+            "a closed consumer ends the stream"
+        );
+    }
+
+    /// `recv()` must not terminate just because a poll came back empty: it
+    /// keeps waiting, and a record produced later is still delivered.
+    #[tokio::test]
+    async fn test_recv_waits_through_empty_polls() {
+        let consumer = Arc::new(test_share_consumer(AcknowledgementMode::Implicit));
+
+        // No assignment, so every internal poll returns empty.
+        let receiver = consumer.clone();
+        let handle = tokio::spawn(async move { receiver.recv().await });
+
+        // Give it several empty poll cycles; it must still be waiting.
+        tokio::time::sleep(RECV_EMPTY_POLL_BACKOFF * 3).await;
+        assert!(
+            !handle.is_finished(),
+            "recv() must keep waiting on an idle topic, not return None"
+        );
+
+        // A record arriving later is delivered.
+        consumer
+            .0
+            .recv_buffer
+            .write()
+            .await
+            .push_back(test_record("t", 0, 42));
+
+        let record = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("recv must finish once a record is available")
+            .expect("join")
+            .expect("recv must not error")
+            .expect("a record must be delivered");
+        assert_eq!(record.offset, 42);
+    }
+
+    /// The heartbeat task must hold only a weak reference, so dropping every
+    /// `ShareConsumer` handle lets the consumer be reclaimed even if `close()`
+    /// was never called.
+    #[tokio::test]
+    async fn test_heartbeat_task_does_not_keep_consumer_alive() {
+        let consumer = test_share_consumer(AcknowledgementMode::Implicit);
+        let weak = Arc::downgrade(&consumer.0);
+
+        // Spawn the heartbeat loop exactly as `subscribe()` does.
+        let handle = {
+            let bg = Arc::downgrade(&consumer.0);
+            tokio::spawn(async move {
+                ShareConsumer::run_heartbeat_loop(bg).await;
+            })
+        };
+        *consumer
+            .0
+            .heartbeat_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(handle);
+
+        // Drop the only user-facing handle without calling close().
+        drop(consumer);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "a strong reference in the heartbeat task would leak the consumer, \
+             its connection pool, and its group membership"
+        );
+    }
+
+    /// The weak heartbeat loop exits promptly once the consumer is gone.
+    #[tokio::test]
+    async fn test_heartbeat_loop_exits_when_consumer_dropped() {
+        let consumer = test_share_consumer(AcknowledgementMode::Implicit);
+        consumer.0.heartbeat_interval_ms.store(5, Ordering::Release);
+        let weak = Arc::downgrade(&consumer.0);
+
+        let handle = tokio::spawn(async move {
+            ShareConsumer::run_heartbeat_loop(weak).await;
+        });
+
+        drop(consumer);
+
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the heartbeat loop must exit once every handle is dropped")
+            .expect("heartbeat task must not panic");
+    }
+
+    /// `wakeup()` sets the flag *and* signals waiters so an in-flight poll can
+    /// be interrupted rather than having to run to completion.
+    #[tokio::test]
+    async fn test_wakeup_interrupts_a_waiting_poll() {
+        let consumer = Arc::new(test_share_consumer(AcknowledgementMode::Implicit));
+
+        let waiter = consumer.clone();
+        let notified = tokio::spawn(async move {
+            waiter.0.wakeup_notify.notified().await;
+        });
+        tokio::task::yield_now().await;
+
+        consumer.wakeup();
+
+        tokio::time::timeout(Duration::from_secs(5), notified)
+            .await
+            .expect("wakeup() must signal waiters, not only set a flag")
+            .expect("waiter task must not panic");
+
+        // The flag path still fails the next poll immediately.
+        let error = consumer
+            .poll(Duration::from_millis(1))
+            .await
+            .expect_err("a pending wakeup fails the next poll");
+        assert!(error.to_string().contains("wakeup"));
+
+        // ...and is consumed, so the poll after that is not failed spuriously.
+        assert!(!consumer.0.wakeup_flag.load(Ordering::Acquire));
+    }
+
+    /// `fetch_max_wait_ms` must actually bound the fetch wait rather than being
+    /// ignored in favour of the poll timeout.
+    #[test]
+    fn test_fetch_max_wait_bounds_the_poll_timeout() {
+        let config = ShareConsumer::builder()
+            .bootstrap_servers("localhost:9092")
+            .group_id("sg")
+            .fetch_max_wait_ms(250)
+            .config;
+
+        let poll_wait_ms = Duration::from_secs(30).as_millis().min(i32::MAX as u128) as i32;
+        let effective = poll_wait_ms.min(config.fetch_max_wait_ms.max(0));
+        assert_eq!(effective, 250, "fetch_max_wait_ms must cap the fetch wait");
+
+        // A poll timeout shorter than the config wins.
+        let short = Duration::from_millis(10).as_millis() as i32;
+        assert_eq!(short.min(config.fetch_max_wait_ms.max(0)), 10);
     }
 }

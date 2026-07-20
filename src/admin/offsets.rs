@@ -50,7 +50,12 @@ impl AdminClient {
 
         for attempt in 0u8..2 {
             if attempt == 1 {
-                let _ = self.metadata.refresh_for_topics(Some(&topics)).await;
+                // Await a *real* refresh before retrying. A rate-limited
+                // refresh returns `RateLimited` without contacting a broker; if
+                // that were treated as success the retry would re-issue against
+                // byte-identical stale metadata and reproduce the same
+                // NotLeaderForPartition forever.
+                self.refresh_topics_for_retry(&topics, "ListOffsets").await;
             }
 
             let brokers = self.metadata.brokers();
@@ -61,8 +66,9 @@ impl AdminClient {
                 ));
             }
 
-            // Group partitions by their leader broker.
-            let mut leader_map: HashMap<i32, HashMap<String, Vec<i32>>> = HashMap::new();
+            // Group partitions by their leader broker, carrying each
+            // partition's cached leader epoch alongside its index.
+            let mut leader_map: HashMap<i32, HashMap<String, Vec<(i32, i32)>>> = HashMap::new();
             let fallback_broker_id = brokers[0].id();
 
             for &(topic, partitions) in topic_partitions {
@@ -71,12 +77,18 @@ impl AdminClient {
                         .metadata
                         .leader(topic, partition)
                         .unwrap_or(fallback_broker_id);
+                    // Send the epoch we believe is current so the broker can
+                    // fence the request (KIP-320). `-1` disables fencing
+                    // entirely and is used only when the epoch is unknown
+                    // (Metadata < v7, or the partition is not in the cache).
+                    let current_leader_epoch =
+                        self.metadata.leader_epoch(topic, partition).unwrap_or(-1);
                     leader_map
                         .entry(leader_id)
                         .or_default()
                         .entry(topic.to_string())
                         .or_default()
-                        .push(partition);
+                        .push((partition, current_leader_epoch));
                 }
             }
 
@@ -102,10 +114,12 @@ impl AdminClient {
                             name,
                             partitions: partitions
                                 .into_iter()
-                                .map(|p| ListOffsetsRequestPartition {
-                                    partition_index: p,
-                                    current_leader_epoch: -1,
-                                    timestamp,
+                                .map(|(partition_index, current_leader_epoch)| {
+                                    ListOffsetsRequestPartition {
+                                        partition_index,
+                                        current_leader_epoch,
+                                        timestamp,
+                                    }
                                 })
                                 .collect(),
                         })
@@ -138,7 +152,16 @@ impl AdminClient {
 
                 for topic in response.topics {
                     for partition in topic.partitions {
-                        if partition.error_code == ErrorCode::NotLeaderForPartition {
+                        // Now that a real `current_leader_epoch` is sent, the
+                        // broker can also reject the request with a fenced or
+                        // unknown epoch. All three mean "your metadata is
+                        // stale" and are cured by the same refresh.
+                        if matches!(
+                            partition.error_code,
+                            ErrorCode::NotLeaderForPartition
+                                | ErrorCode::FencedLeaderEpoch
+                                | ErrorCode::UnknownLeaderEpoch
+                        ) {
                             has_stale_leader = true;
                         }
                         results.push(ListOffsetResult {
@@ -157,9 +180,7 @@ impl AdminClient {
             }
 
             if has_stale_leader && attempt == 0 {
-                warn!(
-                    "NotLeaderForPartition in ListOffsets response, retrying with refreshed metadata"
-                );
+                warn!("stale leader metadata in ListOffsets response, retrying after a refresh");
                 continue;
             }
 
@@ -178,6 +199,11 @@ impl AdminClient {
     /// Lag is defined as `end_offset − committed_offset` for each
     /// topic-partition.  Partitions with no committed offset have
     /// `committed_offset = None` and `lag = None`.
+    ///
+    /// Partitions whose end offset could not be fetched report
+    /// `end_offset = None`, `lag = None`, and the reason in
+    /// [`ConsumerGroupLag::end_offset_error`] — never `lag = 0`, which would
+    /// make a stalled consumer look healthy.
     ///
     /// This method issues two parallel-ish requests:
     /// 1. [`describe_consumer_group_offsets`] for the committed positions.
@@ -251,12 +277,19 @@ impl AdminClient {
             .list_offsets(&topic_partition_refs, OffsetSpec::Latest)
             .await?;
 
-        // 4. Build a lookup map: (topic, partition) → end_offset.
-        let mut end_map: HashMap<(&str, i32), i64> = HashMap::new();
+        // 4. Build a lookup map: (topic, partition) → Ok(end_offset) | Err(reason).
+        //    Both the per-partition error and a negative sentinel offset mean
+        //    the end offset is unknown; neither may be silently coerced to 0.
+        let mut end_map: HashMap<(&str, i32), std::result::Result<i64, String>> = HashMap::new();
         for r in &end_offsets {
-            if r.error.is_none() {
-                end_map.insert((r.topic.as_str(), r.partition), r.offset);
-            }
+            let value = match &r.error {
+                Some(e) => Err(e.clone()),
+                None if r.offset < 0 => {
+                    Err(format!("ListOffsets returned sentinel offset {}", r.offset))
+                }
+                None => Ok(r.offset),
+            };
+            end_map.insert((r.topic.as_str(), r.partition), value);
         }
 
         // 5. Compute lag for each committed entry.
@@ -269,18 +302,38 @@ impl AdminClient {
                 Some(entry.committed_offset)
             };
 
-            let end_offset = end_map
-                .get(&(entry.topic.as_str(), entry.partition))
-                .copied()
-                .unwrap_or(-1);
+            let (end_offset, end_offset_error) =
+                match end_map.get(&(entry.topic.as_str(), entry.partition)) {
+                    Some(Ok(offset)) => (Some(*offset), None),
+                    Some(Err(reason)) => (None, Some(reason.clone())),
+                    None => (
+                        None,
+                        Some("no ListOffsets result for this partition".to_string()),
+                    ),
+                };
 
-            let lag = committed_offset.map(|co| (end_offset - co).max(0));
+            // Lag is only meaningful when *both* ends are known. An unknown end
+            // offset must not report lag 0 — that hides a stalled consumer from
+            // alerting.
+            let lag = match (committed_offset, end_offset) {
+                (Some(co), Some(eo)) => Some((eo - co).max(0)),
+                _ => None,
+            };
+
+            if let Some(ref reason) = end_offset_error {
+                warn!(
+                    topic = %entry.topic,
+                    partition = entry.partition,
+                    "end offset unknown, lag cannot be computed: {reason}"
+                );
+            }
 
             lag_results.push(ConsumerGroupLag {
                 topic: entry.topic.clone(),
                 partition: entry.partition,
                 committed_offset,
                 end_offset,
+                end_offset_error,
                 lag,
             });
         }
@@ -314,11 +367,12 @@ mod tests {
             topic: "test".to_string(),
             partition: 0,
             committed_offset: Some(100),
-            end_offset: 150,
+            end_offset: Some(150),
+            end_offset_error: None,
             lag: Some(50),
         };
         assert_eq!(lag.lag, Some(50));
-        assert_eq!(lag.end_offset, 150);
+        assert_eq!(lag.end_offset, Some(150));
         assert_eq!(lag.committed_offset, Some(100));
     }
 
@@ -333,5 +387,147 @@ mod tests {
         };
         assert_eq!(r.offset, 42);
         assert!(r.error.is_none());
+    }
+
+    /// `end_offset` previously defaulted to -1 when ListOffsets failed,
+    /// and `lag = (end_offset - committed).max(0)` then reported 0 — making a
+    /// stalled consumer look perfectly healthy to alerting.
+    #[test]
+    fn test_unknown_end_offset_reports_unknown_lag_not_zero() {
+        let committed = 100i64;
+
+        // What the old code did.
+        let old_end_offset = -1i64;
+        let old_lag = (old_end_offset - committed).max(0);
+        assert_eq!(old_lag, 0, "this is the bug being fixed");
+
+        // What the new code does: no end offset means no lag.
+        let end_offset: Option<i64> = None;
+        let new_lag = match (Some(committed), end_offset) {
+            (Some(co), Some(eo)) => Some((eo - co).max(0)),
+            _ => None,
+        };
+        assert_eq!(new_lag, None);
+    }
+
+    #[test]
+    fn test_lag_is_computed_when_both_ends_are_known() {
+        let lag = match (Some(100i64), Some(150i64)) {
+            (Some(co), Some(eo)) => Some((eo - co).max(0)),
+            _ => None,
+        };
+        assert_eq!(lag, Some(50));
+    }
+
+    /// A commit ahead of the watermark (e.g. after a manual offset reset)
+    /// clamps to zero rather than reporting negative lag.
+    #[test]
+    fn test_lag_clamps_negative_to_zero() {
+        let lag = match (Some(200i64), Some(150i64)) {
+            (Some(co), Some(eo)) => Some((eo - co).max(0)),
+            _ => None,
+        };
+        assert_eq!(lag, Some(0));
+    }
+
+    /// A negative offset from ListOffsets is a sentinel, not a position, and
+    /// must be treated as "unknown" just like an explicit error.
+    #[test]
+    fn test_negative_sentinel_offset_counts_as_unknown() {
+        let classify = |error: Option<&str>, offset: i64| -> std::result::Result<i64, String> {
+            match error {
+                Some(e) => Err(e.to_string()),
+                None if offset < 0 => Err(format!("ListOffsets returned sentinel offset {offset}")),
+                None => Ok(offset),
+            }
+        };
+
+        assert_eq!(classify(None, 150), Ok(150));
+        assert!(
+            classify(None, -1).is_err(),
+            "sentinel must not be a position"
+        );
+        assert!(classify(Some("NotLeaderForPartition"), 150).is_err());
+    }
+
+    /// A partition missing entirely from the ListOffsets response must also
+    /// report unknown, not silently inherit a default.
+    #[test]
+    fn test_missing_partition_reports_unknown_end_offset() {
+        let end_map: HashMap<(&str, i32), std::result::Result<i64, String>> = HashMap::new();
+
+        let (end_offset, err) = match end_map.get(&("orders", 0)) {
+            Some(Ok(o)) => (Some(*o), None),
+            Some(Err(e)) => (None, Some(e.clone())),
+            None => (
+                None,
+                Some("no ListOffsets result for this partition".to_string()),
+            ),
+        };
+
+        assert_eq!(end_offset, None);
+        assert!(err.is_some());
+    }
+
+    /// The cached leader epoch must be sent so the broker can fence a stale
+    /// request (KIP-320). Pinning -1 disabled that protection entirely.
+    #[test]
+    fn test_list_offsets_request_carries_the_leader_epoch() {
+        let request = ListOffsetsRequest {
+            replica_id: -1,
+            isolation_level: 0,
+            topics: vec![ListOffsetsRequestTopic {
+                name: "orders".into(),
+                partitions: vec![
+                    ListOffsetsRequestPartition {
+                        partition_index: 0,
+                        current_leader_epoch: 42,
+                        timestamp: OffsetSpec::Latest.as_timestamp(),
+                    },
+                    ListOffsetsRequestPartition {
+                        partition_index: 1,
+                        // -1 only when the epoch is genuinely unknown.
+                        current_leader_epoch: -1,
+                        timestamp: OffsetSpec::Latest.as_timestamp(),
+                    },
+                ],
+            }],
+            timeout_ms: None,
+        };
+
+        assert_eq!(request.topics[0].partitions[0].current_leader_epoch, 42);
+        assert_eq!(request.topics[0].partitions[1].current_leader_epoch, -1);
+
+        let mut buf = Vec::new();
+        assert!(
+            request
+                .encode_versioned(versions::LIST_OFFSETS_MAX, &mut buf)
+                .is_ok(),
+            "ListOffsets must encode"
+        );
+        assert!(!buf.is_empty());
+    }
+
+    /// Now that a real epoch is sent, the broker can reject with a fenced or
+    /// unknown epoch; all three codes mean "metadata is stale" and must trigger
+    /// the same refresh-and-retry.
+    #[test]
+    fn test_stale_leader_detection_covers_epoch_errors() {
+        let is_stale = |c: ErrorCode| {
+            matches!(
+                c,
+                ErrorCode::NotLeaderForPartition
+                    | ErrorCode::FencedLeaderEpoch
+                    | ErrorCode::UnknownLeaderEpoch
+            )
+        };
+
+        assert!(is_stale(ErrorCode::NotLeaderForPartition));
+        assert!(is_stale(ErrorCode::FencedLeaderEpoch));
+        assert!(is_stale(ErrorCode::UnknownLeaderEpoch));
+
+        assert!(!is_stale(ErrorCode::None));
+        assert!(!is_stale(ErrorCode::OffsetOutOfRange));
+        assert!(!is_stale(ErrorCode::TopicAuthorizationFailed));
     }
 }

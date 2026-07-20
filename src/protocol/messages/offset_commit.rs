@@ -4,7 +4,9 @@ use super::{VersionedDecode, VersionedEncode, non_nullable_string};
 use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
-use crate::protocol::{array_len_i32, check_compact_array_len, check_decode_array_len};
+use crate::protocol::{
+    array_len_i32, check_compact_array_len, check_decode_array_len, decode_capacity,
+};
 
 // ============================================================================
 // OffsetCommit request/response
@@ -301,7 +303,7 @@ impl OffsetCommitResponse {
 
         let topic_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut topics = Vec::with_capacity(topic_count);
+        let mut topics = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
 
         for _ in 0..topic_count {
             if buf.remaining() < 16 {
@@ -315,7 +317,7 @@ impl OffsetCommitResponse {
 
             let part_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut partitions = Vec::with_capacity(part_count);
+            let mut partitions = Vec::with_capacity(decode_capacity(part_count, buf.remaining()));
 
             for _ in 0..part_count {
                 let partition_index = i32::decode(buf)?;
@@ -344,12 +346,13 @@ impl OffsetCommitResponse {
     /// Shared topics array decoder for non-flexible versions.
     fn decode_topics(buf: &mut impl Buf) -> Result<Vec<OffsetCommitResponseTopic>> {
         let topic_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut topics = Vec::with_capacity(topic_count);
+        let mut topics = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
 
         for _ in 0..topic_count {
             let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
-            let mut partitions = Vec::with_capacity(partition_count);
+            let mut partitions =
+                Vec::with_capacity(decode_capacity(partition_count, buf.remaining()));
 
             for _ in 0..partition_count {
                 let partition_index = i32::decode(buf)?;
@@ -382,13 +385,13 @@ impl OffsetCommitResponse {
     fn decode_topics_compact(buf: &mut impl Buf) -> Result<Vec<OffsetCommitResponseTopic>> {
         let topic_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut topics = Vec::with_capacity(topic_count);
+        let mut topics = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
 
         for _ in 0..topic_count {
             let name = non_nullable_string("topic name", KafkaString::decode_compact(buf)?.0)?;
             let part_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut partitions = Vec::with_capacity(part_count);
+            let mut partitions = Vec::with_capacity(decode_capacity(part_count, buf.remaining()));
 
             for _ in 0..part_count {
                 let partition_index = i32::decode(buf)?;

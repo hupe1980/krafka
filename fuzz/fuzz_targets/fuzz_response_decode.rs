@@ -12,18 +12,26 @@ use krafka::protocol::{
     DescribeConfigsResponse, DescribeDelegationTokenResponse, DescribeGroupsResponse,
     DescribeTopicPartitionsResponse, EndTxnResponse, ExpireDelegationTokenResponse, FetchResponse,
     FindCoordinatorResponse, GetTelemetrySubscriptionsResponse, HeartbeatResponse,
-    IncrementalAlterConfigsResponse, InitProducerIdResponse, JoinGroupResponse,
-    LeaveGroupResponse, ListClientMetricsResourcesResponse, ListGroupsResponse,
-    ListOffsetsResponse, MetadataResponse, OffsetCommitResponse, OffsetFetchResponse,
-    OffsetForLeaderEpochResponse, ProduceResponse, PushTelemetryResponse,
-    RenewDelegationTokenResponse, SaslAuthenticateResponse, SaslHandshakeResponse,
-    ShareAcknowledgeResponse, ShareFetchResponse, ShareGroupDescribeResponse,
-    ShareGroupHeartbeatResponse, SyncGroupResponse, TxnOffsetCommitResponse, VersionedDecode,
+    IncrementalAlterConfigsResponse, InitProducerIdResponse, JoinGroupResponse, LeaveGroupResponse,
+    ListConfigResourcesResponse, ListGroupsResponse, ListOffsetsResponse, MetadataResponse,
+    OffsetCommitResponse, OffsetFetchResponse, OffsetForLeaderEpochResponse, ProduceResponse,
+    PushTelemetryResponse, RenewDelegationTokenResponse, SaslAuthenticateResponse,
+    SaslHandshakeResponse, ShareAcknowledgeResponse, ShareFetchResponse,
+    ShareGroupDescribeResponse, ShareGroupHeartbeatResponse, SyncGroupResponse,
+    TxnOffsetCommitResponse, VersionedDecode,
+};
+// Previously unreachable from any fuzz target.
+use krafka::protocol::{
+    AlterPartitionReassignmentsResponse, AlterReplicaLogDirsResponse,
+    AlterUserScramCredentialsResponse, DescribeLogDirsResponse, DescribeProducersResponse,
+    DescribeQuorumResponse, DescribeTransactionsResponse, DescribeUserScramCredentialsResponse,
+    ElectLeadersResponse, ListPartitionReassignmentsResponse, ListTransactionsResponse,
+    OffsetDeleteResponse, UpdateFeaturesResponse, WriteTxnMarkersResponse,
 };
 
 fuzz_target!(|data: &[u8]| {
     // Use first two bytes to select one API and version per iteration,
-    // dramatically improving fuzzing throughput over decoding all 206
+    // dramatically improving fuzzing throughput over decoding all 200+
     // API/version pairs for every input.
 
     if data.len() < 2 {
@@ -45,17 +53,17 @@ fuzz_target!(|data: &[u8]| {
         }};
     }
 
-    match api % 48 {
-        0  => fuzz_decode!(ProduceResponse, 3, 11),
-        1  => fuzz_decode!(FetchResponse, 4, 15),
-        2  => fuzz_decode!(MetadataResponse, 1, 13),
-        3  => fuzz_decode!(ListOffsetsResponse, 1, 11),
-        4  => fuzz_decode!(OffsetCommitResponse, 2, 9),
-        5  => fuzz_decode!(OffsetFetchResponse, 1, 10),
-        6  => fuzz_decode!(FindCoordinatorResponse, 1, 6),
-        7  => fuzz_decode!(JoinGroupResponse, 4, 6),
-        8  => fuzz_decode!(SyncGroupResponse, 3, 3),
-        9  => fuzz_decode!(HeartbeatResponse, 3, 2),
+    match api % 62 {
+        0 => fuzz_decode!(ProduceResponse, 3, 11),
+        1 => fuzz_decode!(FetchResponse, 4, 15),
+        2 => fuzz_decode!(MetadataResponse, 1, 13),
+        3 => fuzz_decode!(ListOffsetsResponse, 1, 11),
+        4 => fuzz_decode!(OffsetCommitResponse, 2, 9),
+        5 => fuzz_decode!(OffsetFetchResponse, 1, 10),
+        6 => fuzz_decode!(FindCoordinatorResponse, 1, 6),
+        7 => fuzz_decode!(JoinGroupResponse, 4, 6),
+        8 => fuzz_decode!(SyncGroupResponse, 3, 3),
+        9 => fuzz_decode!(HeartbeatResponse, 3, 2),
         10 => fuzz_decode!(LeaveGroupResponse, 3, 3),
         11 => fuzz_decode!(CreateTopicsResponse, 2, 6),
         12 => fuzz_decode!(DeleteTopicsResponse, 1, 6),
@@ -80,7 +88,7 @@ fuzz_target!(|data: &[u8]| {
         31 => fuzz_decode!(DeleteGroupsResponse, 0, 3),
         32 => fuzz_decode!(DescribeClusterResponse, 0, 3),
         33 => fuzz_decode!(ConsumerGroupDescribeResponse, 0, 2),
-        34 => fuzz_decode!(ListClientMetricsResourcesResponse, 0, 1),
+        34 => fuzz_decode!(ListConfigResourcesResponse, 0, 2),
         35 => fuzz_decode!(DescribeTopicPartitionsResponse, 0, 1),
         36 => fuzz_decode!(DescribeClientQuotasResponse, 0, 2),
         37 => fuzz_decode!(AlterClientQuotasResponse, 0, 2),
@@ -94,6 +102,21 @@ fuzz_target!(|data: &[u8]| {
         45 => fuzz_decode!(ShareGroupDescribeResponse, 1, 1),
         46 => fuzz_decode!(ShareFetchResponse, 1, 2),
         47 => fuzz_decode!(ShareAcknowledgeResponse, 1, 2),
+        // ── Previously uncovered decoders ──────────────────────────────────
+        48 => fuzz_decode!(DescribeLogDirsResponse, 1, 4),
+        49 => fuzz_decode!(DescribeProducersResponse, 0, 1),
+        50 => fuzz_decode!(DescribeTransactionsResponse, 0, 1),
+        51 => fuzz_decode!(ListTransactionsResponse, 0, 3),
+        52 => fuzz_decode!(DescribeQuorumResponse, 0, 1),
+        53 => fuzz_decode!(ElectLeadersResponse, 0, 3),
+        54 => fuzz_decode!(AlterPartitionReassignmentsResponse, 0, 1),
+        55 => fuzz_decode!(ListPartitionReassignmentsResponse, 0, 1),
+        56 => fuzz_decode!(AlterReplicaLogDirsResponse, 1, 2),
+        57 => fuzz_decode!(OffsetDeleteResponse, 0, 1),
+        58 => fuzz_decode!(DescribeUserScramCredentialsResponse, 0, 1),
+        59 => fuzz_decode!(AlterUserScramCredentialsResponse, 0, 1),
+        60 => fuzz_decode!(WriteTxnMarkersResponse, 1, 2),
+        61 => fuzz_decode!(UpdateFeaturesResponse, 0, 2),
         _ => unreachable!(),
     }
 });

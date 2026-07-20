@@ -4,7 +4,7 @@ use super::{VersionedDecode, VersionedEncode, non_nullable_string};
 use crate::error::{ErrorCode, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TryEncode};
-use crate::protocol::{array_len_i32, check_decode_array_len};
+use crate::protocol::{array_len_i32, check_decode_array_len, decode_capacity};
 
 // ============================================================================
 // OffsetDelete API (Key 47)
@@ -106,11 +106,12 @@ impl OffsetDeleteResponse {
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let throttle_time_ms = i32::decode(buf)?;
         let topic_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut topics = Vec::with_capacity(topic_count);
+        let mut topics = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
         for _ in 0..topic_count {
             let name = non_nullable_string("topic_name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
-            let mut partitions = Vec::with_capacity(partition_count);
+            let mut partitions =
+                Vec::with_capacity(decode_capacity(partition_count, buf.remaining()));
             for _ in 0..partition_count {
                 let partition_index = i32::decode(buf)?;
                 let error_code = ErrorCode::from_i16(i16::decode(buf)?);

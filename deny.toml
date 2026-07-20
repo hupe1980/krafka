@@ -24,26 +24,19 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
     "CC0-1.0",
-    "MPL-2.0",        # ring uses OpenSSL + ISC; rustls uses same — kept for completeness
     "Zlib",
-    "OpenSSL",        # ring's OpenSSL-licensed portions
+    # Community Data License Agreement (Permissive). Used by `webpki-roots`,
+    # which packages the Mozilla CA root store as data rather than code.
+    "CDLA-Permissive-2.0",
 ]
 
-# Copyleft licenses that must never appear in the dependency graph.
-deny = [
-    "GPL-1.0",
-    "GPL-2.0",
-    "GPL-3.0",
-    "LGPL-2.0",
-    "LGPL-2.1",
-    "LGPL-3.0",
-    "AGPL-1.0",
-    "AGPL-3.0",
-    "SSPL-1.0",
-    "BUSL-1.1",
-]
+# NOTE: the `[licenses] deny` key was removed in cargo-deny 0.15
+# (https://github.com/EmbarkStudios/cargo-deny/pull/611). `allow` is now an
+# exhaustive allowlist: any license not listed above is rejected, which covers
+# every copyleft license this section used to enumerate. Keeping the old key
+# made `cargo deny check` fail config validation outright, silently disabling
+# the licenses, bans, advisories AND sources checks.
 
 # ---------------------------------------------------------------------------
 # Dependency bans
@@ -73,6 +66,25 @@ version = 2
 
 # Treat yanked crates as an error.
 yanked = "deny"
+
+# Advisories that are unreachable from the published library.
+#
+# Every entry below reaches the graph ONLY through `[dev-dependencies]`
+# (`criterion` for benchmarks, `testcontainers` for the integration suite), so
+# no krafka user links against them. Verify with:
+#
+#     cargo tree -e normal --all-features | grep <crate>
+#
+# which must produce no output. Re-audit this list whenever dev-dependencies
+# change; anything reachable via `-e normal` must be fixed, not ignored.
+ignore = [
+    # astral-tokio-tar <- bollard <- testcontainers (integration tests only)
+    "RUSTSEC-2026-0112", # PAX header desynchronization
+    "RUSTSEC-2026-0113", # unpack_in can chmod arbitrary dirs via symlinks
+    "RUSTSEC-2026-0145", # PAX header desynchronization
+    # crossbeam-epoch <- criterion (benchmarks only)
+    "RUSTSEC-2026-0204", # invalid pointer deref in fmt::Pointer
+]
 
 # ---------------------------------------------------------------------------
 # Source allowlist

@@ -294,9 +294,13 @@ impl LatencyTracker {
     }
 
     /// Record a latency value.
+    ///
+    /// Durations longer than `u64::MAX` nanoseconds (~584 years) saturate
+    /// rather than wrapping — a wrapped value would silently record a bogus
+    /// small latency and corrupt `min`/`sum`/the histogram.
     #[inline]
     pub fn record(&self, duration: Duration) {
-        let nanos = duration.as_nanos() as u64;
+        let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
         self.sum_nanos.fetch_add(nanos, Ordering::Relaxed);
         self.min_nanos.fetch_min(nanos, Ordering::Relaxed);
         self.max_nanos.fetch_max(nanos, Ordering::Relaxed);
@@ -505,9 +509,17 @@ pub trait MetricsExporter {
     /// The canonical form in Prometheus is:
     /// `metric_name_total{label_key="label_value"} <value>`.
     ///
+    /// # Default implementation
+    ///
     /// The default implementation embeds label values in the metric name
-    /// (e.g. `name_<value>`) for exporters that do not natively support
-    /// labels. Override this to emit proper labeled output.
+    /// (e.g. `name_<value>`) so the sample is at least *visible* in exporters
+    /// that have no concept of labels.
+    ///
+    /// **This fallback is lossy and should be overridden by any exporter whose
+    /// backend supports dimensions.** Mangling label values into the name means
+    /// the backend cannot aggregate across label values, and an unbounded label
+    /// domain (e.g. a topic name) mints an unbounded number of metric names.
+    /// All exporters shipped with Krafka override it.
     fn export_labeled_counter(
         &mut self,
         name: &str,
@@ -515,16 +527,53 @@ pub trait MetricsExporter {
         labels: &[(&str, &str)],
         value: u64,
     ) {
-        // Fallback: embed label values in the metric name so the metric is
-        // still visible in exporters that don't support labels.
-        let suffix = labels.iter().map(|(_, v)| *v).collect::<Vec<_>>().join("_");
-        let full_name = if suffix.is_empty() {
-            name.to_string()
-        } else {
-            format!("{name}_{suffix}")
-        };
-        self.export_counter(&full_name, help, value);
+        self.export_counter(&mangle_labels_into_name(name, labels), help, value);
     }
+
+    /// Export a gauge with attached key-value labels.
+    ///
+    /// The canonical form in Prometheus is:
+    /// `metric_name{label_key="label_value"} <value>`.
+    ///
+    /// # Default implementation
+    ///
+    /// Mirrors [`export_labeled_counter`](Self::export_labeled_counter): the
+    /// default embeds label values in the metric name and delegates to
+    /// [`export_gauge`](Self::export_gauge). It carries the same caveats and
+    /// should be overridden by exporters whose backend supports dimensions.
+    ///
+    /// This method has a default implementation so that adding it is not a
+    /// breaking change for out-of-tree [`MetricsExporter`] implementations.
+    fn export_labeled_gauge(
+        &mut self,
+        name: &str,
+        help: &str,
+        labels: &[(&str, &str)],
+        value: u64,
+    ) {
+        self.export_gauge(&mangle_labels_into_name(name, labels), help, value);
+    }
+}
+
+/// Fallback name mangling for exporters that cannot represent labels.
+///
+/// Appends each label *value* to the metric name, separated by `_`. Returns
+/// `name` unchanged when `labels` is empty.
+///
+/// Used only by the default [`MetricsExporter::export_labeled_counter`] /
+/// [`MetricsExporter::export_labeled_gauge`] implementations — every exporter
+/// in this crate overrides them with proper labeled output.
+fn mangle_labels_into_name(name: &str, labels: &[(&str, &str)]) -> String {
+    if labels.is_empty() {
+        return name.to_string();
+    }
+    let mut out = String::with_capacity(name.len() + 16);
+    out.push_str(name);
+    for (_, v) in labels {
+        out.push('_');
+        out.push_str(v);
+    }
+    out
 }
 
 /// Trait for types that can export their metrics through a [`MetricsExporter`].
@@ -562,11 +611,15 @@ pub trait MetricsVisitable {
 /// Produces output compatible with Prometheus, Grafana Agent, and
 /// OpenTelemetry's Prometheus receiver.
 ///
-/// Each counter is emitted with a `_total` suffix, latency trackers emit
-/// `_seconds_count`, `_seconds_sum`, `_seconds_min`, and `_seconds_max`.
+/// Each counter is emitted with a `_total` suffix. Latency trackers emit an
+/// OpenMetrics-valid `_seconds` **summary** family (`_seconds_count`,
+/// `_seconds_sum` and `{quantile="…"}` samples) plus separate `_min_seconds`
+/// and `_max_seconds` **gauge** families — min/max are not legal members of a
+/// summary family.
 ///
-/// Labeled counters (e.g. per-topic metrics) are emitted as:
-/// `metric_name_total{label_key="label_value"} <value>`.
+/// Labeled counters and gauges (e.g. per-topic metrics) are emitted as:
+/// `metric_name_total{label_key="label_value"} <value>` and
+/// `metric_name{label_key="label_value"} <value>` respectively.
 pub struct PrometheusExporter {
     output: String,
     /// Tracks metric family names for which the `# HELP` / `# TYPE` header
@@ -679,6 +732,49 @@ impl MetricsExporter for PrometheusExporter {
         }
     }
 
+    /// Export a labeled gauge in proper Prometheus text format.
+    ///
+    /// Identical to [`export_labeled_counter`](Self::export_labeled_counter)
+    /// except the family is typed `gauge` and carries no `_total` suffix:
+    /// ```text
+    /// krafka_producer_topic_buffered_records{topic="orders"} 7
+    /// ```
+    fn export_labeled_gauge(
+        &mut self,
+        name: &str,
+        help: &str,
+        labels: &[(&str, &str)],
+        value: u64,
+    ) {
+        let full_name = sanitize_prometheus_name(name);
+        if !self.declared_families.contains(&full_name) {
+            let _ = writeln!(self.output, "# HELP {} {}", full_name, help);
+            let _ = writeln!(self.output, "# TYPE {} gauge", full_name);
+            self.declared_families.insert(full_name.clone());
+        }
+        if labels.is_empty() {
+            let _ = writeln!(self.output, "{} {}", full_name, value);
+        } else {
+            let label_str = labels
+                .iter()
+                .map(|(k, v)| format!("{}=\"{}\"", k, escape_prometheus_label_value(v)))
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = writeln!(self.output, "{}{{{}}} {}", full_name, label_str, value);
+        }
+    }
+
+    /// Export a latency tracker as an OpenMetrics-valid summary plus two gauges.
+    ///
+    /// The `{name}_seconds` **summary** family carries only the members the
+    /// specification allows: `_count`, `_sum`, and `{quantile="…"}` samples.
+    ///
+    /// `min` and `max` are *not* valid members of a summary family — strict
+    /// OpenMetrics parsers reject `{name}_seconds_min` / `{name}_seconds_max`
+    /// under a `# TYPE {name}_seconds summary` header. They are therefore
+    /// emitted as their own `gauge` families with distinct names that do not
+    /// collide with the summary's member namespace:
+    /// `{name}_min_seconds` and `{name}_max_seconds`.
     fn export_latency(&mut self, name: &str, help: &str, snapshot: &LatencySnapshot) {
         let name = sanitize_prometheus_name(name);
         let _ = writeln!(
@@ -695,12 +791,6 @@ impl MetricsExporter for PrometheusExporter {
             snapshot.sum.as_secs_f64()
         );
 
-        if let Some(min) = snapshot.min {
-            let _ = writeln!(self.output, "{}_seconds_min {:.9}", name, min.as_secs_f64());
-        }
-        if let Some(max) = snapshot.max {
-            let _ = writeln!(self.output, "{}_seconds_max {:.9}", name, max.as_secs_f64());
-        }
         if let Some(p50) = snapshot.p50 {
             let _ = writeln!(
                 self.output,
@@ -724,6 +814,26 @@ impl MetricsExporter for PrometheusExporter {
                 name,
                 p99.as_secs_f64()
             );
+        }
+
+        // min / max live in their own gauge families — see the doc comment.
+        if let Some(min) = snapshot.min {
+            let _ = writeln!(
+                self.output,
+                "# HELP {}_min_seconds {} (minimum observed)",
+                name, help
+            );
+            let _ = writeln!(self.output, "# TYPE {}_min_seconds gauge", name);
+            let _ = writeln!(self.output, "{}_min_seconds {:.9}", name, min.as_secs_f64());
+        }
+        if let Some(max) = snapshot.max {
+            let _ = writeln!(
+                self.output,
+                "# HELP {}_max_seconds {} (maximum observed)",
+                name, help
+            );
+            let _ = writeln!(self.output, "# TYPE {}_max_seconds gauge", name);
+            let _ = writeln!(self.output, "{}_max_seconds {:.9}", name, max.as_secs_f64());
         }
     }
 }
@@ -771,6 +881,30 @@ impl JsonExporter {
         output.push(']');
         output
     }
+
+    /// Push a labeled metric entry with a nested `"labels"` object.
+    fn push_labeled(
+        &mut self,
+        name: &str,
+        kind: &str,
+        help: &str,
+        labels: &[(&str, &str)],
+        value: u64,
+    ) {
+        let labels_json = labels
+            .iter()
+            .map(|(k, v)| format!("\"{}\":\"{}\"", json_escape(k), json_escape(v)))
+            .collect::<Vec<_>>()
+            .join(",");
+        self.entries.push(format!(
+            "{{\"name\":\"{}\",\"type\":\"{}\",\"help\":\"{}\",\"labels\":{{{}}},\"value\":{}}}",
+            json_escape(name),
+            kind,
+            json_escape(help),
+            labels_json,
+            value,
+        ));
+    }
 }
 
 impl Default for JsonExporter {
@@ -817,6 +951,10 @@ impl MetricsExporter for JsonExporter {
         ));
     }
 
+    /// Emit a labeled counter with the labels in a nested `"labels"` object.
+    ///
+    /// The metric `name` is emitted verbatim — label values are never folded
+    /// into it.
     fn export_labeled_counter(
         &mut self,
         name: &str,
@@ -824,18 +962,21 @@ impl MetricsExporter for JsonExporter {
         labels: &[(&str, &str)],
         value: u64,
     ) {
-        let labels_json = labels
-            .iter()
-            .map(|(k, v)| format!("\"{}\":\"{}\"", json_escape(k), json_escape(v)))
-            .collect::<Vec<_>>()
-            .join(",");
-        self.entries.push(format!(
-            "{{\"name\":\"{}\",\"type\":\"counter\",\"help\":\"{}\",\"labels\":{{{}}},\"value\":{}}}",
-            json_escape(name),
-            json_escape(help),
-            labels_json,
-            value,
-        ));
+        self.push_labeled(name, "counter", help, labels, value);
+    }
+
+    /// Emit a labeled gauge with the labels in a nested `"labels"` object.
+    ///
+    /// Mirrors [`export_labeled_counter`](Self::export_labeled_counter) with
+    /// `"type":"gauge"`.
+    fn export_labeled_gauge(
+        &mut self,
+        name: &str,
+        help: &str,
+        labels: &[(&str, &str)],
+        value: u64,
+    ) {
+        self.push_labeled(name, "gauge", help, labels, value);
     }
 
     fn export_latency(&mut self, name: &str, help: &str, snapshot: &LatencySnapshot) {
@@ -936,45 +1077,34 @@ impl MetricsVisitable for ProducerMetrics {
             "Send latency",
             &self.send_latency.snapshot(),
         );
-        // Per-topic counters: snapshot the map while locked, then release the
-        // lock before calling the exporter.  This avoids holding the mutex
-        // across potentially slow exporter I/O and unblocks hot-path calls to
-        // `record_send_for_topic` / `record_error_for_topic`.
-        // Topics are sorted so Prometheus output is deterministic.
-        let topic_snapshots: Vec<(String, u64, u64, u64)> = {
-            let map = self.topic_metrics.lock();
-            let mut snapshots: Vec<(String, u64, u64, u64)> = map
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        k.clone(),
-                        v.records_sent.get(),
-                        v.bytes_sent.get(),
-                        v.errors.get(),
-                    )
-                })
-                .collect();
-            snapshots.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            snapshots
-        }; // lock released here
-        for (topic, records, bytes, errors) in &topic_snapshots {
+        // Per-topic counters: take a snapshot (a lock-free `ArcSwap` load)
+        // before calling the exporter, so no producer hot-path call is ever
+        // blocked by slow exporter I/O.  Topics are sorted so the output is
+        // deterministic.  Metric names are label-free; the topic travels as a
+        // `topic` label/attribute so backends can aggregate across topics.
+        // Topics beyond the tracking cap appear once under `__other__`.
+        let name_records = format!("{prefix}_topic_records_sent");
+        let name_bytes = format!("{prefix}_topic_bytes_sent");
+        let name_errors = format!("{prefix}_topic_errors");
+        for snap in self.topic_snapshot() {
+            let labels = [("topic", snap.topic.as_str())];
             exporter.export_labeled_counter(
-                &format!("{prefix}_topic_records_sent"),
+                &name_records,
                 "Records sent to this topic",
-                &[("topic", topic.as_str())],
-                *records,
+                &labels,
+                snap.records_sent,
             );
             exporter.export_labeled_counter(
-                &format!("{prefix}_topic_bytes_sent"),
+                &name_bytes,
                 "Bytes sent to this topic",
-                &[("topic", topic.as_str())],
-                *bytes,
+                &labels,
+                snap.bytes_sent,
             );
             exporter.export_labeled_counter(
-                &format!("{prefix}_topic_errors"),
+                &name_errors,
                 "Send errors for this topic",
-                &[("topic", topic.as_str())],
-                *errors,
+                &labels,
+                snap.errors,
             );
         }
     }
@@ -1175,6 +1305,10 @@ pub struct KrafkaMetrics {
     consumer: Arc<ConsumerMetrics>,
     /// Connection metrics.
     connection: Arc<ConnectionMetrics>,
+    /// Monotonically increasing counter bumped by [`KrafkaMetrics::reset`].
+    ///
+    /// Shared across clones so every observer sees the same generation.
+    reset_generation: Arc<AtomicU64>,
 }
 
 impl Default for KrafkaMetrics {
@@ -1185,12 +1319,53 @@ impl Default for KrafkaMetrics {
 
 impl KrafkaMetrics {
     /// Create a new metrics registry.
+    ///
+    /// Producer per-topic metrics use [`DEFAULT_MAX_TRACKED_TOPICS`].
     pub fn new() -> Self {
+        Self::with_max_tracked_topics(DEFAULT_MAX_TRACKED_TOPICS)
+    }
+
+    /// Create a new metrics registry with a custom producer per-topic cap.
+    ///
+    /// See [`ProducerMetrics::with_max_tracked_topics`].
+    pub fn with_max_tracked_topics(max_tracked_topics: usize) -> Self {
         Self {
-            producer: Arc::new(ProducerMetrics::new()),
+            producer: Arc::new(ProducerMetrics::with_max_tracked_topics(max_tracked_topics)),
             consumer: Arc::new(ConsumerMetrics::new()),
             connection: Arc::new(ConnectionMetrics::new()),
+            reset_generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Number of times [`reset`](Self::reset) has been called on this registry.
+    ///
+    /// Counters exposed by this registry are **not** monotonic across a
+    /// `reset()` — they rewind to zero. Consumers that compute deltas (such as
+    /// the KIP-714 telemetry reporter, which does `current - previous` with a
+    /// saturating subtraction) must therefore treat a change in this value as
+    /// an instruction to drop their cached baselines; otherwise every delta
+    /// reads as `0` until the counters climb back past their pre-reset values.
+    ///
+    /// The generation itself is monotonic and never reset. Poll it alongside
+    /// each collection:
+    ///
+    /// ```rust
+    /// use krafka::metrics::KrafkaMetrics;
+    ///
+    /// let metrics = KrafkaMetrics::new();
+    /// let mut seen_generation = metrics.reset_generation();
+    ///
+    /// // ... later, on each reporting tick:
+    /// let generation = metrics.reset_generation();
+    /// if generation != seen_generation {
+    ///     // drop delta baselines here
+    ///     seen_generation = generation;
+    /// }
+    /// # let _ = seen_generation;
+    /// ```
+    #[must_use]
+    pub fn reset_generation(&self) -> u64 {
+        self.reset_generation.load(Ordering::Relaxed)
     }
 
     /// Get shared producer metrics handle.
@@ -1258,7 +1433,16 @@ impl KrafkaMetrics {
     }
 
     /// Reset all metrics.
+    ///
+    /// This rewinds counters that are otherwise monotonic, and bumps
+    /// [`reset_generation`](Self::reset_generation) so delta-computing
+    /// consumers can invalidate their baselines. The generation is bumped
+    /// *before* the counters are cleared, so an observer that reads the
+    /// generation after reading a counter can never pair a post-reset counter
+    /// value with a pre-reset generation.
     pub fn reset(&self) {
+        self.reset_generation.fetch_add(1, Ordering::Relaxed);
+
         self.producer.records_sent.reset();
         self.producer.bytes_sent.reset();
         self.producer.batches_sent.reset();
@@ -1287,7 +1471,7 @@ impl KrafkaMetrics {
         self.producer.buffered_records.set(0);
         self.producer.compressed_bytes.reset();
         self.producer.uncompressed_bytes.reset();
-        self.producer.topic_metrics.lock().clear();
+        self.producer.clear_topic_metrics();
 
         self.connection.connections_created.reset();
         self.connection.connections_closed.reset();
@@ -1303,6 +1487,24 @@ impl KrafkaMetrics {
         self.connection.tls_handshake_latency.reset();
     }
 }
+
+/// Default maximum number of distinct topics tracked by [`ProducerMetrics`].
+///
+/// See [`ProducerMetrics::with_max_tracked_topics`] for how to change it and
+/// [`OVERFLOW_TOPIC_KEY`] for what happens beyond the cap.
+pub const DEFAULT_MAX_TRACKED_TOPICS: usize = 1000;
+
+/// Topic key under which all metrics beyond the per-topic cap are aggregated.
+///
+/// Once [`ProducerMetrics`] tracks [`DEFAULT_MAX_TRACKED_TOPICS`] (or the value
+/// passed to [`ProducerMetrics::with_max_tracked_topics`]) distinct topics,
+/// every further topic is folded into a single bucket under this key instead of
+/// allocating a new entry. This bounds both memory and the number of exported
+/// time series for workloads with an unbounded topic domain (e.g. a CDC/outbox
+/// producer writing `cdc.tenant_<uuid>.events`).
+///
+/// The overflow bucket does not itself count against the cap.
+pub const OVERFLOW_TOPIC_KEY: &str = "__other__";
 
 /// Per-topic counters tracked inside [`ProducerMetrics`].
 ///
@@ -1332,7 +1534,19 @@ pub struct TopicProducerMetricsSnapshot {
 }
 
 /// Producer metrics.
-#[derive(Debug, Default)]
+///
+/// # Per-topic metrics
+///
+/// Per-topic counters are stored in a lock-free [`arc_swap::ArcSwap`] map: the
+/// per-record hot path performs a `load()` plus a hash lookup and bumps
+/// atomics, never taking an exclusive lock. Only registering a *new* topic
+/// takes a short write mutex and publishes a copy-on-write replacement map.
+///
+/// The number of distinct topics is capped (see
+/// [`DEFAULT_MAX_TRACKED_TOPICS`] and
+/// [`with_max_tracked_topics`](Self::with_max_tracked_topics)); topics beyond
+/// the cap are aggregated under [`OVERFLOW_TOPIC_KEY`].
+#[derive(Debug)]
 pub struct ProducerMetrics {
     /// Number of records sent successfully.
     pub records_sent: Counter,
@@ -1370,13 +1584,145 @@ pub struct ProducerMetrics {
     /// `{prefix}_topic_records_sent_total{topic="<name>"}`,
     /// `{prefix}_topic_bytes_sent_total{topic="<name>"}`, and
     /// `{prefix}_topic_errors_total{topic="<name>"}`.
-    topic_metrics: parking_lot::Mutex<AHashMap<String, TopicProducerMetrics>>,
+    ///
+    /// Read lock-free via `ArcSwap`; replaced copy-on-write under
+    /// `topic_write_lock` when a new topic is registered.
+    topic_metrics: arc_swap::ArcSwap<AHashMap<String, Arc<TopicProducerMetrics>>>,
+    /// Serialises copy-on-write publication of `topic_metrics`. Taken only on
+    /// the rare new-topic path, never per record.
+    topic_write_lock: parking_lot::Mutex<()>,
+    /// Maximum number of distinct topics tracked individually before falling
+    /// back to the [`OVERFLOW_TOPIC_KEY`] bucket.
+    max_tracked_topics: usize,
+}
+
+impl Default for ProducerMetrics {
+    fn default() -> Self {
+        Self::with_max_tracked_topics(DEFAULT_MAX_TRACKED_TOPICS)
+    }
 }
 
 impl ProducerMetrics {
-    /// Create new producer metrics.
+    /// Create new producer metrics tracking up to
+    /// [`DEFAULT_MAX_TRACKED_TOPICS`] distinct topics.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create new producer metrics with a custom per-topic cap.
+    ///
+    /// At most `max_tracked_topics` distinct topics get their own counters;
+    /// every topic seen after the cap is reached is aggregated into a single
+    /// bucket keyed [`OVERFLOW_TOPIC_KEY`] (which does not itself count against
+    /// the cap). This bounds memory and exported series cardinality for
+    /// producers with an unbounded topic domain.
+    ///
+    /// A cap of `0` routes *all* per-topic metrics into the overflow bucket.
+    pub fn with_max_tracked_topics(max_tracked_topics: usize) -> Self {
+        Self {
+            records_sent: Counter::default(),
+            bytes_sent: Counter::default(),
+            batches_sent: Counter::default(),
+            errors: Counter::default(),
+            retries: Counter::default(),
+            send_latency: LatencyTracker::new(),
+            connections: Gauge::default(),
+            buffered_records: Gauge::default(),
+            compressed_bytes: Counter::default(),
+            uncompressed_bytes: Counter::default(),
+            topic_metrics: arc_swap::ArcSwap::from_pointee(AHashMap::new()),
+            topic_write_lock: parking_lot::Mutex::new(()),
+            max_tracked_topics,
+        }
+    }
+
+    /// The configured maximum number of individually tracked topics.
+    ///
+    /// See [`with_max_tracked_topics`](Self::with_max_tracked_topics).
+    #[must_use]
+    pub fn max_tracked_topics(&self) -> usize {
+        self.max_tracked_topics
+    }
+
+    /// Number of topic buckets currently tracked, including the
+    /// [`OVERFLOW_TOPIC_KEY`] bucket if it exists.
+    #[must_use]
+    pub fn tracked_topic_count(&self) -> usize {
+        self.topic_metrics.load().len()
+    }
+
+    /// Drop all per-topic counters.
+    ///
+    /// Publishes a fresh empty map; concurrent recorders holding a previously
+    /// loaded snapshot may still bump the old entries, whose values are then
+    /// discarded.
+    pub fn clear_topic_metrics(&self) {
+        let _write = self.topic_write_lock.lock();
+        self.topic_metrics.store(Arc::new(AHashMap::new()));
+    }
+
+    /// Run `f` against the counters for `topic`, registering the topic if it is
+    /// new.
+    ///
+    /// Hot path: a lock-free `ArcSwap::load()` plus a hash lookup. Once the cap
+    /// is reached, unknown topics resolve to the already-published overflow
+    /// bucket — also lock-free. Only the first sighting of a topic that still
+    /// fits under the cap falls through to [`Self::register_topic`], which takes
+    /// the write mutex.
+    #[inline]
+    fn with_topic<F: FnOnce(&TopicProducerMetrics)>(&self, topic: &str, f: F) {
+        let guard = self.topic_metrics.load();
+        if let Some(m) = guard.get(topic) {
+            f(m);
+            return;
+        }
+        // Cap already reached and the overflow bucket is published: no lock.
+        if Self::named_topic_count(&guard) >= self.max_tracked_topics
+            && let Some(m) = guard.get(OVERFLOW_TOPIC_KEY)
+        {
+            f(m);
+            return;
+        }
+        drop(guard);
+        f(&self.register_topic(topic));
+    }
+
+    /// Number of entries in `map` excluding the overflow bucket.
+    #[inline]
+    fn named_topic_count(map: &AHashMap<String, Arc<TopicProducerMetrics>>) -> usize {
+        map.len() - usize::from(map.contains_key(OVERFLOW_TOPIC_KEY))
+    }
+
+    /// Register `topic` (or resolve the overflow bucket) under the write lock.
+    ///
+    /// Re-checks the map after acquiring the lock so two threads racing on the
+    /// same new topic end up sharing one entry rather than clobbering each
+    /// other's copy-on-write publication.
+    #[cold]
+    fn register_topic(&self, topic: &str) -> Arc<TopicProducerMetrics> {
+        let _write = self.topic_write_lock.lock();
+        let current = self.topic_metrics.load();
+
+        // Another thread may have registered it while we waited for the lock.
+        if let Some(m) = current.get(topic) {
+            return Arc::clone(m);
+        }
+
+        // Enforce the cap: beyond it, everything lands in the overflow bucket.
+        let key: &str = if Self::named_topic_count(&current) >= self.max_tracked_topics {
+            OVERFLOW_TOPIC_KEY
+        } else {
+            topic
+        };
+        if let Some(m) = current.get(key) {
+            return Arc::clone(m);
+        }
+
+        let entry = Arc::new(TopicProducerMetrics::default());
+        let mut next = (**current).clone();
+        next.insert(key.to_string(), Arc::clone(&entry));
+        self.topic_metrics.store(Arc::new(next));
+        entry
     }
 
     /// Record a successful send.
@@ -1402,70 +1748,52 @@ impl ProducerMetrics {
     /// Record a send error for a specific topic.
     ///
     /// Updates both the global error counter and the per-topic error counter.
+    /// Topics beyond the tracking cap are aggregated under
+    /// [`OVERFLOW_TOPIC_KEY`].
     #[inline]
     pub fn record_error_for_topic(&self, topic: &str) {
         self.errors.inc();
-        let mut map = self.topic_metrics.lock();
-        // Fast path: topic already exists — no allocation.
-        if let Some(m) = map.get_mut(topic) {
-            m.errors.inc();
-        } else {
-            // Slow path (first send for this topic): allocate the key once.
-            let m = TopicProducerMetrics::default();
-            m.errors.inc();
-            map.insert(topic.to_string(), m);
-        }
+        self.with_topic(topic, |m| m.errors.inc());
     }
 
     /// Record a successful send and update per-topic counters.
     ///
     /// This method updates both the global counters and the per-topic
-    /// `records_sent` and `bytes_sent` for the given topic name.
+    /// `records_sent` and `bytes_sent` for the given topic name. Topics beyond
+    /// the tracking cap are aggregated under [`OVERFLOW_TOPIC_KEY`].
     #[inline]
     pub fn record_send_for_topic(&self, topic: &str, bytes: u64) {
         self.records_sent.inc();
         self.bytes_sent.add(bytes);
-        let mut map = self.topic_metrics.lock();
-        // Fast path: topic already exists — no allocation.
-        if let Some(m) = map.get_mut(topic) {
+        self.with_topic(topic, |m| {
             m.records_sent.inc();
             m.bytes_sent.add(bytes);
-        } else {
-            // Slow path (first send for this topic): allocate the key once.
-            let m = TopicProducerMetrics::default();
-            m.records_sent.inc();
-            m.bytes_sent.add(bytes);
-            map.insert(topic.to_string(), m);
-        }
+        });
     }
 
     /// Record a successful batch send and update per-topic counters.
     ///
     /// Increments the global `batches_sent`, `records_sent` (by `records`), and
     /// `bytes_sent` (by `bytes`) counters, and mirrors `records_sent` and
-    /// `bytes_sent` into the per-topic entry for `topic`.
+    /// `bytes_sent` into the per-topic entry for `topic`. Topics beyond the
+    /// tracking cap are aggregated under [`OVERFLOW_TOPIC_KEY`].
     #[inline]
     pub fn record_batch_for_topic(&self, topic: &str, records: u64, bytes: u64) {
         self.batches_sent.inc();
         self.records_sent.add(records);
         self.bytes_sent.add(bytes);
-        let mut map = self.topic_metrics.lock();
-        // Fast path: topic already exists — no allocation.
-        if let Some(m) = map.get_mut(topic) {
+        self.with_topic(topic, |m| {
             m.records_sent.add(records);
             m.bytes_sent.add(bytes);
-        } else {
-            // Slow path (first send for this topic): allocate the key once.
-            let m = TopicProducerMetrics::default();
-            m.records_sent.add(records);
-            m.bytes_sent.add(bytes);
-            map.insert(topic.to_string(), m);
-        }
+        });
     }
 
     /// Return per-topic metric snapshots sorted by topic name.
+    ///
+    /// Includes the [`OVERFLOW_TOPIC_KEY`] bucket (aggregating every topic seen
+    /// beyond the cap) when it exists.
     pub fn topic_snapshot(&self) -> Vec<TopicProducerMetricsSnapshot> {
-        let map = self.topic_metrics.lock();
+        let map = self.topic_metrics.load();
         let mut out: Vec<TopicProducerMetricsSnapshot> = map
             .iter()
             .map(|(topic, m)| TopicProducerMetricsSnapshot {
@@ -2207,8 +2535,12 @@ mod tests {
         assert!(output.contains("# TYPE test_send_latency_seconds summary"));
         assert!(output.contains("test_send_latency_seconds_count 2"));
         assert!(output.contains("test_send_latency_seconds_sum"));
-        assert!(output.contains("test_send_latency_seconds_min"));
-        assert!(output.contains("test_send_latency_seconds_max"));
+        // min/max are their own gauge families — they are not legal members of
+        // a summary family. See `export_latency` on `PrometheusExporter`.
+        assert!(output.contains("# TYPE test_send_latency_min_seconds gauge"));
+        assert!(output.contains("# TYPE test_send_latency_max_seconds gauge"));
+        assert!(!output.contains("test_send_latency_seconds_min"));
+        assert!(!output.contains("test_send_latency_seconds_max"));
     }
 
     #[test]
@@ -2507,5 +2839,510 @@ mod tests {
                 "p{pct}: estimate {est} ns, true {exact_nanos} ns, err={err:.4}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Labeled metrics carry labels, not mangled names
+    // -----------------------------------------------------------------------
+
+    /// Minimal exporter implementing only the three required methods, so the
+    /// trait's *default* labeled implementations are exercised.
+    #[derive(Default)]
+    struct MinimalExporter {
+        lines: Vec<String>,
+    }
+
+    impl MetricsExporter for MinimalExporter {
+        fn export_counter(&mut self, name: &str, _help: &str, value: u64) {
+            self.lines.push(format!("counter {name} {value}"));
+        }
+        fn export_gauge(&mut self, name: &str, _help: &str, value: u64) {
+            self.lines.push(format!("gauge {name} {value}"));
+        }
+        fn export_latency(&mut self, name: &str, _help: &str, snapshot: &LatencySnapshot) {
+            self.lines
+                .push(format!("latency {name} {}", snapshot.count));
+        }
+    }
+
+    #[test]
+    fn test_default_labeled_fallbacks_mangle_names() {
+        let mut exporter = MinimalExporter::default();
+        exporter.export_labeled_counter("m", "h", &[("topic", "orders")], 1);
+        exporter.export_labeled_gauge("g", "h", &[("topic", "orders")], 2);
+        // No labels: the name must be untouched.
+        exporter.export_labeled_counter("m", "h", &[], 3);
+        exporter.export_labeled_gauge("g", "h", &[], 4);
+
+        assert_eq!(
+            exporter.lines,
+            vec![
+                "counter m_orders 1".to_string(),
+                "gauge g_orders 2".to_string(),
+                "counter m 3".to_string(),
+                "gauge g 4".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_mangle_labels_into_name() {
+        assert_eq!(mangle_labels_into_name("m", &[]), "m");
+        assert_eq!(
+            mangle_labels_into_name("m", &[("topic", "orders")]),
+            "m_orders"
+        );
+        assert_eq!(
+            mangle_labels_into_name("m", &[("topic", "orders"), ("broker", "1")]),
+            "m_orders_1"
+        );
+    }
+
+    #[test]
+    fn test_prometheus_labeled_gauge_emits_labels() {
+        let mut exporter = PrometheusExporter::new();
+        exporter.export_labeled_gauge("krafka_topic_lag", "Lag", &[("topic", "orders")], 5);
+        exporter.export_labeled_gauge("krafka_topic_lag", "Lag", &[("topic", "events")], 9);
+        let out = exporter.finish();
+
+        assert!(out.contains("# TYPE krafka_topic_lag gauge"));
+        assert!(out.contains("krafka_topic_lag{topic=\"orders\"} 5"));
+        assert!(out.contains("krafka_topic_lag{topic=\"events\"} 9"));
+        // The name must not be mangled with the label value.
+        assert!(!out.contains("krafka_topic_lag_orders"));
+        // The family header appears exactly once.
+        assert_eq!(out.matches("# TYPE krafka_topic_lag gauge").count(), 1);
+    }
+
+    #[test]
+    fn test_prometheus_labeled_gauge_without_labels() {
+        let mut exporter = PrometheusExporter::new();
+        exporter.export_labeled_gauge("krafka_thing", "Thing", &[], 3);
+        let out = exporter.finish();
+        assert!(out.contains("krafka_thing 3"));
+    }
+
+    #[test]
+    fn test_json_labeled_gauge_emits_labels() {
+        let mut exporter = JsonExporter::new();
+        exporter.export_labeled_gauge("krafka_topic_lag", "Lag", &[("topic", "orders")], 5);
+        let out = exporter.finish();
+
+        assert!(out.contains("\"name\":\"krafka_topic_lag\""));
+        assert!(out.contains("\"type\":\"gauge\""));
+        assert!(out.contains("\"labels\":{\"topic\":\"orders\"}"));
+        assert!(!out.contains("krafka_topic_lag_orders"));
+    }
+
+    #[test]
+    fn test_json_labeled_counter_keeps_name_unmangled() {
+        let mut exporter = JsonExporter::new();
+        exporter.export_labeled_counter("krafka_topic_sent", "Sent", &[("topic", "orders")], 5);
+        let out = exporter.finish();
+        assert!(out.contains("\"name\":\"krafka_topic_sent\""));
+        assert!(out.contains("\"type\":\"counter\""));
+        assert!(out.contains("\"labels\":{\"topic\":\"orders\"}"));
+    }
+
+    #[test]
+    fn test_producer_export_uses_topic_labels_not_mangled_names() {
+        let metrics = ProducerMetrics::new();
+        metrics.record_send_for_topic("orders", 100);
+        metrics.record_error_for_topic("orders");
+
+        let out = metrics.to_prometheus_text("krafka_producer");
+        assert!(out.contains("krafka_producer_topic_records_sent_total{topic=\"orders\"} 1"));
+        assert!(out.contains("krafka_producer_topic_errors_total{topic=\"orders\"} 1"));
+        assert!(!out.contains("krafka_producer_topic_records_sent_orders"));
+    }
+
+    // -----------------------------------------------------------------------
+    // OpenMetrics: min/max must not live inside the summary family
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_prometheus_latency_min_max_are_separate_gauge_families() {
+        let tracker = LatencyTracker::new();
+        tracker.record(Duration::from_millis(10));
+        tracker.record(Duration::from_millis(100));
+
+        let mut exporter = PrometheusExporter::new();
+        exporter.export_latency("krafka_send", "Send latency", &tracker.snapshot());
+        let out = exporter.finish();
+
+        // Summary family keeps only count/sum/quantiles.
+        assert!(out.contains("# TYPE krafka_send_seconds summary"));
+        assert!(out.contains("krafka_send_seconds_count 2"));
+        assert!(out.contains("krafka_send_seconds_sum "));
+        assert!(out.contains("krafka_send_seconds{quantile=\"0.5\"}"));
+
+        // The illegal summary members are gone.
+        assert!(
+            !out.contains("krafka_send_seconds_min"),
+            "_seconds_min is not a legal summary member:\n{out}"
+        );
+        assert!(
+            !out.contains("krafka_send_seconds_max"),
+            "_seconds_max is not a legal summary member:\n{out}"
+        );
+
+        // ...and reappear as their own gauge families.
+        assert!(out.contains("# TYPE krafka_send_min_seconds gauge"));
+        assert!(out.contains("# TYPE krafka_send_max_seconds gauge"));
+        assert!(out.contains("krafka_send_min_seconds "));
+        assert!(out.contains("krafka_send_max_seconds "));
+
+        // Every emitted family declares a TYPE exactly once.
+        assert_eq!(out.matches("# TYPE krafka_send_seconds summary").count(), 1);
+        assert_eq!(
+            out.matches("# TYPE krafka_send_min_seconds gauge").count(),
+            1
+        );
+        assert_eq!(
+            out.matches("# TYPE krafka_send_max_seconds gauge").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_prometheus_latency_empty_snapshot_emits_no_min_max_families() {
+        let tracker = LatencyTracker::new();
+        let mut exporter = PrometheusExporter::new();
+        exporter.export_latency("krafka_send", "Send latency", &tracker.snapshot());
+        let out = exporter.finish();
+
+        assert!(out.contains("# TYPE krafka_send_seconds summary"));
+        assert!(!out.contains("min_seconds"));
+        assert!(!out.contains("max_seconds"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Nanosecond saturation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_latency_record_saturates_instead_of_truncating() {
+        let tracker = LatencyTracker::new();
+        // Duration::MAX is ~584 billion years — far more than u64::MAX nanos.
+        tracker.record(Duration::MAX);
+
+        // A wrapping `as u64` cast would produce a small bogus value here
+        // (`Duration::MAX.as_nanos() as u64` == u64::MAX only by luck of the
+        // low bits, so assert against the saturated value explicitly).
+        assert_eq!(tracker.count(), 1);
+        assert_eq!(tracker.max(), Some(Duration::from_nanos(u64::MAX)));
+        assert_eq!(tracker.sum(), Duration::from_nanos(u64::MAX));
+        // `min()` uses u64::MAX as its "no samples yet" sentinel, so a single
+        // saturated sample is indistinguishable from an empty tracker there.
+        // That sentinel behaviour predates the saturation fix.
+        assert_eq!(tracker.min(), None);
+    }
+
+    #[test]
+    fn test_latency_record_saturates_just_above_u64_nanos() {
+        let tracker = LatencyTracker::new();
+        // 2^64 ns + 1 s: comfortably past u64::MAX nanos, but nowhere near
+        // Duration::MAX, so a truncating cast would wrap to a tiny value.
+        let over = Duration::from_nanos(u64::MAX) + Duration::from_secs(1);
+        tracker.record(over);
+
+        assert_eq!(tracker.count(), 1);
+        assert_eq!(tracker.max(), Some(Duration::from_nanos(u64::MAX)));
+        assert_eq!(tracker.sum(), Duration::from_nanos(u64::MAX));
+    }
+
+    #[test]
+    fn test_latency_record_normal_values_unchanged() {
+        let tracker = LatencyTracker::new();
+        tracker.record(Duration::from_millis(5));
+        assert_eq!(tracker.max(), Some(Duration::from_millis(5)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-topic cap and the `__other__` overflow bucket
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_default_topic_cap() {
+        assert_eq!(DEFAULT_MAX_TRACKED_TOPICS, 1000);
+        assert_eq!(
+            ProducerMetrics::new().max_tracked_topics(),
+            DEFAULT_MAX_TRACKED_TOPICS
+        );
+        assert_eq!(
+            ProducerMetrics::default().max_tracked_topics(),
+            DEFAULT_MAX_TRACKED_TOPICS
+        );
+    }
+
+    #[test]
+    fn test_topic_cap_routes_overflow_to_other_bucket() {
+        let metrics = ProducerMetrics::with_max_tracked_topics(3);
+        for i in 0..3 {
+            metrics.record_send_for_topic(&format!("topic-{i}"), 10);
+        }
+        assert_eq!(metrics.tracked_topic_count(), 3);
+
+        // Three more distinct topics all fold into `__other__`.
+        for i in 3..6 {
+            metrics.record_send_for_topic(&format!("topic-{i}"), 10);
+        }
+        // 3 named + 1 overflow bucket.
+        assert_eq!(metrics.tracked_topic_count(), 4);
+
+        let snapshot = metrics.topic_snapshot();
+        let topics: Vec<&str> = snapshot.iter().map(|s| s.topic.as_str()).collect();
+        assert_eq!(
+            topics,
+            vec![OVERFLOW_TOPIC_KEY, "topic-0", "topic-1", "topic-2"]
+        );
+
+        let other = snapshot
+            .iter()
+            .find(|s| s.topic == OVERFLOW_TOPIC_KEY)
+            .unwrap();
+        assert_eq!(other.records_sent, 3);
+        assert_eq!(other.bytes_sent, 30);
+
+        // Global counters still see every record.
+        assert_eq!(metrics.records_sent.get(), 6);
+        assert_eq!(metrics.bytes_sent.get(), 60);
+    }
+
+    #[test]
+    fn test_topic_cap_does_not_grow_with_unbounded_topic_domain() {
+        let metrics = ProducerMetrics::with_max_tracked_topics(10);
+        for i in 0..5_000 {
+            metrics.record_send_for_topic(&format!("cdc.tenant_{i}.events"), 1);
+        }
+        // 10 named topics + `__other__`, regardless of how many were seen.
+        assert_eq!(metrics.tracked_topic_count(), 11);
+
+        let snapshot = metrics.topic_snapshot();
+        assert_eq!(snapshot.len(), 11);
+        let other = snapshot
+            .iter()
+            .find(|s| s.topic == OVERFLOW_TOPIC_KEY)
+            .unwrap();
+        assert_eq!(other.records_sent, 4_990);
+    }
+
+    #[test]
+    fn test_topic_cap_zero_routes_everything_to_overflow() {
+        let metrics = ProducerMetrics::with_max_tracked_topics(0);
+        metrics.record_send_for_topic("orders", 1);
+        metrics.record_error_for_topic("events");
+        metrics.record_batch_for_topic("payments", 2, 20);
+
+        let snapshot = metrics.topic_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].topic, OVERFLOW_TOPIC_KEY);
+        assert_eq!(snapshot[0].records_sent, 3);
+        assert_eq!(snapshot[0].bytes_sent, 21);
+        assert_eq!(snapshot[0].errors, 1);
+    }
+
+    #[test]
+    fn test_overflow_bucket_is_exported_with_a_topic_label() {
+        let metrics = ProducerMetrics::with_max_tracked_topics(1);
+        metrics.record_send_for_topic("orders", 1);
+        metrics.record_send_for_topic("events", 1);
+
+        let out = metrics.to_prometheus_text("krafka_producer");
+        assert!(out.contains("krafka_producer_topic_records_sent_total{topic=\"orders\"} 1"));
+        assert!(out.contains("krafka_producer_topic_records_sent_total{topic=\"__other__\"} 1"));
+    }
+
+    #[test]
+    fn test_known_topics_still_recorded_after_cap_reached() {
+        let metrics = ProducerMetrics::with_max_tracked_topics(1);
+        metrics.record_send_for_topic("orders", 1);
+        metrics.record_send_for_topic("events", 1); // overflow
+        // The already-tracked topic keeps its own bucket.
+        metrics.record_send_for_topic("orders", 1);
+
+        let snapshot = metrics.topic_snapshot();
+        let orders = snapshot.iter().find(|s| s.topic == "orders").unwrap();
+        assert_eq!(orders.records_sent, 2);
+    }
+
+    #[test]
+    fn test_clear_topic_metrics() {
+        let metrics = ProducerMetrics::new();
+        metrics.record_send_for_topic("orders", 1);
+        assert_eq!(metrics.tracked_topic_count(), 1);
+        metrics.clear_topic_metrics();
+        assert_eq!(metrics.tracked_topic_count(), 0);
+        assert!(metrics.topic_snapshot().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrent per-record recording without a global exclusive lock
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_concurrent_recording_is_correct() {
+        use std::thread;
+
+        const THREADS: u64 = 8;
+        const ITERS: u64 = 2_000;
+
+        let metrics = Arc::new(ProducerMetrics::new());
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let metrics = Arc::clone(&metrics);
+            handles.push(thread::spawn(move || {
+                for _ in 0..ITERS {
+                    // A topic every thread contends on...
+                    metrics.record_send_for_topic("shared", 10);
+                    // ...and one private to this thread.
+                    metrics.record_send_for_topic(&format!("thread-{t}"), 1);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let snapshot = metrics.topic_snapshot();
+        let shared = snapshot.iter().find(|s| s.topic == "shared").unwrap();
+        assert_eq!(shared.records_sent, THREADS * ITERS);
+        assert_eq!(shared.bytes_sent, THREADS * ITERS * 10);
+
+        // Every thread's private topic was registered exactly once.
+        for t in 0..THREADS {
+            let name = format!("thread-{t}");
+            let per_thread = snapshot.iter().find(|s| s.topic == name).unwrap();
+            assert_eq!(per_thread.records_sent, ITERS);
+        }
+        // 1 shared + THREADS private, no duplicates.
+        assert_eq!(snapshot.len(), THREADS as usize + 1);
+        assert_eq!(metrics.records_sent.get(), THREADS * ITERS * 2);
+    }
+
+    #[test]
+    fn test_concurrent_registration_of_the_same_new_topic() {
+        use std::thread;
+
+        const THREADS: u64 = 16;
+        let metrics = Arc::new(ProducerMetrics::new());
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let metrics = Arc::clone(&metrics);
+            handles.push(thread::spawn(move || {
+                metrics.record_send_for_topic("race", 1);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // The copy-on-write publication must not lose any thread's increment.
+        let snapshot = metrics.topic_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].topic, "race");
+        assert_eq!(snapshot[0].records_sent, THREADS);
+    }
+
+    #[test]
+    fn test_concurrent_recording_respects_the_cap() {
+        use std::thread;
+
+        const THREADS: u64 = 8;
+        let metrics = Arc::new(ProducerMetrics::with_max_tracked_topics(20));
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let metrics = Arc::clone(&metrics);
+            handles.push(thread::spawn(move || {
+                for i in 0..200 {
+                    metrics.record_send_for_topic(&format!("t-{t}-{i}"), 1);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // At most 20 named topics plus the overflow bucket.
+        assert!(
+            metrics.tracked_topic_count() <= 21,
+            "cap not enforced: {} buckets",
+            metrics.tracked_topic_count()
+        );
+        // Nothing was dropped: every record landed somewhere.
+        let total: u64 = metrics
+            .topic_snapshot()
+            .iter()
+            .map(|s| s.records_sent)
+            .sum();
+        assert_eq!(total, THREADS * 200);
+    }
+
+    #[test]
+    fn test_batch_and_error_paths_share_topic_buckets() {
+        let metrics = ProducerMetrics::new();
+        metrics.record_send_for_topic("orders", 10);
+        metrics.record_batch_for_topic("orders", 5, 50);
+        metrics.record_error_for_topic("orders");
+
+        let snapshot = metrics.topic_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].records_sent, 6);
+        assert_eq!(snapshot[0].bytes_sent, 60);
+        assert_eq!(snapshot[0].errors, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Reset generation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reset_generation_starts_at_zero_and_increments() {
+        let metrics = KrafkaMetrics::new();
+        assert_eq!(metrics.reset_generation(), 0);
+
+        metrics.reset();
+        assert_eq!(metrics.reset_generation(), 1);
+
+        metrics.reset();
+        metrics.reset();
+        assert_eq!(metrics.reset_generation(), 3);
+    }
+
+    #[test]
+    fn test_reset_generation_is_shared_across_clones() {
+        let metrics = KrafkaMetrics::new();
+        let clone = metrics.clone();
+        metrics.reset();
+        assert_eq!(clone.reset_generation(), 1);
+        assert_eq!(metrics.reset_generation(), 1);
+    }
+
+    #[test]
+    fn test_reset_generation_signals_counter_rewind() {
+        let metrics = KrafkaMetrics::new();
+        let producer = metrics.producer_metrics();
+        producer.record_send_for_topic("orders", 100);
+        assert_eq!(producer.records_sent.get(), 1);
+
+        let before = metrics.reset_generation();
+        metrics.reset();
+
+        // Counters rewound...
+        assert_eq!(producer.records_sent.get(), 0);
+        assert!(producer.topic_snapshot().is_empty());
+        // ...and the generation changed so delta consumers can drop baselines.
+        assert_ne!(metrics.reset_generation(), before);
+    }
+
+    #[test]
+    fn test_krafka_metrics_with_max_tracked_topics() {
+        let metrics = KrafkaMetrics::with_max_tracked_topics(2);
+        let producer = metrics.producer_metrics();
+        assert_eq!(producer.max_tracked_topics(), 2);
+        producer.record_send_for_topic("a", 1);
+        producer.record_send_for_topic("b", 1);
+        producer.record_send_for_topic("c", 1);
+        assert_eq!(producer.tracked_topic_count(), 3); // a, b, __other__
     }
 }

@@ -62,6 +62,20 @@ const ACTION: &str = "kafka-cluster:Connect";
 /// User agent for MSK IAM (includes crate version for diagnostics).
 const USER_AGENT: &str = concat!("krafka-rust-client/", env!("CARGO_PKG_VERSION"));
 
+/// Validity window advertised in the presigned authentication payload.
+///
+/// AWS recommends 900 seconds for `AWS_MSK_IAM`; the Java reference signer
+/// (`aws-msk-iam-auth`) pins this value.  It is part of the signed canonical
+/// query string, so it bounds how long a captured payload remains usable.
+const EXPIRES_SECONDS: &str = "900";
+
+/// `SignedHeaders` value for the presigned signature.
+///
+/// The `AWS_MSK_IAM` 2020_10_22 scheme signs `host` and nothing else; every
+/// other SigV4 parameter travels in the canonical **query string**, not as a
+/// header.  See <https://github.com/aws/aws-msk-iam-auth>.
+const SIGNED_HEADERS: &str = "host";
+
 /// Maximum clock offset applied to MSK IAM SigV4 timestamps.
 pub(crate) const MAX_SIGV4_CLOCK_SKEW_SECS: i64 = 300;
 
@@ -195,15 +209,16 @@ impl MskIamAuthenticator {
     pub fn create_auth_payload_at(&self, timestamp: SystemTime) -> Vec<u8> {
         let (date_stamp, amz_date) = format_timestamp(timestamp);
 
-        // Build the canonical request
-        let (canonical_request, signed_headers) =
-            self.build_canonical_request(&amz_date, &date_stamp);
-
-        // Create string to sign
+        // The credential scope is part of the signed canonical query string,
+        // so it must be built before the canonical request.
         let credential_scope = format!(
             "{}/{}/{}/aws4_request",
             date_stamp, self.region, SERVICE_NAME
         );
+
+        // Build the canonical request (presigned-URL form)
+        let canonical_request = self.build_canonical_request(&amz_date, &credential_scope);
+
         let string_to_sign =
             self.build_string_to_sign(&amz_date, &credential_scope, &canonical_request);
 
@@ -224,7 +239,7 @@ impl MskIamAuthenticator {
         let scope_esc = json_escape_string(&credential_scope);
 
         let mut payload = format!(
-            r#"{{"version":"2020_10_22","host":"{}","user-agent":"{}","action":"{}","x-amz-algorithm":"{}","x-amz-credential":"{}/{}","x-amz-date":"{}","x-amz-signedheaders":"{}","x-amz-signature":"{}""#,
+            r#"{{"version":"2020_10_22","host":"{}","user-agent":"{}","action":"{}","x-amz-algorithm":"{}","x-amz-credential":"{}/{}","x-amz-date":"{}","x-amz-expires":"{}","x-amz-signedheaders":"{}","x-amz-signature":"{}""#,
             host_esc,
             USER_AGENT,
             ACTION,
@@ -232,7 +247,8 @@ impl MskIamAuthenticator {
             akid_esc,
             scope_esc,
             amz_date,
-            signed_headers,
+            EXPIRES_SECONDS,
+            SIGNED_HEADERS,
             signature
         );
 
@@ -251,41 +267,61 @@ impl MskIamAuthenticator {
     }
 
     /// Build the canonical request for signing.
-    fn build_canonical_request(&self, amz_date: &str, _date_stamp: &str) -> (String, String) {
+    ///
+    /// `AWS_MSK_IAM` (version `2020_10_22`) authenticates with a **presigned
+    /// URL** signature, not a header-signed request.  Every SigV4 parameter
+    /// (`X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires`,
+    /// `X-Amz-Security-Token`, `X-Amz-SignedHeaders`) therefore belongs in the
+    /// canonical **query string**, sorted by key, and `host` is the only
+    /// signed header.  Signing those values as headers instead produces a
+    /// signature the broker cannot reproduce.
+    ///
+    /// See <https://github.com/aws/aws-msk-iam-auth> for the wire contract.
+    fn build_canonical_request(&self, amz_date: &str, credential_scope: &str) -> String {
         let http_method = "GET";
         let canonical_uri = "/";
-        let canonical_query_string = format!("Action={}", url_encode(ACTION));
 
-        // Build canonical headers
-        let mut headers: BTreeMap<String, String> = BTreeMap::new();
-        headers.insert("host".to_string(), self.host.clone());
-        headers.insert("x-amz-date".to_string(), amz_date.to_string());
-
+        // Canonical query string: URI-encoded key=value pairs sorted by key.
+        // BTreeMap keeps the sort stable and matches SigV4's byte ordering
+        // because every key here is pure ASCII.
+        let mut params: BTreeMap<String, String> = BTreeMap::new();
+        params.insert("Action".to_string(), ACTION.to_string());
+        params.insert("X-Amz-Algorithm".to_string(), ALGORITHM.to_string());
+        params.insert(
+            "X-Amz-Credential".to_string(),
+            format!("{}/{}", self.access_key_id, credential_scope),
+        );
+        params.insert("X-Amz-Date".to_string(), amz_date.to_string());
+        params.insert("X-Amz-Expires".to_string(), EXPIRES_SECONDS.to_string());
+        params.insert(
+            "X-Amz-SignedHeaders".to_string(),
+            SIGNED_HEADERS.to_string(),
+        );
         if let Some(ref token) = self.session_token {
-            headers.insert("x-amz-security-token".to_string(), token.clone());
+            params.insert("X-Amz-Security-Token".to_string(), token.clone());
         }
 
-        let canonical_headers: String = headers
+        let canonical_query_string = params
             .iter()
-            .map(|(k, v)| format!("{}:{}\n", k, v))
-            .collect();
+            .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
 
-        let signed_headers: String = headers.keys().cloned().collect::<Vec<_>>().join(";");
+        // `host` is the only signed header under this scheme.
+        let canonical_headers = format!("host:{}\n", self.host);
 
         // Empty payload hash for GET
         let payload_hash = hex_encode(&sha256(&[]));
 
-        let canonical_request = format!(
+        format!(
             "{}\n{}\n{}\n{}\n{}\n{}",
             http_method,
             canonical_uri,
             canonical_query_string,
             canonical_headers,
-            signed_headers,
+            SIGNED_HEADERS,
             payload_hash
-        );
-
-        (canonical_request, signed_headers)
+        )
     }
 
     /// Build the string to sign.
@@ -562,6 +598,85 @@ mod tests {
         assert_eq!(json_escape_string("\x00"), r"\u0000"); // null
         assert_eq!(json_escape_string("\x0B"), r"\u000B"); // vertical tab — no RFC 8259 named escape
         assert_eq!(json_escape_string("\x01\x1f"), r"\u0001\u001F");
+    }
+
+    /// The `AWS_MSK_IAM` 2020_10_22 scheme is a **presigned-URL** signature:
+    /// every SigV4 parameter lives in the canonical query string and `host` is
+    /// the only signed header. Signing `x-amz-date` / `x-amz-security-token` as
+    /// headers instead produces a signature MSK brokers cannot reproduce, so
+    /// these tests pin the canonical-request shape.
+    ///
+    /// Reference: <https://github.com/aws/aws-msk-iam-auth>
+    #[test]
+    fn test_canonical_request_is_presigned_url_form() {
+        let creds = test_credentials();
+        let auth =
+            MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com").unwrap();
+        let cr = auth.build_canonical_request(
+            "20240101T000000Z",
+            "20240101/us-east-1/kafka-cluster/aws4_request",
+        );
+        let lines: Vec<&str> = cr.split('\n').collect();
+
+        assert_eq!(lines[0], "GET");
+        assert_eq!(lines[1], "/");
+
+        let qs = lines[2];
+        assert!(qs.starts_with("Action=kafka-cluster%3AConnect&"), "qs={qs}");
+        assert!(qs.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"), "qs={qs}");
+        assert!(qs.contains("X-Amz-Credential=AKIA"), "qs={qs}");
+        assert!(qs.contains("X-Amz-Date=20240101T000000Z"), "qs={qs}");
+        assert!(qs.contains("X-Amz-Expires=900"), "qs={qs}");
+        assert!(qs.contains("X-Amz-SignedHeaders=host"), "qs={qs}");
+
+        // Sorted by key, per SigV4.
+        let keys: Vec<&str> = qs
+            .split('&')
+            .map(|p| p.split('=').next().unwrap())
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(keys, sorted, "canonical query string must be sorted by key");
+
+        // `host` is the ONLY signed header.
+        assert_eq!(lines[3], "host:broker.kafka.us-east-1.amazonaws.com");
+        assert_eq!(lines[4], "");
+        assert_eq!(lines[5], "host");
+        assert_eq!(
+            lines[6],
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn test_canonical_request_includes_session_token_in_query() {
+        let mut creds = test_credentials();
+        creds.session_token = Some("SESSION/TOKEN+VALUE".to_string());
+        let auth =
+            MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com").unwrap();
+        let cr = auth.build_canonical_request(
+            "20240101T000000Z",
+            "20240101/us-east-1/kafka-cluster/aws4_request",
+        );
+        let qs = cr.split('\n').nth(2).unwrap();
+        assert!(
+            qs.contains("X-Amz-Security-Token=SESSION%2FTOKEN%2BVALUE"),
+            "qs={qs}"
+        );
+        assert_eq!(cr.split('\n').nth(5).unwrap(), "host");
+    }
+
+    #[test]
+    fn test_auth_payload_pins_signedheaders_host_and_expires() {
+        let creds = test_credentials();
+        let auth =
+            MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com").unwrap();
+        let payload = String::from_utf8(auth.create_auth_payload()).unwrap();
+        assert!(
+            payload.contains("\"x-amz-signedheaders\":\"host\""),
+            "{payload}"
+        );
+        assert!(payload.contains("\"x-amz-expires\":\"900\""), "{payload}");
     }
 
     #[test]

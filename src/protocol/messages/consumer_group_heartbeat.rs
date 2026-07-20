@@ -1,3 +1,4 @@
+use crate::protocol::decode_capacity;
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode};
@@ -329,7 +330,7 @@ impl ConsumerGroupHeartbeatResponse {
         buf: &mut impl Buf,
     ) -> Result<Vec<ConsumerGroupTopicPartitions>> {
         let len = check_compact_array_len(count)?;
-        let mut result = Vec::with_capacity(len);
+        let mut result = Vec::with_capacity(decode_capacity(len, buf.remaining()));
         for _ in 0..len {
             // TopicId — 16-byte UUID
             if buf.remaining() < 16 {
@@ -344,7 +345,7 @@ impl ConsumerGroupHeartbeatResponse {
             // Partitions — compact array of i32
             let part_count = crate::util::varint::decode_unsigned_varint(buf)?;
             let part_len = check_compact_array_len(part_count)?;
-            let mut partitions = Vec::with_capacity(part_len);
+            let mut partitions = Vec::with_capacity(decode_capacity(part_len, buf.remaining()));
             for _ in 0..part_len {
                 partitions.push(i32::decode(buf)?);
             }

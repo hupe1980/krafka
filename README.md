@@ -18,12 +18,12 @@ A pure Rust, async-native Apache Kafka client designed for high performance, saf
 - 🔄 **Incremental fetch sessions**: KIP-227 fetch sessions for bandwidth-efficient multi-partition consumers
 - 🔐 **TLS/SSL encryption**: Using rustls for secure connections
 - 🔑 **SASL authentication**: PLAIN, SCRAM-SHA-256/512, OAUTHBEARER mechanisms
-- 💯 **Transactions**: Exactly-once semantics with transactional producer
+- 💯 **Transactions**: Exactly-once semantics with KIP-447 zombie fencing
 - ☁️ **Cloud-native**: First-class AWS MSK support including IAM auth
 - 🛡️ **Security hardened**: Secret zeroization, constant-time auth (`subtle`), decompression bomb protection, decode loop bounds (`MAX_DECODE_ARRAY_LEN`)
 - 🔄 **Built-in retry**: Exponential backoff with metadata refresh on leader changes
-- 📊 **Metrics**: Lock-free counters/gauges/latency wired into all hot paths
-- 🧪 **Fuzz tested**: cargo-fuzz targets for protocol arrays, record batches, and response decoders
+- 📊 **Metrics**: Lock-free counters/gauges/latency with bounded per-topic cardinality
+- 🧪 **Fuzz + property tested**: 6 cargo-fuzz targets and proptest round-trips across the protocol layer
 
 > **Minimum Broker Version:** Krafka requires **Apache Kafka 3.9+**. Protocol versions older than the Kafka 3.9 baseline have been removed.
 
@@ -280,6 +280,109 @@ let consumer = Consumer::builder()
     .await?;
 ```
 
+## 🎯 Delivery Semantics
+
+Pick the mode that matches what your data is worth.
+
+| Mode | Guarantee | Cost |
+|------|-----------|------|
+| `acks=0` | At-most-once. No durability — the record may never reach the log. | Lowest latency |
+| `acks=all` + idempotence (**default**) | At-least-once, ordered and gap-free per partition. Batches for a partition are serialised in seal order; sequence numbers are monotonic and never reused. | One round trip to the ISR |
+| Transactions + `send_offsets_to_transaction` | Exactly-once across a read-process-write cycle. | Transaction coordinator round trips |
+
+Under `acks=0`, `RecordMetadata::confirmation` reports `Unacknowledged` — do not
+mistake the returned metadata for a durability guarantee.
+
+### Exactly-once
+
+`send_offsets_to_transaction` takes a [`ConsumerGroupMetadata`], not a bare group
+ID. That metadata is what lets the group coordinator fence a **zombie**: an
+instance that was partitioned away, lost its partitions to a rebalance, and came
+back still holding a transaction. Without it the coordinator accepts the zombie's
+commit and it overwrites the position of the member that now owns the partition.
+
+```rust
+// Re-read for every transaction. The generation changes on every rebalance,
+// so a cached value stops fencing at exactly the moment it matters.
+let group_metadata = consumer
+    .group_metadata()
+    .await
+    .ok_or("consumer has not joined the group yet")?;
+
+producer.begin_transaction()?;
+producer.send("out-topic", Some(b"key"), b"value").await?;
+producer.send_offsets_to_transaction(&offsets, &group_metadata).await?;
+producer.commit_transaction().await?;
+```
+
+See [`examples/exactly_once.rs`](examples/exactly_once.rs) for the full
+read-process-write loop.
+
+## 🧩 Consumer Groups
+
+Both rebalance protocols are supported: the classic JoinGroup/SyncGroup protocol
+and KIP-848 (`group.protocol = consumer`).
+
+Four assignors ship: `Range`, `RoundRobin`, `Sticky` (eager), and
+`CooperativeSticky`. The default is the preference list
+`[Range, CooperativeSticky]`, matching the Java client — every member advertises
+both, so a group moves from eager to cooperative rebalancing in a single rolling
+bounce rather than a full stop-the-world restart.
+
+`max.poll.interval.ms` is enforced: an application that stops polling is ejected
+from the group so its partitions are reassigned, rather than silently holding
+them while a background thread keeps heartbeating.
+
+## 📐 Scope
+
+Krafka speaks the **client** side of the Kafka protocol: 60+ API keys covering
+produce, fetch, group coordination, transactions, and administration.
+Broker-internal APIs (`LeaderAndIsr`, `UpdateMetadata`, `Vote`, `FetchSnapshot`,
+`BrokerHeartbeat`, …) are deliberately absent — a client does not speak them.
+
+The schema-registry module implements the Confluent and AWS Glue **wire formats**
+(magic byte, schema ID framing, caching). Bring your own Avro/Protobuf/JSON-Schema
+codec; krafka does not impose one.
+
+Tokio is the async runtime.
+
+### Authentication
+
+SASL/PLAIN, SASL/SCRAM-SHA-256/512 (with RFC 5929 channel binding), SASL/OAUTHBEARER
+(with proactive token refresh), AWS MSK IAM, and mTLS.
+
+GSSAPI/Kerberos is outside the scope of this client.
+
+## 🧪 Testing Against a Fake Broker
+
+Enable the `test-broker` feature to get an in-process Kafka broker your tests can
+drive directly. Real `Producer`/`Consumer`/`AdminClient` instances connect to it
+over a real TCP socket, so you exercise the actual client — no Docker, no
+containers, and failure modes you cannot reproduce against a healthy cluster.
+
+```rust
+use krafka::testing::{Control, FakeBroker};
+use krafka::protocol::ApiKey;
+use krafka::error::ErrorCode;
+
+let broker = FakeBroker::start().await?;
+
+// Make the next CreateTopics land on a non-controller and assert the client
+// refreshes metadata and retries instead of surfacing the error.
+broker.on(ApiKey::CreateTopics, |_| Control::Error(ErrorCode::NotController));
+
+let admin = AdminClient::builder()
+    .bootstrap_servers(broker.bootstrap_servers())
+    .build()
+    .await?;
+```
+
+`Control` covers `Error`, `Delay`, `Disconnect`, `Silence` and pass-through, and
+the cluster can be manipulated mid-test: `set_leader`, `bump_leader_epoch`,
+`set_group_coordinator`, `set_txn_coordinator`, `set_controller`,
+`set_broker_online`. That makes leader moves, coordinator failover, late
+responses and controller churn ordinary unit tests.
+
 ## 📚 Documentation
 
 Full documentation is available at **[hupe1980.github.io/krafka](https://hupe1980.github.io/krafka)**
@@ -316,27 +419,12 @@ cargo run --example admin
 # Transactional producer example
 cargo run --example transactional_producer
 
+# Exactly-once read-process-write (KIP-447 zombie fencing)
+cargo run --example exactly_once
+
 # Authentication examples (SASL, SCRAM, MSK IAM)
 cargo run --example authentication
 ```
-
-## 📊 Status
-
-Krafka is feature-complete and production-ready.
-
-**Features:**
-- ✅ Protocol layer (all message types, compression, ACL messages, transactions, unified versioned encode/decode dispatch, wire-format validation)
-- ✅ Network layer (async connections, pooling, TLS/SSL, IPv6 support)
-- ✅ Producer (batching with linger timer, partitioning, compression, built-in retry with exponential backoff, metadata refresh on failure, max-in-flight enforcement via semaphore, buffer backpressure via `ProducerConfig::max_block`, interceptor hooks, zero-copy `Bytes` pipeline)
-- ✅ Consumer (polling, streaming `recv()` with error propagation, offset management, auto-commit timer, seek, pause/resume, configurable partition assignment strategy, rebalance listeners, cooperative sticky assignor, static group membership (KIP-345), interceptor hooks, log compaction awareness, batched offset resolution, per-partition retry backoff)
-- ✅ Admin Client (topic CRUD, partitions, configuration, ACL management, consumer groups, record deletion, leader epoch queries, automatic API version negotiation)
-- ✅ Authentication (SASL/PLAIN, SASL/SCRAM-SHA-256/512, SASL/OAUTHBEARER, AWS MSK IAM with SDK support)
-- ✅ TLS/SSL encryption (rustls, mTLS support)
-- ✅ Transactions (exactly-once semantics with transactional producer — full PID/epoch/sequence tracking)
-- ✅ Metrics (counters, gauges, latency tracking — all wired into producer/consumer hot paths)
-- ✅ Tracing (OpenTelemetry-compatible spans with properly declared fields)
-- ✅ Security hardening (secret zeroization, constant-time comparison, PBKDF2 validation, decompression limits, decode loop bounds)
-- ✅ Fuzz testing (cargo-fuzz targets for protocol decode paths)
 
 ## 🤝 Contributing
 

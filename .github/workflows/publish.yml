@@ -17,11 +17,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # All features except `ring` (mutually exclusive with `rustls-aws-lc-rs`).
-  # Mirrors the ALL_FEATURES_NO_RING set used in ci.yml.
-  ALL_FEATURES_NO_RING: >-
-    compression-all,aws-msk,schema-registry,aws-glue-schema-registry,
-    native-tls-roots,unstable-protocol,telemetry,socks5,rustls-aws-lc-rs
 
 jobs:
   publish:
@@ -50,8 +45,17 @@ jobs:
           echo "version=$CARGO_VERSION" >> $GITHUB_OUTPUT
           echo "Version verified: $CARGO_VERSION"
 
-      - name: Run tests
-        run: cargo test --no-default-features --features "$ALL_FEATURES_NO_RING"
+      # `ring` and `rustls-aws-lc-rs` are additive, so `--all-features` works
+      # and needs no feature list duplicated from ci.yml.
+      - name: Run tests (all features)
+        run: cargo test --all-features
+
+      # The published crate's DEFAULT features are `compression` + `ring`, which
+      # is what downstream users get. Test that configuration too -- the
+      # all-features run resolves to the aws-lc-rs backend and never exercises
+      # the ring code paths.
+      - name: Run tests (default features)
+        run: cargo test
 
       - name: Dry run publish
         if: github.event_name == 'workflow_dispatch' && inputs.dry-run == true

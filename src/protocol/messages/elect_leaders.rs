@@ -5,7 +5,8 @@ use crate::error::{ErrorCode, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, Encode, KafkaString, TaggedFields, TryEncode};
 use crate::protocol::{
-    array_len_i32, check_compact_array_len, check_decode_array_len, encode_compact_array_len,
+    array_len_i32, check_compact_array_len, check_decode_array_len, decode_capacity,
+    encode_compact_array_len,
 };
 
 // ============================================================================
@@ -212,7 +213,7 @@ impl ElectLeadersResponse {
 
     /// Decode topic results (non-flexible, v0-v1).
     fn decode_topics_v0(buf: &mut impl Buf, count: usize) -> Result<Vec<ElectLeadersTopicResult>> {
-        let mut topics = Vec::with_capacity(count);
+        let mut topics = Vec::with_capacity(decode_capacity(count, buf.remaining()));
         for _ in 0..count {
             let topic = non_nullable_string("topic", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
@@ -227,7 +228,7 @@ impl ElectLeadersResponse {
 
     /// Decode topic results (flexible, v2).
     fn decode_topics_v2(buf: &mut impl Buf, count: usize) -> Result<Vec<ElectLeadersTopicResult>> {
-        let mut topics = Vec::with_capacity(count);
+        let mut topics = Vec::with_capacity(decode_capacity(count, buf.remaining()));
         for _ in 0..count {
             let topic = non_nullable_string("topic", KafkaString::decode_compact(buf)?.0)?;
             let partition_count =
@@ -247,7 +248,7 @@ impl ElectLeadersResponse {
         buf: &mut impl Buf,
         count: usize,
     ) -> Result<Vec<ElectLeadersPartitionResult>> {
-        let mut partitions = Vec::with_capacity(count);
+        let mut partitions = Vec::with_capacity(decode_capacity(count, buf.remaining()));
         for _ in 0..count {
             let partition_id = i32::decode(buf)?;
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -266,7 +267,7 @@ impl ElectLeadersResponse {
         buf: &mut impl Buf,
         count: usize,
     ) -> Result<Vec<ElectLeadersPartitionResult>> {
-        let mut partitions = Vec::with_capacity(count);
+        let mut partitions = Vec::with_capacity(decode_capacity(count, buf.remaining()));
         for _ in 0..count {
             let partition_id = i32::decode(buf)?;
             let error_code = ErrorCode::from_i16(i16::decode(buf)?);

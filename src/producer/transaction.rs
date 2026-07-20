@@ -55,7 +55,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
-use bytes::{BufMut as _, Bytes};
+use bytes::Bytes;
 use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, warn};
 
@@ -67,19 +67,191 @@ use crate::protocol::{
     AddOffsetsToTxnRequest, AddOffsetsToTxnResponse, AddPartitionsToTxnRequest,
     AddPartitionsToTxnResponse, ApiKey, Compression, EndTxnRequest, EndTxnResponse,
     FindCoordinatorRequest, FindCoordinatorResponse, InitProducerIdRequest, InitProducerIdResponse,
-    ProducePartitionData, ProduceRequest, ProduceResponse, ProduceTopicData, RecordBatchBuilder,
     TxnOffsetCommitRequest, TxnOffsetCommitResponse, VersionedDecode, VersionedEncode, versions,
 };
 use crate::{Offset, PartitionId};
 
+use super::accumulator::{AccumulatorConfig, RecordAccumulator, RecordAccumulatorHandle};
 use super::barrier::InFlightBarrier;
 use super::config::Acks;
 use super::idempotent::ProducerIdentity;
-use super::partitioner::{DefaultPartitioner, Partitioner};
-use super::record::{ProducerRecord, RecordMetadata, RoutedRecord, TopicHandle};
+use super::partitioner::{Partitioner, UniformStickyPartitioner};
+use super::record::{ProducerRecord, RecordMetadata, TopicHandle};
 use super::retry::RetryPolicy;
+use crate::consumer::ConsumerGroupMetadata;
+use crate::metrics::ProducerMetrics;
 
 use crate::schema_registry::SchemaEncoder;
+
+/// Name of the cluster-wide finalized feature that gates KIP-890 semantics.
+const TRANSACTION_VERSION_FEATURE: &str = "transaction.version";
+
+/// Minimum `Produce` version that carries the transactional fields the broker
+/// needs to add a partition to the transaction implicitly (KIP-890 TV2).
+const TV2_MIN_PRODUCE_VERSION: i16 = 12;
+
+/// Minimum `TxnOffsetCommit` version at which the group coordinator, rather
+/// than the client, registers the offsets topic with the transaction
+/// coordinator (KIP-890 TV2).
+const TV2_MIN_TXN_OFFSET_COMMIT_VERSION: i16 = 5;
+
+/// Minimum `EndTxn` version whose response carries the bumped producer ID and
+/// epoch that a TV2 producer is required to adopt (KIP-890 TV2).
+const TV2_MIN_END_TXN_VERSION: i16 = 4;
+
+/// The negotiated KIP-890 transaction protocol in use with this cluster.
+///
+/// Selected once during [`init_transactions`](TransactionalProducer::init_transactions)
+/// from the cluster-finalized `transaction.version` feature, and fixed for the
+/// life of the producer. It is a **runtime** choice: one binary speaks both
+/// protocols and picks per cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[non_exhaustive]
+#[repr(u8)]
+pub enum TransactionVersion {
+    /// Classic transactions, as shipped since Kafka 0.11.
+    ///
+    /// The client explicitly registers each partition with the transaction
+    /// coordinator via `AddPartitionsToTxn` before its first write to that
+    /// partition, and registers the offsets topic via `AddOffsetsToTxn` before
+    /// committing consumer offsets. The producer epoch is bumped only by
+    /// `InitProducerId`, so it survives across transactions.
+    ///
+    /// This is the fallback whenever the cluster does not finalize
+    /// `transaction.version` at level 2 or above, which includes every broker
+    /// predating KIP-890.
+    #[default]
+    V1 = 1,
+    /// KIP-890 transactions (`transaction.version` ≥ 2).
+    ///
+    /// Two behaviours change, and both are why TV2 exists:
+    ///
+    /// 1. **Implicit partition registration.** The `Produce` request itself
+    ///    tells the coordinator which partitions joined the transaction, so
+    ///    `AddPartitionsToTxn` and `AddOffsetsToTxn` are not sent at all. This
+    ///    removes one coordinator round trip per partition per transaction.
+    ///
+    /// 2. **Epoch bump on every completion.** The coordinator increments the
+    ///    producer epoch when it writes the commit or abort marker and returns
+    ///    the new `(producer_id, producer_epoch)` on the `EndTxn` response.
+    ///    Because the epoch advances at the transaction boundary, a delayed
+    ///    write from a previous transaction can never be accepted into the
+    ///    next one — this is the defence against hanging transactions and
+    ///    zombie writes that TV1 structurally cannot provide.
+    V2 = 2,
+}
+
+impl From<u8> for TransactionVersion {
+    /// Decode the discriminant stored in the producer's atomic.
+    ///
+    /// Any value other than 2 decodes to [`V1`](TransactionVersion::V1),
+    /// which keeps an impossible discriminant on the safe protocol rather
+    /// than enabling TV2 on a cluster that may not support it.
+    fn from(v: u8) -> Self {
+        if v == Self::V2 as u8 {
+            Self::V2
+        } else {
+            Self::V1
+        }
+    }
+}
+
+impl TransactionVersion {
+    /// Map a finalized `transaction.version` feature level to a protocol.
+    ///
+    /// Level 0 means the feature is disabled and level 1 only enables flexible
+    /// fields in the coordinator's internal state records — neither changes
+    /// the client protocol, so both are [`V1`](Self::V1). Level 2 and above
+    /// enable the KIP-890 client semantics.
+    #[must_use]
+    pub fn from_feature_level(level: i16) -> Self {
+        if level >= 2 { Self::V2 } else { Self::V1 }
+    }
+
+    /// Whether the KIP-890 client semantics are active.
+    #[must_use]
+    #[inline]
+    pub fn is_v2(self) -> bool {
+        matches!(self, Self::V2)
+    }
+}
+
+impl std::fmt::Display for TransactionVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::V1 => write!(f, "TV1"),
+            Self::V2 => write!(f, "TV2"),
+        }
+    }
+}
+
+/// What one broker reports about its ability to speak KIP-890 TV2.
+///
+/// Collected per broker so that [`negotiated_transaction_version`] can reduce a
+/// mixed-version cluster to the single protocol that every broker can serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BrokerTransactionSupport {
+    /// `max_version_level` of the broker's finalized `transaction.version`
+    /// feature, or 0 when the broker did not report the feature at all.
+    transaction_version_level: i16,
+    /// Highest mutually supported `Produce` version, or `None` when none is.
+    produce_max: Option<i16>,
+    /// Highest mutually supported `TxnOffsetCommit` version.
+    txn_offset_commit_max: Option<i16>,
+    /// Highest mutually supported `EndTxn` version.
+    end_txn_max: Option<i16>,
+}
+
+impl BrokerTransactionSupport {
+    /// The best protocol this single broker can serve.
+    ///
+    /// A broker only counts as TV2-capable if it both finalizes the feature at
+    /// level 2+ **and** can actually speak the three APIs whose newer versions
+    /// carry TV2 semantics. Finalized features are cluster-wide metadata and
+    /// can be observed before every broker has restarted into a build that
+    /// serves the matching API versions, so the feature level alone is not
+    /// sufficient evidence.
+    fn version(self) -> TransactionVersion {
+        let feature = TransactionVersion::from_feature_level(self.transaction_version_level);
+        if !feature.is_v2() {
+            return TransactionVersion::V1;
+        }
+
+        let supports =
+            |negotiated: Option<i16>, required: i16| negotiated.is_some_and(|v| v >= required);
+
+        if supports(self.produce_max, TV2_MIN_PRODUCE_VERSION)
+            && supports(
+                self.txn_offset_commit_max,
+                TV2_MIN_TXN_OFFSET_COMMIT_VERSION,
+            )
+            && supports(self.end_txn_max, TV2_MIN_END_TXN_VERSION)
+        {
+            TransactionVersion::V2
+        } else {
+            TransactionVersion::V1
+        }
+    }
+}
+
+/// Reduce per-broker capability reports to the protocol the producer will use.
+///
+/// Takes the **minimum** across brokers: during a rolling upgrade the finalized
+/// feature can already read as level 2 while some brokers still run an older
+/// build, and speaking TV2 to a broker that expects an explicit
+/// `AddPartitionsToTxn` would silently drop that partition from the
+/// transaction. Downgrading the whole producer to TV1 is always safe because
+/// a TV2-capable broker still serves the TV1 protocol.
+///
+/// An empty report set — no broker could be reached or asked — yields
+/// [`TransactionVersion::V1`], the conservative default.
+fn negotiated_transaction_version(reports: &[BrokerTransactionSupport]) -> TransactionVersion {
+    reports
+        .iter()
+        .map(|r| r.version())
+        .min()
+        .unwrap_or(TransactionVersion::V1)
+}
 
 /// Transaction state machine states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,10 +354,27 @@ pub struct TransactionalProducerConfig {
     transaction_timeout_ms: i32,
     /// Request timeout.
     request_timeout: Duration,
+    /// Time allowed for TCP establishment to one broker.
+    connect_timeout: Duration,
     /// Maximum encoded Kafka request frame size in bytes.
     max_request_size: usize,
     /// Compression.
     compression: Compression,
+    /// Maximum batch size in bytes for the record accumulator.
+    batch_size: usize,
+    /// How long the accumulator waits for a batch to fill before sending it.
+    ///
+    /// Transactional sends are batched through the same
+    /// [`RecordAccumulator`] as the plain producer, so this is the main
+    /// throughput knob. Defaults to 5 ms: a transactional produce is
+    /// `acks=all`, so without batching every record costs a full round trip.
+    linger: Duration,
+    /// Total accumulator buffer memory in bytes.
+    buffer_memory: usize,
+    /// Maximum time `send` blocks waiting for accumulator buffer memory.
+    max_block: Duration,
+    /// Maximum concurrent in-flight produce requests.
+    max_in_flight: usize,
     /// Metadata max age.
     metadata_max_age: Duration,
     /// Authentication configuration.
@@ -203,8 +392,14 @@ impl Default for TransactionalProducerConfig {
             transactional_id: String::new(),
             transaction_timeout_ms: 60000,
             request_timeout: Duration::from_secs(30),
+            connect_timeout: crate::network::DEFAULT_CONNECT_TIMEOUT,
             max_request_size: crate::protocol::MAX_MESSAGE_SIZE,
             compression: Compression::None,
+            batch_size: 16384,
+            linger: Duration::from_millis(5),
+            buffer_memory: 32 * 1024 * 1024,
+            max_block: Duration::from_secs(60),
+            max_in_flight: 5,
             metadata_max_age: Duration::from_secs(300),
             auth: None,
             #[cfg(feature = "socks5")]
@@ -415,6 +610,13 @@ pub struct TransactionalProducer {
     partitioner: Arc<dyn Partitioner>,
     /// Transaction state.
     state: AtomicU8,
+    /// Negotiated KIP-890 protocol, as a [`TransactionVersion`] discriminant.
+    ///
+    /// Written once by [`init_transactions`](Self::init_transactions) before
+    /// the state leaves `Initializing`, and only read afterwards, so relaxed
+    /// visibility concerns do not arise; `SeqCst` is used for uniformity with
+    /// the other atomics on this type.
+    transaction_version: AtomicU8,
     /// Whether the current transaction hit an abortable error and must be
     /// aborted before further send/commit operations are allowed.
     abort_required: AtomicBool,
@@ -430,7 +632,20 @@ pub struct TransactionalProducer {
     /// Always acquired **after** `coordinator_id` (see lock-order note above).
     txn_partitions: Arc<RwLock<TransactionPartitions>>,
     /// Sequence number tracking for idempotent production.
-    identity: ProducerIdentity,
+    ///
+    /// Shared with the [`RecordAccumulator`], which stamps the PID, epoch and
+    /// per-partition sequence onto every batch it builds.
+    identity: Arc<ProducerIdentity>,
+    /// Batching accumulator for transactional sends.
+    ///
+    /// Transactional production used to issue one `acks=all` `ProduceRequest`
+    /// per record and await it, capping throughput at roughly one record per
+    /// round trip per partition. Routing through the accumulator batches
+    /// records exactly like the plain producer while still stamping the
+    /// transactional ID, PID and epoch on each batch.
+    accumulator: RecordAccumulatorHandle,
+    /// Metrics shared with the accumulator.
+    metrics: Arc<ProducerMetrics>,
     /// Retry policy for transient failures.
     retry_policy: RetryPolicy,
     /// Barrier over started transactional operations and shutdown state.
@@ -455,6 +670,143 @@ impl TransactionalProducer {
     #[inline]
     pub fn state(&self) -> TransactionState {
         TransactionState::from(self.state.load(Ordering::SeqCst))
+    }
+
+    /// The KIP-890 transaction protocol negotiated with this cluster.
+    ///
+    /// Returns [`TransactionVersion::V1`] until
+    /// [`init_transactions`](Self::init_transactions) has completed, since the
+    /// finalized feature is only queried there.
+    #[inline]
+    pub fn transaction_version(&self) -> TransactionVersion {
+        TransactionVersion::from(self.transaction_version.load(Ordering::SeqCst))
+    }
+
+    /// Whether the client itself must register partitions and the offsets
+    /// topic with the transaction coordinator before writing to them.
+    ///
+    /// True under TV1, where `AddPartitionsToTxn` / `AddOffsetsToTxn` are the
+    /// only way the coordinator learns which partitions the commit marker has
+    /// to cover. False under TV2 (KIP-890), where the `Produce` and
+    /// `TxnOffsetCommit` requests carry that information themselves — which is
+    /// what removes a coordinator round trip per partition per transaction.
+    #[inline]
+    fn requires_explicit_partition_registration(&self) -> bool {
+        !self.transaction_version().is_v2()
+    }
+
+    /// Ask every known broker what it can serve and settle on one protocol.
+    ///
+    /// The finalized-feature set is only present on `ApiVersions` **v3+**
+    /// responses, and the connection handshake issues `ApiVersions` v0 (it has
+    /// to: it does not yet know what the broker supports). So this re-asks each
+    /// broker at v3+ specifically to read `transaction.version`.
+    ///
+    /// Brokers that cannot be reached, cannot serve `ApiVersions` v3+, or
+    /// answer with an error are skipped rather than treated as TV1. Their
+    /// absence is not evidence about the cluster's feature level, and failing
+    /// the whole producer over one unreachable broker would be worse than
+    /// running a protocol the reachable brokers all agree on. If no broker can
+    /// be asked at all, the result is [`TransactionVersion::V1`].
+    async fn detect_transaction_version(&self) -> TransactionVersion {
+        let brokers = self.metadata.brokers();
+        let mut reports = Vec::with_capacity(brokers.len());
+
+        for broker in &brokers {
+            match self.probe_broker_transaction_support(broker).await {
+                Ok(report) => reports.push(report),
+                Err(error) => {
+                    debug!(
+                        broker = broker.id(),
+                        %error,
+                        "Could not read transaction.version from broker; \
+                         excluding it from the negotiated transaction version"
+                    );
+                }
+            }
+        }
+
+        let version = negotiated_transaction_version(&reports);
+        info!(
+            %version,
+            brokers_probed = reports.len(),
+            "Negotiated KIP-890 transaction version"
+        );
+        version
+    }
+
+    /// Read one broker's finalized `transaction.version` level together with
+    /// the API versions that TV2 depends on.
+    async fn probe_broker_transaction_support(
+        &self,
+        broker: &crate::metadata::BrokerInfo,
+    ) -> Result<BrokerTransactionSupport> {
+        let conn = self
+            .pool
+            .get_connection_by_id(broker.id(), broker.address())
+            .await?;
+
+        // v3 is the first version whose response carries the KIP-584 tagged
+        // fields that hold finalized features.
+        let av_version = conn
+            .negotiate_api_version(ApiKey::ApiVersions, versions::API_VERSIONS_MAX, 3)
+            .await
+            .ok_or_else(|| {
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    "broker does not support ApiVersions v3+, so it cannot report finalized features",
+                )
+            })?;
+
+        let request = crate::protocol::ApiVersionsRequest::new()
+            .with_client_software("krafka", env!("CARGO_PKG_VERSION"));
+
+        let response_bytes = conn
+            .send_request(ApiKey::ApiVersions, av_version, |buf| {
+                if av_version >= 5 {
+                    request.encode_v5(buf)
+                } else {
+                    request.encode_v3(buf)
+                }
+            })
+            .await?;
+
+        let mut buf = response_bytes;
+        let response = crate::protocol::ApiVersionsResponse::decode_v3(&mut buf)?;
+
+        if response.error_code != 0 {
+            return Err(KrafkaError::broker(
+                ErrorCode::from(response.error_code),
+                "ApiVersions request failed while reading transaction.version",
+            ));
+        }
+
+        // An absent feature means the cluster never finalized it, which is the
+        // case for every broker predating KIP-890. Level 0 maps to TV1.
+        let transaction_version_level = response
+            .get_finalized_feature(TRANSACTION_VERSION_FEATURE)
+            .map_or(0, |f| f.max_version_level);
+
+        Ok(BrokerTransactionSupport {
+            transaction_version_level,
+            produce_max: conn
+                .negotiate_api_version(
+                    ApiKey::Produce,
+                    versions::PRODUCE_MAX,
+                    versions::PRODUCE_MIN,
+                )
+                .await,
+            txn_offset_commit_max: conn
+                .negotiate_api_version(
+                    ApiKey::TxnOffsetCommit,
+                    versions::TXN_OFFSET_COMMIT_MAX,
+                    versions::TXN_OFFSET_COMMIT_MIN,
+                )
+                .await,
+            end_txn_max: conn
+                .negotiate_api_version(ApiKey::EndTxn, versions::END_TXN_MAX, versions::END_TXN_MIN)
+                .await,
+        })
     }
 
     /// Return the transactional producer identity, failing fast when
@@ -513,27 +865,75 @@ impl TransactionalProducer {
         )
     }
 
-    fn is_abortable_transaction_error(error: &KrafkaError) -> bool {
-        matches!(
-            error,
-            KrafkaError::Broker {
-                code: ErrorCode::TransactionAbortable,
-                ..
-            }
-        )
+    /// Classify a coordinator RPC result and latch
+    /// [`TransactionState::FatalError`] when the broker reported a fenced or
+    /// otherwise unrecoverable transactional error.
+    ///
+    /// Every coordinator RPC — `AddPartitionsToTxn`, `AddOffsetsToTxn`,
+    /// `TxnOffsetCommit`, `EndTxn` — must be funnelled through this. Without
+    /// it, `InvalidProducerEpoch` / `ProducerFenced` bubbled out to the caller
+    /// while the state machine still read `InTransaction`, so a fenced zombie
+    /// happily carried on sending and committing.
+    ///
+    /// Returns the result unchanged so it can be used inline.
+    fn classify_transaction_result<T>(&self, result: Result<T>) -> Result<T> {
+        if let Err(KrafkaError::Broker { code, .. }) = &result
+            && is_fatal_transaction_error(*code, self.transaction_version())
+        {
+            warn!(
+                error_code = ?code,
+                "Fatal transactional error from coordinator; producer is fenced and must be recreated"
+            );
+            self.set_state(TransactionState::FatalError);
+            return result;
+        }
+
+        // Not fatal, but still transaction-ending: latch the abort requirement
+        // so the next send or commit is refused until abort_transaction() has
+        // run, rather than silently continuing a transaction the coordinator
+        // has already rejected.
+        if let Err(error) = &result
+            && Self::is_abortable_transaction_error(error, self.transaction_version())
+        {
+            self.abort_required.store(true, Ordering::SeqCst);
+        }
+
+        result
+    }
+
+    /// Whether the error ends the current transaction but leaves the producer
+    /// usable after [`abort_transaction`](Self::abort_transaction).
+    ///
+    /// # Transaction version
+    ///
+    /// [`ErrorCode::TransactionAbortable`] (KIP-890) is abortable under both
+    /// versions. [`ErrorCode::InvalidProducerIdMapping`] is abortable only
+    /// under TV1; under TV2 it is fatal instead, so it is excluded here to keep
+    /// the two classifications mutually exclusive — see
+    /// [`is_fatal_transaction_error`].
+    fn is_abortable_transaction_error(error: &KrafkaError, version: TransactionVersion) -> bool {
+        let KrafkaError::Broker { code, .. } = error else {
+            return false;
+        };
+
+        match code {
+            ErrorCode::TransactionAbortable => true,
+            ErrorCode::InvalidProducerIdMapping => !version.is_v2(),
+            _ => false,
+        }
     }
 
     /// Get a connection to the cached transaction coordinator.
     ///
     /// If no coordinator is cached (e.g. after invalidation), automatically
     /// re-discovers it via `FindCoordinator` before returning the connection.
-    async fn coordinator_connection(&self) -> Result<(i32, Arc<BrokerConnection>)> {
+    async fn coordinator_connection(&self, attempt: u32) -> Result<(i32, Arc<BrokerConnection>)> {
         let coordinator_id = {
             let cached = *self.coordinator_id.read().await;
             match cached {
                 Some(id) => id,
                 None => {
-                    let id = self.find_coordinator().await?;
+                    let id = self.find_coordinator(attempt).await?;
                     *self.coordinator_id.write().await = Some(id);
                     debug!("Auto-discovered transaction coordinator: broker {}", id);
                     id
@@ -594,7 +994,7 @@ impl TransactionalProducer {
     /// `op_name` is used in log messages to identify the RPC.
     async fn retry_with_coordinator<F, Fut>(&self, op_name: &str, op: F) -> Result<()>
     where
-        F: Fn() -> Fut,
+        F: Fn(u32) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
         let max_retries = self.retry_policy.max_retries;
@@ -604,7 +1004,7 @@ impl TransactionalProducer {
                 tokio::time::sleep(self.retry_policy.calculate_backoff(attempt)).await;
             }
 
-            let result = op().await;
+            let result = op(attempt).await;
 
             match &result {
                 Ok(()) => return Ok(()),
@@ -679,6 +1079,15 @@ impl TransactionalProducer {
             )));
         }
 
+        // Settle the KIP-890 protocol before the first coordinator RPC. Every
+        // later decision — whether AddPartitionsToTxn is sent, whether the
+        // EndTxn epoch bump is mandatory, how INVALID_PRODUCER_ID_MAPPING is
+        // classified — reads this, so it must be fixed before the producer
+        // becomes usable.
+        let version = self.detect_transaction_version().await;
+        self.transaction_version
+            .store(version as u8, Ordering::SeqCst);
+
         // Find transaction coordinator
         let result = self.do_init_transactions().await;
         if result.is_err() {
@@ -695,8 +1104,8 @@ impl TransactionalProducer {
     /// exponential backoff. On each retry the cached coordinator is invalidated
     /// and re-discovered via `FindCoordinator`.
     async fn do_init_transactions(&self) -> Result<()> {
-        self.retry_with_coordinator("InitProducerId", || async {
-            let (_coordinator_id, conn) = self.coordinator_connection().await?;
+        self.retry_with_coordinator("InitProducerId", |attempt| async move {
+            let (_coordinator_id, conn) = self.coordinator_connection(attempt).await?;
 
             let ip_version = conn
                 .negotiate_api_version(
@@ -749,7 +1158,12 @@ impl TransactionalProducer {
     }
 
     /// Find the transaction coordinator.
-    async fn find_coordinator(&self) -> Result<i32> {
+    ///
+    /// `attempt` rotates which broker is asked, mirroring the idempotent
+    /// producer's `InitProducerId` path. Always querying `brokers[0]` means a
+    /// single unreachable or overloaded broker fails coordinator discovery for
+    /// the whole retry loop, even when every other broker could answer.
+    async fn find_coordinator(&self, attempt: u32) -> Result<i32> {
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::protocol_kind(
@@ -758,7 +1172,7 @@ impl TransactionalProducer {
             ));
         }
 
-        let broker = &brokers[0];
+        let broker = &brokers[attempt as usize % brokers.len()];
         let conn = self
             .pool
             .get_connection_by_id(broker.id(), broker.address())
@@ -859,7 +1273,7 @@ impl TransactionalProducer {
 
     /// Send a producer record within the current transaction.
     pub async fn send_record(&self, record: ProducerRecord) -> Result<RecordMetadata> {
-        let _operation_guard = self.in_flight_barrier.start("transactional producer")?;
+        let operation_guard = self.in_flight_barrier.start("transactional producer")?;
         let current = self.state();
         if current != TransactionState::InTransaction {
             return Err(KrafkaError::invalid_state(format!(
@@ -895,6 +1309,7 @@ impl TransactionalProducer {
 
         let _identity = self.checked_transactional_identity()?;
 
+        let record_size = record.estimated_size();
         let routed = record.into_routed_parts();
         let topic = routed.topic;
         let record = routed.record;
@@ -912,9 +1327,58 @@ impl TransactionalProducer {
             }
         };
 
-        // Add partition to transaction if not already registered.
-        // Uses Pending/Added states to prevent concurrent callers from
-        // skipping the RPC while an in-flight add has not yet completed.
+        // Register the partition with the transaction coordinator.
+        //
+        // Under TV2 (KIP-890) this is skipped entirely: the Produce request
+        // carries the transactional ID, so the broker adds the partition to
+        // the transaction as a side effect of the first write to it. Sending
+        // AddPartitionsToTxn anyway would cost a coordinator round trip per
+        // partition per transaction for no added guarantee — eliminating it is
+        // the throughput win TV2 exists to deliver.
+        //
+        // Under TV1 the coordinator only learns about a partition from an
+        // explicit AddPartitionsToTxn, and a write to an unregistered
+        // partition is not covered by the commit marker, so the RPC must
+        // precede the first record. The Pending/Added states stop concurrent
+        // callers from skipping the RPC while an in-flight add is outstanding.
+        if self.requires_explicit_partition_registration() {
+            self.add_partition_to_txn_if_needed(&topic, partition)
+                .await?;
+        }
+
+        // Hand off to the accumulator, which batches, stamps PID/epoch/sequence
+        // and the transactional ID, and drives retries. The per-partition
+        // dispatch FIFO inside the accumulator keeps sequence order == wire
+        // order for this partition.
+        let result = self
+            .accumulator
+            .append_routed_with_guard(topic, record, record_size, partition, operation_guard)
+            .await;
+
+        // The accumulator has no view of transaction state, so classify its
+        // error here: a fenced epoch reported on the produce path must latch
+        // FatalError exactly as one reported by a coordinator RPC.
+        let result = self.classify_transaction_result(result);
+        match result {
+            Err(error) if Self::is_unknown_producer_id_error(&error) => {
+                Err(self.mark_unknown_producer_id_abort_required("transactional produce"))
+            }
+            other => other,
+        }
+    }
+
+    /// Ensure a partition is registered with the transaction coordinator,
+    /// issuing `AddPartitionsToTxn` at most once per partition per transaction.
+    ///
+    /// # Transaction version
+    ///
+    /// TV1 only. Under TV2 partitions are registered implicitly by the Produce
+    /// request and this is never called.
+    async fn add_partition_to_txn_if_needed(
+        &self,
+        topic: &Arc<str>,
+        partition: PartitionId,
+    ) -> Result<()> {
         loop {
             let mut txn_partitions = self.txn_partitions.write().await;
             match txn_partitions.begin_add(topic.as_ref(), partition) {
@@ -973,8 +1437,7 @@ impl TransactionalProducer {
             }
         }
 
-        // Send the record
-        self.send_to_partition(topic, partition, record).await
+        Ok(())
     }
 
     /// Add a partition to the current transaction.
@@ -982,8 +1445,8 @@ impl TransactionalProducer {
     /// Retries on coordinator errors with exponential backoff, re-discovering
     /// the transaction coordinator between attempts.
     async fn add_partition_to_txn(&self, topic: &str, partition: PartitionId) -> Result<()> {
-        let result = self.retry_with_coordinator("AddPartitionsToTxn", || async {
-            let (_coordinator_id, conn) = self.coordinator_connection().await?;
+        let result = self.retry_with_coordinator("AddPartitionsToTxn", |attempt| async move {
+            let (_coordinator_id, conn) = self.coordinator_connection(attempt).await?;
 
             let (producer_id, producer_epoch) = self.checked_transactional_identity()?;
 
@@ -1041,239 +1504,12 @@ impl TransactionalProducer {
         })
         .await;
 
-        match result {
+        match self.classify_transaction_result(result) {
             Err(error) if Self::is_unknown_producer_id_error(&error) => {
                 Err(self.mark_unknown_producer_id_abort_required("AddPartitionsToTxn"))
             }
             other => other,
         }
-    }
-
-    /// Send a record to a specific partition.
-    ///
-    /// Includes retry logic with exponential backoff for transient failures.
-    /// On `OutOfOrderSequenceNumber`, resets the partition sequence and rebuilds
-    /// the batch with a fresh sequence before retrying.
-    async fn send_to_partition(
-        &self,
-        topic: TopicHandle,
-        partition: PartitionId,
-        record: RoutedRecord,
-    ) -> Result<RecordMetadata> {
-        let retry_policy = &self.retry_policy;
-        let max_retries = retry_policy.max_retries;
-
-        let (producer_id, producer_epoch) = self.checked_transactional_identity()?;
-
-        // Allocate the sequence number once — retries must resend the same
-        // sequence to maintain idempotent semantics.
-        let mut sequence = self.next_sequence(topic.as_ref(), partition).await?;
-
-        // Build the record batch and request once before entering the retry loop.
-        // If encoding fails, roll back the sequence so the next send attempt
-        // starts from the correct value rather than creating a gap.
-        let mut request = match self.build_produce_request(
-            topic.as_ref(),
-            partition,
-            &record,
-            producer_id,
-            producer_epoch,
-            sequence,
-        ) {
-            Ok(req) => req,
-            Err(e) => {
-                let _ = self.identity.rollback_sequence(topic.as_ref(), partition);
-                return Err(e);
-            }
-        };
-
-        for attempt in 0..=max_retries {
-            // Re-acquire connection on each attempt (leader may have moved).
-            let send_result: Result<RecordMetadata> = async {
-                let conn = self
-                    .metadata
-                    .get_leader_connection(topic.as_ref(), partition)
-                    .await?;
-
-                // Transactions require Produce v3+ (transactional_id field).
-                let mut version = conn
-                    .negotiate_api_version(
-                        ApiKey::Produce,
-                        versions::PRODUCE_MAX,
-                        versions::PRODUCE_MIN,
-                    )
-                    .await
-                    .ok_or_else(|| {
-                        KrafkaError::protocol_kind(
-                            ProtocolErrorKind::UnknownApiVersion,
-                            "no mutually supported Produce API version; \
-                             transactional produce requires v3+",
-                        )
-                    })?;
-
-                // KIP-516: Produce v13+ sends topic UUIDs instead of names.
-                // Fill IDs from cache; fall back to v12 if any UUID is not yet known.
-                if version >= 13 && !super::fill_produce_topic_ids(&mut request, &self.metadata) {
-                    version = 12;
-                }
-
-                let encoded_body = super::encode_and_validate_produce_request(
-                    &self.config.client_id,
-                    self.config.max_request_size,
-                    version,
-                    &request,
-                )?;
-
-                let response = conn
-                    .send_request(ApiKey::Produce, version, |buf| {
-                        buf.put_slice(&encoded_body);
-                        Ok(())
-                    })
-                    .await?;
-
-                let mut buf = response;
-                let produce_response = ProduceResponse::decode_versioned(version, &mut buf)?;
-
-                for topic_response in &produce_response.responses {
-                    for partition_response in &topic_response.partition_responses {
-                        if partition_response.index == partition {
-                            if !partition_response.error_code.is_ok() {
-                                if is_fatal_transaction_error(partition_response.error_code) {
-                                    self.set_state(TransactionState::FatalError);
-                                }
-                                return Err(KrafkaError::broker(
-                                    partition_response.error_code,
-                                    format!("produce failed for {topic}-{partition}"),
-                                ));
-                            }
-
-                            self.identity
-                                .acknowledge(topic.as_ref(), partition, sequence);
-                            return Ok(RecordMetadata {
-                                topic: topic.to_string(),
-                                partition,
-                                offset: partition_response.base_offset,
-                                timestamp: partition_response.log_append_time_ms,
-                            });
-                        }
-                    }
-                }
-
-                Err(KrafkaError::protocol_kind(
-                    ProtocolErrorKind::Malformed,
-                    "partition not found in response",
-                ))
-            }
-            .await;
-
-            match send_result {
-                Ok(metadata) => return Ok(metadata),
-                Err(e) => {
-                    if Self::is_unknown_producer_id_error(&e) {
-                        return Err(
-                            self.mark_unknown_producer_id_abort_required("transactional produce")
-                        );
-                    }
-
-                    // OutOfOrderSequenceNumber means the broker's expected
-                    // sequence diverged from ours. Reset local state and
-                    // rebuild the batch with a fresh sequence before retrying.
-                    if let KrafkaError::Broker { code, .. } = &e
-                        && *code == ErrorCode::OutOfOrderSequenceNumber
-                    {
-                        if attempt >= max_retries {
-                            return Err(e);
-                        }
-
-                        warn!(
-                            topic = %topic,
-                            partition = partition,
-                            "OutOfOrderSequenceNumber, resetting sequence and rebuilding batch"
-                        );
-                        self.identity.reset_sequence(topic.as_ref(), partition);
-                        sequence = self.next_sequence(topic.as_ref(), partition).await?;
-                        request = self.build_produce_request(
-                            topic.as_ref(),
-                            partition,
-                            &record,
-                            producer_id,
-                            producer_epoch,
-                            sequence,
-                        )?;
-
-                        tokio::time::sleep(retry_policy.calculate_backoff(attempt + 1)).await;
-                        continue;
-                    }
-
-                    if !e.is_retriable() || attempt >= max_retries {
-                        return Err(e);
-                    }
-
-                    debug!(
-                        topic = %topic,
-                        partition = partition,
-                        attempt = attempt + 1,
-                        "Transient error in txn send, retrying: {}",
-                        e
-                    );
-
-                    if should_refresh_metadata_after_txn_send_error(&e)
-                        && let Err(refresh_err) = self
-                            .metadata
-                            .refresh_for_topics(Some(&[topic.as_ref()]))
-                            .await
-                    {
-                        debug!(error = %refresh_err, "Metadata refresh failed during txn retry");
-                    }
-
-                    tokio::time::sleep(retry_policy.calculate_backoff(attempt + 1)).await;
-                }
-            }
-        }
-
-        Err(KrafkaError::protocol_kind(
-            ProtocolErrorKind::Malformed,
-            format!("transactional produce retry loop exhausted after {max_retries} retries"),
-        ))
-    }
-
-    /// Build a produce request for a single record to a partition.
-    fn build_produce_request(
-        &self,
-        topic: &str,
-        partition: PartitionId,
-        record: &RoutedRecord,
-        producer_id: i64,
-        producer_epoch: i16,
-        sequence: i32,
-    ) -> Result<ProduceRequest> {
-        let mut batch_builder = RecordBatchBuilder::new()
-            .compression(self.config.compression)
-            .producer(producer_id, producer_epoch, sequence)
-            .transactional(true);
-
-        if let Some(ts) = record.timestamp {
-            batch_builder = batch_builder.base_timestamp(ts);
-        }
-
-        batch_builder = record.append_to_batch_builder(batch_builder);
-
-        let batch = batch_builder.build();
-        let batch_bytes = batch.encode()?;
-
-        Ok(ProduceRequest {
-            transactional_id: Some(self.config.transactional_id.clone()),
-            acks: Acks::All.to_i16(),
-            timeout_ms: crate::util::duration_to_millis_i32(self.config.request_timeout),
-            topic_data: vec![ProduceTopicData {
-                name: topic.to_string(),
-                topic_id: None,
-                partition_data: vec![ProducePartitionData {
-                    index: partition,
-                    records: batch_bytes,
-                }],
-            }],
-        })
     }
 
     /// Send consumer offsets within the current transaction.
@@ -1294,10 +1530,38 @@ impl TransactionalProducer {
     /// 1. `AddOffsetsToTxn` — registers the consumer group with the transaction coordinator.
     /// 2. `TxnOffsetCommit` — commits the offsets via the group coordinator, atomically
     ///    with the current transaction.
+    ///
+    /// # KIP-447 zombie fencing
+    ///
+    /// `group_metadata` must come from the `group_metadata()` accessor on the
+    /// consumer whose offsets are being committed, and must be re-read
+    /// for every transaction — the generation changes on every rebalance and a
+    /// cached value defeats the fencing entirely.
+    ///
+    /// The generation, member ID and static instance ID are sent on the
+    /// `TxnOffsetCommit` request so the group coordinator can reject a stale
+    /// committer with `ILLEGAL_GENERATION` or `FENCED_INSTANCE_ID`. Previously
+    /// these were hardcoded to `-1` / `""` / `None`, so a consumer that had
+    /// already been rebalanced away from a partition could still overwrite the
+    /// new owner's committed position — silently reprocessing or skipping
+    /// records and breaking exactly-once.
+    ///
+    /// This method takes `&ConsumerGroupMetadata` rather than a bare
+    /// `group_id: &str`; the group ID is read from the metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::TransactionAbortable`] without contacting any
+    /// broker when
+    /// [`is_fenceable()`](crate::consumer::ConsumerGroupMetadata::is_fenceable)
+    /// is `false` — the consumer has no valid generation (never joined, or
+    /// mid-rebalance), so the commit could not be fenced and must not be made
+    /// part of the transaction. Abort the transaction and retry once the
+    /// consumer has rejoined.
     pub async fn send_offsets_to_transaction(
         &self,
         offsets: &[TopicPartitionOffset],
-        group_id: &str,
+        group_metadata: &ConsumerGroupMetadata,
     ) -> Result<()> {
         let current = self.state();
         if current != TransactionState::InTransaction {
@@ -1309,12 +1573,188 @@ impl TransactionalProducer {
 
         self.ensure_transaction_can_continue("send offsets")?;
 
+        // KIP-447: without a valid generation the coordinator cannot fence a
+        // zombie committer, so refuse rather than silently committing
+        // unfenced offsets inside an "exactly-once" transaction.
+        if !group_metadata.is_fenceable() {
+            self.abort_required.store(true, Ordering::SeqCst);
+            return Err(KrafkaError::broker(
+                ErrorCode::TransactionAbortable,
+                format!(
+                    "consumer group metadata for '{}' carries no valid generation \
+                     (generation_id={}, member_id={:?}); the offset commit could not be \
+                     fenced against a zombie consumer. abort_transaction() is required.",
+                    group_metadata.group_id(),
+                    group_metadata.generation_id(),
+                    group_metadata.member_id(),
+                ),
+            ));
+        }
+
+        let group_id = group_metadata.group_id();
         let (producer_id, producer_epoch) = self.checked_transactional_identity()?;
 
-        // Phase 1: AddOffsetsToTxn — sent to transaction coordinator, with retry.
+        // Phase 1: AddOffsetsToTxn — sent to the transaction coordinator.
+        //
+        // Under TV2 (KIP-890) this is skipped. The group coordinator registers
+        // the __consumer_offsets partition with the transaction coordinator
+        // itself when it handles TxnOffsetCommit v5+, so the client sending
+        // AddOffsetsToTxn is redundant work on the critical path.
+        //
+        // Under TV1 the client must register the offsets topic before the
+        // commit, or the offsets are not covered by the transaction marker.
+        if self.requires_explicit_partition_registration() {
+            self.add_offsets_to_txn(producer_id, producer_epoch, group_id)
+                .await?;
+        }
+
+        // Phase 2: TxnOffsetCommit — sent to the group coordinator, with retry.
+        // The Java client re-discovers the group coordinator and re-enqueues
+        // on coordinator or retriable errors; we mirror that with a retry loop.
+        let commit_request = build_txn_offset_commit_request(
+            &self.config.transactional_id,
+            group_metadata,
+            producer_id,
+            producer_epoch,
+            offsets,
+        );
+
+        // TV2 moves partition registration into the group coordinator's
+        // TxnOffsetCommit handler, which only exists from v5. Committing over
+        // an older version after skipping AddOffsetsToTxn would leave the
+        // offsets outside the transaction — silently non-atomic — so require
+        // the floor rather than downgrading.
+        let toc_min_version = if self.transaction_version().is_v2() {
+            TV2_MIN_TXN_OFFSET_COMMIT_VERSION
+        } else {
+            versions::TXN_OFFSET_COMMIT_MIN
+        };
+
+        let max_retries = self.retry_policy.max_retries;
+
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                tokio::time::sleep(self.retry_policy.calculate_backoff(attempt)).await;
+            }
+
+            let result: Result<()> = async {
+                let (group_node_id, group_host, group_port) =
+                    self.find_group_coordinator(group_id, attempt).await?;
+                let group_addr = format!("{group_host}:{group_port}");
+
+                let group_conn = self
+                    .pool
+                    .get_connection_by_id(group_node_id, &group_addr)
+                    .await?;
+
+                let toc_version = group_conn
+                    .negotiate_api_version(
+                        ApiKey::TxnOffsetCommit,
+                        versions::TXN_OFFSET_COMMIT_MAX,
+                        toc_min_version,
+                    )
+                    .await
+                    .ok_or_else(|| {
+                        KrafkaError::protocol_kind(
+                            ProtocolErrorKind::UnknownApiVersion,
+                            format!(
+                                "no mutually supported TxnOffsetCommit API version (need v{toc_min_version}+)"
+                            ),
+                        )
+                    })?;
+
+                let response_bytes = group_conn
+                    .send_request(ApiKey::TxnOffsetCommit, toc_version, |buf| {
+                        commit_request.encode_versioned(toc_version, buf)
+                    })
+                    .await?;
+
+                let mut buf = response_bytes;
+                let commit_response =
+                    TxnOffsetCommitResponse::decode_versioned(toc_version, &mut buf)?;
+
+                if !commit_response.is_ok() {
+                    // Extract the first per-partition error for actionable diagnostics.
+                    for topic_result in &commit_response.topics {
+                        for part_result in &topic_result.partitions {
+                            if !part_result.error_code.is_ok() {
+                                return Err(KrafkaError::broker(
+                                    part_result.error_code,
+                                    format!(
+                                        "failed to commit offset for {}-{} in transaction",
+                                        topic_result.name, part_result.partition
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    // Fallback if is_ok was false but no individual error found
+                    return Err(KrafkaError::protocol_kind(
+                        ProtocolErrorKind::Malformed,
+                        "failed to commit offsets in transaction",
+                    ));
+                }
+
+                Ok(())
+            }
+            .await;
+
+            let result = self.classify_transaction_result(result);
+
+            if let Err(error) = &result
+                && Self::is_unknown_producer_id_error(error)
+            {
+                return Err(self.mark_unknown_producer_id_abort_required("TxnOffsetCommit"));
+            }
+            if self.state() == TransactionState::FatalError {
+                return result;
+            }
+
+            match &result {
+                Ok(()) => {
+                    debug!("Added offsets to transaction for group {}", group_id);
+                    return Ok(());
+                }
+                Err(e) if Self::needs_coordinator_refresh(e) && attempt < max_retries => {
+                    warn!(
+                        attempt,
+                        error = %e,
+                        "TxnOffsetCommit group coordinator error, re-discovering and retrying"
+                    );
+                }
+                Err(e) if e.is_retriable() && attempt < max_retries => {
+                    warn!(
+                        attempt,
+                        error = %e,
+                        "TxnOffsetCommit retriable error, retrying"
+                    );
+                }
+                Err(_) => return result,
+            }
+        }
+
+        Err(KrafkaError::protocol_kind(
+            ProtocolErrorKind::Malformed,
+            format!("TxnOffsetCommit retry loop exhausted after {max_retries} retries"),
+        ))
+    }
+
+    /// Register the consumer group's offsets topic with the transaction
+    /// coordinator via `AddOffsetsToTxn`, with coordinator retry.
+    ///
+    /// # Transaction version
+    ///
+    /// TV1 only. Under TV2 the group coordinator performs this registration
+    /// while handling `TxnOffsetCommit`, so the client does not send it.
+    async fn add_offsets_to_txn(
+        &self,
+        producer_id: i64,
+        producer_epoch: i16,
+        group_id: &str,
+    ) -> Result<()> {
         let add_offsets_result = self
-            .retry_with_coordinator("AddOffsetsToTxn", || async {
-                let (_coordinator_id, conn) = self.coordinator_connection().await?;
+            .retry_with_coordinator("AddOffsetsToTxn", |attempt| async move {
+                let (_coordinator_id, conn) = self.coordinator_connection(attempt).await?;
 
                 let add_request = AddOffsetsToTxnRequest::new(
                     &self.config.transactional_id,
@@ -1358,133 +1798,23 @@ impl TransactionalProducer {
             })
             .await;
 
-        match add_offsets_result {
+        match self.classify_transaction_result(add_offsets_result) {
             Err(error) if Self::is_unknown_producer_id_error(&error) => {
-                return Err(self.mark_unknown_producer_id_abort_required("AddOffsetsToTxn"));
+                Err(self.mark_unknown_producer_id_abort_required("AddOffsetsToTxn"))
             }
-            Err(error) => return Err(error),
-            Ok(()) => {}
+            other => other,
         }
-
-        // Phase 2: TxnOffsetCommit — sent to the group coordinator, with retry.
-        // The Java client re-discovers the group coordinator and re-enqueues
-        // on coordinator or retriable errors; we mirror that with a retry loop.
-        let mut commit_request = TxnOffsetCommitRequest::new(
-            &self.config.transactional_id,
-            group_id,
-            producer_id,
-            producer_epoch,
-        );
-
-        for tpo in offsets {
-            commit_request =
-                commit_request.add_offset(&tpo.topic, tpo.partition, tpo.next_offset, None);
-        }
-
-        let max_retries = self.retry_policy.max_retries;
-
-        for attempt in 0..=max_retries {
-            if attempt > 0 {
-                tokio::time::sleep(self.retry_policy.calculate_backoff(attempt)).await;
-            }
-
-            let result: Result<()> = async {
-                let (group_node_id, group_host, group_port) =
-                    self.find_group_coordinator(group_id).await?;
-                let group_addr = format!("{group_host}:{group_port}");
-
-                let group_conn = self
-                    .pool
-                    .get_connection_by_id(group_node_id, &group_addr)
-                    .await?;
-
-                let toc_version = group_conn
-                    .negotiate_api_version(
-                        ApiKey::TxnOffsetCommit,
-                        versions::TXN_OFFSET_COMMIT_MAX,
-                        versions::TXN_OFFSET_COMMIT_MIN,
-                    )
-                    .await
-                    .ok_or_else(|| {
-                        KrafkaError::protocol_kind(
-                            ProtocolErrorKind::UnknownApiVersion,
-                            "no mutually supported TxnOffsetCommit API version",
-                        )
-                    })?;
-
-                let response_bytes = group_conn
-                    .send_request(ApiKey::TxnOffsetCommit, toc_version, |buf| {
-                        commit_request.encode_versioned(toc_version, buf)
-                    })
-                    .await?;
-
-                let mut buf = response_bytes;
-                let commit_response =
-                    TxnOffsetCommitResponse::decode_versioned(toc_version, &mut buf)?;
-
-                if !commit_response.is_ok() {
-                    // Extract the first per-partition error for actionable diagnostics.
-                    for topic_result in &commit_response.topics {
-                        for part_result in &topic_result.partitions {
-                            if !part_result.error_code.is_ok() {
-                                return Err(KrafkaError::broker(
-                                    part_result.error_code,
-                                    format!(
-                                        "failed to commit offset for {}-{} in transaction",
-                                        topic_result.name, part_result.partition
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                    // Fallback if is_ok was false but no individual error found
-                    return Err(KrafkaError::protocol_kind(
-                        ProtocolErrorKind::Malformed,
-                        "failed to commit offsets in transaction",
-                    ));
-                }
-
-                Ok(())
-            }
-            .await;
-
-            if let Err(error) = &result
-                && Self::is_unknown_producer_id_error(error)
-            {
-                return Err(self.mark_unknown_producer_id_abort_required("TxnOffsetCommit"));
-            }
-
-            match &result {
-                Ok(()) => {
-                    debug!("Added offsets to transaction for group {}", group_id);
-                    return Ok(());
-                }
-                Err(e) if Self::needs_coordinator_refresh(e) && attempt < max_retries => {
-                    warn!(
-                        attempt,
-                        error = %e,
-                        "TxnOffsetCommit group coordinator error, re-discovering and retrying"
-                    );
-                }
-                Err(e) if e.is_retriable() && attempt < max_retries => {
-                    warn!(
-                        attempt,
-                        error = %e,
-                        "TxnOffsetCommit retriable error, retrying"
-                    );
-                }
-                Err(_) => return result,
-            }
-        }
-
-        Err(KrafkaError::protocol_kind(
-            ProtocolErrorKind::Malformed,
-            format!("TxnOffsetCommit retry loop exhausted after {max_retries} retries"),
-        ))
     }
 
     /// Find the group coordinator, returning (node_id, host, port).
-    async fn find_group_coordinator(&self, group_id: &str) -> Result<(i32, String, i32)> {
+    ///
+    /// `attempt` rotates the broker queried so a single unreachable node cannot
+    /// fail every retry (see [`find_coordinator`](Self::find_coordinator)).
+    async fn find_group_coordinator(
+        &self,
+        group_id: &str,
+        attempt: u32,
+    ) -> Result<(i32, String, i32)> {
         let brokers = self.metadata.brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::protocol_kind(
@@ -1493,7 +1823,7 @@ impl TransactionalProducer {
             ));
         }
 
-        let broker = &brokers[0];
+        let broker = &brokers[attempt as usize % brokers.len()];
         let conn = self
             .pool
             .get_connection_by_id(broker.id(), broker.address())
@@ -1539,6 +1869,11 @@ impl TransactionalProducer {
     pub async fn commit_transaction(&self) -> Result<()> {
         self.ensure_transaction_can_continue("commit transaction")?;
 
+        // Every buffered record must reach the broker before `EndTxn`, or it
+        // would be committed into a transaction the coordinator has already
+        // closed. A flush failure is surfaced as-is; the caller aborts.
+        self.accumulator.flush().await?;
+
         // Atomic CAS: InTransaction → Committing
         if let Err(actual) = self.try_transition(
             TransactionState::InTransaction,
@@ -1563,7 +1898,7 @@ impl TransactionalProducer {
                 self.txn_partitions.write().await.clear();
                 info!("Transaction committed");
             }
-            Err(e) if Self::is_abortable_transaction_error(e) => {
+            Err(e) if Self::is_abortable_transaction_error(e, self.transaction_version()) => {
                 match self.try_transition(
                     TransactionState::Committing,
                     TransactionState::InTransaction,
@@ -1627,6 +1962,13 @@ impl TransactionalProducer {
             )));
         }
 
+        // Drain buffered records first so their send futures resolve rather
+        // than hanging once the transaction is torn down. Errors are expected
+        // here (the transaction is being abandoned) and are only logged.
+        if let Err(err) = self.accumulator.flush().await {
+            debug!(error = %err, "Accumulator flush during abort_transaction failed");
+        }
+
         let needs_reinitialize = self.abort_required.swap(false, Ordering::SeqCst);
         let result = if needs_reinitialize {
             match self.end_transaction(false).await {
@@ -1649,9 +1991,37 @@ impl TransactionalProducer {
                 self.txn_partitions.write().await.clear();
                 info!("Transaction aborted");
             }
-            Err(_) => {
+            // Mirror `commit_transaction`. A retriable failure (coordinator
+            // unavailable, network blip) says nothing about the transaction's
+            // fate, so escalating to FatalError destroyed the caller's only way
+            // to finish aborting. CAS back to InTransaction so `abort_transaction`
+            // can simply be called again. The CAS may fail if a concurrent
+            // operation already moved the state, in which case leave it alone.
+            Err(e) if e.is_retriable() => {
+                match self
+                    .try_transition(TransactionState::Aborting, TransactionState::InTransaction)
+                {
+                    Ok(()) => {
+                        // Restore the abort requirement consumed above so the
+                        // retry re-initialises the identity if it needs to.
+                        if needs_reinitialize {
+                            self.abort_required.store(true, Ordering::SeqCst);
+                        }
+                        warn!(
+                            "Transaction abort failed (retriable), retry abort_transaction(): {e}"
+                        );
+                    }
+                    Err(actual) => {
+                        warn!(
+                            "Transaction abort failed (retriable): {e}; state is now {actual:?} \
+                             (concurrent operation may be in progress)"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
                 self.set_state(TransactionState::FatalError);
-                warn!("Transaction abort failed, producer is now in fatal error state");
+                warn!("Transaction abort failed (fatal): {e}; producer must be recreated");
             }
         }
 
@@ -1662,65 +2032,109 @@ impl TransactionalProducer {
     ///
     /// Retries on coordinator errors with exponential backoff, re-discovering
     /// the transaction coordinator between attempts.
+    ///
+    /// # Transaction version
+    ///
+    /// Under **TV2** the coordinator bumps the producer epoch while writing the
+    /// transaction marker and returns the new `(producer_id, producer_epoch)`
+    /// on the `EndTxn` v4+ response. Adopting it is mandatory, not
+    /// opportunistic: the epoch the producer used for this transaction is
+    /// fenced the instant the marker is written, so carrying it into the next
+    /// transaction fails with `InvalidProducerEpoch`. A TV2 response that
+    /// omits the pair is therefore rejected rather than ignored. `EndTxn` is
+    /// negotiated at v4+ so the fields are guaranteed to be on the wire.
+    ///
+    /// Under **TV1** the coordinator does not bump on completion; the epoch
+    /// only changes at `InitProducerId`. Any pair the broker does send is
+    /// still adopted, but its absence is normal and not an error.
     async fn end_transaction(&self, commit: bool) -> Result<()> {
-        self.retry_with_coordinator("EndTxn", || async {
-            let (_coordinator_id, conn) = self.coordinator_connection().await?;
+        let is_v2 = self.transaction_version().is_v2();
+        let et_min_version = if is_v2 {
+            TV2_MIN_END_TXN_VERSION
+        } else {
+            versions::END_TXN_MIN
+        };
 
-            let (producer_id, producer_epoch) = self.checked_transactional_identity()?;
+        let result = self
+            .retry_with_coordinator("EndTxn", |attempt| async move {
+                let (_coordinator_id, conn) = self.coordinator_connection(attempt).await?;
 
-            let et_version = conn
-                .negotiate_api_version(ApiKey::EndTxn, versions::END_TXN_MAX, versions::END_TXN_MIN)
-                .await
-                .ok_or_else(|| {
-                    KrafkaError::protocol_kind(
-                        ProtocolErrorKind::UnknownApiVersion,
-                        "no mutually supported EndTxn API version",
+                let (producer_id, producer_epoch) = self.checked_transactional_identity()?;
+
+                let et_version = conn
+                    .negotiate_api_version(ApiKey::EndTxn, versions::END_TXN_MAX, et_min_version)
+                    .await
+                    .ok_or_else(|| {
+                        KrafkaError::protocol_kind(
+                            ProtocolErrorKind::UnknownApiVersion,
+                            format!(
+                                "no mutually supported EndTxn API version (need v{et_min_version}+)"
+                            ),
+                        )
+                    })?;
+
+                let request = if commit {
+                    EndTxnRequest::commit(
+                        &self.config.transactional_id,
+                        producer_id,
+                        producer_epoch,
                     )
-                })?;
+                } else {
+                    EndTxnRequest::abort(&self.config.transactional_id, producer_id, producer_epoch)
+                };
 
-            let request = if commit {
-                EndTxnRequest::commit(&self.config.transactional_id, producer_id, producer_epoch)
-            } else {
-                EndTxnRequest::abort(&self.config.transactional_id, producer_id, producer_epoch)
-            };
+                let response_bytes = conn
+                    .send_request(ApiKey::EndTxn, et_version, |buf| {
+                        request.encode_versioned(et_version, buf)
+                    })
+                    .await?;
 
-            let response_bytes = conn
-                .send_request(ApiKey::EndTxn, et_version, |buf| {
-                    request.encode_versioned(et_version, buf)
-                })
-                .await?;
+                let mut buf = response_bytes;
+                let response = EndTxnResponse::decode_versioned(et_version, &mut buf)?;
 
-            let mut buf = response_bytes;
-            let response = EndTxnResponse::decode_versioned(et_version, &mut buf)?;
+                if !response.is_ok() {
+                    return Err(KrafkaError::broker(
+                        response.error_code,
+                        if commit {
+                            "failed to commit transaction"
+                        } else {
+                            "failed to abort transaction"
+                        },
+                    ));
+                }
 
-            if !response.is_ok() {
-                return Err(KrafkaError::broker(
-                    response.error_code,
-                    if commit {
-                        "failed to commit transaction"
-                    } else {
-                        "failed to abort transaction"
-                    },
-                ));
-            }
+                match (response.producer_id, response.producer_epoch) {
+                    (Some(pid), Some(epoch)) if pid >= 0 && epoch >= 0 => {
+                        debug!(
+                            pid,
+                            epoch,
+                            transaction_version = %self.transaction_version(),
+                            "Adopting broker-bumped producer identity from EndTxn response"
+                        );
+                        // Also resets every per-partition sequence to 0, matching
+                        // the broker's expectation for the new epoch.
+                        self.identity.bump_epoch(pid, epoch);
+                    }
+                    _ if is_v2 => {
+                        // The transaction did complete — the marker is written
+                        // and the old epoch is already fenced — but without the
+                        // new epoch this producer cannot start another
+                        // transaction. Surface it instead of failing on the
+                        // next begin_transaction() with a confusing
+                        // InvalidProducerEpoch.
+                        return Err(KrafkaError::protocol_kind(
+                            ProtocolErrorKind::Malformed,
+                            "EndTxn response omitted the bumped producer id/epoch that \
+                             transaction version 2 requires",
+                        ));
+                    }
+                    _ => {}
+                }
 
-            // KIP-890 (Kafka 3.9+): the broker returns the bumped PID and epoch
-            // in EndTxn v4+ responses. Apply the new identity so subsequent
-            // AddPartitionsToTxn requests use the correct epoch.
-            if let (Some(pid), Some(epoch)) = (response.producer_id, response.producer_epoch)
-                && pid >= 0
-                && epoch >= 0
-            {
-                debug!(
-                    pid,
-                    epoch, "KIP-890: applying broker-bumped epoch from EndTxn response"
-                );
-                self.identity.initialize(pid, epoch);
-            }
-
-            Ok(())
-        })
-        .await
+                Ok(())
+            })
+            .await;
+        self.classify_transaction_result(result)
     }
 
     /// Get the transactional ID.
@@ -1739,11 +2153,6 @@ impl TransactionalProducer {
     #[inline]
     pub fn producer_epoch(&self) -> i16 {
         self.identity.producer_epoch()
-    }
-
-    /// Get the next sequence number for a topic-partition.
-    async fn next_sequence(&self, topic: &str, partition: PartitionId) -> Result<i32> {
-        self.identity.next_sequence(topic, partition)
     }
 
     /// Close the transactional producer and release all resources.
@@ -1770,6 +2179,12 @@ impl TransactionalProducer {
         };
 
         let graceful_close = async {
+            // Flush and stop the accumulator so buffered batches are dispatched
+            // before sockets are torn down.
+            if let Err(err) = self.accumulator.shutdown().await {
+                warn!(error = %err, "Accumulator shutdown error during transactional close");
+            }
+
             // Let already-started sends cross the ack boundary before aborting the
             // active transaction or tearing down sockets.
             self.in_flight_barrier.wait_for(target).await;
@@ -1805,6 +2220,15 @@ impl TransactionalProducer {
         close_result
     }
 
+    /// Get the shared producer metrics handle for this producer's accumulator.
+    ///
+    /// Transactional sends are batched through a [`RecordAccumulator`], so the
+    /// same record/batch/retry counters as the plain producer are available.
+    #[inline]
+    pub fn metrics_handle(&self) -> Arc<ProducerMetrics> {
+        self.metrics.clone()
+    }
+
     /// Check if the transactional producer has been explicitly closed.
     ///
     /// Returns `true` only when [`Self::close`] has been called. A producer in
@@ -1816,8 +2240,67 @@ impl TransactionalProducer {
     }
 }
 
-/// Check if an error code is a fatal transaction error.
-fn is_fatal_transaction_error(error_code: ErrorCode) -> bool {
+/// Build the `TxnOffsetCommit` request for a transactional offset commit.
+///
+/// Carries the KIP-447 fencing triple (`generation_id`, `member_id`,
+/// `group_instance_id`) from `group_metadata` onto the wire so the group
+/// coordinator can reject a stale committer. These fields exist on
+/// `TxnOffsetCommit` v3+; on older versions the encoder drops them and the
+/// commit is unfenced, exactly as before.
+///
+/// Split out of [`TransactionalProducer::send_offsets_to_transaction`] so the
+/// field mapping is unit-testable without a live coordinator.
+fn build_txn_offset_commit_request(
+    transactional_id: &str,
+    group_metadata: &ConsumerGroupMetadata,
+    producer_id: i64,
+    producer_epoch: i16,
+    offsets: &[TopicPartitionOffset],
+) -> TxnOffsetCommitRequest {
+    let mut request = TxnOffsetCommitRequest::new(
+        transactional_id,
+        group_metadata.group_id(),
+        producer_id,
+        producer_epoch,
+    );
+    request.generation_id = group_metadata.generation_id();
+    request.member_id = group_metadata.member_id().to_string();
+    request.group_instance_id = group_metadata.group_instance_id().map(str::to_string);
+
+    for tpo in offsets {
+        request = request.add_offset(&tpo.topic, tpo.partition, tpo.next_offset, None);
+    }
+    request
+}
+
+/// Whether an error code permanently fences the producer under `version`.
+///
+/// A fatal error latches [`TransactionState::FatalError`]: the transaction
+/// cannot be aborted and the producer must be recreated. Contrast with
+/// *abortable* errors such as [`ErrorCode::TransactionAbortable`], which leave
+/// the producer usable once [`TransactionalProducer::abort_transaction`] has
+/// run — those are deliberately absent from this set.
+///
+/// # Transaction version
+///
+/// [`ErrorCode::InvalidProducerIdMapping`] is classified differently by
+/// version. It means the coordinator's `transactional.id → producer.id`
+/// mapping no longer matches the ID the producer is using.
+///
+/// - Under **TV1** this is abortable: the producer aborts and re-initializes.
+/// - Under **TV2** it is fatal. TV2 derives a transaction's identity from
+///   `(producer_id, epoch)` and bumps the epoch at every completion, so a
+///   mismatched mapping means the coordinator has already assigned this
+///   transactional ID to a different producer. Recovering in place would let
+///   two producers write under one transactional ID and would break exactly-once
+///   delivery, so KIP-890 requires the producer to give up instead.
+///
+/// All other codes classify identically under both versions.
+fn is_fatal_transaction_error(error_code: ErrorCode, version: TransactionVersion) -> bool {
+    if error_code == ErrorCode::InvalidProducerIdMapping {
+        return version.is_v2();
+    }
+
     matches!(
         error_code,
         ErrorCode::InvalidProducerEpoch
@@ -1826,17 +2309,6 @@ fn is_fatal_transaction_error(error_code: ErrorCode) -> bool {
             | ErrorCode::InvalidTxnState
             | ErrorCode::TransactionCoordinatorFenced
     )
-}
-
-fn should_refresh_metadata_after_txn_send_error(error: &KrafkaError) -> bool {
-    error.is_retriable()
-        && !matches!(
-            error,
-            KrafkaError::Broker {
-                code: ErrorCode::OutOfOrderSequenceNumber,
-                ..
-            }
-        )
 }
 
 /// Builder for TransactionalProducer.
@@ -1877,15 +2349,66 @@ impl TransactionalProducerBuilder {
         self
     }
 
-    /// Set request timeout.
+    /// Set the request timeout: how long one in-flight request may wait for its
+    /// response. Default: 30 s.
+    ///
+    /// Must be at least [`connect_timeout`](Self::connect_timeout), whose
+    /// default is 10 s — a request's clock covers establishing the connection
+    /// it is sent over, so a shorter value would expire every request before
+    /// the handshake could finish. To go below 10 s, lower `connect_timeout`
+    /// as well; `build()` returns a config error otherwise.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.config.request_timeout = timeout;
+        self
+    }
+
+    /// Set the connect timeout: how long TCP establishment to one broker may
+    /// take. Default: 10 s.
+    ///
+    /// This also acts as the floor on
+    /// [`request_timeout`](Self::request_timeout), so lowering it is what makes
+    /// a sub-10-second request timeout possible.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.config.connect_timeout = timeout;
         self
     }
 
     /// Set the maximum encoded Kafka request frame size in bytes.
     pub fn max_request_size(mut self, bytes: usize) -> Self {
         self.config.max_request_size = bytes;
+        self
+    }
+
+    /// Set the maximum batch size in bytes for the accumulator.
+    pub fn batch_size(mut self, bytes: usize) -> Self {
+        self.config.batch_size = bytes;
+        self
+    }
+
+    /// Set how long the accumulator waits for a batch to fill.
+    ///
+    /// Transactional produce requests are `acks=all`, so a linger of zero costs
+    /// a full round trip per record. Defaults to 5 ms.
+    pub fn linger(mut self, linger: Duration) -> Self {
+        self.config.linger = linger;
+        self
+    }
+
+    /// Set the total accumulator buffer memory in bytes.
+    pub fn buffer_memory(mut self, bytes: usize) -> Self {
+        self.config.buffer_memory = bytes;
+        self
+    }
+
+    /// Set the maximum time `send` blocks waiting for buffer memory.
+    pub fn max_block(mut self, max_block: Duration) -> Self {
+        self.config.max_block = max_block;
+        self
+    }
+
+    /// Set the maximum number of concurrent in-flight produce requests.
+    pub fn max_in_flight(mut self, max: usize) -> Self {
+        self.config.max_in_flight = max;
         self
     }
 
@@ -1897,7 +2420,7 @@ impl TransactionalProducerBuilder {
 
     /// Set a custom partitioner.
     ///
-    /// If not set, [`DefaultPartitioner`] is used, which applies murmur2 hashing
+    /// If not set, [`UniformStickyPartitioner`] is used, which applies murmur2 hashing
     /// for keyed messages and round-robin for unkeyed messages.
     pub fn partitioner(mut self, partitioner: impl Partitioner + 'static) -> Self {
         self.partitioner = Some(Arc::new(partitioner));
@@ -2002,7 +2525,8 @@ impl TransactionalProducerBuilder {
 
         let mut pool_config_builder = ConnectionConfig::builder()
             .client_id(&self.config.client_id)
-            .request_timeout(self.config.request_timeout);
+            .request_timeout(self.config.request_timeout)
+            .connect_timeout(self.config.connect_timeout);
 
         if let Some(ref auth) = self.config.auth {
             pool_config_builder = pool_config_builder.auth(auth.clone());
@@ -2035,20 +2559,63 @@ impl TransactionalProducerBuilder {
             self.config.transactional_id
         );
 
+        let partitioner: Arc<dyn Partitioner> = self
+            .partitioner
+            .unwrap_or_else(|| Arc::new(UniformStickyPartitioner::new()));
+        let identity = Arc::new(ProducerIdentity::new());
+        let metrics = Arc::new(ProducerMetrics::default());
+        let in_flight_barrier = Arc::new(InFlightBarrier::new());
+
+        // Transactional sends go through the same batching accumulator as
+        // the plain producer. `transactional_id` makes every ProduceRequest it
+        // builds carry the transactional ID, and the shared `identity` supplies
+        // the PID/epoch/sequence.
+        let accumulator = RecordAccumulator::spawn(
+            AccumulatorConfig {
+                batch_size: self.config.batch_size,
+                linger: self.config.linger,
+                compression: self.config.compression,
+                topic_compression: ahash::AHashMap::new(),
+                // Transactions require acks=all: the coordinator can only
+                // guarantee atomicity over fully replicated writes.
+                acks: Acks::All.to_i16(),
+                client_id: self.config.client_id.clone(),
+                request_timeout: self.config.request_timeout,
+                max_request_size: self.config.max_request_size,
+                buffer_memory: self.config.buffer_memory,
+                max_block_ms: self.config.max_block,
+                in_flight_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                    self.config.max_in_flight.max(1),
+                )),
+                interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
+                identity: Some(identity.clone()),
+                partitioner: partitioner.clone(),
+                state_store: None,
+                transactional_id: Some(self.config.transactional_id.clone()),
+            },
+            metadata.clone(),
+            self.retry_policy.clone(),
+            metrics.clone(),
+            in_flight_barrier.clone(),
+        );
+
         Ok(TransactionalProducer {
             config: self.config,
             metadata,
             pool,
-            partitioner: self
-                .partitioner
-                .unwrap_or_else(|| Arc::new(DefaultPartitioner::new())),
+            partitioner,
             state: AtomicU8::new(TransactionState::Uninitialized as u8),
+            // Overwritten by init_transactions() once the cluster's finalized
+            // transaction.version has been read; TV1 is the safe default.
+            transaction_version: AtomicU8::new(TransactionVersion::V1 as u8),
             abort_required: AtomicBool::new(false),
             coordinator_id: RwLock::new(None),
             txn_partitions: Arc::new(RwLock::new(TransactionPartitions::default())),
-            identity: ProducerIdentity::new(),
+            identity,
+            accumulator,
+            metrics,
             retry_policy: self.retry_policy,
-            in_flight_barrier: Arc::new(InFlightBarrier::new()),
+            in_flight_barrier,
             key_encoder: self.key_encoder,
             value_encoder: self.value_encoder,
         })
@@ -2062,6 +2629,23 @@ mod tests {
 
     use crate::metadata::ClusterMetadata;
     use crate::network::ConnectionPool;
+
+    /// A minimal accumulator handle for state-machine tests that never send.
+    fn test_accumulator() -> RecordAccumulatorHandle {
+        let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
+        let metadata = Arc::new(ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool,
+            Duration::from_secs(300),
+        ));
+        RecordAccumulator::spawn(
+            AccumulatorConfig::default(),
+            metadata,
+            RetryPolicy::default(),
+            Arc::new(ProducerMetrics::default()),
+            Arc::new(InFlightBarrier::new()),
+        )
+    }
 
     #[test]
     fn test_transaction_state() {
@@ -2120,17 +2704,33 @@ mod tests {
 
     #[test]
     fn test_is_fatal_transaction_error() {
-        assert!(is_fatal_transaction_error(ErrorCode::InvalidProducerEpoch));
-        assert!(is_fatal_transaction_error(ErrorCode::ProducerFenced));
-        assert!(is_fatal_transaction_error(
-            ErrorCode::TransactionCoordinatorFenced
-        ));
-        assert!(is_fatal_transaction_error(
-            ErrorCode::TransactionalIdAuthorizationFailed
-        ));
-        assert!(is_fatal_transaction_error(ErrorCode::InvalidTxnState));
-        assert!(!is_fatal_transaction_error(ErrorCode::None));
-        assert!(!is_fatal_transaction_error(ErrorCode::UnknownServerError));
+        for version in [TransactionVersion::V1, TransactionVersion::V2] {
+            assert!(is_fatal_transaction_error(
+                ErrorCode::InvalidProducerEpoch,
+                version
+            ));
+            assert!(is_fatal_transaction_error(
+                ErrorCode::ProducerFenced,
+                version
+            ));
+            assert!(is_fatal_transaction_error(
+                ErrorCode::TransactionCoordinatorFenced,
+                version
+            ));
+            assert!(is_fatal_transaction_error(
+                ErrorCode::TransactionalIdAuthorizationFailed,
+                version
+            ));
+            assert!(is_fatal_transaction_error(
+                ErrorCode::InvalidTxnState,
+                version
+            ));
+            assert!(!is_fatal_transaction_error(ErrorCode::None, version));
+            assert!(!is_fatal_transaction_error(
+                ErrorCode::UnknownServerError,
+                version
+            ));
+        }
     }
 
     #[test]
@@ -2174,22 +2774,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_should_refresh_metadata_after_txn_send_error() {
-        assert!(!should_refresh_metadata_after_txn_send_error(
-            &KrafkaError::broker(ErrorCode::OutOfOrderSequenceNumber, "sequence mismatch")
-        ));
-        assert!(should_refresh_metadata_after_txn_send_error(
-            &KrafkaError::broker(ErrorCode::LeaderNotAvailable, "leader moved")
-        ));
-        assert!(should_refresh_metadata_after_txn_send_error(
-            &KrafkaError::timeout("produce")
-        ));
-        assert!(!should_refresh_metadata_after_txn_send_error(
-            &KrafkaError::broker(ErrorCode::InvalidProducerEpoch, "fenced")
-        ));
-    }
-
     #[tokio::test]
     async fn test_builder_missing_bootstrap() {
         let result = TransactionalProducer::builder()
@@ -2216,12 +2800,15 @@ mod tests {
             },
             metadata,
             pool,
-            partitioner: Arc::new(DefaultPartitioner::new()),
+            partitioner: Arc::new(UniformStickyPartitioner::new()),
             state: AtomicU8::new(TransactionState::InTransaction as u8),
+            transaction_version: AtomicU8::new(TransactionVersion::V1 as u8),
             abort_required: AtomicBool::new(false),
             coordinator_id: RwLock::new(None),
             txn_partitions: Arc::new(RwLock::new(TransactionPartitions::default())),
-            identity: ProducerIdentity::new(),
+            identity: Arc::new(ProducerIdentity::new()),
+            accumulator: test_accumulator(),
+            metrics: Arc::new(ProducerMetrics::default()),
             retry_policy: RetryPolicy::default(),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
             key_encoder: None,
@@ -2247,8 +2834,10 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_mark_unknown_producer_id_requires_abort() {
+    // Needs a runtime: `TransactionalProducer` now owns a `RecordAccumulator`,
+    // which spawns its background task on construction.
+    #[tokio::test]
+    async fn test_mark_unknown_producer_id_requires_abort() {
         let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
         let metadata = Arc::new(ClusterMetadata::new(
             vec!["localhost:9092".to_string()],
@@ -2264,12 +2853,15 @@ mod tests {
             },
             metadata,
             pool,
-            partitioner: Arc::new(DefaultPartitioner::new()),
+            partitioner: Arc::new(UniformStickyPartitioner::new()),
             state: AtomicU8::new(TransactionState::InTransaction as u8),
+            transaction_version: AtomicU8::new(TransactionVersion::V1 as u8),
             abort_required: AtomicBool::new(false),
             coordinator_id: RwLock::new(None),
             txn_partitions: Arc::new(RwLock::new(TransactionPartitions::default())),
-            identity: ProducerIdentity::new(),
+            identity: Arc::new(ProducerIdentity::new()),
+            accumulator: test_accumulator(),
+            metrics: Arc::new(ProducerMetrics::default()),
             retry_policy: RetryPolicy::default(),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
             key_encoder: None,
@@ -2315,12 +2907,15 @@ mod tests {
             },
             metadata,
             pool,
-            partitioner: Arc::new(DefaultPartitioner::new()),
+            partitioner: Arc::new(UniformStickyPartitioner::new()),
             state: AtomicU8::new(TransactionState::InTransaction as u8),
+            transaction_version: AtomicU8::new(TransactionVersion::V1 as u8),
             abort_required: AtomicBool::new(true),
             coordinator_id: RwLock::new(None),
             txn_partitions: Arc::new(RwLock::new(TransactionPartitions::default())),
-            identity: ProducerIdentity::new(),
+            identity: Arc::new(ProducerIdentity::new()),
+            accumulator: test_accumulator(),
+            metrics: Arc::new(ProducerMetrics::default()),
             retry_policy: RetryPolicy::default(),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
             key_encoder: None,
@@ -2724,5 +3319,521 @@ mod tests {
     fn test_transactional_producer_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<TransactionalProducer>();
+    }
+
+    // ── KIP-447 zombie fencing on TxnOffsetCommit ─────────────────
+
+    /// The fencing triple must reach the wire struct; hardcoding
+    /// `-1` / `""` / `None` (the previous behaviour) disables coordinator-side
+    /// validation entirely.
+    #[test]
+    fn test_txn_offset_commit_carries_group_metadata() {
+        let metadata =
+            ConsumerGroupMetadata::new("my-group", 42, "member-7", Some("instance-3".to_string()));
+        let offsets = vec![
+            TopicPartitionOffset::new("orders", 0, 101),
+            TopicPartitionOffset::new("orders", 1, 55),
+        ];
+
+        let request = build_txn_offset_commit_request("txn-1", &metadata, 12345, 4, &offsets);
+
+        assert_eq!(request.transactional_id, "txn-1");
+        assert_eq!(request.group_id, "my-group");
+        assert_eq!(request.producer_id, 12345);
+        assert_eq!(request.producer_epoch, 4);
+        assert_eq!(request.generation_id, 42, "KIP-447 generation must be sent");
+        assert_eq!(
+            request.member_id, "member-7",
+            "KIP-447 member_id must be sent"
+        );
+        assert_eq!(
+            request.group_instance_id.as_deref(),
+            Some("instance-3"),
+            "KIP-345 static instance id must be sent"
+        );
+
+        assert_eq!(request.topics.len(), 1);
+        assert_eq!(request.topics[0].name, "orders");
+        assert_eq!(request.topics[0].partitions.len(), 2);
+        assert_eq!(request.topics[0].partitions[0].committed_offset, 101);
+        assert_eq!(request.topics[0].partitions[1].committed_offset, 55);
+    }
+
+    /// A consumer without static membership sends `None` for the instance ID
+    /// but still carries a real generation and member ID.
+    #[test]
+    fn test_txn_offset_commit_without_static_membership() {
+        let metadata = ConsumerGroupMetadata::new("g", 3, "m", None);
+        let request = build_txn_offset_commit_request("txn", &metadata, 1, 0, &[]);
+        assert_eq!(request.generation_id, 3);
+        assert_eq!(request.member_id, "m");
+        assert!(request.group_instance_id.is_none());
+    }
+
+    /// A consumer that never joined (or is mid-rebalance) cannot be fenced, so
+    /// `send_offsets_to_transaction` must refuse rather than committing
+    /// unfenced offsets inside an "exactly-once" transaction.
+    #[test]
+    fn test_unfenceable_group_metadata_is_rejected() {
+        // These are the pre-KIP-447 wire defaults the old code hardcoded.
+        assert!(!ConsumerGroupMetadata::new("g", -1, "", None).is_fenceable());
+        assert!(!ConsumerGroupMetadata::new("g", 5, "", None).is_fenceable());
+        assert!(!ConsumerGroupMetadata::new("g", -1, "m", None).is_fenceable());
+        assert!(ConsumerGroupMetadata::new("g", 0, "m", None).is_fenceable());
+    }
+
+    // ── Fatal classification on every coordinator RPC ─────────────
+
+    /// The fencing error codes must be classified fatal wherever they surface,
+    /// not only on the produce path.
+    #[test]
+    fn test_fencing_error_codes_are_fatal() {
+        for code in [
+            ErrorCode::InvalidProducerEpoch,
+            ErrorCode::ProducerFenced,
+            ErrorCode::TransactionalIdAuthorizationFailed,
+            ErrorCode::InvalidTxnState,
+            ErrorCode::TransactionCoordinatorFenced,
+        ] {
+            for version in [TransactionVersion::V1, TransactionVersion::V2] {
+                assert!(
+                    is_fatal_transaction_error(code, version),
+                    "{code:?} must be classified as a fatal transaction error under {version}"
+                );
+            }
+        }
+        assert!(!is_fatal_transaction_error(
+            ErrorCode::NotCoordinator,
+            TransactionVersion::V1
+        ));
+        assert!(!is_fatal_transaction_error(
+            ErrorCode::None,
+            TransactionVersion::V1
+        ));
+    }
+    /// Build a producer pinned to `version` with retries disabled, so tests
+    /// that exercise the network paths fail fast instead of backing off.
+    fn test_producer(version: TransactionVersion) -> TransactionalProducer {
+        let pool = Arc::new(ConnectionPool::new(ConnectionConfig::default()));
+        let metadata = Arc::new(ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            pool.clone(),
+            Duration::from_secs(300),
+        ));
+
+        TransactionalProducer {
+            config: TransactionalProducerConfig {
+                bootstrap_servers: "localhost:9092".to_string(),
+                transactional_id: "txn-test".to_string(),
+                ..TransactionalProducerConfig::default()
+            },
+            metadata,
+            pool,
+            partitioner: Arc::new(UniformStickyPartitioner::new()),
+            state: AtomicU8::new(TransactionState::InTransaction as u8),
+            transaction_version: AtomicU8::new(version as u8),
+            abort_required: AtomicBool::new(false),
+            coordinator_id: RwLock::new(None),
+            txn_partitions: Arc::new(RwLock::new(TransactionPartitions::default())),
+            identity: Arc::new(ProducerIdentity::new()),
+            accumulator: test_accumulator(),
+            metrics: Arc::new(ProducerMetrics::default()),
+            retry_policy: RetryPolicy::no_retries(),
+            in_flight_barrier: Arc::new(InFlightBarrier::new()),
+            key_encoder: None,
+            value_encoder: None,
+        }
+    }
+
+    fn support(
+        level: i16,
+        produce: i16,
+        txn_offset_commit: i16,
+        end_txn: i16,
+    ) -> BrokerTransactionSupport {
+        BrokerTransactionSupport {
+            transaction_version_level: level,
+            produce_max: Some(produce),
+            txn_offset_commit_max: Some(txn_offset_commit),
+            end_txn_max: Some(end_txn),
+        }
+    }
+
+    /// A broker that finalizes transaction.version at 2+ and can serve every
+    /// API version TV2 depends on.
+    fn tv2_broker() -> BrokerTransactionSupport {
+        support(
+            2,
+            versions::PRODUCE_MAX,
+            versions::TXN_OFFSET_COMMIT_MAX,
+            versions::END_TXN_MAX,
+        )
+    }
+
+    /// Levels 0 and 1 leave the client protocol unchanged; only level 2
+    /// switches on the KIP-890 semantics.
+    #[test]
+    fn test_transaction_version_from_feature_level() {
+        assert_eq!(
+            TransactionVersion::from_feature_level(0),
+            TransactionVersion::V1
+        );
+        assert_eq!(
+            TransactionVersion::from_feature_level(1),
+            TransactionVersion::V1
+        );
+        assert_eq!(
+            TransactionVersion::from_feature_level(2),
+            TransactionVersion::V2
+        );
+        // A future level must not silently fall back to TV1.
+        assert_eq!(
+            TransactionVersion::from_feature_level(3),
+            TransactionVersion::V2
+        );
+        // A negative level cannot appear on the wire, but must not enable TV2.
+        assert_eq!(
+            TransactionVersion::from_feature_level(-1),
+            TransactionVersion::V1
+        );
+    }
+
+    #[test]
+    fn test_transaction_version_defaults_to_v1() {
+        assert_eq!(TransactionVersion::default(), TransactionVersion::V1);
+        assert!(!TransactionVersion::V1.is_v2());
+        assert!(TransactionVersion::V2.is_v2());
+        // Round-trips through the atomic used on the producer.
+        assert_eq!(
+            TransactionVersion::from(TransactionVersion::V2 as u8),
+            TransactionVersion::V2
+        );
+        assert_eq!(
+            TransactionVersion::from(TransactionVersion::V1 as u8),
+            TransactionVersion::V1
+        );
+        // An impossible discriminant must land on the safe protocol.
+        assert_eq!(TransactionVersion::from(99), TransactionVersion::V1);
+    }
+
+    /// Every broker agrees on TV2 → the producer speaks TV2.
+    #[test]
+    fn test_negotiated_version_uniform_tv2_cluster() {
+        let cluster = [tv2_broker(), tv2_broker(), tv2_broker()];
+        assert_eq!(
+            negotiated_transaction_version(&cluster),
+            TransactionVersion::V2
+        );
+    }
+
+    /// A rolling upgrade can surface the finalized feature at level 2 while
+    /// some brokers still report level 1 or 0. Speaking TV2 to those brokers
+    /// would drop their partitions from the transaction, so the whole producer
+    /// must fall back to TV1.
+    #[test]
+    fn test_negotiated_version_takes_minimum_across_mixed_cluster() {
+        let mixed_with_v1 = [
+            tv2_broker(),
+            tv2_broker(),
+            support(
+                1,
+                versions::PRODUCE_MAX,
+                versions::TXN_OFFSET_COMMIT_MAX,
+                versions::END_TXN_MAX,
+            ),
+        ];
+        assert_eq!(
+            negotiated_transaction_version(&mixed_with_v1),
+            TransactionVersion::V1,
+            "one level-1 broker must downgrade the entire cluster to TV1"
+        );
+
+        let mixed_with_feature_absent = [
+            tv2_broker(),
+            support(
+                0,
+                versions::PRODUCE_MAX,
+                versions::TXN_OFFSET_COMMIT_MAX,
+                versions::END_TXN_MAX,
+            ),
+        ];
+        assert_eq!(
+            negotiated_transaction_version(&mixed_with_feature_absent),
+            TransactionVersion::V1
+        );
+
+        // Order must not matter — this is a minimum, not a first-wins scan.
+        let laggard_first = [
+            support(
+                0,
+                versions::PRODUCE_MAX,
+                versions::TXN_OFFSET_COMMIT_MAX,
+                versions::END_TXN_MAX,
+            ),
+            tv2_broker(),
+        ];
+        assert_eq!(
+            negotiated_transaction_version(&laggard_first),
+            TransactionVersion::V1
+        );
+    }
+
+    /// No broker could be probed — assume nothing and stay on TV1.
+    #[test]
+    fn test_negotiated_version_empty_cluster_is_v1() {
+        assert_eq!(negotiated_transaction_version(&[]), TransactionVersion::V1);
+    }
+
+    /// The finalized feature is cluster-wide metadata and can read as level 2
+    /// before every broker runs a build that serves the matching API versions.
+    /// Each TV2-dependent API is checked independently.
+    #[test]
+    fn test_negotiated_version_requires_the_tv2_api_versions() {
+        let produce_too_old = support(
+            2,
+            TV2_MIN_PRODUCE_VERSION - 1,
+            versions::TXN_OFFSET_COMMIT_MAX,
+            versions::END_TXN_MAX,
+        );
+        assert_eq!(
+            negotiated_transaction_version(&[produce_too_old]),
+            TransactionVersion::V1,
+            "TV2 needs Produce v{TV2_MIN_PRODUCE_VERSION}+ to add partitions implicitly"
+        );
+
+        let txn_offset_commit_too_old = support(
+            2,
+            versions::PRODUCE_MAX,
+            TV2_MIN_TXN_OFFSET_COMMIT_VERSION - 1,
+            versions::END_TXN_MAX,
+        );
+        assert_eq!(
+            negotiated_transaction_version(&[txn_offset_commit_too_old]),
+            TransactionVersion::V1,
+            "TV2 needs TxnOffsetCommit v{TV2_MIN_TXN_OFFSET_COMMIT_VERSION}+"
+        );
+
+        let end_txn_too_old = support(
+            2,
+            versions::PRODUCE_MAX,
+            versions::TXN_OFFSET_COMMIT_MAX,
+            TV2_MIN_END_TXN_VERSION - 1,
+        );
+        assert_eq!(
+            negotiated_transaction_version(&[end_txn_too_old]),
+            TransactionVersion::V1,
+            "TV2 needs EndTxn v{TV2_MIN_END_TXN_VERSION}+ to receive the bumped epoch"
+        );
+
+        // Exactly at the floors is enough.
+        let at_floor = support(
+            2,
+            TV2_MIN_PRODUCE_VERSION,
+            TV2_MIN_TXN_OFFSET_COMMIT_VERSION,
+            TV2_MIN_END_TXN_VERSION,
+        );
+        assert_eq!(
+            negotiated_transaction_version(&[at_floor]),
+            TransactionVersion::V2
+        );
+    }
+
+    /// A broker with no mutually supported version for a TV2 API cannot serve
+    /// TV2 even though it advertises the feature.
+    #[test]
+    fn test_negotiated_version_unnegotiable_api_is_v1() {
+        let no_produce = BrokerTransactionSupport {
+            produce_max: None,
+            ..tv2_broker()
+        };
+        assert_eq!(
+            negotiated_transaction_version(&[no_produce]),
+            TransactionVersion::V1
+        );
+    }
+
+    /// The crate's own maxima must be high enough to reach TV2, otherwise the
+    /// feature can never activate against any broker.
+    #[test]
+    fn test_crate_supports_the_tv2_api_versions() {
+        // Both sides are constants, so this is enforced at compile time:
+        // lowering any of the maxima below a TV2 floor breaks the build here
+        // rather than silently pinning every cluster to TV1.
+        const {
+            assert!(versions::PRODUCE_MAX >= TV2_MIN_PRODUCE_VERSION);
+            assert!(versions::TXN_OFFSET_COMMIT_MAX >= TV2_MIN_TXN_OFFSET_COMMIT_VERSION);
+            assert!(versions::END_TXN_MAX >= TV2_MIN_END_TXN_VERSION);
+        }
+    }
+
+    /// TV1 registers partitions explicitly; TV2 does not send the RPC at all.
+    #[tokio::test]
+    async fn test_tv2_skips_explicit_partition_registration() {
+        let tv1 = test_producer(TransactionVersion::V1);
+        assert!(
+            tv1.requires_explicit_partition_registration(),
+            "TV1 must send AddPartitionsToTxn before the first write to a partition"
+        );
+
+        let tv2 = test_producer(TransactionVersion::V2);
+        assert!(
+            !tv2.requires_explicit_partition_registration(),
+            "TV2 adds partitions implicitly via Produce; AddPartitionsToTxn must be skipped"
+        );
+    }
+
+    /// Under TV2 the produce path must not touch the transaction coordinator.
+    /// With no broker listening, a TV1 send fails during coordinator discovery
+    /// while a TV2 send never gets there — it goes straight to the accumulator.
+    #[tokio::test]
+    async fn test_tv2_produce_path_does_not_contact_the_coordinator() {
+        let tv2 = test_producer(TransactionVersion::V2);
+        tv2.identity.initialize(7, 3);
+
+        let record = ProducerRecord::new("topic", Bytes::from_static(b"value")).with_partition(0);
+        // The send cannot succeed without a broker; the assertion is about
+        // which state it left behind, not the outcome.
+        let _ = tokio::time::timeout(Duration::from_secs(2), tv2.send_record(record)).await;
+
+        assert!(
+            tv2.txn_partitions.read().await.is_empty(),
+            "TV2 must not record per-partition registration state"
+        );
+        assert!(
+            tv2.coordinator_id.read().await.is_none(),
+            "TV2 must not perform coordinator discovery on the produce path"
+        );
+    }
+
+    /// INVALID_PRODUCER_ID_MAPPING is the one code whose severity depends on
+    /// the transaction version: abortable under TV1, fatal under TV2.
+    #[test]
+    fn test_invalid_producer_id_mapping_is_fatal_only_under_tv2() {
+        assert!(
+            !is_fatal_transaction_error(
+                ErrorCode::InvalidProducerIdMapping,
+                TransactionVersion::V1
+            ),
+            "under TV1 the producer aborts and re-initializes"
+        );
+        assert!(
+            is_fatal_transaction_error(ErrorCode::InvalidProducerIdMapping, TransactionVersion::V2),
+            "under TV2 recovering in place could break exactly-once, so it is fatal"
+        );
+
+        let error = KrafkaError::broker(ErrorCode::InvalidProducerIdMapping, "test");
+        assert!(
+            TransactionalProducer::is_abortable_transaction_error(&error, TransactionVersion::V1),
+            "the TV1 classification must be abortable, not merely non-fatal"
+        );
+        assert!(
+            !TransactionalProducer::is_abortable_transaction_error(&error, TransactionVersion::V2),
+            "fatal and abortable must stay mutually exclusive"
+        );
+    }
+
+    /// TRANSACTION_ABORTABLE (KIP-890) ends the transaction but leaves the
+    /// producer reusable after an abort — it must never latch FatalError.
+    #[test]
+    fn test_transaction_abortable_is_abortable_not_fatal() {
+        let error = KrafkaError::broker(ErrorCode::TransactionAbortable, "test");
+        for version in [TransactionVersion::V1, TransactionVersion::V2] {
+            assert!(
+                !is_fatal_transaction_error(ErrorCode::TransactionAbortable, version),
+                "TRANSACTION_ABORTABLE must not be fatal under {version}"
+            );
+            assert!(
+                TransactionalProducer::is_abortable_transaction_error(&error, version),
+                "TRANSACTION_ABORTABLE must be abortable under {version}"
+            );
+        }
+        // Retrying it in place would resume a transaction the broker rejected.
+        assert!(!error.is_retriable());
+    }
+
+    /// A fatal code latches FatalError; an abortable one leaves the state
+    /// machine alone but requires an explicit abort before continuing.
+    #[tokio::test]
+    async fn test_classify_transaction_result_by_version() {
+        let tv2 = test_producer(TransactionVersion::V2);
+        let result: Result<()> = Err(KrafkaError::broker(
+            ErrorCode::InvalidProducerIdMapping,
+            "test",
+        ));
+        assert!(tv2.classify_transaction_result(result).is_err());
+        assert_eq!(tv2.state(), TransactionState::FatalError);
+        assert!(
+            !tv2.abort_required(),
+            "a fatal error is unrecoverable; abort_transaction() cannot help"
+        );
+
+        let tv1 = test_producer(TransactionVersion::V1);
+        let result: Result<()> = Err(KrafkaError::broker(
+            ErrorCode::InvalidProducerIdMapping,
+            "test",
+        ));
+        assert!(tv1.classify_transaction_result(result).is_err());
+        assert_eq!(
+            tv1.state(),
+            TransactionState::InTransaction,
+            "TV1 must not fence the producer over a PID-mapping mismatch"
+        );
+        assert!(
+            tv1.abort_required(),
+            "the transaction is over; the caller must abort before continuing"
+        );
+    }
+
+    /// The producer reports TV1 until init_transactions() has read the feature.
+    #[tokio::test]
+    async fn test_transaction_version_accessor_defaults_to_v1() {
+        let producer = test_producer(TransactionVersion::V1);
+        assert_eq!(producer.transaction_version(), TransactionVersion::V1);
+
+        let producer = test_producer(TransactionVersion::V2);
+        assert_eq!(producer.transaction_version(), TransactionVersion::V2);
+    }
+
+    /// Adopting the EndTxn epoch bump must restart every partition's sequence
+    /// space, since the broker resets its expectation to 0 for the new epoch.
+    #[test]
+    fn test_endtxn_epoch_bump_resets_sequences() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(42, 0);
+
+        // Advance a couple of partitions so a stale counter would be visible.
+        for _ in 0..5 {
+            identity.next_sequence("orders", 0).expect("allocate");
+        }
+        identity.next_sequence("payments", 1).expect("allocate");
+        assert_eq!(identity.peek_sequence("orders", 0), 5);
+        assert_eq!(identity.peek_sequence("payments", 1), 1);
+
+        // The coordinator bumped the epoch while writing the commit marker.
+        identity.bump_epoch(42, 1);
+
+        assert_eq!(identity.producer_id(), 42);
+        assert_eq!(identity.producer_epoch(), 1);
+        assert_eq!(
+            identity.peek_sequence("orders", 0),
+            0,
+            "a bumped epoch starts a fresh sequence space"
+        );
+        assert_eq!(identity.peek_sequence("payments", 1), 0);
+    }
+
+    /// On epoch overflow the coordinator hands back a new producer ID with
+    /// epoch 0 rather than a bumped epoch, so both fields must be adopted.
+    #[test]
+    fn test_endtxn_bump_adopts_new_producer_id_on_epoch_overflow() {
+        let identity = ProducerIdentity::new();
+        identity.initialize(42, i16::MAX);
+        identity.next_sequence("orders", 0).expect("allocate");
+
+        identity.bump_epoch(1000, 0);
+
+        assert_eq!(identity.producer_id(), 1000);
+        assert_eq!(identity.producer_epoch(), 0);
+        assert_eq!(identity.peek_sequence("orders", 0), 0);
     }
 }

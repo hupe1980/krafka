@@ -154,25 +154,27 @@ started once inside `KrafkaClient::build()` and shared by all attached clients.
 
 ### Connection Architecture
 
+One TCP connection per broker, shared by every client attached to the pool.
+Concurrency comes from request pipelining on that connection, not from extra
+sockets: responses are demultiplexed by correlation ID, and up to
+`max_in_flight_requests` requests may be outstanding at once.
+
 ```
   ┌───────────────────────────────────────────────────────────────┐
-  │                       ConnectionPool                           │
+  │                       ConnectionPool                          │
   │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────┐ │
-  │  │ BrokerBundle(1)  │  │ BrokerBundle(2)  │  │ BrokerBundle │ │
-  │  │ ┌──────┬──────┐  │  │ ┌──────┬──────┐  │  │   (N...)     │ │
-  │  │ │Conn 1│Conn 2│  │  │ │Conn 1│Conn 2│  │  │              │ │
-  │  │ └──────┴──────┘  │  │ └──────┴──────┘  │  │              │ │
-  │  │  Round-Robin     │  │  Round-Robin     │  │              │ │
+  │  │ BrokerConn(1)    │  │ BrokerConn(2)    │  │ BrokerConn   │ │
+  │  │  in-flight ≤ N   │  │  in-flight ≤ N   │  │   (N...)     │ │
+  │  │  correlation-id  │  │  correlation-id  │  │              │ │
+  │  │  demultiplexing  │  │  demultiplexing  │  │              │ │
   │  └──────────────────┘  └──────────────────┘  └──────────────┘ │
   └───────────────────────────────────────────────────────────────┘
 ```
 
-For extreme high-throughput (>100k msg/s per broker), configure multiple connections:
-```rust
-let config = ConnectionConfig::builder()
-    .connections_per_broker(4)  // 4 parallel connections
-    .build();
-```
+This mirrors the Apache Kafka Java client. Multiple connections per broker are
+deliberately not offered: the idempotent producer's ordering guarantee bounds
+reordering *per connection*, so a partition's in-flight batches must all travel
+the same socket.
 
 ### Priority Channels
 
@@ -298,9 +300,9 @@ where
 - Automatic refresh when cache is stale (configurable TTL)
 - Forced refresh on NotLeaderForPartition errors
 - Topic-specific refresh when subscribing
-- API version negotiation: negotiates the highest mutually supported Metadata version (v0-v8, no gaps); versions are cumulative (rack since v1, cluster_id since v2, offline replicas since v5), and v7 specifically adds leader_epoch
+- API version negotiation: negotiates the highest mutually supported Metadata version (v1-v13); versions are cumulative (rack since v1, cluster_id since v2, offline replicas since v5, leader_epoch since v7, topic UUIDs since v10)
 
-### KIP-899 Metadata Recovery (Rebootstrap)
+### Metadata Recovery (Rebootstrap)
 
 Clients default to `MetadataRecoveryStrategy::Rebootstrap`. When no broker is
 reachable for longer than the rebootstrap trigger (default 5 min), the client
@@ -308,9 +310,14 @@ automatically closes all connections, clears the metadata cache, and falls back
 to bootstrap servers to re-discover the cluster. This handles scenarios like
 full-cluster rolling restarts where every cached broker IP becomes stale.
 
-The server can also request a rebootstrap by returning `REBOOTSTRAP_REQUIRED`
-(error code 124) in a metadata response. Runtime seed-broker updates are
-supported via `update_seed_brokers()`.
+A broker can also request a rebootstrap directly by returning
+`REBOOTSTRAP_REQUIRED` (error code **129**) in the top-level `error_code` of a
+Metadata v13+ response. Against older brokers only the local timeout trigger
+applies. Runtime seed-broker updates are supported via `update_seed_brokers()`.
+
+The strategy itself comes from KIP-899 (Kafka 3.8); the timeout trigger, the
+`REBOOTSTRAP_REQUIRED` error code, and defaulting to `Rebootstrap` come from
+KIP-1102 (Kafka 4.0).
 
 ## Producer Architecture
 

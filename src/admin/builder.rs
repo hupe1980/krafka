@@ -34,9 +34,27 @@ impl AdminClientBuilder {
         self
     }
 
-    /// Set request timeout.
+    /// Set request timeout: how long one in-flight request may wait for its
+    /// response. Default: 30 s.
+    ///
+    /// Must be at least [`connect_timeout`](Self::connect_timeout), whose
+    /// default is 10 s — a request's clock covers establishing the connection
+    /// it is sent over, so a shorter value would expire every request before
+    /// the handshake could finish. To go below 10 s, lower `connect_timeout`
+    /// as well; `build()` returns a config error otherwise.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.config.request_timeout = timeout;
+        self
+    }
+
+    /// Set the connect timeout: how long TCP establishment to one broker may
+    /// take. Default: 10 s.
+    ///
+    /// This also acts as the floor on
+    /// [`request_timeout`](Self::request_timeout), so lowering it is what makes
+    /// a sub-10-second request timeout possible.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.config.connect_timeout = timeout;
         self
     }
 
@@ -135,6 +153,11 @@ impl AdminClientBuilder {
             return Err(KrafkaError::config("bootstrap.servers is required"));
         }
 
+        // `pool_owned` decides whether `AdminClient::close()` may tear the pool
+        // down. A pool borrowed from a `KrafkaClient` is shared with that
+        // client's producers and consumers and must survive admin close.
+        let pool_owned = self.shared.is_none();
+
         let (pool, metadata) = if let Some((pool, metadata)) = self.shared {
             // Use the pre-built shared pool and metadata from a KrafkaClient.
             (pool, metadata)
@@ -145,7 +168,8 @@ impl AdminClientBuilder {
             // Create connection config with client ID and auth
             let mut conn_config_builder = ConnectionConfig::builder()
                 .client_id(&self.config.client_id)
-                .request_timeout(self.config.request_timeout);
+                .request_timeout(self.config.request_timeout)
+                .connect_timeout(self.config.connect_timeout);
 
             if let Some(ref auth) = self.config.auth {
                 conn_config_builder = conn_config_builder.auth(auth.clone());
@@ -164,7 +188,10 @@ impl AdminClientBuilder {
             let metadata = Arc::new(
                 ClusterMetadata::new(bootstrap_servers, pool.clone(), Duration::from_secs(300))
                     .with_recovery_strategy(self.config.metadata_recovery_strategy)
-                    .with_rebootstrap_trigger(self.config.metadata_recovery_rebootstrap_trigger),
+                    .with_rebootstrap_trigger(self.config.metadata_recovery_rebootstrap_trigger)
+                    // Bound waits on an in-flight refresh by the request
+                    // timeout rather than the 300 s metadata max-age.
+                    .with_request_timeout(self.config.request_timeout),
             );
 
             metadata.refresh().await?;
@@ -185,6 +212,7 @@ impl AdminClientBuilder {
             config: self.config,
             metadata,
             pool,
+            pool_owned,
             closed: std::sync::atomic::AtomicBool::new(false),
         })
     }

@@ -9,12 +9,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
-  # All features except `ring` (mutually exclusive with `rustls-aws-lc-rs`).
-  # CI uses `rustls-aws-lc-rs` as the representative TLS backend.
-  # A separate `check-ring` job validates the `ring` backend in isolation.
-  ALL_FEATURES_NO_RING: >-
-    compression-all,aws-msk,schema-registry,aws-glue-schema-registry,
-    native-tls-roots,unstable-protocol,telemetry,socks5,rustls-aws-lc-rs
+  # `ring` and `rustls-aws-lc-rs` are additive: when both are enabled,
+  # `rustls-aws-lc-rs` wins (see `auth::tls::resolve_crypto_provider`).
+  # `--all-features` is therefore valid and needs no hand-maintained feature
+  # list to keep in sync.
 
 jobs:
   check:
@@ -24,18 +22,63 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Check (rustls-aws-lc-rs backend, all other features)
-        run: cargo check --all-targets --no-default-features --features "$ALL_FEATURES_NO_RING"
+      - name: Check (all features)
+        run: cargo check --all-targets --all-features
 
-  check-ring:
-    name: Check (ring backend)
+  # `ring` is the DEFAULT backend, so it is what most downstream users compile.
+  # It must be *tested*, not merely type-checked: the `cfg(not(rustls-aws-lc-rs))`
+  # arms in `auth/tls.rs` and `schema_registry/http.rs` only run here.
+  test-ring:
+    name: Test (ring backend)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Check (ring backend only, no rustls-aws-lc-rs)
-        run: cargo check --all-targets --no-default-features --features "compression-all,schema-registry,native-tls-roots,unstable-protocol,telemetry,socks5,ring"
+      - name: Test (ring backend only, no rustls-aws-lc-rs)
+        run: cargo test --all-targets --no-default-features --features "compression-all,aws-msk,schema-registry,aws-glue-schema-registry,native-tls-roots,unstable-protocol,telemetry,socks5,ring"
+
+  # Guards the minimum viable configuration. A missing crypto backend used to
+  # fail deep inside rustls; the `compile_error!` in lib.rs plus this job keep
+  # that diagnostic honest, and the second step pins feature additivity.
+  minimal-features:
+    name: Minimal features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build with only a TLS backend (no compression, no extras)
+        run: cargo check --no-default-features --features "ring"
+      - name: Both backends enabled (features must be additive)
+        run: cargo check --no-default-features --features "ring,rustls-aws-lc-rs"
+
+  # A network client's socket options, dual-stack connection racing and
+  # filesystem handling are platform-sensitive. Without these jobs non-Linux
+  # targets were never compiled at all.
+  cross-platform:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # aws-lc-rs needs a C toolchain/NASM on Windows; use the pure-Rust `ring`
+      # backend so this job stays fast and dependency-light.
+      - run: cargo test --no-default-features --features "compression,schema-registry,unstable-protocol,telemetry,socks5,ring"
+
+  supply-chain:
+    name: Supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
 
   fmt:
     name: Format
@@ -56,7 +99,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --no-default-features --features "$ALL_FEATURES_NO_RING"
+      - run: cargo clippy --all-targets --all-features
 
   test:
     name: Test
@@ -65,7 +108,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --no-default-features --features "$ALL_FEATURES_NO_RING"
+      - run: cargo test --all-features
 
   doc:
     name: Documentation
@@ -74,7 +117,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps --no-default-features --features "$ALL_FEATURES_NO_RING"
+      - run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -Dwarnings
 

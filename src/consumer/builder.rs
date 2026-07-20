@@ -102,15 +102,56 @@ impl ConsumerBuilder {
         self
     }
 
+    /// Set the maximum number of records buffered internally by
+    /// [`recv()`](super::Consumer::recv).
+    ///
+    /// When the buffer reaches this limit, `poll()` stops fetching until it
+    /// drains, bounding memory when the application consumes more slowly than
+    /// the broker delivers. `0` disables the cap. Defaults to 500.
+    pub fn max_buffered_records(mut self, max: i32) -> Self {
+        self.config.max_buffered_records = max;
+        self
+    }
+
+    /// Set how long the broker may hold a fetch request waiting for
+    /// `fetch_min_bytes` to accumulate.
+    ///
+    /// Independent of the [`poll()`](super::Consumer::poll) timeout: `poll()`
+    /// issues fetches in a loop until its own deadline, so a short value here
+    /// still supports long polling. Defaults to 500 ms, matching Java's
+    /// `fetch.max.wait.ms`.
+    pub fn fetch_max_wait(mut self, wait: Duration) -> Self {
+        self.config.fetch_max_wait = wait;
+        self
+    }
+
     /// Set maximum poll interval before consumer is considered dead.
     pub fn max_poll_interval(mut self, interval: Duration) -> Self {
         self.config.max_poll_interval = interval;
         self
     }
 
-    /// Set request timeout.
+    /// Set the request timeout: how long one in-flight request may wait for its
+    /// response. Default: 30 s.
+    ///
+    /// Must be at least [`connect_timeout`](Self::connect_timeout), whose
+    /// default is 10 s — a request's clock covers establishing the connection
+    /// it is sent over, so a shorter value would expire every request before
+    /// the handshake could finish. To go below 10 s, lower `connect_timeout`
+    /// as well; `build()` returns a config error otherwise.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.config.request_timeout = timeout;
+        self
+    }
+
+    /// Set the connect timeout: how long TCP establishment to one broker may
+    /// take. Default: 10 s.
+    ///
+    /// This also acts as the floor on
+    /// [`request_timeout`](Self::request_timeout), so lowering it is what makes
+    /// a sub-10-second request timeout possible.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.config.connect_timeout = timeout;
         self
     }
 
@@ -132,9 +173,29 @@ impl ConsumerBuilder {
         self
     }
 
-    /// Set partition assignment strategy for consumer groups.
+    /// Set a single partition assignment strategy for consumer groups,
+    /// replacing the default preference list.
+    ///
+    /// Pinning the group to one protocol means it cannot be migrated to a
+    /// different rebalance protocol without a full group restart; prefer
+    /// [`partition_assignment_strategies`](Self::partition_assignment_strategies)
+    /// where that matters.
     pub fn partition_assignment_strategy(mut self, strategy: PartitionAssignmentStrategy) -> Self {
-        self.config.partition_assignment_strategy = strategy;
+        self.config.partition_assignment_strategies = vec![strategy];
+        self
+    }
+
+    /// Set the partition assignment strategies in order of preference.
+    ///
+    /// All are advertised in JoinGroup; the coordinator selects the
+    /// most-preferred protocol that every member of the group supports. The
+    /// default is `[Range, CooperativeSticky]`, which allows a group to move
+    /// from the eager to the cooperative protocol in a single rolling bounce.
+    pub fn partition_assignment_strategies(
+        mut self,
+        strategies: impl IntoIterator<Item = PartitionAssignmentStrategy>,
+    ) -> Self {
+        self.config.partition_assignment_strategies = strategies.into_iter().collect();
         self
     }
 
@@ -405,7 +466,18 @@ impl ConsumerBuilder {
     }
 
     /// Build the consumer.
+    ///
+    /// # Errors
+    ///
+    /// All configuration constraints are enforced here, via the same
+    /// validation used by [`ConsumerConfigBuilder::build`]. See
+    /// [`ConsumerConfigBuilder::build`] for the full list.
+    ///
+    /// [`ConsumerConfigBuilder::build`]: crate::consumer::ConsumerConfigBuilder::build
     pub async fn build(self) -> Result<Consumer> {
+        // `bootstrap_servers` is optional when a pre-built client supplies the
+        // connection pool, so that one check is done here rather than in the
+        // shared validator, which has no visibility into `shared`.
         if self.shared.is_none() && self.config.bootstrap_servers.is_empty() {
             return Err(KrafkaError::config("bootstrap.servers is required"));
         }
@@ -415,19 +487,37 @@ impl ConsumerBuilder {
                  offsets will not be persisted to the broker"
             );
         }
-        if self.config.heartbeat_interval >= self.config.session_timeout {
-            return Err(KrafkaError::config(format!(
-                "heartbeat_interval ({:?}) must be less than session_timeout ({:?}) \
-                 (recommended: session_timeout / 3)",
-                self.config.heartbeat_interval, self.config.session_timeout,
-            )));
+
+        // Run the shared validator so that constraints such as
+        // `max_poll_records != 0` are enforced on this path too. Without this
+        // the only entry point that checked them was unreachable, and
+        // `max_poll_records(0)` produced a consumer that silently returned no
+        // records forever.
+        if self.shared.is_some() && self.config.bootstrap_servers.is_empty() {
+            // Satisfy the validator's non-empty check without mutating the
+            // caller's config semantics; the pool is already connected.
+            let mut probe = self.config.clone();
+            probe.bootstrap_servers = "<provided-by-client>".to_string();
+            crate::consumer::config::validate(&probe)?;
+        } else {
+            crate::consumer::config::validate(&self.config)?;
         }
+
+        // `session_timeout` and `max_poll_interval` bound two independent
+        // failure modes — coordinator liveness versus application progress —
+        // so neither has to be smaller than the other. A session timeout
+        // larger than the poll interval is unusual enough to flag, but it is
+        // a legitimate configuration and must not block startup.
         if self.config.session_timeout > self.config.max_poll_interval {
-            return Err(KrafkaError::config(format!(
-                "session_timeout ({:?}) must be <= max_poll_interval ({:?})",
-                self.config.session_timeout, self.config.max_poll_interval,
-            )));
+            tracing::warn!(
+                session_timeout = ?self.config.session_timeout,
+                max_poll_interval = ?self.config.max_poll_interval,
+                "session_timeout exceeds max_poll_interval; a stalled application \
+                 will be removed from the group by the poll-interval check before \
+                 the coordinator's session timer would notice"
+            );
         }
+
         let mut consumer = Consumer::new(self.config, self.shared).await?;
         if let Some(listener) = self.rebalance_listener {
             consumer.rebalance_listener = listener;
@@ -577,7 +667,7 @@ mod tests {
             .partition_assignment_strategy(PartitionAssignmentStrategy::RoundRobin);
 
         assert_eq!(
-            builder.config.partition_assignment_strategy,
+            builder.config.partition_assignment_strategy(),
             PartitionAssignmentStrategy::RoundRobin
         );
     }
@@ -707,5 +797,135 @@ mod tests {
             .group_id("test-group");
         // The builder should have no group field; only group_coordinator is used
         assert!(builder.config.group_id.is_some());
+    }
+
+    // ── Builder validation ───────────────────────────────────────────────
+    //
+    // These constraints previously lived only in `ConsumerConfigBuilder::build`,
+    // which no public API could reach, so `Consumer::builder()` accepted values
+    // that produce a broken consumer.
+
+    #[tokio::test]
+    async fn test_builder_rejects_zero_max_poll_records() {
+        // 0 truncates every fetched batch to nothing: the consumer reads from
+        // the broker and returns no records, forever, with no error.
+        let result = Consumer::builder()
+            .bootstrap_servers("localhost:9092")
+            .max_poll_records(0)
+            .build()
+            .await;
+
+        let err = result.err().expect("max_poll_records(0) must be rejected");
+        assert!(
+            err.to_string().contains("max_poll_records"),
+            "error should name the offending setting, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_max_poll_records_below_minus_one() {
+        let result = Consumer::builder()
+            .bootstrap_servers("localhost:9092")
+            .max_poll_records(-2)
+            .build()
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_negative_max_buffered_records() {
+        let result = Consumer::builder()
+            .bootstrap_servers("localhost:9092")
+            .max_buffered_records(-1)
+            .build()
+            .await;
+
+        let err = result.err().expect("negative buffer cap must be rejected");
+        assert!(err.to_string().contains("max_buffered_records"));
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_fetch_min_above_fetch_max() {
+        let result = Consumer::builder()
+            .bootstrap_servers("localhost:9092")
+            .fetch_min_bytes(1000)
+            .fetch_max_bytes(100)
+            .build()
+            .await;
+
+        let err = result.err().expect("min above max must be rejected");
+        assert!(err.to_string().contains("fetch_min_bytes"));
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_empty_group_id() {
+        let result = Consumer::builder()
+            .bootstrap_servers("localhost:9092")
+            .group_id("")
+            .build()
+            .await;
+
+        let err = result.err().expect("empty group id must be rejected");
+        assert!(err.to_string().contains("group_id"));
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_empty_assignment_strategy_list() {
+        let result = Consumer::builder()
+            .bootstrap_servers("localhost:9092")
+            .partition_assignment_strategies(Vec::new())
+            .build()
+            .await;
+
+        let err = result.err().expect("empty strategy list must be rejected");
+        assert!(err.to_string().contains("partition_assignment_strategies"));
+    }
+
+    #[tokio::test]
+    async fn test_builder_accepts_session_timeout_above_max_poll_interval() {
+        // These bound two independent failure modes — coordinator liveness
+        // versus application progress — so neither has to be smaller than the
+        // other. This is a warning, not a rejection. The build still fails
+        // here because there is no broker to connect to, but it must not fail
+        // with a *config* error.
+        let result = Consumer::builder()
+            .bootstrap_servers("localhost:1")
+            .session_timeout(Duration::from_secs(120))
+            .max_poll_interval(Duration::from_secs(60))
+            .heartbeat_interval(Duration::from_secs(3))
+            .build()
+            .await;
+
+        if let Err(e) = result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("must be <= max_poll_interval"),
+                "session_timeout > max_poll_interval must not be a config error, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_builder_default_strategies_allow_protocol_migration() {
+        // Advertising both is what lets a group move from the eager to the
+        // cooperative protocol in one rolling bounce.
+        let builder = Consumer::builder();
+        assert_eq!(
+            builder.config.partition_assignment_strategies(),
+            &[
+                PartitionAssignmentStrategy::Range,
+                PartitionAssignmentStrategy::CooperativeSticky
+            ]
+        );
+    }
+
+    #[test]
+    fn test_builder_single_strategy_replaces_list() {
+        let builder =
+            Consumer::builder().partition_assignment_strategy(PartitionAssignmentStrategy::Sticky);
+        assert_eq!(
+            builder.config.partition_assignment_strategies(),
+            &[PartitionAssignmentStrategy::Sticky]
+        );
     }
 }

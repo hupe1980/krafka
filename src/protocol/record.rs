@@ -3,6 +3,7 @@
 //! This module implements the Kafka record batch format (v2),
 //! which is used for both producing and consuming messages.
 
+use super::decode_capacity;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::error::{KrafkaError, ProtocolErrorKind, Result};
@@ -590,7 +591,7 @@ impl Record {
                 ),
             ));
         }
-        let mut headers = Vec::with_capacity(header_count);
+        let mut headers = Vec::with_capacity(decode_capacity(header_count, buf.remaining()));
         for _ in 0..header_count {
             headers.push(RecordHeader::decode(&mut rbuf)?);
         }
@@ -974,7 +975,9 @@ impl RecordBatch {
                 ),
             ));
         }
-        let mut records = Vec::with_capacity(records_len);
+        // Bound the pre-allocation by the *decompressed* record bytes actually
+        // present — `buf` has already been split past this batch.
+        let mut records = Vec::with_capacity(decode_capacity(records_len, records_buf.len()));
         for _ in 0..records_len {
             records.push(Record::decode(&mut records_buf)?);
         }
@@ -1001,22 +1004,36 @@ impl RecordBatch {
     /// accommodate edge cases. Future versions may make this runtime-configurable.
     pub const MAX_DECOMPRESSED_SIZE: usize = 128 * 1024 * 1024;
 
+    /// Decompress the record section of a batch.
+    ///
+    /// `data` is taken as `&Bytes` rather than `&[u8]` so the uncompressed case
+    /// — the common one on the consumer hot path — is a refcount bump on the
+    /// already-sliced, CRC-covered region instead of a full copy of the record
+    /// payload. The compression arms deref to `&[u8]` transparently.
     fn decompress_records(
         compression: Compression,
-        data: &[u8],
+        data: &Bytes,
         _max_decompressed_size: usize,
     ) -> Result<Bytes> {
+        // Borrowed view for the codec arms, which all want `&[u8]`.
+        #[allow(unused_variables)]
+        let compressed: &[u8] = data.as_ref();
         #[allow(unused_variables)]
         let result: Vec<u8> = match compression {
-            Compression::None => return Ok(Bytes::copy_from_slice(data)),
+            // Zero-copy: the caller already holds a `Bytes` slice of the
+            // CRC-covered region, so share it instead of copying.
+            Compression::None => return Ok(data.clone()),
             #[cfg(feature = "gzip")]
             Compression::Gzip => {
                 use flate2::read::GzDecoder;
                 use std::io::Read;
 
-                let decoder = GzDecoder::new(data);
+                let decoder = GzDecoder::new(compressed);
                 let mut limited = decoder.take(_max_decompressed_size as u64 + 1);
-                let capacity = data.len().saturating_mul(3).min(_max_decompressed_size);
+                let capacity = compressed
+                    .len()
+                    .saturating_mul(3)
+                    .min(_max_decompressed_size);
                 let mut decompressed = Vec::with_capacity(capacity);
                 limited
                     .read_to_end(&mut decompressed)
@@ -1033,7 +1050,7 @@ impl RecordBatch {
             Compression::Snappy => {
                 // Pre-check decompressed length from snappy header before allocating.
                 // snap::raw::decompress_len reads the varint length prefix without decompressing.
-                let declared_len = snap::raw::decompress_len(data)
+                let declared_len = snap::raw::decompress_len(compressed)
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
                 if declared_len > _max_decompressed_size {
                     return Err(KrafkaError::compression(format!(
@@ -1043,7 +1060,7 @@ impl RecordBatch {
                 }
                 let mut decoder = snap::raw::Decoder::new();
                 decoder
-                    .decompress_vec(data)
+                    .decompress_vec(compressed)
                     .map_err(|e| KrafkaError::compression(e.to_string()))?
             }
             #[cfg(not(feature = "snappy"))]
@@ -1055,9 +1072,12 @@ impl RecordBatch {
             #[cfg(feature = "lz4")]
             Compression::Lz4 => {
                 use std::io::Read;
-                let decoder = lz4_flex::frame::FrameDecoder::new(data);
+                let decoder = lz4_flex::frame::FrameDecoder::new(compressed);
                 let mut limited = decoder.take(_max_decompressed_size as u64 + 1);
-                let capacity = data.len().saturating_mul(4).min(_max_decompressed_size);
+                let capacity = compressed
+                    .len()
+                    .saturating_mul(4)
+                    .min(_max_decompressed_size);
                 let mut decompressed = Vec::with_capacity(capacity);
                 limited
                     .read_to_end(&mut decompressed)
@@ -1075,10 +1095,13 @@ impl RecordBatch {
                 // Use streaming decoder with size limit instead of decode_all
                 // to prevent decompression bombs from causing OOM.
                 use std::io::Read;
-                let decoder = zstd::Decoder::new(data)
+                let decoder = zstd::Decoder::new(compressed)
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
                 let mut limited = decoder.take(_max_decompressed_size as u64 + 1);
-                let capacity = data.len().saturating_mul(3).min(_max_decompressed_size);
+                let capacity = compressed
+                    .len()
+                    .saturating_mul(3)
+                    .min(_max_decompressed_size);
                 let mut decompressed = Vec::with_capacity(capacity);
                 limited
                     .read_to_end(&mut decompressed)
@@ -1429,9 +1452,16 @@ impl LazyRecordBatch {
     /// Eagerly decode all records into a Vec.
     ///
     /// This is equivalent to `records().collect()` but with proper error handling.
+    ///
+    /// Returns [`ProtocolErrorKind::TruncatedFrame`] if the batch header
+    /// declares more records than `raw_records` actually carries.
     pub fn decode_all(&self) -> Result<Vec<Record>> {
-        let mut records =
-            Vec::with_capacity((self.records_count as usize).min(super::MAX_DECODE_ARRAY_LEN));
+        // The declared count is attacker-controlled; every record occupies at
+        // least one wire byte, so the raw record bytes bound the allocation.
+        let mut records = Vec::with_capacity(decode_capacity(
+            (self.records_count as usize).min(super::MAX_DECODE_ARRAY_LEN),
+            self.raw_records.len(),
+        ));
         for result in self.records() {
             records.push(result?);
         }
@@ -1466,21 +1496,42 @@ pub struct LazyRecordIterator {
 impl Iterator for LazyRecordIterator {
     type Item = Result<Record>;
 
+    /// Yields the next record, or `Some(Err(TruncatedFrame))` if the batch
+    /// declared more records than its bytes actually carry.
+    ///
+    /// Silently stopping at the end of the buffer would make this lazy path
+    /// disagree with the eager [`RecordBatch::decode`], which loops exactly
+    /// `records_count` times and errors on truncation. The batch CRC does not
+    /// protect against this: it covers the (possibly compressed) record bytes,
+    /// so a malicious broker can craft a matching CRC for a short batch.
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 || self.buf.is_empty() {
+        if self.remaining == 0 {
             return None;
+        }
+        if self.buf.is_empty() {
+            // Declared count outlives the available bytes — surface it rather
+            // than silently truncating the batch.
+            self.remaining = 0;
+            return Some(Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
+                "record batch declares more records than the buffer contains",
+            )));
         }
         self.remaining -= 1;
         Some(Record::decode(&mut self.buf))
     }
 
+    /// The declared count is an upper bound only: iteration may end early with
+    /// an error, so the lower bound is `0`.
+    ///
+    /// This deliberately does not implement [`ExactSizeIterator`] — the exact
+    /// length is not knowable without decoding, and claiming otherwise would
+    /// mislead `collect()` preallocation.
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
+        (0, Some(self.remaining))
     }
 }
-
-impl ExactSizeIterator for LazyRecordIterator {}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -1837,7 +1888,7 @@ mod tests {
 
         let result = RecordBatch::decompress_records(
             Compression::Snappy,
-            &fake_snappy,
+            &Bytes::from(fake_snappy),
             RecordBatch::MAX_DECOMPRESSED_SIZE,
         );
         assert!(result.is_err());
@@ -2024,5 +2075,125 @@ mod tests {
         let mut buf = BytesMut::new();
         b.try_encode(&mut buf).unwrap();
         assert_eq!(buf.len(), 4 + 3); // 4-byte i32 length + 3 bytes data
+    }
+
+    // ── Regression: LazyRecordIterator truncation ──────────────────────
+
+    /// Build a `LazyRecordBatch` whose header over-declares `records_count`
+    /// relative to the record bytes it actually carries.
+    fn short_lazy_batch(declared: i32, actual: usize) -> LazyRecordBatch {
+        let mut raw = BytesMut::new();
+        for i in 0..actual {
+            Record::new(Some(Bytes::from("k")), Some(Bytes::from("v")))
+                .with_offset_delta(i as i32)
+                .encode(&mut raw)
+                .unwrap();
+        }
+        LazyRecordBatch {
+            base_offset: 0,
+            partition_leader_epoch: -1,
+            attributes: RecordBatchAttributes::default(),
+            last_offset_delta: 0,
+            base_timestamp: 0,
+            max_timestamp: 0,
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+            records_count: declared,
+            raw_records: raw.freeze(),
+        }
+    }
+
+    /// A batch declaring more records than it carries must surface an error
+    /// rather than silently yielding a short record list.
+    ///
+    /// The batch CRC is no defence here: it covers the (possibly compressed)
+    /// record bytes, so a malicious broker can craft a matching CRC for a
+    /// deliberately short batch.
+    #[test]
+    fn lazy_iterator_errors_on_truncated_records() {
+        let lazy = short_lazy_batch(100, 3);
+        let results: Vec<_> = lazy.records().collect();
+
+        // Three good records, then exactly one error, then the iterator stops.
+        assert_eq!(results.len(), 4, "expected 3 records + 1 error");
+        for r in results.iter().take(3) {
+            assert!(r.is_ok(), "first three records must decode");
+        }
+        let err = results[3].as_ref().unwrap_err();
+        assert!(
+            format!("{err}").contains("more records than"),
+            "expected a truncated-frame error, got: {err}"
+        );
+    }
+
+    /// `decode_all` propagates that error instead of returning a short Vec.
+    #[test]
+    fn lazy_decode_all_errors_on_truncated_records() {
+        assert!(short_lazy_batch(100, 3).decode_all().is_err());
+    }
+
+    /// The lazy and eager paths must agree on identical bytes. Previously the
+    /// eager `RecordBatch::decode` errored while the lazy iterator returned
+    /// `Ok(3 records)`.
+    #[test]
+    fn lazy_and_eager_agree_on_truncated_batch() {
+        let lazy = short_lazy_batch(100, 3);
+        let mut raw = lazy.raw_records.clone();
+
+        // Eager: decode exactly `records_count` records from the same bytes.
+        let mut eager_err = false;
+        for _ in 0..100 {
+            if Record::decode(&mut raw).is_err() {
+                eager_err = true;
+                break;
+            }
+        }
+        assert!(eager_err, "eager path must reject the truncated batch");
+        assert!(
+            lazy.decode_all().is_err(),
+            "lazy path must reject it too — the two must not disagree"
+        );
+    }
+
+    /// `size_hint` must not over-promise: iteration can stop early with an
+    /// error, so the lower bound is 0. `LazyRecordIterator` deliberately does
+    /// not implement `ExactSizeIterator`.
+    #[test]
+    fn lazy_iterator_size_hint_lower_bound_is_zero() {
+        let lazy = short_lazy_batch(100, 3);
+        let it = lazy.records();
+        assert_eq!(it.size_hint(), (0, Some(100)));
+    }
+
+    /// An honest batch still iterates exactly and without error.
+    #[test]
+    fn lazy_iterator_exact_batch_has_no_error() {
+        let lazy = short_lazy_batch(3, 3);
+        let records: Vec<_> = lazy.records().collect();
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().all(|r| r.is_ok()));
+        assert_eq!(lazy.decode_all().unwrap().len(), 3);
+    }
+
+    // ── Regression: uncompressed decompress path is zero-copy ──────────
+
+    /// For `Compression::None` the returned `Bytes` must share the caller's
+    /// allocation rather than being a fresh copy.
+    #[test]
+    fn decompress_none_is_zero_copy() {
+        let src = Bytes::from(vec![7u8; 4096]);
+        let out = RecordBatch::decompress_records(
+            Compression::None,
+            &src,
+            RecordBatch::MAX_DECOMPRESSED_SIZE,
+        )
+        .unwrap();
+        assert_eq!(out, src);
+        assert_eq!(
+            out.as_ptr(),
+            src.as_ptr(),
+            "uncompressed path must not copy the record payload"
+        );
     }
 }

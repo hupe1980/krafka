@@ -163,8 +163,11 @@ pub enum ApiKey {
     GetTelemetrySubscriptions = 71,
     /// Push telemetry (KIP-714).
     PushTelemetry = 72,
-    /// List client metrics resources (KIP-714).
-    ListClientMetricsResources = 74,
+    /// List config resources (KIP-1142).
+    ///
+    /// Kafka 4.1 renamed this API from `ListClientMetricsResources`; v0 keeps
+    /// the old client-metrics-only semantics, v1 lists any config resource type.
+    ListConfigResources = 74,
     /// Describe topic partitions (KIP-966).
     DescribeTopicPartitions = 75,
     /// Share group heartbeat (KIP-932).
@@ -180,6 +183,88 @@ pub enum ApiKey {
 }
 
 impl ApiKey {
+    /// Lowest response version whose body **begins** with a `throttle_time_ms`
+    /// INT32, or `None` if this API never puts it first.
+    ///
+    /// Kafka answers a quota-throttled client by telling it how long to wait
+    /// (KIP-219), and every API below carries that number as the first field
+    /// after the response header. That regularity is what lets one hook in the
+    /// connection layer honour the throttle for *all* of them, rather than each
+    /// of the ~50 call sites having to remember to forward a field it otherwise
+    /// has no use for.
+    ///
+    /// Excluded, deliberately:
+    ///
+    /// - `Produce` — `throttle_time_ms` is the response's *trailing* field, so
+    ///   it cannot be read without decoding the whole body. The produce paths
+    ///   forward it themselves.
+    /// - `ApiVersions`, `SaslAuthenticate`, `OffsetDelete`, and the delegation
+    ///   token APIs — the throttle sits behind an `error_code` or other
+    ///   leading fields.
+    /// - `SaslHandshake`, `WriteTxnMarkers`, `DescribeQuorum` and the
+    ///   controller-internal APIs — no throttle field at all.
+    ///
+    /// Versions below the returned one predate the field and must not be
+    /// peeked: their first four bytes are an array length or an error code.
+    #[must_use]
+    pub fn leading_throttle_time_min_version(self) -> Option<i16> {
+        let min = match self {
+            Self::Fetch => 1,
+            Self::ListOffsets => 2,
+            Self::Metadata | Self::OffsetCommit | Self::OffsetFetch => 3,
+            Self::FindCoordinator
+            | Self::JoinGroup
+            | Self::Heartbeat
+            | Self::LeaveGroup
+            | Self::SyncGroup
+            | Self::DescribeGroups
+            | Self::ListGroups
+            | Self::DeleteTopics
+            | Self::DescribeAcls
+            | Self::CreateAcls
+            | Self::DeleteAcls
+            | Self::AlterReplicaLogDirs
+            | Self::DescribeLogDirs => 1,
+            Self::CreateTopics | Self::OffsetForLeaderEpoch => 2,
+            Self::DeleteRecords
+            | Self::InitProducerId
+            | Self::AddPartitionsToTxn
+            | Self::AddOffsetsToTxn
+            | Self::EndTxn
+            | Self::TxnOffsetCommit
+            | Self::DescribeConfigs
+            | Self::AlterConfigs
+            | Self::CreatePartitions
+            | Self::DeleteGroups
+            | Self::ElectLeaders
+            | Self::IncrementalAlterConfigs
+            | Self::AlterPartitionReassignments
+            | Self::ListPartitionReassignments
+            | Self::DescribeClientQuotas
+            | Self::AlterClientQuotas
+            | Self::DescribeUserScramCredentials
+            | Self::AlterUserScramCredentials
+            | Self::UpdateFeatures
+            | Self::DescribeCluster
+            | Self::DescribeProducers
+            | Self::DescribeTransactions
+            | Self::ListTransactions
+            | Self::AllocateProducerIds
+            | Self::ConsumerGroupHeartbeat
+            | Self::ConsumerGroupDescribe
+            | Self::GetTelemetrySubscriptions
+            | Self::PushTelemetry
+            | Self::ListConfigResources
+            | Self::DescribeTopicPartitions
+            | Self::ShareGroupHeartbeat
+            | Self::ShareGroupDescribe
+            | Self::ShareFetch
+            | Self::ShareAcknowledge => 0,
+            _ => return None,
+        };
+        Some(min)
+    }
+
     /// Create an ApiKey from a raw i16 value.
     #[inline]
     pub fn from_i16(key: i16) -> Self {
@@ -256,7 +341,7 @@ impl ApiKey {
             69 => Self::ConsumerGroupDescribe,
             71 => Self::GetTelemetrySubscriptions,
             72 => Self::PushTelemetry,
-            74 => Self::ListClientMetricsResources,
+            74 => Self::ListConfigResources,
             75 => Self::DescribeTopicPartitions,
             76 => Self::ShareGroupHeartbeat,
             77 => Self::ShareGroupDescribe,
@@ -342,7 +427,7 @@ impl ApiKey {
             Self::ConsumerGroupDescribe => 69,
             Self::GetTelemetrySubscriptions => 71,
             Self::PushTelemetry => 72,
-            Self::ListClientMetricsResources => 74,
+            Self::ListConfigResources => 74,
             Self::DescribeTopicPartitions => 75,
             Self::ShareGroupHeartbeat => 76,
             Self::ShareGroupDescribe => 77,
@@ -431,7 +516,7 @@ impl ApiKey {
             Self::ConsumerGroupDescribe => 0,
             Self::GetTelemetrySubscriptions => 0,
             Self::PushTelemetry => 0,
-            Self::ListClientMetricsResources => 0,
+            Self::ListConfigResources => 0,
             Self::DescribeTopicPartitions => 0,
             Self::ShareGroupHeartbeat => 0,
             Self::ShareGroupDescribe => 0,
@@ -813,7 +898,7 @@ impl ApiVersionsResponse {
                 ),
             ));
         }
-        let mut features = Vec::with_capacity(items);
+        let mut features = Vec::with_capacity(super::decode_capacity(items, buf.len()));
         for _ in 0..items {
             let name = super::non_nullable_string(
                 "feature name",
@@ -885,7 +970,7 @@ impl ApiVersionsResponse {
                 ),
             ));
         }
-        let mut features = Vec::with_capacity(items);
+        let mut features = Vec::with_capacity(super::decode_capacity(items, buf.len()));
         for _ in 0..items {
             let name = super::non_nullable_string(
                 "finalized feature name",

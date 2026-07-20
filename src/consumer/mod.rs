@@ -11,13 +11,35 @@
 //! Krafka provides **at-least-once** delivery semantics by default, which is the
 //! standard Kafka consumer behavior:
 //!
-//! 1. Messages are delivered to the application via `poll()`
-//! 2. Offsets are committed after processing (auto-commit or manual)
+//! 1. Messages are delivered to the application via `poll()` or `recv()`
+//! 2. Offsets are committed after delivery (auto-commit or manual)
 //! 3. If the consumer crashes after processing but before commit, messages may
 //!    be redelivered on restart
 //!
 //! This is the safest default as it ensures no message loss. For use cases that
 //! cannot tolerate duplicates, applications should implement idempotent processing.
+//!
+//! ## How the guarantee is upheld
+//!
+//! Two properties make "no message loss" hold rather than merely being the
+//! intent:
+//!
+//! - **Only delivered records are ever acknowledged.** A single `poll()`
+//!   fetches a batch, but `recv()` hands records out one at a time and keeps
+//!   the remainder in an internal buffer. Commits are clamped to the lowest
+//!   offset still sitting in that buffer, so records that were fetched but
+//!   never given to the application are never committed. A crash re-delivers
+//!   them.
+//! - **A cancelled `poll()` never loses records.** The fetch position is
+//!   advanced as the very last step of `poll()`, after the records are ready
+//!   to be returned and with nothing awaited in between. Dropping the future
+//!   — a `tokio::time::timeout` firing, or a losing `select!` branch — leaves
+//!   the position untouched, so the records are simply fetched again.
+//!
+//! Note that auto-commit still acknowledges records once they have been
+//! *delivered*, not once they have been *processed*. If the application needs
+//! the commit to reflect completed processing, disable auto-commit and call
+//! [`Consumer::commit`] after processing.
 //!
 //! ## Controlling Commit Behavior
 //!
@@ -39,6 +61,7 @@ mod builder;
 mod config;
 mod fetch_session;
 mod group;
+mod group_metadata;
 mod lock_order;
 mod offset;
 mod record;
@@ -59,8 +82,9 @@ use group::ErasedRebalanceListener;
 pub use group::{
     ConsumerGroup, ConsumerRebalanceListener, CooperativeStickyAssignor, GroupCoordinator,
     GroupMember, GroupState, HeartbeatController, HeartbeatStatus, MemberAssignment,
-    NoOpRebalanceListener, PartitionAssignor, RangeAssignor, RoundRobinAssignor,
+    NoOpRebalanceListener, PartitionAssignor, RangeAssignor, RoundRobinAssignor, StickyAssignor,
 };
+pub use group_metadata::ConsumerGroupMetadata;
 pub use offset::{OffsetAndMetadata, OffsetStore, ResetOffset};
 pub use record::{ConsumerRecord, ConsumerRecords, TopicPartition};
 pub use stream::ConsumerStream;
@@ -78,7 +102,7 @@ use tracing::{debug, error, info, warn};
 use lock_order::LeveledRwLock;
 
 use crate::error::{KrafkaError, ProtocolErrorKind, RecvError, Result};
-use crate::metadata::{BrokerInfo, ClusterMetadata, TopicInfo};
+use crate::metadata::{BrokerInfo, ClusterMetadata, TopicInfo, broker_info_for_node};
 use crate::metrics::{ConnectionMetrics, ConsumerMetrics};
 use crate::network::{ConnectionConfig, ConnectionPool};
 use crate::protocol::{
@@ -187,6 +211,28 @@ struct PartitionState {
     /// resolved or was never retried. Prevents retry storms when offset
     /// resolution fails persistently (e.g. broker unavailable).
     offset_retry_backoff: Option<(Instant, Duration)>,
+    /// Leader epoch of the record batch the fetch position last advanced
+    /// through (KIP-320).
+    ///
+    /// Sent back to the broker as `last_fetched_epoch` so it can verify that
+    /// the client's `(position, epoch)` pair actually exists in its log. When
+    /// it does not — the signature of an unclean leader election — the broker
+    /// answers with a `DivergingEpoch` instead of records.
+    ///
+    /// `None` means the epoch at the current position is genuinely unknown:
+    /// a freshly assigned partition, or one that was just repositioned by
+    /// `seek()` or an offset reset. The request then carries `-1`, which
+    /// disables divergence detection until the first batch is consumed.
+    last_fetched_epoch: Option<i32>,
+    /// Whether the current fetch position has been checked against the
+    /// leader's log with `OffsetForLeaderEpoch`.
+    ///
+    /// `false` on a fresh assignment and after every reposition, so the
+    /// consumer validates before its first fetch from that position rather
+    /// than waiting for the broker to reject it. This is what closes the
+    /// window in which an unclean leader election silently hands the consumer
+    /// records the new leader never had.
+    position_validated: bool,
 }
 
 /// Cluster metadata snapshot returned by [`Consumer::fetch_metadata`].
@@ -350,6 +396,100 @@ pub struct Consumer {
     value_decoder: Option<Arc<dyn crate::schema_registry::SchemaDecoder>>,
 }
 
+/// A pending advance of a partition's fetch position, tagged with the position
+/// the fetch was issued from.
+///
+/// Carrying `requested` is what makes a fetch response verifiable after the
+/// fact. A response is only meaningful relative to the position that produced
+/// it: if the application called `seek()` while the fetch was in flight, the
+/// records in the response are from the *old* position and applying `next`
+/// would move the consumer back to where the seek was supposed to take it away
+/// from, silently discarding the seek.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FetchOffsetUpdate {
+    /// Position the fetch request was built from.
+    requested: Offset,
+    /// Position to advance to, i.e. last delivered offset + 1.
+    next: Offset,
+    /// Leader epoch of the record batch that `next` falls just past, or `-1`
+    /// when the response carried nothing that pins the epoch down.
+    ///
+    /// Travelling with the position update keeps the two in step: the epoch is
+    /// only stored if the position it describes is actually applied, so the
+    /// consumer never reports an epoch that does not match where it is.
+    epoch: i32,
+}
+
+/// Decide which pending fetch-position updates are still valid.
+///
+/// An update is applied only if the partition's stored position is *still* the
+/// one the fetch was issued from. Anything else means the position moved while
+/// the fetch was in flight — a `seek()`, an offset reset, or a rebalance — and
+/// the response describes a position the consumer has deliberately left.
+///
+/// Returns the keys whose updates were discarded, for logging.
+fn apply_fetch_offset_updates(
+    offsets: &mut HashMap<(String, PartitionId), Offset>,
+    updates: Vec<((String, PartitionId), FetchOffsetUpdate)>,
+) -> Vec<(String, PartitionId)> {
+    let mut discarded = Vec::new();
+    for (key, update) in updates {
+        match offsets.get(&key) {
+            Some(&current) if current == update.requested => {
+                offsets.insert(key, update.next);
+            }
+            // Either the position moved (seek/reset) or the partition was
+            // revoked. In both cases the fetch is stale; drop it.
+            _ => discarded.push(key),
+        }
+    }
+    discarded
+}
+
+/// Compute the highest offset that is safe to commit for each partition.
+///
+/// A partition's fetch position runs ahead of what the application has
+/// actually seen: `poll()` advances it for every record it fetched, but
+/// `recv()` hands those records out one at a time and parks the rest in the
+/// receive buffer. Committing the fetch position would therefore acknowledge
+/// records that are still sitting in the buffer — if the process dies before
+/// they are consumed, the group resumes past them and they are never
+/// processed.
+///
+/// The first still-buffered record of a partition marks the boundary: every
+/// record below it has been handed to the application, and every record from
+/// it upward has not. So the committable position is the fetch position
+/// clamped to the lowest buffered offset.
+fn committable_positions(
+    positions: &HashMap<(String, PartitionId), Offset>,
+    buffered: &std::collections::VecDeque<ConsumerRecord>,
+) -> HashMap<(String, PartitionId), Offset> {
+    // Lowest offset still awaiting delivery, per partition.
+    let mut lowest_undelivered: HashMap<(String, PartitionId), Offset> = HashMap::new();
+    for record in buffered {
+        let key = (record.topic.clone(), record.partition);
+        lowest_undelivered
+            .entry(key)
+            .and_modify(|o| {
+                if record.offset < *o {
+                    *o = record.offset;
+                }
+            })
+            .or_insert(record.offset);
+    }
+
+    positions
+        .iter()
+        .map(|(key, &position)| {
+            let committable = match lowest_undelivered.get(key) {
+                Some(&first_undelivered) => position.min(first_undelivered),
+                None => position,
+            };
+            (key.clone(), committable)
+        })
+        .collect()
+}
+
 /// Compute aggregate lag from offset and high-watermark caches.
 ///
 /// Returns `(total_lag, max_lag)` where `total_lag` is the sum across all
@@ -400,6 +540,26 @@ fn seed_initial_offsets_for_assigned(
         }
     }
     inserted
+}
+
+/// Forget what the consumer knew about the leader epoch at a partition's
+/// position, and mark the position as needing validation.
+///
+/// Called whenever a position is set from outside the fetch loop — `seek()`,
+/// `seek_many()`, an `auto.offset.reset`, or a broker-reported truncation.
+/// The recorded epoch describes the *old* position and would be wrong if sent
+/// with the new one: the broker would compare a `(position, epoch)` pair the
+/// consumer never actually observed and could report a spurious divergence.
+///
+/// Creates the state entry when absent so a later fetch cannot mistake an
+/// unvalidated position for a validated one.
+fn invalidate_position_epoch(
+    partition_state: &mut HashMap<(String, PartitionId), PartitionState>,
+    key: &(String, PartitionId),
+) {
+    let entry = partition_state.entry(key.clone()).or_default();
+    entry.last_fetched_epoch = None;
+    entry.position_validated = false;
 }
 
 fn apply_seek_many_offsets(
@@ -599,8 +759,12 @@ struct FetchRoutingPlan {
 /// (the caller is responsible for filtering). For each key the function
 /// checks whether a preferred replica exists and is not expired. If so,
 /// the partition is routed to that replica, regardless of whether a leader
-/// is known. If there is no valid preferred replica, the function falls
-/// back to the leader if one is known; otherwise the partition is skipped.
+/// is known. If there is no valid preferred replica, the leader from
+/// `leaders` is used; otherwise the partition is skipped.
+///
+/// `leaders` is read from the metadata cache, which is also where a
+/// broker-reported leader (KIP-951) lands, so a failover the broker announced
+/// in a fetch response is already reflected here.
 ///
 /// This is a pure function extracted from `Consumer::poll()` so that the
 /// routing logic can be unit-tested without a live broker.
@@ -628,14 +792,13 @@ fn build_fetch_routing_plan(
 
         let broker_id = match target_broker {
             Some(id) => id,
-            None => {
-                if let Some(&leader_id) = leaders.get(&key) {
-                    leader_id
-                } else {
+            None => match leaders.get(&key).copied() {
+                Some(leader_id) => leader_id,
+                None => {
                     skipped.push(key);
                     continue;
                 }
-            }
+            },
         };
 
         partitions_by_broker.entry(broker_id).or_default().push(key);
@@ -750,7 +913,8 @@ impl Consumer {
         } else {
             let mut pool_config_builder = ConnectionConfig::builder()
                 .client_id(&config.client_id)
-                .request_timeout(config.request_timeout);
+                .request_timeout(config.request_timeout)
+                .connect_timeout(config.connect_timeout);
 
             if let Some(ref auth) = config.auth {
                 pool_config_builder = pool_config_builder.auth(auth.clone());
@@ -800,7 +964,7 @@ impl Consumer {
                     config.heartbeat_interval,
                     config.max_poll_interval, // rebalance_timeout matches Java client's max.poll.interval.ms
                 )
-                .with_assignor_strategy(config.partition_assignment_strategy)
+                .with_assignor_strategies(config.partition_assignment_strategies.clone())
                 .with_group_instance_id(config.group_instance_id.clone())
                 .with_client_rack(config.client_rack.clone())
                 .with_isolation_level(config.isolation_level.to_i8())
@@ -853,6 +1017,14 @@ impl Consumer {
         // reach the panicking `KafkaString::encode` path via the MetadataRequest
         // / Heartbeat / subscription payload.
         validate_topic_names(topics.iter().copied())?;
+
+        // Re-arm poll-interval tracking. Subscribing is the deliberate restart
+        // of consumption, so it clears a previous max.poll.interval.ms
+        // expiry and gives an application that recovered from a stall a way
+        // back into the group.
+        if let Some(ref coordinator) = self.group_coordinator {
+            coordinator.reset_poll_tracking();
+        }
 
         // Scope the write lock so it is dropped before network I/O
         {
@@ -1157,7 +1329,7 @@ impl Consumer {
     /// consolidated [`PartitionState`] map (high watermark, log start offset,
     /// preferred replica, offset-retry backoff), then zeros the lag metrics.
     async fn clear_partition_state(&self) {
-        self.fetch_sessions.lock().reset_all();
+        self.close_fetch_sessions().await;
         self.offsets.write().await.clear();
         self.recv_buffer.lock().clear();
         self.paused.write().await.clear();
@@ -1166,6 +1338,74 @@ impl Consumer {
         self.metrics.paused_partitions.set(0);
         self.metrics.lag.set(0);
         self.metrics.lag_max.set(0);
+    }
+
+    /// Tell every broker we are done with its incremental fetch session.
+    ///
+    /// A fetch session is server-side state: the broker remembers the exact
+    /// set of partitions and offsets this client last asked for, so that
+    /// subsequent requests only need to carry the differences. Abandoning a
+    /// session without saying so leaves that state pinned until the broker's
+    /// LRU eventually evicts it. Brokers cap the number of sessions they will
+    /// keep, so a consumer that rebalances repeatedly can occupy slot after
+    /// slot and push other clients off the cache entirely — they then fall
+    /// back to full fetches and start seeing `FETCH_SESSION_ID_NOT_FOUND`.
+    ///
+    /// Sending the final epoch releases the slot immediately. Failures are
+    /// logged and ignored: the local state is cleared regardless, and an
+    /// unreleased session is a resource-usage problem rather than a
+    /// correctness one.
+    async fn close_fetch_sessions(&self) {
+        // `close_all` clears local state and returns the sessions that were
+        // actually established. The sync guard must be released before any
+        // await.
+        let closes = self.fetch_sessions.lock().close_all();
+
+        for close in closes {
+            let Some(broker) = self.metadata.broker(close.broker_id) else {
+                continue;
+            };
+            let Ok(conn) = self
+                .pool
+                .get_connection_by_id(close.broker_id, broker.address())
+                .await
+            else {
+                continue;
+            };
+            // Fetch sessions only exist from v7 onward.
+            let Some(version) = conn
+                .negotiate_api_version(ApiKey::Fetch, versions::FETCH_MAX, 7)
+                .await
+            else {
+                continue;
+            };
+
+            let request = FetchRequest {
+                replica_id: -1,
+                max_wait_ms: 0,
+                min_bytes: 0,
+                max_bytes: 0,
+                isolation_level: self.config.isolation_level.to_i8(),
+                session_id: close.session_id,
+                session_epoch: close.session_epoch,
+                topics: Vec::new(),
+                forgotten_topics: Vec::new(),
+                rack_id: self.config.client_rack.clone().unwrap_or_default(),
+            };
+
+            if let Err(e) = conn
+                .send_request(ApiKey::Fetch, version, |buf| {
+                    request.encode_versioned(version, buf)
+                })
+                .await
+            {
+                debug!(
+                    broker_id = close.broker_id,
+                    session_id = close.session_id,
+                    "Failed to close fetch session: {e}"
+                );
+            }
+        }
     }
 
     // ── Rebalance listener wrappers ──────────────────────────────────────
@@ -1450,6 +1690,21 @@ impl Consumer {
                 }
             }
             if !revoked_parts.is_empty() {
+                // Commit before revoking, matching the two-round cooperative
+                // path and the KIP-848 path.
+                //
+                // `apply_partition_revocations` deletes these partitions from
+                // the offset map, so any progress not committed by this point
+                // is unrecoverable — there is no later opportunity, and the
+                // member taking over resumes from the last periodic commit and
+                // re-processes everything since.
+                if self.config.enable_auto_commit
+                    && self.group_coordinator.is_some()
+                    && let Err(e) = self.commit().await
+                {
+                    warn!("Commit before cooperative revocation failed: {e}");
+                }
+
                 self.safe_on_partitions_revoked(&revoked_parts).await;
                 let revoked_tuples: Vec<(String, PartitionId)> = revoked_parts
                     .iter()
@@ -1592,12 +1847,17 @@ impl Consumer {
             self.fetch_and_apply_committed_offsets(&new_parts).await?;
         }
 
-        // KIP-848 §revocation-ack: after processing revocations, send an
-        // immediate heartbeat with the updated owned partitions so the
-        // coordinator can proceed with the rebalance.
-        if !revoked.is_empty() {
-            coordinator.acknowledge_revocation().await;
-        }
+        // Acknowledge the reconciliation unconditionally, once callbacks have
+        // run and offsets for newly assigned partitions have been fetched.
+        //
+        // The acknowledgement is what advances the member epoch, and the
+        // coordinator treats the member as still reconciling until it arrives.
+        // Sending it only when partitions were revoked leaves a member that
+        // received a pure grant — the common case when a group grows, or on
+        // the very first assignment — stuck at its old epoch forever: the
+        // group never finishes reconciling, and commits eventually start
+        // failing with STALE_MEMBER_EPOCH.
+        coordinator.acknowledge_revocation().await;
 
         Ok(())
     }
@@ -1900,10 +2160,18 @@ impl Consumer {
     }
 
     /// Seek to a specific offset.
+    ///
+    /// The new position invalidates everything the consumer knew about where
+    /// it was in the log: the leader epoch at the old position says nothing
+    /// about the new one, and the new one has not been checked against the
+    /// leader. Both are reset so the next poll re-validates the position
+    /// before fetching from it.
     pub async fn seek(&self, topic: &str, partition: PartitionId, offset: Offset) -> Result<()> {
         {
             let mut offsets = self.offsets.write().await;
             offsets.insert((topic.to_string(), partition), offset);
+            let mut partition_state = self.partition_state.write().await;
+            invalidate_position_epoch(&mut partition_state, &(topic.to_string(), partition));
         }
         self.recompute_lag_metrics().await;
         self.metrics.record_seek(1);
@@ -1935,6 +2203,10 @@ impl Consumer {
         {
             let mut stored = self.offsets.write().await;
             apply_seek_many_offsets(&mut stored, offsets);
+            let mut partition_state = self.partition_state.write().await;
+            for key in offsets.keys() {
+                invalidate_position_epoch(&mut partition_state, key);
+            }
         }
         self.recompute_lag_metrics().await;
         self.metrics.record_seek(offsets.len() as u64);
@@ -2402,12 +2674,77 @@ impl Consumer {
     /// # }
     /// ```
     pub async fn poll(&self, timeout: Duration) -> Result<Vec<ConsumerRecord>> {
+        // Establish the lock-order tracking scope for the whole poll cycle.
+        // The per-lock ordering assertions only run inside such a scope, so
+        // wrapping the top-level entry point is what makes them effective in
+        // debug builds. Compiles away entirely in release builds.
+        lock_order::with_lock_tracking(self.poll_inner(timeout)).await
+    }
+
+    async fn poll_inner(&self, timeout: Duration) -> Result<Vec<ConsumerRecord>> {
         if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(KrafkaError::invalid_state("consumer is closed"));
         }
 
         let _poll_timer = self.metrics.poll_latency.start();
         self.metrics.polls.inc();
+
+        // Enforce max.poll.interval.ms before doing anything else.
+        //
+        // If the heartbeat task observed that the application stopped calling
+        // poll() for longer than the configured interval, this consumer has
+        // stopped heartbeating and the coordinator is reassigning its
+        // partitions. Returning records now would let the application keep
+        // processing partitions it no longer owns, concurrently with their new
+        // owner. Report it instead so the caller can restart the consumer.
+        if let Some(ref coordinator) = self.group_coordinator
+            && coordinator.poll_interval_exceeded()
+        {
+            // These partitions are genuinely lost, not cleanly revoked: the
+            // coordinator has already stopped counting this member as alive
+            // and may have handed them to someone else. Committing them now
+            // could overwrite the new owner's position, which is exactly why
+            // `on_partitions_lost` (rather than `on_partitions_revoked`)
+            // documents that listeners must not commit from it.
+            let lost: Vec<TopicPartition> = {
+                let assignments = self.assignments.read().await;
+                assignments
+                    .iter()
+                    .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
+                    .collect()
+            };
+            if !lost.is_empty() {
+                self.safe_on_partitions_lost(&lost).await;
+            }
+
+            // Best-effort explicit leave so the partitions move immediately
+            // rather than after the session timeout.
+            if let Err(e) = coordinator.leave_group().await {
+                debug!("LeaveGroup after poll-interval expiry failed: {e}");
+            }
+            return Err(KrafkaError::invalid_state(format!(
+                "consumer exceeded max_poll_interval ({:?}) between poll() calls and was \
+                 removed from group '{}'; its partitions have been reassigned. Process \
+                 records faster, reduce max_poll_records, or raise max_poll_interval.",
+                coordinator.max_poll_interval(),
+                coordinator.group_id(),
+            )));
+        }
+
+        // Surface a non-retriable error recorded by the background heartbeat
+        // task. These have no caller to return to when they occur, so without
+        // this the application would see a consumer that simply never receives
+        // records, with the reason confined to the logs.
+        if let Some(ref coordinator) = self.group_coordinator
+            && let Some(message) = coordinator.take_fatal_error()
+        {
+            return Err(KrafkaError::invalid_state(message));
+        }
+
+        // Mark the application as alive for this interval.
+        if let Some(ref coordinator) = self.group_coordinator {
+            coordinator.note_poll();
+        }
 
         // Auto-commit timer: commit if interval has elapsed
         if self.config.enable_auto_commit && self.group_coordinator.is_some() {
@@ -2698,73 +3035,164 @@ impl Consumer {
         drop(paused);
         drop(assignments);
 
+        // Confirm that every position about to be fetched from actually
+        // exists in its leader's log before asking for records from it.
+        // Partitions that were validated earlier and have only moved forward
+        // through consumed batches are skipped, so this costs one round trip
+        // per repositioning, not one per poll.
+        {
+            let to_validate: Vec<(String, PartitionId)> = plan
+                .partitions_by_broker
+                .values()
+                .flat_map(|keys| keys.iter().cloned())
+                .collect();
+            self.validate_pending_positions(&to_validate).await;
+        }
+
+        let deadline = Instant::now() + timeout;
         let mut all_records = Vec::new();
-        let mut all_offset_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
+        let mut all_offset_updates: Vec<((String, PartitionId), FetchOffsetUpdate)> = Vec::new();
         let mut all_hw_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
 
-        // Fetch from each broker (one request per broker, containing all its partitions)
-        for (broker_id, topic_partitions) in plan.partitions_by_broker {
-            match self
-                .batch_fetch_from_broker(broker_id, &topic_partitions, timeout)
-                .await
-            {
-                Ok((records, offset_updates, hw_updates)) => {
-                    all_records.extend(records);
-                    all_offset_updates.extend(offset_updates);
-                    all_hw_updates.extend(hw_updates);
-                }
-                Err(e) => {
-                    self.metrics.record_error();
-                    warn!("Batch fetch from broker {} failed: {}", broker_id, e);
-                    // Clear preferred replica mappings for all partitions that
-                    // were being fetched from this broker.  If the broker was
-                    // actually the leader the entries won't exist (no-op), but
-                    // if it was a preferred replica this avoids routing to a
-                    // dead broker for up to metadata_max_age.
-                    let mut partition_state = self.partition_state.write().await;
-                    for tp in &topic_partitions {
-                        if let Some(state) = partition_state.get_mut(tp) {
-                            state.preferred_replica = None;
+        // Client-side long poll.
+        //
+        // Each broker request parks for at most `fetch_max_wait`, which is
+        // independent of (and normally far shorter than) the caller's timeout,
+        // so a single round rarely uses the whole budget. Looping here is what
+        // turns those short broker-side waits into the long poll the caller
+        // asked for, without ever asking a broker to hold a request longer
+        // than the connection layer is willing to wait for it.
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let max_wait = self.config.fetch_max_wait.min(remaining);
+
+            // Issue every broker's fetch concurrently against one shared
+            // deadline. Sequential per-broker fetches each waiting up to the
+            // full budget would let a single poll() block for N times the
+            // requested timeout on an N-broker cluster, starving the inline
+            // heartbeat and blowing through max.poll.interval.ms.
+            let fetches =
+                plan.partitions_by_broker
+                    .iter()
+                    .map(|(broker_id, topic_partitions)| async move {
+                        let result = self
+                            .batch_fetch_from_broker(*broker_id, topic_partitions, max_wait)
+                            .await;
+                        (*broker_id, topic_partitions, result)
+                    });
+
+            for (broker_id, topic_partitions, result) in futures::future::join_all(fetches).await {
+                match result {
+                    Ok((records, offset_updates, hw_updates)) => {
+                        all_records.extend(records);
+                        all_offset_updates.extend(offset_updates);
+                        all_hw_updates.extend(hw_updates);
+                    }
+                    Err(e) => {
+                        self.metrics.record_error();
+                        warn!("Batch fetch from broker {} failed: {}", broker_id, e);
+                        // Clear preferred replica mappings for all partitions that
+                        // were being fetched from this broker.  If the broker was
+                        // actually the leader the entries won't exist (no-op), but
+                        // if it was a preferred replica this avoids routing to a
+                        // dead broker for up to metadata_max_age.
+                        let mut partition_state = self.partition_state.write().await;
+                        for tp in topic_partitions {
+                            if let Some(state) = partition_state.get_mut(tp) {
+                                state.preferred_replica = None;
+                            }
                         }
                     }
                 }
             }
+
+            // Return as soon as there is anything to deliver; only an empty
+            // round is worth retrying.
+            if !all_records.is_empty() || Instant::now() >= deadline {
+                break;
+            }
         }
 
-        // Enforce max_poll_records
+        // Which partitions produced at least one record before any filtering.
+        // Partitions whose fetch advanced purely through control batches or
+        // aborted-transaction data have an offset update but no records; those
+        // updates must survive filtering or the consumer re-fetches the same
+        // non-deliverable batches forever.
+        let fetched_any: HashSet<(String, PartitionId)> = all_records
+            .iter()
+            .map(|r| (r.topic.clone(), r.partition))
+            .collect();
+
+        // Withhold records for partitions paused since the fetch was issued.
+        // Filtering only at request-build time is not enough: a fetch already
+        // in flight when pause() is called still returns data, and delivering
+        // it (and advancing past it) defeats the pause.
+        {
+            let paused = self.paused.read().await;
+            if !paused.is_empty() {
+                all_records.retain(|r| !paused.contains(&(r.topic.clone(), r.partition)));
+            }
+        }
+
+        // Enforce max_poll_records.
         // -1 means unlimited (no truncation); positive values cap the batch.
-        // Only advance offsets for records actually delivered.
-        // When truncating, recompute offset updates from delivered records only.
         if self.config.max_poll_records != -1 {
             let max = self.config.max_poll_records as usize;
             if all_records.len() > max {
                 all_records.truncate(max);
-                // Recompute offset updates from the truncated set: for each
-                // (topic, partition), the new offset is max(record.offset) + 1
-                // only for records that survived truncation.
-                let mut delivered_offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
-                for r in &all_records {
-                    let key = (r.topic.clone(), r.partition);
-                    let entry = delivered_offsets.entry(key).or_insert(r.offset);
-                    if r.offset > *entry {
-                        *entry = r.offset;
-                    }
-                }
-                all_offset_updates = delivered_offsets
-                    .into_iter()
-                    .map(|(key, offset)| (key, offset.saturating_add(1)))
-                    .collect();
             }
         }
 
-        // Commit the offset updates (deferred from batch_fetch_from_broker until after max_poll_records handling)
-        let offsets_changed = !all_offset_updates.is_empty();
-        if offsets_changed {
-            let mut offsets = self.offsets.write().await;
-            for (key, new_offset) in all_offset_updates {
-                offsets.insert(key, new_offset);
+        // Clamp the pending position updates to what is actually being
+        // delivered, so a record that was withheld or truncated away is
+        // re-fetched rather than skipped.
+        let mut delivered_max: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        for r in &all_records {
+            let key = (r.topic.clone(), r.partition);
+            delivered_max
+                .entry(key)
+                .and_modify(|o| {
+                    if r.offset > *o {
+                        *o = r.offset;
+                    }
+                })
+                .or_insert(r.offset);
+        }
+        // Leader epoch of the last record actually being delivered per
+        // partition. When `max_poll_records` (or a pause) cuts a response
+        // short, the clamped position may land in an earlier batch than the
+        // one the fetch ended on, and reporting the later batch's epoch back
+        // to the broker would describe a `(position, epoch)` pair the consumer
+        // never held — which the broker would read as a divergence.
+        let mut delivered_epoch: HashMap<(String, PartitionId), i32> = HashMap::new();
+        for r in &all_records {
+            let key = (r.topic.clone(), r.partition);
+            if delivered_max.get(&key) == Some(&r.offset)
+                && let Some(epoch) = r.leader_epoch
+            {
+                delivered_epoch.insert(key, epoch);
             }
         }
+
+        all_offset_updates.retain_mut(|(key, update)| {
+            if !fetched_any.contains(key) {
+                // Advance came from control/aborted batches, not deliverable
+                // records; nothing was withheld so keep it as-is.
+                return true;
+            }
+            match delivered_max.get(key) {
+                Some(&max_delivered) => {
+                    let clamped = update.next.min(max_delivered.saturating_add(1));
+                    if clamped != update.next {
+                        update.epoch = delivered_epoch.get(key).copied().unwrap_or(-1);
+                    }
+                    update.next = clamped;
+                    true
+                }
+                // Every record for this partition was withheld or truncated.
+                None => false,
+            }
+        });
 
         // Update high watermarks
         let hw_changed = !all_hw_updates.is_empty();
@@ -2778,8 +3206,11 @@ impl Consumer {
             }
         }
 
-        // Recompute lag metrics whenever offsets or watermarks changed
-        if offsets_changed || hw_changed {
+        // Recompute lag metrics whenever watermarks changed. This runs before
+        // the position update below, so the reported lag can be one poll
+        // behind; lag is documented as eventually consistent and this ordering
+        // is what keeps the position update free of any trailing await.
+        if hw_changed {
             self.recompute_lag_metrics().await;
         }
 
@@ -2813,6 +3244,69 @@ impl Consumer {
             }
         }
 
+        // Advance the fetch position last, with nothing awaited between the
+        // mutation and the return.
+        //
+        // This function can be dropped at any await point — a `tokio::time::timeout`
+        // firing, or a losing branch of a `select!`. If the position were
+        // advanced earlier, such a cancellation would discard `all_records`
+        // while leaving the position past them, and the next auto-commit would
+        // make that skip permanent. Doing the write here means a cancelled
+        // poll always leaves the position exactly where it was, so the records
+        // are simply re-fetched.
+        //
+        // Acquiring the lock is itself an await, but a cancellation there
+        // happens strictly before any mutation and is therefore harmless.
+        if !all_offset_updates.is_empty() {
+            let epochs: Vec<((String, PartitionId), i32)> = all_offset_updates
+                .iter()
+                .map(|(key, update)| (key.clone(), update.epoch))
+                .collect();
+
+            // Both locks are taken before anything is mutated, so a
+            // cancellation while waiting for either leaves position and epoch
+            // consistent with each other.
+            let mut offsets = self.offsets.write().await;
+            let mut partition_state = self.partition_state.write().await;
+            let discarded = apply_fetch_offset_updates(&mut offsets, all_offset_updates);
+            let discarded_set: HashSet<&(String, PartitionId)> = discarded.iter().collect();
+            for (key, epoch) in &epochs {
+                if discarded_set.contains(key) {
+                    continue;
+                }
+                // The epoch belongs to the position that was just applied, so
+                // it is only stored when that position survived the staleness
+                // check. `-1` means the response carried nothing that pins the
+                // epoch down; keep the previous value rather than blinding the
+                // next divergence check.
+                if *epoch >= 0 {
+                    partition_state
+                        .entry(key.clone())
+                        .or_default()
+                        .last_fetched_epoch = Some(*epoch);
+                }
+            }
+            drop(discarded_set);
+            drop(partition_state);
+            drop(offsets);
+
+            // A stale response's records describe a position the consumer has
+            // deliberately moved away from, so they must not be delivered
+            // either — returning them would hand the application records from
+            // before a seek() that it explicitly asked to skip past.
+            if !discarded.is_empty() {
+                let stale: HashSet<(String, PartitionId)> = discarded.into_iter().collect();
+                for (topic, partition) in &stale {
+                    debug!(
+                        topic = %topic,
+                        partition,
+                        "Discarding fetch response: position changed while the fetch was in flight"
+                    );
+                }
+                all_records.retain(|r| !stale.contains(&(r.topic.clone(), r.partition)));
+            }
+        }
+
         Ok(all_records)
     }
 
@@ -2820,14 +3314,22 @@ impl Consumer {
     ///
     /// This is more efficient than individual fetches because it sends a single
     /// network request for all partitions led by the same broker.
+    ///
+    /// `max_wait` is the broker-side `max_wait_ms` — how long the broker may
+    /// hold the request waiting for `fetch_min_bytes`. It is deliberately not
+    /// the caller's poll timeout; see [`ConsumerConfig::fetch_max_wait`].
+    ///
+    /// Each returned offset update carries the offset the fetch was *issued
+    /// from* so the caller can drop updates that a concurrent `seek()`
+    /// invalidated.
     async fn batch_fetch_from_broker(
         &self,
         broker_id: crate::BrokerId,
         topic_partitions: &[(String, PartitionId)],
-        timeout: Duration,
+        max_wait: Duration,
     ) -> Result<(
         Vec<ConsumerRecord>,
-        Vec<((String, PartitionId), Offset)>,
+        Vec<((String, PartitionId), FetchOffsetUpdate)>,
         Vec<((String, PartitionId), Offset)>,
     )> {
         if topic_partitions.is_empty() {
@@ -2837,15 +3339,13 @@ impl Consumer {
         self.metrics.record_fetch();
         let _fetch_timer = self.metrics.fetch_latency.start();
 
-        // Get connection to this broker
-        let broker = self
-            .metadata
-            .broker(broker_id)
+        // Get connection to this broker. A leader learned from a fetch
+        // response (KIP-951) can be a broker the metadata cache has not seen
+        // yet, so fall back to the endpoint the broker advertised.
+        let address = self
+            .broker_address(broker_id)
             .ok_or_else(|| KrafkaError::invalid_state(format!("broker {} not found", broker_id)))?;
-        let conn = self
-            .pool
-            .get_connection_by_id(broker_id, broker.address())
-            .await?;
+        let conn = self.pool.get_connection_by_id(broker_id, &address).await?;
 
         // Group by topic for the request structure
         let mut topics_map: HashMap<String, Vec<PartitionId>> = HashMap::new();
@@ -2860,6 +3360,27 @@ impl Consumer {
         // Acquire the offsets read lock once for the entire build instead of
         // per-partition to reduce lock acquire/release overhead.
         let offsets_snapshot = self.offsets.read().await;
+        // Leader epochs of the batches each partition last advanced through.
+        // Sent as `last_fetched_epoch` so the broker can tell us when our log
+        // no longer matches its own (KIP-320).
+        let last_fetched_epochs: HashMap<(String, PartitionId), i32> = {
+            let partition_state = self.partition_state.read().await;
+            topic_partitions
+                .iter()
+                .filter_map(|key| {
+                    partition_state
+                        .get(key)
+                        .and_then(|s| s.last_fetched_epoch)
+                        .map(|epoch| (key.clone(), epoch))
+                })
+                .collect()
+        };
+        // The position each partition is being fetched from, captured once at
+        // request-build time. Reading it again after the response has arrived
+        // would defeat the staleness check: by then a concurrent `seek()` may
+        // already have moved the position, and comparing the response against
+        // the moved value would make the stale response look current.
+        let mut requested_offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
         let mut fetch_topics = Vec::with_capacity(topics_map.len());
         for (topic, partitions) in &topics_map {
             let mut fetch_partitions = Vec::with_capacity(partitions.len());
@@ -2876,13 +3397,19 @@ impl Consumer {
                         continue;
                     }
                 };
+                requested_offsets.insert((topic.clone(), partition), offset);
                 // Get leader epoch from metadata for fencing stale reads
                 let leader_epoch = self.metadata.leader_epoch(topic, partition).unwrap_or(-1);
                 fetch_partitions.push(FetchPartitionRequest {
                     partition,
                     current_leader_epoch: leader_epoch,
                     fetch_offset: offset,
-                    last_fetched_epoch: -1,
+                    // -1 disables divergence detection and is only correct
+                    // when the epoch at this position is genuinely unknown.
+                    last_fetched_epoch: last_fetched_epochs
+                        .get(&(topic.clone(), partition))
+                        .copied()
+                        .unwrap_or(-1),
                     log_start_offset: -1,
                     partition_max_bytes: self
                         .config
@@ -3002,7 +3529,7 @@ impl Consumer {
 
         let request = FetchRequest {
             replica_id: -1, // Consumer
-            max_wait_ms: crate::util::duration_to_millis_i32(timeout),
+            max_wait_ms: crate::util::duration_to_millis_i32(max_wait),
             min_bytes: self.config.fetch_min_bytes,
             max_bytes: self.config.fetch_max_bytes,
             isolation_level: self.config.isolation_level.to_i8(),
@@ -3094,13 +3621,18 @@ impl Consumer {
 
         // Process records
         let mut records = Vec::new();
-        let mut offset_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
+        let mut offset_updates: Vec<((String, PartitionId), FetchOffsetUpdate)> = Vec::new();
         let mut hw_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
         let mut lso_updates: Vec<((String, PartitionId), Offset)> = Vec::new();
 
         // Preferred replica updates (KIP-392): Some(id) to set, None to clear.
         // Collected during the loop, applied in a single write lock afterwards.
         let mut pref_updates: Vec<((String, PartitionId), Option<crate::BrokerId>)> = Vec::new();
+
+        // Addresses the broker advertised for the leaders it names below
+        // (KIP-951). Passing one along with a hint is what makes a freshly
+        // promoted broker reachable before metadata has caught up.
+        let node_endpoints = std::mem::take(&mut fetch_response.node_endpoints);
 
         for topic_response in fetch_response.responses {
             let topic_name = &topic_response.topic;
@@ -3134,6 +3666,18 @@ impl Consumer {
                     }
                 }
 
+                // The broker compared the (position, epoch) pair we sent with
+                // its own log and found they diverge: everything at or after
+                // `end_offset` in our view of the partition was never part of
+                // the current leader's log. Continuing from the old position
+                // would deliver records that no longer exist upstream and skip
+                // the ones that replaced them.
+                if let Some(diverging) = partition_response.diverging_epoch {
+                    self.truncate_to_diverging_offset(topic_name, partition, diverging)
+                        .await;
+                    continue;
+                }
+
                 if !partition_response.error_code.is_ok() {
                     // When fetching from a preferred replica and the broker
                     // returns an error, clear the preferred replica so the
@@ -3156,6 +3700,31 @@ impl Consumer {
                         );
                         pref_updates.push((key.clone(), None));
                     }
+
+                    // The broker that rejected this fetch also told us who
+                    // should have received it (KIP-951). Folding it into the
+                    // metadata cache now saves a refresh on every leader
+                    // failover; without it the partition stalls for a full
+                    // refresh cycle.
+                    if matches!(
+                        partition_response.error_code,
+                        crate::error::ErrorCode::NotLeaderForPartition
+                            | crate::error::ErrorCode::FencedLeaderEpoch
+                    ) && let Some(leader) = partition_response.current_leader
+                    {
+                        debug!(
+                            "Broker {} reports {}-{} now led by node {} (epoch {})",
+                            broker_id, topic_name, partition, leader.leader_id, leader.leader_epoch
+                        );
+                        self.metadata.apply_leader_hint(
+                            topic_name,
+                            partition,
+                            leader.leader_id,
+                            leader.leader_epoch,
+                            broker_info_for_node(&node_endpoints, leader.leader_id),
+                        );
+                    }
+
                     // Handle leader epoch errors by validating via OffsetForLeaderEpoch
                     if partition_response.error_code == crate::error::ErrorCode::FencedLeaderEpoch
                         || partition_response.error_code
@@ -3216,26 +3785,29 @@ impl Consumer {
                 if let Some(record_bytes) = partition_response.records {
                     let mut batch_buf = record_bytes;
                     let mut last_offset_for_partition: Option<Offset> = None;
+                    // Leader epoch of the batch the position last advanced
+                    // through, reported back on the next fetch so the broker
+                    // can detect divergence (KIP-320).
+                    let mut last_epoch_for_partition: i32 = -1;
 
-                    // Fetch offset for this partition — used to skip records
-                    // already delivered in a prior poll when Kafka returns a
-                    // batch that starts before the requested offset.
-                    // Read lock is acquired and dropped inline to avoid cloning
-                    // the entire offsets map on every fetch pass.
-                    // Missing entry means this is the first fetch; accept all
-                    // records (offset 0 skips nothing since Kafka offsets ≥ 0).
-                    let partition_fetch_offset = {
-                        let offsets = self.offsets.read().await;
-                        match offsets.get(&key).copied() {
-                            Some(offset) => offset,
-                            None => {
-                                debug!(
-                                    topic = %topic_name,
-                                    partition,
-                                    "No tracked offset for partition, accepting all records"
-                                );
-                                0
-                            }
+                    // Offset this partition was actually fetched from — used to
+                    // skip records already delivered in a prior poll, since
+                    // Kafka returns whole batches that may start earlier.
+                    //
+                    // This is the value captured when the request was built,
+                    // not a fresh read: re-reading here would pick up any
+                    // concurrent `seek()` and silently reinterpret this
+                    // response as if it had been requested from the new
+                    // position.
+                    let partition_fetch_offset = match requested_offsets.get(&key).copied() {
+                        Some(offset) => offset,
+                        None => {
+                            debug!(
+                                topic = %topic_name,
+                                partition,
+                                "Received records for a partition that was not requested, ignoring"
+                            );
+                            continue;
                         }
                     };
 
@@ -3251,6 +3823,7 @@ impl Consumer {
                             self.config.max_decompressed_size,
                         ) {
                             Ok(batch) => {
+                                let batch_epoch = batch.partition_leader_epoch;
                                 // Advance the aborted-transaction state machine.
                                 // Activate any AbortedTransaction entries whose
                                 // first_offset has been reached.  The list is
@@ -3278,6 +3851,7 @@ impl Consumer {
                                         .base_offset
                                         .saturating_add(batch.last_offset_delta as i64);
                                     last_offset_for_partition = Some(control_offset);
+                                    last_epoch_for_partition = batch_epoch;
                                     continue;
                                 }
 
@@ -3293,6 +3867,7 @@ impl Consumer {
                                         .base_offset
                                         .saturating_add(batch.last_offset_delta as i64);
                                     last_offset_for_partition = Some(aborted_last);
+                                    last_epoch_for_partition = batch_epoch;
                                     continue;
                                 }
 
@@ -3325,10 +3900,11 @@ impl Consumer {
                                             .into_iter()
                                             .map(|h| (h.key, h.value))
                                             .collect(),
-                                        leader_epoch: None,
+                                        leader_epoch: Some(batch_epoch),
                                         delivery_count: None,
                                     });
                                     last_offset_for_partition = Some(record_offset);
+                                    last_epoch_for_partition = batch_epoch;
                                 }
                             }
                             Err(e) => {
@@ -3338,9 +3914,18 @@ impl Consumer {
                         }
                     }
 
-                    // Track offset update for this partition
+                    // Track offset update for this partition, tagged with the
+                    // position the fetch was issued from so the caller can
+                    // detect that a `seek()` has since invalidated it.
                     if let Some(last_offset) = last_offset_for_partition {
-                        offset_updates.push((key, last_offset.saturating_add(1)));
+                        offset_updates.push((
+                            key,
+                            FetchOffsetUpdate {
+                                requested: partition_fetch_offset,
+                                next: last_offset.saturating_add(1),
+                                epoch: last_epoch_for_partition,
+                            },
+                        ));
                     }
                 }
             }
@@ -3388,6 +3973,138 @@ impl Consumer {
         Ok((records, offset_updates, hw_updates))
     }
 
+    /// Resolve the `host:port` to connect to for a broker ID.
+    ///
+    /// The metadata cache is the single source of truth, including for leaders
+    /// a broker named in a fetch response (KIP-951) — those endpoints are
+    /// registered there by
+    /// [`ClusterMetadata::apply_leader_hint`](crate::metadata::ClusterMetadata::apply_leader_hint).
+    fn broker_address(&self, broker_id: crate::BrokerId) -> Option<String> {
+        self.metadata
+            .broker(broker_id)
+            .map(|broker| broker.address().to_string())
+    }
+
+    /// Move a partition back to the point where its log still matched the
+    /// leader's, after the broker reported a divergence (KIP-320).
+    ///
+    /// Everything the consumer holds at or beyond `end_offset` came from a log
+    /// the current leader does not have — the aftermath of an unclean leader
+    /// election. Three pieces of state have to move together:
+    ///
+    /// - the fetch position, back to `end_offset`;
+    /// - buffered records at or beyond it, which would otherwise be handed to
+    ///   the application even though they no longer exist upstream;
+    /// - the recorded leader epoch, which described the discarded position.
+    ///
+    /// This is not an out-of-range condition: `end_offset` is a valid offset in
+    /// the leader's log, so `auto.offset.reset` deliberately does not apply.
+    /// Resetting here would move the consumer to the log's start or end and
+    /// lose far more than the divergence itself.
+    async fn truncate_to_diverging_offset(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+        diverging: crate::protocol::DivergingEpoch,
+    ) {
+        let key = (topic.to_string(), partition);
+        let new_position = diverging.end_offset;
+
+        let mut offsets = self.offsets.write().await;
+        let old_position = offsets.get(&key).copied();
+        offsets.insert(key.clone(), new_position);
+        let mut partition_state = self.partition_state.write().await;
+        let entry = partition_state.entry(key).or_default();
+        entry.last_fetched_epoch = None;
+        // The broker has just told us exactly where the logs part company, so
+        // the new position needs no further validation.
+        entry.position_validated = true;
+        drop(partition_state);
+        drop(offsets);
+
+        // Records already fetched from beyond the divergence point are from
+        // the discarded log and must not reach the application.
+        let dropped = {
+            let mut buffer = self.recv_buffer.lock();
+            let before = buffer.len();
+            buffer.retain(|record| {
+                record.topic != topic
+                    || record.partition != partition
+                    || record.offset < new_position
+            });
+            let after = buffer.len();
+            self.metrics.buffered_records.set(after as u64);
+            before - after
+        };
+
+        warn!(
+            topic = %topic,
+            partition,
+            old_position = ?old_position,
+            new_position,
+            diverging_epoch = diverging.epoch,
+            dropped_buffered_records = dropped,
+            "Log truncation detected: the partition's log diverged from the leader's; \
+             rewinding the fetch position"
+        );
+
+        self.metrics.record_seek(1);
+        self.recompute_lag_metrics().await;
+    }
+
+    /// Check the fetch positions of partitions that have not been validated
+    /// since they were last set, and truncate any that sit beyond the leader's
+    /// log (KIP-320).
+    ///
+    /// Runs before fetching rather than in response to an error. A partition
+    /// that was assigned or `seek()`-ed after an unclean leader election can
+    /// hold a position the new leader never had, and the broker will happily
+    /// serve records from it — the mismatch is only visible if the client asks
+    /// about the epoch first. Validating up front is what turns that silent
+    /// data-consistency failure into a bounded rewind.
+    ///
+    /// Failures are logged and the partition is left unvalidated so the next
+    /// poll retries; they must not block fetching, which would turn a
+    /// transient broker problem into a stalled consumer.
+    async fn validate_pending_positions(&self, keys: &[(String, PartitionId)]) {
+        let pending: Vec<(String, PartitionId)> = {
+            let offsets = self.offsets.read().await;
+            let partition_state = self.partition_state.read().await;
+            keys.iter()
+                .filter(|key| offsets.contains_key(*key))
+                .filter(|key| {
+                    partition_state
+                        .get(*key)
+                        .is_none_or(|state| !state.position_validated)
+                })
+                .cloned()
+                .collect()
+        };
+
+        for (topic, partition) in pending {
+            match self
+                .validate_offset_for_leader_epoch_inner(&topic, partition, false)
+                .await
+            {
+                Ok(()) => {
+                    let mut partition_state = self.partition_state.write().await;
+                    partition_state
+                        .entry((topic, partition))
+                        .or_default()
+                        .position_validated = true;
+                }
+                Err(e) => {
+                    debug!(
+                        topic = %topic,
+                        partition,
+                        error = %e,
+                        "Offset validation failed; retrying on the next poll"
+                    );
+                }
+            }
+        }
+    }
+
     /// Handle an `OffsetOutOfRange` error for a single partition by resolving
     /// a new offset via the configured `auto_offset_reset` policy.
     async fn handle_offset_out_of_range(&self, topic: &str, partition: PartitionId) {
@@ -3428,29 +4145,60 @@ impl Consumer {
         };
 
         if let Some(new_offset) = offset {
-            self.offsets.write().await.insert(key, new_offset);
+            let mut offsets = self.offsets.write().await;
+            offsets.insert(key.clone(), new_offset);
+            let mut partition_state = self.partition_state.write().await;
+            invalidate_position_epoch(&mut partition_state, &key);
+            drop(partition_state);
+            drop(offsets);
             self.recompute_lag_metrics().await;
         }
     }
 
-    /// Validate the consumer's offset for a partition using OffsetForLeaderEpoch.
+    /// Validate the consumer's offset for a partition using OffsetForLeaderEpoch,
+    /// refreshing metadata first.
     ///
-    /// When a leader epoch error occurs during fetch, this method queries the
-    /// broker for the end offset of the current leader epoch. If the consumer's
-    /// current offset is beyond this (indicating log truncation), the offset
-    /// is reset to the truncation point.
+    /// Used on the error path, where the leader epoch the client holds is
+    /// already known to be wrong and cached leader information cannot be
+    /// trusted to address the request.
     async fn validate_offset_for_leader_epoch(
         &self,
         topic: &str,
         partition: PartitionId,
+    ) -> Result<()> {
+        self.validate_offset_for_leader_epoch_inner(topic, partition, true)
+            .await
+    }
+
+    /// Ask the leader where the epoch at the consumer's position ends, and
+    /// truncate the position if it sits beyond that point.
+    ///
+    /// The request pairs the epoch the consumer last consumed
+    /// ([`PartitionState::last_fetched_epoch`], falling back to the leader
+    /// epoch from metadata when nothing has been consumed yet) with the
+    /// current leader epoch. The broker answers with the last offset of that
+    /// epoch. A position beyond it exists only in a log the current leader
+    /// discarded, so the position is rewound to the broker's answer.
+    ///
+    /// `refresh_metadata` controls whether cached leader information is
+    /// refreshed first. The proactive path skips the refresh: it runs on every
+    /// newly positioned partition, and forcing a metadata round trip there
+    /// would reintroduce the very latency this is meant to avoid.
+    ///
+    /// Truncation here lands on a valid offset in the leader's log, so it is
+    /// deliberately not routed through `auto.offset.reset`.
+    async fn validate_offset_for_leader_epoch_inner(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+        refresh_metadata: bool,
     ) -> Result<()> {
         use crate::protocol::OffsetForLeaderEpochPartition;
         use crate::protocol::OffsetForLeaderEpochRequest;
         use crate::protocol::OffsetForLeaderEpochResponse;
         use crate::protocol::OffsetForLeaderEpochTopic;
 
-        // Refresh metadata first to get updated leader info
-        if let Err(e) = self.metadata.refresh_for_topics(Some(&[topic])).await {
+        if refresh_metadata && let Err(e) = self.metadata.refresh_for_topics(Some(&[topic])).await {
             warn!(
                 "Metadata refresh failed for {}: {}, using cached metadata",
                 topic, e
@@ -3462,6 +4210,18 @@ impl Consumer {
         if leader_epoch < 0 {
             return Ok(());
         }
+
+        // The epoch to ask about is the one the position actually came from.
+        // Without it there is nothing to compare against but the current
+        // epoch, which still catches a position past the leader's log end.
+        let position_epoch = {
+            let partition_state = self.partition_state.read().await;
+            partition_state
+                .get(&(topic.to_string(), partition))
+                .and_then(|state| state.last_fetched_epoch)
+                .filter(|&epoch| epoch >= 0)
+                .unwrap_or(leader_epoch)
+        };
 
         let leader_id = self.metadata.leader(topic, partition).ok_or_else(|| {
             KrafkaError::invalid_state(format!("no leader for {topic}-{partition}"))
@@ -3484,7 +4244,7 @@ impl Consumer {
                 partitions: vec![OffsetForLeaderEpochPartition {
                     partition,
                     current_leader_epoch: leader_epoch,
-                    leader_epoch,
+                    leader_epoch: position_epoch,
                 }],
             }],
         };
@@ -3538,11 +4298,32 @@ impl Consumer {
 
                     if current_offset > partition_result.end_offset {
                         warn!(
-                            "Log truncation detected for {}-{}: offset {} > end_offset {}, resetting",
-                            topic, partition, current_offset, partition_result.end_offset
+                            topic = %topic,
+                            partition,
+                            old_position = current_offset,
+                            new_position = partition_result.end_offset,
+                            "Log truncation detected: the position is past the end of its \
+                             leader epoch; rewinding the fetch position"
                         );
                         let mut offsets = self.offsets.write().await;
                         offsets.insert(key.clone(), partition_result.end_offset);
+                        let mut partition_state = self.partition_state.write().await;
+                        let entry = partition_state.entry(key.clone()).or_default();
+                        entry.last_fetched_epoch = None;
+                        drop(partition_state);
+                        drop(offsets);
+
+                        // Buffered records from beyond the truncation point
+                        // belong to the discarded log.
+                        let mut buffer = self.recv_buffer.lock();
+                        buffer.retain(|record| {
+                            record.topic != topic
+                                || record.partition != partition
+                                || record.offset < partition_result.end_offset
+                        });
+                        self.metrics.buffered_records.set(buffer.len() as u64);
+                        drop(buffer);
+
                         offset_changed = true;
                     }
                 }
@@ -3718,7 +4499,7 @@ impl Consumer {
                 debug!("No offsets to commit");
                 return Ok(());
             }
-            offsets.clone()
+            self.committable_snapshot(&offsets)
         };
 
         self.metrics.commits.inc();
@@ -3806,8 +4587,11 @@ impl Consumer {
                     return OffsetCommitHandle::ready(Ok(()));
                 }
                 self.metrics.commits.inc();
+                // Clamp to what the application has actually received so
+                // buffered-but-undelivered records are never acknowledged.
+                let committable = self.committable_snapshot(&guard);
                 match Self::build_commit_offsets(
-                    &guard,
+                    &committable,
                     assigned_set.as_ref(),
                     self.group_coordinator.is_some(),
                 ) {
@@ -3843,6 +4627,33 @@ impl Consumer {
             offsets_snapshot,
             committed_offsets,
         )))
+    }
+
+    /// Clamp each partition's fetch position to the highest offset that has
+    /// actually been handed to the application.
+    ///
+    /// `poll()` advances the fetch position for every record it retrieved, but
+    /// `recv()` returns those records one at a time and holds the remainder in
+    /// the receive buffer. Committing the raw fetch position would therefore
+    /// acknowledge records that are still buffered and unprocessed: with the
+    /// defaults, one `poll()` fetches 500 records, the application consumes a
+    /// handful, and the next auto-commit tick durably records all 500 as done.
+    /// A crash at that point skips every record still in the buffer — silently,
+    /// and with no way to recover them.
+    ///
+    /// Clamping to the lowest still-buffered offset is what makes the
+    /// documented at-least-once guarantee hold: a record is only ever
+    /// acknowledged after it has been delivered.
+    ///
+    /// The receive buffer's sync lock is taken while the `offsets` read guard
+    /// is held, which respects the documented lock order (async levels before
+    /// sync levels) and involves no `.await`.
+    fn committable_snapshot(
+        &self,
+        offsets: &HashMap<(String, PartitionId), Offset>,
+    ) -> HashMap<(String, PartitionId), Offset> {
+        let buffer = self.recv_buffer.lock();
+        committable_positions(offsets, &buffer)
     }
 
     fn build_commit_offsets(
@@ -4235,11 +5046,24 @@ impl Consumer {
 
     /// Unsubscribe from all topics.
     ///
-    /// properly notifies the rebalance listener, leaves the
-    /// consumer group, clears offsets, paused set, and drains recv buffer.
+    /// Commits offsets (when auto-commit is enabled), notifies the rebalance
+    /// listener, leaves the consumer group, and clears offsets, the paused
+    /// set, and the receive buffer.
     ///
     /// Returns a leave-group error after local state has still been cleared.
     pub async fn unsubscribe(&self) -> Result<()> {
+        // Give up the partitions the same way a rebalance would: check
+        // progress in before the assignment is released. Skipping this while
+        // auto-commit is enabled means everything consumed since the last
+        // periodic tick is silently re-delivered to whoever picks these
+        // partitions up next.
+        if self.config.enable_auto_commit
+            && self.group_coordinator.is_some()
+            && let Err(e) = self.commit().await
+        {
+            warn!("Commit during unsubscribe failed: {e}");
+        }
+
         // Notify listener of revoked partitions before clearing.
         // Collect while holding the lock, then drop the lock before .await
         // to avoid holding a read guard across an await point.
@@ -4363,18 +5187,26 @@ impl Consumer {
             Ok(())
         };
 
-        // Notify listener that partitions are being lost.
-        // Collect while holding the lock, then drop it before .await
-        // to avoid holding a read guard across an await point.
-        let lost: Vec<TopicPartition> = {
+        // Report a clean shutdown as a *revocation*, not a loss.
+        //
+        // `on_partitions_lost` means "these partitions were taken away and it
+        // is no longer safe to commit them" — the trait documentation tells
+        // implementors not to commit from it. A deliberate `close()` is the
+        // opposite situation: the consumer still owns these partitions and
+        // this is the listener's last chance to checkpoint. Firing the lost
+        // callback here means a listener that does its final commit in
+        // `on_partitions_revoked`, as documented, never gets to run it.
+        //
+        // Java draws the same distinction in `onLeavePrepare`.
+        let revoked: Vec<TopicPartition> = {
             let assignments = self.assignments.read().await;
             assignments
                 .iter()
                 .flat_map(|(t, ps)| ps.iter().map(move |&p| TopicPartition::new(t, p)))
                 .collect()
         };
-        if !lost.is_empty() {
-            self.safe_on_partitions_lost(&lost).await;
+        if !revoked.is_empty() {
+            self.safe_on_partitions_revoked(&revoked).await;
         }
 
         // Leave consumer group if we have a group coordinator
@@ -4404,6 +5236,42 @@ impl Consumer {
     #[inline]
     pub fn is_closed(&self) -> bool {
         self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A live snapshot of this consumer's identity within its group.
+    ///
+    /// Returns `None` when the consumer has no `group_id`, or when it has not
+    /// yet completed a join and therefore has no identity to report.
+    ///
+    /// # What it is for
+    ///
+    /// Pass this to a transactional producer when committing consumer offsets
+    /// inside a transaction. It lets the group coordinator fence commits from
+    /// a zombie consumer — one that was partitioned away, lost its partitions
+    /// to a rebalance, and then returned. Without it the coordinator accepts
+    /// the zombie's commit unconditionally and overwrites the position of the
+    /// member that now owns those partitions, breaking exactly-once. See
+    /// [`ConsumerGroupMetadata`].
+    ///
+    /// # Re-read it for every transaction
+    ///
+    /// The generation changes on every rebalance, so a cached snapshot goes
+    /// stale without warning. Call this again for each transaction rather than
+    /// holding on to the result:
+    ///
+    /// ```ignore
+    /// loop {
+    ///     let records = consumer.poll(Duration::from_secs(1)).await?;
+    ///     producer.begin_transaction()?;
+    ///     // ... produce derived records ...
+    ///     let metadata = consumer.group_metadata().await
+    ///         .ok_or_else(|| anyhow!("consumer is not in a group"))?;
+    ///     producer.send_offsets_to_transaction(&offsets, &metadata).await?;
+    ///     producer.commit_transaction().await?;
+    /// }
+    /// ```
+    pub async fn group_metadata(&self) -> Option<ConsumerGroupMetadata> {
+        self.group_coordinator.as_ref()?.group_metadata().await
     }
 
     /// Get the group coordinator, if one is configured.
@@ -4502,7 +5370,7 @@ mod tests {
     fn test_partition_assignment_strategy_default() {
         let config = ConsumerConfig::default();
         assert_eq!(
-            config.partition_assignment_strategy,
+            config.partition_assignment_strategy(),
             PartitionAssignmentStrategy::Range
         );
     }
@@ -5049,9 +5917,15 @@ mod tests {
         // rebalance_timeout should default to max_poll_interval (not session_timeout)
         let config = ConsumerConfig::default();
         // In the Java client, rebalance_timeout defaults to max.poll.interval.ms (300s)
-        // not session.timeout.ms (10s). Verify our config has both.
+        // not session.timeout.ms (45s). Verify our config has both.
         assert_eq!(config.max_poll_interval, Duration::from_secs(300));
-        assert_eq!(config.session_timeout, Duration::from_secs(10));
+        assert_eq!(
+            config.session_timeout,
+            Duration::from_secs(45),
+            "session_timeout matches Java/librdkafka since Kafka 3.0; the older 10s \
+             default caused spurious rebalances under GC pauses and is rejected by \
+             brokers with group.min.session.timeout.ms > 10000"
+        );
         // The rebalance_timeout passed to GroupCoordinator should be max_poll_interval
         assert!(config.max_poll_interval > config.session_timeout);
     }
@@ -5829,6 +6703,8 @@ mod tests {
                 preferred_replica: Some((3_i32, Instant::now() + Duration::from_secs(60))),
                 offset_retry_backoff: Some((Instant::now(), Duration::from_millis(100))),
                 watermark_updated_at: None,
+                last_fetched_epoch: Some(7),
+                position_validated: true,
             },
         );
 
@@ -6466,5 +7342,467 @@ mod tests {
         assert_eq!(metrics.seeks, 1);
         assert_eq!(metrics.lag, 10);
         assert_eq!(metrics.lag_max, 10);
+    }
+
+    // ── Committable position (buffered-but-undelivered records) ──────────
+
+    /// A partition with nothing buffered can commit its full fetch position.
+    #[test]
+    fn test_committable_position_matches_fetch_position_when_buffer_empty() {
+        let mut positions = HashMap::new();
+        positions.insert(("t".to_string(), 0), 500);
+
+        let buffer = std::collections::VecDeque::new();
+        let committable = committable_positions(&positions, &buffer);
+
+        assert_eq!(committable.get(&("t".to_string(), 0)), Some(&500));
+    }
+
+    /// The core at-least-once property: records fetched into the receive
+    /// buffer but not yet handed to the application must not be committed.
+    /// Committing the fetch position here would acknowledge 497 records the
+    /// application never saw.
+    #[test]
+    fn test_committable_position_clamped_to_lowest_buffered_offset() {
+        let mut positions = HashMap::new();
+        positions.insert(("t".to_string(), 0), 500);
+
+        // poll() fetched 0..500 and recv() delivered 0, 1, 2; 3..500 remain.
+        let buffer: std::collections::VecDeque<ConsumerRecord> =
+            (3..500).map(|o| make_record("t", 0, o)).collect();
+
+        let committable = committable_positions(&positions, &buffer);
+
+        assert_eq!(
+            committable.get(&("t".to_string(), 0)),
+            Some(&3),
+            "must commit only up to the first undelivered record"
+        );
+    }
+
+    /// Buffered records for one partition must not hold back another.
+    #[test]
+    fn test_committable_position_is_per_partition() {
+        let mut positions = HashMap::new();
+        positions.insert(("t".to_string(), 0), 100);
+        positions.insert(("t".to_string(), 1), 200);
+
+        let buffer: std::collections::VecDeque<ConsumerRecord> =
+            vec![make_record("t", 0, 40), make_record("t", 0, 41)].into();
+
+        let committable = committable_positions(&positions, &buffer);
+
+        assert_eq!(committable.get(&("t".to_string(), 0)), Some(&40));
+        assert_eq!(
+            committable.get(&("t".to_string(), 1)),
+            Some(&200),
+            "a partition with no buffered records is unaffected"
+        );
+    }
+
+    /// Buffer order is not guaranteed to be ascending across interleaved
+    /// partitions, so the minimum must be computed, not taken from the front.
+    #[test]
+    fn test_committable_position_uses_minimum_not_first_buffered() {
+        let mut positions = HashMap::new();
+        positions.insert(("t".to_string(), 0), 100);
+
+        let buffer: std::collections::VecDeque<ConsumerRecord> = vec![
+            make_record("t", 0, 70),
+            make_record("t", 0, 55),
+            make_record("t", 0, 90),
+        ]
+        .into();
+
+        let committable = committable_positions(&positions, &buffer);
+        assert_eq!(committable.get(&("t".to_string(), 0)), Some(&55));
+    }
+
+    /// The committable position never exceeds the fetch position, even if the
+    /// buffer somehow holds a higher offset.
+    #[test]
+    fn test_committable_position_never_exceeds_fetch_position() {
+        let mut positions = HashMap::new();
+        positions.insert(("t".to_string(), 0), 10);
+
+        let buffer: std::collections::VecDeque<ConsumerRecord> =
+            vec![make_record("t", 0, 999)].into();
+
+        let committable = committable_positions(&positions, &buffer);
+        assert_eq!(committable.get(&("t".to_string(), 0)), Some(&10));
+    }
+
+    // ── Stale fetch responses after seek() ───────────────────────────────
+
+    /// The ordinary case: the position is untouched while the fetch is in
+    /// flight, so the update applies.
+    #[test]
+    fn test_fetch_update_applied_when_position_unchanged() {
+        let mut offsets = HashMap::new();
+        offsets.insert(("t".to_string(), 0), 1000);
+
+        let discarded = apply_fetch_offset_updates(
+            &mut offsets,
+            vec![(
+                ("t".to_string(), 0),
+                FetchOffsetUpdate {
+                    epoch: -1,
+                    requested: 1000,
+                    next: 1500,
+                },
+            )],
+        );
+
+        assert!(discarded.is_empty());
+        assert_eq!(offsets.get(&("t".to_string(), 0)), Some(&1500));
+    }
+
+    /// A fetch issued from 1000 must not overwrite a seek to 100 that landed
+    /// while it was in flight — otherwise the seek is silently discarded and
+    /// the consumer resumes at 1500.
+    #[test]
+    fn test_fetch_update_discarded_after_concurrent_seek() {
+        let mut offsets = HashMap::new();
+        offsets.insert(("t".to_string(), 0), 100); // seek() already applied
+
+        let discarded = apply_fetch_offset_updates(
+            &mut offsets,
+            vec![(
+                ("t".to_string(), 0),
+                FetchOffsetUpdate {
+                    epoch: -1,
+                    requested: 1000,
+                    next: 1500,
+                },
+            )],
+        );
+
+        assert_eq!(discarded, vec![("t".to_string(), 0)]);
+        assert_eq!(
+            offsets.get(&("t".to_string(), 0)),
+            Some(&100),
+            "seek() must survive an in-flight fetch from the old position"
+        );
+    }
+
+    /// A partition revoked while its fetch was in flight has no position at
+    /// all; the update must not resurrect it.
+    #[test]
+    fn test_fetch_update_discarded_for_revoked_partition() {
+        let mut offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+
+        let discarded = apply_fetch_offset_updates(
+            &mut offsets,
+            vec![(
+                ("t".to_string(), 0),
+                FetchOffsetUpdate {
+                    epoch: -1,
+                    requested: 5,
+                    next: 10,
+                },
+            )],
+        );
+
+        assert_eq!(discarded, vec![("t".to_string(), 0)]);
+        assert!(offsets.is_empty());
+    }
+
+    /// A stale update for one partition must not block a valid one for
+    /// another partition in the same batch.
+    #[test]
+    fn test_fetch_updates_are_evaluated_independently() {
+        let mut offsets = HashMap::new();
+        offsets.insert(("t".to_string(), 0), 100); // moved by seek
+        offsets.insert(("t".to_string(), 1), 200); // untouched
+
+        let discarded = apply_fetch_offset_updates(
+            &mut offsets,
+            vec![
+                (
+                    ("t".to_string(), 0),
+                    FetchOffsetUpdate {
+                        epoch: -1,
+                        requested: 1000,
+                        next: 1500,
+                    },
+                ),
+                (
+                    ("t".to_string(), 1),
+                    FetchOffsetUpdate {
+                        epoch: -1,
+                        requested: 200,
+                        next: 250,
+                    },
+                ),
+            ],
+        );
+
+        assert_eq!(discarded, vec![("t".to_string(), 0)]);
+        assert_eq!(offsets.get(&("t".to_string(), 0)), Some(&100));
+        assert_eq!(offsets.get(&("t".to_string(), 1)), Some(&250));
+    }
+
+    // ====================================================================
+    // KIP-320 log-truncation detection / KIP-951 leader discovery
+    // ====================================================================
+
+    #[test]
+    fn test_invalidate_position_epoch_clears_epoch_and_validation() {
+        let key = ("t".to_string(), 0);
+        let mut partition_state: HashMap<(String, PartitionId), PartitionState> = HashMap::new();
+        let entry = partition_state.entry(key.clone()).or_default();
+        entry.last_fetched_epoch = Some(11);
+        entry.position_validated = true;
+        entry.high_watermark = Some(900);
+
+        invalidate_position_epoch(&mut partition_state, &key);
+
+        let state = &partition_state[&key];
+        assert_eq!(state.last_fetched_epoch, None);
+        assert!(!state.position_validated);
+        // Unrelated cached facts survive — only what describes the position
+        // is discarded.
+        assert_eq!(state.high_watermark, Some(900));
+    }
+
+    #[test]
+    fn test_invalidate_position_epoch_creates_entry_when_absent() {
+        let key = ("t".to_string(), 3);
+        let mut partition_state: HashMap<(String, PartitionId), PartitionState> = HashMap::new();
+
+        invalidate_position_epoch(&mut partition_state, &key);
+
+        // Without an entry a later fetch could not tell an unvalidated
+        // position from a validated one.
+        assert!(!partition_state[&key].position_validated);
+    }
+
+    #[tokio::test]
+    async fn test_seek_marks_position_for_revalidation() {
+        let consumer = make_test_consumer();
+        let key = ("orders".to_string(), 0);
+        {
+            let mut partition_state = consumer.partition_state.write().await;
+            let entry = partition_state.entry(key.clone()).or_default();
+            entry.last_fetched_epoch = Some(4);
+            entry.position_validated = true;
+        }
+
+        consumer.seek("orders", 0, 500).await.unwrap();
+
+        let partition_state = consumer.partition_state.read().await;
+        assert_eq!(partition_state[&key].last_fetched_epoch, None);
+        assert!(!partition_state[&key].position_validated);
+    }
+
+    #[tokio::test]
+    async fn test_seek_many_marks_all_positions_for_revalidation() {
+        let consumer = make_test_consumer();
+        let keys = [("orders".to_string(), 0), ("orders".to_string(), 1)];
+        {
+            let mut partition_state = consumer.partition_state.write().await;
+            for key in &keys {
+                let entry = partition_state.entry(key.clone()).or_default();
+                entry.last_fetched_epoch = Some(4);
+                entry.position_validated = true;
+            }
+        }
+
+        let mut targets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        targets.insert(keys[0].clone(), 10);
+        targets.insert(keys[1].clone(), 20);
+        consumer.seek_many(&targets).await.unwrap();
+
+        let partition_state = consumer.partition_state.read().await;
+        for key in &keys {
+            assert_eq!(partition_state[key].last_fetched_epoch, None);
+            assert!(!partition_state[key].position_validated);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_truncation_rewinds_position_and_drops_buffered_records() {
+        let consumer = make_test_consumer();
+        let key = ("orders".to_string(), 0);
+
+        consumer.offsets.write().await.insert(key.clone(), 1_000);
+        {
+            let mut partition_state = consumer.partition_state.write().await;
+            let entry = partition_state.entry(key.clone()).or_default();
+            entry.last_fetched_epoch = Some(7);
+        }
+        {
+            let mut buffer = consumer.recv_buffer.lock();
+            buffer.push_back(make_record("orders", 0, 940)); // below the divergence
+            buffer.push_back(make_record("orders", 0, 950)); // at the divergence
+            buffer.push_back(make_record("orders", 0, 980)); // beyond it
+            buffer.push_back(make_record("orders", 1, 999)); // other partition
+        }
+
+        consumer
+            .truncate_to_diverging_offset(
+                "orders",
+                0,
+                crate::protocol::DivergingEpoch {
+                    epoch: 6,
+                    end_offset: 950,
+                },
+            )
+            .await;
+
+        assert_eq!(consumer.offsets.read().await[&key], 950);
+
+        let partition_state = consumer.partition_state.read().await;
+        assert_eq!(partition_state[&key].last_fetched_epoch, None);
+        // The broker just told us exactly where the logs part, so nothing
+        // more needs validating.
+        assert!(partition_state[&key].position_validated);
+        drop(partition_state);
+
+        let buffered: Vec<(String, Offset)> = consumer
+            .recv_buffer
+            .lock()
+            .iter()
+            .map(|r| (format!("{}-{}", r.topic, r.partition), r.offset))
+            .collect();
+        assert_eq!(
+            buffered,
+            vec![("orders-0".to_string(), 940), ("orders-1".to_string(), 999)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_truncation_does_not_apply_auto_offset_reset() {
+        // `auto.offset.reset` would move the position to the start or end of
+        // the log. A divergence point is a valid offset, so the position must
+        // land exactly on it.
+        let consumer = make_test_consumer();
+        let key = ("orders".to_string(), 0);
+        consumer.offsets.write().await.insert(key.clone(), 5_000);
+
+        consumer
+            .truncate_to_diverging_offset(
+                "orders",
+                0,
+                crate::protocol::DivergingEpoch {
+                    epoch: 2,
+                    end_offset: 4_096,
+                },
+            )
+            .await;
+
+        assert_eq!(consumer.offsets.read().await[&key], 4_096);
+    }
+
+    #[test]
+    fn test_routing_plan_uses_the_metadata_leader() {
+        // A broker-reported leader (KIP-951) reaches this function through the
+        // metadata cache, so there is one leader source and no precedence
+        // question between them.
+        let now = Instant::now();
+        let key = ("orders".to_string(), 0);
+        let partition_state: HashMap<(String, PartitionId), PartitionState> = HashMap::new();
+
+        let mut leaders = HashMap::new();
+        leaders.insert(key.clone(), 9);
+
+        let plan = build_fetch_routing_plan(vec![key.clone()], &partition_state, &leaders, now);
+
+        assert_eq!(plan.partitions_by_broker[&9], vec![key]);
+        assert!(plan.skipped.is_empty());
+    }
+
+    #[test]
+    fn test_routing_plan_skips_partitions_without_a_leader() {
+        let now = Instant::now();
+        let key = ("orders".to_string(), 0);
+        let partition_state: HashMap<(String, PartitionId), PartitionState> = HashMap::new();
+
+        let plan =
+            build_fetch_routing_plan(vec![key.clone()], &partition_state, &HashMap::new(), now);
+
+        assert!(plan.partitions_by_broker.is_empty());
+        assert_eq!(plan.skipped, vec![key]);
+    }
+
+    #[test]
+    fn test_routing_plan_preferred_replica_wins_over_the_leader() {
+        // KIP-392 read-replica routing is a deliberate choice by the broker
+        // serving this consumer and is not invalidated by a leader change.
+        let now = Instant::now();
+        let key = ("orders".to_string(), 0);
+        let mut partition_state: HashMap<(String, PartitionId), PartitionState> = HashMap::new();
+        partition_state
+            .entry(key.clone())
+            .or_default()
+            .preferred_replica = Some((5, now + Duration::from_secs(60)));
+
+        let mut leaders = HashMap::new();
+        leaders.insert(key.clone(), 9);
+
+        let plan = build_fetch_routing_plan(vec![key.clone()], &partition_state, &leaders, now);
+
+        assert_eq!(plan.partitions_by_broker[&5], vec![key]);
+    }
+
+    /// A leader hint carrying an endpoint makes a broker the metadata cache has
+    /// never seen dialable straight away.
+    #[tokio::test]
+    async fn test_broker_address_uses_an_endpoint_from_a_leader_hint() {
+        let consumer = make_test_consumer();
+        assert_eq!(consumer.broker_address(42), None);
+
+        assert!(consumer.metadata.apply_leader_hint(
+            "orders",
+            0,
+            42,
+            5,
+            Some(BrokerInfo::new(
+                42,
+                "broker-42.internal".to_string(),
+                9092,
+                None
+            )),
+        ));
+
+        assert_eq!(
+            consumer.broker_address(42),
+            Some("broker-42.internal:9092".to_string())
+        );
+    }
+
+    #[test]
+    fn test_fetch_offset_update_carries_epoch_only_when_applied() {
+        let mut offsets: HashMap<(String, PartitionId), Offset> = HashMap::new();
+        offsets.insert(("t".to_string(), 0), 100);
+        offsets.insert(("t".to_string(), 1), 200);
+
+        let updates = vec![
+            (
+                ("t".to_string(), 0),
+                FetchOffsetUpdate {
+                    requested: 100,
+                    next: 150,
+                    epoch: 5,
+                },
+            ),
+            (
+                // Position moved while the fetch was in flight.
+                ("t".to_string(), 1),
+                FetchOffsetUpdate {
+                    requested: 180,
+                    next: 250,
+                    epoch: 6,
+                },
+            ),
+        ];
+
+        let discarded = apply_fetch_offset_updates(&mut offsets, updates);
+
+        assert_eq!(discarded, vec![("t".to_string(), 1)]);
+        assert_eq!(offsets[&("t".to_string(), 0)], 150);
+        // The stale update left the position alone, so its epoch must not be
+        // recorded either.
+        assert_eq!(offsets[&("t".to_string(), 1)], 200);
     }
 }

@@ -105,26 +105,57 @@
 //! | `socks5` | no | SOCKS5 proxy support via `tokio-socks`. |
 //! | `telemetry` | no | OpenTelemetry exporter for producer/consumer metrics. |
 //! | `unstable-protocol` | no | Enables experimental protocol APIs (Share Consumer, KIP-932). APIs under this feature may change without semver notice. |
+//! | `ring` | **yes** | rustls crypto backend using `ring` (pure Rust). |
+//! | `rustls-aws-lc-rs` | no | rustls crypto backend using `aws-lc-rs`. Preferred on AWS Graviton and for FIPS deployments. |
+//! | `native-tls-roots` | no | Load platform-native root certificates via `rustls-native-certs`. |
+//! | `test-broker` | no | In-process fake Kafka broker for testing your own code against a real client. Not for production builds. |
 //!
-//! To disable the default compression codecs and pick only what you need:
+//! ## TLS crypto backend
+//!
+//! Exactly one rustls crypto backend is used at runtime. `ring` is the default;
+//! `rustls-aws-lc-rs` selects `aws-lc-rs` instead.
+//!
+//! These features are **additive**, as Cargo requires: if two crates in your
+//! dependency graph each select a different backend, the build still succeeds
+//! and `rustls-aws-lc-rs` wins. To pin a specific backend regardless of what
+//! your dependency graph enabled, install it as the process default before
+//! constructing any krafka client:
+//!
+//! ```rust,ignore
+//! rustls::crypto::ring::default_provider().install_default().ok();
+//! ```
+//!
+//! Enabling **neither** backend is a compile error — rustls cannot build a
+//! `ClientConfig` without a crypto provider.
+//!
+//! To disable the default features and pick only what you need, remember that
+//! `default-features = false` also drops `ring`:
 //!
 //! ```toml
 //! [dependencies]
-//! krafka = { version = "0.12.0", default-features = false, features = ["lz4"] }
+//! # `ring` (or `rustls-aws-lc-rs`) is required — without it the build fails.
+//! krafka = { version = "0.12.0", default-features = false, features = ["lz4", "ring"] }
 //! ```
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(unsafe_code)]
 
-// `ring` and `rustls-aws-lc-rs` are mutually exclusive rustls crypto backends.
-// Activating both simultaneously causes a runtime "no default crypto provider"
-// panic and links against both C libraries unnecessarily.  Fail at compile time
-// with a clear message rather than a mysterious runtime error.
-#[cfg(all(feature = "ring", feature = "rustls-aws-lc-rs"))]
+// Cargo features must be *additive*: if crate A depends on krafka with `ring`
+// and crate B depends on krafka with `rustls-aws-lc-rs`, Cargo unifies the two
+// feature sets and both are enabled.  Rejecting that combination at compile
+// time would make the two crates impossible to use together, with no recourse
+// for the application author.  Instead the backends are additive and
+// `rustls-aws-lc-rs` deterministically wins when both are active — see
+// `auth::tls::resolve_crypto_provider`.
+//
+// At least one backend is required, because rustls cannot construct a
+// `ClientConfig` without a crypto provider.
+#[cfg(not(any(feature = "ring", feature = "rustls-aws-lc-rs")))]
 compile_error!(
-    "features `ring` and `rustls-aws-lc-rs` are mutually exclusive — \
-     select exactly one rustls crypto backend. \
-     Add `default-features = false` to your krafka dependency and pick one."
+    "krafka requires a rustls crypto backend, but neither `ring` nor \
+     `rustls-aws-lc-rs` is enabled. The default `ring` backend is disabled by \
+     `default-features = false`; re-enable it with `features = [\"ring\"]`, or \
+     select `features = [\"rustls-aws-lc-rs\"]` instead."
 );
 
 // krafka's metrics layer relies on 64-bit atomic operations (AtomicU64).
@@ -172,6 +203,12 @@ pub mod share_consumer;
 #[cfg(feature = "telemetry")]
 #[cfg_attr(docsrs, doc(cfg(feature = "telemetry")))]
 pub mod telemetry;
+/// In-process fake Kafka broker for deterministic client tests.
+///
+/// Enabled by the `test-broker` feature. Not compiled into production builds.
+#[cfg(feature = "test-broker")]
+#[cfg_attr(docsrs, doc(cfg(feature = "test-broker")))]
+pub mod testing;
 pub mod tracing_ext;
 pub mod util;
 

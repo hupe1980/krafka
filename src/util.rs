@@ -1,4 +1,11 @@
-//! Utility functions for Krafka.\n//!\n//! This module provides low-level utilities used throughout the crate:\n//!\n//! - **Correlation ID generation**: Thread-safe ID generation for request/response matching\n//! - **CRC32C**: Checksum calculation for Kafka record validation\n//! - **Varint encoding**: Variable-length integer encoding for compact protocols\n//! - **SNI hostname extraction**: Parse hostnames from address strings for TLS SNI
+//! Utility functions for Krafka.
+//!
+//! This module provides low-level utilities used throughout the crate:
+//!
+//! - **Correlation ID generation**: Thread-safe ID generation for request/response matching
+//! - **CRC32C**: Checksum calculation for Kafka record validation
+//! - **Varint encoding**: Variable-length integer encoding for compact protocols
+//! - **SNI hostname extraction**: Parse hostnames from address strings for TLS SNI
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -30,7 +37,15 @@ pub struct BackoffPolicy {
     pub max_backoff: Duration,
     /// Backoff multiplier for exponential growth (typically 2.0).
     pub backoff_multiplier: f64,
-    /// Jitter factor (0.0–1.0) to randomize backoff and prevent thundering herd.
+    /// Jitter factor to randomize backoff and prevent thundering herd.
+    ///
+    /// **Valid range: `0.0..=1.0`.** The field is public for struct-literal
+    /// construction, so an out-of-range or non-finite value can be written
+    /// directly. It is never trusted: every read goes through
+    /// [`BackoffPolicy::jitter_factor`], which clamps to `0.0..=1.0` and maps
+    /// `NaN` to `0.0`. Prefer [`BackoffPolicy::with_jitter_factor`] or
+    /// [`BackoffPolicy::set_jitter_factor`], which normalize the stored value
+    /// eagerly so the invariant also holds for anything reading the field.
     pub jitter_factor: f64,
 }
 
@@ -64,6 +79,11 @@ impl BackoffPolicy {
     /// `max_backoff` must be >= `initial_backoff`. If not, `max_backoff` is
     /// silently clamped up to `initial_backoff` so the contract that
     /// `initial_backoff <= result <= max_backoff + jitter_range` holds.
+    ///
+    /// `jitter_factor` is read through [`Self::jitter_factor`], which clamps it
+    /// to `0.0..=1.0` and maps `NaN` to `0.0`. A negative or non-finite
+    /// `jitter_factor` therefore disables jitter instead of panicking on an
+    /// empty sampling range.
     #[inline]
     pub fn calculate_backoff(&self, attempt: u32) -> Duration {
         if attempt == 0 {
@@ -83,21 +103,33 @@ impl BackoffPolicy {
         let initial_secs = self.initial_backoff.as_secs_f64();
         let effective_max_secs = effective_max.as_secs_f64();
         let exponent = attempt.saturating_sub(1).min(i32::MAX as u32) as i32;
-        // If the initial value already equals the ceiling, or if the exponent
-        // is large enough that floating-point will overflow to infinity, skip
-        // powi entirely and go straight to jitter application at the cap.
-        let base_backoff = if initial_secs >= effective_max_secs || exponent >= 1024 {
+        // If the initial value already equals the ceiling, or if a *growing*
+        // exponential has an exponent large enough that floating point would
+        // overflow to infinity, skip powi entirely and go straight to jitter
+        // application at the cap. The `> 1.0` guard matters: with a multiplier
+        // of 1.0 the series is flat and with a multiplier below 1.0 it shrinks,
+        // so jumping to the ceiling for a large attempt count would invert the
+        // configured behaviour.
+        let base_backoff = if initial_secs >= effective_max_secs
+            || (self.backoff_multiplier > 1.0 && exponent >= 1024)
+        {
             effective_max_secs
         } else {
-            // Exponential backoff: initial * multiplier^(attempt-1)
+            // Exponential backoff: initial * multiplier^(attempt-1).
+            // A non-finite multiplier makes the product NaN; `f64::min` returns
+            // the non-NaN operand, so the result degrades to the ceiling rather
+            // than propagating NaN.
             (initial_secs * self.backoff_multiplier.powi(exponent)).min(effective_max_secs)
         };
 
         // Add ±jitter to prevent thundering herd.
         // The final .max(initial_backoff) clamps the floor so negative jitter
         // cannot reduce the delay below the configured initial_backoff.
-        let jitter_range = base_backoff * self.jitter_factor;
-        let jitter = if self.jitter_factor > 0.0 {
+        // Read through the accessor so a directly-assigned negative/NaN
+        // jitter_factor cannot produce an empty (panicking) sampling range.
+        let jitter_factor = self.jitter_factor();
+        let jitter_range = base_backoff * jitter_factor;
+        let jitter = if jitter_factor > 0.0 && jitter_range > 0.0 {
             JITTER_RNG.with(|rng| rng.borrow_mut().random_range(-jitter_range..=jitter_range))
         } else {
             0.0
@@ -133,10 +165,46 @@ impl BackoffPolicy {
         self.backoff_multiplier
     }
 
-    /// Jitter factor (0.0–1.0).
+    /// Jitter factor, always normalized into `0.0..=1.0`.
+    ///
+    /// The backing field is public and may hold an out-of-range or non-finite
+    /// value if it was assigned directly. This accessor is the authoritative
+    /// read: values below `0.0` clamp to `0.0`, values above `1.0` clamp to
+    /// `1.0`, and `NaN` maps to `0.0` (jitter disabled). Clamping here is what
+    /// keeps [`Self::calculate_backoff`] from sampling an empty range.
     #[inline]
     pub fn jitter_factor(&self) -> f64 {
-        self.jitter_factor
+        Self::clamp_jitter_factor(self.jitter_factor)
+    }
+
+    /// Normalize a raw jitter factor into `0.0..=1.0`, mapping `NaN` to `0.0`.
+    #[inline]
+    fn clamp_jitter_factor(factor: f64) -> f64 {
+        if factor.is_nan() {
+            0.0
+        } else {
+            factor.clamp(0.0, 1.0)
+        }
+    }
+
+    /// Set the jitter factor, clamping it into `0.0..=1.0`.
+    ///
+    /// Negative values become `0.0`, values above `1.0` become `1.0`, and
+    /// `NaN` becomes `0.0`. Use this instead of assigning the public field so
+    /// the stored value already satisfies the invariant.
+    #[inline]
+    pub fn set_jitter_factor(&mut self, factor: f64) {
+        self.jitter_factor = Self::clamp_jitter_factor(factor);
+    }
+
+    /// Builder-style variant of [`Self::set_jitter_factor`].
+    ///
+    /// The factor is clamped into `0.0..=1.0` (`NaN` becomes `0.0`).
+    #[inline]
+    #[must_use]
+    pub fn with_jitter_factor(mut self, factor: f64) -> Self {
+        self.set_jitter_factor(factor);
+        self
     }
 }
 
@@ -353,7 +421,11 @@ pub mod varint {
         buf.put_u8(value as u8);
     }
 
-    /// Decode a signed 32-bit varint.
+    /// Decode a signed 32-bit varint (zigzag encoded).
+    ///
+    /// Inherits the strictness of [`decode_unsigned_varint`]: encodings whose
+    /// fifth byte carries bits above the 32-bit value range are rejected rather
+    /// than silently truncated.
     #[inline]
     pub fn decode_signed_varint(buf: &mut impl Buf) -> Result<i32> {
         let unsigned = decode_unsigned_varint(buf)?;
@@ -361,6 +433,15 @@ pub mod varint {
     }
 
     /// Decode an unsigned 32-bit varint.
+    ///
+    /// At most five bytes are consumed. The fifth (final) byte may only carry
+    /// the four remaining value bits, so any payload above `0x0F` in that
+    /// position would overflow `u32`. Such encodings are **rejected** with
+    /// [`ProtocolErrorKind::InvalidLength`] rather than silently truncated —
+    /// matching the Java client's `readUnsignedVarint`, which throws. This
+    /// keeps `FF FF FF FF 7F` (non-canonical) distinguishable from
+    /// `FF FF FF FF 0F` (canonical `u32::MAX`); previously both decoded to
+    /// `u32::MAX`.
     #[inline]
     pub fn decode_unsigned_varint(buf: &mut impl Buf) -> Result<u32> {
         let mut result: u32 = 0;
@@ -375,6 +456,16 @@ pub mod varint {
             }
 
             let byte = buf.get_u8();
+
+            // The 5th byte (shift == 28) holds only bits 28..=31; anything
+            // above 0x0F would be shifted out of the u32 entirely.
+            if shift == 28 && byte & 0x7F > 0x0F {
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidLength,
+                    "varint overflows u32",
+                ));
+            }
+
             result |= ((byte & 0x7F) as u32) << shift;
 
             if byte & 0x80 == 0 {
@@ -393,7 +484,11 @@ pub mod varint {
         Ok(result)
     }
 
-    /// Decode a signed 64-bit varlong.
+    /// Decode a signed 64-bit varlong (zigzag encoded).
+    ///
+    /// Inherits the strictness of [`decode_unsigned_varlong`]: encodings whose
+    /// tenth byte carries bits above the 64-bit value range are rejected rather
+    /// than silently truncated.
     #[inline]
     pub fn decode_signed_varlong(buf: &mut impl Buf) -> Result<i64> {
         let unsigned = decode_unsigned_varlong(buf)?;
@@ -401,6 +496,12 @@ pub mod varint {
     }
 
     /// Decode an unsigned 64-bit varlong.
+    ///
+    /// At most ten bytes are consumed. The tenth (final) byte may only carry
+    /// the single remaining value bit, so any payload above `0x01` in that
+    /// position would overflow `u64`. Such encodings are **rejected** with
+    /// [`ProtocolErrorKind::InvalidLength`] rather than silently truncated,
+    /// mirroring [`decode_unsigned_varint`] and the Java client's `readVarlong`.
     #[inline]
     pub fn decode_unsigned_varlong(buf: &mut impl Buf) -> Result<u64> {
         let mut result: u64 = 0;
@@ -415,6 +516,16 @@ pub mod varint {
             }
 
             let byte = buf.get_u8();
+
+            // The 10th byte (shift == 63) holds only bit 63; anything above
+            // 0x01 would be shifted out of the u64 entirely.
+            if shift == 63 && byte & 0x7F > 0x01 {
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidLength,
+                    "varlong overflows u64",
+                ));
+            }
+
             result |= ((byte & 0x7F) as u64) << shift;
 
             if byte & 0x80 == 0 {
@@ -492,6 +603,237 @@ mod tests {
             let decoded = varint::decode_signed_varlong(&mut buf.freeze()).unwrap();
             assert_eq!(decoded, value, "Failed for value {value}");
         }
+    }
+
+    // --- Varint overflow / non-canonical encoding rejection ---
+
+    #[test]
+    fn test_decode_unsigned_varint_max_canonical() {
+        // FF FF FF FF 0F is the canonical 5-byte encoding of u32::MAX.
+        let mut buf = &[0xFFu8, 0xFF, 0xFF, 0xFF, 0x0F][..];
+        assert_eq!(varint::decode_unsigned_varint(&mut buf).unwrap(), u32::MAX);
+    }
+
+    #[test]
+    fn test_decode_unsigned_varint_rejects_overflowing_fifth_byte() {
+        // FF FF FF FF 7F sets bits 32-34, which do not fit in a u32. It used
+        // to decode to u32::MAX (silent truncation); it must now be rejected.
+        let mut buf = &[0xFFu8, 0xFF, 0xFF, 0xFF, 0x7F][..];
+        let err = varint::decode_unsigned_varint(&mut buf).unwrap_err();
+        assert!(
+            err.to_string().contains("overflows u32"),
+            "unexpected error: {err}"
+        );
+
+        // Smallest rejected fifth byte: 0x10 (bit 32).
+        let mut buf = &[0xFFu8, 0xFF, 0xFF, 0xFF, 0x10][..];
+        assert!(varint::decode_unsigned_varint(&mut buf).is_err());
+    }
+
+    #[test]
+    fn test_decode_unsigned_varint_still_rejects_too_long() {
+        // A 6th continuation byte is still reported as "varint too long".
+        let mut buf = &[0xFFu8, 0xFF, 0xFF, 0xFF, 0x8F, 0x01][..];
+        let err = varint::decode_unsigned_varint(&mut buf).unwrap_err();
+        assert!(
+            err.to_string().contains("too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_decode_signed_varint_rejects_overflowing_fifth_byte() {
+        let mut buf = &[0xFFu8, 0xFF, 0xFF, 0xFF, 0x7F][..];
+        assert!(varint::decode_signed_varint(&mut buf).is_err());
+    }
+
+    #[test]
+    fn test_decode_unsigned_varlong_max_canonical() {
+        // Ten-byte canonical encoding of u64::MAX ends in 0x01.
+        let mut buf = &[0xFFu8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01][..];
+        assert_eq!(varint::decode_unsigned_varlong(&mut buf).unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn test_decode_unsigned_varlong_rejects_overflowing_tenth_byte() {
+        // 0x7F in the tenth byte sets bits 64-69, which do not fit in a u64.
+        let mut buf = &[0xFFu8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F][..];
+        let err = varint::decode_unsigned_varlong(&mut buf).unwrap_err();
+        assert!(
+            err.to_string().contains("overflows u64"),
+            "unexpected error: {err}"
+        );
+
+        // Smallest rejected tenth byte: 0x02 (bit 64).
+        let mut buf = &[0xFFu8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02][..];
+        assert!(varint::decode_unsigned_varlong(&mut buf).is_err());
+    }
+
+    // --- BackoffPolicy jitter_factor clamping ---
+
+    #[test]
+    fn test_jitter_factor_accessor_clamps_negative() {
+        let policy = BackoffPolicy {
+            jitter_factor: -0.5,
+            ..BackoffPolicy::default()
+        };
+        assert_eq!(policy.jitter_factor(), 0.0);
+    }
+
+    #[test]
+    fn test_jitter_factor_accessor_clamps_above_one() {
+        let policy = BackoffPolicy {
+            jitter_factor: 7.5,
+            ..BackoffPolicy::default()
+        };
+        assert_eq!(policy.jitter_factor(), 1.0);
+    }
+
+    #[test]
+    fn test_jitter_factor_accessor_maps_nan_to_zero() {
+        let policy = BackoffPolicy {
+            jitter_factor: f64::NAN,
+            ..BackoffPolicy::default()
+        };
+        assert_eq!(policy.jitter_factor(), 0.0);
+    }
+
+    #[test]
+    fn test_set_and_with_jitter_factor_clamp_stored_value() {
+        let mut policy = BackoffPolicy::default();
+        policy.set_jitter_factor(-1.0);
+        assert_eq!(policy.jitter_factor, 0.0);
+        policy.set_jitter_factor(3.0);
+        assert_eq!(policy.jitter_factor, 1.0);
+        policy.set_jitter_factor(f64::NAN);
+        assert_eq!(policy.jitter_factor, 0.0);
+
+        let policy = BackoffPolicy::default().with_jitter_factor(-2.0);
+        assert_eq!(policy.jitter_factor, 0.0);
+        let policy = BackoffPolicy::default().with_jitter_factor(0.25);
+        assert_eq!(policy.jitter_factor, 0.25);
+    }
+
+    #[test]
+    fn test_calculate_backoff_does_not_panic_on_negative_jitter_factor() {
+        // A negative jitter_factor previously produced an empty sampling range
+        // (`random_range(0.05..=-0.05)`), which panics. It must now behave
+        // exactly like jitter_factor == 0.0.
+        let policy = BackoffPolicy {
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(10),
+            backoff_multiplier: 2.0,
+            jitter_factor: -0.5,
+        };
+        let no_jitter = BackoffPolicy {
+            jitter_factor: 0.0,
+            ..policy.clone()
+        };
+        for attempt in 1..=6 {
+            assert_eq!(
+                policy.calculate_backoff(attempt),
+                no_jitter.calculate_backoff(attempt),
+                "negative jitter_factor must behave like 0.0 (attempt {attempt})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_calculate_backoff_does_not_panic_on_nan_jitter_factor() {
+        let policy = BackoffPolicy {
+            jitter_factor: f64::NAN,
+            ..BackoffPolicy::default()
+        };
+        // NaN disables jitter, so the result is the deterministic exponential.
+        assert_eq!(policy.calculate_backoff(1), Duration::from_millis(100));
+        assert_eq!(policy.calculate_backoff(2), Duration::from_millis(200));
+    }
+
+    #[test]
+    fn test_calculate_backoff_clamps_jitter_factor_above_one() {
+        // jitter_factor > 1.0 is clamped to 1.0, so jitter never exceeds ±base.
+        let policy = BackoffPolicy {
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(10),
+            backoff_multiplier: 2.0,
+            jitter_factor: 100.0,
+        };
+        for _ in 0..64 {
+            let d = policy.calculate_backoff(4).as_secs_f64();
+            // base = 0.8s, jitter in [-0.8, 0.8], floored at initial (0.1s).
+            assert!((0.1..=1.6).contains(&d), "backoff out of range: {d}");
+        }
+    }
+
+    #[test]
+    fn test_calculate_backoff_grows_exponentially_and_caps() {
+        let policy = BackoffPolicy {
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_millis(1000),
+            backoff_multiplier: 2.0,
+            jitter_factor: 0.0,
+        };
+        assert_eq!(policy.calculate_backoff(0), Duration::ZERO);
+        assert_eq!(policy.calculate_backoff(1), Duration::from_millis(100));
+        assert_eq!(policy.calculate_backoff(2), Duration::from_millis(200));
+        assert_eq!(policy.calculate_backoff(3), Duration::from_millis(400));
+        assert_eq!(policy.calculate_backoff(4), Duration::from_millis(800));
+        // Capped from here on.
+        assert_eq!(policy.calculate_backoff(5), Duration::from_millis(1000));
+        assert_eq!(policy.calculate_backoff(50), Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn test_calculate_backoff_flat_multiplier_stays_flat_for_huge_attempts() {
+        // A multiplier of 1.0 describes a flat series. A large attempt number
+        // must not be short-circuited to `max_backoff`.
+        let policy = BackoffPolicy {
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(10),
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        };
+        assert_eq!(policy.calculate_backoff(1), Duration::from_millis(100));
+        assert_eq!(policy.calculate_backoff(5_000), Duration::from_millis(100));
+        assert_eq!(
+            policy.calculate_backoff(u32::MAX),
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn test_calculate_backoff_shrinking_multiplier_floors_at_initial() {
+        // A multiplier below 1.0 shrinks; the floor is `initial_backoff`, not
+        // the ceiling.
+        let policy = BackoffPolicy {
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(10),
+            backoff_multiplier: 0.5,
+            jitter_factor: 0.0,
+        };
+        assert_eq!(policy.calculate_backoff(10_000), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn test_calculate_backoff_is_jittered_within_bounds() {
+        let policy = BackoffPolicy {
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_millis(1000),
+            backoff_multiplier: 2.0,
+            jitter_factor: 0.2,
+        };
+        // Attempt 3 has a base of 400 ms and ±20% jitter, so results land in
+        // [320, 480] ms and must not all be identical.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..256 {
+            let d = policy.calculate_backoff(3);
+            assert!(
+                d >= Duration::from_millis(320) && d <= Duration::from_millis(480),
+                "jittered backoff out of bounds: {d:?}"
+            );
+            seen.insert(d.as_nanos());
+        }
+        assert!(seen.len() > 1, "jitter must actually randomize the delay");
     }
 
     #[test]

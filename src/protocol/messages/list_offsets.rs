@@ -4,7 +4,9 @@ use super::{VersionedDecode, VersionedEncode, non_nullable_string};
 use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::protocol::api::ApiKey;
 use crate::protocol::primitives::{Decode, KafkaString, TaggedFields, TryEncode};
-use crate::protocol::{array_len_i32, check_compact_array_len, check_decode_array_len};
+use crate::protocol::{
+    array_len_i32, check_compact_array_len, check_decode_array_len, decode_capacity,
+};
 
 // ============================================================================
 // ListOffsets request/response
@@ -210,7 +212,7 @@ impl ListOffsetsResponse {
             ));
         }
         let topic_count = check_decode_array_len(buf.get_i32())?;
-        let mut topics = Vec::with_capacity(topic_count);
+        let mut topics = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
         for _ in 0..topic_count {
             let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             if buf.remaining() < 4 {
@@ -220,7 +222,8 @@ impl ListOffsetsResponse {
                 ));
             }
             let partition_count = check_decode_array_len(buf.get_i32())?;
-            let mut partitions = Vec::with_capacity(partition_count);
+            let mut partitions =
+                Vec::with_capacity(decode_capacity(partition_count, buf.remaining()));
             // Each partition needs 4 + 2 + 8 + 8 = 22 bytes
             for _ in 0..partition_count {
                 if buf.remaining() < 22 {
@@ -274,11 +277,12 @@ impl ListOffsetsResponse {
         let _throttle_time_ms = buf.get_i32();
 
         let topic_count = check_decode_array_len(i32::decode(buf)?)?;
-        let mut topics = Vec::with_capacity(topic_count);
+        let mut topics = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
         for _ in 0..topic_count {
             let name = non_nullable_string("topic name", KafkaString::decode(buf)?.0)?;
             let partition_count = check_decode_array_len(i32::decode(buf)?)?;
-            let mut partitions = Vec::with_capacity(partition_count);
+            let mut partitions =
+                Vec::with_capacity(decode_capacity(partition_count, buf.remaining()));
             for _ in 0..partition_count {
                 let partition_index = i32::decode(buf)?;
                 let error_code = ErrorCode::from_i16(i16::decode(buf)?);
@@ -304,12 +308,13 @@ impl ListOffsetsResponse {
 
         let topic_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut topics = Vec::with_capacity(topic_count);
+        let mut topics = Vec::with_capacity(decode_capacity(topic_count, buf.remaining()));
         for _ in 0..topic_count {
             let name = non_nullable_string("topic name", KafkaString::decode_compact(buf)?.0)?;
             let partition_count =
                 check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-            let mut partitions = Vec::with_capacity(partition_count);
+            let mut partitions =
+                Vec::with_capacity(decode_capacity(partition_count, buf.remaining()));
             for _ in 0..partition_count {
                 let partition_index = i32::decode(buf)?;
                 let error_code = ErrorCode::from_i16(i16::decode(buf)?);

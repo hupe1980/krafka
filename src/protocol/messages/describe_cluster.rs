@@ -1,3 +1,4 @@
+use crate::protocol::decode_capacity;
 use bytes::{Buf, BufMut};
 
 use super::{VersionedDecode, VersionedEncode, non_nullable_string};
@@ -103,7 +104,7 @@ impl DescribeClusterResponse {
 
         let broker_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut brokers = Vec::with_capacity(broker_count);
+        let mut brokers = Vec::with_capacity(decode_capacity(broker_count, buf.remaining()));
         for _ in 0..broker_count {
             let broker_id = i32::decode(buf)?;
             let host = non_nullable_string("host", KafkaString::decode_compact(buf)?.0)?;
@@ -145,7 +146,7 @@ impl DescribeClusterResponse {
 
         let broker_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut brokers = Vec::with_capacity(broker_count);
+        let mut brokers = Vec::with_capacity(decode_capacity(broker_count, buf.remaining()));
         for _ in 0..broker_count {
             let broker_id = i32::decode(buf)?;
             let host = non_nullable_string("host", KafkaString::decode_compact(buf)?.0)?;
@@ -187,7 +188,7 @@ impl DescribeClusterResponse {
 
         let broker_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let mut brokers = Vec::with_capacity(broker_count);
+        let mut brokers = Vec::with_capacity(decode_capacity(broker_count, buf.remaining()));
         for _ in 0..broker_count {
             let broker_id = i32::decode(buf)?;
             let host = non_nullable_string("host", KafkaString::decode_compact(buf)?.0)?;

@@ -3,7 +3,6 @@
 //! This module provides connection handling with support for:
 //! - **Request priority**: High-priority requests (heartbeats, metadata) are processed
 //!   before normal-priority requests to prevent consumer group ejection during backpressure.
-//! - **Multi-connection bundles**: Multiple connections per broker for extreme high-throughput.
 //! - **TLS/SSL encryption**: Automatic TLS upgrade when configured.
 //! - **SASL authentication**: PLAIN, SCRAM-SHA-256/512, AWS MSK IAM handshake on connect.
 
@@ -277,9 +276,18 @@ impl RequestPriority {
 /// The Java client defaults to `fetch.max.bytes = 50 MB` and
 /// `max.in.flight.requests.per.connection = 5`.  Consider lowering these
 /// values to match the Java defaults if RSS is a concern.
+/// Default time allowed for TCP establishment to one broker.
+///
+/// This is also the floor on `request_timeout`: a request cannot be given less
+/// time than the connection it travels over is allowed to take, or it would
+/// expire before the handshake could finish. Clients that want a request
+/// timeout below this must lower `connect_timeout` to match — every client
+/// builder exposes a `connect_timeout` setter for exactly that.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Clone)]
 pub struct ConnectionConfig {
-    /// Connection timeout.
+    /// Connection timeout. See [`DEFAULT_CONNECT_TIMEOUT`].
     pub(crate) connect_timeout: Duration,
     /// Request timeout.
     pub(crate) request_timeout: Duration,
@@ -291,11 +299,6 @@ pub struct ConnectionConfig {
     pub(crate) nodelay: bool,
     /// Client ID.
     pub(crate) client_id: String,
-    /// Number of connections per broker for high-throughput scenarios.
-    ///
-    /// Default is 1. For extreme high-throughput (>100k msg/s per broker),
-    /// consider 2-4 connections to parallelize I/O operations.
-    pub(crate) connections_per_broker: usize,
     /// High-priority channel capacity for heartbeats and metadata requests.
     ///
     /// This should be small since high-priority requests should be rare.
@@ -385,7 +388,6 @@ impl std::fmt::Debug for ConnectionConfig {
             .field("recv_buffer_size", &self.recv_buffer_size)
             .field("nodelay", &self.nodelay)
             .field("client_id", &self.client_id)
-            .field("connections_per_broker", &self.connections_per_broker)
             .field(
                 "high_priority_channel_capacity",
                 &self.high_priority_channel_capacity,
@@ -425,14 +427,6 @@ impl Default for ConnectionConfig {
 }
 
 impl ConnectionConfig {
-    /// Hard cap on `connections_per_broker`.
-    ///
-    /// Values above this are silently clamped in the builder.  The limit
-    /// prevents accidental OS file-descriptor exhaustion in misconfigured
-    /// deployments: with a 10-broker cluster and the default `ulimit -n 1024`,
-    /// a user setting 1000 would exhaust descriptors during pool initialisation.
-    pub const MAX_CONNECTIONS_PER_BROKER: usize = 32;
-
     /// Create a new connection config builder.
     pub fn builder() -> ConnectionConfigBuilder {
         ConnectionConfigBuilder::default()
@@ -524,12 +518,6 @@ impl ConnectionConfig {
         &self.client_id
     }
 
-    /// Returns the number of connections per broker.
-    #[inline]
-    pub fn connections_per_broker(&self) -> usize {
-        self.connections_per_broker
-    }
-
     /// Returns the high-priority channel capacity.
     #[inline]
     pub fn high_priority_channel_capacity(&self) -> usize {
@@ -595,13 +583,12 @@ impl Default for ConnectionConfigBuilder {
     /// all defaults are validated by the same rules as user-supplied configs.
     fn default() -> Self {
         ConnectionConfigBuilder(ConnectionConfig {
-            connect_timeout: Duration::from_secs(10),
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             request_timeout: Duration::from_secs(30),
             send_buffer_size: None,
             recv_buffer_size: None,
             nodelay: true,
             client_id: "krafka".to_string(),
-            connections_per_broker: 1,
             high_priority_channel_capacity: 64,
             normal_priority_channel_capacity: 256,
             max_response_size: crate::protocol::MAX_MESSAGE_SIZE,
@@ -620,13 +607,22 @@ impl Default for ConnectionConfigBuilder {
 }
 
 impl ConnectionConfigBuilder {
-    /// Set the connect timeout.
+    /// Set the connect timeout: how long TCP establishment to one broker may
+    /// take. Default: [`DEFAULT_CONNECT_TIMEOUT`].
+    ///
+    /// [`build`](Self::build) rejects a `request_timeout` shorter than this, so
+    /// lowering `connect_timeout` is what makes a short `request_timeout`
+    /// possible.
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.0.connect_timeout = timeout;
         self
     }
 
-    /// Set the request timeout.
+    /// Set the request timeout: how long one in-flight request may wait for its
+    /// response. Default: 30 s.
+    ///
+    /// Must be at least [`connect_timeout`](Self::connect_timeout), since the
+    /// request's clock covers establishing the connection it is sent over.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.0.request_timeout = timeout;
         self
@@ -641,17 +637,6 @@ impl ConnectionConfigBuilder {
     /// Set TCP nodelay.
     pub fn nodelay(mut self, nodelay: bool) -> Self {
         self.0.nodelay = nodelay;
-        self
-    }
-
-    /// Set the number of connections per broker.
-    ///
-    /// For extreme high-throughput (>100k msg/s per broker), use 2-4 connections.
-    /// Default is 1.  Values are clamped to `[1, MAX_CONNECTIONS_PER_BROKER]`
-    /// (currently 32) to prevent accidental file-descriptor exhaustion.
-    pub fn connections_per_broker(mut self, count: usize) -> Self {
-        self.0.connections_per_broker =
-            count.clamp(1, ConnectionConfig::MAX_CONNECTIONS_PER_BROKER);
         self
     }
 
@@ -775,7 +760,8 @@ impl ConnectionConfigBuilder {
         if self.0.request_timeout < self.0.connect_timeout {
             return Err(crate::error::KrafkaError::config(format!(
                 "request_timeout ({:?}) must be >= connect_timeout ({:?}); \
-                 otherwise all requests time out before the connection completes",
+                 otherwise all requests time out before the connection completes. \
+                 Lower connect_timeout to match if you want a shorter request_timeout",
                 self.0.request_timeout, self.0.connect_timeout
             )));
         }
@@ -805,11 +791,87 @@ impl ConnectionConfigBuilder {
     }
 }
 
+/// Maximum frame size accepted during the pre-authentication SASL handshake.
+///
+/// The handshake exchanges a `SaslHandshakeResponse` (an error code plus a
+/// mechanism-name list) and `SaslAuthenticateResponse`s (an error message plus
+/// a SCRAM/OAUTHBEARER challenge). Real frames run to a few hundred bytes;
+/// 64 KiB is generous by three orders of magnitude.
+///
+/// This is deliberately **not** `max_response_size` (100 MiB by default). An
+/// unauthenticated peer must never be able to make the client allocate a
+/// 100 MiB buffer on its say-so — that is a ~1 600 000× pre-auth memory
+/// amplifier against a single 4-byte length prefix, per connection.
+pub(crate) const MAX_SASL_FRAME_BYTES: usize = 64 * 1024;
+
+/// Chunk size used when incrementally reading a framed handshake response.
+///
+/// The declared length is not trusted enough to pre-size the buffer; bytes are
+/// appended as they arrive, so a peer that declares a large frame and then
+/// dribbles only ever holds the memory it has actually sent.
+const HANDSHAKE_READ_CHUNK: usize = 8 * 1024;
+
+/// Largest broker-requested throttle this client will honour, in milliseconds.
+///
+/// A real quota delay is at most one quota window, which brokers cap well below
+/// this. The bound exists because the value is read by peeking the response's
+/// leading INT32 rather than by decoding the whole body: if a version table
+/// entry were ever wrong, the peeked bytes would be an array length or an
+/// error code, and an unbounded value would stall the connection for hours.
+/// Clamping turns that class of mistake into a bounded, observable delay.
+const MAX_HONOURED_THROTTLE_MS: i32 = 5 * 60 * 1000;
+
+/// Read `throttle_time_ms` out of a response body without decoding it (KIP-219).
+///
+/// Returns `None` when this API and version do not begin with the field, when
+/// the body is too short, or when the value is not a plausible throttle. See
+/// [`ApiKey::leading_throttle_time_min_version`] for which APIs qualify and why
+/// `Produce` is not one of them.
+fn leading_throttle_time_ms(api_key: ApiKey, api_version: i16, body: &[u8]) -> Option<i32> {
+    if api_version < api_key.leading_throttle_time_min_version()? {
+        return None;
+    }
+    let bytes: [u8; 4] = body.get(..4)?.try_into().ok()?;
+    let throttle_time_ms = i32::from_be_bytes(bytes);
+    if throttle_time_ms > 0 && throttle_time_ms <= MAX_HONOURED_THROTTLE_MS {
+        Some(throttle_time_ms)
+    } else {
+        None
+    }
+}
+
+/// How long [`BrokerConnection::close`] waits on a full high-priority channel.
+///
+/// `close()` must never block shutdown indefinitely; a connection whose event
+/// loop is wedged in `write_all` is exactly the case that matters.
+const CLOSE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The canonical error for "this connection is gone".
+///
+/// Connection loss is **routine and recoverable**: a broker rolling restart or
+/// a broker-side `connections.max.idle.ms` reap produces a clean EOF on a
+/// perfectly healthy client. It is therefore reported as
+/// [`KrafkaError::Network`], which [`KrafkaError::is_retriable`] classifies as
+/// retriable — never as `InvalidState`, which falls into the `_ => false` arm
+/// and tells callers a fully recoverable event is permanent.
+fn connection_closed_error() -> KrafkaError {
+    KrafkaError::network(std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "connection closed",
+    ))
+}
+
 /// A pending request waiting for a response.
 struct PendingRequest {
     response_tx: oneshot::Sender<Result<Bytes>>,
     api_key: ApiKey,
     api_version: i16,
+    /// In-flight slot held for the lifetime of this request.
+    ///
+    /// Dropped when the entry leaves the pending map (response dispatched,
+    /// timeout fired, or connection drained), which is what releases a
+    /// submitter blocked in [`BrokerConnection::send_request_with_priority`].
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// Command sent to the connection task.
@@ -821,6 +883,13 @@ enum ConnectionCommand {
         api_key: ApiKey,
         api_version: i16,
         response_tx: oneshot::Sender<Result<Bytes>>,
+        /// In-flight slot acquired by the submitter before enqueueing.
+        ///
+        /// Holding a permit *before* the channel send is what turns the
+        /// in-flight cap into real backpressure: the submitter waits for a
+        /// free slot instead of the event loop rejecting a request that has
+        /// already been queued.
+        permit: tokio::sync::OwnedSemaphorePermit,
     },
     /// Send data without registering a pending response (fire-and-forget).
     ///
@@ -873,6 +942,15 @@ pub struct BrokerConnection {
     /// concurrent senders both storing a "recent" value, which is fine
     /// because either observer still reads "recently used".
     last_used_nanos: AtomicU64,
+    /// One permit per allowed in-flight request.
+    ///
+    /// Submitters acquire an owned permit *before* enqueueing, and the permit
+    /// travels with the request into the pending map, so it is released only
+    /// when the request finally resolves. This makes `max_in_flight_requests`
+    /// a blocking backpressure limit rather than a rejection threshold — which
+    /// is why the normal-priority channel (256 slots) can be far deeper than
+    /// the in-flight cap (10 by default) without over-admitting work.
+    in_flight: Arc<tokio::sync::Semaphore>,
 }
 
 /// Connection statistics for monitoring.
@@ -960,9 +1038,17 @@ impl BrokerConnection {
             throttle_until: Arc::new(parking_lot::Mutex::new(Instant::now())),
             created_at: Instant::now(),
             last_used_nanos: AtomicU64::new(0),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(config.max_in_flight_requests)),
         };
 
         let request_timeout = config.request_timeout;
+
+        // Deadline for everything after TCP establishment: TLS handshake and
+        // the full SASL exchange. Measured from *now* (post-TCP) so a slow but
+        // legitimate TCP connect does not eat the handshake's budget, while a
+        // peer that completes TCP and then goes silent still cannot hang
+        // `connect()` indefinitely.
+        let handshake_deadline = tokio::time::Instant::now() + config.connect_timeout;
 
         // Build the event-loop parameter bundle once.  The struct is moved
         // into `spawn_connection_task` in whichever auth path executes —
@@ -1001,13 +1087,26 @@ impl BrokerConnection {
             // Handle IPv6 bracket notation like [::1]:9092.
             let hostname = extract_sni_hostname(address)?;
             let tls_start = std::time::Instant::now();
-            let tls_stream = connect_tls(
-                stream,
-                hostname,
-                tls_config.sni_hostname.as_deref(),
-                &connector,
+            // `connect_timeout` bounds TCP establishment only. A peer that
+            // completes TCP and then stalls the TLS handshake would otherwise
+            // hang `connect()` forever — and, via the pool's per-address
+            // `connecting` slot, every other task targeting this broker.
+            let tls_stream = tokio::time::timeout_at(
+                handshake_deadline,
+                connect_tls(
+                    stream,
+                    hostname,
+                    tls_config.sni_hostname.as_deref(),
+                    &connector,
+                ),
             )
-            .await?;
+            .await
+            .map_err(|_| {
+                KrafkaError::timeout(format!(
+                    "TLS handshake with {address} did not complete within {:?}",
+                    config.connect_timeout
+                ))
+            })??;
             config
                 .connection_metrics
                 .record_tls_handshake(tls_start.elapsed());
@@ -1021,17 +1120,30 @@ impl BrokerConnection {
                 // Extract tls-server-end-point channel binding data (RFC 5929 §4.1)
                 // before the stream is consumed. This binds the SCRAM exchange to
                 // this specific TLS session.
-                let channel_binding = extract_tls_server_end_point(&tls_stream)
-                    .map(ChannelBinding::TlsServerEndPoint)
-                    .unwrap_or(ChannelBinding::None);
+                // Channel binding is opt-out (`AuthConfig::with_scram_channel_binding`).
+                // Default-on keeps the strongest behaviour; brokers that do not
+                // implement RFC 5929 reject a bound exchange with an opaque
+                // failure, and there is no in-band way to detect that, so the
+                // fallback has to be an explicit configuration choice.
+                let channel_binding = if auth.scram_channel_binding {
+                    extract_tls_server_end_point(&tls_stream)
+                        .map(ChannelBinding::TlsServerEndPoint)
+                        .unwrap_or(ChannelBinding::None)
+                } else {
+                    debug!(
+                        "SCRAM channel binding disabled by configuration for {address}; \
+                         using unbound n,, GS2 framing"
+                    );
+                    ChannelBinding::None
+                };
 
                 let session_lifetime_ms = Self::perform_sasl_handshake(
                     &mut tls_stream,
                     auth,
                     address,
                     &config.client_id,
-                    config.max_response_size,
                     request_timeout,
+                    handshake_deadline,
                     channel_binding,
                     &config.msk_iam_clock_offset_secs,
                 )
@@ -1058,8 +1170,8 @@ impl BrokerConnection {
                 auth,
                 address,
                 &config.client_id,
-                config.max_response_size,
                 request_timeout,
+                handshake_deadline,
                 ChannelBinding::None,
                 &config.msk_iam_clock_offset_secs,
             )
@@ -1213,8 +1325,8 @@ impl BrokerConnection {
         auth: &AuthConfig,
         address: &str,
         client_id: &str,
-        max_response_size: usize,
         request_timeout: Duration,
+        deadline: tokio::time::Instant,
         channel_binding: ChannelBinding,
         msk_iam_clock_offset_secs: &Arc<AtomicI64>,
     ) -> Result<i64>
@@ -1291,8 +1403,15 @@ impl BrokerConnection {
             .map_err(KrafkaError::network)?;
         stream.flush().await.map_err(KrafkaError::network)?;
 
-        // Read handshake response
-        let mut response_buf = Self::read_framed_response(stream, max_response_size).await?;
+        // Read handshake response.
+        //
+        // Bounded in *time* by the handshake deadline and in *size* by
+        // MAX_SASL_FRAME_BYTES. Neither bound existed before: an unauthenticated
+        // peer could declare a 100 MiB frame and dribble bytes (pinning 100 MiB
+        // of zeroed heap per connection, pre-auth), or simply never write at
+        // all and hang connect() forever.
+        let mut response_buf =
+            Self::read_handshake_frame(stream, deadline, "SaslHandshake").await?;
         let _header = ResponseHeader::decode(&mut response_buf, ApiKey::SaslHandshake, 1)?;
 
         let handshake_response = SaslHandshakeResponse::decode_v0(&mut response_buf)?;
@@ -1312,11 +1431,10 @@ impl BrokerConnection {
         let initial_bytes = authenticator.initial_response()?;
         Self::send_sasl_authenticate(stream, &initial_bytes, client_id).await?;
 
-        let auth_response =
-            Self::read_sasl_authenticate_response(stream, max_response_size).await?;
+        let auth_response = Self::read_sasl_authenticate_response(stream, deadline).await?;
         if !auth_response.error_code.is_ok() {
             let err_msg = auth_response.error_message.unwrap_or_default();
-            // Best-effort clock skew detection for MSK IAM (C4).
+            // Best-effort clock skew detection for MSK IAM.
             // AWS SigV4 errors for clock skew typically contain
             // phrases like "Signature expired" or "request time
             // too skewed".  When detected, apply a ±5 min offset
@@ -1390,8 +1508,7 @@ impl BrokerConnection {
 
                         Self::send_sasl_authenticate(stream, &response_bytes, client_id).await?;
 
-                        let resp = Self::read_sasl_authenticate_response(stream, max_response_size)
-                            .await?;
+                        let resp = Self::read_sasl_authenticate_response(stream, deadline).await?;
                         if !resp.error_code.is_ok() {
                             return Err(KrafkaError::auth(format!(
                                 "SASL authentication step failed: {:?} - {}",
@@ -1454,18 +1571,61 @@ impl BrokerConnection {
     /// Decodes using v1 to obtain the `session_lifetime_ms` field (KIP-368).
     async fn read_sasl_authenticate_response<S>(
         stream: &mut S,
-        max_response_size: usize,
+        deadline: tokio::time::Instant,
     ) -> Result<SaslAuthenticateResponse>
     where
         S: AsyncRead + Unpin,
     {
-        let mut buf = Self::read_framed_response(stream, max_response_size).await?;
+        let mut buf = Self::read_handshake_frame(stream, deadline, "SaslAuthenticate").await?;
         let _header = ResponseHeader::decode(&mut buf, ApiKey::SaslAuthenticate, 1)?;
         SaslAuthenticateResponse::decode_v1(&mut buf)
     }
 
-    /// Read a length-prefixed Kafka response from a stream.
-    async fn read_framed_response<S>(stream: &mut S, max_response_size: usize) -> Result<Bytes>
+    /// Read one pre-authentication frame, bounded in both size and time.
+    ///
+    /// Combines the [`MAX_SASL_FRAME_BYTES`] size cap of
+    /// [`Self::read_framed_response`] with an absolute deadline, so a peer
+    /// that completes TCP (and TLS) and then dribbles or stalls cannot hold
+    /// the connection attempt open.
+    async fn read_handshake_frame<S>(
+        stream: &mut S,
+        deadline: tokio::time::Instant,
+        what: &str,
+    ) -> Result<Bytes>
+    where
+        S: AsyncRead + Unpin,
+    {
+        tokio::time::timeout_at(
+            deadline,
+            Self::read_framed_response(stream, MAX_SASL_FRAME_BYTES),
+        )
+        .await
+        .map_err(|_| {
+            KrafkaError::timeout(format!(
+                "timed out reading the {what} response during SASL handshake"
+            ))
+        })?
+    }
+
+    /// Read a length-prefixed Kafka response from a raw, **pre-authentication**
+    /// stream.
+    ///
+    /// Only used by the SASL handshake path, where the peer has not proved
+    /// anything yet. Two properties matter here that do not matter for the
+    /// post-auth decoder:
+    ///
+    /// - `max_len` is the small [`MAX_SASL_FRAME_BYTES`] cap, not
+    ///   `max_response_size`. A hostile bootstrap endpoint must not be able to
+    ///   make the client reserve 100 MiB per connection before authenticating.
+    /// - The body is accumulated in [`HANDSHAKE_READ_CHUNK`] steps rather than
+    ///   pre-sized from the declared length, so a peer that declares a large
+    ///   frame and then dribbles bytes only ever holds the memory it has
+    ///   actually sent.
+    ///
+    /// The caller is responsible for bounding this in time; see
+    /// [`Self::perform_sasl_handshake`], which wraps every call in a
+    /// `timeout_at` against the handshake deadline.
+    async fn read_framed_response<S>(stream: &mut S, max_len: usize) -> Result<Bytes>
     where
         S: AsyncRead + Unpin,
     {
@@ -1477,21 +1637,39 @@ impl BrokerConnection {
             .map_err(KrafkaError::network)?;
         let len_i32 = i32::from_be_bytes(len_buf);
 
-        if len_i32 <= 0 || (len_i32 as usize) > max_response_size {
+        if len_i32 <= 0 || (len_i32 as usize) > max_len {
             return Err(KrafkaError::protocol_kind(
                 ProtocolErrorKind::InvalidLength,
-                format!("Invalid response length: {len_i32} (max: {max_response_size})"),
+                format!(
+                    "Invalid pre-authentication response length: {len_i32} (max: {max_len}); \
+                     refusing to allocate on an unauthenticated peer's say-so"
+                ),
             ));
         }
 
         let len = len_i32 as usize;
 
-        // Read the response body
-        let mut body = vec![0u8; len];
-        stream
-            .read_exact(&mut body)
-            .await
-            .map_err(KrafkaError::network)?;
+        // Grow the buffer as bytes actually arrive instead of trusting `len`
+        // enough to allocate it up front.
+        let mut body = Vec::with_capacity(len.min(HANDSHAKE_READ_CHUNK));
+        let mut chunk = [0u8; HANDSHAKE_READ_CHUNK];
+        while body.len() < len {
+            let want = (len - body.len()).min(HANDSHAKE_READ_CHUNK);
+            let n = stream
+                .read(&mut chunk[..want])
+                .await
+                .map_err(KrafkaError::network)?;
+            if n == 0 {
+                return Err(KrafkaError::network(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "peer closed during SASL handshake after {} of {len} bytes",
+                        body.len()
+                    ),
+                )));
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
 
         Ok(Bytes::from(body))
     }
@@ -1692,6 +1870,16 @@ impl BrokerConnection {
         // Maps correlation_id → queue key for O(1) cancellation on response receipt.
         let mut delay_keys: AHashMap<CorrelationId, delay_queue::Key> = AHashMap::new();
 
+        // Correlation IDs whose client-side timeout fired while the request was
+        // still outstanding. Kafka brokers do not cancel work when a client
+        // times out -- they answer late. Without this record a late response
+        // looks like a never-issued correlation ID, i.e. protocol desync, and
+        // would tear down a healthy connection along with every other in-flight
+        // request on it. Bounded by `max_in_flight_requests` (FIFO eviction),
+        // so it cannot grow without limit.
+        let mut timed_out: std::collections::VecDeque<CorrelationId> =
+            std::collections::VecDeque::new();
+
         // Reader task sends decoded response frames to this loop via a bounded
         // channel.  The capacity matches max_in_flight_requests: the broker
         // can only send responses for outstanding requests, so this cap is
@@ -1873,6 +2061,7 @@ impl BrokerConnection {
                                 &mut pending,
                                 &mut delay_queue,
                                 &mut delay_keys,
+                                &mut timed_out,
                                 frame,
                                 &broker_address,
                             ) {
@@ -1902,6 +2091,12 @@ impl BrokerConnection {
                     let id = expired.into_inner();
                     if let Some(req) = pending.remove(&id) {
                         delay_keys.remove(&id);
+                        // Remember the ID so a late broker response is dropped
+                        // quietly instead of being read as a protocol desync.
+                        if timed_out.len() >= max_in_flight_requests {
+                            timed_out.pop_front();
+                        }
+                        timed_out.push_back(id);
                         warn!(
                             correlation_id = id,
                             "Request timed out after {:?}", request_timeout
@@ -1968,16 +2163,32 @@ impl BrokerConnection {
             }
         }
 
-        // Drop the writer half to signal EOF to the broker, then abort the
-        // reader task — we no longer need its output.
+        // Shut the write half down *before* dropping it.
+        //
+        // For a plain TCP stream, dropping the half closes the socket and the
+        // peer sees FIN either way. For a **split TLS stream** it does not:
+        // the rustls session needs an explicit `shutdown()` to emit the
+        // `close_notify` alert and half-close the TCP connection underneath.
+        // Without it the broker logs an unclean truncation on every normal
+        // disconnect — noisy, and indistinguishable from a real truncation
+        // attack.
+        //
+        // Best-effort: the peer may already be gone, and a failure here has no
+        // bearing on the teardown that follows.
+        let _ = writer.shutdown().await;
         drop(writer);
         reader_handle.abort();
 
         // Drain all in-flight requests and notify callers that the connection
         // is gone.
+        //
+        // A clean EOF here is the *expected* outcome of a broker rolling
+        // restart or an idle reap, so callers get a retriable network error
+        // and reconnect — not `InvalidState`, which they would surface as a
+        // permanent failure.
         let pending_error = terminal_error
             .clone()
-            .unwrap_or_else(|| KrafkaError::invalid_state("connection closed"));
+            .unwrap_or_else(connection_closed_error);
         for (_, req) in pending.drain() {
             let _ = req.response_tx.send(Err(pending_error.clone()));
         }
@@ -2034,6 +2245,7 @@ impl BrokerConnection {
                 api_key,
                 api_version,
                 response_tx,
+                permit,
             } => {
                 if pending.contains_key(&correlation_id) {
                     let error = KrafkaError::invalid_state(format!(
@@ -2049,15 +2261,25 @@ impl BrokerConnection {
                     return Err(error);
                 }
 
-                // Reject when at capacity to prevent unbounded memory growth.
+                // Defence in depth. The submitter already holds an in-flight
+                // permit (see `BrokerConnection::in_flight`), so the semaphore
+                // makes this branch unreachable; reaching it would mean permit
+                // accounting is broken.
+                //
+                // It reports a *retriable* network error rather than
+                // `InvalidState`: an in-flight cap is transient backpressure,
+                // and reporting it as permanent turns a momentary queue depth
+                // into a hard client failure.
                 if pending.len() >= max_in_flight_requests {
                     warn!(
                         pending = pending.len(),
                         max = max_in_flight_requests,
-                        "Rejecting request: max in-flight requests reached"
+                        "Rejecting request: max in-flight requests reached \
+                         (in-flight permit accounting inconsistent)"
                     );
-                    let _ = response_tx.send(Err(KrafkaError::invalid_state(format!(
-                        "max in-flight requests ({max_in_flight_requests}) reached"
+                    let _ = response_tx.send(Err(KrafkaError::network(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!("max in-flight requests ({max_in_flight_requests}) reached; retry"),
                     ))));
                     return Ok(false);
                 }
@@ -2084,8 +2306,18 @@ impl BrokerConnection {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
                         error!("Write error: {}", e);
+                        let msg = e.to_string();
                         let _ = response_tx.send(Err(KrafkaError::network(e)));
-                        return Ok(false);
+                        // `write_all` may have written a partial frame before
+                        // failing. Keeping the connection alive would append
+                        // the next request's bytes to that truncated frame,
+                        // desynchronizing the broker's parser for the life of
+                        // the socket. Tear the connection down instead — the
+                        // same reasoning as the write-timeout arm below.
+                        return Err(KrafkaError::network(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            format!("write failed, stream indeterminate: {msg}"),
+                        )));
                     }
                     Err(_) => {
                         let msg = format!("write timed out after {request_timeout:?}");
@@ -2107,6 +2339,7 @@ impl BrokerConnection {
                         response_tx,
                         api_key,
                         api_version,
+                        _permit: permit,
                     },
                 );
                 Ok(false)
@@ -2125,7 +2358,12 @@ impl BrokerConnection {
                 .await;
                 match write_result {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => error!("Fire-and-forget write error: {}", e),
+                    Ok(Err(e)) => {
+                        // As above: a partial write leaves the stream
+                        // indeterminate, so the connection must not be reused.
+                        error!("Fire-and-forget write error: {}", e);
+                        return Err(KrafkaError::network(e));
+                    }
                     Err(_) => {
                         error!(
                             "Fire-and-forget write timed out after {:?}",
@@ -2153,6 +2391,7 @@ impl BrokerConnection {
         pending: &mut AHashMap<CorrelationId, PendingRequest>,
         delay_queue: &mut DelayQueue<CorrelationId>,
         delay_keys: &mut AHashMap<CorrelationId, delay_queue::Key>,
+        timed_out: &mut std::collections::VecDeque<CorrelationId>,
         response: Bytes,
         broker_address: &str,
     ) -> Result<()> {
@@ -2218,8 +2457,21 @@ impl BrokerConnection {
                     ));
                 }
             }
+        } else if let Some(pos) = timed_out.iter().position(|&id| id == correlation_id) {
+            // Late response for a request whose client-side timeout already
+            // fired. The caller has been given a Timeout error; the broker is
+            // behaving correctly by answering. Drop the frame and keep the
+            // connection -- tearing it down here would fail every other
+            // in-flight request and, under load, cause a reconnect storm.
+            timed_out.remove(pos);
+            debug!(
+                correlation_id,
+                broker = broker_address,
+                frame_bytes = response.len(),
+                "Discarding late response for a timed-out request"
+            );
         } else {
-            // Unknown correlation ID indicates a protocol desync.
+            // Genuinely never-issued correlation ID: protocol desync.
             return Err(KrafkaError::protocol_kind(
                 ProtocolErrorKind::Malformed,
                 format!(
@@ -2230,6 +2482,29 @@ impl BrokerConnection {
         }
 
         Ok(())
+    }
+
+    /// Acquire an in-flight slot, bounded by `deadline`.
+    ///
+    /// Blocking here *is* the backpressure mechanism: when
+    /// `max_in_flight_requests` requests are already outstanding, the
+    /// submitter waits for one to resolve rather than queueing work the event
+    /// loop would refuse.
+    async fn acquire_in_flight(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        tokio::time::timeout_at(deadline, self.in_flight.clone().acquire_owned())
+            .await
+            .map_err(|_| {
+                KrafkaError::timeout(format!(
+                    "waiting for an in-flight slot on {} (max_in_flight_requests={})",
+                    self.address, self.config.max_in_flight_requests
+                ))
+            })?
+            // The semaphore is never closed while the connection exists, so
+            // this can only fail during teardown.
+            .map_err(|_| connection_closed_error())
     }
 
     /// Fetch API versions from the broker.
@@ -2248,18 +2523,27 @@ impl BrokerConnection {
         request.encode_v0(encoder.buffer_mut())?;
         encoder.finish_message(pos)?;
 
+        // One deadline covers slot acquisition, the channel send, and the
+        // response wait, so the whole call is bounded by request_timeout.
+        let deadline = tokio::time::Instant::now() + self.config.request_timeout;
+        let permit = self.acquire_in_flight(deadline).await?;
+
         // Send request (use high priority for API versions)
         let (response_tx, response_rx) = oneshot::channel();
-        self.high_priority_tx
-            .send(ConnectionCommand::Request {
+        tokio::time::timeout_at(
+            deadline,
+            self.high_priority_tx.send(ConnectionCommand::Request {
                 data: encoder.take(),
                 correlation_id,
                 api_key: ApiKey::ApiVersions,
                 api_version: 0,
                 response_tx,
-            })
-            .await
-            .map_err(|_| KrafkaError::invalid_state("connection closed"))?;
+                permit,
+            }),
+        )
+        .await
+        .map_err(|_| KrafkaError::timeout("enqueuing api versions request"))?
+        .map_err(|_| connection_closed_error())?;
 
         self.stats
             .high_priority_requests
@@ -2268,11 +2552,11 @@ impl BrokerConnection {
             .connection_metrics
             .record_high_priority_request();
 
-        // Wait for response
-        let response = timeout(self.config.request_timeout, response_rx)
+        // Wait for response on the same deadline the send used.
+        let response = tokio::time::timeout_at(deadline, response_rx)
             .await
             .map_err(|_| KrafkaError::timeout("api versions request"))?
-            .map_err(|_| KrafkaError::invalid_state("response channel closed"))??;
+            .map_err(|_| connection_closed_error())??;
 
         // Decode response
         let mut buf = response;
@@ -2358,6 +2642,20 @@ impl BrokerConnection {
     /// Use this when you need to override the automatic priority selection.
     /// Normal-priority requests are delayed when the broker has signalled
     /// quota throttling (KIP-219).
+    ///
+    /// # Timeout
+    ///
+    /// A single deadline is computed on entry and covers **every** phase:
+    /// acquiring an in-flight slot, enqueueing on the priority channel, and
+    /// waiting for the response. Total wall-clock time is therefore bounded by
+    /// `request_timeout`. Previously only the response wait was bounded, so a
+    /// full channel could push the total past 2× `request_timeout`.
+    ///
+    /// # Backpressure
+    ///
+    /// When `max_in_flight_requests` requests are already outstanding this
+    /// call *waits* for a slot rather than failing. The semaphore, not the
+    /// channel depth, decides how much work is admitted.
     pub async fn send_request_with_priority(
         &self,
         api_key: ApiKey,
@@ -2368,6 +2666,9 @@ impl BrokerConnection {
         // M1: refresh the idle timestamp on every submission so the pool's
         // idle-evictor does not close an actively used connection.
         self.mark_used();
+
+        // One deadline for the whole call — see the doc comment above.
+        let deadline = tokio::time::Instant::now() + self.config.request_timeout;
 
         // KIP-219: honour broker throttle for normal-priority requests.
         if priority == RequestPriority::Normal {
@@ -2397,19 +2698,33 @@ impl BrokerConnection {
         request_body(encoder.buffer_mut())?;
         encoder.finish_message(pos)?;
 
+        // Acquire an in-flight slot before enqueueing. This is the real
+        // backpressure point: without it the 256-slot normal channel admits
+        // ~25× more work than the default in-flight cap of 10 accepts.
+        let permit = self.acquire_in_flight(deadline).await?;
+
         // Send request to appropriate channel
         let (response_tx, response_rx) = oneshot::channel();
         let channel = self.channel_for_priority(priority);
-        channel
-            .send(ConnectionCommand::Request {
+        tokio::time::timeout_at(
+            deadline,
+            channel.send(ConnectionCommand::Request {
                 data: encoder.take(),
                 correlation_id,
                 api_key,
                 api_version,
                 response_tx,
-            })
-            .await
-            .map_err(|_| KrafkaError::invalid_state("connection closed"))?;
+                permit,
+            }),
+        )
+        .await
+        .map_err(|_| {
+            KrafkaError::timeout(format!(
+                "enqueuing {api_key:?} request to {} (channel full)",
+                self.address
+            ))
+        })?
+        .map_err(|_| connection_closed_error())?;
 
         // Update stats
         match priority {
@@ -2431,11 +2746,20 @@ impl BrokerConnection {
             }
         }
 
-        // Wait for response
-        let response = timeout(self.config.request_timeout, response_rx)
+        // Wait for the response on the *same* deadline the send used, so send
+        // and receive share one request_timeout budget rather than one each.
+        let response = tokio::time::timeout_at(deadline, response_rx)
             .await
             .map_err(|_| KrafkaError::timeout("request"))?
-            .map_err(|_| KrafkaError::invalid_state("response channel closed"))??;
+            .map_err(|_| connection_closed_error())??;
+
+        // KIP-219: honour the throttle the broker asked for, for every API that
+        // reports it as the response's leading field. Doing it here means an
+        // admin client backs off under quota pressure without each of the ~50
+        // admin call sites having to forward a field it does not otherwise use.
+        if let Some(throttle_time_ms) = leading_throttle_time_ms(api_key, api_version, &response) {
+            self.notify_throttle(throttle_time_ms);
+        }
 
         Ok(response)
     }
@@ -2468,12 +2792,20 @@ impl BrokerConnection {
 
         // Send as fire-and-forget — no pending entry is created
         let channel = self.channel_for_priority(RequestPriority::Normal);
-        channel
-            .send(ConnectionCommand::FireAndForget {
+        tokio::time::timeout(
+            self.config.request_timeout,
+            channel.send(ConnectionCommand::FireAndForget {
                 data: encoder.take(),
-            })
-            .await
-            .map_err(|_| KrafkaError::invalid_state("connection closed"))?;
+            }),
+        )
+        .await
+        .map_err(|_| {
+            KrafkaError::timeout(format!(
+                "enqueuing fire-and-forget {api_key:?} to {} (channel full)",
+                self.address
+            ))
+        })?
+        .map_err(|_| connection_closed_error())?;
 
         self.stats
             .normal_priority_requests
@@ -2680,6 +3012,7 @@ impl BrokerConnection {
                 // timestamp that makes eviction tests vacuously pass.
                 .expect("idle_for exceeds system uptime; cannot backdate Instant"),
             last_used_nanos: AtomicU64::new(0),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -2704,9 +3037,36 @@ impl BrokerConnection {
     }
 
     /// Close the connection.
+    ///
+    /// Signals the event loop over the high-priority channel. The send is
+    /// bounded by [`CLOSE_SEND_TIMEOUT`]: a connection whose event loop is
+    /// wedged in `write_all` cannot accept the command, and an unbounded
+    /// `send().await` there would block the caller — and, through
+    /// [`ConnectionPool::close_all`](super::ConnectionPool::close_all), the
+    /// whole client shutdown — indefinitely.
+    ///
+    /// Giving up is safe: the socket is still torn down when the last `Arc` to
+    /// this connection drops.
     pub async fn close(&self) {
-        // Use high-priority channel for close command
-        let _ = self.high_priority_tx.send(ConnectionCommand::Close).await;
+        // Fast path: a free channel slot closes without ever yielding.
+        match self.high_priority_tx.try_send(ConnectionCommand::Close) {
+            Ok(()) => {}
+            // Receiver already gone — the loop has exited; nothing to signal.
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(cmd)) => {
+                if timeout(CLOSE_SEND_TIMEOUT, self.high_priority_tx.send(cmd))
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        broker = %self.address,
+                        "close() timed out after {CLOSE_SEND_TIMEOUT:?} waiting for the \
+                         high-priority channel; the event loop is stalled. Socket teardown \
+                         falls back to Drop."
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -2727,6 +3087,15 @@ impl Drop for BrokerConnection {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// A standalone in-flight permit for tests that construct a
+    /// `ConnectionCommand::Request` or `PendingRequest` directly, without
+    /// going through `send_request_with_priority`.
+    fn test_permit() -> tokio::sync::OwnedSemaphorePermit {
+        Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("fresh semaphore always has a permit")
+    }
 
     #[test]
     fn test_connection_config_builder() {
@@ -2751,7 +3120,6 @@ mod tests {
         assert_eq!(config.request_timeout, Duration::from_secs(30));
         assert_eq!(config.client_id, "krafka");
         assert!(config.nodelay);
-        assert_eq!(config.connections_per_broker, 1);
         assert_eq!(config.high_priority_channel_capacity, 64);
         assert_eq!(config.normal_priority_channel_capacity, 256);
         assert!(config.auth.is_none());
@@ -2788,13 +3156,11 @@ mod tests {
     #[test]
     fn test_connection_config_builder_with_priority() {
         let config = ConnectionConfig::builder()
-            .connections_per_broker(4)
             .high_priority_channel_capacity(32)
             .normal_priority_channel_capacity(512)
             .build()
             .unwrap();
 
-        assert_eq!(config.connections_per_broker, 4);
         assert_eq!(config.high_priority_channel_capacity, 32);
         assert_eq!(config.normal_priority_channel_capacity, 512);
     }
@@ -2803,27 +3169,13 @@ mod tests {
     fn test_connection_config_min_values() {
         // Ensure minimums are enforced
         let config = ConnectionConfig::builder()
-            .connections_per_broker(0) // Should become 1
             .high_priority_channel_capacity(0) // Should become 16
             .normal_priority_channel_capacity(0) // Should become 64
             .build()
             .unwrap();
 
-        assert_eq!(config.connections_per_broker, 1);
         assert_eq!(config.high_priority_channel_capacity, 16);
         assert_eq!(config.normal_priority_channel_capacity, 64);
-    }
-
-    #[test]
-    fn test_connections_per_broker_clamped_to_max() {
-        let config = ConnectionConfig::builder()
-            .connections_per_broker(usize::MAX)
-            .build()
-            .unwrap();
-        assert_eq!(
-            config.connections_per_broker,
-            ConnectionConfig::MAX_CONNECTIONS_PER_BROKER
-        );
     }
 
     #[test]
@@ -2915,6 +3267,48 @@ mod tests {
         assert_eq!(stats.bypass_yield_count(), 1);
     }
 
+    /// A broker that answers *after* the client-side timeout must not be
+    /// treated as protocol desync. Kafka does not cancel work on client
+    /// timeout, so late responses are normal under load; tearing down the
+    /// connection would fail every other in-flight request on it.
+    #[test]
+    fn test_dispatch_response_late_response_does_not_desync_connection() {
+        let correlation_id: CorrelationId = 42;
+        let mut pending = AHashMap::new(); // request already removed by the timeout
+        let mut delay_queue = DelayQueue::new();
+        let mut delay_keys = AHashMap::new();
+        let mut timed_out = std::collections::VecDeque::from([correlation_id]);
+
+        let result = BrokerConnection::dispatch_response(
+            &mut pending,
+            &mut delay_queue,
+            &mut delay_keys,
+            &mut timed_out,
+            Bytes::copy_from_slice(&correlation_id.to_be_bytes()),
+            "broker-1:9092",
+        );
+        assert!(
+            result.is_ok(),
+            "late response must be discarded, not reported as desync: {result:?}"
+        );
+        // The ID is consumed, so a second frame with the same ID is a genuine
+        // desync rather than another free pass.
+        assert!(timed_out.is_empty());
+
+        let second = BrokerConnection::dispatch_response(
+            &mut pending,
+            &mut delay_queue,
+            &mut delay_keys,
+            &mut timed_out,
+            Bytes::copy_from_slice(&correlation_id.to_be_bytes()),
+            "broker-1:9092",
+        );
+        assert!(
+            second.is_err(),
+            "a truly unknown correlation id is still fatal"
+        );
+    }
+
     #[test]
     fn test_dispatch_response_header_decode_error_includes_context() {
         let correlation_id = 7;
@@ -2926,15 +3320,18 @@ mod tests {
                 response_tx,
                 api_key: ApiKey::Metadata,
                 api_version: 9,
+                _permit: test_permit(),
             },
         );
         let mut delay_queue = DelayQueue::new();
         let mut delay_keys = AHashMap::new();
 
+        let mut timed_out = std::collections::VecDeque::new();
         let err = BrokerConnection::dispatch_response(
             &mut pending,
             &mut delay_queue,
             &mut delay_keys,
+            &mut timed_out,
             Bytes::copy_from_slice(&correlation_id.to_be_bytes()),
             "broker-1:9092",
         )
@@ -3404,12 +3801,11 @@ mod tests {
         let data: [u8; 4] = (-1i32).to_be_bytes();
         let mut cursor = std::io::Cursor::new(data);
         let result =
-            BrokerConnection::read_framed_response(&mut cursor, crate::protocol::MAX_MESSAGE_SIZE)
-                .await;
+            BrokerConnection::read_framed_response(&mut cursor, MAX_SASL_FRAME_BYTES).await;
         assert!(result.is_err(), "negative frame length should be rejected");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
-            err_msg.contains("Invalid response length: -1"),
+            err_msg.contains("response length: -1"),
             "error should show negative value: {err_msg}"
         );
     }
@@ -3457,6 +3853,7 @@ mod tests {
                 api_key: ApiKey::Metadata,
                 api_version: 0,
                 response_tx,
+                permit: test_permit(),
             })
             .await
             .unwrap();
@@ -3520,6 +3917,7 @@ mod tests {
                     api_key: ApiKey::Heartbeat,
                     api_version: 0,
                     response_tx,
+                    permit: test_permit(),
                 })
                 .unwrap();
         }
@@ -3532,6 +3930,7 @@ mod tests {
                 api_key: ApiKey::Produce,
                 api_version: 0,
                 response_tx: normal_response_tx,
+                permit: test_permit(),
             })
             .unwrap();
 
@@ -3604,6 +4003,7 @@ mod tests {
                 api_key: ApiKey::Metadata,
                 api_version: 0,
                 response_tx: first_response_tx,
+                permit: test_permit(),
             })
             .await
             .unwrap();
@@ -3620,6 +4020,7 @@ mod tests {
                 api_key: ApiKey::Metadata,
                 api_version: 0,
                 response_tx: second_response_tx,
+                permit: test_permit(),
             })
             .await
             .unwrap();
@@ -3863,6 +4264,7 @@ mod tests {
             throttle_until: Arc::new(parking_lot::Mutex::new(Instant::now())),
             created_at: Instant::now(),
             last_used_nanos: AtomicU64::new(0),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(1)),
         };
 
         conn.send_fire_and_forget(ApiKey::Produce, 0, |_| Ok(()))
@@ -4253,6 +4655,7 @@ mod tests {
                 api_key: ApiKey::Produce,
                 api_version: 0,
                 response_tx,
+                permit: test_permit(),
             })
             .await
             .unwrap();
@@ -4305,6 +4708,7 @@ mod tests {
                 api_key: ApiKey::Produce,
                 api_version: 0,
                 response_tx,
+                permit: test_permit(),
             })
             .await
             .unwrap();
@@ -4326,5 +4730,311 @@ mod tests {
             "expected successful response before timeout, got: {:?}",
             result.unwrap_err()
         );
+    }
+
+    // ── Connection loss / backpressure must be retriable ───────────────
+
+    #[test]
+    fn test_connection_closed_error_is_retriable() {
+        // A clean EOF from a broker rolling restart or an idle reap is
+        // recoverable. Reporting it as `InvalidState` (not in `is_retriable`'s
+        // matched arms) would make callers give up permanently.
+        let err = connection_closed_error();
+        assert!(
+            err.is_retriable(),
+            "connection loss must be retriable, got: {err:?}"
+        );
+        assert!(matches!(err, KrafkaError::Network(_)));
+    }
+
+    #[test]
+    fn test_in_flight_cap_error_is_retriable() {
+        // The defence-in-depth rejection inside the event loop must not tell
+        // callers that transient backpressure is permanent.
+        let err = KrafkaError::network(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "max in-flight requests (10) reached; retry",
+        ));
+        assert!(err.is_retriable());
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_permits_bound_concurrency() {
+        // The semaphore, not the channel depth, decides admission.
+        let sem = Arc::new(tokio::sync::Semaphore::new(2));
+        let a = sem.clone().try_acquire_owned().unwrap();
+        let b = sem.clone().try_acquire_owned().unwrap();
+        assert!(
+            sem.clone().try_acquire_owned().is_err(),
+            "third acquire must block once the cap is reached"
+        );
+        drop(a);
+        assert!(
+            sem.clone().try_acquire_owned().is_ok(),
+            "releasing a permit must admit the next request"
+        );
+        drop(b);
+    }
+
+    // ── Pre-authentication reads are bounded in size and time ──────────
+
+    #[tokio::test]
+    async fn test_read_framed_response_rejects_oversized_sasl_frame() {
+        // A hostile bootstrap endpoint declaring a large frame pre-auth must
+        // be rejected against MAX_SASL_FRAME_BYTES, not max_response_size.
+        let declared = (MAX_SASL_FRAME_BYTES as i32) + 1;
+        let mut cursor = std::io::Cursor::new(declared.to_be_bytes().to_vec());
+        let err = BrokerConnection::read_framed_response(&mut cursor, MAX_SASL_FRAME_BYTES)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("pre-authentication"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sasl_frame_cap_is_far_below_max_response_size() {
+        // Regression guard for the pre-auth allocation amplification factor:
+        // 100 MiB of zeroed heap per connection, pre-auth, from a 4-byte
+        // length prefix.
+        const { assert!(MAX_SASL_FRAME_BYTES < crate::protocol::MAX_MESSAGE_SIZE / 1000) };
+    }
+
+    #[tokio::test]
+    async fn test_read_framed_response_does_not_preallocate_declared_length() {
+        // Peer declares a large (but legal) frame and then sends nothing.
+        // The read must fail with EOF rather than having already reserved the
+        // full declared length.
+        let declared = (MAX_SASL_FRAME_BYTES as i32) - 1;
+        let mut data = declared.to_be_bytes().to_vec();
+        data.extend_from_slice(b"only a few bytes");
+        let mut cursor = std::io::Cursor::new(data);
+        let err = BrokerConnection::read_framed_response(&mut cursor, MAX_SASL_FRAME_BYTES)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("peer closed during SASL handshake"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_handshake_frame_times_out_on_silent_peer() {
+        // TCP completes, then the peer never writes.
+        // Without a deadline this hangs connect() — and, through the pool's
+        // per-address coalescing slot, every task targeting that broker.
+        let (mut client, _server) = tokio::io::duplex(64);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let err = BrokerConnection::read_handshake_frame(&mut client, deadline, "SaslHandshake")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KrafkaError::Timeout { .. }), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_read_handshake_frame_times_out_on_dribbling_peer() {
+        // Declares a frame, sends the prefix, then stalls forever.
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            let _ = server.write_all(&1024i32.to_be_bytes()).await;
+            let _ = server.write_all(b"partial").await;
+            // Hold the stream open without completing the frame.
+            std::future::pending::<()>().await;
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let err = BrokerConnection::read_handshake_frame(&mut client, deadline, "SaslAuthenticate")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KrafkaError::Timeout { .. }), "got: {err:?}");
+    }
+
+    // ── SCRAM channel binding is opt-out, default on ───────────────────
+
+    #[test]
+    fn test_scram_channel_binding_defaults_to_enabled() {
+        let auth = crate::auth::AuthConfig::sasl_scram_sha256("u", "p");
+        assert!(
+            auth.scram_channel_binding(),
+            "channel binding must stay on by default"
+        );
+    }
+
+    #[test]
+    fn test_scram_channel_binding_can_be_disabled() {
+        let auth =
+            crate::auth::AuthConfig::sasl_scram_sha256("u", "p").with_scram_channel_binding(false);
+        assert!(!auth.scram_channel_binding());
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // KIP-219: reading throttle_time_ms off the response without decoding
+    // ══════════════════════════════════════════════════════════════════
+
+    use bytes::BufMut as _;
+
+    fn body_with_leading_i32(value: i32) -> Vec<u8> {
+        value.to_be_bytes().to_vec()
+    }
+
+    #[test]
+    fn test_leading_throttle_is_read_for_an_api_that_reports_it_first() {
+        let body = body_with_leading_i32(1234);
+        assert_eq!(
+            leading_throttle_time_ms(ApiKey::CreateTopics, 4, &body),
+            Some(1234)
+        );
+    }
+
+    #[test]
+    fn test_leading_throttle_is_ignored_below_the_versions_that_carry_it() {
+        // CreateTopics gained throttle_time_ms in v2; in v0/v1 the first four
+        // bytes are the topics array length, which must never be read as a
+        // throttle.
+        let body = body_with_leading_i32(3);
+        assert_eq!(
+            leading_throttle_time_ms(ApiKey::CreateTopics, 1, &body),
+            None
+        );
+        assert_eq!(
+            leading_throttle_time_ms(ApiKey::CreateTopics, 2, &body),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn test_produce_is_excluded_from_the_leading_throttle_hook() {
+        // Produce reports throttle_time_ms as the response's *trailing* field;
+        // its leading bytes are the topics array length. The produce paths
+        // forward the decoded value themselves.
+        let body = body_with_leading_i32(50_000);
+        assert_eq!(leading_throttle_time_ms(ApiKey::Produce, 10, &body), None);
+        assert!(
+            ApiKey::Produce
+                .leading_throttle_time_min_version()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_apis_without_a_leading_throttle_are_excluded() {
+        for api_key in [
+            ApiKey::ApiVersions,
+            ApiKey::SaslHandshake,
+            ApiKey::SaslAuthenticate,
+            ApiKey::OffsetDelete,
+            ApiKey::CreateDelegationToken,
+            ApiKey::DescribeDelegationToken,
+            ApiKey::WriteTxnMarkers,
+            ApiKey::DescribeQuorum,
+        ] {
+            assert!(
+                api_key.leading_throttle_time_min_version().is_none(),
+                "{api_key:?} does not report throttle_time_ms first"
+            );
+        }
+    }
+
+    #[test]
+    fn test_implausible_and_non_positive_throttles_are_ignored() {
+        // A value this large is not a throttle any broker would ask for; it is
+        // far more likely a table mistake, and honouring it would stall the
+        // connection for hours.
+        let huge = body_with_leading_i32(MAX_HONOURED_THROTTLE_MS + 1);
+        assert_eq!(leading_throttle_time_ms(ApiKey::Metadata, 8, &huge), None);
+
+        let at_limit = body_with_leading_i32(MAX_HONOURED_THROTTLE_MS);
+        assert_eq!(
+            leading_throttle_time_ms(ApiKey::Metadata, 8, &at_limit),
+            Some(MAX_HONOURED_THROTTLE_MS)
+        );
+
+        for value in [0, -1, i32::MIN] {
+            assert_eq!(
+                leading_throttle_time_ms(ApiKey::Metadata, 8, &body_with_leading_i32(value)),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_truncated_body_is_not_peeked() {
+        assert_eq!(
+            leading_throttle_time_ms(ApiKey::Metadata, 8, &[0, 0, 1]),
+            None
+        );
+        assert_eq!(leading_throttle_time_ms(ApiKey::Metadata, 8, &[]), None);
+    }
+
+    /// Cross-check the version table against the crate's own decoders: build a
+    /// minimal response body, peek it, and confirm the real decoder reads the
+    /// same number out of the same bytes.
+    #[test]
+    fn test_the_peeked_value_agrees_with_the_real_decoders() {
+        use crate::protocol::VersionedDecode;
+
+        // CreateTopics v4: throttle_time_ms, then an i32 array length.
+        let mut body = BytesMut::new();
+        body.put_i32(777);
+        body.put_i32(0);
+        let body = body.freeze();
+        assert_eq!(
+            leading_throttle_time_ms(ApiKey::CreateTopics, 4, &body),
+            Some(777)
+        );
+        let decoded =
+            crate::protocol::CreateTopicsResponse::decode_versioned(4, &mut body.clone()).unwrap();
+        assert_eq!(decoded.throttle_time_ms, 777);
+
+        // DeleteGroups v2 (flexible): throttle_time_ms, compact array, tags.
+        let mut body = BytesMut::new();
+        body.put_i32(4242);
+        body.put_u8(1); // compact array length 0
+        body.put_u8(0); // empty tagged fields
+        let body = body.freeze();
+        assert_eq!(
+            leading_throttle_time_ms(ApiKey::DeleteGroups, 2, &body),
+            Some(4242)
+        );
+        let decoded =
+            crate::protocol::DeleteGroupsResponse::decode_versioned(2, &mut body.clone()).unwrap();
+        assert_eq!(decoded.throttle_time_ms, 4242);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // connect_timeout as the floor on request_timeout
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_a_short_request_timeout_is_accepted_once_connect_timeout_is_lowered() {
+        let config = ConnectionConfig::builder()
+            .request_timeout(Duration::from_secs(2))
+            .connect_timeout(Duration::from_secs(2))
+            .build()
+            .expect("a 2 s request timeout is reachable by lowering connect_timeout");
+
+        assert_eq!(config.request_timeout, Duration::from_secs(2));
+        assert_eq!(config.connect_timeout, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_a_request_timeout_below_the_default_connect_timeout_is_rejected() {
+        let err = ConnectionConfig::builder()
+            .request_timeout(Duration::from_secs(2))
+            .build()
+            .expect_err("request_timeout below connect_timeout must not build");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("connect_timeout"),
+            "the error must name the setter to change: {message}"
+        );
+    }
+
+    #[test]
+    fn test_the_default_connect_timeout_constant_is_what_the_builder_uses() {
+        let config = ConnectionConfig::default();
+        assert_eq!(config.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
     }
 }

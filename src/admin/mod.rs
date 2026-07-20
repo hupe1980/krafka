@@ -87,6 +87,51 @@ pub use builder::AdminClientBuilder;
 /// Default partition limit for DescribeTopicPartitions pagination.
 const DEFAULT_RESPONSE_PARTITION_LIMIT: i32 = 2000;
 
+/// Hard cap on DescribeTopicPartitions pagination iterations.
+///
+/// A broker that returns a non-advancing cursor (a bug, or a hostile peer)
+/// would otherwise spin this loop forever while `all_topics` grows without
+/// bound.
+const MAX_DESCRIBE_TOPIC_PARTITIONS_PAGES: usize = 10_000;
+
+/// How many times a controller-only request is re-issued after the broker
+/// answers `NOT_CONTROLLER` / `UNKNOWN_CONTROLLER_ID`.
+///
+/// Mirrors the Java admin client, which retries controller-routed requests up
+/// to `retries` times spaced by `retry.backoff.ms`.
+const CONTROLLER_MAX_ATTEMPTS: u32 = 5;
+
+/// Backoff between controller re-resolution attempts (`retry.backoff.ms`).
+const CONTROLLER_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+
+/// How many times coordinator discovery (`FindCoordinator`) is retried on a
+/// retriable error before the operation fails.
+const COORDINATOR_MAX_ATTEMPTS: u32 = 5;
+
+/// Backoff between `FindCoordinator` attempts.
+const COORDINATOR_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+
+/// `true` when an error code means "you sent this to the wrong broker; find the
+/// controller again".
+#[inline]
+fn is_controller_moved(code: crate::error::ErrorCode) -> bool {
+    matches!(
+        code,
+        crate::error::ErrorCode::NotController | crate::error::ErrorCode::UnknownControllerId
+    )
+}
+
+/// Outcome of one attempt at a controller-routed request.
+///
+/// Returned by the closure passed to [`AdminClient::with_controller`].
+enum ControllerAttempt<T> {
+    /// The request was served; this is the final result.
+    Done(T),
+    /// The broker reported that it is not (or no longer) the controller. The
+    /// admin client refreshes metadata, re-resolves the controller, and retries.
+    NotController(crate::error::ErrorCode),
+}
+
 /// Configuration for creating a topic.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -294,6 +339,37 @@ impl ConfigEntry {
     }
 }
 
+/// Per-resource result from
+/// [`AdminClient::describe_configs_per_resource`].
+///
+/// Keeping the resource identity and its error alongside the entries is what
+/// makes `TOPIC_AUTHORIZATION_FAILED` distinguishable from "this resource has
+/// no config overrides" — flattening every resource into one entry list loses
+/// both facts.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct DescribeConfigsResourceResult {
+    /// The type of resource described.
+    pub resource_type: ConfigResourceType,
+    /// The name of the resource described.
+    pub resource_name: String,
+    /// The raw per-resource error code. [`crate::error::ErrorCode::None`] on success.
+    pub error_code: crate::error::ErrorCode,
+    /// Human-readable per-resource error, or `None` on success.
+    pub error: Option<String>,
+    /// Configuration entries for this resource. Empty when `error` is set.
+    pub configs: Vec<ConfigEntry>,
+}
+
+impl DescribeConfigsResourceResult {
+    /// Whether this resource was described successfully.
+    #[inline]
+    #[must_use]
+    pub fn is_ok(&self) -> bool {
+        self.error_code.is_ok()
+    }
+}
+
 /// A synonym for a configuration key.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -476,11 +552,29 @@ pub struct ConsumerGroupListing {
 #[derive(Debug, Clone)]
 pub struct DescribeTopicPartitionsResult {
     /// Described topics.
+    ///
+    /// Complete unless [`next_cursor_topic`](Self::next_cursor_topic) is set.
     pub topics: Vec<TopicPartitionDescription>,
-    /// Pagination cursor topic name for the next page, if more pages remain.
+    /// Pagination cursor topic name for the page that was **not** fetched.
+    ///
+    /// Normally `None`: the client drains every page before returning. It is
+    /// populated only when pagination was abandoned because the broker returned
+    /// a cursor that did not advance, or because the page cap was hit — in
+    /// which case [`topics`](Self::topics) is a partial result.
     pub next_cursor_topic: Option<String>,
-    /// Pagination cursor partition index for the next page.
+    /// Pagination cursor partition index matching
+    /// [`next_cursor_topic`](Self::next_cursor_topic).
     pub next_cursor_partition: Option<i32>,
+}
+
+impl DescribeTopicPartitionsResult {
+    /// Whether pagination completed. `false` means [`topics`](Self::topics)
+    /// is truncated and a cursor is reported.
+    #[inline]
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.next_cursor_topic.is_none()
+    }
 }
 
 /// Per-topic result from [`AdminClient::describe_topic_partitions()`].
@@ -802,6 +896,8 @@ pub struct AdminConfig {
     pub(crate) client_id: String,
     /// Request timeout.
     pub(crate) request_timeout: Duration,
+    /// Time allowed for TCP establishment to one broker.
+    pub(crate) connect_timeout: Duration,
     /// Metadata recovery strategy (KIP-899).
     pub(crate) metadata_recovery_strategy: MetadataRecoveryStrategy,
     /// Duration after which failing metadata refreshes trigger a rebootstrap
@@ -821,6 +917,7 @@ impl Default for AdminConfig {
             bootstrap_servers: String::new(),
             client_id: "krafka-admin".to_string(),
             request_timeout: Duration::from_secs(30),
+            connect_timeout: crate::network::DEFAULT_CONNECT_TIMEOUT,
             metadata_recovery_strategy: MetadataRecoveryStrategy::Rebootstrap,
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             auth: None,
@@ -852,6 +949,12 @@ impl AdminConfig {
     #[inline]
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
+    }
+
+    /// Returns the connect timeout.
+    #[inline]
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
     }
 
     /// Returns the metadata recovery strategy (KIP-899).
@@ -900,9 +1003,27 @@ impl AdminConfigBuilder {
         self
     }
 
-    /// Set request timeout.
+    /// Set request timeout: how long one in-flight request may wait for its
+    /// response. Default: 30 s.
+    ///
+    /// Must be at least [`connect_timeout`](Self::connect_timeout), whose
+    /// default is 10 s — a request's clock covers establishing the connection
+    /// it is sent over, so a shorter value would expire every request before
+    /// the handshake could finish. To go below 10 s, lower `connect_timeout`
+    /// as well; `build()` returns a config error otherwise.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.config.request_timeout = timeout;
+        self
+    }
+
+    /// Set the connect timeout: how long TCP establishment to one broker may
+    /// take. Default: 10 s.
+    ///
+    /// This also acts as the floor on
+    /// [`request_timeout`](Self::request_timeout), so lowering it is what makes
+    /// a sub-10-second request timeout possible.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.config.connect_timeout = timeout;
         self
     }
 
@@ -985,6 +1106,14 @@ pub struct AdminClient {
     metadata: Arc<ClusterMetadata>,
     /// Connection pool.
     pool: Arc<ConnectionPool>,
+    /// Whether this admin client created the pool (and may therefore tear it
+    /// down on [`close`](AdminClient::close)) or borrowed it from a
+    /// [`KrafkaClient`](crate::client::KrafkaClient) via
+    /// [`AdminClientBuilder::with_client`].
+    ///
+    /// Closing a *shared* pool would drop every producer and consumer
+    /// connection on that client and fail all in-flight Produce/Fetch requests.
+    pub(crate) pool_owned: bool,
     /// Whether the client has been closed.
     closed: std::sync::atomic::AtomicBool,
 }
@@ -1024,9 +1153,13 @@ impl AdminClient {
 
     /// Get a connection to any available broker.
     ///
-    /// Checks the client is not closed, picks the first available broker, and
-    /// returns a connection from the pool. Most admin commands can be sent to
-    /// any broker (the broker will forward as needed).
+    /// Checks the client is not closed, picks an available broker, and returns
+    /// a connection from the pool. Suitable only for APIs that any broker can
+    /// serve (reads such as `DescribeAcls`, `DescribeConfigs`, `ListGroups`).
+    ///
+    /// **Do not use this for controller-only or coordinator-only APIs** — see
+    /// [`with_controller`](Self::with_controller) and
+    /// [`find_group_coordinator`](Self::find_group_coordinator).
     async fn get_any_broker_connection(&self) -> Result<Arc<BrokerConnection>> {
         self.check_not_closed()?;
         let brokers = self.metadata.brokers();
@@ -1042,44 +1175,188 @@ impl AdminClient {
             .await
     }
 
-    /// Resolve the group coordinator for `group_id`.
-    async fn find_group_coordinator(&self, group_id: &str) -> Result<Arc<BrokerConnection>> {
-        let any_conn = self.get_any_broker_connection().await?;
-        let coord_request = FindCoordinatorRequest::for_group(group_id);
-        let coord_version = any_conn
-            .negotiate_api_version(
-                ApiKey::FindCoordinator,
-                versions::FIND_COORDINATOR_MAX,
-                versions::FIND_COORDINATOR_MIN,
-            )
-            .await
-            .ok_or_else(|| {
-                KrafkaError::protocol_kind(
-                    ProtocolErrorKind::UnknownApiVersion,
-                    "no mutually supported FindCoordinator API version",
-                )
-            })?;
-        let coord_response_bytes = any_conn
-            .send_request(ApiKey::FindCoordinator, coord_version, |buf| {
-                coord_request.encode_versioned(coord_version, buf)
-            })
-            .await?;
-        let mut coord_buf = coord_response_bytes;
-        let coord_response =
-            FindCoordinatorResponse::decode_versioned(coord_version, &mut coord_buf)?;
+    /// Get a connection to the cluster controller.
+    ///
+    /// Controller-only APIs must be routed here rather than to an arbitrary
+    /// broker. A non-controller broker does forward such requests, but during a
+    /// controller failover it answers `NOT_CONTROLLER` (41) instead — which the
+    /// admin APIs surface only as a per-item error string, so a caller checking
+    /// nothing but the `Result` concludes the operation succeeded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::ErrorCode::UnknownControllerId`] if the cluster
+    /// reports no controller even after a metadata refresh.
+    pub async fn get_controller_connection(&self) -> Result<Arc<BrokerConnection>> {
+        self.check_not_closed()?;
+        self.metadata.get_controller_connection().await
+    }
 
-        if coord_response.error_code.is_ok() {
-            let addr = format!("{}:{}", coord_response.host, coord_response.port);
-            self.pool
-                .get_connection_by_id(coord_response.node_id, &addr)
-                .await
-        } else {
-            warn!(
-                "FindCoordinator failed for group '{}': {:?}, using any broker",
-                group_id, coord_response.error_code
-            );
-            Ok(any_conn)
+    /// Run a controller-only request with bounded `NOT_CONTROLLER` retries.
+    ///
+    /// The closure receives a connection to the current controller and returns
+    /// either [`ControllerAttempt::Done`] with the final result, or
+    /// [`ControllerAttempt::NotController`] to request re-resolution.
+    ///
+    /// Between attempts the admin client waits `retry.backoff.ms`, forces a
+    /// metadata refresh (so the newly elected controller is discovered), and
+    /// reconnects. After [`CONTROLLER_MAX_ATTEMPTS`] unsuccessful attempts the
+    /// last controller error is returned as a hard [`KrafkaError::Broker`],
+    /// never as an `Ok` carrying a per-item error string.
+    async fn with_controller<T, F, Fut>(&self, api: &str, mut op: F) -> Result<T>
+    where
+        F: FnMut(Arc<BrokerConnection>) -> Fut,
+        Fut: std::future::Future<Output = Result<ControllerAttempt<T>>>,
+    {
+        self.check_not_closed()?;
+        let mut last_code = crate::error::ErrorCode::NotController;
+
+        for attempt in 0..CONTROLLER_MAX_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(CONTROLLER_RETRY_BACKOFF).await;
+                // A full refresh re-reads `controller_id`; without it we would
+                // reconnect to the same stale controller forever.
+                if let Err(e) = self.metadata.refresh().await {
+                    warn!("{api}: metadata refresh failed while re-resolving the controller: {e}");
+                }
+            }
+
+            let conn = self.get_controller_connection().await?;
+            match op(conn).await? {
+                ControllerAttempt::Done(value) => return Ok(value),
+                ControllerAttempt::NotController(code) => {
+                    last_code = code;
+                    warn!(
+                        "{api}: broker reported {code:?} (attempt {}/{}); \
+                         re-resolving the controller",
+                        attempt + 1,
+                        CONTROLLER_MAX_ATTEMPTS
+                    );
+                }
+            }
         }
+
+        Err(KrafkaError::broker(
+            last_code,
+            format!(
+                "{api}: the controller did not stabilise after {CONTROLLER_MAX_ATTEMPTS} attempts"
+            ),
+        ))
+    }
+
+    /// Resolve the coordinator node for a group or transactional ID.
+    ///
+    /// Retries `FindCoordinator` with backoff while the broker reports a
+    /// retriable error (`COORDINATOR_NOT_AVAILABLE`, `COORDINATOR_LOAD_IN_PROGRESS`,
+    /// …). Unlike the previous behaviour, an unresolved coordinator is an
+    /// **error** rather than a silent fallback to an arbitrary broker: that
+    /// fallback guaranteed the follow-up request would fail with
+    /// `NOT_COORDINATOR`, with the real cause already discarded.
+    async fn find_coordinator_node(
+        &self,
+        key: &str,
+        for_transaction: bool,
+    ) -> Result<(i32, String)> {
+        let kind = if for_transaction {
+            "transaction"
+        } else {
+            "group"
+        };
+        let mut last_code = crate::error::ErrorCode::CoordinatorNotAvailable;
+
+        for attempt in 0..COORDINATOR_MAX_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(COORDINATOR_RETRY_BACKOFF).await;
+            }
+
+            let conn = self.get_any_broker_connection().await?;
+            let request = if for_transaction {
+                FindCoordinatorRequest::for_transaction(key)
+            } else {
+                FindCoordinatorRequest::for_group(key)
+            };
+
+            let version = conn
+                .negotiate_api_version(
+                    ApiKey::FindCoordinator,
+                    versions::FIND_COORDINATOR_MAX,
+                    versions::FIND_COORDINATOR_MIN,
+                )
+                .await
+                .ok_or_else(|| {
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::UnknownApiVersion,
+                        "no mutually supported FindCoordinator API version",
+                    )
+                })?;
+
+            let response_bytes = conn
+                .send_request(ApiKey::FindCoordinator, version, |buf| {
+                    request.encode_versioned(version, buf)
+                })
+                .await?;
+            let mut buf = response_bytes;
+            let response = FindCoordinatorResponse::decode_versioned(version, &mut buf)?;
+
+            if response.error_code.is_ok() {
+                return Ok((
+                    response.node_id,
+                    format!("{}:{}", response.host, response.port),
+                ));
+            }
+
+            last_code = response.error_code;
+            if !response.error_code.is_retriable() {
+                break;
+            }
+            warn!(
+                "FindCoordinator for {kind} '{key}' returned {:?} (attempt {}/{})",
+                response.error_code,
+                attempt + 1,
+                COORDINATOR_MAX_ATTEMPTS
+            );
+        }
+
+        Err(KrafkaError::broker(
+            last_code,
+            format!("could not resolve the coordinator for {kind} '{key}'"),
+        ))
+    }
+
+    /// Refresh metadata for `topics` before a stale-leader retry.
+    ///
+    /// A bare `refresh_for_topics` can be suppressed by the `retry.backoff.ms`
+    /// rate limiter, in which case the cache is untouched. Retrying against
+    /// unchanged metadata reproduces the same `NotLeaderForPartition` and
+    /// wastes the single retry the caller has. This helper waits out the
+    /// backoff and re-issues so the retry sees genuinely new data.
+    ///
+    /// Refresh failures are logged rather than propagated: the caller still has
+    /// a usable (if stale) cache and its own error reporting per partition.
+    async fn refresh_topics_for_retry(&self, topics: &[&str], api: &str) {
+        use crate::metadata::RefreshOutcome;
+
+        match self.metadata.refresh_for_topics_outcome(Some(topics)).await {
+            Ok(RefreshOutcome::Refreshed | RefreshOutcome::AlreadyFresh) => {}
+            Ok(RefreshOutcome::RateLimited(remaining)) => {
+                tokio::time::sleep(remaining).await;
+                if let Err(e) = self.metadata.refresh_for_topics(Some(topics)).await {
+                    warn!("{api}: metadata refresh failed before retry: {e}");
+                }
+            }
+            Err(e) => warn!("{api}: metadata refresh failed before retry: {e}"),
+        }
+    }
+
+    /// Resolve and connect to the group coordinator for `group_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the broker's error code if the coordinator cannot be resolved.
+    /// The request is **not** misrouted to an arbitrary broker.
+    async fn find_group_coordinator(&self, group_id: &str) -> Result<Arc<BrokerConnection>> {
+        let (node_id, addr) = self.find_coordinator_node(group_id, false).await?;
+        self.pool.get_connection_by_id(node_id, &addr).await
     }
 
     /// Delete consumer groups by ID.
@@ -1178,12 +1455,26 @@ impl AdminClient {
         // Collect all pages into a single result.
         let mut all_topics: Vec<TopicPartitionDescription> = Vec::new();
         let mut cursor = None;
+        let mut pages = 0usize;
+        // Set when the loop stops early with a cursor still outstanding, so the
+        // caller can tell a truncated result from a complete one.
+        let mut unfinished_cursor: Option<DescribeTopicPartitionsCursor> = None;
 
         loop {
+            pages += 1;
+            if pages > MAX_DESCRIBE_TOPIC_PARTITIONS_PAGES {
+                warn!(
+                    "DescribeTopicPartitions exceeded {MAX_DESCRIBE_TOPIC_PARTITIONS_PAGES} pages; \
+                     the broker is returning a non-advancing cursor. Returning a partial result."
+                );
+                unfinished_cursor = cursor.clone();
+                break;
+            }
+
             let request = DescribeTopicPartitionsRequest {
                 topics: topics.clone(),
                 response_partition_limit: DEFAULT_RESPONSE_PARTITION_LIMIT,
-                cursor,
+                cursor: cursor.clone(),
             };
 
             let response_bytes = conn
@@ -1246,20 +1537,39 @@ impl AdminClient {
             // Check for more pages.
             match response.next_cursor {
                 Some(c) => {
-                    cursor = Some(DescribeTopicPartitionsCursor {
+                    let next = DescribeTopicPartitionsCursor {
                         topic_name: c.topic_name,
                         partition_index: c.partition_index,
-                    });
+                    };
+                    // A cursor identical to the one we just sent means the
+                    // broker is not making progress; stop rather than spin.
+                    if cursor.as_ref().is_some_and(|prev| {
+                        prev.topic_name == next.topic_name
+                            && prev.partition_index == next.partition_index
+                    }) {
+                        warn!(
+                            topic = %next.topic_name,
+                            partition = next.partition_index,
+                            "DescribeTopicPartitions returned a non-advancing cursor; \
+                             stopping pagination with a partial result"
+                        );
+                        unfinished_cursor = Some(next);
+                        break;
+                    }
+                    cursor = Some(next);
                 }
                 None => break,
             }
         }
 
-        info!("Described partitions for {} topics", all_topics.len());
+        info!(
+            "Described partitions for {} topics across {pages} page(s)",
+            all_topics.len()
+        );
         Ok(DescribeTopicPartitionsResult {
             topics: all_topics,
-            next_cursor_topic: None,
-            next_cursor_partition: None,
+            next_cursor_topic: unfinished_cursor.as_ref().map(|c| c.topic_name.clone()),
+            next_cursor_partition: unfinished_cursor.as_ref().map(|c| c.partition_index),
         })
     }
 
@@ -1288,18 +1598,44 @@ impl AdminClient {
 
     /// Close the admin client.
     ///
-    /// Sets the closed flag and tears down all broker connections.
-    /// In-flight RPCs that have not yet received a response will fail
-    /// with a network error. Callers should ensure long-running admin
-    /// operations have completed before calling `close()`.
+    /// Sets the closed flag so that subsequent operations fail fast.
+    ///
+    /// # Connection teardown depends on pool ownership
+    ///
+    /// - **Own pool** (the client was built from `bootstrap_servers`): all
+    ///   broker connections are torn down. In-flight admin RPCs that have not
+    ///   yet received a response will fail with a network error, so callers
+    ///   should let long-running admin operations finish first.
+    /// - **Shared pool** (built via
+    ///   [`AdminClientBuilder::with_client`]): connections are left untouched.
+    ///   The pool belongs to the [`KrafkaClient`](crate::client::KrafkaClient),
+    ///   and closing it here would kill every producer and consumer connection
+    ///   on that client and fail all in-flight Produce/Fetch requests. Close
+    ///   the `KrafkaClient` to release those connections.
     ///
     /// Calling `close()` more than once is a no-op.
     pub async fn close(&self) {
         if self.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        self.pool.close_all().await;
-        info!("AdminClient closed");
+        if self.pool_owned {
+            self.pool.close_all().await;
+            info!("AdminClient closed (connection pool torn down)");
+        } else {
+            info!("AdminClient closed (shared connection pool left open)");
+        }
+    }
+
+    /// Whether this admin client owns its connection pool.
+    ///
+    /// `false` when the pool was borrowed from a
+    /// [`KrafkaClient`](crate::client::KrafkaClient) via
+    /// [`AdminClientBuilder::with_client`]; in that case
+    /// [`close`](Self::close) does not tear down connections.
+    #[inline]
+    #[must_use]
+    pub fn owns_pool(&self) -> bool {
+        self.pool_owned
     }
 
     /// Check if the admin client is closed.
@@ -1777,6 +2113,14 @@ impl OffsetSpec {
 }
 
 /// Per-partition consumer group lag from [`AdminClient::consumer_group_lag`].
+///
+/// # Unknown lag is `None`, never `0`
+///
+/// When `ListOffsets` fails for a partition, its end offset is unknown and both
+/// [`end_offset`](Self::end_offset) and [`lag`](Self::lag) are `None`, with the
+/// reason in [`end_offset_error`](Self::end_offset_error). Reporting `0` there
+/// would hide a stalled consumer from lag alerting, which is exactly the
+/// condition alerting exists to catch.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ConsumerGroupLag {
@@ -1787,10 +2131,16 @@ pub struct ConsumerGroupLag {
     /// Last committed offset for this group/partition, or `None` if no offset
     /// has been committed yet.
     pub committed_offset: Option<i64>,
-    /// Current end offset (high-watermark) of the partition.
-    pub end_offset: i64,
-    /// Lag = `end_offset − committed_offset`, or `None` if no offset was
-    /// committed.  Clamped to zero — a negative lag indicates the offset was
+    /// Current end offset (high-watermark) of the partition, or `None` if the
+    /// `ListOffsets` request did not return a usable value for it.
+    pub end_offset: Option<i64>,
+    /// The per-partition `ListOffsets` error, if the end offset could not be
+    /// determined. `None` when the end offset was fetched successfully.
+    pub end_offset_error: Option<String>,
+    /// Lag = `end_offset − committed_offset`.
+    ///
+    /// `None` when no offset was committed **or** when the end offset is
+    /// unknown. Clamped to zero — a negative lag indicates the offset was
     /// committed ahead of the watermark (e.g. after a manual reset).
     pub lag: Option<i64>,
 }
@@ -2085,5 +2435,320 @@ mod tests {
             .build();
         let proxy = config.proxy().expect("proxy should be set");
         assert_eq!(proxy.address(), "proxy:1080");
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Controller routing
+    // ══════════════════════════════════════════════════════════════════
+
+    /// The two codes that mean "you sent a controller-only request to a broker
+    /// that is not (or is no longer) the controller".
+    #[test]
+    fn test_is_controller_moved_matches_exactly_the_controller_errors() {
+        use crate::error::ErrorCode;
+
+        assert!(is_controller_moved(ErrorCode::NotController));
+        assert!(is_controller_moved(ErrorCode::UnknownControllerId));
+
+        // Everything else must fall through to normal error handling —
+        // treating unrelated failures as a controller move would retry
+        // destructive operations that already failed for a different reason.
+        for code in [
+            ErrorCode::None,
+            ErrorCode::TopicAlreadyExists,
+            ErrorCode::ClusterAuthorizationFailed,
+            ErrorCode::InvalidRequest,
+            ErrorCode::NotCoordinator,
+            ErrorCode::StaleControllerEpoch,
+            ErrorCode::LeaderNotAvailable,
+        ] {
+            assert!(
+                !is_controller_moved(code),
+                "{code:?} must not be treated as a controller move"
+            );
+        }
+    }
+
+    /// NOT_CONTROLLER must be retriable so the controller loop is allowed to
+    /// re-resolve; controller rerouting depends on this classification.
+    #[test]
+    fn test_not_controller_is_retriable_so_routing_can_recover() {
+        assert!(crate::error::ErrorCode::NotController.is_retriable());
+    }
+
+    #[test]
+    fn test_controller_retry_budget_is_bounded() {
+        // At least one retry is needed to survive a controller failover, and
+        // the budget must stay bounded so a destructive op cannot spin.
+        assert!((2..=10).contains(&CONTROLLER_MAX_ATTEMPTS));
+        assert!(CONTROLLER_RETRY_BACKOFF > Duration::ZERO);
+        // Worst-case added latency stays well inside a typical request timeout.
+        let worst_case = CONTROLLER_RETRY_BACKOFF * CONTROLLER_MAX_ATTEMPTS;
+        assert!(worst_case < Duration::from_secs(5), "got {worst_case:?}");
+    }
+
+    #[test]
+    fn test_coordinator_retry_budget_is_bounded() {
+        assert!((2..=10).contains(&COORDINATOR_MAX_ATTEMPTS));
+        assert!(COORDINATOR_RETRY_BACKOFF > Duration::ZERO);
+        let worst_case = COORDINATOR_RETRY_BACKOFF * COORDINATOR_MAX_ATTEMPTS;
+        assert!(worst_case < Duration::from_secs(5), "got {worst_case:?}");
+    }
+
+    /// Coordinator discovery retries only while the error is retriable; a
+    /// terminal error must break out immediately instead of burning the budget.
+    #[test]
+    fn test_coordinator_retry_only_on_retriable_codes() {
+        use crate::error::ErrorCode;
+
+        assert!(ErrorCode::CoordinatorNotAvailable.is_retriable());
+        assert!(ErrorCode::CoordinatorLoadInProgress.is_retriable());
+        assert!(ErrorCode::NotCoordinator.is_retriable());
+
+        assert!(!ErrorCode::GroupAuthorizationFailed.is_retriable());
+        assert!(!ErrorCode::InvalidGroupId.is_retriable());
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Close() must not tear down a shared pool
+    // ══════════════════════════════════════════════════════════════════
+
+    fn test_client(pool_owned: bool) -> AdminClient {
+        let pool = Arc::new(ConnectionPool::new(
+            crate::network::ConnectionConfig::default(),
+        ));
+        let metadata = Arc::new(ClusterMetadata::new(
+            vec!["localhost:9092".to_string()],
+            Arc::clone(&pool),
+            Duration::from_secs(300),
+        ));
+        AdminClient {
+            config: AdminConfig::default(),
+            metadata,
+            pool,
+            pool_owned,
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// A client built from `bootstrap_servers` owns its pool and may close it.
+    #[tokio::test]
+    async fn test_close_tears_down_an_owned_pool() {
+        let client = test_client(true);
+        assert!(client.owns_pool());
+
+        client.close().await;
+        assert!(client.is_closed());
+    }
+
+    /// A client sharing a `KrafkaClient`'s pool must only mark itself closed.
+    /// Calling `close_all()` here would drop every producer and consumer
+    /// connection on that client and fail all in-flight Produce/Fetch requests.
+    #[tokio::test]
+    async fn test_close_leaves_a_shared_pool_open() {
+        let client = test_client(false);
+        assert!(!client.owns_pool());
+
+        client.close().await;
+        assert!(client.is_closed());
+
+        // The shared pool is still usable by its real owner.
+        let _ = client.pool().metrics();
+    }
+
+    #[tokio::test]
+    async fn test_close_is_idempotent() {
+        let client = test_client(true);
+        client.close().await;
+        client.close().await;
+        assert!(client.is_closed());
+    }
+
+    #[tokio::test]
+    async fn test_operations_fail_fast_after_close() {
+        let client = test_client(true);
+        client.close().await;
+
+        let err = client.check_not_closed().unwrap_err();
+        assert!(err.to_string().contains("closed"), "got: {err}");
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // DescribeTopicPartitions pagination
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_pagination_is_capped() {
+        // An uncapped loop spins forever on a non-advancing cursor.
+        assert!((1..=100_000).contains(&MAX_DESCRIBE_TOPIC_PARTITIONS_PAGES));
+    }
+
+    /// A complete result reports no cursor; a truncated one reports where it
+    /// stopped, so callers can tell the two apart. Previously the cursor fields
+    /// were always `None` and therefore dead.
+    #[test]
+    fn test_describe_topic_partitions_result_signals_completeness() {
+        let complete = DescribeTopicPartitionsResult {
+            topics: vec![],
+            next_cursor_topic: None,
+            next_cursor_partition: None,
+        };
+        assert!(complete.is_complete());
+
+        let truncated = DescribeTopicPartitionsResult {
+            topics: vec![],
+            next_cursor_topic: Some("orders".into()),
+            next_cursor_partition: Some(42),
+        };
+        assert!(!truncated.is_complete());
+        assert_eq!(truncated.next_cursor_topic.as_deref(), Some("orders"));
+        assert_eq!(truncated.next_cursor_partition, Some(42));
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Unknown lag must never read as zero
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_lag_is_none_when_the_end_offset_is_unknown() {
+        let stalled = ConsumerGroupLag {
+            topic: "orders".into(),
+            partition: 0,
+            committed_offset: Some(100),
+            end_offset: None,
+            end_offset_error: Some("NotLeaderForPartition".into()),
+            lag: None,
+        };
+
+        assert_eq!(
+            stalled.lag, None,
+            "an unknown end offset must report unknown lag, not 0 — \
+             reporting 0 hides a stalled consumer from alerting"
+        );
+        assert!(stalled.end_offset_error.is_some());
+    }
+
+    #[test]
+    fn test_lag_is_none_without_a_committed_offset() {
+        let fresh = ConsumerGroupLag {
+            topic: "orders".into(),
+            partition: 0,
+            committed_offset: None,
+            end_offset: Some(500),
+            end_offset_error: None,
+            lag: None,
+        };
+        assert_eq!(fresh.lag, None);
+    }
+
+    #[test]
+    fn test_lag_is_computed_and_clamped_when_both_ends_are_known() {
+        let healthy = ConsumerGroupLag {
+            topic: "orders".into(),
+            partition: 0,
+            committed_offset: Some(100),
+            end_offset: Some(150),
+            end_offset_error: None,
+            lag: Some(50),
+        };
+        assert_eq!(healthy.lag, Some(50));
+
+        // A commit ahead of the watermark (e.g. after a manual reset) clamps
+        // to zero rather than reporting negative lag.
+        let (committed, end) = (200i64, 150i64);
+        assert_eq!((end - committed).max(0), 0);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // DescribeConfigs per-resource attribution
+    // ══════════════════════════════════════════════════════════════════
+
+    /// An authorization failure must be distinguishable from "this resource
+    /// has no config overrides"; flattening every resource into one entry list
+    /// made the two identical.
+    #[test]
+    fn test_describe_configs_resource_result_preserves_error_attribution() {
+        let denied = DescribeConfigsResourceResult {
+            resource_type: ConfigResourceType::Topic,
+            resource_name: "secret".into(),
+            error_code: crate::error::ErrorCode::TopicAuthorizationFailed,
+            error: Some("TopicAuthorizationFailed".into()),
+            configs: vec![],
+        };
+        let empty = DescribeConfigsResourceResult {
+            resource_type: ConfigResourceType::Topic,
+            resource_name: "plain".into(),
+            error_code: crate::error::ErrorCode::None,
+            error: None,
+            configs: vec![],
+        };
+
+        assert!(!denied.is_ok());
+        assert!(empty.is_ok());
+        assert_eq!(denied.configs.len(), empty.configs.len());
+        assert_ne!(
+            denied.is_ok(),
+            empty.is_ok(),
+            "both have zero configs, so only the error code tells them apart"
+        );
+        assert_eq!(denied.resource_name, "secret");
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // ConfigValue semantics
+    // ══════════════════════════════════════════════════════════════════
+
+    fn entry(value: Option<&str>, is_default: bool, is_sensitive: bool) -> ConfigEntry {
+        ConfigEntry {
+            name: "k".into(),
+            value: value.map(str::to_string),
+            read_only: false,
+            is_default,
+            is_sensitive,
+            config_source: -1,
+            synonyms: vec![],
+            config_type: 0,
+            documentation: None,
+        }
+    }
+
+    #[test]
+    fn test_config_value_classification() {
+        assert_eq!(
+            entry(Some("123"), false, false).config_value(),
+            ConfigValue::Value("123".into())
+        );
+        // Sensitivity wins: a redacted value must never be exposed as Value.
+        assert_eq!(
+            entry(Some("hunter2"), false, true).config_value(),
+            ConfigValue::Sensitive
+        );
+        assert_eq!(
+            entry(None, true, false).config_value(),
+            ConfigValue::Default
+        );
+        assert_eq!(
+            entry(None, false, false).config_value(),
+            ConfigValue::Unavailable
+        );
+    }
+
+    #[test]
+    fn test_config_value_parse_only_succeeds_for_explicit_values() {
+        assert_eq!(
+            ConfigValue::Value("86400000".into())
+                .parse::<i64>()
+                .unwrap(),
+            86_400_000
+        );
+        assert!(ConfigValue::Value("nope".into()).parse::<i64>().is_err());
+        assert!(ConfigValue::Sensitive.parse::<i64>().is_err());
+        assert!(ConfigValue::Default.parse::<i64>().is_err());
+        assert!(ConfigValue::Unavailable.parse::<i64>().is_err());
+
+        assert!(ConfigValue::Value("x".into()).is_set());
+        assert!(!ConfigValue::Default.is_set());
+        assert_eq!(ConfigValue::Value("x".into()).as_str(), Some("x"));
+        assert_eq!(ConfigValue::Sensitive.as_str(), None);
     }
 }
