@@ -329,9 +329,18 @@ Four assignors ship: `Range`, `RoundRobin`, `Sticky` (eager), and
 both, so a group moves from eager to cooperative rebalancing in a single rolling
 bounce rather than a full stop-the-world restart.
 
-`max.poll.interval.ms` is enforced: an application that stops polling is ejected
-from the group so its partitions are reassigned, rather than silently holding
-them while a background thread keeps heartbeating.
+Rebalances do not wait on your poll loop. The background group task keeps
+heartbeating through a rebalance and sends `JoinGroup`/`SyncGroup` itself, so a
+consumer that is idle or busy between `poll()` calls does not hold the rest of
+the group up. The new assignment is applied — and your rebalance listener
+called — on the next `poll()`, so callbacks and record delivery stay on one
+thread and an offset commit cannot race a revocation.
+
+`max.poll.interval.ms` is still enforced: an application that genuinely stops
+polling leaves the group so its partitions are reassigned promptly, rather than
+holding them while a background task vouches for it. Static members
+(`group.instance.id`) instead keep their assignment until the session expires,
+so a restart can reclaim it.
 
 ## 📐 Scope
 

@@ -18,6 +18,42 @@
 //! appears in compiler diagnostics and documentation, making order inversions
 //! visible during code review.
 //!
+//! # What the background heartbeat task may touch
+//!
+//! Since the classic-protocol heartbeat task performs `JoinGroup`/`SyncGroup`
+//! on the application's behalf, two tasks can be inside the consumer at once.
+//! The hierarchy above is not what keeps them apart — the division of state is:
+//!
+//! - The five locks above are the consumer's **data plane** and are reached
+//!   **only from the poll path**. The heartbeat task never acquires any of
+//!   them. That is what lets rebalance callbacks, offset bookkeeping and the
+//!   receive buffer stay free of concurrency: they still only ever run on the
+//!   task the application drives.
+//! - The heartbeat task confines itself to `GroupCoordinator` state — group
+//!   identity, the coordinator connection, and the parked assignment. Those
+//!   locks live inside `GroupCoordinator`, are always the outermost thing a
+//!   task acquires, and are released before any consumer-level lock is taken,
+//!   so they cannot participate in a cycle with levels 1–5.
+//!
+//! Three `GroupCoordinator` fields carry the hand-off between the two tasks
+//! and are deliberately *not* levelled async locks, because each is read or
+//! written in a single operation with no `.await` under it:
+//!
+//! - `pending_rebalance` (`parking_lot::Mutex`) — the assignment itself,
+//!   moved across with one `take`/`replace`.
+//! - `rejoin_in_flight` (`watch::Sender<bool>`) — whether a rebalance is
+//!   running. A watch rather than a flag so `poll()` can wait on it instead of
+//!   busy-returning empty results.
+//! - `heartbeat_epoch` (`AtomicU64`) — which heartbeat task is current, so a
+//!   task still shutting down does not reset state belonging to its successor.
+//!
+//! Keeping all three out of the hierarchy is what stops the hand-off from
+//! needing a position in it at all.
+//!
+//! No lock at any level may be held across an `.await` that performs network
+//! I/O. The join/sync path in particular clones what it needs out of
+//! `GroupCoordinator` and drops the guard before sending a request.
+//!
 //! # Runtime Checks (debug builds)
 //!
 //! In `debug_assertions` builds, each [`LeveledRwLock`] checks the task-local

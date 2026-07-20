@@ -382,6 +382,24 @@ protocol (KIP-429), minimizing partition movement and avoiding stop-the-world
 rebalances when consumers join or leave the group.
 
 **Key features:**
+### Rebalances do not block on your poll loop
+
+The background group task keeps heartbeating through a rebalance and issues
+`JoinGroup`/`SyncGroup` itself. A consumer that is idle, or busy processing
+between `poll()` calls, therefore does not hold up the other members — the
+coordinator can complete the rebalance for the whole group immediately.
+
+The new assignment is *applied* on this consumer's next `poll()`: offsets are
+committed, `on_partitions_revoked` runs, partition state is updated, then
+`on_partitions_assigned` runs. Keeping that on the poll path is deliberate — it
+means your rebalance listener never runs concurrently with your own use of the
+consumer, and an offset commit cannot race a revocation.
+
+If an application stops polling entirely, `max.poll.interval.ms` applies: the
+consumer leaves the group so its partitions are reassigned promptly. A static
+member (`group.instance.id`) instead stops heartbeating and keeps its assignment
+until the session expires, so a restarting instance can reclaim it.
+
 - **Incremental two-phase rebalance**: Only the partitions being moved are revoked
   and cleaned up — unaffected partitions retain their state and do not go through
   a full revoke/reassign cycle.

@@ -69,7 +69,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # aws-lc-rs needs a C toolchain/NASM on Windows; use the pure-Rust `ring`
       # backend so this job stays fast and dependency-light.
-      - run: cargo test --no-default-features --features "compression,schema-registry,unstable-protocol,telemetry,socks5,ring"
+      #
+      # `test-broker` is included deliberately: it binds real TCP listeners and
+      # drives real clients over loopback, which is exactly the behaviour most
+      # likely to differ between platforms.
+      - run: cargo test --no-default-features --features "compression,schema-registry,unstable-protocol,telemetry,socks5,test-broker,ring"
 
   supply-chain:
     name: Supply chain (cargo-deny)

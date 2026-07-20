@@ -261,7 +261,7 @@ impl ConfluentSchemaRegistry {
                 let creds =
                     zeroize::Zeroizing::new(format!("{}:{}", username.as_str(), password.as_str()));
                 let encoded = zeroize::Zeroizing::new(base64_encode(creds.as_bytes()));
-                Some(zeroize::Zeroizing::new(format!("Basic {}", &*encoded)))
+                Some(zeroize::Zeroizing::new(format!("Basic {}", *encoded)))
             }
             RegistryAuth::Bearer { token } => Some(zeroize::Zeroizing::new(format!(
                 "Bearer {}",

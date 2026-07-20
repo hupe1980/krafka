@@ -228,7 +228,7 @@ impl ScramClient {
             Zeroizing::new(format!("n={},r={}", escaped_username, self.client_nonce));
 
         // Full client-first-message
-        let message = format!("{}{}", gs2_header, &*self.client_first_bare);
+        let message = format!("{}{}", gs2_header, *self.client_first_bare);
 
         self.state = ScramState::WaitingServerFirst;
         message.into_bytes()
@@ -385,7 +385,7 @@ impl ScramClient {
         // AuthMessage
         let auth_message = format!(
             "{},{},{}",
-            &*self.client_first_bare, server_first_str, client_final_without_proof
+            *self.client_first_bare, server_first_str, client_final_without_proof
         );
 
         let client_signature = self.compute_hmac(&stored_key, auth_message.as_bytes());

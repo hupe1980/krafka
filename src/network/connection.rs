@@ -883,6 +883,14 @@ enum ConnectionCommand {
         api_key: ApiKey,
         api_version: i16,
         response_tx: oneshot::Sender<Result<Bytes>>,
+        /// Wall-clock budget for writing this request and awaiting its
+        /// response.
+        ///
+        /// Normally the connection's `request_timeout`, but APIs the broker
+        /// legitimately parks (JoinGroup during a group rebalance) carry a
+        /// longer budget so the event loop does not expire a request the
+        /// broker is still holding on purpose.
+        timeout: Duration,
         /// In-flight slot acquired by the submitter before enqueueing.
         ///
         /// Holding a permit *before* the channel send is what turns the
@@ -2245,6 +2253,7 @@ impl BrokerConnection {
                 api_key,
                 api_version,
                 response_tx,
+                timeout: budget,
                 permit,
             } => {
                 if pending.contains_key(&correlation_id) {
@@ -2286,8 +2295,8 @@ impl BrokerConnection {
 
                 // Snapshot the deadline before touching the wire so that the
                 // end-to-end budget (write + network round-trip) is exactly
-                // request_timeout, not up to 2× request_timeout.
-                let deadline = tokio::time::Instant::now() + request_timeout;
+                // one budget, not up to 2× the budget.
+                let deadline = tokio::time::Instant::now() + budget;
 
                 // Write to the wire.  Register in pending only after a successful
                 // write so we never create a leaked entry for an undelivered request.
@@ -2320,7 +2329,7 @@ impl BrokerConnection {
                         )));
                     }
                     Err(_) => {
-                        let msg = format!("write timed out after {request_timeout:?}");
+                        let msg = format!("write timed out after {budget:?}");
                         error!("{msg}");
                         let _ = response_tx.send(Err(KrafkaError::timeout(msg.clone())));
                         // The stream is in an indeterminate state — close the connection.
@@ -2330,7 +2339,7 @@ impl BrokerConnection {
 
                 // Register pending entry and arm the per-request timeout at the
                 // same absolute deadline used for the write, so the whole
-                // request (write + response wait) is bounded by request_timeout.
+                // request (write + response wait) is bounded by one budget.
                 let key = delay_queue.insert_at(correlation_id, deadline);
                 delay_keys.insert(correlation_id, key);
                 pending.insert(
@@ -2538,6 +2547,7 @@ impl BrokerConnection {
                 api_key: ApiKey::ApiVersions,
                 api_version: 0,
                 response_tx,
+                timeout: self.config.request_timeout,
                 permit,
             }),
         )
@@ -2637,6 +2647,31 @@ impl BrokerConnection {
             .await
     }
 
+    /// Send a request that the broker is expected to hold open for longer than
+    /// `request_timeout`.
+    ///
+    /// A few Kafka APIs are long-polls on the broker side: the coordinator
+    /// parks a `JoinGroup` for as long as the group's rebalance takes, which is
+    /// bounded by the group's rebalance timeout (`max.poll.interval.ms`), not
+    /// by the client's `request.timeout.ms`. Sending those with the ordinary
+    /// budget aborts them client-side mid-rebalance, which looks like a
+    /// coordinator failure and restarts the join from scratch — while the
+    /// broker still holds the original request.
+    ///
+    /// `timeout` is a floor of `request_timeout`, never a way to shorten it.
+    pub async fn send_request_with_timeout(
+        &self,
+        api_key: ApiKey,
+        api_version: i16,
+        timeout: Duration,
+        request_body: impl FnOnce(&mut BytesMut) -> Result<()>,
+    ) -> Result<Bytes> {
+        let priority = RequestPriority::for_api_key(api_key);
+        let budget = timeout.max(self.config.request_timeout);
+        self.send_inner(api_key, api_version, priority, budget, request_body)
+            .await
+    }
+
     /// Send a request with explicit priority.
     ///
     /// Use this when you need to override the automatic priority selection.
@@ -2663,12 +2698,35 @@ impl BrokerConnection {
         priority: RequestPriority,
         request_body: impl FnOnce(&mut BytesMut) -> Result<()>,
     ) -> Result<Bytes> {
+        self.send_inner(
+            api_key,
+            api_version,
+            priority,
+            self.config.request_timeout,
+            request_body,
+        )
+        .await
+    }
+
+    /// Shared submission path for [`send_request_with_priority`] and
+    /// [`send_request_with_timeout`]; `budget` bounds the whole call.
+    ///
+    /// [`send_request_with_priority`]: Self::send_request_with_priority
+    /// [`send_request_with_timeout`]: Self::send_request_with_timeout
+    async fn send_inner(
+        &self,
+        api_key: ApiKey,
+        api_version: i16,
+        priority: RequestPriority,
+        budget: Duration,
+        request_body: impl FnOnce(&mut BytesMut) -> Result<()>,
+    ) -> Result<Bytes> {
         // M1: refresh the idle timestamp on every submission so the pool's
         // idle-evictor does not close an actively used connection.
         self.mark_used();
 
         // One deadline for the whole call — see the doc comment above.
-        let deadline = tokio::time::Instant::now() + self.config.request_timeout;
+        let deadline = tokio::time::Instant::now() + budget;
 
         // KIP-219: honour broker throttle for normal-priority requests.
         if priority == RequestPriority::Normal {
@@ -2714,6 +2772,7 @@ impl BrokerConnection {
                 api_key,
                 api_version,
                 response_tx,
+                timeout: budget,
                 permit,
             }),
         )
@@ -3853,6 +3912,7 @@ mod tests {
                 api_key: ApiKey::Metadata,
                 api_version: 0,
                 response_tx,
+                timeout: Duration::from_secs(30),
                 permit: test_permit(),
             })
             .await
@@ -3917,6 +3977,7 @@ mod tests {
                     api_key: ApiKey::Heartbeat,
                     api_version: 0,
                     response_tx,
+                    timeout: Duration::from_secs(30),
                     permit: test_permit(),
                 })
                 .unwrap();
@@ -3930,6 +3991,7 @@ mod tests {
                 api_key: ApiKey::Produce,
                 api_version: 0,
                 response_tx: normal_response_tx,
+                timeout: Duration::from_secs(30),
                 permit: test_permit(),
             })
             .unwrap();
@@ -4003,6 +4065,7 @@ mod tests {
                 api_key: ApiKey::Metadata,
                 api_version: 0,
                 response_tx: first_response_tx,
+                timeout: Duration::from_secs(30),
                 permit: test_permit(),
             })
             .await
@@ -4020,6 +4083,7 @@ mod tests {
                 api_key: ApiKey::Metadata,
                 api_version: 0,
                 response_tx: second_response_tx,
+                timeout: Duration::from_secs(30),
                 permit: test_permit(),
             })
             .await
@@ -4655,6 +4719,7 @@ mod tests {
                 api_key: ApiKey::Produce,
                 api_version: 0,
                 response_tx,
+                timeout: request_timeout,
                 permit: test_permit(),
             })
             .await
@@ -4708,6 +4773,7 @@ mod tests {
                 api_key: ApiKey::Produce,
                 api_version: 0,
                 response_tx,
+                timeout: request_timeout,
                 permit: test_permit(),
             })
             .await
@@ -4728,6 +4794,81 @@ mod tests {
         assert!(
             result.is_ok(),
             "expected successful response before timeout, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    /// A request carrying its own, longer budget must survive past the
+    /// connection's `request_timeout`.
+    ///
+    /// `JoinGroup` is the case that matters: the coordinator holds it open for
+    /// the length of the group's rebalance, which is bounded by
+    /// `max.poll.interval.ms` and routinely exceeds `request.timeout.ms`. If
+    /// the event loop expired it on the connection-wide budget, every rebalance
+    /// slower than `request.timeout.ms` would fail client-side while the broker
+    /// was still working on it.
+    #[tokio::test]
+    async fn test_per_request_timeout_outlives_connection_request_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(client);
+        let (_high_tx, high_rx) = mpsc::channel(4);
+        let (normal_tx, normal_rx) = mpsc::channel(4);
+        let stats = Arc::new(ConnectionStats::default());
+        let metrics = Arc::new(ConnectionMetrics::default());
+
+        let correlation_id: i32 = 4242;
+
+        tokio::spawn(BrokerConnection::run_connection_loop(
+            reader,
+            writer,
+            ConnectionLoopParams {
+                address: "test-broker".to_string(),
+                high_priority_rx: high_rx,
+                normal_priority_rx: normal_rx,
+                // The connection-wide budget the request must not be held to.
+                request_timeout: Duration::from_millis(150),
+                stats,
+                metrics,
+                max_response_size: crate::protocol::MAX_MESSAGE_SIZE,
+                max_in_flight_requests: 256,
+                max_high_priority_bypasses: 4,
+            },
+        ));
+
+        let (response_tx, response_rx) = oneshot::channel();
+        normal_tx
+            .send(ConnectionCommand::Request {
+                data: Bytes::from_static(b"join"),
+                correlation_id,
+                api_key: ApiKey::JoinGroup,
+                api_version: 0,
+                response_tx,
+                timeout: Duration::from_secs(5),
+                permit: test_permit(),
+            })
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 4];
+        server.read_exact(&mut buf).await.unwrap();
+
+        // Answer well after the connection-wide timeout, well within the
+        // request's own budget — exactly how a parked JoinGroup behaves.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        server.write_all(&(4i32).to_be_bytes()).await.unwrap();
+        server
+            .write_all(&correlation_id.to_be_bytes())
+            .await
+            .unwrap();
+        server.flush().await.unwrap();
+
+        let result = response_rx.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "a request with its own longer budget must not be expired at the \
+             connection's request_timeout, got: {:?}",
             result.unwrap_err()
         );
     }

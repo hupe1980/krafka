@@ -38,6 +38,14 @@ use crate::protocol::{
     },
 };
 
+/// Slack added on top of the group's rebalance timeout when bounding a
+/// `JoinGroup` client-side.
+///
+/// The coordinator parks a `JoinGroup` until every member has rejoined or the
+/// rebalance timeout elapses, then answers. The slack lets that answer reach us
+/// instead of racing the client-side deadline.
+const JOIN_GROUP_TIMEOUT_SLACK: Duration = Duration::from_secs(5);
+
 /// Callback interface for partition rebalance events.
 /// Async callback interface for partition rebalance events.
 ///
@@ -793,7 +801,7 @@ impl PartitionAssignor for CooperativeStickyAssignor {
             'outer: for over_member in &overloaded {
                 for under_member in &underloaded {
                     // Find a partition to move
-                    for (_key, owner) in sticky_assignments.iter_mut() {
+                    for owner in sticky_assignments.values_mut() {
                         if owner == over_member {
                             *owner = under_member.clone();
                             if let Some(count) = member_partition_counts.get_mut(over_member) {
@@ -1181,6 +1189,33 @@ pub enum HeartbeatCommand {
     AcknowledgeRevocation,
 }
 
+/// A completed `JoinGroup`/`SyncGroup` round that is waiting for `poll()` to
+/// apply it.
+///
+/// The classic rebalance has two halves with very different requirements. The
+/// first half — `JoinGroup` and `SyncGroup` — is the group's synchronisation
+/// barrier: the coordinator cannot answer *any* member's `JoinGroup` until
+/// every member has sent one, so a member that delays it holds up the whole
+/// group. It touches nothing but group identity (member id, generation, the
+/// selected protocol and the opaque assignment bytes), so the background
+/// heartbeat task can run it safely.
+///
+/// The second half — revocation callbacks, rewriting the offset map, partition
+/// state and the receive buffer, then assignment callbacks — is the consumer's
+/// data plane and runs user code. Nothing outside the group needs it to happen
+/// promptly; it only gates *this* member's own fetching. Doing it on a
+/// background task would race the application, so the background task parks
+/// its result here and `poll()` applies it at the point it already applies a
+/// rebalance.
+#[derive(Debug, Clone)]
+pub struct PendingRebalance {
+    /// The assignment the coordinator handed this member.
+    pub assignment: MemberAssignment,
+    /// Partitions that must be revoked before a second cooperative round
+    /// (KIP-429). Always empty for eager protocols.
+    pub to_revoke: Vec<(String, PartitionId)>,
+}
+
 /// Group coordinator that manages group membership, heartbeats, and offset commits.
 ///
 /// This struct encapsulates all the logic for consumer group protocol:
@@ -1281,6 +1316,35 @@ pub struct GroupCoordinator {
     fatal_error: Arc<parking_lot::Mutex<Option<String>>>,
     /// Channel to control heartbeat task.
     heartbeat_cmd_tx: RwLock<Option<mpsc::Sender<HeartbeatCommand>>>,
+    /// Result of a `JoinGroup`/`SyncGroup` the background heartbeat task ran on
+    /// this member's behalf, waiting for the next `poll()` to apply it.
+    ///
+    /// A `parking_lot::Mutex` rather than an async lock: every access is a
+    /// `take` or a `replace` of a small value with no `.await` under the guard,
+    /// so it can be read from the poll path and written from the heartbeat task
+    /// without participating in the lock hierarchy at all.
+    pending_rebalance: Arc<parking_lot::Mutex<Option<PendingRebalance>>>,
+    /// `true` while the heartbeat task has a `JoinGroup`/`SyncGroup` in flight.
+    ///
+    /// `poll()` reads this to avoid starting a second, competing join for the
+    /// same rebalance: two `JoinGroup`s from one member race to define its
+    /// generation, and whichever loses leaves the consumer applying an
+    /// assignment the coordinator has already superseded.
+    ///
+    /// A `watch` channel rather than a flag so `poll()` can *wait* for the
+    /// rebalance instead of returning empty over and over. A plain flag would
+    /// turn a slow rebalance — one waiting on some other member that really has
+    /// stopped responding — into a poll loop spinning at full speed for the
+    /// length of the rebalance timeout.
+    rejoin_in_flight: tokio::sync::watch::Sender<bool>,
+    /// Incremented every time a heartbeat task is started.
+    ///
+    /// `stop_heartbeat_task` asks the current task to exit but does not wait
+    /// for it, so a task can still be running its shutdown when its successor
+    /// is already live. The epoch lets a task recognise that it has been
+    /// superseded and skip its cleanup, instead of resetting group state that
+    /// now belongs to the join its successor just completed.
+    heartbeat_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Subscribed topics.
     subscribed_topics: RwLock<Vec<String>>,
     /// Protocol type (always "consumer").
@@ -1378,6 +1442,9 @@ impl GroupCoordinator {
             poll_tracker: Arc::new(PollTracker::new(rebalance_timeout)),
             fatal_error: Arc::new(parking_lot::Mutex::new(None)),
             heartbeat_cmd_tx: RwLock::new(None),
+            pending_rebalance: Arc::new(parking_lot::Mutex::new(None)),
+            rejoin_in_flight: tokio::sync::watch::Sender::new(false),
+            heartbeat_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             subscribed_topics: RwLock::new(Vec::new()),
             protocol_type: "consumer".to_string(),
             assignment_strategies: vec![
@@ -1740,6 +1807,19 @@ impl GroupCoordinator {
         Ok(())
     }
 
+    /// Client-side budget for a single `JoinGroup` round-trip.
+    ///
+    /// The coordinator answers a `JoinGroup` only once the rebalance it belongs
+    /// to has converged, so the request's latency is governed by the group's
+    /// rebalance timeout rather than by `request.timeout.ms`. This mirrors the
+    /// Java client's `joinGroupTimeoutMs`. The connection layer additionally
+    /// floors the result at its own `request_timeout`, so this can only ever
+    /// lengthen the budget.
+    pub fn join_group_timeout(&self) -> Duration {
+        self.rebalance_timeout
+            .saturating_add(JOIN_GROUP_TIMEOUT_SLACK)
+    }
+
     /// Drop the cached coordinator when the broker tells us it is no longer
     /// the coordinator for this group.
     ///
@@ -1888,8 +1968,19 @@ impl GroupCoordinator {
                 )
             })?;
 
+        // A JoinGroup is a long-poll: the coordinator holds it open until every
+        // member of the group has rejoined, or until the group's rebalance
+        // timeout expires. That window is `rebalance_timeout`
+        // (`max.poll.interval.ms`, 5 minutes by default) and is unrelated to
+        // `request.timeout.ms`. Bounding it by the ordinary request timeout
+        // aborts joins client-side in the middle of a perfectly healthy
+        // rebalance — any rebalance that takes longer to converge than
+        // `request.timeout.ms`, such as one waiting on an idle member's session
+        // to expire, fails instead of completing.
+        let join_timeout = self.join_group_timeout();
+
         let response = conn
-            .send_request(ApiKey::JoinGroup, jg_version, |buf| {
+            .send_request_with_timeout(ApiKey::JoinGroup, jg_version, join_timeout, |buf| {
                 request.encode_versioned(jg_version, buf)
             })
             .await?;
@@ -1916,7 +2007,7 @@ impl GroupCoordinator {
             };
 
             let retry_response = conn
-                .send_request(ApiKey::JoinGroup, jg_version, |buf| {
+                .send_request_with_timeout(ApiKey::JoinGroup, jg_version, join_timeout, |buf| {
                     retry_request.encode_versioned(jg_version, buf)
                 })
                 .await?;
@@ -2098,7 +2189,7 @@ impl GroupCoordinator {
     /// For cooperative protocols, the caller should use
     /// `perform_cooperative_join_and_sync` instead for the two-phase flow.
     pub async fn ensure_active_membership(
-        &self,
+        self: &Arc<Self>,
         topics: &[String],
     ) -> Result<(MemberAssignment, bool)> {
         // Dispatch based on group protocol
@@ -2144,8 +2235,16 @@ impl GroupCoordinator {
         }
     }
 
-    /// Perform the full join and sync sequence.
-    async fn perform_join_and_sync(&self) -> Result<MemberAssignment> {
+    /// Run one `JoinGroup`/`SyncGroup` round trip.
+    ///
+    /// This is the group's synchronisation barrier and nothing else: it moves
+    /// member id, generation, negotiated protocol and the raw assignment bytes
+    /// forward, and touches no consumer data-plane state. That is what makes it
+    /// safe to call either from `poll()` or from the background heartbeat task.
+    ///
+    /// Deliberately does *not* start the heartbeat task, so the background task
+    /// can call it without asking `stop_heartbeat_task` to terminate itself.
+    async fn join_and_sync(&self) -> Result<MemberAssignment> {
         // Find coordinator if needed
         if self.coordinator_conn.read().await.is_none() {
             self.find_coordinator().await?;
@@ -2155,12 +2254,82 @@ impl GroupCoordinator {
         let join_response = self.join_group().await?;
 
         // Sync group
-        let assignment = self.sync_group(&join_response).await?;
+        self.sync_group(&join_response).await
+    }
+
+    /// Partitions this member must give up to reach `assignment`, per the
+    /// cooperative-sticky protocol. Empty for eager protocols, which revoke
+    /// everything and start over.
+    async fn cooperative_revocations(
+        &self,
+        assignment: &MemberAssignment,
+    ) -> Vec<(String, PartitionId)> {
+        if !self.is_cooperative() {
+            return Vec::new();
+        }
+        let member_id = self.inner.read().await.member_id.clone();
+        self.sticky_assignor
+            .get_partitions_to_revoke(&member_id, assignment)
+    }
+
+    /// Perform the full join and sync sequence, then (re)start heartbeating.
+    async fn perform_join_and_sync(self: &Arc<Self>) -> Result<MemberAssignment> {
+        let assignment = self.join_and_sync().await?;
 
         // Start heartbeat task
         self.start_heartbeat_task().await;
 
         Ok(assignment)
+    }
+
+    /// Run a rebalance from the background heartbeat task and park the result.
+    ///
+    /// Called when a heartbeat comes back `REBALANCE_IN_PROGRESS`. Completing
+    /// the join/sync here is what releases every *other* member of the group:
+    /// the coordinator holds their `JoinGroup` responses until this member's
+    /// arrives, and it would otherwise not arrive until the application next
+    /// called `poll()`.
+    async fn background_rejoin(&self) -> Result<PendingRebalance> {
+        let assignment = self.join_and_sync().await?;
+        let to_revoke = self.cooperative_revocations(&assignment).await;
+        Ok(PendingRebalance {
+            assignment,
+            to_revoke,
+        })
+    }
+
+    /// Take the assignment a background rebalance parked for `poll()`, if any.
+    pub(crate) fn take_pending_rebalance(&self) -> Option<PendingRebalance> {
+        self.pending_rebalance.lock().take()
+    }
+
+    /// Discard any parked assignment. Called whenever membership is torn down,
+    /// so a stale generation's assignment cannot be applied after a leave or a
+    /// fresh join.
+    pub(crate) fn clear_pending_rebalance(&self) {
+        *self.pending_rebalance.lock() = None;
+    }
+
+    /// Whether the background heartbeat task is currently mid-rebalance.
+    ///
+    /// `poll()` uses this to hold off driving its own `JoinGroup` rather than
+    /// racing the one already in flight.
+    pub(crate) fn rejoin_in_flight(&self) -> bool {
+        *self.rejoin_in_flight.borrow()
+    }
+
+    /// Block until the background rebalance finishes, or `budget` elapses.
+    ///
+    /// Returns immediately when no rebalance is in flight. Subscribing before
+    /// the check is what makes this free of the race a notification primitive
+    /// would have: a rebalance that completes in the gap marks the receiver
+    /// changed, so the wait returns at once rather than sitting out the budget.
+    pub(crate) async fn await_rejoin(&self, budget: Duration) {
+        let mut rx = self.rejoin_in_flight.subscribe();
+        if !*rx.borrow_and_update() {
+            return;
+        }
+        let _ = tokio::time::timeout(budget, rx.changed()).await;
     }
 
     /// Perform cooperative incremental rebalance (KIP-429).
@@ -2176,24 +2345,12 @@ impl GroupCoordinator {
     /// is non-empty, the caller must revoke those partitions and call this
     /// method again.
     pub async fn perform_cooperative_join_and_sync(
-        &self,
+        self: &Arc<Self>,
     ) -> Result<(MemberAssignment, Vec<(String, PartitionId)>)> {
-        // Find coordinator if needed
-        if self.coordinator_conn.read().await.is_none() {
-            self.find_coordinator().await?;
-        }
-
-        // Join group
-        let join_response = self.join_group().await?;
-
-        // Sync group to get new target assignment
-        let new_assignment = self.sync_group(&join_response).await?;
+        let new_assignment = self.join_and_sync().await?;
 
         // Compute what needs to be revoked
-        let member_id = self.inner.read().await.member_id.clone();
-        let to_revoke = self
-            .sticky_assignor
-            .get_partitions_to_revoke(&member_id, &new_assignment);
+        let to_revoke = self.cooperative_revocations(&new_assignment).await;
 
         if to_revoke.is_empty() {
             // No revocations needed — assignment is final
@@ -2212,7 +2369,14 @@ impl GroupCoordinator {
     }
 
     /// Start the background heartbeat task.
-    pub(crate) async fn start_heartbeat_task(&self) {
+    ///
+    /// Beyond keeping the session alive, this task owns the group's
+    /// synchronisation barrier: when a heartbeat reports
+    /// `REBALANCE_IN_PROGRESS` it runs `JoinGroup`/`SyncGroup` itself and parks
+    /// the resulting assignment for the next `poll()`. Waiting for `poll()` to
+    /// send the `JoinGroup` would stall every other member of the group behind
+    /// this application's poll interval.
+    pub(crate) async fn start_heartbeat_task(self: &Arc<Self>) {
         // Stop existing task if any
         self.stop_heartbeat_task().await;
 
@@ -2223,6 +2387,11 @@ impl GroupCoordinator {
         // completed a successful join/sync.
         self.heartbeat_controller.take_rebalance_needed();
         self.heartbeat_controller.take_member_invalidated();
+
+        // Likewise any assignment the previous task parked: it belongs to a
+        // generation that the join/sync we just finished has superseded.
+        self.clear_pending_rebalance();
+        self.rejoin_in_flight.send_replace(false);
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<HeartbeatCommand>(10);
         *self.heartbeat_cmd_tx.write().await = Some(cmd_tx);
@@ -2236,6 +2405,15 @@ impl GroupCoordinator {
         let inner_ref = self.inner.clone();
         let coordinator_conn_ref = self.coordinator_conn.clone();
         let group_instance_id = self.group_instance_id.clone();
+        // Weak, so a `Consumer` that is dropped without `close()` is still
+        // collected rather than being kept alive by its own heartbeat task.
+        let coordinator_ref = Arc::downgrade(self);
+        // Claim an epoch after the old task has been told to stop, so this
+        // task's number is strictly newer than any task still shutting down.
+        let epoch = self
+            .heartbeat_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
 
         // start() before spawn is safe here — the classic task has no early-return
         // paths before the loop. KIP-848's task calls start() *inside* spawn after
@@ -2255,8 +2433,57 @@ impl GroupCoordinator {
             // Option ensures they are always set and cleared atomically.
             let mut cached_hb: Option<(usize, i16)> = None;
 
+            // A rebalance this task runs on the application's behalf.
+            //
+            // The join/sync goes on its own task so heartbeats keep flowing
+            // while `JoinGroup` sits at the coordinator: that request is a long
+            // poll bounded by the *rebalance* timeout, far longer than the
+            // session timeout it would otherwise blow through if it blocked
+            // this loop.
+            //
+            // The rebalance task parks its own result; this channel only says
+            // that it finished, so the loop knows it may start another one.
+            let (rejoin_tx, mut rejoin_rx) = mpsc::channel::<Result<usize>>(1);
+            let mut rejoin_handle: Option<tokio::task::JoinHandle<()>> = None;
+
             loop {
                 tokio::select! {
+                    // Biased so a completed rebalance is parked before the next
+                    // heartbeat goes out, keeping the parked assignment and the
+                    // generation the heartbeat reports in step.
+                    biased;
+
+                    rejoin_result = rejoin_rx.recv() => {
+                        rejoin_handle = None;
+                        match rejoin_result {
+                            Some(Ok(topic_count)) => {
+                                debug!(
+                                    "Background rebalance for group '{}' completed with {} \
+                                     topic(s) assigned; the assignment will be applied on the \
+                                     next poll()",
+                                    group_id, topic_count
+                                );
+                            }
+                            Some(Err(e)) => {
+                                warn!(
+                                    "Background rebalance for group '{}' failed: {}; \
+                                     handing the rejoin back to poll()",
+                                    group_id, e
+                                );
+                                // join_group/sync_group have already reset
+                                // whatever state the error invalidated. Let
+                                // poll() retry the whole sequence, including
+                                // coordinator rediscovery, from a clean start.
+                                heartbeat_controller.signal_rebalance();
+                                heartbeat_controller.stop();
+                                break;
+                            }
+                            // `rejoin_tx` is held by this task for its whole
+                            // lifetime, so the channel cannot close under us.
+                            None => {}
+                        }
+                    }
+
                     _ = interval.tick() => {
                         if !heartbeat_controller.is_running() {
                             break;
@@ -2266,9 +2493,17 @@ impl GroupCoordinator {
                         // consuming. Continuing to heartbeat here would keep
                         // this member's partitions assigned to a process that
                         // is not reading them, with no rebalance and no error
-                        // ever surfacing. Dropping out of the heartbeat loop
-                        // lets the coordinator expire the session and hand the
-                        // partitions to a member that is making progress.
+                        // ever surfacing.
+                        //
+                        // Leave the group explicitly rather than merely going
+                        // quiet: a LeaveGroup makes the coordinator reassign
+                        // the partitions immediately, whereas lapsing costs a
+                        // further `session.timeout.ms` of unconsumed traffic.
+                        // `leave_group` skips the RPC for static members
+                        // (KIP-345), which is the documented behaviour — a
+                        // static member that exceeds the interval keeps its
+                        // assignment until its session expires, so a restart
+                        // can reclaim it.
                         if poll_tracker.is_expired() {
                             if poll_tracker.mark_exceeded() {
                                 warn!(
@@ -2281,6 +2516,15 @@ impl GroupCoordinator {
                                 );
                             }
                             heartbeat_controller.stop();
+                            if let Some(coordinator) = coordinator_ref.upgrade()
+                                && let Err(e) = coordinator.leave_group().await
+                            {
+                                debug!(
+                                    "LeaveGroup after max_poll_interval expiry failed for \
+                                     group '{}': {}; the session will lapse instead",
+                                    group_id, e
+                                );
+                            }
                             break;
                         }
 
@@ -2347,10 +2591,41 @@ impl GroupCoordinator {
                                                 debug!("Heartbeat successful for group '{}'", group_id);
                                             }
                                             HeartbeatStatus::RebalanceNeeded => {
-                                                warn!("Rebalance needed for group '{}', stopping heartbeat", group_id);
-                                                heartbeat_controller.signal_rebalance();
-                                                heartbeat_controller.stop();
-                                                break;
+                                                // Keep heartbeating. The coordinator holds a
+                                                // heartbeating member in the group for the full
+                                                // rebalance timeout; one that goes quiet is
+                                                // evicted after session.timeout.ms and has to
+                                                // re-register with an empty member id, losing
+                                                // its sticky assignment for no reason.
+                                                if rejoin_handle.is_none() {
+                                                    let Some(coordinator) = coordinator_ref.upgrade() else {
+                                                        heartbeat_controller.stop();
+                                                        break;
+                                                    };
+                                                    debug!(
+                                                        "Rebalance in progress for group '{}'; \
+                                                         rejoining in the background",
+                                                        group_id
+                                                    );
+                                                    coordinator.rejoin_in_flight.send_replace(true);
+                                                    let tx = rejoin_tx.clone();
+                                                    rejoin_handle = Some(tokio::spawn(async move {
+                                                        let outcome = match coordinator.background_rejoin().await {
+                                                            Ok(pending) => {
+                                                                let topics = pending.assignment.partitions.len();
+                                                                // Park the assignment *before*
+                                                                // clearing the in-flight flag, so a
+                                                                // poll() woken by that flag always
+                                                                // finds the result waiting for it.
+                                                                *coordinator.pending_rebalance.lock() = Some(pending);
+                                                                Ok(topics)
+                                                            }
+                                                            Err(e) => Err(e),
+                                                        };
+                                                        coordinator.rejoin_in_flight.send_replace(false);
+                                                        let _ = tx.send(outcome).await;
+                                                    }));
+                                                }
                                             }
                                             status if status.requires_rejoin() => {
                                                 warn!("Heartbeat status {:?} requires rejoin for group '{}'", status, group_id);
@@ -2362,12 +2637,24 @@ impl GroupCoordinator {
                                                 // member_id + generation_id) happens in
                                                 // needs_rejoin() which has full access to the
                                                 // coordinator.
+                                                //
+                                                // Any assignment a background rebalance parked
+                                                // belongs to a generation the coordinator has now
+                                                // forgotten. Applying it would have poll() start
+                                                // fetching partitions this member no longer holds,
+                                                // alongside whoever was given them instead.
+                                                if let Some(coordinator) = coordinator_ref.upgrade() {
+                                                    coordinator.clear_pending_rebalance();
+                                                }
                                                 heartbeat_controller.signal_member_invalidated();
                                                 heartbeat_controller.stop();
                                                 break;
                                             }
                                             HeartbeatStatus::FatalError => {
                                                 error!("Fatal heartbeat error for group '{}'", group_id);
+                                                if let Some(coordinator) = coordinator_ref.upgrade() {
+                                                    coordinator.clear_pending_rebalance();
+                                                }
                                                 heartbeat_controller.stop();
                                                 break;
                                             }
@@ -2409,6 +2696,34 @@ impl GroupCoordinator {
                 }
             }
 
+            // A rebalance still in flight belongs to this task; abandoning it
+            // would leave the coordinator in Joining/AwaitingSync, which
+            // `needs_rejoin()` does not treat as needing a rejoin — the
+            // consumer would then never rebalance again. Cancel it and hand
+            // the rebalance back to poll().
+            if let Some(handle) = rejoin_handle {
+                handle.abort();
+                if let Some(coordinator) = coordinator_ref.upgrade()
+                    // Only if no successor has started. A newer task means
+                    // `start_heartbeat_task` ran, which happens after a
+                    // successful join/sync — resetting the group to
+                    // PreparingRebalance here would discard that join and
+                    // force a rebalance that nothing asked for.
+                    && coordinator
+                        .heartbeat_epoch
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        == epoch
+                {
+                    coordinator.rejoin_in_flight.send_replace(false);
+                    // The join may have parked a result in the instant before
+                    // the abort landed; it belongs to a rebalance nobody
+                    // finished, so poll() must redo it rather than apply it.
+                    coordinator.clear_pending_rebalance();
+                    coordinator.inner.write().await.state = GroupState::PreparingRebalance;
+                    heartbeat_controller.signal_rebalance();
+                }
+            }
+
             debug!("Heartbeat task ended for group '{}'", group_id);
         });
     }
@@ -2424,6 +2739,9 @@ impl GroupCoordinator {
 
     /// Trigger a rejoin.
     pub async fn trigger_rejoin(&self) {
+        // Any parked assignment predates the rejoin being requested here, so
+        // applying it afterwards would install a superseded generation's view.
+        self.clear_pending_rebalance();
         self.inner.write().await.state = GroupState::PreparingRebalance;
         let tx = self.heartbeat_cmd_tx.read().await.clone();
         if let Some(tx) = tx {
@@ -3305,15 +3623,34 @@ impl GroupCoordinator {
     /// Returns `true` if a rejoin was triggered and the caller should
     /// abort the current rebalance phase (return early from poll).
     pub async fn handle_inline_heartbeat_status(&self, status: HeartbeatStatus) -> bool {
-        if status.requires_rejoin() {
-            if status.is_session_invalidating() {
-                self.reset_member_identity().await;
-            }
-            self.trigger_rejoin().await;
-            true
-        } else {
-            false
+        if !status.requires_rejoin() {
+            return false;
         }
+
+        if status.is_session_invalidating() {
+            // The coordinator no longer recognises this member. Drop the
+            // identity and hand the rejoin to poll(), which will re-register
+            // from scratch.
+            self.reset_member_identity().await;
+            self.trigger_rejoin().await;
+            return true;
+        }
+
+        // Plain REBALANCE_IN_PROGRESS.
+        //
+        // `trigger_rejoin` tells the heartbeat task to exit, which is the right
+        // thing only when there is no heartbeat task to do the work. While one
+        // is running it will read the same status on its next tick and drive
+        // the JoinGroup/SyncGroup straight away; tearing it down here would
+        // discard that and push the rejoin back onto the next poll() — the
+        // delay this inline heartbeat exists to avoid — and would abandon a
+        // rebalance already in flight.
+        if self.heartbeat_controller.is_running() {
+            return false;
+        }
+
+        self.trigger_rejoin().await;
+        true
     }
 
     /// Commit offsets to the coordinator.
@@ -3815,6 +4152,12 @@ impl GroupCoordinator {
 
     /// Leave the consumer group.
     pub async fn leave_group(&self) -> Result<()> {
+        // Drop any assignment a background rebalance parked before the reset
+        // paths below get a chance to: a member on its way out must not leave
+        // one behind for a later poll() to pick up. Done first so it also
+        // covers the already-Unjoined early return.
+        self.clear_pending_rebalance();
+
         let state = self.inner.read().await.state;
         if state == GroupState::Unjoined || state == GroupState::Dead {
             return Ok(());
@@ -4061,6 +4404,7 @@ impl GroupCoordinator {
 
     /// Reset coordinator state.
     async fn reset(&self) {
+        self.clear_pending_rebalance();
         self.reset_member_identity().await;
         {
             let mut inner = self.inner.write().await;
@@ -4096,6 +4440,7 @@ impl GroupCoordinator {
     /// advertise ownership of partitions this consumer has already stopped
     /// fetching.
     async fn reset_for_static_leave(&self) {
+        self.clear_pending_rebalance();
         let member_id = self.inner.read().await.member_id.clone();
         if !member_id.is_empty() {
             self.sticky_assignor.clear_member(&member_id);
@@ -4123,6 +4468,7 @@ impl GroupCoordinator {
     /// and epoch 0". Sticky assignor, assignment, and target state are
     /// cleared because the coordinator revoked all partitions on fencing.
     async fn reset_for_kip848_fencing(&self) {
+        self.clear_pending_rebalance();
         let member_id = self.inner.read().await.member_id.clone();
         if !member_id.is_empty() {
             self.sticky_assignor.clear_member(&member_id);
@@ -4582,6 +4928,362 @@ mod tests {
             Duration::from_secs(30),
         )
         .with_assignor_strategy(strategy)
+    }
+
+    /// A `JoinGroup` must be given the group's rebalance window, not the
+    /// ordinary request budget.
+    ///
+    /// The coordinator parks a `JoinGroup` until the rebalance it belongs to
+    /// converges — every other member rejoining, or the rebalance timeout
+    /// elapsing. With the default consumer configuration that window is
+    /// `max.poll.interval.ms` (5 min) while `request.timeout.ms` is 30 s, so
+    /// bounding the join by the latter aborts healthy rebalances client-side:
+    /// any rebalance that needs longer than 30 s to converge (for instance one
+    /// waiting on an idle member's 45 s session to lapse) fails the join
+    /// instead of completing it.
+    #[test]
+    fn test_join_group_timeout_covers_the_rebalance_window() {
+        let coordinator =
+            test_coordinator(crate::consumer::config::PartitionAssignmentStrategy::Range);
+
+        // test_coordinator is built with a 30 s rebalance timeout.
+        assert_eq!(
+            coordinator.join_group_timeout(),
+            Duration::from_secs(30) + JOIN_GROUP_TIMEOUT_SLACK,
+        );
+        assert!(
+            coordinator.join_group_timeout() > coordinator.rebalance_timeout,
+            "the join budget must outlast the rebalance window so the \
+             coordinator's answer can reach us"
+        );
+
+        // With the shipped consumer defaults the join budget must comfortably
+        // exceed the default request timeout of 30 s.
+        let defaults = crate::consumer::config::ConsumerConfig::default();
+        let coordinator = GroupCoordinator::new(
+            "test-group",
+            Arc::new(ConnectionPool::new(
+                crate::network::ConnectionConfig::default(),
+            )),
+            Arc::new(ClusterMetadata::new(
+                vec!["localhost:9092".to_string()],
+                Arc::new(ConnectionPool::new(
+                    crate::network::ConnectionConfig::default(),
+                )),
+                Duration::from_secs(300),
+            )),
+            defaults.session_timeout(),
+            defaults.heartbeat_interval(),
+            defaults.max_poll_interval(),
+        );
+        assert!(
+            coordinator.join_group_timeout() > defaults.request_timeout(),
+            "join budget {:?} must exceed request_timeout {:?}",
+            coordinator.join_group_timeout(),
+            defaults.request_timeout(),
+        );
+        assert!(
+            coordinator.join_group_timeout() > defaults.session_timeout(),
+            "join budget {:?} must outlast session_timeout {:?}, or a rebalance \
+             that waits for an idle member's session to lapse can never complete",
+            coordinator.join_group_timeout(),
+            defaults.session_timeout(),
+        );
+    }
+
+    // ── Background rebalance hand-off ──────────────────────────────────────
+    //
+    // The heartbeat task runs JoinGroup/SyncGroup and parks the result; poll()
+    // consumes it and applies the callbacks and data-plane changes. These tests
+    // pin down the hand-off itself — that the assignment survives exactly one
+    // trip across it, and that every path which invalidates the generation
+    // drops it rather than letting poll() apply a superseded view.
+
+    fn pending(topic: &str, partitions: Vec<PartitionId>) -> PendingRebalance {
+        let mut assignment = MemberAssignment::empty();
+        assignment.add(topic, partitions);
+        PendingRebalance {
+            assignment,
+            to_revoke: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_pending_rebalance_is_delivered_exactly_once() {
+        let coordinator =
+            test_coordinator(crate::consumer::config::PartitionAssignmentStrategy::Range);
+
+        assert!(
+            coordinator.take_pending_rebalance().is_none(),
+            "a coordinator that has never rebalanced has nothing parked"
+        );
+
+        *coordinator.pending_rebalance.lock() = Some(pending("t", vec![0, 1]));
+
+        let taken = coordinator
+            .take_pending_rebalance()
+            .expect("the parked assignment must be handed to the first caller");
+        assert_eq!(taken.assignment.get("t"), Some([0, 1].as_slice()));
+
+        assert!(
+            coordinator.take_pending_rebalance().is_none(),
+            "taking must consume: a second poll() re-applying the same \
+             assignment would re-fire on_partitions_assigned for partitions \
+             it already owns"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trigger_rejoin_drops_a_parked_assignment() {
+        let coordinator =
+            test_coordinator(crate::consumer::config::PartitionAssignmentStrategy::Range);
+        *coordinator.pending_rebalance.lock() = Some(pending("t", vec![0]));
+
+        coordinator.trigger_rejoin().await;
+
+        assert!(
+            coordinator.take_pending_rebalance().is_none(),
+            "the parked assignment predates the rejoin just requested, so \
+             applying it would install a generation the group has left behind"
+        );
+        assert_eq!(coordinator.state().await, GroupState::PreparingRebalance);
+    }
+
+    #[tokio::test]
+    async fn test_reset_drops_a_parked_assignment() {
+        let coordinator =
+            test_coordinator(crate::consumer::config::PartitionAssignmentStrategy::Range);
+        *coordinator.pending_rebalance.lock() = Some(pending("t", vec![0]));
+
+        coordinator.reset().await;
+
+        assert!(
+            coordinator.take_pending_rebalance().is_none(),
+            "a consumer that has left the group must not go on to assign \
+             itself partitions from its old membership"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_starting_the_heartbeat_task_drops_a_parked_assignment() {
+        let coordinator = Arc::new(test_coordinator(
+            crate::consumer::config::PartitionAssignmentStrategy::Range,
+        ));
+        *coordinator.pending_rebalance.lock() = Some(pending("t", vec![0]));
+
+        // start_heartbeat_task runs after a fresh join/sync, whose assignment
+        // supersedes anything the previous task parked.
+        coordinator.start_heartbeat_task().await;
+        coordinator.stop_heartbeat_task().await;
+
+        assert!(coordinator.take_pending_rebalance().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_await_rejoin_returns_immediately_when_idle() {
+        let coordinator =
+            test_coordinator(crate::consumer::config::PartitionAssignmentStrategy::Range);
+
+        assert!(!coordinator.rejoin_in_flight());
+
+        // A poll() with no background rebalance running must not spend any of
+        // its budget here — this is the ordinary path through every poll.
+        let start = std::time::Instant::now();
+        coordinator.await_rejoin(Duration::from_secs(30)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "await_rejoin blocked for {:?} with no rebalance in flight",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_await_rejoin_wakes_when_the_rebalance_finishes() {
+        let coordinator = Arc::new(test_coordinator(
+            crate::consumer::config::PartitionAssignmentStrategy::Range,
+        ));
+        coordinator.rejoin_in_flight.send_replace(true);
+        assert!(coordinator.rejoin_in_flight());
+
+        let finisher = coordinator.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            finisher.rejoin_in_flight.send_replace(false);
+        });
+
+        // The budget here is far longer than the rebalance takes: poll() must
+        // resume as soon as the assignment is ready, not sit out its timeout.
+        let start = std::time::Instant::now();
+        coordinator.await_rejoin(Duration::from_secs(30)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "await_rejoin did not wake on completion; waited {:?}",
+            start.elapsed()
+        );
+        assert!(!coordinator.rejoin_in_flight());
+    }
+
+    #[tokio::test]
+    async fn test_await_rejoin_gives_up_after_the_budget() {
+        let coordinator =
+            test_coordinator(crate::consumer::config::PartitionAssignmentStrategy::Range);
+        coordinator.rejoin_in_flight.send_replace(true);
+
+        // A rebalance that is genuinely stuck — waiting on some other member
+        // that has stopped responding — must not hold poll() past its timeout.
+        let start = std::time::Instant::now();
+        coordinator.await_rejoin(Duration::from_millis(100)).await;
+        assert!(start.elapsed() >= Duration::from_millis(100));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "await_rejoin overran its budget by {:?}",
+            start.elapsed()
+        );
+        assert!(
+            coordinator.rejoin_in_flight(),
+            "the rebalance is still running; poll() reports an empty result \
+             rather than assuming it finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_eager_protocols_never_produce_cooperative_revocations() {
+        let coordinator =
+            test_coordinator(crate::consumer::config::PartitionAssignmentStrategy::Range);
+        let mut assignment = MemberAssignment::empty();
+        assignment.add("t", vec![0, 1]);
+
+        assert!(
+            coordinator
+                .cooperative_revocations(&assignment)
+                .await
+                .is_empty(),
+            "eager rebalances revoke everything and start over; a partial \
+             revocation list would make poll() take the two-round path"
+        );
+    }
+
+    /// `stop_heartbeat_task` asks the current task to exit but does not wait
+    /// for it, so a task can still be shutting down while its successor is
+    /// live. Each task therefore carries an epoch and only cleans up if it is
+    /// still the current one — otherwise a straggler would reset the group to
+    /// PreparingRebalance on top of the join its successor had just completed,
+    /// forcing a rebalance nothing asked for.
+    #[tokio::test]
+    async fn test_each_heartbeat_task_gets_a_newer_epoch() {
+        let coordinator = Arc::new(test_coordinator(
+            crate::consumer::config::PartitionAssignmentStrategy::Range,
+        ));
+        let epoch_of = || {
+            coordinator
+                .heartbeat_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+        };
+
+        let initial = epoch_of();
+        coordinator.start_heartbeat_task().await;
+        let first = epoch_of();
+        coordinator.start_heartbeat_task().await;
+        let second = epoch_of();
+        coordinator.stop_heartbeat_task().await;
+
+        assert!(
+            first > initial && second > first,
+            "each task must claim a strictly newer epoch ({initial} -> {first} -> {second})"
+        );
+    }
+
+    /// An inline heartbeat that reports a plain rebalance must not tear down a
+    /// running heartbeat task: that task is the thing that rejoins promptly,
+    /// and `trigger_rejoin` would stop it and push the work back onto the next
+    /// `poll()` — reinstating exactly the delay this change removes.
+    #[tokio::test]
+    async fn test_inline_heartbeat_leaves_a_running_task_to_rebalance() {
+        let coordinator =
+            test_coordinator(crate::consumer::config::PartitionAssignmentStrategy::Range);
+        coordinator.heartbeat_controller.start();
+        *coordinator.pending_rebalance.lock() = Some(pending("t", vec![0]));
+
+        let handled = coordinator
+            .handle_inline_heartbeat_status(HeartbeatStatus::RebalanceNeeded)
+            .await;
+
+        assert!(
+            !handled,
+            "poll() must not treat the rebalance as its own to drive"
+        );
+        assert_ne!(
+            coordinator.state().await,
+            GroupState::PreparingRebalance,
+            "the heartbeat task owns this rebalance; poll() must not reset the state under it"
+        );
+        assert!(
+            coordinator.take_pending_rebalance().is_some(),
+            "a parked assignment must survive an inline heartbeat"
+        );
+    }
+
+    /// With no heartbeat task running there is nothing to drive the rejoin in
+    /// the background, so the inline heartbeat must fall back to handing it to
+    /// `poll()`.
+    #[tokio::test]
+    async fn test_inline_heartbeat_drives_the_rejoin_when_no_task_runs() {
+        let coordinator =
+            test_coordinator(crate::consumer::config::PartitionAssignmentStrategy::Range);
+        assert!(!coordinator.heartbeat_controller.is_running());
+
+        let handled = coordinator
+            .handle_inline_heartbeat_status(HeartbeatStatus::RebalanceNeeded)
+            .await;
+
+        assert!(handled);
+        assert_eq!(coordinator.state().await, GroupState::PreparingRebalance);
+    }
+
+    /// A session-invalidating heartbeat outranks a parked assignment: the
+    /// coordinator has forgotten this member, so the generation the assignment
+    /// belongs to no longer exists. Applying it would have `poll()` fetch
+    /// partitions alongside whichever member was given them instead.
+    #[tokio::test]
+    async fn test_session_invalidation_outranks_a_parked_assignment() {
+        let coordinator =
+            test_coordinator(crate::consumer::config::PartitionAssignmentStrategy::Range);
+        coordinator.heartbeat_controller.start();
+        *coordinator.pending_rebalance.lock() = Some(pending("t", vec![0]));
+
+        let handled = coordinator
+            .handle_inline_heartbeat_status(HeartbeatStatus::UnknownMember)
+            .await;
+
+        assert!(handled, "an invalidated member must rejoin from poll()");
+        assert!(
+            coordinator.take_pending_rebalance().is_none(),
+            "the parked assignment belongs to a generation the coordinator \
+             has discarded"
+        );
+    }
+
+    /// `REBALANCE_IN_PROGRESS` is the one rejoin reason that leaves the session
+    /// intact, which is why the heartbeat task now keeps heartbeating through
+    /// it instead of exiting. If it were ever reclassified as
+    /// session-invalidating, the task would start clearing member identity on
+    /// every ordinary rebalance and every member would lose its sticky
+    /// assignment.
+    #[test]
+    fn test_rebalance_in_progress_does_not_invalidate_the_session() {
+        assert!(HeartbeatStatus::RebalanceNeeded.requires_rejoin());
+        assert!(!HeartbeatStatus::RebalanceNeeded.is_session_invalidating());
+
+        for status in [
+            HeartbeatStatus::UnknownMember,
+            HeartbeatStatus::IllegalGeneration,
+            HeartbeatStatus::SessionTimeout,
+        ] {
+            assert!(
+                status.is_session_invalidating(),
+                "{status:?} must still stop the heartbeat task"
+            );
+        }
     }
 
     #[test]

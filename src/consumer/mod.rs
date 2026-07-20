@@ -82,7 +82,8 @@ use group::ErasedRebalanceListener;
 pub use group::{
     ConsumerGroup, ConsumerRebalanceListener, CooperativeStickyAssignor, GroupCoordinator,
     GroupMember, GroupState, HeartbeatController, HeartbeatStatus, MemberAssignment,
-    NoOpRebalanceListener, PartitionAssignor, RangeAssignor, RoundRobinAssignor, StickyAssignor,
+    NoOpRebalanceListener, PartitionAssignor, PendingRebalance, RangeAssignor, RoundRobinAssignor,
+    StickyAssignor,
 };
 pub use group_metadata::ConsumerGroupMetadata;
 pub use offset::{OffsetAndMetadata, OffsetStore, ResetOffset};
@@ -1012,6 +1013,25 @@ impl Consumer {
     ///
     /// Replaces the current subscription with the given topics (matching
     /// the Kafka Java client's replace semantics).
+    ///
+    /// # How long this can block
+    ///
+    /// Only the eager (non-cooperative) classic protocol joins here; the
+    /// cooperative and KIP-848 paths just record the subscription and let the
+    /// next `poll()` do the work.
+    ///
+    /// Joining is not bounded by `request.timeout.ms`. The coordinator answers
+    /// `JoinGroup` only once every member of the group has sent one, so the
+    /// call is budgeted against the group's rebalance window
+    /// (`max.poll.interval.ms` plus a small margin), matching the Java client.
+    ///
+    /// In practice it returns as soon as the other members respond. A krafka
+    /// consumer rejoins from its background heartbeat task the moment the
+    /// coordinator reports a rebalance, so an idle application between `poll()`
+    /// calls no longer holds the group up. The full rebalance window is only
+    /// reached when some member genuinely cannot answer — a client that drives
+    /// `JoinGroup` from its application thread and has stopped polling, or one
+    /// whose process has died and whose session has yet to expire.
     pub async fn subscribe(&self, topics: &[&str]) -> Result<()> {
         // H6: reject empty / oversize topic names at ingress so they cannot
         // reach the panicking `KafkaString::encode` path via the MetadataRequest
@@ -1535,12 +1555,46 @@ impl Consumer {
     ///
     /// Returns `true` if poll() should return an empty result immediately
     /// (e.g., cooperative rebalance requires another poll cycle).
-    async fn handle_group_rebalance(&self) -> Result<bool> {
+    ///
+    /// The background heartbeat task may already have completed the group's
+    /// `JoinGroup`/`SyncGroup` barrier and parked the resulting assignment, so
+    /// that is checked first: the coordinator has moved on to a new generation
+    /// and the local view has to catch up before any fetch is issued.
+    async fn handle_group_rebalance(&self, timeout: Duration) -> Result<bool> {
         let Some(ref coordinator) = self.group_coordinator else {
             return Ok(false);
         };
 
-        if coordinator.needs_rejoin().await {
+        // A rebalance the heartbeat task is already running is the one that
+        // will produce this member's next assignment. Wait for it — up to the
+        // caller's own poll budget — rather than returning empty immediately,
+        // which would spin, or starting a competing JoinGroup, which would
+        // leave two of this member's joins racing to define its generation.
+        coordinator.await_rejoin(timeout).await;
+
+        if let Some(pending) = coordinator.take_pending_rebalance() {
+            // Callbacks and data-plane state stay on the poll path, exactly
+            // where they are for a poll-driven rebalance: commit, revoke,
+            // rewrite offsets/partition state/buffers, assign.
+            if coordinator.is_cooperative() {
+                if self
+                    .handle_cooperative_rebalance(coordinator, Some(pending))
+                    .await?
+                {
+                    return Ok(true);
+                }
+            } else {
+                let topics: Vec<String> = self.subscriptions.read().await.iter().cloned().collect();
+                self.handle_eager_rebalance(coordinator, &topics, Some(pending.assignment))
+                    .await?;
+            }
+        } else if coordinator.rejoin_in_flight() {
+            // Still rebalancing after the whole poll budget. There is nothing
+            // to fetch mid-rebalance, so report an empty poll; the assignment
+            // is picked up by whichever poll the rebalance finishes under.
+            debug!("Background rebalance still in flight; returning an empty poll");
+            return Ok(true);
+        } else if coordinator.needs_rejoin().await {
             let topics: Vec<String> = self.subscriptions.read().await.iter().cloned().collect();
             if !topics.is_empty() {
                 coordinator.set_subscribed_topics(topics.clone()).await;
@@ -1555,11 +1609,12 @@ impl Consumer {
                     coordinator.ensure_active_membership(&topics).await?;
                     self.handle_kip848_rebalance(coordinator).await?;
                 } else if coordinator.is_cooperative() {
-                    if self.handle_cooperative_rebalance(coordinator).await? {
+                    if self.handle_cooperative_rebalance(coordinator, None).await? {
                         return Ok(true);
                     }
                 } else {
-                    self.handle_eager_rebalance(coordinator, &topics).await?;
+                    self.handle_eager_rebalance(coordinator, &topics, None)
+                        .await?;
                 }
             }
         }
@@ -1584,15 +1639,24 @@ impl Consumer {
 
     /// Handle cooperative incremental rebalance (KIP-429).
     ///
+    /// `phase1` carries a join/sync the background heartbeat task already
+    /// completed; passing `None` makes this method run that first round itself.
+    /// Either way the revocation callbacks, the second rejoin and the final
+    /// assignment all happen here, on the poll path.
+    ///
     /// Returns `true` if poll() should return an empty result immediately,
     /// which happens when an inline heartbeat signals rejoin or when the
     /// cooperative round limit is exceeded.
     async fn handle_cooperative_rebalance(
         &self,
         coordinator: &Arc<GroupCoordinator>,
+        phase1: Option<PendingRebalance>,
     ) -> Result<bool> {
         // Phase 1: join+sync to get new target assignment
-        let (new_assignment, to_revoke) = coordinator.perform_cooperative_join_and_sync().await?;
+        let (new_assignment, to_revoke) = match phase1 {
+            Some(p) => (p.assignment, p.to_revoke),
+            None => coordinator.perform_cooperative_join_and_sync().await?,
+        };
 
         if !to_revoke.is_empty() {
             // Revoke only the diff — keep consuming unaffected partitions
@@ -1863,10 +1927,16 @@ impl Consumer {
     }
 
     /// Handle eager rebalance: revoke all partitions, then reassign from scratch.
+    ///
+    /// `pending` carries an assignment the background heartbeat task already
+    /// obtained through `JoinGroup`/`SyncGroup`. When it is `None` this method
+    /// performs the join itself. The revoke-all, the callbacks and the offset
+    /// fetch are identical in both cases and always run here, on the poll path.
     async fn handle_eager_rebalance(
         &self,
         coordinator: &Arc<GroupCoordinator>,
         topics: &[String],
+        pending: Option<MemberAssignment>,
     ) -> Result<()> {
         let old_assignments = self.assignments.read().await.clone();
         if !old_assignments.is_empty() {
@@ -1902,10 +1972,15 @@ impl Consumer {
 
         self.metrics.rebalances.inc();
 
-        // `joined` is always true here: handle_group_rebalance gates on
-        // needs_rejoin(), so ensure_active_membership always performs a
-        // full JoinGroup/SyncGroup.
-        let (assignment, _joined) = coordinator.ensure_active_membership(topics).await?;
+        let assignment = match pending {
+            // The background task already ran the join/sync for this
+            // generation; re-running it would start an unnecessary rebalance.
+            Some(assignment) => assignment,
+            // `joined` is always true here: handle_group_rebalance gates on
+            // needs_rejoin(), so ensure_active_membership always performs a
+            // full JoinGroup/SyncGroup.
+            None => coordinator.ensure_active_membership(topics).await?.0,
+        };
 
         // Update our assignments
         let mut assignments = self.assignments.write().await;
@@ -2765,7 +2840,7 @@ impl Consumer {
         }
 
         // Handle group rebalance if needed
-        if self.handle_group_rebalance().await? {
+        if self.handle_group_rebalance(timeout).await? {
             return Ok(vec![]);
         }
 
