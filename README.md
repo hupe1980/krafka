@@ -36,11 +36,11 @@ Add Krafka to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-krafka = "0.13.0"
+krafka = "0.14.0"
 tokio = { version = "1", features = ["full"] }
 
 # For AWS MSK IAM authentication with full SDK support:
-# krafka = { version = "0.13.0", features = ["aws-msk"] }
+# krafka = { version = "0.14.0", features = ["aws-msk"] }
 ```
 
 ### Producer
@@ -245,10 +245,10 @@ To select only what you need:
 # Option 1: enable only the codecs you need
 # `default-features = false` also drops the default `ring` TLS backend, so a
 # crypto backend must be named explicitly.
-krafka = { version = "0.13.0", default-features = false, features = ["lz4", "snappy", "ring"] }
+krafka = { version = "0.14.0", default-features = false, features = ["lz4", "snappy", "ring"] }
 
 # Option 2: enable all compression codecs, including zstd
-# krafka = { version = "0.13.0", features = ["compression-all"] }
+# krafka = { version = "0.14.0", features = ["compression-all"] }
 ```
 
 ### TLS crypto backend
@@ -258,7 +258,7 @@ default; `rustls-aws-lc-rs` selects aws-lc-rs instead, which is the better
 choice on AWS Graviton and in FIPS-oriented deployments:
 
 ```toml
-krafka = { version = "0.13.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
+krafka = { version = "0.14.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
 ```
 
 The two backends are **additive**, not mutually exclusive — a transitive

@@ -134,10 +134,10 @@ To trim binary size further, disable defaults and select only the codecs you nee
 # Option 1: enable only the codecs you need
 # `default-features = false` also drops the default `ring` TLS backend, so a
 # crypto backend must be named explicitly.
-krafka = { version = "0.13.0", default-features = false, features = ["lz4", "ring"] }
+krafka = { version = "0.14.0", default-features = false, features = ["lz4", "ring"] }
 
 # Option 2: enable all compression codecs, including zstd
-# krafka = { version = "0.13.0", features = ["compression-all"] }
+# krafka = { version = "0.14.0", features = ["compression-all"] }
 ```
 
 ### Batching

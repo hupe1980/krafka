@@ -319,7 +319,7 @@ Krafka's TLS is `rustls`, which needs a crypto backend. `ring` is the default;
 FIPS-oriented deployments:
 
 ```toml
-krafka = { version = "0.13.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
+krafka = { version = "0.14.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
 ```
 
 The two features are **additive**. Cargo features cannot be made mutually
@@ -368,7 +368,7 @@ By default, Krafka uses compiled-in `webpki-roots`. To use the operating system 
 
 ```toml
 [dependencies]
-krafka = { version = "0.13.0", features = ["native-tls-roots"] }
+krafka = { version = "0.14.0", features = ["native-tls-roots"] }
 ```
 
 ```rust
@@ -447,7 +447,7 @@ For production deployments on EC2, ECS, Lambda, or EKS, use the AWS SDK default 
 use krafka::auth::{AuthConfig, AwsMskIamCredentials};
 
 // Requires the `aws-msk` feature in Cargo.toml:
-// krafka = { version = "0.13.0", features = ["aws-msk"] }
+// krafka = { version = "0.14.0", features = ["aws-msk"] }
 
 // Loads from (in order):
 // 1. Environment variables
