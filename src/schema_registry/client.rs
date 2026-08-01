@@ -551,17 +551,40 @@ fn sanitize_url(url: String) -> String {
     normalize_url(url)
 }
 
-/// Minimal percent-encoding for subject names in URL path segments.
+/// Percent-encode a single URL path segment (RFC 3986 §3.3).
+///
+/// # Why this is allow-list rather than deny-list
+///
+/// The encoded value is interpolated into a request target that
+/// [`crate::schema_registry::http`] serialises by hand into a `\r\n`-delimited
+/// HTTP/1.1 message. A previous deny-list here escaped only `% / space # ?`,
+/// which left **CR and LF unescaped**: a subject name containing `\r\n` would
+/// terminate the request line and let the remainder be read as headers or as a
+/// second pipelined request — classic request splitting. Subject names are not
+/// always operator-controlled (`RecordNameStrategy` derives them from the
+/// schema, i.e. from data), so this is reachable input.
+///
+/// Anything outside RFC 3986's `unreserved` set is therefore percent-encoded,
+/// which covers CR, LF, NUL, every other control character, every delimiter,
+/// and all non-ASCII bytes (encoded per their UTF-8 octets). Over-encoding a
+/// path segment is always safe: servers decode `%XX` back to the same bytes.
 fn percent_encode(input: &str) -> String {
+    /// RFC 3986 §2.3 `unreserved`: ALPHA / DIGIT / "-" / "." / "_" / "~".
+    #[inline]
+    const fn is_unreserved(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
+    }
+
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
     let mut encoded = String::with_capacity(input.len());
-    for c in input.chars() {
-        match c {
-            '%' => encoded.push_str("%25"),
-            '/' => encoded.push_str("%2F"),
-            ' ' => encoded.push_str("%20"),
-            '#' => encoded.push_str("%23"),
-            '?' => encoded.push_str("%3F"),
-            _ => encoded.push(c),
+    for &byte in input.as_bytes() {
+        if is_unreserved(byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0F) as usize] as char);
         }
     }
     encoded
@@ -943,6 +966,49 @@ mod tests {
         assert_eq!(percent_encode("has space"), "has%20space");
         assert_eq!(percent_encode("100%"), "100%25");
         assert_eq!(percent_encode("a?b#c"), "a%3Fb%23c");
+        // RFC 3986 `unreserved` passes through untouched.
+        assert_eq!(percent_encode("a-b.c_d~e0"), "a-b.c_d~e0");
+        // The common Kafka subject shape (`<topic>-value`) is unchanged, so
+        // the strict encoder costs nothing on the normal path.
+        assert_eq!(percent_encode("orders-value"), "orders-value");
+    }
+
+    /// The encoded subject lands in a hand-serialised HTTP/1.1 request line, so
+    /// a CR or LF that survives encoding splits the request. Subject names are
+    /// data-derived under `RecordNameStrategy`, so this is reachable input.
+    #[test]
+    fn test_percent_encode_neutralises_request_splitting() {
+        let injected = percent_encode("evil\r\nX-Injected: 1\r\n\r\nGET /admin HTTP/1.1");
+        assert!(
+            !injected.contains('\r') && !injected.contains('\n'),
+            "CR/LF must not survive encoding: {injected}"
+        );
+        assert!(
+            injected.contains("%0D%0A"),
+            "CRLF must be escaped as %0D%0A"
+        );
+        assert!(
+            !injected.contains(' '),
+            "a raw space would terminate the request target: {injected}"
+        );
+    }
+
+    /// No byte outside RFC 3986 `unreserved` may pass through — the property
+    /// the allow-list exists to guarantee.
+    #[test]
+    fn test_percent_encode_emits_only_unreserved_and_escapes() {
+        // Every ASCII byte, plus control characters and a multi-byte char.
+        let all: String = (0u8..=127).map(char::from).chain(['ä', '€']).collect();
+        let encoded = percent_encode(&all);
+        for b in encoded.bytes() {
+            assert!(
+                b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'%'),
+                "unexpected byte 0x{b:02X} in encoded output"
+            );
+        }
+        assert!(encoded.contains("%00"), "NUL must be escaped");
+        // Non-ASCII is encoded per UTF-8 octet: 'ä' is C3 A4.
+        assert!(encoded.contains("%C3%A4"), "non-ASCII must be escaped");
     }
 
     #[test]

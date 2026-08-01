@@ -77,6 +77,28 @@ impl AdminClientBuilder {
         self
     }
 
+    /// Set the metadata recovery strategy (KIP-1102).
+    ///
+    /// Controls what the client does when every known broker becomes
+    /// unreachable: keep retrying the cached broker set, or fall back to the
+    /// original bootstrap servers.
+    pub fn metadata_recovery_strategy(
+        mut self,
+        strategy: crate::metadata::MetadataRecoveryStrategy,
+    ) -> Self {
+        self.config.metadata_recovery_strategy = strategy;
+        self
+    }
+
+    /// How long metadata must stay unrefreshable before a rebootstrap fires.
+    ///
+    /// Only effective with
+    /// [`MetadataRecoveryStrategy::Rebootstrap`](crate::metadata::MetadataRecoveryStrategy::Rebootstrap).
+    pub fn metadata_recovery_rebootstrap_trigger(mut self, duration: Duration) -> Self {
+        self.config.metadata_recovery_rebootstrap_trigger = duration;
+        self
+    }
+
     /// Set SOCKS5 proxy configuration.
     ///
     /// Routes all broker connections through the specified SOCKS5 proxy.

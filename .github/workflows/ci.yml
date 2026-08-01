@@ -9,12 +9,41 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
-  # `ring` and `rustls-aws-lc-rs` are additive: when both are enabled,
-  # `rustls-aws-lc-rs` wins (see `auth::tls::resolve_crypto_provider`).
-  # `--all-features` is therefore valid and needs no hand-maintained feature
-  # list to keep in sync.
+
+# Every job below runs a `just` recipe rather than an inline cargo command.
+# The justfile is the single source of truth for what the checks are, so
+# `just ci` locally runs exactly what CI runs and the two cannot drift.
+# Feature strings in particular live in one place (justfile variables) instead
+# of being duplicated across YAML.
+#
+# `ring` and `rustls-aws-lc-rs` are additive: when both are enabled,
+# `rustls-aws-lc-rs` wins (see `auth::tls::resolve_crypto_provider`), so
+# `--all-features` is valid and needs no hand-maintained exclusion list.
 
 jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: extractions/setup-just@v3
+      - run: just fmt-check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v3
+      - run: just clippy
+
   check:
     name: Check
     runs-on: ubuntu-latest
@@ -22,12 +51,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Check (all features)
-        run: cargo check --all-targets --all-features
+      - uses: extractions/setup-just@v3
+      - run: just check
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v3
+      - run: just test
 
   # `ring` is the DEFAULT backend, so it is what most downstream users compile.
-  # It must be *tested*, not merely type-checked: the `cfg(not(rustls-aws-lc-rs))`
-  # arms in `auth/tls.rs` and `schema_registry/http.rs` only run here.
+  # It must be *tested*, not merely type-checked: the
+  # `cfg(not(feature = "rustls-aws-lc-rs"))` arms in `auth/tls.rs` and
+  # `schema_registry/http.rs` only run here.
   test-ring:
     name: Test (ring backend)
     runs-on: ubuntu-latest
@@ -35,12 +75,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Test (ring backend only, no rustls-aws-lc-rs)
-        run: cargo test --all-targets --no-default-features --features "compression-all,aws-msk,schema-registry,aws-glue-schema-registry,native-tls-roots,unstable-protocol,telemetry,socks5,ring"
+      - uses: extractions/setup-just@v3
+      - run: just test-ring
 
   # Guards the minimum viable configuration. A missing crypto backend used to
   # fail deep inside rustls; the `compile_error!` in lib.rs plus this job keep
-  # that diagnostic honest, and the second step pins feature additivity.
+  # that diagnostic honest, and the second command pins feature additivity.
   minimal-features:
     name: Minimal features
     runs-on: ubuntu-latest
@@ -48,10 +88,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build with only a TLS backend (no compression, no extras)
-        run: cargo check --no-default-features --features "ring"
-      - name: Both backends enabled (features must be additive)
-        run: cargo check --no-default-features --features "ring,rustls-aws-lc-rs"
+      - uses: extractions/setup-just@v3
+      - run: just minimal-features
 
   # A network client's socket options, dual-stack connection racing and
   # filesystem handling are platform-sensitive. Without these jobs non-Linux
@@ -67,13 +105,26 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # aws-lc-rs needs a C toolchain/NASM on Windows; use the pure-Rust `ring`
-      # backend so this job stays fast and dependency-light.
-      #
-      # `test-broker` is included deliberately: it binds real TCP listeners and
-      # drives real clients over loopback, which is exactly the behaviour most
-      # likely to differ between platforms.
-      - run: cargo test --no-default-features --features "compression,schema-registry,unstable-protocol,telemetry,socks5,test-broker,ring"
+      - uses: extractions/setup-just@v3
+      - run: just test-cross-platform
+
+  api-parity:
+    name: API surface parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v3
+      - run: just api-parity
+
+  doc:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v3
+      - run: just doc
 
   supply-chain:
     name: Supply chain (cargo-deny)
@@ -83,47 +134,6 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories bans licenses sources
-
-  fmt:
-    name: Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-features
-
-  doc:
-    name: Documentation
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: -Dwarnings
 
   integration:
     name: Integration Tests (Kafka ${{ matrix.kafka-version }})
@@ -144,6 +154,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v3
       - name: Pre-pull Kafka image
         run: |
           for i in 1 2 3; do
@@ -151,7 +162,7 @@ jobs:
             echo "Retry $i failed, waiting..."
             sleep 10
           done
-      - run: cargo test --test integration_tests -- --ignored --test-threads=1
+      - run: just integration
         timeout-minutes: 45
         env:
           KAFKA_VERSION: ${{ matrix.kafka-version }}
@@ -166,5 +177,8 @@ jobs:
         with:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@v2
-      # Skip aws-msk feature - requires specific version handling
+      # Not `just msrv`: that recipe shells out to `rustup run 1.88` so a
+      # developer can check the MSRV without switching their default toolchain.
+      # Here the job's toolchain already *is* 1.88, so the plain command is
+      # both simpler and a genuine check that the pinned toolchain builds.
       - run: cargo check

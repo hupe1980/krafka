@@ -62,13 +62,18 @@ fn arb_kafka_bytes() -> impl Strategy<Value = KafkaBytes> {
 }
 
 fn arb_tagged_fields() -> impl Strategy<Value = TaggedFields> {
-    // Tags must be strictly increasing on the wire in real Kafka messages, but
-    // the codec here is order-preserving, so any sequence round-trips.
+    // KIP-482 requires strictly ascending tags on the wire, and Kafka rejects
+    // anything else with InvalidRequestException — so an out-of-order section
+    // is not a case the codec has to round-trip, it is a case that must never
+    // be built. Generating sorted, deduplicated tags keeps this property test
+    // about the encoding rather than about a shape the encoder now refuses.
     prop::collection::vec(
         (any::<u32>(), prop::collection::vec(any::<u8>(), 0..32)),
         0..8,
     )
-    .prop_map(|v| {
+    .prop_map(|mut v| {
+        v.sort_by_key(|(tag, _)| *tag);
+        v.dedup_by_key(|(tag, _)| *tag);
         TaggedFields(
             v.into_iter()
                 .map(|(tag, data)| TaggedField {

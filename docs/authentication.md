@@ -20,6 +20,22 @@ Krafka supports multiple security protocols:
 | `SASL_PLAINTEXT` | No | Yes (SASL) |
 | `SASL_SSL` | Yes (TLS) | Yes (SASL) |
 
+### Not supported: GSSAPI / Kerberos
+
+Krafka implements PLAIN, SCRAM-SHA-256/512, OAUTHBEARER and AWS MSK IAM. It does
+**not** implement GSSAPI, and this is a deliberate position rather than an
+oversight.
+
+There is no mature pure-Rust GSSAPI implementation. Supporting it would mean
+linking `libgssapi` (and MIT Kerberos or Heimdal), which would break the crate's
+central promise — no C dependencies by default — for every user, in exchange for
+a mechanism most deployments do not use. Kerberos-integrated environments are
+therefore not served by this client today.
+
+If you need Kerberos, `rust-rdkafka` supports it through librdkafka. If your
+broker offers OAUTHBEARER alongside Kerberos, that path works here and is the
+usual migration route.
+
 ### Supported SASL Mechanisms
 
 | Mechanism | Description |
@@ -295,6 +311,33 @@ The implementation follows RFC 7628 GS2 framing:
 > OAUTHBEARER or SCRAM as alternatives.
 
 ## TLS/SSL Encryption
+
+### Crypto backend
+
+Krafka's TLS is `rustls`, which needs a crypto backend. `ring` is the default;
+`rustls-aws-lc-rs` selects aws-lc-rs, preferable on AWS Graviton and in
+FIPS-oriented deployments:
+
+```toml
+krafka = { version = "0.13.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
+```
+
+The two features are **additive**. Cargo features cannot be made mutually
+exclusive without breaking dependency graphs where two crates each pick a
+different backend, so enabling `rustls-aws-lc-rs` on top of the default `ring`
+(or building with `--all-features`) is a supported configuration: aws-lc-rs
+wins deterministically. Krafka selects the provider explicitly on every path,
+including certificate verification, rather than letting `rustls` infer it from
+crate features — inference panics when the features are ambiguous.
+
+To pick the backend for the whole process, including Krafka, install one before
+opening any connection:
+
+```rust,ignore
+rustls::crypto::aws_lc_rs::default_provider()
+    .install_default()
+    .expect("crypto provider already installed");
+```
 
 ### Basic TLS
 

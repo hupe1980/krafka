@@ -260,6 +260,82 @@ impl ConsumerBuilder {
         self
     }
 
+    /// Select the consumer group protocol.
+    ///
+    /// [`GroupProtocol::Classic`](super::GroupProtocol::Classic) uses the
+    /// traditional JoinGroup/SyncGroup/Heartbeat flow and is the default.
+    /// [`GroupProtocol::Consumer`](super::GroupProtocol::Consumer) uses the
+    /// KIP-848 protocol, where the coordinator computes assignments
+    /// server-side and `ConsumerGroupHeartbeat` is the sole membership
+    /// channel.
+    ///
+    /// **`Consumer` requires Kafka 3.7+ and is not yet recommended for
+    /// production** — see [`GroupProtocol`](super::GroupProtocol) for the
+    /// current caveats.
+    pub fn group_protocol(mut self, protocol: super::GroupProtocol) -> Self {
+        self.config.group_protocol = protocol;
+        self
+    }
+
+    /// Set the maximum decompressed size for a single record batch.
+    ///
+    /// Compressed payloads that decompress beyond this limit are rejected as
+    /// potential compression bombs. Lower it when consuming from a topic whose
+    /// producers are not fully trusted; the default is 128 MiB.
+    pub fn max_decompressed_size(mut self, size: usize) -> Self {
+        self.config.max_decompressed_size = size;
+        self
+    }
+
+    /// Set the metadata recovery strategy (KIP-1102).
+    ///
+    /// Controls what the client does when every known broker becomes
+    /// unreachable: keep retrying the cached broker set, or fall back to the
+    /// original bootstrap servers.
+    pub fn metadata_recovery_strategy(
+        mut self,
+        strategy: crate::metadata::MetadataRecoveryStrategy,
+    ) -> Self {
+        self.config.metadata_recovery_strategy = strategy;
+        self
+    }
+
+    /// How long metadata must stay unrefreshable before a rebootstrap fires.
+    ///
+    /// Only effective with
+    /// [`MetadataRecoveryStrategy::Rebootstrap`](crate::metadata::MetadataRecoveryStrategy::Rebootstrap).
+    pub fn metadata_recovery_rebootstrap_trigger(mut self, duration: Duration) -> Self {
+        self.config.metadata_recovery_rebootstrap_trigger = duration;
+        self
+    }
+
+    /// Set the maximum number of cooperative-rebalance rejoin rounds per poll.
+    ///
+    /// Bounds the work one `poll()` will do converging a cooperative
+    /// rebalance. Default: 10; values below 1 are clamped to 1.
+    pub fn max_cooperative_rebalance_rounds(mut self, rounds: usize) -> Self {
+        self.config.max_cooperative_rebalance_rounds = rounds.max(1);
+        self
+    }
+
+    /// Set how long `poll()` sleeps when there is nothing to do.
+    ///
+    /// Smaller values reduce latency when records arrive during the sleep
+    /// window, at the cost of CPU under sustained idle. Default: 10 ms.
+    pub fn idle_poll_backoff(mut self, backoff: Duration) -> Self {
+        self.config.idle_poll_backoff = backoff;
+        self
+    }
+
+    /// Set the maximum time allowed for the `on_partitions_revoked` callback.
+    ///
+    /// If the callback exceeds this duration the consumer logs a warning and
+    /// proceeds with the rebalance rather than stalling the group. Default: 5 s.
+    pub fn revocation_timeout(mut self, timeout: Duration) -> Self {
+        self.config.revocation_timeout = timeout;
+        self
+    }
+
     /// Set a rebalance listener to be notified of partition assignment changes.
     pub fn rebalance_listener(
         mut self,

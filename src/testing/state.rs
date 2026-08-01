@@ -146,6 +146,41 @@ pub struct GroupState {
     pub offsets: HashMap<(String, i32), CommittedOffset>,
     /// Counter behind generated member IDs.
     pub member_seq: u32,
+    /// KIP-848 members, keyed by client-generated member ID.
+    ///
+    /// Separate from [`Self::members`], which models the classic
+    /// JoinGroup/SyncGroup protocol. The two protocols have different member
+    /// identity and epoch rules, and conflating them in one map made it
+    /// impossible to model either faithfully.
+    pub consumer_members: HashMap<String, ConsumerGroupMemberState>,
+    /// Epoch the whole group is on. Bumped whenever the set of members or
+    /// their subscriptions changes, which is what forces reconciliation.
+    pub group_epoch: i32,
+}
+
+/// One KIP-848 member's coordinator-side state.
+#[derive(Debug, Clone, Default)]
+pub struct ConsumerGroupMemberState {
+    /// The epoch this member is currently on. `0` until its first assignment.
+    pub member_epoch: i32,
+    /// Static membership ID, if the member supplied one.
+    pub instance_id: Option<String>,
+    /// Topics the member last told the coordinator it subscribes to.
+    pub subscribed_topics: Vec<String>,
+    /// Partitions the coordinator has assigned, keyed by topic name.
+    pub assignment: HashMap<String, Vec<i32>>,
+    /// Partitions the member last *reported* owning.
+    ///
+    /// Distinct from [`Self::assignment`]: the coordinator may have granted
+    /// partitions the member has not acknowledged yet, and may be waiting for
+    /// the member to release partitions it still holds. Reconciliation is
+    /// exactly the gap between these two fields.
+    pub owned: HashMap<String, Vec<i32>>,
+    /// Whether [`Self::assignment`] changed since it was last sent.
+    ///
+    /// The assignment field is only put on the wire when it moves; a null
+    /// assignment means "keep what you have".
+    pub assignment_dirty: bool,
 }
 
 /// The whole fake cluster.

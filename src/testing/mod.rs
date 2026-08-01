@@ -149,6 +149,19 @@ pub enum Control {
     /// no response is ever written, so this also blocks every later request on
     /// the same connection — Kafka responses are ordered per connection.
     Silence,
+    /// Answer a `Fetch` normally, but corrupt the record bytes so the batch
+    /// fails its CRC32C check.
+    ///
+    /// Models on-disk or on-the-wire corruption: the response framing is
+    /// intact and the error is *inside* the record batch, which is the only
+    /// way to reach the client's batch-decode failure path. A byte inside the
+    /// CRC-covered region is flipped, leaving `batch_length` untouched so the
+    /// surrounding response still parses.
+    ///
+    /// Only modelled for `Fetch`; applying it to any other API is an error
+    /// rather than a silent pass-through, so a test cannot quietly assert
+    /// nothing.
+    CorruptRecords,
 }
 
 /// A request the broker received, as recorded for assertions.
@@ -634,8 +647,30 @@ async fn serve(mut stream: TcpStream, node_id: i32, shared: Arc<Shared>) -> Resu
             ));
         }
 
-        let mut frame = vec![0u8; len as usize];
-        stream.read_exact(&mut frame).await.map_err(io_error)?;
+        // Grow as bytes arrive rather than pre-sizing from the declared
+        // length. `MAX_FRAME_LEN` already bounds the damage, but pre-sizing is
+        // the one habit the client's own `read_framed_response` deliberately
+        // avoids — a peer that declares a large frame and then dribbles should
+        // only ever hold the memory it has actually sent. Modelling that here
+        // too keeps the harness from teaching the opposite lesson.
+        const CHUNK: usize = 8 * 1024;
+        let len = len as usize;
+        let mut frame = Vec::with_capacity(len.min(CHUNK));
+        let mut chunk = [0u8; CHUNK];
+        while frame.len() < len {
+            let want = (len - frame.len()).min(CHUNK);
+            let read = stream.read(&mut chunk[..want]).await.map_err(io_error)?;
+            if read == 0 {
+                return Err(io_error(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "fake broker: peer closed after {} of {len} frame bytes",
+                        frame.len()
+                    ),
+                )));
+            }
+            frame.extend_from_slice(&chunk[..read]);
+        }
         let mut frame = Bytes::from(frame);
 
         let header = read_request_header(&mut frame)?;
@@ -690,10 +725,23 @@ async fn serve(mut stream: TcpStream, node_id: i32, shared: Arc<Shared>) -> Resu
 
         let mut body = BytesMut::new();
         let outcome = match control {
-            Control::Error(code) => handlers::dispatch_error(api_key, &mut frame, code, &mut body),
+            Control::Error(code) => {
+                handlers::dispatch_error(api_key, header.api_version, &mut frame, code, &mut body)
+            }
+            Control::CorruptRecords => {
+                let mut cluster = shared.cluster.lock();
+                handlers::dispatch_corrupt(api_key, &mut frame, node_id, &mut cluster, &mut body)
+            }
             _ => {
                 let mut cluster = shared.cluster.lock();
-                handlers::dispatch(api_key, &mut frame, node_id, &mut cluster, &mut body)
+                handlers::dispatch(
+                    api_key,
+                    header.api_version,
+                    &mut frame,
+                    node_id,
+                    &mut cluster,
+                    &mut body,
+                )
             }
         };
         outcome?;

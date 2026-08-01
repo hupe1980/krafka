@@ -202,7 +202,8 @@ fn handle_protocol_error(err: &KrafkaError) {
             // Retriable — transient short read, reconnect and retry.
         }
         Some(ProtocolErrorKind::CrcMismatch) => {
-            // Retriable — on-wire corruption, reconnect and retry.
+            // NOT retriable — re-fetching the same offset returns the same
+            // bytes. Treat as data corruption and escalate.
         }
         Some(ProtocolErrorKind::UnknownApiVersion) => {
             // Not retriable — permanent client/broker version mismatch.
@@ -229,7 +230,7 @@ protocol error (CrcMismatch): record batch CRC check failed
 | Variant | Retriable | Meaning |
 |---|---|---|
 | `TruncatedFrame` | ✓ | Buffer exhausted before a complete frame could be read |
-| `CrcMismatch` | ✓ | Record batch CRC32C mismatch — on-wire corruption |
+| `CrcMismatch` | ✗ | Record batch CRC32C mismatch — corruption; re-fetching the same offset yields the same bytes |
 | `Malformed` | ✓ | Structurally malformed response (often transient) |
 | `UnknownApiVersion` | ✗ | No mutually supported API version — permanent mismatch |
 | `InvalidLength` | ✗ | Encoded length exceeds protocol maximum or safety cap |

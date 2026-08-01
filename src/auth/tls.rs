@@ -201,7 +201,18 @@ fn build_tls_config_sync(config: &TlsConfig) -> Result<ClientConfig> {
     }
 
     let root_store = load_root_store(config)?;
-    let builder = ClientConfig::builder().with_root_certificates(root_store);
+    // Never `ClientConfig::builder()`: that helper resolves the backend from
+    // rustls' own crate features and *panics* when both `ring` and `aws_lc_rs`
+    // are compiled in with no process-level provider installed. Cargo features
+    // are additive, so `--features rustls-aws-lc-rs` keeps the default `ring`
+    // and reaches exactly that state — as does `--all-features`. Going through
+    // `resolve_crypto_provider` is what makes the additive-backend contract
+    // documented in `lib.rs` true on the verifying path, not just the
+    // `verify_server_cert = false` one.
+    let builder = ClientConfig::builder_with_provider(resolve_crypto_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| KrafkaError::config(format!("Failed to set protocol versions: {e}")))?
+        .with_root_certificates(root_store);
     let client_auth = load_client_auth(config)?;
     let mut tls_config = finish_with_client_auth(builder, client_auth)?;
 
