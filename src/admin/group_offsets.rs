@@ -252,6 +252,12 @@ impl AdminClient {
                     .map(|&(partition, offset)| OffsetCommitRequestPartition {
                         partition_index: partition,
                         committed_offset: offset,
+                        // `-1` is correct here, unlike on the consumer's own
+                        // commit path. An administratively set offset is not
+                        // derived from a record this client consumed, so there
+                        // is no leader epoch it can honestly vouch for;
+                        // inventing one would defeat the KIP-320 check it is
+                        // supposed to feed.
                         committed_leader_epoch: -1,
                         commit_timestamp: -1,
                         committed_metadata: None,

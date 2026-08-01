@@ -31,6 +31,35 @@ This enables dynamic version negotiation for optimal compatibility and feature u
 4. Client stores version ranges for future requests
 5. Each request negotiates the best version within the client's `[MIN, MAX]` range
 
+### Bootstrapping `ApiVersions` itself
+
+`ApiVersions` is the one API whose version cannot be negotiated from a previous
+`ApiVersions` response — it *is* the negotiation. Krafka therefore sends
+`versions::API_VERSIONS_MAX` (v4 by default) and, if the broker answers
+`UNSUPPORTED_VERSION`, retries at the ceiling that rejection advertises. The
+protocol mandates that a rejection is encoded with the **v0** response layout
+precisely so a client that guessed too high can still parse the reply, so the
+fallback costs exactly one extra round trip and never fails the handshake.
+
+The default ceiling is the highest version a *released* Kafka supports, not the
+highest Krafka can encode: sending v5 (KIP-1242, unreleased) to a Kafka 4.x
+broker would cost a rejected round trip on **every** connection. v5 is available
+behind the `unstable-protocol` feature for testing against unreleased builds.
+
+Negotiating v3+ rather than pinning v0 is what puts two things on the wire:
+
+- **KIP-511** — `ClientSoftwareName` / `ClientSoftwareVersion`, which is how a
+  broker's `client.software.name` / `client.software.version` metrics identify
+  Krafka. These fields do not exist below v3.
+- **KIP-584** — `SupportedFeatures` and `FinalizedFeatures`, carried in v3+
+  tagged fields. Krafka caches them per connection; read them with
+  [`BrokerConnection::broker_features()`], which exposes
+  `finalized_level(name)` and `supported_range(name)` so callers can gate
+  optional behaviour on a cluster-wide feature level without a second round
+  trip.
+
+[`BrokerConnection::broker_features()`]: https://docs.rs/krafka/latest/krafka/network/struct.BrokerConnection.html#method.broker_features
+
 ### Using Version Negotiation
 
 ```rust
@@ -43,6 +72,30 @@ let fetch_version = conn
     .expect("broker does not support any usable Fetch version");
 println!("Using Fetch v{}", fetch_version);
 ```
+
+### Leader epochs end to end (KIP-320)
+
+KIP-320 only detects log truncation if the leader epoch travels with the
+position everywhere it goes. Krafka sends it on all three legs:
+
+| Leg | Field | What it buys |
+|---|---|---|
+| `Fetch` | `current_leader_epoch`, `last_fetched_epoch` | The broker reports `diverging_epoch` when the client's log no longer matches its own. |
+| `ListOffsets` | `current_leader_epoch` | A reset resolved against a stale leader is rejected with `FENCED_LEADER_EPOCH` instead of returning an offset from a log the client cannot vouch for. |
+| `OffsetCommit` → `OffsetFetch` | `committed_leader_epoch` | The check survives a restart or a rebalance: the next owner of the partition resumes with the epoch the position was read at. |
+
+Missing any one leg silently degrades the guarantee rather than breaking
+visibly — the client keeps working and simply stops noticing truncation. The
+commit leg is the easiest to overlook, because its absence is invisible until a
+consumer restarts.
+
+A fenced `ListOffsets` forces a metadata refresh before the retry, so the
+epoch check converges instead of failing identically forever.
+
+`-1` remains the correct value where the client genuinely has no epoch: a
+position that came from a `seek()` or an offset reset, or an offset set
+administratively through `AdminClient::alter_consumer_group_offsets`. Inventing
+one there would defeat the check it feeds.
 
 ### Minimum Broker Version
 

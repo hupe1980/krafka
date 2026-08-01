@@ -15,12 +15,15 @@ A pure Rust, async-native Apache Kafka client designed for high performance, saf
 - 🔒 **Zero unsafe**: Safe Rust by default
 - 🚀 **High performance**: Zero-copy buffers, inline hot paths, efficient batching, concurrent batch flushing
 - 📦 **Full protocol support**: Kafka protocol with all compression codecs
+- 🤝 **Real version negotiation**: `ApiVersions` is negotiated, not pinned — KIP-511 client identity reaches the broker and KIP-584 cluster feature levels are cached per connection
 - 🔄 **Incremental fetch sessions**: KIP-227 fetch sessions for bandwidth-efficient multi-partition consumers
+- 🧩 **KIP-848 consumer groups**: server-side assignment with validated reconciliation — revoke-before-assign, epoch fencing, and no partition ever owned by two members at once
 - 🔐 **TLS/SSL encryption**: Using rustls for secure connections
 - 🔑 **SASL authentication**: PLAIN, SCRAM-SHA-256/512, OAUTHBEARER mechanisms
-- 💯 **Transactions**: Exactly-once semantics with KIP-447 zombie fencing
+- 💯 **Transactions**: Exactly-once semantics with KIP-447 zombie fencing, and a state machine that refuses the KAFKA-17754 abort-after-commit-timeout hazard
+- 🧭 **Truncation detection (KIP-320)**: leader epochs are sent on Fetch *and* ListOffsets *and* persisted through OffsetCommit, so the check survives restarts and rebalances
 - ☁️ **Cloud-native**: First-class AWS MSK support including IAM auth
-- 🛡️ **Security hardened**: Secret zeroization, constant-time auth (`subtle`), decompression bomb protection, decode loop bounds (`MAX_DECODE_ARRAY_LEN`)
+- 🛡️ **Security hardened**: Secret zeroization, constant-time auth (`subtle`), decompression bomb protection, decode loop bounds (`MAX_DECODE_ARRAY_LEN`), RFC 3986 path encoding on every outbound HTTP target
 - 🔄 **Built-in retry**: Exponential backoff with metadata refresh on leader changes
 - 📊 **Metrics**: Lock-free counters/gauges/latency with bounded per-topic cardinality
 - 🧪 **Fuzz + property tested**: 6 cargo-fuzz targets and proptest round-trips across the protocol layer
@@ -247,6 +250,50 @@ krafka = { version = "0.13.0", default-features = false, features = ["lz4", "sna
 # Option 2: enable all compression codecs, including zstd
 # krafka = { version = "0.13.0", features = ["compression-all"] }
 ```
+
+### TLS crypto backend
+
+Krafka uses `rustls` and needs exactly one crypto backend. `ring` is the
+default; `rustls-aws-lc-rs` selects aws-lc-rs instead, which is the better
+choice on AWS Graviton and in FIPS-oriented deployments:
+
+```toml
+krafka = { version = "0.13.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
+```
+
+The two backends are **additive**, not mutually exclusive — a transitive
+dependency may well enable the other one, and Cargo would have no way to
+resolve a conflict if they were exclusive. When both are compiled in,
+aws-lc-rs deterministically wins. Krafka always selects the provider
+explicitly rather than letting `rustls` infer it from crate features, so the
+combination cannot produce a runtime panic. Installing a process-wide provider
+with `CryptoProvider::install_default()` overrides the choice for the whole
+application, Krafka included.
+
+## 🛠️ Development
+
+Tasks are driven by [`just`](https://just.systems). The `justfile` is the single
+source of truth for what the checks are — CI calls the same recipes, so a check
+cannot pass locally and fail in CI because the two drifted apart.
+
+```bash
+just              # list every recipe
+just ci           # everything CI runs, except the Docker-backed suites
+just ci-full      # ci + supply-chain audit + Docker integration tests
+just pre-commit   # the fast subset (fmt, clippy, check)
+just install-hooks  # wire pre-commit into .git/hooks
+just t <pattern>  # run one test by name, with output
+```
+
+Individual recipes mirror one CI job each: `fmt-check`, `clippy`, `check`,
+`api-parity`, `test`, `test-ring`, `test-cross-platform`, `minimal-features`,
+`doc`, `deny`, `integration`, `msrv`.
+
+`just api-parity` is worth calling out: it checks mechanically that every option
+on an internal `*ConfigBuilder` is reachable from the public `*Builder` that
+`Client::builder()` returns. An option present on one and not the other is
+implemented, documentable and uncallable — which is how KIP-848 selection and
+the producer's dead-letter queue both shipped unreachable.
 
 ## ⚡ Performance Tuning
 

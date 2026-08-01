@@ -711,7 +711,21 @@ pub struct TaggedField {
 }
 
 impl TryEncode for TaggedFields {
+    /// # Ordering
+    ///
+    /// KIP-482 requires tagged fields to be serialised in ascending tag order,
+    /// and Kafka's own decoder enforces it: an out-of-order tag is rejected
+    /// with `InvalidRequestException`, not skipped. Callers therefore must not
+    /// be trusted to have sorted, so the check lives here — a debug assertion
+    /// rather than a sort, because krafka builds every tagged-field section in
+    /// order and a silent re-sort would hide the construction bug instead of
+    /// surfacing it.
     fn try_encode(&self, buf: &mut impl BufMut) -> Result<()> {
+        debug_assert!(
+            self.0.windows(2).all(|w| w[0].tag < w[1].tag),
+            "tagged fields must be encoded in strictly ascending tag order (KIP-482); \
+             brokers reject out-of-order tags with InvalidRequestException"
+        );
         let count = u32::try_from(self.0.len()).map_err(|_| {
             KrafkaError::protocol_kind(
                 ProtocolErrorKind::InvalidLength,

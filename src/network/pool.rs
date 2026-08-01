@@ -723,11 +723,21 @@ impl ConnectionPool {
         broker_id: BrokerId,
         address: &str,
     ) -> Result<Arc<BrokerConnection>> {
-        // Fast path: sync read lock
+        // Fast path: sync read lock.
+        //
+        // The cached socket must also still point at the address the caller
+        // resolved. A broker keeps its node ID across a move — a Kubernetes
+        // reschedule, a changed `advertised.listeners`, a swap behind a load
+        // balancer — so a `by_id` hit alone does not prove the connection
+        // reaches the node metadata now says it does. Without the address
+        // check, requests keep going to the old endpoint for as long as that
+        // socket happens to stay alive, which in a swap is indefinitely and
+        // sends every request for this broker to the wrong one.
         {
             let s = self.state.read();
             if let Some(conn) = s.by_id.get(&broker_id)
                 && conn.is_usable()
+                && conn.address() == address
             {
                 return Ok(conn.clone());
             }
@@ -736,9 +746,15 @@ impl ConnectionPool {
         let conn = self.get_or_reconnect(address).await?;
 
         // Register under this broker ID so future fast-path lookups hit.
+        // Replace on an address mismatch for the same reason as above: the
+        // stale entry is not merely useless, it is actively misrouting.
         {
             let mut s = self.state.write();
-            if !s.by_id.get(&broker_id).is_some_and(|c| c.is_usable()) {
+            let keep_existing = s
+                .by_id
+                .get(&broker_id)
+                .is_some_and(|c| c.is_usable() && c.address() == address);
+            if !keep_existing {
                 s.by_id.insert(broker_id, conn.clone());
             }
         }

@@ -503,6 +503,15 @@ let producer = Producer::builder()
     .await?;
 ```
 
+> **`acks=0` also gives up quota feedback.** The broker sends no response, so
+> there is no `throttle_time_ms` to read (KIP-219) and a producer sending
+> *only* `acks=0` traffic never learns it is being throttled. A throttle
+> learned from any other API on the same connection is still honoured, but a
+> pure `acks=0` client keeps writing at full rate until the broker mutes the
+> channel itself. Combined with the loss of delivery confirmation, `acks=0`
+> gives up more than durability alone — prefer `acks=1` unless you have
+> measured that the difference matters.
+
 ### Durability
 
 For maximum durability:
@@ -693,6 +702,33 @@ match do_work(&producer).await {
 // When finished with the producer, always close it
 producer.close().await;
 ```
+
+> **Never abort after a commit times out.** If `commit_transaction()` fails with
+> a timeout or a connection loss, the coordinator may already have committed —
+> the response was simply lost. Aborting then is the
+> [KAFKA-17754](https://issues.apache.org/jira/browse/KAFKA-17754) trigger: the
+> delayed `EndTxn` can be applied to a *later* transaction and tear it. The Java
+> client's documentation recommends aborting in this case; that advice predates
+> KAFKA-17754 and Krafka deliberately does not follow it.
+>
+> Krafka enforces this rather than relying on you to remember it. A commit whose
+> outcome is unknown moves the producer to `TransactionState::CommitIndeterminate`,
+> from which:
+>
+> - `abort_transaction()` returns an error explaining why, instead of performing
+>   an abort that could silently corrupt data;
+> - `close()` leaves the transaction alone rather than auto-aborting it, and logs
+>   that it did so;
+> - `commit_transaction()` may be retried — `EndTxn` is idempotent for the same
+>   producer id and epoch, so a duplicate commit either lands or is recognised by
+>   the coordinator as the one it already applied.
+>
+> If you cannot retry, drop the producer. The coordinator resolves the
+> transaction on its own via `transaction.timeout.ms`.
+>
+> A commit that fails with a *broker error code* is different: the coordinator
+> answered and declined, so the transaction is definitively still open and the
+> producer returns to `InTransaction`, where aborting is safe.
 
 ### Graceful Shutdown (Transactional)
 

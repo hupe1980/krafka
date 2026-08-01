@@ -239,23 +239,48 @@ pub(crate) struct MetadataReq {
 }
 
 impl MetadataReq {
-    pub(crate) fn read(buf: &mut impl Buf) -> Result<Self> {
-        let topics = match read_nullable_array_len(buf)? {
+    /// Read a v12 (flexible) Metadata request.
+    ///
+    /// v12 differs from v8 in three ways that matter here: compact
+    /// encodings throughout, a 16-byte `TopicId` before each topic name, and
+    /// the removal of `IncludeClusterAuthorizedOperations`.
+    ///
+    /// A topic entry may carry a UUID instead of a name (that is the point of
+    /// v12), but krafka only ever *requests* by name, so a null name is
+    /// reported rather than silently resolved — the fake broker should not
+    /// invent behaviour the client does not exercise.
+    pub(crate) fn read_v12(buf: &mut impl Buf) -> Result<Self> {
+        let topics = match read_compact_nullable_array_len(buf)? {
             None => None,
             Some(count) => {
                 let mut names = Vec::with_capacity(count);
                 for _ in 0..count {
-                    names.push(read_string(buf)?);
+                    if buf.remaining() < 16 {
+                        return Err(crate::error::KrafkaError::protocol_kind(
+                            crate::error::ProtocolErrorKind::TruncatedFrame,
+                            "fake broker: truncated topic id in Metadata v12 request",
+                        ));
+                    }
+                    let mut topic_id = [0u8; 16];
+                    buf.copy_to_slice(&mut topic_id);
+                    let name = read_compact_nullable_string(buf)?.ok_or_else(|| {
+                        crate::error::KrafkaError::protocol_kind(
+                            crate::error::ProtocolErrorKind::InvalidValue,
+                            "fake broker: Metadata v12 topic lookup by UUID is not modelled; \
+                             krafka always requests by name",
+                        )
+                    })?;
+                    skip_tagged_fields(buf)?;
+                    names.push(name);
                 }
                 Some(names)
             }
         };
         let allow_auto_topic_creation = bool::decode(buf)?;
-        // include_cluster_authorized_operations / include_topic_authorized_operations.
-        // The client always sends `false` for both and ignores the results, so
-        // they are read purely to keep the cursor aligned.
+        // include_topic_authorized_operations — the client always sends false
+        // and ignores the result, so it is read only to keep the cursor aligned.
         let _ = bool::decode(buf)?;
-        let _ = bool::decode(buf)?;
+        skip_tagged_fields(buf)?;
         Ok(Self {
             topics,
             allow_auto_topic_creation,
@@ -398,11 +423,172 @@ impl FetchReq {
     }
 }
 
+/// Read a compact nullable string (flexible encoding).
+pub(crate) fn read_compact_nullable_string(buf: &mut impl Buf) -> Result<Option<String>> {
+    Ok(KafkaString::decode_compact(buf)?.0)
+}
+
+/// Read a compact nullable array length, returning `None` for a null array.
+///
+/// Distinguishing null from empty matters for `ConsumerGroupHeartbeat`: a null
+/// `SubscribedTopicNames` means "unchanged since my last heartbeat", while an
+/// empty one means "I am subscribed to nothing".
+pub(crate) fn read_compact_nullable_array_len(buf: &mut impl Buf) -> Result<Option<usize>> {
+    let raw = crate::util::varint::decode_unsigned_varint(buf)?;
+    if raw == 0 {
+        return Ok(None);
+    }
+    Ok(Some(crate::protocol::check_compact_array_len(raw)?))
+}
+
+/// One member's owned partitions inside a `ConsumerGroupHeartbeat` request.
+#[derive(Debug, Clone)]
+pub(crate) struct HeartbeatTopicPartitions {
+    /// Topic UUID.
+    pub topic_id: [u8; 16],
+    /// Partitions the member currently owns for that topic.
+    pub partitions: Vec<i32>,
+}
+
+/// `ConsumerGroupHeartbeat` request, v1 wire format (KIP-848 + KIP-1082).
+///
+/// Mirrors `ConsumerGroupHeartbeatRequest::encode_v1`.
+#[derive(Debug, Clone)]
+pub(crate) struct ConsumerGroupHeartbeatReq {
+    /// Group being joined or maintained.
+    pub group_id: String,
+    /// Client-generated member ID (KIP-1082).
+    pub member_id: String,
+    /// `0` to join, `-1` to leave, `-2` for a static member's temporary leave.
+    pub member_epoch: i32,
+    /// Static membership ID, if any.
+    pub instance_id: Option<String>,
+    /// Client rack, for rack-aware assignment.
+    #[allow(dead_code)]
+    pub rack_id: Option<String>,
+    /// Rebalance timeout, or `-1` when unchanged.
+    #[allow(dead_code)]
+    pub rebalance_timeout_ms: i32,
+    /// Subscribed topics, or `None` when unchanged since the last heartbeat.
+    pub subscribed_topic_names: Option<Vec<String>>,
+    /// Regex subscription, or `None`.
+    #[allow(dead_code)]
+    pub subscribed_topic_regex: Option<String>,
+    /// Requested server-side assignor, or `None`.
+    #[allow(dead_code)]
+    pub server_assignor: Option<String>,
+    /// Partitions the member currently owns, or `None` when unchanged.
+    #[allow(dead_code)]
+    pub topic_partitions: Option<Vec<HeartbeatTopicPartitions>>,
+}
+
+impl ConsumerGroupHeartbeatReq {
+    pub(crate) fn read(buf: &mut impl Buf) -> Result<Self> {
+        let group_id = read_compact_string(buf)?;
+        let member_id = read_compact_string(buf)?;
+        let member_epoch = i32::decode(buf)?;
+        let instance_id = read_compact_nullable_string(buf)?;
+        let rack_id = read_compact_nullable_string(buf)?;
+        let rebalance_timeout_ms = i32::decode(buf)?;
+
+        let subscribed_topic_names = match read_compact_nullable_array_len(buf)? {
+            None => None,
+            Some(count) => {
+                let mut names = Vec::with_capacity(count);
+                for _ in 0..count {
+                    names.push(read_compact_string(buf)?);
+                }
+                Some(names)
+            }
+        };
+
+        let subscribed_topic_regex = read_compact_nullable_string(buf)?;
+        let server_assignor = read_compact_nullable_string(buf)?;
+
+        let topic_partitions = match read_compact_nullable_array_len(buf)? {
+            None => None,
+            Some(count) => {
+                let mut entries = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let mut topic_id = [0u8; 16];
+                    if buf.remaining() < 16 {
+                        return Err(crate::error::KrafkaError::protocol_kind(
+                            crate::error::ProtocolErrorKind::TruncatedFrame,
+                            "fake broker: truncated topic id in ConsumerGroupHeartbeat",
+                        ));
+                    }
+                    buf.copy_to_slice(&mut topic_id);
+                    let partition_count = read_compact_array_len(buf)?;
+                    let mut partitions = Vec::with_capacity(partition_count);
+                    for _ in 0..partition_count {
+                        partitions.push(i32::decode(buf)?);
+                    }
+                    skip_tagged_fields(buf)?;
+                    entries.push(HeartbeatTopicPartitions {
+                        topic_id,
+                        partitions,
+                    });
+                }
+                Some(entries)
+            }
+        };
+
+        skip_tagged_fields(buf)?;
+
+        Ok(Self {
+            group_id,
+            member_id,
+            member_epoch,
+            instance_id,
+            rack_id,
+            rebalance_timeout_ms,
+            subscribed_topic_names,
+            subscribed_topic_regex,
+            server_assignor,
+            topic_partitions,
+        })
+    }
+}
+
+/// Write a `ConsumerGroupHeartbeat` response assignment.
+///
+/// Non-tagged nullable structs in flexible versions use a single signed byte
+/// as the presence marker: negative means null, `1` means the fields follow.
+/// This mirrors `ConsumerGroupHeartbeatResponse::decode_assignment`.
+pub(crate) fn write_heartbeat_assignment(
+    out: &mut BytesMut,
+    assignment: Option<&[HeartbeatTopicPartitions]>,
+) -> Result<()> {
+    match assignment {
+        None => {
+            out.put_i8(-1);
+            Ok(())
+        }
+        Some(entries) => {
+            out.put_i8(1);
+            write_compact_array_len(out, entries.len())?;
+            for entry in entries {
+                out.put_slice(&entry.topic_id);
+                write_compact_array_len(out, entry.partitions.len())?;
+                for partition in &entry.partitions {
+                    out.put_i32(*partition);
+                }
+                write_empty_tagged_fields(out)?;
+            }
+            write_empty_tagged_fields(out)
+        }
+    }
+}
+
 /// One partition inside a ListOffsets request.
 #[derive(Debug, Clone)]
 pub(crate) struct ListOffsetsReqPartition {
     /// Partition index.
     pub partition_index: i32,
+    /// The client's view of the partition's leader epoch, or `-1` when it has
+    /// none. Retained so the handler can fence a stale client the way a real
+    /// broker does (KIP-320); dropping it made that path untestable.
+    pub current_leader_epoch: i32,
     /// `-2` for earliest, `-1` for latest, otherwise a millisecond timestamp.
     pub timestamp: i64,
 }
@@ -437,10 +623,11 @@ impl ListOffsetsReq {
             let mut partitions = Vec::with_capacity(partition_count);
             for _ in 0..partition_count {
                 let partition_index = i32::decode(buf)?;
-                let _current_leader_epoch = i32::decode(buf)?;
+                let current_leader_epoch = i32::decode(buf)?;
                 let timestamp = i64::decode(buf)?;
                 partitions.push(ListOffsetsReqPartition {
                     partition_index,
+                    current_leader_epoch,
                     timestamp,
                 });
             }

@@ -2,6 +2,49 @@
 
 This guide covers Krafka's built-in performance optimizations and how to tune them for extreme high-throughput scenarios.
 
+
+## Benchmarking
+
+`just bench` runs the criterion suite in `benches/`: varint encoding, CRC32C,
+murmur2, record-batch encode/decode, and the partitioners. These are
+**micro-benchmarks**. They are the right tool for catching a regression in one
+function and the wrong tool for answering "how fast is this client".
+
+**There is deliberately no end-to-end throughput benchmark, and no published
+comparison against other clients.** That is an open gap, not an oversight — see
+the note below on what it would take to close it honestly.
+
+### Why the in-process broker cannot serve as a benchmark peer
+
+An end-to-end benchmark driving the real client against
+`krafka::testing::FakeBroker` was built and then removed, because it measured
+the wrong thing. The giveaway: with the fake broker as the peer, all five
+compression codecs reported the same throughput to within noise. A benchmark
+that cannot separate gzip from lz4 is not measuring compression — the fake
+broker's per-request handling dominated, so the numbers described the test
+double rather than the client.
+
+The fake broker is an excellent correctness harness and a poor performance one.
+It holds a single lock across request handling and keeps its log in memory; it
+was never built to be fast.
+
+### What a credible benchmark would require
+
+- A **real broker**, because fsync, replication and the page cache are most of
+  what a produce path waits on.
+- **Published hardware and configuration** on both sides — broker *and* client.
+  The Redpanda-vs-Kafka dispute turned entirely on
+  `log.flush.interval.messages=1` forcing an fsync per batch.
+- **Raw artifacts and a reproduction script**, not summary numbers.
+- **Percentiles from a verified histogram.** The OpenMessaging Benchmark carried
+  a histogram bug that invalidated published latency percentiles for years.
+
+The ecosystem's history here is cautionary rather than encouraging: franz-go
+withdrew its own "4× faster" claims from its README. Until krafka can meet the
+bar above, this documentation describes the *design* choices that should make it
+fast — zero-copy buffers, per-partition pipelining, batching, lock-free metrics
+— and claims no measured outcome.
+
 ## Request Priority Channels
 
 Krafka implements priority-based request scheduling to prevent consumer group ejection during backpressure.

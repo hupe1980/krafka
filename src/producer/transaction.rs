@@ -272,6 +272,18 @@ pub enum TransactionState {
     FatalError = 5,
     /// Initialization in progress (prevents concurrent init_transactions calls).
     Initializing = 6,
+    /// `EndTxn(commit)` was dispatched but its outcome is unknown.
+    ///
+    /// Reached when a commit fails with a timeout or a connection loss — the
+    /// coordinator may or may not have applied it. This is deliberately *not*
+    /// `InTransaction`: aborting from here is the
+    /// [KAFKA-17754](https://issues.apache.org/jira/browse/KAFKA-17754)
+    /// trigger, where a delayed `EndTxn` lands on the wrong transaction and
+    /// tears it. The only safe moves are to **retry the commit** (`EndTxn` is
+    /// idempotent for the same producer id and epoch) or to abandon the
+    /// producer and let the coordinator resolve the transaction via its own
+    /// `transaction.timeout.ms`.
+    CommitIndeterminate = 7,
 }
 
 impl From<u8> for TransactionState {
@@ -284,6 +296,7 @@ impl From<u8> for TransactionState {
             4 => Self::Aborting,
             5 => Self::FatalError,
             6 => Self::Initializing,
+            7 => Self::CommitIndeterminate,
             _ => {
                 warn!(
                     discriminant = v,
@@ -305,6 +318,7 @@ impl std::fmt::Display for TransactionState {
             Self::Aborting => "Aborting",
             Self::FatalError => "FatalError",
             Self::Initializing => "Initializing",
+            Self::CommitIndeterminate => "CommitIndeterminate",
         })
     }
 }
@@ -1874,11 +1888,23 @@ impl TransactionalProducer {
         // closed. A flush failure is surfaced as-is; the caller aborts.
         self.accumulator.flush().await?;
 
-        // Atomic CAS: InTransaction → Committing
-        if let Err(actual) = self.try_transition(
-            TransactionState::InTransaction,
-            TransactionState::Committing,
-        ) {
+        // Atomic CAS: InTransaction → Committing, or retry a commit whose
+        // outcome we never learned. Retrying is safe and is the *only* safe
+        // move from `CommitIndeterminate`: `EndTxn` is idempotent for a given
+        // producer id and epoch, so a duplicate commit either lands or is
+        // recognised by the coordinator as the one it already applied.
+        if let Err(actual) = self
+            .try_transition(
+                TransactionState::InTransaction,
+                TransactionState::Committing,
+            )
+            .or_else(|_| {
+                self.try_transition(
+                    TransactionState::CommitIndeterminate,
+                    TransactionState::Committing,
+                )
+            })
+        {
             return Err(KrafkaError::invalid_state(format!(
                 "cannot commit in state {:?}",
                 actual
@@ -1917,15 +1943,43 @@ impl TransactionalProducer {
             }
             Err(e) => {
                 if e.is_retriable() {
-                    // Use CAS to safely revert Committing → InTransaction.
-                    // If abort_transaction() raced and moved to Aborting,
-                    // the CAS fails and we leave the state alone.
-                    match self.try_transition(
-                        TransactionState::Committing,
-                        TransactionState::InTransaction,
-                    ) {
+                    // Whether it is safe to go back to `InTransaction` turns
+                    // entirely on whether the coordinator could already have
+                    // applied the commit.
+                    //
+                    // A `Broker { .. }` error *is* the coordinator's answer:
+                    // it looked at the request and declined it, so the
+                    // transaction is definitively still open and reverting is
+                    // safe.
+                    //
+                    // A timeout or a connection loss is not an answer. The
+                    // `EndTxn` may have been applied and the response lost, so
+                    // the outcome is unknown. Reverting to `InTransaction`
+                    // there is what makes a later abort — including the
+                    // automatic one in `close()` — land on a transaction the
+                    // coordinator may already have committed, tearing it
+                    // (KAFKA-17754). Park in `CommitIndeterminate` instead,
+                    // from which the only permitted move is another commit.
+                    let outcome_unknown =
+                        matches!(e, KrafkaError::Timeout { .. } | KrafkaError::Network(_));
+                    let revert_to = if outcome_unknown {
+                        TransactionState::CommitIndeterminate
+                    } else {
+                        TransactionState::InTransaction
+                    };
+                    // Use CAS so a concurrent abort that already moved the
+                    // state is not overwritten.
+                    match self.try_transition(TransactionState::Committing, revert_to) {
                         Ok(()) => {
-                            warn!("Transaction commit failed (retriable): {}", e);
+                            if outcome_unknown {
+                                warn!(
+                                    "Transaction commit outcome unknown ({e}); the coordinator \
+                                     may already have committed it. Retry commit_transaction() — \
+                                     aborting from here could tear the transaction (KAFKA-17754)."
+                                );
+                            } else {
+                                warn!("Transaction commit failed (retriable): {}", e);
+                            }
                         }
                         Err(actual) => {
                             warn!(
@@ -1947,7 +2001,35 @@ impl TransactionalProducer {
     }
 
     /// Abort the current transaction.
+    ///
+    /// # Refused after an indeterminate commit
+    ///
+    /// If a previous [`commit_transaction`](Self::commit_transaction) failed
+    /// with a timeout or a connection loss, the coordinator may already have
+    /// committed. Aborting then is the
+    /// [KAFKA-17754](https://issues.apache.org/jira/browse/KAFKA-17754)
+    /// trigger: the delayed `EndTxn` can be applied to a *later* transaction
+    /// and tear it. This call therefore returns an error in that state rather
+    /// than performing an abort that may silently corrupt data. Retry the
+    /// commit, or drop the producer and let the coordinator resolve the
+    /// transaction through its own `transaction.timeout.ms`.
+    ///
+    /// Note that the Java client's documentation recommends aborting after a
+    /// commit timeout. That advice predates KAFKA-17754 and krafka
+    /// deliberately does not follow it.
     pub async fn abort_transaction(&self) -> Result<()> {
+        if self.state() == TransactionState::CommitIndeterminate {
+            return Err(KrafkaError::invalid_state(
+                "cannot abort: a previous commit_transaction() timed out or lost its \
+                 connection, so the coordinator may already have committed this \
+                 transaction. Aborting now could be applied to a later transaction and \
+                 tear it (KAFKA-17754). Retry commit_transaction() — EndTxn is idempotent \
+                 for the same producer id and epoch — or drop this producer and let the \
+                 coordinator resolve the transaction via transaction.timeout.ms."
+                    .to_string(),
+            ));
+        }
+
         // Atomic CAS: try InTransaction → Aborting first, then Committing → Aborting
         let transition = self
             .try_transition(TransactionState::InTransaction, TransactionState::Aborting)
@@ -2190,10 +2272,26 @@ impl TransactionalProducer {
             self.in_flight_barrier.wait_for(target).await;
 
             // If in-transaction, abort first to clean up broker state.
+            //
+            // `CommitIndeterminate` is deliberately excluded. The commit may
+            // already have been applied, so an abort here could be applied to
+            // a later transaction and tear it (KAFKA-17754) — and unlike a
+            // user-initiated abort, this one would happen automatically on
+            // every `close()` after a commit timeout. Leaving the transaction
+            // alone lets the coordinator resolve it via
+            // `transaction.timeout.ms`, which is the outcome with no
+            // correctness hazard.
             let current = self.state();
             if current == TransactionState::InTransaction {
                 warn!("Closing transactional producer with active transaction — aborting");
                 self.abort_transaction().await?;
+            } else if current == TransactionState::CommitIndeterminate {
+                warn!(
+                    "Closing transactional producer after a commit whose outcome is unknown; \
+                     leaving the transaction for the coordinator to resolve via \
+                     transaction.timeout.ms rather than aborting a possibly-committed \
+                     transaction (KAFKA-17754)"
+                );
             }
 
             Ok::<(), KrafkaError>(())
@@ -3120,8 +3218,9 @@ mod tests {
 
     #[test]
     fn test_transaction_state_unknown_maps_to_fatal() {
-        // Values not explicitly mapped (except 5 which is FatalError) fall to FatalError
-        assert_eq!(TransactionState::from(7), TransactionState::FatalError);
+        // Values not explicitly mapped fall to FatalError. 7 is now
+        // CommitIndeterminate, so the first unmapped discriminant is 8.
+        assert_eq!(TransactionState::from(8), TransactionState::FatalError);
         assert_eq!(TransactionState::from(255), TransactionState::FatalError);
     }
 
@@ -3835,5 +3934,70 @@ mod tests {
         assert_eq!(identity.producer_id(), 1000);
         assert_eq!(identity.producer_epoch(), 0);
         assert_eq!(identity.peek_sequence("orders", 0), 0);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod commit_indeterminate_tests {
+    use super::*;
+
+    /// A commit whose outcome the coordinator never reported must not leave the
+    /// producer in a state where anything can abort it.
+    ///
+    /// This is the KAFKA-17754 hazard. Before this state existed, a commit
+    /// timeout reverted to `InTransaction`, and `close()` unconditionally
+    /// aborts from `InTransaction` — so a commit timeout followed by an
+    /// ordinary `close()` issued an abort against a transaction the
+    /// coordinator may already have committed, with no user action involved.
+    #[test]
+    fn a_timed_out_commit_is_not_reported_as_still_in_transaction() {
+        // Only errors that are *not* the coordinator's answer are indeterminate.
+        for error in [
+            KrafkaError::timeout("EndTxn"),
+            KrafkaError::network(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection closed",
+            )),
+        ] {
+            assert!(
+                matches!(error, KrafkaError::Timeout { .. } | KrafkaError::Network(_)),
+                "{error} must classify as outcome-unknown"
+            );
+            assert!(
+                error.is_retriable(),
+                "{error} must be retriable, or it would take the fatal path instead"
+            );
+        }
+    }
+
+    /// A broker error *is* an answer: the coordinator saw the request and
+    /// declined it, so the transaction is definitively still open and going
+    /// back to `InTransaction` is safe.
+    #[test]
+    fn a_broker_rejection_is_a_definite_answer_not_an_unknown_outcome() {
+        let error = KrafkaError::broker(
+            ErrorCode::CoordinatorNotAvailable,
+            "coordinator moved".to_string(),
+        );
+        assert!(error.is_retriable());
+        assert!(
+            !matches!(error, KrafkaError::Timeout { .. } | KrafkaError::Network(_)),
+            "a broker error must not be treated as an unknown outcome"
+        );
+    }
+
+    /// The state must survive the `u8` round trip it is stored as, or a
+    /// restored producer would silently look like something else.
+    #[test]
+    fn commit_indeterminate_round_trips_through_its_discriminant() {
+        assert_eq!(
+            TransactionState::from(TransactionState::CommitIndeterminate as u8),
+            TransactionState::CommitIndeterminate
+        );
+        assert_eq!(
+            TransactionState::CommitIndeterminate.to_string(),
+            "CommitIndeterminate"
+        );
     }
 }

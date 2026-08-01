@@ -1925,6 +1925,17 @@ pub struct ConsumerMetrics {
     pub buffered_records: Gauge,
     /// Total number of seek operations (seek + seek_many).
     pub seeks: Counter,
+    /// Record batches the consumer could not decode.
+    ///
+    /// Counts CRC mismatches, unsupported magic bytes and out-of-range fields
+    /// in fetched record batches — i.e. on-the-wire or on-disk corruption.
+    /// Trailing batches cut short by the fetch size limit are **not** counted:
+    /// those are expected and the next fetch re-requests them.
+    ///
+    /// Any sustained non-zero rate here means a partition is failing to
+    /// advance; correlate with the `warn!` that accompanies each increment,
+    /// which names the topic, partition and offset.
+    pub batch_decode_errors: Counter,
 }
 
 impl ConsumerMetrics {
@@ -1961,6 +1972,15 @@ impl ConsumerMetrics {
     #[inline]
     pub fn record_fetch(&self) {
         self.fetches.inc();
+    }
+
+    /// Record a record batch that failed to decode because it was corrupt.
+    ///
+    /// See [`ConsumerMetrics::batch_decode_errors`] for what does and does not
+    /// count.
+    #[inline]
+    pub fn record_batch_decode_error(&self) {
+        self.batch_decode_errors.inc();
     }
 
     /// Record a commit.
@@ -2000,6 +2020,7 @@ impl ConsumerMetrics {
             paused_partitions: self.paused_partitions.get(),
             buffered_records: self.buffered_records.get(),
             seeks: self.seeks.get(),
+            batch_decode_errors: self.batch_decode_errors.get(),
         }
     }
 }
@@ -2040,6 +2061,10 @@ pub struct ConsumerMetricsSnapshot {
     pub buffered_records: u64,
     /// Total seek operations (seek + seek_many partition count).
     pub seeks: u64,
+    /// Record batches that failed to decode because they were corrupt.
+    ///
+    /// See [`ConsumerMetrics::batch_decode_errors`].
+    pub batch_decode_errors: u64,
 }
 
 /// Connection pool metrics.

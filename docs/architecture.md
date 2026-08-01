@@ -21,6 +21,20 @@ This document describes the internal architecture of Krafka, a pure Rust Apache 
 - Non-blocking I/O everywhere
 - Efficient connection multiplexing
 
+**Tokio is a hard dependency, deliberately.** Krafka is not runtime-agnostic and
+does not intend to be. Supporting `smol`, `async-std` or `glommio` would mean
+abstracting timers, TCP and task spawning behind traits that every hot path
+would then go through — the connection event loop, the accumulator's
+per-partition pipeline, the `DelayQueue` timer wheel and the idle evictor all
+use Tokio primitives directly, and several correctness properties (cancellation
+safety at specific await points, `DelayQueue` ordering) are reasoned about in
+Tokio's semantics.
+
+The cost of that abstraction is paid by every user; the benefit accrues to the
+minority not already on Tokio, which is the ecosystem default and what the vast
+majority of Kafka-adjacent Rust services run. If you need a different runtime,
+this is the wrong client.
+
 ### 3. Zero Unsafe
 - Memory safety guaranteed by Rust's type system
 - No undefined behavior risks

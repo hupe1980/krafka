@@ -1649,6 +1649,77 @@ impl ProducerBuilder {
         self
     }
 
+    /// Override the compression codec for one topic.
+    ///
+    /// Topics without an override use the producer-wide
+    /// [`compression`](Self::compression) setting. Useful when one high-volume
+    /// topic warrants a heavier codec than the rest of the traffic.
+    pub fn topic_compression(mut self, topic: impl Into<String>, compression: Compression) -> Self {
+        self.config
+            .topic_compression
+            .insert(topic.into(), compression);
+        self
+    }
+
+    /// Set the total bytes the producer may buffer for unsent records.
+    ///
+    /// This is the backpressure budget: once it is exhausted, `send()` blocks
+    /// for up to [`max_block`](Self::max_block) rather than growing without
+    /// bound.
+    pub fn buffer_memory(mut self, bytes: usize) -> Self {
+        self.config.buffer_memory = bytes;
+        self
+    }
+
+    /// How long `send()` may block when the buffer is full before failing.
+    pub fn max_block(mut self, duration: Duration) -> Self {
+        self.config.max_block = duration;
+        self
+    }
+
+    /// Route permanently failed records to a dead-letter queue.
+    ///
+    /// # Scope
+    ///
+    /// The producer DLQ is invoked on the **direct-send path only**
+    /// (`linger = 0`). Records that went through the accumulator are not
+    /// individually available after batching, so for that path use the
+    /// `on_acknowledgement` interceptor hook together with a
+    /// [`DeadLetterQueue`](crate::dlq::DeadLetterQueue) implementation.
+    pub fn dead_letter_queue(mut self, dlq: Arc<dyn crate::dlq::DeadLetterQueue>) -> Self {
+        self.config.dead_letter_queue = Some(dlq);
+        self
+    }
+
+    /// Set the metadata recovery strategy (KIP-1102).
+    ///
+    /// Controls what the client does when every known broker becomes
+    /// unreachable: keep retrying the cached broker set, or fall back to the
+    /// original bootstrap servers.
+    pub fn metadata_recovery_strategy(
+        mut self,
+        strategy: crate::metadata::MetadataRecoveryStrategy,
+    ) -> Self {
+        self.config.metadata_recovery_strategy = strategy;
+        self
+    }
+
+    /// How long metadata must stay unrefreshable before a rebootstrap fires.
+    ///
+    /// Only effective with
+    /// [`MetadataRecoveryStrategy::Rebootstrap`](crate::metadata::MetadataRecoveryStrategy::Rebootstrap).
+    pub fn metadata_recovery_rebootstrap_trigger(mut self, duration: Duration) -> Self {
+        self.config.metadata_recovery_rebootstrap_trigger = duration;
+        self
+    }
+
+    /// Route all broker connections through a SOCKS5 proxy.
+    #[cfg(feature = "socks5")]
+    pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
+        self.config.proxy = Some(proxy);
+        self
+    }
+
     /// Set the compression type.
     pub fn compression(mut self, compression: Compression) -> Self {
         self.config.compression = compression;

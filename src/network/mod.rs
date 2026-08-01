@@ -31,7 +31,7 @@ mod pool;
 mod secure;
 
 pub use connection::{
-    BrokerConnection, ConnectionConfig, ConnectionConfigBuilder, ConnectionStats,
+    BrokerConnection, BrokerFeatures, ConnectionConfig, ConnectionConfigBuilder, ConnectionStats,
     DEFAULT_CONNECT_TIMEOUT, RequestPriority,
 };
 #[cfg(feature = "socks5")]

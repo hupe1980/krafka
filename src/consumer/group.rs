@@ -1314,6 +1314,16 @@ pub struct GroupCoordinator {
     /// the consumer simply never receiving an assignment and never reporting
     /// why. Recording the error here lets the next `poll()` return it.
     fatal_error: Arc<parking_lot::Mutex<Option<String>>>,
+    /// Set when the coordinator fences this member (KIP-848), meaning its
+    /// partitions have been taken away without a clean revocation.
+    ///
+    /// The coordinator-side reset clears *its* view of the assignment, but the
+    /// consumer keeps a separate map that drives fetching and — critically —
+    /// bounds which partitions `commit()` is allowed to write. Leaving that map
+    /// populated after fencing lets an auto-commit overwrite the progress of
+    /// whichever member now owns those partitions. This flag is how the
+    /// coordinator tells the consumer to drop them.
+    membership_lost: Arc<std::sync::atomic::AtomicBool>,
     /// Channel to control heartbeat task.
     heartbeat_cmd_tx: RwLock<Option<mpsc::Sender<HeartbeatCommand>>>,
     /// Result of a `JoinGroup`/`SyncGroup` the background heartbeat task ran on
@@ -1441,6 +1451,7 @@ impl GroupCoordinator {
             // exactly the bound the poll tracker enforces.
             poll_tracker: Arc::new(PollTracker::new(rebalance_timeout)),
             fatal_error: Arc::new(parking_lot::Mutex::new(None)),
+            membership_lost: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             heartbeat_cmd_tx: RwLock::new(None),
             pending_rebalance: Arc::new(parking_lot::Mutex::new(None)),
             rejoin_in_flight: tokio::sync::watch::Sender::new(false),
@@ -1614,6 +1625,15 @@ impl GroupCoordinator {
     /// exactly once.
     pub(crate) fn take_fatal_error(&self) -> Option<String> {
         self.fatal_error.lock().take()
+    }
+
+    /// Check and clear the "this member was fenced" flag.
+    ///
+    /// Returns `true` exactly once per fencing event, so the consumer performs
+    /// the partition hand-back once rather than on every subsequent poll.
+    pub(crate) fn take_membership_lost(&self) -> bool {
+        self.membership_lost
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// Take a snapshot of this member's group identity.
@@ -2913,8 +2933,21 @@ impl GroupCoordinator {
                         self.group_id, hb_response.error_code
                     );
                     if self.is_consumer_protocol() {
-                        // KIP-848: preserve member_id for re-registration.
-                        *self.member_epoch.write().await = 0;
+                        // KIP-848 is explicit that a fenced member "is expected
+                        // to immediately give up all its partitions and rejoin
+                        // the group with a full heartbeat ... and a member epoch
+                        // equal to zero". Zeroing the epoch alone satisfies only
+                        // the second half: the local assignment would survive,
+                        // and this consumer would keep fetching and committing
+                        // partitions the coordinator has already handed to
+                        // another member — a silent split-brain over those
+                        // partitions.
+                        //
+                        // `reset_for_kip848_fencing` exists for exactly this and
+                        // is what the background heartbeat task's fencing path
+                        // ends up running; using it here keeps the two paths from
+                        // disagreeing about what fencing means.
+                        self.reset_for_kip848_fencing().await;
                     } else {
                         self.reset_member_identity().await;
                     }
@@ -2995,6 +3028,29 @@ impl GroupCoordinator {
                          to map topic IDs to names.",
                     ));
                 }
+            }
+        } else if hb_response.member_epoch > 0 {
+            // A null Assignment means "nothing changed since your last
+            // heartbeat" — it is the *normal* steady-state response, not an
+            // absence of membership. The coordinator only sends the field when
+            // the assignment actually moves.
+            //
+            // Treating a null assignment as "not yet joined" left the member
+            // stuck outside `Stable`, which `needs_rejoin()` reads as "rejoin
+            // required", so the poll loop sent another full heartbeat, got
+            // another null assignment, and looped — tens of thousands of
+            // ConsumerGroupHeartbeat requests per second against the
+            // coordinator. Acknowledging the epoch is what closes that loop:
+            // an accepted non-zero epoch *is* the coordinator confirming
+            // membership.
+            let mut inner = self.inner.write().await;
+            if inner.state != GroupState::Stable {
+                debug!(
+                    "ConsumerGroupHeartbeat for group '{}' accepted at epoch {} with no \
+                     assignment change; membership is stable",
+                    self.group_id, hb_response.member_epoch
+                );
+                inner.state = GroupState::Stable;
             }
         }
 
@@ -3656,7 +3712,7 @@ impl GroupCoordinator {
     /// Commit offsets to the coordinator.
     pub async fn commit_offsets(
         &self,
-        offsets: &HashMap<(String, PartitionId), (i64, Option<String>)>,
+        offsets: &HashMap<(String, PartitionId), crate::consumer::CommitPosition>,
     ) -> Result<()> {
         if offsets.is_empty() {
             return Ok(());
@@ -3732,16 +3788,24 @@ impl GroupCoordinator {
 
         // Group offsets by topic
         let mut topics_map: HashMap<String, Vec<OffsetCommitRequestPartition>> = HashMap::new();
-        for ((topic, partition), (offset, metadata)) in offsets {
+        for ((topic, partition), position) in offsets {
             topics_map
                 .entry(topic.clone())
                 .or_default()
                 .push(OffsetCommitRequestPartition {
                     partition_index: *partition,
-                    committed_offset: *offset,
-                    committed_leader_epoch: -1,
+                    committed_offset: position.offset,
+                    // Persisted from v6 onward and read back by `OffsetFetch`.
+                    // This is what lets the *next* owner of the partition —
+                    // after a restart or a rebalance — ask
+                    // `OffsetsForLeaderEpoch` whether the log still contains
+                    // this `(offset, epoch)` pair. Committing a hardcoded `-1`
+                    // silently disables KIP-320 truncation detection across
+                    // every commit boundary, which is exactly the window an
+                    // unclean leader election opens.
+                    committed_leader_epoch: position.leader_epoch,
                     commit_timestamp: -1,
-                    committed_metadata: metadata.clone(),
+                    committed_metadata: position.metadata.clone(),
                 });
         }
 
@@ -3873,7 +3937,7 @@ impl GroupCoordinator {
     pub async fn fetch_committed_offsets(
         &self,
         partitions: &HashMap<String, Vec<crate::PartitionId>>,
-    ) -> Result<HashMap<(String, crate::PartitionId), i64>> {
+    ) -> Result<HashMap<(String, crate::PartitionId), crate::consumer::CommittedPosition>> {
         if partitions.is_empty() {
             return Ok(HashMap::new());
         }
@@ -4001,7 +4065,14 @@ impl GroupCoordinator {
                 if partition.error_code.is_ok() && partition.committed_offset >= 0 {
                     result.insert(
                         (topic.name.clone(), partition.partition_index),
-                        partition.committed_offset,
+                        crate::consumer::CommittedPosition {
+                            offset: partition.committed_offset,
+                            // Carried forward so the resumed position can be
+                            // validated against the leader's log before the
+                            // first fetch (KIP-320). `-1` when the group last
+                            // committed without one.
+                            leader_epoch: partition.committed_leader_epoch,
+                        },
                     );
                 }
             }
@@ -4468,6 +4539,11 @@ impl GroupCoordinator {
     /// and epoch 0". Sticky assignor, assignment, and target state are
     /// cleared because the coordinator revoked all partitions on fencing.
     async fn reset_for_kip848_fencing(&self) {
+        // Signal before mutating: the consumer's map is the one that gates
+        // commits, and it must be dropped whether or not anything below
+        // succeeds.
+        self.membership_lost
+            .store(true, std::sync::atomic::Ordering::Release);
         self.clear_pending_rebalance();
         let member_id = self.inner.read().await.member_id.clone();
         if !member_id.is_empty() {

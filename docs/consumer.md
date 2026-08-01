@@ -121,7 +121,81 @@ let consumer = Consumer::builder()
 
 > **Offset Resolution:** When multiple partitions need offset resolution (e.g., after a rebalance or on first poll), Krafka batches `ListOffsets` requests by leader broker — resolving 50 partitions in 2-3 RPCs instead of 50. Failed offset resolutions use per-partition exponential backoff (100ms base, 30s cap) to prevent retry storms under sustained broker unavailability.
 
+> **Corrupt Record Batches:** A trailing batch cut short by the fetch size limit is normal — Krafka delivers the decodable prefix and re-requests the rest on the next fetch. A batch that fails to decode *at the current fetch position* is different: the partition cannot advance past it. Krafka treats that as a partition-level fault:
+>
+> - Other partitions sharing the same leader still decode normally — one corrupt partition does not discard the whole broker's fetch.
+> - `poll()` returns the decode error (`CrcMismatch`, `UnsupportedMagic`, `InvalidValue`, …) naming the topic, partition and offset, and stating both remedies.
+> - No offset is advanced, so nothing is skipped; the records collected in that round are simply re-fetched.
+> - `batch_decode_errors_total` is incremented, so this is alertable without log scraping.
+>
+> Failing the poll is deliberate. Re-fetching the same offset returns the same bytes, so there is no recovery to automate, and a fault the application cannot see is worse than one it can. Two remedies are available:
+>
+> ```rust
+> match consumer.poll(Duration::from_secs(1)).await {
+>     Ok(records) => { /* ... */ }
+>     Err(e) if e.protocol_error_kind() == Some(ProtocolErrorKind::CrcMismatch) => {
+>         // Keep consuming everything else while you investigate...
+>         consumer.pause("events", &[0]).await;
+>         // ...or skip the corrupt data once you have decided it is lost:
+>         // consumer.seek("events", 0, next_good_offset).await?;
+>     }
+>     Err(e) => return Err(e),
+> }
+> ```
+>
+> `pause()` excludes the partition at request-build time, so every other partition keeps flowing.
+
+### KIP-848 consumer group protocol
+
+`GroupProtocol::Consumer` selects the KIP-848 protocol, where the coordinator
+computes assignments server-side and `ConsumerGroupHeartbeat` is the only
+membership channel — no JoinGroup, no SyncGroup, no client-side assignor.
+
+```rust
+use krafka::consumer::{Consumer, GroupProtocol};
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("my-group")
+    .group_protocol(GroupProtocol::Consumer)   // requires Kafka 3.7+
+    .build()
+    .await?;
+```
+
+**The default is `Classic`, the same default librdkafka ships.** Krafka's
+KIP-848 support is validated against a reconciling in-process coordinator that
+covers membership, epoch fencing, server-side assignment, leave-by-epoch, and
+**multi-member reconciliation** — the coordinator revokes before it assigns,
+waits for the shrinking member to acknowledge, and only then releases those
+partitions to their new owner. The test suite asserts on every observation that
+no partition is ever owned by two members at once, and that assertion is
+verified to fail if the safety rule is removed.
+
+Two behaviours are worth knowing because they differ from the classic protocol:
+
+- **Fencing revokes everything.** When the coordinator returns
+  `FENCED_MEMBER_EPOCH` or `UNKNOWN_MEMBER_ID`, the member immediately drops
+  *all* its partitions, fires `on_partitions_lost` (not `on_partitions_revoked`
+  — do not commit from it), and rejoins at epoch 0 with the same member ID. It
+  keeps its partitions only long enough to hand them back, so an auto-commit
+  can never write offsets for a partition another member already owns.
+- **A null assignment means "no change".** The coordinator sends the assignment
+  field only when it moves; a steady-state heartbeat carries none. That is
+  confirmation of membership, not an absence of it.
+- **Reconciliation is acknowledged, not assumed.** When the coordinator shrinks
+  a member's assignment, the member revokes locally and then reports its
+  remaining partitions in the next heartbeat. Until that report arrives the
+  coordinator will not hand those partitions to anyone else, so a slow
+  `on_partitions_revoked` callback delays the rebalance rather than causing an
+  overlap. Keep that callback fast.
+
+KIP-848 requires Metadata v10+ so topic UUIDs in assignments can be resolved to
+names. Against an older broker the client reports that explicitly rather than
+silently consuming nothing.
+
 ### Offset Commit
+
+> **Leader epochs are committed (KIP-320).** Krafka stores the leader epoch each position was read at alongside the committed offset, and reads it back on `OffsetFetch`. That is what lets the next owner of a partition — after a restart or a rebalance — ask the broker whether the log still contains that `(offset, epoch)` pair before consuming from it. Committing a bare offset would disable truncation detection at every commit boundary, which is precisely the window an unclean leader election opens. `OffsetAndMetadata::leader_epoch` is honoured when you commit explicitly; positions that came from a `seek()` or an offset reset commit `-1`, because the consumer has no epoch it can honestly vouch for.
 
 Control how offsets are committed. When auto-commit is enabled (the default), Krafka automatically commits offsets during each `poll()` call when the commit interval has elapsed, during `close()`, and **before partition revocations** during rebalances (so the new partition owner sees up-to-date committed positions). `close().await` still tears down local state before returning; final auto-commit failures that only indicate the member already lost the group during a rebalance are treated as best-effort shutdown races, while other close-time commit failures still surface:
 

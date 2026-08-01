@@ -591,7 +591,14 @@ impl Record {
                 ),
             ));
         }
-        let mut headers = Vec::with_capacity(decode_capacity(header_count, buf.remaining()));
+        // Bound the pre-allocation by the bytes left in *this record*, not by
+        // the rest of the batch. `buf` was already advanced past this record,
+        // so its `remaining()` describes bytes that can never hold these
+        // headers — using it silently widened the clamp that
+        // `decode_capacity` exists to apply, letting a batch of tiny records
+        // each declaring `MAX_DECODE_ARRAY_LEN` headers allocate megabytes
+        // apiece before the first header byte is read.
+        let mut headers = Vec::with_capacity(decode_capacity(header_count, rbuf.remaining()));
         for _ in 0..header_count {
             headers.push(RecordHeader::decode(&mut rbuf)?);
         }

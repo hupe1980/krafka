@@ -231,6 +231,7 @@ krafka_producer_topic_errors_total{topic="orders"}
 | `errors_total` | Counter | Total errors |
 | `rebalances_total` | Counter | Total rebalance operations |
 | `seeks_total` | Counter | Total seek operations (seek + seek_many partition count) |
+| `batch_decode_errors_total` | Counter | Corrupt record batches (CRC mismatch, bad magic, out-of-range field) |
 | `lag` | Gauge | Total consumer lag across all assigned partitions |
 | `lag_max` | Gauge | Maximum per-partition consumer lag |
 | `assigned_partitions` | Gauge | Currently assigned partitions |
@@ -238,6 +239,13 @@ krafka_producer_topic_errors_total{topic="orders"}
 | `buffered_records` | Gauge | Currently buffered records in recv() buffer |
 | `poll_latency_seconds` | Summary | Poll latency statistics |
 | `fetch_latency_seconds` | Summary | Fetch latency statistics |
+
+**Alert on `batch_decode_errors_total`.** It counts record batches that failed
+to decode because the bytes were corrupt — not batches cut short by the fetch
+size limit, which are expected and re-requested on the next fetch. A partition
+whose batch at the current position will not decode cannot advance, so `poll()`
+returns the decode error rather than stalling silently; every increment is
+accompanied by a `warn!` naming the topic, partition and offset.
 
 ### Connection Metrics
 

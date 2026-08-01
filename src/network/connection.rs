@@ -32,7 +32,7 @@ use crate::auth::{
     AuthConfig, ChannelBinding, SaslMechanism, SecurityProtocol, connect_tls,
     extract_tls_server_end_point,
 };
-use crate::error::{KrafkaError, ProtocolErrorKind, Result};
+use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::metrics::ConnectionMetrics;
 
 /// Named parameter bundle for a connection event-loop task.
@@ -188,8 +188,8 @@ impl std::fmt::Debug for ProxyCredentials {
 }
 use crate::protocol::{
     ApiKey, ApiVersionRange, ApiVersionsRequest, ApiVersionsResponse, Decoder, Encoder,
-    RequestHeader, ResponseHeader, SaslAuthenticateRequest, SaslAuthenticateResponse,
-    SaslHandshakeRequest, SaslHandshakeResponse,
+    FinalizedFeature, RequestHeader, ResponseHeader, SaslAuthenticateRequest,
+    SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse, SupportedFeature,
 };
 use crate::util::{CorrelationIdGenerator, NO_RESPONSE_CORRELATION_ID, extract_sni_hostname};
 
@@ -861,6 +861,59 @@ fn connection_closed_error() -> KrafkaError {
     ))
 }
 
+/// Feature levels reported by a broker in its `ApiVersions` response (KIP-584).
+///
+/// Populated during the connection handshake when the broker accepted
+/// `ApiVersions` v3 or newer; the fields ride in that response's tagged fields
+/// and simply do not exist at v0–v2, so a pre-KIP-584 broker leaves this empty.
+///
+/// Read it with [`BrokerConnection::broker_features`]. The common use is
+/// gating optional behaviour on a cluster-wide finalized level, e.g. only
+/// attempting KIP-890 transaction semantics when `transaction.version` is
+/// finalized at 2 or higher.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct BrokerFeatures {
+    /// The `ApiVersions` version that was actually negotiated for this
+    /// connection. Below 3 the remaining fields are always empty.
+    pub negotiated_version: i16,
+    /// Feature ranges this individual broker can support.
+    pub supported: Vec<SupportedFeature>,
+    /// Epoch of [`Self::finalized`]. `-1` means the broker reported none.
+    pub finalized_epoch: i64,
+    /// Cluster-wide finalized feature levels. Only meaningful when
+    /// [`Self::finalized_epoch`] is non-negative.
+    pub finalized: Vec<FinalizedFeature>,
+}
+
+impl BrokerFeatures {
+    /// Cluster-wide finalized max level for `name`, if the cluster reported one.
+    ///
+    /// Returns `None` both when the feature is absent and when the broker
+    /// reported no finalized features at all, so callers get one uniform
+    /// "unknown — do not assume" answer instead of having to check the epoch
+    /// separately.
+    #[must_use]
+    pub fn finalized_level(&self, name: &str) -> Option<i16> {
+        if self.finalized_epoch < 0 {
+            return None;
+        }
+        self.finalized
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| f.max_version_level)
+    }
+
+    /// Version range this broker advertises for `name`, if any.
+    #[must_use]
+    pub fn supported_range(&self, name: &str) -> Option<(i16, i16)> {
+        self.supported
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| (f.min_version, f.max_version))
+    }
+}
+
 /// A pending request waiting for a response.
 struct PendingRequest {
     response_tx: oneshot::Sender<Result<Bytes>>,
@@ -926,6 +979,9 @@ pub struct BrokerConnection {
     normal_priority_tx: mpsc::Sender<ConnectionCommand>,
     /// API versions supported by the broker.
     api_versions: Arc<parking_lot::Mutex<AHashMap<ApiKey, ApiVersionRange>>>,
+    /// Broker/cluster feature levels learned from the ApiVersions handshake
+    /// (KIP-584). Empty when the broker only spoke ApiVersions v0-v2.
+    broker_features: Arc<parking_lot::Mutex<BrokerFeatures>>,
     /// Whether the connection is alive.
     alive: Arc<std::sync::atomic::AtomicBool>,
     /// When the SASL session expires (KIP-368).
@@ -1040,6 +1096,7 @@ impl BrokerConnection {
             high_priority_tx,
             normal_priority_tx,
             api_versions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
+            broker_features: Arc::new(parking_lot::Mutex::new(BrokerFeatures::default())),
             alive,
             session_expiry: None,
             stats,
@@ -2517,19 +2574,155 @@ impl BrokerConnection {
     }
 
     /// Fetch API versions from the broker.
+    ///
+    /// # Why this negotiates instead of pinning v0
+    ///
+    /// ApiVersions is the one API whose version cannot be negotiated from a
+    /// previous ApiVersions response — it is the bootstrap. Pinning it to v0
+    /// is safe but costs two things that matter:
+    ///
+    /// - **KIP-511.** `ClientSoftwareName` / `ClientSoftwareVersion` only exist
+    ///   from v3. Sent at v0 they are silently dropped, so every broker-side
+    ///   `client.software.name` metric reports krafka as unknown.
+    /// - **KIP-584.** `SupportedFeatures` / `FinalizedFeatures` ride in v3+
+    ///   tagged fields. At v0 the client never learns the cluster's finalized
+    ///   feature levels and has to spend a separate round trip to get them.
+    ///
+    /// So we do what the Java client does: send the highest version we can
+    /// encode, and on `UNSUPPORTED_VERSION` fall back. A broker that rejects
+    /// the version answers with a **v0-format body** (this is mandated by the
+    /// protocol precisely so the fallback is decodable) whose `api_keys` names
+    /// the range it does support, giving us the right version in one retry
+    /// rather than a blind walk down.
     async fn fetch_api_versions(&self) -> Result<()> {
+        /// Bounds the fallback walk: highest → broker-advertised max → v0.
+        /// Purely defensive — a broker that keeps answering UNSUPPORTED_VERSION
+        /// for a version it just advertised is broken, and must not spin here.
+        const MAX_ATTEMPTS: usize = 3;
+
         let request =
             ApiVersionsRequest::new().with_client_software("krafka", env!("CARGO_PKG_VERSION"));
 
+        let mut attempt_version = crate::protocol::versions::API_VERSIONS_MAX;
+        let mut attempts = 0usize;
+
+        let response = loop {
+            attempts += 1;
+            let body = self.send_api_versions(&request, attempt_version).await?;
+
+            // The error code is the leading INT16 in every ApiVersions response
+            // version, so it can be read before committing to a body format.
+            let error_code = body
+                .get(..2)
+                .map(|b| i16::from_be_bytes([b[0], b[1]]))
+                .ok_or_else(|| {
+                    KrafkaError::protocol_kind(
+                        ProtocolErrorKind::TruncatedFrame,
+                        "ApiVersions response too short to contain an error code",
+                    )
+                })?;
+
+            let unsupported = error_code == ErrorCode::UnsupportedVersion.to_i16();
+            let mut buf = body;
+            let decoded = if unsupported {
+                // Mandated v0 body layout, regardless of the version we sent.
+                ApiVersionsResponse::decode_v0(&mut buf)?
+            } else {
+                Self::decode_api_versions_at(attempt_version, &mut buf)?
+            };
+
+            if !unsupported {
+                break decoded;
+            }
+
+            // Prefer the ceiling the broker just told us about; otherwise drop
+            // to v0, which every broker since 0.10 supports.
+            let next = decoded
+                .get_api_version(ApiKey::ApiVersions)
+                .map(|range| range.max_version)
+                .filter(|&max| max >= 0 && max < attempt_version)
+                .unwrap_or(0);
+
+            if next >= attempt_version || attempts >= MAX_ATTEMPTS {
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::UnknownApiVersion,
+                    format!(
+                        "broker {} rejected ApiVersions v{attempt_version} with \
+                         UNSUPPORTED_VERSION and offered no lower usable version",
+                        self.address
+                    ),
+                ));
+            }
+
+            debug!(
+                broker = %self.address,
+                rejected = attempt_version,
+                retrying_with = next,
+                "Broker rejected the ApiVersions version; falling back"
+            );
+            attempt_version = next;
+        };
+
+        if response.error_code != 0 {
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::Other,
+                format!("ApiVersions error: {}", response.error_code),
+            ));
+        }
+
+        // Cache the cluster's feature levels (KIP-584) so callers do not need a
+        // second ApiVersions round trip to read them. Empty when the broker
+        // only spoke v0/v1/v2.
+        {
+            let mut features = self.broker_features.lock();
+            features.negotiated_version = attempt_version;
+            features.supported.clone_from(&response.supported_features);
+            features.finalized_epoch = response.finalized_features_epoch;
+            features.finalized.clone_from(&response.finalized_features);
+        }
+
+        let mut versions = self.api_versions.lock();
+        for range in response.api_keys {
+            versions.insert(range.api_key, range);
+        }
+
+        debug!(
+            broker = %self.address,
+            api_versions_version = attempt_version,
+            apis = versions.len(),
+            "Negotiated broker API versions"
+        );
+        Ok(())
+    }
+
+    /// Decode an ApiVersions response body at the version it was requested at.
+    fn decode_api_versions_at(version: i16, buf: &mut Bytes) -> Result<ApiVersionsResponse> {
+        match version {
+            0 => ApiVersionsResponse::decode_v0(buf),
+            1..=2 => ApiVersionsResponse::decode_v1(buf),
+            // v3, v4 and v5 share one response wire format; v4 only relaxes a
+            // field constraint and v5's additions are request-side (KIP-1242).
+            _ => ApiVersionsResponse::decode_v3(buf),
+        }
+    }
+
+    /// Send one ApiVersions request at `version` and return the raw body.
+    async fn send_api_versions(&self, request: &ApiVersionsRequest, version: i16) -> Result<Bytes> {
         let correlation_id = self.correlation_id_gen.next();
         let mut encoder = Encoder::with_capacity(128);
 
-        // Build request
         let pos = encoder.start_message();
-        let header = RequestHeader::new(ApiKey::ApiVersions, 0, correlation_id)
+        let header = RequestHeader::new(ApiKey::ApiVersions, version, correlation_id)
             .with_client_id(&self.config.client_id);
-        header.encode_v1(encoder.buffer_mut())?;
-        request.encode_v0(encoder.buffer_mut())?;
+        // `encode` picks header v1 or v2 from `ApiKey::flexible_version()`,
+        // which is 3 for ApiVersions — exactly the boundary the body encoders
+        // below switch on, so the two can never disagree.
+        header.encode(encoder.buffer_mut())?;
+        match version {
+            0..=2 => request.encode_v0(encoder.buffer_mut())?,
+            3..=4 => request.encode_v3(encoder.buffer_mut())?,
+            _ => request.encode_v5(encoder.buffer_mut())?,
+        }
         encoder.finish_message(pos)?;
 
         // One deadline covers slot acquisition, the channel send, and the
@@ -2537,7 +2730,6 @@ impl BrokerConnection {
         let deadline = tokio::time::Instant::now() + self.config.request_timeout;
         let permit = self.acquire_in_flight(deadline).await?;
 
-        // Send request (use high priority for API versions)
         let (response_tx, response_rx) = oneshot::channel();
         tokio::time::timeout_at(
             deadline,
@@ -2545,7 +2737,7 @@ impl BrokerConnection {
                 data: encoder.take(),
                 correlation_id,
                 api_key: ApiKey::ApiVersions,
-                api_version: 0,
+                api_version: version,
                 response_tx,
                 timeout: self.config.request_timeout,
                 permit,
@@ -2562,31 +2754,20 @@ impl BrokerConnection {
             .connection_metrics
             .record_high_priority_request();
 
-        // Wait for response on the same deadline the send used.
-        let response = tokio::time::timeout_at(deadline, response_rx)
+        tokio::time::timeout_at(deadline, response_rx)
             .await
             .map_err(|_| KrafkaError::timeout("api versions request"))?
-            .map_err(|_| connection_closed_error())??;
+            .map_err(|_| connection_closed_error())?
+    }
 
-        // Decode response
-        let mut buf = response;
-        let api_versions_response = ApiVersionsResponse::decode_v0(&mut buf)?;
-
-        if api_versions_response.error_code != 0 {
-            return Err(KrafkaError::protocol_kind(
-                ProtocolErrorKind::Other,
-                format!("ApiVersions error: {}", api_versions_response.error_code),
-            ));
-        }
-
-        // Store API versions
-        let mut versions = self.api_versions.lock();
-        for range in api_versions_response.api_keys {
-            versions.insert(range.api_key, range);
-        }
-
-        debug!("Fetched {} API versions", versions.len());
-        Ok(())
+    /// Broker and cluster feature levels learned during the ApiVersions
+    /// handshake (KIP-584).
+    ///
+    /// Empty when the broker only supports ApiVersions v0–v2, which predate
+    /// the tagged fields that carry them.
+    #[must_use]
+    pub fn broker_features(&self) -> BrokerFeatures {
+        self.broker_features.lock().clone()
     }
 
     /// Choose the appropriate channel based on request priority.
@@ -2830,6 +3011,23 @@ impl BrokerConnection {
     /// channel is registered in the pending map, avoiding resource leaks and
     /// preserving the normal correlation-ID space for requests that expect
     /// responses.
+    ///
+    /// # Quota feedback is one-directional here (KIP-219)
+    ///
+    /// No response means no `throttle_time_ms`, so a producer running purely
+    /// at `acks=0` never *learns* a throttle from its own traffic. A throttle
+    /// learned from any other API on this connection is still honoured — the
+    /// accumulator checks [`throttle_remaining`](Self::throttle_remaining)
+    /// before dispatching a batch — but a client that sends nothing else keeps
+    /// writing at full rate until the broker mutes the channel itself.
+    ///
+    /// This is inherent to `acks=0` rather than a gap in the implementation:
+    /// the field simply does not exist on a request the broker never answers.
+    /// It is one more reason `acks=0` trades away more than durability.
+    ///
+    /// No in-flight permit is acquired either, for the same reason: the
+    /// permit's job is to bound the pending map, and this path never inserts
+    /// into it.
     pub async fn send_fire_and_forget(
         &self,
         api_key: ApiKey,
@@ -3059,6 +3257,7 @@ impl BrokerConnection {
             high_priority_tx,
             normal_priority_tx,
             api_versions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
+            broker_features: Arc::new(parking_lot::Mutex::new(BrokerFeatures::default())),
             alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             session_expiry: None,
             stats: Arc::new(ConnectionStats::default()),
@@ -3146,6 +3345,30 @@ impl Drop for BrokerConnection {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// Build an `ApiVersionsResponse` body (after the correlation ID) that
+    /// advertises no APIs, shaped for `api_version`.
+    ///
+    /// The hand-rolled mock brokers below have to match the version the client
+    /// actually sent: since the handshake negotiates rather than pinning v0, a
+    /// v0-shaped body answering a v4 request decodes as a truncated frame.
+    fn mock_api_versions_body(api_version: i16) -> BytesMut {
+        use bytes::BufMut as _;
+        let mut body = BytesMut::new();
+        body.put_i16(0); // error_code = NONE
+        if api_version >= 3 {
+            // Flexible: compact array (raw 1 == zero elements), throttle, tags.
+            body.put_u8(1);
+            body.put_i32(0); // throttle_time_ms
+            body.put_u8(0); // empty tagged fields
+        } else {
+            body.put_i32(0); // 0 api keys
+            if api_version >= 1 {
+                body.put_i32(0); // throttle_time_ms
+            }
+        }
+        body
+    }
 
     /// A standalone in-flight permit for tests that construct a
     /// `ConnectionCommand::Request` or `PendingRequest` directly, without
@@ -3504,13 +3727,14 @@ mod tests {
 
         // 3. Read ApiVersionsRequest
         let req = read_frame(&mut stream).await;
+        let api_version = i16::from_be_bytes(req[2..4].try_into().unwrap());
         let correlation_id = i32::from_be_bytes(req[4..8].try_into().unwrap());
 
-        // Send ApiVersionsResponse: correlation_id + error_code(0) + 0 api keys
+        // Answer in the shape the client asked for; the handshake negotiates
+        // the ApiVersions version rather than pinning v0.
         let mut resp = BytesMut::new();
         resp.put_i32(correlation_id);
-        resp.put_i16(0); // error_code
-        resp.put_i32(0); // 0 api keys
+        resp.put_slice(&mock_api_versions_body(api_version));
         write_frame(&mut stream, &resp).await;
 
         let _ = shutdown_rx.await;
@@ -3667,13 +3891,13 @@ mod tests {
 
             // Verify it's ApiVersions (api_key = 18), not SaslHandshake (api_key = 17)
             let api_key = i16::from_be_bytes(body[0..2].try_into().unwrap());
+            let api_version = i16::from_be_bytes(body[2..4].try_into().unwrap());
             let correlation_id = i32::from_be_bytes(body[4..8].try_into().unwrap());
 
             // Send ApiVersionsResponse
             let mut resp = BytesMut::new();
             resp.put_i32(correlation_id);
-            resp.put_i16(0); // error_code
-            resp.put_i32(0); // 0 api keys
+            resp.put_slice(&mock_api_versions_body(api_version));
             let len = resp.len() as i32;
             stream.write_all(&len.to_be_bytes()).await.unwrap();
             stream.write_all(&resp).await.unwrap();
@@ -4322,6 +4546,7 @@ mod tests {
             high_priority_tx,
             normal_priority_tx,
             api_versions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
+            broker_features: Arc::new(parking_lot::Mutex::new(BrokerFeatures::default())),
             alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             session_expiry: None,
             stats: Arc::new(ConnectionStats::default()),

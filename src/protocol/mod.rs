@@ -73,12 +73,25 @@ use crate::error::{KrafkaError, ProtocolErrorKind, Result};
 /// The limit of 100,000 is generous for any realistic Kafka response while
 /// preventing CPU-based denial-of-service amplification.
 ///
-/// # Operator override
+/// # This is a hard limit
 ///
-/// This constant is intentionally `pub`. Deployments with many partitions (e.g.
-/// `ListOffsets` across >100 000 partitions) can raise the limit by patching
-/// the constant at compile time via a build script, or by filing a feature
-/// request to thread a per-connection limit through `ConnectionConfig`.
+/// The constant is `pub` so that callers can *read* it — to size their own
+/// batching, or to explain a rejection in an error message — but it cannot be
+/// overridden from outside the crate: a `const` in a dependency is fixed at the
+/// dependency's compile time, and no build script or feature flag here changes
+/// it.
+///
+/// It bounds one array, not a response, so it is reached only when a single
+/// wire array exceeds 100 000 elements: over 100 000 partitions in *one* topic,
+/// or over 100 000 topics returned by a single full `Metadata` refresh. The
+/// former exceeds anything Kafka supports; the latter is reachable on very
+/// large multi-tenant clusters, and the mitigation is the one such deployments
+/// want anyway — fetch metadata for the topics in use
+/// (`ClusterMetadata::refresh_for_topics`) rather than the whole cluster.
+///
+/// If you have a workload that legitimately needs a higher ceiling, that is a
+/// bug report worth filing: the fix is to thread a limit through
+/// `ConnectionConfig`, not to raise a global constant.
 pub const MAX_DECODE_ARRAY_LEN: usize = 100_000;
 
 /// Maximum number of headers allowed on a single producer record.
@@ -466,8 +479,20 @@ api_versions! {
     "ListGroups" [16] => LIST_GROUPS_MIN = 1 ..= LIST_GROUPS_MAX = 5,
         "v3 flexible, v4 state filter (KIP-518), v5 type filter (KIP-848)";
 
-    "ApiVersions" [18] => API_VERSIONS_MIN = 0 ..= API_VERSIONS_MAX = 5,
-        "v3 flexible, v4 SupportedFeatures fix (KAFKA-17011), v5 ClusterId/NodeId (KIP-1242)";
+    "ApiVersions" [18] cfg(not(feature = "unstable-protocol")) => API_VERSIONS_MIN = 0 ..= API_VERSIONS_MAX = 4,
+        "v3 flexible (KIP-511 client software name), v4 SupportedFeatures fix (KAFKA-17011)",
+        { "ApiVersions is the bootstrap API: its version cannot be negotiated from a \
+           previous ApiVersions response, so the client sends this ceiling and falls \
+           back on UNSUPPORTED_VERSION. The ceiling is therefore the *highest version a \
+           released broker supports*, not the highest this crate can encode — sending \
+           v5 to a Kafka 4.x broker would cost a rejected round trip on every single \
+           connection. v5 (KIP-1242) is available behind `unstable-protocol`." };
+
+    "ApiVersions" [18] cfg(feature = "unstable-protocol") => API_VERSIONS_MIN = 0 ..= API_VERSIONS_MAX = 5,
+        "v3 flexible (KIP-511), v4 SupportedFeatures fix (KAFKA-17011), v5 ClusterId/NodeId (KIP-1242, unstable)",
+        { "v5 targets unreleased Kafka builds. Against a broker that does not implement \
+           it the handshake costs one extra rejected round trip per connection before \
+           falling back — which is why it is not the default ceiling." };
 
     "CreateTopics" [19] => CREATE_TOPICS_MIN = 2 ..= CREATE_TOPICS_MAX = 7,
         "v5 flexible, v7 topic_id in response (KIP-464, KIP-525)",
