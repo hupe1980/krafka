@@ -18,7 +18,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::error::{ErrorCode, Result};
 use crate::protocol::ApiKey;
-use crate::protocol::{Encode, KafkaString, TryEncode};
+use crate::protocol::{Encode, KafkaString, TaggedField, TryEncode};
 
 use super::state::{ClusterState, CommittedOffset, GroupMember};
 use super::wire::*;
@@ -59,6 +59,20 @@ pub(crate) fn supported_versions() -> Vec<(ApiKey, i16)> {
         (ApiKey::InitProducerId, 1),
         (ApiKey::CreateTopics, 4),
         (ApiKey::DeleteTopics, 3),
+        // KIP-932 share groups. v1 is the stable version; v2 (KIP-1206
+        // ShareAcquireMode, KIP-1222 renew-ack) is deliberately not advertised
+        // because neither an acquire mode nor a lock timer is modelled here,
+        // and advertising a version whose semantics the fake broker does not
+        // implement would make tests pass for the wrong reason.
+        (ApiKey::ShareGroupHeartbeat, 1),
+        (ApiKey::ShareFetch, 1),
+        (ApiKey::ShareAcknowledge, 1),
+        // KIP-584. v2 is the Kafka 4.0 version that dropped the per-feature
+        // `Results` array; overriding this down to v0 is how a test reaches
+        // the client's "validate_only needs v1+" refusal.
+        (ApiKey::UpdateFeatures, 2),
+        // KIP-1071, describe half only — see `streams_group_describe`.
+        (ApiKey::StreamsGroupDescribe, 0),
     ]
 }
 
@@ -75,7 +89,7 @@ pub(crate) fn dispatch(
     out: &mut BytesMut,
 ) -> Result<()> {
     match api_key {
-        ApiKey::ApiVersions => api_versions(api_version, out),
+        ApiKey::ApiVersions => api_versions(api_version, state, out),
         ApiKey::Metadata => metadata(body, state, out),
         ApiKey::Produce => produce(body, node_id, state, out),
         ApiKey::Fetch => fetch(body, node_id, state, out),
@@ -91,6 +105,11 @@ pub(crate) fn dispatch(
         ApiKey::InitProducerId => init_producer_id(body, state, out),
         ApiKey::CreateTopics => create_topics(body, node_id, state, out),
         ApiKey::DeleteTopics => delete_topics(body, node_id, state, out),
+        ApiKey::ShareGroupHeartbeat => share_group_heartbeat(body, node_id, state, out),
+        ApiKey::ShareFetch => share_fetch(body, api_version, node_id, state, out),
+        ApiKey::ShareAcknowledge => share_acknowledge(body, api_version, node_id, state, out),
+        ApiKey::UpdateFeatures => update_features(body, api_version, node_id, state, out),
+        ApiKey::StreamsGroupDescribe => streams_group_describe(body, node_id, state, out),
         other => Err(crate::error::KrafkaError::protocol_kind(
             crate::error::ProtocolErrorKind::UnknownApiVersion,
             format!("fake broker has no handler for {other:?}"),
@@ -332,7 +351,7 @@ pub(crate) fn dispatch_error(
 /// supports, so the fake broker rejects exactly what a real one would.
 pub(crate) const API_VERSIONS_RANGE: (i16, i16) = (0, 4);
 
-fn api_versions(request_version: i16, out: &mut BytesMut) -> Result<()> {
+fn api_versions(request_version: i16, state: &ClusterState, out: &mut BytesMut) -> Result<()> {
     let (min_version, max_version) = API_VERSIONS_RANGE;
 
     if request_version < min_version || request_version > max_version {
@@ -358,7 +377,9 @@ fn api_versions(request_version: i16, out: &mut BytesMut) -> Result<()> {
         write_array_len(out, versions.len())?;
     }
     for (api_key, version) in versions {
-        let (lo, hi) = if api_key == ApiKey::ApiVersions {
+        let (lo, hi) = if let Some(&range) = state.api_version_overrides.get(&api_key) {
+            range
+        } else if api_key == ApiKey::ApiVersions {
             (min_version, max_version)
         } else {
             (version, version)
@@ -375,12 +396,75 @@ fn api_versions(request_version: i16, out: &mut BytesMut) -> Result<()> {
         out.put_i32(0);
     }
     if flexible {
-        // No SupportedFeatures / FinalizedFeatures tagged fields: the fake
-        // broker models a cluster that reports none, which is the case the
-        // client must tolerate.
-        write_empty_tagged_fields(out)?;
+        write_feature_tagged_fields(state, out)?;
     }
     Ok(())
+}
+
+/// Write the KIP-584 feature tagged fields of an `ApiVersions` v3+ response.
+///
+/// A cluster with no finalized features writes an empty section, which is the
+/// case a client must tolerate and the one this broker used to model
+/// unconditionally. Once `UpdateFeatures` has finalized something, the fields
+/// are emitted — which is what lets `AdminClient::describe_features()` be
+/// tested against what `update_features()` actually applied, rather than each
+/// being asserted in isolation.
+fn write_feature_tagged_fields(state: &ClusterState, out: &mut BytesMut) -> Result<()> {
+    if state.finalized_features.is_empty() {
+        return write_empty_tagged_fields(out);
+    }
+
+    let mut features: Vec<(&String, &i16)> = state.finalized_features.iter().collect();
+    features.sort_by_key(|(name, _)| (*name).clone());
+
+    // Tag 0 — SupportedFeatures: what this broker *can* run. The fake broker
+    // supports every finalized feature from 1 up to its finalized level, which
+    // is the only relationship a real cluster guarantees.
+    let mut supported = BytesMut::new();
+    write_compact_array_len(&mut supported, features.len())?;
+    for (name, level) in &features {
+        write_compact_string(&mut supported, name)?;
+        supported.put_i16(1); // min_version
+        supported.put_i16(**level); // max_version
+        write_empty_tagged_fields(&mut supported)?;
+    }
+
+    // Tag 1 — FinalizedFeaturesEpoch, as a bare i64. A client that reads a
+    // negative epoch must ignore tag 2 entirely, so this has to be >= 0 for
+    // the finalized features to be visible at all.
+    let mut epoch = BytesMut::new();
+    epoch.put_i64(state.finalized_features_epoch);
+
+    // Tag 2 — FinalizedFeatures. Note the field order: max level precedes min
+    // level here, the reverse of SupportedFeatures. Getting that backwards
+    // produces a response that decodes without error and means the wrong
+    // thing.
+    let mut finalized = BytesMut::new();
+    write_compact_array_len(&mut finalized, features.len())?;
+    for (name, level) in &features {
+        write_compact_string(&mut finalized, name)?;
+        finalized.put_i16(**level); // max_version_level
+        finalized.put_i16(1); // min_version_level
+        write_empty_tagged_fields(&mut finalized)?;
+    }
+
+    write_tagged_fields(
+        out,
+        vec![
+            TaggedField {
+                tag: 0,
+                data: supported.freeze(),
+            },
+            TaggedField {
+                tag: 1,
+                data: epoch.freeze(),
+            },
+            TaggedField {
+                tag: 2,
+                data: finalized.freeze(),
+            },
+        ],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -779,6 +863,13 @@ fn write_fetch_partition(
 /// Short enough that a test does not wait long for the background heartbeat
 /// task to tick, long enough not to saturate the loopback listener.
 pub(crate) const HEARTBEAT_INTERVAL_MS: i32 = 1_000;
+
+/// Acquisition-lock timeout reported in `ShareFetch` responses.
+///
+/// The fake broker never expires a lock — a record stays acquired until the
+/// client acknowledges it. This value is what a client would *see*, so a test
+/// can observe the field being carried; it is not a timer.
+pub(crate) const ACQUISITION_LOCK_TIMEOUT_MS: i32 = 30_000;
 
 /// Serve a KIP-848 `ConsumerGroupHeartbeat`.
 ///
@@ -1653,6 +1744,740 @@ fn delete_topics(
         write_error(out, code);
     }
     Ok(())
+}
+
+// ── Share groups (KIP-932) ───────────────────────────────────────────────
+
+/// Serve a `ShareGroupHeartbeat` (API key 76, v1).
+///
+/// # How this differs from `consumer_group_heartbeat`
+///
+/// A share group has no exclusive partition ownership, so it has no
+/// reconciliation: the coordinator computes an assignment and the member is
+/// on it from that heartbeat onward. There is no revoke step, no
+/// "owned ∩ target" intermediate, and no waiting for a peer to release a
+/// partition — all of which `consumer_group_heartbeat` above must model, and
+/// none of which exists here. That is the protocol difference, not a
+/// simplification.
+///
+/// Everything else carries over: `-1` is a leave, epoch `0` is a join, a
+/// mismatched epoch is `FENCED_MEMBER_EPOCH`, an unknown member at a non-zero
+/// epoch is `UNKNOWN_MEMBER_ID`, and a null assignment means "keep what you
+/// have".
+fn share_group_heartbeat(
+    body: &mut Bytes,
+    node_id: i32,
+    state: &mut ClusterState,
+    out: &mut BytesMut,
+) -> Result<()> {
+    let req = ShareGroupHeartbeatReq::read(body)?;
+
+    if state.group_coordinator(&req.group_id) != node_id {
+        return write_heartbeat_error(out, ErrorCode::NotCoordinator, None, 0);
+    }
+
+    if req.member_epoch < 0 {
+        if let Some(group) = state.share_groups.get_mut(&req.group_id) {
+            group.members.remove(&req.member_id);
+            group.group_epoch += 1;
+            // Whatever the departing member was holding is nobody's now.
+            if group.members.is_empty() {
+                group.release_in_flight();
+            }
+        }
+        return write_share_heartbeat(out, &req.member_id, req.member_epoch, None);
+    }
+
+    let partition_counts: HashMap<String, i32> = state
+        .topics
+        .iter()
+        .map(|(name, t)| (name.clone(), t.partitions.len() as i32))
+        .collect();
+    let topic_ids: HashMap<String, [u8; 16]> = state
+        .topics
+        .iter()
+        .map(|(name, t)| (name.clone(), t.topic_id))
+        .collect();
+
+    let group = state.share_groups.entry(req.group_id.clone()).or_default();
+    let known = group.members.get(&req.member_id).cloned();
+
+    if let Some(existing) = &known
+        && req.member_epoch != 0
+        && req.member_epoch != existing.member_epoch
+    {
+        return write_heartbeat_error(out, ErrorCode::FencedMemberEpoch, Some(&req.member_id), 0);
+    }
+    if known.is_none() && req.member_epoch != 0 {
+        return write_heartbeat_error(out, ErrorCode::UnknownMemberId, Some(&req.member_id), 0);
+    }
+
+    let subscribed = req
+        .subscribed_topic_names
+        .clone()
+        .or_else(|| known.as_ref().map(|m| m.subscribed_topics.clone()))
+        .unwrap_or_default();
+
+    let is_new = known.is_none();
+    let rejoining = known.is_some() && req.member_epoch == 0;
+    let subscription_changed = known
+        .as_ref()
+        .is_some_and(|m| m.subscribed_topics != subscribed);
+    if is_new || rejoining || subscription_changed {
+        group.group_epoch += 1;
+    }
+    let group_epoch = group.group_epoch;
+
+    {
+        let member = group.members.entry(req.member_id.clone()).or_default();
+        member.subscribed_topics = subscribed.clone();
+    }
+
+    // Round-robin every partition of every subscribed topic over the members
+    // that subscribe to it. A share group *may* hand the same partition to
+    // several members; distributing them is the simpler behaviour and is what
+    // the reference `SimpleShareAssignor` does while members ≤ partitions.
+    let mut member_ids: Vec<String> = group.members.keys().cloned().collect();
+    member_ids.sort();
+    let mut targets: HashMap<String, HashMap<String, Vec<i32>>> = HashMap::new();
+    let mut topics: Vec<&String> = partition_counts.keys().collect();
+    topics.sort();
+    for topic in topics {
+        let subscribers: Vec<&String> = member_ids
+            .iter()
+            .filter(|id| {
+                group
+                    .members
+                    .get(*id)
+                    .is_some_and(|m| m.subscribed_topics.contains(topic))
+            })
+            .collect();
+        if subscribers.is_empty() {
+            continue;
+        }
+        let count = partition_counts.get(topic).copied().unwrap_or(0);
+        for partition in 0..count {
+            let owner = subscribers[(partition as usize) % subscribers.len()];
+            targets
+                .entry(owner.clone())
+                .or_default()
+                .entry(topic.clone())
+                .or_default()
+                .push(partition);
+        }
+    }
+
+    let granted = targets.remove(&req.member_id).unwrap_or_default();
+
+    let (member_epoch, send_assignment) = {
+        let member = group.members.entry(req.member_id.clone()).or_default();
+        if member.assignment != granted {
+            member.assignment = granted.clone();
+            member.assignment_dirty = true;
+        }
+        if is_new || rejoining || subscription_changed || member.member_epoch == 0 {
+            member.member_epoch = group_epoch;
+        }
+        let dirty = member.assignment_dirty;
+        member.assignment_dirty = false;
+        (member.member_epoch, dirty)
+    };
+
+    let wire_assignment: Vec<HeartbeatTopicPartitions> = granted
+        .iter()
+        .filter_map(|(topic, partitions)| {
+            topic_ids.get(topic).map(|id| HeartbeatTopicPartitions {
+                topic_id: *id,
+                partitions: partitions.clone(),
+            })
+        })
+        .collect();
+
+    write_share_heartbeat(
+        out,
+        &req.member_id,
+        member_epoch,
+        if send_assignment {
+            Some(&wire_assignment)
+        } else {
+            None
+        },
+    )
+}
+
+/// Write a successful `ShareGroupHeartbeat` response.
+///
+/// The wire shape is identical to `ConsumerGroupHeartbeat`'s, including the
+/// nullable-struct presence byte in front of the assignment, so
+/// [`write_heartbeat_assignment`] serves both.
+fn write_share_heartbeat(
+    out: &mut BytesMut,
+    member_id: &str,
+    member_epoch: i32,
+    assignment: Option<&[HeartbeatTopicPartitions]>,
+) -> Result<()> {
+    out.put_i32(0); // throttle_time_ms
+    write_error(out, ErrorCode::None);
+    write_compact_nullable_string(out, None)?; // error_message
+    write_compact_nullable_string(out, Some(member_id))?;
+    out.put_i32(member_epoch);
+    out.put_i32(HEARTBEAT_INTERVAL_MS);
+    write_heartbeat_assignment(out, assignment)?;
+    write_empty_tagged_fields(out)
+}
+
+/// Resolve a topic UUID back to its name.
+fn topic_name_for_id(state: &ClusterState, topic_id: [u8; 16]) -> Option<String> {
+    state
+        .topics
+        .iter()
+        .find(|(_, t)| t.topic_id == topic_id)
+        .map(|(name, _)| name.clone())
+}
+
+/// Apply every acknowledgement batch a share request piggybacked onto one
+/// partition, returning the error to report in the acknowledge-error field.
+///
+/// A batch whose `acknowledge_types` array has one entry applies that type to
+/// the whole range; otherwise there must be exactly one type per offset, which
+/// is what the KIP-932 format specifies. Anything else is `INVALID_REQUEST` —
+/// the same answer a real broker gives, and worth modelling because the
+/// client builds these arrays itself.
+fn apply_share_acks(
+    state: &mut ClusterState,
+    group_id: &str,
+    topic: &str,
+    partition: i32,
+    batches: &[ShareAckBatch],
+) -> ErrorCode {
+    for batch in batches {
+        if batch.last_offset < batch.first_offset {
+            return ErrorCode::InvalidRequest;
+        }
+        let span = batch.last_offset - batch.first_offset + 1;
+        let types: Vec<i8> = match batch.acknowledge_types.len() {
+            1 => vec![batch.acknowledge_types[0]; span as usize],
+            n if n as i64 == span => batch.acknowledge_types.clone(),
+            _ => return ErrorCode::InvalidRequest,
+        };
+        let share_partition = state
+            .share_groups
+            .entry(group_id.to_string())
+            .or_default()
+            .partitions
+            .entry((topic.to_string(), partition))
+            .or_default();
+        for (i, &ack_type) in types.iter().enumerate() {
+            let offset = batch.first_offset + i as i64;
+            share_partition.acknowledge(offset, offset, ack_type);
+        }
+    }
+    ErrorCode::None
+}
+
+/// Both share data APIs carry the group and member ID as *nullable* compact
+/// strings, because the same request type is reused where the fields do not
+/// apply. On `ShareFetch` and `ShareAcknowledge` they are mandatory: the
+/// broker resolves share-partition state by group and attributes the
+/// acquisition to a member. Returning the records regardless would let a
+/// client that forgot to set them pass every test here and fail against a
+/// real broker.
+///
+/// Returns the group ID when both are present and non-empty.
+fn required_share_identity(
+    group_id: &Option<String>,
+    member_id: &Option<String>,
+) -> Option<String> {
+    let group = group_id.as_deref().filter(|g| !g.is_empty())?;
+    member_id.as_deref().filter(|m| !m.is_empty())?;
+    Some(group.to_string())
+}
+
+/// Serve a `ShareFetch` (API key 78, v1).
+///
+/// Acknowledgements piggybacked on the request are applied *before* records
+/// are acquired, which is the ordering a real broker uses and the reason a
+/// client can accept a batch and fetch the next one in a single round trip.
+fn share_fetch(
+    body: &mut Bytes,
+    api_version: i16,
+    node_id: i32,
+    state: &mut ClusterState,
+    out: &mut BytesMut,
+) -> Result<()> {
+    let req = ShareFetchReq::read(body, api_version)?;
+    let Some(group_id) = required_share_identity(&req.group_id, &req.member_id) else {
+        out.put_i32(0); // throttle_time_ms
+        write_error(out, ErrorCode::InvalidRequest);
+        write_compact_nullable_string(out, Some("ShareFetch requires a group ID and member ID"))?;
+        out.put_i32(ACQUISITION_LOCK_TIMEOUT_MS);
+        write_compact_array_len(out, 0)?; // responses
+        write_compact_array_len(out, 0)?; // node_endpoints
+        return write_empty_tagged_fields(out);
+    };
+
+    out.put_i32(0); // throttle_time_ms
+    write_error(out, ErrorCode::None);
+    write_compact_nullable_string(out, None)?; // error_message
+    out.put_i32(ACQUISITION_LOCK_TIMEOUT_MS);
+
+    // Group the flat (topic_id, partition) list back into topics, preserving
+    // first-seen order so the response mirrors the request.
+    let mut order: Vec<[u8; 16]> = Vec::new();
+    let mut grouped: HashMap<[u8; 16], Vec<&ShareTopicPartitionAcks>> = HashMap::new();
+    for tp in &req.topics {
+        if !grouped.contains_key(&tp.topic_id) {
+            order.push(tp.topic_id);
+        }
+        grouped.entry(tp.topic_id).or_default().push(tp);
+    }
+
+    write_compact_array_len(out, order.len())?;
+    for topic_id in &order {
+        out.put_slice(topic_id);
+        let entries = grouped.get(topic_id).map_or(&[][..], Vec::as_slice);
+        write_compact_array_len(out, entries.len())?;
+        for entry in entries {
+            let Some(topic) = topic_name_for_id(state, *topic_id) else {
+                write_share_fetch_partition(
+                    out,
+                    entry.partition_index,
+                    ErrorCode::UnknownTopicId,
+                    ErrorCode::None,
+                    -1,
+                    -1,
+                    None,
+                    &[],
+                )?;
+                continue;
+            };
+
+            let ack_error = apply_share_acks(
+                state,
+                &group_id,
+                &topic,
+                entry.partition_index,
+                &entry.acknowledgement_batches,
+            );
+
+            let Some(p) = state.partition(&topic, entry.partition_index) else {
+                write_share_fetch_partition(
+                    out,
+                    entry.partition_index,
+                    ErrorCode::UnknownTopicOrPartition,
+                    ack_error,
+                    -1,
+                    -1,
+                    None,
+                    &[],
+                )?;
+                continue;
+            };
+            if p.leader != node_id {
+                let (leader, epoch) = (p.leader, p.leader_epoch);
+                write_share_fetch_partition(
+                    out,
+                    entry.partition_index,
+                    ErrorCode::NotLeaderForPartition,
+                    ack_error,
+                    leader,
+                    epoch,
+                    None,
+                    &[],
+                )?;
+                continue;
+            }
+
+            // Snapshot what the log holds before borrowing the share state.
+            let (leader, leader_epoch, log, next_offset) =
+                (p.leader, p.leader_epoch, p.log.clone(), p.next_offset);
+
+            let share_partition = state
+                .share_groups
+                .entry(group_id.clone())
+                .or_default()
+                .partitions
+                .entry((topic.clone(), entry.partition_index))
+                .or_default();
+            let cursor = share_partition
+                .next_acquire
+                .max(share_partition.start_offset);
+
+            // Acquire whole batches, stopping once `max_records` is reached.
+            // Batch granularity is what a real broker uses too: it never
+            // splits a batch to honour the cap exactly.
+            let mut records = Vec::new();
+            let mut acquired_first = i64::MAX;
+            let mut acquired_last = -1i64;
+            let mut taken = 0i64;
+            for batch in &log {
+                let base = batch_base_offset(batch).unwrap_or(0);
+                let count = batch_record_count(batch).unwrap_or(0);
+                if base + count <= cursor {
+                    continue;
+                }
+                if req.max_records > 0 && taken >= i64::from(req.max_records) {
+                    break;
+                }
+                records.extend_from_slice(batch);
+                acquired_first = acquired_first.min(base.max(cursor));
+                acquired_last = acquired_last.max(base + count - 1);
+                taken += count;
+            }
+
+            let acquired = if acquired_last >= acquired_first {
+                let delivery_count = share_partition.acquire(acquired_first, acquired_last);
+                vec![(acquired_first, acquired_last, delivery_count)]
+            } else {
+                Vec::new()
+            };
+            debug_assert!(
+                acquired.is_empty() || acquired_last < next_offset,
+                "acquired past the high watermark"
+            );
+
+            let records = Bytes::from(records);
+            write_share_fetch_partition(
+                out,
+                entry.partition_index,
+                ErrorCode::None,
+                ack_error,
+                leader,
+                leader_epoch,
+                if records.is_empty() {
+                    None
+                } else {
+                    Some(&records)
+                },
+                &acquired,
+            )?;
+        }
+        write_empty_tagged_fields(out)?; // topic tagged fields
+    }
+
+    write_compact_array_len(out, 0)?; // node_endpoints
+    write_empty_tagged_fields(out)
+}
+
+/// Write one partition of a `ShareFetch` response.
+#[allow(clippy::too_many_arguments)]
+fn write_share_fetch_partition(
+    out: &mut BytesMut,
+    partition: i32,
+    error: ErrorCode,
+    ack_error: ErrorCode,
+    leader_id: i32,
+    leader_epoch: i32,
+    records: Option<&Bytes>,
+    acquired: &[(i64, i64, i16)],
+) -> Result<()> {
+    out.put_i32(partition);
+    write_error(out, error);
+    write_compact_nullable_string(out, None)?; // error_message
+    write_error(out, ack_error);
+    write_compact_nullable_string(out, None)?; // acknowledge_error_message
+    out.put_i32(leader_id);
+    out.put_i32(leader_epoch);
+    write_empty_tagged_fields(out)?; // CurrentLeader tagged section
+    write_compact_nullable_bytes(out, records)?;
+    write_compact_array_len(out, acquired.len())?;
+    for &(first, last, delivery_count) in acquired {
+        out.put_i64(first);
+        out.put_i64(last);
+        out.put_i16(delivery_count);
+        write_empty_tagged_fields(out)?;
+    }
+    write_empty_tagged_fields(out) // partition tagged fields
+}
+
+/// Serve a `ShareAcknowledge` (API key 79, v1).
+fn share_acknowledge(
+    body: &mut Bytes,
+    api_version: i16,
+    node_id: i32,
+    state: &mut ClusterState,
+    out: &mut BytesMut,
+) -> Result<()> {
+    let req = ShareAcknowledgeReq::read(body, api_version)?;
+    let Some(group_id) = required_share_identity(&req.group_id, &req.member_id) else {
+        out.put_i32(0); // throttle_time_ms
+        write_error(out, ErrorCode::InvalidRequest);
+        write_compact_nullable_string(
+            out,
+            Some("ShareAcknowledge requires a group ID and member ID"),
+        )?;
+        write_compact_array_len(out, 0)?; // responses
+        write_compact_array_len(out, 0)?; // node_endpoints
+        return write_empty_tagged_fields(out);
+    };
+
+    out.put_i32(0); // throttle_time_ms
+    write_error(out, ErrorCode::None);
+    write_compact_nullable_string(out, None)?; // error_message
+
+    let mut order: Vec<[u8; 16]> = Vec::new();
+    let mut grouped: HashMap<[u8; 16], Vec<&ShareTopicPartitionAcks>> = HashMap::new();
+    for tp in &req.topics {
+        if !grouped.contains_key(&tp.topic_id) {
+            order.push(tp.topic_id);
+        }
+        grouped.entry(tp.topic_id).or_default().push(tp);
+    }
+
+    write_compact_array_len(out, order.len())?;
+    for topic_id in &order {
+        out.put_slice(topic_id);
+        let entries = grouped.get(topic_id).map_or(&[][..], Vec::as_slice);
+        write_compact_array_len(out, entries.len())?;
+        for entry in entries {
+            let (error, leader, epoch) = match topic_name_for_id(state, *topic_id) {
+                None => (ErrorCode::UnknownTopicId, -1, -1),
+                Some(topic) => match state.partition(&topic, entry.partition_index) {
+                    None => (ErrorCode::UnknownTopicOrPartition, -1, -1),
+                    Some(p) if p.leader != node_id => {
+                        (ErrorCode::NotLeaderForPartition, p.leader, p.leader_epoch)
+                    }
+                    Some(p) => {
+                        let (leader, epoch) = (p.leader, p.leader_epoch);
+                        let code = apply_share_acks(
+                            state,
+                            &group_id,
+                            &topic,
+                            entry.partition_index,
+                            &entry.acknowledgement_batches,
+                        );
+                        (code, leader, epoch)
+                    }
+                },
+            };
+            out.put_i32(entry.partition_index);
+            write_error(out, error);
+            write_compact_nullable_string(out, None)?; // error_message
+            out.put_i32(leader);
+            out.put_i32(epoch);
+            write_empty_tagged_fields(out)?; // CurrentLeader tagged section
+            write_empty_tagged_fields(out)?; // partition tagged fields
+        }
+        write_empty_tagged_fields(out)?; // topic tagged fields
+    }
+
+    write_compact_array_len(out, 0)?; // node_endpoints
+    write_empty_tagged_fields(out)
+}
+
+// ── UpdateFeatures (KIP-584) ─────────────────────────────────────────────
+
+/// Serve an `UpdateFeatures` (API key 57).
+///
+/// The controller-only routing is the point: sending this to an arbitrary
+/// broker is what used to surface a controller failover as a blanket-retriable
+/// protocol error, so the fake broker answers `NOT_CONTROLLER` from anywhere
+/// else exactly as a real one does.
+///
+/// The updates are recorded on the cluster so a test can assert what the
+/// controller was actually asked to do — including, when `validate_only` is
+/// set, that it was asked to do nothing.
+fn update_features(
+    body: &mut Bytes,
+    api_version: i16,
+    node_id: i32,
+    state: &mut ClusterState,
+    out: &mut BytesMut,
+) -> Result<()> {
+    let req = UpdateFeaturesReq::read(body, api_version)?;
+
+    let write_response = |out: &mut BytesMut, code: ErrorCode, results: &[(String, ErrorCode)]| {
+        out.put_i32(0); // throttle_time_ms
+        write_error(out, code);
+        write_compact_nullable_string(out, None)?; // error_message
+        // v2 (KIP-1014) dropped the per-feature array; v0/v1 still carry it.
+        if api_version < 2 {
+            write_compact_array_len(out, results.len())?;
+            for (feature, result) in results {
+                write_compact_string(out, feature)?;
+                write_error(out, *result);
+                write_compact_nullable_string(out, None)?;
+                write_empty_tagged_fields(out)?;
+            }
+        }
+        write_empty_tagged_fields(out)
+    };
+
+    if state.controller_id != node_id {
+        return write_response(out, ErrorCode::NotController, &[]);
+    }
+
+    let results: Vec<(String, ErrorCode)> = req
+        .feature_updates
+        .iter()
+        .map(|u| (u.feature.clone(), ErrorCode::None))
+        .collect();
+
+    if !req.validate_only && !req.feature_updates.is_empty() {
+        for update in &req.feature_updates {
+            if update.max_version_level == 0 {
+                state.finalized_features.remove(&update.feature);
+            } else {
+                state
+                    .finalized_features
+                    .insert(update.feature.clone(), update.max_version_level);
+            }
+        }
+        // KIP-584 requires the epoch to advance whenever the finalized set
+        // changes; a client is entitled to treat an unchanged epoch as an
+        // unchanged set and skip re-reading it.
+        state.finalized_features_epoch += 1;
+    }
+
+    write_response(out, ErrorCode::None, &results)
+}
+
+// ── StreamsGroupDescribe (KIP-1071) ──────────────────────────────────────
+
+/// Serve a `StreamsGroupDescribe` (API key 89, v0).
+///
+/// Group state comes from [`ClusterState::streams_groups`], which a test
+/// populates directly — krafka cannot join a Streams group, so there is
+/// nothing for the broker to derive it from.
+///
+/// The point of serving it at all is the *decoder*: this response exercises
+/// two nullable structs behind presence bytes (`Topology`, `UserEndpoint`), a
+/// nullable array nested inside one of them (`Subtopologies`), and a `uint16`
+/// port. Each is a shape the client gets exactly one chance to read correctly.
+fn streams_group_describe(
+    body: &mut Bytes,
+    node_id: i32,
+    state: &mut ClusterState,
+    out: &mut BytesMut,
+) -> Result<()> {
+    let req = StreamsGroupDescribeReq::read(body)?;
+
+    out.put_i32(0); // throttle_time_ms
+    write_compact_array_len(out, req.group_ids.len())?;
+
+    for group_id in &req.group_ids {
+        // Route check: like every group API, this belongs to the coordinator.
+        if state.group_coordinator(group_id) != node_id {
+            write_error(out, ErrorCode::NotCoordinator);
+            write_compact_nullable_string(out, None)?;
+            write_compact_string(out, group_id)?;
+            write_compact_string(out, "")?; // group_state
+            out.put_i32(0); // group_epoch
+            out.put_i32(0); // assignment_epoch
+            write_presence(out, false); // topology
+            write_compact_array_len(out, 0)?; // members
+            out.put_i32(i32::MIN); // authorized_operations
+            write_empty_tagged_fields(out)?;
+            continue;
+        }
+
+        let Some(group) = state.streams_groups.get(group_id) else {
+            write_error(out, ErrorCode::GroupIdNotFound);
+            write_compact_nullable_string(out, Some("group not found"))?;
+            write_compact_string(out, group_id)?;
+            write_compact_string(out, "")?;
+            out.put_i32(0);
+            out.put_i32(0);
+            write_presence(out, false);
+            write_compact_array_len(out, 0)?;
+            out.put_i32(i32::MIN);
+            write_empty_tagged_fields(out)?;
+            continue;
+        };
+
+        write_error(out, ErrorCode::None);
+        write_compact_nullable_string(out, None)?; // error_message
+        write_compact_string(out, group_id)?;
+        write_compact_string(out, &group.group_state)?;
+        out.put_i32(group.group_epoch);
+        out.put_i32(group.assignment_epoch);
+
+        // Topology: nullable struct.
+        match group.topology_epoch {
+            None => write_presence(out, false),
+            Some(epoch) => {
+                write_presence(out, true);
+                out.put_i32(epoch);
+                // Subtopologies: nullable *array* — raw varint 0 is null,
+                // which the format distinguishes from an empty array.
+                match &group.subtopologies {
+                    None => crate::util::varint::encode_unsigned_varint(0, out),
+                    Some(subs) => {
+                        write_compact_array_len(out, subs.len())?;
+                        for id in subs {
+                            write_compact_string(out, id)?;
+                            write_compact_array_len(out, 1)?; // source_topics
+                            write_compact_string(out, "source-topic")?;
+                            write_compact_array_len(out, 0)?; // repartition_sink_topics
+                            write_compact_array_len(out, 0)?; // state_changelog_topics
+                            write_compact_array_len(out, 0)?; // repartition_source_topics
+                            write_empty_tagged_fields(out)?;
+                        }
+                    }
+                }
+                write_empty_tagged_fields(out)?; // topology tagged fields
+            }
+        }
+
+        write_compact_array_len(out, group.members.len())?;
+        for member in &group.members {
+            write_compact_string(out, &member.member_id)?;
+            out.put_i32(member.member_epoch);
+            write_compact_nullable_string(out, None)?; // instance_id
+            write_compact_nullable_string(out, None)?; // rack_id
+            write_compact_string(out, "krafka-test")?; // client_id
+            write_compact_string(out, "127.0.0.1")?; // client_host
+            out.put_i32(member.topology_epoch);
+            write_compact_string(out, &member.process_id)?;
+
+            // UserEndpoint: nullable struct with a `uint16` port.
+            match &member.user_endpoint {
+                None => write_presence(out, false),
+                Some((host, port)) => {
+                    write_presence(out, true);
+                    write_compact_string(out, host)?;
+                    out.put_u16(*port);
+                    write_empty_tagged_fields(out)?;
+                }
+            }
+
+            write_compact_array_len(out, 0)?; // client_tags
+            write_compact_array_len(out, 0)?; // task_offsets
+            write_compact_array_len(out, 0)?; // task_end_offsets
+            write_streams_assignment(out, &member.active_tasks)?;
+            write_streams_assignment(out, &member.target_active_tasks)?;
+            out.put_u8(0); // is_classic
+            write_empty_tagged_fields(out)?;
+        }
+
+        out.put_i32(if req.include_authorized_operations {
+            0
+        } else {
+            i32::MIN
+        });
+        write_empty_tagged_fields(out)?;
+    }
+
+    write_empty_tagged_fields(out)
+}
+
+/// Write an `Assignment` struct: active, standby and warm-up task lists.
+///
+/// Only active tasks are modelled; standby and warm-up are written empty. A
+/// test that needs them needs a real Streams runtime to produce them.
+fn write_streams_assignment(out: &mut BytesMut, active: &[(String, Vec<i32>)]) -> Result<()> {
+    write_compact_array_len(out, active.len())?;
+    for (subtopology_id, partitions) in active {
+        write_compact_string(out, subtopology_id)?;
+        write_compact_array_len(out, partitions.len())?;
+        for p in partitions {
+            out.put_i32(*p);
+        }
+        write_empty_tagged_fields(out)?;
+    }
+    write_compact_array_len(out, 0)?; // standby_tasks
+    write_compact_array_len(out, 0)?; // warmup_tasks
+    write_empty_tagged_fields(out) // assignment tagged fields
 }
 
 #[cfg(test)]

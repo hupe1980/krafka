@@ -578,6 +578,40 @@ impl FakeBroker {
         }
     }
 
+    /// Advertise a different `ApiVersions` range for one API.
+    ///
+    /// The broker normally advertises exactly the one version each handler
+    /// speaks. This overrides that, so a test can *be* an older broker and
+    /// exercise the client's degradation path rather than asserting a
+    /// re-implementation of the condition.
+    ///
+    /// The handlers still serve their own version, so the range given here
+    /// must include it unless the test expects the request to be refused
+    /// before it is sent — which is the usual reason to reach for this.
+    ///
+    /// ```ignore
+    /// // A broker predating KIP-584's `validate_only` field.
+    /// broker.set_api_versions(ApiKey::UpdateFeatures, 0, 0);
+    /// ```
+    pub fn set_api_versions(&self, api_key: ApiKey, min_version: i16, max_version: i16) {
+        self.shared
+            .cluster
+            .lock()
+            .api_version_overrides
+            .insert(api_key, (min_version, max_version));
+    }
+
+    /// Cluster-finalized level of a feature (KIP-584), if `UpdateFeatures` has
+    /// set one.
+    pub fn finalized_feature(&self, feature: &str) -> Option<i16> {
+        self.shared
+            .cluster
+            .lock()
+            .finalized_features
+            .get(feature)
+            .copied()
+    }
+
     /// Committed offset for a group's topic-partition, if any.
     pub fn committed_offset(&self, group_id: &str, topic: &str, partition: i32) -> Option<i64> {
         self.shared

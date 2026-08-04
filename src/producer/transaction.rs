@@ -391,11 +391,22 @@ pub struct TransactionalProducerConfig {
     max_in_flight: usize,
     /// Metadata max age.
     metadata_max_age: Duration,
+    /// What to do when every known broker becomes unreachable (KIP-899).
+    metadata_recovery_strategy: crate::metadata::MetadataRecoveryStrategy,
+    /// How long metadata refreshes may keep failing before a rebootstrap is
+    /// triggered (KIP-899). Only effective with
+    /// [`MetadataRecoveryStrategy::Rebootstrap`](crate::metadata::MetadataRecoveryStrategy::Rebootstrap).
+    metadata_recovery_rebootstrap_trigger: Duration,
     /// Authentication configuration.
     auth: Option<AuthConfig>,
     /// SOCKS5 proxy configuration (optional).
     #[cfg(feature = "socks5")]
     proxy: Option<crate::network::ProxyConfig>,
+    /// Socket- and pool-level transport tuning.
+    ///
+    /// Defaults reproduce krafka's historical behaviour; see
+    /// [`TransportConfig`](crate::network::TransportConfig).
+    transport: crate::network::TransportConfig,
 }
 
 impl Default for TransactionalProducerConfig {
@@ -415,9 +426,12 @@ impl Default for TransactionalProducerConfig {
             max_block: Duration::from_secs(60),
             max_in_flight: 5,
             metadata_max_age: Duration::from_secs(300),
+            metadata_recovery_strategy: crate::metadata::MetadataRecoveryStrategy::Rebootstrap,
+            metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             auth: None,
             #[cfg(feature = "socks5")]
             proxy: None,
+            transport: crate::network::TransportConfig::default(),
         }
     }
 }
@@ -764,7 +778,6 @@ impl TransactionalProducer {
         // fields that hold finalized features.
         let av_version = conn
             .negotiate_api_version(ApiKey::ApiVersions, versions::API_VERSIONS_MAX, 3)
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -803,23 +816,21 @@ impl TransactionalProducer {
 
         Ok(BrokerTransactionSupport {
             transaction_version_level,
-            produce_max: conn
-                .negotiate_api_version(
-                    ApiKey::Produce,
-                    versions::PRODUCE_MAX,
-                    versions::PRODUCE_MIN,
-                )
-                .await,
-            txn_offset_commit_max: conn
-                .negotiate_api_version(
-                    ApiKey::TxnOffsetCommit,
-                    versions::TXN_OFFSET_COMMIT_MAX,
-                    versions::TXN_OFFSET_COMMIT_MIN,
-                )
-                .await,
-            end_txn_max: conn
-                .negotiate_api_version(ApiKey::EndTxn, versions::END_TXN_MAX, versions::END_TXN_MIN)
-                .await,
+            produce_max: conn.negotiate_api_version(
+                ApiKey::Produce,
+                versions::PRODUCE_MAX,
+                versions::PRODUCE_MIN,
+            ),
+            txn_offset_commit_max: conn.negotiate_api_version(
+                ApiKey::TxnOffsetCommit,
+                versions::TXN_OFFSET_COMMIT_MAX,
+                versions::TXN_OFFSET_COMMIT_MIN,
+            ),
+            end_txn_max: conn.negotiate_api_version(
+                ApiKey::EndTxn,
+                versions::END_TXN_MAX,
+                versions::END_TXN_MIN,
+            ),
         })
     }
 
@@ -1127,7 +1138,6 @@ impl TransactionalProducer {
                     versions::INIT_PRODUCER_ID_MAX,
                     versions::INIT_PRODUCER_ID_MIN,
                 )
-                .await
                 .ok_or_else(|| {
                     KrafkaError::protocol_kind(
                         ProtocolErrorKind::UnknownApiVersion,
@@ -1203,7 +1213,6 @@ impl TransactionalProducer {
                 versions::FIND_COORDINATOR_MAX,
                 versions::FIND_COORDINATOR_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -1470,7 +1479,6 @@ impl TransactionalProducer {
                     versions::ADD_PARTITIONS_TO_TXN_MAX,
                     versions::ADD_PARTITIONS_TO_TXN_MIN,
                 )
-                .await
                 .ok_or_else(|| {
                     KrafkaError::protocol_kind(ProtocolErrorKind::UnknownApiVersion, "no mutually supported AddPartitionsToTxn API version")
                 })?;
@@ -1667,7 +1675,6 @@ impl TransactionalProducer {
                         versions::TXN_OFFSET_COMMIT_MAX,
                         toc_min_version,
                     )
-                    .await
                     .ok_or_else(|| {
                         KrafkaError::protocol_kind(
                             ProtocolErrorKind::UnknownApiVersion,
@@ -1783,7 +1790,6 @@ impl TransactionalProducer {
                         versions::ADD_OFFSETS_TO_TXN_MAX,
                         versions::ADD_OFFSETS_TO_TXN_MIN,
                     )
-                    .await
                     .ok_or_else(|| {
                         KrafkaError::protocol_kind(
                             ProtocolErrorKind::UnknownApiVersion,
@@ -1852,7 +1858,6 @@ impl TransactionalProducer {
                 versions::FIND_COORDINATOR_MAX,
                 versions::FIND_COORDINATOR_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -2145,7 +2150,6 @@ impl TransactionalProducer {
 
                 let et_version = conn
                     .negotiate_api_version(ApiKey::EndTxn, versions::END_TXN_MAX, et_min_version)
-                    .await
                     .ok_or_else(|| {
                         KrafkaError::protocol_kind(
                             ProtocolErrorKind::UnknownApiVersion,
@@ -2316,6 +2320,75 @@ impl TransactionalProducer {
         );
 
         close_result
+    }
+
+    /// Re-read TLS certificate and key files from disk and atomically install
+    /// the new material for all **future** connections (KIP-1288).
+    ///
+    /// Existing TLS sessions are unaffected: they keep the connector they
+    /// handshaked with and are replaced naturally as connections cycle. On
+    /// error the previously loaded certificates stay active, so a call made
+    /// mid-rotation against a half-written PEM is safe to retry.
+    ///
+    /// No-op when TLS is not configured.
+    ///
+    /// Use this for event-driven rotation (an inotify watch, a sidecar
+    /// signal). For unattended rotation set
+    /// [`TransportConfig::tls_reload_interval`](crate::network::TransportConfig)
+    /// instead and krafka reloads on a timer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the certificate or key files cannot be read or
+    /// parsed.
+    pub async fn refresh_tls(&self) -> Result<()> {
+        self.pool.refresh_tls().await
+    }
+
+    /// Replace the bootstrap server list used for metadata recovery (KIP-899).
+    ///
+    /// The new addresses are used on the next metadata refresh that falls back
+    /// to bootstrap servers. Does not close existing connections.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `servers` is empty.
+    pub fn update_seed_brokers(&self, servers: Vec<String>) -> Result<()> {
+        self.metadata.update_seed_brokers(servers)
+    }
+
+    /// Force a rebootstrap: close all connections, clear the metadata cache,
+    /// and fall back to bootstrap servers (KIP-899).
+    pub async fn rebootstrap(&self) {
+        self.metadata.rebootstrap().await;
+    }
+
+    /// Get the shared connection metrics handle used by this producer's broker
+    /// pool.
+    #[inline]
+    pub fn connection_metrics(&self) -> Arc<crate::metrics::ConnectionMetrics> {
+        self.pool.metrics()
+    }
+
+    /// Snapshot the producer metrics.
+    ///
+    /// Transactional sends are batched through the same
+    /// [`RecordAccumulator`](crate::producer::RecordAccumulatorHandle) as the
+    /// plain producer, so the record, byte, error and retry counters mean
+    /// exactly what they do on [`Producer::metrics`](crate::producer::Producer::metrics).
+    ///
+    /// Synchronous, like every other metrics accessor: readable from a
+    /// Prometheus scrape handler or a signal handler.
+    #[inline]
+    pub fn metrics(&self) -> crate::producer::ProducerMetricsSnapshot {
+        crate::producer::ProducerMetricsSnapshot {
+            connections: self.pool.len(),
+            records_sent: self.metrics.records_sent.get(),
+            bytes_sent: self.metrics.bytes_sent.get(),
+            errors: self.metrics.errors.get(),
+            retries: self.metrics.retries.get(),
+            buffered_records: self.metrics.buffered_records.get(),
+        }
     }
 
     /// Get the shared producer metrics handle for this producer's accumulator.
@@ -2540,6 +2613,58 @@ impl TransactionalProducerBuilder {
         self
     }
 
+    /// Configure SASL/OAUTHBEARER with a static token.
+    ///
+    /// For a token that must be refreshed, use
+    /// [`auth`](Self::auth) with
+    /// [`AuthConfig::sasl_oauthbearer_provider`](crate::auth::AuthConfig::sasl_oauthbearer_provider),
+    /// or the built-in OIDC provider behind the `oauth-oidc` feature.
+    pub fn sasl_oauthbearer(mut self, token: impl Into<String>) -> Self {
+        self.config.auth = Some(crate::auth::AuthConfig::sasl_oauthbearer(token));
+        self
+    }
+
+    /// Set the metadata recovery strategy (KIP-899).
+    ///
+    /// Controls what the client does when every known broker becomes
+    /// unreachable: keep retrying the cached broker set, or fall back to the
+    /// original bootstrap servers.
+    pub fn metadata_recovery_strategy(
+        mut self,
+        strategy: crate::metadata::MetadataRecoveryStrategy,
+    ) -> Self {
+        self.config.metadata_recovery_strategy = strategy;
+        self
+    }
+
+    /// Set the maximum age of cached cluster metadata before a refresh.
+    pub fn metadata_max_age(mut self, age: Duration) -> Self {
+        self.config.metadata_max_age = age;
+        self
+    }
+
+    /// Set how long metadata refreshes may keep failing before a rebootstrap
+    /// is triggered (KIP-899).
+    pub fn metadata_recovery_rebootstrap_trigger(mut self, duration: Duration) -> Self {
+        self.config.metadata_recovery_rebootstrap_trigger = duration;
+        self
+    }
+
+    /// Set socket- and pool-level transport tuning.
+    ///
+    /// Covers TCP keepalive and nodelay, the per-connection response ceiling
+    /// and in-flight cap, the priority-channel depths, the Happy Eyeballs
+    /// stagger, idle-connection eviction, a total-connection cap, and the
+    /// KIP-1288 automatic TLS reload interval.
+    ///
+    /// Omitting this call keeps krafka's historical defaults, which
+    /// [`TransportConfig::default`](crate::network::TransportConfig) reproduces
+    /// exactly.
+    pub fn transport(mut self, transport: crate::network::TransportConfig) -> Self {
+        self.config.transport = transport;
+        self
+    }
+
     /// Configure SASL/PLAIN authentication.
     pub fn sasl_plain(mut self, username: &str, password: &str) -> crate::Result<Self> {
         self.config.auth = Some(AuthConfig::sasl_plain(username, password)?);
@@ -2621,10 +2746,12 @@ impl TransactionalProducerBuilder {
             return Err(KrafkaError::config("max_request_size must be >= 1"));
         }
 
-        let mut pool_config_builder = ConnectionConfig::builder()
-            .client_id(&self.config.client_id)
-            .request_timeout(self.config.request_timeout)
-            .connect_timeout(self.config.connect_timeout);
+        let mut pool_config_builder = self.config.transport.apply(
+            ConnectionConfig::builder()
+                .client_id(&self.config.client_id)
+                .request_timeout(self.config.request_timeout)
+                .connect_timeout(self.config.connect_timeout),
+        );
 
         if let Some(ref auth) = self.config.auth {
             pool_config_builder = pool_config_builder.auth(auth.clone());
@@ -2638,17 +2765,25 @@ impl TransactionalProducerBuilder {
         let mut pool_config = pool_config_builder.build()?;
         pool_config.init_tls().await?;
 
-        let pool = Arc::new(ConnectionPool::new(pool_config));
-        pool.start_idle_evictor();
+        // Every client builds its pool through `TransportConfig::build_pool`,
+        // which applies the pool-level settings and starts the background
+        // tasks (idle eviction, OAUTHBEARER refresh, KIP-1288 TLS reload).
+        // Routing all construction sites through one function is what stops
+        // them drifting apart again.
+        let pool = self.config.transport.build_pool(pool_config);
 
         let bootstrap_servers =
             crate::util::parse_bootstrap_servers(&self.config.bootstrap_servers)?;
 
-        let metadata = Arc::new(ClusterMetadata::new(
-            bootstrap_servers,
-            pool.clone(),
-            self.config.metadata_max_age,
-        ));
+        let metadata = Arc::new(
+            ClusterMetadata::new(
+                bootstrap_servers,
+                pool.clone(),
+                self.config.metadata_max_age,
+            )
+            .with_recovery_strategy(self.config.metadata_recovery_strategy)
+            .with_rebootstrap_trigger(self.config.metadata_recovery_rebootstrap_trigger),
+        );
 
         metadata.refresh().await?;
 

@@ -11,7 +11,6 @@
 
 mod accumulator;
 mod barrier;
-mod batch;
 mod config;
 mod idempotent;
 mod partitioner;
@@ -20,8 +19,7 @@ mod retry;
 mod transaction;
 
 pub use accumulator::{AccumulatorConfig, RecordAccumulator, RecordAccumulatorHandle};
-pub use batch::ProducerBatch;
-pub use config::{Acks, ProducerConfig, ProducerConfigBuilder};
+pub use config::{Acks, ProducerConfig};
 pub use idempotent::{
     PartitionSequenceSnapshot, ProducerIdentity, ProducerIdentitySnapshot, ProducerStateStore,
     RollbackOutcome,
@@ -204,14 +202,11 @@ async fn init_idempotent_producer_id(
             Err(error) => return Err(error),
         };
 
-        let ip_version = match conn
-            .negotiate_api_version(
-                ApiKey::InitProducerId,
-                versions::INIT_PRODUCER_ID_MAX,
-                versions::INIT_PRODUCER_ID_MIN,
-            )
-            .await
-        {
+        let ip_version = match conn.negotiate_api_version(
+            ApiKey::InitProducerId,
+            versions::INIT_PRODUCER_ID_MAX,
+            versions::INIT_PRODUCER_ID_MIN,
+        ) {
             Some(version) => version,
             None => {
                 return Err(KrafkaError::protocol_kind(
@@ -555,10 +550,12 @@ impl Producer {
             // fetch — the KrafkaClient already did that at build time.
             (pool, metadata)
         } else {
-            let mut pool_config_builder = ConnectionConfig::builder()
-                .client_id(&config.client_id)
-                .request_timeout(config.request_timeout)
-                .connect_timeout(config.connect_timeout);
+            let mut pool_config_builder = config.transport.apply(
+                ConnectionConfig::builder()
+                    .client_id(&config.client_id)
+                    .request_timeout(config.request_timeout)
+                    .connect_timeout(config.connect_timeout),
+            );
 
             if let Some(ref auth) = config.auth {
                 pool_config_builder = pool_config_builder.auth(auth.clone());
@@ -572,8 +569,12 @@ impl Producer {
             let mut pool_config = pool_config_builder.build()?;
             pool_config.init_tls().await?;
 
-            let pool = Arc::new(ConnectionPool::new(pool_config));
-            pool.start_idle_evictor();
+            // Every client builds its pool through `TransportConfig::build_pool`,
+            // which applies the pool-level settings and starts the background
+            // tasks (idle eviction, OAUTHBEARER refresh, KIP-1288 TLS reload).
+            // Routing all construction sites through one function is what stops
+            // them drifting apart again.
+            let pool = config.transport.build_pool(pool_config);
 
             let bootstrap_servers =
                 crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
@@ -1269,8 +1270,9 @@ impl Producer {
         record: &RoutedRecord,
         sequence: Option<i32>,
     ) -> Result<ProduceRequest> {
-        let mut batch_builder =
-            RecordBatchBuilder::new().compression(self.config.compression_for(topic));
+        let mut batch_builder = RecordBatchBuilder::new()
+            .compression(self.config.compression_for(topic))
+            .compression_level(self.config.compression_level);
 
         // Propagate user-supplied timestamp to the batch
         if let Some(ts) = record.timestamp {
@@ -1333,7 +1335,6 @@ impl Producer {
                 versions::PRODUCE_MAX,
                 versions::PRODUCE_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -1458,6 +1459,29 @@ impl Producer {
         self.metadata.update_seed_brokers(servers)
     }
 
+    /// Re-read TLS certificate and key files from disk and atomically install
+    /// the new material for all **future** connections (KIP-1288).
+    ///
+    /// Existing TLS sessions are unaffected: they keep the connector they
+    /// handshaked with and are replaced naturally as connections cycle. On
+    /// error the previously loaded certificates stay active, so a call made
+    /// mid-rotation against a half-written PEM is safe to retry.
+    ///
+    /// No-op when TLS is not configured.
+    ///
+    /// Use this for event-driven rotation (an inotify watch, a sidecar
+    /// signal). For unattended rotation set
+    /// [`TransportConfig::tls_reload_interval`](crate::network::TransportConfig)
+    /// instead and krafka reloads on a timer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the certificate or key files cannot be read or
+    /// parsed.
+    pub async fn refresh_tls(&self) -> Result<()> {
+        self.pool.refresh_tls().await
+    }
+
     /// Force a rebootstrap: close all connections, clear the metadata cache,
     /// and fall back to bootstrap servers (KIP-899).
     pub async fn rebootstrap(&self) {
@@ -1533,7 +1557,13 @@ impl Producer {
     }
 
     /// Get producer metrics.
-    pub async fn metrics(&self) -> ProducerMetricsSnapshot {
+    ///
+    /// Synchronous, like every other metrics accessor in this crate: the
+    /// counters are atomics and the connection count is a lock-free read. It
+    /// used to be `async` with no `await`, which meant a Prometheus scrape
+    /// handler or a signal handler could read `Consumer::metrics()` but not
+    /// this one.
+    pub fn metrics(&self) -> ProducerMetricsSnapshot {
         ProducerMetricsSnapshot {
             connections: self.pool.len(),
             records_sent: self.metrics.records_sent.get(),
@@ -1720,9 +1750,60 @@ impl ProducerBuilder {
         self
     }
 
+    /// Set socket- and pool-level transport tuning.
+    ///
+    /// Covers TCP keepalive and nodelay, the per-connection response ceiling
+    /// and in-flight cap, the priority-channel depths, the Happy Eyeballs
+    /// stagger, idle-connection eviction, a total-connection cap, and the
+    /// KIP-1288 automatic TLS reload interval.
+    ///
+    /// Omitting this call keeps krafka's historical defaults, which
+    /// [`TransportConfig::default`](crate::network::TransportConfig) reproduces
+    /// exactly.
+    pub fn transport(mut self, transport: crate::network::TransportConfig) -> Self {
+        self.config.transport = transport;
+        self
+    }
+
     /// Set the compression type.
     pub fn compression(mut self, compression: Compression) -> Self {
         self.config.compression = compression;
+        self
+    }
+
+    /// Override the compression codec's default level.
+    ///
+    /// `None` (the default) uses the codec's own default: zlib 6 for `Gzip`,
+    /// 3 for `Zstd` — the same defaults the Java client applies.
+    ///
+    /// Only `Gzip` and `Zstd` take a level. `Snappy` has none in its format,
+    /// and krafka encodes LZ4 with `lz4_flex`, whose frame encoder exposes
+    /// none. Setting a level alongside either is rejected at build time rather
+    /// than ignored, because a silently-ignored tuning knob is how a
+    /// deployment ships believing it was tuned.
+    ///
+    /// # Choosing a value
+    ///
+    /// Zstd's range is what the linked libzstd reports — negative "fast"
+    /// levels through 22. Level 3 already compresses Kafka payloads well; the
+    /// levels above roughly 9 cost CPU far faster than they save bytes, and on
+    /// a producer that is throughput-bound rather than bandwidth-bound they
+    /// are usually a net loss. Measure against your own payloads.
+    ///
+    /// ```no_run
+    /// # use krafka::producer::Producer;
+    /// # use krafka::protocol::Compression;
+    /// # async fn f() -> krafka::error::Result<()> {
+    /// let producer = Producer::builder()
+    ///     .bootstrap_servers("localhost:9092")
+    ///     .compression(Compression::Zstd)
+    ///     .compression_level(Some(1)) // favour throughput over ratio
+    ///     .build()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn compression_level(mut self, level: Option<i32>) -> Self {
+        self.config.compression_level = level;
         self
     }
 
@@ -2067,66 +2148,47 @@ impl ProducerBuilder {
         self
     }
 
+    /// Validate the configuration and return it, without connecting.
+    ///
+    /// Runs exactly the checks [`build`](Self::build) runs — they call the same
+    /// validator — so a config that passes here will not be rejected later for
+    /// a configuration reason. Useful for validating settings at startup, in a
+    /// test, or in a config-linting tool, none of which want a broker.
+    ///
+    /// Note that validation also *normalises*: an idempotent producer's
+    /// `max_in_flight` is capped to 5 (KIP-679), so the returned config may
+    /// differ from what was set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KrafkaError::Config`] for any invalid combination — an empty
+    /// `bootstrap_servers`, a zero `batch_size`, a compression codec whose
+    /// Cargo feature is not enabled, `acks != All` with idempotence, and so on.
+    pub fn build_config(self) -> Result<ProducerConfig> {
+        let has_shared_pool = self.shared.is_some();
+        let mut config = self.config;
+        config::validate(&mut config, has_shared_pool)?;
+        Ok(config)
+    }
+
     /// Build the producer.
+    ///
+    /// Validates the configuration through the same validator the synchronous
+    /// [`build_config`](Self::build_config) uses, then connects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KrafkaError::Config`] for an invalid configuration, or a
+    /// network error if the initial metadata fetch fails.
     pub async fn build(mut self) -> Result<Producer> {
-        if self.shared.is_none() && self.config.bootstrap_servers.is_empty() {
-            return Err(KrafkaError::config("bootstrap.servers is required"));
-        }
-        if self.config.max_in_flight == 0 {
-            return Err(KrafkaError::config(format!(
-                "max_in_flight must be >= 1 (got {})",
-                self.config.max_in_flight
-            )));
-        }
-        if self.config.max_request_size == 0 {
-            return Err(KrafkaError::config("max_request_size must be >= 1"));
-        }
-        if self.config.batch_size == 0 {
-            return Err(KrafkaError::config(format!(
-                "batch_size must be >= 1 (got {})",
-                self.config.batch_size
-            )));
-        }
-        if self.config.delivery_timeout.is_zero() {
-            return Err(KrafkaError::config(
-                "delivery_timeout must be greater than zero",
-            ));
-        }
-        if self.config.idempotent {
-            if self.config.retries == 0 {
-                return Err(KrafkaError::config(
-                    "idempotent producer requires retries > 0",
-                ));
-            }
-            if self.config.acks != Acks::All {
-                return Err(KrafkaError::config(format!(
-                    "idempotent producer requires acks = All (got {:?})",
-                    self.config.acks
-                )));
-            }
-            // Auto-cap to 5 per the Kafka protocol guarantee (KIP-679),
-            // matching Java client and librdkafka behaviour.
-            if self.config.max_in_flight > 5 {
-                tracing::info!(
-                    configured = self.config.max_in_flight,
-                    effective = 5,
-                    "idempotent producer requires max_in_flight ≤ 5; capping automatically"
-                );
-                self.config.max_in_flight = 5;
-            }
-        }
-        if self.config.buffer_memory > 0 && self.config.batch_size > self.config.buffer_memory {
-            return Err(KrafkaError::config(format!(
-                "batch_size must not exceed buffer_memory (got batch_size={}, buffer_memory={})",
-                self.config.batch_size, self.config.buffer_memory
-            )));
-        }
-        if self.config.batch_size > self.config.max_request_size {
-            return Err(KrafkaError::config(format!(
-                "batch_size must not exceed max_request_size (got batch_size={}, max_request_size={})",
-                self.config.batch_size, self.config.max_request_size
-            )));
-        }
+        // One validator, shared with `build_config`. This used to be a second,
+        // hand-maintained copy that had silently drifted: it skipped the
+        // client-id length limit, the infinite-retry-loop guard and — most
+        // visibly — the compression-codec availability checks, so
+        // `.compression(Zstd)` without the `zstd` feature built a producer that
+        // failed on its first send.
+        config::validate(&mut self.config, self.shared.is_some())?;
+
         let interceptor: Arc<dyn crate::interceptor::ProducerInterceptor> =
             if self.interceptors.is_empty() {
                 Arc::new(crate::interceptor::NoOpProducerInterceptor)
@@ -2558,13 +2620,13 @@ mod tests {
 
     #[test]
     fn test_idempotent_autocaps_max_in_flight() {
-        // Source-of-truth validation lives in ProducerConfigBuilder and is
-        // testable without requiring a live broker connection.
-        let cfg = ProducerConfig::builder()
+        // Validation lives in one place (`config::validate`) and is reachable
+        // without a live broker via the synchronous `build_config` terminal.
+        let cfg = Producer::builder()
             .bootstrap_servers("localhost:9092")
             .idempotent(true)
             .max_in_flight(10)
-            .build()
+            .build_config()
             .expect("idempotent config should auto-cap max_in_flight to 5");
         assert_eq!(cfg.max_in_flight(), 5);
     }

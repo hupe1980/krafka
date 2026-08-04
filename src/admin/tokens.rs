@@ -69,7 +69,6 @@ impl AdminClient {
                             versions::CREATE_DELEGATION_TOKEN_MAX,
                             versions::CREATE_DELEGATION_TOKEN_MIN,
                         )
-                        .await
                         .ok_or_else(|| {
                             KrafkaError::protocol_kind(
                                 ProtocolErrorKind::UnknownApiVersion,
@@ -145,7 +144,6 @@ impl AdminClient {
                 versions::RENEW_DELEGATION_TOKEN_MAX,
                 versions::RENEW_DELEGATION_TOKEN_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -203,7 +201,6 @@ impl AdminClient {
                 versions::EXPIRE_DELEGATION_TOKEN_MAX,
                 versions::EXPIRE_DELEGATION_TOKEN_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -263,7 +260,6 @@ impl AdminClient {
                 versions::DESCRIBE_DELEGATION_TOKEN_MAX,
                 versions::DESCRIBE_DELEGATION_TOKEN_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,

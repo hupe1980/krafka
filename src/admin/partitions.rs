@@ -88,7 +88,6 @@ impl AdminClient {
                     versions::DESCRIBE_LOG_DIRS_MAX,
                     versions::DESCRIBE_LOG_DIRS_MIN,
                 )
-                .await
                 .ok_or_else(|| {
                     KrafkaError::protocol_kind(
                         ProtocolErrorKind::UnknownApiVersion,
@@ -178,6 +177,7 @@ impl AdminClient {
                         .collect(),
                     total_bytes: result.total_bytes,
                     usable_bytes: result.usable_bytes,
+                    is_cordoned: result.is_cordoned,
                 });
             }
         }
@@ -244,7 +244,6 @@ impl AdminClient {
                             versions::ELECT_LEADERS_MAX,
                             versions::ELECT_LEADERS_MIN,
                         )
-                        .await
                         .ok_or_else(|| {
                             KrafkaError::protocol_kind(
                                 ProtocolErrorKind::UnknownApiVersion,
@@ -334,6 +333,35 @@ impl AdminClient {
         topics: Vec<ReassignableTopic>,
         timeout: Duration,
     ) -> Result<AlterReassignmentsResult> {
+        self.alter_partition_reassignments_opts(topics, timeout, true)
+            .await
+    }
+
+    /// [`alter_partition_reassignments`](Self::alter_partition_reassignments)
+    /// with control over whether the move may change a partition's replication
+    /// factor (`AlterPartitionReassignments` v1, Kafka 4.1).
+    ///
+    /// Passing `false` asks the broker to reject any target replica set whose
+    /// size differs from the partition's current replica count, answering with
+    /// `INVALID_REPLICATION_FACTOR` instead of applying the change. That is the
+    /// safer default for generated reassignment plans, where an off-by-one
+    /// would otherwise silently reduce durability.
+    ///
+    /// # Version requirement
+    ///
+    /// The field only exists from v1. Against a v0 broker
+    /// `allow_replication_factor_change = false` **cannot be honoured**, so
+    /// this returns [`ProtocolErrorKind::UnknownApiVersion`] rather than
+    /// quietly sending a request that permits the change. Passing `true` — the
+    /// broker default and the v0 behaviour — works against every version.
+    ///
+    /// [`ProtocolErrorKind::UnknownApiVersion`]: crate::error::ProtocolErrorKind::UnknownApiVersion
+    pub async fn alter_partition_reassignments_opts(
+        &self,
+        topics: Vec<ReassignableTopic>,
+        timeout: Duration,
+        allow_replication_factor_change: bool,
+    ) -> Result<AlterReassignmentsResult> {
         self.check_not_closed()?;
         // H6: reject oversize topic names at ingress.
         for t in &topics {
@@ -349,6 +377,7 @@ impl AdminClient {
                 async move {
                     let request = AlterPartitionReassignmentsRequest {
                         timeout_ms,
+                        allow_replication_factor_change,
                         topics: topics.clone(),
                     };
 
@@ -358,13 +387,25 @@ impl AdminClient {
                             versions::ALTER_PARTITION_REASSIGNMENTS_MAX,
                             versions::ALTER_PARTITION_REASSIGNMENTS_MIN,
                         )
-                        .await
                         .ok_or_else(|| {
                             KrafkaError::protocol_kind(
                                 ProtocolErrorKind::UnknownApiVersion,
                                 "no mutually supported AlterPartitionReassignments API version",
                             )
                         })?;
+
+                    // Refusing a replication-factor change is only expressible
+                    // from v1. Silently downgrading would send a request the
+                    // broker reads as "changes allowed" — the opposite of what
+                    // the caller asked for.
+                    if !allow_replication_factor_change && version < 1 {
+                        return Err(KrafkaError::protocol_kind(
+                            ProtocolErrorKind::UnknownApiVersion,
+                            "allow_replication_factor_change = false requires \
+                             AlterPartitionReassignments v1+ (Kafka 4.1), but the \
+                             controller only supports v0",
+                        ));
+                    }
 
                     let response_bytes = conn
                         .send_request(ApiKey::AlterPartitionReassignments, version, |buf| {
@@ -478,7 +519,6 @@ impl AdminClient {
                 versions::LIST_PARTITION_REASSIGNMENTS_MAX,
                 versions::LIST_PARTITION_REASSIGNMENTS_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -667,7 +707,6 @@ impl AdminClient {
                     versions::ALTER_REPLICA_LOG_DIRS_MAX,
                     versions::ALTER_REPLICA_LOG_DIRS_MIN,
                 )
-                .await
                 .ok_or_else(|| {
                     KrafkaError::protocol_kind(
                         ProtocolErrorKind::UnknownApiVersion,
@@ -910,6 +949,7 @@ mod tests {
     fn test_alter_reassignments_distinguishes_start_from_cancel() {
         let request = AlterPartitionReassignmentsRequest {
             timeout_ms: 60_000,
+            allow_replication_factor_change: true,
             topics: vec![ReassignableTopic {
                 name: "orders".into(),
                 partitions: vec![

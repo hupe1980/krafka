@@ -636,15 +636,11 @@ impl TelemetryReporter {
     /// KIP-714 API (or supports only versions outside our range) is treated as
     /// a permanent condition instead of being retried forever.
     async fn get_subscription(&self, client_instance_id: [u8; 16]) -> SubscriptionResult {
-        let Some(api_version) = self
-            .connection
-            .negotiate_api_version(
-                ApiKey::GetTelemetrySubscriptions,
-                versions::GET_TELEMETRY_SUBSCRIPTIONS_MAX,
-                versions::GET_TELEMETRY_SUBSCRIPTIONS_MIN,
-            )
-            .await
-        else {
+        let Some(api_version) = self.connection.negotiate_api_version(
+            ApiKey::GetTelemetrySubscriptions,
+            versions::GET_TELEMETRY_SUBSCRIPTIONS_MAX,
+            versions::GET_TELEMETRY_SUBSCRIPTIONS_MIN,
+        ) else {
             warn!(
                 "Broker does not support a compatible GetTelemetrySubscriptions version; stopping telemetry reporter"
             );
@@ -886,15 +882,11 @@ impl TelemetryReporter {
         payload: Vec<u8>,
         compression: Compression,
     ) -> PushResult {
-        let Some(api_version) = self
-            .connection
-            .negotiate_api_version(
-                ApiKey::PushTelemetry,
-                versions::PUSH_TELEMETRY_MAX,
-                versions::PUSH_TELEMETRY_MIN,
-            )
-            .await
-        else {
+        let Some(api_version) = self.connection.negotiate_api_version(
+            ApiKey::PushTelemetry,
+            versions::PUSH_TELEMETRY_MAX,
+            versions::PUSH_TELEMETRY_MIN,
+        ) else {
             warn!(
                 "Broker does not support a compatible PushTelemetry version; stopping telemetry reporter"
             );
@@ -1101,7 +1093,7 @@ impl TelemetryReporter {
                 continue;
             }
 
-            match compression.compress(payload) {
+            match compression.compress_with_level(payload, None) {
                 Ok(compressed) => {
                     if compressed.len() >= payload.len() {
                         if fallback_compression.is_none() {
@@ -2269,7 +2261,7 @@ mod tests {
             .collect();
         let payload = TelemetryReporter::build_payload_from_metrics(&[], &metric_bytes);
         let compressed = Compression::Gzip
-            .compress(&payload)
+            .compress_with_level(&payload, None)
             .expect("gzip compression should succeed in this test");
 
         assert!(payload.len() > compressed.len());

@@ -161,7 +161,9 @@ impl VersionedEncode for UpdateFeaturesRequest {
     fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
         match version {
             0 => self.encode_v0(buf)?,
-            1 => self.encode_v1(buf)?,
+            // v2 is request-wire-identical to v1; only the *response* changed
+            // (KIP-1014 dropped the per-feature `Results` array).
+            1..=2 => self.encode_v1(buf)?,
             _ => return unsupported_encode!("UpdateFeaturesRequest", version),
         }
         Ok(())
@@ -225,12 +227,33 @@ impl UpdateFeaturesResponse {
             results,
         })
     }
+
+    /// Decode from version 2 (flexible, **no** per-feature results).
+    ///
+    /// v2 removed the `Results` array from the wire: the controller now
+    /// reports a single top-level outcome rather than one entry per feature.
+    /// [`results`](Self::results) is therefore always empty at v2 — a
+    /// successful response means every requested update was applied, and a
+    /// failed one names the reason in [`error_message`](Self::error_message).
+    pub fn decode_v2(buf: &mut impl Buf) -> Result<Self> {
+        let throttle_time_ms = i32::decode(buf)?;
+        let error_code = ErrorCode::from(i16::decode(buf)?);
+        let error_message = KafkaString::decode_compact(buf)?.0;
+        let _ = TaggedFields::decode(buf)?; // top-level tagged fields
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            error_message,
+            results: Vec::new(),
+        })
+    }
 }
 
 impl VersionedDecode for UpdateFeaturesResponse {
     fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
         match version {
             0 | 1 => Self::decode_v0(buf),
+            2 => Self::decode_v2(buf),
             _ => unsupported_decode!("UpdateFeaturesResponse", version),
         }
     }
@@ -321,9 +344,50 @@ mod tests {
         request.encode_versioned(1, &mut buf1).unwrap();
         // v0 and v1 have different wire formats (AllowDowngrade vs UpgradeType)
         assert_ne!(buf0, buf1);
-        // v2 should fail
+        // v2 is request-identical to v1 (only the response changed).
         let mut buf2 = BytesMut::new();
-        assert!(request.encode_versioned(2, &mut buf2).is_err());
+        request.encode_versioned(2, &mut buf2).unwrap();
+        assert_eq!(buf1, buf2);
+        // v3 does not exist.
+        let mut buf3 = BytesMut::new();
+        assert!(request.encode_versioned(3, &mut buf3).is_err());
+    }
+
+    /// v2 dropped the per-feature `Results` array; the decoder must stop after
+    /// the top-level tagged fields instead of trying to read an array that is
+    /// not on the wire.
+    #[test]
+    fn test_update_features_response_decode_v2_has_no_results() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(7); // throttle_time_ms
+        buf.put_i16(0); // error_code (None)
+        varint::encode_unsigned_varint(0, &mut buf); // null error_message
+        put_tagged_fields(&mut buf); // top-level tagged fields
+
+        let resp = UpdateFeaturesResponse::decode_versioned(2, &mut buf.freeze()).unwrap();
+        assert_eq!(resp.throttle_time_ms, 7);
+        assert!(resp.is_ok());
+        assert!(
+            resp.results.is_empty(),
+            "v2 carries no per-feature results on the wire"
+        );
+    }
+
+    /// A v2 error response still names the reason at the top level, which is
+    /// the only place it exists once `Results` is gone.
+    #[test]
+    fn test_update_features_response_decode_v2_error() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0);
+        buf.put_i16(1); // UNKNOWN_SERVER_ERROR
+        let msg = "metadata.version cannot be downgraded";
+        varint::encode_unsigned_varint((msg.len() + 1) as u32, &mut buf);
+        buf.put_slice(msg.as_bytes());
+        put_tagged_fields(&mut buf);
+
+        let resp = UpdateFeaturesResponse::decode_versioned(2, &mut buf.freeze()).unwrap();
+        assert!(!resp.is_ok());
+        assert_eq!(resp.error_message.as_deref(), Some(msg));
     }
 
     #[test]

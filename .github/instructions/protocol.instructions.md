@@ -23,4 +23,4 @@ When adding a new version (`encode_vN` / `decode_vN`):
 
 When adding fields to a request/response struct, check which versions include that field.
 Fields not present in older versions must use sentinel defaults (typically `-1` for i32/i64).
-See `docs/protocol.md` for version-to-field mapping.
+See `site/content/docs/protocol.md` for version-to-field mapping.

@@ -160,6 +160,11 @@ pub(crate) fn read_compact_string(buf: &mut impl Buf) -> Result<String> {
     })
 }
 
+/// Write a non-nullable compact string.
+pub(crate) fn write_compact_string(buf: &mut impl BufMut, value: &str) -> Result<()> {
+    KafkaString::new(value).try_encode_compact(buf)
+}
+
 /// Write a nullable compact string.
 pub(crate) fn write_compact_nullable_string(
     buf: &mut impl BufMut,
@@ -174,6 +179,17 @@ pub(crate) fn write_compact_nullable_string(
 /// Read compact nullable bytes.
 pub(crate) fn read_compact_nullable_bytes(buf: &mut impl Buf) -> Result<Option<Bytes>> {
     Ok(KafkaBytes::decode_compact(buf)?.0)
+}
+
+/// Write nullable compact bytes.
+pub(crate) fn write_compact_nullable_bytes(
+    buf: &mut impl BufMut,
+    value: Option<&Bytes>,
+) -> Result<()> {
+    match value {
+        Some(v) => KafkaBytes(Some(v.clone())).try_encode_compact(buf),
+        None => KafkaBytes(None).try_encode_compact(buf),
+    }
 }
 
 /// Write an empty tagged-field section: a single zero varint.
@@ -1125,4 +1141,283 @@ mod tests {
         buf.put_i32(-1);
         assert!(read_array_len(&mut buf.freeze()).is_err());
     }
+}
+
+// ── Share groups (KIP-932) ───────────────────────────────────────────────
+
+/// A `ShareGroupHeartbeat` v1 request.
+#[derive(Debug)]
+pub(crate) struct ShareGroupHeartbeatReq {
+    /// Share group ID.
+    pub group_id: String,
+    /// Client-generated member ID (KIP-932 share groups always use one).
+    pub member_id: String,
+    /// Member epoch; `-1` signals a leave.
+    pub member_epoch: i32,
+    /// Subscribed topics, or `None` when unchanged since the last heartbeat.
+    pub subscribed_topic_names: Option<Vec<String>>,
+}
+
+impl ShareGroupHeartbeatReq {
+    pub(crate) fn read(buf: &mut impl Buf) -> Result<Self> {
+        let group_id = read_compact_string(buf)?;
+        let member_id = read_compact_string(buf)?;
+        let member_epoch = i32::decode(buf)?;
+        let _rack_id = read_compact_nullable_string(buf)?;
+        let subscribed_topic_names = match read_compact_nullable_array_len(buf)? {
+            None => None,
+            Some(n) => {
+                let mut topics = Vec::with_capacity(n);
+                for _ in 0..n {
+                    topics.push(read_compact_string(buf)?);
+                }
+                Some(topics)
+            }
+        };
+        skip_tagged_fields(buf)?;
+        Ok(Self {
+            group_id,
+            member_id,
+            member_epoch,
+            subscribed_topic_names,
+        })
+    }
+}
+
+/// One acknowledgement batch inside a `ShareFetch` / `ShareAcknowledge`.
+#[derive(Debug)]
+pub(crate) struct ShareAckBatch {
+    /// First offset of the range.
+    pub first_offset: i64,
+    /// Last offset of the range, inclusive.
+    pub last_offset: i64,
+    /// One acknowledge type per offset in the range.
+    pub acknowledge_types: Vec<i8>,
+}
+
+/// A `(topic_id, partition, acks)` triple from a share request.
+#[derive(Debug)]
+pub(crate) struct ShareTopicPartitionAcks {
+    /// Topic UUID.
+    pub topic_id: [u8; 16],
+    /// Partition index.
+    pub partition_index: i32,
+    /// Acknowledgement batches piggybacked on this partition.
+    pub acknowledgement_batches: Vec<ShareAckBatch>,
+}
+
+/// Read the `Topics -> Partitions -> AcknowledgementBatches` nesting shared by
+/// `ShareFetch` and `ShareAcknowledge`, then the trailing forgotten-topics
+/// array where present.
+fn read_share_topics(buf: &mut impl Buf) -> Result<Vec<ShareTopicPartitionAcks>> {
+    let topic_count = read_compact_array_len(buf)?;
+    let mut out = Vec::new();
+    for _ in 0..topic_count {
+        let mut topic_id = [0u8; 16];
+        if buf.remaining() < 16 {
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::TruncatedFrame,
+                "not enough bytes for share topic_id",
+            ));
+        }
+        buf.copy_to_slice(&mut topic_id);
+        let part_count = read_compact_array_len(buf)?;
+        for _ in 0..part_count {
+            let partition_index = i32::decode(buf)?;
+            let batch_count = read_compact_array_len(buf)?;
+            let mut batches = Vec::with_capacity(batch_count);
+            for _ in 0..batch_count {
+                let first_offset = i64::decode(buf)?;
+                let last_offset = i64::decode(buf)?;
+                let type_count = read_compact_array_len(buf)?;
+                let mut acknowledge_types = Vec::with_capacity(type_count);
+                for _ in 0..type_count {
+                    acknowledge_types.push(i8::decode(buf)?);
+                }
+                skip_tagged_fields(buf)?;
+                batches.push(ShareAckBatch {
+                    first_offset,
+                    last_offset,
+                    acknowledge_types,
+                });
+            }
+            skip_tagged_fields(buf)?;
+            out.push(ShareTopicPartitionAcks {
+                topic_id,
+                partition_index,
+                acknowledgement_batches: batches,
+            });
+        }
+        skip_tagged_fields(buf)?;
+    }
+    Ok(out)
+}
+
+/// A `ShareFetch` v1/v2 request.
+#[derive(Debug)]
+pub(crate) struct ShareFetchReq {
+    /// Share group ID.
+    pub group_id: Option<String>,
+    /// Member ID.
+    pub member_id: Option<String>,
+    /// Maximum records the broker may acquire for this request.
+    pub max_records: i32,
+    /// Requested topic-partitions, with any piggybacked acknowledgements.
+    pub topics: Vec<ShareTopicPartitionAcks>,
+}
+
+impl ShareFetchReq {
+    pub(crate) fn read(buf: &mut impl Buf, version: i16) -> Result<Self> {
+        let group_id = read_compact_nullable_string(buf)?;
+        let member_id = read_compact_nullable_string(buf)?;
+        let _share_session_epoch = i32::decode(buf)?;
+        let _max_wait_ms = i32::decode(buf)?;
+        let _min_bytes = i32::decode(buf)?;
+        let _max_bytes = i32::decode(buf)?;
+        let max_records = i32::decode(buf)?;
+        let _batch_size = i32::decode(buf)?;
+        if version >= 2 {
+            let _share_acquire_mode = i8::decode(buf)?;
+            let _is_renew_ack = i8::decode(buf)?;
+        }
+        let topics = read_share_topics(buf)?;
+        // ForgottenTopicsData: topic_id + partition list, no ack batches.
+        let forgotten_count = read_compact_array_len(buf)?;
+        for _ in 0..forgotten_count {
+            if buf.remaining() < 16 {
+                return Err(KrafkaError::protocol_kind(
+                    ProtocolErrorKind::TruncatedFrame,
+                    "not enough bytes for forgotten topic_id",
+                ));
+            }
+            buf.advance(16);
+            let n = read_compact_array_len(buf)?;
+            for _ in 0..n {
+                let _ = i32::decode(buf)?;
+            }
+            skip_tagged_fields(buf)?;
+        }
+        skip_tagged_fields(buf)?;
+        Ok(Self {
+            group_id,
+            member_id,
+            max_records,
+            topics,
+        })
+    }
+}
+
+/// A `ShareAcknowledge` v1/v2 request.
+#[derive(Debug)]
+pub(crate) struct ShareAcknowledgeReq {
+    /// Share group ID.
+    pub group_id: Option<String>,
+    /// Member ID.
+    pub member_id: Option<String>,
+    /// Acknowledged topic-partitions.
+    pub topics: Vec<ShareTopicPartitionAcks>,
+}
+
+impl ShareAcknowledgeReq {
+    pub(crate) fn read(buf: &mut impl Buf, version: i16) -> Result<Self> {
+        let group_id = read_compact_nullable_string(buf)?;
+        let member_id = read_compact_nullable_string(buf)?;
+        let _share_session_epoch = i32::decode(buf)?;
+        if version >= 2 {
+            let _is_renew_ack = i8::decode(buf)?;
+        }
+        let topics = read_share_topics(buf)?;
+        skip_tagged_fields(buf)?;
+        Ok(Self {
+            group_id,
+            member_id,
+            topics,
+        })
+    }
+}
+
+// ── UpdateFeatures (KIP-584) ─────────────────────────────────────────────
+
+/// One feature update inside an `UpdateFeatures` request.
+#[derive(Debug)]
+pub(crate) struct FeatureUpdate {
+    /// Feature name, e.g. `metadata.version`.
+    pub feature: String,
+    /// Requested version level; `0` deletes the feature.
+    pub max_version_level: i16,
+}
+
+/// An `UpdateFeatures` v0–v2 request.
+#[derive(Debug)]
+pub(crate) struct UpdateFeaturesReq {
+    /// Requested updates.
+    pub feature_updates: Vec<FeatureUpdate>,
+    /// Whether the controller should simulate rather than apply.
+    ///
+    /// Absent before v1, which is the whole reason this handler cares about
+    /// the version: a v0 controller silently *applies* what the caller asked
+    /// to simulate.
+    pub validate_only: bool,
+}
+
+impl UpdateFeaturesReq {
+    pub(crate) fn read(buf: &mut impl Buf, version: i16) -> Result<Self> {
+        let _timeout_ms = i32::decode(buf)?;
+        let count = read_compact_array_len(buf)?;
+        let mut feature_updates = Vec::with_capacity(count);
+        for _ in 0..count {
+            let feature = read_compact_string(buf)?;
+            let max_version_level = i16::decode(buf)?;
+            // v0 has AllowDowngrade (bool), v1+ has UpgradeType (i8). Both are
+            // one byte and neither changes what this handler does.
+            let _ = i8::decode(buf)?;
+            skip_tagged_fields(buf)?;
+            feature_updates.push(FeatureUpdate {
+                feature,
+                max_version_level,
+            });
+        }
+        let validate_only = if version >= 1 {
+            i8::decode(buf)? != 0
+        } else {
+            false
+        };
+        skip_tagged_fields(buf)?;
+        Ok(Self {
+            feature_updates,
+            validate_only,
+        })
+    }
+}
+
+// ── StreamsGroupDescribe (KIP-1071) ──────────────────────────────────────
+
+/// A `StreamsGroupDescribe` v0 request.
+#[derive(Debug)]
+pub(crate) struct StreamsGroupDescribeReq {
+    /// Groups to describe.
+    pub group_ids: Vec<String>,
+    /// Whether the caller asked for the authorized-operations bitfield.
+    pub include_authorized_operations: bool,
+}
+
+impl StreamsGroupDescribeReq {
+    pub(crate) fn read(buf: &mut impl Buf) -> Result<Self> {
+        let count = read_compact_array_len(buf)?;
+        let mut group_ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            group_ids.push(read_compact_string(buf)?);
+        }
+        let include_authorized_operations = i8::decode(buf)? != 0;
+        skip_tagged_fields(buf)?;
+        Ok(Self {
+            group_ids,
+            include_authorized_operations,
+        })
+    }
+}
+
+/// Write a non-tagged nullable struct's presence byte.
+pub(crate) fn write_presence(buf: &mut impl BufMut, present: bool) {
+    buf.put_i8(if present { 1 } else { -1 });
 }

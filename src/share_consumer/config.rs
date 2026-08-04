@@ -103,6 +103,14 @@ pub struct ShareConsumerConfig {
     pub(crate) fetch_max_wait_ms: i32,
     /// Request timeout.
     pub(crate) request_timeout: Duration,
+    /// How long TCP establishment to one broker may take.
+    ///
+    /// Also the floor on [`request_timeout`](Self::request_timeout): a request
+    /// cannot be given less time than the connection it travels over. Without
+    /// this setter, a share consumer could not use a `request_timeout` below
+    /// the 10 s default at all — `build()` rejected it with an error naming a
+    /// value the builder had no way to change.
+    pub(crate) connect_timeout: Duration,
     /// Session timeout for share group membership.
     pub(crate) session_timeout: Duration,
     /// Heartbeat interval.
@@ -128,6 +136,11 @@ pub struct ShareConsumerConfig {
     /// SOCKS5 proxy configuration.
     #[cfg(feature = "socks5")]
     pub(crate) proxy: Option<crate::network::ProxyConfig>,
+    /// Socket- and pool-level transport tuning.
+    ///
+    /// Defaults reproduce krafka's historical behaviour; see
+    /// [`TransportConfig`](crate::network::TransportConfig).
+    pub(crate) transport: crate::network::TransportConfig,
 }
 
 impl Default for ShareConsumerConfig {
@@ -145,6 +158,7 @@ impl Default for ShareConsumerConfig {
             batch_size: 500,
             fetch_max_wait_ms: 500,
             request_timeout: Duration::from_secs(30),
+            connect_timeout: crate::network::DEFAULT_CONNECT_TIMEOUT,
             session_timeout: Duration::from_secs(45),
             heartbeat_interval: Duration::from_secs(5),
             client_rack: None,
@@ -156,6 +170,7 @@ impl Default for ShareConsumerConfig {
             max_decompressed_size: crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE,
             #[cfg(feature = "socks5")]
             proxy: None,
+            transport: crate::network::TransportConfig::default(),
         }
     }
 }

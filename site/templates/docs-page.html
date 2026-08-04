@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block body %}
+<div class="docs-layout wrap">
+
+  <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="docs-sidebar">Menu</button>
+
+  <aside id="docs-sidebar" class="docs-sidebar">
+    {% set current = page.extra.slug_id | default(value="") %}
+    {% include "docs-nav.html" %}
+  </aside>
+
+  <main id="main" class="docs-main">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="{{ get_url(path='@/_index.md') | safe }}">krafka</a>
+      <span aria-hidden="true">/</span>
+      <a href="{{ get_url(path='@/docs/_index.md') | safe }}">Docs</a>
+      <span aria-hidden="true">/</span>
+      <span aria-current="page">{{ page.title }}</span>
+    </nav>
+
+    <article class="prose">
+      <h1>{{ page.title }}</h1>
+      <p class="page-description">{{ page.description }}</p>
+      {{ page.content | safe }}
+    </article>
+
+    <footer class="page-footer">
+      <a href="{{ config.extra.repo }}/edit/main/site/content/docs/{{ page.relative_path | split(pat='/') | last }}" rel="noopener">Edit this page on GitHub</a>
+    </footer>
+  </main>
+
+  {% if page.toc | length > 1 %}
+  <aside class="docs-toc" aria-label="On this page">
+    <p class="nav-group">On this page</p>
+    <ul>
+      {% for h in page.toc %}
+      <li><a href="{{ h.permalink | safe }}">{{ h.title }}</a>
+        {% if h.children | length > 0 %}
+        <ul>
+          {% for c in h.children %}<li><a href="{{ c.permalink | safe }}">{{ c.title }}</a></li>{% endfor %}
+        </ul>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+  </aside>
+  {% endif %}
+
+</div>
+{% endblock body %}

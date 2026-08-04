@@ -963,7 +963,7 @@ impl RecordAccumulator {
                 msg = receiver.recv() => {
                     match msg {
                         Some(AccumulatorMessage::Append(append)) => {
-                            self.handle_append(append).await;
+                            self.handle_append(append);
                         }
                         Some(AccumulatorMessage::Flush { response_tx }) => {
                             let result = self.flush_all().await;
@@ -998,7 +998,7 @@ impl RecordAccumulator {
     /// `permit_reservation.forget()` so the eventual `InFlightGuard` can
     /// release the permits on batch completion; error paths let the
     /// reservation drop naturally, returning the permits to the pool.
-    async fn handle_append(&mut self, append: AppendCommand) {
+    fn handle_append(&mut self, append: AppendCommand) {
         let AppendCommand {
             topic,
             record,
@@ -1699,14 +1699,11 @@ impl RecordAccumulator {
             }
 
             // Negotiate Produce version for this broker.
-            let mut produce_version = match conn
-                .negotiate_api_version(
-                    ApiKey::Produce,
-                    versions::PRODUCE_MAX,
-                    versions::PRODUCE_MIN,
-                )
-                .await
-            {
+            let mut produce_version = match conn.negotiate_api_version(
+                ApiKey::Produce,
+                versions::PRODUCE_MAX,
+                versions::PRODUCE_MIN,
+            ) {
                 Some(v) => v,
                 None => {
                     let e = KrafkaError::protocol_kind(

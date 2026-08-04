@@ -1,6 +1,6 @@
 [package]
 name = "krafka"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["hupe1980"]
@@ -112,6 +112,18 @@ aws-msk = ["dep:aws-config", "dep:aws-credential-types"]
 # Enable the built-in Confluent Schema Registry HTTP client.
 # The core schema_registry module (wire format, trait, caching) is always available.
 schema-registry = ["dep:serde", "dep:serde_json"]
+# Enable the built-in OIDC token provider for SASL/OAUTHBEARER: the OAuth 2.0
+# `client_credentials` grant (KIP-768) plus the RFC 7523 client-assertion
+# variant (KIP-1258).
+#
+# Without it, `OAuthBearerTokenProvider` is still available and you supply
+# tokens yourself; this feature is the batteries-included path.
+#
+# No cryptography dependency is added. Assertions are supplied as pre-signed
+# JWTs — read from a file written by a sidecar, or produced by a callback —
+# because pinning an RSA/ECDSA implementation on every user is a supply-chain
+# decision that belongs to the application, not the client.
+oauth-oidc = ["dep:serde", "dep:serde_json", "tokio/fs"]
 # Enable the AWS Glue Schema Registry SDK client.
 # The core glue module (wire format, trait, caching) is always available.
 # This feature adds the aws-sdk-glue dependency for direct Glue API calls
@@ -120,8 +132,15 @@ aws-glue-schema-registry = ["dep:aws-sdk-glue", "dep:aws-config", "dep:flate2"]
 # Enable loading platform-native root certificates for TLS client verification.
 # When enabled, `TlsConfig::with_native_roots()` can use the OS trust store.
 native-tls-roots = ["dep:rustls-native-certs"]
-# Enable cutting-edge protocol versions that target unreleased Kafka builds.
-# Includes Fetch v17-v18, ApiVersions v5, InitProducerId v6, and Share Groups.
+# Enable protocol versions that Kafka itself marks `latestVersionUnstable`, i.e.
+# versions a released broker does not advertise unless it was started with
+# `unstable.api.versions.enable=true`.
+#
+# Includes ApiVersions v5 (KIP-1242), InitProducerId v6 (KIP-939 two-phase
+# commit) and the Share Consumer (KIP-932) module.
+#
+# Fetch v17/v18 are NOT in this list: they shipped in Kafka 4.0 and 4.1 as
+# stable versions and are negotiated by default.
 unstable-protocol = []
 # Enable KIP-714 client telemetry APIs (GetTelemetrySubscriptions, PushTelemetry).
 telemetry = []
@@ -174,7 +193,13 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.rust]
 unsafe_code = "deny"
-missing_docs = "warn"
+# Denied rather than warned, for the same reason as the clippy lints below: a
+# warning binds only PRs that pass through CI's `-Dwarnings`, while a deny binds
+# anyone who builds the crate. An undocumented public item in a client library
+# is a defect — this crate's own review history includes a feature that was
+# implemented, documented and uncallable, and the documentation is what people
+# reach for first.
+missing_docs = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
 rust_2018_idioms = { level = "warn", priority = -1 }
 
@@ -190,7 +215,18 @@ rust_2018_idioms = { level = "warn", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
-undocumented_unsafe_blocks = "warn"
+undocumented_unsafe_blocks = "deny"
+
+# An `async fn` with no `await` inside is contagious: it forces every caller —
+# and every caller's caller — to be async for what is a synchronous operation,
+# and it costs a future state machine at every call site.
+#
+# Five had accumulated. `BrokerConnection::negotiate_api_version` made 86 call
+# sites `.await` a `parking_lot::Mutex` lookup, and `Producer::metrics()` was
+# the only metrics accessor in the crate that could not be read from a
+# synchronous context — a Prometheus scrape handler could call
+# `Consumer::metrics()` but not the producer's.
+unused_async = "deny"
 
 [profile.release]
 lto = true

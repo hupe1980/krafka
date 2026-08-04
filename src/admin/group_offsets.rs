@@ -61,7 +61,6 @@ impl AdminClient {
                 versions::OFFSET_DELETE_MAX,
                 versions::OFFSET_DELETE_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -168,7 +167,6 @@ impl AdminClient {
                 versions::OFFSET_FETCH_MAX,
                 versions::OFFSET_FETCH_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -281,7 +279,6 @@ impl AdminClient {
                 versions::OFFSET_COMMIT_MAX,
                 versions::OFFSET_COMMIT_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,

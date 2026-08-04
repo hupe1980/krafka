@@ -57,6 +57,7 @@
 //! - [`write_txn_markers`] — WriteTxnMarkers
 //! - [`telemetry`] — KIP-714 telemetry (feature-gated)
 //! - [`share`] — KIP-932 share groups (feature-gated)
+//! - [`share_group_offsets`] — Share-group offset admin (Keys 90–92, KIP-932/KIP-1226)
 
 use bytes::{Buf, BufMut, Bytes};
 
@@ -250,6 +251,12 @@ pub use sasl::*;
 
 mod share;
 pub use share::*;
+
+mod share_group_offsets;
+pub use share_group_offsets::*;
+
+mod streams_group_describe;
+pub use streams_group_describe::*;
 
 #[cfg(feature = "telemetry")]
 mod telemetry;

@@ -73,13 +73,11 @@ impl AdminClient {
             let conn = self.pool.get_connection_by_id(*broker_id, addr).await?;
 
             // Try ConsumerGroupDescribe (Key 69) first for all groups on this broker.
-            let kip848_version = conn
-                .negotiate_api_version(
-                    ApiKey::ConsumerGroupDescribe,
-                    versions::CONSUMER_GROUP_DESCRIBE_MAX,
-                    versions::CONSUMER_GROUP_DESCRIBE_MIN,
-                )
-                .await;
+            let kip848_version = conn.negotiate_api_version(
+                ApiKey::ConsumerGroupDescribe,
+                versions::CONSUMER_GROUP_DESCRIBE_MAX,
+                versions::CONSUMER_GROUP_DESCRIBE_MIN,
+            );
 
             let mut classic_fallback: Vec<String> = Vec::new();
             let mut maybe_classic: Vec<(String, ConsumerGroupDescription)> = Vec::new();
@@ -215,7 +213,6 @@ impl AdminClient {
                         versions::DESCRIBE_GROUPS_MAX,
                         versions::DESCRIBE_GROUPS_MIN,
                     )
-                    .await
                     .ok_or_else(|| {
                         KrafkaError::protocol_kind(
                             ProtocolErrorKind::UnknownApiVersion,
@@ -355,14 +352,11 @@ impl AdminClient {
                 types_filter: Vec::new(),
             };
 
-            let version = match conn
-                .negotiate_api_version(
-                    ApiKey::ListGroups,
-                    versions::LIST_GROUPS_MAX,
-                    versions::LIST_GROUPS_MIN,
-                )
-                .await
-            {
+            let version = match conn.negotiate_api_version(
+                ApiKey::ListGroups,
+                versions::LIST_GROUPS_MAX,
+                versions::LIST_GROUPS_MIN,
+            ) {
                 Some(v) => v,
                 None => {
                     warn!(
@@ -534,7 +528,6 @@ impl AdminClient {
                         versions::DELETE_RECORDS_MAX,
                         versions::DELETE_RECORDS_MIN,
                     )
-                    .await
                     .ok_or_else(|| {
                         KrafkaError::protocol_kind(
                             ProtocolErrorKind::UnknownApiVersion,
@@ -684,7 +677,6 @@ impl AdminClient {
                         versions::OFFSET_FOR_LEADER_EPOCH_MAX,
                         versions::OFFSET_FOR_LEADER_EPOCH_MIN,
                     )
-                    .await
                     .ok_or_else(|| {
                         KrafkaError::protocol_kind(
                             ProtocolErrorKind::UnknownApiVersion,

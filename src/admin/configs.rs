@@ -41,7 +41,6 @@ impl AdminClient {
                 versions::DESCRIBE_CONFIGS_MAX,
                 versions::DESCRIBE_CONFIGS_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -182,7 +181,6 @@ impl AdminClient {
                             versions::INCREMENTAL_ALTER_CONFIGS_MAX,
                             versions::INCREMENTAL_ALTER_CONFIGS_MIN,
                         )
-                        .await
                         .ok_or_else(|| {
                             KrafkaError::protocol_kind(
                                 ProtocolErrorKind::UnknownApiVersion,
@@ -364,7 +362,6 @@ impl AdminClient {
                 versions::DESCRIBE_CLUSTER_MAX,
                 versions::DESCRIBE_CLUSTER_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-label="krafka — a pure-Rust Apache Kafka client">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#17170f"/>
+      <stop offset="1" stop-color="#24160e"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <circle cx="1060" cy="90" r="260" fill="#d34516" opacity="0.10"/>
+  <rect x="80" y="140" width="72" height="72" rx="16" fill="#d34516"/>
+  <path d="M97 156h11v20l16-20h13l-18 22 18 24h-13l-16-21v21H97z" fill="#fff"/>
+  <text x="176" y="200" font-family="ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif" font-size="60" font-weight="700" fill="#ffffff" letter-spacing="-2">krafka</text>
+  <text x="80" y="330" font-family="ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif" font-size="54" font-weight="700" fill="#ffffff" letter-spacing="-1.5">A pure-Rust Apache Kafka client.</text>
+  <text x="80" y="400" font-family="ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif" font-size="34" fill="#a49e8e">No librdkafka. No C toolchain. No unsafe. No panics.</text>
+  <text x="80" y="452" font-family="ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif" font-size="34" fill="#a49e8e">Protocol parity with Apache Kafka 4.3, enforced in CI.</text>
+  <rect x="80" y="518" width="360" height="60" rx="10" fill="#1f1f18" stroke="#3a3a30"/>
+  <text x="104" y="557" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="26" fill="#f08a5f">cargo add krafka</text>
+  <text x="1120" y="560" text-anchor="end" font-family="ui-sans-serif,system-ui,sans-serif" font-size="24" fill="#6f6a5d">hupe1980.github.io/krafka</text>
+</svg>

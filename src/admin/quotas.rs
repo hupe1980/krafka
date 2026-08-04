@@ -66,7 +66,6 @@ impl AdminClient {
                 versions::DESCRIBE_CLIENT_QUOTAS_MAX,
                 versions::DESCRIBE_CLIENT_QUOTAS_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -200,7 +199,6 @@ impl AdminClient {
                             versions::ALTER_CLIENT_QUOTAS_MAX,
                             versions::ALTER_CLIENT_QUOTAS_MIN,
                         )
-                        .await
                         .ok_or_else(|| {
                             KrafkaError::protocol_kind(
                                 ProtocolErrorKind::UnknownApiVersion,

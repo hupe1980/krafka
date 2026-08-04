@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% set is_home = true %}
+
+{% block body %}
+<main id="main">
+
+  <section class="hero">
+    <div class="wrap">
+      <p class="eyebrow">Apache Kafka · Rust · Tokio</p>
+      <h1>{{ section.extra.tagline }}</h1>
+      <p class="lede">{{ section.extra.lede | markdown(inline=true) | safe }}</p>
+
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="{{ get_url(path='@/docs/getting-started.md') | safe }}">Get started</a>
+        <a class="btn" href="{{ get_url(path='@/docs/_index.md') | safe }}">Documentation</a>
+        <a class="btn btn-ghost" href="{{ config.extra.repo }}" rel="noopener">GitHub</a>
+      </div>
+
+      <div class="install">
+        <code id="install-cmd">cargo add krafka</code>
+        <button class="copy-btn" type="button" data-copy-target="install-cmd" aria-label="Copy install command">Copy</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="stats" aria-label="At a glance">
+    <div class="wrap stat-grid">
+      {%- for h in section.extra.highlights %}
+      <div class="stat">
+        <span class="stat-value">{{ h.value }}</span>
+        <span class="stat-label">{{ h.label }}</span>
+        <span class="stat-note">{{ h.note }}</span>
+      </div>
+      {%- endfor %}
+    </div>
+  </section>
+
+  <section class="pillars">
+    <div class="wrap">
+      <h2 class="section-heading">Built on four commitments</h2>
+      <div class="pillar-grid">
+        {%- for p in section.extra.pillars %}
+        <article class="pillar">
+          <h3>{{ p.title }}</h3>
+          <p>{{ p.body | markdown(inline=true) | safe }}</p>
+        </article>
+        {%- endfor %}
+      </div>
+    </div>
+  </section>
+
+  <section class="prose-section">
+    <div class="wrap prose">
+      {{ section.content | safe }}
+    </div>
+  </section>
+
+  <section class="cta">
+    <div class="wrap">
+      <h2>Ready to move some bytes?</h2>
+      <p>Five minutes from <code>cargo add</code> to a consumed record.</p>
+      <a class="btn btn-primary" href="{{ get_url(path='@/docs/getting-started.md') | safe }}">Read the guide</a>
+    </div>
+  </section>
+
+</main>
+{% endblock body %}

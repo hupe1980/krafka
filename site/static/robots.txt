@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://hupe1980.github.io/krafka/sitemap.xml

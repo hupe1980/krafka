@@ -195,7 +195,16 @@ impl<const L: usize, T> LeveledRwLock<L, T> {
     ///
     /// In `debug_assertions` builds this also checks the lock-ordering
     /// invariant, ensuring the same guarantee as the async `write()` path.
-    #[allow(dead_code)] // part of the API; not every caller uses it today
+    // Deliberately kept despite having no production caller today.
+    //
+    // The point of `LeveledRwLock` is that *every* acquisition passes through
+    // the ordering check. A missing `try_write` would push the next caller who
+    // needs one to reach for the inner `tokio::sync::RwLock` directly and
+    // silently bypass the tracker — which is the failure this type exists to
+    // prevent. `try_read`, its counterpart, does have callers.
+    //
+    // Covered by `test_try_write_returns_guard`, so it cannot rot unnoticed.
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn try_write(
         &self,

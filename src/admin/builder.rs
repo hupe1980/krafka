@@ -108,6 +108,29 @@ impl AdminClientBuilder {
         self
     }
 
+    /// Set the maximum age of cached cluster metadata before a refresh.
+    ///
+    /// Default: 5 min, matching the other clients.
+    pub fn metadata_max_age(mut self, age: Duration) -> Self {
+        self.config.metadata_max_age = age;
+        self
+    }
+
+    /// Set socket- and pool-level transport tuning.
+    ///
+    /// Covers TCP keepalive and nodelay, the per-connection response ceiling
+    /// and in-flight cap, the priority-channel depths, the Happy Eyeballs
+    /// stagger, idle-connection eviction, a total-connection cap, and the
+    /// KIP-1288 automatic TLS reload interval.
+    ///
+    /// Omitting this call keeps krafka's historical defaults, which
+    /// [`TransportConfig::default`](crate::network::TransportConfig) reproduces
+    /// exactly.
+    pub fn transport(mut self, transport: crate::network::TransportConfig) -> Self {
+        self.config.transport = transport;
+        self
+    }
+
     /// Configure SASL/PLAIN authentication.
     pub fn sasl_plain(
         mut self,
@@ -168,6 +191,22 @@ impl AdminClientBuilder {
         self.shared = Some((client.pool().clone(), client.metadata().clone()));
         self
     }
+    /// Validate the configuration and return it, without connecting.
+    ///
+    /// Runs the same checks [`build`](Self::build) runs before it opens a
+    /// socket, so a config that passes here will not be rejected later for a
+    /// configuration reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KrafkaError::Config`](crate::error::KrafkaError::Config) when
+    /// `bootstrap_servers` is empty and no shared client was supplied.
+    pub fn build_config(self) -> Result<AdminConfig> {
+        if self.shared.is_none() && self.config.bootstrap_servers.is_empty() {
+            return Err(KrafkaError::config("bootstrap.servers is required"));
+        }
+        Ok(self.config)
+    }
 
     /// Build the admin client.
     pub async fn build(self) -> Result<AdminClient> {
@@ -188,10 +227,12 @@ impl AdminClientBuilder {
                 crate::util::parse_bootstrap_servers(&self.config.bootstrap_servers)?;
 
             // Create connection config with client ID and auth
-            let mut conn_config_builder = ConnectionConfig::builder()
-                .client_id(&self.config.client_id)
-                .request_timeout(self.config.request_timeout)
-                .connect_timeout(self.config.connect_timeout);
+            let mut conn_config_builder = self.config.transport.apply(
+                ConnectionConfig::builder()
+                    .client_id(&self.config.client_id)
+                    .request_timeout(self.config.request_timeout)
+                    .connect_timeout(self.config.connect_timeout),
+            );
 
             if let Some(ref auth) = self.config.auth {
                 conn_config_builder = conn_config_builder.auth(auth.clone());
@@ -205,15 +246,23 @@ impl AdminClientBuilder {
             let mut conn_config = conn_config_builder.build()?;
             conn_config.init_tls().await?;
 
-            let pool = Arc::new(ConnectionPool::new(conn_config));
-            pool.start_idle_evictor();
+            // Every client builds its pool through `TransportConfig::build_pool`,
+            // which applies the pool-level settings and starts the background
+            // tasks (idle eviction, OAUTHBEARER refresh, KIP-1288 TLS reload).
+            // Routing all construction sites through one function is what stops
+            // them drifting apart again.
+            let pool = self.config.transport.build_pool(conn_config);
             let metadata = Arc::new(
-                ClusterMetadata::new(bootstrap_servers, pool.clone(), Duration::from_secs(300))
-                    .with_recovery_strategy(self.config.metadata_recovery_strategy)
-                    .with_rebootstrap_trigger(self.config.metadata_recovery_rebootstrap_trigger)
-                    // Bound waits on an in-flight refresh by the request
-                    // timeout rather than the 300 s metadata max-age.
-                    .with_request_timeout(self.config.request_timeout),
+                ClusterMetadata::new(
+                    bootstrap_servers,
+                    pool.clone(),
+                    self.config.metadata_max_age,
+                )
+                .with_recovery_strategy(self.config.metadata_recovery_strategy)
+                .with_rebootstrap_trigger(self.config.metadata_recovery_rebootstrap_trigger)
+                // Bound waits on an in-flight refresh by the request
+                // timeout rather than the 300 s metadata max-age.
+                .with_request_timeout(self.config.request_timeout),
             );
 
             metadata.refresh().await?;

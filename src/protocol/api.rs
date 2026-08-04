@@ -159,10 +159,14 @@ pub enum ApiKey {
     ConsumerGroupHeartbeat = 68,
     /// Consumer group describe (KIP-848).
     ConsumerGroupDescribe = 69,
+    /// Controller registration (KRaft controller-internal).
+    ControllerRegistration = 70,
     /// Get telemetry subscriptions (KIP-714).
     GetTelemetrySubscriptions = 71,
     /// Push telemetry (KIP-714).
     PushTelemetry = 72,
+    /// Assign replicas to log directories (KIP-858, broker-internal).
+    AssignReplicasToDirs = 73,
     /// List config resources (KIP-1142).
     ///
     /// Kafka 4.1 renamed this API from `ListClientMetricsResources`; v0 keeps
@@ -178,6 +182,32 @@ pub enum ApiKey {
     ShareFetch = 78,
     /// Share acknowledge (KIP-932).
     ShareAcknowledge = 79,
+    /// Add a KRaft voter (KIP-853).
+    AddRaftVoter = 80,
+    /// Remove a KRaft voter (KIP-853).
+    RemoveRaftVoter = 81,
+    /// Update a KRaft voter (KIP-853, controller-internal).
+    UpdateRaftVoter = 82,
+    /// Initialize share-group state (KIP-932, broker-internal persister).
+    InitializeShareGroupState = 83,
+    /// Read share-group state (KIP-932, broker-internal persister).
+    ReadShareGroupState = 84,
+    /// Write share-group state (KIP-932, broker-internal persister).
+    WriteShareGroupState = 85,
+    /// Delete share-group state (KIP-932, broker-internal persister).
+    DeleteShareGroupState = 86,
+    /// Read share-group state summary (KIP-932, broker-internal persister).
+    ReadShareGroupStateSummary = 87,
+    /// Streams group heartbeat (KIP-1071).
+    StreamsGroupHeartbeat = 88,
+    /// Streams group describe (KIP-1071).
+    StreamsGroupDescribe = 89,
+    /// Describe share-group offsets (KIP-932, KIP-1226 adds lag).
+    DescribeShareGroupOffsets = 90,
+    /// Alter (reset) share-group offsets (KIP-932).
+    AlterShareGroupOffsets = 91,
+    /// Delete share-group offsets (KIP-932).
+    DeleteShareGroupOffsets = 92,
     /// Unknown API key.
     Unknown(i16),
 }
@@ -259,7 +289,12 @@ impl ApiKey {
             | Self::ShareGroupHeartbeat
             | Self::ShareGroupDescribe
             | Self::ShareFetch
-            | Self::ShareAcknowledge => 0,
+            | Self::ShareAcknowledge
+            | Self::StreamsGroupHeartbeat
+            | Self::StreamsGroupDescribe
+            | Self::DescribeShareGroupOffsets
+            | Self::AlterShareGroupOffsets
+            | Self::DeleteShareGroupOffsets => 0,
             _ => return None,
         };
         Some(min)
@@ -347,6 +382,21 @@ impl ApiKey {
             77 => Self::ShareGroupDescribe,
             78 => Self::ShareFetch,
             79 => Self::ShareAcknowledge,
+            70 => Self::ControllerRegistration,
+            73 => Self::AssignReplicasToDirs,
+            80 => Self::AddRaftVoter,
+            81 => Self::RemoveRaftVoter,
+            82 => Self::UpdateRaftVoter,
+            83 => Self::InitializeShareGroupState,
+            84 => Self::ReadShareGroupState,
+            85 => Self::WriteShareGroupState,
+            86 => Self::DeleteShareGroupState,
+            87 => Self::ReadShareGroupStateSummary,
+            88 => Self::StreamsGroupHeartbeat,
+            89 => Self::StreamsGroupDescribe,
+            90 => Self::DescribeShareGroupOffsets,
+            91 => Self::AlterShareGroupOffsets,
+            92 => Self::DeleteShareGroupOffsets,
             other => Self::Unknown(other),
         }
     }
@@ -433,6 +483,21 @@ impl ApiKey {
             Self::ShareGroupDescribe => 77,
             Self::ShareFetch => 78,
             Self::ShareAcknowledge => 79,
+            Self::ControllerRegistration => 70,
+            Self::AssignReplicasToDirs => 73,
+            Self::AddRaftVoter => 80,
+            Self::RemoveRaftVoter => 81,
+            Self::UpdateRaftVoter => 82,
+            Self::InitializeShareGroupState => 83,
+            Self::ReadShareGroupState => 84,
+            Self::WriteShareGroupState => 85,
+            Self::DeleteShareGroupState => 86,
+            Self::ReadShareGroupStateSummary => 87,
+            Self::StreamsGroupHeartbeat => 88,
+            Self::StreamsGroupDescribe => 89,
+            Self::DescribeShareGroupOffsets => 90,
+            Self::AlterShareGroupOffsets => 91,
+            Self::DeleteShareGroupOffsets => 92,
             Self::Unknown(key) => key,
         }
     }
@@ -522,6 +587,22 @@ impl ApiKey {
             Self::ShareGroupDescribe => 0,
             Self::ShareFetch => 0,
             Self::ShareAcknowledge => 0,
+            // Every API added from Kafka 3.7 onwards is flexible from v0.
+            Self::ControllerRegistration
+            | Self::AssignReplicasToDirs
+            | Self::AddRaftVoter
+            | Self::RemoveRaftVoter
+            | Self::UpdateRaftVoter
+            | Self::InitializeShareGroupState
+            | Self::ReadShareGroupState
+            | Self::WriteShareGroupState
+            | Self::DeleteShareGroupState
+            | Self::ReadShareGroupStateSummary
+            | Self::StreamsGroupHeartbeat
+            | Self::StreamsGroupDescribe
+            | Self::DescribeShareGroupOffsets
+            | Self::AlterShareGroupOffsets
+            | Self::DeleteShareGroupOffsets => 0,
             // Unknown APIs: assume never flexible (safest default).
             Self::Unknown(_) => i16::MAX,
         }

@@ -101,10 +101,11 @@
 //! | `zstd` | no | Zstd compression via `zstd` (requires C toolchain). |
 //! | `aws-msk` | no | AWS MSK IAM authentication with SDK credential chain. |
 //! | `schema-registry` | no | Confluent Schema Registry HTTP client. |
+//! | `oauth-oidc` | no | Built-in OIDC token provider for SASL/OAUTHBEARER: the `client_credentials` grant (KIP-768) and RFC 7523 client assertions (KIP-1258). Adds no cryptography dependency — assertions are supplied pre-signed. |
 //! | `aws-glue-schema-registry` | no | AWS Glue Schema Registry SDK client. |
 //! | `socks5` | no | SOCKS5 proxy support via `tokio-socks`. |
 //! | `telemetry` | no | OpenTelemetry exporter for producer/consumer metrics. |
-//! | `unstable-protocol` | no | Enables experimental protocol APIs (Share Consumer, KIP-932). APIs under this feature may change without semver notice. |
+//! | `unstable-protocol` | no | Enables protocol versions Kafka marks `latestVersionUnstable` — a released broker does not advertise them without `unstable.api.versions.enable=true`. Covers `ApiVersions` v5 (KIP-1242), `InitProducerId` v6 (KIP-939) and the Share Consumer (KIP-932). APIs under this feature may change without semver notice. |
 //! | `ring` | **yes** | rustls crypto backend using `ring` (pure Rust). |
 //! | `rustls-aws-lc-rs` | no | rustls crypto backend using `aws-lc-rs`. Preferred on AWS Graviton and for FIPS deployments. |
 //! | `native-tls-roots` | no | Load platform-native root certificates via `rustls-native-certs`. |
@@ -134,7 +135,7 @@
 //! ```toml
 //! [dependencies]
 //! # `ring` (or `rustls-aws-lc-rs`) is required — without it the build fails.
-//! krafka = { version = "0.14.0", default-features = false, features = ["lz4", "ring"] }
+//! krafka = { version = "0.15.0", default-features = false, features = ["lz4", "ring"] }
 //! ```
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -174,6 +175,13 @@ pub mod client;
 pub mod consumer;
 pub mod dlq;
 pub mod error;
+/// Minimal async HTTP/1.1 client shared by the OIDC token provider and the
+/// Confluent Schema Registry client.
+///
+/// Compiled only when a feature needs it (`oauth-oidc` or `schema-registry`).
+/// This is an implementation detail and not part of the stable public API.
+#[cfg(any(feature = "oauth-oidc", feature = "schema-registry"))]
+mod http;
 pub mod interceptor;
 /// Cluster metadata cache and refresh logic.
 ///

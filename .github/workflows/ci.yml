@@ -108,13 +108,40 @@ jobs:
       - uses: extractions/setup-just@v3
       - run: just test-cross-platform
 
-  api-parity:
-    name: API surface parity
+  protocol-parity:
+    name: Protocol version parity
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: extractions/setup-just@v3
-      - run: just api-parity
+      # Reads the vendored `xtask/kafka_protocol_snapshot.json`, so this job
+      # needs no network and cannot flake on a GitHub API rate limit. Refresh
+      # the snapshot deliberately with `just refresh-protocol-snapshot <tag>`.
+      - run: just protocol-parity
+
+  secret-debug:
+    name: No secrets in Debug
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v3
+      - run: just secret-debug
+
+  version-check:
+    name: Version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v3
+      - run: just version-check
+
+  test-reachability:
+    name: No tests that cannot fail
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v3
+      - run: just test-reachability
 
   doc:
     name: Documentation

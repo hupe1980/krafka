@@ -1147,7 +1147,6 @@ impl ClusterMetadata {
                     crate::protocol::versions::METADATA_MAX,
                     crate::protocol::versions::METADATA_MIN,
                 )
-                .await
                 .unwrap_or_else(|| {
                     debug!("Metadata API version negotiation unavailable; falling back to MIN");
                     crate::protocol::versions::METADATA_MIN

@@ -9,7 +9,8 @@ use crate::protocol::{check_compact_array_len, decode_capacity, encode_compact_a
 // ============================================================================
 // AlterPartitionReassignments API (Key 45)
 //
-// v0 baseline. All versions use flexible encoding.
+// v0 baseline, v1 adds AllowReplicationFactorChange (Kafka 4.1).
+// All versions use flexible encoding.
 // ============================================================================
 
 /// A partition reassignment specification.
@@ -35,6 +36,22 @@ pub struct ReassignableTopic {
 pub struct AlterPartitionReassignmentsRequest {
     /// Timeout in milliseconds.
     pub timeout_ms: i32,
+    /// Whether a reassignment may change a partition's replication factor
+    /// (v1+, Kafka 4.1).
+    ///
+    /// `true` — the broker default and the v0 behaviour — accepts a target
+    /// replica set of a different size than the current one, silently changing
+    /// the topic's replication factor.
+    ///
+    /// `false` asks the broker to reject any such move with
+    /// `INVALID_REPLICATION_FACTOR` instead. That is the safer choice for a
+    /// rebalance tool: an off-by-one in a generated reassignment plan then
+    /// fails loudly rather than quietly reducing durability.
+    ///
+    /// Ignored when the negotiated version is v0, where the field does not
+    /// exist on the wire; see
+    /// [`AdminClient::alter_partition_reassignments`](crate::admin::AdminClient::alter_partition_reassignments).
+    pub allow_replication_factor_change: bool,
     /// Topics to reassign.
     pub topics: Vec<ReassignableTopic>,
 }
@@ -47,7 +64,23 @@ impl AlterPartitionReassignmentsRequest {
 
     /// Encode for version 0 (flexible encoding).
     pub fn encode_v0(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.encode_inner(buf, false)
+    }
+
+    /// Encode for version 1 (adds `AllowReplicationFactorChange`).
+    pub fn encode_v1(&self, buf: &mut impl BufMut) -> Result<()> {
+        self.encode_inner(buf, true)
+    }
+
+    fn encode_inner(
+        &self,
+        buf: &mut impl BufMut,
+        include_allow_replication_factor_change: bool,
+    ) -> Result<()> {
         self.timeout_ms.encode(buf);
+        if include_allow_replication_factor_change {
+            self.allow_replication_factor_change.encode(buf);
+        }
         encode_compact_array_len(self.topics.len(), buf)?;
         for topic in &self.topics {
             KafkaString::new(&topic.name).try_encode_compact(buf)?;
@@ -79,6 +112,7 @@ impl VersionedEncode for AlterPartitionReassignmentsRequest {
     fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
         match version {
             0 => self.encode_v0(buf),
+            1 => self.encode_v1(buf),
             _ => unsupported_encode!("AlterPartitionReassignmentsRequest", version),
         }
     }
@@ -115,6 +149,10 @@ pub struct AlterPartitionReassignmentsResponse {
     pub error_code: ErrorCode,
     /// Top-level error message, or `None` if no error.
     pub error_message: Option<String>,
+    /// v1+: the `AllowReplicationFactorChange` value the broker actually
+    /// applied. Always `true` at v0, where the field does not exist and the
+    /// broker's behaviour is unconditionally "allowed".
+    pub allow_replication_factor_change: bool,
     /// Per-topic results.
     pub responses: Vec<ReassignableTopicResponse>,
 }
@@ -122,7 +160,21 @@ pub struct AlterPartitionReassignmentsResponse {
 impl AlterPartitionReassignmentsResponse {
     /// Decode from version 0 (flexible encoding).
     pub fn decode_v0(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode_inner(buf, false)
+    }
+
+    /// Decode from version 1 (adds `AllowReplicationFactorChange`).
+    pub fn decode_v1(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode_inner(buf, true)
+    }
+
+    fn decode_inner(buf: &mut impl Buf, has_allow_replication_factor_change: bool) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
+        let allow_replication_factor_change = if has_allow_replication_factor_change {
+            bool::decode(buf)?
+        } else {
+            true
+        };
         let error_code = ErrorCode::from_i16(i16::decode(buf)?);
         let error_message = KafkaString::decode_compact(buf)?.0;
 
@@ -155,6 +207,7 @@ impl AlterPartitionReassignmentsResponse {
             throttle_time_ms,
             error_code,
             error_message,
+            allow_replication_factor_change,
             responses,
         })
     }
@@ -164,6 +217,7 @@ impl VersionedDecode for AlterPartitionReassignmentsResponse {
     fn decode_versioned(version: i16, buf: &mut impl Buf) -> Result<Self> {
         match version {
             0 => Self::decode_v0(buf),
+            1 => Self::decode_v1(buf),
             _ => unsupported_decode!("AlterPartitionReassignmentsResponse", version),
         }
     }
@@ -192,6 +246,7 @@ mod tests {
     fn test_alter_partition_reassignments_request_encode_v0() {
         let request = AlterPartitionReassignmentsRequest {
             timeout_ms: 60_000,
+            allow_replication_factor_change: true,
             topics: vec![ReassignableTopic {
                 name: "my-topic".to_string(),
                 partitions: vec![
@@ -216,11 +271,61 @@ mod tests {
     fn test_alter_partition_reassignments_versioned_unsupported() {
         let request = AlterPartitionReassignmentsRequest {
             timeout_ms: 60_000,
+            allow_replication_factor_change: true,
             topics: Vec::new(),
         };
         let mut buf = BytesMut::new();
         assert!(request.encode_versioned(-1, &mut buf).is_err());
-        assert!(request.encode_versioned(1, &mut buf).is_err());
+        assert!(request.encode_versioned(2, &mut buf).is_err());
+    }
+
+    /// v1 inserts `AllowReplicationFactorChange` immediately after `TimeoutMs`
+    /// and before the topics array. Getting that order wrong would shift every
+    /// subsequent field and make the broker reject the request.
+    #[test]
+    fn test_alter_partition_reassignments_request_encode_v1_field_order() {
+        let request = AlterPartitionReassignmentsRequest {
+            timeout_ms: 30_000,
+            allow_replication_factor_change: false,
+            topics: Vec::new(),
+        };
+
+        let mut buf = BytesMut::new();
+        request.encode_v1(&mut buf).unwrap();
+
+        let mut cur = &buf[..];
+        assert_eq!(i32::decode(&mut cur).unwrap(), 30_000);
+        assert!(
+            !bool::decode(&mut cur).unwrap(),
+            "AllowReplicationFactorChange must follow TimeoutMs"
+        );
+        // Empty compact topics array is varint(1).
+        assert_eq!(
+            crate::util::varint::decode_unsigned_varint(&mut cur).unwrap(),
+            1
+        );
+        // Top-level tagged fields.
+        assert_eq!(
+            crate::util::varint::decode_unsigned_varint(&mut cur).unwrap(),
+            0
+        );
+        assert!(cur.is_empty());
+    }
+
+    /// v0 must not emit the v1-only field — a v0 broker would read it as the
+    /// leading byte of the topics array.
+    #[test]
+    fn test_alter_partition_reassignments_request_v0_omits_v1_field() {
+        let request = AlterPartitionReassignmentsRequest {
+            timeout_ms: 30_000,
+            allow_replication_factor_change: false,
+            topics: Vec::new(),
+        };
+        let mut v0 = BytesMut::new();
+        let mut v1 = BytesMut::new();
+        request.encode_v0(&mut v0).unwrap();
+        request.encode_v1(&mut v1).unwrap();
+        assert_eq!(v1.len(), v0.len() + 1, "v1 adds exactly one bool byte");
     }
 
     /// Build a compact (flexible) string: varint(len+1) followed by raw bytes.
@@ -316,14 +421,48 @@ mod tests {
                 .is_err()
         );
         assert!(
-            AlterPartitionReassignmentsResponse::decode_versioned(1, &mut buf.freeze()).is_err()
+            AlterPartitionReassignmentsResponse::decode_versioned(2, &mut buf.freeze()).is_err()
         );
+    }
+
+    /// v1 echoes the applied `AllowReplicationFactorChange` right after
+    /// `ThrottleTimeMs`, ahead of the error code.
+    #[test]
+    fn test_alter_partition_reassignments_response_decode_v1() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_u8(0); // allow_replication_factor_change = false
+        buf.put_i16(0); // error_code = NONE
+        put_compact_null_string(&mut buf); // error_message
+        put_compact_array_len(&mut buf, 0); // responses
+        put_empty_tagged_fields(&mut buf);
+
+        let resp = AlterPartitionReassignmentsResponse::decode_versioned(1, &mut buf.freeze())
+            .expect("v1 response decodes");
+        assert!(!resp.allow_replication_factor_change);
+        assert!(resp.error_code.is_ok());
+    }
+
+    /// At v0 the field is absent from the wire; the decoded value reports the
+    /// broker's actual v0 behaviour, which is "changes allowed".
+    #[test]
+    fn test_alter_partition_reassignments_response_v0_defaults_allow_true() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0);
+        buf.put_i16(0);
+        put_compact_null_string(&mut buf);
+        put_compact_array_len(&mut buf, 0);
+        put_empty_tagged_fields(&mut buf);
+
+        let resp = AlterPartitionReassignmentsResponse::decode_v0(&mut buf.freeze()).unwrap();
+        assert!(resp.allow_replication_factor_change);
     }
 
     #[test]
     fn test_alter_partition_reassignments_request_empty_topics() {
         let request = AlterPartitionReassignmentsRequest {
             timeout_ms: 30_000,
+            allow_replication_factor_change: true,
             topics: Vec::new(),
         };
         let mut buf = BytesMut::new();

@@ -68,31 +68,57 @@ impl IsolationLevel {
 /// introduced in KIP-848, where the server performs assignment and
 /// members communicate exclusively via heartbeats.
 ///
-/// # Stability
+/// # Which one to choose
 ///
-/// `GroupProtocol::Consumer` (KIP-848) requires **Kafka 3.7 or later** with
-/// the new consumer group protocol enabled on the broker
-/// (`group.coordinator.new.enable=true`). The implementation is functional
-/// but not yet validated against the full KIP-848 specification in all
-/// edge cases (incremental rebalance, epoch fencing, mixed-version clusters).
+/// **Prefer [`Consumer`](Self::Consumer).** KIP-848 was declared production
+/// ready in Apache Kafka 4.0 and is the default server-side protocol from 4.0
+/// onwards. Apache Kafka 4.3 began *deprecating* the classic protocol in the
+/// Java consumer (KIP-1274 phase 1: a warning today, the default flips in 5.0,
+/// removal in 6.0). krafka's floor is Kafka 3.9, so `Classic` remains the
+/// default here for one more release — but it is the legacy path, not the safe
+/// path, and selecting it emits a one-time deprecation warning to match the
+/// Java client.
 ///
-/// For production workloads, use `GroupProtocol::Classic` (the default)
-/// unless you are specifically targeting Kafka 3.7+ and have validated
-/// the KIP-848 behaviour for your workload.
+/// | | `Classic` | `Consumer` (KIP-848) |
+/// |---|---|---|
+/// | Assignment computed by | the group leader, client-side | the group coordinator, broker-side |
+/// | Rebalance | stop-the-world barrier across all members | incremental, per-member reconciliation |
+/// | A slow member | stalls the whole group | affects only its own partitions |
+/// | Broker requirement | any | Kafka 4.0+ (3.7+ with `group.coordinator.new.enable=true`) |
+/// | Apache status | deprecated from 4.3 (KIP-1274) | production ready from 4.0 |
+///
+/// krafka's KIP-848 implementation is validated end to end against a
+/// multi-member reconciliation suite: revoke-before-assign ordering, epoch
+/// fencing, and the invariant that no partition is ever owned by two members
+/// at once.
+///
+/// Switching is a one-line change, but note that the two protocols **cannot
+/// mix within one group** on brokers below 4.0: move every member of a group
+/// together, or upgrade the cluster first.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GroupProtocol {
     /// Classic group protocol (JoinGroup/SyncGroup/Heartbeat).
     ///
-    /// Supported on all Kafka broker versions. This is the default and
-    /// recommended choice for production workloads.
+    /// Works against every broker version, and is still krafka's default so
+    /// that upgrading the client is never itself a protocol migration.
+    ///
+    /// **Deprecated upstream.** Apache Kafka 4.3 (KIP-1274 phase 1) logs a
+    /// warning whenever the Java consumer runs this protocol; Kafka 5.0 flips
+    /// the default to [`Consumer`](Self::Consumer) and 6.0 removes classic
+    /// support entirely. krafka mirrors the warning. Plan the migration now
+    /// rather than at the 5.0 upgrade.
     #[default]
     Classic,
     /// KIP-848 consumer group protocol (ConsumerGroupHeartbeat).
     ///
-    /// **Requires Kafka 3.7+ with `group.coordinator.new.enable=true`.**
-    /// Not yet fully validated for all rebalance edge cases. Prefer
-    /// `Classic` for production use until this note is removed.
+    /// Server-side assignment with incremental reconciliation: a rebalance no
+    /// longer stops every member, and a slow member no longer stalls the
+    /// group.
+    ///
+    /// Production ready since Apache Kafka 4.0 and the recommended choice for
+    /// new deployments. Requires Kafka 4.0+, or 3.7–3.9 with
+    /// `group.coordinator.new.enable=true` on the broker.
     Consumer,
 }
 
@@ -175,7 +201,9 @@ impl PartitionAssignmentStrategy {
 
 /// Consumer configuration.
 ///
-/// Use [`ConsumerConfig::builder()`] or [`Default::default()`] to construct.
+/// Produced by [`Consumer::builder()`](super::Consumer::builder), whose
+/// [`build_config`](super::ConsumerBuilder::build_config) terminal returns it
+/// without connecting. [`Default::default()`] also works.
 #[derive(Debug, Clone)]
 pub struct ConsumerConfig {
     /// Bootstrap servers (comma-separated).
@@ -339,6 +367,12 @@ pub struct ConsumerConfig {
     /// SOCKS5 proxy configuration (optional).
     #[cfg(feature = "socks5")]
     pub(crate) proxy: Option<crate::network::ProxyConfig>,
+    /// Socket- and pool-level transport tuning.
+    ///
+    /// Defaults reproduce krafka's historical behaviour; see
+    /// [`TransportConfig`](crate::network::TransportConfig).
+    pub(crate) transport: crate::network::TransportConfig,
+
     /// Per-partition initial offsets applied before auto-offset-reset.
     ///
     /// When a partition is first assigned and has no committed group offset,
@@ -346,7 +380,7 @@ pub struct ConsumerConfig {
     /// position, overriding `auto_offset_reset`.
     ///
     /// Keyed by `(topic, partition)`.  Build via
-    /// [`ConsumerConfigBuilder::initial_offsets`].
+    /// [`ConsumerBuilder::initial_offsets`](super::ConsumerBuilder::initial_offsets).
     pub(crate) initial_offsets: HashMap<(String, PartitionId), Offset>,
     /// Maximum number of cooperative-rebalance rejoin rounds per poll cycle.
     ///
@@ -431,6 +465,7 @@ impl Default for ConsumerConfig {
             max_decompressed_size: crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE,
             #[cfg(feature = "socks5")]
             proxy: None,
+            transport: crate::network::TransportConfig::default(),
             initial_offsets: HashMap::new(),
             max_cooperative_rebalance_rounds: 10,
             lag_staleness_threshold: Duration::from_secs(60),
@@ -441,11 +476,6 @@ impl Default for ConsumerConfig {
 }
 
 impl ConsumerConfig {
-    /// Create a new config builder.
-    pub fn builder() -> ConsumerConfigBuilder {
-        ConsumerConfigBuilder::default()
-    }
-
     /// Returns the bootstrap servers.
     #[inline]
     pub fn bootstrap_servers(&self) -> &str {
@@ -642,379 +672,15 @@ impl ConsumerConfig {
     }
 }
 
-/// Builder for ConsumerConfig.
-#[must_use = "builders do nothing until .build() is called"]
-#[derive(Debug, Default)]
-pub struct ConsumerConfigBuilder {
-    config: ConsumerConfig,
-}
-
-impl ConsumerConfigBuilder {
-    /// Set bootstrap servers.
-    pub fn bootstrap_servers(mut self, servers: impl Into<String>) -> Self {
-        self.config.bootstrap_servers = servers.into();
-        self
-    }
-
-    /// Set group ID.
-    pub fn group_id(mut self, id: impl Into<String>) -> Self {
-        self.config.group_id = Some(id.into());
-        self
-    }
-
-    /// Set client ID.
-    pub fn client_id(mut self, id: impl Into<String>) -> Self {
-        self.config.client_id = id.into();
-        self
-    }
-
-    /// Set auto offset reset.
-    pub fn auto_offset_reset(mut self, reset: AutoOffsetReset) -> Self {
-        self.config.auto_offset_reset = reset;
-        self
-    }
-
-    /// Enable automatic offset commit.
-    ///
-    /// See [`ConsumerConfig::enable_auto_commit`] for semantics and caveats.
-    pub fn enable_auto_commit(mut self, enable: bool) -> Self {
-        self.config.enable_auto_commit = enable;
-        self
-    }
-
-    /// Set auto commit interval.
-    pub fn auto_commit_interval(mut self, interval: Duration) -> Self {
-        self.config.auto_commit_interval = interval;
-        self
-    }
-
-    /// Set isolation level.
-    pub fn isolation_level(mut self, level: IsolationLevel) -> Self {
-        self.config.isolation_level = level;
-        self
-    }
-
-    /// Set authentication configuration.
-    ///
-    /// Enables TLS and/or SASL authentication for all connections.
-    pub fn auth(mut self, auth: AuthConfig) -> Self {
-        self.config.auth = Some(auth);
-        self
-    }
-
-    /// Set the maximum decompressed size for record batches.
-    ///
-    /// Compressed payloads that decompress beyond this limit are rejected as
-    /// potential compression bombs. Defaults to
-    /// [`RecordBatch::MAX_DECOMPRESSED_SIZE`](crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE) (128 MiB).
-    pub fn max_decompressed_size(mut self, size: usize) -> Self {
-        self.config.max_decompressed_size = size;
-        self
-    }
-
-    /// Set SOCKS5 proxy configuration.
-    ///
-    /// Routes all broker connections through the specified SOCKS5 proxy.
-    #[cfg(feature = "socks5")]
-    pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
-        self.config.proxy = Some(proxy);
-        self
-    }
-
-    /// Set a single partition assignment strategy, replacing the default
-    /// preference list.
-    ///
-    /// Note that pinning the group to exactly one protocol removes the ability
-    /// to migrate between rebalance protocols without a full group outage. Use
-    /// [`partition_assignment_strategies`](Self::partition_assignment_strategies)
-    /// to advertise several.
-    pub fn partition_assignment_strategy(mut self, strategy: PartitionAssignmentStrategy) -> Self {
-        self.config.partition_assignment_strategies = vec![strategy];
-        self
-    }
-
-    /// Set the partition assignment strategies in order of preference.
-    ///
-    /// All are advertised in JoinGroup; the coordinator selects the
-    /// most-preferred protocol supported by every member of the group. See
-    /// [`ConsumerConfig::partition_assignment_strategies`] for how this
-    /// enables rolling protocol migrations.
-    ///
-    /// An empty list is rejected at build time.
-    pub fn partition_assignment_strategies(
-        mut self,
-        strategies: impl IntoIterator<Item = PartitionAssignmentStrategy>,
-    ) -> Self {
-        self.config.partition_assignment_strategies = strategies.into_iter().collect();
-        self
-    }
-
-    /// Set the group protocol (KIP-848).
-    ///
-    /// `Classic` uses the traditional JoinGroup/SyncGroup/Heartbeat flow.
-    /// `Consumer` uses the new server-side assignment via ConsumerGroupHeartbeat.
-    ///
-    /// **`GroupProtocol::Consumer` requires Kafka 3.7+ and is not yet
-    /// recommended for production.** See [`GroupProtocol`] for details.
-    pub fn group_protocol(mut self, protocol: GroupProtocol) -> Self {
-        self.config.group_protocol = protocol;
-        self
-    }
-
-    /// Set the static group membership instance ID (KIP-345).
-    ///
-    /// When set, the consumer uses static membership. The broker preserves
-    /// partition assignments across restarts as long as the same instance ID
-    /// is used. This avoids unnecessary rebalances when consumers restart.
-    pub fn group_instance_id(mut self, id: impl Into<String>) -> Self {
-        self.config.group_instance_id = Some(id.into());
-        self
-    }
-
-    /// Set minimum bytes to fetch per request.
-    pub fn fetch_min_bytes(mut self, bytes: i32) -> Self {
-        self.config.fetch_min_bytes = bytes;
-        self
-    }
-
-    /// Set how long the broker may hold a fetch request waiting for
-    /// [`fetch_min_bytes`](Self::fetch_min_bytes) to accumulate.
-    ///
-    /// This is independent of the [`poll()`](super::Consumer::poll) timeout;
-    /// see [`ConsumerConfig::fetch_max_wait`]. Should be kept comfortably
-    /// below `request_timeout`.
-    pub fn fetch_max_wait(mut self, wait: Duration) -> Self {
-        self.config.fetch_max_wait = wait;
-        self
-    }
-
-    /// Set maximum bytes to fetch per request.
-    pub fn fetch_max_bytes(mut self, bytes: i32) -> Self {
-        self.config.fetch_max_bytes = bytes;
-        self
-    }
-
-    /// Set maximum bytes per partition per fetch request.
-    pub fn max_partition_fetch_bytes(mut self, bytes: i32) -> Self {
-        self.config.max_partition_fetch_bytes = bytes;
-        self
-    }
-
-    /// Override the per-partition fetch byte limit for a specific topic.
-    ///
-    /// When set, partitions of `topic` use `bytes` instead of
-    /// [`max_partition_fetch_bytes`](ConsumerConfigBuilder::max_partition_fetch_bytes).
-    /// Can be called multiple times to configure multiple topics.
-    pub fn topic_fetch_max_bytes(mut self, topic: impl Into<String>, bytes: i32) -> Self {
-        self.config
-            .topic_fetch_max_bytes
-            .insert(topic.into(), bytes);
-        self
-    }
-
-    /// Set maximum records per [`poll()`](super::Consumer::poll) call.
-    ///
-    /// - `-1` means unlimited — no truncation.
-    /// - Positive values cap each poll batch at that many records.
-    /// - `0` and other negative values are rejected at build time.
-    ///
-    /// Default: 500.
-    pub fn max_poll_records(mut self, max: i32) -> Self {
-        self.config.max_poll_records = max;
-        self
-    }
-
-    /// Set maximum records buffered internally by `recv()`.
-    ///
-    /// When the internal buffer reaches this limit, `poll()` skips fetching
-    /// new data until the buffer drains below the threshold. For
-    /// `recv()`-only callers the buffer is naturally bounded by
-    /// `max_poll_records`; this cap guards against mixed `poll()`/`recv()`
-    /// usage and concurrent `recv()` callers.  Set to 0 to disable
-    /// (unlimited). Defaults to 500.
-    pub fn max_buffered_records(mut self, max: i32) -> Self {
-        self.config.max_buffered_records = max;
-        self
-    }
-
-    /// Set maximum poll interval before the consumer is considered dead.
-    pub fn max_poll_interval(mut self, interval: Duration) -> Self {
-        self.config.max_poll_interval = interval;
-        self
-    }
-
-    /// Set request timeout: how long one in-flight request may wait for its
-    /// response. Default: 30 s.
-    ///
-    /// Must be at least [`connect_timeout`](Self::connect_timeout), whose
-    /// default is 10 s — a request's clock covers establishing the connection
-    /// it is sent over, so a shorter value would expire every request before
-    /// the handshake could finish. To go below 10 s, lower `connect_timeout`
-    /// as well; `build()` returns a config error otherwise.
-    pub fn request_timeout(mut self, timeout: Duration) -> Self {
-        self.config.request_timeout = timeout;
-        self
-    }
-
-    /// Set the connect timeout: how long TCP establishment to one broker may
-    /// take. Default: 10 s.
-    ///
-    /// This also acts as the floor on
-    /// [`request_timeout`](Self::request_timeout), so lowering it is what makes
-    /// a sub-10-second request timeout possible.
-    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
-        self.config.connect_timeout = timeout;
-        self
-    }
-
-    /// Set session timeout for consumer group membership.
-    pub fn session_timeout(mut self, timeout: Duration) -> Self {
-        self.config.session_timeout = timeout;
-        self
-    }
-
-    /// Set heartbeat interval.
-    pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
-        self.config.heartbeat_interval = interval;
-        self
-    }
-
-    /// Set metadata max age before refresh.
-    pub fn metadata_max_age(mut self, duration: Duration) -> Self {
-        self.config.metadata_max_age = duration;
-        self
-    }
-
-    /// Set the client rack ID for closest-replica fetching (KIP-392).
-    pub fn client_rack(mut self, rack: impl Into<String>) -> Self {
-        self.config.client_rack = Some(rack.into());
-        self
-    }
-
-    /// Set the metadata recovery strategy (KIP-899).
-    pub fn metadata_recovery_strategy(mut self, strategy: MetadataRecoveryStrategy) -> Self {
-        self.config.metadata_recovery_strategy = strategy;
-        self
-    }
-
-    /// Set the rebootstrap trigger duration (KIP-899).
-    ///
-    /// Only effective when [`MetadataRecoveryStrategy::Rebootstrap`] is set.
-    pub fn metadata_recovery_rebootstrap_trigger(mut self, duration: Duration) -> Self {
-        self.config.metadata_recovery_rebootstrap_trigger = duration;
-        self
-    }
-
-    /// Set the topic cache TTL for partial metadata refreshes.
-    ///
-    /// During partial refreshes, cached topics that have not been refreshed
-    /// within this duration are evicted to prevent unbounded cache growth.
-    ///
-    /// Default: 5 minutes (matching Java's `metadata.max.idle.ms`).
-    pub fn metadata_topic_cache_ttl(mut self, ttl: Duration) -> Self {
-        self.config.metadata_topic_cache_ttl = Some(ttl);
-        self
-    }
-
-    /// Disable topic cache TTL eviction for partial metadata refreshes.
-    ///
-    /// By default, cached topics are evicted after 5 minutes to prevent
-    /// unbounded growth on topic churn. Call this to opt out of TTL eviction;
-    /// entries will then persist across partial refreshes indefinitely.
-    pub fn disable_metadata_topic_cache_ttl(mut self) -> Self {
-        self.config.metadata_topic_cache_ttl = None;
-        self
-    }
-
-    /// Set per-partition initial offsets applied before auto-offset-reset.
-    ///
-    /// When a partition is first assigned and has no committed group offset,
-    /// the consumer will start fetching from the given offset instead of
-    /// applying `auto_offset_reset`.  This is useful for exactly-once recovery
-    /// when you know the exact position to resume from.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// ConsumerConfig::builder()
-    ///     .bootstrap_servers("localhost:9092")
-    ///     .initial_offsets([
-    ///         (("my-topic".to_string(), 0), 1_000),
-    ///         (("my-topic".to_string(), 1), 2_000),
-    ///     ])
-    ///     .build()?;
-    /// ```
-    pub fn initial_offsets(
-        mut self,
-        offsets: impl IntoIterator<Item = ((String, PartitionId), Offset)>,
-    ) -> Self {
-        self.config.initial_offsets = offsets.into_iter().collect();
-        self
-    }
-
-    /// Set the maximum number of cooperative-rebalance rejoin rounds per poll.
-    ///
-    /// Default: 10. Values below 1 are clamped to 1.
-    pub fn max_cooperative_rebalance_rounds(mut self, rounds: usize) -> Self {
-        self.config.max_cooperative_rebalance_rounds = rounds.max(1);
-        self
-    }
-
-    /// Set the staleness threshold for high-watermark freshness in `lag()`.
-    ///
-    /// Partitions whose cached watermark is older than this threshold appear in
-    /// [`crate::consumer::LagResult::stale_partitions`]. Pass `Duration::MAX`
-    /// to disable
-    /// staleness reporting.
-    ///
-    /// Default: 60 s.
-    pub fn lag_staleness_threshold(mut self, threshold: Duration) -> Self {
-        self.config.lag_staleness_threshold = threshold;
-        self
-    }
-
-    /// Set the maximum backoff sleep when a poll cycle returns no new records.
-    ///
-    /// In [`batch_recv`](super::Consumer::batch_recv) and
-    /// [`recv`](super::Consumer::recv), if an internal `poll()` returns with
-    /// no new records (e.g., no assignment, rebalance, or backpressure), the
-    /// consumer sleeps for up to this duration before retrying. Smaller values
-    /// reduce the response latency when records arrive during the sleep window
-    /// at the cost of higher CPU usage under sustained idle conditions.
-    ///
-    /// Default: 10 ms.
-    pub fn idle_poll_backoff(mut self, backoff: Duration) -> Self {
-        self.config.idle_poll_backoff = backoff;
-        self
-    }
-
-    /// Set the maximum time allowed for the `on_partitions_revoked` callback.
-    ///
-    /// If the callback exceeds this duration, the consumer logs a warning and
-    /// proceeds with the rebalance. Default: 5 s.
-    pub fn revocation_timeout(mut self, timeout: Duration) -> Self {
-        self.config.revocation_timeout = timeout;
-        self
-    }
-
-    /// Build the config.
-    ///
-    /// # Errors
-    ///
-    /// See the crate-internal `validate` helper for the full list of constraints.
-    pub fn build(self) -> crate::Result<ConsumerConfig> {
-        validate(&self.config)?;
-        Ok(self.config)
-    }
-}
-
 /// Validate a fully-populated [`ConsumerConfig`].
 ///
 /// This is the single source of truth for consumer configuration constraints.
-/// Both [`ConsumerConfigBuilder::build`] and
-/// [`ConsumerBuilder::build`](super::ConsumerBuilder::build) route through it,
-/// so a config can never reach a live [`Consumer`](super::Consumer) without
-/// having been checked — regardless of which builder the caller used.
+/// This is the single place the rules live. Both the synchronous
+/// [`ConsumerBuilder::build_config`](super::ConsumerBuilder::build_config)
+/// terminal and the async
+/// [`ConsumerBuilder::build`](super::ConsumerBuilder::build) call it, so a
+/// config can never reach a live [`Consumer`](super::Consumer) unchecked and
+/// the two entry points cannot disagree.
 ///
 /// # Errors
 ///
@@ -1123,14 +789,14 @@ mod tests {
 
     #[test]
     fn test_config_builder() {
-        let config = ConsumerConfig::builder()
+        let config = crate::consumer::Consumer::builder()
             .bootstrap_servers("localhost:9092")
             .group_id("test-group")
             .auto_offset_reset(AutoOffsetReset::Earliest)
             .enable_auto_commit(false)
             .isolation_level(IsolationLevel::ReadCommitted)
             .partition_assignment_strategy(PartitionAssignmentStrategy::CooperativeSticky)
-            .build()
+            .build_config()
             .unwrap();
 
         assert_eq!(config.bootstrap_servers, "localhost:9092");
@@ -1159,10 +825,10 @@ mod tests {
 
     #[test]
     fn test_config_builder_fetch_min_bytes() {
-        let config = ConsumerConfig::builder()
+        let config = crate::consumer::Consumer::builder()
             .bootstrap_servers("localhost:9092")
             .fetch_min_bytes(1024)
-            .build()
+            .build_config()
             .unwrap();
         assert_eq!(
             config.fetch_min_bytes, 1024,
@@ -1172,10 +838,10 @@ mod tests {
 
     #[test]
     fn test_config_builder_fetch_max_bytes() {
-        let config = ConsumerConfig::builder()
+        let config = crate::consumer::Consumer::builder()
             .bootstrap_servers("localhost:9092")
             .fetch_max_bytes(10 * 1024 * 1024)
-            .build()
+            .build_config()
             .unwrap();
         assert_eq!(
             config.fetch_max_bytes,
@@ -1186,10 +852,10 @@ mod tests {
 
     #[test]
     fn test_config_builder_metadata_max_age() {
-        let config = ConsumerConfig::builder()
+        let config = crate::consumer::Consumer::builder()
             .bootstrap_servers("localhost:9092")
             .metadata_max_age(Duration::from_secs(60))
-            .build()
+            .build_config()
             .unwrap();
         assert_eq!(
             config.metadata_max_age,
@@ -1209,11 +875,11 @@ mod tests {
 
     #[test]
     fn test_config_builder_group_instance_id() {
-        let config = ConsumerConfig::builder()
+        let config = crate::consumer::Consumer::builder()
             .bootstrap_servers("localhost:9092")
             .group_id("my-group")
             .group_instance_id("instance-1")
-            .build()
+            .build_config()
             .unwrap();
         assert_eq!(
             config.group_instance_id,
@@ -1233,10 +899,10 @@ mod tests {
 
     #[test]
     fn test_config_builder_client_rack() {
-        let config = ConsumerConfig::builder()
+        let config = crate::consumer::Consumer::builder()
             .bootstrap_servers("localhost:9092")
             .client_rack("us-east-1a")
-            .build()
+            .build_config()
             .unwrap();
         assert_eq!(
             config.client_rack,
@@ -1245,6 +911,31 @@ mod tests {
         );
     }
 
+    /// A setter that stores into a field nobody reads is exactly the defect
+    /// `TransportConfig` was introduced to fix, so the round-trip is asserted
+    /// rather than assumed. The connection-level half (config → socket) is
+    /// covered by `network::transport`'s
+    /// `every_connection_field_reaches_the_connection_config`.
+    #[test]
+    fn test_config_builder_transport_round_trips() {
+        let transport = crate::network::TransportConfig::builder()
+            .tcp_keepalive(Some(std::time::Duration::from_secs(11)))
+            .max_connections(Some(7))
+            .build()
+            .expect("valid transport config");
+
+        let config = crate::consumer::Consumer::builder()
+            .bootstrap_servers("localhost:9092")
+            .transport(transport)
+            .build_config()
+            .expect("config builds");
+
+        assert_eq!(
+            config.transport.tcp_keepalive(),
+            Some(std::time::Duration::from_secs(11))
+        );
+        assert_eq!(config.transport.max_connections(), Some(7));
+    }
     #[test]
     fn test_config_default_group_protocol_is_classic() {
         let config = ConsumerConfig::default();
@@ -1257,10 +948,10 @@ mod tests {
 
     #[test]
     fn test_config_builder_group_protocol_consumer() {
-        let config = ConsumerConfig::builder()
+        let config = crate::consumer::Consumer::builder()
             .bootstrap_servers("localhost:9092")
             .group_protocol(GroupProtocol::Consumer)
-            .build()
+            .build_config()
             .unwrap();
         assert_eq!(
             config.group_protocol(),
@@ -1272,10 +963,10 @@ mod tests {
     #[cfg(feature = "socks5")]
     #[test]
     fn test_config_builder_proxy_round_trip() {
-        let config = ConsumerConfig::builder()
+        let config = crate::consumer::Consumer::builder()
             .bootstrap_servers("localhost:9092")
             .proxy(crate::network::ProxyConfig::new("proxy:1080"))
-            .build()
+            .build_config()
             .unwrap();
         let proxy = config.proxy().expect("proxy should be set");
         assert_eq!(proxy.address(), "proxy:1080");
@@ -1296,11 +987,11 @@ mod tests {
 
     #[test]
     fn test_config_builder_recovery_strategy() {
-        let config = ConsumerConfig::builder()
+        let config = crate::consumer::Consumer::builder()
             .bootstrap_servers("localhost:9092")
             .metadata_recovery_strategy(MetadataRecoveryStrategy::Rebootstrap)
             .metadata_recovery_rebootstrap_trigger(Duration::from_secs(60))
-            .build()
+            .build_config()
             .unwrap();
         assert_eq!(
             config.metadata_recovery_strategy(),
@@ -1314,10 +1005,10 @@ mod tests {
 
     #[test]
     fn test_config_builder_rejects_negative_max_buffered_records() {
-        let result = ConsumerConfig::builder()
+        let result = crate::consumer::Consumer::builder()
             .bootstrap_servers("localhost:9092")
             .max_buffered_records(-1)
-            .build();
+            .build_config();
         assert!(result.is_err());
         assert!(
             result
@@ -1330,10 +1021,10 @@ mod tests {
 
     #[test]
     fn test_config_builder_accepts_zero_max_buffered_records() {
-        let config = ConsumerConfig::builder()
+        let config = crate::consumer::Consumer::builder()
             .bootstrap_servers("localhost:9092")
             .max_buffered_records(0)
-            .build()
+            .build_config()
             .unwrap();
         assert_eq!(config.max_buffered_records(), 0);
     }
@@ -1341,10 +1032,10 @@ mod tests {
     #[test]
     fn test_config_builder_accepts_minus_one_max_poll_records_as_unlimited() {
         // -1 means unlimited — poll() must not truncate any records.
-        let config = ConsumerConfig::builder()
+        let config = crate::consumer::Consumer::builder()
             .bootstrap_servers("localhost:9092")
             .max_poll_records(-1)
-            .build()
+            .build_config()
             .unwrap();
         assert_eq!(
             config.max_poll_records(),
@@ -1355,10 +1046,10 @@ mod tests {
 
     #[test]
     fn test_config_builder_rejects_zero_max_poll_records() {
-        let result = ConsumerConfig::builder()
+        let result = crate::consumer::Consumer::builder()
             .bootstrap_servers("localhost:9092")
             .max_poll_records(0)
-            .build();
+            .build_config();
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("max_poll_records"),
@@ -1368,10 +1059,10 @@ mod tests {
 
     #[test]
     fn test_config_builder_rejects_negative_max_poll_records() {
-        let result = ConsumerConfig::builder()
+        let result = crate::consumer::Consumer::builder()
             .bootstrap_servers("localhost:9092")
             .max_poll_records(-2)
-            .build();
+            .build_config();
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("max_poll_records"),
@@ -1381,7 +1072,9 @@ mod tests {
 
     #[test]
     fn test_config_builder_rejects_empty_bootstrap_servers() {
-        let result = ConsumerConfig::builder().bootstrap_servers("").build();
+        let result = crate::consumer::Consumer::builder()
+            .bootstrap_servers("")
+            .build_config();
         assert!(result.is_err());
         assert!(
             result
@@ -1394,10 +1087,10 @@ mod tests {
 
     #[test]
     fn test_config_builder_rejects_empty_group_id() {
-        let result = ConsumerConfig::builder()
+        let result = crate::consumer::Consumer::builder()
             .bootstrap_servers("localhost:9092")
             .group_id("")
-            .build();
+            .build_config();
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("group_id"),

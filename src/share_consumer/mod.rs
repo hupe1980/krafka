@@ -490,6 +490,17 @@ struct ShareConsumerInner {
     metadata: Arc<ClusterMetadata>,
     /// Connection pool.
     pool: Arc<ConnectionPool>,
+    /// Application-level metrics.
+    ///
+    /// Reuses [`ConsumerMetrics`] rather than defining a share-group-specific
+    /// type: a share consumer polls, receives records, acknowledges and hits
+    /// errors exactly as a classic consumer does, and the counters mean the
+    /// same thing. `commits` counts acknowledgement flushes, which is the
+    /// share-group analogue of an offset commit.
+    ///
+    /// Rebalance, lag and partition gauges are left at zero — the coordinator
+    /// owns assignment and there is no per-partition position to lag behind.
+    metrics: Arc<crate::metrics::ConsumerMetrics>,
     /// Subscribed topics.
     subscriptions: RwLock<HashSet<String>>,
     /// Current partition assignments from the coordinator.
@@ -613,9 +624,12 @@ impl ShareConsumer {
 
     /// Create a new share consumer with the given configuration.
     async fn new(config: ShareConsumerConfig) -> Result<Self> {
-        let mut pool_config_builder = ConnectionConfig::builder()
-            .client_id(&config.client_id)
-            .request_timeout(config.request_timeout);
+        let mut pool_config_builder = config.transport.apply(
+            ConnectionConfig::builder()
+                .client_id(&config.client_id)
+                .request_timeout(config.request_timeout)
+                .connect_timeout(config.connect_timeout),
+        );
 
         if let Some(ref auth) = config.auth {
             pool_config_builder = pool_config_builder.auth(auth.clone());
@@ -629,8 +643,12 @@ impl ShareConsumer {
         let mut pool_config = pool_config_builder.build()?;
         pool_config.init_tls().await?;
 
-        let pool = Arc::new(ConnectionPool::new(pool_config));
-        pool.start_idle_evictor();
+        // Every client builds its pool through `TransportConfig::build_pool`,
+        // which applies the pool-level settings and starts the background
+        // tasks (idle eviction, OAUTHBEARER refresh, KIP-1288 TLS reload).
+        // Routing all construction sites through one function is what stops
+        // them drifting apart again.
+        let pool = config.transport.build_pool(pool_config);
 
         let bootstrap_servers = crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
 
@@ -659,6 +677,7 @@ impl ShareConsumer {
             config,
             metadata,
             pool,
+            metrics: Arc::new(crate::metrics::ConsumerMetrics::new()),
             subscriptions: RwLock::new(HashSet::new()),
             assignments: RwLock::new(HashMap::new()),
             member_id: ArcSwap::new(Arc::new(crate::util::random_uuid_v4())),
@@ -778,7 +797,15 @@ impl ShareConsumer {
     /// records actually handed to the caller are acknowledgement-tracked.
     pub async fn poll(&self, timeout: Duration) -> Result<Vec<ConsumerRecord>> {
         let max = self.0.config.max_poll_records as usize;
-        self.poll_inner(timeout, max).await
+        let _timer = self.0.metrics.poll_latency.start();
+        self.0.metrics.polls.inc();
+        let result = self.poll_inner(timeout, max).await;
+        match &result {
+            Ok(records) if records.is_empty() => self.0.metrics.empty_polls.inc(),
+            Ok(_) => {}
+            Err(_) => self.0.metrics.record_error(),
+        }
+        result
     }
 
     /// Shared implementation of [`poll()`](Self::poll) and [`recv()`](Self::recv).
@@ -1047,7 +1074,6 @@ impl ShareConsumer {
                         versions::SHARE_FETCH_MAX,
                         versions::SHARE_FETCH_MIN,
                     )
-                    .await
                     .ok_or_else(|| {
                         KrafkaError::protocol_kind(
                             ProtocolErrorKind::UnknownApiVersion,
@@ -1379,6 +1405,15 @@ impl ShareConsumer {
             return;
         }
 
+        // The single choke point for "handed to the application", so it is the
+        // honest place to count. Instrumenting each `poll_inner` return instead
+        // would miss the buffered-surplus path, which is a real delivery.
+        let bytes: u64 = records
+            .iter()
+            .map(|r| r.value.as_ref().map_or(0, |v| v.len() as u64))
+            .sum();
+        self.0.metrics.record_receive(records.len() as u64, bytes);
+
         match self.0.config.acknowledgement_mode {
             AcknowledgementMode::Implicit => {
                 let ids = self.0.topic_ids.read().await.clone();
@@ -1611,6 +1646,9 @@ impl ShareConsumer {
                 self.0
                     .explicit_flush_retry_required
                     .store(false, Ordering::SeqCst);
+                // A successful acknowledgement flush is the share-group
+                // analogue of an offset commit.
+                self.0.metrics.record_commit();
                 Ok(())
             }
             Some(error) => {
@@ -1998,6 +2036,61 @@ impl ShareConsumer {
         Ok(())
     }
 
+    /// Re-read TLS certificate and key files from disk and atomically install
+    /// the new material for all **future** connections (KIP-1288).
+    ///
+    /// Existing TLS sessions are unaffected: they keep the connector they
+    /// handshaked with and are replaced naturally as connections cycle. On
+    /// error the previously loaded certificates stay active, so a call made
+    /// mid-rotation against a half-written PEM is safe to retry.
+    ///
+    /// No-op when TLS is not configured.
+    ///
+    /// Use this for event-driven rotation (an inotify watch, a sidecar
+    /// signal). For unattended rotation set
+    /// [`TransportConfig::tls_reload_interval`](crate::network::TransportConfig)
+    /// instead and krafka reloads on a timer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the certificate or key files cannot be read or
+    /// parsed.
+    pub async fn refresh_tls(&self) -> Result<()> {
+        self.0.pool.refresh_tls().await
+    }
+
+    /// Replace the bootstrap server list used for metadata recovery (KIP-899).
+    ///
+    /// The new addresses are used on the next metadata refresh that falls back
+    /// to bootstrap servers. Does not close existing connections.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `servers` is empty.
+    pub fn update_seed_brokers(&self, servers: Vec<String>) -> Result<()> {
+        self.0.metadata.update_seed_brokers(servers)
+    }
+
+    /// Force a rebootstrap: close all connections, clear the metadata cache,
+    /// and fall back to bootstrap servers (KIP-899).
+    pub async fn rebootstrap(&self) {
+        self.0.metadata.rebootstrap().await;
+    }
+
+    /// Snapshot the share consumer's application metrics.
+    ///
+    /// Counts polls, empty polls, records and bytes received, acknowledgement
+    /// flushes (`commits`) and errors. Without this a share group was
+    /// operable but not observable: the transport counters from
+    /// [`connection_metrics`](Self::connection_metrics) showed requests, and
+    /// nothing showed records.
+    ///
+    /// Synchronous, like every other metrics accessor in the crate.
+    #[inline]
+    pub fn metrics(&self) -> Arc<crate::metrics::ConsumerMetrics> {
+        self.0.metrics.clone()
+    }
+
     /// Get the shared connection metrics handle used by this share consumer's broker pool.
     #[inline]
     pub fn connection_metrics(&self) -> Arc<ConnectionMetrics> {
@@ -2151,14 +2244,11 @@ impl ShareConsumer {
                 Err(_) => continue,
             };
 
-            let version = match conn
-                .negotiate_api_version(
-                    ApiKey::FindCoordinator,
-                    versions::FIND_COORDINATOR_MAX,
-                    versions::FIND_COORDINATOR_MIN,
-                )
-                .await
-            {
+            let version = match conn.negotiate_api_version(
+                ApiKey::FindCoordinator,
+                versions::FIND_COORDINATOR_MAX,
+                versions::FIND_COORDINATOR_MIN,
+            ) {
                 Some(v) => v,
                 None => continue,
             };
@@ -2258,7 +2348,6 @@ impl ShareConsumer {
                 versions::SHARE_GROUP_HEARTBEAT_MAX,
                 versions::SHARE_GROUP_HEARTBEAT_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -2517,7 +2606,6 @@ impl ShareConsumer {
                     versions::SHARE_ACKNOWLEDGE_MAX,
                     versions::SHARE_ACKNOWLEDGE_MIN,
                 )
-                .await
                 .ok_or_else(|| {
                     KrafkaError::protocol_kind(
                         ProtocolErrorKind::UnknownApiVersion,
@@ -2658,14 +2746,11 @@ impl ShareConsumer {
             .get_connection_by_id(coord_id, &coord_addr)
             .await?;
 
-        let version = match conn
-            .negotiate_api_version(
-                ApiKey::ShareGroupHeartbeat,
-                versions::SHARE_GROUP_HEARTBEAT_MAX,
-                versions::SHARE_GROUP_HEARTBEAT_MIN,
-            )
-            .await
-        {
+        let version = match conn.negotiate_api_version(
+            ApiKey::ShareGroupHeartbeat,
+            versions::SHARE_GROUP_HEARTBEAT_MAX,
+            versions::SHARE_GROUP_HEARTBEAT_MIN,
+        ) {
             Some(v) => v,
             None => {
                 return Err(KrafkaError::protocol_kind(
@@ -2735,14 +2820,11 @@ impl ShareConsumer {
                 }
             };
 
-            let version = match conn
-                .negotiate_api_version(
-                    ApiKey::ShareFetch,
-                    versions::SHARE_FETCH_MAX,
-                    versions::SHARE_FETCH_MIN,
-                )
-                .await
-            {
+            let version = match conn.negotiate_api_version(
+                ApiKey::ShareFetch,
+                versions::SHARE_FETCH_MAX,
+                versions::SHARE_FETCH_MIN,
+            ) {
                 Some(v) => v,
                 None => continue,
             };
@@ -2882,6 +2964,21 @@ impl ShareConsumerBuilder {
         self
     }
 
+    /// Set socket- and pool-level transport tuning.
+    ///
+    /// Covers TCP keepalive and nodelay, the per-connection response ceiling
+    /// and in-flight cap, the priority-channel depths, the Happy Eyeballs
+    /// stagger, idle-connection eviction, a total-connection cap, and the
+    /// KIP-1288 automatic TLS reload interval.
+    ///
+    /// Omitting this call keeps krafka's historical defaults, which
+    /// [`TransportConfig::default`](crate::network::TransportConfig) reproduces
+    /// exactly.
+    pub fn transport(mut self, transport: crate::network::TransportConfig) -> Self {
+        self.config.transport = transport;
+        self
+    }
+
     /// Set the acknowledgement mode.
     pub fn acknowledgement_mode(mut self, mode: AcknowledgementMode) -> Self {
         self.config.acknowledgement_mode = mode;
@@ -2917,6 +3014,79 @@ impl ShareConsumerBuilder {
     /// Set the request timeout.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.config.request_timeout = timeout;
+        self
+    }
+
+    /// Configure SASL/OAUTHBEARER with a static token.
+    ///
+    /// For a token that must be refreshed, use
+    /// [`auth`](Self::auth) with
+    /// [`AuthConfig::sasl_oauthbearer_provider`](crate::auth::AuthConfig::sasl_oauthbearer_provider),
+    /// or the built-in OIDC provider behind the `oauth-oidc` feature.
+    pub fn sasl_oauthbearer(mut self, token: impl Into<String>) -> Self {
+        self.config.auth = Some(crate::auth::AuthConfig::sasl_oauthbearer(token));
+        self
+    }
+
+    /// Set the metadata recovery strategy (KIP-899).
+    ///
+    /// Controls what the client does when every known broker becomes
+    /// unreachable: keep retrying the cached broker set, or fall back to the
+    /// original bootstrap servers.
+    pub fn metadata_recovery_strategy(
+        mut self,
+        strategy: crate::metadata::MetadataRecoveryStrategy,
+    ) -> Self {
+        self.config.metadata_recovery_strategy = strategy;
+        self
+    }
+
+    /// Configure SASL/PLAIN authentication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the credentials contain bytes the SASL framing
+    /// cannot carry.
+    pub fn sasl_plain(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Result<Self> {
+        self.config.auth = Some(crate::auth::AuthConfig::sasl_plain(username, password)?);
+        Ok(self)
+    }
+
+    /// Configure SASL/SCRAM-SHA-256 authentication.
+    pub fn sasl_scram_sha256(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.config.auth = Some(crate::auth::AuthConfig::sasl_scram_sha256(
+            username, password,
+        ));
+        self
+    }
+
+    /// Configure SASL/SCRAM-SHA-512 authentication.
+    pub fn sasl_scram_sha512(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.config.auth = Some(crate::auth::AuthConfig::sasl_scram_sha512(
+            username, password,
+        ));
+        self
+    }
+
+    /// Set the connect timeout: how long TCP establishment to one broker may
+    /// take. Default: 10 s.
+    ///
+    /// [`request_timeout`](Self::request_timeout) must be at least this value,
+    /// so lowering this is what makes a short request timeout possible.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.config.connect_timeout = timeout;
         self
     }
 
@@ -3047,6 +3217,7 @@ mod tests {
             config,
             metadata,
             pool,
+            metrics: Arc::new(crate::metrics::ConsumerMetrics::new()),
             subscriptions: RwLock::new(HashSet::new()),
             assignments: RwLock::new(HashMap::new()),
             member_id: ArcSwap::new(Arc::new(crate::util::random_uuid_v4())),
