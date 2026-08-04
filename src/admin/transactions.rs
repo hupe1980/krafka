@@ -105,7 +105,6 @@ impl AdminClient {
                         versions::DESCRIBE_PRODUCERS_MAX,
                         versions::DESCRIBE_PRODUCERS_MIN,
                     )
-                    .await
                     .ok_or_else(|| {
                         KrafkaError::protocol_kind(
                             ProtocolErrorKind::UnknownApiVersion,
@@ -261,7 +260,6 @@ impl AdminClient {
                     versions::DESCRIBE_TRANSACTIONS_MAX,
                     versions::DESCRIBE_TRANSACTIONS_MIN,
                 )
-                .await
                 .ok_or_else(|| {
                     KrafkaError::protocol_kind(
                         ProtocolErrorKind::UnknownApiVersion,
@@ -393,7 +391,6 @@ impl AdminClient {
                     versions::LIST_TRANSACTIONS_MAX,
                     versions::LIST_TRANSACTIONS_MIN,
                 )
-                .await
                 .ok_or_else(|| {
                     KrafkaError::protocol_kind(
                         ProtocolErrorKind::UnknownApiVersion,
@@ -529,7 +526,6 @@ impl AdminClient {
                 versions::LIST_CONFIG_RESOURCES_MAX,
                 versions::LIST_CONFIG_RESOURCES_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -713,7 +709,6 @@ impl AdminClient {
                     versions::WRITE_TXN_MARKERS_MAX,
                     versions::WRITE_TXN_MARKERS_MIN,
                 )
-                .await
                 .ok_or_else(|| {
                     KrafkaError::protocol_kind(
                         ProtocolErrorKind::UnknownApiVersion,
@@ -1010,7 +1005,7 @@ impl AdminClient {
     ///
     /// ```ignore
     /// let result = admin
-    ///     .describe_quorum(&[("__cluster_metadata", &[0])])
+    ///     .describe_metadata_quorum(&[("__cluster_metadata", &[0])])
     ///     .await?;
     /// ```
     pub async fn describe_metadata_quorum(
@@ -1039,7 +1034,6 @@ impl AdminClient {
                 versions::DESCRIBE_QUORUM_MAX,
                 versions::DESCRIBE_QUORUM_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -1070,10 +1064,16 @@ impl AdminClient {
                     .into_iter()
                     .map(|p| QuorumPartitionResult {
                         partition_index: p.partition_index,
+                        // Prefer the broker's own message (v2+, KIP-853); the
+                        // error code's name is the fallback where it does not
+                        // exist on the wire.
                         error: if p.error_code.is_ok() {
                             None
                         } else {
-                            Some(format!("{:?}", p.error_code))
+                            Some(
+                                p.error_message
+                                    .unwrap_or_else(|| format!("{:?}", p.error_code)),
+                            )
                         },
                         leader_id: p.leader_id,
                         leader_epoch: p.leader_epoch,
@@ -1084,6 +1084,9 @@ impl AdminClient {
                             .map(|v| QuorumReplicaInfo {
                                 replica_id: v.replica_id,
                                 log_end_offset: v.log_end_offset,
+                                last_fetch_timestamp: v.last_fetch_timestamp,
+                                last_caught_up_timestamp: v.last_caught_up_timestamp,
+                                replica_directory_id: v.replica_directory_id,
                             })
                             .collect(),
                         observers: p
@@ -1092,6 +1095,9 @@ impl AdminClient {
                             .map(|o| QuorumReplicaInfo {
                                 replica_id: o.replica_id,
                                 log_end_offset: o.log_end_offset,
+                                last_fetch_timestamp: o.last_fetch_timestamp,
+                                last_caught_up_timestamp: o.last_caught_up_timestamp,
+                                replica_directory_id: o.replica_directory_id,
                             })
                             .collect(),
                     })
@@ -1105,9 +1111,29 @@ impl AdminClient {
             error: if response.error_code.is_ok() {
                 None
             } else {
-                Some(format!("{:?}", response.error_code))
+                Some(
+                    response
+                        .error_message
+                        .unwrap_or_else(|| format!("{:?}", response.error_code)),
+                )
             },
             topics,
+            nodes: response
+                .nodes
+                .into_iter()
+                .map(|n| QuorumNodeInfo {
+                    node_id: n.node_id,
+                    listeners: n
+                        .listeners
+                        .into_iter()
+                        .map(|l| QuorumListenerInfo {
+                            name: l.name,
+                            host: l.host,
+                            port: l.port,
+                        })
+                        .collect(),
+                })
+                .collect(),
         })
     }
 }

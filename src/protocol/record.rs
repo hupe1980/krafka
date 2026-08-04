@@ -118,8 +118,46 @@ impl Compression {
         }
     }
 
-    /// Compress an arbitrary payload with this codec.
-    pub(crate) fn compress(&self, payload: &[u8]) -> Result<Bytes> {
+    /// Whether this codec accepts a compression level.
+    ///
+    /// `Snappy` has no level in its format at all. `Lz4` does in principle,
+    /// but krafka encodes LZ4 with `lz4_flex`, whose frame encoder exposes no
+    /// level — so accepting one here would be a setting that silently does
+    /// nothing, which is worse than not offering it.
+    #[must_use]
+    pub const fn supports_level(&self) -> bool {
+        matches!(self, Self::Gzip | Self::Zstd)
+    }
+
+    /// Inclusive range of levels this codec accepts, or `None` when it takes
+    /// no level.
+    ///
+    /// `Gzip` is zlib's 0–9. `Zstd`'s range comes from the linked libzstd
+    /// rather than a hard-coded constant, because it has widened over time:
+    /// negative "fast" levels were added in 1.3.4 and the floor has moved
+    /// since.
+    #[must_use]
+    pub fn level_range(&self) -> Option<std::ops::RangeInclusive<i32>> {
+        match self {
+            Self::Gzip => Some(0..=9),
+            #[cfg(feature = "zstd")]
+            Self::Zstd => Some(zstd::compression_level_range()),
+            #[cfg(not(feature = "zstd"))]
+            Self::Zstd => Some(-131_072..=22),
+            _ => None,
+        }
+    }
+
+    /// Compress an arbitrary payload, optionally overriding the codec's
+    /// default level.
+    ///
+    /// `level` is `None` for the codec default — zlib 6 for `Gzip`, 3 for
+    /// `Zstd`, matching the Java client. A `Some` value for a codec that takes
+    /// no level is a caller bug that configuration validation should already
+    /// have rejected; it is ignored here rather than failing a send that is
+    /// already on the hot path.
+    pub(crate) fn compress_with_level(&self, payload: &[u8], level: Option<i32>) -> Result<Bytes> {
+        let _ = level;
         match self {
             Self::None => Ok(Bytes::copy_from_slice(payload)),
             #[cfg(feature = "gzip")]
@@ -127,7 +165,14 @@ impl Compression {
                 use flate2::write::GzEncoder;
                 use std::io::Write;
 
-                let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+                let flate_level = match level {
+                    // Clamped rather than rejected: validation has already
+                    // bounded this, and clamping keeps a hot-path send from
+                    // failing on an out-of-range value that slipped through.
+                    Some(l) => flate2::Compression::new(l.clamp(0, 9) as u32),
+                    None => flate2::Compression::default(),
+                };
+                let mut encoder = GzEncoder::new(Vec::new(), flate_level);
                 encoder
                     .write_all(payload)
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
@@ -183,7 +228,8 @@ impl Compression {
             )),
             #[cfg(feature = "zstd")]
             Self::Zstd => {
-                let compressed = zstd::encode_all(payload, 3)
+                // 3 is libzstd's default and the Java client's.
+                let compressed = zstd::encode_all(payload, level.unwrap_or(3))
                     .map_err(|e| KrafkaError::compression(e.to_string()))?;
                 Ok(Bytes::from(compressed))
             }
@@ -692,6 +738,13 @@ pub struct RecordBatch {
     pub base_sequence: i32,
     /// Records in the batch.
     pub records: Vec<Record>,
+    /// Compression level used when encoding, or `None` for the codec default.
+    ///
+    /// Deliberately not `pub`: this is an encode-time knob, not part of the
+    /// decoded wire representation. A batch decoded from the wire carries the
+    /// codec but not the level the producer used, because the format does not
+    /// record it — making this public would imply it round-trips.
+    pub(crate) compression_level: Option<i32>,
 }
 
 impl RecordBatch {
@@ -709,6 +762,7 @@ impl RecordBatch {
             producer_epoch: -1,
             base_sequence: -1,
             records: Vec::new(),
+            compression_level: None,
         }
     }
 
@@ -858,7 +912,9 @@ impl RecordBatch {
     }
 
     fn compress_records(&self, records: &[u8]) -> Result<Bytes> {
-        self.attributes.compression.compress(records)
+        self.attributes
+            .compression
+            .compress_with_level(records, self.compression_level)
     }
 
     /// Decode a record batch from bytes.
@@ -1001,6 +1057,7 @@ impl RecordBatch {
             producer_epoch,
             base_sequence,
             records,
+            compression_level: None,
         })
     }
 
@@ -1151,6 +1208,7 @@ impl Default for RecordBatch {
 #[derive(Debug, Default)]
 pub struct RecordBatchBuilder {
     compression: Compression,
+    compression_level: Option<i32>,
     records: Vec<Record>,
     base_timestamp: Option<i64>,
     producer_id: i64,
@@ -1164,6 +1222,7 @@ impl RecordBatchBuilder {
     pub fn new() -> Self {
         Self {
             compression: Compression::None,
+            compression_level: None,
             records: Vec::new(),
             base_timestamp: None,
             producer_id: -1,
@@ -1176,6 +1235,16 @@ impl RecordBatchBuilder {
     /// Set the compression type.
     pub fn compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
+        self
+    }
+
+    /// Override the codec's default compression level.
+    ///
+    /// `None` uses the codec default: zlib 6 for `Gzip`, 3 for `Zstd` — the
+    /// same defaults the Java client uses. Ignored by codecs that take no
+    /// level; see [`Compression::supports_level`].
+    pub fn compression_level(mut self, level: Option<i32>) -> Self {
+        self.compression_level = level;
         self
     }
 
@@ -1267,6 +1336,7 @@ impl RecordBatchBuilder {
             producer_epoch: self.producer_epoch,
             base_sequence: self.base_sequence,
             records: self.records,
+            compression_level: self.compression_level,
         }
     }
 }
@@ -1489,6 +1559,7 @@ impl LazyRecordBatch {
             producer_epoch: self.producer_epoch,
             base_sequence: self.base_sequence,
             records: self.decode_all()?,
+            compression_level: None,
         })
     }
 }
@@ -1543,6 +1614,142 @@ impl Iterator for LazyRecordIterator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+
+    /// A payload that is structured enough to compress but varied enough that
+    /// match-finding effort actually matters.
+    ///
+    /// The first attempt at these tests used `(i % 7) as u8`, which zstd
+    /// reduces to 24 bytes at *every* level — so the assertion compared 24
+    /// against 24 and the test failed for a reason that had nothing to do with
+    /// the code. Kafka payloads are records, so the fixture is records.
+    #[cfg(any(feature = "zstd", feature = "gzip"))]
+    fn compressible_payload() -> Vec<u8> {
+        let mut out = String::new();
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        for i in 0..2_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.push_str(&format!(
+                "{{\"id\":{i},\"user\":\"u{}\",\"ts\":{},\"evt\":\"click\",\"v\":{}}}\n",
+                x % 100_000,
+                1_700_000_000_000u64 + (x % 1_000_000),
+                x % 997
+            ));
+        }
+        out.into_bytes()
+    }
+
+    /// A compression level must change the bytes on the wire.
+    ///
+    /// Asserting that the setting survives the builder would prove nothing:
+    /// the defect class this guards against is a knob that is stored,
+    /// documented and never consulted. Comparing the *encoded output* at two
+    /// levels is the only assertion that fails if `compress_with_level` stops
+    /// threading it through.
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_compression_level_changes_the_encoded_bytes() {
+        let payload = compressible_payload();
+
+        let fast = Compression::Zstd
+            .compress_with_level(&payload, Some(1))
+            .expect("level 1 must encode");
+        let dense = Compression::Zstd
+            .compress_with_level(&payload, Some(19))
+            .expect("level 19 must encode");
+        let default = Compression::Zstd
+            .compress_with_level(&payload, None)
+            .expect("default must encode");
+
+        // Only the extremes are asserted. zstd's mid levels are not monotonic
+        // in output size — on this fixture level 3 is *larger* than level 1,
+        // because they use different match-finding strategies rather than the
+        // same one turned up. Asserting a monotonic ladder would encode a
+        // property zstd does not promise.
+        assert!(
+            dense.len() < fast.len(),
+            "level 19 must compress better than level 1, got {} vs {}",
+            dense.len(),
+            fast.len()
+        );
+        assert_eq!(
+            default,
+            Compression::Zstd
+                .compress_with_level(&payload, Some(3))
+                .expect("level 3 must encode"),
+            "the documented default is 3; if that changes, the docs are wrong"
+        );
+    }
+
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn gzip_compression_level_changes_the_encoded_bytes() {
+        let payload = compressible_payload();
+
+        let none = Compression::Gzip
+            .compress_with_level(&payload, Some(0))
+            .expect("level 0 must encode");
+        let best = Compression::Gzip
+            .compress_with_level(&payload, Some(9))
+            .expect("level 9 must encode");
+
+        assert!(
+            best.len() < none.len(),
+            "level 9 must compress better than level 0 (store), got {} vs {}",
+            best.len(),
+            none.len()
+        );
+        assert_eq!(
+            Compression::Gzip
+                .compress_with_level(&payload, None)
+                .expect("default must encode"),
+            Compression::Gzip
+                .compress_with_level(&payload, Some(6))
+                .expect("level 6 must encode"),
+            "zlib's default is 6; if that changes, the docs are wrong"
+        );
+    }
+
+    /// The level must survive the whole batch-encode path, not just the codec.
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn record_batch_carries_the_compression_level_to_the_wire() {
+        let payload = compressible_payload();
+
+        let encode_at = |level: Option<i32>| {
+            RecordBatchBuilder::new()
+                .compression(Compression::Zstd)
+                .compression_level(level)
+                .add_record(None::<Bytes>, Some(Bytes::from(payload.clone())))
+                .build()
+                .encode()
+                .expect("batch must encode")
+        };
+
+        let fast = encode_at(Some(1));
+        let dense = encode_at(Some(19));
+        assert!(
+            dense.len() < fast.len(),
+            "the level must reach the codec through RecordBatch::encode, got {} vs {}",
+            dense.len(),
+            fast.len()
+        );
+    }
+
+    /// Codecs that take no level must report so, so validation can reject a
+    /// setting that would otherwise be silently ignored.
+    #[test]
+    fn only_gzip_and_zstd_accept_a_level() {
+        assert!(Compression::Gzip.supports_level());
+        assert!(Compression::Zstd.supports_level());
+        assert!(!Compression::Snappy.supports_level());
+        assert!(!Compression::Lz4.supports_level());
+        assert!(!Compression::None.supports_level());
+
+        assert_eq!(Compression::Gzip.level_range(), Some(0..=9));
+        assert!(Compression::Snappy.level_range().is_none());
+    }
     use super::*;
 
     #[test]

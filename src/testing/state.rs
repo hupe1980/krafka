@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use bytes::Bytes;
 
 use super::wire;
+use crate::protocol::ApiKey;
 
 /// A broker in the fake cluster's metadata.
 #[derive(Debug, Clone)]
@@ -183,6 +184,184 @@ pub struct ConsumerGroupMemberState {
     pub assignment_dirty: bool,
 }
 
+/// A share group (KIP-932).
+///
+/// # What is modelled, and what is not
+///
+/// A share group differs from a consumer group in the one way that matters
+/// here: a partition is not *owned* by a member. The coordinator hands the
+/// same partition to several members, and the broker — not the client —
+/// decides which records each member gets. There is therefore no
+/// revoke-before-assign reconciliation to model; assignment takes effect on
+/// the heartbeat that carries it.
+///
+/// What *is* modelled is the share-partition state machine that replaces
+/// committed offsets: a start offset (SPSO), a cursor of records handed out
+/// but not yet resolved, and a per-record delivery count. `ACCEPT` and
+/// `REJECT` advance the start offset; `RELEASE` makes the record available
+/// again with a higher delivery count.
+///
+/// Records acquired but never resolved are returned to the pool when the
+/// member holding them leaves, which is what makes the start offset
+/// load-bearing: it is the point a new member starts from, and only an
+/// `ACCEPT` or `REJECT` moves it.
+///
+/// What is **not** modelled: acquisition-lock *expiry* (an in-flight record
+/// comes back when its holder leaves, never on a timer), the archived state,
+/// `group.share.delivery.attempts` limits, and `RENEW` (KIP-1222) — which is
+/// accepted and has no effect, because with no lock timer there is nothing to
+/// extend. Tests must not be read as validating any of those.
+#[derive(Debug, Clone, Default)]
+pub struct ShareGroupState {
+    /// Epoch of the group as a whole, bumped when membership or subscriptions
+    /// change.
+    pub group_epoch: i32,
+    /// Members, keyed by client-generated member ID.
+    pub members: HashMap<String, ShareMemberState>,
+    /// Per-share-partition delivery state, keyed by `(topic, partition)`.
+    pub partitions: HashMap<(String, i32), SharePartitionState>,
+}
+
+/// One share-group member's coordinator-side state.
+#[derive(Debug, Clone, Default)]
+pub struct ShareMemberState {
+    /// Epoch the coordinator last handed this member.
+    pub member_epoch: i32,
+    /// Topics the member last told the coordinator it subscribes to.
+    pub subscribed_topics: Vec<String>,
+    /// Partitions the coordinator has assigned, keyed by topic name.
+    pub assignment: HashMap<String, Vec<i32>>,
+    /// Whether [`Self::assignment`] changed since it was last put on the wire.
+    pub assignment_dirty: bool,
+}
+
+/// Delivery state of one share partition.
+#[derive(Debug, Clone, Default)]
+pub struct SharePartitionState {
+    /// Share-partition start offset (SPSO): nothing below this is ever
+    /// delivered again.
+    pub start_offset: i64,
+    /// Offset of the next record to hand out.
+    ///
+    /// Always at or above [`Self::start_offset`]. The gap between them is the
+    /// set of records that are in flight — acquired by some member and not yet
+    /// resolved.
+    pub next_acquire: i64,
+    /// How many times each offset has been delivered, keyed by offset. Only
+    /// offsets delivered more than once are present.
+    pub delivery_counts: HashMap<i64, i16>,
+}
+
+impl ShareGroupState {
+    /// Return every in-flight record to the pool.
+    ///
+    /// A record between the start offset and the acquisition cursor has been
+    /// handed to a member that has not resolved it. On a real broker it comes
+    /// back when the acquisition lock expires; here the trigger is the holder
+    /// leaving the group, which is the same event a client can actually cause.
+    ///
+    /// This is what makes an unacknowledged record distinguishable from an
+    /// accepted one. Without it the cursor would only ever move forward, and
+    /// "the client accepted the batch" and "the client dropped it on the
+    /// floor" would produce identical broker state.
+    pub(crate) fn release_in_flight(&mut self) {
+        for partition in self.partitions.values_mut() {
+            partition.next_acquire = partition.start_offset;
+        }
+    }
+}
+
+impl SharePartitionState {
+    /// Record that `[first, last]` was handed to a member, returning the
+    /// delivery count each of those offsets is now on.
+    ///
+    /// A real broker tracks a delivery count per record; this returns the
+    /// maximum over the range, which is what goes in the single
+    /// `delivery_count` field of an `AcquiredRecords` entry.
+    pub(crate) fn acquire(&mut self, first: i64, last: i64) -> i16 {
+        let mut max = 1;
+        for offset in first..=last {
+            let count = self.delivery_counts.entry(offset).or_insert(0);
+            *count = count.saturating_add(1);
+            max = max.max(*count);
+        }
+        self.next_acquire = self.next_acquire.max(last + 1);
+        max
+    }
+
+    /// Apply one acknowledgement to `[first, last]`.
+    ///
+    /// `acknowledge_type` is the KIP-932 wire value: 1 = ACCEPT, 2 = RELEASE,
+    /// 3 = REJECT, 4 = RENEW (KIP-1222). `0` is a gap marker and resolves
+    /// nothing.
+    pub(crate) fn acknowledge(&mut self, first: i64, last: i64, acknowledge_type: i8) {
+        match acknowledge_type {
+            // ACCEPT and REJECT both retire the record: neither is ever
+            // delivered again. They differ only in what a real broker reports,
+            // which nothing here observes.
+            1 | 3 => {
+                self.start_offset = self.start_offset.max(last + 1);
+                for offset in first..=last {
+                    self.delivery_counts.remove(&offset);
+                }
+            }
+            // RELEASE returns the record to the pool. The cursor rewinds so it
+            // is handed out again; the delivery count already recorded by
+            // `acquire` is what makes the redelivery observable.
+            2 => {
+                self.next_acquire = self.next_acquire.min(first.max(self.start_offset));
+            }
+            // RENEW extends an acquisition lock. There is no lock timer here,
+            // so there is nothing to extend — but it must not be treated as an
+            // error either, or a client exercising KIP-1222 would see failures
+            // a real broker would not produce.
+            _ => {}
+        }
+    }
+}
+
+/// A Streams group (KIP-1071), as far as `StreamsGroupDescribe` exposes it.
+///
+/// Deliberately a flat fixture rather than a simulation. krafka has no Streams
+/// runtime, so there is no client behaviour to model here — only a response
+/// for the describe path to decode. Modelling task assignment would be
+/// inventing a coordinator whose behaviour nothing in this crate depends on.
+#[derive(Debug, Clone, Default)]
+pub struct StreamsGroupState {
+    /// Group state string, e.g. `Stable`.
+    pub group_state: String,
+    /// Group epoch.
+    pub group_epoch: i32,
+    /// Assignment epoch.
+    pub assignment_epoch: i32,
+    /// Epoch of the initialized topology, or `None` for no topology at all.
+    pub topology_epoch: Option<i32>,
+    /// Subtopology IDs, or `None` for the "uninitialized / source topics
+    /// missing" state, which the wire format distinguishes from an empty list.
+    pub subtopologies: Option<Vec<String>>,
+    /// Members.
+    pub members: Vec<StreamsMemberState>,
+}
+
+/// One Streams group member.
+#[derive(Debug, Clone, Default)]
+pub struct StreamsMemberState {
+    /// Member ID.
+    pub member_id: String,
+    /// Member epoch.
+    pub member_epoch: i32,
+    /// Epoch of the topology this member is running.
+    pub topology_epoch: i32,
+    /// Streams instance identity.
+    pub process_id: String,
+    /// Interactive Queries endpoint, if configured.
+    pub user_endpoint: Option<(String, u16)>,
+    /// Active tasks as `(subtopology_id, partitions)`.
+    pub active_tasks: Vec<(String, Vec<i32>)>,
+    /// Target active tasks. Differs from [`Self::active_tasks`] mid-rebalance.
+    pub target_active_tasks: Vec<(String, Vec<i32>)>,
+}
+
 /// The whole fake cluster.
 #[derive(Debug)]
 pub struct ClusterState {
@@ -196,6 +375,21 @@ pub struct ClusterState {
     pub topics: HashMap<String, TopicState>,
     /// Consumer groups, keyed by group ID.
     pub groups: HashMap<String, GroupState>,
+    /// Share groups (KIP-932), keyed by group ID.
+    ///
+    /// Separate from [`Self::groups`]: a share group shares a namespace
+    /// with consumer groups on a real broker, but has entirely different
+    /// membership and delivery semantics, and conflating them would make
+    /// neither modellable.
+    pub share_groups: HashMap<String, ShareGroupState>,
+    /// Streams groups (KIP-1071), keyed by group ID.
+    ///
+    /// Populated only by a test via [`ClusterState`] directly: krafka cannot
+    /// *join* a Streams group — that needs `StreamsGroupHeartbeat` and an
+    /// application topology — so there is nothing for the broker to derive
+    /// this from. It exists so `describe_streams_groups` has something real to
+    /// read back, which is the whole of what krafka does with KIP-1071.
+    pub streams_groups: HashMap<String, StreamsGroupState>,
     /// Group coordinator overrides, keyed by group ID. Groups without an entry
     /// resolve to [`ClusterState::default_coordinator`].
     pub group_coordinators: HashMap<String, i32>,
@@ -209,6 +403,23 @@ pub struct ClusterState {
     pub next_producer_id: i64,
     /// Producer epochs, keyed by producer ID.
     pub producer_epochs: HashMap<i64, i16>,
+    /// Cluster-finalized feature version levels (KIP-584), keyed by feature
+    /// name. Written by `UpdateFeatures`, so a test can assert what the
+    /// controller actually applied — or, under `validate_only`, did not.
+    pub finalized_features: HashMap<String, i16>,
+    /// Epoch of [`Self::finalized_features`], advanced on every change.
+    pub finalized_features_epoch: i64,
+    /// Advertised `ApiVersions` ranges that override the built-in table.
+    ///
+    /// The built-in table names one version per API — whatever the handlers
+    /// actually speak. That makes every "the client must degrade against an
+    /// older broker" path untestable, because there is no way to *be* an older
+    /// broker: `validate_only` refused below `UpdateFeatures` v1, `Renew`
+    /// stripped below `ShareFetch` v2, share-group lag absent below
+    /// `DescribeShareGroupOffsets` v1. Each of those is a real branch guarding
+    /// a real hazard, and each was covered only by a test that re-implemented
+    /// the condition.
+    pub api_version_overrides: HashMap<ApiKey, (i16, i16)>,
     /// Counter behind generated topic UUIDs.
     topic_id_seq: u64,
 }
@@ -233,6 +444,11 @@ impl ClusterState {
             controller_id: 0,
             topics: HashMap::new(),
             groups: HashMap::new(),
+            share_groups: HashMap::new(),
+            streams_groups: HashMap::new(),
+            finalized_features: HashMap::new(),
+            finalized_features_epoch: 0,
+            api_version_overrides: HashMap::new(),
             group_coordinators: HashMap::new(),
             txn_coordinators: HashMap::new(),
             auto_create_topics: true,

@@ -1273,6 +1273,33 @@ impl GroupInner {
     }
 }
 
+/// Emit the KIP-1274 phase-1 deprecation warning for the classic rebalance
+/// protocol, at most once per process.
+///
+/// Apache Kafka 4.3 logs this from the Java consumer on every classic-protocol
+/// start; krafka mirrors it so that an operator reading either client's logs
+/// learns the same thing. The timeline it refers to is fixed upstream: 4.3
+/// warns, 5.0 flips the default to the KIP-848 protocol and deprecates the
+/// classic one in `KafkaConsumer`, 6.0 removes it.
+///
+/// Once per process rather than once per consumer: an application that creates
+/// many short-lived consumers would otherwise turn a migration notice into log
+/// spam, which is the reliable way to make sure nobody reads it.
+pub fn warn_classic_protocol_deprecated() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        warn!(
+            "Consumer group is using the CLASSIC rebalance protocol. Apache Kafka 4.3 \
+             deprecated it (KIP-1274): the default becomes the KIP-848 consumer protocol \
+             in Kafka 5.0 and classic support is removed in 6.0. Switch with \
+             `Consumer::builder().group_protocol(GroupProtocol::Consumer)` — it needs \
+             Kafka 4.0+ (or 3.7-3.9 with `group.coordinator.new.enable=true`), moves \
+             assignment to the broker, and makes rebalances incremental instead of \
+             stop-the-world. This warning is emitted once per process."
+        );
+    });
+}
+
 /// Manages the consumer group lifecycle: join, sync, heartbeat, and leave.
 ///
 /// Communicates with the group coordinator broker via the Kafka group management
@@ -1529,7 +1556,15 @@ impl GroupCoordinator {
     }
 
     /// Set the group protocol (KIP-848, builder pattern).
+    ///
+    /// Selecting [`GroupProtocol::Classic`] emits the KIP-1274 phase-1
+    /// deprecation warning, once per process.
+    ///
+    /// [`GroupProtocol::Classic`]: crate::consumer::config::GroupProtocol::Classic
     pub fn with_group_protocol(mut self, protocol: crate::consumer::config::GroupProtocol) -> Self {
+        if protocol == crate::consumer::config::GroupProtocol::Classic {
+            warn_classic_protocol_deprecated();
+        }
         self.group_protocol = protocol;
         self
     }
@@ -1762,7 +1797,6 @@ impl GroupCoordinator {
                 FIND_COORDINATOR_MAX,
                 FIND_COORDINATOR_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -1977,7 +2011,6 @@ impl GroupCoordinator {
         };
         let jg_version = conn
             .negotiate_api_version(ApiKey::JoinGroup, JOIN_GROUP_MAX, join_group_min)
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -2103,8 +2136,7 @@ impl GroupCoordinator {
 
         // If we're the leader, compute assignments
         let assignments = if join_response.is_leader() {
-            self.compute_assignments(&topics, &join_response.members)
-                .await?
+            self.compute_assignments(&topics, &join_response.members)?
         } else {
             Vec::new()
         };
@@ -2129,7 +2161,6 @@ impl GroupCoordinator {
         // Negotiate SyncGroup version — v3+ required (KIP-345 static membership).
         let sg_version = conn
             .negotiate_api_version(ApiKey::SyncGroup, SYNC_GROUP_MAX, SYNC_GROUP_MIN)
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -2567,7 +2598,6 @@ impl GroupCoordinator {
                                         HEARTBEAT_MAX,
                                         HEARTBEAT_MIN,
                                     )
-                                    .await
                                 {
                                     Some(v) => {
                                         cached_hb = Some((conn_id, v));
@@ -2856,14 +2886,11 @@ impl GroupCoordinator {
             self.group_id, member_id, member_epoch
         );
 
-        let Some(hb_version) = conn
-            .negotiate_api_version(
-                ApiKey::ConsumerGroupHeartbeat,
-                CONSUMER_GROUP_HEARTBEAT_MAX,
-                CONSUMER_GROUP_HEARTBEAT_MIN,
-            )
-            .await
-        else {
+        let Some(hb_version) = conn.negotiate_api_version(
+            ApiKey::ConsumerGroupHeartbeat,
+            CONSUMER_GROUP_HEARTBEAT_MAX,
+            CONSUMER_GROUP_HEARTBEAT_MIN,
+        ) else {
             return Err(KrafkaError::protocol_kind(
                 ProtocolErrorKind::UnknownApiVersion,
                 "ConsumerGroupHeartbeat is unsupported by the broker; \
@@ -3219,14 +3246,11 @@ impl GroupCoordinator {
             let hb_version = {
                 let coordinator_conn = coordinator_conn_ref.read().await.clone();
                 if let Some(ref conn) = coordinator_conn {
-                    match conn
-                        .negotiate_api_version(
-                            ApiKey::ConsumerGroupHeartbeat,
-                            CONSUMER_GROUP_HEARTBEAT_MAX,
-                            CONSUMER_GROUP_HEARTBEAT_MIN,
-                        )
-                        .await
-                    {
+                    match conn.negotiate_api_version(
+                        ApiKey::ConsumerGroupHeartbeat,
+                        CONSUMER_GROUP_HEARTBEAT_MAX,
+                        CONSUMER_GROUP_HEARTBEAT_MIN,
+                    ) {
                         Some(v) => v,
                         None => {
                             error!(
@@ -3646,7 +3670,6 @@ impl GroupCoordinator {
         // Negotiate heartbeat version with broker (MIN=3, KIP-345 static membership).
         let hb_version = conn
             .negotiate_api_version(ApiKey::Heartbeat, HEARTBEAT_MAX, HEARTBEAT_MIN)
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -3764,7 +3787,6 @@ impl GroupCoordinator {
 
         let oc_version = conn
             .negotiate_api_version(ApiKey::OffsetCommit, OFFSET_COMMIT_MAX, OFFSET_COMMIT_MIN)
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -3960,7 +3982,6 @@ impl GroupCoordinator {
         // v10 KIP-848 topic_id replaces topic name on the wire.
         let of_version = conn
             .negotiate_api_version(ApiKey::OffsetFetch, OFFSET_FETCH_MAX, OFFSET_FETCH_MIN)
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -4180,7 +4201,6 @@ impl GroupCoordinator {
 
             let lo_version = conn
                 .negotiate_api_version(ApiKey::ListOffsets, LIST_OFFSETS_MAX, LIST_OFFSETS_MIN)
-                .await
                 .ok_or_else(|| {
                     KrafkaError::protocol_kind(
                         ProtocolErrorKind::UnknownApiVersion,
@@ -4304,7 +4324,6 @@ impl GroupCoordinator {
         // Negotiate version with broker (MIN=3, KIP-345 batch leave).
         let lg_version = conn
             .negotiate_api_version(ApiKey::LeaveGroup, LEAVE_GROUP_MAX, LEAVE_GROUP_MIN)
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -4414,14 +4433,11 @@ impl GroupCoordinator {
             self.group_id, member_id, leave_epoch
         );
 
-        let Some(hb_version) = conn
-            .negotiate_api_version(
-                ApiKey::ConsumerGroupHeartbeat,
-                CONSUMER_GROUP_HEARTBEAT_MAX,
-                CONSUMER_GROUP_HEARTBEAT_MIN,
-            )
-            .await
-        else {
+        let Some(hb_version) = conn.negotiate_api_version(
+            ApiKey::ConsumerGroupHeartbeat,
+            CONSUMER_GROUP_HEARTBEAT_MAX,
+            CONSUMER_GROUP_HEARTBEAT_MIN,
+        ) else {
             warn!(
                 "ConsumerGroupHeartbeat unsupported; cannot send KIP-848 leave for '{}'",
                 self.group_id
@@ -4842,7 +4858,7 @@ impl GroupCoordinator {
     }
 
     /// Compute assignments when we are the group leader.
-    async fn compute_assignments(
+    fn compute_assignments(
         &self,
         topics: &[String],
         members: &[JoinGroupResponseMember],

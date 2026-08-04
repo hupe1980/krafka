@@ -1,0 +1,98 @@
+# Zola configuration for the krafka documentation site.
+#
+# Replaced a Jekyll + just-the-docs setup. The reasons were concrete, not
+# fashion:
+#
+#   - `performance.md` had no front matter, so Jekyll never rendered it. The
+#     page was linked from the README and the home page and served as raw
+#     Markdown. Zola fails the build on a page it cannot parse.
+#   - Four pairs of pages shared a `nav_order`, leaving half the navigation in
+#     undefined order. Weights here are unique and asserted by `just docs-check`.
+#   - Relative `*.md` cross-links resolved on GitHub and broke on the site.
+#     Zola's `@/` internal links are resolved and **validated at build time**,
+#     so a broken link is a failed build rather than a 404 someone reports.
+#   - No Ruby toolchain. Zola is a single binary, which is also why the whole
+#     site can be built in CI in seconds without a bundler lockfile.
+
+base_url = "https://hupe1980.github.io/krafka"
+title = "krafka"
+description = "A pure-Rust, async-native Apache Kafka client. No librdkafka, no C toolchain, no unsafe, no panics."
+author = "krafka contributors"
+
+default_language = "en"
+compile_sass = true
+minify_html = true
+generate_feeds = true
+feed_filenames = ["atom.xml"]
+
+# Client-side search over an elasticlunr index Zola builds at compile time. No
+# third-party search service, so no external request on page load and nothing
+# to leak a reader's queries to.
+#
+# Every top-level key must stay above the first `[table]` header below. TOML
+# assigns a bare key to whichever table precedes it, so this line sitting under
+# `[link_checker]` silently became `link_checker.build_search_index` — accepted
+# without warning, and the search index simply was not generated.
+build_search_index = true
+
+# Build-time link validation. This is the whole reason the cross-links were
+# rewritten to `@/`-form: a rename that orphans a link now fails CI.
+[link_checker]
+internal_level = "error"
+external_level = "warn"
+
+[search]
+index_format = "elasticlunr_json"
+
+[markdown.highlighting]
+# Zola 0.22 replaced syntect with `giallo` and reworked this block: `style =
+# "class"` emits class names instead of inline colours, which is what lets the
+# two themes be swapped by a media query rather than re-rendering every page.
+# The output filenames are fixed at `giallo-light.css` / `giallo-dark.css`.
+style = "class"
+light_theme = "catppuccin-latte"
+dark_theme = "catppuccin-mocha"
+
+[markdown]
+# Heading anchors make every section linkable, which is what lets an issue or
+# a doc comment point at a specific paragraph rather than a page.
+insert_anchor_links = "heading"
+smart_punctuation = false
+bottom_footnotes = true
+
+[extra]
+repo = "https://github.com/hupe1980/krafka"
+crate = "https://crates.io/crates/krafka"
+api_docs = "https://docs.rs/krafka"
+# Shown in the footer and the JSON-LD `softwareVersion`. Kept in step with
+# Cargo.toml by `just docs-check`.
+version = "0.15.0"
+license = "MIT OR Apache-2.0"
+# Social preview card. Referenced by og:image and twitter:image.
+og_image = "og.png"
+
+# Documentation navigation. Grouping is deliberate: a flat 14-item list gives a
+# reader no way to tell "I need this now" from "I need this eventually".
+#
+# Page URLs stay flat (`/docs/producer/`) rather than nested under the group,
+# because a URL that encodes an editorial grouping breaks every time the
+# grouping is reconsidered.
+[[extra.nav]]
+title = "Start here"
+pages = ["getting-started", "configuration"]
+
+[[extra.nav]]
+title = "Clients"
+pages = ["producer", "consumer", "share-consumer", "admin"]
+
+[[extra.nav]]
+title = "Integration"
+pages = ["authentication", "schema-registry", "interceptors"]
+
+[[extra.nav]]
+title = "Operations"
+pages = ["metrics", "performance", "testing", "errors"]
+
+[[extra.nav]]
+title = "Reference"
+pages = ["protocol", "architecture"]

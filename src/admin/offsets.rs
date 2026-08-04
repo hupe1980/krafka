@@ -133,7 +133,6 @@ impl AdminClient {
                         versions::LIST_OFFSETS_MAX,
                         versions::LIST_OFFSETS_MIN,
                     )
-                    .await
                     .ok_or_else(|| {
                         KrafkaError::protocol_kind(
                             ProtocolErrorKind::UnknownApiVersion,

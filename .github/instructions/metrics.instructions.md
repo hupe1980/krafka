@@ -14,7 +14,7 @@ Every new metric must appear in **all six** locations:
 3. Prometheus text export via `PrometheusExporter` (verified by existing `export_metrics` path)
 4. Snapshot struct field + `snapshot()` method
 5. `KrafkaMetrics::reset()` — counters via `.reset()`, gauges via `.set(0)`
-6. `docs/metrics.md` — in the correct table with type and description
+6. `site/content/docs/metrics.md` — in the correct table with type and description
 
 ## Pluggable Export Traits
 

@@ -41,7 +41,6 @@ impl AdminClient {
                 versions::DESCRIBE_ACLS_MAX,
                 versions::DESCRIBE_ACLS_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -122,7 +121,6 @@ impl AdminClient {
                             versions::CREATE_ACLS_MAX,
                             versions::CREATE_ACLS_MIN,
                         )
-                        .await
                         .ok_or_else(|| {
                             KrafkaError::protocol_kind(
                                 ProtocolErrorKind::UnknownApiVersion,
@@ -216,7 +214,6 @@ impl AdminClient {
                             versions::DELETE_ACLS_MAX,
                             versions::DELETE_ACLS_MIN,
                         )
-                        .await
                         .ok_or_else(|| {
                             KrafkaError::protocol_kind(
                                 ProtocolErrorKind::UnknownApiVersion,

@@ -41,7 +41,6 @@ impl AdminClient {
                 // Need v3+ for tagged feature fields
                 3,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -85,10 +84,22 @@ impl AdminClient {
     ///
     /// Requires `ALTER` permission on the cluster.
     ///
+    /// # Per-feature results are version-dependent
+    ///
+    /// `UpdateFeatures` v2 (Kafka 4.0+) removed the per-feature `Results` array
+    /// from the response: the controller now answers with a single top-level
+    /// outcome. Against a v2 broker,
+    /// [`UpdateFeaturesResult::results`] is therefore **empty**, and a
+    /// successful return means every requested update was applied. Against a
+    /// v0/v1 broker the per-feature breakdown is still populated. Treat
+    /// `Ok(_)` — not a non-empty `results` — as the success signal, and use
+    /// `results` only as extra diagnostics when it happens to be present.
+    ///
     /// # Example
     /// ```ignore
     /// use krafka::protocol::FeatureUpdateKey;
     ///
+    /// // `Ok` means the update was applied. `results` is a v0/v1-only detail.
     /// let results = admin.update_features(
     ///     vec![FeatureUpdateKey::upgrade("metadata.version", 17)],
     ///     false, // validate_only
@@ -125,7 +136,6 @@ impl AdminClient {
                             versions::UPDATE_FEATURES_MAX,
                             versions::UPDATE_FEATURES_MIN,
                         )
-                        .await
                         .ok_or_else(|| {
                             KrafkaError::protocol_kind(
                                 ProtocolErrorKind::UnknownApiVersion,
@@ -226,23 +236,6 @@ mod tests {
             .encode_versioned(versions::UPDATE_FEATURES_MAX, &mut buf)
             .expect("UpdateFeatures must encode with validate_only");
         assert!(!buf.is_empty());
-    }
-
-    /// `validate_only` needs UpdateFeatures v1+. Silently downgrading to v0
-    /// would apply a change the caller explicitly asked to only simulate, so
-    /// the version guard must reject rather than proceed.
-    #[test]
-    fn test_validate_only_below_v1_is_rejected() {
-        let validate_only = true;
-        let version = 0i16;
-        let rejected = validate_only && version < 1;
-        assert!(
-            rejected,
-            "validate_only on a v0 broker must be rejected, never silently applied"
-        );
-
-        // v1+ is fine.
-        assert!(!(validate_only && 1i16 < 1));
     }
 
     /// A broker error must keep its `ErrorCode` so `is_retriable()` governs

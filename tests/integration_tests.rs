@@ -1706,7 +1706,7 @@ async fn test_producer_metrics() {
             .expect("send failed");
     }
 
-    let metrics = producer.metrics().await;
+    let metrics = producer.metrics();
     assert_eq!(metrics.records_sent, 5, "Should have sent 5 records");
     assert!(metrics.bytes_sent > 0, "Should have sent bytes");
     assert_eq!(metrics.errors, 0, "Should have no errors");

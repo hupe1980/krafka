@@ -83,7 +83,6 @@ impl AdminClient {
                             versions::CREATE_TOPICS_MAX,
                             versions::CREATE_TOPICS_MIN,
                         )
-                        .await
                         .ok_or_else(|| {
                             KrafkaError::protocol_kind(
                                 ProtocolErrorKind::UnknownApiVersion,
@@ -197,7 +196,6 @@ impl AdminClient {
                             versions::DELETE_TOPICS_MAX,
                             versions::DELETE_TOPICS_MIN,
                         )
-                        .await
                         .ok_or_else(|| {
                             KrafkaError::protocol_kind(
                                 ProtocolErrorKind::UnknownApiVersion,
@@ -302,7 +300,6 @@ impl AdminClient {
                             versions::CREATE_PARTITIONS_MAX,
                             versions::CREATE_PARTITIONS_MIN,
                         )
-                        .await
                         .ok_or_else(|| {
                             KrafkaError::protocol_kind(
                                 ProtocolErrorKind::UnknownApiVersion,

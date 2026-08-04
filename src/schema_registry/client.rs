@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::http::{HttpClient, base64_encode};
 use super::{Schema, SchemaId, SchemaReference, SchemaRegistryClient, SchemaType, SchemaVersion};
 use crate::error::{KrafkaError, Result};
+use crate::http::{HttpClient, base64_encode};
 
 /// Content type for the Confluent Schema Registry REST API.
 const SCHEMA_REGISTRY_CONTENT_TYPE: &str = "application/vnd.schemaregistry.v1+json";

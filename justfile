@@ -23,13 +23,13 @@ set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 # Everything except the aws-lc-rs backend, so the default `ring` code paths are
 # the ones that actually execute. `cfg(not(feature = "rustls-aws-lc-rs"))` arms
 # exist in `auth/tls.rs` and `schema_registry/http.rs` and run nowhere else.
-ring_features := "compression-all,aws-msk,schema-registry,aws-glue-schema-registry,native-tls-roots,unstable-protocol,telemetry,socks5,ring"
+ring_features := "compression-all,aws-msk,schema-registry,aws-glue-schema-registry,oauth-oidc,native-tls-roots,unstable-protocol,telemetry,socks5,ring"
 
 # Portable subset for macOS and Windows: pure-Rust `ring` avoids needing a C
 # toolchain and NASM. `test-broker` is deliberately included — it binds real
 # TCP listeners and drives real clients over loopback, which is the behaviour
 # most likely to differ between platforms.
-cross_platform_features := "compression,schema-registry,unstable-protocol,telemetry,socks5,test-broker,ring"
+cross_platform_features := "compression,schema-registry,oauth-oidc,unstable-protocol,telemetry,socks5,test-broker,ring"
 
 # Minimum supported Rust version, mirroring `rust-version` in Cargo.toml.
 msrv := "1.88"
@@ -45,7 +45,7 @@ default:
 # Ordered cheapest-first so a formatting slip fails in seconds rather than
 # after a full test run.
 [doc("Everything CI runs (no Docker suites)")]
-ci: fmt-check clippy check api-parity test-ring test minimal-features doc
+ci: fmt-check clippy check protocol-parity secret-debug test-reachability version-check site-check test-ring test minimal-features doc
     @echo ""
     @echo "✓ ci passed — Docker suites not included, run 'just integration' for those"
 
@@ -112,16 +112,74 @@ minimal-features:
     cargo check --no-default-features --features "ring"
     cargo check --no-default-features --features "ring,rustls-aws-lc-rs"
 
-# Check that every config-builder option is reachable from the public builder.
+# Check the API version table against Apache Kafka's own message schemas.
 #
-# An option on a `*ConfigBuilder` that is missing from the corresponding public
-# `*Builder` is implemented, documentable and uncallable. Two such gaps shipped
-# before this check existed: KIP-848 could not be selected from
-# `Consumer::builder()`, and `docs/errors.md` carried a `dead_letter_queue`
-# example that did not compile.
-[doc("Public builders must expose every config option")]
-api-parity:
-    python3 xtask/api_parity.py
+# Reads a vendored snapshot, so it needs no network and cannot flake. It catches
+# the drift class a reviewer found by hand: four APIs pinned below their stable
+# Kafka ceiling, and a `Fetch` v17/v18 gate that existed only in prose.
+[doc("API version table must match the vendored Kafka schema snapshot")]
+protocol-parity:
+    python3 xtask/protocol_parity.py
+
+# No credential-bearing type may derive Debug.
+#
+# `Debug` is the quiet way secrets reach a log aggregator: a `tracing` field, an
+# error context or a panic message that formats the enclosing struct is enough.
+# Two instances shipped before this check existed — the OIDC client secret and
+# the raw SASL payload, which for PLAIN is the password in cleartext.
+[doc("No credential-bearing type may derive Debug")]
+secret-debug:
+    python3 xtask/secret_debug.py
+
+# No test may assert over its own literals.
+#
+# A negative control is the only proof a test works. Running one against the
+# share-group model produced a green suite, and the same suspicion applied to
+# the rest of the suite found a test that re-implemented the condition it
+# claimed to check — so deleting the guard it covered (a dry run that silently
+# applies a data-lossy feature downgrade) left it green.
+[doc("No test may assert over its own literals")]
+test-reachability:
+    python3 xtask/test_reachability.py
+
+# Every place that names krafka's own version must agree with Cargo.toml.
+#
+# A bump is a search-and-replace, and search-and-replace is blind to anywhere
+# already stale: bumping 0.14 -> 0.15 could not find `fuzz/Cargo.lock`, which
+# had been pinned at 0.12.0 for two releases. This asserts the invariant
+# instead of searching for a value.
+[doc("krafka's version is consistent everywhere it appears")]
+version-check:
+    python3 xtask/version_check.py
+
+# Structural invariants for the documentation site.
+#
+# Zola fails the build on an unparseable page or a broken internal link. It
+# cannot see a duplicate nav weight or a page no index links to — both are
+# valid sites — and the Jekyll setup this replaced had four of the first and
+# one of the second (a 711-line schema-registry guide reachable from nothing).
+[doc("Documentation site structure is sound")]
+site-check:
+    python3 xtask/site_check.py
+    python3 xtask/doc_api.py
+
+# Build the documentation site into site/public.
+[doc("Build the documentation site")]
+site-build:
+    cd site && zola build
+
+# Serve the documentation site with live reload on http://127.0.0.1:1111.
+[doc("Serve the documentation site locally")]
+site-serve:
+    cd site && zola serve
+
+# Re-fetch the vendored Kafka schema snapshot. Run deliberately, review the
+# diff, then run `just protocol-parity` to see what krafka must do about it.
+#
+#   just refresh-protocol-snapshot 4.3
+[doc("Refresh the vendored Kafka protocol snapshot (needs network)")]
+refresh-protocol-snapshot ref="4.3":
+    python3 xtask/protocol_parity.py --refresh --ref {{ref}}
 
 # Build the docs with warnings denied, matching CI.
 doc:

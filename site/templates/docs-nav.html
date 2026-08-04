@@ -1,0 +1,40 @@
+{#-
+  Documentation sidebar.
+
+  Driven by `extra.nav` in config.toml, not by directory order. The grouping is
+  editorial ("when do you need this?") and the URLs are flat, so the two can be
+  reconsidered independently — a nested content directory would bake the
+  current grouping into every permalink.
+
+  `current` is the slug of the page being rendered, or "" on the docs index.
+-#}
+{%- set docs = get_section(path="docs/_index.md") -%}
+<nav class="docs-nav" aria-label="Documentation">
+  <form class="docs-search" role="search" onsubmit="return false;">
+    <label class="sr-only" for="docs-search-input">Search documentation</label>
+    <input id="docs-search-input" type="search" placeholder="Search docs…" autocomplete="off" spellcheck="false"
+           data-index="{{ get_url(path='search_index.en.json') | safe }}">
+    <div id="docs-search-results" class="search-results" hidden></div>
+  </form>
+
+  {%- for group in config.extra.nav %}
+  <p class="nav-group">{{ group.title }}</p>
+  <ul>
+    {%- for slug in group.pages %}
+      {%- for p in docs.pages %}
+        {%- if p.extra.slug_id == slug %}
+    <li>
+      <a href="{{ p.permalink | safe }}"{% if p.extra.slug_id == current %} aria-current="page"{% endif %}>{{ p.title }}</a>
+    </li>
+        {%- endif %}
+      {%- endfor %}
+    {%- endfor %}
+  </ul>
+  {%- endfor %}
+
+  <p class="nav-group">External</p>
+  <ul>
+    <li><a href="{{ config.extra.api_docs }}" rel="noopener">API reference ↗</a></li>
+    <li><a href="{{ config.extra.repo }}" rel="noopener">Source ↗</a></li>
+  </ul>
+</nav>

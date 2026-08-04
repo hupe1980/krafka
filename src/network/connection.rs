@@ -3075,7 +3075,12 @@ impl BrokerConnection {
     }
 
     /// Get the supported API version for a specific API.
-    pub async fn get_api_version(&self, api_key: ApiKey) -> Option<ApiVersionRange> {
+    ///
+    /// Synchronous: the negotiated table is a `parking_lot::Mutex` populated
+    /// during the handshake, so this is a map lookup. It was `async` with no
+    /// `await` inside, which forced every caller — and therefore every caller's
+    /// caller — to be async for a lock read.
+    pub fn get_api_version(&self, api_key: ApiKey) -> Option<ApiVersionRange> {
         let versions = self.api_versions.lock();
         versions.get(&api_key).copied()
     }
@@ -3100,9 +3105,9 @@ impl BrokerConnection {
     ///
     /// ```rust,ignore
     /// // Client supports Fetch v4-v12
-    /// let version = conn.negotiate_api_version(ApiKey::Fetch, 12, 4).await;
+    /// let version = conn.negotiate_api_version(ApiKey::Fetch, 12, 4);
     /// ```
-    pub async fn negotiate_api_version(
+    pub fn negotiate_api_version(
         &self,
         api_key: ApiKey,
         client_max: i16,
@@ -3115,8 +3120,8 @@ impl BrokerConnection {
     }
 
     /// Negotiate the best API version with minimum version defaulting to 0.
-    pub async fn negotiate_api_version_max(&self, api_key: ApiKey, client_max: i16) -> Option<i16> {
-        self.negotiate_api_version(api_key, client_max, 0).await
+    pub fn negotiate_api_version_max(&self, api_key: ApiKey, client_max: i16) -> Option<i16> {
+        self.negotiate_api_version(api_key, client_max, 0)
     }
 
     /// Compute the session expiry instant from a broker-reported lifetime.

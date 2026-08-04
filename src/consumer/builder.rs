@@ -262,16 +262,16 @@ impl ConsumerBuilder {
 
     /// Select the consumer group protocol.
     ///
-    /// [`GroupProtocol::Classic`](super::GroupProtocol::Classic) uses the
-    /// traditional JoinGroup/SyncGroup/Heartbeat flow and is the default.
-    /// [`GroupProtocol::Consumer`](super::GroupProtocol::Consumer) uses the
+    /// [`GroupProtocol::Consumer`](super::GroupProtocol::Consumer) — the
     /// KIP-848 protocol, where the coordinator computes assignments
-    /// server-side and `ConsumerGroupHeartbeat` is the sole membership
-    /// channel.
+    /// server-side and `ConsumerGroupHeartbeat` is the sole membership channel
+    /// — is the **recommended** choice. It has been production ready since
+    /// Apache Kafka 4.0.
     ///
-    /// **`Consumer` requires Kafka 3.7+ and is not yet recommended for
-    /// production** — see [`GroupProtocol`](super::GroupProtocol) for the
-    /// current caveats.
+    /// [`GroupProtocol::Classic`](super::GroupProtocol::Classic) remains the
+    /// default so that upgrading krafka is never itself a protocol migration,
+    /// but Apache Kafka 4.3 has begun deprecating it (KIP-1274) and krafka
+    /// logs a one-time warning when a group starts on it.
     pub fn group_protocol(mut self, protocol: super::GroupProtocol) -> Self {
         self.config.group_protocol = protocol;
         self
@@ -373,6 +373,21 @@ impl ConsumerBuilder {
     #[cfg(feature = "socks5")]
     pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
         self.config.proxy = Some(proxy);
+        self
+    }
+
+    /// Set socket- and pool-level transport tuning.
+    ///
+    /// Covers TCP keepalive and nodelay, the per-connection response ceiling
+    /// and in-flight cap, the priority-channel depths, the Happy Eyeballs
+    /// stagger, idle-connection eviction, a total-connection cap, and the
+    /// KIP-1288 automatic TLS reload interval.
+    ///
+    /// Omitting this call keeps krafka's historical defaults, which
+    /// [`TransportConfig::default`](crate::network::TransportConfig) reproduces
+    /// exactly.
+    pub fn transport(mut self, transport: crate::network::TransportConfig) -> Self {
+        self.config.transport = transport;
         self
     }
 
@@ -541,15 +556,40 @@ impl ConsumerBuilder {
         self
     }
 
+    /// Validate the configuration and return it, without connecting.
+    ///
+    /// Runs exactly the checks [`build`](Self::build) runs — they call the same
+    /// validator — so a config that passes here will not be rejected later for
+    /// a configuration reason. Useful for validating settings at startup, in a
+    /// test, or in a config-linting tool, none of which want a broker.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KrafkaError::Config`](crate::error::KrafkaError::Config) for
+    /// any invalid combination; see
+    /// the consumer configuration validator for the full list.
+    pub fn build_config(self) -> Result<ConsumerConfig> {
+        // A shared pool supplies the connection, so an empty bootstrap list is
+        // legitimate there. Mirror what `build` does rather than duplicating
+        // the reasoning.
+        if self.shared.is_some() && self.config.bootstrap_servers.is_empty() {
+            let mut probe = self.config.clone();
+            probe.bootstrap_servers = "<provided-by-client>".to_string();
+            super::config::validate(&probe)?;
+            return Ok(self.config);
+        }
+        super::config::validate(&self.config)?;
+        Ok(self.config)
+    }
+
     /// Build the consumer.
     ///
     /// # Errors
     ///
     /// All configuration constraints are enforced here, via the same
-    /// validation used by [`ConsumerConfigBuilder::build`]. See
-    /// [`ConsumerConfigBuilder::build`] for the full list.
+    /// consumer configuration validator. See its documentation for the full
+    /// list.
     ///
-    /// [`ConsumerConfigBuilder::build`]: crate::consumer::ConsumerConfigBuilder::build
     pub async fn build(self) -> Result<Consumer> {
         // `bootstrap_servers` is optional when a pre-built client supplies the
         // connection pool, so that one check is done here rather than in the
@@ -877,7 +917,7 @@ mod tests {
 
     // ── Builder validation ───────────────────────────────────────────────
     //
-    // These constraints previously lived only in `ConsumerConfigBuilder::build`,
+    // These constraints previously lived only in the deleted `ConsumerConfigBuilder::build`,
     // which no public API could reach, so `Consumer::builder()` accepted values
     // that produce a broken consumer.
 

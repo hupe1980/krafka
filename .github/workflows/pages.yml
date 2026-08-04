@@ -1,0 +1,96 @@
+'on':
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - 'xtask/site_check.py'
+      - 'xtask/doc_api.py'
+      - '.github/workflows/pages.yml'
+  # The API check compares the guides against `src/`, so a rename in the crate
+  # can break the site without touching it.
+  pull_request:
+    paths:
+      - 'site/**'
+      - 'src/**'
+      - 'xtask/site_check.py'
+      - 'xtask/doc_api.py'
+  workflow_dispatch:
+
+name: Documentation site
+
+# GitHub Pages used to build `docs/` with its own Jekyll pipeline, which meant
+# a broken site was only discoverable after merge. Building here means a
+# structural fault fails the pull request instead.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel a deploy in flight; queue behind it. Cancelling mid-upload can
+# leave the Pages artifact half-published.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  ZOLA_VERSION: '0.22.1'
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zola
+        run: |
+          curl -sSfL \
+            "https://github.com/getzola/zola/releases/download/v${ZOLA_VERSION}/zola-v${ZOLA_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C /usr/local/bin zola
+          zola --version
+
+      - name: Check site structure
+        run: python3 xtask/site_check.py
+
+      - name: Check documented APIs exist
+        run: python3 xtask/doc_api.py
+
+      # `--drafts` is deliberately absent, and `internal_level = "error"` in
+      # zola.toml makes a broken internal link fail right here.
+      - name: Build
+        working-directory: site
+        run: zola build
+
+      - name: Verify output
+        working-directory: site
+        run: |
+          test -s public/index.html
+          test -s public/sitemap.xml
+          test -s public/robots.txt
+          test -s public/search_index.en.json
+          # One <h1> per page. Two is a real SEO fault and it is how the
+          # migration started: every guide carried its own H1 while the
+          # template emitted another from the front matter.
+          fail=0
+          for f in public/docs/*/index.html; do
+            n=$(grep -o '<h1' "$f" | wc -l)
+            if [ "$n" -ne 1 ]; then echo "::error::$f has $n <h1> elements"; fail=1; fi
+          done
+          exit $fail
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/public
+
+  deploy:
+    name: Deploy
+    # Pull requests build and verify but must not publish.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

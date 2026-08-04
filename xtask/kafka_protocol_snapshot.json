@@ -1,0 +1,656 @@
+{
+  "apis": {
+    "AddOffsetsToTxn": {
+      "flexible_from": 3,
+      "key": 25,
+      "latest_version_unstable": false,
+      "max_version": 4,
+      "min_version": 0
+    },
+    "AddPartitionsToTxn": {
+      "flexible_from": 3,
+      "key": 24,
+      "latest_version_unstable": false,
+      "max_version": 5,
+      "min_version": 0
+    },
+    "AddRaftVoter": {
+      "flexible_from": 0,
+      "key": 80,
+      "latest_version_unstable": false,
+      "max_version": 1,
+      "min_version": 0
+    },
+    "AllocateProducerIds": {
+      "flexible_from": 0,
+      "key": 67,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "AlterClientQuotas": {
+      "flexible_from": 1,
+      "key": 49,
+      "latest_version_unstable": false,
+      "max_version": 1,
+      "min_version": 0
+    },
+    "AlterConfigs": {
+      "flexible_from": 2,
+      "key": 33,
+      "latest_version_unstable": false,
+      "max_version": 2,
+      "min_version": 0
+    },
+    "AlterPartition": {
+      "flexible_from": 0,
+      "key": 56,
+      "latest_version_unstable": false,
+      "max_version": 3,
+      "min_version": 2
+    },
+    "AlterPartitionReassignments": {
+      "flexible_from": 0,
+      "key": 45,
+      "latest_version_unstable": false,
+      "max_version": 1,
+      "min_version": 0
+    },
+    "AlterReplicaLogDirs": {
+      "flexible_from": 2,
+      "key": 34,
+      "latest_version_unstable": false,
+      "max_version": 2,
+      "min_version": 1
+    },
+    "AlterShareGroupOffsets": {
+      "flexible_from": 0,
+      "key": 91,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "AlterUserScramCredentials": {
+      "flexible_from": 0,
+      "key": 51,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "ApiVersions": {
+      "flexible_from": 3,
+      "key": 18,
+      "latest_version_unstable": false,
+      "max_version": 4,
+      "min_version": 0
+    },
+    "AssignReplicasToDirs": {
+      "flexible_from": 0,
+      "key": 73,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "BeginQuorumEpoch": {
+      "flexible_from": 1,
+      "key": 53,
+      "latest_version_unstable": false,
+      "max_version": 1,
+      "min_version": 0
+    },
+    "BrokerHeartbeat": {
+      "flexible_from": 0,
+      "key": 63,
+      "latest_version_unstable": false,
+      "max_version": 2,
+      "min_version": 0
+    },
+    "BrokerRegistration": {
+      "flexible_from": 0,
+      "key": 62,
+      "latest_version_unstable": false,
+      "max_version": 4,
+      "min_version": 0
+    },
+    "ConsumerGroupDescribe": {
+      "flexible_from": 0,
+      "key": 69,
+      "latest_version_unstable": false,
+      "max_version": 1,
+      "min_version": 0
+    },
+    "ConsumerGroupHeartbeat": {
+      "flexible_from": 0,
+      "key": 68,
+      "latest_version_unstable": false,
+      "max_version": 1,
+      "min_version": 0
+    },
+    "ControlledShutdown": {
+      "flexible_from": null,
+      "key": 7,
+      "latest_version_unstable": false,
+      "max_version": null,
+      "min_version": null
+    },
+    "ControllerRegistration": {
+      "flexible_from": 0,
+      "key": 70,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "CreateAcls": {
+      "flexible_from": 2,
+      "key": 30,
+      "latest_version_unstable": false,
+      "max_version": 3,
+      "min_version": 1
+    },
+    "CreateDelegationToken": {
+      "flexible_from": 2,
+      "key": 38,
+      "latest_version_unstable": false,
+      "max_version": 3,
+      "min_version": 1
+    },
+    "CreatePartitions": {
+      "flexible_from": 2,
+      "key": 37,
+      "latest_version_unstable": false,
+      "max_version": 3,
+      "min_version": 0
+    },
+    "CreateTopics": {
+      "flexible_from": 5,
+      "key": 19,
+      "latest_version_unstable": false,
+      "max_version": 7,
+      "min_version": 2
+    },
+    "DeleteAcls": {
+      "flexible_from": 2,
+      "key": 31,
+      "latest_version_unstable": false,
+      "max_version": 3,
+      "min_version": 1
+    },
+    "DeleteGroups": {
+      "flexible_from": 2,
+      "key": 42,
+      "latest_version_unstable": false,
+      "max_version": 2,
+      "min_version": 0
+    },
+    "DeleteRecords": {
+      "flexible_from": 2,
+      "key": 21,
+      "latest_version_unstable": false,
+      "max_version": 2,
+      "min_version": 0
+    },
+    "DeleteShareGroupOffsets": {
+      "flexible_from": 0,
+      "key": 92,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "DeleteShareGroupState": {
+      "flexible_from": 0,
+      "key": 86,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "DeleteTopics": {
+      "flexible_from": 4,
+      "key": 20,
+      "latest_version_unstable": false,
+      "max_version": 6,
+      "min_version": 1
+    },
+    "DescribeAcls": {
+      "flexible_from": 2,
+      "key": 29,
+      "latest_version_unstable": false,
+      "max_version": 3,
+      "min_version": 1
+    },
+    "DescribeClientQuotas": {
+      "flexible_from": 1,
+      "key": 48,
+      "latest_version_unstable": false,
+      "max_version": 1,
+      "min_version": 0
+    },
+    "DescribeCluster": {
+      "flexible_from": 0,
+      "key": 60,
+      "latest_version_unstable": false,
+      "max_version": 2,
+      "min_version": 0
+    },
+    "DescribeConfigs": {
+      "flexible_from": 4,
+      "key": 32,
+      "latest_version_unstable": false,
+      "max_version": 4,
+      "min_version": 1
+    },
+    "DescribeDelegationToken": {
+      "flexible_from": 2,
+      "key": 41,
+      "latest_version_unstable": false,
+      "max_version": 3,
+      "min_version": 1
+    },
+    "DescribeGroups": {
+      "flexible_from": 5,
+      "key": 15,
+      "latest_version_unstable": false,
+      "max_version": 6,
+      "min_version": 0
+    },
+    "DescribeLogDirs": {
+      "flexible_from": 2,
+      "key": 35,
+      "latest_version_unstable": false,
+      "max_version": 5,
+      "min_version": 1
+    },
+    "DescribeProducers": {
+      "flexible_from": 0,
+      "key": 61,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "DescribeQuorum": {
+      "flexible_from": 0,
+      "key": 55,
+      "latest_version_unstable": false,
+      "max_version": 2,
+      "min_version": 0
+    },
+    "DescribeShareGroupOffsets": {
+      "flexible_from": 0,
+      "key": 90,
+      "latest_version_unstable": false,
+      "max_version": 1,
+      "min_version": 0
+    },
+    "DescribeTopicPartitions": {
+      "flexible_from": 0,
+      "key": 75,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "DescribeTransactions": {
+      "flexible_from": 0,
+      "key": 65,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "DescribeUserScramCredentials": {
+      "flexible_from": 0,
+      "key": 50,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "ElectLeaders": {
+      "flexible_from": 2,
+      "key": 43,
+      "latest_version_unstable": false,
+      "max_version": 2,
+      "min_version": 0
+    },
+    "EndQuorumEpoch": {
+      "flexible_from": 1,
+      "key": 54,
+      "latest_version_unstable": false,
+      "max_version": 1,
+      "min_version": 0
+    },
+    "EndTxn": {
+      "flexible_from": 3,
+      "key": 26,
+      "latest_version_unstable": false,
+      "max_version": 5,
+      "min_version": 0
+    },
+    "Envelope": {
+      "flexible_from": 0,
+      "key": 58,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "ExpireDelegationToken": {
+      "flexible_from": 2,
+      "key": 40,
+      "latest_version_unstable": false,
+      "max_version": 2,
+      "min_version": 1
+    },
+    "Fetch": {
+      "flexible_from": 12,
+      "key": 1,
+      "latest_version_unstable": false,
+      "max_version": 18,
+      "min_version": 4
+    },
+    "FetchSnapshot": {
+      "flexible_from": 0,
+      "key": 59,
+      "latest_version_unstable": false,
+      "max_version": 1,
+      "min_version": 0
+    },
+    "FindCoordinator": {
+      "flexible_from": 3,
+      "key": 10,
+      "latest_version_unstable": false,
+      "max_version": 6,
+      "min_version": 0
+    },
+    "GetTelemetrySubscriptions": {
+      "flexible_from": 0,
+      "key": 71,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "Heartbeat": {
+      "flexible_from": 4,
+      "key": 12,
+      "latest_version_unstable": false,
+      "max_version": 4,
+      "min_version": 0
+    },
+    "IncrementalAlterConfigs": {
+      "flexible_from": 1,
+      "key": 44,
+      "latest_version_unstable": false,
+      "max_version": 1,
+      "min_version": 0
+    },
+    "InitProducerId": {
+      "flexible_from": 2,
+      "key": 22,
+      "latest_version_unstable": true,
+      "max_version": 6,
+      "min_version": 0
+    },
+    "InitializeShareGroupState": {
+      "flexible_from": 0,
+      "key": 83,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "JoinGroup": {
+      "flexible_from": 6,
+      "key": 11,
+      "latest_version_unstable": false,
+      "max_version": 9,
+      "min_version": 0
+    },
+    "LeaderAndIsr": {
+      "flexible_from": null,
+      "key": 4,
+      "latest_version_unstable": false,
+      "max_version": null,
+      "min_version": null
+    },
+    "LeaveGroup": {
+      "flexible_from": 4,
+      "key": 13,
+      "latest_version_unstable": false,
+      "max_version": 5,
+      "min_version": 0
+    },
+    "ListConfigResources": {
+      "flexible_from": 0,
+      "key": 74,
+      "latest_version_unstable": false,
+      "max_version": 1,
+      "min_version": 0
+    },
+    "ListGroups": {
+      "flexible_from": 3,
+      "key": 16,
+      "latest_version_unstable": false,
+      "max_version": 5,
+      "min_version": 0
+    },
+    "ListOffsets": {
+      "flexible_from": 6,
+      "key": 2,
+      "latest_version_unstable": false,
+      "max_version": 11,
+      "min_version": 1
+    },
+    "ListPartitionReassignments": {
+      "flexible_from": 0,
+      "key": 46,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "ListTransactions": {
+      "flexible_from": 0,
+      "key": 66,
+      "latest_version_unstable": false,
+      "max_version": 2,
+      "min_version": 0
+    },
+    "Metadata": {
+      "flexible_from": 9,
+      "key": 3,
+      "latest_version_unstable": false,
+      "max_version": 13,
+      "min_version": 0
+    },
+    "OffsetCommit": {
+      "flexible_from": 8,
+      "key": 8,
+      "latest_version_unstable": false,
+      "max_version": 10,
+      "min_version": 2
+    },
+    "OffsetDelete": {
+      "flexible_from": null,
+      "key": 47,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "OffsetFetch": {
+      "flexible_from": 6,
+      "key": 9,
+      "latest_version_unstable": false,
+      "max_version": 10,
+      "min_version": 1
+    },
+    "OffsetForLeaderEpoch": {
+      "flexible_from": 4,
+      "key": 23,
+      "latest_version_unstable": false,
+      "max_version": 4,
+      "min_version": 2
+    },
+    "Produce": {
+      "flexible_from": 9,
+      "key": 0,
+      "latest_version_unstable": false,
+      "max_version": 13,
+      "min_version": 3
+    },
+    "PushTelemetry": {
+      "flexible_from": 0,
+      "key": 72,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "ReadShareGroupState": {
+      "flexible_from": 0,
+      "key": 84,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "ReadShareGroupStateSummary": {
+      "flexible_from": 0,
+      "key": 87,
+      "latest_version_unstable": false,
+      "max_version": 1,
+      "min_version": 0
+    },
+    "RemoveRaftVoter": {
+      "flexible_from": 0,
+      "key": 81,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "RenewDelegationToken": {
+      "flexible_from": 2,
+      "key": 39,
+      "latest_version_unstable": false,
+      "max_version": 2,
+      "min_version": 1
+    },
+    "SaslAuthenticate": {
+      "flexible_from": 2,
+      "key": 36,
+      "latest_version_unstable": false,
+      "max_version": 2,
+      "min_version": 0
+    },
+    "SaslHandshake": {
+      "flexible_from": null,
+      "key": 17,
+      "latest_version_unstable": false,
+      "max_version": 1,
+      "min_version": 0
+    },
+    "ShareAcknowledge": {
+      "flexible_from": 0,
+      "key": 79,
+      "latest_version_unstable": false,
+      "max_version": 2,
+      "min_version": 1
+    },
+    "ShareFetch": {
+      "flexible_from": 0,
+      "key": 78,
+      "latest_version_unstable": false,
+      "max_version": 2,
+      "min_version": 1
+    },
+    "ShareGroupDescribe": {
+      "flexible_from": 0,
+      "key": 77,
+      "latest_version_unstable": false,
+      "max_version": 1,
+      "min_version": 1
+    },
+    "ShareGroupHeartbeat": {
+      "flexible_from": 0,
+      "key": 76,
+      "latest_version_unstable": false,
+      "max_version": 1,
+      "min_version": 1
+    },
+    "StopReplica": {
+      "flexible_from": null,
+      "key": 5,
+      "latest_version_unstable": false,
+      "max_version": null,
+      "min_version": null
+    },
+    "StreamsGroupDescribe": {
+      "flexible_from": 0,
+      "key": 89,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "StreamsGroupHeartbeat": {
+      "flexible_from": 0,
+      "key": 88,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "SyncGroup": {
+      "flexible_from": 4,
+      "key": 14,
+      "latest_version_unstable": false,
+      "max_version": 5,
+      "min_version": 0
+    },
+    "TxnOffsetCommit": {
+      "flexible_from": 3,
+      "key": 28,
+      "latest_version_unstable": false,
+      "max_version": 5,
+      "min_version": 0
+    },
+    "UnregisterBroker": {
+      "flexible_from": 0,
+      "key": 64,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "UpdateFeatures": {
+      "flexible_from": 0,
+      "key": 57,
+      "latest_version_unstable": false,
+      "max_version": 2,
+      "min_version": 0
+    },
+    "UpdateMetadata": {
+      "flexible_from": null,
+      "key": 6,
+      "latest_version_unstable": false,
+      "max_version": null,
+      "min_version": null
+    },
+    "UpdateRaftVoter": {
+      "flexible_from": 0,
+      "key": 82,
+      "latest_version_unstable": false,
+      "max_version": 0,
+      "min_version": 0
+    },
+    "Vote": {
+      "flexible_from": 0,
+      "key": 52,
+      "latest_version_unstable": false,
+      "max_version": 2,
+      "min_version": 0
+    },
+    "WriteShareGroupState": {
+      "flexible_from": 0,
+      "key": 85,
+      "latest_version_unstable": false,
+      "max_version": 1,
+      "min_version": 0
+    },
+    "WriteTxnMarkers": {
+      "flexible_from": 1,
+      "key": 27,
+      "latest_version_unstable": false,
+      "max_version": 2,
+      "min_version": 1
+    }
+  },
+  "kafka_ref": "4.3"
+}

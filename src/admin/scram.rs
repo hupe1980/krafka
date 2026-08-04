@@ -40,7 +40,6 @@ impl AdminClient {
                 versions::DESCRIBE_USER_SCRAM_CREDENTIALS_MAX,
                 versions::DESCRIBE_USER_SCRAM_CREDENTIALS_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -165,7 +164,6 @@ impl AdminClient {
                             versions::ALTER_USER_SCRAM_CREDENTIALS_MAX,
                             versions::ALTER_USER_SCRAM_CREDENTIALS_MIN,
                         )
-                        .await
                         .ok_or_else(|| {
                             KrafkaError::protocol_kind(
                                 ProtocolErrorKind::UnknownApiVersion,

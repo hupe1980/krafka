@@ -80,10 +80,40 @@ impl SaslHandshakeResponse {
 // ============================================================================
 
 /// Request to authenticate via SASL.
-#[derive(Debug, Clone)]
+///
+/// # `Debug` is redacted
+///
+/// [`auth_bytes`](Self::auth_bytes) is the raw mechanism payload, which *is*
+/// the credential:
+///
+/// | Mechanism | What `auth_bytes` contains |
+/// |---|---|
+/// | `PLAIN` | `\0username\0password` — the password in cleartext |
+/// | `OAUTHBEARER` | `n,,\x01auth=Bearer <token>\x01\x01` — the bearer token verbatim |
+/// | `SCRAM-SHA-*` | the client-first/client-final messages, including the client proof |
+/// | `AWS_MSK_IAM` | a SigV4-signed payload |
+///
+/// A derived `Debug` would print all of that into any log line, error context
+/// or panic message that formatted the request. The manual impl reports the
+/// length only, matching what [`AuthConfig`](crate::auth::AuthConfig),
+/// `ProxyCredentials` and the delegation-token types already do.
+#[derive(Clone)]
 pub struct SaslAuthenticateRequest {
     /// SASL authentication bytes.
+    ///
+    /// Treat as secret — see the type-level documentation.
     pub auth_bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for SaslAuthenticateRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SaslAuthenticateRequest")
+            .field(
+                "auth_bytes",
+                &format_args!("[REDACTED; {} bytes]", self.auth_bytes.len()),
+            )
+            .finish()
+    }
 }
 
 impl SaslAuthenticateRequest {
@@ -108,16 +138,37 @@ impl SaslAuthenticateRequest {
 }
 
 /// Response from SASL authentication.
-#[derive(Debug, Clone)]
+///
+/// `Debug` redacts [`auth_bytes`](Self::auth_bytes) for the same reason as
+/// [`SaslAuthenticateRequest`]: on a multi-step mechanism the server's
+/// challenge is part of the authentication exchange, and on a failed
+/// negotiation it can echo client-supplied material back.
+#[derive(Clone)]
 pub struct SaslAuthenticateResponse {
     /// Error code.
     pub error_code: ErrorCode,
     /// Error message (if any).
     pub error_message: Option<String>,
     /// Authentication response bytes.
+    ///
+    /// Treat as secret — see the type-level documentation.
     pub auth_bytes: Vec<u8>,
     /// Session lifetime in milliseconds (v1+).
     pub session_lifetime_ms: i64,
+}
+
+impl std::fmt::Debug for SaslAuthenticateResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SaslAuthenticateResponse")
+            .field("error_code", &self.error_code)
+            .field("error_message", &self.error_message)
+            .field(
+                "auth_bytes",
+                &format_args!("[REDACTED; {} bytes]", self.auth_bytes.len()),
+            )
+            .field("session_lifetime_ms", &self.session_lifetime_ms)
+            .finish()
+    }
 }
 
 impl SaslAuthenticateResponse {
@@ -201,6 +252,68 @@ impl VersionedDecode for SaslAuthenticateResponse {
             1 => Self::decode_v1(buf),
             _ => unsupported_decode!("SaslAuthenticateResponse", version),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod redaction_tests {
+    use super::*;
+
+    /// For SASL/PLAIN the request payload *is* the password. A derived `Debug`
+    /// printed it verbatim into any log line, error context or panic message
+    /// that formatted the request.
+    #[test]
+    fn sasl_authenticate_request_debug_redacts_the_credential() {
+        // Exactly what the PLAIN mechanism puts on the wire.
+        let payload = b"\0alice\0hunter2".to_vec();
+        let rendered = format!("{:?}", SaslAuthenticateRequest::new(payload.clone()));
+
+        assert!(
+            !rendered.contains("hunter2"),
+            "the password must not appear in Debug output: {rendered}"
+        );
+        assert!(
+            !rendered.contains("alice"),
+            "the username must not appear either: {rendered}"
+        );
+        assert!(rendered.contains("REDACTED"), "got: {rendered}");
+        // The length is still reported, which is what makes the redaction
+        // debuggable rather than merely opaque.
+        assert!(
+            rendered.contains(&payload.len().to_string()),
+            "got: {rendered}"
+        );
+    }
+
+    /// An OAUTHBEARER payload carries the bearer token verbatim.
+    #[test]
+    fn sasl_authenticate_request_debug_redacts_a_bearer_token() {
+        let jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2ln";
+        let payload = format!("n,,\x01auth=Bearer {jwt}\x01\x01").into_bytes();
+        let rendered = format!("{:?}", SaslAuthenticateRequest::new(payload));
+        assert!(!rendered.contains(jwt), "got: {rendered}");
+        assert!(rendered.contains("REDACTED"), "got: {rendered}");
+    }
+
+    /// The response carries the server's half of a multi-step exchange.
+    #[test]
+    fn sasl_authenticate_response_debug_redacts_the_challenge() {
+        let response = SaslAuthenticateResponse {
+            error_code: ErrorCode::None,
+            error_message: None,
+            auth_bytes: b"v=rmF9pqV8S7suAoZWja4dJRkFsKQ=".to_vec(),
+            session_lifetime_ms: 3_600_000,
+        };
+        let rendered = format!("{response:?}");
+        assert!(
+            !rendered.contains("rmF9pqV8S7suAoZWja4dJRkFsKQ"),
+            "got: {rendered}"
+        );
+        assert!(rendered.contains("REDACTED"), "got: {rendered}");
+        // Non-secret fields stay visible — the point is redaction, not silence.
+        assert!(rendered.contains("3600000"), "got: {rendered}");
+        assert!(rendered.contains("error_code"), "got: {rendered}");
     }
 }
 

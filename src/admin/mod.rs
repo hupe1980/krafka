@@ -79,6 +79,12 @@ mod offsets;
 mod partitions;
 mod quotas;
 mod scram;
+mod share_group_offsets;
+mod streams_groups;
+pub use share_group_offsets::{
+    DescribeShareGroupOffsetsResult, ShareGroupOffsetAlteration, ShareGroupOffsetDeletion,
+    ShareGroupPartitionOffset,
+};
 mod tokens;
 mod topics;
 mod transactions;
@@ -887,7 +893,9 @@ impl AclFilter {
 
 /// Admin client configuration.
 ///
-/// Use [`AdminConfig::builder()`] or [`Default::default()`] to construct.
+/// Produced by [`AdminClient::builder()`], whose
+/// [`build_config`](AdminClientBuilder::build_config) terminal returns it
+/// without connecting. [`Default::default()`] also works.
 #[derive(Debug, Clone)]
 pub struct AdminConfig {
     /// Bootstrap servers.
@@ -909,6 +917,16 @@ pub struct AdminConfig {
     /// SOCKS5 proxy configuration (optional).
     #[cfg(feature = "socks5")]
     pub(crate) proxy: Option<crate::network::ProxyConfig>,
+    /// Socket- and pool-level transport tuning.
+    ///
+    /// Defaults reproduce krafka's historical behaviour; see
+    /// [`TransportConfig`](crate::network::TransportConfig).
+    pub(crate) transport: crate::network::TransportConfig,
+    /// Maximum age of cached cluster metadata before a refresh.
+    ///
+    /// Was hard-coded to 5 min at the one construction site, so an admin
+    /// client on a fast-churning cluster could not shorten it.
+    pub(crate) metadata_max_age: Duration,
 }
 
 impl Default for AdminConfig {
@@ -923,16 +941,13 @@ impl Default for AdminConfig {
             auth: None,
             #[cfg(feature = "socks5")]
             proxy: None,
+            transport: crate::network::TransportConfig::default(),
+            metadata_max_age: Duration::from_secs(300),
         }
     }
 }
 
 impl AdminConfig {
-    /// Create a new config builder.
-    pub fn builder() -> AdminConfigBuilder {
-        AdminConfigBuilder::default()
-    }
-
     /// Returns the bootstrap servers.
     #[inline]
     pub fn bootstrap_servers(&self) -> &str {
@@ -980,83 +995,6 @@ impl AdminConfig {
     #[inline]
     pub fn proxy(&self) -> Option<&crate::network::ProxyConfig> {
         self.proxy.as_ref()
-    }
-}
-
-/// Builder for AdminConfig.
-#[must_use = "builders do nothing until .build() is called"]
-#[derive(Debug, Default)]
-pub struct AdminConfigBuilder {
-    config: AdminConfig,
-}
-
-impl AdminConfigBuilder {
-    /// Set bootstrap servers.
-    pub fn bootstrap_servers(mut self, servers: impl Into<String>) -> Self {
-        self.config.bootstrap_servers = servers.into();
-        self
-    }
-
-    /// Set client ID.
-    pub fn client_id(mut self, id: impl Into<String>) -> Self {
-        self.config.client_id = id.into();
-        self
-    }
-
-    /// Set request timeout: how long one in-flight request may wait for its
-    /// response. Default: 30 s.
-    ///
-    /// Must be at least [`connect_timeout`](Self::connect_timeout), whose
-    /// default is 10 s — a request's clock covers establishing the connection
-    /// it is sent over, so a shorter value would expire every request before
-    /// the handshake could finish. To go below 10 s, lower `connect_timeout`
-    /// as well; `build()` returns a config error otherwise.
-    pub fn request_timeout(mut self, timeout: Duration) -> Self {
-        self.config.request_timeout = timeout;
-        self
-    }
-
-    /// Set the connect timeout: how long TCP establishment to one broker may
-    /// take. Default: 10 s.
-    ///
-    /// This also acts as the floor on
-    /// [`request_timeout`](Self::request_timeout), so lowering it is what makes
-    /// a sub-10-second request timeout possible.
-    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
-        self.config.connect_timeout = timeout;
-        self
-    }
-
-    /// Set the metadata recovery strategy (KIP-899).
-    pub fn metadata_recovery_strategy(mut self, strategy: MetadataRecoveryStrategy) -> Self {
-        self.config.metadata_recovery_strategy = strategy;
-        self
-    }
-
-    /// Set the rebootstrap trigger duration (KIP-899).
-    ///
-    /// Only effective when [`MetadataRecoveryStrategy::Rebootstrap`] is set.
-    pub fn metadata_recovery_rebootstrap_trigger(mut self, duration: Duration) -> Self {
-        self.config.metadata_recovery_rebootstrap_trigger = duration;
-        self
-    }
-
-    /// Set authentication configuration.
-    pub fn auth(mut self, auth: AuthConfig) -> Self {
-        self.config.auth = Some(auth);
-        self
-    }
-
-    /// Set SOCKS5 proxy configuration.
-    #[cfg(feature = "socks5")]
-    pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
-        self.config.proxy = Some(proxy);
-        self
-    }
-
-    /// Build the AdminConfig.
-    pub fn build(self) -> AdminConfig {
-        self.config
     }
 }
 
@@ -1282,7 +1220,6 @@ impl AdminClient {
                     versions::FIND_COORDINATOR_MAX,
                     versions::FIND_COORDINATOR_MIN,
                 )
-                .await
                 .ok_or_else(|| {
                     KrafkaError::protocol_kind(
                         ProtocolErrorKind::UnknownApiVersion,
@@ -1378,7 +1315,6 @@ impl AdminClient {
                 versions::DELETE_GROUPS_MAX,
                 versions::DELETE_GROUPS_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -1444,7 +1380,6 @@ impl AdminClient {
                 versions::DESCRIBE_TOPIC_PARTITIONS_MAX,
                 versions::DESCRIBE_TOPIC_PARTITIONS_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -1590,6 +1525,29 @@ impl AdminClient {
         self.metadata.update_seed_brokers(servers)
     }
 
+    /// Re-read TLS certificate and key files from disk and atomically install
+    /// the new material for all **future** connections (KIP-1288).
+    ///
+    /// Existing TLS sessions are unaffected: they keep the connector they
+    /// handshaked with and are replaced naturally as connections cycle. On
+    /// error the previously loaded certificates stay active, so a call made
+    /// mid-rotation against a half-written PEM is safe to retry.
+    ///
+    /// No-op when TLS is not configured.
+    ///
+    /// Use this for event-driven rotation (an inotify watch, a sidecar
+    /// signal). For unattended rotation set
+    /// [`TransportConfig::tls_reload_interval`](crate::network::TransportConfig)
+    /// instead and krafka reloads on a timer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the certificate or key files cannot be read or
+    /// parsed.
+    pub async fn refresh_tls(&self) -> Result<()> {
+        self.pool.refresh_tls().await
+    }
+
     /// Force a rebootstrap: close all connections, clear the metadata cache,
     /// and fall back to bootstrap servers (KIP-899).
     pub async fn rebootstrap(&self) {
@@ -1699,6 +1657,13 @@ pub struct LogDirInfo {
     pub total_bytes: i64,
     /// Usable bytes on the volume (-1 if unknown, v4+).
     pub usable_bytes: i64,
+    /// Whether the directory is cordoned for decommissioning (KIP-1066,
+    /// `DescribeLogDirs` v5+).
+    ///
+    /// A cordoned directory keeps serving its existing replicas but receives
+    /// no new partition placements. `false` against brokers older than Kafka
+    /// 4.3, where the field does not exist and no directory can be cordoned.
+    pub is_cordoned: bool,
 }
 
 /// Per-topic partition details within a log directory.
@@ -2023,7 +1988,7 @@ pub struct WriteTxnMarkersResult {
     pub topics: Vec<WriteTxnMarkersTopicResult>,
 }
 
-/// Replica (voter or observer) info from `AdminClient::describe_quorum`.
+/// Replica (voter or observer) info from `AdminClient::describe_metadata_quorum`.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct QuorumReplicaInfo {
@@ -2031,15 +1996,68 @@ pub struct QuorumReplicaInfo {
     pub replica_id: i32,
     /// Last known log end offset, or -1 if unknown.
     pub log_end_offset: i64,
+    /// Leader wall-clock time (epoch millis) of this replica's most recent
+    /// fetch, or `-1` when unknown (KIP-836, `DescribeQuorum` v1+).
+    ///
+    /// `-1` for the leader's own entry, and for every replica when the broker
+    /// only speaks v0. Subtract from the leader's clock to answer "how long
+    /// has this voter been silent" — the check that distinguishes a slow
+    /// follower from a dead one before a controller loses quorum.
+    pub last_fetch_timestamp: i64,
+    /// Leader wall-clock append time (epoch millis) of the offset this replica
+    /// last fetched, or `-1` when unknown (KIP-836, `DescribeQuorum` v1+).
+    ///
+    /// The gap between this and the leader's current time is the replica's
+    /// real replication lag in wall-clock terms, which `log_end_offset` alone
+    /// cannot express on a low-traffic partition.
+    pub last_caught_up_timestamp: i64,
+    /// Directory UUID of this replica's log directory (KIP-853,
+    /// `DescribeQuorum` v2+), or `None` against an older broker.
+    ///
+    /// From KIP-853 a KRaft voter is identified by `(replica_id,
+    /// directory_id)`, not by ID alone. A reconfiguration tool that removes a
+    /// voter by ID can otherwise remove a node rebuilt on a fresh disk while
+    /// leaving the original in the quorum.
+    pub replica_directory_id: Option<[u8; 16]>,
 }
 
-/// Per-partition quorum info from `AdminClient::describe_quorum`.
+/// A listener endpoint of a quorum node (KIP-853, `DescribeQuorum` v2+).
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct QuorumListenerInfo {
+    /// Listener name, e.g. `CONTROLLER`.
+    pub name: String,
+    /// Host name.
+    pub host: String,
+    /// Port.
+    pub port: u16,
+}
+
+/// A node in the KRaft quorum and the endpoints it can be reached on
+/// (KIP-853, `DescribeQuorum` v2+).
+///
+/// Below v2 `DescribeQuorum` reported replica IDs with no way to contact them,
+/// leaving callers to cross-reference `DescribeCluster` and hope the two
+/// agreed.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct QuorumNodeInfo {
+    /// Node ID, matching a `replica_id` in the voter and observer lists.
+    pub node_id: i32,
+    /// Listener endpoints for this node.
+    pub listeners: Vec<QuorumListenerInfo>,
+}
+
+/// Per-partition quorum info from `AdminClient::describe_metadata_quorum`.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct QuorumPartitionResult {
     /// Partition index.
     pub partition_index: i32,
     /// Per-partition error, or `None` on success.
+    ///
+    /// Carries the broker's own message from `DescribeQuorum` v2+ (KIP-853)
+    /// and falls back to the error code's name on older versions.
     pub error: Option<String>,
     /// Leader broker ID, or -1 if unknown.
     pub leader_id: i32,
@@ -2053,7 +2071,7 @@ pub struct QuorumPartitionResult {
     pub observers: Vec<QuorumReplicaInfo>,
 }
 
-/// Per-topic quorum info from `AdminClient::describe_quorum`.
+/// Per-topic quorum info from `AdminClient::describe_metadata_quorum`.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct QuorumTopicResult {
@@ -2063,7 +2081,7 @@ pub struct QuorumTopicResult {
     pub partitions: Vec<QuorumPartitionResult>,
 }
 
-/// Result from `AdminClient::describe_quorum`.
+/// Result from `AdminClient::describe_metadata_quorum`.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DescribeQuorumResult {
@@ -2071,6 +2089,9 @@ pub struct DescribeQuorumResult {
     pub error: Option<String>,
     /// Per-topic quorum data.
     pub topics: Vec<QuorumTopicResult>,
+    /// Quorum nodes and their endpoints (KIP-853, `DescribeQuorum` v2+).
+    /// Empty against an older broker.
+    pub nodes: Vec<QuorumNodeInfo>,
 }
 
 /// A single per-partition result from [`AdminClient::list_offsets`].
@@ -2430,9 +2451,11 @@ mod tests {
     #[cfg(feature = "socks5")]
     #[test]
     fn test_admin_config_builder_proxy_round_trip() {
-        let config = AdminConfig::builder()
+        let config = crate::admin::AdminClient::builder()
+            .bootstrap_servers("localhost:9092")
             .proxy(crate::network::ProxyConfig::new("proxy:1080"))
-            .build();
+            .build_config()
+            .expect("config should build");
         let proxy = config.proxy().expect("proxy should be set");
         assert_eq!(proxy.address(), "proxy:1080");
     }

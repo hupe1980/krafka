@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Forbid tests that cannot fail.
+
+# Why this exists
+
+A negative control is the only way to know a test works: break the production
+code on purpose and check that the test goes red. Running one against krafka's
+new share-group model produced a green suite — the deleted code was governed by
+state nothing read back, and the test had been asserting a property the crate
+did not actually decide.
+
+Applying the same suspicion to the rest of the suite found a second instance,
+this one pure:
+
+    #[test]
+    fn test_validate_only_below_v1_is_rejected() {
+        let validate_only = true;
+        let version = 0i16;
+        let rejected = validate_only && version < 1;
+        assert!(rejected, "validate_only on a v0 broker must be rejected");
+    }
+
+The condition it checks lives in `AdminClient::update_features`. The test
+re-implements it and asserts the re-implementation, so deleting the guard —
+which would let a caller's dry run silently *apply* a data-lossy feature
+downgrade — changed nothing here. It is now an end-to-end test against the fake
+broker, and it asserts the strong form: no request was sent at all.
+
+# What it checks
+
+A `#[test]` or `#[tokio::test]` body that never reaches into the crate:
+
+  1. no path (`::`),
+  2. no upper-case-initial identifier — every type, variant and constant,
+  3. no call except the assertion and formatting macros,
+
+yet still contains an assertion. Such a test can only be asserting arithmetic
+over its own literals.
+
+The heuristic is deliberately narrow. It will not catch a test that reaches
+into the crate and then asserts something trivial — no script can. It catches
+the shape that has actually occurred, and costs nothing to keep.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+TEST_RE = re.compile(
+    r"#\[(?:tokio::)?test[^\]]*\]\s*(?:#\[[^\]]*\]\s*)*(?:async\s+)?fn\s+(\w+)"
+)
+IDENT = re.compile(r"\b([A-Za-z_]\w*)\b")
+
+# Macros that do not reach into the crate.
+INERT_MACROS = {
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "matches",
+    "vec",
+    "format",
+    "println",
+    "eprintln",
+    "panic",
+    "write",
+    "writeln",
+    "unreachable",
+    "todo",
+}
+
+
+def strip_comments(text: str) -> str:
+    """Blank out comments, preserving offsets so line numbers stay correct."""
+    out = list(text)
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                out[i] = " "
+                i += 1
+        elif text.startswith("/*", i):
+            depth = 1
+            out[i] = out[i + 1] = " "
+            i += 2
+            while i < n and depth:
+                if text.startswith("/*", i):
+                    depth += 1
+                    out[i] = out[i + 1] = " "
+                    i += 2
+                elif text.startswith("*/", i):
+                    depth -= 1
+                    out[i] = out[i + 1] = " "
+                    i += 2
+                else:
+                    out[i] = " " if text[i] != "\n" else "\n"
+                    i += 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def body_of(text: str, open_brace: int) -> str | None:
+    depth = 0
+    for i in range(open_brace, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_brace + 1 : i]
+    return None
+
+
+def main() -> int:
+    failures: list[str] = []
+    checked = 0
+
+    paths = sorted(ROOT.glob("src/**/*.rs")) + sorted(ROOT.glob("tests/*.rs"))
+    for path in paths:
+        raw = path.read_text()
+        text = strip_comments(raw)
+        for m in TEST_RE.finditer(text):
+            brace = text.find("{", m.end())
+            if brace == -1:
+                continue
+            body = body_of(text, brace)
+            if body is None:
+                continue
+
+            checked += 1
+            if "assert" not in body:
+                continue
+            if "::" in body:
+                continue
+            if any(i[:1].isupper() for i in IDENT.findall(body)):
+                continue
+            macros = set(re.findall(r"\b(\w+)\s*!", body))
+            calls = set(re.findall(r"\b(\w+)\s*\(", body)) - macros
+            if calls or (macros - INERT_MACROS):
+                continue
+
+            line = raw[: m.start()].count("\n") + 1
+            failures.append(
+                f"{path.relative_to(ROOT)}:{line}  `{m.group(1)}` asserts over its own "
+                "literals.\n"
+                "    The body names no type, calls no function and follows no path into\n"
+                "    the crate, so deleting the production code it claims to cover would\n"
+                "    leave it green. Assert against the real call — the fake broker\n"
+                "    (`test-broker`) reaches the paths that need a cluster.\n"
+            )
+
+    if failures:
+        print("Test-reachability check FAILED\n", file=sys.stderr)
+        for failure in failures:
+            print(f"  - {failure}", file=sys.stderr)
+        return 1
+
+    print(f"✓ Test reachability: {checked} test functions scanned, all reach the crate")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

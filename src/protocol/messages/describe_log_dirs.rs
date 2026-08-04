@@ -104,7 +104,9 @@ impl VersionedEncode for DescribeLogDirsRequest {
     fn encode_versioned(&self, version: i16, buf: &mut impl BufMut) -> Result<()> {
         match version {
             1 => self.encode_v1(buf)?,
-            2..=4 => self.encode_v2(buf)?,
+            // v3, v4 and v5 are request-wire-identical to v2; every addition
+            // since has been response-side.
+            2..=5 => self.encode_v2(buf)?,
             _ => return unsupported_encode!("DescribeLogDirsRequest", version),
         }
         Ok(())
@@ -150,6 +152,13 @@ pub struct DescribeLogDirsResult {
     pub total_bytes: i64,
     /// Usable size in bytes of the volume (v4+). `-1` if unavailable.
     pub usable_bytes: i64,
+    /// Whether the directory is cordoned (v5+, KIP-1066). `false` below v5,
+    /// where the field does not exist and no directory can be cordoned.
+    ///
+    /// A cordoned directory is one an operator has marked for
+    /// decommissioning: the broker stops placing new partitions on it while
+    /// existing replicas keep serving.
+    pub is_cordoned: bool,
 }
 
 /// DescribeLogDirs response.
@@ -179,42 +188,40 @@ impl DescribeLogDirsResponse {
 
     /// Decode from version 2 (flexible, no top-level error, no volume info).
     pub fn decode_v2(buf: &mut impl Buf) -> Result<Self> {
-        let throttle_time_ms = i32::decode(buf)?;
-        let result_count =
-            check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let results = Self::decode_results_v2(buf, result_count, false)?;
-        let _ = TaggedFields::decode(buf)?;
-
-        Ok(Self {
-            throttle_time_ms,
-            error_code: ErrorCode::None,
-            results,
-        })
+        Self::decode_flexible(buf, false, false, false)
     }
 
     /// Decode from version 3 (flexible, top-level error, no volume info).
     pub fn decode_v3(buf: &mut impl Buf) -> Result<Self> {
-        let throttle_time_ms = i32::decode(buf)?;
-        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
-        let result_count =
-            check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let results = Self::decode_results_v2(buf, result_count, false)?;
-        let _ = TaggedFields::decode(buf)?;
-
-        Ok(Self {
-            throttle_time_ms,
-            error_code,
-            results,
-        })
+        Self::decode_flexible(buf, true, false, false)
     }
 
     /// Decode from version 4 (flexible, top-level error, volume info).
     pub fn decode_v4(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode_flexible(buf, true, true, false)
+    }
+
+    /// Decode from version 5 (adds the per-directory `IsCordoned` flag, KIP-1066).
+    pub fn decode_v5(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode_flexible(buf, true, true, true)
+    }
+
+    /// Shared flexible (v2+) response decoder.
+    fn decode_flexible(
+        buf: &mut impl Buf,
+        has_top_level_error: bool,
+        has_volume_info: bool,
+        has_is_cordoned: bool,
+    ) -> Result<Self> {
         let throttle_time_ms = i32::decode(buf)?;
-        let error_code = ErrorCode::from_i16(i16::decode(buf)?);
+        let error_code = if has_top_level_error {
+            ErrorCode::from_i16(i16::decode(buf)?)
+        } else {
+            ErrorCode::None
+        };
         let result_count =
             check_compact_array_len(crate::util::varint::decode_unsigned_varint(buf)?)?;
-        let results = Self::decode_results_v2(buf, result_count, true)?;
+        let results = Self::decode_results_v2(buf, result_count, has_volume_info, has_is_cordoned)?;
         let _ = TaggedFields::decode(buf)?;
 
         Ok(Self {
@@ -242,6 +249,7 @@ impl DescribeLogDirsResponse {
                 topics,
                 total_bytes: -1,
                 usable_bytes: -1,
+                is_cordoned: false,
             });
         }
         Ok(results)
@@ -252,6 +260,7 @@ impl DescribeLogDirsResponse {
         buf: &mut impl Buf,
         count: usize,
         has_volume_info: bool,
+        has_is_cordoned: bool,
     ) -> Result<Vec<DescribeLogDirsResult>> {
         let mut results = Vec::with_capacity(decode_capacity(count, buf.remaining()));
         for _ in 0..count {
@@ -266,6 +275,11 @@ impl DescribeLogDirsResponse {
             } else {
                 (-1, -1)
             };
+            let is_cordoned = if has_is_cordoned {
+                bool::decode(buf)?
+            } else {
+                false
+            };
 
             let _ = TaggedFields::decode(buf)?;
             results.push(DescribeLogDirsResult {
@@ -274,6 +288,7 @@ impl DescribeLogDirsResponse {
                 topics,
                 total_bytes,
                 usable_bytes,
+                is_cordoned,
             });
         }
         Ok(results)
@@ -356,6 +371,7 @@ impl VersionedDecode for DescribeLogDirsResponse {
             2 => Self::decode_v2(buf),
             3 => Self::decode_v3(buf),
             4 => Self::decode_v4(buf),
+            5 => Self::decode_v5(buf),
             _ => unsupported_decode!("DescribeLogDirsResponse", version),
         }
     }
@@ -536,14 +552,14 @@ mod tests {
         let request = DescribeLogDirsRequest::all();
         let mut buf = BytesMut::new();
         assert!(request.encode_versioned(0, &mut buf).is_err());
-        assert!(request.encode_versioned(5, &mut buf).is_err());
+        assert!(request.encode_versioned(6, &mut buf).is_err());
     }
 
     #[test]
     fn test_describe_log_dirs_versioned_decode_unsupported() {
         let buf = BytesMut::new();
         assert!(DescribeLogDirsResponse::decode_versioned(0, &mut buf.clone().freeze()).is_err());
-        assert!(DescribeLogDirsResponse::decode_versioned(5, &mut buf.freeze()).is_err());
+        assert!(DescribeLogDirsResponse::decode_versioned(6, &mut buf.freeze()).is_err());
     }
 
     #[test]
@@ -653,6 +669,51 @@ mod tests {
         assert_eq!(p.partition_size, 2048);
         assert_eq!(p.offset_lag, 10);
         assert!(p.is_future_key);
+        assert!(
+            !dir.is_cordoned,
+            "v4 has no IsCordoned field; it must default to false"
+        );
+    }
+
+    /// v5 (KIP-1066) appends `IsCordoned` after the v4 volume fields and before
+    /// the per-result tagged fields. Reading it in the wrong place would
+    /// consume the tagged-fields byte and desynchronise the rest of the array.
+    #[test]
+    fn test_describe_log_dirs_response_decode_v5_is_cordoned() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0); // throttle_time_ms
+        buf.put_i16(0); // top-level error_code
+        put_compact_array_len(&mut buf, 2); // two log dirs
+        for (dir, cordoned) in [("/data/a", 0u8), ("/data/b", 1u8)] {
+            buf.put_i16(0); // result error_code
+            put_compact_string(&mut buf, dir);
+            put_compact_array_len(&mut buf, 0); // no topics
+            buf.put_i64(500_000_000_000); // total_bytes
+            buf.put_i64(200_000_000_000); // usable_bytes
+            buf.put_u8(cordoned); // is_cordoned (v5+)
+            put_empty_tagged_fields(&mut buf); // result tagged fields
+        }
+        put_empty_tagged_fields(&mut buf); // top-level tagged fields
+
+        let resp = DescribeLogDirsResponse::decode_versioned(5, &mut buf.freeze())
+            .expect("v5 response decodes");
+        assert_eq!(resp.results.len(), 2);
+        assert_eq!(resp.results[0].log_dir, "/data/a");
+        assert!(!resp.results[0].is_cordoned);
+        assert_eq!(resp.results[1].log_dir, "/data/b");
+        assert!(resp.results[1].is_cordoned);
+        assert_eq!(resp.results[1].total_bytes, 500_000_000_000);
+    }
+
+    /// v5 is request-wire-identical to v2; only the response grew.
+    #[test]
+    fn test_describe_log_dirs_request_v5_matches_v2() {
+        let request = DescribeLogDirsRequest::all();
+        let mut v2 = BytesMut::new();
+        let mut v5 = BytesMut::new();
+        request.encode_versioned(2, &mut v2).unwrap();
+        request.encode_versioned(5, &mut v5).unwrap();
+        assert_eq!(v2, v5);
     }
 
     #[test]

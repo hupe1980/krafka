@@ -15,11 +15,22 @@
 
 pub mod msk_iam;
 pub mod oauthbearer;
+/// Built-in OIDC token provider for SASL/OAUTHBEARER: the OAuth 2.0
+/// `client_credentials` grant (KIP-768) and the RFC 7523 client-assertion
+/// variant (KIP-1258).
+///
+/// Requires the `oauth-oidc` feature.
+#[cfg(feature = "oauth-oidc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "oauth-oidc")))]
+pub mod oidc;
 pub mod scram;
 pub mod tls;
 
 pub use msk_iam::MskIamAuthenticator;
 pub use oauthbearer::{OAuthBearerToken, OAuthBearerTokenProvider, OAuthBearerTokenProviderHandle};
+#[cfg(feature = "oauth-oidc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "oauth-oidc")))]
+pub use oidc::{AssertionSource, ClientCredentials, OidcTokenProvider, OidcTokenProviderBuilder};
 pub use scram::{
     ChannelBinding, MAX_PBKDF2_ITERATIONS, MIN_PBKDF2_ITERATIONS, ScramClient, ScramMechanism,
     ScramState,

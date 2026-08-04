@@ -75,8 +75,7 @@ pub use compacted::{
     CompactedTopicConsumer, CompactedTopicConsumerBuilder, TableChange,
 };
 pub use config::{
-    AutoOffsetReset, ConsumerConfig, ConsumerConfigBuilder, GroupProtocol, IsolationLevel,
-    PartitionAssignmentStrategy,
+    AutoOffsetReset, ConsumerConfig, GroupProtocol, IsolationLevel, PartitionAssignmentStrategy,
 };
 use group::ErasedRebalanceListener;
 pub use group::{
@@ -270,7 +269,7 @@ pub enum BatchRecvOutcome {
 ///
 /// High watermarks are cached from the most recent fetch response. A partition
 /// is considered *stale* if its cached watermark has not been updated within
-/// [`crate::consumer::ConsumerConfigBuilder::lag_staleness_threshold`]
+/// [`ConsumerBuilder::lag_staleness_threshold`](crate::consumer::ConsumerBuilder::lag_staleness_threshold)
 /// (default: 60 s). Stale lag
 /// values are still returned, but the calling code can decide to treat them
 /// as unreliable.
@@ -379,6 +378,15 @@ pub struct Consumer {
     paused: LeveledRwLock<4, HashSet<(String, PartitionId)>>,
     /// Whether the consumer is closed.
     closed: std::sync::atomic::AtomicBool,
+    /// Set by [`Consumer::wakeup`], cleared by the `poll()` that observes it.
+    ///
+    /// A flag *and* a `Notify` are both needed: the flag makes a `wakeup()`
+    /// that lands before `poll()` is called still take effect (a bare `Notify`
+    /// only wakes tasks already waiting, so that call would be lost), and the
+    /// `Notify` interrupts a `poll()` already parked on a fetch.
+    wakeup_flag: std::sync::atomic::AtomicBool,
+    /// Wakes a `poll()` that is currently parked on a broker fetch.
+    wakeup_notify: tokio::sync::Notify,
     /// Group coordinator for full group protocol support.
     group_coordinator: Option<Arc<GroupCoordinator>>,
     /// Consumer metrics.
@@ -1026,10 +1034,12 @@ impl Consumer {
             // Use the pre-built shared pool and metadata from a KrafkaClient.
             (pool, metadata)
         } else {
-            let mut pool_config_builder = ConnectionConfig::builder()
-                .client_id(&config.client_id)
-                .request_timeout(config.request_timeout)
-                .connect_timeout(config.connect_timeout);
+            let mut pool_config_builder = config.transport.apply(
+                ConnectionConfig::builder()
+                    .client_id(&config.client_id)
+                    .request_timeout(config.request_timeout)
+                    .connect_timeout(config.connect_timeout),
+            );
 
             if let Some(ref auth) = config.auth {
                 pool_config_builder = pool_config_builder.auth(auth.clone());
@@ -1043,8 +1053,12 @@ impl Consumer {
             let mut pool_config = pool_config_builder.build()?;
             pool_config.init_tls().await?;
 
-            let pool = Arc::new(ConnectionPool::new(pool_config));
-            pool.start_idle_evictor();
+            // Every client builds its pool through `TransportConfig::build_pool`,
+            // which applies the pool-level settings and starts the background
+            // tasks (idle eviction, OAUTHBEARER refresh, KIP-1288 TLS reload).
+            // Routing all construction sites through one function is what stops
+            // them drifting apart again.
+            let pool = config.transport.build_pool(pool_config);
 
             let bootstrap_servers =
                 crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
@@ -1110,6 +1124,8 @@ impl Consumer {
             offsets: LeveledRwLock::new(HashMap::new()),
             paused: LeveledRwLock::new(HashSet::new()),
             closed: std::sync::atomic::AtomicBool::new(false),
+            wakeup_flag: std::sync::atomic::AtomicBool::new(false),
+            wakeup_notify: tokio::sync::Notify::new(),
             group_coordinator,
             metrics,
             rebalance_listener: Arc::new(NoOpRebalanceListener),
@@ -1507,9 +1523,7 @@ impl Consumer {
                 continue;
             };
             // Fetch sessions only exist from v7 onward.
-            let Some(version) = conn
-                .negotiate_api_version(ApiKey::Fetch, versions::FETCH_MAX, 7)
-                .await
+            let Some(version) = conn.negotiate_api_version(ApiKey::Fetch, versions::FETCH_MAX, 7)
             else {
                 continue;
             };
@@ -2793,14 +2807,11 @@ impl Consumer {
             };
 
             // Negotiate ListOffsets version — require v1+ (MIN).
-            let list_version = match conn
-                .negotiate_api_version(
-                    ApiKey::ListOffsets,
-                    versions::LIST_OFFSETS_MAX,
-                    versions::LIST_OFFSETS_MIN,
-                )
-                .await
-            {
+            let list_version = match conn.negotiate_api_version(
+                ApiKey::ListOffsets,
+                versions::LIST_OFFSETS_MAX,
+                versions::LIST_OFFSETS_MIN,
+            ) {
                 Some(v) => v,
                 None => {
                     let err = KrafkaError::protocol_kind(
@@ -2933,6 +2944,15 @@ impl Consumer {
     async fn poll_inner(&self, timeout: Duration) -> Result<Vec<ConsumerRecord>> {
         if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(KrafkaError::invalid_state("consumer is closed"));
+        }
+
+        // Clear and check before doing any work, so a `wakeup()` that arrived
+        // before this call still interrupts it rather than being swallowed.
+        if self
+            .wakeup_flag
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(KrafkaError::invalid_state("wakeup() was called"));
         }
 
         let _poll_timer = self.metrics.poll_latency.start();
@@ -3378,7 +3398,25 @@ impl Consumer {
                         (*broker_id, topic_partitions, result)
                     });
 
-            for (broker_id, topic_partitions, result) in futures::future::join_all(fetches).await {
+            // `wakeup()` must interrupt a poll that is already parked on the
+            // brokers, not merely the next one. Records already collected by
+            // earlier loop iterations are returned rather than discarded — an
+            // interrupted poll that threw away fetched records would move
+            // offsets forward with nothing delivered.
+            let fetch_results = tokio::select! {
+                biased;
+                () = self.wakeup_notify.notified() => {
+                    self.wakeup_flag
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    if all_records.is_empty() {
+                        return Err(KrafkaError::invalid_state("wakeup() was called"));
+                    }
+                    break;
+                }
+                results = futures::future::join_all(fetches) => results,
+            };
+
+            for (broker_id, topic_partitions, result) in fetch_results {
                 match result {
                     Ok(outcome) => {
                         all_records.extend(outcome.records);
@@ -3748,16 +3786,23 @@ impl Consumer {
         // Drop the read lock before the network call.
         drop(offsets_snapshot);
 
-        // Negotiate fetch API version — prefer FETCH_MAX (up to v16) and fall
-        // back gracefully.  Key milestones:
+        // Negotiate fetch API version — prefer FETCH_MAX and fall back
+        // gracefully.  Key milestones:
         //   v7  — incremental fetch sessions (KIP-227)
         //   v9  — current_leader_epoch fencing (KIP-320)
         //   v11 — rack_id for closest-replica routing (KIP-392)
         //   v13 — topic UUIDs replace topic names (KIP-516)
         //   v15 — remove ReplicaId from header (KIP-903)
+        //   v17 — per-partition ReplicaDirectoryId tagged field (KIP-853)
+        //   v18 — per-partition HighWatermark tagged field (KIP-1166)
+        //
+        // v17 and v18 only add *follower*-populated tagged fields, so a
+        // consumer request at those versions is byte-identical to v16 apart
+        // from the version number, and the response format is unchanged from
+        // v13. Negotiating them costs nothing and keeps the client from being
+        // reported as stale in broker-side client-version metrics.
         let mut fetch_version = conn
             .negotiate_api_version(ApiKey::Fetch, versions::FETCH_MAX, 7)
-            .await
             .unwrap_or_else(|| {
                 debug!(
                     "No mutually supported Fetch v7+ for broker {broker_id}, falling back to v4"
@@ -4658,7 +4703,6 @@ impl Consumer {
                 versions::OFFSET_FOR_LEADER_EPOCH_MAX,
                 versions::OFFSET_FOR_LEADER_EPOCH_MIN,
             )
-            .await
             .ok_or_else(|| {
                 KrafkaError::protocol_kind(
                     ProtocolErrorKind::UnknownApiVersion,
@@ -5388,7 +5432,7 @@ impl Consumer {
     ///
     /// Returns a [`LagResult`] containing per-partition lag values and a list
     /// of partitions whose cached high watermark is older than
-    /// [`crate::consumer::ConsumerConfigBuilder::lag_staleness_threshold`]
+    /// [`ConsumerBuilder::lag_staleness_threshold`](crate::consumer::ConsumerBuilder::lag_staleness_threshold)
     /// (default: 60 s).
     ///
     /// Partitions whose high watermark or position is not yet known are
@@ -5604,6 +5648,29 @@ impl Consumer {
         self.metadata.update_seed_brokers(servers)
     }
 
+    /// Re-read TLS certificate and key files from disk and atomically install
+    /// the new material for all **future** connections (KIP-1288).
+    ///
+    /// Existing TLS sessions are unaffected: they keep the connector they
+    /// handshaked with and are replaced naturally as connections cycle. On
+    /// error the previously loaded certificates stay active, so a call made
+    /// mid-rotation against a half-written PEM is safe to retry.
+    ///
+    /// No-op when TLS is not configured.
+    ///
+    /// Use this for event-driven rotation (an inotify watch, a sidecar
+    /// signal). For unattended rotation set
+    /// [`TransportConfig::tls_reload_interval`](crate::network::TransportConfig)
+    /// instead and krafka reloads on a timer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the certificate or key files cannot be read or
+    /// parsed.
+    pub async fn refresh_tls(&self) -> Result<()> {
+        self.pool.refresh_tls().await
+    }
+
     /// Force a rebootstrap: close all connections, clear the metadata cache,
     /// and fall back to bootstrap servers (KIP-899).
     pub async fn rebootstrap(&self) {
@@ -5703,6 +5770,111 @@ impl Consumer {
     #[inline]
     pub fn is_closed(&self) -> bool {
         self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Committed offsets for the given partitions, read from the group
+    /// coordinator.
+    ///
+    /// This is the authoritative answer to "where is this group?", as opposed
+    /// to [`position`](Self::position), which reports where *this consumer*
+    /// will read next. The two differ by exactly the records consumed but not
+    /// yet committed, which is the window an at-least-once pipeline replays
+    /// after a crash.
+    ///
+    /// A partition the group has never committed is absent from the returned
+    /// map rather than reported as `0` — those are very different states, and
+    /// conflating them is how a monitoring dashboard reports a healthy group
+    /// sitting at the start of a topic.
+    ///
+    /// Requires a `group_id`; returns [`KrafkaError::InvalidState`] for an
+    /// assign-only consumer, which has no coordinator to ask.
+    ///
+    /// Counterpart to Java's `KafkaConsumer.committed(Set<TopicPartition>)`.
+    ///
+    /// ```no_run
+    /// # use krafka::consumer::Consumer;
+    /// # async fn f(consumer: &Consumer) -> krafka::error::Result<()> {
+    /// let committed = consumer.committed(&[("orders", 0), ("orders", 1)]).await?;
+    /// for ((topic, partition), pos) in &committed {
+    ///     println!("{topic}-{partition} committed at {}", pos.offset);
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub async fn committed(
+        &self,
+        partitions: &[(&str, PartitionId)],
+    ) -> Result<HashMap<(String, PartitionId), CommittedPosition>> {
+        if self.is_closed() {
+            return Err(KrafkaError::invalid_state("consumer is closed"));
+        }
+
+        let Some(ref coordinator) = self.group_coordinator else {
+            return Err(KrafkaError::invalid_state(
+                "committed() requires a group_id; an assign-only consumer has no \
+                 coordinator to read committed offsets from",
+            ));
+        };
+
+        if partitions.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut by_topic: HashMap<String, Vec<PartitionId>> = HashMap::new();
+        for (topic, partition) in partitions {
+            validate_topic_name(topic)?;
+            by_topic
+                .entry((*topic).to_string())
+                .or_default()
+                .push(*partition);
+        }
+
+        coordinator.fetch_committed_offsets(&by_topic).await
+    }
+
+    /// Interrupt [`poll()`](Self::poll) / [`recv()`](Self::recv) from another
+    /// task.
+    ///
+    /// A `poll()` already parked on a broker fetch is interrupted without
+    /// waiting for the brokers; a `poll()` that has not started yet returns
+    /// the same error immediately, so a `wakeup()` racing the call is not
+    /// lost. Records already fetched by that `poll()` are still returned
+    /// rather than discarded — throwing them away would advance offsets with
+    /// nothing delivered.
+    ///
+    /// The consumer stays usable: the next `poll()` proceeds normally. Safe to
+    /// call concurrently with any other consumer method.
+    ///
+    /// This is the counterpart to Java's `KafkaConsumer.wakeup()`, and
+    /// mirrors [`ShareConsumer::wakeup`](crate::share_consumer::ShareConsumer::wakeup).
+    /// Dropping the `poll()` future also cancels it, but only from the task
+    /// that owns the future — `wakeup()` works from any task, which is the
+    /// case a shutdown handler actually has.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use std::time::Duration;
+    /// # async fn f(
+    /// #     consumer: Arc<krafka::consumer::Consumer>,
+    /// #     shutdown: tokio::sync::oneshot::Receiver<()>,
+    /// # ) {
+    /// let c = Arc::clone(&consumer);
+    /// tokio::spawn(async move {
+    ///     let _ = shutdown.await;
+    ///     c.wakeup(); // unblocks the poll loop below, from another task
+    /// });
+    ///
+    /// while let Ok(records) = consumer.poll(Duration::from_secs(30)).await {
+    ///     for record in records {
+    ///         let _ = record;
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    #[inline]
+    pub fn wakeup(&self) {
+        self.wakeup_flag
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.wakeup_notify.notify_waiters();
     }
 
     /// A live snapshot of this consumer's identity within its group.
@@ -7380,6 +7552,8 @@ mod tests {
             offsets: LeveledRwLock::new(HashMap::new()),
             paused: LeveledRwLock::new(HashSet::new()),
             closed: std::sync::atomic::AtomicBool::new(false),
+            wakeup_flag: std::sync::atomic::AtomicBool::new(false),
+            wakeup_notify: tokio::sync::Notify::new(),
             group_coordinator: None,
             metrics: Arc::new(ConsumerMetrics::default()),
             rebalance_listener: Arc::new(NoOpRebalanceListener),

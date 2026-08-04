@@ -279,6 +279,10 @@ pub struct ConnectionPool {
     /// `None` when the pool is not configured with an OAUTHBEARER provider.
     /// Aborted by `close_all` alongside the idle-evictor.
     oauth_refresh_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Handle of the background TLS certificate reload task (KIP-1288).
+    /// `None` unless `TransportConfig::tls_reload_interval` was set.
+    /// Aborted by `close_all`.
+    tls_reload_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl ConnectionPool {
@@ -299,6 +303,7 @@ impl ConnectionPool {
             max_total_connections: None,
             evictor_handle: Mutex::new(None),
             oauth_refresh_handle: Mutex::new(None),
+            tls_reload_handle: Mutex::new(None),
         }
     }
 
@@ -320,6 +325,7 @@ impl ConnectionPool {
             max_total_connections: None,
             evictor_handle: Mutex::new(None),
             oauth_refresh_handle: Mutex::new(None),
+            tls_reload_handle: Mutex::new(None),
         }
     }
 
@@ -959,6 +965,74 @@ impl ConnectionPool {
         }
     }
 
+    /// Start the background TLS certificate reload task (KIP-1288).
+    ///
+    /// Every `interval`, re-reads the configured certificate, key and
+    /// trust-store files from disk and atomically swaps the connector used by
+    /// all *future* connections. Existing TLS sessions keep the connector they
+    /// handshaked with.
+    ///
+    /// No-op unless the pool's `AuthConfig` carries a TLS configuration —
+    /// there is nothing on disk to reload otherwise — and no-op outside a Tokio
+    /// runtime.
+    ///
+    /// A failed reload (file missing mid-rotation, half-written PEM) is logged
+    /// at `warn!` and the previous connector stays active, so a non-atomic
+    /// rotation converges on the next tick instead of breaking every new
+    /// connection in between.
+    ///
+    /// Idempotent: a second call aborts the previous task. [`Self::close_all`]
+    /// aborts it. Started automatically by
+    /// [`TransportConfig::tls_reload_interval`](super::TransportConfig::tls_reload_interval).
+    pub fn start_tls_reload(self: &Arc<Self>, interval: Duration) {
+        if interval.is_zero() {
+            warn!("start_tls_reload called with a zero interval; ignoring");
+            return;
+        }
+        if self
+            .config
+            .auth
+            .as_ref()
+            .and_then(|a| a.tls_config.as_ref())
+            .is_none()
+        {
+            return;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            warn!(
+                "start_tls_reload called outside a Tokio runtime; automatic TLS \
+                 reloading disabled. Call `refresh_tls()` explicitly instead."
+            );
+            return;
+        }
+
+        // Dead-man switch: once the pool is dropped the weak upgrade fails and
+        // the task exits on its next tick rather than holding the pool alive.
+        let weak = Arc::downgrade(self);
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // skip the immediate fire
+            loop {
+                ticker.tick().await;
+                let Some(pool) = weak.upgrade() else {
+                    break;
+                };
+                match pool.refresh_tls().await {
+                    Ok(()) => debug!("Periodic TLS reload completed"),
+                    Err(e) => warn!(
+                        error = %e,
+                        "Periodic TLS reload failed; keeping the previously loaded \
+                         certificates and retrying on the next tick"
+                    ),
+                }
+            }
+        });
+        if let Some(prev) = self.tls_reload_handle.lock().replace(handle) {
+            prev.abort();
+        }
+    }
+
     /// Close all connections and drain both maps.
     ///
     /// Stops the idle-evictor, drains the broker-ID and address maps under
@@ -974,6 +1048,9 @@ impl ConnectionPool {
             handle.abort();
         }
         if let Some(handle) = self.oauth_refresh_handle.lock().take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.tls_reload_handle.lock().take() {
             handle.abort();
         }
 

@@ -31,9 +31,9 @@
 //!
 //! // Negotiate the best version for Fetch
 //! // Prefer Fetch v7..=v11; fall back to v4 if the broker doesn't support v7+.
-//! let fetch_version = match conn.negotiate_api_version(ApiKey::Fetch, 11, 7).await {
+//! let fetch_version = match conn.negotiate_api_version(ApiKey::Fetch, 11, 7) {
 //!     Some(v) => v,
-//!     None => conn.negotiate_api_version(ApiKey::Fetch, 4, 4).await
+//!     None => conn.negotiate_api_version(ApiKey::Fetch, 4, 4)
 //!         .expect("broker does not support any usable Fetch version"),
 //! };
 //! println!("Using Fetch v{}", fetch_version);
@@ -430,10 +430,15 @@ api_versions! {
            transaction partitions implicitly; v13 replaces the topic name with the \
            topic UUID in both request and response." };
 
-    "Fetch" [1] => FETCH_MIN = 4 ..= FETCH_MAX = 16,
-        "v12 flexible, v13–v14 topic-ID (KIP-516), v15–v16 ReplicaState + node_endpoints (KIP-903/KIP-951)",
-        { "Kafka 4.0 removed v0–v3. v17–v18 (KIP-853/KIP-1166) target unreleased \
-           Kafka builds and are only negotiated with the `unstable-protocol` feature." };
+    "Fetch" [1] => FETCH_MIN = 4 ..= FETCH_MAX = 18,
+        "v12 flexible, v13–v14 topic-ID (KIP-516), v15–v16 ReplicaState + node_endpoints (KIP-903/KIP-951), v17 directory ID (KIP-853), v18 high-watermark (KIP-1166)",
+        { "Kafka 4.0 removed v0–v3 and shipped v17; v18 shipped in Kafka 4.1. \
+           Neither is marked `latestVersionUnstable` in the broker schema, so both \
+           are advertised by released brokers and negotiated by default. The two \
+           additions are per-partition tagged fields that only a *follower* fetch \
+           populates, so a consumer's v17/v18 request is byte-identical to v16 \
+           apart from the version number, and the response format is unchanged \
+           from v13." };
 
     "ListOffsets" [2] => LIST_OFFSETS_MIN = 1 ..= LIST_OFFSETS_MAX = 11,
         "v6 flexible, v7 max_timestamp (KIP-734), v8 local log-start (KIP-405), v11 earliest pending upload (KIP-1023)",
@@ -549,15 +554,21 @@ api_versions! {
         "v2 flexible, v3 user resource type",
         { "Kafka 4.0 removed v0." };
 
-    "DescribeConfigs" [32] => DESCRIBE_CONFIGS_MIN = 0 ..= DESCRIBE_CONFIGS_MAX = 4,
-        "v1 config_source + synonyms, v3 config_type + documentation, v4 flexible";
+    "DescribeConfigs" [32] => DESCRIBE_CONFIGS_MIN = 1 ..= DESCRIBE_CONFIGS_MAX = 4,
+        "v1 config_source + synonyms, v3 config_type + documentation, v4 flexible",
+        { "Kafka 4.0 removed v0, so v1 is the floor. The v0 codec arms are kept — \
+           `negotiate` takes the broker's minimum, so they are unreachable against \
+           any supported broker — but the advertised MIN no longer claims a \
+           version no released broker accepts." };
 
     "AlterReplicaLogDirs" [34] => ALTER_REPLICA_LOG_DIRS_MIN = 1 ..= ALTER_REPLICA_LOG_DIRS_MAX = 2,
         "v1 non-flexible, v2 flexible encoding";
 
-    "DescribeLogDirs" [35] => DESCRIBE_LOG_DIRS_MIN = 1 ..= DESCRIBE_LOG_DIRS_MAX = 4,
-        "v2 flexible, v3 top-level error_code, v4 TotalBytes + UsableBytes",
-        { "Kafka 4.0 removed v0." };
+    "DescribeLogDirs" [35] => DESCRIBE_LOG_DIRS_MIN = 1 ..= DESCRIBE_LOG_DIRS_MAX = 5,
+        "v2 flexible, v3 top-level error_code, v4 TotalBytes + UsableBytes, v5 IsCordoned (KIP-1066)",
+        { "Kafka 4.0 removed v0. Every version since v2 is request-wire-identical; \
+           the additions are all response-side, so `IsCordoned` surfaces on \
+           `DescribeLogDirsResult` and reads `false` against older brokers." };
 
     "CreatePartitions" [37] => CREATE_PARTITIONS_MIN = 0 ..= CREATE_PARTITIONS_MAX = 3,
         "v2 flexible encoding, v3 KIP-599 throttling";
@@ -587,8 +598,12 @@ api_versions! {
     "IncrementalAlterConfigs" [44] => INCREMENTAL_ALTER_CONFIGS_MIN = 0 ..= INCREMENTAL_ALTER_CONFIGS_MAX = 1,
         "v0 non-flexible, v1 flexible encoding";
 
-    "AlterPartitionReassignments" [45] => ALTER_PARTITION_REASSIGNMENTS_MIN = 0 ..= ALTER_PARTITION_REASSIGNMENTS_MAX = 0,
-        "v0 only, flexible from v0 (KIP-455)";
+    "AlterPartitionReassignments" [45] => ALTER_PARTITION_REASSIGNMENTS_MIN = 0 ..= ALTER_PARTITION_REASSIGNMENTS_MAX = 1,
+        "v0 KIP-455, v1 AllowReplicationFactorChange; flexible from v0",
+        { "v1 (Kafka 4.1) lets a caller forbid a reassignment that would change a \
+           partition's replication factor, so an off-by-one in a generated plan \
+           fails with INVALID_REPLICATION_FACTOR instead of silently reducing \
+           durability." };
 
     "ListPartitionReassignments" [46] => LIST_PARTITION_REASSIGNMENTS_MIN = 0 ..= LIST_PARTITION_REASSIGNMENTS_MAX = 0,
         "v0 only, flexible from v0 (KIP-455)";
@@ -608,13 +623,19 @@ api_versions! {
     "AlterUserScramCredentials" [51] => ALTER_USER_SCRAM_CREDENTIALS_MIN = 0 ..= ALTER_USER_SCRAM_CREDENTIALS_MAX = 0,
         "v0 only, flexible from v0 (KIP-554)";
 
-    "DescribeQuorum" [55] => DESCRIBE_QUORUM_MIN = 0 ..= DESCRIBE_QUORUM_MAX = 0,
-        "v0 only, flexible from v0",
-        { "Kafka defines v1 (timestamps, KIP-836) and v2 (Nodes, KIP-853); this client \
-           has no codec for them yet, so the ceiling stays at v0." };
+    "DescribeQuorum" [55] => DESCRIBE_QUORUM_MIN = 0 ..= DESCRIBE_QUORUM_MAX = 2,
+        "v0 baseline, v1 replica timestamps (KIP-836), v2 Nodes + ReplicaDirectoryId + error messages (KIP-853); flexible from v0",
+        { "All three versions share one request; every addition is response-side. \
+           v1 answers what v0 could not — *which* voter is lagging and for how \
+           long — and v2 adds the endpoints to reach each node and the directory \
+           UUID that distinguishes a voter from a same-ID node rebuilt on a fresh \
+           disk." };
 
-    "UpdateFeatures" [57] => UPDATE_FEATURES_MIN = 0 ..= UPDATE_FEATURES_MAX = 1,
-        "v0 AllowDowngrade, v1 UpgradeType + ValidateOnly (KIP-584)";
+    "UpdateFeatures" [57] => UPDATE_FEATURES_MIN = 0 ..= UPDATE_FEATURES_MAX = 2,
+        "v0 AllowDowngrade, v1 UpgradeType + ValidateOnly (KIP-584), v2 drops per-feature results",
+        { "v2 is request-identical to v1; the response no longer carries the \
+           `Results` array, so `UpdateFeaturesResponse::results` is empty and the \
+           single top-level error code is the whole answer." };
 
     "DescribeCluster" [60] => DESCRIBE_CLUSTER_MIN = 0 ..= DESCRIBE_CLUSTER_MAX = 2,
         "v0 flexible (KIP-700), v1 endpoint_type (KIP-919), v2 is_fenced (KIP-1073)";
@@ -658,11 +679,34 @@ api_versions! {
     "ShareGroupDescribe" [77] => SHARE_GROUP_DESCRIBE_MIN = 1 ..= SHARE_GROUP_DESCRIBE_MAX = 1,
         "v1 only (KIP-932 share groups; includes per-member rack ID)";
 
+
     "ShareFetch" [78] => SHARE_FETCH_MIN = 1 ..= SHARE_FETCH_MAX = 2,
         "v1 KIP-932, v2 KIP-1206 + KIP-1222";
 
     "ShareAcknowledge" [79] => SHARE_ACKNOWLEDGE_MIN = 1 ..= SHARE_ACKNOWLEDGE_MAX = 2,
         "v1 KIP-932, v2 KIP-1222";
+
+    // KIP-1071, describe half only. `StreamsGroupHeartbeat` (key 88) is a
+    // Streams-*runtime* API whose request carries the application topology; a
+    // client that fabricated one would corrupt the topology metadata every
+    // real member of the group shares. See `xtask/protocol_parity.py`.
+    "StreamsGroupDescribe" [89] => STREAMS_GROUP_DESCRIBE_MIN = 0 ..= STREAMS_GROUP_DESCRIBE_MAX = 0,
+        "v0 only (KIP-1071 Streams groups; observational — see DELIBERATE_GAPS for key 88)";
+
+    "DescribeShareGroupOffsets" [90] => DESCRIBE_SHARE_GROUP_OFFSETS_MIN = 0 ..= DESCRIBE_SHARE_GROUP_OFFSETS_MAX = 1,
+        "v0 KIP-932 share-partition start offsets, v1 adds Lag (KIP-1226)",
+        { "Served by the group coordinator. A null topics array means \"every \
+           topic-partition this group has state for\"; an empty array means none." };
+
+    "AlterShareGroupOffsets" [91] => ALTER_SHARE_GROUP_OFFSETS_MIN = 0 ..= ALTER_SHARE_GROUP_OFFSETS_MAX = 0,
+        "v0 only (KIP-932); resets share-partition start offsets",
+        { "The group must be empty; a live member draws NON_EMPTY_GROUP, for the \
+           same reason AlterConsumerGroupOffsets does." };
+
+    "DeleteShareGroupOffsets" [92] => DELETE_SHARE_GROUP_OFFSETS_MIN = 0 ..= DELETE_SHARE_GROUP_OFFSETS_MAX = 0,
+        "v0 only (KIP-932); deletes a share group's per-topic offset state",
+        { "The group must be empty. Use after retiring a topic so the coordinator \
+           stops carrying state for partitions that no longer exist." };
 }
 
 #[cfg(test)]

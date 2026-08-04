@@ -28,11 +28,15 @@ CONCEPT.md
 FINDINGS.md
 .DS_Store
 
-# Jekyll docs
-docs/_site/
-docs/.jekyll-cache/
-docs/Gemfile.lock
-docs/vendor/
+# Zola documentation site (site/) build output.
+#
+# `giallo-*.css` are the syntax-highlighting themes Zola generates from
+# `[markdown.highlighting]`. It writes them into `static/` — the source tree —
+# rather than straight to `public/`, so they must be ignored or every build
+# shows up as a diff.
+site/public/
+site/static/processed_images/
+site/static/giallo-*.css
 
 # Added by cargo
 
@@ -46,3 +50,6 @@ fuzz/coverage/
 
 # Agent worktrees and local tooling state.
 .claude/
+
+# Python bytecode from the xtask check scripts.
+__pycache__/

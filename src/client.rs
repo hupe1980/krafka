@@ -81,6 +81,7 @@ impl KrafkaClient {
             metadata_recovery_strategy: MetadataRecoveryStrategy::Rebootstrap,
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             metadata_topic_cache_ttl: Some(Duration::from_secs(300)),
+            transport: crate::network::TransportConfig::default(),
             #[cfg(feature = "socks5")]
             proxy: None,
         }
@@ -92,6 +93,24 @@ impl KrafkaClient {
     /// over accessing the pool directly.
     pub fn pool(&self) -> &Arc<ConnectionPool> {
         &self.pool
+    }
+
+    /// Re-read TLS certificate and key files from disk and atomically install
+    /// the new material for all **future** connections opened from this shared
+    /// pool (KIP-1288).
+    ///
+    /// Existing TLS sessions are unaffected. Because a `KrafkaClient` owns the
+    /// pool that its producers, consumers and admin clients share, one call
+    /// here rotates certificates for all of them.
+    ///
+    /// No-op when TLS is not configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the certificate or key files cannot be read or
+    /// parsed; the previous material stays active.
+    pub async fn refresh_tls(&self) -> Result<()> {
+        self.pool.refresh_tls().await
     }
 
     /// Returns a reference to the shared metadata cache.
@@ -117,6 +136,7 @@ pub struct KrafkaClientBuilder {
     metadata_recovery_strategy: MetadataRecoveryStrategy,
     metadata_recovery_rebootstrap_trigger: Duration,
     metadata_topic_cache_ttl: Option<Duration>,
+    transport: crate::network::TransportConfig,
     #[cfg(feature = "socks5")]
     proxy: Option<crate::network::ProxyConfig>,
 }
@@ -215,11 +235,72 @@ impl KrafkaClientBuilder {
         self
     }
 
+    /// Configure SASL/PLAIN authentication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the credentials contain bytes the SASL framing
+    /// cannot carry.
+    pub fn sasl_plain(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> crate::Result<Self> {
+        self.auth = Some(AuthConfig::sasl_plain(username, password)?);
+        Ok(self)
+    }
+
+    /// Configure SASL/SCRAM-SHA-256 authentication.
+    pub fn sasl_scram_sha256(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.auth = Some(AuthConfig::sasl_scram_sha256(username, password));
+        self
+    }
+
+    /// Configure SASL/SCRAM-SHA-512 authentication.
+    pub fn sasl_scram_sha512(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.auth = Some(AuthConfig::sasl_scram_sha512(username, password));
+        self
+    }
+
+    /// Configure SASL/OAUTHBEARER with a static token.
+    ///
+    /// For a token that must be refreshed, use
+    /// [`auth`](Self::auth) with
+    /// [`AuthConfig::sasl_oauthbearer_provider`](crate::auth::AuthConfig::sasl_oauthbearer_provider),
+    /// or the built-in OIDC provider behind the `oauth-oidc` feature.
+    pub fn sasl_oauthbearer(mut self, token: impl Into<String>) -> Self {
+        self.auth = Some(AuthConfig::sasl_oauthbearer(token));
+        self
+    }
+
     /// Configure a SOCKS5 proxy for all broker connections.
     #[cfg(feature = "socks5")]
     #[cfg_attr(docsrs, doc(cfg(feature = "socks5")))]
     pub fn proxy(mut self, proxy: crate::network::ProxyConfig) -> Self {
         self.proxy = Some(proxy);
+        self
+    }
+
+    /// Set socket- and pool-level transport tuning.
+    ///
+    /// Covers TCP keepalive and nodelay, the per-connection response ceiling
+    /// and in-flight cap, the priority-channel depths, the Happy Eyeballs
+    /// stagger, idle-connection eviction, a total-connection cap, and the
+    /// KIP-1288 automatic TLS reload interval.
+    ///
+    /// Omitting this call keeps krafka's historical defaults, which
+    /// [`TransportConfig::default`](crate::network::TransportConfig) reproduces
+    /// exactly.
+    pub fn transport(mut self, transport: crate::network::TransportConfig) -> Self {
+        self.transport = transport;
         self
     }
 
@@ -237,10 +318,12 @@ impl KrafkaClientBuilder {
             return Err(KrafkaError::config("bootstrap_servers must not be empty"));
         }
 
-        let mut pool_config_builder: ConnectionConfigBuilder = ConnectionConfig::builder()
-            .client_id(&self.client_id)
-            .request_timeout(self.request_timeout)
-            .connect_timeout(self.connect_timeout);
+        let mut pool_config_builder: ConnectionConfigBuilder = self.transport.apply(
+            ConnectionConfig::builder()
+                .client_id(&self.client_id)
+                .request_timeout(self.request_timeout)
+                .connect_timeout(self.connect_timeout),
+        );
 
         if let Some(ref auth) = self.auth {
             pool_config_builder = pool_config_builder.auth(auth.clone());
@@ -254,8 +337,12 @@ impl KrafkaClientBuilder {
         let mut pool_config = pool_config_builder.build()?;
         pool_config.init_tls().await?;
 
-        let pool = Arc::new(ConnectionPool::new(pool_config));
-        pool.start_idle_evictor();
+        // Every client builds its pool through `TransportConfig::build_pool`,
+        // which applies the pool-level settings and starts the background
+        // tasks (idle eviction, OAUTHBEARER refresh, KIP-1288 TLS reload).
+        // Routing all construction sites through one function is what stops
+        // them drifting apart again.
+        let pool = self.transport.build_pool(pool_config);
 
         let bootstrap_servers = crate::util::parse_bootstrap_servers(&self.bootstrap_servers)?;
 

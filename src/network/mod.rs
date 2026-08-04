@@ -29,6 +29,7 @@ mod connection;
 mod happy_eyeballs;
 mod pool;
 mod secure;
+mod transport;
 
 pub use connection::{
     BrokerConnection, BrokerFeatures, ConnectionConfig, ConnectionConfigBuilder, ConnectionStats,
@@ -41,3 +42,4 @@ pub use pool::{ConnectionPool, ConnectionRetryConfig, DEFAULT_MAX_IDLE};
 pub use secure::{
     ChallengeResponse, SaslAuthenticator, SecureConnectionConfig, SecureConnectionConfigBuilder,
 };
+pub use transport::{TransportConfig, TransportConfigBuilder};

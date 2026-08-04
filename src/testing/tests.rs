@@ -1469,3 +1469,1167 @@ async fn a_departing_kip848_member_hands_its_partitions_back() {
         survivor.assignment().await
     );
 }
+
+// ── TransportConfig reaches the socket ───────────────────────────────────
+//
+// A review found eleven documented `ConnectionConfig` / `ConnectionPool`
+// settings that no client builder could reach: every client constructed its
+// config from four fields and called `ConnectionPool::new`, so the rest were
+// pinned to their defaults forever. `TransportConfig` is the fix.
+//
+// Unit tests already assert the value survives the builder and lands on
+// `ConnectionConfig`. That is not the same claim as "it changes what the socket
+// does" — the previous defect was precisely a value that existed in a config
+// struct and never reached the wire. These tests close that gap by observing
+// the *behaviour* against a real TCP listener.
+
+/// `max_response_size` must bound the frame the reader accepts.
+///
+/// A 1 KiB ceiling against a metadata response describing 128 partitions: the
+/// connection must fail rather than accept the oversized frame. If the setting
+/// never reached `Decoder::with_max_size`, the client would connect happily.
+///
+/// The partition count matters — an earlier draft of this test used eight
+/// partitions, whose response fits comfortably inside 1 KiB, and passed for the
+/// wrong reason.
+#[tokio::test]
+async fn transport_max_response_size_reaches_the_frame_decoder() {
+    let broker = FakeBroker::start().await.unwrap();
+    for topic in ["alpha", "bravo", "charlie", "delta"] {
+        broker.create_topic(topic, 32);
+    }
+
+    let transport = crate::network::TransportConfig::builder()
+        // 1 KiB is the enforced minimum, and far below a metadata response
+        // describing 128 partitions.
+        .max_response_size(1024)
+        .build()
+        .expect("valid transport config");
+
+    let result = crate::admin::AdminClient::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .transport(transport)
+        .build()
+        .await;
+
+    let err = result
+        .err()
+        .expect("a 1 KiB response ceiling must reject a 128-partition metadata response");
+    let message = err.to_string();
+    assert!(
+        message.contains("exceeds maximum")
+            || message.contains("connection closed")
+            || message.contains("Connection reset"),
+        "expected a frame-size rejection, got: {message}"
+    );
+}
+
+/// The same cluster, with the default ceiling, must connect — otherwise the
+/// test above would pass for the wrong reason (a broken fake broker, an
+/// unrelated connect failure).
+#[tokio::test]
+async fn transport_default_response_size_still_connects() {
+    let broker = FakeBroker::start().await.unwrap();
+    for topic in ["alpha", "bravo", "charlie", "delta"] {
+        broker.create_topic(topic, 32);
+    }
+
+    let admin = crate::admin::AdminClient::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .transport(crate::network::TransportConfig::default())
+        .build()
+        .await
+        .expect("the default ceiling must not reject a normal metadata response");
+
+    admin.close().await;
+}
+
+/// `max_connections` must bound the pool, not just live in the config struct.
+///
+/// A two-broker cluster with a cap of one. Producing to both partitions needs
+/// two sockets — the partitions have different leaders — so the cap must refuse
+/// one of them by name.
+///
+/// The refusal may land on the initial metadata refresh or on a later send,
+/// depending on which broker the client bootstraps against and whether the
+/// refresh needed the second node. Asserting on *either* keeps the test
+/// deterministic; an earlier draft asserted the build must fail and passed
+/// alone but failed under the full suite.
+///
+/// Without the cap reaching `ConnectionPool` — which it could not before,
+/// because `with_max_total_connections` takes `self` by value and the pool is
+/// `Arc`-wrapped on the next line — both sockets would open and nothing here
+/// would be refused.
+#[tokio::test]
+async fn transport_max_connections_bounds_the_pool() {
+    let broker = FakeBroker::start_cluster(2).await.unwrap();
+    broker.create_topic("events", 2);
+    broker.set_leader("events", 0, 0);
+    broker.set_leader("events", 1, 1);
+
+    let transport = crate::network::TransportConfig::builder()
+        .max_connections(Some(1))
+        .build()
+        .expect("valid transport config");
+
+    let mut refusal: Option<String> = None;
+
+    match crate::producer::Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .linger(Duration::from_millis(5))
+        .transport(transport)
+        .build()
+        .await
+    {
+        Err(e) => refusal = Some(e.to_string()),
+        Ok(producer) => {
+            for partition in 0..2 {
+                let record = crate::producer::ProducerRecord::new("events", b"payload".to_vec())
+                    .with_partition(partition);
+                if let Err(e) = producer.send_record(record).await {
+                    refusal.get_or_insert_with(|| e.to_string());
+                }
+            }
+            producer.close().await;
+        }
+    }
+
+    let message = refusal.expect(
+        "max_connections(1) must refuse a second broker connection somewhere; \
+         if nothing was refused, the cap never reached ConnectionPool",
+    );
+    assert!(
+        message.contains("connection pool limit reached"),
+        "the refusal must come from the pool cap, not an unrelated failure: {message}"
+    );
+}
+
+/// The same two-broker cluster with a cap that accommodates it must connect,
+/// so the test above cannot pass because of a broken fixture.
+#[tokio::test]
+async fn transport_sufficient_max_connections_connects() {
+    let broker = FakeBroker::start_cluster(2).await.unwrap();
+    broker.create_topic("events", 2);
+    broker.set_leader("events", 0, 0);
+    broker.set_leader("events", 1, 1);
+
+    let transport = crate::network::TransportConfig::builder()
+        .max_connections(Some(8))
+        .build()
+        .expect("valid transport config");
+
+    let producer = crate::producer::Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .linger(Duration::from_millis(5))
+        .transport(transport)
+        .build()
+        .await
+        .expect("a cap of 8 must accommodate a two-broker cluster");
+
+    for partition in 0..2 {
+        let record = crate::producer::ProducerRecord::new("events", b"payload".to_vec())
+            .with_partition(partition);
+        let _metadata = producer
+            .send_record(record)
+            .await
+            .expect("both partitions should be reachable under a sufficient cap");
+    }
+
+    producer.close().await;
+}
+
+// ── Streams groups (KIP-1071) ────────────────────────────────────────────
+
+/// `describe_streams_groups` must decode a fully-populated response.
+///
+/// The value is in the shapes, not the data. This response carries two
+/// nullable structs behind presence bytes (`Topology`, `UserEndpoint`), a
+/// nullable array nested inside one of them (`Subtopologies`), and a `uint16`
+/// port — each a place where a decoder that guesses desynchronises the rest of
+/// the frame and produces plausible garbage rather than an error.
+#[tokio::test]
+async fn describe_streams_groups_decodes_topology_and_members() {
+    use crate::testing::state::{StreamsGroupState, StreamsMemberState};
+
+    let broker = FakeBroker::start().await.unwrap();
+    broker.with_state(|s| {
+        s.streams_groups.insert(
+            "wordcount".to_string(),
+            StreamsGroupState {
+                group_state: "Stable".to_string(),
+                group_epoch: 7,
+                assignment_epoch: 7,
+                topology_epoch: Some(3),
+                subtopologies: Some(vec!["0".to_string(), "1".to_string()]),
+                members: vec![
+                    StreamsMemberState {
+                        member_id: "m-1".to_string(),
+                        member_epoch: 7,
+                        topology_epoch: 3,
+                        process_id: "proc-a".to_string(),
+                        // Port above 32767: decoded as i16 this comes back
+                        // negative, which is exactly the bug worth catching.
+                        user_endpoint: Some(("iq.internal".to_string(), 61234)),
+                        active_tasks: vec![("0".to_string(), vec![0, 1])],
+                        target_active_tasks: vec![("0".to_string(), vec![0, 1])],
+                    },
+                    StreamsMemberState {
+                        member_id: "m-2".to_string(),
+                        member_epoch: 7,
+                        // Behind the group's topology epoch of 3.
+                        topology_epoch: 2,
+                        process_id: "proc-b".to_string(),
+                        user_endpoint: None,
+                        active_tasks: vec![("1".to_string(), vec![0])],
+                        // Mid-rebalance: target differs from current.
+                        target_active_tasks: vec![("1".to_string(), vec![0, 1])],
+                    },
+                ],
+            },
+        );
+    });
+
+    let admin = admin_for(&broker).await;
+    let groups = admin
+        .describe_streams_groups(&["wordcount"])
+        .await
+        .expect("StreamsGroupDescribe should succeed");
+
+    assert_eq!(groups.len(), 1);
+    let group = &groups[0];
+    assert_eq!(group.group_id, "wordcount");
+    assert_eq!(group.group_state, "Stable");
+    assert_eq!(group.group_epoch, 7);
+
+    let topology = group.topology.as_ref().expect("topology must be present");
+    assert_eq!(topology.epoch, 3);
+    let subs = topology
+        .subtopologies
+        .as_ref()
+        .expect("subtopologies must be present, not null");
+    assert_eq!(subs.len(), 2);
+    assert_eq!(subs[0].subtopology_id, "0");
+    assert_eq!(subs[0].source_topics, vec!["source-topic".to_string()]);
+
+    assert_eq!(group.members.len(), 2);
+
+    let m1 = &group.members[0];
+    let endpoint = m1
+        .user_endpoint
+        .as_ref()
+        .expect("m-1 has an Interactive Queries endpoint");
+    assert_eq!(endpoint.host, "iq.internal");
+    assert_eq!(
+        endpoint.port, 61234,
+        "Endpoint.Port is uint16; decoding it signed wraps this negative"
+    );
+    assert_eq!(m1.assignment.active_tasks.len(), 1);
+    assert_eq!(m1.assignment.active_tasks[0].partitions, vec![0, 1]);
+    assert_eq!(
+        m1.assignment, m1.target_assignment,
+        "m-1 is settled on its target"
+    );
+
+    let m2 = &group.members[1];
+    assert!(m2.user_endpoint.is_none(), "m-2 configured no endpoint");
+    assert!(
+        m2.topology_epoch < topology.epoch,
+        "m-2 is still running an older topology"
+    );
+    assert_ne!(
+        m2.assignment, m2.target_assignment,
+        "m-2 has not finished rebalancing"
+    );
+
+    assert_eq!(
+        group.authorized_operations,
+        i32::MIN,
+        "authorized operations were not requested, so the sentinel is returned"
+    );
+}
+
+/// A null topology and a null subtopology array are different states, and both
+/// must survive the decoder.
+///
+/// `Subtopologies: null` means "uninitialized, or source topics missing" —
+/// materially different from a topology with zero subtopologies, and a decoder
+/// that collapses them reports a broken application as an empty one.
+#[tokio::test]
+async fn describe_streams_groups_distinguishes_null_from_empty() {
+    use crate::testing::state::StreamsGroupState;
+
+    let broker = FakeBroker::start().await.unwrap();
+    broker.with_state(|s| {
+        s.streams_groups.insert(
+            "no-topology".to_string(),
+            StreamsGroupState {
+                group_state: "Empty".to_string(),
+                topology_epoch: None,
+                ..Default::default()
+            },
+        );
+        s.streams_groups.insert(
+            "uninitialized".to_string(),
+            StreamsGroupState {
+                group_state: "NotReady".to_string(),
+                topology_epoch: Some(1),
+                subtopologies: None,
+                ..Default::default()
+            },
+        );
+        s.streams_groups.insert(
+            "empty-topology".to_string(),
+            StreamsGroupState {
+                group_state: "Stable".to_string(),
+                topology_epoch: Some(1),
+                subtopologies: Some(Vec::new()),
+                ..Default::default()
+            },
+        );
+    });
+
+    let admin = admin_for(&broker).await;
+    let groups = admin
+        .describe_streams_groups(&["no-topology", "uninitialized", "empty-topology"])
+        .await
+        .expect("all three should decode");
+
+    let by_id: std::collections::HashMap<_, _> =
+        groups.iter().map(|g| (g.group_id.as_str(), g)).collect();
+
+    assert!(
+        by_id["no-topology"].topology.is_none(),
+        "a null Topology struct must decode as None"
+    );
+    assert!(
+        by_id["uninitialized"]
+            .topology
+            .as_ref()
+            .expect("topology present")
+            .subtopologies
+            .is_none(),
+        "a null Subtopologies array must stay None, not become an empty Vec"
+    );
+    assert_eq!(
+        by_id["empty-topology"]
+            .topology
+            .as_ref()
+            .expect("topology present")
+            .subtopologies
+            .as_ref()
+            .expect("present but empty")
+            .len(),
+        0,
+        "an empty Subtopologies array is a different state from null"
+    );
+}
+
+/// An unknown group must be reported per-group, not fail the whole call.
+#[tokio::test]
+async fn describe_streams_groups_reports_unknown_groups_individually() {
+    use crate::testing::state::StreamsGroupState;
+
+    let broker = FakeBroker::start().await.unwrap();
+    broker.with_state(|s| {
+        s.streams_groups.insert(
+            "known".to_string(),
+            StreamsGroupState {
+                group_state: "Stable".to_string(),
+                ..Default::default()
+            },
+        );
+    });
+
+    let admin = admin_for(&broker).await;
+    let groups = admin
+        .describe_streams_groups(&["known", "missing"])
+        .await
+        .expect("one unknown group must not fail the call");
+
+    let by_id: std::collections::HashMap<_, _> =
+        groups.iter().map(|g| (g.group_id.as_str(), g)).collect();
+    assert!(by_id["known"].error_code.is_ok());
+    assert_eq!(by_id["missing"].error_code, ErrorCode::GroupIdNotFound);
+}
+
+// ── Consumer wakeup and committed-offset lookup ──────────────────────────
+
+/// `wakeup()` must interrupt a `poll()` that is already parked on the broker,
+/// not merely the next one.
+///
+/// The broker is told to hold `Fetch` past the poll deadline, so a `poll()`
+/// without `wakeup()` would sit for the full timeout. The assertion is on
+/// *elapsed time*: a test that only checked the returned error would pass
+/// against an implementation that waited out the fetch and reported the wakeup
+/// afterwards, which is the bug worth catching.
+#[tokio::test]
+async fn wakeup_interrupts_a_poll_parked_on_a_fetch() {
+    use std::sync::Arc;
+
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let consumer = Arc::new(
+        crate::consumer::Consumer::builder()
+            .bootstrap_servers(broker.bootstrap_servers())
+            .group_id("wakeup-group")
+            .request_timeout(SHORT_REQUEST_TIMEOUT)
+            .connect_timeout(SHORT_CONNECT_TIMEOUT)
+            .build()
+            .await
+            .expect("consumer should connect"),
+    );
+    consumer.subscribe(&["events"]).await.unwrap();
+
+    // Let the group settle so the poll below reaches the fetch stage.
+    let _ = consumer.poll(Duration::from_secs(2)).await;
+
+    broker.on(ApiKey::Fetch, |_| Control::Delay(Duration::from_secs(20)));
+
+    let waker = Arc::clone(&consumer);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        waker.wakeup();
+    });
+
+    let started = tokio::time::Instant::now();
+    let outcome = consumer.poll(Duration::from_secs(15)).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "wakeup() must cut the poll short, but it took {elapsed:?}"
+    );
+    assert!(
+        outcome.is_err(),
+        "an interrupted poll with no records must report the wakeup, got {outcome:?}"
+    );
+
+    broker.clear_hooks();
+    // The consumer must remain usable, which is what separates wakeup() from
+    // close(): the next poll proceeds normally rather than erroring again.
+    let after = consumer.poll(Duration::from_secs(2)).await;
+    assert!(
+        after.is_ok(),
+        "the consumer must stay usable after wakeup(), got {after:?}"
+    );
+}
+
+/// A `wakeup()` that lands *before* `poll()` is called must still take effect.
+///
+/// A bare `Notify` only wakes tasks already waiting, so this call would be
+/// swallowed; the flag is what makes it survive the race.
+#[tokio::test]
+async fn wakeup_before_poll_is_not_lost() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let consumer = crate::consumer::Consumer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .group_id("wakeup-race-group")
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("consumer should connect");
+
+    consumer.wakeup();
+
+    let outcome = consumer.poll(Duration::from_millis(500)).await;
+    assert!(
+        outcome.is_err(),
+        "a wakeup() before poll() must not be swallowed, got {outcome:?}"
+    );
+
+    // Exactly one poll is interrupted — the flag is consumed, not sticky.
+    let after = consumer.poll(Duration::from_millis(500)).await;
+    assert!(
+        after.is_ok(),
+        "the wakeup flag must be consumed by one poll, got {after:?}"
+    );
+}
+
+/// `committed()` must report what the group actually committed, and must
+/// distinguish "never committed" from "committed at 0".
+#[tokio::test]
+async fn committed_reports_the_groups_offsets_from_the_coordinator() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 2);
+
+    let producer = producer_for(&broker).await;
+    for partition in 0..2i32 {
+        for i in 0..3u8 {
+            let record =
+                crate::producer::ProducerRecord::new("events", vec![i]).with_partition(partition);
+            let _ = producer.send_record(record).await.unwrap();
+        }
+    }
+    producer.close().await;
+
+    let consumer = crate::consumer::Consumer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .group_id("committed-group")
+        .auto_offset_reset(crate::consumer::AutoOffsetReset::Earliest)
+        .enable_auto_commit(false)
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("consumer should connect");
+    consumer.subscribe(&["events"]).await.unwrap();
+
+    // Nothing committed yet: an absent entry, not a zero.
+    let before = consumer
+        .committed(&[("events", 0), ("events", 1)])
+        .await
+        .expect("committed() should reach the coordinator");
+    assert!(
+        before
+            .get(&("events".to_string(), 0))
+            .is_none_or(|p| p.offset < 0),
+        "a group that has never committed must not report offset 0, got {before:?}"
+    );
+
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    let mut seen = 0;
+    while seen < 6 && tokio::time::Instant::now() < deadline {
+        seen += consumer
+            .poll(Duration::from_millis(200))
+            .await
+            .unwrap()
+            .len();
+    }
+    assert_eq!(seen, 6, "all produced records should arrive");
+    consumer.commit_sync().await.expect("commit should succeed");
+
+    let after = consumer
+        .committed(&[("events", 0), ("events", 1)])
+        .await
+        .expect("committed() should reach the coordinator");
+    for partition in 0..2i32 {
+        let pos = after
+            .get(&("events".to_string(), partition))
+            .unwrap_or_else(|| panic!("partition {partition} must have a committed offset"));
+        assert_eq!(
+            pos.offset, 3,
+            "three records were consumed from partition {partition}"
+        );
+    }
+
+    let _ = consumer.close().await;
+}
+
+/// `committed()` needs a coordinator, so an assign-only consumer must get a
+/// clear error rather than an empty map that reads as "nothing committed".
+#[tokio::test]
+async fn committed_without_a_group_id_is_an_error() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let consumer = crate::consumer::Consumer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("an assign-only consumer needs no group");
+
+    let err = consumer
+        .committed(&[("events", 0)])
+        .await
+        .expect_err("no group_id means no coordinator");
+    assert!(
+        err.to_string().contains("group_id"),
+        "the error must name what is missing, got: {err}"
+    );
+}
+
+// ── KIP-584 feature updates ──────────────────────────────────────────────
+
+/// `validate_only` must be **refused** against a broker whose `UpdateFeatures`
+/// predates the field, not silently downgraded.
+///
+/// This is a destructive-operation guard: `UpdateFeatures` v0 has no
+/// `ValidateOnly` field, so sending the request anyway *applies* the change the
+/// caller explicitly asked to only simulate. Downgrading a `metadata.version`
+/// is data-lossy, so "the dry run turned out not to be one" is about the worst
+/// outcome this API has.
+///
+/// The load-bearing assertion is the last one: **no request was sent**. An
+/// implementation that sent the request and then complained would pass an
+/// error-is-returned check while having already done the damage.
+///
+/// This test replaces one that computed `validate_only && version < 1` in the
+/// test body and asserted the result. That version passed no matter what
+/// `update_features` did — including if the guard were deleted outright.
+#[tokio::test]
+async fn validate_only_is_refused_by_a_broker_that_predates_the_field() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.set_api_versions(ApiKey::UpdateFeatures, 0, 0);
+
+    let admin = admin_for(&broker).await;
+
+    let outcome = admin
+        .update_features(
+            vec![crate::protocol::FeatureUpdateKey::upgrade(
+                "metadata.version",
+                17,
+            )],
+            true, // validate_only
+        )
+        .await;
+
+    assert!(
+        outcome.is_err(),
+        "a v0 broker cannot honour validate_only, so this must not succeed"
+    );
+    assert_eq!(
+        broker.request_count(ApiKey::UpdateFeatures),
+        0,
+        "the request must be refused before it is sent — a dry run that \
+         reaches the controller has already stopped being one"
+    );
+    assert_eq!(
+        broker.finalized_feature("metadata.version"),
+        None,
+        "nothing may have been applied"
+    );
+}
+
+/// The same call against a current broker must reach the controller and, being
+/// a dry run, change nothing.
+///
+/// Without this half the test above would pass against a client that refused
+/// `validate_only` unconditionally.
+#[tokio::test]
+async fn validate_only_reaches_a_current_broker_and_applies_nothing() {
+    let broker = FakeBroker::start().await.unwrap();
+    let admin = admin_for(&broker).await;
+
+    admin
+        .update_features(
+            vec![crate::protocol::FeatureUpdateKey::upgrade(
+                "metadata.version",
+                17,
+            )],
+            true, // validate_only
+        )
+        .await
+        .expect("a v2 broker supports validate_only");
+
+    assert_eq!(
+        broker.request_count(ApiKey::UpdateFeatures),
+        1,
+        "the dry run must actually be validated by the controller"
+    );
+    assert_eq!(
+        broker.finalized_feature("metadata.version"),
+        None,
+        "a dry run must not apply the update"
+    );
+}
+
+/// A real update must be applied, and must go to the **controller**.
+#[tokio::test]
+async fn a_feature_update_is_applied_by_the_controller() {
+    let broker = FakeBroker::start_cluster(3).await.unwrap();
+    broker.set_controller(2);
+
+    let admin = admin_for(&broker).await;
+
+    admin
+        .update_features(
+            vec![crate::protocol::FeatureUpdateKey::upgrade(
+                "metadata.version",
+                17,
+            )],
+            false,
+        )
+        .await
+        .expect("the update should be applied");
+
+    assert_eq!(
+        broker.finalized_feature("metadata.version"),
+        Some(17),
+        "the controller must have applied the requested level"
+    );
+    assert_eq!(
+        broker.request_nodes(ApiKey::UpdateFeatures),
+        vec![2],
+        "UpdateFeatures is controller-only; reaching any other broker is the \
+         bug that made a controller failover look blanket-retriable"
+    );
+}
+
+/// `describe_features` must report what `update_features` applied.
+///
+/// Both halves were previously tested only against themselves: `update_features`
+/// by asserting its request encodes, `describe_features` not at all. Neither
+/// could catch a mismatch between them, and KIP-584 has a specific trap for
+/// that — `SupportedFeatures` carries `(min, max)` while `FinalizedFeatures`
+/// carries `(max, min)`. A response with those transposed decodes cleanly and
+/// reports the wrong levels.
+#[tokio::test]
+async fn describe_features_reports_what_update_features_applied() {
+    let broker = FakeBroker::start().await.unwrap();
+    let admin = admin_for(&broker).await;
+
+    let before = admin
+        .describe_features()
+        .await
+        .expect("describe_features should work on a cluster with no features");
+    assert!(
+        before.finalized_features.is_empty(),
+        "a cluster that has finalized nothing must report nothing"
+    );
+    assert!(
+        before.finalized_features_epoch < 0,
+        "an absent epoch means the finalized list is not to be trusted, saw {}",
+        before.finalized_features_epoch
+    );
+
+    admin
+        .update_features(
+            vec![crate::protocol::FeatureUpdateKey::upgrade(
+                "metadata.version",
+                17,
+            )],
+            false,
+        )
+        .await
+        .expect("the update should be applied");
+
+    let after = admin
+        .describe_features()
+        .await
+        .expect("describe_features should work after an update");
+
+    let finalized = after
+        .finalized_features
+        .iter()
+        .find(|f| f.name == "metadata.version")
+        .expect("the finalized feature must be reported back");
+    assert_eq!(
+        finalized.max_version_level, 17,
+        "the level read back must be the level applied — transposing the \
+         (max, min) pair here decodes without error and reports 1"
+    );
+    assert!(
+        after.finalized_features_epoch >= 0,
+        "finalized features are only valid alongside a non-negative epoch"
+    );
+
+    let supported = after
+        .supported_features
+        .iter()
+        .find(|f| f.name == "metadata.version")
+        .expect("the broker must also advertise what it supports");
+    assert!(
+        supported.max_version >= finalized.max_version_level,
+        "a broker cannot finalize a level above what it supports: {} < {}",
+        supported.max_version,
+        finalized.max_version_level
+    );
+}
+
+// ── Share groups (KIP-932) ───────────────────────────────────────────────
+//
+// The fake broker serves `ShareGroupHeartbeat`, `ShareFetch` and
+// `ShareAcknowledge` at v1, including the share-partition state machine that
+// replaces committed offsets: a start offset, an acquisition cursor, and a
+// per-record delivery count. See `ShareGroupState` for what is and is not
+// modelled — in particular, acquisition locks never expire here, so a record
+// is redelivered only when it is explicitly released.
+
+#[cfg(feature = "unstable-protocol")]
+async fn share_consumer_for(
+    broker: &FakeBroker,
+    group_id: &str,
+) -> crate::share_consumer::ShareConsumer {
+    share_consumer_with(broker, group_id, |b| b).await
+}
+
+/// A share consumer with the short test timeouts, plus whatever `tune` adds.
+#[cfg(feature = "unstable-protocol")]
+async fn share_consumer_with(
+    broker: &FakeBroker,
+    group_id: &str,
+    tune: impl FnOnce(
+        crate::share_consumer::ShareConsumerBuilder,
+    ) -> crate::share_consumer::ShareConsumerBuilder,
+) -> crate::share_consumer::ShareConsumer {
+    tune(
+        crate::share_consumer::ShareConsumer::builder()
+            .bootstrap_servers(broker.bootstrap_servers())
+            .group_id(group_id)
+            .request_timeout(SHORT_REQUEST_TIMEOUT)
+            // Before this setter existed, a `request_timeout` below the 10 s
+            // default `connect_timeout` was rejected at build time with an error
+            // naming a value the builder had no way to change.
+            .connect_timeout(SHORT_CONNECT_TIMEOUT),
+    )
+    .build()
+    .await
+    .expect("share consumer should connect")
+}
+
+/// Poll until `want` records have arrived or the deadline passes.
+///
+/// A share consumer's first poll is a heartbeat that returns no assignment, so
+/// a single `poll()` proving nothing is expected rather than a failure.
+#[cfg(feature = "unstable-protocol")]
+async fn drain_share(
+    consumer: &crate::share_consumer::ShareConsumer,
+    want: usize,
+) -> Vec<crate::consumer::ConsumerRecord> {
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    let mut got = Vec::new();
+    while got.len() < want && tokio::time::Instant::now() < deadline {
+        match consumer.poll(Duration::from_millis(200)).await {
+            Ok(records) => got.extend(records),
+            Err(e) => panic!("share poll failed: {e}"),
+        }
+    }
+    got
+}
+
+/// A share consumer must receive the records a producer wrote, and its
+/// delivery counters must move with them.
+///
+/// A share group used to be operable but not observable: the transport
+/// counters showed requests and nothing showed records. A metric that exists
+/// but is never incremented is worse than none, because it reads as "zero
+/// records" rather than "not measured" — so this asserts the counters against
+/// the records actually returned, not merely that they are non-zero.
+#[cfg(feature = "unstable-protocol")]
+#[tokio::test]
+async fn a_share_consumer_receives_records_and_counts_them() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let producer = producer_for(&broker).await;
+    for i in 0..5u8 {
+        let _ = producer
+            .send("events", None, &[b'v', i])
+            .await
+            .expect("send should be acknowledged");
+    }
+    producer.close().await;
+
+    let consumer = share_consumer_for(&broker, "delivery-group").await;
+    let metrics = consumer.metrics();
+    assert_eq!(metrics.records_received.get(), 0, "nothing polled yet");
+
+    consumer
+        .subscribe(&["events"])
+        .await
+        .expect("subscribe should reach the coordinator");
+
+    let records = drain_share(&consumer, 5).await;
+    assert_eq!(records.len(), 5, "every produced record must be delivered");
+
+    let mut payloads: Vec<Vec<u8>> = records
+        .iter()
+        .filter_map(|r| r.value.as_ref().map(|v| v.to_vec()))
+        .collect();
+    payloads.sort();
+    assert_eq!(
+        payloads,
+        (0..5u8).map(|i| vec![b'v', i]).collect::<Vec<_>>(),
+        "delivered payloads must be the produced ones"
+    );
+
+    assert_eq!(
+        metrics.records_received.get(),
+        5,
+        "records_received must match what poll() actually returned"
+    );
+    assert!(
+        metrics.bytes_received.get() >= 10,
+        "five two-byte values is at least ten bytes, saw {}",
+        metrics.bytes_received.get()
+    );
+    assert!(
+        metrics.polls.get() >= 1,
+        "every poll() must be counted, empty or not"
+    );
+
+    let _ = consumer.close().await;
+}
+
+/// Accepted records must not be redelivered, and released records must be.
+///
+/// This is the property that replaces committed offsets in a share group. It
+/// is the one thing a share consumer cannot be trusted without: an
+/// acknowledgement that does not advance the share-partition start offset
+/// turns every restart into a full replay, and a release that does not rewind
+/// the cursor silently drops the record the application asked to retry.
+#[cfg(feature = "unstable-protocol")]
+#[tokio::test]
+async fn accepting_retires_a_record_and_releasing_redelivers_it() {
+    use crate::share_consumer::AcknowledgeType;
+
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let producer = producer_for(&broker).await;
+    for i in 0..2u8 {
+        let _ = producer.send("events", None, &[i]).await.unwrap();
+    }
+    producer.close().await;
+
+    // Implicit mode acknowledges everything the poll returned on the next
+    // fetch, which would make "accept one, release the other" unexpressible.
+    let consumer = share_consumer_with(&broker, "ack-group", |b| {
+        b.acknowledgement_mode(crate::share_consumer::AcknowledgementMode::Explicit)
+    })
+    .await;
+    consumer.subscribe(&["events"]).await.unwrap();
+
+    let first = drain_share(&consumer, 2).await;
+    assert_eq!(first.len(), 2);
+
+    // Accept offset 0, release offset 1. Both acknowledgements are flushed on
+    // the next fetch, which is where a real client piggybacks them too.
+    for record in &first {
+        let ack = if record.offset == 0 {
+            AcknowledgeType::Accept
+        } else {
+            AcknowledgeType::Release
+        };
+        consumer
+            .acknowledge(record, ack)
+            .await
+            .expect("acknowledgement should be accepted");
+    }
+
+    let redelivered = drain_share(&consumer, 1).await;
+    assert!(
+        !redelivered.is_empty(),
+        "a released record must be handed out again"
+    );
+    assert!(
+        redelivered.iter().all(|r| r.offset == 1),
+        "only the released offset may come back, saw {:?}",
+        redelivered.iter().map(|r| r.offset).collect::<Vec<_>>()
+    );
+    assert!(
+        redelivered
+            .iter()
+            .all(|r| r.delivery_count.is_some_and(|c| c >= 2)),
+        "a redelivery must report a delivery count above one, saw {:?}",
+        redelivered
+            .iter()
+            .map(|r| r.delivery_count)
+            .collect::<Vec<_>>()
+    );
+
+    let _ = consumer.close().await;
+}
+
+/// An accepted record must not come back to the next member of the group; an
+/// unacknowledged one must.
+///
+/// This is the share-group replacement for "committed offsets survive a
+/// restart", and it is the only assertion here that can tell an `ACCEPT`
+/// apart from doing nothing. Within a single session it cannot: the
+/// acquisition cursor has already moved past the record either way. The
+/// difference only shows once the holder leaves and the in-flight records are
+/// returned to the pool — at which point an accepted record is below the
+/// share-partition start offset and an unacknowledged one is not.
+#[cfg(feature = "unstable-protocol")]
+#[tokio::test]
+async fn an_accepted_record_is_not_redelivered_to_the_next_member() {
+    use crate::share_consumer::{AcknowledgeType, AcknowledgementMode};
+
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let producer = producer_for(&broker).await;
+    for i in 0..2u8 {
+        let _ = producer.send("events", None, &[i]).await.unwrap();
+    }
+    producer.close().await;
+
+    let first = share_consumer_with(&broker, "restart-group", |b| {
+        b.acknowledgement_mode(AcknowledgementMode::Explicit)
+    })
+    .await;
+    first.subscribe(&["events"]).await.unwrap();
+
+    let records = drain_share(&first, 2).await;
+    assert_eq!(
+        records.len(),
+        2,
+        "both records should reach the first member"
+    );
+
+    // Accept offset 0 and nothing else. Offset 1 stays in flight.
+    let accepted = records
+        .iter()
+        .find(|r| r.offset == 0)
+        .expect("offset 0 should have been delivered");
+    first
+        .acknowledge(accepted, AcknowledgeType::Accept)
+        .await
+        .expect("acknowledgement should be accepted");
+    // The acknowledgement is flushed on close; without it the accept would
+    // never reach the broker and this test would prove nothing.
+    first.close().await.expect("close should flush the ack");
+
+    let second = share_consumer_for(&broker, "restart-group").await;
+    second.subscribe(&["events"]).await.unwrap();
+
+    let redelivered = drain_share(&second, 1).await;
+    assert!(
+        !redelivered.is_empty(),
+        "the unacknowledged record must be handed to the next member"
+    );
+    assert!(
+        redelivered.iter().all(|r| r.offset == 1),
+        "an accepted record must never come back, saw offsets {:?}",
+        redelivered.iter().map(|r| r.offset).collect::<Vec<_>>()
+    );
+
+    let _ = second.close().await;
+}
+
+/// Two members of one share group must divide the partitions between them,
+/// and between them must see every record exactly once.
+///
+/// The interesting half is the second clause. A share group has no exclusive
+/// ownership, so nothing in the protocol *prevents* the same record reaching
+/// two members; what prevents it is the coordinator handing each partition's
+/// share state to one member at a time. A client that ignored its assignment
+/// and fetched every partition would still pass a "did I get records?" test
+/// and fail this one.
+#[cfg(feature = "unstable-protocol")]
+#[tokio::test]
+async fn two_share_group_members_split_the_partitions() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 2);
+
+    let producer = producer_for(&broker).await;
+    for partition in 0..2i32 {
+        for i in 0..3u8 {
+            let record = crate::producer::ProducerRecord::new("events", vec![partition as u8, i])
+                .with_partition(partition);
+            let _ = producer.send_record(record).await.unwrap();
+        }
+    }
+    producer.close().await;
+
+    let a = share_consumer_for(&broker, "split-group").await;
+    let b = share_consumer_for(&broker, "split-group").await;
+    a.subscribe(&["events"]).await.unwrap();
+    b.subscribe(&["events"]).await.unwrap();
+
+    // Let both members reach a steady assignment before inspecting it: the
+    // first member is assigned everything until the second one joins.
+    //
+    // Records that arrive during this settling are kept, not discarded — the
+    // whole point of the final assertion is that no record is delivered twice
+    // and none is lost, and throwing away the first member's early deliveries
+    // would hide both.
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let drain = async |c: &crate::share_consumer::ShareConsumer, into: &mut Vec<Vec<u8>>| {
+        if let Ok(records) = c.poll(Duration::from_millis(100)).await {
+            into.extend(
+                records
+                    .into_iter()
+                    .filter_map(|r| r.value.map(|v| v.to_vec())),
+            );
+        }
+    };
+
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        let (assign_a, assign_b) = (a.assignment().await, b.assignment().await);
+        let count = |m: &ahash::AHashMap<String, Vec<crate::PartitionId>>| {
+            m.values().map(Vec::len).sum::<usize>()
+        };
+        if count(&assign_a) == 1 && count(&assign_b) == 1 {
+            break;
+        }
+        drain(&a, &mut seen).await;
+        drain(&b, &mut seen).await;
+    }
+
+    let assign_a = a.assignment().await;
+    let assign_b = b.assignment().await;
+    let partitions = |m: &ahash::AHashMap<String, Vec<crate::PartitionId>>| {
+        m.values().flatten().copied().collect::<HashSet<_>>()
+    };
+    let (pa, pb) = (partitions(&assign_a), partitions(&assign_b));
+    assert_eq!(pa.len(), 1, "each member should hold one of two partitions");
+    assert_eq!(pb.len(), 1);
+    assert!(
+        pa.is_disjoint(&pb),
+        "the coordinator must not hand one partition to both members: {pa:?} vs {pb:?}"
+    );
+
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    while seen.len() < 6 && tokio::time::Instant::now() < deadline {
+        drain(&a, &mut seen).await;
+        drain(&b, &mut seen).await;
+    }
+
+    seen.sort();
+    let expected: Vec<Vec<u8>> = (0..2u8)
+        .flat_map(|p| (0..3u8).map(move |i| vec![p, i]))
+        .collect();
+    assert_eq!(
+        seen, expected,
+        "between them the two members must see every record exactly once"
+    );
+
+    let _ = a.close().await;
+    let _ = b.close().await;
+}
+
+/// A poll with no subscription must be counted as an empty poll and deliver
+/// nothing.
+#[cfg(feature = "unstable-protocol")]
+#[tokio::test]
+async fn share_consumer_poll_metrics_are_wired() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let consumer = share_consumer_for(&broker, "metrics-share-group").await;
+
+    let metrics = consumer.metrics();
+    assert_eq!(metrics.polls.get(), 0, "no poll has happened yet");
+    assert_eq!(metrics.empty_polls.get(), 0);
+
+    // No subscription, so every poll legitimately returns nothing. That is
+    // exactly the path `empty_polls` exists to count.
+    for _ in 0..3 {
+        let _ = consumer.poll(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        metrics.polls.get(),
+        3,
+        "every poll() must be counted, empty or not"
+    );
+    assert_eq!(
+        metrics.empty_polls.get(),
+        3,
+        "a poll with no assignment is an empty poll"
+    );
+    assert_eq!(
+        metrics.records_received.get(),
+        0,
+        "nothing was delivered, so nothing may be counted as delivered"
+    );
+
+    let _ = consumer.close().await;
+}

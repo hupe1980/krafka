@@ -1,0 +1,178 @@
+{#-
+  Base template: the document shell and the entire SEO surface.
+
+  Every page's <head> is assembled here rather than per-template, because a
+  meta tag that exists on some pages and not others is worse than one that
+  exists nowhere — it makes the gap invisible in review.
+-#}
+<!DOCTYPE html>
+<html lang="{{ lang | default(value=config.default_language) }}" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+{#- Title, description and canonical URL.
+
+    Resolved once here rather than per-template: a meta tag that exists on some
+    pages and not others is worse than one that exists nowhere, because the gap
+    is invisible in review. `is_home` is set by index.html. -#}
+{%- if is_home -%}
+  {%- set page_title = "krafka — a pure-Rust Apache Kafka client" -%}
+{%- elif page.title -%}
+  {%- set page_title = page.title ~ " · krafka" -%}
+{%- elif section.title -%}
+  {%- set page_title = section.title ~ " · krafka" -%}
+{%- else -%}
+  {%- set page_title = config.title -%}
+{%- endif -%}
+{%- set descr = page.description | default(value=section.description) | default(value=config.description) -%}
+{%- set canonical = current_url | default(value=config.base_url) -%}
+{%- set og_image = get_url(path=config.extra.og_image) -%}
+
+<title>{{ page_title }}</title>
+<meta name="description" content="{{ descr }}">
+<link rel="canonical" href="{{ canonical | safe }}">
+
+{#- Open Graph and X/Twitter. `summary_large_image` needs an absolute image
+    URL, which is why `og_image` goes through `get_url`. -#}
+<meta property="og:type" content="{% if page.title %}article{% else %}website{% endif %}">
+<meta property="og:site_name" content="krafka">
+<meta property="og:title" content="{{ page_title }}">
+<meta property="og:description" content="{{ descr }}">
+<meta property="og:url" content="{{ canonical | safe }}">
+<meta property="og:image" content="{{ og_image | safe }}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="krafka — a pure-Rust Apache Kafka client">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{ page_title }}">
+<meta name="twitter:description" content="{{ descr }}">
+<meta name="twitter:image" content="{{ og_image | safe }}">
+
+<link rel="icon" href="{{ get_url(path='favicon.svg') | safe }}" type="image/svg+xml">
+<link rel="alternate" type="application/atom+xml" title="krafka" href="{{ get_url(path='atom.xml') | safe }}">
+
+{#- One stylesheet plus the two syntax themes giallo generates.
+
+    The syntax themes cannot be swapped by `data-theme` the way the site
+    palette is: giallo emits the same class names in both files, so whichever
+    loads second always wins. The dark sheet is therefore gated by its `media`
+    attribute, which the script below rewrites when the reader picks a theme
+    explicitly. Defaulting it to the OS preference means a reader who never
+    touches the toggle gets the right colours with no script at all. -#}
+<link rel="stylesheet" href="{{ get_url(path='main.css', cachebust=true) | safe }}">
+<link rel="stylesheet" href="{{ get_url(path='giallo-light.css') | safe }}">
+<link rel="stylesheet" id="syntax-dark" href="{{ get_url(path='giallo-dark.css') | safe }}" media="(prefers-color-scheme: dark)">
+
+{#- Structured data. `SoftwareSourceCode` is the accurate type for a library;
+    `SoftwareApplication` would imply something a person installs and runs.
+    Values go through `json_encode` so a quote in a description cannot break
+    the document. -#}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "krafka",
+  "description": {{ config.description | json_encode | safe }},
+  "url": {{ config.base_url | json_encode | safe }},
+  "codeRepository": {{ config.extra.repo | json_encode | safe }},
+  "programmingLanguage": "Rust",
+  "runtimePlatform": "Rust",
+  "license": ["https://opensource.org/licenses/MIT", "https://opensource.org/licenses/Apache-2.0"],
+  "softwareVersion": {{ config.extra.version | json_encode | safe }},
+  "applicationCategory": "DeveloperApplication",
+  "keywords": "apache kafka, rust, kafka client, async, tokio, librdkafka alternative, kafka protocol, KIP-848, KIP-932, exactly-once, share groups"
+}
+</script>
+{%- if page.title %}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": {{ page.title | json_encode | safe }},
+  "description": {{ descr | json_encode | safe }},
+  "url": {{ canonical | json_encode | safe }},
+  "isPartOf": { "@type": "WebSite", "name": "krafka", "url": {{ config.base_url | json_encode | safe }} },
+  "author": { "@type": "Organization", "name": {{ config.author | json_encode | safe }} },
+  "proficiencyLevel": "Expert"
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    { "@type": "ListItem", "position": 1, "name": "krafka", "item": {{ config.base_url | json_encode | safe }} },
+    { "@type": "ListItem", "position": 2, "name": "Documentation", "item": {{ get_url(path='@/docs/_index.md') | json_encode | safe }} },
+    { "@type": "ListItem", "position": 3, "name": {{ page.title | json_encode | safe }}, "item": {{ canonical | json_encode | safe }} }
+  ]
+}
+</script>
+{%- endif %}
+
+{#- Theme resolution runs before first paint so a dark-mode reader never sees a
+    white flash. It is the only blocking script on the page. -#}
+<script>
+  (function () {
+    var stored = null;
+    try { stored = localStorage.getItem("krafka-theme"); } catch (e) {}
+    var theme = stored || "auto";
+    document.documentElement.setAttribute("data-theme", theme);
+    // Runs before <body> so the syntax sheet is already correct at first
+    // paint. `app.js` reuses this function for the toggle.
+    window.krafkaSyntaxTheme = function (t) {
+      var link = document.getElementById("syntax-dark");
+      if (!link) return;
+      link.media = t === "dark" ? "all"
+                 : t === "light" ? "not all"
+                 : "(prefers-color-scheme: dark)";
+    };
+    window.krafkaSyntaxTheme(theme);
+  })();
+</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap header-inner">
+    <a class="brand" href="{{ get_url(path='@/_index.md') | safe }}">
+      <img src="{{ get_url(path='logo.svg') | safe }}" alt="" width="28" height="28" aria-hidden="true">
+      <span>krafka</span>
+    </a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="{{ get_url(path='@/docs/_index.md') | safe }}"{% if current_path is starting_with("/krafka/docs") %} aria-current="page"{% endif %}>Docs</a>
+      <a href="{{ config.extra.api_docs }}" rel="noopener">API</a>
+      <a href="{{ config.extra.crate }}" rel="noopener">Crates.io</a>
+      <a href="{{ config.extra.repo }}" rel="noopener">GitHub</a>
+    </nav>
+    <button class="theme-toggle" type="button" aria-label="Switch colour theme" title="Switch colour theme">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false">
+        <path class="icon-sun" d="M12 4V2m0 20v-2m8-8h2M2 12h2m13.66-5.66 1.41-1.41M4.93 19.07l1.41-1.41m0-11.32L4.93 4.93m14.14 14.14-1.41-1.41M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        <path class="icon-moon" d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+      </svg>
+    </button>
+  </div>
+</header>
+
+{% block body %}{% endblock body %}
+
+<footer class="site-footer">
+  <div class="wrap footer-inner">
+    <div>
+      <strong>krafka {{ config.extra.version }}</strong>
+      <p>A pure-Rust, async-native Apache Kafka client. Apache Kafka is a trademark of the Apache Software Foundation; this project is not affiliated with or endorsed by the ASF.</p>
+    </div>
+    <nav aria-label="Footer">
+      <a href="{{ get_url(path='@/docs/getting-started.md') | safe }}">Getting Started</a>
+      <a href="{{ config.extra.api_docs }}" rel="noopener">API reference</a>
+      <a href="{{ config.extra.repo }}" rel="noopener">Source</a>
+      <a href="{{ config.extra.repo }}#license" rel="noopener">{{ config.extra.license }}</a>
+    </nav>
+  </div>
+</footer>
+
+<script src="{{ get_url(path='app.js', cachebust=true) | safe }}" defer></script>
+</body>
+</html>

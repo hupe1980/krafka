@@ -40,7 +40,7 @@ Test logic via:
 
 ## Rebalance Protocol
 
-See `docs/consumer.md` for cooperative vs eager rebalance semantics.
+See `site/content/docs/consumer.md` for cooperative vs eager rebalance semantics.
 Key invariant: `on_partitions_revoked` fires only for moved partitions in cooperative mode; `on_partitions_lost` fires for unexpectedly vanished ones (session timeout, fencing).
 
 ## Buffer Cap (`max_buffered_records`)

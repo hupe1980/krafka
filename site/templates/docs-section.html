@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+
+{% block body %}
+<div class="docs-layout wrap">
+
+  <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="docs-sidebar">Menu</button>
+
+  <aside id="docs-sidebar" class="docs-sidebar">
+    {% set current = "" %}
+    {% include "docs-nav.html" %}
+  </aside>
+
+  <main id="main" class="docs-main">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="{{ get_url(path='@/_index.md') | safe }}">krafka</a>
+      <span aria-hidden="true">/</span>
+      <span aria-current="page">Docs</span>
+    </nav>
+
+    <article class="prose">
+      <h1>{{ section.title }}</h1>
+      {{ section.content | safe }}
+    </article>
+
+    {% for group in config.extra.nav %}
+    <section class="doc-group">
+      <h2>{{ group.title }}</h2>
+      <div class="card-grid">
+        {%- for slug in group.pages %}
+          {%- for p in section.pages %}
+            {%- if p.extra.slug_id == slug %}
+        <a class="card" href="{{ p.permalink | safe }}">
+          <h3>{{ p.title }}</h3>
+          <p>{{ p.description }}</p>
+        </a>
+            {%- endif %}
+          {%- endfor %}
+        {%- endfor %}
+      </div>
+    </section>
+    {% endfor %}
+  </main>
+
+</div>
+{% endblock body %}
