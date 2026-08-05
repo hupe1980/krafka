@@ -322,21 +322,33 @@ pub(crate) struct ProduceReqTopic {
     pub partitions: Vec<ProduceReqPartition>,
 }
 
-/// Produce request, v10 wire format.
+/// Produce request, v12 wire format.
 ///
-/// Mirrors `ProduceRequest::encode_v9` (which covers v9–v12). v10 is the
-/// lowest version carrying the KIP-951 `CurrentLeader` and `NodeEndpoints`
-/// tagged fields, which is why Produce — unlike the other APIs here — is served
-/// on a flexible version rather than the simpler v8.
+/// Mirrors `ProduceRequest::encode_v9`, which covers v9–v12: the request layout
+/// is identical across them, as is the response decoder, so serving v12 rather
+/// than v10 costs nothing. v10 is the lowest version carrying the KIP-951
+/// `CurrentLeader` and `NodeEndpoints` tagged fields — which is why Produce,
+/// unlike the other APIs here, is served on a flexible version rather than the
+/// simpler v8 — and v12 is the floor KIP-890 (TV2) requires.
 #[derive(Debug, Clone)]
 pub(crate) struct ProduceReq {
+    /// Transactional ID, when the write belongs to a transaction.
+    ///
+    /// Read rather than discarded because it is the whole of the KIP-890 (TV2)
+    /// contract: the coordinator learns which partitions a transaction touched
+    /// from the `Produce` request itself, with no `AddPartitionsToTxn` round
+    /// trip. A broker that ignores it silently drops those partitions from the
+    /// commit marker.
+    pub transactional_id: Option<String>,
     /// Topics being produced to.
     pub topics: Vec<ProduceReqTopic>,
 }
 
 impl ProduceReq {
     pub(crate) fn read(buf: &mut impl Buf) -> Result<Self> {
-        let _transactional_id = KafkaString::decode_compact(buf)?.0;
+        let transactional_id = KafkaString::decode_compact(buf)?
+            .0
+            .filter(|s| !s.is_empty());
         let _acks = i16::decode(buf)?;
         let _timeout_ms = i32::decode(buf)?;
         let topic_count = read_compact_array_len(buf)?;
@@ -355,7 +367,10 @@ impl ProduceReq {
             topics.push(ProduceReqTopic { name, partitions });
         }
         skip_tagged_fields(buf)?;
-        Ok(Self { topics })
+        Ok(Self {
+            transactional_id,
+            topics,
+        })
     }
 }
 
@@ -387,6 +402,14 @@ pub(crate) struct FetchReq {
     /// Fetch session ID, echoed back in the response so the client's session
     /// bookkeeping stays consistent.
     pub session_id: i32,
+    /// `0` = `read_uncommitted`, `1` = `read_committed`.
+    ///
+    /// Read rather than discarded because it selects whether the fetch stops
+    /// at the last stable offset and reports aborted transactions. A broker
+    /// that ignores it hands a `read_committed` consumer records from open and
+    /// aborted transactions, which is the one guarantee the isolation level
+    /// exists to provide.
+    pub isolation_level: i8,
     /// Topics being fetched.
     pub topics: Vec<FetchReqTopic>,
 }
@@ -397,7 +420,7 @@ impl FetchReq {
         let _max_wait_ms = i32::decode(buf)?;
         let _min_bytes = i32::decode(buf)?;
         let _max_bytes = i32::decode(buf)?;
-        let _isolation_level = i8::decode(buf)?;
+        let isolation_level = i8::decode(buf)?;
         let session_id = i32::decode(buf)?;
         let _session_epoch = i32::decode(buf)?;
 
@@ -435,7 +458,11 @@ impl FetchReq {
         // rack_id (v11+).
         let _ = read_nullable_string(buf)?;
 
-        Ok(Self { session_id, topics })
+        Ok(Self {
+            session_id,
+            isolation_level,
+            topics,
+        })
     }
 }
 
@@ -934,13 +961,200 @@ impl OffsetFetchReq {
 ///
 /// Mirrors `InitProducerIdRequest::encode_v0` (which covers v0–v1).
 #[derive(Debug, Clone)]
-pub(crate) struct InitProducerIdReq;
+pub(crate) struct InitProducerIdReq {
+    /// Transactional ID, or `None` for a plain idempotent producer.
+    ///
+    /// This is the fencing key: a known transactional ID must get its existing
+    /// producer ID back with a **higher** epoch, so the previous incarnation's
+    /// writes are rejected (KIP-360). Discarding it, as this reader used to,
+    /// makes every `InitProducerId` mint a fresh identity and fences nothing.
+    pub transactional_id: Option<String>,
+}
 
 impl InitProducerIdReq {
     pub(crate) fn read(buf: &mut impl Buf) -> Result<Self> {
-        let _transactional_id = read_nullable_string(buf)?;
+        let transactional_id = read_nullable_string(buf)?.filter(|s| !s.is_empty());
         let _transaction_timeout_ms = i32::decode(buf)?;
-        Ok(Self)
+        Ok(Self { transactional_id })
+    }
+}
+
+/// `AddPartitionsToTxn` request, v0 wire format (KIP-98, TV1 only).
+///
+/// Mirrors `AddPartitionsToTxnRequest::encode_v0`.
+#[derive(Debug, Clone)]
+pub(crate) struct AddPartitionsToTxnReq {
+    /// Transactional ID.
+    pub transactional_id: String,
+    /// Producer ID the client believes it holds.
+    pub producer_id: i64,
+    /// Producer epoch the client believes it holds.
+    pub producer_epoch: i16,
+    /// Partitions to enrol, as `(topic, partition)`.
+    pub partitions: Vec<(String, i32)>,
+}
+
+impl AddPartitionsToTxnReq {
+    pub(crate) fn read(buf: &mut impl Buf) -> Result<Self> {
+        let transactional_id = read_string(buf)?;
+        let producer_id = i64::decode(buf)?;
+        let producer_epoch = i16::decode(buf)?;
+        let topic_count = read_array_len(buf)?;
+        let mut partitions = Vec::with_capacity(topic_count);
+        for _ in 0..topic_count {
+            let name = read_string(buf)?;
+            let partition_count = read_array_len(buf)?;
+            for _ in 0..partition_count {
+                partitions.push((name.clone(), i32::decode(buf)?));
+            }
+        }
+        Ok(Self {
+            transactional_id,
+            producer_id,
+            producer_epoch,
+            partitions,
+        })
+    }
+}
+
+/// `AddOffsetsToTxn` request, v0 wire format (KIP-98, TV1 only).
+///
+/// Mirrors `AddOffsetsToTxnRequest::encode_v0`.
+#[derive(Debug, Clone)]
+pub(crate) struct AddOffsetsToTxnReq {
+    /// Transactional ID.
+    pub transactional_id: String,
+    /// Producer ID the client believes it holds.
+    pub producer_id: i64,
+    /// Producer epoch the client believes it holds.
+    pub producer_epoch: i16,
+    /// Consumer group whose offsets join the transaction.
+    pub group_id: String,
+}
+
+impl AddOffsetsToTxnReq {
+    pub(crate) fn read(buf: &mut impl Buf) -> Result<Self> {
+        Ok(Self {
+            transactional_id: read_string(buf)?,
+            producer_id: i64::decode(buf)?,
+            producer_epoch: i16::decode(buf)?,
+            group_id: read_string(buf)?,
+        })
+    }
+}
+
+/// `EndTxn` request, v3–v5 wire format (flexible).
+///
+/// Mirrors `EndTxnRequest::encode_v3`, which covers v3–v5 — the request layout
+/// is identical across them; only the *response* grows the KIP-890 bumped
+/// identity at v5.
+#[derive(Debug, Clone)]
+pub(crate) struct EndTxnReq {
+    /// Transactional ID.
+    pub transactional_id: String,
+    /// Producer ID the client believes it holds.
+    pub producer_id: i64,
+    /// Producer epoch the client believes it holds.
+    pub producer_epoch: i16,
+    /// `true` to commit, `false` to abort.
+    pub committed: bool,
+}
+
+impl EndTxnReq {
+    pub(crate) fn read(buf: &mut impl Buf) -> Result<Self> {
+        let transactional_id = read_compact_string(buf)?;
+        let producer_id = i64::decode(buf)?;
+        let producer_epoch = i16::decode(buf)?;
+        let committed = i8::decode(buf)? != 0;
+        skip_tagged_fields(buf)?;
+        Ok(Self {
+            transactional_id,
+            producer_id,
+            producer_epoch,
+            committed,
+        })
+    }
+}
+
+/// One staged offset inside a `TxnOffsetCommit` request.
+#[derive(Debug, Clone)]
+pub(crate) struct TxnOffsetCommitReqPartition {
+    /// Topic name.
+    pub topic: String,
+    /// Partition index.
+    pub partition: i32,
+    /// Offset the group will resume from.
+    pub committed_offset: i64,
+    /// Leader epoch the offset was read at, or `-1`.
+    pub committed_leader_epoch: i32,
+    /// Opaque metadata.
+    pub metadata: Option<String>,
+}
+
+/// `TxnOffsetCommit` request, v3–v5 wire format (flexible).
+///
+/// Mirrors `TxnOffsetCommitRequest::encode_v3`, which covers v3–v5.
+#[derive(Debug, Clone)]
+pub(crate) struct TxnOffsetCommitReq {
+    /// Transactional ID.
+    pub transactional_id: String,
+    /// Consumer group receiving the offsets.
+    pub group_id: String,
+    /// Producer ID the client believes it holds.
+    pub producer_id: i64,
+    /// Producer epoch the client believes it holds.
+    pub producer_epoch: i16,
+    /// KIP-447 fencing triple: the group generation the committer belongs to.
+    pub generation_id: i32,
+    /// KIP-447 fencing triple: the committer's member ID.
+    pub member_id: String,
+    /// KIP-447 fencing triple: the committer's static-membership ID, if any.
+    pub group_instance_id: Option<String>,
+    /// Offsets being staged.
+    pub offsets: Vec<TxnOffsetCommitReqPartition>,
+}
+
+impl TxnOffsetCommitReq {
+    pub(crate) fn read(buf: &mut impl Buf) -> Result<Self> {
+        let transactional_id = read_compact_string(buf)?;
+        let group_id = read_compact_string(buf)?;
+        let producer_id = i64::decode(buf)?;
+        let producer_epoch = i16::decode(buf)?;
+        let generation_id = i32::decode(buf)?;
+        let member_id = read_compact_string(buf)?;
+        let group_instance_id = read_compact_nullable_string(buf)?;
+        let topic_count = read_compact_array_len(buf)?;
+        let mut offsets = Vec::with_capacity(topic_count);
+        for _ in 0..topic_count {
+            let topic = read_compact_string(buf)?;
+            let partition_count = read_compact_array_len(buf)?;
+            for _ in 0..partition_count {
+                let partition = i32::decode(buf)?;
+                let committed_offset = i64::decode(buf)?;
+                let committed_leader_epoch = i32::decode(buf)?;
+                let metadata = read_compact_nullable_string(buf)?;
+                skip_tagged_fields(buf)?;
+                offsets.push(TxnOffsetCommitReqPartition {
+                    topic: topic.clone(),
+                    partition,
+                    committed_offset,
+                    committed_leader_epoch,
+                    metadata,
+                });
+            }
+            skip_tagged_fields(buf)?;
+        }
+        skip_tagged_fields(buf)?;
+        Ok(Self {
+            transactional_id,
+            group_id,
+            producer_id,
+            producer_epoch,
+            generation_id,
+            member_id,
+            group_instance_id,
+            offsets,
+        })
     }
 }
 

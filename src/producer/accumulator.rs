@@ -624,6 +624,14 @@ pub struct AccumulatorConfig {
     pub linger: Duration,
     /// Compression type for batches.
     pub compression: Compression,
+    /// Compression level, or `None` for the codec's own default.
+    ///
+    /// Applies to whichever codec is selected for the batch, including a
+    /// per-topic override. This field exists because it was missing: the
+    /// direct-send path honoured `compression_level` and this one silently
+    /// dropped it, so the setting applied to exactly the configuration
+    /// (`linger = 0`) that batches the least.
+    pub compression_level: Option<i32>,
     /// Per-topic compression overrides.
     ///
     /// When a topic is present in this map, its compression type takes
@@ -672,6 +680,15 @@ pub struct AccumulatorConfig {
     /// production batches instead of issuing one `acks=all` round trip per
     /// record. `None` for plain and idempotent producers.
     pub transactional_id: Option<String>,
+    /// Dead-letter queue for records whose batch failed permanently.
+    ///
+    /// Invoked once per record after the retry budget is exhausted (or on a
+    /// non-retriable error), immediately before the failure is handed back to
+    /// the caller — the same point at which the direct-send path routes to the
+    /// DLQ. Before this field existed the producer DLQ was reachable only when
+    /// `linger = 0`, so configuring both a DLQ and any batching silently
+    /// disabled the DLQ.
+    pub(crate) dead_letter_queue: Option<Arc<dyn crate::dlq::DeadLetterQueue>>,
 }
 
 impl Clone for AccumulatorConfig {
@@ -680,6 +697,7 @@ impl Clone for AccumulatorConfig {
             batch_size: self.batch_size,
             linger: self.linger,
             compression: self.compression,
+            compression_level: self.compression_level,
             topic_compression: self.topic_compression.clone(),
             acks: self.acks,
             client_id: self.client_id.clone(),
@@ -693,6 +711,7 @@ impl Clone for AccumulatorConfig {
             partitioner: self.partitioner.clone(),
             state_store: self.state_store.clone(),
             transactional_id: self.transactional_id.clone(),
+            dead_letter_queue: self.dead_letter_queue.clone(),
         }
     }
 }
@@ -721,6 +740,7 @@ impl Default for AccumulatorConfig {
             batch_size: 16384,
             linger: Duration::ZERO,
             compression: Compression::None,
+            compression_level: None,
             topic_compression: AHashMap::new(),
             acks: -1,
             client_id: "krafka".to_string(),
@@ -734,6 +754,7 @@ impl Default for AccumulatorConfig {
             partitioner: Arc::new(super::partitioner::UniformStickyPartitioner::new()),
             state_store: None,
             transactional_id: None,
+            dead_letter_queue: None,
         }
     }
 }
@@ -1434,11 +1455,7 @@ impl RecordAccumulator {
 
             if let Err(error) = init_result {
                 metrics.record_error_for_topic(topic.as_ref());
-                for pending_record in pending {
-                    let _ = pending_record
-                        .response_tx
-                        .send(AppendResponse::Done(Err(error.clone())));
-                }
+                Self::fail_pending(&topic, partition, pending, &error, &config).await;
                 return;
             }
         }
@@ -1462,6 +1479,51 @@ impl RecordAccumulator {
         .await;
     }
 
+    /// Terminally fail every record in `pending` with `error`.
+    ///
+    /// One place, so the three things that must happen on a terminal failure —
+    /// the `on_acknowledgement` interceptor callback, the dead-letter-queue
+    /// hand-off, and the response to the waiting `send()` — cannot be applied
+    /// on one failure path and forgotten on another. They were: the DLQ ran on
+    /// none of them, because the batched path had no DLQ at all.
+    ///
+    /// The DLQ is invoked before the error is delivered, so a caller that
+    /// reacts to the error can rely on the record already being safe.
+    async fn fail_pending(
+        topic: &TopicHandle,
+        partition: PartitionId,
+        pending: Vec<PendingRecord>,
+        error: &KrafkaError,
+        config: &AccumulatorConfig,
+    ) {
+        let topic_owned = topic.to_string();
+        for p in pending {
+            let meta = RecordMetadata {
+                topic: topic_owned.clone(),
+                partition,
+                offset: -1,
+                timestamp: 0,
+                delivery: DeliveryConfirmation::Failed,
+            };
+            crate::interceptor::safe_on_acknowledgement(&*config.interceptor, &meta, Some(error));
+
+            if let Some(dlq) = config.dead_letter_queue.as_ref() {
+                let dlq_record = ProducerRecord {
+                    topic: topic_owned.clone(),
+                    partition: Some(partition),
+                    key: p.record.key.clone(),
+                    value: p.record.value.clone(),
+                    timestamp: p.record.timestamp,
+                    headers: p.record.headers.clone(),
+                    record_name: None,
+                };
+                dlq.send(dlq_record, error.to_string()).await;
+            }
+
+            let _ = p.response_tx.send(AppendResponse::Done(Err(error.clone())));
+        }
+    }
+
     /// Encode one produce request for `pending`.
     ///
     /// Returns the request plus `(compressed_bytes, uncompressed_bytes)` so the
@@ -1483,7 +1545,9 @@ impl RecordAccumulator {
             .get(topic.as_ref())
             .copied()
             .unwrap_or(config.compression);
-        let mut batch_builder = RecordBatchBuilder::new().compression(effective_compression);
+        let mut batch_builder = RecordBatchBuilder::new()
+            .compression(effective_compression)
+            .compression_level(config.compression_level);
 
         // Tag with idempotent producer identity
         if let (Some(identity), Some(s)) = (&config.identity, sequence) {
@@ -1607,9 +1671,7 @@ impl RecordAccumulator {
         {
             Ok(s) => s,
             Err(e) => {
-                for p in pending {
-                    let _ = p.response_tx.send(AppendResponse::Done(Err(e.clone())));
-                }
+                Self::fail_pending(topic, partition, pending, &e, config).await;
                 return;
             }
         };
@@ -1629,9 +1691,7 @@ impl RecordAccumulator {
                             record_count,
                         );
                     }
-                    for p in pending {
-                        let _ = p.response_tx.send(AppendResponse::Done(Err(e.clone())));
-                    }
+                    Self::fail_pending(topic, partition, pending, &e, config).await;
                     return;
                 }
             };
@@ -2101,22 +2161,7 @@ impl RecordAccumulator {
                 }
 
                 metrics.record_error_for_topic(topic.as_ref());
-                let topic_owned = topic.to_string();
-                for p in pending {
-                    let meta = RecordMetadata {
-                        topic: topic_owned.clone(),
-                        partition,
-                        offset: -1,
-                        timestamp: 0,
-                        delivery: DeliveryConfirmation::Failed,
-                    };
-                    crate::interceptor::safe_on_acknowledgement(
-                        &*config.interceptor,
-                        &meta,
-                        Some(&e),
-                    );
-                    let _ = p.response_tx.send(AppendResponse::Done(Err(e.clone())));
-                }
+                Self::fail_pending(topic, partition, pending, &e, config).await;
             }
         }
     }
@@ -2243,6 +2288,8 @@ mod tests {
             state_store: None,
             topic_compression: AHashMap::new(),
             transactional_id: None,
+            compression_level: None,
+            dead_letter_queue: None,
         };
         assert_eq!(config.batch_size, 65536);
         assert_eq!(config.linger, Duration::from_millis(50));
@@ -2250,6 +2297,233 @@ mod tests {
         assert_eq!(config.client_id, "test-client");
         assert_eq!(config.max_request_size, 131072);
         assert_eq!(config.buffer_memory, 64 * 1024 * 1024);
+    }
+
+    /// A record ready to be encoded, with the guards a real one carries.
+    fn test_pending(value: bytes::Bytes) -> PendingRecord {
+        let (response_tx, _response_rx) = oneshot::channel();
+        let estimated_size = value.len();
+        PendingRecord {
+            record: RoutedRecord {
+                key: None,
+                value,
+                timestamp: None,
+                headers: Vec::new(),
+            },
+            response_tx,
+            offset_in_batch: 0,
+            estimated_size,
+            _buffered_record_guard: BufferedRecordGuard::new(
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(ProducerMetrics::default()),
+            ),
+            _operation_guard: Arc::new(InFlightBarrier::new())
+                .start("test")
+                .expect("a fresh barrier is open"),
+        }
+    }
+
+    /// A payload with enough structure that the compression level changes the
+    /// output size — a run of identical bytes would compress to the same few
+    /// bytes at every level and prove nothing.
+    #[cfg(any(feature = "zstd", feature = "gzip"))]
+    fn compressible_payload() -> bytes::Bytes {
+        let mut s = String::with_capacity(96 * 1024);
+        for i in 0..2048 {
+            s.push_str(&format!(
+                "{{\"id\":{i},\"user\":\"user-{}\",\"score\":{},\"tag\":\"{}\"}}\n",
+                i % 97,
+                i * 7 % 1013,
+                if i % 3 == 0 { "alpha" } else { "beta" }
+            ));
+        }
+        bytes::Bytes::from(s)
+    }
+
+    /// Encode one batch and report the compressed record-set size.
+    ///
+    /// The *size* is the observable, not the bytes: `RecordBatchBuilder`
+    /// stamps a wall-clock base timestamp, so two encodings of the same records
+    /// never compare equal and a byte-inequality assertion would pass whether
+    /// or not the level was applied. (It did — that assertion was written
+    /// first, its negative control passed, and this is the replacement.)
+    #[cfg(any(feature = "zstd", feature = "gzip"))]
+    async fn encoded_size(codec: Compression, level: Option<i32>, payload: bytes::Bytes) -> usize {
+        let topic: TopicHandle = Arc::from("levels");
+        let config = AccumulatorConfig {
+            compression: codec,
+            compression_level: level,
+            ..AccumulatorConfig::default()
+        };
+        let pending = vec![test_pending(payload)];
+        let (request, compressed, _uncompressed) =
+            RecordAccumulator::encode_batch_request(&topic, 0, &pending, None, &config)
+                .await
+                .expect("encoding one batch cannot fail");
+        assert_eq!(
+            compressed as usize,
+            request.topic_data[0].partition_data[0].records.len(),
+            "the reported compressed length must match the encoded record set"
+        );
+        compressed as usize
+    }
+
+    /// `compression_level` must reach the **batched** encoder.
+    ///
+    /// It did not. `ProducerBuilder::compression_level` was applied only in
+    /// `build_produce_request`, the direct-send path taken when `linger = 0`.
+    /// Any producer with `linger > 0` — the throughput-tuned configuration, and
+    /// the *only* configuration a `TransactionalProducer` has — silently
+    /// encoded at the codec's default level. Nothing reported it, because a
+    /// batch compressed at the wrong level is a perfectly valid batch.
+    ///
+    /// Negative control: deleting the `.compression_level(..)` call from
+    /// `encode_batch_request` makes both sizes equal and this fails.
+    #[cfg(feature = "zstd")]
+    #[tokio::test]
+    async fn zstd_compression_level_reaches_the_batched_encoder() {
+        let payload = compressible_payload();
+        let fast = encoded_size(Compression::Zstd, Some(1), payload.clone()).await;
+        let dense = encoded_size(Compression::Zstd, Some(19), payload).await;
+
+        assert!(
+            dense < fast,
+            "zstd level 19 must compress harder than level 1 (got {dense} vs {fast} bytes); \
+             equal sizes mean the level never reached the encoder"
+        );
+    }
+
+    /// Same guarantee for gzip, whose level range and encoder are unrelated to
+    /// zstd's — one codec passing does not imply the other does.
+    #[cfg(feature = "gzip")]
+    #[tokio::test]
+    async fn gzip_compression_level_reaches_the_batched_encoder() {
+        let payload = compressible_payload();
+        let fast = encoded_size(Compression::Gzip, Some(1), payload.clone()).await;
+        let dense = encoded_size(Compression::Gzip, Some(9), payload).await;
+
+        assert!(
+            dense < fast,
+            "gzip level 9 must compress harder than level 1 (got {dense} vs {fast} bytes)"
+        );
+    }
+
+    /// The per-topic override and the level must be applied together, since
+    /// the level is validated against whichever codec the override selected.
+    #[cfg(all(feature = "zstd", feature = "gzip"))]
+    #[tokio::test]
+    async fn per_topic_codec_beats_the_producer_wide_setting() {
+        let topic: TopicHandle = Arc::from("overridden");
+
+        let mut topic_compression = AHashMap::new();
+        topic_compression.insert("overridden".to_string(), Compression::Gzip);
+        let config = AccumulatorConfig {
+            compression: Compression::Zstd,
+            compression_level: Some(1),
+            topic_compression,
+            ..AccumulatorConfig::default()
+        };
+
+        let pending = vec![test_pending(compressible_payload())];
+        let (request, _c, _u) =
+            RecordAccumulator::encode_batch_request(&topic, 0, &pending, None, &config)
+                .await
+                .expect("gzip level 1 is valid");
+
+        // The record-batch attributes field sits at offset 21 and carries the
+        // codec in its low three bits: gzip is 1, zstd is 4.
+        let records = &request.topic_data[0].partition_data[0].records;
+        let attributes = i16::from_be_bytes([records[21], records[22]]);
+        assert_eq!(
+            attributes & 0x07,
+            1,
+            "the per-topic gzip override must beat the producer-wide zstd setting"
+        );
+    }
+
+    /// A DLQ that records what it was handed.
+    #[derive(Debug, Default)]
+    struct RecordingDlq {
+        received: parking_lot::Mutex<Vec<(String, String)>>,
+    }
+
+    impl crate::dlq::DeadLetterQueue for RecordingDlq {
+        fn send<'a>(
+            &'a self,
+            record: ProducerRecord,
+            error: String,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            let value = String::from_utf8_lossy(&record.value).into_owned();
+            Box::pin(async move {
+                self.received.lock().push((value, error));
+            })
+        }
+    }
+
+    /// A permanently failed batch must reach the dead-letter queue.
+    ///
+    /// `ProducerBuilder::dead_letter_queue` used to be documented as
+    /// direct-send-only, which meant configuring a DLQ alongside any batching
+    /// silently disabled it — and batching is what a throughput-tuned producer
+    /// runs, and the only thing a `TransactionalProducer` does. The records
+    /// were available the whole time; nothing was reading them.
+    ///
+    /// Negative control: deleting the `dead_letter_queue` block from
+    /// `fail_pending` leaves the DLQ empty and this fails.
+    #[tokio::test]
+    async fn a_permanently_failed_batch_reaches_the_dead_letter_queue() {
+        let dlq = Arc::new(RecordingDlq::default());
+        let config = AccumulatorConfig {
+            dead_letter_queue: Some(dlq.clone()),
+            ..AccumulatorConfig::default()
+        };
+        let topic: TopicHandle = Arc::from("orders");
+        let pending = vec![
+            test_pending(bytes::Bytes::from_static(b"first")),
+            test_pending(bytes::Bytes::from_static(b"second")),
+        ];
+
+        let error = KrafkaError::broker(ErrorCode::RecordListTooLarge, "batch rejected");
+        RecordAccumulator::fail_pending(&topic, 3, pending, &error, &config).await;
+
+        let received = dlq.received.lock().clone();
+        assert_eq!(
+            received.len(),
+            2,
+            "every record in the failed batch must be routed, got {received:?}"
+        );
+        assert_eq!(received[0].0, "first");
+        assert_eq!(received[1].0, "second");
+        assert!(
+            received[0].1.contains("batch rejected"),
+            "the DLQ must be told why, got: {}",
+            received[0].1
+        );
+    }
+
+    /// Without a DLQ the same path must still deliver the error to every
+    /// waiting `send()` — the DLQ is an addition, not a replacement.
+    #[tokio::test]
+    async fn failing_a_batch_without_a_dlq_still_answers_every_caller() {
+        let config = AccumulatorConfig::default();
+        let topic: TopicHandle = Arc::from("orders");
+
+        let (tx_a, rx_a) = oneshot::channel();
+        let (tx_b, rx_b) = oneshot::channel();
+        let mut a = test_pending(bytes::Bytes::from_static(b"a"));
+        let mut b = test_pending(bytes::Bytes::from_static(b"b"));
+        a.response_tx = tx_a;
+        b.response_tx = tx_b;
+
+        let error = KrafkaError::broker(ErrorCode::RecordListTooLarge, "batch rejected");
+        RecordAccumulator::fail_pending(&topic, 0, vec![a, b], &error, &config).await;
+
+        for rx in [rx_a, rx_b] {
+            match rx.await {
+                Ok(AppendResponse::Done(Err(e))) => assert!(e.to_string().contains("rejected")),
+                other => panic!("expected a delivered failure, got {other:?}"),
+            }
+        }
     }
 
     #[test]

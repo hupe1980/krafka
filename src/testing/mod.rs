@@ -60,10 +60,17 @@
 //!
 //! `ApiVersions`, `Metadata`, `FindCoordinator`, `Produce`, `Fetch`,
 //! `ListOffsets`, `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`,
-//! `OffsetCommit`, `OffsetFetch`, `InitProducerId`, `CreateTopics` and
-//! `DeleteTopics`. Logs are in memory, per topic-partition, and nothing is
-//! persisted. Any other API is simply not advertised in `ApiVersions`, so the
-//! client's own version negotiation refuses it before a request is sent.
+//! `OffsetCommit`, `OffsetFetch`, `CreateTopics` and `DeleteTopics`, plus the
+//! full transaction protocol — `InitProducerId` with KIP-360 fencing,
+//! `AddPartitionsToTxn`, `AddOffsetsToTxn`, `TxnOffsetCommit` and `EndTxn`,
+//! with real commit and abort control batches and `read_committed` isolation.
+//! [`FakeBroker::set_transaction_version`](crate::testing::FakeBroker::set_transaction_version)
+//! selects between the TV1 and KIP-890
+//! TV2 protocols the same way a real cluster does.
+//!
+//! Logs are in memory, per topic-partition, and nothing is persisted. Any other
+//! API is simply not advertised in `ApiVersions`, so the client's own version
+//! negotiation refuses it before a request is sent.
 //!
 //! # Version pinning
 //!
@@ -631,6 +638,89 @@ impl FakeBroker {
             .lock()
             .partition(topic, partition)
             .map(|p| p.next_offset)
+    }
+
+    /// Finalize the cluster's `transaction.version` level (KIP-890).
+    ///
+    /// This is the switch between the two transaction protocols, and it is the
+    /// same switch a real cluster uses — the client reads the finalized feature
+    /// out of `ApiVersions` and negotiates from it, so nothing here is
+    /// special-cased for testing.
+    ///
+    /// | Level | Protocol | What the client does |
+    /// |---|---|---|
+    /// | `0` or `1` *(default)* | TV1 | Registers partitions with `AddPartitionsToTxn` and the offsets topic with `AddOffsetsToTxn` before writing |
+    /// | `2` | TV2 | Sends neither: `Produce` and `TxnOffsetCommit` carry the transactional ID, and `EndTxn` returns a bumped epoch |
+    ///
+    /// A fresh broker finalizes nothing, so the default is TV1 — the
+    /// conservative protocol, and the one a client must still speak against an
+    /// older cluster.
+    ///
+    /// ```rust,no_run
+    /// # use krafka::testing::FakeBroker;
+    /// # async fn example() -> krafka::error::Result<()> {
+    /// let broker = FakeBroker::start().await?;
+    /// broker.set_transaction_version(2); // negotiate KIP-890
+    /// # Ok(()) }
+    /// ```
+    pub fn set_transaction_version(&self, level: i16) {
+        let mut cluster = self.shared.cluster.lock();
+        cluster
+            .finalized_features
+            .insert("transaction.version".to_string(), level);
+        cluster.finalized_features_epoch += 1;
+    }
+
+    /// Producer ID and epoch the coordinator currently holds for a
+    /// transactional ID, if `InitProducerId` has run for it.
+    ///
+    /// The epoch is what proves fencing happened: re-initialising the same
+    /// transactional ID must return the same producer ID with a higher epoch,
+    /// and under KIP-890 every completed transaction bumps it again.
+    pub fn transactional_producer(&self, transactional_id: &str) -> Option<(i64, i16)> {
+        self.shared
+            .cluster
+            .lock()
+            .transactions
+            .get(transactional_id)
+            .map(|t| (t.producer_id, t.producer_epoch))
+    }
+
+    /// Whether a transaction is currently open for `transactional_id`.
+    pub fn transaction_is_open(&self, transactional_id: &str) -> bool {
+        self.shared
+            .cluster
+            .lock()
+            .transactions
+            .get(transactional_id)
+            .is_some_and(|t| t.open)
+    }
+
+    /// Last stable offset of a partition: the first offset a `read_committed`
+    /// consumer may not read past.
+    ///
+    /// Equal to the high watermark when no transaction is open on the
+    /// partition, and pinned at the open transaction's first record otherwise.
+    pub fn last_stable_offset(&self, topic: &str, partition: i32) -> Option<i64> {
+        self.shared
+            .cluster
+            .lock()
+            .partition(topic, partition)
+            .map(|p| p.last_stable_offset())
+    }
+
+    /// Aborted transactions recorded on a partition, as
+    /// `(producer_id, first_offset)`.
+    ///
+    /// This is exactly what a `read_committed` fetch reports, and what the
+    /// consumer uses to drop the aborted data records.
+    pub fn aborted_transactions(&self, topic: &str, partition: i32) -> Vec<(i64, i64)> {
+        self.shared
+            .cluster
+            .lock()
+            .partition(topic, partition)
+            .map(|p| p.aborted_transactions_from(0))
+            .unwrap_or_default()
     }
 }
 

@@ -951,6 +951,11 @@ impl ConnectionPool {
         else {
             return;
         };
+        // Bind before the runtime check: token fetches on the *connection*
+        // path happen with or without a background refresh task, and they are
+        // the ones an operator most needs counted.
+        provider.bind_metrics(self.metrics());
+
         if tokio::runtime::Handle::try_current().is_err() {
             warn!(
                 "start_token_refresh called outside a Tokio runtime; OAUTHBEARER \
@@ -1115,6 +1120,20 @@ impl ConnectionPool {
     /// Returns `true` if no usable connections known by broker ID exist.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Test-only: whether any background task is still installed.
+    ///
+    /// [`close_all`](Self::close_all) aborts and clears the idle evictor, the
+    /// OAUTHBEARER refresh task and the TLS reload task, so this is the
+    /// observable for *"was this pool torn down"* — which is what the
+    /// shared-pool tests on each client need to assert, and which no public
+    /// accessor exposes (nor should: it is an implementation detail).
+    #[cfg(test)]
+    pub(crate) fn has_background_tasks(&self) -> bool {
+        self.evictor_handle.lock().is_some()
+            || self.oauth_refresh_handle.lock().is_some()
+            || self.tls_reload_handle.lock().is_some()
     }
 }
 
@@ -1420,6 +1439,62 @@ mod tests {
             pool.oauth_refresh_handle.lock().is_none(),
             "must not panic in tokio::spawn without a runtime"
         );
+    }
+
+    /// Token fetches must land on the pool's own `ConnectionMetrics`.
+    ///
+    /// The counters are useless if nothing binds them: an OAUTHBEARER provider
+    /// is called per connection, and a misconfigured `token_endpoint` is
+    /// otherwise indistinguishable from an unreachable broker.
+    ///
+    /// Negative control: removing the `bind_metrics` call from
+    /// `start_token_refresh` leaves the counter at zero and this fails.
+    #[tokio::test]
+    async fn token_fetches_are_reported_to_the_pools_metrics() {
+        let config = oauth_pool_config();
+        let pool = Arc::new(ConnectionPool::new(config));
+        pool.start_token_refresh();
+
+        let provider = pool
+            .config
+            .auth
+            .as_ref()
+            .and_then(|a| a.oauthbearer_provider())
+            .expect("the config carries a provider")
+            .clone();
+        provider.provide_token().await.expect("provider succeeds");
+
+        assert_eq!(
+            pool.metrics().oauth_token_fetches.get(),
+            1,
+            "the connection-path fetch must reach the pool's metrics"
+        );
+        pool.close_all().await;
+    }
+
+    /// Binding must happen even outside a Tokio runtime, where the background
+    /// refresh task cannot start — the connection path still fetches there.
+    #[test]
+    fn metrics_are_bound_even_when_the_refresh_task_cannot_start() {
+        let pool = Arc::new(ConnectionPool::new(oauth_pool_config()));
+        pool.start_token_refresh();
+
+        let provider = pool
+            .config
+            .auth
+            .as_ref()
+            .and_then(|a| a.oauthbearer_provider())
+            .expect("the config carries a provider")
+            .clone();
+
+        let metrics = pool.metrics();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(async { provider.provide_token().await })
+            .expect("provider succeeds");
+
+        assert_eq!(metrics.oauth_token_fetches.get(), 1);
     }
 
     // ── Reconnection is bounded so waiters cannot wedge forever ────────

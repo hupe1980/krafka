@@ -17,6 +17,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter("krafka=debug")
         .init();
 
+    // Validate the configuration before touching the network.
+    //
+    // `build_config()` runs exactly the checks `build()` runs — same validator,
+    // no broker — which is what makes a `validate-config` subcommand or a unit
+    // test possible for an exactly-once deployment.
+    let config = TransactionalProducer::builder()
+        .bootstrap_servers("localhost:9092")
+        .transactional_id("krafka-example-txn-1")
+        .build_config()?;
+    println!(
+        "Configuration valid: transactional.id={}, acks={:?}, delivery_timeout={:?}",
+        config.transactional_id(),
+        config.acks(),
+        config.delivery_timeout()
+    );
+
     // Create transactional producer with unique ID
     // The transactional.id must be unique per producer instance
     let producer = TransactionalProducer::builder()
@@ -24,6 +40,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .transactional_id("krafka-example-txn-1")
         .client_id("krafka-transactional-producer")
         .transaction_timeout(Duration::from_secs(60))
+        // Bound how long one batch may sit in flight. A stuck batch holds the
+        // transaction open, and an open transaction blocks every
+        // read_committed consumer at its first offset — so keep this at or
+        // below transaction_timeout.
+        .delivery_timeout(Duration::from_secs(45))
         .build()
         .await?;
 
@@ -48,6 +69,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = producer
         .send("notifications", Some(b"user-789"), b"Order confirmation")
         .await?;
+
+    // Optional: force the buffered batches onto the wire now, so a send
+    // failure surfaces here rather than inside commit_transaction(). Not
+    // required — commit_transaction() flushes first, and must, or a commit
+    // marker could be written while records were still buffered.
+    producer.flush().await?;
 
     // Commit makes all messages visible to consumers
     producer.commit_transaction().await?;

@@ -50,6 +50,7 @@
 //! producer.commit_transaction().await?;
 //! ```
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -354,8 +355,10 @@ impl TopicPartitionOffset {
 
 /// Configuration for a transactional producer.
 ///
-/// Use [`TransactionalProducer::builder()`] to construct. Direct field construction
-/// is intentionally not supported to enforce invariant validation at build time.
+/// Produced by
+/// [`TransactionalProducerBuilder::build_config`], which validates it without
+/// connecting. Direct field construction is intentionally not supported so that
+/// every instance has been through the validator.
 #[derive(Debug, Clone)]
 pub struct TransactionalProducerConfig {
     /// Bootstrap servers.
@@ -370,10 +373,22 @@ pub struct TransactionalProducerConfig {
     request_timeout: Duration,
     /// Time allowed for TCP establishment to one broker.
     connect_timeout: Duration,
+    /// Total time a record may spend in flight, including batching, retries and
+    /// backoff.
+    ///
+    /// Matters more here than on the plain producer: a batch that keeps
+    /// retrying holds the transaction open, and an open transaction blocks
+    /// `read_committed` consumers at its first offset until the coordinator's
+    /// own `transaction_timeout` fires.
+    delivery_timeout: Duration,
     /// Maximum encoded Kafka request frame size in bytes.
     max_request_size: usize,
     /// Compression.
     compression: Compression,
+    /// Compression level, or `None` for the codec's own default.
+    compression_level: Option<i32>,
+    /// Per-topic compression overrides, taking precedence over `compression`.
+    topic_compression: HashMap<String, Compression>,
     /// Maximum batch size in bytes for the record accumulator.
     batch_size: usize,
     /// How long the accumulator waits for a batch to fill before sending it.
@@ -391,6 +406,8 @@ pub struct TransactionalProducerConfig {
     max_in_flight: usize,
     /// Metadata max age.
     metadata_max_age: Duration,
+    /// Topic cache TTL for partial metadata refreshes, or `None` to disable it.
+    metadata_topic_cache_ttl: Option<Duration>,
     /// What to do when every known broker becomes unreachable (KIP-899).
     metadata_recovery_strategy: crate::metadata::MetadataRecoveryStrategy,
     /// How long metadata refreshes may keep failing before a rebootstrap is
@@ -407,6 +424,8 @@ pub struct TransactionalProducerConfig {
     /// Defaults reproduce krafka's historical behaviour; see
     /// [`TransportConfig`](crate::network::TransportConfig).
     transport: crate::network::TransportConfig,
+    /// Dead-letter queue for records whose batch failed permanently.
+    dead_letter_queue: Option<Arc<dyn crate::dlq::DeadLetterQueue>>,
 }
 
 impl Default for TransactionalProducerConfig {
@@ -418,22 +437,261 @@ impl Default for TransactionalProducerConfig {
             transaction_timeout_ms: 60000,
             request_timeout: Duration::from_secs(30),
             connect_timeout: crate::network::DEFAULT_CONNECT_TIMEOUT,
+            delivery_timeout: Duration::from_secs(120),
             max_request_size: crate::protocol::MAX_MESSAGE_SIZE,
             compression: Compression::None,
+            compression_level: None,
+            topic_compression: HashMap::new(),
             batch_size: 16384,
             linger: Duration::from_millis(5),
             buffer_memory: 32 * 1024 * 1024,
             max_block: Duration::from_secs(60),
             max_in_flight: 5,
             metadata_max_age: Duration::from_secs(300),
+            metadata_topic_cache_ttl: Some(Duration::from_secs(300)),
             metadata_recovery_strategy: crate::metadata::MetadataRecoveryStrategy::Rebootstrap,
             metadata_recovery_rebootstrap_trigger: Duration::from_secs(300),
             auth: None,
             #[cfg(feature = "socks5")]
             proxy: None,
             transport: crate::network::TransportConfig::default(),
+            dead_letter_queue: None,
         }
     }
+}
+
+impl TransactionalProducerConfig {
+    /// Returns the bootstrap servers.
+    #[inline]
+    pub fn bootstrap_servers(&self) -> &str {
+        &self.bootstrap_servers
+    }
+
+    /// Returns the client ID.
+    #[inline]
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// Returns the transactional ID.
+    #[inline]
+    pub fn transactional_id(&self) -> &str {
+        &self.transactional_id
+    }
+
+    /// Returns the transaction timeout.
+    #[inline]
+    pub fn transaction_timeout(&self) -> Duration {
+        Duration::from_millis(self.transaction_timeout_ms.max(0) as u64)
+    }
+
+    /// Returns the request timeout.
+    #[inline]
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    /// Returns the connect timeout.
+    #[inline]
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    /// Returns the total delivery timeout.
+    #[inline]
+    pub fn delivery_timeout(&self) -> Duration {
+        self.delivery_timeout
+    }
+
+    /// Returns the maximum encoded request frame size in bytes.
+    #[inline]
+    pub fn max_request_size(&self) -> usize {
+        self.max_request_size
+    }
+
+    /// Returns the compression codec.
+    #[inline]
+    pub fn compression(&self) -> Compression {
+        self.compression
+    }
+
+    /// Returns the configured compression level, or `None` for the codec
+    /// default.
+    #[inline]
+    pub fn compression_level(&self) -> Option<i32> {
+        self.compression_level
+    }
+
+    /// Returns the effective compression for a given topic.
+    #[inline]
+    pub fn compression_for(&self, topic: &str) -> Compression {
+        self.topic_compression
+            .get(topic)
+            .copied()
+            .unwrap_or(self.compression)
+    }
+
+    /// Returns the batch size in bytes.
+    #[inline]
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    /// Returns the linger duration.
+    #[inline]
+    pub fn linger(&self) -> Duration {
+        self.linger
+    }
+
+    /// Returns the accumulator buffer memory in bytes.
+    #[inline]
+    pub fn buffer_memory(&self) -> usize {
+        self.buffer_memory
+    }
+
+    /// Returns the maximum time `send` blocks waiting for buffer memory.
+    #[inline]
+    pub fn max_block(&self) -> Duration {
+        self.max_block
+    }
+
+    /// Returns the maximum concurrent in-flight produce requests.
+    #[inline]
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight
+    }
+
+    /// Returns the metadata max age.
+    #[inline]
+    pub fn metadata_max_age(&self) -> Duration {
+        self.metadata_max_age
+    }
+
+    /// Returns the topic cache TTL for partial metadata refreshes.
+    #[inline]
+    pub fn metadata_topic_cache_ttl(&self) -> Option<Duration> {
+        self.metadata_topic_cache_ttl
+    }
+
+    /// Returns the metadata recovery strategy (KIP-899).
+    #[inline]
+    pub fn metadata_recovery_strategy(&self) -> crate::metadata::MetadataRecoveryStrategy {
+        self.metadata_recovery_strategy
+    }
+
+    /// Returns the rebootstrap trigger duration (KIP-899).
+    #[inline]
+    pub fn metadata_recovery_rebootstrap_trigger(&self) -> Duration {
+        self.metadata_recovery_rebootstrap_trigger
+    }
+
+    /// Returns the authentication configuration, if set.
+    #[inline]
+    pub fn auth(&self) -> Option<&AuthConfig> {
+        self.auth.as_ref()
+    }
+
+    /// Returns the SOCKS5 proxy configuration, if set.
+    #[cfg(feature = "socks5")]
+    #[inline]
+    pub fn proxy(&self) -> Option<&crate::network::ProxyConfig> {
+        self.proxy.as_ref()
+    }
+
+    /// Returns the acknowledgment level.
+    ///
+    /// Always [`Acks::All`]: the transaction coordinator can only guarantee
+    /// atomicity over fully replicated writes, so this is fixed rather than
+    /// configurable. See [`TransactionalProducerBuilder`] for the other
+    /// deliberate exclusion.
+    #[inline]
+    pub fn acks(&self) -> Acks {
+        Acks::All
+    }
+}
+
+/// Validate and normalise a [`TransactionalProducerConfig`].
+///
+/// The transactional twin of
+/// [`producer::config::validate`](super::config::validate), and it shares that
+/// module's compression rules rather than restating them — a codec check that
+/// exists on one producer and not the other is the defect class this release
+/// is closing.
+///
+/// `has_shared_pool` relaxes the `bootstrap_servers` requirement for a producer
+/// built with [`TransactionalProducerBuilder::with_client`].
+fn validate(config: &TransactionalProducerConfig, has_shared_pool: bool) -> Result<()> {
+    if !has_shared_pool && config.bootstrap_servers.is_empty() {
+        return Err(KrafkaError::config("bootstrap.servers is required"));
+    }
+    if config.transactional_id.is_empty() {
+        return Err(KrafkaError::config("transactional_id is required"));
+    }
+    // Validate against Kafka's KafkaString wire limit (i16::MAX bytes).
+    const MAX_KAFKA_STRING_LEN: usize = i16::MAX as usize;
+    if config.transactional_id.len() > MAX_KAFKA_STRING_LEN {
+        return Err(KrafkaError::config(format!(
+            "transactional_id is {} bytes, exceeding the Kafka wire limit of {MAX_KAFKA_STRING_LEN}",
+            config.transactional_id.len()
+        )));
+    }
+    if config.client_id.len() > MAX_KAFKA_STRING_LEN {
+        return Err(KrafkaError::config(format!(
+            "client_id is {} bytes, exceeding the Kafka wire limit of {MAX_KAFKA_STRING_LEN}",
+            config.client_id.len()
+        )));
+    }
+    if config.transaction_timeout_ms <= 0 {
+        return Err(KrafkaError::config("transaction_timeout must be > 0"));
+    }
+    if config.max_request_size == 0 {
+        return Err(KrafkaError::config("max_request_size must be >= 1"));
+    }
+    if config.batch_size == 0 {
+        return Err(KrafkaError::config("batch_size must be >= 1"));
+    }
+    if config.max_in_flight == 0 {
+        return Err(KrafkaError::config("max_in_flight must be >= 1"));
+    }
+    if config.delivery_timeout.is_zero() {
+        return Err(KrafkaError::config(
+            "delivery_timeout must be greater than zero",
+        ));
+    }
+    if config.buffer_memory > 0 && config.batch_size > config.buffer_memory {
+        return Err(KrafkaError::config(format!(
+            "batch_size must not exceed buffer_memory (got batch_size={}, buffer_memory={})",
+            config.batch_size, config.buffer_memory
+        )));
+    }
+    if config.batch_size > config.max_request_size {
+        return Err(KrafkaError::config(format!(
+            "batch_size must not exceed max_request_size (got batch_size={}, max_request_size={})",
+            config.batch_size, config.max_request_size
+        )));
+    }
+
+    super::config::validate_compression(
+        config.compression,
+        config.compression_level,
+        &config.topic_compression,
+    )?;
+
+    // A delivery budget longer than the coordinator's own transaction timeout
+    // cannot be honoured: the coordinator aborts the transaction first, and
+    // every record still retrying inside it dies with it. Warn rather than
+    // reject — the two are set by different people often enough that failing
+    // the build would be worse than saying so.
+    let transaction_timeout = Duration::from_millis(config.transaction_timeout_ms.max(0) as u64);
+    if config.delivery_timeout > transaction_timeout {
+        warn!(
+            delivery_timeout_secs = config.delivery_timeout.as_secs_f64(),
+            transaction_timeout_secs = transaction_timeout.as_secs_f64(),
+            "delivery_timeout exceeds transaction_timeout; the coordinator aborts the \
+             transaction first, so the extra delivery budget is unreachable"
+        );
+    }
+    Ok(())
 }
 
 /// State of a partition within the current transaction.
@@ -634,6 +892,15 @@ pub struct TransactionalProducer {
     metadata: Arc<ClusterMetadata>,
     /// Connection pool.
     pool: Arc<ConnectionPool>,
+    /// Whether this client owns its connection pool.
+    ///
+    /// `false` when the pool was borrowed from a
+    /// [`KrafkaClient`](crate::client::KrafkaClient) via `with_client`.
+    ///
+    /// Closing a borrowed pool would tear down every sibling client's
+    /// connections and fail their in-flight requests — which is what happened
+    /// until `AdminClient`'s handling of this was extended to its siblings.
+    pool_owned: bool,
     /// Partitioner.
     partitioner: Arc<dyn Partitioner>,
     /// Transaction state.
@@ -686,6 +953,16 @@ pub struct TransactionalProducer {
     ///
     /// Equivalent to `value.serializer` in the Java `KafkaProducer`.
     value_encoder: Option<Arc<dyn SchemaEncoder>>,
+    /// Interceptor chain, shared with the accumulator.
+    ///
+    /// `on_send` is invoked here; `on_acknowledgement` fires inside the
+    /// accumulator once the broker answers or the batch fails permanently.
+    interceptor: Arc<dyn crate::interceptor::ProducerInterceptor>,
+    /// Optional pluggable persistence hook for producer identity state.
+    ///
+    /// Loaded once in [`init_transactions`](Self::init_transactions); stored
+    /// fire-and-forget by the accumulator after each acknowledged batch.
+    state_store: Option<Arc<dyn super::idempotent::ErasedProducerStateStore>>,
 }
 
 impl TransactionalProducer {
@@ -1169,6 +1446,39 @@ impl TransactionalProducer {
             self.identity
                 .initialize(response.producer_id, response.producer_epoch);
 
+            // Restore per-partition sequences from the state store, if one is
+            // configured. This is the producer the store exists for: the
+            // coordinator hands back the *same* PID and epoch when a known
+            // `transactional.id` re-initialises, which is the only condition
+            // under which a stored snapshot is still valid.
+            if let Some(ref store) = self.state_store {
+                match store.load_erased().await {
+                    Ok(Some(snapshot))
+                        if snapshot.producer_id == self.identity.producer_id()
+                            && snapshot.producer_epoch == self.identity.producer_epoch() =>
+                    {
+                        self.identity.restore_from_snapshot(&snapshot);
+                        info!(
+                            pid = self.identity.producer_id(),
+                            epoch = self.identity.producer_epoch(),
+                            partitions = snapshot.partition_sequences.len(),
+                            "Transactional producer identity restored from state store"
+                        );
+                    }
+                    Ok(Some(_)) => {
+                        debug!(
+                            "State store snapshot PID/epoch mismatch — sequences not \
+                             restored; the coordinator assigned a new producer identity"
+                        );
+                    }
+                    Ok(None) => debug!("No previous producer state found in state store"),
+                    Err(err) => warn!(
+                        error = %err,
+                        "Failed to load producer state from store; continuing with fresh state"
+                    ),
+                }
+            }
+
             self.abort_required.store(false, Ordering::SeqCst);
             self.set_state(TransactionState::Ready);
             info!(
@@ -1307,8 +1617,14 @@ impl TransactionalProducer {
 
         self.ensure_transaction_can_continue("send records")?;
 
-        // Transparently apply producer-level schema encoders if configured.
+        // Interceptors run before anything else observes the record, matching
+        // the plain producer: an interceptor that rewrites the topic must do so
+        // before the partition is chosen and before the partition is registered
+        // with the transaction coordinator.
         let mut record = record;
+        crate::interceptor::safe_on_send(&*self.interceptor, &mut record);
+
+        // Transparently apply producer-level schema encoders if configured.
         if let Some(enc) = &self.value_encoder {
             record.value = enc
                 .encode(
@@ -2223,6 +2539,44 @@ impl TransactionalProducer {
         self.classify_transaction_result(result)
     }
 
+    /// Dispatch every buffered record and wait for all in-flight sends to
+    /// complete.
+    ///
+    /// # You do not need this before `commit_transaction`
+    ///
+    /// [`commit_transaction`](Self::commit_transaction) flushes first, and must
+    /// — a commit marker written while records are still buffered would leave
+    /// them outside the transaction they were sent in. An explicit pre-commit
+    /// flush is therefore redundant, not merely optional.
+    ///
+    /// # What it is for
+    ///
+    /// Two things:
+    ///
+    /// - Forcing buffered records onto the wire mid-transaction, so their
+    ///   failures surface *now* rather than at commit time. Every error a
+    ///   `send()` can produce is otherwise deferred to
+    ///   [`commit_transaction`](Self::commit_transaction), where it arrives
+    ///   without the record's context.
+    /// - Writing code generic over "a producer". `Producer::flush` exists, so
+    ///   an enum or trait spanning both producers previously had to special-case
+    ///   the gap. It no longer does.
+    ///
+    /// Unlike `Producer::flush`, this does **not** make the records visible to
+    /// a `read_committed` consumer — only
+    /// [`commit_transaction`](Self::commit_transaction) does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the accumulator's flush fails; individual record
+    /// failures surface through the `send()` future that owns them.
+    pub async fn flush(&self) -> Result<()> {
+        let target = self.in_flight_barrier.snapshot();
+        self.accumulator.flush().await?;
+        self.in_flight_barrier.wait_for(target).await;
+        Ok(())
+    }
+
     /// Get the transactional ID.
     #[inline]
     pub fn transactional_id(&self) -> &str {
@@ -2312,12 +2666,21 @@ impl TransactionalProducer {
         // Set state to prevent further use
         self.set_state(TransactionState::FatalError);
 
-        // Close all connections in the pool
-        self.pool.close_all().await;
-        info!(
-            "TransactionalProducer closed: txn.id()={}",
-            self.config.transactional_id
-        );
+        // Close the connections — unless the pool was borrowed from a
+        // `KrafkaClient`, in which case it belongs to that client and tearing
+        // it down here would kill every sibling client sharing it.
+        if self.pool_owned {
+            self.pool.close_all().await;
+            info!(
+                "TransactionalProducer closed: txn.id()={} (connection pool torn down)",
+                self.config.transactional_id
+            );
+        } else {
+            info!(
+                "TransactionalProducer closed: txn.id()={} (shared connection pool left open)",
+                self.config.transactional_id
+            );
+        }
 
         close_result
     }
@@ -2398,6 +2761,19 @@ impl TransactionalProducer {
     #[inline]
     pub fn metrics_handle(&self) -> Arc<ProducerMetrics> {
         self.metrics.clone()
+    }
+
+    /// Whether this client owns its connection pool.
+    ///
+    /// `false` when the pool was borrowed from a
+    /// [`KrafkaClient`](crate::client::KrafkaClient) via `with_client`. In that
+    /// case [`close`](Self::close) leaves the connections untouched — closing
+    /// them would tear down every sibling client on that `KrafkaClient` and
+    /// fail their in-flight requests. Close the `KrafkaClient` to release them.
+    #[inline]
+    #[must_use]
+    pub fn owns_pool(&self) -> bool {
+        self.pool_owned
     }
 
     /// Check if the transactional producer has been explicitly closed.
@@ -2482,7 +2858,22 @@ fn is_fatal_transaction_error(error_code: ErrorCode, version: TransactionVersion
     )
 }
 
-/// Builder for TransactionalProducer.
+/// Builder for [`TransactionalProducer`].
+///
+/// Mirrors [`ProducerBuilder`](super::ProducerBuilder) setter for setter, with
+/// two deliberate exclusions:
+///
+/// - **`acks`** — fixed to [`Acks::All`]. The transaction coordinator can only
+///   guarantee atomicity over fully replicated writes, so a weaker setting
+///   would silently break the guarantee the type exists to provide.
+/// - **`idempotent`** — always on. A transactional producer *is* an idempotent
+///   producer with a stable `transactional.id`; there is nothing to disable.
+///
+/// Everything else — compression levels, delivery timeout, interceptors, a
+/// dead-letter queue, a state store, a shared client, the synchronous
+/// [`build_config`](Self::build_config) terminal — is present here because it
+/// is present on the plain producer. `tests/builder_surface.rs` asserts that at
+/// compile time, so the two cannot drift apart again.
 #[derive(Default)]
 #[must_use = "builders do nothing until .build() is called"]
 pub struct TransactionalProducerBuilder {
@@ -2491,6 +2882,11 @@ pub struct TransactionalProducerBuilder {
     partitioner: Option<Arc<dyn Partitioner>>,
     key_encoder: Option<Arc<dyn SchemaEncoder>>,
     value_encoder: Option<Arc<dyn SchemaEncoder>>,
+    interceptors: Vec<Arc<dyn crate::interceptor::ProducerInterceptor>>,
+    /// Pre-built pool and metadata from a [`KrafkaClient`](crate::client::KrafkaClient).
+    shared: Option<(Arc<ConnectionPool>, Arc<ClusterMetadata>)>,
+    /// Optional pluggable persistence hook for producer identity state.
+    state_store: Option<Arc<dyn super::idempotent::ErasedProducerStateStore>>,
 }
 
 impl TransactionalProducerBuilder {
@@ -2583,9 +2979,131 @@ impl TransactionalProducerBuilder {
         self
     }
 
+    /// Set the total delivery timeout: how long a record may spend in flight,
+    /// including batching, retries and backoff. Default: 120 s.
+    ///
+    /// This bound matters more for a transactional producer than for a plain
+    /// one: a batch that keeps retrying holds the transaction open, and an open
+    /// transaction blocks every `read_committed` consumer at its first offset.
+    /// Keep it at or below [`transaction_timeout`](Self::transaction_timeout) —
+    /// the coordinator aborts at that point regardless, and `build()` warns
+    /// when the two disagree.
+    pub fn delivery_timeout(mut self, timeout: Duration) -> Self {
+        self.config.delivery_timeout = timeout;
+        self
+    }
+
     /// Set compression.
     pub fn compression(mut self, compression: Compression) -> Self {
         self.config.compression = compression;
+        self
+    }
+
+    /// Override the compression codec's default level.
+    ///
+    /// `None` (the default) uses the codec's own default: zlib 6 for `Gzip`,
+    /// 3 for `Zstd`. Only `Gzip` and `Zstd` take a level; setting one alongside
+    /// `Snappy` or `Lz4` is rejected by
+    /// [`build_config`](Self::build_config) and [`build`](Self::build) rather
+    /// than ignored.
+    ///
+    /// See
+    /// [`ProducerBuilder::compression_level`](super::ProducerBuilder::compression_level)
+    /// for how to choose a value.
+    pub fn compression_level(mut self, level: Option<i32>) -> Self {
+        self.config.compression_level = level;
+        self
+    }
+
+    /// Override the compression codec for one topic.
+    ///
+    /// Topics without an override use the producer-wide
+    /// [`compression`](Self::compression) setting.
+    pub fn topic_compression(mut self, topic: impl Into<String>, compression: Compression) -> Self {
+        self.config
+            .topic_compression
+            .insert(topic.into(), compression);
+        self
+    }
+
+    /// Route permanently failed records to a dead-letter queue.
+    ///
+    /// Each record is handed to the DLQ once, after its retry budget is
+    /// exhausted or on a non-retriable error, immediately before the failure is
+    /// returned from [`send_record`](TransactionalProducer::send_record).
+    ///
+    /// The DLQ write happens **outside** the transaction: it is a separate
+    /// producer, so it is not covered by the commit marker and survives the
+    /// abort that a permanently failed send forces. That is the point — a
+    /// record lost to an aborted transaction is otherwise unrecoverable.
+    pub fn dead_letter_queue(mut self, dlq: Arc<dyn crate::dlq::DeadLetterQueue>) -> Self {
+        self.config.dead_letter_queue = Some(dlq);
+        self
+    }
+
+    /// Set a producer interceptor, replacing any previously added interceptors.
+    ///
+    /// `on_send` runs before the record is routed; `on_acknowledgement` runs
+    /// once the broker answers, or once the send fails permanently.
+    ///
+    /// To register several as an ordered chain, use
+    /// [`add_interceptor`](Self::add_interceptor).
+    pub fn interceptor(
+        mut self,
+        interceptor: Arc<dyn crate::interceptor::ProducerInterceptor>,
+    ) -> Self {
+        self.interceptors = vec![interceptor];
+        self
+    }
+
+    /// Append a producer interceptor to the chain.
+    ///
+    /// Interceptors execute in the order they are added, each individually
+    /// panic-isolated.
+    pub fn add_interceptor(
+        mut self,
+        interceptor: Arc<dyn crate::interceptor::ProducerInterceptor>,
+    ) -> Self {
+        self.interceptors.push(interceptor);
+        self
+    }
+
+    /// Attach a pluggable state store for producer identity persistence.
+    ///
+    /// This is the producer the store was designed for. Restoration requires
+    /// the broker to hand back the same `producer_id` and `producer_epoch` the
+    /// snapshot recorded, which only happens for a producer re-initialising
+    /// under a `transactional.id` the coordinator already knows.
+    ///
+    /// `load()` runs once inside
+    /// [`init_transactions`](TransactionalProducer::init_transactions), after
+    /// `InitProducerId` returns; `store()` runs fire-and-forget after each
+    /// acknowledged batch.
+    pub fn state_store(mut self, store: impl super::ProducerStateStore + 'static) -> Self {
+        self.state_store = Some(Arc::new(store));
+        self
+    }
+
+    /// Share a [`KrafkaClient`](crate::client::KrafkaClient)'s connection pool
+    /// and metadata cache instead of creating a new one.
+    ///
+    /// When this method is called, `bootstrap_servers` is optional — the client
+    /// was already connected at `KrafkaClient::build` time.
+    pub fn with_client(mut self, client: &crate::client::KrafkaClient) -> Self {
+        self.shared = Some((client.pool().clone(), client.metadata().clone()));
+        self
+    }
+
+    /// Set the topic cache TTL for partial metadata refreshes.
+    pub fn metadata_topic_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.config.metadata_topic_cache_ttl = Some(ttl);
+        self
+    }
+
+    /// Disable the topic cache TTL, so cached per-topic metadata never expires
+    /// on age alone.
+    pub fn disable_metadata_topic_cache_ttl(mut self) -> Self {
+        self.config.metadata_topic_cache_ttl = None;
         self
     }
 
@@ -2665,21 +3183,55 @@ impl TransactionalProducerBuilder {
         self
     }
 
-    /// Configure SASL/PLAIN authentication.
-    pub fn sasl_plain(mut self, username: &str, password: &str) -> crate::Result<Self> {
+    /// Configure SASL/PLAIN authentication over cleartext.
+    ///
+    /// For `SASL_SSL`, use
+    /// `.auth(AuthConfig::sasl_plain_ssl(user, pass, TlsConfig::new())?)`.
+    pub fn sasl_plain(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> crate::Result<Self> {
         self.config.auth = Some(AuthConfig::sasl_plain(username, password)?);
         Ok(self)
     }
 
-    /// Configure SASL/SCRAM-SHA-256 authentication.
-    pub fn sasl_scram_sha256(mut self, username: &str, password: &str) -> Self {
+    /// Configure SASL/SCRAM-SHA-256 authentication over cleartext.
+    ///
+    /// For `SASL_SSL`, use
+    /// `.auth(AuthConfig::sasl_scram_sha256_ssl(user, pass, TlsConfig::new()))`.
+    pub fn sasl_scram_sha256(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
         self.config.auth = Some(AuthConfig::sasl_scram_sha256(username, password));
         self
     }
 
-    /// Configure SASL/SCRAM-SHA-512 authentication.
-    pub fn sasl_scram_sha512(mut self, username: &str, password: &str) -> Self {
+    /// Configure SASL/SCRAM-SHA-512 authentication over cleartext.
+    ///
+    /// For `SASL_SSL`, use
+    /// `.auth(AuthConfig::sasl_scram_sha512_ssl(user, pass, TlsConfig::new()))`.
+    pub fn sasl_scram_sha512(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
         self.config.auth = Some(AuthConfig::sasl_scram_sha512(username, password));
+        self
+    }
+
+    /// Configure SASL/OAUTHBEARER authentication with an async token provider.
+    ///
+    /// The provider is called on every new broker connection, so tokens are
+    /// always fresh. Pair with the built-in OIDC provider behind the
+    /// `oauth-oidc` feature.
+    pub fn sasl_oauthbearer_provider(
+        mut self,
+        provider: impl crate::auth::OAuthBearerTokenProvider + 'static,
+    ) -> Self {
+        self.config.auth = Some(AuthConfig::sasl_oauthbearer_provider(provider));
         self
     }
 
@@ -2717,75 +3269,98 @@ impl TransactionalProducerBuilder {
         self
     }
 
+    /// Validate the configuration and return it, without connecting.
+    ///
+    /// Runs exactly the checks [`build`](Self::build) runs — they call the same
+    /// validator — so a config that passes here will not be rejected later for
+    /// a configuration reason. Useful for validating settings at startup, in a
+    /// unit test, or in a `validate-config` CLI subcommand, none of which want
+    /// a live broker.
+    ///
+    /// This is the transactional counterpart of
+    /// [`ProducerBuilder::build_config`](super::ProducerBuilder::build_config).
+    /// Its absence used to make a transactional producer the one client whose
+    /// configuration could not be checked without a cluster.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KrafkaError::Config`](crate::error::KrafkaError::Config) for
+    /// any invalid combination — a missing `transactional_id`, a zero
+    /// `batch_size`, a compression codec whose Cargo feature is not enabled, a
+    /// compression level the selected codec cannot use, and so on.
+    pub fn build_config(self) -> Result<TransactionalProducerConfig> {
+        validate(&self.config, self.shared.is_some())?;
+        Ok(self.config)
+    }
+
     /// Build the transactional producer.
+    ///
+    /// Validates through the same validator the synchronous
+    /// [`build_config`](Self::build_config) uses, then connects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KrafkaError::Config`](crate::error::KrafkaError::Config) for
+    /// an invalid configuration, or a network error if the initial metadata
+    /// fetch fails.
     pub async fn build(self) -> Result<TransactionalProducer> {
-        if self.config.bootstrap_servers.is_empty() {
-            return Err(KrafkaError::config("bootstrap.servers is required"));
-        }
-        if self.config.transactional_id.is_empty() {
-            return Err(KrafkaError::config("transactional_id is required"));
-        }
-        // Validate against Kafka's KafkaString wire limit (i16::MAX bytes).
-        const MAX_KAFKA_STRING_LEN: usize = i16::MAX as usize;
-        if self.config.transactional_id.len() > MAX_KAFKA_STRING_LEN {
-            return Err(KrafkaError::config(format!(
-                "transactional_id is {} bytes, exceeding the Kafka wire limit of {MAX_KAFKA_STRING_LEN}",
-                self.config.transactional_id.len()
-            )));
-        }
-        if self.config.client_id.len() > MAX_KAFKA_STRING_LEN {
-            return Err(KrafkaError::config(format!(
-                "client_id is {} bytes, exceeding the Kafka wire limit of {MAX_KAFKA_STRING_LEN}",
-                self.config.client_id.len()
-            )));
-        }
-        if self.config.transaction_timeout_ms <= 0 {
-            return Err(KrafkaError::config("transaction_timeout must be > 0"));
-        }
-        if self.config.max_request_size == 0 {
-            return Err(KrafkaError::config("max_request_size must be >= 1"));
-        }
+        // One validator, shared with `build_config`. Keeping the rules in a
+        // free function rather than inline here is what makes the synchronous
+        // terminal possible at all.
+        validate(&self.config, self.shared.is_some())?;
 
-        let mut pool_config_builder = self.config.transport.apply(
-            ConnectionConfig::builder()
-                .client_id(&self.config.client_id)
-                .request_timeout(self.config.request_timeout)
-                .connect_timeout(self.config.connect_timeout),
-        );
+        let pool_owned = self.shared.is_none();
+        let (pool, metadata) = if let Some((pool, metadata)) = self.shared.clone() {
+            (pool, metadata)
+        } else {
+            let mut pool_config_builder = self.config.transport.apply(
+                ConnectionConfig::builder()
+                    .client_id(&self.config.client_id)
+                    .request_timeout(self.config.request_timeout)
+                    .connect_timeout(self.config.connect_timeout),
+            );
 
-        if let Some(ref auth) = self.config.auth {
-            pool_config_builder = pool_config_builder.auth(auth.clone());
-        }
+            if let Some(ref auth) = self.config.auth {
+                pool_config_builder = pool_config_builder.auth(auth.clone());
+            }
 
-        #[cfg(feature = "socks5")]
-        if let Some(ref proxy) = self.config.proxy {
-            pool_config_builder = pool_config_builder.proxy(proxy.clone());
-        }
+            #[cfg(feature = "socks5")]
+            if let Some(ref proxy) = self.config.proxy {
+                pool_config_builder = pool_config_builder.proxy(proxy.clone());
+            }
 
-        let mut pool_config = pool_config_builder.build()?;
-        pool_config.init_tls().await?;
+            let mut pool_config = pool_config_builder.build()?;
+            pool_config.init_tls().await?;
 
-        // Every client builds its pool through `TransportConfig::build_pool`,
-        // which applies the pool-level settings and starts the background
-        // tasks (idle eviction, OAUTHBEARER refresh, KIP-1288 TLS reload).
-        // Routing all construction sites through one function is what stops
-        // them drifting apart again.
-        let pool = self.config.transport.build_pool(pool_config);
+            // Every client builds its pool through `TransportConfig::build_pool`,
+            // which applies the pool-level settings and starts the background
+            // tasks (idle eviction, OAUTHBEARER refresh, KIP-1288 TLS reload).
+            // Routing all construction sites through one function is what stops
+            // them drifting apart again.
+            let pool = self.config.transport.build_pool(pool_config);
 
-        let bootstrap_servers =
-            crate::util::parse_bootstrap_servers(&self.config.bootstrap_servers)?;
+            let bootstrap_servers =
+                crate::util::parse_bootstrap_servers(&self.config.bootstrap_servers)?;
 
-        let metadata = Arc::new(
-            ClusterMetadata::new(
-                bootstrap_servers,
-                pool.clone(),
-                self.config.metadata_max_age,
-            )
-            .with_recovery_strategy(self.config.metadata_recovery_strategy)
-            .with_rebootstrap_trigger(self.config.metadata_recovery_rebootstrap_trigger),
-        );
+            let metadata = Arc::new({
+                let mut meta = ClusterMetadata::new(
+                    bootstrap_servers,
+                    pool.clone(),
+                    self.config.metadata_max_age,
+                )
+                .with_recovery_strategy(self.config.metadata_recovery_strategy)
+                .with_rebootstrap_trigger(self.config.metadata_recovery_rebootstrap_trigger);
+                if let Some(ttl) = self.config.metadata_topic_cache_ttl {
+                    meta = meta.with_topic_cache_ttl(ttl);
+                } else {
+                    meta = meta.with_topic_cache_ttl_disabled();
+                }
+                meta
+            });
 
-        metadata.refresh().await?;
+            metadata.refresh().await?;
+            (pool, metadata)
+        };
 
         info!(
             "TransactionalProducer created with transactional.id()={}",
@@ -2799,6 +3374,28 @@ impl TransactionalProducerBuilder {
         let metrics = Arc::new(ProducerMetrics::default());
         let in_flight_barrier = Arc::new(InFlightBarrier::new());
 
+        let interceptor: Arc<dyn crate::interceptor::ProducerInterceptor> =
+            if self.interceptors.is_empty() {
+                Arc::new(crate::interceptor::NoOpProducerInterceptor)
+            } else if self.interceptors.len() == 1 {
+                // infallible: len == 1 guaranteed by the surrounding else-if
+                let Some(single) = self.interceptors.into_iter().next() else {
+                    unreachable!("len == 1 verified above");
+                };
+                single
+            } else {
+                Arc::new(crate::interceptor::ProducerInterceptorChain::new(
+                    self.interceptors,
+                ))
+            };
+
+        // The retry policy carries the delivery deadline, exactly as on the
+        // plain producer, so a batch cannot retry indefinitely inside an open
+        // transaction.
+        let retry_policy = self
+            .retry_policy
+            .with_delivery_timeout(Some(self.config.delivery_timeout));
+
         // Transactional sends go through the same batching accumulator as
         // the plain producer. `transactional_id` makes every ProduceRequest it
         // builds carry the transactional ID, and the shared `identity` supplies
@@ -2808,7 +3405,8 @@ impl TransactionalProducerBuilder {
                 batch_size: self.config.batch_size,
                 linger: self.config.linger,
                 compression: self.config.compression,
-                topic_compression: ahash::AHashMap::new(),
+                compression_level: self.config.compression_level,
+                topic_compression: self.config.topic_compression.clone().into_iter().collect(),
                 // Transactions require acks=all: the coordinator can only
                 // guarantee atomicity over fully replicated writes.
                 acks: Acks::All.to_i16(),
@@ -2820,14 +3418,15 @@ impl TransactionalProducerBuilder {
                 in_flight_semaphore: Arc::new(tokio::sync::Semaphore::new(
                     self.config.max_in_flight.max(1),
                 )),
-                interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
+                interceptor: interceptor.clone(),
                 identity: Some(identity.clone()),
                 partitioner: partitioner.clone(),
-                state_store: None,
+                state_store: self.state_store.clone(),
                 transactional_id: Some(self.config.transactional_id.clone()),
+                dead_letter_queue: self.config.dead_letter_queue.clone(),
             },
             metadata.clone(),
-            self.retry_policy.clone(),
+            retry_policy.clone(),
             metrics.clone(),
             in_flight_barrier.clone(),
         );
@@ -2847,10 +3446,13 @@ impl TransactionalProducerBuilder {
             identity,
             accumulator,
             metrics,
-            retry_policy: self.retry_policy,
+            retry_policy,
             in_flight_barrier,
             key_encoder: self.key_encoder,
             value_encoder: self.value_encoder,
+            interceptor,
+            state_store: self.state_store,
+            pool_owned,
         })
     }
 }
@@ -3046,6 +3648,9 @@ mod tests {
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
             key_encoder: None,
             value_encoder: None,
+            interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
+            state_store: None,
+            pool_owned: true,
         };
 
         let record = ProducerRecord::new("topic", Bytes::from_static(b"value")).with_partition(0);
@@ -3099,6 +3704,9 @@ mod tests {
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
             key_encoder: None,
             value_encoder: None,
+            interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
+            state_store: None,
+            pool_owned: true,
         };
 
         let error = producer.mark_unknown_producer_id_abort_required("transactional produce");
@@ -3153,6 +3761,9 @@ mod tests {
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
             key_encoder: None,
             value_encoder: None,
+            interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
+            state_store: None,
+            pool_owned: true,
         };
 
         let error = producer.commit_transaction().await.unwrap_err();
@@ -3206,6 +3817,171 @@ mod tests {
             .transactional_id("txn-1");
 
         assert!(builder.config.auth.is_none());
+    }
+
+    // ── build_config: validation without a broker ───────────────────────────
+    //
+    // `TransactionalProducerBuilder` used to offer only `build()`, so checking
+    // a transactional producer's configuration in a unit test or a
+    // `validate-config` subcommand required a live cluster — while the README
+    // promised "`build_config()` to validate without a broker … both through
+    // the same validator" for every client.
+
+    /// A minimal builder that passes validation.
+    fn valid_txn_builder() -> TransactionalProducerBuilder {
+        TransactionalProducer::builder()
+            .bootstrap_servers("localhost:9092")
+            .transactional_id("txn-1")
+    }
+
+    #[test]
+    fn build_config_returns_a_validated_config_without_connecting() {
+        let config = valid_txn_builder()
+            .client_id("checkout")
+            .delivery_timeout(Duration::from_secs(45))
+            .build_config()
+            .expect("a minimal transactional configuration is valid");
+
+        assert_eq!(config.transactional_id(), "txn-1");
+        assert_eq!(config.client_id(), "checkout");
+        assert_eq!(config.delivery_timeout(), Duration::from_secs(45));
+        assert_eq!(
+            config.acks(),
+            Acks::All,
+            "acks is fixed, not merely defaulted"
+        );
+    }
+
+    #[test]
+    fn build_config_rejects_a_missing_transactional_id() {
+        let err = TransactionalProducer::builder()
+            .bootstrap_servers("localhost:9092")
+            .build_config()
+            .expect_err("transactional_id is required")
+            .to_string();
+        assert!(err.contains("transactional_id"), "got: {err}");
+    }
+
+    #[test]
+    fn build_config_rejects_an_empty_bootstrap_list() {
+        let err = TransactionalProducer::builder()
+            .transactional_id("txn-1")
+            .build_config()
+            .expect_err("bootstrap servers are required without a shared client")
+            .to_string();
+        assert!(err.contains("bootstrap"), "got: {err}");
+    }
+
+    #[test]
+    fn build_config_rejects_zero_delivery_timeout() {
+        let err = valid_txn_builder()
+            .delivery_timeout(Duration::ZERO)
+            .build_config()
+            .expect_err("a zero delivery budget can never be met")
+            .to_string();
+        assert!(err.contains("delivery_timeout"), "got: {err}");
+    }
+
+    #[test]
+    fn build_config_rejects_a_batch_larger_than_the_buffer() {
+        let err = valid_txn_builder()
+            .batch_size(4096)
+            .buffer_memory(1024)
+            .build_config()
+            .expect_err("a batch that cannot fit in the buffer would deadlock")
+            .to_string();
+        assert!(err.contains("buffer_memory"), "got: {err}");
+    }
+
+    /// The compression rules are shared with the plain producer rather than
+    /// restated, so a codec check cannot exist on one producer and not the
+    /// other.
+    #[cfg(feature = "snappy")]
+    #[test]
+    fn build_config_rejects_a_level_on_a_levelless_codec() {
+        let err = valid_txn_builder()
+            .compression(Compression::Snappy)
+            .compression_level(Some(9))
+            .build_config()
+            .expect_err("Snappy takes no level")
+            .to_string();
+        assert!(
+            err.contains("takes no level"),
+            "the error must say the codec has no level, got: {err}"
+        );
+    }
+
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn build_config_rejects_an_out_of_range_level() {
+        let err = valid_txn_builder()
+            .compression(Compression::Gzip)
+            .compression_level(Some(42))
+            .build_config()
+            .expect_err("gzip tops out at 9")
+            .to_string();
+        assert!(
+            err.contains("0..=9"),
+            "the error must name the range: {err}"
+        );
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn a_valid_compression_level_reaches_the_config() {
+        let config = valid_txn_builder()
+            .compression(Compression::Zstd)
+            .compression_level(Some(1))
+            .build_config()
+            .expect("level 1 is valid for zstd");
+        assert_eq!(config.compression_level(), Some(1));
+    }
+
+    #[cfg(all(feature = "zstd", feature = "snappy"))]
+    #[test]
+    fn a_per_topic_codec_is_validated_against_the_level() {
+        let err = valid_txn_builder()
+            .compression(Compression::Zstd)
+            .compression_level(Some(1))
+            .topic_compression("events", Compression::Snappy)
+            .build_config()
+            .expect_err("the per-topic Snappy override takes no level")
+            .to_string();
+        assert!(
+            err.contains("events"),
+            "the error must name the topic: {err}"
+        );
+    }
+
+    #[test]
+    fn topic_compression_overrides_reach_the_config() {
+        let config = valid_txn_builder()
+            .topic_compression("high-volume", Compression::None)
+            .build_config()
+            .expect("an override to None is always available");
+        assert_eq!(config.compression_for("high-volume"), Compression::None);
+        assert_eq!(
+            config.compression_for("anything-else"),
+            config.compression()
+        );
+    }
+
+    #[test]
+    fn metadata_topic_cache_ttl_round_trips_and_can_be_disabled() {
+        let ttl = valid_txn_builder()
+            .metadata_topic_cache_ttl(Duration::from_secs(600))
+            .build_config()
+            .expect("valid");
+        assert_eq!(
+            ttl.metadata_topic_cache_ttl(),
+            Some(Duration::from_secs(600))
+        );
+
+        let disabled = valid_txn_builder()
+            .disable_metadata_topic_cache_ttl()
+            .build_config()
+            .expect("valid");
+        assert_eq!(disabled.metadata_topic_cache_ttl(), None);
     }
 
     #[test]
@@ -3676,6 +4452,42 @@ mod tests {
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
             key_encoder: None,
             value_encoder: None,
+            interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
+            state_store: None,
+            pool_owned: true,
+        }
+    }
+
+    /// `close()` must leave a pool borrowed from a `KrafkaClient` alone.
+    ///
+    /// Every client but `AdminClient` called `close_all()` unconditionally, so
+    /// closing one client built with `with_client` tore down the shared pool
+    /// and failed every sibling's in-flight requests — the exact opposite of
+    /// what sharing a client is for.
+    ///
+    /// Negative control: making `close_inner` call `close_all()`
+    /// unconditionally fails the `shared` half.
+    #[tokio::test]
+    async fn close_only_tears_down_a_pool_it_owns() {
+        for pool_owned in [true, false] {
+            let mut producer = test_producer(TransactionVersion::V2);
+            producer.pool_owned = pool_owned;
+            producer.set_state(TransactionState::Ready);
+
+            let pool = producer.pool.clone();
+            // Install a background task so the teardown is observable.
+            pool.start_idle_evictor();
+            assert!(pool.has_background_tasks());
+
+            assert_eq!(producer.owns_pool(), pool_owned);
+            producer.close().await;
+            assert!(producer.is_closed());
+
+            assert_eq!(
+                pool.has_background_tasks(),
+                !pool_owned,
+                "pool_owned={pool_owned}: the pool must be torn down only when owned"
+            );
         }
     }
 
@@ -3936,6 +4748,57 @@ mod tests {
         assert!(
             tv2.coordinator_id.read().await.is_none(),
             "TV2 must not perform coordinator discovery on the produce path"
+        );
+    }
+
+    /// The interceptor chain must run on the transactional send path.
+    ///
+    /// The README lists interceptors as a general observability feature. They
+    /// were producer-only: `TransactionalProducerBuilder` had no
+    /// `interceptor`/`add_interceptor`, and the accumulator it spawned was
+    /// hard-wired to `NoOpProducerInterceptor` — so a chain configured for a
+    /// transactional deployment could not exist, let alone run.
+    ///
+    /// `on_send` runs before partitioning, so an interceptor that rewrites the
+    /// topic is honoured. Asserted through the observable effect rather than
+    /// the wiring: the send itself cannot succeed without a broker.
+    ///
+    /// Negative control: removing the `safe_on_send` call from `send_record`
+    /// leaves the recorder empty and this fails.
+    #[tokio::test]
+    async fn interceptors_run_on_the_transactional_send_path() {
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Debug, Default)]
+        struct CountingInterceptor {
+            sends: AtomicUsize,
+        }
+        impl crate::interceptor::ProducerInterceptor for CountingInterceptor {
+            fn on_send(
+                &self,
+                record: &mut ProducerRecord,
+            ) -> crate::interceptor::InterceptorResult {
+                self.sends.fetch_add(1, Ordering::SeqCst);
+                record
+                    .headers
+                    .push(("seen-by".to_string(), Bytes::from_static(b"interceptor")));
+                Ok(())
+            }
+        }
+
+        let interceptor = Arc::new(CountingInterceptor::default());
+        let mut producer = test_producer(TransactionVersion::V2);
+        producer.interceptor = interceptor.clone();
+        producer.identity.initialize(7, 3);
+
+        let record = ProducerRecord::new("topic", Bytes::from_static(b"value")).with_partition(0);
+        // Cannot succeed without a broker; the assertion is about what ran.
+        let _ = tokio::time::timeout(Duration::from_secs(2), producer.send_record(record)).await;
+
+        assert_eq!(
+            interceptor.sends.load(Ordering::SeqCst),
+            1,
+            "on_send must be invoked exactly once per transactional send"
         );
     }
 

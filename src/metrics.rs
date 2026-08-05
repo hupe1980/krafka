@@ -1265,6 +1265,26 @@ impl MetricsVisitable for ConnectionMetrics {
             "TLS handshake latency (TLS connections only)",
             &self.tls_handshake_latency.snapshot(),
         );
+        exporter.export_counter(
+            &format!("{prefix}_oauth_token_fetches"),
+            "SASL/OAUTHBEARER token fetches attempted",
+            self.oauth_token_fetches.get(),
+        );
+        exporter.export_counter(
+            &format!("{prefix}_oauth_token_fetch_failures"),
+            "SASL/OAUTHBEARER token fetches that returned an error",
+            self.oauth_token_fetch_failures.get(),
+        );
+        exporter.export_latency(
+            &format!("{prefix}_oauth_token_fetch_latency"),
+            "SASL/OAUTHBEARER token fetch latency (successful fetches only)",
+            &self.oauth_token_fetch_latency.snapshot(),
+        );
+        exporter.export_gauge(
+            &format!("{prefix}_oauth_token_expiry_epoch_ms"),
+            "Expiry of the cached OAUTHBEARER token, ms since the Unix epoch (0 = unknown)",
+            self.oauth_token_expiry_epoch_ms.get(),
+        );
     }
 }
 
@@ -2095,6 +2115,30 @@ pub struct ConnectionMetrics {
     pub connect_latency: LatencyTracker,
     /// TLS handshake latency (only populated for TLS-secured connections).
     pub tls_handshake_latency: LatencyTracker,
+    /// SASL/OAUTHBEARER token fetches attempted, successful or not.
+    ///
+    /// Populated only when the client authenticates with an OAUTHBEARER
+    /// *provider* — a static token is never fetched. Counts both the
+    /// on-connect resolution and the background proactive refresh; the cached
+    /// reads in between are not fetches and are not counted.
+    pub oauth_token_fetches: Counter,
+    /// SASL/OAUTHBEARER token fetches that returned an error.
+    ///
+    /// This is the signal a misconfigured `token_endpoint` produces. Without
+    /// it, an OAuth round trip failing on every connection is indistinguishable
+    /// from the broker being unreachable: both show up as connection failures
+    /// and nothing names the identity provider.
+    pub oauth_token_fetch_failures: Counter,
+    /// Latency of SASL/OAUTHBEARER token fetches, successful ones only.
+    pub oauth_token_fetch_latency: LatencyTracker,
+    /// Expiry of the currently cached OAUTHBEARER token, in milliseconds since
+    /// the Unix epoch.
+    ///
+    /// `0` means no token has been fetched yet, or the identity provider
+    /// returned no `expires_in`. Subtract the scrape time to plot the
+    /// remaining lifetime — the panel that shows a refresh loop failing before
+    /// any connection does.
+    pub oauth_token_expiry_epoch_ms: Gauge,
 }
 
 impl ConnectionMetrics {
@@ -2161,6 +2205,31 @@ impl ConnectionMetrics {
         self.tls_handshake_latency.record(duration);
     }
 
+    /// Record a successful SASL/OAUTHBEARER token fetch.
+    ///
+    /// `expiry_epoch_ms` is the token's declared expiry, or `None` when the
+    /// identity provider returned no `expires_in`.
+    #[inline]
+    pub fn record_oauth_token_fetch(&self, duration: Duration, expiry_epoch_ms: Option<i64>) {
+        self.oauth_token_fetches.inc();
+        self.oauth_token_fetch_latency.record(duration);
+        // A negative or absent expiry is reported as 0 — "unknown" — rather
+        // than wrapping into a far-future gauge value.
+        self.oauth_token_expiry_epoch_ms
+            .set(expiry_epoch_ms.unwrap_or(0).max(0) as u64);
+    }
+
+    /// Record a failed SASL/OAUTHBEARER token fetch.
+    ///
+    /// The cached expiry is deliberately left alone: the previous token may
+    /// still be valid, and zeroing it here would make a single transient
+    /// failure look like a total loss of credentials.
+    #[inline]
+    pub fn record_oauth_token_fetch_failure(&self) {
+        self.oauth_token_fetches.inc();
+        self.oauth_token_fetch_failures.inc();
+    }
+
     /// Get a snapshot of all metrics.
     pub fn snapshot(&self) -> ConnectionMetricsSnapshot {
         ConnectionMetricsSnapshot {
@@ -2176,6 +2245,10 @@ impl ConnectionMetrics {
             active_connections: self.active_connections.get(),
             connect_latency: self.connect_latency.snapshot(),
             tls_handshake_latency: self.tls_handshake_latency.snapshot(),
+            oauth_token_fetches: self.oauth_token_fetches.get(),
+            oauth_token_fetch_failures: self.oauth_token_fetch_failures.get(),
+            oauth_token_fetch_latency: self.oauth_token_fetch_latency.snapshot(),
+            oauth_token_expiry_epoch_ms: self.oauth_token_expiry_epoch_ms.get(),
         }
     }
 }
@@ -2208,6 +2281,15 @@ pub struct ConnectionMetricsSnapshot {
     pub connect_latency: LatencySnapshot,
     /// TLS handshake latency statistics (only populated for TLS connections).
     pub tls_handshake_latency: LatencySnapshot,
+    /// SASL/OAUTHBEARER token fetches attempted.
+    pub oauth_token_fetches: u64,
+    /// SASL/OAUTHBEARER token fetches that failed.
+    pub oauth_token_fetch_failures: u64,
+    /// SASL/OAUTHBEARER token fetch latency (successful fetches only).
+    pub oauth_token_fetch_latency: LatencySnapshot,
+    /// Expiry of the cached OAUTHBEARER token, ms since the Unix epoch;
+    /// `0` when unknown.
+    pub oauth_token_expiry_epoch_ms: u64,
 }
 
 #[cfg(test)]

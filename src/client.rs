@@ -1,7 +1,8 @@
 //! Shared transport for connection pooling and metadata across multiple clients.
 //!
 //! By default every [`Producer`](crate::producer::Producer),
-//! [`Consumer`](crate::consumer::Consumer), and
+//! [`TransactionalProducer`](crate::producer::TransactionalProducer),
+//! [`Consumer`](crate::consumer::Consumer), `ShareConsumer` and
 //! [`AdminClient`](crate::admin::AdminClient) creates its own TCP connection
 //! pool and metadata cache. An application that runs one producer and two
 //! consumers against a 5-broker cluster therefore opens **15** TCP
@@ -11,7 +12,29 @@
 //! cache. Passing one to each builder via
 //! [`.with_client()`](crate::producer::ProducerBuilder::with_client) reduces
 //! the connection count to **5** regardless of how many client objects are
-//! created.
+//! created. Every client builder accepts it.
+//!
+//! # Who closes the pool
+//!
+//! The `KrafkaClient` does. A client built with `.with_client(..)` **borrows**
+//! the pool: its own `close()` shuts that client down and leaves the sockets
+//! alone, and its `owns_pool()` returns `false`. Closing the `KrafkaClient`
+//! releases them.
+//!
+//! This is load-bearing rather than cosmetic. A client that tore down a
+//! borrowed pool would kill every sibling's connections and fail their
+//! in-flight Produce and Fetch requests — undoing the whole point of sharing.
+//! Only [`AdminClient`](crate::admin::AdminClient) got this right initially;
+//! its four siblings called `close_all()` unconditionally until this release.
+//!
+//! # One transport for all of them
+//!
+//! A [`TransportConfig`](crate::network::TransportConfig) given to the
+//! `KrafkaClient` applies to every attached client, since there is one pool.
+//! That is the reliable way to guarantee a SOCKS5 route, a file-descriptor cap
+//! or a KIP-1288 TLS reload interval covers the whole process — with separate
+//! pools, one client left on the defaults quietly takes a different network
+//! path.
 //!
 //! # Example
 //!

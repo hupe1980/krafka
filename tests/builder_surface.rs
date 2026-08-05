@@ -27,6 +27,8 @@
 //! The closures are never called. Type checking is the whole assertion.
 
 #![allow(clippy::let_underscore_untyped)]
+// A failing `expect` in a test *is* the failure report.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use krafka::network::TransportConfig;
 
@@ -63,6 +65,10 @@ fn every_client_builder_accepts_a_transport_config() {
 /// A builder with only `build()` pushes its users back to needing a live
 /// cluster to find out that, say, their compression codec was not compiled in.
 ///
+/// `TransactionalProducerBuilder` was the one client that had only `build()`,
+/// which made a `validate-config` subcommand impossible for exactly-once
+/// deployments — while the README promised the property for every client.
+///
 /// The return types are named explicitly so this also pins down *what*
 /// `build_config` hands back.
 #[test]
@@ -73,6 +79,249 @@ fn client_builders_expose_a_synchronous_validation_terminal() {
         || krafka::producer::Producer::builder().build_config();
     let _: fn() -> krafka::error::Result<krafka::admin::AdminConfig> =
         || krafka::admin::AdminClient::builder().build_config();
+    let _: fn() -> krafka::error::Result<krafka::producer::TransactionalProducerConfig> =
+        || krafka::producer::TransactionalProducer::builder().build_config();
+}
+
+/// Every SASL mechanism must be constructible under **both** `SASL_PLAINTEXT`
+/// and `SASL_SSL` from the public API alone.
+///
+/// # Why a matrix and not a list of constructors
+///
+/// `AuthConfig` grew one `_ssl` constructor per mechanism, and the set was
+/// maintained by hand. `sasl_plain_ssl` and `sasl_oauthbearer_ssl` existed;
+/// `sasl_scram_sha256_ssl` and `sasl_scram_sha512_ssl` did not. Since
+/// `security_protocol` and `tls_config` are private and there was no
+/// `with_tls`, `SASL_SSL` + SCRAM — the default secured listener on Redpanda
+/// Cloud, Aiven, Instaclustr and most Strimzi installs — was **unreachable**
+/// from outside the crate. `AuthConfig::from_env` produced it only because it
+/// lives inside the crate and could assign the private fields directly.
+///
+/// The failure was silent: `sasl_scram_sha512(..)` returned a config that
+/// looked right and then attempted a cleartext SASL handshake against a TLS
+/// listener.
+///
+/// This walks the matrix instead of enumerating constructors, so a mechanism
+/// added later cannot quietly miss a cell.
+#[test]
+fn every_sasl_mechanism_is_reachable_over_both_transports() {
+    use krafka::auth::{AuthConfig, SaslMechanism, SecurityProtocol, TlsConfig};
+
+    /// Every mechanism krafka can authenticate with, and how to build it over
+    /// cleartext. TLS is applied uniformly below.
+    fn cleartext_configs() -> Vec<(SaslMechanism, AuthConfig)> {
+        vec![
+            (
+                SaslMechanism::Plain,
+                AuthConfig::sasl_plain("user", "pass").expect("valid PLAIN credentials"),
+            ),
+            (
+                SaslMechanism::ScramSha256,
+                AuthConfig::sasl_scram_sha256("user", "pass"),
+            ),
+            (
+                SaslMechanism::ScramSha512,
+                AuthConfig::sasl_scram_sha512("user", "pass"),
+            ),
+            (
+                SaslMechanism::OAuthBearer,
+                AuthConfig::sasl_oauthbearer("jwt"),
+            ),
+            // AWS_MSK_IAM is TLS-only by construction — MSK exposes no
+            // cleartext IAM listener — so its SASL_PLAINTEXT cell is
+            // deliberately absent and it is asserted separately below.
+        ]
+    }
+
+    for (mechanism, cleartext) in cleartext_configs() {
+        assert_eq!(
+            cleartext.security_protocol(),
+            &SecurityProtocol::SaslPlaintext,
+            "{mechanism} must be constructible over SASL_PLAINTEXT"
+        );
+        assert_eq!(cleartext.sasl_mechanism(), Some(&mechanism));
+        assert!(cleartext.tls_config().is_none());
+
+        let encrypted = cleartext.with_tls(TlsConfig::new().with_ca_cert("/etc/kafka/ca.pem"));
+        assert_eq!(
+            encrypted.security_protocol(),
+            &SecurityProtocol::SaslSsl,
+            "{mechanism} must be constructible over SASL_SSL"
+        );
+        assert_eq!(
+            encrypted.sasl_mechanism(),
+            Some(&mechanism),
+            "{mechanism} must survive the TLS upgrade"
+        );
+        assert_eq!(
+            encrypted.tls_config().and_then(|t| t.ca_cert_path()),
+            Some("/etc/kafka/ca.pem"),
+            "{mechanism} must carry the caller's TLS settings, not defaults"
+        );
+    }
+
+    // AWS_MSK_IAM: TLS-only, and its TLS settings must still be replaceable —
+    // the default `TlsConfig::new()` pins no CA and overrides no SNI.
+    let msk = AuthConfig::aws_msk_iam("AKID", "secret", "us-east-1")
+        .with_tls(TlsConfig::new().with_sni_hostname("b-1.msk.example.com"));
+    assert_eq!(msk.security_protocol(), &SecurityProtocol::SaslSsl);
+    assert_eq!(msk.sasl_mechanism(), Some(&SaslMechanism::AwsMskIam));
+    assert_eq!(
+        msk.tls_config().and_then(|t| t.sni_hostname()),
+        Some("b-1.msk.example.com")
+    );
+
+    // The dedicated `_ssl` constructors must agree with the general form, so
+    // the convenience shorthand cannot drift from `with_tls`.
+    assert_eq!(
+        AuthConfig::sasl_scram_sha256_ssl("u", "p", TlsConfig::new()).security_protocol(),
+        AuthConfig::sasl_scram_sha256("u", "p")
+            .with_tls(TlsConfig::new())
+            .security_protocol()
+    );
+    assert_eq!(
+        AuthConfig::sasl_scram_sha512_ssl("u", "p", TlsConfig::new()).security_protocol(),
+        AuthConfig::sasl_scram_sha512("u", "p")
+            .with_tls(TlsConfig::new())
+            .security_protocol()
+    );
+
+    // TLS without SASL must remain reachable through the same method.
+    assert_eq!(
+        AuthConfig::plaintext()
+            .with_tls(TlsConfig::new())
+            .security_protocol(),
+        &SecurityProtocol::Ssl
+    );
+}
+
+/// The two producer builders must offer the same configuration surface.
+///
+/// `TransactionalProducerBuilder` was missing seventeen of
+/// `ProducerBuilder`'s methods. Three of them mattered:
+///
+/// - `build_config()` — see the test above.
+/// - `compression_level()` — the headline 0.15 tuning knob, unreachable for
+///   the producer that always batches and therefore always compresses.
+/// - `delivery_timeout()` — the bound on how long a batch may sit in flight,
+///   which matters *more* here: a stuck batch holds an open transaction and
+///   blocks every `read_committed` consumer behind it.
+///
+/// `acks` and `idempotent` are excluded on purpose — both are fixed by the
+/// transactional protocol, and a setter for either would be a way to break the
+/// guarantee. Nothing else is.
+///
+/// The `client_builders_share_one_configuration_surface` test below covers what
+/// *all six* clients share; this covers what the producer family shares.
+#[test]
+fn both_producer_builders_share_one_configuration_surface() {
+    use krafka::producer::{Producer, ProducerRecord, TransactionalProducer};
+    use krafka::protocol::Compression;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct NoopInterceptor;
+    impl krafka::interceptor::ProducerInterceptor for NoopInterceptor {
+        fn on_send(&self, _record: &mut ProducerRecord) -> krafka::interceptor::InterceptorResult {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoopDlq;
+    impl krafka::dlq::DeadLetterQueue for NoopDlq {
+        fn send<'a>(
+            &'a self,
+            _record: ProducerRecord,
+            _error: String,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+    }
+
+    struct NoopStore;
+    impl krafka::producer::ProducerStateStore for NoopStore {
+        async fn load(
+            &self,
+        ) -> krafka::error::Result<Option<krafka::producer::ProducerIdentitySnapshot>> {
+            Ok(None)
+        }
+        async fn store(
+            &self,
+            _snapshot: &krafka::producer::ProducerIdentitySnapshot,
+        ) -> krafka::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    macro_rules! assert_producer_setters {
+        ($make:expr) => {{
+            let _ = |d: Duration| $make.linger(d);
+            let _ = |n: usize| $make.batch_size(n);
+            let _ = |n: usize| $make.buffer_memory(n);
+            let _ = |d: Duration| $make.max_block(d);
+            let _ = |n: usize| $make.max_in_flight(n);
+            let _ = |n: usize| $make.max_request_size(n);
+            let _ = |n: u32| $make.retries(n);
+            let _ = |d: Duration| $make.retry_backoff(d);
+            let _ = |d: Duration| $make.delivery_timeout(d);
+            let _ = |c: Compression| $make.compression(c);
+            let _ = |l: Option<i32>| $make.compression_level(l);
+            let _ = |t: &str, c: Compression| $make.topic_compression(t, c);
+            let _ = |d: Duration| $make.metadata_topic_cache_ttl(d);
+            let _ = || $make.disable_metadata_topic_cache_ttl();
+            let _ = |d: Duration| $make.metadata_recovery_rebootstrap_trigger(d);
+            let _ = |q: Arc<NoopDlq>| $make.dead_letter_queue(q);
+            let _ = |i: Arc<NoopInterceptor>| $make.interceptor(i);
+            let _ = |i: Arc<NoopInterceptor>| $make.add_interceptor(i);
+            let _ = || $make.state_store(NoopStore);
+            let _ = |c: &krafka::client::KrafkaClient| $make.with_client(c);
+            let _ = |p: krafka::producer::UniformStickyPartitioner| $make.partitioner(p);
+            let _ = |e: Arc<dyn krafka::schema_registry::SchemaEncoder>| $make.key_encoder(e);
+            let _ = |e: Arc<dyn krafka::schema_registry::SchemaEncoder>| $make.value_encoder(e);
+            let _ = || {
+                $make.sasl_oauthbearer_provider(|| async {
+                    Ok(krafka::auth::OAuthBearerToken::new("jwt"))
+                })
+            };
+
+            #[cfg(feature = "socks5")]
+            let _ = |p: krafka::network::ProxyConfig| $make.proxy(p);
+        }};
+    }
+
+    assert_producer_setters!(Producer::builder());
+    assert_producer_setters!(TransactionalProducer::builder());
+}
+
+/// Both producers must offer the same operational surface.
+///
+/// `Producer::flush()` existed and `TransactionalProducer` had no equivalent,
+/// so code generic over "a producer" — an enum dispatching over the two — had
+/// to special-case the gap, with no way to tell from the docs whether an
+/// explicit pre-commit flush was unnecessary or merely unavailable.
+#[test]
+fn both_producers_share_one_operational_surface() {
+    macro_rules! assert_producer_ops {
+        ($ty:ty) => {{
+            async fn _flush(p: &$ty) -> krafka::error::Result<()> {
+                p.flush().await
+            }
+            async fn _close(p: &$ty) {
+                p.close().await;
+            }
+            async fn _close_timeout(p: &$ty, d: std::time::Duration) -> krafka::error::Result<()> {
+                p.close_with_timeout(d).await
+            }
+            fn _metrics(p: &$ty) -> krafka::producer::ProducerMetricsSnapshot {
+                p.metrics()
+            }
+        }};
+    }
+
+    assert_producer_ops!(krafka::producer::Producer);
+    assert_producer_ops!(krafka::producer::TransactionalProducer);
 }
 
 /// Certificate rotation must be reachable from every long-lived client
@@ -178,6 +427,24 @@ fn client_builders_share_one_configuration_surface() {
         }};
     }
 
+    // Pool sharing, on every builder that is not itself the pool's owner.
+    //
+    // `ShareConsumerBuilder` had no `with_client` at all, so a share consumer
+    // could not join a `KrafkaClient`'s pool and always opened its own
+    // connections to every broker — the connection multiplication
+    // `KrafkaClient` exists to prevent.
+    macro_rules! assert_shares_a_client {
+        ($make:expr) => {{
+            let _ = |c: &krafka::client::KrafkaClient| $make.with_client(c);
+        }};
+    }
+    assert_shares_a_client!(krafka::consumer::Consumer::builder());
+    assert_shares_a_client!(krafka::producer::Producer::builder());
+    assert_shares_a_client!(krafka::admin::AdminClient::builder());
+    assert_shares_a_client!(krafka::producer::TransactionalProducer::builder());
+    #[cfg(feature = "unstable-protocol")]
+    assert_shares_a_client!(krafka::share_consumer::ShareConsumer::builder());
+
     assert_common_setters!(krafka::consumer::Consumer::builder());
     assert_common_setters!(krafka::producer::Producer::builder());
     assert_common_setters!(krafka::admin::AdminClient::builder());
@@ -217,6 +484,17 @@ fn every_long_lived_client_shares_one_operational_surface() {
             }
             fn _closed(c: &$ty) -> bool {
                 c.is_closed()
+            }
+            // Whether `close()` may tear down the connection pool.
+            //
+            // A pool borrowed from a `KrafkaClient` via `with_client` belongs
+            // to that client. `AdminClient` knew this and left a shared pool
+            // alone; `Producer`, `Consumer` and `TransactionalProducer` called
+            // `close_all()` unconditionally, so closing one of them killed
+            // every sibling's connections and failed their in-flight requests
+            // — the whole point of sharing a client, undone by its shutdown.
+            fn _owns_pool(c: &$ty) -> bool {
+                c.owns_pool()
             }
         }};
     }

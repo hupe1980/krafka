@@ -300,6 +300,9 @@ pub struct AwsMskIamCredentials {
 
 impl AwsMskIamCredentials {
     /// Create new AWS MSK IAM credentials.
+    ///
+    /// For temporary credentials, chain
+    /// [`with_session_token`](Self::with_session_token).
     pub fn new(
         access_key_id: impl Into<String>,
         secret_access_key: impl Into<String>,
@@ -313,19 +316,61 @@ impl AwsMskIamCredentials {
         }
     }
 
-    /// Create with session token (for temporary credentials).
-    pub fn with_session_token(
-        access_key_id: impl Into<String>,
-        secret_access_key: impl Into<String>,
-        session_token: impl Into<String>,
-        region: impl Into<String>,
-    ) -> Self {
-        Self {
-            access_key_id: access_key_id.into(),
-            secret_access_key: secret_access_key.into(),
-            session_token: Some(session_token.into()),
-            region: region.into(),
+    /// Attach a session token (for temporary credentials).
+    ///
+    /// ```rust
+    /// use krafka::auth::AwsMskIamCredentials;
+    ///
+    /// let creds = AwsMskIamCredentials::new("AKID", "secret", "eu-central-1")
+    ///     .with_session_token("FwoGZXIvYXdzE...");
+    /// assert!(creds.has_session_token());
+    /// ```
+    #[must_use]
+    pub fn with_session_token(mut self, session_token: impl Into<String>) -> Self {
+        // Wipe any token being replaced: `Option<String>`'s own drop frees the
+        // buffer without clearing it, so a rotated token would otherwise stay
+        // readable in freed heap memory — which is the one thing the
+        // `ZeroizeOnDrop` on this type exists to prevent.
+        if let Some(previous) = self.session_token.as_mut() {
+            previous.zeroize();
         }
+        self.session_token = Some(session_token.into());
+        self
+    }
+
+    /// Replace the AWS region, preserving every other field.
+    ///
+    /// # Why this exists
+    ///
+    /// `secret_access_key` and `session_token` are deliberately unreadable —
+    /// see the type-level note. Without a consuming setter that hygiene became
+    /// an obstacle: an embedder that loads credentials with
+    /// [`from_env`](Self::from_env) but takes the region from its own
+    /// configuration file had no way to combine the two. The natural-looking
+    /// workaround —
+    ///
+    /// ```rust,ignore
+    /// AwsMskIamCredentials::new(creds.access_key_id(), secret, configured_region)
+    /// ```
+    ///
+    /// — silently **drops the session token**, and every deployment using an
+    /// assumed role, an EC2/ECS instance profile or an EKS web identity then
+    /// fails SigV4 verification at connect time with an error that never
+    /// mentions the token.
+    ///
+    /// ```rust
+    /// use krafka::auth::AwsMskIamCredentials;
+    ///
+    /// let creds = AwsMskIamCredentials::new("AKID", "secret", "us-east-1")
+    ///     .with_session_token("token")
+    ///     .with_region("eu-central-1");
+    /// assert_eq!(creds.region(), "eu-central-1");
+    /// assert!(creds.has_session_token(), "re-regioning must preserve the token");
+    /// ```
+    #[must_use]
+    pub fn with_region(mut self, region: impl Into<String>) -> Self {
+        self.region = region.into();
+        self
     }
 
     /// Returns the AWS access key ID.
@@ -363,16 +408,6 @@ impl AwsMskIamCredentials {
     ///
     /// Returns error if required environment variables are not set.
     pub fn from_env() -> crate::error::Result<Self> {
-        let access_key_id = std::env::var("AWS_ACCESS_KEY_ID").map_err(|_| {
-            crate::error::KrafkaError::config("AWS_ACCESS_KEY_ID environment variable not set")
-        })?;
-
-        let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY").map_err(|_| {
-            crate::error::KrafkaError::config("AWS_SECRET_ACCESS_KEY environment variable not set")
-        })?;
-
-        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
-
         let region = std::env::var("AWS_REGION")
             .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
             .map_err(|_| {
@@ -381,11 +416,50 @@ impl AwsMskIamCredentials {
                 )
             })?;
 
+        Self::from_env_with_region(region)
+    }
+
+    /// Create credentials from environment variables, with the region supplied
+    /// by the caller.
+    ///
+    /// Identical to [`from_env`](Self::from_env) except that `AWS_REGION` /
+    /// `AWS_DEFAULT_REGION` are neither read nor required. Use this when the
+    /// region comes from your own configuration — a config file, a CLI flag, a
+    /// secret manager — rather than from the process environment.
+    ///
+    /// It exists so that combining "keys from the environment" with "region
+    /// from configuration" does not require re-implementing this function.
+    /// Equivalent to `from_env()?.with_region(region)` when the environment
+    /// also carries a region, and possible when it does not.
+    ///
+    /// # No feature flag required
+    ///
+    /// Like [`from_env`](Self::from_env), this works **without** the `aws-msk`
+    /// feature.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` is
+    /// not set.
+    pub fn from_env_with_region(region: impl Into<String>) -> crate::error::Result<Self> {
+        let access_key_id = std::env::var("AWS_ACCESS_KEY_ID").map_err(|_| {
+            crate::error::KrafkaError::config("AWS_ACCESS_KEY_ID environment variable not set")
+        })?;
+
+        let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY").map_err(|_| {
+            crate::error::KrafkaError::config("AWS_SECRET_ACCESS_KEY environment variable not set")
+        })?;
+
+        // Read unconditionally: a temporary credential without its session
+        // token is not a usable credential, and dropping it here is precisely
+        // the failure this API is shaped to prevent.
+        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+
         Ok(Self {
             access_key_id,
             secret_access_key,
             session_token,
-            region,
+            region: region.into(),
         })
     }
 
@@ -700,6 +774,55 @@ impl AuthConfig {
         }
     }
 
+    /// Wrap this configuration in TLS, upgrading the security protocol.
+    ///
+    /// | Before | After |
+    /// |---|---|
+    /// | `PLAINTEXT` | `SSL` |
+    /// | `SASL_PLAINTEXT` | `SASL_SSL` |
+    /// | `SSL` / `SASL_SSL` | unchanged, `tls_config` replaced |
+    ///
+    /// # Why this is the general form
+    ///
+    /// Every SASL mechanism composes with TLS, but the per-mechanism `_ssl`
+    /// constructors only cover the combinations someone remembered to write.
+    /// `SASL_SSL` + SCRAM — the default secured listener on Redpanda Cloud,
+    /// Aiven, Instaclustr and most Strimzi installs — was unreachable from
+    /// outside the crate for exactly that reason: `sasl_scram_sha256` hard-coded
+    /// `SASL_PLAINTEXT`, there was no `sasl_scram_sha256_ssl`, and
+    /// `security_protocol` / `tls_config` are private.
+    ///
+    /// The failure mode was quiet and bad: the returned config *looked* right,
+    /// and the client then attempted a cleartext SASL handshake against a TLS
+    /// listener — at best an opaque protocol error, at worst a SCRAM exchange
+    /// running unencrypted against a permissive broker.
+    ///
+    /// This method makes the combination structural rather than enumerated, so
+    /// a mechanism added later cannot miss it. `tests/builder_surface.rs`
+    /// asserts every `SaslMechanism` is constructible under both
+    /// `SASL_PLAINTEXT` and `SASL_SSL` from the public API alone.
+    ///
+    /// ```rust
+    /// use krafka::auth::{AuthConfig, SecurityProtocol, TlsConfig};
+    ///
+    /// let tls = TlsConfig::new().with_ca_cert("/etc/kafka/ca.pem");
+    /// let config = AuthConfig::sasl_scram_sha512("user", "pass").with_tls(tls);
+    ///
+    /// assert_eq!(config.security_protocol(), &SecurityProtocol::SaslSsl);
+    /// assert!(config.tls_config().is_some());
+    /// ```
+    #[must_use]
+    pub fn with_tls(mut self, tls_config: TlsConfig) -> Self {
+        self.security_protocol = match self.security_protocol {
+            SecurityProtocol::Plaintext => SecurityProtocol::Ssl,
+            SecurityProtocol::SaslPlaintext => SecurityProtocol::SaslSsl,
+            // Already encrypted — keep the protocol, take the new settings.
+            already_tls => already_tls,
+        };
+        self.tls_config = Some(tls_config);
+        self
+    }
+
     /// Create a SASL/PLAIN configuration.
     pub fn sasl_plain(
         username: impl Into<String>,
@@ -728,7 +851,11 @@ impl AuthConfig {
         })
     }
 
-    /// Create a SASL/SCRAM-SHA-256 configuration.
+    /// Create a SASL/SCRAM-SHA-256 configuration over cleartext.
+    ///
+    /// For `SASL_SSL` — the default secured listener on most managed Kafka
+    /// offerings — use [`sasl_scram_sha256_ssl`](Self::sasl_scram_sha256_ssl),
+    /// or chain [`with_tls`](Self::with_tls).
     pub fn sasl_scram_sha256(username: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
             security_protocol: SecurityProtocol::SaslPlaintext,
@@ -738,7 +865,20 @@ impl AuthConfig {
         }
     }
 
-    /// Create a SASL/SCRAM-SHA-512 configuration.
+    /// Create a SASL/SCRAM-SHA-256 over TLS configuration.
+    pub fn sasl_scram_sha256_ssl(
+        username: impl Into<String>,
+        password: impl Into<String>,
+        tls_config: TlsConfig,
+    ) -> Self {
+        Self::sasl_scram_sha256(username, password).with_tls(tls_config)
+    }
+
+    /// Create a SASL/SCRAM-SHA-512 configuration over cleartext.
+    ///
+    /// For `SASL_SSL` — the default secured listener on most managed Kafka
+    /// offerings — use [`sasl_scram_sha512_ssl`](Self::sasl_scram_sha512_ssl),
+    /// or chain [`with_tls`](Self::with_tls).
     pub fn sasl_scram_sha512(username: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
             security_protocol: SecurityProtocol::SaslPlaintext,
@@ -746,6 +886,15 @@ impl AuthConfig {
             scram_credentials: Some(ScramCredentials::new(username, password)),
             ..Default::default()
         }
+    }
+
+    /// Create a SASL/SCRAM-SHA-512 over TLS configuration.
+    pub fn sasl_scram_sha512_ssl(
+        username: impl Into<String>,
+        password: impl Into<String>,
+        tls_config: TlsConfig,
+    ) -> Self {
+        Self::sasl_scram_sha512(username, password).with_tls(tls_config)
     }
 
     /// Create an AWS MSK IAM configuration.
@@ -1065,16 +1214,46 @@ impl AuthConfig {
     /// | Variable | Values |
     /// |---|---|
     /// | `KAFKA_SECURITY_PROTOCOL` | `PLAINTEXT` *(default)*, `SSL`, `SASL_PLAINTEXT`, `SASL_SSL` |
-    /// | `KAFKA_SASL_MECHANISM` | `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512` |
-    /// | `KAFKA_SASL_USERNAME` | any string |
-    /// | `KAFKA_SASL_PASSWORD` | any string |
+    /// | `KAFKA_SASL_MECHANISM` | `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`, `OAUTHBEARER`, `AWS_MSK_IAM` |
+    /// | `KAFKA_SASL_USERNAME` | any string — required for `PLAIN` and both SCRAM mechanisms |
+    /// | `KAFKA_SASL_PASSWORD` | any string — required for `PLAIN` and both SCRAM mechanisms |
+    /// | `KAFKA_SASL_OAUTHBEARER_TOKEN` | a JWT — required for `OAUTHBEARER` |
+    ///
+    /// `AWS_MSK_IAM` takes its credentials from
+    /// [`AwsMskIamCredentials::from_env`], i.e. `AWS_ACCESS_KEY_ID`,
+    /// `AWS_SECRET_ACCESS_KEY`, the optional `AWS_SESSION_TOKEN` and
+    /// `AWS_REGION` / `AWS_DEFAULT_REGION`.
+    ///
+    /// TLS material is read for every protocol that encrypts (`SSL`,
+    /// `SASL_SSL`, and `AWS_MSK_IAM`, which is always TLS):
+    ///
+    /// | Variable | Effect |
+    /// |---|---|
+    /// | `KAFKA_SSL_CA_LOCATION` | [`TlsConfig::with_ca_cert`] — pins this CA bundle |
+    /// | `KAFKA_SSL_CERTIFICATE_LOCATION` | client certificate (mTLS); requires the key too |
+    /// | `KAFKA_SSL_KEY_LOCATION` | client private key (mTLS); requires the certificate too |
+    /// | `KAFKA_SSL_SNI_HOSTNAME` | [`TlsConfig::with_sni_hostname`] |
+    ///
+    /// Unset TLS variables leave [`TlsConfig::new()`] defaults, which verify
+    /// the server certificate against the compiled-in WebPKI roots. There is
+    /// deliberately no environment variable that disables verification: use
+    /// [`TlsConfig::insecure`] explicitly in code if you need that.
     ///
     /// Returns `AuthConfig::plaintext()` when `KAFKA_SECURITY_PROTOCOL` is absent.
     ///
+    /// # This is not the general-purpose path
+    ///
+    /// `from_env` is a convenience for applications whose configuration *is*
+    /// the environment. A library embedder resolving credentials from a secret
+    /// manager or a config file should build an [`AuthConfig`] directly —
+    /// every combination this function produces is reachable from the public
+    /// constructors plus [`with_tls`](Self::with_tls).
+    ///
     /// # Errors
     ///
-    /// Returns an error when a required variable is missing or an unrecognised
-    /// value is supplied for `KAFKA_SECURITY_PROTOCOL` or `KAFKA_SASL_MECHANISM`.
+    /// Returns an error when a required variable is missing, when only one half
+    /// of the client-certificate pair is set, or when an unrecognised value is
+    /// supplied for `KAFKA_SECURITY_PROTOCOL` or `KAFKA_SASL_MECHANISM`.
     ///
     /// # Security
     ///
@@ -1086,57 +1265,128 @@ impl AuthConfig {
 
         match protocol.to_uppercase().as_str() {
             "PLAINTEXT" => Ok(Self::plaintext()),
-            "SSL" => Ok(Self::ssl(TlsConfig::new())),
+            "SSL" => Ok(Self::ssl(Self::tls_config_from_env()?)),
             "SASL_PLAINTEXT" | "SASL_SSL" => {
                 let mechanism = std::env::var("KAFKA_SASL_MECHANISM").map_err(|_| {
                     crate::error::KrafkaError::config("KAFKA_SASL_MECHANISM not set")
                 })?;
-                let username = std::env::var("KAFKA_SASL_USERNAME").map_err(|_| {
-                    crate::error::KrafkaError::config("KAFKA_SASL_USERNAME not set")
-                })?;
-                let password = std::env::var("KAFKA_SASL_PASSWORD").map_err(|_| {
-                    crate::error::KrafkaError::config("KAFKA_SASL_PASSWORD not set")
-                })?;
                 let use_tls = protocol.to_uppercase() == "SASL_SSL";
-                match mechanism.to_uppercase().as_str() {
-                    "PLAIN" => {
-                        if use_tls {
-                            Self::sasl_plain_ssl(username, password, TlsConfig::new())
-                        } else {
-                            Self::sasl_plain(username, password)
-                        }
-                    }
-                    "SCRAM-SHA-256" => {
-                        let mut cfg = Self::sasl_scram_sha256(username, password);
-                        if use_tls {
-                            cfg.security_protocol = SecurityProtocol::SaslSsl;
-                            cfg.tls_config = Some(TlsConfig::new());
-                        }
-                        Ok(cfg)
-                    }
-                    "SCRAM-SHA-512" => {
-                        let mut cfg = Self::sasl_scram_sha512(username, password);
-                        if use_tls {
-                            cfg.security_protocol = SecurityProtocol::SaslSsl;
-                            cfg.tls_config = Some(TlsConfig::new());
-                        }
-                        Ok(cfg)
-                    }
-                    other => {
-                        // Zeroize the password before returning so it does not
-                        // linger on the heap after an unknown-mechanism error.
-                        let mut password = password;
-                        password.zeroize();
-                        Err(crate::error::KrafkaError::config(format!(
-                            "unknown SASL mechanism in KAFKA_SASL_MECHANISM: {other}"
-                        )))
-                    }
-                }
+
+                // One TLS config, applied through `with_tls` for every
+                // mechanism. The SCRAM arms used to assign `security_protocol`
+                // and `tls_config` directly — reachable only from inside the
+                // crate, which is what made `SASL_SSL` + SCRAM impossible to
+                // build from outside it.
+                let config = Self::sasl_config_from_env(&mechanism)?;
+                Ok(if use_tls {
+                    config.with_tls(Self::tls_config_from_env()?)
+                } else {
+                    config
+                })
             }
             other => Err(crate::error::KrafkaError::config(format!(
                 "unknown security protocol in KAFKA_SECURITY_PROTOCOL: {other}"
             ))),
         }
+    }
+
+    /// Build the SASL half of [`from_env`](Self::from_env), always over
+    /// cleartext; the caller applies TLS.
+    fn sasl_config_from_env(mechanism: &str) -> crate::Result<Self> {
+        /// Read the username/password pair the password-based mechanisms need.
+        fn user_password() -> crate::Result<(String, String)> {
+            let username = std::env::var("KAFKA_SASL_USERNAME")
+                .map_err(|_| crate::error::KrafkaError::config("KAFKA_SASL_USERNAME not set"))?;
+            let password = std::env::var("KAFKA_SASL_PASSWORD")
+                .map_err(|_| crate::error::KrafkaError::config("KAFKA_SASL_PASSWORD not set"))?;
+            Ok((username, password))
+        }
+
+        match mechanism.to_uppercase().as_str() {
+            "PLAIN" => {
+                let (username, password) = user_password()?;
+                Self::sasl_plain(username, password)
+            }
+            "SCRAM-SHA-256" => {
+                let (username, password) = user_password()?;
+                Ok(Self::sasl_scram_sha256(username, password))
+            }
+            "SCRAM-SHA-512" => {
+                let (username, password) = user_password()?;
+                Ok(Self::sasl_scram_sha512(username, password))
+            }
+            "OAUTHBEARER" => {
+                let token = std::env::var("KAFKA_SASL_OAUTHBEARER_TOKEN").map_err(|_| {
+                    crate::error::KrafkaError::config(
+                        "KAFKA_SASL_OAUTHBEARER_TOKEN not set; a static token is the only \
+                         OAUTHBEARER configuration expressible in environment variables — \
+                         for the OIDC client-credentials flow build the config in code with \
+                         AuthConfig::sasl_oauthbearer_provider",
+                    )
+                })?;
+                Ok(Self::sasl_oauthbearer(token))
+            }
+            "AWS_MSK_IAM" => Ok(Self::aws_msk_iam_with_credentials(
+                AwsMskIamCredentials::from_env()?,
+            )),
+            other => Err(crate::error::KrafkaError::config(format!(
+                "unknown SASL mechanism in KAFKA_SASL_MECHANISM: {other}"
+            ))),
+        }
+    }
+
+    /// Build a [`TlsConfig`] from the `KAFKA_SSL_*` environment variables.
+    fn tls_config_from_env() -> crate::Result<TlsConfig> {
+        Self::tls_config_from_parts(
+            std::env::var("KAFKA_SSL_CA_LOCATION").ok(),
+            std::env::var("KAFKA_SSL_CERTIFICATE_LOCATION").ok(),
+            std::env::var("KAFKA_SSL_KEY_LOCATION").ok(),
+            std::env::var("KAFKA_SSL_SNI_HOSTNAME").ok(),
+        )
+    }
+
+    /// The pure half of [`tls_config_from_env`](Self::tls_config_from_env).
+    ///
+    /// Split out because environment mutation is `unsafe` in the 2024 edition,
+    /// so the rules below are otherwise untestable.
+    fn tls_config_from_parts(
+        ca: Option<String>,
+        cert: Option<String>,
+        key: Option<String>,
+        sni: Option<String>,
+    ) -> crate::Result<TlsConfig> {
+        let mut tls = TlsConfig::new();
+
+        if let Some(ca) = ca {
+            tls = tls.with_ca_cert(ca);
+        }
+
+        // A half-configured mTLS pair is a misconfiguration, not a default:
+        // silently ignoring a lone certificate path would present no client
+        // identity to a broker that requires one, and the resulting handshake
+        // failure names neither variable.
+        match (cert, key) {
+            (Some(cert), Some(key)) => tls = tls.with_client_cert(cert, key),
+            (Some(_), None) => {
+                return Err(crate::error::KrafkaError::config(
+                    "KAFKA_SSL_CERTIFICATE_LOCATION is set without KAFKA_SSL_KEY_LOCATION; \
+                     a client certificate needs its private key",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(crate::error::KrafkaError::config(
+                    "KAFKA_SSL_KEY_LOCATION is set without KAFKA_SSL_CERTIFICATE_LOCATION; \
+                     a client private key needs its certificate",
+                ));
+            }
+            (None, None) => {}
+        }
+
+        if let Some(sni) = sni {
+            tls = tls.with_sni_hostname(sni);
+        }
+
+        Ok(tls)
     }
 }
 
@@ -1234,14 +1484,197 @@ mod tests {
 
     #[test]
     fn test_aws_msk_credentials_with_session_token() {
-        let creds = AwsMskIamCredentials::with_session_token(
-            "AKID123",
-            "secret123",
-            "token123",
-            "us-east-1",
-        );
+        let creds = AwsMskIamCredentials::new("AKID123", "secret123", "us-east-1")
+            .with_session_token("token123");
         assert_eq!(creds.access_key_id(), "AKID123");
         assert!(creds.has_session_token());
+    }
+
+    /// Re-regioning must not lose the session token.
+    ///
+    /// This is the whole reason [`AwsMskIamCredentials::with_region`] exists:
+    /// the only way to change the region used to be to rebuild the credential
+    /// through `new`, which drops the token, and MSK then rejects the SigV4
+    /// signature at connect time with an error that never mentions it.
+    ///
+    /// Negative control: deleting the `session_token` copy from `with_region`
+    /// (i.e. rebuilding via `new`) fails this assertion.
+    #[test]
+    fn with_region_preserves_the_session_token() {
+        let creds = AwsMskIamCredentials::new("AKID", "secret", "us-east-1")
+            .with_session_token("session-token")
+            .with_region("eu-central-1");
+
+        assert_eq!(creds.region(), "eu-central-1");
+        assert!(
+            creds.has_session_token(),
+            "with_region must preserve temporary-credential material"
+        );
+        assert_eq!(creds.access_key_id(), "AKID");
+        // The secret is unreadable by design, so assert it survived by the one
+        // observable route: the signer sees it.
+        assert_eq!(creds.secret_access_key, "secret");
+    }
+
+    /// `with_region` must also work on a credential that has no token, and
+    /// must not invent one.
+    #[test]
+    fn with_region_does_not_invent_a_session_token() {
+        let creds =
+            AwsMskIamCredentials::new("AKID", "secret", "us-east-1").with_region("ap-south-1");
+        assert_eq!(creds.region(), "ap-south-1");
+        assert!(!creds.has_session_token());
+    }
+
+    #[test]
+    fn with_tls_upgrades_every_cleartext_protocol() {
+        // PLAINTEXT → SSL
+        let ssl = AuthConfig::plaintext().with_tls(TlsConfig::new());
+        assert_eq!(ssl.security_protocol(), &SecurityProtocol::Ssl);
+        assert!(ssl.tls_config().is_some());
+
+        // SASL_PLAINTEXT → SASL_SSL, for every mechanism that can be built
+        // over cleartext.
+        for config in [
+            AuthConfig::sasl_plain("u", "p").expect("valid PLAIN credentials"),
+            AuthConfig::sasl_scram_sha256("u", "p"),
+            AuthConfig::sasl_scram_sha512("u", "p"),
+            AuthConfig::sasl_oauthbearer("jwt"),
+        ] {
+            let mechanism = config.sasl_mechanism().cloned();
+            let upgraded = config.with_tls(TlsConfig::new());
+            assert_eq!(
+                upgraded.security_protocol(),
+                &SecurityProtocol::SaslSsl,
+                "mechanism {mechanism:?} must upgrade to SASL_SSL"
+            );
+            assert!(upgraded.tls_config().is_some());
+            assert_eq!(upgraded.sasl_mechanism(), mechanism.as_ref());
+        }
+    }
+
+    /// An already-TLS config keeps its protocol and takes the new settings —
+    /// upgrading `SASL_SSL` to `SSL` would silently drop the SASL exchange.
+    #[test]
+    fn with_tls_on_an_encrypted_config_replaces_only_the_settings() {
+        let config = AuthConfig::aws_msk_iam("AKID", "secret", "us-east-1")
+            .with_tls(TlsConfig::new().with_sni_hostname("broker.example.com"));
+
+        assert_eq!(config.security_protocol(), &SecurityProtocol::SaslSsl);
+        assert_eq!(
+            config.sasl_mechanism(),
+            Some(&SaslMechanism::AwsMskIam),
+            "the mechanism must survive"
+        );
+        assert_eq!(
+            config.tls_config().and_then(TlsConfig::sni_hostname),
+            Some("broker.example.com")
+        );
+    }
+
+    #[test]
+    fn scram_ssl_constructors_produce_sasl_ssl() {
+        let sha256 = AuthConfig::sasl_scram_sha256_ssl("u", "p", TlsConfig::new());
+        assert_eq!(sha256.security_protocol(), &SecurityProtocol::SaslSsl);
+        assert_eq!(sha256.sasl_mechanism(), Some(&SaslMechanism::ScramSha256));
+        assert!(sha256.scram_credentials().is_some());
+        assert!(sha256.requires_tls() && sha256.requires_sasl());
+
+        let sha512 = AuthConfig::sasl_scram_sha512_ssl("u", "p", TlsConfig::new());
+        assert_eq!(sha512.security_protocol(), &SecurityProtocol::SaslSsl);
+        assert_eq!(sha512.sasl_mechanism(), Some(&SaslMechanism::ScramSha512));
+        assert!(sha512.scram_credentials().is_some());
+    }
+
+    /// A half-configured mTLS pair must be rejected, not ignored.
+    ///
+    /// Ignoring it presents no client identity to a broker that requires one,
+    /// and the handshake failure that follows names neither variable.
+    ///
+    /// Environment mutation is `unsafe` in the 2024 edition, so this drives the
+    /// pure helper `from_env` delegates to.
+    #[test]
+    fn a_half_configured_client_certificate_pair_is_rejected() {
+        let cert_only = AuthConfig::tls_config_from_parts(
+            None,
+            Some("/etc/kafka/client.pem".to_string()),
+            None,
+            None,
+        )
+        .expect_err("a certificate without a key must be rejected");
+        assert!(
+            cert_only.to_string().contains("KAFKA_SSL_KEY_LOCATION"),
+            "the error must name the missing variable, got: {cert_only}"
+        );
+
+        let key_only = AuthConfig::tls_config_from_parts(
+            None,
+            None,
+            Some("/etc/kafka/client.key".to_string()),
+            None,
+        )
+        .expect_err("a key without a certificate must be rejected");
+        assert!(
+            key_only
+                .to_string()
+                .contains("KAFKA_SSL_CERTIFICATE_LOCATION"),
+            "the error must name the missing variable, got: {key_only}"
+        );
+    }
+
+    /// Every `KAFKA_SSL_*` variable must reach the `TlsConfig`. A setter that
+    /// parses its input and stores it nowhere is the defect class this whole
+    /// review keeps finding.
+    #[test]
+    fn tls_environment_material_reaches_the_config() {
+        let tls = AuthConfig::tls_config_from_parts(
+            Some("/etc/kafka/ca.pem".to_string()),
+            Some("/etc/kafka/client.pem".to_string()),
+            Some("/etc/kafka/client.key".to_string()),
+            Some("broker.internal".to_string()),
+        )
+        .expect("a complete TLS environment is valid");
+
+        assert_eq!(tls.ca_cert_path(), Some("/etc/kafka/ca.pem"));
+        assert_eq!(tls.client_cert_path(), Some("/etc/kafka/client.pem"));
+        assert_eq!(tls.client_key_path(), Some("/etc/kafka/client.key"));
+        assert_eq!(tls.sni_hostname(), Some("broker.internal"));
+        assert!(
+            tls.verify_server_cert(),
+            "no environment variable may disable verification"
+        );
+    }
+
+    /// Every mechanism `KAFKA_SASL_MECHANISM` accepts must compose with TLS.
+    ///
+    /// The SCRAM arms are the reason this exists: they used to assign the
+    /// private `security_protocol` field directly, so `SASL_SSL` + SCRAM
+    /// worked from inside the crate and was unreachable from outside it.
+    #[test]
+    fn every_env_mechanism_reaches_sasl_ssl() {
+        // AWS_MSK_IAM is excluded: its credentials come from the AWS
+        // environment, which this test does not set. It is covered by
+        // `test_auth_config_aws_msk_iam`, and is TLS-only by construction.
+        for mechanism in ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"] {
+            // The password-based arms need credentials; supply them directly
+            // rather than through the environment.
+            let cleartext = match mechanism {
+                "PLAIN" => AuthConfig::sasl_plain("u", "p").expect("valid"),
+                "SCRAM-SHA-256" => AuthConfig::sasl_scram_sha256("u", "p"),
+                _ => AuthConfig::sasl_scram_sha512("u", "p"),
+            };
+            assert_eq!(
+                cleartext.security_protocol(),
+                &SecurityProtocol::SaslPlaintext,
+                "{mechanism} must start as SASL_PLAINTEXT"
+            );
+            let encrypted = cleartext.with_tls(TlsConfig::new());
+            assert_eq!(
+                encrypted.security_protocol(),
+                &SecurityProtocol::SaslSsl,
+                "{mechanism} must reach SASL_SSL"
+            );
+        }
     }
 
     #[test]

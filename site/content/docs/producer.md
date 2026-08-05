@@ -132,10 +132,10 @@ To trim binary size further, disable defaults and select only the codecs you nee
 # Option 1: enable only the codecs you need
 # `default-features = false` also drops the default `ring` TLS backend, so a
 # crypto backend must be named explicitly.
-krafka = { version = "0.15.0", default-features = false, features = ["lz4", "ring"] }
+krafka = { version = "0.16.0", default-features = false, features = ["lz4", "ring"] }
 
 # Option 2: enable all compression codecs, including zstd
-# krafka = { version = "0.15.0", features = ["compression-all"] }
+# krafka = { version = "0.16.0", features = ["compression-all"] }
 ```
 
 #### Compression level
@@ -162,6 +162,11 @@ Setting a level alongside a codec that takes none is **rejected at build
 time**, as is a level outside the codec's range, and per-topic codec overrides
 are validated against it too. Neither case is silently ignored: a tuning knob
 that quietly does nothing is how a deployment ships believing it was tuned.
+
+The level applies on both send paths — batched (`linger > 0`) and direct
+(`linger = 0`) — and on the `TransactionalProducer`, which always batches. The
+same rules are enforced by one shared validator, so a codec check cannot exist
+on one producer and not the other.
 
 Higher is not better. zstd's output size is **not monotonic** in level — the
 match-finding strategy changes as levels rise, and on realistic record payloads
@@ -664,6 +669,12 @@ async fn main() -> Result<()> {
 
 ### Configuration
 
+`TransactionalProducerBuilder` mirrors `ProducerBuilder` setter for setter:
+compression and compression levels, delivery timeout, interceptors, a
+dead-letter queue, a state store, `with_client`, the metadata cache TTLs, and
+the synchronous `build_config()` terminal. `tests/builder_surface.rs` asserts
+that at compile time, so the two builders cannot drift apart.
+
 ```rust
 use krafka::producer::TransactionalProducer;
 use krafka::protocol::Compression;
@@ -673,12 +684,64 @@ let producer = TransactionalProducer::builder()
     .bootstrap_servers("localhost:9092")
     .transactional_id("order-processor-1")
     .client_id("my-app")
-    .transaction_timeout(Duration::from_secs(60))          // 60 second timeout
+    .transaction_timeout(Duration::from_secs(60))          // coordinator's deadline
     .request_timeout(Duration::from_secs(30))
-    .compression(Compression::Lz4)
+    .delivery_timeout(Duration::from_secs(45))             // bound on one batch in flight
+    .compression(Compression::Zstd)
+    .compression_level(Some(1))
     .build()
     .await?;
 ```
+
+Two setters are **deliberately absent**, because the transactional protocol
+fixes both:
+
+| Absent setter | Why |
+|---|---|
+| `acks` | Fixed to `Acks::All`. The coordinator can only guarantee atomicity over fully replicated writes, so a weaker setting would silently break the guarantee the type exists to provide. |
+| `idempotent` | Always on. A transactional producer *is* an idempotent producer with a stable `transactional.id`; there is nothing to disable. |
+
+#### Delivery timeout
+
+`delivery_timeout` bounds how long one batch may spend in flight, including
+batching, retries and backoff. It matters more here than on the plain producer:
+a batch that keeps retrying holds the transaction open, and an open transaction
+blocks every `read_committed` consumer at its first offset.
+
+Keep it at or below `transaction_timeout` — the coordinator aborts at that point
+regardless. `build()` and `build_config()` warn when the two disagree.
+
+#### Validating without a broker
+
+`build_config()` runs exactly the checks `build()` runs and returns the
+validated `TransactionalProducerConfig` without connecting — for a
+`validate-config` subcommand, a startup check, or a unit test:
+
+```rust
+let config = TransactionalProducer::builder()
+    .bootstrap_servers("localhost:9092")
+    .transactional_id("order-processor-1")
+    .compression(Compression::Zstd)
+    .compression_level(Some(1))
+    .build_config()?;      // no cluster required
+
+assert_eq!(config.compression_level(), Some(1));
+```
+
+#### Flushing
+
+`flush()` dispatches every buffered record and waits for the in-flight sends to
+complete. You do **not** need it before `commit_transaction()`, which flushes
+first and must — a commit marker written while records were still buffered would
+leave them outside the transaction they were sent in.
+
+It is there for two other reasons: forcing buffered records onto the wire
+mid-transaction so their failures surface with the record's context rather than
+at commit time, and writing code generic over "a producer" without special-casing
+which of the two you hold.
+
+Unlike `Producer::flush`, it does not make the records visible to a
+`read_committed` consumer — only `commit_transaction()` does.
 
 ### Authentication
 
@@ -687,11 +750,20 @@ Connect a transactional producer to secured Kafka clusters:
 ```rust
 use krafka::producer::TransactionalProducer;
 
-// SASL/SCRAM-SHA-256
+// SASL/SCRAM-SHA-256 over cleartext (development only)
 let producer = TransactionalProducer::builder()
     .bootstrap_servers("broker:9093")
     .transactional_id("my-txn-id")
     .sasl_scram_sha256("username", "password")
+    .build()
+    .await?;
+
+// SASL_SSL + SCRAM-SHA-512 — what a managed cluster almost always wants
+use krafka::auth::{AuthConfig, TlsConfig};
+let producer = TransactionalProducer::builder()
+    .bootstrap_servers("broker:9093")
+    .transactional_id("my-txn-id")
+    .auth(AuthConfig::sasl_scram_sha512_ssl("username", "password", TlsConfig::new()))
     .build()
     .await?;
 

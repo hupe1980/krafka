@@ -43,7 +43,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Mutex, RwLock};
@@ -52,6 +52,7 @@ use tracing::{debug, warn};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::{KrafkaError, Result};
+use crate::metrics::ConnectionMetrics;
 
 const OAUTHBEARER_EXPIRY_SKEW_MARGIN_MS: i64 = 30_000;
 
@@ -141,6 +142,50 @@ struct OAuthTokenStoreInner {
     /// the cached token stale queue behind this lock; the first winner fetches
     /// while the rest get the result on unlock.
     refreshing: Mutex<()>,
+    /// Connection metrics to report token fetches into, once a pool has bound
+    /// itself. See [`OAuthBearerTokenProviderHandle::bind_metrics`].
+    metrics: OnceLock<Arc<ConnectionMetrics>>,
+}
+
+impl OAuthTokenStoreInner {
+    /// Fetch one token from the wrapped provider, recording the outcome.
+    ///
+    /// Every fetch in the crate goes through here — the on-connect resolution
+    /// and the background proactive refresh both — so the counters cannot
+    /// cover one path and miss the other.
+    ///
+    /// The `warn!` on failure is the load-bearing part even without metrics: a
+    /// misconfigured `token_endpoint` used to surface only as connection
+    /// failures, with nothing anywhere naming the OAuth round trip as the
+    /// cause.
+    async fn fetch(&self) -> Result<OAuthBearerToken> {
+        let started = Instant::now();
+        match self.provider.provide_token().await {
+            Ok(token) => {
+                if let Some(metrics) = self.metrics.get() {
+                    metrics.record_oauth_token_fetch(started.elapsed(), token.lifetime_ms());
+                }
+                debug!(
+                    lifetime_ms = token.lifetime_ms(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "OAUTHBEARER token fetched"
+                );
+                Ok(token)
+            }
+            Err(e) => {
+                if let Some(metrics) = self.metrics.get() {
+                    metrics.record_oauth_token_fetch_failure();
+                }
+                warn!(
+                    error = %e,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "OAUTHBEARER token fetch failed; broker connections needing a fresh \
+                     token will fail until the provider recovers"
+                );
+                Err(e)
+            }
+        }
+    }
 }
 
 /// A cached token together with the instant it was fetched.
@@ -209,7 +254,27 @@ impl OAuthBearerTokenProviderHandle {
             provider: Arc::new(provider),
             cached: RwLock::new(None),
             refreshing: Mutex::new(()),
+            metrics: OnceLock::new(),
         }))
+    }
+
+    /// Report token fetches into `metrics`.
+    ///
+    /// Called by [`ConnectionPool`](crate::network::ConnectionPool) when it
+    /// starts the proactive-refresh task, so `oauth_token_fetches`,
+    /// `oauth_token_fetch_failures`, `oauth_token_fetch_latency` and
+    /// `oauth_token_expiry_epoch_ms` show up on the same
+    /// [`ConnectionMetrics`] a client already exports.
+    ///
+    /// **First binding wins.** All clones of a handle share one store, so an
+    /// [`AuthConfig`](super::AuthConfig) cloned across two pools reports into
+    /// whichever bound first. Every fetch is still logged either way, and
+    /// clients that share a pool — the recommended shape — share one
+    /// `ConnectionMetrics` anyway.
+    pub(crate) fn bind_metrics(&self, metrics: Arc<ConnectionMetrics>) {
+        // `set` fails only when already bound, which is exactly the
+        // first-binding-wins rule; there is nothing to report.
+        let _ = self.0.metrics.set(metrics);
     }
 
     /// Return a fresh token, using the cache when available.
@@ -248,7 +313,7 @@ impl OAuthBearerTokenProviderHandle {
         }
 
         // Fetch a fresh token and update the cache.
-        let token = self.0.provider.provide_token().await?;
+        let token = self.0.fetch().await?;
         *self.0.cached.write().await = Some(CachedToken::new(token.clone()));
         Ok(token)
     }
@@ -306,22 +371,14 @@ impl OAuthBearerTokenProviderHandle {
                     tokio::time::sleep(sleep_duration).await;
                 }
 
-                // Proactively refresh under the coalescing lock.
+                // Proactively refresh under the coalescing lock. `fetch`
+                // records the outcome and logs a failure at WARN.
                 let _coalesce = inner.refreshing.lock().await;
-                match inner.provider.provide_token().await {
+                match inner.fetch().await {
                     Ok(token) => {
-                        debug!(
-                            lifetime_ms = token.lifetime_ms(),
-                            "OAuthBearer token proactively refreshed"
-                        );
                         *inner.cached.write().await = Some(CachedToken::new(token));
                     }
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            "OAuthBearer proactive token refresh failed; \
-                             will retry on next refresh window"
-                        );
+                    Err(_) => {
                         // Back off briefly before restarting the sleep loop
                         // so a transient provider failure doesn't busy-spin.
                         drop(_coalesce);
@@ -902,6 +959,115 @@ mod tests {
         let far = current_epoch_ms().unwrap() + 3_600_000;
         let entry = CachedToken::new(OAuthBearerToken::new("jwt").with_lifetime_ms(far));
         assert!(!entry.is_stale(), "well outside the skew window");
+    }
+
+    // ── Token-fetch observability ───────────────────────────────────────────
+    //
+    // An OAUTHBEARER provider is called per connection, so a misconfigured
+    // `token_endpoint` used to surface only as connection failures: nothing
+    // counted the OAuth round trip and nothing named it as the cause. These
+    // pin the counters to the two paths that fetch.
+
+    #[tokio::test]
+    async fn a_successful_fetch_is_counted_with_its_expiry() {
+        let metrics = Arc::new(ConnectionMetrics::new());
+        let expiry = current_epoch_ms().unwrap() + 3_600_000;
+        let handle = OAuthBearerTokenProviderHandle::new(move || async move {
+            Ok(OAuthBearerToken::new("jwt").with_lifetime_ms(expiry))
+        });
+        handle.bind_metrics(metrics.clone());
+
+        handle.provide_token().await.expect("provider succeeds");
+
+        assert_eq!(metrics.oauth_token_fetches.get(), 1);
+        assert_eq!(metrics.oauth_token_fetch_failures.get(), 0);
+        assert_eq!(
+            metrics.oauth_token_expiry_epoch_ms.get(),
+            expiry as u64,
+            "the dashboard's remaining-lifetime panel reads this gauge"
+        );
+
+        // A cache hit is not a fetch.
+        handle.provide_token().await.expect("cached");
+        assert_eq!(
+            metrics.oauth_token_fetches.get(),
+            1,
+            "serving from cache must not be counted as a fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_is_counted_separately() {
+        let metrics = Arc::new(ConnectionMetrics::new());
+        let handle = OAuthBearerTokenProviderHandle::new(|| async {
+            Err(KrafkaError::auth("token endpoint returned HTTP 401"))
+        });
+        handle.bind_metrics(metrics.clone());
+
+        let err = handle
+            .provide_token()
+            .await
+            .expect_err("the provider fails");
+        assert!(err.to_string().contains("401"), "the error must survive");
+
+        assert_eq!(metrics.oauth_token_fetches.get(), 1);
+        assert_eq!(metrics.oauth_token_fetch_failures.get(), 1);
+        assert_eq!(
+            metrics.oauth_token_expiry_epoch_ms.get(),
+            0,
+            "a failure must not claim a token expiry"
+        );
+    }
+
+    /// A failure must not clear the expiry of a token that is still valid —
+    /// that would make one transient blip look like a total credential loss.
+    #[tokio::test]
+    async fn a_failed_refresh_leaves_the_previous_expiry_alone() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let metrics = Arc::new(ConnectionMetrics::new());
+        let expiry = current_epoch_ms().unwrap() + 3_600_000;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let handle = OAuthBearerTokenProviderHandle::new(move || {
+            let c = c.clone();
+            async move {
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(OAuthBearerToken::new("jwt").with_lifetime_ms(expiry))
+                } else {
+                    Err(KrafkaError::auth("identity provider unavailable"))
+                }
+            }
+        });
+        handle.bind_metrics(metrics.clone());
+
+        handle.provide_token().await.expect("first fetch succeeds");
+        // Force the next call past the cache.
+        handle
+            .test_seed_cache(
+                OAuthBearerToken::new("jwt"),
+                OAUTHBEARER_UNKNOWN_EXPIRY_MAX_AGE + Duration::from_secs(1),
+            )
+            .await;
+        handle
+            .provide_token()
+            .await
+            .expect_err("second fetch fails");
+
+        assert_eq!(metrics.oauth_token_fetches.get(), 2);
+        assert_eq!(metrics.oauth_token_fetch_failures.get(), 1);
+        assert_eq!(
+            metrics.oauth_token_expiry_epoch_ms.get(),
+            expiry as u64,
+            "a failed refresh must leave the known expiry in place"
+        );
+    }
+
+    /// Metrics are optional: an unbound handle must fetch exactly as before.
+    #[tokio::test]
+    async fn an_unbound_handle_still_fetches() {
+        let handle =
+            OAuthBearerTokenProviderHandle::new(|| async { Ok(OAuthBearerToken::new("jwt")) });
+        assert!(handle.provide_token().await.is_ok());
     }
 
     #[tokio::test]

@@ -49,6 +49,56 @@
 //! # }
 //! ```
 //!
+//! # Pass the same instance to every client that shares a network path
+//!
+//! A `TransportConfig` describes *how this process reaches the cluster*: the
+//! SOCKS5 route, the file-descriptor budget, the response ceiling, the
+//! certificate-reload interval. Those are properties of the path, not of the
+//! client, so every client that travels the path needs the same one.
+//!
+//! This is easy to get wrong in one specific way. A service that builds a
+//! long-lived [`Producer`] with a tuned transport and a short-lived
+//! [`AdminClient`] for a preflight topic check — with the transport left at
+//! its default on the admin client — has quietly given the admin client a
+//! *different network path*: no proxy, no FD cap, no TLS reload. The preflight
+//! then fails in an environment where the producer works, or worse, succeeds by
+//! bypassing the proxy the deployment requires.
+//!
+//! Build it once and clone it:
+//!
+//! ```rust,no_run
+//! use krafka::admin::AdminClient;
+//! use krafka::network::TransportConfig;
+//! use krafka::producer::Producer;
+//!
+//! # async fn example() -> Result<(), krafka::error::KrafkaError> {
+//! let transport = TransportConfig::builder()
+//!     .max_connections(Some(64))
+//!     .tls_reload_interval(Some(std::time::Duration::from_secs(300)))
+//!     .build()?;
+//!
+//! let admin = AdminClient::builder()
+//!     .bootstrap_servers("localhost:9092")
+//!     .transport(transport.clone())
+//!     .build()
+//!     .await?;
+//!
+//! let producer = Producer::builder()
+//!     .bootstrap_servers("localhost:9092")
+//!     .transport(transport)
+//!     .build()
+//!     .await?;
+//! # let _ = (admin, producer);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Cloning shares the settings, not the sockets: each client still opens its
+//! own pool. To share the *connections* too, build one
+//! [`KrafkaClient`] with the transport and pass it to each builder's
+//! `with_client(..)` — then there is exactly one pool and the question cannot
+//! arise.
+//!
 //! [`ConnectionConfig`]: super::ConnectionConfig
 //! [`ConnectionPool`]: super::ConnectionPool
 //! [`Producer`]: crate::producer::Producer
@@ -72,8 +122,10 @@ use super::pool::{ConnectionPool, DEFAULT_MAX_IDLE};
 /// via `.transport(..)`. [`Default`] reproduces krafka's historical behaviour
 /// exactly, so an unset field is never a behaviour change.
 ///
-/// See the `network::transport` module documentation for why this type
-/// exists.
+/// **Pass the same instance — cloned — to every client that must share the
+/// network path.** A client left on the defaults gets a different path: no
+/// proxy, no descriptor cap, no TLS reload. See the module documentation for
+/// the worked example and for why this type exists.
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
     /// Disable Nagle's algorithm on every broker socket. Default: `true`.

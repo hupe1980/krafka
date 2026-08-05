@@ -126,7 +126,38 @@ reordering *per connection*, so a partition's batches must stay on one socket.
 If you need more parallelism to one broker today, run more clients: each
 `Producer`/`Consumer` built without `.with_client(...)` owns its own pool. Use
 `KrafkaClient` when you want the opposite — several clients sharing one pool
-and one connection per broker.
+and one connection per broker. `with_client` is available on every client
+builder: `Producer`, `TransactionalProducer`, `Consumer`, `ShareConsumer` and
+`AdminClient`.
+
+#### Who closes a shared pool
+
+A client built with `.with_client(...)` **borrows** its pool. Its `close()`
+shuts the client down and leaves the connections alone; `owns_pool()` reports
+`false`. Close the `KrafkaClient` to release the sockets.
+
+This matters because the alternative is silent: a client that tore down a
+borrowed pool would kill every sibling's connections and fail their in-flight
+Produce and Fetch requests, undoing exactly what sharing the client was for.
+`AdminClient` handled this correctly from the start; its four siblings called
+`close_all()` unconditionally until this release.
+
+```rust
+let client = KrafkaClient::builder("localhost:9092").build().await?;
+
+let producer = Producer::builder().with_client(&client).build().await?;
+let consumer = Consumer::builder().group_id("g").with_client(&client).build().await?;
+
+assert!(!producer.owns_pool());
+
+producer.close().await;   // consumer keeps working
+consumer.close().await;
+client.close().await;     // now the sockets go
+```
+
+If you pass a `TransportConfig` to a `KrafkaClient`, every client sharing it
+inherits that network path — no per-client `.transport(...)` needed, and no way
+for one of them to quietly bypass the proxy.
 
 > **Note:** The connection pool uses a read-lock fast path for hot-path lookups.
 > During reconnection, all locks are dropped before performing network I/O,

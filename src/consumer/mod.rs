@@ -368,6 +368,15 @@ pub struct Consumer {
     metadata: Arc<ClusterMetadata>,
     /// Connection pool.
     pool: Arc<ConnectionPool>,
+    /// Whether this client owns its connection pool.
+    ///
+    /// `false` when the pool was borrowed from a
+    /// [`KrafkaClient`](crate::client::KrafkaClient) via `with_client`.
+    ///
+    /// Closing a borrowed pool would tear down every sibling client's
+    /// connections and fail their in-flight requests — which is what happened
+    /// until `AdminClient`'s handling of this was extended to its siblings.
+    pool_owned: bool,
     /// Subscribed topics. Lock level 1 — acquire first (see `LOCK ORDER`).
     subscriptions: LeveledRwLock<1, HashSet<String>>,
     /// Assigned partitions. Lock level 2 — acquire after `subscriptions`.
@@ -1030,6 +1039,7 @@ impl Consumer {
         config: ConsumerConfig,
         shared: Option<(Arc<ConnectionPool>, Arc<ClusterMetadata>)>,
     ) -> Result<Self> {
+        let pool_owned = shared.is_none();
         let (pool, metadata) = if let Some((pool, metadata)) = shared {
             // Use the pre-built shared pool and metadata from a KrafkaClient.
             (pool, metadata)
@@ -1119,6 +1129,7 @@ impl Consumer {
             config,
             metadata,
             pool,
+            pool_owned,
             subscriptions: LeveledRwLock::new(HashSet::new()),
             assignments: LeveledRwLock::new(HashMap::new()),
             offsets: LeveledRwLock::new(HashMap::new()),
@@ -5760,10 +5771,31 @@ impl Consumer {
         // Notify interceptor of shutdown
         crate::interceptor::safe_consumer_close(&*self.interceptor);
 
-        self.pool.close_all().await;
-        info!("Consumer closed");
+        // A pool borrowed from a `KrafkaClient` belongs to that client: tearing
+        // it down here would kill every sibling producer, admin client and
+        // consumer sharing it and fail their in-flight requests. `AdminClient`
+        // already got this right; its siblings did not.
+        if self.pool_owned {
+            self.pool.close_all().await;
+            info!("Consumer closed (connection pool torn down)");
+        } else {
+            info!("Consumer closed (shared connection pool left open)");
+        }
 
         Self::select_close_result(auto_commit_result, leave_group_result)
+    }
+
+    /// Whether this client owns its connection pool.
+    ///
+    /// `false` when the pool was borrowed from a
+    /// [`KrafkaClient`](crate::client::KrafkaClient) via `with_client`. In that
+    /// case [`close`](Self::close) leaves the connections untouched — closing
+    /// them would tear down every sibling client on that `KrafkaClient` and
+    /// fail their in-flight requests. Close the `KrafkaClient` to release them.
+    #[inline]
+    #[must_use]
+    pub fn owns_pool(&self) -> bool {
+        self.pool_owned
     }
 
     /// Check if the consumer is closed.
@@ -7547,6 +7579,7 @@ mod tests {
             config,
             metadata,
             pool,
+            pool_owned: true,
             subscriptions: LeveledRwLock::new(HashSet::new()),
             assignments: LeveledRwLock::new(HashMap::new()),
             offsets: LeveledRwLock::new(HashMap::new()),

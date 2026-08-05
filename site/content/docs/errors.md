@@ -590,7 +590,20 @@ let producer = Producer::builder()
     .await?;
 ```
 
-> **Note:** The producer DLQ is only invoked on the direct-send path (linger = 0). For the accumulator path (linger > 0), use the `on_acknowledgement` interceptor hook.
+> **Scope:** the producer DLQ is invoked on **both** send paths — batched
+> (`linger > 0`) and direct (`linger = 0`) — and on the
+> `TransactionalProducer`, which always batches. Each record is handed to the
+> DLQ once, after its retry budget is exhausted or on a non-retriable error,
+> immediately before the failure is returned. `send()` still returns the error:
+> the DLQ preserves the payload, it does not swallow the failure.
+>
+> This used to be direct-send only, which meant configuring a DLQ alongside any
+> batching silently disabled it.
+
+On a `TransactionalProducer` the DLQ write happens **outside** the transaction —
+it is a separate producer, so it is not covered by the commit marker and
+survives the abort that a permanently failed send forces. That is the point: a
+record lost to an aborted transaction is otherwise unrecoverable.
 
 ### Consumer-side DLQ (poison pills)
 

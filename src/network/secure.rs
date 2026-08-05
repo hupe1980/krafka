@@ -4,10 +4,12 @@
 
 use std::time::Duration;
 
+#[cfg(test)]
+use crate::auth::SecurityProtocol;
 use crate::auth::{
     AuthConfig, AwsMskIamCredentialProvider, ChannelBinding, MskIamAuthenticator, OAuthBearerToken,
     OAuthBearerTokenProvider, PlainCredentials, SaslMechanism, ScramClient, ScramMechanism,
-    SecurityProtocol, TlsConfig,
+    TlsConfig,
 };
 use crate::error::{KrafkaError, Result};
 use zeroize::Zeroizing;
@@ -72,9 +74,12 @@ impl SecureConnectionConfigBuilder {
         self
     }
 
-    /// Set authentication config.
+    /// Set the authentication config.
+    ///
+    /// Any TLS already configured with [`tls`](Self::tls) is carried forward
+    /// unless `auth` brings its own, so order does not matter here either.
     pub fn auth(mut self, auth: AuthConfig) -> Self {
-        self.auth = auth;
+        self.set_auth(auth);
         self
     }
 
@@ -84,7 +89,7 @@ impl SecureConnectionConfigBuilder {
         username: impl Into<String>,
         password: impl Into<String>,
     ) -> crate::Result<Self> {
-        self.auth = AuthConfig::sasl_plain(username, password)?;
+        self.set_auth(AuthConfig::sasl_plain(username, password)?);
         Ok(self)
     }
 
@@ -94,7 +99,7 @@ impl SecureConnectionConfigBuilder {
         username: impl Into<String>,
         password: impl Into<String>,
     ) -> Self {
-        self.auth = AuthConfig::sasl_scram_sha256(username, password);
+        self.set_auth(AuthConfig::sasl_scram_sha256(username, password));
         self
     }
 
@@ -104,7 +109,7 @@ impl SecureConnectionConfigBuilder {
         username: impl Into<String>,
         password: impl Into<String>,
     ) -> Self {
-        self.auth = AuthConfig::sasl_scram_sha512(username, password);
+        self.set_auth(AuthConfig::sasl_scram_sha512(username, password));
         self
     }
 
@@ -115,7 +120,11 @@ impl SecureConnectionConfigBuilder {
         secret_access_key: impl Into<String>,
         region: impl Into<String>,
     ) -> Self {
-        self.auth = AuthConfig::aws_msk_iam(access_key_id, secret_access_key, region);
+        self.set_auth(AuthConfig::aws_msk_iam(
+            access_key_id,
+            secret_access_key,
+            region,
+        ));
         self
     }
 
@@ -127,7 +136,7 @@ impl SecureConnectionConfigBuilder {
         mut self,
         provider: impl AwsMskIamCredentialProvider + 'static,
     ) -> Self {
-        self.auth = AuthConfig::aws_msk_iam_provider(provider);
+        self.set_auth(AuthConfig::aws_msk_iam_provider(provider));
         self
     }
 
@@ -136,13 +145,13 @@ impl SecureConnectionConfigBuilder {
     /// For automatic token refresh, use [`sasl_oauthbearer_provider()`](Self::sasl_oauthbearer_provider).
     /// For SASL extensions, use [`sasl_oauthbearer_token()`](Self::sasl_oauthbearer_token).
     pub fn sasl_oauthbearer(mut self, token: impl Into<String>) -> Self {
-        self.auth = AuthConfig::sasl_oauthbearer(token);
+        self.set_auth(AuthConfig::sasl_oauthbearer(token));
         self
     }
 
     /// Configure SASL/OAUTHBEARER authentication with a pre-built token.
     pub fn sasl_oauthbearer_token(mut self, token: OAuthBearerToken) -> Self {
-        self.auth = AuthConfig::sasl_oauthbearer_token(token);
+        self.set_auth(AuthConfig::sasl_oauthbearer_token(token));
         self
     }
 
@@ -154,19 +163,57 @@ impl SecureConnectionConfigBuilder {
         mut self,
         provider: impl OAuthBearerTokenProvider + 'static,
     ) -> Self {
-        self.auth = AuthConfig::sasl_oauthbearer_provider(provider);
+        self.set_auth(AuthConfig::sasl_oauthbearer_provider(provider));
         self
     }
 
-    /// Configure TLS with default settings.
+    /// Wrap the configured authentication in TLS.
+    ///
+    /// `PLAINTEXT` becomes `SSL` and `SASL_PLAINTEXT` becomes `SASL_SSL`; an
+    /// already-encrypted config keeps its protocol and takes the new settings.
+    /// Delegates to [`AuthConfig::with_tls`], so there is one implementation of
+    /// the upgrade rule rather than two that can drift.
+    ///
+    /// **Order does not matter.** Calling `.tls(..)` before a SASL setter used
+    /// to lose the TLS configuration, because each SASL setter replaced the
+    /// whole `AuthConfig`; the setters now carry any TLS already configured
+    /// forward. Both of these produce `SASL_SSL`:
+    ///
+    /// ```rust
+    /// use krafka::auth::{SecurityProtocol, TlsConfig};
+    /// use krafka::network::SecureConnectionConfig;
+    ///
+    /// let a = SecureConnectionConfig::builder()
+    ///     .sasl_scram_sha512("user", "pass")
+    ///     .tls(TlsConfig::new())
+    ///     .build();
+    /// let b = SecureConnectionConfig::builder()
+    ///     .tls(TlsConfig::new())
+    ///     .sasl_scram_sha512("user", "pass")
+    ///     .build();
+    ///
+    /// assert_eq!(a.auth.security_protocol(), &SecurityProtocol::SaslSsl);
+    /// assert_eq!(b.auth.security_protocol(), &SecurityProtocol::SaslSsl);
+    /// ```
     pub fn tls(mut self, tls_config: TlsConfig) -> Self {
-        self.auth.tls_config = Some(tls_config);
-        if self.auth.security_protocol == SecurityProtocol::Plaintext {
-            self.auth.security_protocol = SecurityProtocol::Ssl;
-        } else if self.auth.security_protocol == SecurityProtocol::SaslPlaintext {
-            self.auth.security_protocol = SecurityProtocol::SaslSsl;
-        }
+        self.auth = std::mem::take(&mut self.auth).with_tls(tls_config);
         self
+    }
+
+    /// Replace the authentication config, carrying forward any TLS settings
+    /// already configured on the builder.
+    ///
+    /// Without this, `.tls(..).sasl_scram_sha512(..)` silently produced a
+    /// cleartext SASL handshake against a TLS listener — the exact failure
+    /// [`AuthConfig::with_tls`] exists to make unreachable.
+    fn set_auth(&mut self, auth: AuthConfig) {
+        let carried_tls = self.auth.tls_config().cloned();
+        self.auth = match carried_tls {
+            // An explicit `auth(..)` that already carries TLS wins over the
+            // builder's earlier `.tls(..)`.
+            Some(tls) if auth.tls_config().is_none() => auth.with_tls(tls),
+            _ => auth,
+        };
     }
 
     /// Build the config.
@@ -538,6 +585,70 @@ mod tests {
         assert_eq!(config.auth.security_protocol, SecurityProtocol::Plaintext);
         assert!(!config.auth.requires_tls());
         assert!(!config.auth.requires_sasl());
+    }
+
+    /// `.tls(..)` must survive whatever SASL setter follows it.
+    ///
+    /// Each SASL setter replaced the whole `AuthConfig`, so `.tls(t)` before
+    /// `.sasl_scram_sha512(..)` silently produced `SASL_PLAINTEXT` with a
+    /// `tls_config` nobody would read — a cleartext SASL handshake against a
+    /// TLS listener, which is the failure `AuthConfig::with_tls` exists to
+    /// make unreachable.
+    ///
+    /// Negative control: reverting `set_auth` to a plain `self.auth = auth`
+    /// assignment fails the `tls_first` half.
+    #[test]
+    fn tls_composes_with_sasl_in_either_order() {
+        for (label, config) in [
+            (
+                "sasl_first",
+                SecureConnectionConfig::builder()
+                    .sasl_scram_sha512("user", "pass")
+                    .tls(TlsConfig::new().with_ca_cert("/etc/kafka/ca.pem"))
+                    .build(),
+            ),
+            (
+                "tls_first",
+                SecureConnectionConfig::builder()
+                    .tls(TlsConfig::new().with_ca_cert("/etc/kafka/ca.pem"))
+                    .sasl_scram_sha512("user", "pass")
+                    .build(),
+            ),
+        ] {
+            assert_eq!(
+                config.auth.security_protocol(),
+                &SecurityProtocol::SaslSsl,
+                "{label}: SCRAM over TLS must be SASL_SSL"
+            );
+            assert_eq!(
+                config.auth.sasl_mechanism(),
+                Some(&SaslMechanism::ScramSha512),
+                "{label}: the mechanism must survive"
+            );
+            assert_eq!(
+                config.auth.tls_config().and_then(|t| t.ca_cert_path()),
+                Some("/etc/kafka/ca.pem"),
+                "{label}: the caller's CA must survive"
+            );
+        }
+    }
+
+    /// An `AuthConfig` that brings its own TLS must win over the builder's.
+    #[test]
+    fn an_explicit_auth_config_keeps_its_own_tls() {
+        let config = SecureConnectionConfig::builder()
+            .tls(TlsConfig::new().with_ca_cert("/builder/ca.pem"))
+            .auth(AuthConfig::sasl_scram_sha256_ssl(
+                "user",
+                "pass",
+                TlsConfig::new().with_ca_cert("/explicit/ca.pem"),
+            ))
+            .build();
+
+        assert_eq!(
+            config.auth.tls_config().and_then(|t| t.ca_cert_path()),
+            Some("/explicit/ca.pem")
+        );
     }
 
     #[test]
