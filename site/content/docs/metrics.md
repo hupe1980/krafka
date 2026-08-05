@@ -261,6 +261,37 @@ accompanied by a `warn!` naming the topic, partition and offset.
 | `active_connections` | Gauge | Current active connections |
 | `connect_latency_seconds` | Summary | Connection establishment latency |
 | `tls_handshake_latency_seconds` | Summary | TLS handshake latency (populated for TLS connections only) |
+| `oauth_token_fetches_total` | Counter | SASL/OAUTHBEARER token fetches attempted |
+| `oauth_token_fetch_failures_total` | Counter | SASL/OAUTHBEARER token fetches that returned an error |
+| `oauth_token_fetch_latency_seconds` | Summary | Token fetch latency (successful fetches only) |
+| `oauth_token_expiry_epoch_ms` | Gauge | Expiry of the cached token, ms since the Unix epoch (`0` = unknown) |
+
+#### OAUTHBEARER token lifecycle
+
+The four `oauth_*` metrics are populated only when the client authenticates with
+an OAUTHBEARER **provider** — a static token is never fetched. They cover both
+the on-connect resolution and the background proactive refresh; the cached reads
+in between are not fetches and are not counted.
+
+They exist because a misconfigured `token_endpoint` is otherwise
+indistinguishable from an unreachable broker: the provider is called per
+connection, so the OAuth round trip fails, the connection fails, and nothing
+names the identity provider as the cause. Every failed fetch also emits a
+`tracing` event at `WARN`, so the signal is available without a metrics
+pipeline.
+
+```promql
+# Is the identity provider healthy?
+rate(krafka_connection_oauth_token_fetch_failures_total[5m]) > 0
+
+# How long until the cached token expires?
+(krafka_connection_oauth_token_expiry_epoch_ms / 1000) - time()
+```
+
+A failed fetch increments `oauth_token_fetches_total` **and**
+`oauth_token_fetch_failures_total`, and leaves `oauth_token_expiry_epoch_ms`
+alone — the previously fetched token may still be valid, and zeroing it would
+make one transient blip look like a total loss of credentials.
 
 ## Latency Tracking
 
@@ -316,7 +347,7 @@ Enable the `telemetry` feature for native OTLP protobuf export and KIP-714 broke
 
 ```toml
 [dependencies]
-krafka = { version = "0.15.0", features = ["telemetry"] }
+krafka = { version = "0.16.0", features = ["telemetry"] }
 ```
 
 Export metrics as OTLP protobuf bytes for ingestion by any OTLP-compatible backend:

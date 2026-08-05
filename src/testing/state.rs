@@ -52,6 +52,29 @@ pub struct PartitionState {
     /// broker acknowledges writes immediately, this doubles as the high
     /// watermark.
     pub next_offset: i64,
+    /// Base offset of the currently open transaction's first batch on this
+    /// partition, or `None` when no transaction is open here.
+    ///
+    /// This is what pins the last stable offset: a `read_committed` consumer
+    /// must not see past it until the transaction completes. Modelling it is
+    /// the difference between a test that proves exactly-once isolation and
+    /// one that proves records were written.
+    pub pending_txn_first_offset: Option<i64>,
+    /// Completed-but-aborted transactions, as
+    /// `(producer_id, first_offset, marker_offset)`.
+    ///
+    /// The first two are what a `read_committed` fetch reports; the client
+    /// uses them, together with the abort control batch, to drop the data
+    /// records — so a broker that omits them makes aborted records look
+    /// committed.
+    ///
+    /// `marker_offset` is bookkeeping. A fetch must report only the aborted
+    /// transactions that **overlap the range it returns**: the client activates
+    /// an entry as soon as it scans a batch at or past its `first_offset`, so
+    /// an entry left over from an older, already-consumed transaction would
+    /// mark its producer aborted again and silently filter that producer's
+    /// *committed* batches later in the log.
+    pub aborted_transactions: Vec<(i64, i64, i64)>,
 }
 
 impl PartitionState {
@@ -64,7 +87,19 @@ impl PartitionState {
             log: Vec::new(),
             log_start_offset: 0,
             next_offset: 0,
+            pending_txn_first_offset: None,
+            aborted_transactions: Vec::new(),
         }
+    }
+
+    /// The last stable offset: the first offset a `read_committed` consumer
+    /// may not read past.
+    ///
+    /// Derived rather than stored, so it cannot drift out of step with the
+    /// open transaction it describes. With no transaction open it is the high
+    /// watermark; with one open it is that transaction's first offset.
+    pub(crate) fn last_stable_offset(&self) -> i64 {
+        self.pending_txn_first_offset.unwrap_or(self.next_offset)
     }
 
     /// Append a producer's record batch, stamping it with the offset it was
@@ -85,15 +120,42 @@ impl PartitionState {
     /// gets the entire batch, exactly as a real broker does, leaving the
     /// client to discard the records below its requested offset.
     pub(crate) fn read_from(&self, fetch_offset: i64) -> Bytes {
+        self.read_range(fetch_offset, i64::MAX)
+    }
+
+    /// As [`read_from`](Self::read_from), but stopping before `limit`.
+    ///
+    /// A `read_committed` fetch passes the last stable offset as `limit`: a
+    /// batch belonging to a transaction that has not completed must not be
+    /// returned at all, or the consumer could surface records that a later
+    /// abort retracts.
+    ///
+    /// Whole batches only, as a real broker does — a batch straddling `limit`
+    /// is withheld, since half of it is uncommitted.
+    pub(crate) fn read_range(&self, fetch_offset: i64, limit: i64) -> Bytes {
         let mut out = Vec::new();
         for batch in &self.log {
             let base = wire::batch_base_offset(batch).unwrap_or(0);
             let count = wire::batch_record_count(batch).unwrap_or(0);
-            if base + count > fetch_offset {
+            if base + count > fetch_offset && base + count <= limit {
                 out.extend_from_slice(batch);
             }
         }
         Bytes::from(out)
+    }
+
+    /// Aborted transactions overlapping `[fetch_offset, ..)`, as the
+    /// `(producer_id, first_offset)` pairs a fetch response carries.
+    ///
+    /// An entry whose abort marker is already below `fetch_offset` describes a
+    /// transaction this consumer has read past; reporting it would re-activate
+    /// its producer and filter that producer's later committed batches.
+    pub(crate) fn aborted_transactions_from(&self, fetch_offset: i64) -> Vec<(i64, i64)> {
+        self.aborted_transactions
+            .iter()
+            .filter(|(_, _, marker_offset)| *marker_offset >= fetch_offset)
+            .map(|(producer_id, first_offset, _)| (*producer_id, *first_offset))
+            .collect()
     }
 }
 
@@ -104,6 +166,37 @@ pub struct TopicState {
     pub topic_id: [u8; 16],
     /// Partitions, indexed by partition number.
     pub partitions: Vec<PartitionState>,
+}
+
+/// One transactional producer, as the transaction coordinator sees it.
+///
+/// Keyed by transactional ID rather than producer ID, because that is the
+/// identity Kafka fences on: re-running `InitProducerId` for a known
+/// transactional ID returns the **same** producer ID with a **higher** epoch,
+/// which is what makes a zombie producer's writes rejected (KIP-360).
+#[derive(Debug, Clone, Default)]
+pub struct TransactionState {
+    /// Producer ID assigned to this transactional ID, stable across
+    /// re-initialisation.
+    pub producer_id: i64,
+    /// Current epoch. Bumped by every `InitProducerId` and by the completion
+    /// of every transaction under TV2.
+    pub producer_epoch: i16,
+    /// Whether a transaction is currently open.
+    pub open: bool,
+    /// Partitions this transaction has written to.
+    ///
+    /// Under TV1 the client registers them with `AddPartitionsToTxn`; under
+    /// TV2 (KIP-890) the `Produce` request carries the transactional ID and
+    /// the coordinator infers them. Both routes land here, which is what lets
+    /// one commit path serve both protocols.
+    pub partitions: Vec<(String, i32)>,
+    /// Offsets staged by `TxnOffsetCommit`, keyed by group ID.
+    ///
+    /// Held back until commit: an aborted transaction must leave the group's
+    /// committed offsets exactly as it found them, which is the half of
+    /// exactly-once that a produce-only test never reaches.
+    pub staged_offsets: HashMap<String, HashMap<(String, i32), CommittedOffset>>,
 }
 
 /// A member of a consumer group.
@@ -403,6 +496,8 @@ pub struct ClusterState {
     pub next_producer_id: i64,
     /// Producer epochs, keyed by producer ID.
     pub producer_epochs: HashMap<i64, i16>,
+    /// Open and idle transactions, keyed by transactional ID.
+    pub transactions: HashMap<String, TransactionState>,
     /// Cluster-finalized feature version levels (KIP-584), keyed by feature
     /// name. Written by `UpdateFeatures`, so a test can assert what the
     /// controller actually applied — or, under `validate_only`, did not.
@@ -455,6 +550,7 @@ impl ClusterState {
             default_partitions: 1,
             next_producer_id: 1000,
             producer_epochs: HashMap::new(),
+            transactions: HashMap::new(),
             topic_id_seq: 1,
         }
     }

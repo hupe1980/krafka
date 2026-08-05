@@ -130,6 +130,15 @@ pub struct Producer {
     /// all retries or hit a non-retriable error are routed here before the
     /// error is returned to the caller.
     dlq: Option<Arc<dyn crate::dlq::DeadLetterQueue>>,
+    /// Whether this client owns its connection pool.
+    ///
+    /// `false` when the pool was borrowed from a
+    /// [`KrafkaClient`](crate::client::KrafkaClient) via `with_client`.
+    ///
+    /// Closing a borrowed pool would tear down every sibling client's
+    /// connections and fail their in-flight requests — which is what happened
+    /// until `AdminClient`'s handling of this was extended to its siblings.
+    pool_owned: bool,
 }
 
 fn is_unknown_producer_id_error(error: &KrafkaError) -> bool {
@@ -544,6 +553,7 @@ impl Producer {
         shared: Option<(Arc<ConnectionPool>, Arc<crate::metadata::ClusterMetadata>)>,
         state_store: Option<Arc<dyn ErasedProducerStateStore>>,
     ) -> Result<Self> {
+        let pool_owned = shared.is_none();
         let (pool, metadata) = if let Some((pool, metadata)) = shared {
             // Use the pre-built shared pool and metadata from a KrafkaClient.
             // No need to construct a new pool or perform an initial metadata
@@ -697,6 +707,7 @@ impl Producer {
                 batch_size: config.batch_size,
                 linger: config.linger,
                 compression: config.compression,
+                compression_level: config.compression_level,
                 topic_compression: config.topic_compression.clone().into_iter().collect(),
                 acks: config.acks.to_i16(),
                 client_id: config.client_id.clone(),
@@ -710,6 +721,7 @@ impl Producer {
                 partitioner: partitioner.clone(),
                 state_store: state_store.clone(),
                 transactional_id: None,
+                dead_letter_queue: config.dead_letter_queue.clone(),
             };
             Some(accumulator::RecordAccumulator::spawn(
                 acc_config,
@@ -742,6 +754,7 @@ impl Producer {
             key_encoder,
             value_encoder,
             dlq: config.dead_letter_queue,
+            pool_owned,
         })
     }
 
@@ -1544,10 +1557,31 @@ impl Producer {
         // Notify interceptor of shutdown
         crate::interceptor::safe_producer_close(&*self.interceptor);
 
-        self.pool.close_all().await;
-        info!("Producer closed");
+        // A pool borrowed from a `KrafkaClient` belongs to that client: tearing
+        // it down here would kill every sibling consumer, admin client and
+        // producer sharing it and fail their in-flight requests. `AdminClient`
+        // already got this right; its siblings did not.
+        if self.pool_owned {
+            self.pool.close_all().await;
+            info!("Producer closed (connection pool torn down)");
+        } else {
+            info!("Producer closed (shared connection pool left open)");
+        }
 
         close_result
+    }
+
+    /// Whether this client owns its connection pool.
+    ///
+    /// `false` when the pool was borrowed from a
+    /// [`KrafkaClient`](crate::client::KrafkaClient) via `with_client`. In that
+    /// case [`close`](Self::close) leaves the connections untouched — closing
+    /// them would tear down every sibling client on that `KrafkaClient` and
+    /// fail their in-flight requests. Close the `KrafkaClient` to release them.
+    #[inline]
+    #[must_use]
+    pub fn owns_pool(&self) -> bool {
+        self.pool_owned
     }
 
     /// Check if the producer is closed.
@@ -1709,13 +1743,20 @@ impl ProducerBuilder {
 
     /// Route permanently failed records to a dead-letter queue.
     ///
+    /// Each record is handed to the DLQ once, after its retry budget is
+    /// exhausted or on a non-retriable error, immediately before the failure is
+    /// returned to the caller. `send()` still returns the error — the DLQ
+    /// preserves the payload, it does not swallow the failure.
+    ///
     /// # Scope
     ///
-    /// The producer DLQ is invoked on the **direct-send path only**
-    /// (`linger = 0`). Records that went through the accumulator are not
-    /// individually available after batching, so for that path use the
-    /// `on_acknowledgement` interceptor hook together with a
-    /// [`DeadLetterQueue`](crate::dlq::DeadLetterQueue) implementation.
+    /// Both send paths, batched (`linger > 0`) and direct (`linger = 0`).
+    ///
+    /// This used to be direct-send only, which meant configuring a DLQ
+    /// alongside any batching silently disabled it — and batching is the
+    /// configuration a throughput-tuned producer runs in. The accumulator keeps
+    /// each record's key, value, headers and timestamp for the lifetime of its
+    /// batch, so there was never anything preventing it.
     pub fn dead_letter_queue(mut self, dlq: Arc<dyn crate::dlq::DeadLetterQueue>) -> Self {
         self.config.dead_letter_queue = Some(dlq);
         self
@@ -2533,6 +2574,7 @@ mod tests {
             state_store: None,
             key_encoder: None,
             value_encoder: None,
+            pool_owned: true,
             dlq: None,
         };
 

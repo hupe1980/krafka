@@ -490,6 +490,11 @@ struct ShareConsumerInner {
     metadata: Arc<ClusterMetadata>,
     /// Connection pool.
     pool: Arc<ConnectionPool>,
+    /// Whether this client owns its connection pool.
+    ///
+    /// `false` when the pool was borrowed from a
+    /// [`KrafkaClient`](crate::client::KrafkaClient) via `with_client`.
+    pool_owned: bool,
     /// Application-level metrics.
     ///
     /// Reuses [`ConsumerMetrics`] rather than defining a share-group-specific
@@ -623,49 +628,59 @@ impl ShareConsumer {
     }
 
     /// Create a new share consumer with the given configuration.
-    async fn new(config: ShareConsumerConfig) -> Result<Self> {
-        let mut pool_config_builder = config.transport.apply(
-            ConnectionConfig::builder()
-                .client_id(&config.client_id)
-                .request_timeout(config.request_timeout)
-                .connect_timeout(config.connect_timeout),
-        );
+    async fn new(
+        config: ShareConsumerConfig,
+        shared: Option<(Arc<ConnectionPool>, Arc<ClusterMetadata>)>,
+    ) -> Result<Self> {
+        let pool_owned = shared.is_none();
+        let (pool, metadata) = if let Some((pool, metadata)) = shared {
+            (pool, metadata)
+        } else {
+            let mut pool_config_builder = config.transport.apply(
+                ConnectionConfig::builder()
+                    .client_id(&config.client_id)
+                    .request_timeout(config.request_timeout)
+                    .connect_timeout(config.connect_timeout),
+            );
 
-        if let Some(ref auth) = config.auth {
-            pool_config_builder = pool_config_builder.auth(auth.clone());
-        }
-
-        #[cfg(feature = "socks5")]
-        if let Some(ref proxy) = config.proxy {
-            pool_config_builder = pool_config_builder.proxy(proxy.clone());
-        }
-
-        let mut pool_config = pool_config_builder.build()?;
-        pool_config.init_tls().await?;
-
-        // Every client builds its pool through `TransportConfig::build_pool`,
-        // which applies the pool-level settings and starts the background
-        // tasks (idle eviction, OAUTHBEARER refresh, KIP-1288 TLS reload).
-        // Routing all construction sites through one function is what stops
-        // them drifting apart again.
-        let pool = config.transport.build_pool(pool_config);
-
-        let bootstrap_servers = crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
-
-        let metadata = Arc::new({
-            let mut meta =
-                ClusterMetadata::new(bootstrap_servers, pool.clone(), config.metadata_max_age)
-                    .with_recovery_strategy(config.metadata_recovery_strategy)
-                    .with_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger);
-            if let Some(ttl) = config.metadata_topic_cache_ttl {
-                meta = meta.with_topic_cache_ttl(ttl);
-            } else {
-                meta = meta.with_topic_cache_ttl_disabled();
+            if let Some(ref auth) = config.auth {
+                pool_config_builder = pool_config_builder.auth(auth.clone());
             }
-            meta
-        });
 
-        metadata.refresh().await?;
+            #[cfg(feature = "socks5")]
+            if let Some(ref proxy) = config.proxy {
+                pool_config_builder = pool_config_builder.proxy(proxy.clone());
+            }
+
+            let mut pool_config = pool_config_builder.build()?;
+            pool_config.init_tls().await?;
+
+            // Every client builds its pool through `TransportConfig::build_pool`,
+            // which applies the pool-level settings and starts the background
+            // tasks (idle eviction, OAUTHBEARER refresh, KIP-1288 TLS reload).
+            // Routing all construction sites through one function is what stops
+            // them drifting apart again.
+            let pool = config.transport.build_pool(pool_config);
+
+            let bootstrap_servers =
+                crate::util::parse_bootstrap_servers(&config.bootstrap_servers)?;
+
+            let metadata = Arc::new({
+                let mut meta =
+                    ClusterMetadata::new(bootstrap_servers, pool.clone(), config.metadata_max_age)
+                        .with_recovery_strategy(config.metadata_recovery_strategy)
+                        .with_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger);
+                if let Some(ttl) = config.metadata_topic_cache_ttl {
+                    meta = meta.with_topic_cache_ttl(ttl);
+                } else {
+                    meta = meta.with_topic_cache_ttl_disabled();
+                }
+                meta
+            });
+
+            metadata.refresh().await?;
+            (pool, metadata)
+        };
 
         info!(
             "ShareConsumer initialized with {} brokers, group_id='{}'",
@@ -677,6 +692,7 @@ impl ShareConsumer {
             config,
             metadata,
             pool,
+            pool_owned,
             metrics: Arc::new(crate::metrics::ConsumerMetrics::new()),
             subscriptions: RwLock::new(HashSet::new()),
             assignments: RwLock::new(HashMap::new()),
@@ -1876,12 +1892,38 @@ impl ShareConsumer {
         self.0.assignments.write().await.clear();
         self.clear_partition_state().await;
 
-        self.0.pool.close_all().await;
+        // A pool borrowed from a `KrafkaClient` belongs to that client; closing
+        // it here would tear down every sibling client's connections.
+        if self.0.pool_owned {
+            self.0.pool.close_all().await;
+        }
 
-        info!("ShareConsumer closed (group '{}')", self.0.config.group_id);
+        info!(
+            "ShareConsumer closed (group '{}', pool {})",
+            self.0.config.group_id,
+            if self.0.pool_owned {
+                "torn down"
+            } else {
+                "shared, left open"
+            }
+        );
 
         commit_result?;
         leave_result
+    }
+
+    /// Whether this client owns its connection pool.
+    ///
+    /// `false` when the pool was borrowed from a
+    /// [`KrafkaClient`](crate::client::KrafkaClient) via
+    /// [`with_client`](ShareConsumerBuilder::with_client). In that case
+    /// [`close`](Self::close) leaves the connections untouched — closing them
+    /// would tear down every sibling client on that `KrafkaClient` and fail
+    /// their in-flight requests.
+    #[inline]
+    #[must_use]
+    pub fn owns_pool(&self) -> bool {
+        self.0.pool_owned
     }
 
     /// Returns true if the consumer has been closed.
@@ -1953,11 +1995,18 @@ impl ShareConsumer {
         self.0.assignments.write().await.clear();
         self.clear_partition_state().await;
 
-        self.0.pool.close_all().await;
+        if self.0.pool_owned {
+            self.0.pool.close_all().await;
+        }
 
         info!(
-            "ShareConsumer closed with timeout (group '{}')",
-            self.0.config.group_id
+            "ShareConsumer closed with timeout (group '{}', pool {})",
+            self.0.config.group_id,
+            if self.0.pool_owned {
+                "torn down"
+            } else {
+                "shared, left open"
+            }
         );
 
         commit_result?;
@@ -2943,9 +2992,28 @@ impl ShareConsumer {
 #[must_use = "builders do nothing until .build() is called"]
 pub struct ShareConsumerBuilder {
     config: ShareConsumerConfig,
+    /// Pre-built pool and metadata from a [`KrafkaClient`](crate::client::KrafkaClient).
+    shared: Option<(Arc<ConnectionPool>, Arc<ClusterMetadata>)>,
 }
 
 impl ShareConsumerBuilder {
+    /// Share a [`KrafkaClient`](crate::client::KrafkaClient)'s connection pool
+    /// and metadata cache instead of creating a new one.
+    ///
+    /// When multiple clients run in the same process, build one
+    /// [`KrafkaClient`](crate::client::KrafkaClient) and pass it to each
+    /// builder: they then multiplex over the same TCP connections, reducing the
+    /// total connection count from `N × brokers` to `brokers`.
+    ///
+    /// With this set, `bootstrap_servers` is optional — the client was already
+    /// connected at `KrafkaClient::build` time — and
+    /// [`close`](ShareConsumer::close) leaves the shared pool open for its
+    /// owner.
+    pub fn with_client(mut self, client: &crate::client::KrafkaClient) -> Self {
+        self.shared = Some((client.pool().clone(), client.metadata().clone()));
+        self
+    }
+
     /// Set the bootstrap servers.
     pub fn bootstrap_servers(mut self, servers: impl Into<String>) -> Self {
         self.config.bootstrap_servers = servers.into();
@@ -3160,7 +3228,7 @@ impl ShareConsumerBuilder {
 
     /// Build the share consumer.
     pub async fn build(self) -> Result<ShareConsumer> {
-        if self.config.bootstrap_servers.is_empty() {
+        if self.shared.is_none() && self.config.bootstrap_servers.is_empty() {
             return Err(KrafkaError::config("bootstrap.servers is required"));
         }
         if self.config.group_id.is_empty() {
@@ -3186,7 +3254,7 @@ impl ShareConsumerBuilder {
                 self.config.max_poll_records,
             )));
         }
-        ShareConsumer::new(self.config).await
+        ShareConsumer::new(self.config, self.shared).await
     }
 }
 
@@ -3217,6 +3285,7 @@ mod tests {
             config,
             metadata,
             pool,
+            pool_owned: true,
             metrics: Arc::new(crate::metrics::ConsumerMetrics::new()),
             subscriptions: RwLock::new(HashSet::new()),
             assignments: RwLock::new(HashMap::new()),

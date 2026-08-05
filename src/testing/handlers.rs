@@ -20,7 +20,7 @@ use crate::error::{ErrorCode, Result};
 use crate::protocol::ApiKey;
 use crate::protocol::{Encode, KafkaString, TaggedField, TryEncode};
 
-use super::state::{ClusterState, CommittedOffset, GroupMember};
+use super::state::{ClusterState, CommittedOffset, GroupMember, TransactionState};
 use super::wire::*;
 
 /// The single API version the fake broker speaks for each supported API.
@@ -43,7 +43,11 @@ pub(crate) fn supported_versions() -> Vec<(ApiKey, i16)> {
         // v10 is the lowest Produce version carrying the KIP-951 leader hint,
         // which a client test needs to observe a failover without a metadata
         // refresh. It is flexible, hence the tagged-field handling in `wire`.
-        (ApiKey::Produce, 10),
+        // v12 is the lowest Produce version KIP-890 (TV2) accepts, and its
+        // request and response layouts are identical to v10's — the client
+        // uses one codec for v9–v12 in both directions — so serving it costs
+        // nothing and is what lets the fake broker negotiate TV2.
+        (ApiKey::Produce, 12),
         (ApiKey::Fetch, 11),
         (ApiKey::ListOffsets, 5),
         (ApiKey::FindCoordinator, 2),
@@ -57,6 +61,15 @@ pub(crate) fn supported_versions() -> Vec<(ApiKey, i16)> {
         // carrying the client-generated member ID (KIP-1082).
         (ApiKey::ConsumerGroupHeartbeat, 1),
         (ApiKey::InitProducerId, 1),
+        // Transactions. v0 for the two TV1-only APIs, because the client still
+        // speaks the non-flexible format there and there is less to get wrong.
+        // `EndTxn` and `TxnOffsetCommit` are served at v5: their request
+        // layouts are unchanged from v3, and v5 is the floor KIP-890 requires,
+        // so one codec covers both transaction versions.
+        (ApiKey::AddPartitionsToTxn, 0),
+        (ApiKey::AddOffsetsToTxn, 0),
+        (ApiKey::TxnOffsetCommit, 5),
+        (ApiKey::EndTxn, 5),
         (ApiKey::CreateTopics, 4),
         (ApiKey::DeleteTopics, 3),
         // KIP-932 share groups. v1 is the stable version; v2 (KIP-1206
@@ -103,6 +116,10 @@ pub(crate) fn dispatch(
         ApiKey::OffsetFetch => offset_fetch(body, node_id, state, out),
         ApiKey::ConsumerGroupHeartbeat => consumer_group_heartbeat(body, node_id, state, out),
         ApiKey::InitProducerId => init_producer_id(body, state, out),
+        ApiKey::AddPartitionsToTxn => add_partitions_to_txn(body, node_id, state, out),
+        ApiKey::AddOffsetsToTxn => add_offsets_to_txn(body, node_id, state, out),
+        ApiKey::TxnOffsetCommit => txn_offset_commit(body, node_id, state, out),
+        ApiKey::EndTxn => end_txn(body, api_version, node_id, state, out),
         ApiKey::CreateTopics => create_topics(body, node_id, state, out),
         ApiKey::DeleteTopics => delete_topics(body, node_id, state, out),
         ApiKey::ShareGroupHeartbeat => share_group_heartbeat(body, node_id, state, out),
@@ -613,14 +630,40 @@ fn produce(
                     )?;
                 }
                 Some(_) => {
+                    // A transactional write pins the partition's last stable
+                    // offset at the transaction's first record, so a
+                    // `read_committed` consumer cannot see it before the
+                    // commit marker lands. Under TV2 (KIP-890) this is also
+                    // how the partition joins the transaction at all — there
+                    // is no `AddPartitionsToTxn`.
+                    let txn_producer = req.transactional_id.as_ref().and_then(|id| {
+                        state
+                            .transactions
+                            .get(id)
+                            .map(|t| (id.clone(), t.producer_id))
+                    });
                     let (base_offset, log_start_offset) = match (
                         &partition.records,
                         state.partition_mut(&topic.name, partition.index),
                     ) {
-                        (Some(records), Some(p)) => (p.append(records), p.log_start_offset),
+                        (Some(records), Some(p)) => {
+                            if txn_producer.is_some() && p.pending_txn_first_offset.is_none() {
+                                p.pending_txn_first_offset = Some(p.next_offset);
+                            }
+                            (p.append(records), p.log_start_offset)
+                        }
                         (None, Some(p)) => (p.next_offset, p.log_start_offset),
                         _ => (-1, -1),
                     };
+                    if let Some((transactional_id, _)) = txn_producer
+                        && let Some(txn) = state.transactions.get_mut(&transactional_id)
+                    {
+                        txn.open = true;
+                        let entry = (topic.name.clone(), partition.index);
+                        if !txn.partitions.contains(&entry) {
+                            txn.partitions.push(entry);
+                        }
+                    }
                     write_produce_partition(
                         out,
                         partition.index,
@@ -814,18 +857,34 @@ fn fetch_inner(
                     None,
                 )?,
                 Some(p) => {
-                    let records = p.read_from(partition.fetch_offset);
+                    // `read_committed` (isolation_level 1) stops at the last
+                    // stable offset and reports the aborted transactions the
+                    // client must filter. `read_uncommitted` sees everything,
+                    // including records inside an open transaction.
+                    let read_committed = req.isolation_level == 1;
+                    let records = if read_committed {
+                        p.read_range(partition.fetch_offset, p.last_stable_offset())
+                    } else {
+                        p.read_from(partition.fetch_offset)
+                    };
                     let records = if corrupt {
                         corrupt_record_bytes(&records)
                     } else {
                         records
                     };
-                    write_fetch_partition(
+                    let aborted = if read_committed {
+                        p.aborted_transactions_from(partition.fetch_offset)
+                    } else {
+                        Vec::new()
+                    };
+                    write_fetch_partition_with_aborted(
                         out,
                         partition.partition,
                         ErrorCode::None,
                         p.next_offset,
+                        p.last_stable_offset(),
                         p.log_start_offset,
+                        &aborted,
                         Some(&records),
                     )?;
                 }
@@ -843,12 +902,43 @@ fn write_fetch_partition(
     log_start_offset: i64,
     records: Option<&Bytes>,
 ) -> Result<()> {
+    // With no transaction in flight the last stable offset *is* the high
+    // watermark, which is what every error path here reports.
+    write_fetch_partition_with_aborted(
+        out,
+        partition,
+        code,
+        high_watermark,
+        high_watermark,
+        log_start_offset,
+        &[],
+        records,
+    )
+}
+
+/// As [`write_fetch_partition`], but carrying a distinct last stable offset
+/// and the aborted-transaction list a `read_committed` fetch needs.
+#[allow(clippy::too_many_arguments)]
+fn write_fetch_partition_with_aborted(
+    out: &mut BytesMut,
+    partition: i32,
+    code: ErrorCode,
+    high_watermark: i64,
+    last_stable_offset: i64,
+    log_start_offset: i64,
+    aborted: &[(i64, i64)],
+    records: Option<&Bytes>,
+) -> Result<()> {
     out.put_i32(partition);
     write_error(out, code);
     out.put_i64(high_watermark);
-    out.put_i64(high_watermark); // last_stable_offset
+    out.put_i64(last_stable_offset);
     out.put_i64(log_start_offset);
-    write_array_len(out, 0)?; // aborted_transactions
+    write_array_len(out, aborted.len())?;
+    for (producer_id, first_offset) in aborted {
+        out.put_i64(*producer_id);
+        out.put_i64(*first_offset);
+    }
     out.put_i32(-1); // preferred_read_replica
     write_nullable_bytes(out, records)?;
     Ok(())
@@ -1655,14 +1745,388 @@ fn offset_fetch(
 // ---------------------------------------------------------------------------
 
 fn init_producer_id(body: &mut Bytes, state: &mut ClusterState, out: &mut BytesMut) -> Result<()> {
-    let _ = InitProducerIdReq::read(body)?;
-    let (producer_id, producer_epoch) = state.allocate_producer_id();
+    let req = InitProducerIdReq::read(body)?;
+
+    let (producer_id, producer_epoch) = match req.transactional_id {
+        // A plain idempotent producer gets a fresh identity every time: there
+        // is nothing to fence, because nothing persists across sessions.
+        None => state.allocate_producer_id(),
+        // A transactional producer gets its **existing** producer ID back with
+        // a higher epoch. That is the whole of KIP-360 zombie fencing: the
+        // previous incarnation keeps writing with the old epoch and every one
+        // of its requests is now rejected. Minting a fresh ID instead — which
+        // this handler used to do — fences nothing, and a test written against
+        // it would pass with the fencing removed from the client.
+        Some(transactional_id) => {
+            let next_id = state.next_producer_id;
+            let txn = state
+                .transactions
+                .entry(transactional_id)
+                .or_insert_with(|| TransactionState {
+                    producer_id: next_id,
+                    producer_epoch: -1,
+                    ..TransactionState::default()
+                });
+            if txn.producer_id == next_id {
+                state.next_producer_id += 1;
+            }
+            txn.producer_epoch = txn.producer_epoch.saturating_add(1);
+            // A transaction left open by the previous incarnation is abandoned,
+            // as a real coordinator does before handing out the new epoch.
+            txn.open = false;
+            txn.partitions.clear();
+            txn.staged_offsets.clear();
+            (txn.producer_id, txn.producer_epoch)
+        }
+    };
 
     out.put_i32(0); // throttle_time_ms
     write_error(out, ErrorCode::None);
     out.put_i64(producer_id);
     out.put_i16(producer_epoch);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Transactions (KIP-98, KIP-360, KIP-447, KIP-890)
+// ---------------------------------------------------------------------------
+
+/// Reject a transactional request that is misrouted or carries a stale
+/// identity.
+///
+/// Two independent rejections, in the order a real coordinator applies them:
+///
+/// 1. **Misrouted** — the request reached a broker that does not coordinate
+///    this transactional ID, so the client must re-discover the coordinator.
+/// 2. **Fenced** — the producer ID or epoch is not the one this coordinator
+///    last handed out. A newer epoch exists, so this producer is a zombie and
+///    every write it attempts must fail. Returning `INVALID_PRODUCER_EPOCH`
+///    here is what makes the client's fatal-error latch reachable without a
+///    second live producer.
+fn txn_check(
+    state: &ClusterState,
+    transactional_id: &str,
+    producer_id: i64,
+    producer_epoch: i16,
+    node_id: i32,
+) -> Option<ErrorCode> {
+    let coordinator = state.txn_coordinator(transactional_id);
+    if coordinator != node_id {
+        return Some(
+            if state.broker(coordinator).map(|b| b.online) == Some(true) {
+                ErrorCode::NotCoordinator
+            } else {
+                ErrorCode::CoordinatorNotAvailable
+            },
+        );
+    }
+    match state.transactions.get(transactional_id) {
+        None => Some(ErrorCode::InvalidProducerIdMapping),
+        Some(txn) if txn.producer_id != producer_id => Some(ErrorCode::InvalidProducerIdMapping),
+        Some(txn) if txn.producer_epoch != producer_epoch => Some(ErrorCode::InvalidProducerEpoch),
+        Some(_) => None,
+    }
+}
+
+/// Serve `AddPartitionsToTxn` v0 — TV1 only.
+///
+/// Under TV2 the client never sends this, and a test can prove that by
+/// asserting the request count is zero after a transaction.
+fn add_partitions_to_txn(
+    body: &mut Bytes,
+    node_id: i32,
+    state: &mut ClusterState,
+    out: &mut BytesMut,
+) -> Result<()> {
+    let req = AddPartitionsToTxnReq::read(body)?;
+    let rejection = txn_check(
+        state,
+        &req.transactional_id,
+        req.producer_id,
+        req.producer_epoch,
+        node_id,
+    );
+
+    if rejection.is_none()
+        && let Some(txn) = state.transactions.get_mut(&req.transactional_id)
+    {
+        txn.open = true;
+        for entry in &req.partitions {
+            if !txn.partitions.contains(entry) {
+                txn.partitions.push(entry.clone());
+            }
+        }
+    }
+
+    // Response v0: throttle_time_ms, then results grouped by topic.
+    let mut by_topic: Vec<(String, Vec<i32>)> = Vec::new();
+    for (topic, partition) in &req.partitions {
+        match by_topic.iter_mut().find(|(name, _)| name == topic) {
+            Some((_, partitions)) => partitions.push(*partition),
+            None => by_topic.push((topic.clone(), vec![*partition])),
+        }
+    }
+
+    out.put_i32(0); // throttle_time_ms
+    write_array_len(out, by_topic.len())?;
+    for (topic, partitions) in &by_topic {
+        write_string(out, topic)?;
+        write_array_len(out, partitions.len())?;
+        for partition in partitions {
+            out.put_i32(*partition);
+            write_error(out, rejection.unwrap_or(ErrorCode::None));
+        }
+    }
+    Ok(())
+}
+
+/// Serve `AddOffsetsToTxn` v0 — TV1 only.
+fn add_offsets_to_txn(
+    body: &mut Bytes,
+    node_id: i32,
+    state: &mut ClusterState,
+    out: &mut BytesMut,
+) -> Result<()> {
+    let req = AddOffsetsToTxnReq::read(body)?;
+    let rejection = txn_check(
+        state,
+        &req.transactional_id,
+        req.producer_id,
+        req.producer_epoch,
+        node_id,
+    );
+
+    if rejection.is_none()
+        && let Some(txn) = state.transactions.get_mut(&req.transactional_id)
+    {
+        txn.open = true;
+        txn.staged_offsets.entry(req.group_id).or_default();
+    }
+
+    out.put_i32(0); // throttle_time_ms
+    write_error(out, rejection.unwrap_or(ErrorCode::None));
+    Ok(())
+}
+
+/// Serve `TxnOffsetCommit` v3–v5.
+///
+/// The offsets are **staged**, not committed: they become visible to
+/// `OffsetFetch` only when `EndTxn(commit)` applies them. An aborted
+/// transaction must leave the group's committed offsets exactly as it found
+/// them — which is the half of exactly-once a produce-only test never reaches.
+fn txn_offset_commit(
+    body: &mut Bytes,
+    node_id: i32,
+    state: &mut ClusterState,
+    out: &mut BytesMut,
+) -> Result<()> {
+    let req = TxnOffsetCommitReq::read(body)?;
+
+    // Routed to the **group** coordinator, not the transaction coordinator.
+    let rejection = coordinator_check(state, &req.group_id, node_id).or_else(|| {
+        match state.transactions.get(&req.transactional_id) {
+            None => Some(ErrorCode::InvalidProducerIdMapping),
+            Some(txn) if txn.producer_id != req.producer_id => {
+                Some(ErrorCode::InvalidProducerIdMapping)
+            }
+            Some(txn) if txn.producer_epoch != req.producer_epoch => {
+                Some(ErrorCode::InvalidProducerEpoch)
+            }
+            // KIP-447: a committer whose group generation is stale, or whose
+            // member ID the group no longer knows, has been rebalanced out.
+            // Its offsets would resurrect a position the new owner has already
+            // moved past, so both halves of the fencing triple are checked —
+            // a coordinator that reads only the generation lets a member
+            // evicted within one generation keep committing.
+            Some(_) => state.groups.get(&req.group_id).and_then(|group| {
+                if req.generation_id >= 0 && group.generation_id != req.generation_id {
+                    Some(ErrorCode::IllegalGeneration)
+                } else if !req.member_id.is_empty()
+                    && !group.members.is_empty()
+                    && !group.members.iter().any(|m| {
+                        m.member_id == req.member_id
+                            || (req.group_instance_id.is_some()
+                                && m.group_instance_id == req.group_instance_id)
+                    })
+                {
+                    Some(ErrorCode::UnknownMemberId)
+                } else {
+                    None
+                }
+            }),
+        }
+    });
+
+    if rejection.is_none()
+        && let Some(txn) = state.transactions.get_mut(&req.transactional_id)
+    {
+        txn.open = true;
+        let staged = txn.staged_offsets.entry(req.group_id.clone()).or_default();
+        for offset in &req.offsets {
+            staged.insert(
+                (offset.topic.clone(), offset.partition),
+                CommittedOffset {
+                    offset: offset.committed_offset,
+                    leader_epoch: offset.committed_leader_epoch,
+                    metadata: offset.metadata.clone(),
+                },
+            );
+        }
+    }
+
+    // Response v3+: flexible, results grouped by topic.
+    let mut by_topic: Vec<(String, Vec<i32>)> = Vec::new();
+    for offset in &req.offsets {
+        match by_topic.iter_mut().find(|(name, _)| *name == offset.topic) {
+            Some((_, partitions)) => partitions.push(offset.partition),
+            None => by_topic.push((offset.topic.clone(), vec![offset.partition])),
+        }
+    }
+
+    out.put_i32(0); // throttle_time_ms
+    write_compact_array_len(out, by_topic.len())?;
+    for (topic, partitions) in &by_topic {
+        KafkaString::new(topic).try_encode_compact(out)?;
+        write_compact_array_len(out, partitions.len())?;
+        for partition in partitions {
+            out.put_i32(*partition);
+            write_error(out, rejection.unwrap_or(ErrorCode::None));
+            write_empty_tagged_fields(out)?;
+        }
+        write_empty_tagged_fields(out)?;
+    }
+    write_empty_tagged_fields(out)
+}
+
+/// Serve `EndTxn` v3–v5: write the markers and settle the transaction.
+///
+/// Committing does three things, and a broker that skips any of them makes a
+/// green test meaningless:
+///
+/// 1. Appends a **commit control batch** to every partition in the
+///    transaction. The client uses it to clear its aborted-producer set, so
+///    without it a later transaction from the same producer is filtered out.
+/// 2. Releases the last stable offset, making the records visible to a
+///    `read_committed` consumer.
+/// 3. Applies the staged offsets to the consumer group.
+///
+/// Aborting appends an **abort control batch**, records the aborted range so
+/// the next `read_committed` fetch reports it, and discards the staged
+/// offsets.
+///
+/// Under TV2 (KIP-890) the response carries a bumped producer epoch, which the
+/// client adopts for the next transaction. That is emitted whenever the
+/// negotiated version is v5, which is exactly when the client asks for it.
+fn end_txn(
+    body: &mut Bytes,
+    api_version: i16,
+    node_id: i32,
+    state: &mut ClusterState,
+    out: &mut BytesMut,
+) -> Result<()> {
+    let req = EndTxnReq::read(body)?;
+    let rejection = txn_check(
+        state,
+        &req.transactional_id,
+        req.producer_id,
+        req.producer_epoch,
+        node_id,
+    );
+
+    let mut producer_id = req.producer_id;
+    let mut producer_epoch = req.producer_epoch;
+
+    if rejection.is_none() {
+        let Some(txn) = state.transactions.get(&req.transactional_id) else {
+            unreachable!("txn_check returned None, so the transaction exists");
+        };
+        let partitions = txn.partitions.clone();
+        let staged = txn.staged_offsets.clone();
+        let pid = txn.producer_id;
+        let epoch = txn.producer_epoch;
+
+        for (topic, partition) in &partitions {
+            let Some(p) = state.partition_mut(topic, *partition) else {
+                continue;
+            };
+            let first_offset = p.pending_txn_first_offset.take();
+            let marker = control_batch(req.committed, pid, epoch);
+            let marker_offset = p.append(&marker);
+            if !req.committed
+                && let Some(first) = first_offset
+            {
+                p.aborted_transactions.push((pid, first, marker_offset));
+            }
+        }
+
+        if req.committed {
+            for (group_id, offsets) in staged {
+                let group = state.groups.entry(group_id).or_default();
+                for (key, value) in offsets {
+                    group.offsets.insert(key, value);
+                }
+            }
+        }
+
+        let Some(txn) = state.transactions.get_mut(&req.transactional_id) else {
+            unreachable!("the transaction was present a moment ago");
+        };
+        txn.open = false;
+        txn.partitions.clear();
+        txn.staged_offsets.clear();
+        // KIP-890 bumps the epoch at every completion, which is what lets the
+        // coordinator tell a retried `EndTxn` from a new transaction.
+        if api_version >= 5 {
+            txn.producer_epoch = txn.producer_epoch.saturating_add(1);
+        }
+        producer_id = txn.producer_id;
+        producer_epoch = txn.producer_epoch;
+    }
+
+    out.put_i32(0); // throttle_time_ms
+    write_error(out, rejection.unwrap_or(ErrorCode::None));
+    if api_version >= 5 {
+        out.put_i64(producer_id);
+        out.put_i16(producer_epoch);
+    }
+    write_empty_tagged_fields(out)
+}
+
+/// Build a transaction commit or abort marker.
+///
+/// A control batch is a normal v2 record batch with the control bit set and
+/// one record whose key is `(version: i16, type: i16)` — `0` abort, `1`
+/// commit. The client reads the control bit to skip the batch and to clear the
+/// producer from its aborted set, so the marker has to be a *real* batch that
+/// decodes, not a placeholder.
+fn control_batch(committed: bool, producer_id: i64, producer_epoch: i16) -> Bytes {
+    use crate::protocol::{Record, RecordBatch};
+
+    let mut key = BytesMut::with_capacity(4);
+    key.put_i16(0); // control-record format version
+    key.put_i16(if committed { 1 } else { 0 });
+
+    let mut batch = RecordBatch::new();
+    batch.attributes.is_transactional = true;
+    batch.attributes.is_control_batch = true;
+    batch.producer_id = producer_id;
+    batch.producer_epoch = producer_epoch;
+    batch.base_sequence = 0;
+    batch.last_offset_delta = 0;
+    batch.add_record(Record {
+        attributes: 0,
+        timestamp_delta: 0,
+        offset_delta: 0,
+        key: Some(key.freeze()),
+        value: Some(Bytes::new()),
+        headers: Vec::new(),
+    });
+
+    // Encoding a single-record batch with no compression cannot fail; falling
+    // back to an empty marker would silently produce a partition whose
+    // transaction never completes, so the panic-free path returns something
+    // the test will notice instead.
+    batch.encode().unwrap_or_else(|_| Bytes::new())
 }
 
 // ---------------------------------------------------------------------------

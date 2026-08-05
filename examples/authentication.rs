@@ -52,16 +52,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Example 5: SASL/SCRAM-SHA-256
     println!("5. SASL/SCRAM-SHA-256 Authentication");
     let config = AuthConfig::sasl_scram_sha256("username", "password");
-    println!("   Security: SASL_PLAINTEXT");
+    println!("   Security: {}", config.security_protocol());
     println!("   Mechanism: {:?}", config.sasl_mechanism());
     println!("   Use case: Secure challenge-response auth (stronger than PLAIN)\n");
 
-    // Example 6: SASL/SCRAM-SHA-512
-    println!("6. SASL/SCRAM-SHA-512 Authentication");
-    let config = AuthConfig::sasl_scram_sha512("username", "password");
-    println!("   Security: SASL_PLAINTEXT");
+    // Example 6: SASL_SSL + SCRAM-SHA-512
+    //
+    // This is the default secured listener on Redpanda Cloud, Aiven,
+    // Instaclustr and most Strimzi installs. Two equivalent spellings:
+    println!("6. SASL_SSL + SCRAM-SHA-512 Authentication");
+    let config = AuthConfig::sasl_scram_sha512_ssl("username", "password", TlsConfig::new());
+    println!("   Security: {}", config.security_protocol());
     println!("   Mechanism: {:?}", config.sasl_mechanism());
-    println!("   Use case: Maximum security SCRAM authentication\n");
+
+    // ...or build the TLS configuration separately and compose it on. Every
+    // mechanism composes the same way, so this form never runs out of
+    // constructors.
+    let config = AuthConfig::sasl_scram_sha512("username", "password")
+        .with_tls(TlsConfig::new().with_ca_cert("/etc/kafka/ca.pem"));
+    println!("   Security (with_tls): {}", config.security_protocol());
+    println!("   Requires TLS: {}", config.requires_tls());
+    println!("   Use case: Managed Kafka with a private CA\n");
 
     // Example 7: AWS MSK IAM Authentication
     println!("7. AWS MSK IAM Authentication");
@@ -83,8 +94,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Method B: Explicit credentials (for development only)
-    println!("   Method B: Explicit credentials (development only)");
+    // Method B: Keys from the environment, region from your own config.
+    //
+    // Never rebuild the credential through `new` to change one field: the
+    // secret and session token are deliberately unreadable, so rebuilding
+    // drops the token and every assumed-role / instance-profile / EKS
+    // web-identity deployment fails SigV4 at connect time.
+    println!("   Method B: Region from configuration, keys from the environment");
+    match AwsMskIamCredentials::from_env_with_region("eu-central-1") {
+        Ok(creds) => println!(
+            "   Region: {}, temporary credentials: {}",
+            creds.region(),
+            creds.has_session_token()
+        ),
+        Err(e) => println!("   Not available: {}", e),
+    }
+
+    // Method C: Explicit credentials (for development only)
+    println!("   Method C: Explicit credentials (development only)");
     let config = AuthConfig::aws_msk_iam(
         "AKIAIOSFODNN7EXAMPLE",
         "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",

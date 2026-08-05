@@ -20,7 +20,7 @@ socket, so the client under test is the actual `Producer`, `Consumer` or
 
 ```toml
 [dev-dependencies]
-krafka = { version = "0.15", features = ["test-broker"] }
+krafka = { version = "0.16", features = ["test-broker"] }
 ```
 
 ## A first test
@@ -100,6 +100,75 @@ broker.set_broker_online(1, false);
 `set_txn_coordinator` does the same for a transactional ID, and `with_state`
 gives direct access for anything not covered by a named setter.
 
+## Transactions and exactly-once
+
+The broker implements the full transactional path — `InitProducerId` with
+KIP-360 fencing, `AddPartitionsToTxn`, `AddOffsetsToTxn`, `TxnOffsetCommit`,
+`EndTxn`, real commit and abort control batches, and `read_committed`
+isolation. A complete consume-transform-produce cycle runs in-process:
+
+```rust
+use krafka::consumer::IsolationLevel;
+use krafka::producer::TransactionalProducer;
+use krafka::testing::FakeBroker;
+
+let broker = FakeBroker::start().await?;
+broker.create_topic("orders", 1);
+
+let producer = TransactionalProducer::builder()
+    .bootstrap_servers(broker.bootstrap_servers())
+    .transactional_id("checkout-0")
+    .build()
+    .await?;
+
+producer.init_transactions().await?;
+producer.begin_transaction()?;
+producer.send("orders", None, b"payload").await?;
+producer.flush().await?;
+
+// Until the commit lands, a read_committed consumer may not read past the
+// transaction's first record.
+assert_eq!(broker.last_stable_offset("orders", 0), Some(0));
+
+producer.commit_transaction().await?;
+```
+
+### Choosing the transaction protocol
+
+`set_transaction_version` finalizes the cluster's `transaction.version`
+feature. The client reads it out of `ApiVersions` and negotiates from it, so
+the protocol is chosen the same way a real cluster chooses it:
+
+| Level | Protocol | What the client does |
+|---|---|---|
+| `0` or `1` *(default)* | TV1 | Registers partitions with `AddPartitionsToTxn` and the offsets topic with `AddOffsetsToTxn` before writing |
+| `2` | TV2 (KIP-890) | Sends neither — `Produce` and `TxnOffsetCommit` carry the transactional ID, and `EndTxn` returns a bumped epoch |
+
+```rust
+broker.set_transaction_version(2);
+// ...run a transaction...
+assert_eq!(
+    broker.request_count(ApiKey::AddPartitionsToTxn), 0,
+    "TV2 exists to remove that round trip; a client that still sends it is wrong",
+);
+```
+
+### Inspecting transaction state
+
+```rust
+broker.transactional_producer("checkout-0");   // (producer_id, epoch)
+broker.transaction_is_open("checkout-0");      // is a transaction in flight?
+broker.last_stable_offset("orders", 0);        // the read_committed ceiling
+broker.aborted_transactions("orders", 0);      // (producer_id, first_offset) pairs
+broker.committed_offset("etl-group", "orders", 0);
+```
+
+`transactional_producer` is how you assert fencing: re-initialising the same
+transactional ID must return the **same** producer ID with a **higher** epoch,
+and under TV2 every completed transaction bumps it again. A broker that minted
+a fresh producer ID instead would fence nothing, and a test written against it
+would pass with the client's fencing deleted.
+
 ## Being an older broker
 
 `set_api_versions` overrides the range the broker advertises for one API. This
@@ -146,8 +215,18 @@ than no test because it trains people to re-run.
 ## What the broker implements
 
 The produce and fetch path, `ListOffsets`, `Metadata` v12 (topic UUIDs),
-`FindCoordinator`, `InitProducerId`, `CreateTopics`/`DeleteTopics`,
-`UpdateFeatures` with controller routing, and **both** group protocols:
+`FindCoordinator`, `CreateTopics`/`DeleteTopics`, `UpdateFeatures` with
+controller routing, the full transaction protocol, and **both** group
+protocols:
+
+- **Transactions** — `InitProducerId` with KIP-360 fencing (a stable producer
+  ID per transactional ID, epoch bumped on every re-initialisation),
+  `AddPartitionsToTxn` and `AddOffsetsToTxn` under TV1, `TxnOffsetCommit` with
+  KIP-447 generation-and-member fencing, and `EndTxn` writing real commit and
+  abort control batches. Offsets staged by a transaction are applied only on
+  commit. `read_committed` fetches stop at the last stable offset and report
+  aborted transactions, so the consumer's own filtering runs for real.
+  KIP-890's TV2 is selected by finalizing `transaction.version` — see above.
 
 - **Classic** — `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`,
   `OffsetCommit`, `OffsetFetch`.
@@ -184,6 +263,9 @@ are explicit:
   pass for the wrong reason.
 - **Multi-member classic rebalancing.** The classic protocol's coordinator side
   is modelled far more shallowly than KIP-848's.
+- **Transaction timeouts.** `transaction.timeout.ms` is accepted and ignored:
+  a transaction stays open until the client ends it. Tests must not be read as
+  validating coordinator-side timeout behaviour.
 - **Replication, retention, compaction and quotas.** There is one in-memory log
   per partition and no background machinery at all.
 - **Performance.** The fake broker is an excellent correctness harness and a

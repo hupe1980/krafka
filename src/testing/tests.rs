@@ -2633,3 +2633,481 @@ async fn share_consumer_poll_metrics_are_wired() {
 
     let _ = consumer.close().await;
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// Transactions (KIP-98, KIP-360, KIP-447, KIP-890)
+// ══════════════════════════════════════════════════════════════════════════
+//
+// These used to need Docker. The transactional paths — the two-phase commit,
+// epoch fencing, `read_committed` isolation, offsets that move only when the
+// transaction does — are the ones where a client bug costs data, and they were
+// the ones the in-process broker could not reach: it served `InitProducerId`
+// by minting a fresh producer ID and nothing else.
+//
+// Everything asserted below is client-observable. `transaction.version` is
+// finalized through the same `ApiVersions` feature a real cluster uses, so the
+// TV1/TV2 split is negotiated rather than injected.
+
+use crate::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
+use crate::producer::{TopicPartitionOffset, TransactionVersion, TransactionalProducer};
+
+async fn txn_producer_for(broker: &FakeBroker, transactional_id: &str) -> TransactionalProducer {
+    TransactionalProducer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .transactional_id(transactional_id)
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("transactional producer should connect")
+}
+
+/// A standalone consumer reading `topic` from the beginning at `isolation`.
+async fn reader_for(broker: &FakeBroker, topic: &str, isolation: IsolationLevel) -> Consumer {
+    let consumer = Consumer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .isolation_level(isolation)
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("consumer should connect");
+    consumer
+        .assign(topic, vec![0])
+        .await
+        .expect("manual assignment should succeed");
+    consumer
+}
+
+/// Poll until `deadline`, returning every record value seen.
+async fn drain(consumer: &Consumer, polls: usize) -> Vec<String> {
+    let mut values = Vec::new();
+    for _ in 0..polls {
+        if let Ok(records) = consumer.poll(Duration::from_millis(200)).await {
+            for record in records {
+                let value = record.value.as_deref().unwrap_or_default();
+                values.push(String::from_utf8_lossy(value).into_owned());
+            }
+        }
+    }
+    values
+}
+
+/// A committed transaction must be visible to a `read_committed` consumer.
+///
+/// Negative control: making `end_txn` skip the commit marker and the
+/// last-stable-offset release leaves the consumer with nothing, because the
+/// fetch stops at the pinned LSO.
+#[tokio::test]
+async fn committed_transaction_becomes_visible_to_read_committed() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("orders", 1);
+
+    let producer = txn_producer_for(&broker, "txn-visible").await;
+    producer.init_transactions().await.expect("init");
+    producer.begin_transaction().expect("begin");
+    let _ = producer
+        .send("orders", None, b"committed-1")
+        .await
+        .expect("send");
+
+    // Before the commit the record is written but not stable: a
+    // read_committed fetch must not be allowed past the transaction's first
+    // offset.
+    producer.flush().await.expect("flush");
+    assert_eq!(
+        broker.last_stable_offset("orders", 0),
+        Some(0),
+        "an open transaction must pin the last stable offset at its first record"
+    );
+    assert!(broker.transaction_is_open("txn-visible"));
+
+    producer.commit_transaction().await.expect("commit");
+    assert!(!broker.transaction_is_open("txn-visible"));
+
+    let consumer = reader_for(&broker, "orders", IsolationLevel::ReadCommitted).await;
+    let values = drain(&consumer, 6).await;
+    assert_eq!(
+        values,
+        vec!["committed-1".to_string()],
+        "a committed transaction must be delivered exactly once"
+    );
+
+    let _ = consumer.close().await;
+    producer.close().await;
+}
+
+/// An aborted transaction must be invisible to a `read_committed` consumer,
+/// and visible to a `read_uncommitted` one.
+///
+/// The two halves matter together: seeing nothing under `read_committed`
+/// proves filtering happened only if the records were actually written, which
+/// the `read_uncommitted` half establishes.
+#[tokio::test]
+async fn aborted_transaction_is_filtered_only_for_read_committed() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("orders", 1);
+
+    let producer = txn_producer_for(&broker, "txn-abort").await;
+    producer.init_transactions().await.expect("init");
+    producer.begin_transaction().expect("begin");
+    let _ = producer
+        .send("orders", None, b"doomed")
+        .await
+        .expect("send");
+    producer.abort_transaction().await.expect("abort");
+
+    let (producer_id, _) = broker
+        .transactional_producer("txn-abort")
+        .expect("the coordinator knows this transactional id");
+    assert_eq!(
+        broker.aborted_transactions("orders", 0),
+        vec![(producer_id, 0)],
+        "the abort must be recorded so a read_committed fetch can report it"
+    );
+
+    let committed = reader_for(&broker, "orders", IsolationLevel::ReadCommitted).await;
+    assert!(
+        drain(&committed, 6).await.is_empty(),
+        "read_committed must not surface records from an aborted transaction"
+    );
+    let _ = committed.close().await;
+
+    let uncommitted = reader_for(&broker, "orders", IsolationLevel::ReadUncommitted).await;
+    assert_eq!(
+        drain(&uncommitted, 6).await,
+        vec!["doomed".to_string()],
+        "the records were written — read_uncommitted proves the filtering above \
+         was filtering, not an empty log"
+    );
+    let _ = uncommitted.close().await;
+
+    producer.close().await;
+}
+
+/// A committed transaction must not filter the *next* one from the same
+/// producer.
+///
+/// The client clears a producer from its aborted set when it sees that
+/// producer's control batch. A broker that writes no marker leaves the
+/// producer flagged forever, so every later transaction silently disappears —
+/// a failure that only shows up on the second transaction.
+#[tokio::test]
+async fn an_abort_does_not_poison_the_next_transaction() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("orders", 1);
+
+    let producer = txn_producer_for(&broker, "txn-sequence").await;
+    producer.init_transactions().await.expect("init");
+
+    producer.begin_transaction().expect("begin 1");
+    let _ = producer
+        .send("orders", None, b"aborted")
+        .await
+        .expect("send");
+    producer.abort_transaction().await.expect("abort");
+
+    producer.begin_transaction().expect("begin 2");
+    let _ = producer
+        .send("orders", None, b"committed")
+        .await
+        .expect("send");
+    producer.commit_transaction().await.expect("commit");
+
+    let consumer = reader_for(&broker, "orders", IsolationLevel::ReadCommitted).await;
+    assert_eq!(
+        drain(&consumer, 8).await,
+        vec!["committed".to_string()],
+        "the second transaction must survive the first one's abort"
+    );
+
+    let _ = consumer.close().await;
+    producer.close().await;
+}
+
+/// Offsets sent to a transaction must move only when the transaction commits.
+///
+/// This is the consume-transform-produce guarantee: an aborted transaction
+/// must leave the group's committed position exactly where it was, or the
+/// records it read are lost.
+#[tokio::test]
+async fn transactional_offsets_move_only_on_commit() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("orders", 1);
+
+    let producer = txn_producer_for(&broker, "txn-offsets").await;
+    producer.init_transactions().await.expect("init");
+
+    // KIP-447 requires a fenceable committer: the client refuses to stage
+    // offsets carrying no generation, because such a commit could not be
+    // rejected if this producer were a zombie. A real consumer supplies its
+    // own metadata via `Consumer::group_metadata()`.
+    let group = crate::consumer::ConsumerGroupMetadata::new("etl-group", 7, "member-1", None);
+    let offsets = vec![TopicPartitionOffset::new("orders", 0, 42)];
+
+    // Aborted: the group must not move.
+    producer.begin_transaction().expect("begin 1");
+    let _ = producer.send("orders", None, b"x").await.expect("send");
+    producer
+        .send_offsets_to_transaction(&offsets, &group)
+        .await
+        .expect("stage offsets");
+    producer.abort_transaction().await.expect("abort");
+    assert_eq!(
+        broker.committed_offset("etl-group", "orders", 0),
+        None,
+        "an aborted transaction must not commit the offsets it staged"
+    );
+
+    // Committed: the group moves to the staged position.
+    producer.begin_transaction().expect("begin 2");
+    let _ = producer.send("orders", None, b"y").await.expect("send");
+    producer
+        .send_offsets_to_transaction(&offsets, &group)
+        .await
+        .expect("stage offsets");
+    producer.commit_transaction().await.expect("commit");
+    assert_eq!(
+        broker.committed_offset("etl-group", "orders", 0),
+        Some(42),
+        "a committed transaction must apply the offsets it staged"
+    );
+
+    producer.close().await;
+}
+
+/// Re-initialising a transactional ID must fence the previous incarnation
+/// (KIP-360).
+///
+/// The producer ID stays the same and the epoch rises; the old producer's
+/// writes are then rejected with a fatal error it cannot abort out of.
+#[tokio::test]
+async fn re_initialising_fences_the_previous_producer() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("orders", 1);
+
+    let zombie = txn_producer_for(&broker, "txn-fenced").await;
+    zombie.init_transactions().await.expect("init");
+    let (first_pid, first_epoch) = broker.transactional_producer("txn-fenced").unwrap();
+
+    let successor = txn_producer_for(&broker, "txn-fenced").await;
+    successor.init_transactions().await.expect("init");
+    let (second_pid, second_epoch) = broker.transactional_producer("txn-fenced").unwrap();
+
+    assert_eq!(
+        second_pid, first_pid,
+        "the producer ID is the fencing identity and must be stable"
+    );
+    assert!(
+        second_epoch > first_epoch,
+        "a new incarnation must get a higher epoch ({second_epoch} vs {first_epoch})"
+    );
+
+    // The zombie is now writing with a stale epoch. Its next transactional
+    // operation must fail fatally rather than silently interleaving.
+    zombie.begin_transaction().expect("begin");
+    let outcome = zombie.send("orders", None, b"zombie").await;
+    let outcome = match outcome {
+        Err(e) => Err(e),
+        // The send may be accepted into the accumulator; the commit is where
+        // the coordinator rejects the stale epoch.
+        Ok(_) => zombie.commit_transaction().await.map(|()| unreachable!()),
+    };
+    assert!(
+        outcome.is_err(),
+        "a fenced producer must not be able to complete a transaction"
+    );
+    assert_eq!(
+        zombie.state(),
+        crate::producer::TransactionState::FatalError,
+        "a fencing error is fatal: the producer must be recreated, not retried"
+    );
+
+    successor.close().await;
+}
+
+/// TV1 is the default, and it registers partitions explicitly.
+#[tokio::test]
+async fn tv1_registers_partitions_with_add_partitions_to_txn() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("orders", 1);
+
+    let producer = txn_producer_for(&broker, "txn-tv1").await;
+    producer.init_transactions().await.expect("init");
+    assert_eq!(
+        producer.transaction_version(),
+        TransactionVersion::V1,
+        "a cluster that has not finalized transaction.version is TV1"
+    );
+
+    producer.begin_transaction().expect("begin");
+    let _ = producer.send("orders", None, b"v1").await.expect("send");
+    producer.commit_transaction().await.expect("commit");
+
+    assert!(
+        broker.request_count(ApiKey::AddPartitionsToTxn) > 0,
+        "TV1 must register each partition with the coordinator before writing"
+    );
+
+    let consumer = reader_for(&broker, "orders", IsolationLevel::ReadCommitted).await;
+    assert_eq!(drain(&consumer, 6).await, vec!["v1".to_string()]);
+    let _ = consumer.close().await;
+    producer.close().await;
+}
+
+/// TV2 (KIP-890) must skip `AddPartitionsToTxn` entirely and still commit.
+///
+/// Eliminating that coordinator round trip per partition per transaction is
+/// the whole throughput point of TV2, so a client that sends it anyway is
+/// wrong even though the transaction still works. Asserting the count is zero
+/// is the only way to see that.
+#[tokio::test]
+async fn tv2_commits_without_add_partitions_to_txn() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("orders", 1);
+    broker.set_transaction_version(2);
+
+    let producer = txn_producer_for(&broker, "txn-tv2").await;
+    producer.init_transactions().await.expect("init");
+    assert_eq!(
+        producer.transaction_version(),
+        TransactionVersion::V2,
+        "a cluster finalizing transaction.version=2 must negotiate TV2"
+    );
+
+    let (_, epoch_before) = broker.transactional_producer("txn-tv2").unwrap();
+
+    producer.begin_transaction().expect("begin");
+    let _ = producer.send("orders", None, b"v2").await.expect("send");
+    producer.commit_transaction().await.expect("commit");
+
+    assert_eq!(
+        broker.request_count(ApiKey::AddPartitionsToTxn),
+        0,
+        "TV2 carries the transactional ID on Produce; the extra round trip must be gone"
+    );
+
+    let (_, epoch_after) = broker.transactional_producer("txn-tv2").unwrap();
+    assert!(
+        epoch_after > epoch_before,
+        "KIP-890 bumps the producer epoch at every transaction completion"
+    );
+
+    let consumer = reader_for(&broker, "orders", IsolationLevel::ReadCommitted).await;
+    assert_eq!(drain(&consumer, 6).await, vec!["v2".to_string()]);
+    let _ = consumer.close().await;
+    producer.close().await;
+}
+
+/// A transaction spanning two partitions must commit atomically.
+#[tokio::test]
+async fn a_multi_partition_transaction_commits_atomically() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("orders", 2);
+
+    let producer = txn_producer_for(&broker, "txn-multi").await;
+    producer.init_transactions().await.expect("init");
+    producer.begin_transaction().expect("begin");
+
+    for partition in 0..2 {
+        let record = crate::producer::ProducerRecord::new(
+            "orders",
+            bytes::Bytes::from(format!("p{partition}")),
+        )
+        .with_partition(partition);
+        let _ = producer.send_record(record).await.expect("send");
+    }
+    producer.flush().await.expect("flush");
+
+    for partition in 0..2 {
+        assert_eq!(
+            broker.last_stable_offset("orders", partition),
+            Some(0),
+            "every partition in the transaction must be pinned until the commit"
+        );
+    }
+
+    producer.commit_transaction().await.expect("commit");
+
+    for partition in 0..2 {
+        assert!(
+            broker.last_stable_offset("orders", partition) > Some(0),
+            "the commit must release every partition, not just the first"
+        );
+    }
+    producer.close().await;
+}
+
+/// An old abort must not filter a later committed transaction from the same
+/// producer, once the consumer has read past the abort marker.
+///
+/// The client activates an aborted-transaction entry as soon as it scans a
+/// batch at or past that entry's `first_offset`. A broker that reports every
+/// abort it has ever seen — regardless of the range being fetched — therefore
+/// re-flags the producer on a later fetch and silently drops its **committed**
+/// records. The bug is invisible on the first poll and appears on the second,
+/// which is exactly the shape that survives a casual test.
+///
+/// Negative control: making `aborted_transactions_from` return the whole list
+/// instead of the overlapping ones fails this.
+#[tokio::test]
+async fn an_old_abort_is_not_reported_to_a_consumer_that_has_read_past_it() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("orders", 1);
+
+    let producer = txn_producer_for(&broker, "txn-stale").await;
+    producer.init_transactions().await.expect("init");
+
+    producer.begin_transaction().expect("begin 1");
+    let _ = producer
+        .send("orders", None, b"aborted")
+        .await
+        .expect("send");
+    producer.abort_transaction().await.expect("abort");
+
+    producer.begin_transaction().expect("begin 2");
+    let _ = producer
+        .send("orders", None, b"committed")
+        .await
+        .expect("send");
+    producer.commit_transaction().await.expect("commit");
+
+    // Fetching from *after* the abort marker must see the committed record.
+    // The abort lives at offsets 0–1, so offset 2 is past it.
+    let marker_end = 2;
+    assert!(
+        broker
+            .aborted_transactions("orders", 0)
+            .iter()
+            .all(|(_, first)| *first < marker_end),
+        "the abort under test must lie below the fetch offset"
+    );
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .isolation_level(IsolationLevel::ReadCommitted)
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("consumer should connect");
+    consumer
+        .assign("orders", vec![0])
+        .await
+        .expect("manual assignment");
+    consumer
+        .seek("orders", 0, marker_end)
+        .await
+        .expect("seek past the abort marker");
+
+    assert_eq!(
+        drain(&consumer, 8).await,
+        vec!["committed".to_string()],
+        "a consumer that has read past an abort must still receive the \
+         committed transaction that follows it"
+    );
+
+    let _ = consumer.close().await;
+    producer.close().await;
+}

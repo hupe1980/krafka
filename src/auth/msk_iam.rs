@@ -531,12 +531,12 @@ mod tests {
 
     #[test]
     fn test_auth_payload_with_session_token() {
-        let creds = AwsMskIamCredentials::with_session_token(
+        let creds = AwsMskIamCredentials::new(
             "AKIAIOSFODNN7EXAMPLE",
             "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            "FwoGZXIvYXdzEBYaDNZSNzRZzDJiLuQ8l==",
             "us-east-1",
-        );
+        )
+        .with_session_token("FwoGZXIvYXdzEBYaDNZSNzRZzDJiLuQ8l==");
         let auth =
             MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com").unwrap();
         let payload = auth.create_auth_payload();
@@ -761,12 +761,12 @@ mod tests {
 
     #[test]
     fn test_msk_iam_debug_redacts_secrets() {
-        let creds = AwsMskIamCredentials::with_session_token(
+        let creds = AwsMskIamCredentials::new(
             "AKIAIOSFODNN7EXAMPLE",
             "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            "FwoGZXIvYXdzEBYaDNZSNzRZzDJiLuQ8l==",
             "us-east-1",
-        );
+        )
+        .with_session_token("FwoGZXIvYXdzEBYaDNZSNzRZzDJiLuQ8l==");
         let auth =
             MskIamAuthenticator::new(&creds, "broker.kafka.us-east-1.amazonaws.com").unwrap();
         let debug_output = format!("{:?}", auth);

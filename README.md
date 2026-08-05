@@ -41,13 +41,13 @@ silent gap raises a fatal error instead of reporting success.
 | | |
 |---|---|
 | **Clients** | Producer (batching, compression, idempotence, transactions) · Consumer (classic **and** KIP-848 server-side assignment with validated revoke-before-assign reconciliation) · `ShareConsumer` (KIP-932 at Kafka 4.2 parity, incl. KIP-1222 `Renew` and KIP-1206 `ShareAcquireMode`) · full `AdminClient` |
-| **Security** | rustls TLS/mTLS with **hot certificate reload** (KIP-1288) · SASL PLAIN, SCRAM-SHA-256/512, OAUTHBEARER · built-in OIDC provider for `client_credentials` (KIP-768) and RFC 7523 client assertions (KIP-1258), with no cryptography dependency added · AWS MSK IAM |
-| **Consistency** | Every client shares one configuration surface and one operational surface (`close`, `rebootstrap`, `update_seed_brokers`, `refresh_tls`, `metrics`) — asserted at compile time. One builder per client, with `build_config()` to validate without a broker and `build()` to validate and connect, both through the same validator |
-| **Tuning** | Per-codec compression levels (Gzip 0–9, Zstd through 22) validated against the selected codec at build time, so a level set on a codec that has none is rejected rather than ignored |
-| **Transport** | One `TransportConfig` on every builder: TCP keepalive, response ceiling, in-flight cap, idle eviction, file-descriptor cap · KIP-227 incremental fetch sessions · SOCKS5 |
-| **Observability** | Lock-free counters, gauges and latency histograms with bounded per-topic cardinality · Prometheus export · interceptors · OpenTelemetry semantic conventions |
+| **Security** | rustls TLS/mTLS with **hot certificate reload** (KIP-1288) · SASL PLAIN, SCRAM-SHA-256/512, OAUTHBEARER · built-in OIDC provider for `client_credentials` (KIP-768) and RFC 7523 client assertions (KIP-1258), with no cryptography dependency added · AWS MSK IAM · every mechanism composes with TLS through one `with_tls`, asserted reachable over both `SASL_PLAINTEXT` and `SASL_SSL` at compile time |
+| **Consistency** | Every client shares one configuration surface and one operational surface (`close`, `rebootstrap`, `update_seed_brokers`, `refresh_tls`, `metrics`) — asserted at compile time, builders included. One builder per client, with `build_config()` to validate without a broker and `build()` to validate and connect, both through the same validator. The transactional producer mirrors the plain one setter for setter, minus the two settings transactions fix (`acks`, `idempotent`) |
+| **Tuning** | Per-codec compression levels (Gzip 0–9, Zstd through 22) validated against the selected codec at build time, so a level set on a codec that has none is rejected rather than ignored — on both send paths and on the transactional producer |
+| **Transport** | One `TransportConfig` on every builder — pass the same instance to every client that shares a network path: TCP keepalive, response ceiling, in-flight cap, idle eviction, file-descriptor cap · KIP-227 incremental fetch sessions · SOCKS5 |
+| **Observability** | Lock-free counters, gauges and latency histograms with bounded per-topic cardinality · Prometheus export · producer interceptors and dead-letter queues on **both** producers and both send paths · OAUTHBEARER token-fetch counters and expiry gauge · OpenTelemetry semantic conventions |
 | **Hardening** | Secret zeroization · constant-time comparison (`subtle`) · decompression-bomb limits · decode-loop bounds · RFC 3986 path encoding on every outbound HTTP target · CI forbids any credential-bearing type from deriving `Debug` |
-| **Testing** | 2 400+ tests · 6 cargo-fuzz targets · proptest round-trips across the protocol layer · an in-process fake broker with fault injection, so client tests need no Docker |
+| **Testing** | 2 400+ tests · 6 cargo-fuzz targets · proptest round-trips across the protocol layer · an in-process fake broker with fault injection that serves the **full transaction protocol** — KIP-360 fencing, commit/abort markers, `read_committed` isolation, TV1 and KIP-890 TV2 — so even exactly-once tests need no Docker |
 
 > **Broker versions:** krafka requires **Apache Kafka 3.9+**; protocol versions below that baseline have been removed. Features needing a newer broker (KIP-848 consumer groups, KIP-932 share groups, KIP-1066 cordoned log dirs) say so where they are documented and fail with a clear `UnknownApiVersion` rather than silently degrading.
 
@@ -57,11 +57,11 @@ Add krafka to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-krafka = "0.15.0"
+krafka = "0.16.0"
 tokio = { version = "1", features = ["full"] }
 
 # For AWS MSK IAM authentication with full SDK support:
-# krafka = { version = "0.15.0", features = ["aws-msk"] }
+# krafka = { version = "0.16.0", features = ["aws-msk"] }
 ```
 
 ### Producer
@@ -192,12 +192,17 @@ use krafka::producer::Producer;
 use krafka::consumer::Consumer;
 use krafka::AdminClient;
 
-// Producer with SASL/SCRAM-SHA-256
+// Producer with SASL_SSL + SCRAM-SHA-512 (the usual managed-Kafka listener)
+use krafka::auth::{AuthConfig, TlsConfig};
 let producer = Producer::builder()
     .bootstrap_servers("broker:9093")
-    .sasl_scram_sha256("username", "password")
+    .auth(AuthConfig::sasl_scram_sha512_ssl("username", "password", TlsConfig::new()))
     .build()
     .await?;
+
+// Any mechanism composes with TLS through `with_tls`
+let auth = AuthConfig::sasl_scram_sha256("username", "password")
+    .with_tls(TlsConfig::new().with_ca_cert("/etc/kafka/ca.pem"));
 
 // Consumer with SASL/PLAIN
 let consumer = Consumer::builder()
@@ -215,7 +220,6 @@ let producer = Producer::builder()
     .await?;
 
 // Admin with AWS MSK IAM
-use krafka::auth::AuthConfig;
 let auth = AuthConfig::aws_msk_iam("access_key", "secret_key", "us-east-1");
 let admin = AdminClient::builder()
     .bootstrap_servers("broker:9094")
@@ -266,10 +270,10 @@ To select only what you need:
 # Option 1: enable only the codecs you need
 # `default-features = false` also drops the default `ring` TLS backend, so a
 # crypto backend must be named explicitly.
-krafka = { version = "0.15.0", default-features = false, features = ["lz4", "snappy", "ring"] }
+krafka = { version = "0.16.0", default-features = false, features = ["lz4", "snappy", "ring"] }
 
 # Option 2: enable all compression codecs, including zstd
-# krafka = { version = "0.15.0", features = ["compression-all"] }
+# krafka = { version = "0.16.0", features = ["compression-all"] }
 ```
 
 ### TLS crypto backend
@@ -279,7 +283,7 @@ default; `rustls-aws-lc-rs` selects aws-lc-rs instead, which is the better
 choice on AWS Graviton and in FIPS-oriented deployments:
 
 ```toml
-krafka = { version = "0.15.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
+krafka = { version = "0.16.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
 ```
 
 The two backends are **additive**, not mutually exclusive — a transitive
@@ -317,6 +321,15 @@ builder accepts a `TransportConfig`, offers a synchronous `build_config()`
 alongside the async `build()`, exposes `refresh_tls()`, and keeps metrics and
 version negotiation callable without an async context. Every line fails to
 compile if the method it names disappears.
+
+It also asserts two matrices that a per-client check could not see. Every
+`SaslMechanism` must be constructible under **both** `SASL_PLAINTEXT` and
+`SASL_SSL` from the public API alone — `SASL_SSL` + SCRAM, the default secured
+listener on most managed Kafka offerings, was unreachable from outside the crate
+because the `_ssl` constructors were a hand-maintained list and SCRAM was missing
+from it. And both producer builders must expose the same configuration surface —
+the transactional one was missing seventeen setters, including the
+`build_config()` this file already promised for every client.
 
 This replaced a Python parity script. krafka used to have two builders per
 client — 72 hand-maintained forwarding methods whose config half nothing outside
@@ -587,29 +600,83 @@ let admin = AdminClient::builder()
 
 It serves the produce/fetch path, both group protocols — classic and KIP-848
 with real revoke-before-assign reconciliation — KIP-932 share groups with the
-share-partition state machine, and KIP-584 feature administration. See the
-**[Testing guide](https://hupe1980.github.io/krafka/docs/testing/)** for what
-it does and, just as importantly, what it deliberately does not model.
+share-partition state machine, KIP-584 feature administration, and the full
+transaction protocol.
+
+Transactions are modelled end to end, which is what makes exactly-once testable
+without a cluster: `InitProducerId` returns a stable producer ID per
+transactional ID with an epoch that rises on every re-initialisation (KIP-360
+fencing), `EndTxn` writes real commit and abort control batches, offsets staged
+by `TxnOffsetCommit` apply only on commit, and a `read_committed` fetch stops at
+the last stable offset and reports aborted transactions so the consumer's own
+filtering runs for real. `set_transaction_version(2)` finalizes the
+`transaction.version` feature and the client negotiates KIP-890 TV2 from it —
+the same route a real cluster takes — so both protocols are reachable.
+
+```rust
+broker.set_transaction_version(2);
+// ...run a transaction through a TransactionalProducer...
+assert_eq!(broker.request_count(ApiKey::AddPartitionsToTxn), 0);
+```
+
+See the **[Testing guide](https://hupe1980.github.io/krafka/docs/testing/)** for
+what it does and, just as importantly, what it deliberately does not model.
 
 
-## ⬆️ Upgrading to 0.15
+## ⬆️ Upgrading to 0.16
 
-**Breaking:** `ProducerBatch` is removed. It was exported but called by nothing
-in the crate — the real batching is internal to the accumulator — and its
-`build()` produced a `RecordBatch` with no producer ID, epoch or sequence, so
-anything sent from it bypassed idempotence entirely. There is no replacement
-because there was never a working use: `Producer::send`/`send_record` batch for
-you.
+### Breaking
 
-**New:**
+- **`AwsMskIamCredentials::with_session_token` is now a builder method**, not a
+  four-argument constructor. Build with
+  `AwsMskIamCredentials::new(id, secret, region).with_session_token(token)`.
+  The old form fails to compile rather than changing meaning.
 
-- `Producer::builder().compression_level(Some(n))` — Gzip 0–9, Zstd through 22.
-  Rejected at build time for codecs that take no level rather than ignored.
-- `Consumer::wakeup()` — interrupt a `poll()` from another task, matching
-  `ShareConsumer::wakeup()`.
-- `Consumer::committed(&[(topic, partition)])` — read the group's committed
-  offsets from the coordinator.
-- `AdminClient::describe_streams_groups()` — KIP-1071 Streams group describe.
+### Fixed — three settings that silently did nothing
+
+- **`compression_level` was dropped on the batching path.** It applied only at
+  `linger = 0`, so the throughput-tuned configuration — and every
+  `TransactionalProducer`, which always batches — encoded at the codec's
+  default. Now applied on both paths and on both producers.
+- **`dead_letter_queue` was direct-send only.** Configuring a DLQ alongside any
+  batching silently disabled it. Now invoked on both paths, and on the
+  transactional producer.
+- **`close()` tore down a *shared* connection pool.** A `Producer`, `Consumer`
+  or `TransactionalProducer` built with `.with_client(..)` called `close_all()`
+  unconditionally, killing every sibling client's connections. Every client now
+  reports `owns_pool()` and leaves a borrowed pool to its `KrafkaClient`.
+  `SecureConnectionConfigBuilder::tls()` likewise lost its TLS configuration if
+  called before a SASL setter; order no longer matters.
+
+### New
+
+- **`AuthConfig::with_tls(TlsConfig)`** — every SASL mechanism composes with
+  TLS through one method. `SASL_SSL` + SCRAM, the default secured listener on
+  most managed Kafka offerings, was previously unreachable from outside the
+  crate. `sasl_scram_sha256_ssl` / `sasl_scram_sha512_ssl` added for symmetry;
+  `AuthConfig::from_env` gained `KAFKA_SSL_*` material and the `OAUTHBEARER`
+  and `AWS_MSK_IAM` mechanisms.
+- **`AwsMskIamCredentials::with_region` and `from_env_with_region`** — change
+  the region without losing the session token, and load keys from the
+  environment with the region from your own configuration.
+- **`TransactionalProducerBuilder` reaches parity with `ProducerBuilder`** —
+  `build_config()`, `compression_level`, `topic_compression`,
+  `delivery_timeout`, `dead_letter_queue`, `interceptor`/`add_interceptor`,
+  `state_store`, `with_client`, the metadata cache TTLs and
+  `sasl_oauthbearer_provider`. `acks` and `idempotent` stay excluded because
+  transactions fix both.
+- **`TransactionalProducer::flush()`** — so code generic over "a producer" need
+  not special-case which one it holds.
+- **`ShareConsumerBuilder::with_client`** — the one client that could not share
+  a `KrafkaClient`'s pool now can.
+- **OAUTHBEARER token-lifecycle metrics** — `oauth_token_fetches`,
+  `oauth_token_fetch_failures`, `oauth_token_fetch_latency` and
+  `oauth_token_expiry_epoch_ms` on `ConnectionMetrics`, plus a `WARN` on every
+  failed fetch. A misconfigured `token_endpoint` is no longer indistinguishable
+  from an unreachable broker.
+- **The fake broker serves the full transaction protocol** — KIP-360 fencing,
+  commit/abort control batches, `read_committed` isolation, TV1 and KIP-890
+  TV2. Exactly-once is now testable without Docker.
 
 ## 📚 Documentation
 

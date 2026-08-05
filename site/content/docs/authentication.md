@@ -51,10 +51,35 @@ use krafka::auth::{AuthConfig, SecurityProtocol};
 
 // Check what's configured
 let config = AuthConfig::sasl_scram_sha256("user", "pass");
-println!("Protocol: {}", config.security_protocol);
+println!("Protocol: {}", config.security_protocol());
 println!("Requires TLS: {}", config.requires_tls());
 println!("Requires SASL: {}", config.requires_sasl());
 ```
+
+### Adding TLS to any mechanism
+
+Every mechanism composes with TLS through one method, `with_tls`:
+
+| Before | After `with_tls(..)` |
+|---|---|
+| `PLAINTEXT` | `SSL` |
+| `SASL_PLAINTEXT` | `SASL_SSL` |
+| `SSL` / `SASL_SSL` | unchanged; the TLS settings are replaced |
+
+```rust
+use krafka::auth::{AuthConfig, TlsConfig};
+
+// SASL_SSL + SCRAM-SHA-512 — the default secured listener on Redpanda Cloud,
+// Aiven, Instaclustr and most Strimzi installs.
+let tls = TlsConfig::new().with_ca_cert("/etc/kafka/ca.pem");
+let config = AuthConfig::sasl_scram_sha512("username", "password").with_tls(tls);
+```
+
+Prefer this to the per-mechanism `_ssl` constructors when you build the TLS
+configuration separately — it is the same thing, and it cannot be missing for
+the mechanism you happen to need. `tests/builder_surface.rs` asserts that every
+`SaslMechanism` is constructible under both `SASL_PLAINTEXT` and `SASL_SSL`
+from the public API alone.
 
 ## SASL Authentication
 
@@ -78,9 +103,13 @@ let config = AuthConfig::sasl_plain_ssl("username", "password", TlsConfig::new()
 Challenge-response authentication with SHA-256 hashing. More secure than PLAIN.
 
 ```rust
-use krafka::auth::AuthConfig;
+use krafka::auth::{AuthConfig, TlsConfig};
 
+// Without TLS (development only!)
 let config = AuthConfig::sasl_scram_sha256("username", "password");
+
+// With TLS (recommended for production)
+let config = AuthConfig::sasl_scram_sha256_ssl("username", "password", TlsConfig::new());
 ```
 
 ### SASL/SCRAM-SHA-512
@@ -88,10 +117,18 @@ let config = AuthConfig::sasl_scram_sha256("username", "password");
 Maximum security SCRAM authentication with SHA-512 hashing.
 
 ```rust
-use krafka::auth::AuthConfig;
+use krafka::auth::{AuthConfig, TlsConfig};
 
+// Without TLS (development only!)
 let config = AuthConfig::sasl_scram_sha512("username", "password");
+
+// With TLS — this is what a managed Kafka offering almost always wants
+let config = AuthConfig::sasl_scram_sha512_ssl("username", "password", TlsConfig::new());
 ```
+
+Over TLS, SCRAM is additionally bound to the TLS session with
+`tls-server-end-point` channel binding (RFC 5929 §4.1) unless you turn it off
+with `with_scram_channel_binding(false)`.
 
 ### SCRAM Protocol Details
 
@@ -314,7 +351,7 @@ Enable the `oauth-oidc` feature and krafka fetches access tokens itself, instead
 of you writing the OAuth client:
 
 ```toml
-krafka = { version = "0.15.0", features = ["oauth-oidc"] }
+krafka = { version = "0.16.0", features = ["oauth-oidc"] }
 ```
 
 Two ways to authenticate to the token endpoint:
@@ -409,7 +446,7 @@ krafka's TLS is `rustls`, which needs a crypto backend. `ring` is the default;
 FIPS-oriented deployments:
 
 ```toml
-krafka = { version = "0.15.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
+krafka = { version = "0.16.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
 ```
 
 The two features are **additive**. Cargo features cannot be made mutually
@@ -458,7 +495,7 @@ By default, krafka uses compiled-in `webpki-roots`. To use the operating system 
 
 ```toml
 [dependencies]
-krafka = { version = "0.15.0", features = ["native-tls-roots"] }
+krafka = { version = "0.16.0", features = ["native-tls-roots"] }
 ```
 
 ```rust
@@ -569,6 +606,31 @@ Environment variables used:
 - `AWS_SESSION_TOKEN` - Optional (for temporary credentials)
 - `AWS_REGION` or `AWS_DEFAULT_REGION` - Required
 
+#### When the region comes from your own configuration
+
+If the keys live in the environment but the region comes from a config file or a
+secret manager, use `from_env_with_region`, which neither reads nor requires
+`AWS_REGION`:
+
+```rust
+use krafka::auth::{AuthConfig, AwsMskIamCredentials};
+
+let creds = AwsMskIamCredentials::from_env_with_region(configured_region)?;
+let config = AuthConfig::aws_msk_iam_with_credentials(creds);
+```
+
+To re-region a credential you already have, use `with_region`:
+
+```rust
+let creds = AwsMskIamCredentials::from_env()?.with_region("eu-central-1");
+```
+
+Do **not** rebuild the credential through `new` to change one field:
+`secret_access_key` and `session_token` are deliberately unreadable, so
+rebuilding silently drops the session token. Every deployment using an assumed
+role, an EC2/ECS instance profile or an EKS web identity then fails SigV4
+verification at connect time, with an error that never mentions the token.
+
 ### From AWS SDK Default Chain (Recommended for Production)
 
 For production deployments on EC2, ECS, Lambda, or EKS, use the AWS SDK default chain:
@@ -577,7 +639,7 @@ For production deployments on EC2, ECS, Lambda, or EKS, use the AWS SDK default 
 use krafka::auth::{AuthConfig, AwsMskIamCredentials};
 
 // Requires the `aws-msk` feature in Cargo.toml:
-// krafka = { version = "0.15.0", features = ["aws-msk"] }
+// krafka = { version = "0.16.0", features = ["aws-msk"] }
 
 // Loads from (in order):
 // 1. Environment variables
@@ -605,12 +667,12 @@ let config = AuthConfig::aws_msk_iam(
 // With temporary credentials (session token)
 use krafka::auth::AwsMskIamCredentials;
 
-let creds = AwsMskIamCredentials::with_session_token(
+let creds = AwsMskIamCredentials::new(
     "AKIAIOSFODNN7EXAMPLE",
     "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-    "session-token-here",
     "us-east-1",
-);
+)
+.with_session_token("session-token-here");
 ```
 
 ### Using SecureConnectionConfig with MSK IAM
@@ -733,12 +795,52 @@ let tls = TlsConfig::new().with_alpn_protocols(vec![b"kafka".to_vec()]);
 | `sasl_plain(user, pass)` | SASL_PLAINTEXT | PLAIN |
 | `sasl_plain_ssl(user, pass, tls)` | SASL_SSL | PLAIN |
 | `sasl_scram_sha256(user, pass)` | SASL_PLAINTEXT | SCRAM-SHA-256 |
+| `sasl_scram_sha256_ssl(user, pass, tls)` | SASL_SSL | SCRAM-SHA-256 |
 | `sasl_scram_sha512(user, pass)` | SASL_PLAINTEXT | SCRAM-SHA-512 |
+| `sasl_scram_sha512_ssl(user, pass, tls)` | SASL_SSL | SCRAM-SHA-512 |
 | `sasl_oauthbearer(token)` | SASL_PLAINTEXT | OAUTHBEARER |
 | `sasl_oauthbearer_ssl(token, tls)` | SASL_SSL | OAUTHBEARER |
 | `sasl_oauthbearer_token(OAuthBearerToken)` | SASL_PLAINTEXT | OAUTHBEARER |
 | `sasl_oauthbearer_token_ssl(OAuthBearerToken, tls)` | SASL_SSL | OAUTHBEARER |
+| `sasl_oauthbearer_provider(provider)` | SASL_PLAINTEXT | OAUTHBEARER |
+| `sasl_oauthbearer_provider_ssl(provider, tls)` | SASL_SSL | OAUTHBEARER |
 | `aws_msk_iam(key, secret, region)` | SASL_SSL | AWS_MSK_IAM |
+| `aws_msk_iam_with_credentials(creds)` | SASL_SSL | AWS_MSK_IAM |
+| `aws_msk_iam_provider(provider)` | SASL_SSL | AWS_MSK_IAM |
+
+Plus one method that applies to all of them:
+
+| Method | Effect |
+|--------|--------|
+| `with_tls(TlsConfig)` | `PLAINTEXT` → `SSL`, `SASL_PLAINTEXT` → `SASL_SSL`; already-encrypted configs keep their protocol and take the new TLS settings |
+
+The `_ssl` constructors are shorthand for `with_tls`. Reach for `with_tls` when
+you build the `TlsConfig` separately or when you want one code path that handles
+every mechanism.
+
+### From environment variables
+
+`AuthConfig::from_env` builds any of the above from the standard Kafka
+environment variables. It is a convenience for applications whose configuration
+*is* the environment; a library embedder resolving credentials from a secret
+manager should build the `AuthConfig` directly.
+
+| Variable | Values |
+|---|---|
+| `KAFKA_SECURITY_PROTOCOL` | `PLAINTEXT` (default), `SSL`, `SASL_PLAINTEXT`, `SASL_SSL` |
+| `KAFKA_SASL_MECHANISM` | `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`, `OAUTHBEARER`, `AWS_MSK_IAM` |
+| `KAFKA_SASL_USERNAME` / `KAFKA_SASL_PASSWORD` | required for `PLAIN` and both SCRAM mechanisms |
+| `KAFKA_SASL_OAUTHBEARER_TOKEN` | a JWT; required for `OAUTHBEARER` |
+| `KAFKA_SSL_CA_LOCATION` | CA bundle to pin (replaces the WebPKI roots) |
+| `KAFKA_SSL_CERTIFICATE_LOCATION` | client certificate for mTLS; requires the key too |
+| `KAFKA_SSL_KEY_LOCATION` | client private key for mTLS; requires the certificate too |
+| `KAFKA_SSL_SNI_HOSTNAME` | SNI override |
+
+`AWS_MSK_IAM` takes its credentials from `AwsMskIamCredentials::from_env()`.
+Setting only one half of the client-certificate pair is an error rather than a
+silently ignored setting. There is deliberately no environment variable that
+disables certificate verification — use `TlsConfig::insecure()` in code if you
+need that.
 
 ## Client Authentication
 

@@ -338,6 +338,83 @@ impl ProducerConfig {
     }
 }
 
+/// Validate a compression codec, its level and any per-topic overrides.
+///
+/// # Why this is shared
+///
+/// Both producers compress, so both need these rules — and
+/// [`TransactionalProducer`](crate::producer::TransactionalProducer) is the one
+/// that always batches, which is where a mis-set level costs the most CPU. The
+/// rules living in `ProducerConfig::validate` alone is how the transactional
+/// producer ended up with no `compression_level` setter at all: there was
+/// nowhere to validate one.
+///
+/// Three separate rules, each of which was a real silent failure:
+///
+/// 1. A codec whose Cargo feature is not enabled fails at build time, not on
+///    the first `send()`.
+/// 2. A level set alongside a codec that has none (Snappy, LZ4) is an error —
+///    an operator who sets it believes they tuned something.
+/// 3. Per-topic overrides are checked against the level too, so a level valid
+///    for the default codec cannot silently apply to a topic using another.
+pub(crate) fn validate_compression(
+    compression: Compression,
+    compression_level: Option<i32>,
+    topic_compression: &HashMap<String, Compression>,
+) -> Result<()> {
+    // Reject a compression codec that was not compiled in. This gives a clear
+    // build-time-equivalent error at producer construction rather than waiting
+    // until the first message is sent to discover the feature is missing.
+    if !compression.is_available() {
+        let feature = compression.required_feature().unwrap_or("unknown");
+        return Err(KrafkaError::config(format!(
+            "compression codec {compression:?} requires the `{feature}` Cargo feature; \
+             either enable the feature or choose a different compression codec"
+        )));
+    }
+
+    // Same check for per-topic compression overrides.
+    for (topic, codec) in topic_compression {
+        if !codec.is_available() {
+            let feature = codec.required_feature().unwrap_or("unknown");
+            return Err(KrafkaError::config(format!(
+                "per-topic compression codec {codec:?} for topic {topic:?} requires the \
+                 `{feature}` Cargo feature"
+            )));
+        }
+    }
+
+    // A compression level that the selected codec cannot use is a
+    // configuration error, not something to ignore: an operator who sets
+    // `compression_level(9)` alongside Snappy believes they tuned something.
+    let Some(level) = compression_level else {
+        return Ok(());
+    };
+    let mut codecs: Vec<(Option<&str>, Compression)> = vec![(None, compression)];
+    for (topic, codec) in topic_compression {
+        codecs.push((Some(topic.as_str()), *codec));
+    }
+    for (topic, codec) in codecs {
+        let where_ = topic.map_or_else(String::new, |t| format!(" (topic {t:?})"));
+        let Some(range) = codec.level_range().filter(|_| codec.supports_level()) else {
+            return Err(KrafkaError::config(format!(
+                "compression_level {level} was set but codec {codec:?}{where_} takes no \
+                 level; krafka encodes Snappy with `snap` and LZ4 with `lz4_flex`, neither \
+                 of which exposes one. Remove compression_level or select Gzip or Zstd"
+            )));
+        };
+        if !range.contains(&level) {
+            return Err(KrafkaError::config(format!(
+                "compression_level {level} is out of range for codec {codec:?}{where_}; \
+                 valid levels are {}..={}",
+                range.start(),
+                range.end()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Validate and normalise a [`ProducerConfig`].
 ///
 /// # Why this is a free function
@@ -412,53 +489,11 @@ pub(crate) fn validate(config: &mut ProducerConfig, has_shared_pool: bool) -> Re
              an infinite retry loop; set a finite delivery_timeout or reduce retries",
         ));
     }
-    // Reject a compression codec that was not compiled in. This gives a clear
-    // build-time-equivalent error at producer construction rather than waiting
-    // until the first message is sent to discover the feature is missing.
-    if !config.compression.is_available() {
-        let feature = config.compression.required_feature().unwrap_or("unknown");
-        return Err(KrafkaError::config(format!(
-            "compression codec {:?} requires the `{feature}` Cargo feature; \
-             either enable the feature or choose a different compression codec",
-            config.compression
-        )));
-    }
-    // A compression level that the selected codec cannot use is a
-    // configuration error, not something to ignore: an operator who sets
-    // `compression_level(9)` alongside Snappy believes they tuned something.
-    if let Some(level) = config.compression_level {
-        let mut codecs: Vec<(Option<&str>, Compression)> = vec![(None, config.compression)];
-        for (topic, codec) in &config.topic_compression {
-            codecs.push((Some(topic.as_str()), *codec));
-        }
-        for (topic, codec) in codecs {
-            let where_ = topic.map_or_else(String::new, |t| format!(" (topic {t:?})"));
-            let Some(range) = codec.level_range().filter(|_| codec.supports_level()) else {
-                return Err(KrafkaError::config(format!(
-                    "compression_level {level} was set but codec {codec:?}{where_} takes                      no level; krafka encodes Snappy with `snap` and LZ4 with `lz4_flex`,                      neither of which exposes one. Remove compression_level or select                      Gzip or Zstd"
-                )));
-            };
-            if !range.contains(&level) {
-                return Err(KrafkaError::config(format!(
-                    "compression_level {level} is out of range for codec {codec:?}{where_};                      valid levels are {}..={}",
-                    range.start(),
-                    range.end()
-                )));
-            }
-        }
-    }
-
-    // Same check for per-topic compression overrides.
-    for (topic, codec) in &config.topic_compression {
-        if !codec.is_available() {
-            let feature = codec.required_feature().unwrap_or("unknown");
-            return Err(KrafkaError::config(format!(
-                "per-topic compression codec {:?} for topic {topic:?} requires the \
-                 `{feature}` Cargo feature",
-                codec
-            )));
-        }
-    }
+    validate_compression(
+        config.compression,
+        config.compression_level,
+        &config.topic_compression,
+    )?;
     // Warn when delivery_timeout is shorter than a single full retry cycle.
     // In this case some retry attempts can never complete before the deadline,
     // causing premature delivery failures without exhausting all retries.
