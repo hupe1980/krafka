@@ -23,6 +23,28 @@ client now lives in [`schemreg`](https://crates.io/crates/schemreg), which also
 has native Apicurio support and real Avro / Protobuf / JSON codecs that krafka
 never had.
 
+### Testing
+
+- **`just mutants`** — scoped mutation testing over the invariant-dense modules
+  (sequence arithmetic, the in-flight barrier, varint codecs, fetch sessions).
+  Deliberately not part of `ci`: 8 200 mutants across the crate is roughly
+  45 CPU-hours, and the timing-based fake-broker tests turn many mutants into
+  timeouts rather than failures.
+
+  It found that **four separate corruptions of `is_newer_sequence` passed the
+  whole test suite**. That function decides whether a broker acknowledgement
+  moves `last_acked_sequence` forward, which feeds `can_reset_after_out_of_order`
+  and `reset_sequence`. Every existing test used `candidate == 0`, `last == 0`,
+  or values small enough that subtracting, adding and dividing all landed on the
+  same side of the half-sequence-space threshold — so the assertions held for
+  arithmetic that was wrong. Three new tests pin the forward branch, the wrap
+  branch and the exact-half-space boundary, chosen so each mutation flips the
+  answer rather than just an intermediate.
+
+  It also caught a missing assertion: `take_reinit_request` resets the producer
+  epoch alongside the ID, but `is_initialized()` only inspects the ID, so a
+  stale epoch was invisible to the test.
+
 ### Fixed
 
 - **A share-consumer `commit_sync()` or `close()` could strand

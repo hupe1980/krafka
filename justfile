@@ -163,6 +163,26 @@ site-check:
     python3 xtask/site_check.py
     python3 xtask/doc_api.py
 
+# Mutation-test the invariant-dense modules.
+#
+# Not part of `ci`: 8 200 mutants across the crate is roughly 45 CPU-hours, and
+# the timing-based fake-broker tests turn many mutants into timeouts rather than
+# failures. Scoped to pure, fast, high-consequence code — sequence arithmetic,
+# the in-flight barrier, varint codecs — where a surviving mutant means a real
+# assertion is missing.
+#
+# It has already earned its keep: four mutants of `is_newer_sequence` survived,
+# because every existing test used values where subtracting, adding and
+# dividing all landed on the same side of the threshold.
+[doc("Mutation-test the invariant-dense modules")]
+mutants *ARGS:
+    cargo mutants \
+        --file src/barrier.rs \
+        --file src/producer/idempotent.rs \
+        --file src/util.rs \
+        --file src/consumer/fetch_session.rs \
+        -j 4 --timeout 120 {{ARGS}} -- --all-features --lib
+
 # Compile the guide snippets marked ```rust,compile.
 #
 # `doc_api.py` checks that names resolve; it cannot check that a call has the
