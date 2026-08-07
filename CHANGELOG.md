@@ -90,6 +90,19 @@ consumer's offset accessors — see **Breaking** below before upgrading.
   same fix, which is also what stops those callers' futures hanging after the
   transaction is torn down.
 
+- **A commit could write the `EndTxn` marker while `send_offsets_to_transaction`
+  was still on the wire.** That call is the join between the consumer's position
+  and the producer's output — the whole point of consume-transform-produce is
+  that the two commit atomically — but it never registered with the producer's
+  in-flight barrier. A concurrent `commit_transaction()` therefore could not see
+  it: the commit found the barrier idle, flushed, and sent `EndTxn` while the
+  `TxnOffsetCommit` was still in flight, leaving the offsets **outside** the
+  transaction. The output records stayed atomic with each other but not with the
+  consumer's position, which is the one guarantee the API exists to provide.
+  `send_offsets_to_transaction` now takes a barrier guard before reading the
+  state, which makes the two orderings exhaustive: either the commit waits for
+  it, or it started after the commit transitioned and is refused.
+
 - **A commit marker could end a `read_committed` abort filter early.** The
   aborted-transaction filter deactivated a producer on **any** control batch,
   never reading the marker's type field (`0` = ABORT, `1` = COMMIT). Any

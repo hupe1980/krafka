@@ -3365,3 +3365,95 @@ async fn a_commit_stops_admitting_records_before_it_drains() {
 
     producer.close().await;
 }
+
+/// A commit must not write the `EndTxn` marker while `send_offsets_to_transaction`
+/// is still in flight.
+///
+/// `send_offsets_to_transaction` is the join between the consumer's position
+/// and the producer's output — the whole point of consume-transform-produce is
+/// that the two commit atomically. It did not register with the in-flight
+/// barrier, so a concurrent `commit_transaction()` could not see it: the commit
+/// would transition, find the barrier idle, flush and send `EndTxn` while the
+/// `TxnOffsetCommit` was still on the wire, leaving the offsets outside the
+/// transaction.
+///
+/// # Why this needs two brokers
+///
+/// `TxnOffsetCommit` goes to the **group** coordinator and `EndTxn` to the
+/// **transaction** coordinator. On a single node they share one connection, and
+/// the broker's own per-connection serialisation masks the client-side race —
+/// an earlier version of this test passed with the fix reverted for exactly
+/// that reason. Splitting the two coordinators across nodes gives them
+/// independent connections, which is the arrangement a real cluster has.
+#[tokio::test]
+async fn a_commit_waits_for_an_in_flight_offset_commit() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::consumer::ConsumerGroupMetadata;
+    use crate::producer::TopicPartitionOffset;
+
+    let broker = FakeBroker::start_cluster(2).await.unwrap();
+    broker.create_topic("orders", 1);
+    // Independent connections: the delayed offset commit cannot queue the
+    // EndTxn behind it.
+    broker.set_group_coordinator("g", 0);
+    broker.set_txn_coordinator("txn-offsets-ordering", 1);
+
+    let producer = Arc::new(
+        TransactionalProducer::builder()
+            .bootstrap_servers(broker.bootstrap_servers())
+            .transactional_id("txn-offsets-ordering")
+            .request_timeout(SHORT_REQUEST_TIMEOUT)
+            .connect_timeout(SHORT_CONNECT_TIMEOUT)
+            .build()
+            .await
+            .expect("transactional producer should connect"),
+    );
+    producer.init_transactions().await.expect("init");
+    producer.begin_transaction().expect("begin");
+    let _ = producer
+        .send("orders", None, b"payload")
+        .await
+        .expect("send");
+
+    // Hold the offset commit on the wire, on the group coordinator only.
+    broker.on(ApiKey::TxnOffsetCommit, |_| {
+        Control::Delay(Duration::from_millis(500))
+    });
+
+    let done = Arc::new(AtomicBool::new(false));
+    let offsets_done = Arc::clone(&done);
+    let offsets_producer = Arc::clone(&producer);
+    let offsets = tokio::spawn(async move {
+        let metadata = ConsumerGroupMetadata::new("g", 1, "member-1", None);
+        let result = offsets_producer
+            .send_offsets_to_transaction(&[TopicPartitionOffset::new("orders", 0, 42)], &metadata)
+            .await;
+        offsets_done.store(true, Ordering::SeqCst);
+        result
+    });
+
+    // Let the offset commit register with the barrier and reach the broker.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !done.load(Ordering::SeqCst),
+        "the offset commit must still be in flight for this test to mean anything"
+    );
+
+    producer.commit_transaction().await.expect("commit");
+
+    assert!(
+        done.load(Ordering::SeqCst),
+        "commit_transaction() returned while TxnOffsetCommit was still in flight —          the EndTxn marker would have been written with the offsets outside the          transaction"
+    );
+
+    let offsets_result = offsets.await.expect("offset task should not panic");
+    assert!(
+        offsets_result.is_ok(),
+        "the offset commit should complete inside the transaction: {offsets_result:?}"
+    );
+
+    broker.clear_hooks();
+    producer.close().await;
+}

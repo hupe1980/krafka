@@ -682,6 +682,10 @@ Release-by-release detail lives in **[CHANGELOG.md](CHANGELOG.md)**.
   to new records, so a concurrent `send()` could slip in behind the flush and
   stay buffered until after `EndTxn` — landing in the *following* transaction,
   and vanishing if that one aborted.
+- **A commit could write `EndTxn` while `send_offsets_to_transaction` was still
+  in flight**, committing the consumer's offsets outside the transaction. The
+  output records stayed atomic with each other but not with the position that
+  produced them.
 
 - **`assign()` leaked state for partitions it dropped.** Narrowing a manual
   assignment left the old partitions' positions, watermarks and buffered

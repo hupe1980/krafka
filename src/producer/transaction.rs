@@ -1901,6 +1901,25 @@ impl TransactionalProducer {
         offsets: &[TopicPartitionOffset],
         group_metadata: &ConsumerGroupMetadata,
     ) -> Result<()> {
+        // Register with the in-flight barrier *before* reading the state, for
+        // the same reason `send_record` does — and this is the call where it
+        // matters most.
+        //
+        // `commit_transaction` transitions to `Committing`, then waits for the
+        // barrier, then flushes, then sends `EndTxn`. Taking the guard first
+        // makes the two orderings exhaustive: either this operation registered
+        // before the commit's barrier snapshot, and the commit waits for it, or
+        // it registered afterwards — in which case the commit has already
+        // transitioned and the state check below refuses.
+        //
+        // Without the guard this method was invisible to that wait, so a
+        // concurrent commit could write the `EndTxn` marker while the
+        // `TxnOffsetCommit` was still in flight. The offsets would then be
+        // committed *outside* the transaction, which is the one thing
+        // consume-transform-produce exists to prevent: the output records would
+        // be atomic with each other but not with the consumer's position.
+        let _operation_guard = self.in_flight_barrier.start("transactional producer")?;
+
         let current = self.state();
         if current != TransactionState::InTransaction {
             return Err(KrafkaError::invalid_state(format!(

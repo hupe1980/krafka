@@ -804,6 +804,13 @@ match do_work(&producer).await {
 producer.close().await;
 ```
 
+> **`send_offsets_to_transaction` must complete inside the transaction.** A
+> commit waits for an offset commit that is already in flight, so the `EndTxn`
+> marker is never written around one. An offset commit started *after* the
+> commit has begun is refused with the same `Committing` error as a send. Both
+> orderings are safe; there is no arrangement in which the offsets land outside
+> the transaction.
+
 > **A commit closes the transaction before it drains it.** The moment
 > `commit_transaction()` is entered it transitions out of `InTransaction`, so
 > any concurrent `send()` from another task is refused with an
