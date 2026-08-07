@@ -66,6 +66,7 @@ use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::auth::AuthConfig;
+use crate::barrier::InFlightBarrier;
 use crate::consumer::ConsumerRecord;
 use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
 use crate::metadata::ClusterMetadata;
@@ -568,6 +569,19 @@ struct ShareConsumerInner {
     /// Signalled by `wakeup()` so a `poll()` already blocked on a `ShareFetch`
     /// is interrupted instead of having to run to completion.
     wakeup_notify: Notify,
+    /// Tracks polls that have started but not finished.
+    ///
+    /// `poll()` drains every pending acknowledgement into a `PendingAckGuard`
+    /// for the duration of its `ShareFetch`, so during that window the acks are
+    /// invisible to `pending_acks`. Without this barrier a concurrent
+    /// `commit_sync()` or `close()` would drain an empty map, report success,
+    /// and leave those acknowledgements to be restored by the guard moments
+    /// later with nobody left to send them.
+    ///
+    /// That is not a theoretical interleaving: the documented shutdown is
+    /// `wakeup()` followed by `close()`, and `wakeup()` does not wait for the
+    /// poll it interrupts to unwind.
+    in_flight_polls: Arc<InFlightBarrier>,
 }
 
 impl Drop for ShareConsumerInner {
@@ -712,6 +726,7 @@ impl ShareConsumer {
             heartbeat_task: SyncMutex::new(None),
             wakeup_flag: AtomicBool::new(false),
             wakeup_notify: Notify::new(),
+            in_flight_polls: Arc::new(InFlightBarrier::new()),
         })))
     }
 
@@ -953,6 +968,12 @@ impl ShareConsumer {
                     .map(|(topic, partition, _)| (topic.as_str(), *partition))
             })
             .collect();
+
+        // Hold an in-flight slot for as long as the acknowledgements are out of
+        // `pending_acks`. `commit_sync()` and `close()` wait on this before
+        // draining, so they cannot flush an empty map while this poll is
+        // holding the acks — see `ShareConsumerInner::in_flight_polls`.
+        let _poll_guard = self.0.in_flight_polls.start("share consumer")?;
 
         // Drain acknowledgement batches to piggyback on fetch requests.
         //
@@ -1597,6 +1618,17 @@ impl ShareConsumer {
     }
 
     async fn flush_pending_acks(&self) -> Result<()> {
+        // Wait for any poll that is currently holding the acknowledgements out
+        // of `pending_acks`. Draining first would take an empty map, report
+        // success, and strand whatever the poll's guard restores a moment
+        // later. The documented shutdown — `wakeup()` then `close()` — hits
+        // exactly this interleaving, because `wakeup()` does not wait for the
+        // poll it interrupts to unwind.
+        self.0
+            .in_flight_polls
+            .wait_for(self.0.in_flight_polls.snapshot())
+            .await;
+
         let ack_state_generation = self.0.ack_state_generation.load(Ordering::SeqCst);
 
         // If there are acks in the UNROUTED shard (no leader known at
@@ -3305,6 +3337,7 @@ mod tests {
             heartbeat_task: SyncMutex::new(None),
             wakeup_flag: AtomicBool::new(false),
             wakeup_notify: Notify::new(),
+            in_flight_polls: Arc::new(InFlightBarrier::new()),
         }))
     }
 

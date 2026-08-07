@@ -25,13 +25,13 @@ pub struct ProducerRecord {
     pub timestamp: Option<Timestamp>,
     /// Record headers.
     pub headers: Vec<(String, Bytes)>,
-    /// Optional record name forwarded to the schema encoder's subject-name strategy.
+    /// Optional type name forwarded to the
+    /// [`Serializer`](crate::serdes::Serializer).
     ///
-    /// Required when using
-    /// [`crate::schema_registry::SubjectNameStrategy::RecordName`] or
-    /// [`crate::schema_registry::SubjectNameStrategy::TopicRecordName`]. Pass
-    /// `None` (or omit) when using the default
-    /// [`crate::schema_registry::SubjectNameStrategy::TopicName`] strategy.
+    /// krafka never interprets it. It exists because a serializer often needs
+    /// to name the record's *type* as well as its topic — a schema-registry
+    /// serializer deriving a subject from a record name, for instance. Leave it
+    /// `None` unless your serializer documents that it reads it.
     pub record_name: Option<String>,
 }
 
@@ -79,13 +79,12 @@ impl ProducerRecord {
         self
     }
 
-    /// Set the record name for schema subject-name resolution.
+    /// Set the type name passed to the
+    /// [`Serializer`](crate::serdes::Serializer).
     ///
-    /// Only needed when using
-    /// [`crate::schema_registry::SubjectNameStrategy::RecordName`] or
-    /// [`crate::schema_registry::SubjectNameStrategy::TopicRecordName`].
-    /// Ignored by the default
-    /// `TopicName` strategy.
+    /// Only needed when the configured serializer reads it — for example a
+    /// schema-registry serializer whose subject-name strategy is derived from
+    /// the record name rather than the topic.
     pub fn with_record_name(mut self, name: impl Into<String>) -> Self {
         self.record_name = Some(name.into());
         self

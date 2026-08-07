@@ -57,11 +57,11 @@ Add krafka to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-krafka = "0.17.0"
+krafka = "0.18.0"
 tokio = { version = "1", features = ["full"] }
 
 # For AWS MSK IAM authentication with full SDK support:
-# krafka = { version = "0.17.0", features = ["aws-msk"] }
+# krafka = { version = "0.18.0", features = ["aws-msk"] }
 ```
 
 ### Producer
@@ -239,7 +239,7 @@ let admin = AdminClient::builder()
 | `admin` | Cluster administration: topics, partitions, groups, configs, ACLs, quotas, tokens |
 | `client` | `KrafkaClient` — one connection pool and metadata cache shared by several clients |
 | `auth` | SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM, TLS and mTLS |
-| `schema_registry` | Confluent and AWS Glue wire formats, encoders/decoders, caching |
+| `serdes` | `Serializer` / `Deserializer` hooks applied on the way to and from the wire |
 | `interceptor` | Producer and consumer hooks for tracing and enrichment |
 | `dlq` | Dead-letter queues for records that exhaust their retries |
 | `metrics` | Lock-free counters, gauges and latency histograms; Prometheus export |
@@ -285,10 +285,10 @@ To select only what you need:
 # Option 1: enable only the codecs you need
 # `default-features = false` also drops the default `ring` TLS backend, so a
 # crypto backend must be named explicitly.
-krafka = { version = "0.17.0", default-features = false, features = ["lz4", "snappy", "ring"] }
+krafka = { version = "0.18.0", default-features = false, features = ["lz4", "snappy", "ring"] }
 
 # Option 2: enable all compression codecs, including zstd
-# krafka = { version = "0.17.0", features = ["compression-all"] }
+# krafka = { version = "0.18.0", features = ["compression-all"] }
 ```
 
 ### TLS crypto backend
@@ -298,7 +298,7 @@ default; `rustls-aws-lc-rs` selects aws-lc-rs instead, which is the better
 choice on AWS Graviton and in FIPS-oriented deployments:
 
 ```toml
-krafka = { version = "0.17.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
+krafka = { version = "0.18.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
 ```
 
 The two backends are **additive**, not mutually exclusive — a transitive
@@ -569,9 +569,14 @@ rather than `Unknown(87)`.
 Not implemented: KIP-1071 Streams group protocol (keys 88–89) and KIP-1258
 OAuth client assertion.
 
-The schema-registry module implements the Confluent and AWS Glue **wire formats**
-(magic byte, schema ID framing, caching). Bring your own Avro/Protobuf/JSON-Schema
-codec; krafka does not impose one.
+**Schema registries are out of scope**, as they are for every comparable client
+— Java's `kafka-clients` has none, librdkafka has none, franz-go keeps `pkg/sr`
+out of `kgo`. A registry is a different service with a different protocol, auth
+model and release cadence. krafka provides the *hook* (`serdes::Serializer` /
+`Deserializer`, the equivalent of Java's `key.serializer`); pair it with
+[`schemreg`](https://crates.io/crates/schemreg) for Confluent, AWS Glue or
+Apicurio, and Avro / Protobuf / JSON codecs. See the
+[Cookbook](https://hupe1980.github.io/krafka/docs/cookbook/#use-a-schema-registry).
 
 Tokio is the async runtime.
 
@@ -641,6 +646,40 @@ what it does and, just as importantly, what it deliberately does not model.
 ## ⬆️ Upgrading
 
 Release-by-release detail lives in **[CHANGELOG.md](CHANGELOG.md)**.
+
+### Upgrading to 0.18
+
+#### Fixed
+
+- **A share-consumer flush could strand acknowledgements.** `poll()` holds the
+  pending acks out of the map for the duration of its `ShareFetch`, so a
+  concurrent `commit_sync()` or `close()` flushed an empty map and reported
+  success. The documented `wakeup()` → `close()` shutdown hits exactly that
+  window. Both flush paths now wait for in-flight polls first.
+
+#### Breaking — schema registry moved out
+
+`krafka::schema_registry` is gone, with the `schema-registry` and
+`aws-glue-schema-registry` features. The registry client now lives in
+[`schemreg`](https://crates.io/crates/schemreg), which additionally supports
+Apicurio and ships Avro / Protobuf / JSON codecs krafka never had.
+
+Every comparable client draws the line here — Java's `kafka-clients` has no
+registry support, librdkafka has none, franz-go keeps `pkg/sr` out of `kgo`. A
+registry is a different service; coupling it to the protocol client meant a
+registry API change could force a Kafka client release.
+
+What krafka keeps is the hook, generalised:
+
+- `SchemaEncoder` / `SchemaDecoder` → **`krafka::serdes::Serializer` /
+  `Deserializer`** (`encode` → `serialize`, `decode` → `deserialize`).
+- `key_encoder` / `value_encoder` → **`key_serializer` / `value_serializer`**;
+  `key_decoder` / `value_decoder` → **`key_deserializer` / `value_deserializer`**.
+- `KrafkaError::SchemaRegistry` → **`KrafkaError::Http`**.
+
+Since the traits are plain `Bytes -> Bytes`, they now cover encryption and
+compression as well as schema framing. The ~20-line `schemreg` adapter is in the
+[Cookbook](https://hupe1980.github.io/krafka/docs/cookbook/#use-a-schema-registry).
 
 ### Upgrading to 0.17
 
@@ -796,7 +835,7 @@ Release history: **[CHANGELOG.md](CHANGELOG.md)**
 | Start here | Clients | Integration | Operations | Reference |
 |---|---|---|---|---|
 | [Getting Started](https://hupe1980.github.io/krafka/docs/getting-started/) | [Producer](https://hupe1980.github.io/krafka/docs/producer/) | [Authentication](https://hupe1980.github.io/krafka/docs/authentication/) | [Metrics](https://hupe1980.github.io/krafka/docs/metrics/) | [Protocol Support](https://hupe1980.github.io/krafka/docs/protocol/) |
-| [Cookbook](https://hupe1980.github.io/krafka/docs/cookbook/) | [Consumer](https://hupe1980.github.io/krafka/docs/consumer/) | [Schema Registry](https://hupe1980.github.io/krafka/docs/schema-registry/) | [Performance](https://hupe1980.github.io/krafka/docs/performance/) | [Architecture](https://hupe1980.github.io/krafka/docs/architecture/) |
+| [Cookbook](https://hupe1980.github.io/krafka/docs/cookbook/) | [Consumer](https://hupe1980.github.io/krafka/docs/consumer/) | | [Performance](https://hupe1980.github.io/krafka/docs/performance/) | [Architecture](https://hupe1980.github.io/krafka/docs/architecture/) |
 | [Configuration](https://hupe1980.github.io/krafka/docs/configuration/) | [Share Consumer](https://hupe1980.github.io/krafka/docs/share-consumer/) | [Interceptors](https://hupe1980.github.io/krafka/docs/interceptors/) | [Testing](https://hupe1980.github.io/krafka/docs/testing/) | |
 | | [Admin Client](https://hupe1980.github.io/krafka/docs/admin/) | | [Error Handling](https://hupe1980.github.io/krafka/docs/errors/) | |
 

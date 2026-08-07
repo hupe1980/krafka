@@ -117,10 +117,10 @@ pub enum KrafkaError {
     /// Schema registry errors.
     ///
     /// The `source` field preserves the underlying transport or decode error
-    /// chain (e.g., `reqwest::Error`) so callers can distinguish a connection
-    /// timeout from a 404 or a 5xx without parsing the message string.
-    #[error("schema registry error: {message}")]
-    SchemaRegistry {
+    /// chain so callers can distinguish a connection timeout from a 404 or a
+    /// 5xx without parsing the message string.
+    #[error("http error: {message}")]
+    Http {
         /// Human-readable error message.
         message: String,
         /// Underlying cause, if any (connection error, HTTP decode failure, etc.).
@@ -159,7 +159,7 @@ impl Clone for KrafkaError {
             Self::Serialization { message } => Self::Serialization {
                 message: message.clone(),
             },
-            Self::SchemaRegistry { message, source } => Self::SchemaRegistry {
+            Self::Http { message, source } => Self::Http {
                 message: message.clone(),
                 source: source.clone(),
             },
@@ -254,26 +254,29 @@ impl KrafkaError {
         }
     }
 
-    /// Create a new schema registry error.
+    /// Create a new HTTP error.
+    ///
+    /// Raised by the built-in HTTP/1.1 client, which serves the OIDC token
+    /// provider (`oauth-oidc`).
     #[cold]
-    pub fn schema_registry(message: impl Into<String>) -> Self {
-        Self::SchemaRegistry {
+    pub fn http(message: impl Into<String>) -> Self {
+        Self::Http {
             message: message.into(),
             source: None,
         }
     }
 
-    /// Create a new schema registry error with an underlying cause.
+    /// Create a new HTTP error with an underlying cause.
     ///
     /// The source is preserved in `std::error::Error::source()` and can be
     /// downcast by callers who need to distinguish transport errors from
     /// API-level failures.
     #[cold]
-    pub fn schema_registry_with_source<E>(message: impl Into<String>, source: E) -> Self
+    pub fn http_with_source<E>(message: impl Into<String>, source: E) -> Self
     where
         E: std::error::Error + Send + Sync + 'static,
     {
-        Self::SchemaRegistry {
+        Self::Http {
             message: message.into(),
             source: Some(ArcError::new(source)),
         }

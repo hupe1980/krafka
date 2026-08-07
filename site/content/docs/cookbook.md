@@ -22,6 +22,7 @@ kept inline and everything else linked.
 - [Backpressure: stop reading when the sink stalls](#backpressure-stop-reading-when-the-sink-stalls)
 - [Replay from a point in time](#replay-from-a-point-in-time)
 - [Build an in-memory table from a compacted topic](#build-an-in-memory-table-from-a-compacted-topic)
+- [Use a schema registry](#use-a-schema-registry)
 - [Route poison records to a dead-letter topic](#route-poison-records-to-a-dead-letter-topic)
 - [Share one connection pool across clients](#share-one-connection-pool-across-clients)
 - [Rotate TLS certificates without a restart](#rotate-tls-certificates-without-a-restart)
@@ -227,6 +228,103 @@ loop {
 Tombstones (null values) delete the key. On an actively written topic `scan()`
 is best-effort rather than a bounded snapshot — see
 [Compacted Topics](@/docs/consumer.md).
+
+---
+
+## Use a schema registry
+
+krafka does not ship a schema-registry client, and that is deliberate: every
+comparable client draws the same line. Java's `kafka-clients` has none
+(`kafka-avro-serializer` is a separate artifact), librdkafka has none
+(`libschemaregistry` is a separate library), and franz-go keeps `pkg/sr` out of
+`kgo`. A registry is a different service with a different protocol, auth model
+and release cadence; coupling it to the Kafka client means a registry API change
+forces a Kafka client release.
+
+What krafka provides is the *hook* — [`Serializer`] and [`Deserializer`], the
+equivalent of Java's `key.serializer` / `value.serializer`. Pair it with
+[`schemreg`](https://crates.io/crates/schemreg), which covers the Confluent
+registry, AWS Glue, Apicurio, and Avro / Protobuf / JSON codecs:
+
+```toml
+[dependencies]
+krafka   = "0.18"
+schemreg = { version = "0.4", features = ["confluent", "avro"] }
+```
+
+The two traits do not know about each other, so bridge them with a newtype.
+This is the whole adapter:
+
+```rust
+use std::future::Future;
+use std::pin::Pin;
+
+use bytes::Bytes;
+use krafka::serdes::{Deserializer, Serializer};
+
+/// Bridges a `schemreg` encoder into krafka's producer hook.
+struct SchemaSerializer<T>(T);
+
+impl<T> Serializer for SchemaSerializer<T>
+where
+    T: schemreg::traits::SchemaEncoder + Send + Sync,
+{
+    fn serialize(
+        &self,
+        payload: Bytes,
+        topic: &str,
+        record_name: Option<&str>,
+        is_key: bool,
+    ) -> Pin<Box<dyn Future<Output = krafka::Result<Bytes>> + Send + '_>> {
+        let topic = topic.to_owned();
+        let record_name = record_name.map(str::to_owned);
+        Box::pin(async move {
+            self.0
+                .encode(payload, &topic, record_name.as_deref(), is_key)
+                .await
+                .map_err(|e| krafka::KrafkaError::config(e.to_string()))
+        })
+    }
+}
+```
+
+Write the mirror image for `Deserializer` (it takes no `record_name` — on the
+read path the framing identifies the schema), then wire both in:
+
+```rust
+let producer = Producer::builder()
+    .bootstrap_servers("localhost:9092")
+    .value_serializer(Arc::new(SchemaSerializer(encoder)))
+    .build()
+    .await?;
+
+let consumer = Consumer::builder()
+    .bootstrap_servers("localhost:9092")
+    .group_id("orders")
+    .value_deserializer(Arc::new(SchemaDeserializer(decoder)))
+    .build()
+    .await?;
+```
+
+From here `send()` frames every value on the way out and `poll()` unframes it on
+the way in — the application only ever sees decoded bytes.
+
+> **Map the error type deliberately.** The adapter above collapses every
+> registry failure into `KrafkaError::config`, which is fine for getting
+> started and wrong for production: a registry that is *unreachable* is
+> retriable, a schema that is *incompatible* is not, and `is_retriable()` cannot
+> tell them apart once both are `Config`. Match on `schemreg`'s error and map
+> the transport cases to `KrafkaError::network` so krafka's retry logic can act
+> on them.
+
+### Beyond schemas
+
+The traits are plain `Bytes -> Bytes`, so the same hook covers envelope
+encryption, an application-level compression scheme, or a bare `serde_json`
+round-trip. Nothing about it is schema-specific.
+
+[`Serializer`]: https://docs.rs/krafka/latest/krafka/serdes/trait.Serializer.html
+[`Deserializer`]: https://docs.rs/krafka/latest/krafka/serdes/trait.Deserializer.html
 
 ---
 

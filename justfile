@@ -23,13 +23,13 @@ set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 # Everything except the aws-lc-rs backend, so the default `ring` code paths are
 # the ones that actually execute. `cfg(not(feature = "rustls-aws-lc-rs"))` arms
 # exist in `auth/tls.rs` and `schema_registry/http.rs` and run nowhere else.
-ring_features := "compression-all,aws-msk,schema-registry,aws-glue-schema-registry,oauth-oidc,native-tls-roots,unstable-protocol,telemetry,socks5,ring"
+ring_features := "compression-all,aws-msk,oauth-oidc,native-tls-roots,unstable-protocol,telemetry,socks5,ring"
 
 # Portable subset for macOS and Windows: pure-Rust `ring` avoids needing a C
 # toolchain and NASM. `test-broker` is deliberately included — it binds real
 # TCP listeners and drives real clients over loopback, which is the behaviour
 # most likely to differ between platforms.
-cross_platform_features := "compression,schema-registry,oauth-oidc,unstable-protocol,telemetry,socks5,test-broker,ring"
+cross_platform_features := "compression,oauth-oidc,unstable-protocol,telemetry,socks5,test-broker,ring"
 
 # Minimum supported Rust version, mirroring `rust-version` in Cargo.toml.
 msrv := "1.88"

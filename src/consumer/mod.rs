@@ -485,13 +485,13 @@ pub struct Consumer {
     /// When set, every consumed record's key is passed through this decoder
     /// before being returned to the caller. Equivalent to `key.deserializer`
     /// in the Java `KafkaConsumer`.
-    key_decoder: Option<Arc<dyn crate::schema_registry::SchemaDecoder>>,
+    key_deserializer: Option<Arc<dyn crate::serdes::Deserializer>>,
     /// Optional value decoder applied transparently after each `poll()` / `recv()`.
     ///
     /// When set, every consumed record's value is passed through this decoder
     /// before being returned to the caller. Equivalent to `value.deserializer`
     /// in the Java `KafkaConsumer`.
-    value_decoder: Option<Arc<dyn crate::schema_registry::SchemaDecoder>>,
+    value_deserializer: Option<Arc<dyn crate::serdes::Deserializer>>,
 }
 
 /// A pending advance of a partition's fetch position, tagged with the position
@@ -1354,8 +1354,8 @@ impl Consumer {
             fetch_rotation: std::sync::atomic::AtomicUsize::new(0),
             fetch_sessions: SyncMutex::new(FetchSessionCache::new()),
             partition_state: LeveledRwLock::new(HashMap::new()),
-            key_decoder: None,
-            value_decoder: None,
+            key_deserializer: None,
+            value_deserializer: None,
         })
     }
 
@@ -3988,13 +3988,13 @@ impl Consumer {
 
         // Schema decoding runs after the interceptor (which may rewrite key or
         // value) and immediately before the records are handed back.
-        if self.key_decoder.is_some() || self.value_decoder.is_some() {
+        if self.key_deserializer.is_some() || self.value_deserializer.is_some() {
             for record in &mut records {
-                if let (Some(dec), Some(value)) = (&self.value_decoder, record.value.take()) {
-                    record.value = Some(dec.decode(value, &record.topic, false).await?);
+                if let (Some(dec), Some(value)) = (&self.value_deserializer, record.value.take()) {
+                    record.value = Some(dec.deserialize(value, &record.topic, false).await?);
                 }
-                if let (Some(dec), Some(key)) = (&self.key_decoder, record.key.take()) {
-                    record.key = Some(dec.decode(key, &record.topic, true).await?);
+                if let (Some(dec), Some(key)) = (&self.key_deserializer, record.key.take()) {
+                    record.key = Some(dec.deserialize(key, &record.topic, true).await?);
                 }
             }
         }
@@ -8481,8 +8481,8 @@ mod tests {
             fetch_rotation: std::sync::atomic::AtomicUsize::new(0),
             fetch_sessions: SyncMutex::new(FetchSessionCache::new()),
             partition_state: LeveledRwLock::new(HashMap::new()),
-            key_decoder: None,
-            value_decoder: None,
+            key_deserializer: None,
+            value_deserializer: None,
         }
     }
 

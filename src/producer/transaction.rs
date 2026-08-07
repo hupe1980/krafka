@@ -73,16 +73,16 @@ use crate::protocol::{
 use crate::{Offset, PartitionId};
 
 use super::accumulator::{AccumulatorConfig, RecordAccumulator, RecordAccumulatorHandle};
-use super::barrier::InFlightBarrier;
 use super::config::Acks;
 use super::idempotent::ProducerIdentity;
 use super::partitioner::{Partitioner, UniformStickyPartitioner};
 use super::record::{ProducerRecord, RecordMetadata, TopicHandle};
 use super::retry::RetryPolicy;
+use crate::barrier::InFlightBarrier;
 use crate::consumer::ConsumerGroupMetadata;
 use crate::metrics::ProducerMetrics;
 
-use crate::schema_registry::SchemaEncoder;
+use crate::serdes::Serializer;
 
 /// Name of the cluster-wide finalized feature that gates KIP-890 semantics.
 const TRANSACTION_VERSION_FEATURE: &str = "transaction.version";
@@ -948,11 +948,11 @@ pub struct TransactionalProducer {
     /// Optional key encoder applied transparently in `send_record`.
     ///
     /// Equivalent to `key.serializer` in the Java `KafkaProducer`.
-    key_encoder: Option<Arc<dyn SchemaEncoder>>,
+    key_serializer: Option<Arc<dyn Serializer>>,
     /// Optional value encoder applied transparently in `send_record`.
     ///
     /// Equivalent to `value.serializer` in the Java `KafkaProducer`.
-    value_encoder: Option<Arc<dyn SchemaEncoder>>,
+    value_serializer: Option<Arc<dyn Serializer>>,
     /// Interceptor chain, shared with the accumulator.
     ///
     /// `on_send` is invoked here; `on_acknowledgement` fires inside the
@@ -1625,9 +1625,9 @@ impl TransactionalProducer {
         crate::interceptor::safe_on_send(&*self.interceptor, &mut record);
 
         // Transparently apply producer-level schema encoders if configured.
-        if let Some(enc) = &self.value_encoder {
+        if let Some(enc) = &self.value_serializer {
             record.value = enc
-                .encode(
+                .serialize(
                     record.value.clone(),
                     &record.topic,
                     record.record_name.as_deref(),
@@ -1635,10 +1635,10 @@ impl TransactionalProducer {
                 )
                 .await?;
         }
-        if let Some(enc) = &self.key_encoder {
+        if let Some(enc) = &self.key_serializer {
             let key = record.key.clone().unwrap_or_default();
             record.key = Some(
-                enc.encode(key, &record.topic, record.record_name.as_deref(), true)
+                enc.serialize(key, &record.topic, record.record_name.as_deref(), true)
                     .await?,
             );
         }
@@ -2942,8 +2942,8 @@ pub struct TransactionalProducerBuilder {
     config: TransactionalProducerConfig,
     retry_policy: RetryPolicy,
     partitioner: Option<Arc<dyn Partitioner>>,
-    key_encoder: Option<Arc<dyn SchemaEncoder>>,
-    value_encoder: Option<Arc<dyn SchemaEncoder>>,
+    key_serializer: Option<Arc<dyn Serializer>>,
+    value_serializer: Option<Arc<dyn Serializer>>,
     interceptors: Vec<Arc<dyn crate::interceptor::ProducerInterceptor>>,
     /// Pre-built pool and metadata from a [`KrafkaClient`](crate::client::KrafkaClient).
     shared: Option<(Arc<ConnectionPool>, Arc<ClusterMetadata>)>,
@@ -3301,16 +3301,16 @@ impl TransactionalProducerBuilder {
     ///
     /// Equivalent to `key.serializer` in the Java `KafkaProducer`. Configure
     /// it once here and encoding is transparent on every send.
-    pub fn key_encoder(mut self, encoder: Arc<dyn SchemaEncoder>) -> Self {
-        self.key_encoder = Some(encoder);
+    pub fn key_serializer(mut self, encoder: Arc<dyn Serializer>) -> Self {
+        self.key_serializer = Some(encoder);
         self
     }
 
     /// Attach a value encoder applied automatically on every [`send_record`](TransactionalProducer::send_record) call.
     ///
     /// Equivalent to `value.serializer` in the Java `KafkaProducer`.
-    pub fn value_encoder(mut self, encoder: Arc<dyn SchemaEncoder>) -> Self {
-        self.value_encoder = Some(encoder);
+    pub fn value_serializer(mut self, encoder: Arc<dyn Serializer>) -> Self {
+        self.value_serializer = Some(encoder);
         self
     }
 
@@ -3510,8 +3510,8 @@ impl TransactionalProducerBuilder {
             metrics,
             retry_policy,
             in_flight_barrier,
-            key_encoder: self.key_encoder,
-            value_encoder: self.value_encoder,
+            key_serializer: self.key_serializer,
+            value_serializer: self.value_serializer,
             interceptor,
             state_store: self.state_store,
             pool_owned,
@@ -3708,8 +3708,8 @@ mod tests {
             metrics: Arc::new(ProducerMetrics::default()),
             retry_policy: RetryPolicy::default(),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
-            key_encoder: None,
-            value_encoder: None,
+            key_serializer: None,
+            value_serializer: None,
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             state_store: None,
             pool_owned: true,
@@ -3764,8 +3764,8 @@ mod tests {
             metrics: Arc::new(ProducerMetrics::default()),
             retry_policy: RetryPolicy::default(),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
-            key_encoder: None,
-            value_encoder: None,
+            key_serializer: None,
+            value_serializer: None,
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             state_store: None,
             pool_owned: true,
@@ -3821,8 +3821,8 @@ mod tests {
             metrics: Arc::new(ProducerMetrics::default()),
             retry_policy: RetryPolicy::default(),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
-            key_encoder: None,
-            value_encoder: None,
+            key_serializer: None,
+            value_serializer: None,
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             state_store: None,
             pool_owned: true,
@@ -4512,8 +4512,8 @@ mod tests {
             metrics: Arc::new(ProducerMetrics::default()),
             retry_policy: RetryPolicy::no_retries(),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
-            key_encoder: None,
-            value_encoder: None,
+            key_serializer: None,
+            value_serializer: None,
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             state_store: None,
             pool_owned: true,

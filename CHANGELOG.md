@@ -15,6 +15,75 @@ not a complete record.
 
 Nothing yet.
 
+## [0.18.0] — 2026-08-07
+
+Schema-registry support is removed from krafka and replaced by a generic
+serialization hook. This is a scope change, not a capability loss: the registry
+client now lives in [`schemreg`](https://crates.io/crates/schemreg), which also
+has native Apicurio support and real Avro / Protobuf / JSON codecs that krafka
+never had.
+
+### Fixed
+
+- **A share-consumer `commit_sync()` or `close()` could strand
+  acknowledgements.** `poll()` drains every entry out of `pending_acks` into a
+  guard for the duration of its `ShareFetch`, so during that window the map is
+  empty. A concurrent flush took nothing, reported success, and left the
+  acknowledgements to be restored by the guard a moment later with nobody left
+  to send them — so records the application had explicitly acknowledged were
+  redelivered anyway.
+
+  This is the documented shutdown sequence, not an exotic race: `wakeup()`
+  followed by `close()`, where `wakeup()` does not wait for the poll it
+  interrupts to unwind. Both flush paths now wait on an in-flight barrier
+  first — the same fix as the transactional producer's, and the same barrier
+  type, which moved to `crate::barrier` now that two subsystems use it.
+
+### Breaking
+
+- **`krafka::schema_registry` is gone**, along with the `schema-registry` and
+  `aws-glue-schema-registry` features and the `aws-sdk-glue` dependency. 6 487
+  lines of Confluent + AWS Glue registry client, wire formats, caching and
+  subject strategies are no longer part of this crate.
+
+  A schema registry is a different service with a different protocol, auth model
+  and release cadence, and every comparable client draws the line in the same
+  place: Java's `kafka-clients` has no registry support (`kafka-avro-serializer`
+  is a separate artifact), librdkafka has none (`libschemaregistry` is a
+  separate library), and franz-go keeps `pkg/sr` out of `kgo`. Carrying it here
+  meant a registry API change could force a Kafka client release.
+
+  Move to `schemreg` and bridge it with a newtype — the adapter is about twenty
+  lines and is written out in the
+  [Cookbook](https://hupe1980.github.io/krafka/docs/cookbook/#use-a-schema-registry).
+
+- **`SchemaEncoder` / `SchemaDecoder` are now `serdes::Serializer` /
+  `serdes::Deserializer`**, in the new `krafka::serdes` module. The trait shapes
+  are unchanged apart from the method names (`encode` → `serialize`,
+  `decode` → `deserialize`); only the naming and the home moved. They are the
+  equivalent of Java's `key.serializer` / `value.serializer`: krafka owns the
+  place the transformation happens, the ecosystem owns the transformations.
+
+  Because the traits are plain `Bytes -> Bytes`, they now also cover envelope
+  encryption, application-level compression, or a bare `serde_json` round-trip.
+
+- **Builder setters renamed** to match: `key_encoder` → `key_serializer`,
+  `value_encoder` → `value_serializer` (both producers), `key_decoder` →
+  `key_deserializer`, `value_decoder` → `value_deserializer` (consumer).
+
+- **`KrafkaError::SchemaRegistry` is now `KrafkaError::Http`**, with
+  `schema_registry()` / `schema_registry_with_source()` becoming `http()` /
+  `http_with_source()`. The variant only ever described failures from the
+  built-in HTTP client, which now serves the OIDC token provider alone.
+
+### Changed
+
+- The built-in HTTP/1.1 client (`src/http.rs`) is compiled for `oauth-oidc`
+  only. It stays because the OIDC token provider uses it — removing the registry
+  client did not remove the need for an HTTP client, and claiming otherwise
+  would have been the easy overstatement here.
+
+
 ## [0.17.0] — 2026-08-07
 
 Ten defects fixed in the consumer's fetch-to-delivery path, and the read path
@@ -354,7 +423,8 @@ Initial development: wire protocol, producer, consumer, admin client,
 authentication (SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM), TLS,
 compression codecs, schema registry integration and the metrics layer.
 
-[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/hupe1980/krafka/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/hupe1980/krafka/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/hupe1980/krafka/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/hupe1980/krafka/compare/v0.14.0...v0.15.0

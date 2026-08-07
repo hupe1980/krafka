@@ -10,7 +10,6 @@
 //! - Transactional production for exactly-once delivery
 
 mod accumulator;
-mod barrier;
 mod config;
 mod idempotent;
 mod partitioner;
@@ -54,11 +53,11 @@ use crate::protocol::{
     ProduceRequest, ProduceResponse, ProduceTopicData, RecordBatchBuilder, VersionedDecode,
     VersionedEncode, versions,
 };
-use crate::schema_registry::SchemaEncoder;
+use crate::serdes::Serializer;
 
-use self::barrier::{InFlightBarrier, InFlightOpGuard};
 use self::idempotent::ErasedProducerStateStore;
 use self::record::{RoutedRecord, TopicHandle};
+use crate::barrier::{InFlightBarrier, InFlightOpGuard};
 
 struct SendMemoryReservation {
     bytes: usize,
@@ -117,13 +116,13 @@ pub struct Producer {
     /// registration + Confluent wire framing) on every `send_record` call,
     /// before partitioning or batching.  Equivalent to `key.serializer` in
     /// the Java `KafkaProducer`.
-    key_encoder: Option<Arc<dyn SchemaEncoder>>,
+    key_serializer: Option<Arc<dyn Serializer>>,
     /// Optional value encoder applied transparently in `send_record`.
     ///
     /// When set, the record value is passed through this encoder on every
     /// `send_record` call.  Equivalent to `value.serializer` in the Java
     /// `KafkaProducer`.
-    value_encoder: Option<Arc<dyn SchemaEncoder>>,
+    value_serializer: Option<Arc<dyn Serializer>>,
     /// Optional dead-letter queue for permanently-failed records.
     ///
     /// When set, records on the direct-send path (linger = 0) that exhaust
@@ -578,8 +577,8 @@ impl Producer {
         config: ProducerConfig,
         interceptor: Arc<dyn crate::interceptor::ProducerInterceptor>,
         partitioner: Option<Arc<dyn Partitioner>>,
-        key_encoder: Option<Arc<dyn SchemaEncoder>>,
-        value_encoder: Option<Arc<dyn SchemaEncoder>>,
+        key_serializer: Option<Arc<dyn Serializer>>,
+        value_serializer: Option<Arc<dyn Serializer>>,
         shared: Option<(Arc<ConnectionPool>, Arc<crate::metadata::ClusterMetadata>)>,
         state_store: Option<Arc<dyn ErasedProducerStateStore>>,
     ) -> Result<Self> {
@@ -781,8 +780,8 @@ impl Producer {
             interceptor,
             identity,
             state_store,
-            key_encoder,
-            value_encoder,
+            key_serializer,
+            value_serializer,
             dlq: config.dead_letter_queue,
             pool_owned,
         })
@@ -855,9 +854,9 @@ impl Producer {
         // Transparently apply producer-level schema encoders if configured.
         // Runs after the interceptor (which may set topic/key/value) but before
         // validation, so oversized encoded payloads are still caught.
-        if let Some(enc) = &self.value_encoder {
+        if let Some(enc) = &self.value_serializer {
             record.value = enc
-                .encode(
+                .serialize(
                     record.value.clone(),
                     &record.topic,
                     record.record_name.as_deref(),
@@ -865,10 +864,10 @@ impl Producer {
                 )
                 .await?;
         }
-        if let Some(enc) = &self.key_encoder {
+        if let Some(enc) = &self.key_serializer {
             let key = record.key.clone().unwrap_or_default();
             record.key = Some(
-                enc.encode(key, &record.topic, record.record_name.as_deref(), true)
+                enc.serialize(key, &record.topic, record.record_name.as_deref(), true)
                     .await?,
             );
         }
@@ -1716,8 +1715,8 @@ pub struct ProducerBuilder {
     config: ProducerConfig,
     interceptors: Vec<Arc<dyn crate::interceptor::ProducerInterceptor>>,
     partitioner: Option<Arc<dyn Partitioner>>,
-    key_encoder: Option<Arc<dyn SchemaEncoder>>,
-    value_encoder: Option<Arc<dyn SchemaEncoder>>,
+    key_serializer: Option<Arc<dyn Serializer>>,
+    value_serializer: Option<Arc<dyn Serializer>>,
     /// Pre-built pool and metadata from a [`KrafkaClient`](crate::client::KrafkaClient).
     shared: Option<(Arc<ConnectionPool>, Arc<crate::metadata::ClusterMetadata>)>,
     /// Optional pluggable persistence hook for producer identity state.
@@ -2149,8 +2148,8 @@ impl ProducerBuilder {
     /// set [`ProducerRecord::record_name`] (via
     /// [`with_record_name`](ProducerRecord::with_record_name)) on each record
     /// before sending.
-    pub fn key_encoder(mut self, encoder: Arc<dyn SchemaEncoder>) -> Self {
-        self.key_encoder = Some(encoder);
+    pub fn key_serializer(mut self, encoder: Arc<dyn Serializer>) -> Self {
+        self.key_serializer = Some(encoder);
         self
     }
 
@@ -2159,8 +2158,8 @@ impl ProducerBuilder {
     /// This is the Rust equivalent of `value.serializer` in the Java
     /// `KafkaProducer`. Configure it once here and encoding is transparent
     /// on every send.
-    pub fn value_encoder(mut self, encoder: Arc<dyn SchemaEncoder>) -> Self {
-        self.value_encoder = Some(encoder);
+    pub fn value_serializer(mut self, encoder: Arc<dyn Serializer>) -> Self {
+        self.value_serializer = Some(encoder);
         self
     }
 
@@ -2278,8 +2277,8 @@ impl ProducerBuilder {
             self.config,
             interceptor,
             self.partitioner,
-            self.key_encoder,
-            self.value_encoder,
+            self.key_serializer,
+            self.value_serializer,
             self.shared,
             self.state_store,
         )
@@ -2602,8 +2601,8 @@ mod tests {
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             identity: None,
             state_store: None,
-            key_encoder: None,
-            value_encoder: None,
+            key_serializer: None,
+            value_serializer: None,
             pool_owned: true,
             dlq: None,
         };

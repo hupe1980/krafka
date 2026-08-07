@@ -20,7 +20,7 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::interval;
 use tracing::{debug, trace, warn};
 
-use super::barrier::{InFlightBarrier, InFlightOpGuard};
+use crate::barrier::{InFlightBarrier, InFlightOpGuard};
 
 use super::record::{
     DeliveryConfirmation, ProducerRecord, RecordMetadata, RoutedRecord, TopicHandle,

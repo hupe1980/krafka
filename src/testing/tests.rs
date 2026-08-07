@@ -3457,3 +3457,67 @@ async fn a_commit_waits_for_an_in_flight_offset_commit() {
     broker.clear_hooks();
     producer.close().await;
 }
+
+// ── Share consumer: a flush must not race a poll holding the acks ─────────
+
+/// `commit_sync()` must not report success while a concurrent `poll()` is
+/// holding the acknowledgements.
+///
+/// `poll()` drains every entry out of `pending_acks` into a `PendingAckGuard`
+/// for the duration of its `ShareFetch`. During that window the map is empty,
+/// so a `commit_sync()` (or the flush inside `close()`) would take nothing,
+/// report success, and strand the acknowledgements the guard restores a moment
+/// later — leaving the records to be redelivered even though the application
+/// had explicitly acknowledged them.
+///
+/// The documented shutdown is `wakeup()` then `close()`, and `wakeup()` does
+/// not wait for the poll it interrupts to unwind, so this interleaving is the
+/// normal one rather than an exotic race.
+#[cfg(feature = "unstable-protocol")]
+#[tokio::test]
+async fn a_flush_waits_for_a_poll_holding_the_acknowledgements() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let consumer = Arc::new(share_consumer_for(&broker, "share-flush-race").await);
+    consumer.subscribe(&["events"]).await.unwrap();
+    // Let the group settle so the next poll reaches the fetch stage.
+    let _ = consumer.poll(Duration::from_millis(300)).await;
+
+    // Hold the poll inside its ShareFetch, with the acks drained out of the map.
+    broker.on(ApiKey::ShareFetch, |_| {
+        Control::Delay(Duration::from_millis(600))
+    });
+
+    let polling = Arc::clone(&consumer);
+    let poll_done = Arc::new(AtomicBool::new(false));
+    let poll_flag = Arc::clone(&poll_done);
+    let poll = tokio::spawn(async move {
+        let out = polling.poll(Duration::from_secs(2)).await;
+        poll_flag.store(true, Ordering::SeqCst);
+        out
+    });
+
+    // Let the poll register with the barrier and drain the acks.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !poll_done.load(Ordering::SeqCst),
+        "the poll must still be in flight for this test to mean anything"
+    );
+
+    consumer.commit_sync().await.expect("commit_sync");
+
+    assert!(
+        poll_done.load(Ordering::SeqCst),
+        "commit_sync() returned while a poll was still holding the pending \
+         acknowledgements — it would have flushed an empty map and reported \
+         success, stranding them"
+    );
+
+    broker.clear_hooks();
+    let _ = poll.await.expect("poll task should not panic");
+    let _ = consumer.close().await;
+}

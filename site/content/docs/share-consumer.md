@@ -114,6 +114,14 @@ for record in &records {
 }
 ```
 
+> **A flush waits for an in-flight poll.** `poll()` holds the pending
+> acknowledgements out of the internal map while its `ShareFetch` is on the
+> wire. `commit_sync()` and `close()` wait for that poll to finish before
+> draining, so neither can flush an empty map and report success while
+> acknowledgements are still in flight. This matters for the usual shutdown —
+> `wakeup()` then `close()` — because `wakeup()` does not wait for the poll it
+> interrupts to unwind.
+
 ## Async Commit
 
 `commit_async()` returns a handle that resolves to the final commit outcome. This keeps the send off the caller's immediate path while still surfacing transport, decode, and broker errors explicitly. If any failure occurs, the batch is restored locally for the next commit cycle rather than silently dropped:

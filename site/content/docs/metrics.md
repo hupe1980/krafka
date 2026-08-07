@@ -347,7 +347,7 @@ Enable the `telemetry` feature for native OTLP protobuf export and KIP-714 broke
 
 ```toml
 [dependencies]
-krafka = { version = "0.17.0", features = ["telemetry"] }
+krafka = { version = "0.18.0", features = ["telemetry"] }
 ```
 
 Export metrics as OTLP protobuf bytes for ingestion by any OTLP-compatible backend:

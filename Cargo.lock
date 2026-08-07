@@ -217,30 +217,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-sdk-glue"
-version = "1.137.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "034b1d0fa165c64bf825b8ba5e5567b115f7439be1f13e51c5c754de98b896d9"
-dependencies = [
- "aws-credential-types",
- "aws-runtime",
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-observability",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-types",
- "bytes",
- "fastrand",
- "http 0.2.12",
- "http 1.4.2",
- "regex-lite",
- "tracing",
-]
-
-[[package]]
 name = "aws-sdk-sso"
 version = "1.93.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -470,7 +446,6 @@ dependencies = [
  "base64-simd",
  "bytes",
  "bytes-utils",
- "futures-core",
  "http 0.2.12",
  "http 1.4.2",
  "http-body 0.4.6",
@@ -483,8 +458,6 @@ dependencies = [
  "ryu",
  "serde",
  "time",
- "tokio",
- "tokio-util",
 ]
 
 [[package]]
@@ -1725,13 +1698,12 @@ dependencies = [
 
 [[package]]
 name = "krafka"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "ahash",
  "arc-swap",
  "aws-config",
  "aws-credential-types",
- "aws-sdk-glue",
  "base64",
  "bytes",
  "crc32c",

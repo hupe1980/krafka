@@ -1,6 +1,6 @@
 [package]
 name = "krafka"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["hupe1980"]
@@ -72,18 +72,15 @@ rustls-native-certs = { version = "0.8", optional = true }
 # For smaller binaries, use AwsMskIamCredentials::from_env() which
 # works without the aws-msk feature (manual credential loading).
 # Keep aws-config focused on the credential providers CLI/client apps expect
-# (credentials-process, sso) and opt both AWS crates into the modern HTTPS
-# client explicitly; aws-sdk-glue disables default features so it cannot pull
-# in the legacy Smithy Rustls transport path.
+# (credentials-process, sso) and opt into the modern HTTPS client explicitly.
 aws-config = { version = "1", optional = true, default-features = false, features = ["credentials-process", "default-https-client", "rt-tokio", "sso"] }
 aws-credential-types = { version = "1", optional = true }
-aws-sdk-glue = { version = "1", optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 arc-swap = "1.9.0"
 
 # SOCKS5 proxy support (optional)
 tokio-socks = { version = "0.5", optional = true }
 
-# JSON serialisation for schema registry (optional)
+# JSON serialisation for the OIDC token provider (optional)
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 
@@ -109,9 +106,6 @@ zstd = ["dep:zstd"]
 # If binary size is critical, use manual credential loading with AwsMskIamCredentials::from_env()
 # which works without this feature.
 aws-msk = ["dep:aws-config", "dep:aws-credential-types"]
-# Enable the built-in Confluent Schema Registry HTTP client.
-# The core schema_registry module (wire format, trait, caching) is always available.
-schema-registry = ["dep:serde", "dep:serde_json"]
 # Enable the built-in OIDC token provider for SASL/OAUTHBEARER: the OAuth 2.0
 # `client_credentials` grant (KIP-768) plus the RFC 7523 client-assertion
 # variant (KIP-1258).
@@ -124,11 +118,6 @@ schema-registry = ["dep:serde", "dep:serde_json"]
 # because pinning an RSA/ECDSA implementation on every user is a supply-chain
 # decision that belongs to the application, not the client.
 oauth-oidc = ["dep:serde", "dep:serde_json", "tokio/fs"]
-# Enable the AWS Glue Schema Registry SDK client.
-# The core glue module (wire format, trait, caching) is always available.
-# This feature adds the aws-sdk-glue dependency for direct Glue API calls
-# and activates flate2 for Glue ZLIB compression.
-aws-glue-schema-registry = ["dep:aws-sdk-glue", "dep:aws-config", "dep:flate2"]
 # Enable loading platform-native root certificates for TLS client verification.
 # When enabled, `TlsConfig::with_native_roots()` can use the OS trust store.
 native-tls-roots = ["dep:rustls-native-certs"]

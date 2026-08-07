@@ -1,13 +1,12 @@
-//! Minimal async HTTP/1.1 client used by the schema registry.
+//! Minimal async HTTP/1.1 client used by the OIDC token provider.
 //!
-//! Replaces reqwest, eliminating hyper, h2, and tower from the dependency
-//! tree.  The only additional crates used here are `tokio-rustls` and
-//! `webpki-roots`, both of which are already required by the Kafka transport
-//! layer.
+//! Avoids reqwest, and with it hyper, h2 and tower. The only additional crates
+//! used here are `tokio-rustls` and `webpki-roots`, both already required by
+//! the Kafka transport layer.
 //!
 //! Design constraints:
-//! - One new TCP (+ TLS) connection per request — schema-registry lookups are
-//!   infrequent; the simplicity outweighs the minor overhead.
+//! - One new TCP (+ TLS) connection per request — token fetches happen once per
+//!   token lifetime; the simplicity outweighs the minor overhead.
 //! - Supports HTTP and HTTPS, GET / POST / DELETE with JSON bodies.
 //! - Handles both `Content-Length` and `Transfer-Encoding: chunked` response
 //!   bodies.
@@ -31,7 +30,8 @@ use tokio_rustls::client::TlsStream;
 
 use crate::error::{KrafkaError, Result};
 
-/// Hard cap on response body size (16 MiB).  Schemas are large but bounded.
+/// Hard cap on response body size (16 MiB). Token responses are small; this is
+/// a bound against a hostile or broken peer, not a working limit.
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Hard cap on a single status / header / chunk-size / trailer line (8 KiB).
@@ -54,8 +54,8 @@ const MAX_TRAILERS: usize = 32;
 /// Timeout applied when the caller does not specify one.
 ///
 /// The client is never unbounded: `None` selects this value rather than
-/// disabling the timeout, because a schema-registry lookup that has not
-/// completed in a minute is indistinguishable from a hung peer.
+/// disabling the timeout, because a token fetch that has not completed in a
+/// minute is indistinguishable from a hung peer.
 pub(crate) const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Read one newline-terminated line, rejecting anything longer than
@@ -77,9 +77,9 @@ async fn read_line_bounded<R: AsyncRead + Unpin>(
     let n = limited
         .read_line(line)
         .await
-        .map_err(|e| KrafkaError::schema_registry(format!("reading {what} failed: {e}")))?;
+        .map_err(|e| KrafkaError::http(format!("reading {what} failed: {e}")))?;
     if n as u64 > MAX_LINE_BYTES {
-        return Err(KrafkaError::schema_registry(format!(
+        return Err(KrafkaError::http(format!(
             "{what} exceeds the {MAX_LINE_BYTES}-byte line limit"
         )));
     }
@@ -128,7 +128,7 @@ impl ParsedUrl {
             (false, s)
         } else {
             return Err(KrafkaError::config(format!(
-                "schema registry URL must start with http:// or https://, got: {url}"
+                "URL must start with http:// or https://, got: {url}"
             )));
         };
 
@@ -243,10 +243,12 @@ pub(crate) struct HttpResponse {
     /// Callers should validate this before attempting to parse the body as JSON
     /// to avoid confusing parse errors from HTML error pages or proxy responses.
     ///
-    /// Read by the schema-registry client; the OIDC token provider inspects the
-    /// body instead, because RFC 6749 error responses are JSON regardless of
-    /// what a proxy in front of the identity provider labels them.
-    #[cfg_attr(not(feature = "schema-registry"), allow(dead_code))]
+    /// The OIDC token provider inspects the body rather than this field,
+    /// because RFC 6749 error responses are JSON regardless of what a proxy in
+    /// front of the identity provider labels them. Kept because a
+    /// `Content-Type` mismatch is the first thing to look at when an identity
+    /// provider returns an HTML error page.
+    #[allow(dead_code)]
     pub content_type: Option<String>,
     /// Raw response body bytes.
     pub body: Vec<u8>,
@@ -347,7 +349,7 @@ impl HttpClient {
         );
         tokio::time::timeout(self.timeout, fut)
             .await
-            .map_err(|_| KrafkaError::timeout("schema registry HTTP request timed out"))?
+            .map_err(|_| KrafkaError::timeout("HTTP request timed out"))?
     }
 }
 
@@ -364,10 +366,7 @@ async fn do_request(
     let tcp = TcpStream::connect((url.host.as_str(), url.port))
         .await
         .map_err(|e| {
-            KrafkaError::schema_registry(format!(
-                "connect to {}:{} failed: {e}",
-                url.host, url.port
-            ))
+            KrafkaError::http(format!("connect to {}:{} failed: {e}", url.host, url.port))
         })?;
 
     let stream = if url.is_https {
@@ -376,7 +375,7 @@ async fn do_request(
             .to_owned();
         let connector = TlsConnector::from(Arc::clone(tls_config));
         let tls = connector.connect(server_name, tcp).await.map_err(|e| {
-            KrafkaError::schema_registry(format!("TLS handshake with {} failed: {e}", url.host))
+            KrafkaError::http(format!("TLS handshake with {} failed: {e}", url.host))
         })?;
         HttpStream::Tls(Box::new(tls))
     } else {
@@ -410,18 +409,20 @@ async fn do_request(
     req.push_str("\r\n");
 
     let mut stream = stream;
-    stream.write_all(req.as_bytes()).await.map_err(|e| {
-        KrafkaError::schema_registry(format!("writing request headers failed: {e}"))
-    })?;
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| KrafkaError::http(format!("writing request headers failed: {e}")))?;
     if let Some(b) = body {
-        stream.write_all(b).await.map_err(|e| {
-            KrafkaError::schema_registry(format!("writing request body failed: {e}"))
-        })?;
+        stream
+            .write_all(b)
+            .await
+            .map_err(|e| KrafkaError::http(format!("writing request body failed: {e}")))?;
     }
     stream
         .flush()
         .await
-        .map_err(|e| KrafkaError::schema_registry(format!("flushing request failed: {e}")))?;
+        .map_err(|e| KrafkaError::http(format!("flushing request failed: {e}")))?;
 
     let mut reader = BufReader::new(stream);
     read_response(&mut reader).await
@@ -453,7 +454,7 @@ async fn read_response<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Resul
         }
         header_count += 1;
         if header_count > MAX_HEADERS {
-            return Err(KrafkaError::schema_registry(format!(
+            return Err(KrafkaError::http(format!(
                 "response contains more than {MAX_HEADERS} headers"
             )));
         }
@@ -480,14 +481,15 @@ async fn read_response<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Resul
         read_chunked_body(reader).await?
     } else if let Some(n) = content_length {
         if n > MAX_BODY_BYTES {
-            return Err(KrafkaError::schema_registry(format!(
+            return Err(KrafkaError::http(format!(
                 "response Content-Length {n} exceeds {MAX_BODY_BYTES}-byte limit"
             )));
         }
         let mut buf = vec![0u8; n];
-        reader.read_exact(&mut buf).await.map_err(|e| {
-            KrafkaError::schema_registry(format!("reading response body failed: {e}"))
-        })?;
+        reader
+            .read_exact(&mut buf)
+            .await
+            .map_err(|e| KrafkaError::http(format!("reading response body failed: {e}")))?;
         buf
     } else {
         // No Content-Length and not chunked — read to EOF (`Connection: close`).
@@ -501,11 +503,9 @@ async fn read_response<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Resul
             .take(MAX_BODY_BYTES as u64 + 1)
             .read_to_end(&mut buf)
             .await
-            .map_err(|e| {
-                KrafkaError::schema_registry(format!("reading response body failed: {e}"))
-            })?;
+            .map_err(|e| KrafkaError::http(format!("reading response body failed: {e}")))?;
         if buf.len() > MAX_BODY_BYTES {
-            return Err(KrafkaError::schema_registry(format!(
+            return Err(KrafkaError::http(format!(
                 "response body exceeds {MAX_BODY_BYTES}-byte limit"
             )));
         }
@@ -525,7 +525,7 @@ fn parse_status_line(line: &str) -> Result<u16> {
     let _version = parts.next().unwrap_or("");
     let code = parts.next().unwrap_or("");
     code.parse::<u16>().map_err(|_| {
-        KrafkaError::schema_registry(format!("malformed HTTP status line: {:?}", line.trim_end()))
+        KrafkaError::http(format!("malformed HTTP status line: {:?}", line.trim_end()))
     })
 }
 
@@ -538,12 +538,12 @@ async fn read_chunked_body<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> R
         read_line_bounded(reader, &mut line, "chunk size line").await?;
         let hex = line.split(';').next().unwrap_or("").trim();
         let chunk_size = usize::from_str_radix(hex, 16)
-            .map_err(|_| KrafkaError::schema_registry(format!("invalid chunk size: {hex:?}")))?;
+            .map_err(|_| KrafkaError::http(format!("invalid chunk size: {hex:?}")))?;
         if chunk_size == 0 {
             break;
         }
         if body.len() + chunk_size > MAX_BODY_BYTES {
-            return Err(KrafkaError::schema_registry(format!(
+            return Err(KrafkaError::http(format!(
                 "chunked response body exceeds {MAX_BODY_BYTES}-byte limit"
             )));
         }
@@ -552,13 +552,13 @@ async fn read_chunked_body<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> R
         reader
             .read_exact(&mut body[start..])
             .await
-            .map_err(|e| KrafkaError::schema_registry(format!("reading chunk data failed: {e}")))?;
+            .map_err(|e| KrafkaError::http(format!("reading chunk data failed: {e}")))?;
         // Consume the CRLF that trails each chunk data block.
         let mut crlf = [0u8; 2];
         reader
             .read_exact(&mut crlf)
             .await
-            .map_err(|e| KrafkaError::schema_registry(format!("reading chunk CRLF failed: {e}")))?;
+            .map_err(|e| KrafkaError::http(format!("reading chunk CRLF failed: {e}")))?;
     }
     // Consume the trailing CRLF (or any trailing headers we don't use).
     //

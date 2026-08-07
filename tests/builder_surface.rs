@@ -278,8 +278,8 @@ fn both_producer_builders_share_one_configuration_surface() {
             let _ = || $make.state_store(NoopStore);
             let _ = |c: &krafka::client::KrafkaClient| $make.with_client(c);
             let _ = |p: krafka::producer::UniformStickyPartitioner| $make.partitioner(p);
-            let _ = |e: Arc<dyn krafka::schema_registry::SchemaEncoder>| $make.key_encoder(e);
-            let _ = |e: Arc<dyn krafka::schema_registry::SchemaEncoder>| $make.value_encoder(e);
+            let _ = |e: Arc<dyn krafka::serdes::Serializer>| $make.key_serializer(e);
+            let _ = |e: Arc<dyn krafka::serdes::Serializer>| $make.value_serializer(e);
             let _ = || {
                 $make.sasl_oauthbearer_provider(|| async {
                     Ok(krafka::auth::OAuthBearerToken::new("jwt"))
