@@ -117,7 +117,6 @@ pub const MAX_RECORD_HEADERS: usize = 10_000;
 ///
 /// Checks:
 /// - Non-empty.
-/// - Non-empty.
 /// - At most 249 characters (Kafka broker limit, matches the Java client's
 ///   `Topic.MAX_NAME_LENGTH`).
 /// - Contains only `[a-zA-Z0-9._-]` — the strict Kafka topic name character

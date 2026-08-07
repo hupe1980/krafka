@@ -72,7 +72,7 @@ Priority is automatically assigned based on API key:
 
 ### Configuration
 
-```rust
+```rust,compile
 use krafka::network::ConnectionConfig;
 
 let config = ConnectionConfig::builder()
@@ -169,7 +169,7 @@ for one of them to quietly bypass the proxy.
 `max_in_flight_requests` and the rest of the socket- and pool-level settings
 live on `TransportConfig`, accepted by every builder:
 
-```rust
+```rust,compile
 use krafka::network::TransportConfig;
 use std::time::Duration;
 
@@ -226,7 +226,9 @@ let producer = ProducerBuilder::new()
 
 ### Consumer Fetch Optimization
 
-The consumer automatically batches fetch requests by leader broker:
+The consumer automatically batches fetch requests by leader broker, and issues
+every broker's fetch concurrently against one shared deadline — so a poll on an
+N-broker cluster costs one round trip, not N:
 
 ```rust
 let consumer = ConsumerBuilder::new()
@@ -235,6 +237,46 @@ let consumer = ConsumerBuilder::new()
     .fetch_max_wait(Duration::from_millis(100))  // Max wait time
     .build();
 ```
+
+### Read-ahead
+
+A fetch response can carry `fetch_max_bytes` (50 MB by default) while
+`max_poll_records` (500) caps what one `poll()` may return. Rather than decode
+the whole response and discard the excess, or decode exactly the cap and pay a
+round trip every poll, krafka decodes **`max_poll_records` + the receive
+buffer's free capacity** and parks the surplus:
+
+```text
+poll 1   fetch → decode 1000 → deliver 500, park 500
+poll 2   buffer → deliver 500                        (no network)
+poll 3   fetch → decode 1000 → deliver 500, park 500
+```
+
+In steady state that halves the number of Fetch round trips and removes network
+latency from every other poll. Nothing is decoded twice and nothing is dropped.
+
+Read-ahead depth is `max_buffered_records` (default 500). Raise it to pipeline
+deeper on high-throughput consumers; lower it to bound resident memory:
+
+```rust
+let consumer = ConsumerBuilder::new()
+    .max_poll_records(500)
+    .max_buffered_records(2000)   // read up to 4 polls ahead
+    .build();
+```
+
+Because the consumer reads ahead of delivery, its *fetch* position runs ahead of
+its *delivered* position. Commits, `position()` and lag all follow the delivered
+one, so a crash never acknowledges a record `poll()` did not return — see
+[Position vs fetch position](@/docs/consumer.md#position-vs-fetch-position).
+
+### Partition fairness
+
+Both the broker's `fetch_max_bytes` accounting and the `max_poll_records` cap
+consume partitions in request order, so a fixed order starves whatever sits at
+the tail. krafka sorts the assigned partitions and rotates them by one position
+per poll, giving every partition its turn at the front — the same guarantee the
+Java client gets from `PartitionStates.moveToEnd`.
 
 ### Batched Offset Resolution
 

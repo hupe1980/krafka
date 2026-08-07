@@ -3111,3 +3111,180 @@ async fn an_old_abort_is_not_reported_to_a_consumer_that_has_read_past_it() {
     let _ = consumer.close().await;
     producer.close().await;
 }
+
+// ── Prefetch buffer ────────────────────────────────────────────────────────
+
+/// Records fetched past the delivery cap must be *parked*, not thrown away.
+///
+/// The consumer decodes one delivery's worth plus the buffer's free capacity,
+/// so a fetch that returns more than `max_poll_records` fills the buffer and
+/// the *next* poll is served from memory with no Fetch on the wire. The
+/// previous design truncated the surplus and re-fetched it, which paid for the
+/// same bytes twice — once in decode, once on the network.
+///
+/// Counting Fetch requests is what makes this a real assertion: comparing only
+/// the records returned would pass just as well against the old behaviour.
+#[tokio::test]
+async fn a_second_poll_is_served_from_the_prefetch_buffer_without_a_fetch() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let producer = crate::producer::Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("producer should connect");
+    for i in 0..20u32 {
+        let _ = producer
+            .send("events", None, format!("v{i}").as_bytes())
+            .await
+            .expect("send");
+    }
+    producer.close().await;
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .max_poll_records(5)
+        .max_buffered_records(50)
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("consumer should connect");
+    consumer
+        .assign("events", vec![0])
+        .await
+        .expect("manual assignment");
+
+    // First poll: goes to the broker and comes back with the delivery cap.
+    let first = consumer
+        .poll(Duration::from_millis(500))
+        .await
+        .expect("first poll");
+    assert_eq!(first.len(), 5, "the delivery cap must still be honoured");
+    let fetches_after_first = broker.request_count(ApiKey::Fetch);
+    assert!(
+        fetches_after_first >= 1,
+        "the first poll has to reach the broker"
+    );
+
+    // Second poll: served entirely from the buffer the first poll filled.
+    let second = consumer
+        .poll(Duration::from_millis(500))
+        .await
+        .expect("second poll");
+    assert_eq!(second.len(), 5, "the buffer must serve a full batch");
+    assert_eq!(
+        broker.request_count(ApiKey::Fetch),
+        fetches_after_first,
+        "a poll served from the prefetch buffer must not issue a Fetch"
+    );
+
+    // Offsets are contiguous across the boundary: nothing skipped, nothing
+    // duplicated by the park-and-serve round trip.
+    let seen: Vec<i64> = first
+        .iter()
+        .chain(second.iter())
+        .map(|r| r.offset)
+        .collect();
+    assert_eq!(seen, (0..10).collect::<Vec<i64>>());
+
+    let _ = consumer.close().await;
+}
+
+/// Parking records must never let the commit run ahead of delivery.
+///
+/// The fetch position advances over everything fetched, including the parked
+/// surplus. If the committed offset followed the fetch position, a crash after
+/// the first poll would skip every parked record. `committable_positions`
+/// holds the commit at the first undelivered offset instead, and this asserts
+/// that end to end rather than through the helper.
+#[tokio::test]
+async fn a_commit_never_acknowledges_records_still_parked_in_the_buffer() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let producer = crate::producer::Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("producer should connect");
+    for i in 0..20u32 {
+        let _ = producer
+            .send("events", None, format!("v{i}").as_bytes())
+            .await
+            .expect("send");
+    }
+    producer.close().await;
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .group_id("prefetch-commit-group")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .enable_auto_commit(false)
+        .max_poll_records(5)
+        .max_buffered_records(50)
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("consumer should connect");
+    consumer.subscribe(&["events"]).await.unwrap();
+
+    // Poll until a batch arrives; the surplus lands in the buffer.
+    let mut delivered = 0usize;
+    for _ in 0..10 {
+        let records = consumer
+            .poll(Duration::from_millis(300))
+            .await
+            .expect("poll");
+        delivered += records.len();
+        if delivered > 0 {
+            break;
+        }
+    }
+    assert!(delivered > 0, "the consumer must receive something");
+
+    // `position()` reports where delivery is, `fetch_position()` where the
+    // read-ahead is. They must differ by exactly what is parked, and the
+    // commit must follow `position()`.
+    let position = consumer
+        .position("events", 0)
+        .await
+        .expect("position must be tracked");
+    let fetch_position = consumer
+        .fetch_position("events", 0)
+        .await
+        .expect("fetch position must be tracked");
+    assert_eq!(
+        position, delivered as i64,
+        "position() must report the delivered offset, not the read-ahead"
+    );
+    assert!(
+        fetch_position > position,
+        "the consumer must have read ahead of delivery, got fetch={fetch_position} \
+         position={position}"
+    );
+
+    consumer.commit().await.expect("commit");
+
+    let committed = broker
+        .committed_offset("prefetch-commit-group", "events", 0)
+        .expect("the group must have a committed offset");
+    assert_eq!(
+        committed, delivered as i64,
+        "the commit must acknowledge exactly what was delivered — a commit at \
+         the fetch position would skip the parked surplus on restart"
+    );
+    assert_eq!(
+        committed, position,
+        "commit() and position() must never disagree"
+    );
+
+    let _ = consumer.close().await;
+}

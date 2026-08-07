@@ -86,7 +86,7 @@ A **subject** determines where a schema is registered and looked up in the regis
 | `RecordName` | `{record_name}` | Same type across multiple topics |
 | `TopicRecordName` | `{topic}-{record_name}` | Per-topic evolution of shared types |
 
-```rust
+```rust,compile
 use krafka::schema_registry::SubjectNameStrategy;
 
 let strategy = SubjectNameStrategy::TopicName;
@@ -191,7 +191,7 @@ let bounded = CachedSchemaRegistry::with_max_entries(other_registry, 1024);
 
 For provider-agnostic cache lifecycle operations, both wrappers implement `AnySchemaCache`:
 
-```rust
+```rust,compile
 use krafka::schema_registry::{AnySchemaCache, CachedSchemaRegistry, SchemaId};
 
 async fn reset_and_prewarm(cache: &dyn AnySchemaCache<Id = SchemaId>) -> krafka::Result<()> {
@@ -206,7 +206,7 @@ Enable the `schema-registry` feature to use the built-in HTTP client:
 
 ```toml
 [dependencies]
-krafka = { version = "0.16.0", features = ["schema-registry"] }
+krafka = { version = "0.17.0", features = ["schema-registry"] }
 ```
 
 ### Basic Usage
@@ -247,7 +247,7 @@ for record in &records {
 
 ### Authentication
 
-```rust
+```rust,compile
 use krafka::schema_registry::ConfluentSchemaRegistry;
 
 // Basic auth
@@ -410,7 +410,7 @@ For `Bytes` values (e.g., from `CompactedTable`), use `decode_glue_wire_format_b
 
 The `GlueSchemaRegistryClient` trait allows pluggable backends (always available, no feature required):
 
-```rust
+```rust,compile
 use krafka::schema_registry::glue::{
     GlueSchemaRegistryClient, GlueSchema, GlueSchemaVersionId, GlueDataFormat,
 };
@@ -422,7 +422,7 @@ Enable the `aws-glue-schema-registry` feature to use the built-in SDK client:
 
 ```toml
 [dependencies]
-krafka = { version = "0.16.0", features = ["aws-glue-schema-registry"] }
+krafka = { version = "0.17.0", features = ["aws-glue-schema-registry"] }
 ```
 
 ```rust
@@ -511,7 +511,7 @@ encoding is automatic on every `send_record()` call — no per-record boilerplat
 
 ```toml
 [dependencies]
-krafka = { version = "0.16.0", features = ["schema-registry"] }
+krafka = { version = "0.17.0", features = ["schema-registry"] }
 ```
 
 ```rust
@@ -591,7 +591,7 @@ producer.send_record(
 Implement `SchemaEncoder` for custom framing logic (e.g., non-Confluent registries,
 multi-schema routing):
 
-```rust
+```rust,compile
 use std::pin::Pin;
 use std::future::Future;
 use bytes::Bytes;

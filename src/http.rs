@@ -97,6 +97,30 @@ struct ParsedUrl {
 }
 
 impl ParsedUrl {
+    /// The value for the `Host` request header, per RFC 9110 §7.2.
+    ///
+    /// Two rules the previous implementation broke by sending the bare host:
+    ///
+    /// * the port **must** be included whenever it is not the scheme default,
+    ///   and the Confluent Schema Registry's own default is 8081 — so the
+    ///   common deployment was the one that sent the wrong header. Name-based
+    ///   virtual hosting, most reverse proxies and any origin that validates
+    ///   `Host` against its configured authority reject or mis-route it;
+    /// * an IPv6 literal must stay bracketed, or the colons in the address are
+    ///   indistinguishable from a port separator.
+    fn host_header(&self) -> String {
+        let bracketed = self.host.contains(':');
+        let default_port = if self.is_https { 443 } else { 80 };
+        match (bracketed, self.port == default_port) {
+            (true, true) => format!("[{}]", self.host),
+            (true, false) => format!("[{}]:{}", self.host, self.port),
+            (false, true) => self.host.clone(),
+            (false, false) => format!("{}:{}", self.host, self.port),
+        }
+    }
+}
+
+impl ParsedUrl {
     fn parse(url: &str) -> Result<Self> {
         let (is_https, rest) = if let Some(s) = url.strip_prefix("https://") {
             (true, s)
@@ -365,7 +389,7 @@ async fn do_request(
     req.push(' ');
     req.push_str(&url.path_and_query);
     req.push_str(" HTTP/1.1\r\nHost: ");
-    req.push_str(&url.host);
+    req.push_str(&url.host_header());
     req.push_str("\r\nConnection: close\r\n");
     if let Some(auth) = auth_header {
         req.push_str("Authorization: ");
@@ -654,6 +678,48 @@ mod tests {
         assert_eq!(u.host, "::1");
         assert_eq!(u.port, 9092);
         assert_eq!(u.path_and_query, "/path");
+    }
+
+    #[test]
+    fn test_host_header_includes_non_default_port() {
+        // The Confluent Schema Registry's default port is 8081, so this is the
+        // *common* case, not an edge case: omitting it broke name-based
+        // virtual hosting and every reverse proxy that routes on `Host`.
+        let u = ParsedUrl::parse("http://registry.example.com:8081/subjects").unwrap();
+        assert_eq!(u.host_header(), "registry.example.com:8081");
+
+        let u = ParsedUrl::parse("https://registry.example.com:9443/subjects").unwrap();
+        assert_eq!(u.host_header(), "registry.example.com:9443");
+    }
+
+    #[test]
+    fn test_host_header_omits_default_port() {
+        // RFC 9110 §7.2: the port is elided when it is the scheme default.
+        let u = ParsedUrl::parse("http://registry.example.com/subjects").unwrap();
+        assert_eq!(u.host_header(), "registry.example.com");
+
+        let u = ParsedUrl::parse("https://registry.example.com/subjects").unwrap();
+        assert_eq!(u.host_header(), "registry.example.com");
+
+        let u = ParsedUrl::parse("http://registry.example.com:80/subjects").unwrap();
+        assert_eq!(u.host_header(), "registry.example.com");
+
+        let u = ParsedUrl::parse("https://registry.example.com:443/subjects").unwrap();
+        assert_eq!(u.host_header(), "registry.example.com");
+    }
+
+    #[test]
+    fn test_host_header_brackets_ipv6_literals() {
+        // Without brackets the colons in the address are indistinguishable
+        // from a port separator.
+        let u = ParsedUrl::parse("http://[::1]:8081/subjects").unwrap();
+        assert_eq!(u.host_header(), "[::1]:8081");
+
+        let u = ParsedUrl::parse("http://[2001:db8::1]/subjects").unwrap();
+        assert_eq!(u.host_header(), "[2001:db8::1]");
+
+        let u = ParsedUrl::parse("https://[2001:db8::1]:443/subjects").unwrap();
+        assert_eq!(u.host_header(), "[2001:db8::1]");
     }
 
     #[test]

@@ -97,7 +97,7 @@ assert_eq!(code, ErrorCode::NotLeaderForPartition);
 
 ### Basic Error Handling
 
-```rust
+```rust,compile
 use krafka::error::{KrafkaError, Result};
 use krafka::producer::Producer;
 
@@ -118,7 +118,7 @@ async fn send_message(producer: &Producer) -> Result<()> {
 
 ### Pattern Matching on Errors
 
-```rust
+```rust,compile
 use krafka::error::KrafkaError;
 
 fn handle_error(error: KrafkaError) {
@@ -153,7 +153,7 @@ to duplicate retry-classification logic. Protocol errors are further classified
 by `ProtocolErrorKind` (see [below](#protocolerrorkind)) so you can distinguish
 a transient truncated frame from a permanent API-version mismatch.
 
-```rust
+```rust,compile
 use krafka::error::KrafkaError;
 use std::time::Duration;
 
@@ -191,7 +191,7 @@ where
 alongside the human-readable message. This lets callers make retry decisions
 without substring-matching the message text.
 
-```rust
+```rust,compile
 use krafka::{KrafkaError, ProtocolErrorKind};
 
 fn handle_protocol_error(err: &KrafkaError) {
@@ -241,7 +241,7 @@ protocol error (CrcMismatch): record batch CRC check failed
 
 Add context to errors for better debugging:
 
-```rust
+```rust,compile
 use krafka::error::{KrafkaError, Result};
 
 async fn process_topic(producer: &Producer, topic: &str) -> Result<()> {
@@ -263,7 +263,7 @@ async fn process_topic(producer: &Producer, topic: &str) -> Result<()> {
 
 When `auto_offset_reset` is set to `None` and a partition has no committed offset, `poll()` will return an error:
 
-```rust
+```rust,compile
 use krafka::consumer::{Consumer, AutoOffsetReset};
 
 let consumer = Consumer::builder()
@@ -318,7 +318,7 @@ async fn consume_safely(consumer: &Consumer) {
 
 ### Commit Error Handling
 
-```rust
+```rust,compile
 use krafka::error::KrafkaError;
 
 async fn commit_with_retry(consumer: &Consumer, retries: u32) -> Result<(), KrafkaError> {
@@ -487,7 +487,7 @@ async fn process_with_fallback(record: &ConsumerRecord) -> Result<()> {
 
 ### 5. Circuit Breaker Pattern
 
-```rust
+```rust,compile
 use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -543,13 +543,19 @@ A _dead-letter queue_ (DLQ) receives records that cannot be processed or deliver
 
 Configure a DLQ on the producer to automatically route records to an error topic when all retry attempts are exhausted:
 
-```rust
+> This example is kept compiling by a doctest on the
+> [`DeadLetterQueue`](https://docs.rs/krafka/latest/krafka/dlq/trait.DeadLetterQueue.html)
+> trait itself, so it cannot silently drift from the API.
+
+```rust,compile
 use std::pin::Pin;
 use std::future::Future;
 use std::sync::Arc;
 use krafka::dlq::DeadLetterQueue;
 use krafka::producer::{Producer, ProducerRecord};
 
+// `Debug` is a supertrait of `DeadLetterQueue`; `Producer` implements it, so
+// an implementation can own one.
 #[derive(Debug)]
 struct KafkaDlq {
     producer: Producer,
@@ -575,6 +581,8 @@ impl DeadLetterQueue for KafkaDlq {
     }
 }
 
+// A separate producer: sharing the one whose sends are failing would queue the
+// dead-letter write behind the same stalled broker.
 let dlq_producer = Producer::builder()
     .bootstrap_servers("localhost:9092")
     .build()

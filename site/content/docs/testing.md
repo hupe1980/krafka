@@ -20,12 +20,12 @@ socket, so the client under test is the actual `Producer`, `Consumer` or
 
 ```toml
 [dev-dependencies]
-krafka = { version = "0.16", features = ["test-broker"] }
+krafka = { version = "0.17", features = ["test-broker"] }
 ```
 
 ## A first test
 
-```rust
+```rust,compile
 use krafka::testing::FakeBroker;
 use krafka::producer::Producer;
 
@@ -107,7 +107,7 @@ KIP-360 fencing, `AddPartitionsToTxn`, `AddOffsetsToTxn`, `TxnOffsetCommit`,
 `EndTxn`, real commit and abort control batches, and `read_committed`
 isolation. A complete consume-transform-produce cycle runs in-process:
 
-```rust
+```rust,compile
 use krafka::consumer::IsolationLevel;
 use krafka::producer::TransactionalProducer;
 use krafka::testing::FakeBroker;

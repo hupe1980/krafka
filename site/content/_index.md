@@ -83,13 +83,13 @@ make actually reach the wire.
 
 ```toml
 [dependencies]
-krafka = "0.16"
+krafka = "0.17"
 tokio = { version = "1", features = ["full"] }
 ```
 
 ## Produce
 
-```rust
+```rust,compile
 use krafka::producer::Producer;
 
 #[tokio::main]
@@ -107,7 +107,7 @@ async fn main() -> krafka::error::Result<()> {
 
 ## Consume
 
-```rust
+```rust,compile
 use krafka::consumer::{AutoOffsetReset, Consumer};
 use std::time::Duration;
 

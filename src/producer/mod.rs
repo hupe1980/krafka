@@ -502,6 +502,36 @@ pub(crate) fn fill_produce_topic_ids(
     all_resolved
 }
 
+/// Hand-written rather than derived, for two reasons.
+///
+/// The mechanical one: several fields are `Arc<dyn Trait>` — the partitioner,
+/// the interceptor, the DLQ, the schema encoders — and a derive would require
+/// `Debug` on every one of those traits.
+///
+/// The one that matters: [`DeadLetterQueue`](crate::dlq::DeadLetterQueue)
+/// requires `Debug`, and the obvious implementation of it owns a `Producer` to
+/// write dead letters back into Kafka. Without this impl that natural design
+/// does not compile, and the documented example for the crate's own DLQ trait
+/// was wrong for exactly that reason.
+///
+/// Only non-secret, non-`dyn` state is printed. `ProducerConfig` is
+/// deliberately excluded — it can carry SASL credentials, and the crate's
+/// `secret-debug` CI check exists to keep credential-bearing types out of
+/// `Debug` output.
+impl std::fmt::Debug for Producer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Producer")
+            .field("client_id", &self.config.client_id)
+            .field("batching", &self.accumulator.is_some())
+            .field("idempotent", &self.identity.is_some())
+            .field("max_request_size", &self.max_request_size)
+            .field("memory_capacity", &self.memory_capacity)
+            .field("connections", &self.pool.len())
+            .field("owns_pool", &self.owns_pool())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Producer {
     /// Create a new producer builder.
     pub fn builder() -> ProducerBuilder {
@@ -2772,8 +2802,7 @@ mod tests {
             .request_timeout(Duration::from_secs(2))
             .build()
             .await
-            .err()
-            .expect("request_timeout below the default connect_timeout must be rejected");
+            .expect_err("request_timeout below the default connect_timeout must be rejected");
         assert!(
             err.to_string().contains("connect_timeout"),
             "the error should name the setter to change: {err}"
@@ -2787,8 +2816,7 @@ mod tests {
             .connect_timeout(Duration::from_secs(2))
             .build()
             .await
-            .err()
-            .expect("no broker is listening on port 1");
+            .expect_err("no broker is listening on port 1");
         assert!(
             !err.to_string().contains("connect_timeout"),
             "config validation should have passed, got {err}"

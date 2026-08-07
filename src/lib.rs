@@ -135,7 +135,7 @@
 //! ```toml
 //! [dependencies]
 //! # `ring` (or `rustls-aws-lc-rs`) is required — without it the build fails.
-//! krafka = { version = "0.16.0", default-features = false, features = ["lz4", "ring"] }
+//! krafka = { version = "0.17.0", default-features = false, features = ["lz4", "ring"] }
 //! ```
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -219,6 +219,37 @@ pub mod telemetry;
 pub mod testing;
 pub mod tracing_ext;
 pub mod util;
+
+/// The types you need to write a producer, a consumer or an admin client.
+///
+/// ```rust
+/// use krafka::prelude::*;
+/// ```
+///
+/// A glob import, so an explicit `use` of the same type shadows it rather than
+/// colliding. Everything here is re-exported from its own module; the prelude
+/// exists so that the common case is one line instead of eight, and so that the
+/// documentation snippets have a single import that keeps them honest.
+///
+/// Deliberately excluded: anything feature-gated (`ShareConsumer`, the
+/// telemetry reporter, the fake broker), and anything a caller is unlikely to
+/// name more than once per program (`ConnectionConfig`, the metrics exporters).
+/// A prelude that pulls in names you did not ask for is worse than no prelude.
+pub mod prelude {
+    pub use crate::admin::{AdminClient, NewTopic};
+    pub use crate::client::KrafkaClient;
+    pub use crate::consumer::{
+        AutoOffsetReset, Consumer, ConsumerRecord, IsolationLevel, OffsetAndMetadata,
+        TopicPartition,
+    };
+    pub use crate::dlq::{DeadLetterQueue, KafkaDeadLetterQueue};
+    // `Result` is deliberately absent: krafka's alias takes one parameter, so
+    // a glob that shadowed `std::result::Result` would break every
+    // `Result<T, E>` in the importing module. Write `krafka::Result<T>`.
+    pub use crate::error::KrafkaError;
+    pub use crate::producer::{Producer, ProducerRecord, TransactionalProducer};
+    pub use crate::protocol::Compression;
+}
 
 pub use error::{KrafkaError, ProtocolErrorKind, RecvError, Result};
 pub use metadata::MetadataRecoveryStrategy;

@@ -45,7 +45,7 @@ default:
 # Ordered cheapest-first so a formatting slip fails in seconds rather than
 # after a full test run.
 [doc("Everything CI runs (no Docker suites)")]
-ci: fmt-check clippy check protocol-parity secret-debug test-reachability version-check site-check test-ring test minimal-features doc
+ci: fmt-check clippy check protocol-parity secret-debug test-reachability version-check site-check docs-test test-ring test minimal-features doc
     @echo ""
     @echo "✓ ci passed — Docker suites not included, run 'just integration' for those"
 
@@ -162,6 +162,17 @@ version-check:
 site-check:
     python3 xtask/site_check.py
     python3 xtask/doc_api.py
+
+# Compile the guide snippets marked ```rust,compile.
+#
+# `doc_api.py` checks that names resolve; it cannot check that a call has the
+# right shape, because a plausible snippet reaches only for names that exist.
+# Three fabricated APIs passed it, and the documented way to implement the
+# crate's own `DeadLetterQueue` trait shipped broken for two releases. This
+# compiles the snippets instead.
+[doc("Documentation snippets compile")]
+docs-test:
+    python3 xtask/docs_test.py
 
 # Build the documentation site into site/public.
 [doc("Build the documentation site")]

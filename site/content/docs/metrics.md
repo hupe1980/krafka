@@ -52,7 +52,7 @@ impl MetricsExporter for StatsDExporter {
 
 Each client type has its own metrics:
 
-```rust
+```rust,compile
 use krafka::metrics::{ProducerMetrics, ConsumerMetrics, ConnectionMetrics, MetricsVisitable};
 
 let producer_metrics = ProducerMetrics::new();
@@ -71,7 +71,7 @@ println!("Bytes sent: {}", snapshot.bytes_sent);
 
 ## Prometheus Export
 
-```rust
+```rust,compile
 use krafka::metrics::{ProducerMetrics, MetricsVisitable};
 
 let metrics = ProducerMetrics::new();
@@ -85,7 +85,7 @@ println!("{}", prometheus_output);
 
 Or use the exporter directly:
 
-```rust
+```rust,compile
 use krafka::metrics::{ProducerMetrics, PrometheusExporter, MetricsVisitable};
 
 let metrics = ProducerMetrics::new();
@@ -112,7 +112,7 @@ let json = exporter.finish();
 
 Use `KrafkaMetrics` to collect and export all metrics from multiple components:
 
-```rust
+```rust,compile
 use std::sync::Arc;
 use krafka::metrics::KrafkaMetrics;
 
@@ -148,7 +148,7 @@ metrics.reset();
 
 For production use, expose metrics via HTTP:
 
-```rust
+```rust,compile
 use std::sync::Arc;
 use krafka::metrics::KrafkaMetrics;
 
@@ -347,7 +347,7 @@ Enable the `telemetry` feature for native OTLP protobuf export and KIP-714 broke
 
 ```toml
 [dependencies]
-krafka = { version = "0.16.0", features = ["telemetry"] }
+krafka = { version = "0.17.0", features = ["telemetry"] }
 ```
 
 Export metrics as OTLP protobuf bytes for ingestion by any OTLP-compatible backend:
@@ -401,7 +401,7 @@ next interval.
 
 You can also bridge metrics to an external OpenTelemetry SDK using snapshots or a custom exporter:
 
-```rust
+```rust,compile
 use krafka::metrics::{KrafkaMetrics, ProducerMetricsSnapshot};
 
 fn export_to_otel(snapshot: &ProducerMetricsSnapshot) {

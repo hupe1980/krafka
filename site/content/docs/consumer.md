@@ -26,7 +26,7 @@ The krafka consumer is an async-native, feature-rich Kafka consumer with:
 
 ## Basic Usage
 
-```rust
+```rust,compile
 use krafka::consumer::Consumer;
 use krafka::error::Result;
 use std::time::Duration;
@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
 
 Connect to secured Kafka clusters using SASL or TLS:
 
-```rust
+```rust,compile
 use krafka::consumer::Consumer;
 
 // SASL/SCRAM-SHA-256
@@ -84,7 +84,7 @@ See the [Authentication Guide](@/docs/authentication.md) for all supported mecha
 
 Control behavior when no committed offset exists:
 
-```rust
+```rust,compile
 use krafka::consumer::{Consumer, AutoOffsetReset};
 
 // Start from the earliest available message
@@ -149,7 +149,7 @@ let consumer = Consumer::builder()
 computes assignments server-side and `ConsumerGroupHeartbeat` is the only
 membership channel — no JoinGroup, no SyncGroup, no client-side assignor.
 
-```rust
+```rust,compile
 use krafka::consumer::{Consumer, GroupProtocol};
 
 let consumer = Consumer::builder()
@@ -224,7 +224,7 @@ Control how offsets are committed. When auto-commit is enabled (the default), kr
 > For strict at-least-once, disable auto-commit and call `commit()` after
 > processing each batch.
 
-```rust
+```rust,compile
 use krafka::consumer::Consumer;
 use std::time::Duration;
 
@@ -250,7 +250,7 @@ let consumer = Consumer::builder()
 
 Control message fetching behavior:
 
-```rust
+```rust,compile
 use krafka::consumer::Consumer;
 use std::time::Duration;
 
@@ -277,7 +277,61 @@ For single-caller `recv()` usage the buffer is naturally bounded by `max_poll_re
 
 Set to `0` to disable the buffer cap (unlimited). Defaults to `500`.
 
+### Read-ahead
+
+The buffer is not only an overflow area — it is a prefetch pipeline.
+
+Each fetch decodes one delivery's worth (`max_poll_records`) **plus** whatever
+capacity the buffer has free, and parks the surplus. The next `poll()` finds
+the buffer stocked and returns immediately, without a single byte on the wire.
+In steady state that halves the number of Fetch round trips and removes the
+network latency from every other poll.
+
+```text
+poll 1   fetch → decode 1000 → deliver 500, park 500
+poll 2   buffer → deliver 500                        (no network)
+poll 3   fetch → decode 1000 → deliver 500, park 500
+```
+
+A fetch response may carry up to `fetch_max_bytes` (50 MB by default). Decoding
+all of it to return 500 records would throw the rest away and re-decode the same
+bytes next poll; decoding exactly 500 would fix the waste but pay a round trip
+every poll. Decoding `max_poll_records + free buffer capacity` fixes both.
+
+Nothing is ever dropped, so the fetch position advances over everything
+decoded — and the commit is held behind whatever is still parked (see
+[Position vs fetch position](#position-vs-fetch-position)).
+
+Partitions take turns at the front of the fetch order, rotating by one position
+per poll. Both the broker's `fetch_max_bytes` accounting and the
+`max_poll_records` cap consume partitions in request order, so the rotation is
+what stops a busy partition at the front from starving the rest.
+
+### Position vs fetch position
+
+Because the consumer reads ahead, two offsets exist per partition and they mean
+different things:
+
+| Accessor | Meaning |
+|---|---|
+| `position()` | The offset of the next record that will be **delivered** to you. This is what a commit writes. |
+| `fetch_position()` | The offset the next **fetch** starts from. Runs ahead by whatever is parked. |
+
+`position()`, `lag()`, `current_lag()`, `is_caught_up()` and `commit()` are all
+derived from the same boundary — the lowest offset still awaiting delivery — so
+they can never disagree about a partition. In particular, records read ahead
+into the buffer still count as lag: they have been fetched, but the application
+has not seen them.
+
 ```rust
+let delivered = consumer.position("orders", 0).await;      // commit follows this
+let read_ahead = consumer.fetch_position("orders", 0).await; // >= delivered
+```
+
+A crash between the two loses nothing: the commit never acknowledges a record
+that was not returned from `poll()`.
+
+```rust,compile
 use krafka::consumer::Consumer;
 
 let consumer = Consumer::builder()
@@ -292,7 +346,7 @@ let consumer = Consumer::builder()
 
 Control visibility of transactional records. When consuming from topics that receive transactional writes, set `isolation_level` to `read_committed` to only see committed records:
 
-```rust
+```rust,compile
 use krafka::consumer::{Consumer, IsolationLevel};
 
 let consumer = Consumer::builder()
@@ -314,7 +368,7 @@ let consumer = Consumer::builder()
 
 During a partial metadata refresh (where only the subscribed topics are re-fetched rather than the entire cluster), krafka caches each topic's metadata between refreshes. By default, a topic entry is evicted from this cache after **5 minutes** of not being successfully refreshed — matching Java's `metadata.max.idle.ms` — to prevent unbounded growth when topics are deleted or subscriptions change.
 
-```rust
+```rust,compile
 use krafka::consumer::Consumer;
 use std::time::Duration;
 
@@ -346,7 +400,7 @@ let consumer = Consumer::builder()
 3. Each partition is consumed by exactly one consumer
 4. When consumers join/leave, partitions are rebalanced
 
-```rust
+```rust,compile
 use krafka::consumer::Consumer;
 
 // Multiple consumers in the same group share partitions
@@ -371,7 +425,7 @@ consumer2.subscribe(&["events"]).await?;
 
 krafka supports multiple assignment strategies. Configure the strategy via the builder:
 
-```rust
+```rust,compile
 use krafka::consumer::{Consumer, PartitionAssignmentStrategy};
 
 // Range assignor (default)
@@ -437,7 +491,7 @@ protocols later.
 
 The underlying assignor implementations are also available directly:
 
-```rust
+```rust,compile
 use krafka::consumer::{RangeAssignor, RoundRobinAssignor, CooperativeStickyAssignor, PartitionAssignor};
 
 // Range assignor (default)
@@ -497,7 +551,7 @@ until the session expires, so a restarting instance can reclaim it.
   while `on_partitions_lost` is used when ownership may already have been transferred
   (e.g., session timeout, fencing, or graceful shutdown via `close()`).
 
-```rust
+```rust,compile
 use krafka::consumer::{ConsumerBuilder, PartitionAssignmentStrategy};
 
 let consumer = ConsumerBuilder::default()
@@ -614,16 +668,32 @@ loop {
 
 ### Async Commit
 
-For non-blocking commits:
+`commit_async()` is **not** an `async fn` — it returns an `OffsetCommitHandle`
+immediately and runs the commit in the background. That is the point: you can
+keep processing while the commit is in flight and collect the outcome later.
 
 ```rust
-// Commit asynchronously and await the final outcome.
-// Snapshot, transport, and broker failures are surfaced on the handle.
-// Retriable coordinator failures use the same short retry loop as commit().
-// If the assignment or offset snapshot cannot be taken, the handle resolves
-// to an error instead of silently skipping the commit cycle.
+// Start the commit and carry on processing.
+let commit = consumer.commit_async();
+
+let records = consumer.poll(Duration::from_secs(1)).await?;
+process(&records);
+
+// Collect the outcome when it suits you. Snapshot, transport and broker
+// failures all surface here; retriable coordinator failures use the same
+// short backoff loop as `commit()`.
+commit.await?;
+```
+
+Awaiting it straight away is legal but equivalent to `commit()`:
+
+```rust
 consumer.commit_async().await?;
 ```
+
+Dropping the handle detaches the background task — the commit still runs, but
+its result is discarded. The type is `#[must_use]` so this has to be
+deliberate.
 
 ### Commit with Metadata
 
@@ -682,6 +752,17 @@ consumer.seek_to_beginning("topic", 0).await?;
 consumer.seek_to_end("topic", 0).await?;
 ```
 
+Every seek is a hard reposition. Records already fetched for the affected
+partitions are discarded, so the next `poll()` / `recv()` returns data from the
+new position and nothing from before it — and, just as importantly, the next
+commit reflects the position that was sought to rather than being dragged back
+onto a stale buffered record. The same applies when `auto_offset_reset` moves a
+partition after `OFFSET_OUT_OF_RANGE`.
+
+The recorded leader epoch is invalidated too, so the consumer re-validates the
+new position against the leader's log (KIP-320) before fetching from it rather
+than reporting a `(position, epoch)` pair it never actually held.
+
 ### Starting from Known Offsets (Exactly-Once Recovery)
 
 Use `initial_offsets` on the builder to set per-partition start positions before
@@ -711,7 +792,7 @@ partitions; unmatched partitions still follow `auto_offset_reset`.
 
 Temporarily pause consumption of specific partitions:
 
-```rust
+```rust,compile
 // Pause specific partitions
 consumer.pause("orders", &[0, 1]).await;
 
@@ -723,10 +804,21 @@ println!("Paused partitions: {:?}", paused);
 consumer.resume("orders", &[0, 1]).await;
 ```
 
-Paused partitions are skipped during `poll()` until resumed. This is useful for:
+Paused partitions are skipped until resumed — by `poll()`, and equally by
+`recv()`, `batch_recv()` and `stream()`, which withhold any records that were
+already buffered for a partition when it was paused. `pause()` therefore means
+the same thing whichever read API you use.
+
+Withheld records are *held*, not discarded: the fetch position has already
+advanced past them, so they are delivered on `resume()` rather than re-fetched,
+and a commit taken while paused stays behind them so nothing is acknowledged
+before the application has seen it.
+
+This is useful for:
 - Back-pressure handling when downstream is slow
 - Prioritizing certain partitions
 - Implementing rate limiting
+- Isolating a partition with a corrupt batch while everything else keeps flowing
 
 > **Rebalance behavior:** Pause state is preserved for partitions that remain assigned to the same consumer across both eager and cooperative rebalances. Only revoked partitions lose their pause state. `unsubscribe()` and `close()` still clear all pause state.
 
@@ -739,7 +831,7 @@ For direct partition control (without consumer groups):
 
 > **Standalone Recovery:** Standalone consumers have the same `OffsetOutOfRange` recovery as group consumers — the configured `auto_offset_reset` policy is applied automatically to recover stalled partitions.
 
-```rust
+```rust,compile
 use krafka::consumer::Consumer;
 
 let consumer = Consumer::builder()
@@ -759,7 +851,7 @@ consumer.assign("topic", vec![0, 1, 2]).await?;
 
 `subscribe()` **replaces** the current subscription (it does not append):
 
-```rust
+```rust,compile
 // Subscribe to initial topics
 consumer.subscribe(&["orders", "payments"]).await?;
 
@@ -769,7 +861,7 @@ consumer.subscribe(&["shipments"]).await?;
 
 ### Check Subscriptions and Assignments
 
-```rust
+```rust,compile
 // Get subscribed topics
 let topics = consumer.subscription().await;
 println!("Subscribed to: {:?}", topics);
@@ -794,11 +886,12 @@ consumer.unsubscribe().await?;
 
 Temporarily pause consumption of specific partitions without disconnecting:
 
-```rust
+```rust,compile
 // Pause partitions 0 and 1 of "orders" topic
 consumer.pause("orders", &[0, 1]).await;
 
-// These partitions will be skipped during poll()
+// These partitions are skipped by every read API — poll(), recv(),
+// batch_recv() and stream() — including records already buffered for them.
 let records = consumer.poll(Duration::from_secs(1)).await?;
 // Only records from non-paused partitions are returned
 
@@ -856,7 +949,7 @@ ensuring no data loss even when `poll()` returns multiple records.
 - `Err(RecvError::Closed)` — the consumer was shut down.
 - `Err(RecvError::Error(e))` — a broker or network error occurred.
 
-```rust
+```rust,compile
 use krafka::consumer::Consumer;
 use krafka::error::Result;
 use krafka::RecvError;
@@ -883,7 +976,7 @@ async fn consume_stream(consumer: &Consumer) -> Result<()> {
 returning an explicit [`BatchRecvOutcome`] so timeout/close/empty-request are
 unambiguous:
 
-```rust
+```rust,compile
 use std::time::Duration;
 use krafka::consumer::{BatchRecvOutcome, Consumer};
 use krafka::error::Result;
@@ -1054,7 +1147,7 @@ krafka implements [KIP-392](https://cwiki.apache.org/confluence/display/KAFKA/KI
 
 Set `client_rack` to the rack or availability zone of the consumer:
 
-```rust
+```rust,compile
 let consumer = Consumer::builder()
     .bootstrap_servers("localhost:9092")
     .group_id("my-group")
@@ -1087,7 +1180,7 @@ let consumer = Consumer::builder()
 
 ### High Throughput
 
-```rust
+```rust,compile
 use krafka::consumer::Consumer;
 use std::time::Duration;
 
@@ -1105,7 +1198,7 @@ let consumer = Consumer::builder()
 
 ### Low Latency
 
-```rust
+```rust,compile
 use krafka::consumer::Consumer;
 use std::time::Duration;
 
@@ -1121,7 +1214,7 @@ let consumer = Consumer::builder()
 
 ### Memory Efficiency
 
-```rust
+```rust,compile
 use krafka::consumer::Consumer;
 use std::time::Duration;
 
@@ -1145,7 +1238,7 @@ without triggering a rebalance for the entire group.
 
 ### Enabling Static Membership
 
-```rust
+```rust,compile
 use krafka::consumer::Consumer;
 
 let consumer = Consumer::builder()
@@ -1179,7 +1272,7 @@ When `group_instance_id` is set, krafka automatically:
 - Increase `session_timeout` to cover restart duration (e.g., 5 minutes for rolling deployments)
 - Use with `CooperativeSticky` assignor for minimal partition movement
 
-```rust
+```rust,compile
 use krafka::consumer::{Consumer, PartitionAssignmentStrategy};
 use std::time::Duration;
 
@@ -1208,7 +1301,7 @@ protocol. Requires Kafka 4.0+ (or 3.7–3.9 with
 production-stable). This is the **recommended** protocol; the classic one is
 deprecated upstream from Kafka 4.3 (KIP-1274).
 
-```rust
+```rust,compile
 use krafka::consumer::{Consumer, GroupProtocol};
 
 let consumer = Consumer::builder()
@@ -1404,7 +1497,7 @@ This means:
 
 Records in compacted topics with a key but no value are **tombstones** — deletion markers that eventually cause the key to be removed from the log. Use `ConsumerRecord::is_tombstone()` to detect them:
 
-```rust
+```rust,compile
 use std::time::Duration;
 
 // Assuming `consumer` is an already-configured Consumer instance
@@ -1422,7 +1515,7 @@ for record in &records {
 
 `CompactedTable` is a standalone, Kafka-agnostic data structure that maintains an in-memory key→value snapshot from consumer records. It handles tombstones automatically and tracks changes via `TableChange`. Because it is decoupled from the consumer, it composes with **any** consumer setup — group-coordinated, standalone, or manually assigned:
 
-```rust
+```rust,compile
 use krafka::consumer::{Consumer, CompactedTable};
 use std::time::Duration;
 
@@ -1466,7 +1559,7 @@ Key behaviors:
 
 For the common case of scanning an entire compacted topic from the beginning, `CompactedTopicConsumer` bundles a `Consumer` and `CompactedTable` together with built-in caught-up detection:
 
-```rust
+```rust,compile
 use krafka::consumer::CompactedTopicConsumer;
 use std::time::Duration;
 
@@ -1554,20 +1647,67 @@ let mut ctc = CompactedTopicConsumer::builder()
 
 ## Offset Lag Tracking
 
-krafka tracks consumer lag automatically by caching the high watermark returned in every fetch response. When the broker supports Fetch v5+, the log start offset is also cached. No additional network calls are needed.
+krafka tracks consumer lag automatically by caching the end offset returned in
+every fetch response. When the broker supports Fetch v5+, the log start offset
+is also cached. No additional network calls are needed.
 
-Lag values are returned as `u64` (always non-negative, clamped at zero when the position is ahead of the watermark) to match the internal metrics representation.
+Lag values are returned as `u64` (always non-negative, clamped at zero when the
+position is ahead of the end offset) to match the internal metrics
+representation.
 
-```rust
+### Lag under `read_committed`
+
+The end offset lag is measured against **depends on the isolation level**, and
+the difference matters as soon as transactions are involved:
+
+| Isolation level | End offset used | Why |
+|---|---|---|
+| `ReadUncommitted` (default) | high watermark | Every appended record is deliverable |
+| `ReadCommitted` | **last stable offset (LSO)** | The broker will not deliver a record at or above the LSO |
+
+Measuring a `read_committed` consumer against the high watermark reports lag it
+can never close: with a transaction open on the partition, the gap between the
+LSO and the high watermark is the size of that open transaction, and it stays
+there until the transaction commits or aborts no matter how much the consumer
+reads. `is_caught_up()` would never return `true`, and a lag-based autoscaler
+would scale out against a consumer that is fully drained.
+
+`current_lag()`, `lag()`, `is_caught_up()`, `cached_end_offset()` and the
+`lag` / `lag_max` metrics all respect the configured isolation level. Two
+accessors expose the raw values when you want them explicitly:
+
+```rust,compile
+// Isolation-aware: the LSO under read_committed, the high watermark otherwise.
+let end = consumer.cached_end_offset("orders", 0).await;
+
+// Always the log-end offset, including records inside open transactions.
+let hw = consumer.cached_high_watermark("orders", 0).await;
+
+// The first offset belonging to an open transaction, when the broker
+// reported one (Fetch v4+).
+let lso = consumer.cached_last_stable_offset("orders", 0).await;
+```
+
+The gap between `cached_high_watermark` and `cached_last_stable_offset` is
+exactly the volume of in-flight transactional data on that partition — a useful
+signal for spotting a transaction that is taking too long to complete.
+
+```rust,compile
 // Per-partition lag (returns None if no fetch has completed for this partition)
 if let Some(lag) = consumer.current_lag("my-topic", 0).await {
     println!("Partition 0 lag: {} records", lag);
 }
 
-// All partition lags at once
+// All partition lags at once. `lag()` returns a `LagResult`, not a bare map:
+// alongside the per-partition values it names the partitions whose cached
+// watermark is older than `lag_staleness_threshold` (default 60 s), so a lag
+// of "0" that is simply out of date is distinguishable from a real zero.
 let lags = consumer.lag().await;
-for ((topic, partition), lag) in &lags {
+for ((topic, partition), lag) in &lags.lag {
     println!("{}-{}: {} records behind", topic, partition, lag);
+}
+for (topic, partition) in &lags.stale_partitions {
+    println!("{}-{}: lag value may be outdated", topic, partition);
 }
 
 // Cached beginning/end offsets (no network call)
@@ -1575,7 +1715,9 @@ if let Some(start) = consumer.cached_beginning_offset("my-topic", 0).await {
     println!("Earliest available offset: {}", start);
 }
 if let Some(end) = consumer.cached_end_offset("my-topic", 0).await {
-    println!("High watermark: {}", end);
+    // Under read_committed this is the last stable offset, not the high
+    // watermark — see "Lag under read_committed" above.
+    println!("End offset: {}", end);
 }
 ```
 
@@ -1588,12 +1730,12 @@ Lag is also exposed via metrics (recomputed after every offset or high-watermark
 
 High watermarks and log start offsets are automatically cleared when partitions are revoked or the consumer unsubscribes. Lag metrics are recomputed accordingly.
 
-> **Staleness caveat** — High watermarks are only updated when a fetch
+> **Staleness caveat** — End offsets are only updated when a fetch
 > response is received from the broker. If the consumer is paused, slow, or
-> not polling, the cached watermarks (and therefore `current_lag`,
-> `compute_aggregate_lag`, and the `lag`/`lag_max` metrics) can become stale
-> and undercount the true lag. Treat lag values as eventually consistent
-> rather than real-time.
+> not polling, the cached values (and therefore `current_lag`, `lag()` and the
+> `lag`/`lag_max` metrics) can become stale and undercount the true lag. Treat
+> lag values as eventually consistent rather than real-time. For a precise
+> answer, call `fetch_end_offset()`, which issues a live `ListOffsets` RPC.
 
 ## Next Steps
 
@@ -1641,7 +1783,7 @@ handler actually has. This mirrors Java's `KafkaConsumer.wakeup()` and
 `committed()` asks the group coordinator where the *group* is, as opposed to
 `position()`, which reports where *this consumer* will read next:
 
-```rust
+```rust,compile
 let committed = consumer.committed(&[("orders", 0), ("orders", 1)]).await?;
 for ((topic, partition), pos) in &committed {
     println!("{topic}-{partition} committed at {}", pos.offset);

@@ -46,7 +46,7 @@ usual migration route.
 
 ## Security Protocol Selection
 
-```rust
+```rust,compile
 use krafka::auth::{AuthConfig, SecurityProtocol};
 
 // Check what's configured
@@ -66,7 +66,7 @@ Every mechanism composes with TLS through one method, `with_tls`:
 | `SASL_PLAINTEXT` | `SASL_SSL` |
 | `SSL` / `SASL_SSL` | unchanged; the TLS settings are replaced |
 
-```rust
+```rust,compile
 use krafka::auth::{AuthConfig, TlsConfig};
 
 // SASL_SSL + SCRAM-SHA-512 — the default secured listener on Redpanda Cloud,
@@ -87,7 +87,7 @@ from the public API alone.
 
 Simple username/password authentication. **Always use with TLS in production!**
 
-```rust
+```rust,compile
 use krafka::auth::AuthConfig;
 
 // Without TLS (development only!)
@@ -102,7 +102,7 @@ let config = AuthConfig::sasl_plain_ssl("username", "password", TlsConfig::new()
 
 Challenge-response authentication with SHA-256 hashing. More secure than PLAIN.
 
-```rust
+```rust,compile
 use krafka::auth::{AuthConfig, TlsConfig};
 
 // Without TLS (development only!)
@@ -116,7 +116,7 @@ let config = AuthConfig::sasl_scram_sha256_ssl("username", "password", TlsConfig
 
 Maximum security SCRAM authentication with SHA-512 hashing.
 
-```rust
+```rust,compile
 use krafka::auth::{AuthConfig, TlsConfig};
 
 // Without TLS (development only!)
@@ -172,7 +172,7 @@ let client_first = scram.client_first_message();
 
 OAuth 2.0 bearer token authentication per [RFC 7628](https://datatracker.ietf.org/doc/html/rfc7628) and [KIP-255](https://cwiki.apache.org/confluence/display/KAFKA/KIP-255%3A+OAuth+Authentication+via+SASL%2FOAUTHBEARER).
 
-```rust
+```rust,compile
 use krafka::auth::{AuthConfig, OAuthBearerToken};
 
 // Basic token authentication
@@ -187,7 +187,7 @@ let config = AuthConfig::sasl_oauthbearer_ssl("your-jwt-token-here", TlsConfig::
 
 For providers like Confluent Cloud that require additional SASL extensions:
 
-```rust
+```rust,compile
 use krafka::auth::{AuthConfig, OAuthBearerToken};
 
 // Create token with extensions
@@ -307,7 +307,7 @@ let consumer = Consumer::builder()
 
 **With TLS (production)**
 
-```rust
+```rust,compile
 use krafka::auth::{AuthConfig, OAuthBearerToken, TlsConfig};
 
 let config = AuthConfig::sasl_oauthbearer_provider_ssl(
@@ -351,7 +351,7 @@ Enable the `oauth-oidc` feature and krafka fetches access tokens itself, instead
 of you writing the OAuth client:
 
 ```toml
-krafka = { version = "0.16.0", features = ["oauth-oidc"] }
+krafka = { version = "0.17.0", features = ["oauth-oidc"] }
 ```
 
 Two ways to authenticate to the token endpoint:
@@ -363,7 +363,7 @@ Two ways to authenticate to the token endpoint:
 
 **Client secret:**
 
-```rust
+```rust,compile
 use krafka::auth::{AuthConfig, oidc::{ClientCredentials, OidcTokenProvider}};
 use std::time::Duration;
 
@@ -380,7 +380,7 @@ let auth = AuthConfig::sasl_oauthbearer_provider(provider);
 is a short-lived signature rather than a long-lived shared secret, and the
 private key never leaves the workload:
 
-```rust
+```rust,compile
 use krafka::auth::oidc::{AssertionSource, ClientCredentials, OidcTokenProvider};
 
 let provider = OidcTokenProvider::builder("https://idp.example.com/oauth2/token")
@@ -446,7 +446,7 @@ krafka's TLS is `rustls`, which needs a crypto backend. `ring` is the default;
 FIPS-oriented deployments:
 
 ```toml
-krafka = { version = "0.16.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
+krafka = { version = "0.17.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
 ```
 
 The two features are **additive**. Cargo features cannot be made mutually
@@ -470,7 +470,7 @@ rustls::crypto::aws_lc_rs::default_provider()
 
 Use Mozilla's root certificates for server verification:
 
-```rust
+```rust,compile
 use krafka::auth::{AuthConfig, TlsConfig};
 
 let config = AuthConfig::ssl(TlsConfig::new());
@@ -480,7 +480,7 @@ let config = AuthConfig::ssl(TlsConfig::new());
 
 For self-signed or private CA certificates:
 
-```rust
+```rust,compile
 use krafka::auth::TlsConfig;
 
 let tls_config = TlsConfig::new()
@@ -495,10 +495,10 @@ By default, krafka uses compiled-in `webpki-roots`. To use the operating system 
 
 ```toml
 [dependencies]
-krafka = { version = "0.16.0", features = ["native-tls-roots"] }
+krafka = { version = "0.17.0", features = ["native-tls-roots"] }
 ```
 
-```rust
+```rust,compile
 use krafka::auth::TlsConfig;
 
 let tls_config = TlsConfig::new()
@@ -511,7 +511,7 @@ You can combine `with_native_roots()` and `with_ca_cert()` to trust both platfor
 
 Client certificate authentication:
 
-```rust
+```rust,compile
 use krafka::auth::TlsConfig;
 
 let tls_config = TlsConfig::new()
@@ -546,7 +546,7 @@ producer.refresh_tls().await?;
 
 **Unattended** — reload on a timer:
 
-```rust
+```rust,compile
 use krafka::network::TransportConfig;
 use std::time::Duration;
 
@@ -574,7 +574,7 @@ them.
 
 **Never use in production!**
 
-```rust
+```rust,compile
 use krafka::auth::TlsConfig;
 
 let tls_config = TlsConfig::insecure();
@@ -592,7 +592,7 @@ For AWS Managed Streaming for Apache Kafka using IAM authentication:
 
 The simplest approach is to load credentials from environment variables:
 
-```rust
+```rust,compile
 use krafka::auth::{AuthConfig, AwsMskIamCredentials};
 
 // Load from AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_REGION
@@ -635,11 +635,11 @@ verification at connect time, with an error that never mentions the token.
 
 For production deployments on EC2, ECS, Lambda, or EKS, use the AWS SDK default chain:
 
-```rust
+```rust,compile
 use krafka::auth::{AuthConfig, AwsMskIamCredentials};
 
 // Requires the `aws-msk` feature in Cargo.toml:
-// krafka = { version = "0.16.0", features = ["aws-msk"] }
+// krafka = { version = "0.17.0", features = ["aws-msk"] }
 
 // Loads from (in order):
 // 1. Environment variables
@@ -654,7 +654,7 @@ let config = AuthConfig::aws_msk_iam_with_credentials(creds);
 
 For development or testing, you can provide credentials directly:
 
-```rust
+```rust,compile
 use krafka::auth::AuthConfig;
 
 // With permanent credentials (avoid in production!)
@@ -677,7 +677,7 @@ let creds = AwsMskIamCredentials::new(
 
 ### Using SecureConnectionConfig with MSK IAM
 
-```rust
+```rust,compile
 use krafka::network::SecureConnectionConfig;
 
 let config = SecureConnectionConfig::builder()
@@ -690,7 +690,7 @@ let config = SecureConnectionConfig::builder()
 
 For production workloads using temporary credentials (STS, IRSA, ECS task role, EC2 instance profile), use a credential provider so that credentials are automatically refreshed on every broker reconnection:
 
-```rust
+```rust,compile
 use krafka::auth::{AuthConfig, AwsMskIamCredentials};
 
 // With a closure (requires `aws-msk` feature for from_default_chain)
@@ -718,7 +718,7 @@ let config = AuthConfig::aws_msk_iam_provider(MyCredentialProvider);
 
 The provider pattern mirrors OAUTHBEARER's `sasl_oauthbearer_provider()`. The `SecureConnectionConfig` builder also supports it:
 
-```rust
+```rust,compile
 use krafka::network::SecureConnectionConfig;
 use krafka::auth::AwsMskIamCredentials;
 
@@ -734,7 +734,7 @@ let config = SecureConnectionConfig::builder()
 
 For low-level control over the authentication process:
 
-```rust
+```rust,compile
 use krafka::auth::{AwsMskIamCredentials, MskIamAuthenticator};
 
 let creds = AwsMskIamCredentials::new("AKID", "secret", "us-east-1");
@@ -776,7 +776,7 @@ The implementation uses AWS Signature v4 signing:
 
 Some environments (service meshes, load balancers like Envoy or AWS ALB) require ALPN for protocol multiplexing. Use `with_kafka_alpn()` as a convenience or `with_alpn_protocols()` for custom protocols:
 
-```rust
+```rust,compile
 use krafka::auth::TlsConfig;
 
 // Advertise "kafka" ALPN protocol
@@ -1028,7 +1028,7 @@ This behaviour matches the Java Kafka client and is fully automatic — no clien
 
 For integrated TLS and SASL configuration, use `SecureConnectionConfig`:
 
-```rust
+```rust,compile
 use krafka::network::SecureConnectionConfig;
 use krafka::auth::TlsConfig;
 use std::time::Duration;

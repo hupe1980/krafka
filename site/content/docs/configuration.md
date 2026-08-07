@@ -58,7 +58,7 @@ Compression::Zstd    // Zstandard compression (feature = "zstd")
 
 ### Producer Builder Example
 
-```rust
+```rust,compile
 use krafka::producer::{Producer, Acks};
 use krafka::protocol::Compression;
 use std::time::Duration;
@@ -128,7 +128,7 @@ IsolationLevel::ReadCommitted    // Only read committed transaction messages
 
 ### Consumer Builder Example
 
-```rust
+```rust,compile
 use krafka::consumer::{Consumer, AutoOffsetReset, IsolationLevel};
 use std::time::Duration;
 
@@ -163,7 +163,7 @@ let consumer = Consumer::builder()
 
 ### Admin Client Builder Example
 
-```rust
+```rust,compile
 use krafka::admin::AdminClient;
 use std::time::Duration;
 
@@ -189,7 +189,7 @@ passes the synchronous terminal will not be rejected later for a configuration
 reason. That makes settings testable at startup, in a unit test, or in a
 config-linting tool — none of which want a live cluster.
 
-```rust
+```rust,compile
 use krafka::producer::Producer;
 
 // Fails immediately: the `zstd` codec is not compiled in.
@@ -235,7 +235,7 @@ type is never itself a behaviour change.
 | `max_connections` | `Option<usize>` | `None` | Cap on live connections across all brokers. Set it on clusters whose broker count can jump, to bound file descriptors. |
 | `tls_reload_interval` | `Option<Duration>` | `None` | Re-read TLS certificate files from disk on a timer (KIP-1288). |
 
-```rust
+```rust,compile
 use krafka::network::TransportConfig;
 use krafka::consumer::Consumer;
 use std::time::Duration;
@@ -294,12 +294,12 @@ DNS resolution, so broker hostnames are sent as-is (not pre-resolved).
 Enable the `socks5` feature:
 
 ```toml
-krafka = { version = "0.16.0", features = ["socks5"] }
+krafka = { version = "0.17.0", features = ["socks5"] }
 ```
 
 ### Proxy Without Authentication
 
-```rust
+```rust,compile
 use krafka::network::ProxyConfig;
 
 let consumer = Consumer::builder()
@@ -312,7 +312,7 @@ let consumer = Consumer::builder()
 
 ### Proxy With Authentication
 
-```rust
+```rust,compile
 use krafka::network::ProxyConfig;
 
 let producer = Producer::builder()
@@ -413,7 +413,7 @@ let producer = Producer::builder()
 
 ### High Throughput Consumer
 
-```rust
+```rust,compile
 let consumer = Consumer::builder()
     .bootstrap_servers("localhost:9092")
     .group_id("high-throughput")
@@ -426,7 +426,7 @@ let consumer = Consumer::builder()
 
 ### Low Latency Consumer
 
-```rust
+```rust,compile
 let consumer = Consumer::builder()
     .bootstrap_servers("localhost:9092")
     .group_id("low-latency")
