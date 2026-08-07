@@ -677,6 +677,11 @@ Release-by-release detail lives in **[CHANGELOG.md](CHANGELOG.md)**.
 - **A commit marker could end a `read_committed` abort filter early.** The
   aborted-transaction filter deactivated on *any* control batch without reading
   the marker's type field, so aborted records could reach the application.
+- **A transactional commit could orphan a record into the next transaction.**
+  `commit_transaction()` drained the accumulator before closing the transaction
+  to new records, so a concurrent `send()` could slip in behind the flush and
+  stay buffered until after `EndTxn` — landing in the *following* transaction,
+  and vanishing if that one aborted.
 
 - **`assign()` leaked state for partitions it dropped.** Narrowing a manual
   assignment left the old partitions' positions, watermarks and buffered

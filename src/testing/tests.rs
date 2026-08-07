@@ -3288,3 +3288,80 @@ async fn a_commit_never_acknowledges_records_still_parked_in_the_buffer() {
 
     let _ = consumer.close().await;
 }
+
+// ── Transaction state machine: the commit closes before it drains ──────────
+
+/// A commit must stop admitting records *before* it drains the accumulator,
+/// not after.
+///
+/// `send_record` admits a record when it observes `InTransaction`. The commit
+/// path used to flush first and transition second, which left a window between
+/// the flush completing and the state changing where a concurrent send was
+/// still accepted — and its record was then still buffered when `EndTxn` went
+/// out. It would either be rejected by the broker as `INVALID_TXN_STATE` or,
+/// once `begin_transaction` had been called again, silently join the *next*
+/// transaction: a record the application was told had been committed could
+/// disappear when a later transaction aborted.
+///
+/// The test holds the commit inside its drain (by delaying `Produce`) and
+/// asserts that a send issued during that window is refused. Under the old
+/// ordering the state observed here is `InTransaction` and the send is
+/// accepted.
+#[tokio::test]
+async fn a_commit_stops_admitting_records_before_it_drains() {
+    use std::sync::Arc;
+
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("orders", 1);
+
+    let producer = Arc::new(
+        TransactionalProducer::builder()
+            .bootstrap_servers(broker.bootstrap_servers())
+            .transactional_id("txn-commit-ordering")
+            // Batch, so the record below sits in the accumulator and the
+            // commit's flush is what pushes it to the broker.
+            .linger(Duration::from_millis(200))
+            .request_timeout(SHORT_REQUEST_TIMEOUT)
+            .connect_timeout(SHORT_CONNECT_TIMEOUT)
+            .build()
+            .await
+            .expect("transactional producer should connect"),
+    );
+    producer.init_transactions().await.expect("init");
+    producer.begin_transaction().expect("begin");
+
+    // One record, buffered by the linger window.
+    let buffered = Arc::clone(&producer);
+    let send = tokio::spawn(async move { buffered.send("orders", None, b"first").await });
+
+    // Hold the commit inside its flush.
+    broker.on(ApiKey::Produce, |_| {
+        Control::Delay(Duration::from_millis(600))
+    });
+
+    let committing = Arc::clone(&producer);
+    let commit = tokio::spawn(async move { committing.commit_transaction().await });
+
+    // Give the commit time to transition and enter its drain.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert_eq!(
+        producer.state(),
+        crate::producer::TransactionState::Committing,
+        "the commit must own the state while it drains, so no further record \
+         can be admitted into a transaction that is already closing"
+    );
+
+    let refused = producer.send("orders", None, b"too-late").await;
+    let error = refused.expect_err("a send during the commit's drain must be refused");
+    assert!(
+        error.to_string().contains("Committing"),
+        "the refusal must name the state that caused it, got: {error}"
+    );
+
+    broker.clear_hooks();
+    let _ = send.await.expect("send task should not panic");
+    let _ = commit.await.expect("commit task should not panic");
+
+    producer.close().await;
+}

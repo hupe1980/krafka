@@ -2204,16 +2204,25 @@ impl TransactionalProducer {
     pub async fn commit_transaction(&self) -> Result<()> {
         self.ensure_transaction_can_continue("commit transaction")?;
 
-        // Every buffered record must reach the broker before `EndTxn`, or it
-        // would be committed into a transaction the coordinator has already
-        // closed. A flush failure is surfaced as-is; the caller aborts.
-        self.accumulator.flush().await?;
-
+        // Close the transaction to new records *before* draining it.
+        //
         // Atomic CAS: InTransaction → Committing, or retry a commit whose
         // outcome we never learned. Retrying is safe and is the *only* safe
         // move from `CommitIndeterminate`: `EndTxn` is idempotent for a given
         // producer id and epoch, so a duplicate commit either lands or is
         // recognised by the coordinator as the one it already applied.
+        //
+        // The order matters and used to be the other way round — flush, then
+        // transition. `send_record` admits a record when it observes
+        // `InTransaction`, so between the flush completing and the state
+        // changing there was a window in which a concurrent send appended a
+        // record the flush had already passed. That record was still buffered
+        // when `EndTxn` went out, and would then either be rejected by the
+        // broker as `INVALID_TXN_STATE` or, if `begin_transaction` had since
+        // been called, silently join the *next* transaction — so a record the
+        // application was told had been committed could disappear when a later
+        // transaction aborted. `abort_transaction` already transitioned first;
+        // this is the same discipline.
         if let Err(actual) = self
             .try_transition(
                 TransactionState::InTransaction,
@@ -2230,6 +2239,30 @@ impl TransactionalProducer {
                 "cannot commit in state {:?}",
                 actual
             )));
+        }
+
+        // Every buffered record must reach the broker before `EndTxn`, or it
+        // would be committed into a transaction the coordinator has already
+        // closed.
+        //
+        // Two things have to drain, not one. `accumulator.flush()` empties the
+        // batch queue, but a `send_record` that passed its state check a moment
+        // ago may not have *reached* the accumulator yet — it is still running
+        // interceptors or encoders. Waiting on the in-flight barrier first
+        // ensures those land in the queue, and the flush then drains them.
+        // Draining only the queue would leave exactly the records that were
+        // closest to the transition unaccounted for.
+        self.in_flight_barrier
+            .wait_for(self.in_flight_barrier.snapshot())
+            .await;
+        if let Err(error) = self.accumulator.flush().await {
+            // Nothing was sent to the coordinator, so the transaction is still
+            // open. Hand the state back so the caller can abort it.
+            let _ = self.try_transition(
+                TransactionState::Committing,
+                TransactionState::InTransaction,
+            );
+            return Err(error);
         }
 
         let result = match self.end_transaction(true).await {
@@ -2368,6 +2401,16 @@ impl TransactionalProducer {
         // Drain buffered records first so their send futures resolve rather
         // than hanging once the transaction is torn down. Errors are expected
         // here (the transaction is being abandoned) and are only logged.
+        //
+        // The barrier wait comes first for the same reason as in
+        // `commit_transaction`: a `send_record` that passed its state check
+        // just before the transition above has not necessarily reached the
+        // accumulator yet, and flushing without waiting would leave its batch
+        // buffered — and its caller's future unresolved — after the transaction
+        // was torn down.
+        self.in_flight_barrier
+            .wait_for(self.in_flight_barrier.snapshot())
+            .await;
         if let Err(err) = self.accumulator.flush().await {
             debug!(error = %err, "Accumulator flush during abort_transaction failed");
         }

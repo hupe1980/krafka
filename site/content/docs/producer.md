@@ -804,6 +804,16 @@ match do_work(&producer).await {
 producer.close().await;
 ```
 
+> **A commit closes the transaction before it drains it.** The moment
+> `commit_transaction()` is entered it transitions out of `InTransaction`, so
+> any concurrent `send()` from another task is refused with an
+> `InvalidState` error naming the `Committing` state. This is deliberate: a
+> record admitted after the drain had begun would still be buffered when
+> `EndTxn` went out, and would land in the *next* transaction — vanishing if
+> that one aborted. If you share a `TransactionalProducer` across tasks, treat
+> that error as "the transaction closed under me" and retry the record in the
+> next one.
+
 > **Never abort after a commit times out.** If `commit_transaction()` fails with
 > a timeout or a connection loss, the coordinator may already have committed —
 > the response was simply lost. Aborting then is the

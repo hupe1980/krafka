@@ -70,6 +70,26 @@ consumer's offset accessors — see **Breaking** below before upgrading.
   withheld — and deliberately *kept* in the buffer rather than discarded, since
   the fetch position has already advanced past them.
 
+- **A transactional commit could orphan a record into the next transaction.**
+  `commit_transaction()` drained the accumulator *before* transitioning out of
+  `InTransaction`. Since `send_record` admits a record whenever it observes
+  `InTransaction`, a concurrent send in the window between the flush completing
+  and the state changing was accepted — and its record was still buffered when
+  `EndTxn` went out. It would either be rejected by the broker as
+  `INVALID_TXN_STATE` or, once `begin_transaction()` had been called again,
+  silently join the *next* transaction: a record the application was told had
+  been committed could disappear when a later transaction aborted. The
+  transition now happens first, mirroring `abort_transaction()`, which always
+  did it in that order.
+
+  Draining now also waits on the in-flight barrier before flushing. Emptying the
+  batch queue is not enough on its own: a `send_record` that passed its state
+  check moments earlier may still be running interceptors or encoders and has
+  not reached the accumulator yet, so the flush would miss exactly the records
+  closest to the transition. `abort_transaction()` had the same gap and gets the
+  same fix, which is also what stops those callers' futures hanging after the
+  transaction is torn down.
+
 - **A commit marker could end a `read_committed` abort filter early.** The
   aborted-transaction filter deactivated a producer on **any** control batch,
   never reading the marker's type field (`0` = ABORT, `1` = COMMIT). Any
