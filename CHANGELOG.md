@@ -45,7 +45,54 @@ never had.
   epoch alongside the ID, but `is_initialized()` only inspects the ID, so a
   stale epoch was invisible to the test.
 
+  Running it over the rest of the scoped set found five more gaps, all in code
+  that fails *quietly* when it is wrong — which is why nothing had noticed:
+
+  - **`SessionKey::from_request` never tested a zero UUID.** A zero topic ID
+    means "no topic ID" (Fetch v12 and below), not "the topic whose ID is
+    zero". Three separate corruptions of that guard survived; any of them would
+    have collapsed every pre-v13 topic onto the single key `Uuid([0; 16])`, so
+    one topic's partition state would overwrite another's and the incremental
+    diff would describe the wrong topic.
+  - **`update_from_response` stored the UUID under the same rule, also
+    untested.** It is what `FetchForgottenTopic` entries carry, so a zero UUID
+    stored as real would tell the broker to forget topic `0`.
+  - **`next_epoch` could have returned a constant.** The fetch-session epoch is
+    how the broker detects a desynchronised session; a constant one draws
+    `INVALID_FETCH_SESSION_EPOCH`, the client resets, and every fetch silently
+    degrades to a full one — KIP-227's entire benefit lost with no error
+    surfaced.
+  - **`InFlightBarrier::is_closing` and its `Debug` impl** were both
+    unasserted. The barrier is what three shutdown paths block on, so its
+    `Debug` output is the first thing read when one appears to hang.
+  - **The UUID version/variant test was a coin flip.** It asserted the nibbles
+    of one random UUID, so a corrupted variant mask (`& 0x3F` → `| 0x3F`, which
+    leaves bit 6 random) passed half the time. The bit-stamping is now a
+    separate function checked against all 256 input bytes.
+
+  Not every surviving mutant is a defect. Three of them were provably
+  *equivalent* — `base + jitter` vs `base - jitter` over a symmetric jitter
+  range, and two `|` → `^` swaps on bits the preceding mask had already
+  cleared, identical for all 256 inputs. Those are left alone deliberately;
+  mutation score is a diagnostic, not a target.
+
 ### Fixed
+
+- **`BackoffPolicy::calculate_backoff` jumped to `max_backoff` for a
+  slow-growing multiplier.** It short-circuited whenever
+  `multiplier > 1.0 && exponent >= 1024`, to avoid "evaluating `powi` with a
+  large exponent". Both halves of that were wrong: `powi` is repeated squaring,
+  so even `i32::MAX` costs ~31 multiplications, and for a multiplier just above
+  1.0 the series is nowhere near the ceiling at attempt 1025 — with
+  `multiplier = 1.0000001` a 100 ms initial backoff jumped straight to the
+  full 10 s ceiling instead of the ~100.01 ms it had actually reached.
+
+  The guard is removed rather than corrected: `.min(ceiling)` already carries
+  every case it was covering. A growing multiplier overflows `powi` to `+inf`
+  and `inf.min(ceiling)` is the ceiling; a shrinking one underflows to `0.0`
+  and the existing floor lifts it back to `initial_backoff`; a non-finite one
+  yields `NaN`, and `f64::min` returns the non-`NaN` operand. Mutation testing
+  found it: negating the `||` changed nothing any test could observe.
 
 - **A share-consumer `commit_sync()` or `close()` could strand
   acknowledgements.** `poll()` drains every entry out of `pending_acks` into a

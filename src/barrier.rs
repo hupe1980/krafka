@@ -135,6 +135,61 @@ impl Drop for InFlightOpGuard {
 mod tests {
     use super::*;
 
+    // Both tests below exist because `cargo mutants` showed the suite could not
+    // tell the real implementations from stubs: `is_closing` could return a
+    // constant `true` and the `Debug` impl could render nothing, and every
+    // assertion still held.
+
+    /// `is_closing` must track the flag, not answer a constant.
+    ///
+    /// It gates `start()`, so a stub that always answered `true` would refuse
+    /// every operation on a healthy barrier — and a stub answering `false`
+    /// would admit work into a closing one, which is the case the barrier
+    /// exists to prevent.
+    #[tokio::test]
+    async fn is_closing_tracks_the_flag() {
+        let barrier = Arc::new(InFlightBarrier::new());
+        assert!(!barrier.is_closing(), "a fresh barrier is open");
+
+        let guard = barrier.start("producer").unwrap();
+        assert!(
+            !barrier.is_closing(),
+            "an in-flight operation does not close it"
+        );
+
+        barrier.begin_close();
+        assert!(barrier.is_closing(), "begin_close must be observable");
+        drop(guard);
+        assert!(barrier.is_closing(), "completing work does not reopen it");
+    }
+
+    /// The `Debug` impl must render the counters it claims to.
+    ///
+    /// This is the type three shutdown paths block on (the transactional
+    /// producer's commit and abort, and the share consumer's acknowledgement
+    /// flush). When one of them appears to hang, this output is the first thing
+    /// anyone reads — a `Debug` that silently rendered nothing would hide
+    /// exactly the state needed to tell "waiting for real work" from "leaked a
+    /// guard".
+    #[tokio::test]
+    async fn debug_renders_the_counters() {
+        let barrier = Arc::new(InFlightBarrier::new());
+        let guard = barrier.start("producer").unwrap();
+
+        let rendered = format!("{barrier:?}");
+        assert!(rendered.contains("InFlightBarrier"), "got: {rendered}");
+        assert!(rendered.contains("closing: false"), "got: {rendered}");
+        assert!(rendered.contains("started: 1"), "got: {rendered}");
+        assert!(rendered.contains("completed: 0"), "got: {rendered}");
+
+        drop(guard);
+        let rendered = format!("{barrier:?}");
+        assert!(
+            rendered.contains("completed: 1"),
+            "the counters must move, not just be present: {rendered}"
+        );
+    }
+
     #[tokio::test]
     async fn test_wait_for_snapshot_ignores_later_operations() {
         let barrier = Arc::new(InFlightBarrier::new());
