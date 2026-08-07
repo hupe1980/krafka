@@ -253,7 +253,7 @@ them.
 
 Client-supported versions are defined in `krafka::protocol::versions`:
 
-```rust
+```rust,compile
 use krafka::protocol::versions;
 
 // Each API has both MIN and MAX constants
@@ -295,7 +295,7 @@ version (needed for protocol bootstrapping).
 
 Core request/response message types in `krafka::protocol` implement the `VersionedEncode` and `VersionedDecode` traits, which dispatch to the correct `encode_vN`/`decode_vN` method based on the protocol version number:
 
-```rust
+```rust,compile
 use krafka::protocol::{VersionedEncode, VersionedDecode, MetadataRequest, MetadataResponse};
 
 let request = MetadataRequest::all_topics();

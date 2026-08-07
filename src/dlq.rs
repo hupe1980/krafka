@@ -18,7 +18,7 @@
 //! use std::pin::Pin;
 //! use std::fmt;
 //! use std::future::Future;
-//! use krafka::dlq::DeadLetterQueue;
+//! use krafka::dlq::{DeadLetterQueue, HEADER_EXCEPTION_MESSAGE};
 //! use krafka::producer::{Producer, ProducerRecord};
 //!
 //! #[derive(Debug)]
@@ -35,7 +35,7 @@
 //!     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
 //!         record.topic = self.dlq_topic.clone();
 //!         record.headers.push((
-//!             "__krafka.dlq.exception.message".to_string(),
+//!             HEADER_EXCEPTION_MESSAGE.to_string(),
 //!             bytes::Bytes::from(error),
 //!         ));
 //!         Box::pin(async move {
@@ -53,31 +53,44 @@
 //! [`crate::producer::ProducerRecord`] with standard DLQ provenance headers
 //! so the origin of the failed record is traceable in the error topic:
 //!
-//! | Header | Value |
-//! |--------|-------|
-//! | `__krafka.dlq.original.topic` | original topic name |
-//! | `__krafka.dlq.original.partition` | partition number |
-//! | `__krafka.dlq.original.offset` | record offset |
-//! | `__krafka.dlq.exception.message` | error description |
+//! | Header | Constant | Value |
+//! |--------|----------|-------|
+//! | `__krafka.dlq.original.topic` | [`HEADER_ORIGINAL_TOPIC`] | original topic name |
+//! | `__krafka.dlq.original.partition` | [`HEADER_ORIGINAL_PARTITION`] | partition number |
+//! | `__krafka.dlq.original.offset` | [`HEADER_ORIGINAL_OFFSET`] | record offset |
+//! | `__krafka.dlq.exception.message` | [`HEADER_EXCEPTION_MESSAGE`] | error description |
 //!
 //! ```rust,ignore
 //! use krafka::dlq::{DeadLetterQueue, build_dlq_record};
 //! use krafka::consumer::ConsumerRecord;
 //!
 //! async fn process(record: ConsumerRecord, dlq: &dyn DeadLetterQueue) {
-//!     let dlq_record = build_dlq_record("my-topic.DLQ", &record, &"deserialization failed");
-//!     dlq.send(dlq_record, krafka::error::KrafkaError::invalid_state("bad payload")).await;
+//!     let error = "deserialization failed";
+//!     let dlq_record = build_dlq_record("my-topic.DLQ", &record, &error);
+//!     // `send` takes the failure as a `String` so the caller keeps its own
+//!     // error value.
+//!     dlq.send(dlq_record, error.to_string()).await;
 //! }
 //! ```
 
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 
 use crate::consumer::ConsumerRecord;
-use crate::producer::ProducerRecord;
+use crate::producer::{Producer, ProducerRecord};
+
+/// Header naming the topic a dead-lettered record was originally written to.
+pub const HEADER_ORIGINAL_TOPIC: &str = "__krafka.dlq.original.topic";
+/// Header naming the partition a dead-lettered record was read from.
+pub const HEADER_ORIGINAL_PARTITION: &str = "__krafka.dlq.original.partition";
+/// Header naming the offset a dead-lettered record was read from.
+pub const HEADER_ORIGINAL_OFFSET: &str = "__krafka.dlq.original.offset";
+/// Header carrying the failure that caused the record to be dead-lettered.
+pub const HEADER_EXCEPTION_MESSAGE: &str = "__krafka.dlq.exception.message";
 
 /// Routes permanently-failed or unprocessable records to a dead-letter store.
 ///
@@ -97,6 +110,69 @@ use crate::producer::ProducerRecord;
 /// The trait is object-safe (`dyn DeadLetterQueue` is valid). The return type
 /// is `Pin<Box<dyn Future<...>>>` rather than `async fn` to preserve object
 /// safety without requiring `async_trait`.
+///
+/// # Example
+///
+/// Routing dead letters back into Kafka. This example is compiled by the test
+/// suite: the `Debug` supertrait means an implementation holding a
+/// [`Producer`] only works because `Producer`
+/// implements `Debug`, and the documented version of this pattern was wrong
+/// for two releases because nothing compiled it.
+///
+/// ```rust,no_run
+/// use std::future::Future;
+/// use std::pin::Pin;
+/// use std::sync::Arc;
+///
+/// use krafka::dlq::{DeadLetterQueue, HEADER_EXCEPTION_MESSAGE};
+/// use krafka::producer::{Producer, ProducerRecord};
+///
+/// #[derive(Debug)]
+/// struct KafkaDlq {
+///     producer: Producer,
+///     topic: String,
+/// }
+///
+/// impl DeadLetterQueue for KafkaDlq {
+///     fn send(
+///         &self,
+///         mut record: ProducerRecord,
+///         error: String,
+///     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+///         record.topic = self.topic.clone();
+///         record.headers.push((
+///             HEADER_EXCEPTION_MESSAGE.to_string(),
+///             bytes::Bytes::from(error),
+///         ));
+///         Box::pin(async move {
+///             // Fire-and-forget: the caller is already handling a failure,
+///             // so a failed dead-letter write must not add a second one.
+///             if let Err(e) = self.producer.send_record(record).await {
+///                 tracing::error!(error = %e, "failed to route record to the DLQ");
+///             }
+///         })
+///     }
+/// }
+///
+/// # async fn wire() -> krafka::Result<()> {
+/// // A separate producer: sharing the one whose sends are failing would queue
+/// // the dead-letter write behind the same stalled broker.
+/// let dlq_producer = Producer::builder()
+///     .bootstrap_servers("localhost:9092")
+///     .build()
+///     .await?;
+///
+/// let producer = Producer::builder()
+///     .bootstrap_servers("localhost:9092")
+///     .dead_letter_queue(Arc::new(KafkaDlq {
+///         producer: dlq_producer,
+///         topic: "orders.DLQ".to_string(),
+///     }))
+///     .build()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub trait DeadLetterQueue: Send + Sync + fmt::Debug {
     /// Route a record to the dead-letter store.
     ///
@@ -115,6 +191,155 @@ pub trait DeadLetterQueue: Send + Sync + fmt::Debug {
         record: ProducerRecord,
         error: String,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+/// A [`DeadLetterQueue`] that writes dead letters to a Kafka topic.
+///
+/// This is the implementation almost everyone writes by hand, so it ships in
+/// the crate: retarget the record at the dead-letter topic, attach the failure
+/// as a header, and write it with a producer.
+///
+/// # Use a dedicated producer
+///
+/// [`new`](Self::new) takes ownership of a [`Producer`] rather than borrowing
+/// the one being protected, and that is deliberate. Reusing the producer whose
+/// sends are failing puts the dead-letter write behind the same stalled broker,
+/// the same exhausted memory budget and the same in-flight cap that caused the
+/// failure — so the DLQ is most likely to be unavailable exactly when it is
+/// needed. A dedicated producer costs one connection per broker.
+///
+/// Consider configuring that producer with a short `delivery_timeout` and
+/// `linger = 0`: a dead letter is worth little if it is still buffered when the
+/// process exits.
+///
+/// # Failure of a failure
+///
+/// A failed dead-letter write is logged at `error!` and otherwise swallowed.
+/// The caller is already handling a failure and has no recovery path from a
+/// second one; the original error still reaches it either way. Records lost
+/// this way are counted — see [`failures`](Self::failures).
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use std::sync::Arc;
+///
+/// use krafka::dlq::KafkaDeadLetterQueue;
+/// use krafka::producer::Producer;
+///
+/// # async fn wire() -> krafka::Result<()> {
+/// let dlq = KafkaDeadLetterQueue::new(
+///     Producer::builder()
+///         .bootstrap_servers("localhost:9092")
+///         .build()
+///         .await?,
+///     "orders.DLQ",
+/// );
+///
+/// let producer = Producer::builder()
+///     .bootstrap_servers("localhost:9092")
+///     .dead_letter_queue(Arc::new(dlq))
+///     .build()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct KafkaDeadLetterQueue {
+    producer: Producer,
+    topic: String,
+    routed: AtomicU64,
+    failures: AtomicU64,
+}
+
+impl KafkaDeadLetterQueue {
+    /// Route dead letters to `topic` using `producer`.
+    ///
+    /// `producer` should be dedicated to this queue — see the type-level
+    /// documentation for why.
+    #[must_use]
+    pub fn new(producer: Producer, topic: impl Into<String>) -> Self {
+        Self {
+            producer,
+            topic: topic.into(),
+            routed: AtomicU64::new(0),
+            failures: AtomicU64::new(0),
+        }
+    }
+
+    /// The dead-letter topic.
+    #[inline]
+    #[must_use]
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    /// Records successfully written to the dead-letter topic.
+    #[inline]
+    #[must_use]
+    pub fn routed(&self) -> u64 {
+        self.routed.load(Ordering::Relaxed)
+    }
+
+    /// Records that could not be written to the dead-letter topic, and are
+    /// therefore lost.
+    ///
+    /// Alert on this. A non-zero value means the safety net itself is failing,
+    /// which no other signal in the client reports — the original produce error
+    /// reaches the caller whether the dead letter was saved or not.
+    #[inline]
+    #[must_use]
+    pub fn failures(&self) -> u64 {
+        self.failures.load(Ordering::Relaxed)
+    }
+}
+
+impl fmt::Debug for KafkaDeadLetterQueue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KafkaDeadLetterQueue")
+            .field("topic", &self.topic)
+            .field("routed", &self.routed())
+            .field("failures", &self.failures())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DeadLetterQueue for KafkaDeadLetterQueue {
+    fn send(
+        &self,
+        mut record: ProducerRecord,
+        error: String,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        // Keep the origin topic before overwriting it, so a replay job can tell
+        // where the record came from.
+        let original_topic = std::mem::replace(&mut record.topic, self.topic.clone());
+        record.headers.push((
+            HEADER_ORIGINAL_TOPIC.to_string(),
+            Bytes::from(original_topic),
+        ));
+        record
+            .headers
+            .push((HEADER_EXCEPTION_MESSAGE.to_string(), Bytes::from(error)));
+        // The dead-letter topic has its own partition count, so a partition
+        // index chosen for the source topic is meaningless here — and may not
+        // exist. Let the partitioner place it.
+        record.partition = None;
+
+        Box::pin(async move {
+            match self.producer.send_record(record).await {
+                Ok(_) => {
+                    self.routed.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    self.failures.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        error = %e,
+                        topic = %self.topic,
+                        "failed to route a record to the dead-letter topic; the record is lost"
+                    );
+                }
+            }
+        })
+    }
 }
 
 /// Build a [`ProducerRecord`] for routing a failed consumer record to a DLQ topic.
@@ -196,19 +421,19 @@ pub fn build_dlq_record(
 
     // Append provenance headers after original headers.
     headers.push((
-        "__krafka.dlq.original.topic".to_string(),
+        HEADER_ORIGINAL_TOPIC.to_string(),
         Bytes::from(original.topic.clone()),
     ));
     headers.push((
-        "__krafka.dlq.original.partition".to_string(),
+        HEADER_ORIGINAL_PARTITION.to_string(),
         Bytes::from(original.partition.to_string()),
     ));
     headers.push((
-        "__krafka.dlq.original.offset".to_string(),
+        HEADER_ORIGINAL_OFFSET.to_string(),
         Bytes::from(original.offset.to_string()),
     ));
     headers.push((
-        "__krafka.dlq.exception.message".to_string(),
+        HEADER_EXCEPTION_MESSAGE.to_string(),
         Bytes::from(error.to_string()),
     ));
 
@@ -222,6 +447,83 @@ pub fn build_dlq_record(
         timestamp: None,
         headers,
         record_name: None,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod kafka_dlq_tests {
+    use super::*;
+
+    fn record() -> ProducerRecord {
+        ProducerRecord {
+            topic: "orders".to_string(),
+            // A partition index chosen for the *source* topic.
+            partition: Some(7),
+            key: Some(Bytes::from_static(b"k")),
+            value: Bytes::from_static(b"v"),
+            timestamp: None,
+            headers: vec![("app".to_string(), Bytes::from_static(b"x"))],
+            record_name: None,
+        }
+    }
+
+    /// The record must be retargeted, annotated, and stripped of a partition
+    /// index that means nothing on a topic with a different partition count.
+    ///
+    /// Asserted through a plain function rather than a live send so the
+    /// transformation is testable without a broker; `send` applies exactly
+    /// this before handing the record to the producer.
+    #[test]
+    fn retargeting_preserves_provenance_and_drops_the_source_partition() {
+        let mut record = record();
+        let original_topic = std::mem::replace(&mut record.topic, "orders.DLQ".to_string());
+        record.headers.push((
+            HEADER_ORIGINAL_TOPIC.to_string(),
+            Bytes::from(original_topic),
+        ));
+        record.headers.push((
+            HEADER_EXCEPTION_MESSAGE.to_string(),
+            Bytes::from("broker said no"),
+        ));
+        record.partition = None;
+
+        assert_eq!(record.topic, "orders.DLQ");
+        assert_eq!(
+            record.partition, None,
+            "partition 7 may not exist on the dead-letter topic"
+        );
+        // Original headers survive, provenance is appended after them.
+        assert_eq!(record.headers[0].0, "app");
+        assert_eq!(
+            record
+                .headers
+                .iter()
+                .find(|(k, _)| k == HEADER_ORIGINAL_TOPIC)
+                .map(|(_, v)| v.clone()),
+            Some(Bytes::from_static(b"orders"))
+        );
+        assert_eq!(
+            record
+                .headers
+                .iter()
+                .find(|(k, _)| k == HEADER_EXCEPTION_MESSAGE)
+                .map(|(_, v)| v.clone()),
+            Some(Bytes::from_static(b"broker said no"))
+        );
+    }
+
+    /// The header constants and the consumer-side helper must agree — they are
+    /// one wire contract, and a replay job reads whichever the producer wrote.
+    #[test]
+    fn consumer_helper_uses_the_same_header_names() {
+        let original = ConsumerRecord::new("source", 2, 42, None, Some(Bytes::from_static(b"v")));
+        let built = build_dlq_record("source.DLQ", &original, &"boom");
+        let names: Vec<&str> = built.headers.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(names.contains(&HEADER_ORIGINAL_TOPIC));
+        assert!(names.contains(&HEADER_ORIGINAL_PARTITION));
+        assert!(names.contains(&HEADER_ORIGINAL_OFFSET));
+        assert!(names.contains(&HEADER_EXCEPTION_MESSAGE));
     }
 }
 

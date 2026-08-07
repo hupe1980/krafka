@@ -114,6 +114,14 @@ for record in &records {
 }
 ```
 
+> **A flush waits for an in-flight poll.** `poll()` holds the pending
+> acknowledgements out of the internal map while its `ShareFetch` is on the
+> wire. `commit_sync()` and `close()` wait for that poll to finish before
+> draining, so neither can flush an empty map and report success while
+> acknowledgements are still in flight. This matters for the usual shutdown —
+> `wakeup()` then `close()` — because `wakeup()` does not wait for the poll it
+> interrupts to unwind.
+
 ## Async Commit
 
 `commit_async()` returns a handle that resolves to the final commit outcome. This keeps the send off the caller's immediate path while still surfacing transport, decode, and broker errors explicitly. If any failure occurs, the batch is restored locally for the next commit cycle rather than silently dropped:
@@ -161,7 +169,7 @@ while let Some(record) = stream.next().await {
 
 During a partial metadata refresh (where only the subscribed topics are re-fetched rather than the entire cluster), krafka caches each topic's metadata between refreshes. By default, a topic entry is evicted from this cache after **5 minutes** of not being successfully refreshed — matching Java's `metadata.max.idle.ms` — to prevent unbounded growth when topics are deleted or subscriptions change.
 
-```rust
+```rust,compile
 use krafka::share_consumer::ShareConsumer;
 use std::time::Duration;
 
@@ -244,7 +252,7 @@ Use `close_with_timeout(duration)` to bound each cleanup phase. If a phase excee
 
 Call `wakeup()` from any thread or task to interrupt an in-progress `poll()` call:
 
-```rust
+```rust,compile
 // In another task:
 consumer.wakeup();
 
@@ -264,7 +272,7 @@ consumer.wakeup();
 consumer exposes — a share consumer polls, receives, acknowledges and errors in
 the same shapes, so the counters mean the same thing:
 
-```rust
+```rust,compile
 let m = consumer.metrics();
 println!(
     "polls={} empty={} records={} bytes={} acks={} errors={}",
@@ -293,7 +301,7 @@ A running share group is not the same as an operable one. Reading its
 start offsets, resetting them, and cleaning up after a retired topic are
 `AdminClient` operations (Kafka 4.2+):
 
-```rust
+```rust,compile
 // Lag monitoring — `lag` requires Kafka 4.3 (KIP-1226); older brokers report None.
 let described = admin.describe_share_group_offsets("my-share-group", None).await?;
 for p in &described.partitions {

@@ -27,8 +27,8 @@ pub struct ConsumerBuilder {
     config: ConsumerConfig,
     rebalance_listener: Option<Arc<dyn ErasedRebalanceListener>>,
     interceptors: Vec<Arc<dyn crate::interceptor::ConsumerInterceptor>>,
-    key_decoder: Option<Arc<dyn crate::schema_registry::SchemaDecoder>>,
-    value_decoder: Option<Arc<dyn crate::schema_registry::SchemaDecoder>>,
+    key_deserializer: Option<Arc<dyn crate::serdes::Deserializer>>,
+    value_deserializer: Option<Arc<dyn crate::serdes::Deserializer>>,
     /// Pre-built pool and metadata from a [`KrafkaClient`](crate::client::KrafkaClient).
     shared: Option<(Arc<ConnectionPool>, Arc<ClusterMetadata>)>,
 }
@@ -523,8 +523,8 @@ impl ConsumerBuilder {
     /// decoder before being returned to the caller.  The decoder runs after
     /// the interceptor.  Equivalent to `key.deserializer` in the Java
     /// `KafkaConsumer`.
-    pub fn key_decoder(mut self, decoder: Arc<dyn crate::schema_registry::SchemaDecoder>) -> Self {
-        self.key_decoder = Some(decoder);
+    pub fn key_deserializer(mut self, decoder: Arc<dyn crate::serdes::Deserializer>) -> Self {
+        self.key_deserializer = Some(decoder);
         self
     }
 
@@ -534,11 +534,8 @@ impl ConsumerBuilder {
     /// decoder before being returned to the caller.  The decoder runs after
     /// the interceptor.  Equivalent to `value.deserializer` in the Java
     /// `KafkaConsumer`.
-    pub fn value_decoder(
-        mut self,
-        decoder: Arc<dyn crate::schema_registry::SchemaDecoder>,
-    ) -> Self {
-        self.value_decoder = Some(decoder);
+    pub fn value_deserializer(mut self, decoder: Arc<dyn crate::serdes::Deserializer>) -> Self {
+        self.value_deserializer = Some(decoder);
         self
     }
 
@@ -651,11 +648,11 @@ impl ConsumerBuilder {
                 ))
             };
         }
-        if let Some(dec) = self.key_decoder {
-            consumer.key_decoder = Some(dec);
+        if let Some(dec) = self.key_deserializer {
+            consumer.key_deserializer = Some(dec);
         }
-        if let Some(dec) = self.value_decoder {
-            consumer.value_decoder = Some(dec);
+        if let Some(dec) = self.value_deserializer {
+            consumer.value_deserializer = Some(dec);
         }
         Ok(consumer)
     }

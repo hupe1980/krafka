@@ -73,16 +73,16 @@ use crate::protocol::{
 use crate::{Offset, PartitionId};
 
 use super::accumulator::{AccumulatorConfig, RecordAccumulator, RecordAccumulatorHandle};
-use super::barrier::InFlightBarrier;
 use super::config::Acks;
 use super::idempotent::ProducerIdentity;
 use super::partitioner::{Partitioner, UniformStickyPartitioner};
 use super::record::{ProducerRecord, RecordMetadata, TopicHandle};
 use super::retry::RetryPolicy;
+use crate::barrier::InFlightBarrier;
 use crate::consumer::ConsumerGroupMetadata;
 use crate::metrics::ProducerMetrics;
 
-use crate::schema_registry::SchemaEncoder;
+use crate::serdes::Serializer;
 
 /// Name of the cluster-wide finalized feature that gates KIP-890 semantics.
 const TRANSACTION_VERSION_FEATURE: &str = "transaction.version";
@@ -948,11 +948,11 @@ pub struct TransactionalProducer {
     /// Optional key encoder applied transparently in `send_record`.
     ///
     /// Equivalent to `key.serializer` in the Java `KafkaProducer`.
-    key_encoder: Option<Arc<dyn SchemaEncoder>>,
+    key_serializer: Option<Arc<dyn Serializer>>,
     /// Optional value encoder applied transparently in `send_record`.
     ///
     /// Equivalent to `value.serializer` in the Java `KafkaProducer`.
-    value_encoder: Option<Arc<dyn SchemaEncoder>>,
+    value_serializer: Option<Arc<dyn Serializer>>,
     /// Interceptor chain, shared with the accumulator.
     ///
     /// `on_send` is invoked here; `on_acknowledgement` fires inside the
@@ -1625,9 +1625,9 @@ impl TransactionalProducer {
         crate::interceptor::safe_on_send(&*self.interceptor, &mut record);
 
         // Transparently apply producer-level schema encoders if configured.
-        if let Some(enc) = &self.value_encoder {
+        if let Some(enc) = &self.value_serializer {
             record.value = enc
-                .encode(
+                .serialize(
                     record.value.clone(),
                     &record.topic,
                     record.record_name.as_deref(),
@@ -1635,10 +1635,10 @@ impl TransactionalProducer {
                 )
                 .await?;
         }
-        if let Some(enc) = &self.key_encoder {
+        if let Some(enc) = &self.key_serializer {
             let key = record.key.clone().unwrap_or_default();
             record.key = Some(
-                enc.encode(key, &record.topic, record.record_name.as_deref(), true)
+                enc.serialize(key, &record.topic, record.record_name.as_deref(), true)
                     .await?,
             );
         }
@@ -1901,6 +1901,25 @@ impl TransactionalProducer {
         offsets: &[TopicPartitionOffset],
         group_metadata: &ConsumerGroupMetadata,
     ) -> Result<()> {
+        // Register with the in-flight barrier *before* reading the state, for
+        // the same reason `send_record` does — and this is the call where it
+        // matters most.
+        //
+        // `commit_transaction` transitions to `Committing`, then waits for the
+        // barrier, then flushes, then sends `EndTxn`. Taking the guard first
+        // makes the two orderings exhaustive: either this operation registered
+        // before the commit's barrier snapshot, and the commit waits for it, or
+        // it registered afterwards — in which case the commit has already
+        // transitioned and the state check below refuses.
+        //
+        // Without the guard this method was invisible to that wait, so a
+        // concurrent commit could write the `EndTxn` marker while the
+        // `TxnOffsetCommit` was still in flight. The offsets would then be
+        // committed *outside* the transaction, which is the one thing
+        // consume-transform-produce exists to prevent: the output records would
+        // be atomic with each other but not with the consumer's position.
+        let _operation_guard = self.in_flight_barrier.start("transactional producer")?;
+
         let current = self.state();
         if current != TransactionState::InTransaction {
             return Err(KrafkaError::invalid_state(format!(
@@ -2204,16 +2223,25 @@ impl TransactionalProducer {
     pub async fn commit_transaction(&self) -> Result<()> {
         self.ensure_transaction_can_continue("commit transaction")?;
 
-        // Every buffered record must reach the broker before `EndTxn`, or it
-        // would be committed into a transaction the coordinator has already
-        // closed. A flush failure is surfaced as-is; the caller aborts.
-        self.accumulator.flush().await?;
-
+        // Close the transaction to new records *before* draining it.
+        //
         // Atomic CAS: InTransaction → Committing, or retry a commit whose
         // outcome we never learned. Retrying is safe and is the *only* safe
         // move from `CommitIndeterminate`: `EndTxn` is idempotent for a given
         // producer id and epoch, so a duplicate commit either lands or is
         // recognised by the coordinator as the one it already applied.
+        //
+        // The order matters and used to be the other way round — flush, then
+        // transition. `send_record` admits a record when it observes
+        // `InTransaction`, so between the flush completing and the state
+        // changing there was a window in which a concurrent send appended a
+        // record the flush had already passed. That record was still buffered
+        // when `EndTxn` went out, and would then either be rejected by the
+        // broker as `INVALID_TXN_STATE` or, if `begin_transaction` had since
+        // been called, silently join the *next* transaction — so a record the
+        // application was told had been committed could disappear when a later
+        // transaction aborted. `abort_transaction` already transitioned first;
+        // this is the same discipline.
         if let Err(actual) = self
             .try_transition(
                 TransactionState::InTransaction,
@@ -2230,6 +2258,30 @@ impl TransactionalProducer {
                 "cannot commit in state {:?}",
                 actual
             )));
+        }
+
+        // Every buffered record must reach the broker before `EndTxn`, or it
+        // would be committed into a transaction the coordinator has already
+        // closed.
+        //
+        // Two things have to drain, not one. `accumulator.flush()` empties the
+        // batch queue, but a `send_record` that passed its state check a moment
+        // ago may not have *reached* the accumulator yet — it is still running
+        // interceptors or encoders. Waiting on the in-flight barrier first
+        // ensures those land in the queue, and the flush then drains them.
+        // Draining only the queue would leave exactly the records that were
+        // closest to the transition unaccounted for.
+        self.in_flight_barrier
+            .wait_for(self.in_flight_barrier.snapshot())
+            .await;
+        if let Err(error) = self.accumulator.flush().await {
+            // Nothing was sent to the coordinator, so the transaction is still
+            // open. Hand the state back so the caller can abort it.
+            let _ = self.try_transition(
+                TransactionState::Committing,
+                TransactionState::InTransaction,
+            );
+            return Err(error);
         }
 
         let result = match self.end_transaction(true).await {
@@ -2368,6 +2420,16 @@ impl TransactionalProducer {
         // Drain buffered records first so their send futures resolve rather
         // than hanging once the transaction is torn down. Errors are expected
         // here (the transaction is being abandoned) and are only logged.
+        //
+        // The barrier wait comes first for the same reason as in
+        // `commit_transaction`: a `send_record` that passed its state check
+        // just before the transition above has not necessarily reached the
+        // accumulator yet, and flushing without waiting would leave its batch
+        // buffered — and its caller's future unresolved — after the transaction
+        // was torn down.
+        self.in_flight_barrier
+            .wait_for(self.in_flight_barrier.snapshot())
+            .await;
         if let Err(err) = self.accumulator.flush().await {
             debug!(error = %err, "Accumulator flush during abort_transaction failed");
         }
@@ -2880,8 +2942,8 @@ pub struct TransactionalProducerBuilder {
     config: TransactionalProducerConfig,
     retry_policy: RetryPolicy,
     partitioner: Option<Arc<dyn Partitioner>>,
-    key_encoder: Option<Arc<dyn SchemaEncoder>>,
-    value_encoder: Option<Arc<dyn SchemaEncoder>>,
+    key_serializer: Option<Arc<dyn Serializer>>,
+    value_serializer: Option<Arc<dyn Serializer>>,
     interceptors: Vec<Arc<dyn crate::interceptor::ProducerInterceptor>>,
     /// Pre-built pool and metadata from a [`KrafkaClient`](crate::client::KrafkaClient).
     shared: Option<(Arc<ConnectionPool>, Arc<ClusterMetadata>)>,
@@ -3239,16 +3301,16 @@ impl TransactionalProducerBuilder {
     ///
     /// Equivalent to `key.serializer` in the Java `KafkaProducer`. Configure
     /// it once here and encoding is transparent on every send.
-    pub fn key_encoder(mut self, encoder: Arc<dyn SchemaEncoder>) -> Self {
-        self.key_encoder = Some(encoder);
+    pub fn key_serializer(mut self, encoder: Arc<dyn Serializer>) -> Self {
+        self.key_serializer = Some(encoder);
         self
     }
 
     /// Attach a value encoder applied automatically on every [`send_record`](TransactionalProducer::send_record) call.
     ///
     /// Equivalent to `value.serializer` in the Java `KafkaProducer`.
-    pub fn value_encoder(mut self, encoder: Arc<dyn SchemaEncoder>) -> Self {
-        self.value_encoder = Some(encoder);
+    pub fn value_serializer(mut self, encoder: Arc<dyn Serializer>) -> Self {
+        self.value_serializer = Some(encoder);
         self
     }
 
@@ -3448,8 +3510,8 @@ impl TransactionalProducerBuilder {
             metrics,
             retry_policy,
             in_flight_barrier,
-            key_encoder: self.key_encoder,
-            value_encoder: self.value_encoder,
+            key_serializer: self.key_serializer,
+            value_serializer: self.value_serializer,
             interceptor,
             state_store: self.state_store,
             pool_owned,
@@ -3646,8 +3708,8 @@ mod tests {
             metrics: Arc::new(ProducerMetrics::default()),
             retry_policy: RetryPolicy::default(),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
-            key_encoder: None,
-            value_encoder: None,
+            key_serializer: None,
+            value_serializer: None,
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             state_store: None,
             pool_owned: true,
@@ -3702,8 +3764,8 @@ mod tests {
             metrics: Arc::new(ProducerMetrics::default()),
             retry_policy: RetryPolicy::default(),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
-            key_encoder: None,
-            value_encoder: None,
+            key_serializer: None,
+            value_serializer: None,
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             state_store: None,
             pool_owned: true,
@@ -3759,8 +3821,8 @@ mod tests {
             metrics: Arc::new(ProducerMetrics::default()),
             retry_policy: RetryPolicy::default(),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
-            key_encoder: None,
-            value_encoder: None,
+            key_serializer: None,
+            value_serializer: None,
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             state_store: None,
             pool_owned: true,
@@ -4450,8 +4512,8 @@ mod tests {
             metrics: Arc::new(ProducerMetrics::default()),
             retry_policy: RetryPolicy::no_retries(),
             in_flight_barrier: Arc::new(InFlightBarrier::new()),
-            key_encoder: None,
-            value_encoder: None,
+            key_serializer: None,
+            value_serializer: None,
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             state_store: None,
             pool_owned: true,

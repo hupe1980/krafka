@@ -3111,3 +3111,413 @@ async fn an_old_abort_is_not_reported_to_a_consumer_that_has_read_past_it() {
     let _ = consumer.close().await;
     producer.close().await;
 }
+
+// ── Prefetch buffer ────────────────────────────────────────────────────────
+
+/// Records fetched past the delivery cap must be *parked*, not thrown away.
+///
+/// The consumer decodes one delivery's worth plus the buffer's free capacity,
+/// so a fetch that returns more than `max_poll_records` fills the buffer and
+/// the *next* poll is served from memory with no Fetch on the wire. The
+/// previous design truncated the surplus and re-fetched it, which paid for the
+/// same bytes twice — once in decode, once on the network.
+///
+/// Counting Fetch requests is what makes this a real assertion: comparing only
+/// the records returned would pass just as well against the old behaviour.
+#[tokio::test]
+async fn a_second_poll_is_served_from_the_prefetch_buffer_without_a_fetch() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let producer = crate::producer::Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("producer should connect");
+    for i in 0..20u32 {
+        let _ = producer
+            .send("events", None, format!("v{i}").as_bytes())
+            .await
+            .expect("send");
+    }
+    producer.close().await;
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .max_poll_records(5)
+        .max_buffered_records(50)
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("consumer should connect");
+    consumer
+        .assign("events", vec![0])
+        .await
+        .expect("manual assignment");
+
+    // First poll: goes to the broker and comes back with the delivery cap.
+    let first = consumer
+        .poll(Duration::from_millis(500))
+        .await
+        .expect("first poll");
+    assert_eq!(first.len(), 5, "the delivery cap must still be honoured");
+    let fetches_after_first = broker.request_count(ApiKey::Fetch);
+    assert!(
+        fetches_after_first >= 1,
+        "the first poll has to reach the broker"
+    );
+
+    // Second poll: served entirely from the buffer the first poll filled.
+    let second = consumer
+        .poll(Duration::from_millis(500))
+        .await
+        .expect("second poll");
+    assert_eq!(second.len(), 5, "the buffer must serve a full batch");
+    assert_eq!(
+        broker.request_count(ApiKey::Fetch),
+        fetches_after_first,
+        "a poll served from the prefetch buffer must not issue a Fetch"
+    );
+
+    // Offsets are contiguous across the boundary: nothing skipped, nothing
+    // duplicated by the park-and-serve round trip.
+    let seen: Vec<i64> = first
+        .iter()
+        .chain(second.iter())
+        .map(|r| r.offset)
+        .collect();
+    assert_eq!(seen, (0..10).collect::<Vec<i64>>());
+
+    let _ = consumer.close().await;
+}
+
+/// Parking records must never let the commit run ahead of delivery.
+///
+/// The fetch position advances over everything fetched, including the parked
+/// surplus. If the committed offset followed the fetch position, a crash after
+/// the first poll would skip every parked record. `committable_positions`
+/// holds the commit at the first undelivered offset instead, and this asserts
+/// that end to end rather than through the helper.
+#[tokio::test]
+async fn a_commit_never_acknowledges_records_still_parked_in_the_buffer() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let producer = crate::producer::Producer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("producer should connect");
+    for i in 0..20u32 {
+        let _ = producer
+            .send("events", None, format!("v{i}").as_bytes())
+            .await
+            .expect("send");
+    }
+    producer.close().await;
+
+    let consumer = Consumer::builder()
+        .bootstrap_servers(broker.bootstrap_servers())
+        .group_id("prefetch-commit-group")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .enable_auto_commit(false)
+        .max_poll_records(5)
+        .max_buffered_records(50)
+        .request_timeout(SHORT_REQUEST_TIMEOUT)
+        .connect_timeout(SHORT_CONNECT_TIMEOUT)
+        .build()
+        .await
+        .expect("consumer should connect");
+    consumer.subscribe(&["events"]).await.unwrap();
+
+    // Poll until a batch arrives; the surplus lands in the buffer.
+    let mut delivered = 0usize;
+    for _ in 0..10 {
+        let records = consumer
+            .poll(Duration::from_millis(300))
+            .await
+            .expect("poll");
+        delivered += records.len();
+        if delivered > 0 {
+            break;
+        }
+    }
+    assert!(delivered > 0, "the consumer must receive something");
+
+    // `position()` reports where delivery is, `fetch_position()` where the
+    // read-ahead is. They must differ by exactly what is parked, and the
+    // commit must follow `position()`.
+    let position = consumer
+        .position("events", 0)
+        .await
+        .expect("position must be tracked");
+    let fetch_position = consumer
+        .fetch_position("events", 0)
+        .await
+        .expect("fetch position must be tracked");
+    assert_eq!(
+        position, delivered as i64,
+        "position() must report the delivered offset, not the read-ahead"
+    );
+    assert!(
+        fetch_position > position,
+        "the consumer must have read ahead of delivery, got fetch={fetch_position} \
+         position={position}"
+    );
+
+    consumer.commit().await.expect("commit");
+
+    let committed = broker
+        .committed_offset("prefetch-commit-group", "events", 0)
+        .expect("the group must have a committed offset");
+    assert_eq!(
+        committed, delivered as i64,
+        "the commit must acknowledge exactly what was delivered — a commit at \
+         the fetch position would skip the parked surplus on restart"
+    );
+    assert_eq!(
+        committed, position,
+        "commit() and position() must never disagree"
+    );
+
+    let _ = consumer.close().await;
+}
+
+// ── Transaction state machine: the commit closes before it drains ──────────
+
+/// A commit must stop admitting records *before* it drains the accumulator,
+/// not after.
+///
+/// `send_record` admits a record when it observes `InTransaction`. The commit
+/// path used to flush first and transition second, which left a window between
+/// the flush completing and the state changing where a concurrent send was
+/// still accepted — and its record was then still buffered when `EndTxn` went
+/// out. It would either be rejected by the broker as `INVALID_TXN_STATE` or,
+/// once `begin_transaction` had been called again, silently join the *next*
+/// transaction: a record the application was told had been committed could
+/// disappear when a later transaction aborted.
+///
+/// The test holds the commit inside its drain (by delaying `Produce`) and
+/// asserts that a send issued during that window is refused. Under the old
+/// ordering the state observed here is `InTransaction` and the send is
+/// accepted.
+#[tokio::test]
+async fn a_commit_stops_admitting_records_before_it_drains() {
+    use std::sync::Arc;
+
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("orders", 1);
+
+    let producer = Arc::new(
+        TransactionalProducer::builder()
+            .bootstrap_servers(broker.bootstrap_servers())
+            .transactional_id("txn-commit-ordering")
+            // Batch, so the record below sits in the accumulator and the
+            // commit's flush is what pushes it to the broker.
+            .linger(Duration::from_millis(200))
+            .request_timeout(SHORT_REQUEST_TIMEOUT)
+            .connect_timeout(SHORT_CONNECT_TIMEOUT)
+            .build()
+            .await
+            .expect("transactional producer should connect"),
+    );
+    producer.init_transactions().await.expect("init");
+    producer.begin_transaction().expect("begin");
+
+    // One record, buffered by the linger window.
+    let buffered = Arc::clone(&producer);
+    let send = tokio::spawn(async move { buffered.send("orders", None, b"first").await });
+
+    // Hold the commit inside its flush.
+    broker.on(ApiKey::Produce, |_| {
+        Control::Delay(Duration::from_millis(600))
+    });
+
+    let committing = Arc::clone(&producer);
+    let commit = tokio::spawn(async move { committing.commit_transaction().await });
+
+    // Give the commit time to transition and enter its drain.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert_eq!(
+        producer.state(),
+        crate::producer::TransactionState::Committing,
+        "the commit must own the state while it drains, so no further record \
+         can be admitted into a transaction that is already closing"
+    );
+
+    let refused = producer.send("orders", None, b"too-late").await;
+    let error = refused.expect_err("a send during the commit's drain must be refused");
+    assert!(
+        error.to_string().contains("Committing"),
+        "the refusal must name the state that caused it, got: {error}"
+    );
+
+    broker.clear_hooks();
+    let _ = send.await.expect("send task should not panic");
+    let _ = commit.await.expect("commit task should not panic");
+
+    producer.close().await;
+}
+
+/// A commit must not write the `EndTxn` marker while `send_offsets_to_transaction`
+/// is still in flight.
+///
+/// `send_offsets_to_transaction` is the join between the consumer's position
+/// and the producer's output — the whole point of consume-transform-produce is
+/// that the two commit atomically. It did not register with the in-flight
+/// barrier, so a concurrent `commit_transaction()` could not see it: the commit
+/// would transition, find the barrier idle, flush and send `EndTxn` while the
+/// `TxnOffsetCommit` was still on the wire, leaving the offsets outside the
+/// transaction.
+///
+/// # Why this needs two brokers
+///
+/// `TxnOffsetCommit` goes to the **group** coordinator and `EndTxn` to the
+/// **transaction** coordinator. On a single node they share one connection, and
+/// the broker's own per-connection serialisation masks the client-side race —
+/// an earlier version of this test passed with the fix reverted for exactly
+/// that reason. Splitting the two coordinators across nodes gives them
+/// independent connections, which is the arrangement a real cluster has.
+#[tokio::test]
+async fn a_commit_waits_for_an_in_flight_offset_commit() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::consumer::ConsumerGroupMetadata;
+    use crate::producer::TopicPartitionOffset;
+
+    let broker = FakeBroker::start_cluster(2).await.unwrap();
+    broker.create_topic("orders", 1);
+    // Independent connections: the delayed offset commit cannot queue the
+    // EndTxn behind it.
+    broker.set_group_coordinator("g", 0);
+    broker.set_txn_coordinator("txn-offsets-ordering", 1);
+
+    let producer = Arc::new(
+        TransactionalProducer::builder()
+            .bootstrap_servers(broker.bootstrap_servers())
+            .transactional_id("txn-offsets-ordering")
+            .request_timeout(SHORT_REQUEST_TIMEOUT)
+            .connect_timeout(SHORT_CONNECT_TIMEOUT)
+            .build()
+            .await
+            .expect("transactional producer should connect"),
+    );
+    producer.init_transactions().await.expect("init");
+    producer.begin_transaction().expect("begin");
+    let _ = producer
+        .send("orders", None, b"payload")
+        .await
+        .expect("send");
+
+    // Hold the offset commit on the wire, on the group coordinator only.
+    broker.on(ApiKey::TxnOffsetCommit, |_| {
+        Control::Delay(Duration::from_millis(500))
+    });
+
+    let done = Arc::new(AtomicBool::new(false));
+    let offsets_done = Arc::clone(&done);
+    let offsets_producer = Arc::clone(&producer);
+    let offsets = tokio::spawn(async move {
+        let metadata = ConsumerGroupMetadata::new("g", 1, "member-1", None);
+        let result = offsets_producer
+            .send_offsets_to_transaction(&[TopicPartitionOffset::new("orders", 0, 42)], &metadata)
+            .await;
+        offsets_done.store(true, Ordering::SeqCst);
+        result
+    });
+
+    // Let the offset commit register with the barrier and reach the broker.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !done.load(Ordering::SeqCst),
+        "the offset commit must still be in flight for this test to mean anything"
+    );
+
+    producer.commit_transaction().await.expect("commit");
+
+    assert!(
+        done.load(Ordering::SeqCst),
+        "commit_transaction() returned while TxnOffsetCommit was still in flight —          the EndTxn marker would have been written with the offsets outside the          transaction"
+    );
+
+    let offsets_result = offsets.await.expect("offset task should not panic");
+    assert!(
+        offsets_result.is_ok(),
+        "the offset commit should complete inside the transaction: {offsets_result:?}"
+    );
+
+    broker.clear_hooks();
+    producer.close().await;
+}
+
+// ── Share consumer: a flush must not race a poll holding the acks ─────────
+
+/// `commit_sync()` must not report success while a concurrent `poll()` is
+/// holding the acknowledgements.
+///
+/// `poll()` drains every entry out of `pending_acks` into a `PendingAckGuard`
+/// for the duration of its `ShareFetch`. During that window the map is empty,
+/// so a `commit_sync()` (or the flush inside `close()`) would take nothing,
+/// report success, and strand the acknowledgements the guard restores a moment
+/// later — leaving the records to be redelivered even though the application
+/// had explicitly acknowledged them.
+///
+/// The documented shutdown is `wakeup()` then `close()`, and `wakeup()` does
+/// not wait for the poll it interrupts to unwind, so this interleaving is the
+/// normal one rather than an exotic race.
+#[cfg(feature = "unstable-protocol")]
+#[tokio::test]
+async fn a_flush_waits_for_a_poll_holding_the_acknowledgements() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("events", 1);
+
+    let consumer = Arc::new(share_consumer_for(&broker, "share-flush-race").await);
+    consumer.subscribe(&["events"]).await.unwrap();
+    // Let the group settle so the next poll reaches the fetch stage.
+    let _ = consumer.poll(Duration::from_millis(300)).await;
+
+    // Hold the poll inside its ShareFetch, with the acks drained out of the map.
+    broker.on(ApiKey::ShareFetch, |_| {
+        Control::Delay(Duration::from_millis(600))
+    });
+
+    let polling = Arc::clone(&consumer);
+    let poll_done = Arc::new(AtomicBool::new(false));
+    let poll_flag = Arc::clone(&poll_done);
+    let poll = tokio::spawn(async move {
+        let out = polling.poll(Duration::from_secs(2)).await;
+        poll_flag.store(true, Ordering::SeqCst);
+        out
+    });
+
+    // Let the poll register with the barrier and drain the acks.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !poll_done.load(Ordering::SeqCst),
+        "the poll must still be in flight for this test to mean anything"
+    );
+
+    consumer.commit_sync().await.expect("commit_sync");
+
+    assert!(
+        poll_done.load(Ordering::SeqCst),
+        "commit_sync() returned while a poll was still holding the pending \
+         acknowledgements — it would have flushed an empty map and reported \
+         success, stranding them"
+    );
+
+    broker.clear_hooks();
+    let _ = poll.await.expect("poll task should not panic");
+    let _ = consumer.close().await;
+}

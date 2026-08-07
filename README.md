@@ -47,7 +47,7 @@ silent gap raises a fatal error instead of reporting success.
 | **Transport** | One `TransportConfig` on every builder — pass the same instance to every client that shares a network path: TCP keepalive, response ceiling, in-flight cap, idle eviction, file-descriptor cap · KIP-227 incremental fetch sessions · SOCKS5 |
 | **Observability** | Lock-free counters, gauges and latency histograms with bounded per-topic cardinality · Prometheus export · producer interceptors and dead-letter queues on **both** producers and both send paths · OAUTHBEARER token-fetch counters and expiry gauge · OpenTelemetry semantic conventions |
 | **Hardening** | Secret zeroization · constant-time comparison (`subtle`) · decompression-bomb limits · decode-loop bounds · RFC 3986 path encoding on every outbound HTTP target · CI forbids any credential-bearing type from deriving `Debug` |
-| **Testing** | 2 400+ tests · 6 cargo-fuzz targets · proptest round-trips across the protocol layer · an in-process fake broker with fault injection that serves the **full transaction protocol** — KIP-360 fencing, commit/abort markers, `read_committed` isolation, TV1 and KIP-890 TV2 — so even exactly-once tests need no Docker |
+| **Testing** | 2 440+ tests · 6 cargo-fuzz targets · proptest round-trips across the protocol layer · an in-process fake broker with fault injection that serves the **full transaction protocol** — KIP-360 fencing, commit/abort markers, `read_committed` isolation, TV1 and KIP-890 TV2 — so even exactly-once tests need no Docker |
 
 > **Broker versions:** krafka requires **Apache Kafka 3.9+**; protocol versions below that baseline have been removed. Features needing a newer broker (KIP-848 consumer groups, KIP-932 share groups, KIP-1066 cordoned log dirs) say so where they are documented and fail with a clear `UnknownApiVersion` rather than silently degrading.
 
@@ -57,16 +57,16 @@ Add krafka to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-krafka = "0.16.0"
+krafka = "0.18.0"
 tokio = { version = "1", features = ["full"] }
 
 # For AWS MSK IAM authentication with full SDK support:
-# krafka = { version = "0.16.0", features = ["aws-msk"] }
+# krafka = { version = "0.18.0", features = ["aws-msk"] }
 ```
 
 ### Producer
 
-```rust
+```rust,compile
 use krafka::producer::Producer;
 use krafka::error::Result;
 
@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
 
 ### Consumer
 
-```rust
+```rust,compile
 use krafka::consumer::{Consumer, AutoOffsetReset};
 use krafka::error::Result;
 use std::time::Duration;
@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
 
 ### Admin Client
 
-```rust
+```rust,compile
 use krafka::admin::{AdminClient, NewTopic};
 use krafka::error::Result;
 use std::time::Duration;
@@ -141,7 +141,8 @@ async fn main() -> Result<()> {
         .await?;
 
     // Create a topic
-    let topic = NewTopic::new("new-topic", 6, 3)
+    // `new` validates the topic name, so it returns a Result.
+    let topic = NewTopic::new("new-topic", 6, 3)?
         .with_config("retention.ms", "604800000");
 
     admin.create_topics(vec![topic], Duration::from_secs(30), false).await?;
@@ -158,7 +159,7 @@ async fn main() -> Result<()> {
 
 For exactly-once semantics across multiple partitions:
 
-```rust
+```rust,compile
 use krafka::producer::TransactionalProducer;
 use krafka::error::Result;
 
@@ -232,18 +233,32 @@ let admin = AdminClient::builder()
 
 | Module | Description |
 |--------|-------------|
-| `producer` | High-throughput message production with batching and compression |
-| `consumer` | Consumer groups with rebalancing, offset management, and static membership |
-| `admin` | Cluster administration (topics, groups, records, configuration, ACLs) |
-| `interceptor` | Producer and consumer interceptor hooks for observability |
-| `protocol` | Kafka wire protocol implementation |
-| `auth` | Authentication (SASL/PLAIN, SASL/SCRAM, SASL/OAUTHBEARER, AWS MSK IAM) |
+| `producer` | Batching, compression, idempotence, transactions, partitioners |
+| `consumer` | Consumer groups (classic + KIP-848), offsets, rebalancing, compacted-topic tables |
+| `share_consumer` | KIP-932 share groups — queue semantics on a Kafka topic *(`unstable-protocol`)* |
+| `admin` | Cluster administration: topics, partitions, groups, configs, ACLs, quotas, tokens |
+| `client` | `KrafkaClient` — one connection pool and metadata cache shared by several clients |
+| `auth` | SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM, TLS and mTLS |
+| `serdes` | `Serializer` / `Deserializer` hooks applied on the way to and from the wire |
+| `interceptor` | Producer and consumer hooks for tracing and enrichment |
+| `dlq` | Dead-letter queues for records that exhaust their retries |
+| `metrics` | Lock-free counters, gauges and latency histograms; Prometheus export |
+| `telemetry` | KIP-714 broker-driven client telemetry and OTLP export *(`telemetry`)* |
+| `tracing_ext` | OpenTelemetry semantic-convention fields for `tracing` spans |
+| `testing` | In-process fake broker with fault injection *(`test-broker`)* |
+| `error` | `KrafkaError`, `ErrorCode`, `ProtocolErrorKind` and retriability classification |
+| `util` | Backoff policy, varint codecs, CRC32C, bootstrap-server parsing |
+| `prelude` | One glob import for the common types (`use krafka::prelude::*`) |
+
+Three more modules are public but `#[doc(hidden)]` — `protocol`, `network` and
+`metadata`. They are reachable for advanced use (custom authenticators, raw
+record batches, benchmarks) but are **not** part of the stable API surface.
 
 ## 🗜️ Compression
 
 krafka supports all Kafka compression codecs, individually feature-gated:
 
-```rust
+```rust,compile
 use krafka::producer::Producer;
 use krafka::protocol::Compression;
 
@@ -270,10 +285,10 @@ To select only what you need:
 # Option 1: enable only the codecs you need
 # `default-features = false` also drops the default `ring` TLS backend, so a
 # crypto backend must be named explicitly.
-krafka = { version = "0.16.0", default-features = false, features = ["lz4", "snappy", "ring"] }
+krafka = { version = "0.18.0", default-features = false, features = ["lz4", "snappy", "ring"] }
 
 # Option 2: enable all compression codecs, including zstd
-# krafka = { version = "0.16.0", features = ["compression-all"] }
+# krafka = { version = "0.18.0", features = ["compression-all"] }
 ```
 
 ### TLS crypto backend
@@ -283,7 +298,7 @@ default; `rustls-aws-lc-rs` selects aws-lc-rs instead, which is the better
 choice on AWS Graviton and in FIPS-oriented deployments:
 
 ```toml
-krafka = { version = "0.16.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
+krafka = { version = "0.18.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
 ```
 
 The two backends are **additive**, not mutually exclusive — a transitive
@@ -367,7 +382,7 @@ which for SASL/PLAIN is `\0username\0password` in cleartext.
 
 ### High Throughput Producer
 
-```rust
+```rust,compile
 use krafka::producer::{Producer, Acks};
 use krafka::protocol::Compression;
 use std::time::Duration;
@@ -384,7 +399,7 @@ let producer = Producer::builder()
 
 ### Low Latency Consumer
 
-```rust
+```rust,compile
 use krafka::consumer::Consumer;
 use std::time::Duration;
 
@@ -404,7 +419,7 @@ builder (`Producer`, `Consumer`, `AdminClient`, `TransactionalProducer`,
 `ShareConsumer`, `KrafkaClient`). The defaults reproduce krafka's historical
 behaviour exactly, so this is opt-in.
 
-```rust
+```rust,compile
 use krafka::network::TransportConfig;
 use krafka::consumer::Consumer;
 use std::time::Duration;
@@ -439,7 +454,7 @@ let consumer = Consumer::builder()
 
 Two paths, because rotation happens two ways:
 
-```rust
+```rust,compile
 // Event-driven: an inotify watch or a sidecar signal fired.
 producer.refresh_tls().await?;
 
@@ -502,7 +517,7 @@ the classic protocol (KIP-1274 phase 1 — warn in 4.3, default flips in 5.0,
 removed in 6.0), and krafka logs the same warning once per process when a group
 starts on it.
 
-```rust
+```rust,compile
 use krafka::consumer::{Consumer, GroupProtocol};
 
 let consumer = Consumer::builder()
@@ -554,9 +569,14 @@ rather than `Unknown(87)`.
 Not implemented: KIP-1071 Streams group protocol (keys 88–89) and KIP-1258
 OAuth client assertion.
 
-The schema-registry module implements the Confluent and AWS Glue **wire formats**
-(magic byte, schema ID framing, caching). Bring your own Avro/Protobuf/JSON-Schema
-codec; krafka does not impose one.
+**Schema registries are out of scope**, as they are for every comparable client
+— Java's `kafka-clients` has none, librdkafka has none, franz-go keeps `pkg/sr`
+out of `kgo`. A registry is a different service with a different protocol, auth
+model and release cadence. krafka provides the *hook* (`serdes::Serializer` /
+`Deserializer`, the equivalent of Java's `key.serializer`); pair it with
+[`schemreg`](https://crates.io/crates/schemreg) for Confluent, AWS Glue or
+Apicurio, and Avro / Protobuf / JSON codecs. See the
+[Cookbook](https://hupe1980.github.io/krafka/docs/cookbook/#use-a-schema-registry).
 
 Tokio is the async runtime.
 
@@ -575,7 +595,7 @@ drive directly. Real `Producer`/`Consumer`/`AdminClient` instances connect to it
 over a real TCP socket, so you exercise the actual client — no Docker, no
 containers, and failure modes you cannot reproduce against a healthy cluster.
 
-```rust
+```rust,compile
 use krafka::testing::{Control, FakeBroker};
 use krafka::protocol::ApiKey;
 use krafka::error::ErrorCode;
@@ -623,7 +643,135 @@ See the **[Testing guide](https://hupe1980.github.io/krafka/docs/testing/)** for
 what it does and, just as importantly, what it deliberately does not model.
 
 
-## ⬆️ Upgrading to 0.16
+## ⬆️ Upgrading
+
+Release-by-release detail lives in **[CHANGELOG.md](CHANGELOG.md)**.
+
+### Upgrading to 0.18
+
+#### Fixed
+
+- **A share-consumer flush could strand acknowledgements.** `poll()` holds the
+  pending acks out of the map for the duration of its `ShareFetch`, so a
+  concurrent `commit_sync()` or `close()` flushed an empty map and reported
+  success. The documented `wakeup()` → `close()` shutdown hits exactly that
+  window. Both flush paths now wait for in-flight polls first.
+
+#### Breaking — schema registry moved out
+
+`krafka::schema_registry` is gone, with the `schema-registry` and
+`aws-glue-schema-registry` features. The registry client now lives in
+[`schemreg`](https://crates.io/crates/schemreg), which additionally supports
+Apicurio and ships Avro / Protobuf / JSON codecs krafka never had.
+
+Every comparable client draws the line here — Java's `kafka-clients` has no
+registry support, librdkafka has none, franz-go keeps `pkg/sr` out of `kgo`. A
+registry is a different service; coupling it to the protocol client meant a
+registry API change could force a Kafka client release.
+
+What krafka keeps is the hook, generalised:
+
+- `SchemaEncoder` / `SchemaDecoder` → **`krafka::serdes::Serializer` /
+  `Deserializer`** (`encode` → `serialize`, `decode` → `deserialize`).
+- `key_encoder` / `value_encoder` → **`key_serializer` / `value_serializer`**;
+  `key_decoder` / `value_decoder` → **`key_deserializer` / `value_deserializer`**.
+- `KrafkaError::SchemaRegistry` → **`KrafkaError::Http`**.
+
+Since the traits are plain `Bytes -> Bytes`, they now cover encryption and
+compression as well as schema framing. The ~20-line `schemreg` adapter is in the
+[Cookbook](https://hupe1980.github.io/krafka/docs/cookbook/#use-a-schema-registry).
+
+### Upgrading to 0.17
+
+#### Breaking
+
+- **`Consumer::cached_end_offset` is isolation-aware.** Under `read_committed`
+  it returns the **last stable offset** rather than the high watermark, because
+  the broker will not deliver a record at or above the LSO. Use the new
+  `cached_high_watermark()` if you specifically want the log-end offset.
+  `read_uncommitted` (the default) is unchanged.
+- **`Consumer::position()` reports the delivered offset, not the read-ahead.**
+  It is the value a commit writes, so `position()` and `commit()` cannot
+  disagree. The read-ahead value is the new `fetch_position()`.
+
+#### Fixed — four defects in the fetch-to-delivery path
+
+- **A `seek()` could move the committed offset *backwards*.** Every reposition
+  path left already-fetched records in the receive buffer, and a commit is
+  clamped down to the lowest still-buffered offset — correct on its own, and
+  what stops an undelivered record from being acknowledged. After
+  `seek_to_end()` on a partition with buffered offset 100 and a new position of
+  5 000, the next commit wrote **100**. Via `auto.offset.reset` the clamped
+  offset could be one the log no longer holds, producing a reset →
+  `OFFSET_OUT_OF_RANGE` loop that never converged.
+- **`read_committed` reported permanent phantom lag.** `last_stable_offset` was
+  decoded from every fetch response and never read, so `lag()`,
+  `is_caught_up()` and the `lag` metrics compared against the high watermark. An
+  open transaction kept a fully drained consumer reporting a backlog it could
+  never close, and `is_caught_up()` could never return `true`.
+- **`pause()` was bypassed by `recv()` / `batch_recv()`.** `poll()` withheld
+  paused partitions; the buffer drain did not, so the same client gave two
+  answers depending on which read API was used. Withheld records are held, not
+  discarded — the fetch position has already advanced past them.
+- **A commit marker could end a `read_committed` abort filter early.** The
+  aborted-transaction filter deactivated on *any* control batch without reading
+  the marker's type field, so aborted records could reach the application.
+- **A transactional commit could orphan a record into the next transaction.**
+  `commit_transaction()` drained the accumulator before closing the transaction
+  to new records, so a concurrent `send()` could slip in behind the flush and
+  stay buffered until after `EndTxn` — landing in the *following* transaction,
+  and vanishing if that one aborted.
+- **A commit could write `EndTxn` while `send_offsets_to_transaction` was still
+  in flight**, committing the consumer's offsets outside the transaction. The
+  output records stayed atomic with each other but not with the position that
+  produced them.
+
+- **`assign()` leaked state for partitions it dropped.** Narrowing a manual
+  assignment left the old partitions' positions, watermarks and buffered
+  records behind — and the stale buffer entry dragged back the commit for the
+  partitions still being consumed.
+
+#### Changed
+
+- **Lag counts records read ahead into the buffer** — fetched is not delivered.
+  `position()`, `lag()`, `current_lag()`, `is_caught_up()` and `commit()` are
+  now all derived from one boundary.
+
+#### Faster
+
+- **Fetch responses are read ahead into a prefetch buffer.** A 50 MB response
+  was fully decoded and then truncated to 500 records, with the surplus dropped
+  and re-decoded next poll — roughly **100× the necessary decode work per poll**
+  on a 50-partition assignment. Each fetch now decodes one delivery's worth plus
+  the buffer's free capacity and *parks* the surplus, so the next poll is served
+  from memory with no Fetch on the wire: half the round trips, and network
+  latency out of every other poll.
+- **Partition fetch order is a real round robin.** Fairness previously depended
+  on unspecified `HashMap` iteration order; partitions now rotate by one
+  position per poll, matching the Java client's `PartitionStates.moveToEnd`.
+
+#### New
+
+- `Consumer::cached_high_watermark` and `Consumer::cached_last_stable_offset` —
+  the gap between them is the volume of in-flight transactional data.
+- `Consumer::fetch_position` — where the next fetch starts, as opposed to where
+  delivery is.
+- **`KafkaDeadLetterQueue`** — the DLQ implementation everyone was writing by
+  hand. Attaches provenance headers, drops the source partition index, and
+  counts what it could not save.
+- **`krafka::prelude`** — one glob import for the common types.
+- **`krafka::interceptor::CommitOffsets`** — names the map `on_commit` takes,
+  so implementors no longer need `ahash` in their own manifest.
+
+#### Documentation
+
+- **`just docs-test` compiles the guide snippets.** It was referenced by the
+  doc tooling for two releases without existing; 196 of 343 Rust blocks are now
+  compile-checked in CI. It found broken examples in the README and Getting
+  Started on its first run — including the admin quick-start, which chained a
+  method onto a `Result`.
+
+### Upgrading to 0.16
 
 ### Breaking
 
@@ -681,13 +829,14 @@ what it does and, just as importantly, what it deliberately does not model.
 ## 📚 Documentation
 
 Full documentation: **[hupe1980.github.io/krafka](https://hupe1980.github.io/krafka)** ·
-API reference: **[docs.rs/krafka](https://docs.rs/krafka)**
+API reference: **[docs.rs/krafka](https://docs.rs/krafka)** ·
+Release history: **[CHANGELOG.md](CHANGELOG.md)**
 
 | Start here | Clients | Integration | Operations | Reference |
 |---|---|---|---|---|
 | [Getting Started](https://hupe1980.github.io/krafka/docs/getting-started/) | [Producer](https://hupe1980.github.io/krafka/docs/producer/) | [Authentication](https://hupe1980.github.io/krafka/docs/authentication/) | [Metrics](https://hupe1980.github.io/krafka/docs/metrics/) | [Protocol Support](https://hupe1980.github.io/krafka/docs/protocol/) |
-| [Configuration](https://hupe1980.github.io/krafka/docs/configuration/) | [Consumer](https://hupe1980.github.io/krafka/docs/consumer/) | [Schema Registry](https://hupe1980.github.io/krafka/docs/schema-registry/) | [Performance](https://hupe1980.github.io/krafka/docs/performance/) | [Architecture](https://hupe1980.github.io/krafka/docs/architecture/) |
-| | [Share Consumer](https://hupe1980.github.io/krafka/docs/share-consumer/) | [Interceptors](https://hupe1980.github.io/krafka/docs/interceptors/) | [Testing](https://hupe1980.github.io/krafka/docs/testing/) | |
+| [Cookbook](https://hupe1980.github.io/krafka/docs/cookbook/) | [Consumer](https://hupe1980.github.io/krafka/docs/consumer/) | | [Performance](https://hupe1980.github.io/krafka/docs/performance/) | [Architecture](https://hupe1980.github.io/krafka/docs/architecture/) |
+| [Configuration](https://hupe1980.github.io/krafka/docs/configuration/) | [Share Consumer](https://hupe1980.github.io/krafka/docs/share-consumer/) | [Interceptors](https://hupe1980.github.io/krafka/docs/interceptors/) | [Testing](https://hupe1980.github.io/krafka/docs/testing/) | |
 | | [Admin Client](https://hupe1980.github.io/krafka/docs/admin/) | | [Error Handling](https://hupe1980.github.io/krafka/docs/errors/) | |
 
 The site is built with [Zola](https://www.getzola.org) from `site/`. Run

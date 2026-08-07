@@ -20,12 +20,12 @@ socket, so the client under test is the actual `Producer`, `Consumer` or
 
 ```toml
 [dev-dependencies]
-krafka = { version = "0.16", features = ["test-broker"] }
+krafka = { version = "0.18", features = ["test-broker"] }
 ```
 
 ## A first test
 
-```rust
+```rust,compile
 use krafka::testing::FakeBroker;
 use krafka::producer::Producer;
 
@@ -107,7 +107,7 @@ KIP-360 fencing, `AddPartitionsToTxn`, `AddOffsetsToTxn`, `TxnOffsetCommit`,
 `EndTxn`, real commit and abort control batches, and `read_committed`
 isolation. A complete consume-transform-produce cycle runs in-process:
 
-```rust
+```rust,compile
 use krafka::consumer::IsolationLevel;
 use krafka::producer::TransactionalProducer;
 use krafka::testing::FakeBroker;
@@ -286,3 +286,41 @@ fix was to model the event that makes the state load-bearing, and the negative
 control is what found it.
 
 If a test passes with the feature deleted, it is not testing the feature.
+
+### Automating the negative control
+
+Doing that by hand catches the tests you thought to check. `just mutants` runs
+[cargo-mutants](https://mutants.rs), which does it exhaustively: it corrupts the
+code in small ways — flip a `<` to `<=`, swap a `-` for a `+`, replace a
+function body with a constant — and reports every corruption the suite still
+passes. A surviving mutant is a missing assertion.
+
+```bash
+just mutants                       # the scoped set
+just mutants -- --re is_newer_sequence   # one function, when verifying a fix
+```
+
+It is **not** part of `just ci`, and that is deliberate: the crate has ~8 200
+mutants, which is roughly 45 CPU-hours, and the timing-based fake-broker tests
+turn many of them into timeouts rather than failures. The recipe is scoped to
+pure, fast, high-consequence code — sequence arithmetic, the in-flight barrier,
+varint codecs, fetch sessions — where a surviving mutant is unambiguous.
+
+It has earned that place. On its first run it showed that **four separate
+corruptions of `is_newer_sequence` passed the entire suite**. That function
+decides whether a broker acknowledgement moves the producer's
+`last_acked_sequence` forward. Every existing test used `candidate == 0`,
+`last == 0`, or values small enough that subtracting, adding *and* dividing all
+landed on the same side of the half-sequence-space threshold — so the
+assertions held for arithmetic that was wrong.
+
+The pattern in every gap it found is the same: **the code fails quietly.** A
+fetch-session epoch stuck at a constant does not error, it just makes the broker
+reject every incremental fetch so the client silently falls back to full ones. A
+zero topic UUID treated as a real identifier does not error, it collapses every
+pre-v13 topic onto one session key. Tests catch loud failures on their own;
+mutation testing is for the quiet ones.
+
+When you verify a fix, scope it with `--re` to the function you changed rather
+than reading a whole-file tally — it answers "did my new tests kill *these*
+mutants?" in minutes instead of half an hour.

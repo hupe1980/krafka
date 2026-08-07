@@ -28,9 +28,10 @@ For every Markdown file under `site/content/`:
   2. `.method(` at the start of a line — a builder-chain or receiver call. The
      name must be a function the crate defines, or be in ALLOWLIST.
 
-Arity is not checked; that needs a compiler. `just docs-test` compiles the
-snippets that are marked compilable, which is the stronger guarantee where it
-applies.
+Arity and shape are not checked here; that needs a compiler. `just docs-test`
+(xtask/docs_test.py) compiles every snippet marked ```rust,compile, which is
+the stronger guarantee where it applies — this check still covers the prose and
+the fragments that cannot be compiled.
 
 The allowlist exists because the guides legitimately show `std`, `tokio`,
 `axum` and `rustls` calls in the same chains as krafka's. Keep it to names that
@@ -53,6 +54,8 @@ ALLOWLIST = {
     "to_string", "into", "iter", "collect", "push", "insert", "get", "len",
     "await", "as_str", "as_ref", "parse", "join", "spawn", "lock", "read",
     "write", "send", "recv", "next", "filter", "for_each", "unwrap_or_err",
+    "as_millis", "as_secs", "duration_since", "tick", "extend", "is_empty",
+    "as_deref", "unwrap_or_default", "from_utf8_lossy", "retain", "contains",
     # tokio / futures
     "run", "serve", "bind", "block_on", "sleep", "timeout", "abort",
     # axum / hyper / tower

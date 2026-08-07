@@ -13,7 +13,7 @@ Add krafka to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-krafka = "0.16.0"
+krafka = "0.18.0"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -42,9 +42,22 @@ services:
       - "9092:9092"
 ```
 
+## The prelude
+
+Every example below spells out its imports so you can see where each type comes
+from. In your own code, one glob import covers the common ones:
+
+```rust,compile
+use krafka::prelude::*;
+```
+
+`Result` is deliberately *not* in the prelude: krafka's alias takes one type
+parameter, so importing it would shadow `std::result::Result` and break every
+`Result<T, E>` in the same module. Write `krafka::Result<T>` when you want it.
+
 ## Your First Producer
 
-```rust
+```rust,compile
 use krafka::producer::Producer;
 use krafka::error::Result;
 
@@ -76,7 +89,7 @@ async fn main() -> Result<()> {
 
 ## Your First Consumer
 
-```rust
+```rust,compile
 use krafka::consumer::Consumer;
 use krafka::error::Result;
 use std::time::Duration;
@@ -105,7 +118,11 @@ async fn main() -> Result<()> {
                 record.partition,
                 record.offset,
                 record.key.map(|k| String::from_utf8_lossy(&k).to_string()),
-                String::from_utf8_lossy(&record.value)
+                record
+                    .value
+                    .as_deref()
+                    .map(String::from_utf8_lossy)
+                    .unwrap_or_default()
             );
         }
     }
@@ -114,7 +131,7 @@ async fn main() -> Result<()> {
 
 ## Using the Admin Client
 
-```rust
+```rust,compile
 use krafka::admin::{AdminClient, NewTopic};
 use krafka::error::Result;
 use std::time::Duration;
@@ -127,7 +144,8 @@ async fn main() -> Result<()> {
         .await?;
 
     // Create a topic
-    let topic = NewTopic::new("new-topic", 3, 1)
+    // `new` validates the topic name, so it returns a Result.
+    let topic = NewTopic::new("new-topic", 3, 1)?
         .with_config("retention.ms", "86400000");
 
     let results = admin
@@ -155,7 +173,7 @@ See the [Configuration Reference](@/docs/configuration.md) for all available opt
 
 ### Common Producer Options
 
-```rust
+```rust,compile
 use krafka::producer::{Producer, Acks};
 use krafka::protocol::Compression;
 use std::time::Duration;
@@ -172,7 +190,7 @@ let producer = Producer::builder()
 
 ### Common Consumer Options
 
-```rust
+```rust,compile
 use krafka::consumer::{Consumer, AutoOffsetReset};
 use std::time::Duration;
 

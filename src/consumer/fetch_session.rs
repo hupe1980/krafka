@@ -493,6 +493,116 @@ impl FetchSessionCache {
 mod tests {
     use super::*;
 
+    // ── Zero-UUID handling and epoch progression ──────────────────────
+    //
+    // Added after `cargo mutants` showed the suite could not distinguish the
+    // real implementations from five different corruptions. All three sites
+    // below fail *quietly* when they are wrong — the client keeps working, it
+    // just stops getting KIP-227's benefit or starts keying sessions wrongly —
+    // which is precisely why nothing noticed.
+
+    const REAL_UUID: [u8; 16] = [7u8; 16];
+
+    /// A zero UUID means "no topic ID" (Fetch v12 and below), not "the topic
+    /// whose ID is zero".
+    ///
+    /// The guard picks between keying a session by UUID and keying it by name.
+    /// Treating a zero UUID as real would collapse *every* pre-v13 topic onto
+    /// the single key `Uuid([0; 16])`, so one topic's partition state would
+    /// overwrite another's and the incremental diff would describe the wrong
+    /// topic entirely.
+    #[test]
+    fn session_key_treats_a_zero_uuid_as_absent() {
+        let mut with_real = make_topic_request("orders", &[(0, 0, 1024)]);
+        with_real.topic_id = Some(REAL_UUID);
+        assert_eq!(
+            SessionKey::from_request(&with_real),
+            SessionKey::Uuid(REAL_UUID),
+            "a real UUID must key the session"
+        );
+
+        let mut with_zero = make_topic_request("orders", &[(0, 0, 1024)]);
+        with_zero.topic_id = Some(ZERO_UUID);
+        assert_eq!(
+            SessionKey::from_request(&with_zero),
+            SessionKey::Name("orders".to_string()),
+            "a zero UUID is not an identifier — fall back to the name"
+        );
+
+        let absent = make_topic_request("orders", &[(0, 0, 1024)]);
+        assert_eq!(
+            SessionKey::from_request(&absent),
+            SessionKey::Name("orders".to_string()),
+            "no UUID at all falls back to the name"
+        );
+
+        // The two fallbacks must agree, or a broker that starts sending zero
+        // UUIDs would silently re-key every existing session.
+        assert_eq!(
+            SessionKey::from_request(&with_zero),
+            SessionKey::from_request(&absent)
+        );
+    }
+
+    /// The stored UUID follows the same rule as the key.
+    ///
+    /// It is what `FetchForgottenTopic` entries carry, so storing a zero UUID
+    /// as if it were real would send `topic_id: 0` for a removed topic and the
+    /// broker would not know which topic to drop.
+    #[test]
+    fn update_from_response_stores_only_a_real_uuid() {
+        let mut state = FetchSessionState::new(1);
+
+        let mut real = make_topic_request("orders", &[(0, 0, 1024)]);
+        real.topic_id = Some(REAL_UUID);
+        state.update_from_response(99, std::slice::from_ref(&real));
+        assert_eq!(
+            state.topics.get(&SessionKey::Uuid(REAL_UUID)).unwrap().uuid,
+            Some(REAL_UUID)
+        );
+
+        let mut zero = make_topic_request("payments", &[(0, 0, 1024)]);
+        zero.topic_id = Some(ZERO_UUID);
+        state.update_from_response(99, std::slice::from_ref(&zero));
+        assert_eq!(
+            state
+                .topics
+                .get(&SessionKey::Name("payments".to_string()))
+                .unwrap()
+                .uuid,
+            None,
+            "a zero UUID must not be stored as an identifier"
+        );
+    }
+
+    /// The epoch advances by one and wraps to 1, never to 0.
+    ///
+    /// Epoch 0 means "start a new session" in KIP-227, so wrapping through it
+    /// would silently turn an incremental fetch into a full one. A constant
+    /// epoch is worse and just as quiet: the broker rejects it with
+    /// `INVALID_FETCH_SESSION_EPOCH`, the client resets, and every fetch
+    /// degrades to a full one — KIP-227's entire benefit lost with no error
+    /// surfaced anywhere.
+    #[test]
+    fn next_epoch_advances_and_wraps_past_zero() {
+        let mut state = FetchSessionState::new(1);
+        assert_eq!(state.epoch, 0, "a fresh session starts at 0");
+        assert_eq!(state.next_epoch(), 1);
+
+        state.epoch = 1;
+        assert_eq!(state.next_epoch(), 2, "the epoch must advance, not repeat");
+
+        state.epoch = 41;
+        assert_eq!(state.next_epoch(), 42);
+
+        state.epoch = i32::MAX;
+        assert_eq!(
+            state.next_epoch(),
+            1,
+            "wrapping must skip 0, which means \"new session\""
+        );
+    }
+
     fn make_topic_request(topic: &str, partitions: &[(i32, i64, i32)]) -> FetchTopicRequest {
         FetchTopicRequest {
             topic: topic.to_string(),

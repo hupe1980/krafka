@@ -1120,6 +1120,85 @@ mod tests {
         assert_eq!(identity.peek_sequence("topic", 0), 2);
     }
 
+    // ── `is_newer_sequence` arithmetic ────────────────────────────────
+    //
+    // These exist because mutation testing (`cargo mutants`) showed the
+    // pre-existing tests could not tell the real implementation from four
+    // different corruptions of it: `candidate - last` → `+`, the wrap branch's
+    // `+` → `-` and `-` → `/`, and the final `<` → `<=`. Every earlier case
+    // used `candidate == 0`, `last == 0`, or values small enough that all the
+    // variants land on the same side of the threshold, so the assertions held
+    // for arithmetic that was wrong.
+    //
+    // The values below are chosen so each mutation flips the *answer*, not
+    // just the intermediate. `is_newer_sequence` decides whether a broker's
+    // acknowledgement moves `last_acked_sequence` forward, which in turn feeds
+    // `can_reset_after_out_of_order` and `reset_sequence` — a wrong answer here
+    // silently rewinds or advances the producer's sequence space.
+
+    /// Forward branch: the distance is `candidate - last`, not `candidate + last`.
+    ///
+    /// Straddles the half-space threshold, so summing instead of subtracting
+    /// reports "not newer" for a sequence that plainly is.
+    #[test]
+    fn is_newer_sequence_subtracts_on_the_forward_branch() {
+        let last = 1 << 30; // 1_073_741_824
+        let candidate = last + 5;
+
+        // True distance is 5 — comfortably inside the half space.
+        assert!(is_newer_sequence(last, candidate));
+        // `candidate + last` would be 2^31 + 5, i.e. outside it.
+        assert!(
+            (candidate as u32).wrapping_add(last as u32) >= HALF_SEQUENCE_SPACE,
+            "the fixture must straddle the threshold or it proves nothing"
+        );
+    }
+
+    /// Wrap branch: the distance is `(SPACE - last) + candidate`.
+    ///
+    /// Kills both the `+` → `-` and the `-` → `/` mutation at once: each
+    /// produces a small distance where the real one is just past the half
+    /// space, flipping "not newer" into "newer".
+    #[test]
+    fn is_newer_sequence_adds_across_the_wrap() {
+        let last = (SEQUENCE_SPACE - ((1 << 29) + 10)) as i32; // 1_610_612_726
+        let candidate = 1 << 29; //   536_870_912
+
+        // (2^29 + 10) + 2^29 = 2^30 + 10 — ten past the half space, so this
+        // candidate is *behind*, not ahead.
+        assert!(
+            !is_newer_sequence(last, candidate),
+            "a candidate more than half the sequence space ahead is behind"
+        );
+
+        // Both corruptions would land far inside the half space and answer
+        // `true`; assert the gap is real rather than trusting the constants.
+        let subtracted = (SEQUENCE_SPACE - last as u32) - candidate as u32;
+        let divided = (SEQUENCE_SPACE / last as u32) + candidate as u32;
+        assert!(subtracted < HALF_SEQUENCE_SPACE);
+        assert!(divided < HALF_SEQUENCE_SPACE);
+    }
+
+    /// The comparison is strictly `<`: a distance of exactly half the sequence
+    /// space is *not* newer.
+    ///
+    /// This is the point the wraparound scheme is undefined at — the candidate
+    /// is equidistant forwards and backwards — so the tie has to break one way
+    /// and stay there.
+    #[test]
+    fn is_newer_sequence_excludes_the_exact_half_space() {
+        let last = 0;
+        let candidate = HALF_SEQUENCE_SPACE as i32; // 1_073_741_824
+
+        assert!(
+            !is_newer_sequence(last, candidate),
+            "exactly half the sequence space away must not count as newer"
+        );
+        // One below the boundary is newer, which is what makes the boundary a
+        // boundary rather than an off-by-one.
+        assert!(is_newer_sequence(last, candidate - 1));
+    }
+
     #[test]
     fn test_acknowledge_wraps_from_max_to_zero() {
         let identity = ProducerIdentity::new();
@@ -1274,6 +1353,11 @@ mod tests {
 
         assert!(identity.take_reinit_request());
         assert!(!identity.is_initialized());
+        // The epoch has to be reset alongside the producer ID. `is_initialized`
+        // only inspects the ID, so a stale epoch left behind here was invisible
+        // — mutation testing flagged this assertion as missing.
+        assert_eq!(identity.producer_id(), -1);
+        assert_eq!(identity.producer_epoch(), -1);
         assert_eq!(identity.peek_sequence("topic", 0), 0);
 
         // Second call is a no-op — the request was already consumed.

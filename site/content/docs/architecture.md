@@ -149,7 +149,7 @@ cluster therefore opens **15** TCP connections (3 clients × 5 brokers).
 `KrafkaClient` solves this by wrapping a single `Arc<ConnectionPool>` + `Arc<ClusterMetadata>`
 that is shared across all clients:
 
-```rust
+```rust,compile
 // One pool + one metadata cache for the whole process.
 let client = KrafkaClient::builder("broker1:9092,broker2:9092")
     .build()

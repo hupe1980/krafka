@@ -100,9 +100,7 @@
 //! | `lz4` | via `compression` | LZ4 compression via `lz4_flex`. |
 //! | `zstd` | no | Zstd compression via `zstd` (requires C toolchain). |
 //! | `aws-msk` | no | AWS MSK IAM authentication with SDK credential chain. |
-//! | `schema-registry` | no | Confluent Schema Registry HTTP client. |
 //! | `oauth-oidc` | no | Built-in OIDC token provider for SASL/OAUTHBEARER: the `client_credentials` grant (KIP-768) and RFC 7523 client assertions (KIP-1258). Adds no cryptography dependency — assertions are supplied pre-signed. |
-//! | `aws-glue-schema-registry` | no | AWS Glue Schema Registry SDK client. |
 //! | `socks5` | no | SOCKS5 proxy support via `tokio-socks`. |
 //! | `telemetry` | no | OpenTelemetry exporter for producer/consumer metrics. |
 //! | `unstable-protocol` | no | Enables protocol versions Kafka marks `latestVersionUnstable` — a released broker does not advertise them without `unstable.api.versions.enable=true`. Covers `ApiVersions` v5 (KIP-1242), `InitProducerId` v6 (KIP-939) and the Share Consumer (KIP-932). APIs under this feature may change without semver notice. |
@@ -135,7 +133,7 @@
 //! ```toml
 //! [dependencies]
 //! # `ring` (or `rustls-aws-lc-rs`) is required — without it the build fails.
-//! krafka = { version = "0.16.0", default-features = false, features = ["lz4", "ring"] }
+//! krafka = { version = "0.18.0", default-features = false, features = ["lz4", "ring"] }
 //! ```
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -171,16 +169,22 @@ compile_error!(
 
 pub mod admin;
 pub mod auth;
+/// Tracks in-flight operations so a flush or a close can wait for work that has
+/// started but not yet reached the structure it will land in.
+///
+/// Shared by the producer (draining a transaction before `EndTxn`) and the
+/// share consumer (draining acknowledgements before `close`), which is why it
+/// sits at the crate root rather than inside either.
+mod barrier;
 pub mod client;
 pub mod consumer;
 pub mod dlq;
 pub mod error;
-/// Minimal async HTTP/1.1 client shared by the OIDC token provider and the
-/// Confluent Schema Registry client.
+/// Minimal async HTTP/1.1 client used by the OIDC token provider.
 ///
-/// Compiled only when a feature needs it (`oauth-oidc` or `schema-registry`).
-/// This is an implementation detail and not part of the stable public API.
-#[cfg(any(feature = "oauth-oidc", feature = "schema-registry"))]
+/// Compiled only when `oauth-oidc` is enabled. This is an implementation
+/// detail and not part of the stable public API.
+#[cfg(feature = "oauth-oidc")]
 mod http;
 pub mod interceptor;
 /// Cluster metadata cache and refresh logic.
@@ -204,7 +208,7 @@ pub mod producer;
 /// the stable public API.
 #[doc(hidden)]
 pub mod protocol;
-pub mod schema_registry;
+pub mod serdes;
 #[cfg(feature = "unstable-protocol")]
 #[cfg_attr(docsrs, doc(cfg(feature = "unstable-protocol")))]
 pub mod share_consumer;
@@ -219,6 +223,37 @@ pub mod telemetry;
 pub mod testing;
 pub mod tracing_ext;
 pub mod util;
+
+/// The types you need to write a producer, a consumer or an admin client.
+///
+/// ```rust
+/// use krafka::prelude::*;
+/// ```
+///
+/// A glob import, so an explicit `use` of the same type shadows it rather than
+/// colliding. Everything here is re-exported from its own module; the prelude
+/// exists so that the common case is one line instead of eight, and so that the
+/// documentation snippets have a single import that keeps them honest.
+///
+/// Deliberately excluded: anything feature-gated (`ShareConsumer`, the
+/// telemetry reporter, the fake broker), and anything a caller is unlikely to
+/// name more than once per program (`ConnectionConfig`, the metrics exporters).
+/// A prelude that pulls in names you did not ask for is worse than no prelude.
+pub mod prelude {
+    pub use crate::admin::{AdminClient, NewTopic};
+    pub use crate::client::KrafkaClient;
+    pub use crate::consumer::{
+        AutoOffsetReset, Consumer, ConsumerRecord, IsolationLevel, OffsetAndMetadata,
+        TopicPartition,
+    };
+    pub use crate::dlq::{DeadLetterQueue, KafkaDeadLetterQueue};
+    // `Result` is deliberately absent: krafka's alias takes one parameter, so
+    // a glob that shadowed `std::result::Result` would break every
+    // `Result<T, E>` in the importing module. Write `krafka::Result<T>`.
+    pub use crate::error::KrafkaError;
+    pub use crate::producer::{Producer, ProducerRecord, TransactionalProducer};
+    pub use crate::protocol::Compression;
+}
 
 pub use error::{KrafkaError, ProtocolErrorKind, RecvError, Result};
 pub use metadata::MetadataRecoveryStrategy;

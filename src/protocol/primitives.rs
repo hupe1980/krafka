@@ -382,13 +382,20 @@ impl Decode for KafkaString {
             ));
         }
 
+        // `copy_to_bytes` already moved the bytes out of the buffer, so
+        // validating in place and copying once into the `String` is one copy
+        // rather than the two `String::from_utf8(bytes.to_vec())` costs. On a
+        // full metadata refresh this runs once per topic name, partition rack
+        // and broker host.
         let bytes = buf.copy_to_bytes(len);
-        let s = String::from_utf8(bytes.to_vec()).map_err(|e| {
-            KrafkaError::protocol_kind(
-                ProtocolErrorKind::InvalidUtf8,
-                format!("invalid UTF-8 string: {e}"),
-            )
-        })?;
+        let s = std::str::from_utf8(&bytes)
+            .map_err(|e| {
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidUtf8,
+                    format!("invalid UTF-8 string: {e}"),
+                )
+            })?
+            .to_owned();
         Ok(Self(Some(s)))
     }
 
@@ -406,13 +413,20 @@ impl Decode for KafkaString {
             ));
         }
 
+        // `copy_to_bytes` already moved the bytes out of the buffer, so
+        // validating in place and copying once into the `String` is one copy
+        // rather than the two `String::from_utf8(bytes.to_vec())` costs. On a
+        // full metadata refresh this runs once per topic name, partition rack
+        // and broker host.
         let bytes = buf.copy_to_bytes(len);
-        let s = String::from_utf8(bytes.to_vec()).map_err(|e| {
-            KrafkaError::protocol_kind(
-                ProtocolErrorKind::InvalidUtf8,
-                format!("invalid UTF-8 string: {e}"),
-            )
-        })?;
+        let s = std::str::from_utf8(&bytes)
+            .map_err(|e| {
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidUtf8,
+                    format!("invalid UTF-8 string: {e}"),
+                )
+            })?
+            .to_owned();
         Ok(Self(Some(s)))
     }
 }

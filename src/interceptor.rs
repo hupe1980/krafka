@@ -100,6 +100,15 @@ use crate::error::KrafkaError;
 use crate::producer::{ProducerRecord, RecordMetadata};
 use crate::{Offset, PartitionId, Timestamp};
 
+/// The offset map handed to [`ConsumerInterceptor::on_commit`].
+///
+/// Named rather than spelled out, because the trait signature would otherwise
+/// leak `ahash::AHashMap` — an implementor would have to add `ahash` to their
+/// own `Cargo.toml` just to name the parameter. The interceptor guide reached
+/// for `std::collections::HashMap` instead, which is a different type, so the
+/// documented implementation never compiled.
+pub type CommitOffsets = HashMap<(String, PartitionId), Offset>;
+
 /// Result type for interceptor callbacks.
 ///
 /// Interceptor errors are **non-fatal**: the chain continues and the error is
@@ -153,6 +162,8 @@ pub trait ProducerInterceptor: Send + Sync + fmt::Debug {
 
 /// Interceptor for the Kafka consumer pipeline.
 ///
+/// (See [`CommitOffsets`] for the map type `on_commit` receives.)
+///
 /// Implement this trait to hook into the consumer's poll and commit flow.
 /// All methods have default no-op implementations so you can override
 /// only the hooks you need.
@@ -176,7 +187,7 @@ pub trait ConsumerInterceptor: Send + Sync + fmt::Debug {
     /// The map keys are `(topic, partition)` and values are the committed offsets.
     fn on_commit(
         &self,
-        _offsets: &HashMap<(String, PartitionId), Offset>,
+        _offsets: &CommitOffsets,
         _error: Option<&KrafkaError>,
     ) -> InterceptorResult {
         Ok(())

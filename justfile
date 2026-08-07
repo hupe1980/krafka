@@ -23,13 +23,13 @@ set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 # Everything except the aws-lc-rs backend, so the default `ring` code paths are
 # the ones that actually execute. `cfg(not(feature = "rustls-aws-lc-rs"))` arms
 # exist in `auth/tls.rs` and `schema_registry/http.rs` and run nowhere else.
-ring_features := "compression-all,aws-msk,schema-registry,aws-glue-schema-registry,oauth-oidc,native-tls-roots,unstable-protocol,telemetry,socks5,ring"
+ring_features := "compression-all,aws-msk,oauth-oidc,native-tls-roots,unstable-protocol,telemetry,socks5,ring"
 
 # Portable subset for macOS and Windows: pure-Rust `ring` avoids needing a C
 # toolchain and NASM. `test-broker` is deliberately included — it binds real
 # TCP listeners and drives real clients over loopback, which is the behaviour
 # most likely to differ between platforms.
-cross_platform_features := "compression,schema-registry,oauth-oidc,unstable-protocol,telemetry,socks5,test-broker,ring"
+cross_platform_features := "compression,oauth-oidc,unstable-protocol,telemetry,socks5,test-broker,ring"
 
 # Minimum supported Rust version, mirroring `rust-version` in Cargo.toml.
 msrv := "1.88"
@@ -45,7 +45,7 @@ default:
 # Ordered cheapest-first so a formatting slip fails in seconds rather than
 # after a full test run.
 [doc("Everything CI runs (no Docker suites)")]
-ci: fmt-check clippy check protocol-parity secret-debug test-reachability version-check site-check test-ring test minimal-features doc
+ci: fmt-check clippy check protocol-parity secret-debug test-reachability version-check site-check docs-test test-ring test minimal-features doc
     @echo ""
     @echo "✓ ci passed — Docker suites not included, run 'just integration' for those"
 
@@ -162,6 +162,37 @@ version-check:
 site-check:
     python3 xtask/site_check.py
     python3 xtask/doc_api.py
+
+# Mutation-test the invariant-dense modules.
+#
+# Not part of `ci`: 8 200 mutants across the crate is roughly 45 CPU-hours, and
+# the timing-based fake-broker tests turn many mutants into timeouts rather than
+# failures. Scoped to pure, fast, high-consequence code — sequence arithmetic,
+# the in-flight barrier, varint codecs — where a surviving mutant means a real
+# assertion is missing.
+#
+# It has already earned its keep: four mutants of `is_newer_sequence` survived,
+# because every existing test used values where subtracting, adding and
+# dividing all landed on the same side of the threshold.
+[doc("Mutation-test the invariant-dense modules")]
+mutants *ARGS:
+    cargo mutants \
+        --file src/barrier.rs \
+        --file src/producer/idempotent.rs \
+        --file src/util.rs \
+        --file src/consumer/fetch_session.rs \
+        -j 4 --timeout 120 {{ARGS}} -- --all-features --lib
+
+# Compile the guide snippets marked ```rust,compile.
+#
+# `doc_api.py` checks that names resolve; it cannot check that a call has the
+# right shape, because a plausible snippet reaches only for names that exist.
+# Three fabricated APIs passed it, and the documented way to implement the
+# crate's own `DeadLetterQueue` trait shipped broken for two releases. This
+# compiles the snippets instead.
+[doc("Documentation snippets compile")]
+docs-test:
+    python3 xtask/docs_test.py
 
 # Build the documentation site into site/public.
 [doc("Build the documentation site")]

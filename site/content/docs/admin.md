@@ -39,7 +39,7 @@ client returns a clear protocol error.
 
 ## Basic Usage
 
-```rust
+```rust,compile
 use krafka::admin::AdminClient;
 use krafka::error::Result;
 
@@ -76,7 +76,7 @@ let admin = AdminClient::builder()
 
 ### SASL/SCRAM-SHA-256
 
-```rust
+```rust,compile
 let admin = AdminClient::builder()
     .bootstrap_servers("localhost:9092")
     .sasl_scram_sha256("username", "password")
@@ -86,7 +86,7 @@ let admin = AdminClient::builder()
 
 ### SASL/SCRAM-SHA-512
 
-```rust
+```rust,compile
 let admin = AdminClient::builder()
     .bootstrap_servers("localhost:9092")
     .sasl_scram_sha512("username", "password")
@@ -98,7 +98,7 @@ let admin = AdminClient::builder()
 
 For AWS MSK IAM or advanced configurations:
 
-```rust
+```rust,compile
 use krafka::admin::AdminClient;
 use krafka::auth::AuthConfig;
 
@@ -154,7 +154,7 @@ admin.create_topics(vec![topic], Duration::from_secs(30), false).await?;
 
 ### Deleting Topics
 
-```rust
+```rust,compile
 use std::time::Duration;
 
 let results = admin
@@ -174,7 +174,7 @@ for result in results {
 
 ### Listing Topics
 
-```rust
+```rust,compile
 let topics = admin.list_topics().await?;
 println!("Topics in cluster:");
 for topic in topics {
@@ -186,7 +186,7 @@ for topic in topics {
 
 `describe_topics()` returns a `HashMap<String, TopicInfo>` keyed by topic name for O(1) look-ups:
 
-```rust
+```rust,compile
 let descriptions = admin
     .describe_topics(&["topic1", "topic2"])
     .await?;
@@ -213,7 +213,7 @@ if let Some(info) = descriptions.get("topic1") {
 
 For a single-topic look-up, prefer the convenience shortcut:
 
-```rust
+```rust,compile
 if let Some(info) = admin.describe_topic("my-topic").await? {
     println!("Partitions: {}", info.partition_count());
 }
@@ -281,7 +281,7 @@ for config in configs.iter().filter(|c| !c.is_default) {
 
 ### Altering Topic Configuration
 
-```rust
+```rust,compile
 use std::collections::HashMap;
 
 let mut configs = HashMap::new();
@@ -300,7 +300,7 @@ match result.error {
 
 ### Describing the Cluster
 
-```rust
+```rust,compile
 let cluster = admin.describe_cluster().await?;
 
 println!("Cluster info:");
@@ -317,7 +317,7 @@ for broker in cluster.brokers {
 
 ### Getting Partition Count
 
-```rust
+```rust,compile
 if let Some(count) = admin.partition_count("my-topic").await? {
     println!("Topic has {} partitions", count);
 } else {
@@ -501,7 +501,7 @@ if let Some(error) = result.error {
 
 Create new access control entries:
 
-```rust
+```rust,compile
 use krafka::protocol::AclBinding;
 
 // Create a simple read ACL
@@ -525,7 +525,7 @@ for (i, r) in result.results.iter().enumerate() {
 
 Delete ACLs matching a filter:
 
-```rust
+```rust,compile
 use krafka::protocol::{AclBindingFilter, AclResourceType, AclPatternType, AclOperation, AclPermissionType};
 
 // Delete all ACLs for a topic
@@ -558,7 +558,7 @@ automatically detects each group's type (classic or KIP-848 consumer protocol)
 and dispatches to the appropriate API (Key 15 or Key 69). The request is routed
 to each group's coordinator broker via FindCoordinator:
 
-```rust
+```rust,compile
 let descriptions = admin
     .describe_consumer_groups(vec!["my-group".to_string(), "other-group".to_string()])
     .await?;
@@ -593,7 +593,7 @@ for group in &descriptions {
 
 List all consumer groups across the cluster:
 
-```rust
+```rust,compile
 let groups = admin.list_consumer_groups().await?;
 
 println!("Consumer groups:");
@@ -611,7 +611,7 @@ for group in &groups {
 Use `describe_topic_partitions()` for paginated, detailed partition information
 including ELR (eligible leader replicas) from KIP-966:
 
-```rust
+```rust,compile
 let result = admin
     .describe_topic_partitions(vec!["my-topic".to_string()])
     .await?;
@@ -652,7 +652,7 @@ for topic in &result.topics {
 
 Delete records from topic partitions before a specified offset. Records with offsets less than the specified offset are marked for deletion (this adjusts the log start offset). Requests are automatically routed to each partition's leader broker:
 
-```rust
+```rust,compile
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -686,7 +686,7 @@ for result in &results {
 
 Query the end offset for a given leader epoch. This is used to detect log truncation after leader changes. Requests are routed to each partition's leader broker:
 
-```rust
+```rust,compile
 // Query the end offset for leader epoch 5 on partition 0 of "my-topic"
 let results = admin
     .offset_for_leader_epoch(vec![
@@ -723,7 +723,7 @@ SASL/SCRAM authentication.
 
 ### Creating a Token
 
-```rust
+```rust,compile
 use std::time::Duration;
 
 // Create a token that "alice" can renew, with a 24-hour lifetime
@@ -745,7 +745,7 @@ Use `None` for `max_lifetime` to accept the server default (typically 7 days).
 
 ### Describing Tokens
 
-```rust
+```rust,compile
 // Describe all tokens visible to the caller
 let tokens = admin.describe_delegation_token(None).await?;
 for token in &tokens {
@@ -767,7 +767,7 @@ let tokens = admin
 
 ### Renewing a Token
 
-```rust
+```rust,compile
 use std::time::Duration;
 
 // Obtain a token (e.g., from a prior create call)
@@ -789,7 +789,7 @@ match result.error {
 
 ### Expiring a Token
 
-```rust
+```rust,compile
 use std::time::Duration;
 
 // Obtain a token (e.g., from describe)
@@ -822,7 +822,7 @@ current quotas and `alter_client_quotas` to change them.
 
 ### Describing Quotas
 
-```rust
+```rust,compile
 // Describe all quotas for user "alice" (match_type 0 = exact match)
 let result = admin
     .describe_client_quotas(&[("user", 0, Some("alice"))], false)
@@ -849,7 +849,7 @@ types are returned (entities with additional unspecified types are excluded).
 
 ### Altering Quotas
 
-```rust
+```rust,compile
 use krafka::admin::QuotaAlteration;
 
 // Set producer byte rate for user "alice"
@@ -894,7 +894,7 @@ or delete finalized feature levels.
 
 ### Describing Features
 
-```rust
+```rust,compile
 let features = admin.describe_features().await?;
 println!("Epoch: {}", features.finalized_features_epoch);
 for f in &features.supported_features {
@@ -963,7 +963,7 @@ capacity.
 
 ### Describe All Log Directories
 
-```rust
+```rust,compile
 let dirs = admin.describe_log_dirs(None).await?;
 for dir in &dirs {
     println!("broker {} — {} (total: {}, usable: {})",
@@ -983,7 +983,7 @@ for dir in &dirs {
 
 ### Describe Specific Topics
 
-```rust
+```rust,compile
 use krafka::protocol::DescribableLogDirTopic;
 
 let filter = vec![DescribableLogDirTopic {
@@ -1023,7 +1023,7 @@ Supports preferred election (elect the preferred replica) and unclean election
 
 ### Preferred Election for All Partitions
 
-```rust
+```rust,compile
 use krafka::protocol::ElectionType;
 
 let results = admin
@@ -1040,7 +1040,7 @@ for topic in &results {
 
 ### Unclean Election for Specific Partitions
 
-```rust
+```rust,compile
 use krafka::protocol::{ElectionType, ElectLeadersTopicPartitions};
 
 let results = admin
@@ -1073,7 +1073,7 @@ let results = admin
 
 ### Start a Reassignment
 
-```rust
+```rust,compile
 use krafka::protocol::{ReassignableTopic, ReassignablePartition};
 
 let result = admin.alter_partition_reassignments(
@@ -1101,7 +1101,7 @@ for topic in &result.topics {
 
 ### Cancel a Pending Reassignment
 
-```rust
+```rust,compile
 use krafka::protocol::{ReassignableTopic, ReassignablePartition};
 
 // Set replicas to None to cancel
@@ -1119,7 +1119,7 @@ let result = admin.alter_partition_reassignments(
 
 ### List Ongoing Reassignments
 
-```rust
+```rust,compile
 let reassignments = admin
     .list_partition_reassignments(None, Duration::from_secs(60))
     .await?;
@@ -1150,7 +1150,7 @@ Manage SASL/SCRAM credentials (KIP-554) for users.
 
 ### Describe SCRAM Credentials
 
-```rust
+```rust,compile
 // Describe all users
 let result = admin.describe_user_scram_credentials(None).await?;
 for user in &result.users {
@@ -1165,7 +1165,7 @@ let result = admin
 
 ### Alter SCRAM Credentials
 
-```rust
+```rust,compile
 use krafka::protocol::{ScramCredentialDeletion, ScramCredentialUpsertion};
 use krafka::auth::ScramMechanism;
 use zeroize::Zeroizing;
@@ -1196,7 +1196,7 @@ let results = admin.alter_user_scram_credentials(
 
 ### Move Replicas Between Log Directories
 
-```rust
+```rust,compile
 use krafka::protocol::{AlterReplicaLogDir, AlterReplicaLogDirTopic};
 
 let results = admin.alter_replica_log_dirs(vec![
@@ -1243,7 +1243,7 @@ if let Some(err) = &result.error {
 
 Inspect active producers on partitions (useful for debugging stuck transactions).
 
-```rust
+```rust,compile
 let results = admin
     .describe_producers(&[("my-topic", &[0, 1])])
     .await?;
@@ -1260,7 +1260,7 @@ for topic in &results {
 
 ### Describe Transactions
 
-```rust
+```rust,compile
 let results = admin
     .describe_transactions(&["txn-1", "txn-2"])
     .await?;
@@ -1292,7 +1292,7 @@ for txn in &result.transactions {
 
 ### List Client Metrics Subscriptions
 
-```rust
+```rust,compile
 let names = admin.list_client_metrics_resources().await?;
 for name in &names {
     println!("subscription: {name}");
@@ -1350,7 +1350,7 @@ let results = admin
 Inspect the KRaft quorum for cluster metadata partitions. Returns voter and
 observer replicas, leader info, and high watermark.
 
-```rust
+```rust,compile
 let result = admin
     .describe_metadata_quorum(&[("__cluster_metadata", &[0])])
     .await?;
@@ -1400,7 +1400,7 @@ can actually do:
   removes a voter by ID can otherwise remove a node rebuilt on a fresh disk
   while leaving the original in the quorum.
 
-```rust
+```rust,compile
 let result = admin
     .describe_metadata_quorum(&[("__cluster_metadata", &[0])])
     .await?;
@@ -1422,7 +1422,7 @@ manage it. All require Kafka 4.2+.
 
 ### Describing share group offsets
 
-```rust
+```rust,compile
 // Every topic-partition the group holds state for.
 let described = admin.describe_share_group_offsets("orders-share", None).await?;
 for p in &described.partitions {
@@ -1451,7 +1451,7 @@ misleading `0`.
 already processed; moving it forwards skips records permanently. The group must
 be **empty** — a live member draws `NON_EMPTY_GROUP`.
 
-```rust
+```rust,compile
 let results = admin
     .alter_share_group_offsets("orders-share", &[("orders", &[(0, 0), (1, 0)][..])])
     .await?;
@@ -1493,7 +1493,7 @@ let results = admin.delete_share_group_offsets("orders-share", &["retired-topic"
 topology, members, per-member task assignments, and changelog offsets. Requires
 Kafka 4.1+.
 
-```rust
+```rust,compile
 let groups = admin.describe_streams_groups(&["my-streams-app"]).await?;
 
 for group in &groups {

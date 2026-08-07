@@ -103,22 +103,30 @@ impl BackoffPolicy {
         let initial_secs = self.initial_backoff.as_secs_f64();
         let effective_max_secs = effective_max.as_secs_f64();
         let exponent = attempt.saturating_sub(1).min(i32::MAX as u32) as i32;
-        // If the initial value already equals the ceiling, or if a *growing*
-        // exponential has an exponent large enough that floating point would
-        // overflow to infinity, skip powi entirely and go straight to jitter
-        // application at the cap. The `> 1.0` guard matters: with a multiplier
-        // of 1.0 the series is flat and with a multiplier below 1.0 it shrinks,
-        // so jumping to the ceiling for a large attempt count would invert the
-        // configured behaviour.
-        let base_backoff = if initial_secs >= effective_max_secs
-            || (self.backoff_multiplier > 1.0 && exponent >= 1024)
-        {
+        // Exponential backoff: initial * multiplier^(attempt-1), clamped.
+        //
+        // `min` carries every edge case, which is why there is no
+        // large-exponent special case here:
+        //
+        // * a growing multiplier overflows `powi` to `+inf`, and
+        //   `inf.min(ceiling)` is the ceiling — the intended answer;
+        // * a shrinking multiplier underflows to `0.0`, and the floor applied
+        //   below lifts it back to `initial_backoff`;
+        // * a non-finite multiplier makes the product `NaN`, and `f64::min`
+        //   returns the non-`NaN` operand rather than propagating it.
+        //
+        // A previous version short-circuited to the ceiling whenever
+        // `multiplier > 1.0 && exponent >= 1024`, to avoid "evaluating powi with
+        // a large exponent". That guard was both unnecessary and wrong:
+        // `powi` is repeated squaring, so even `i32::MAX` costs ~31
+        // multiplications, and for a multiplier just above 1.0 the exponential
+        // is nowhere near the ceiling at attempt 1025 — `multiplier = 1.0000001`
+        // jumped from 100 ms straight to `max_backoff` instead of the 100.01 ms
+        // it had actually reached. Mutation testing surfaced it: negating the
+        // `||` changed nothing any test could see.
+        let base_backoff = if initial_secs >= effective_max_secs {
             effective_max_secs
         } else {
-            // Exponential backoff: initial * multiplier^(attempt-1).
-            // A non-finite multiplier makes the product NaN; `f64::min` returns
-            // the non-NaN operand, so the result degrades to the ceiling rather
-            // than propagating NaN.
             (initial_secs * self.backoff_multiplier.powi(exponent)).min(effective_max_secs)
         };
 
@@ -127,6 +135,21 @@ impl BackoffPolicy {
         // cannot reduce the delay below the configured initial_backoff.
         // Read through the accessor so a directly-assigned negative/NaN
         // jitter_factor cannot produce an empty (panicking) sampling range.
+        //
+        // `cargo mutants` reports four surviving mutants across the jitter
+        // block below. All four are *equivalent* — no test can distinguish
+        // them, and none should be written to try:
+        //
+        // * `jitter_factor > 0.0` → `>= 0.0`, and `&&` → `||`: `jitter_range`
+        //   is `base_backoff * jitter_factor`, so the two conditions cannot
+        //   disagree except when `base_backoff` is zero — and there
+        //   `random_range(-0.0..=0.0)` returns `0.0` regardless.
+        // * `base_backoff + jitter` → `-`: the jitter is sampled symmetrically
+        //   from `[-range, +range]`, so negating it yields the same
+        //   distribution.
+        //
+        // Recorded here so the next person to run mutation testing does not
+        // spend the afternoon contorting a test around them.
         let jitter_factor = self.jitter_factor();
         let jitter_range = base_backoff * jitter_factor;
         let jitter = if jitter_factor > 0.0 && jitter_range > 0.0 {
@@ -221,6 +244,20 @@ pub(crate) const NO_RESPONSE_CORRELATION_ID: i32 = i32::MIN;
 /// to prevent silent wraparound. A warning is logged when the cap fires so
 /// over-large timeouts are visible in production logs rather than silently
 /// becoming a much smaller value.
+///
+/// # A note for anyone running `cargo mutants` here
+///
+/// Eight mutants survive in this function, all inside the warning's rate
+/// limiter — the interval constant, the `ms > i32::MAX` warn trigger, and the
+/// `compare_exchange` bookkeeping. **None of them change the returned value**,
+/// which is `ms.min(i32::MAX as u128) as i32` on the last line and is covered
+/// by its own tests.
+///
+/// They are left alone on purpose. Pinning them would mean asserting on
+/// `tracing` output gated by a `static` that lives for the whole process, so
+/// the test's result would depend on whether some earlier test in the binary
+/// had already consumed the hour-long window. An order-dependent test is worse
+/// than no test, and the thing it would protect is a log line.
 #[inline]
 pub fn duration_to_millis_i32(d: Duration) -> i32 {
     /// Minimum interval between clamp warnings. Fires at most once per hour so
@@ -269,6 +306,29 @@ pub fn duration_to_millis_i64(d: Duration) -> i64 {
     d.as_millis().min(i64::MAX as u128) as i64
 }
 
+/// Stamp the RFC 4122 version (4) and variant bits into a random 16-byte
+/// buffer.
+///
+/// Split out of [`random_uuid_v4`] so the bit manipulation can be checked
+/// against every possible input byte rather than against whatever the RNG
+/// happened to produce. The previous test asserted the version and variant
+/// nibbles of a single random UUID, which caught a corrupted variant mask only
+/// half the time — a coin flip dressed up as an assertion.
+///
+/// `cargo mutants` reports the two `|` operators below as surviving mutants
+/// (`| 0x40` → `^ 0x40`, `| 0x80` → `^ 0x80`). Both are *equivalent*: the
+/// preceding mask has already cleared exactly the bits being set, so `|` and
+/// `^` agree for all 256 inputs — checked exhaustively in
+/// `stamp_uuid_v4_bits_is_correct_for_every_input`. The mutants that are *not*
+/// equivalent, notably `& 0x3F` → `| 0x3F`, are killed by that same test.
+#[inline]
+fn stamp_uuid_v4_bits(bytes: &mut [u8; 16]) {
+    // Version 4: high nibble of byte 6 becomes 0b0100.
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;
+    // Variant RFC 4122: top two bits of byte 8 become 0b10.
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+}
+
 /// Generate a random UUID v4 string (KIP-1082 client-generated member ID).
 ///
 /// Format: `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx` where `y` is one of
@@ -280,9 +340,7 @@ pub fn duration_to_millis_i64(d: Duration) -> i64 {
 pub fn random_uuid_v4() -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut bytes: [u8; 16] = rand::random();
-    // Set version (4) and variant (RFC 4122).
-    bytes[6] = (bytes[6] & 0x0F) | 0x40;
-    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+    stamp_uuid_v4_bits(&mut bytes);
 
     // Encode into a 36-byte UUID string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
     // Dashes fall after byte groups 4, 6, 8, 10 (byte indices 4, 6, 8, 10).
@@ -883,6 +941,101 @@ mod tests {
         // Duration exactly at i64::MAX millis
         let exact = Duration::from_millis(i64::MAX as u64);
         assert_eq!(duration_to_millis_i64(exact), i64::MAX);
+    }
+
+    // ── Findings from `cargo mutants` ─────────────────────────────────
+
+    /// The version and variant bits, checked against every possible input.
+    ///
+    /// This replaces asserting the nibbles of one random UUID, which caught a
+    /// corrupted variant mask only half the time — the surviving mutant
+    /// (`& 0x3F` → `| 0x3F`) leaves bit 6 random, so the old test passed on a
+    /// coin flip.
+    #[test]
+    fn stamp_uuid_v4_bits_is_correct_for_every_input() {
+        for byte in 0u8..=255 {
+            let mut bytes = [byte; 16];
+            stamp_uuid_v4_bits(&mut bytes);
+
+            assert_eq!(
+                bytes[6] >> 4,
+                4,
+                "version nibble must be 4 for input byte {byte:#04x}"
+            );
+            assert_eq!(
+                bytes[6] & 0x0F,
+                byte & 0x0F,
+                "the low nibble of byte 6 must survive untouched"
+            );
+            assert_eq!(
+                bytes[8] >> 6,
+                0b10,
+                "variant bits must be 0b10 for input byte {byte:#04x}"
+            );
+            assert_eq!(
+                bytes[8] & 0x3F,
+                byte & 0x3F,
+                "the low six bits of byte 8 must survive untouched"
+            );
+            // Every other byte is left alone.
+            for i in [0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15] {
+                assert_eq!(bytes[i], byte, "byte {i} must not be modified");
+            }
+        }
+    }
+
+    /// A multiplier just above 1.0 must keep growing, not jump to the ceiling.
+    ///
+    /// The previous implementation short-circuited to `max_backoff` whenever
+    /// `multiplier > 1.0 && exponent >= 1024`, on the theory that such an
+    /// exponent would overflow. It does not for a multiplier this close to 1:
+    /// at attempt 1025 the series has reached ~100.01 ms, and the old code
+    /// returned the full 10 s ceiling — a 100× jump.
+    #[test]
+    fn calculate_backoff_does_not_jump_to_the_ceiling_for_slow_growth() {
+        let policy = BackoffPolicy {
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(10),
+            backoff_multiplier: 1.000_000_1,
+            jitter_factor: 0.0,
+        };
+
+        let backoff = policy.calculate_backoff(1025);
+        assert!(
+            backoff < Duration::from_millis(101),
+            "a multiplier of 1.0000001 has barely grown by attempt 1025, got {backoff:?}"
+        );
+        assert!(backoff >= Duration::from_millis(100));
+    }
+
+    /// A genuinely growing multiplier still saturates at the ceiling, which is
+    /// what the removed short-circuit was there for — `powi` overflowing to
+    /// `inf` and `inf.min(ceiling)` gives the same answer without the guard.
+    #[test]
+    fn calculate_backoff_saturates_when_the_exponential_overflows() {
+        let policy = BackoffPolicy {
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(10),
+            backoff_multiplier: 2.0,
+            jitter_factor: 0.0,
+        };
+        assert_eq!(policy.calculate_backoff(2_000), Duration::from_secs(10));
+        assert_eq!(policy.calculate_backoff(u32::MAX), Duration::from_secs(10));
+    }
+
+    /// The accessors report the configured values rather than defaults.
+    #[test]
+    fn backoff_accessors_return_the_configured_values() {
+        let policy = BackoffPolicy {
+            initial_backoff: Duration::from_millis(250),
+            max_backoff: Duration::from_secs(30),
+            backoff_multiplier: 3.5,
+            jitter_factor: 0.25,
+        };
+        assert_eq!(policy.initial_backoff(), Duration::from_millis(250));
+        assert_eq!(policy.max_backoff(), Duration::from_secs(30));
+        assert!((policy.backoff_multiplier() - 3.5).abs() < f64::EPSILON);
+        assert!((policy.jitter_factor() - 0.25).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -10,7 +10,6 @@
 //! - Transactional production for exactly-once delivery
 
 mod accumulator;
-mod barrier;
 mod config;
 mod idempotent;
 mod partitioner;
@@ -54,11 +53,11 @@ use crate::protocol::{
     ProduceRequest, ProduceResponse, ProduceTopicData, RecordBatchBuilder, VersionedDecode,
     VersionedEncode, versions,
 };
-use crate::schema_registry::SchemaEncoder;
+use crate::serdes::Serializer;
 
-use self::barrier::{InFlightBarrier, InFlightOpGuard};
 use self::idempotent::ErasedProducerStateStore;
 use self::record::{RoutedRecord, TopicHandle};
+use crate::barrier::{InFlightBarrier, InFlightOpGuard};
 
 struct SendMemoryReservation {
     bytes: usize,
@@ -117,13 +116,13 @@ pub struct Producer {
     /// registration + Confluent wire framing) on every `send_record` call,
     /// before partitioning or batching.  Equivalent to `key.serializer` in
     /// the Java `KafkaProducer`.
-    key_encoder: Option<Arc<dyn SchemaEncoder>>,
+    key_serializer: Option<Arc<dyn Serializer>>,
     /// Optional value encoder applied transparently in `send_record`.
     ///
     /// When set, the record value is passed through this encoder on every
     /// `send_record` call.  Equivalent to `value.serializer` in the Java
     /// `KafkaProducer`.
-    value_encoder: Option<Arc<dyn SchemaEncoder>>,
+    value_serializer: Option<Arc<dyn Serializer>>,
     /// Optional dead-letter queue for permanently-failed records.
     ///
     /// When set, records on the direct-send path (linger = 0) that exhaust
@@ -502,6 +501,36 @@ pub(crate) fn fill_produce_topic_ids(
     all_resolved
 }
 
+/// Hand-written rather than derived, for two reasons.
+///
+/// The mechanical one: several fields are `Arc<dyn Trait>` — the partitioner,
+/// the interceptor, the DLQ, the schema encoders — and a derive would require
+/// `Debug` on every one of those traits.
+///
+/// The one that matters: [`DeadLetterQueue`](crate::dlq::DeadLetterQueue)
+/// requires `Debug`, and the obvious implementation of it owns a `Producer` to
+/// write dead letters back into Kafka. Without this impl that natural design
+/// does not compile, and the documented example for the crate's own DLQ trait
+/// was wrong for exactly that reason.
+///
+/// Only non-secret, non-`dyn` state is printed. `ProducerConfig` is
+/// deliberately excluded — it can carry SASL credentials, and the crate's
+/// `secret-debug` CI check exists to keep credential-bearing types out of
+/// `Debug` output.
+impl std::fmt::Debug for Producer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Producer")
+            .field("client_id", &self.config.client_id)
+            .field("batching", &self.accumulator.is_some())
+            .field("idempotent", &self.identity.is_some())
+            .field("max_request_size", &self.max_request_size)
+            .field("memory_capacity", &self.memory_capacity)
+            .field("connections", &self.pool.len())
+            .field("owns_pool", &self.owns_pool())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Producer {
     /// Create a new producer builder.
     pub fn builder() -> ProducerBuilder {
@@ -548,8 +577,8 @@ impl Producer {
         config: ProducerConfig,
         interceptor: Arc<dyn crate::interceptor::ProducerInterceptor>,
         partitioner: Option<Arc<dyn Partitioner>>,
-        key_encoder: Option<Arc<dyn SchemaEncoder>>,
-        value_encoder: Option<Arc<dyn SchemaEncoder>>,
+        key_serializer: Option<Arc<dyn Serializer>>,
+        value_serializer: Option<Arc<dyn Serializer>>,
         shared: Option<(Arc<ConnectionPool>, Arc<crate::metadata::ClusterMetadata>)>,
         state_store: Option<Arc<dyn ErasedProducerStateStore>>,
     ) -> Result<Self> {
@@ -751,8 +780,8 @@ impl Producer {
             interceptor,
             identity,
             state_store,
-            key_encoder,
-            value_encoder,
+            key_serializer,
+            value_serializer,
             dlq: config.dead_letter_queue,
             pool_owned,
         })
@@ -825,9 +854,9 @@ impl Producer {
         // Transparently apply producer-level schema encoders if configured.
         // Runs after the interceptor (which may set topic/key/value) but before
         // validation, so oversized encoded payloads are still caught.
-        if let Some(enc) = &self.value_encoder {
+        if let Some(enc) = &self.value_serializer {
             record.value = enc
-                .encode(
+                .serialize(
                     record.value.clone(),
                     &record.topic,
                     record.record_name.as_deref(),
@@ -835,10 +864,10 @@ impl Producer {
                 )
                 .await?;
         }
-        if let Some(enc) = &self.key_encoder {
+        if let Some(enc) = &self.key_serializer {
             let key = record.key.clone().unwrap_or_default();
             record.key = Some(
-                enc.encode(key, &record.topic, record.record_name.as_deref(), true)
+                enc.serialize(key, &record.topic, record.record_name.as_deref(), true)
                     .await?,
             );
         }
@@ -1686,8 +1715,8 @@ pub struct ProducerBuilder {
     config: ProducerConfig,
     interceptors: Vec<Arc<dyn crate::interceptor::ProducerInterceptor>>,
     partitioner: Option<Arc<dyn Partitioner>>,
-    key_encoder: Option<Arc<dyn SchemaEncoder>>,
-    value_encoder: Option<Arc<dyn SchemaEncoder>>,
+    key_serializer: Option<Arc<dyn Serializer>>,
+    value_serializer: Option<Arc<dyn Serializer>>,
     /// Pre-built pool and metadata from a [`KrafkaClient`](crate::client::KrafkaClient).
     shared: Option<(Arc<ConnectionPool>, Arc<crate::metadata::ClusterMetadata>)>,
     /// Optional pluggable persistence hook for producer identity state.
@@ -2119,8 +2148,8 @@ impl ProducerBuilder {
     /// set [`ProducerRecord::record_name`] (via
     /// [`with_record_name`](ProducerRecord::with_record_name)) on each record
     /// before sending.
-    pub fn key_encoder(mut self, encoder: Arc<dyn SchemaEncoder>) -> Self {
-        self.key_encoder = Some(encoder);
+    pub fn key_serializer(mut self, encoder: Arc<dyn Serializer>) -> Self {
+        self.key_serializer = Some(encoder);
         self
     }
 
@@ -2129,8 +2158,8 @@ impl ProducerBuilder {
     /// This is the Rust equivalent of `value.serializer` in the Java
     /// `KafkaProducer`. Configure it once here and encoding is transparent
     /// on every send.
-    pub fn value_encoder(mut self, encoder: Arc<dyn SchemaEncoder>) -> Self {
-        self.value_encoder = Some(encoder);
+    pub fn value_serializer(mut self, encoder: Arc<dyn Serializer>) -> Self {
+        self.value_serializer = Some(encoder);
         self
     }
 
@@ -2248,8 +2277,8 @@ impl ProducerBuilder {
             self.config,
             interceptor,
             self.partitioner,
-            self.key_encoder,
-            self.value_encoder,
+            self.key_serializer,
+            self.value_serializer,
             self.shared,
             self.state_store,
         )
@@ -2572,8 +2601,8 @@ mod tests {
             interceptor: Arc::new(crate::interceptor::NoOpProducerInterceptor),
             identity: None,
             state_store: None,
-            key_encoder: None,
-            value_encoder: None,
+            key_serializer: None,
+            value_serializer: None,
             pool_owned: true,
             dlq: None,
         };
@@ -2772,8 +2801,7 @@ mod tests {
             .request_timeout(Duration::from_secs(2))
             .build()
             .await
-            .err()
-            .expect("request_timeout below the default connect_timeout must be rejected");
+            .expect_err("request_timeout below the default connect_timeout must be rejected");
         assert!(
             err.to_string().contains("connect_timeout"),
             "the error should name the setter to change: {err}"
@@ -2787,8 +2815,7 @@ mod tests {
             .connect_timeout(Duration::from_secs(2))
             .build()
             .await
-            .err()
-            .expect("no broker is listening on port 1");
+            .expect_err("no broker is listening on port 1");
         assert!(
             !err.to_string().contains("connect_timeout"),
             "config validation should have passed, got {err}"

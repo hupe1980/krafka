@@ -95,7 +95,7 @@ let producer = Producer::builder()
 
 ### Example: Metrics Counter
 
-```rust
+```rust,compile
 use krafka::interceptor::{InterceptorResult, ProducerInterceptor};
 use krafka::producer::{ProducerRecord, RecordMetadata};
 use krafka::error::KrafkaError;
@@ -183,19 +183,20 @@ let consumer = Consumer::builder()
 
 ### Example: Commit Monitoring
 
-```rust
-use krafka::interceptor::{ConsumerInterceptor, InterceptorResult};
+```rust,compile
+use krafka::interceptor::{CommitOffsets, ConsumerInterceptor, InterceptorResult};
 use krafka::error::KrafkaError;
-use krafka::{Offset, PartitionId};
-use std::collections::HashMap;
 
 #[derive(Debug)]
 struct CommitMonitor;
 
 impl ConsumerInterceptor for CommitMonitor {
+    // `CommitOffsets` is the map type the trait uses. Naming the underlying
+    // `std::collections::HashMap` here would not compile — the trait's map is
+    // an `ahash::AHashMap`, which is a different type.
     fn on_commit(
         &self,
-        offsets: &HashMap<(String, PartitionId), Offset>,
+        offsets: &CommitOffsets,
         error: Option<&KrafkaError>,
     ) -> InterceptorResult {
         match error {
@@ -321,7 +322,7 @@ There is zero overhead — the no-op methods are inlined away by the compiler.
 Interceptors must implement `Send + Sync + Debug`. Use atomic types or `Mutex`/`RwLock`
 for any mutable state:
 
-```rust
+```rust,compile
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug)]
