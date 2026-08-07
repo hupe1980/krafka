@@ -248,7 +248,7 @@ registry, AWS Glue, Apicurio, and Avro / Protobuf / JSON codecs:
 
 ```toml
 [dependencies]
-krafka   = "0.18"
+krafka   = "0.17"
 schemreg = { version = "0.4", features = ["confluent", "avro"] }
 ```
 

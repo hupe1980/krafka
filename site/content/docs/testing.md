@@ -20,7 +20,7 @@ socket, so the client under test is the actual `Producer`, `Consumer` or
 
 ```toml
 [dev-dependencies]
-krafka = { version = "0.18", features = ["test-broker"] }
+krafka = { version = "0.17", features = ["test-broker"] }
 ```
 
 ## A first test

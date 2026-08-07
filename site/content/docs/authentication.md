@@ -351,7 +351,7 @@ Enable the `oauth-oidc` feature and krafka fetches access tokens itself, instead
 of you writing the OAuth client:
 
 ```toml
-krafka = { version = "0.18.0", features = ["oauth-oidc"] }
+krafka = { version = "0.17.0", features = ["oauth-oidc"] }
 ```
 
 Two ways to authenticate to the token endpoint:
@@ -446,7 +446,7 @@ krafka's TLS is `rustls`, which needs a crypto backend. `ring` is the default;
 FIPS-oriented deployments:
 
 ```toml
-krafka = { version = "0.18.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
+krafka = { version = "0.17.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
 ```
 
 The two features are **additive**. Cargo features cannot be made mutually
@@ -495,7 +495,7 @@ By default, krafka uses compiled-in `webpki-roots`. To use the operating system 
 
 ```toml
 [dependencies]
-krafka = { version = "0.18.0", features = ["native-tls-roots"] }
+krafka = { version = "0.17.0", features = ["native-tls-roots"] }
 ```
 
 ```rust,compile
@@ -639,7 +639,7 @@ For production deployments on EC2, ECS, Lambda, or EKS, use the AWS SDK default 
 use krafka::auth::{AuthConfig, AwsMskIamCredentials};
 
 // Requires the `aws-msk` feature in Cargo.toml:
-// krafka = { version = "0.18.0", features = ["aws-msk"] }
+// krafka = { version = "0.17.0", features = ["aws-msk"] }
 
 // Loads from (in order):
 // 1. Environment variables

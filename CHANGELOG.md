@@ -15,98 +15,18 @@ not a complete record.
 
 Nothing yet.
 
-## [0.18.0] — 2026-08-07
+## [0.17.0] — 2026-08-07
 
-Schema-registry support is removed from krafka and replaced by a generic
-serialization hook. This is a scope change, not a capability loss: the registry
-client now lives in [`schemreg`](https://crates.io/crates/schemreg), which also
-has native Apicurio support and real Avro / Protobuf / JSON codecs that krafka
-never had.
+Ten defects fixed in the consumer's fetch-to-delivery path, the read path turned
+into a real prefetch pipeline, and schema-registry support replaced by a generic
+serialization hook.
 
-### Testing
+Dropping the registry is a scope change, not a capability loss: the client now
+lives in [`schemreg`](https://crates.io/crates/schemreg), which also has native
+Apicurio support and real Avro / Protobuf / JSON codecs that krafka never had.
 
-- **`just mutants`** — scoped mutation testing over the invariant-dense modules
-  (sequence arithmetic, the in-flight barrier, varint codecs, fetch sessions).
-  Deliberately not part of `ci`: 8 200 mutants across the crate is roughly
-  45 CPU-hours, and the timing-based fake-broker tests turn many mutants into
-  timeouts rather than failures.
-
-  It found that **four separate corruptions of `is_newer_sequence` passed the
-  whole test suite**. That function decides whether a broker acknowledgement
-  moves `last_acked_sequence` forward, which feeds `can_reset_after_out_of_order`
-  and `reset_sequence`. Every existing test used `candidate == 0`, `last == 0`,
-  or values small enough that subtracting, adding and dividing all landed on the
-  same side of the half-sequence-space threshold — so the assertions held for
-  arithmetic that was wrong. Three new tests pin the forward branch, the wrap
-  branch and the exact-half-space boundary, chosen so each mutation flips the
-  answer rather than just an intermediate.
-
-  It also caught a missing assertion: `take_reinit_request` resets the producer
-  epoch alongside the ID, but `is_initialized()` only inspects the ID, so a
-  stale epoch was invisible to the test.
-
-  Running it over the rest of the scoped set found five more gaps, all in code
-  that fails *quietly* when it is wrong — which is why nothing had noticed:
-
-  - **`SessionKey::from_request` never tested a zero UUID.** A zero topic ID
-    means "no topic ID" (Fetch v12 and below), not "the topic whose ID is
-    zero". Three separate corruptions of that guard survived; any of them would
-    have collapsed every pre-v13 topic onto the single key `Uuid([0; 16])`, so
-    one topic's partition state would overwrite another's and the incremental
-    diff would describe the wrong topic.
-  - **`update_from_response` stored the UUID under the same rule, also
-    untested.** It is what `FetchForgottenTopic` entries carry, so a zero UUID
-    stored as real would tell the broker to forget topic `0`.
-  - **`next_epoch` could have returned a constant.** The fetch-session epoch is
-    how the broker detects a desynchronised session; a constant one draws
-    `INVALID_FETCH_SESSION_EPOCH`, the client resets, and every fetch silently
-    degrades to a full one — KIP-227's entire benefit lost with no error
-    surfaced.
-  - **`InFlightBarrier::is_closing` and its `Debug` impl** were both
-    unasserted. The barrier is what three shutdown paths block on, so its
-    `Debug` output is the first thing read when one appears to hang.
-  - **The UUID version/variant test was a coin flip.** It asserted the nibbles
-    of one random UUID, so a corrupted variant mask (`& 0x3F` → `| 0x3F`, which
-    leaves bit 6 random) passed half the time. The bit-stamping is now a
-    separate function checked against all 256 input bytes.
-
-  Not every surviving mutant is a defect. Three of them were provably
-  *equivalent* — `base + jitter` vs `base - jitter` over a symmetric jitter
-  range, and two `|` → `^` swaps on bits the preceding mask had already
-  cleared, identical for all 256 inputs. Those are left alone deliberately;
-  mutation score is a diagnostic, not a target.
-
-### Fixed
-
-- **`BackoffPolicy::calculate_backoff` jumped to `max_backoff` for a
-  slow-growing multiplier.** It short-circuited whenever
-  `multiplier > 1.0 && exponent >= 1024`, to avoid "evaluating `powi` with a
-  large exponent". Both halves of that were wrong: `powi` is repeated squaring,
-  so even `i32::MAX` costs ~31 multiplications, and for a multiplier just above
-  1.0 the series is nowhere near the ceiling at attempt 1025 — with
-  `multiplier = 1.0000001` a 100 ms initial backoff jumped straight to the
-  full 10 s ceiling instead of the ~100.01 ms it had actually reached.
-
-  The guard is removed rather than corrected: `.min(ceiling)` already carries
-  every case it was covering. A growing multiplier overflows `powi` to `+inf`
-  and `inf.min(ceiling)` is the ceiling; a shrinking one underflows to `0.0`
-  and the existing floor lifts it back to `initial_backoff`; a non-finite one
-  yields `NaN`, and `f64::min` returns the non-`NaN` operand. Mutation testing
-  found it: negating the `||` changed nothing any test could observe.
-
-- **A share-consumer `commit_sync()` or `close()` could strand
-  acknowledgements.** `poll()` drains every entry out of `pending_acks` into a
-  guard for the duration of its `ShareFetch`, so during that window the map is
-  empty. A concurrent flush took nothing, reported success, and left the
-  acknowledgements to be restored by the guard a moment later with nobody left
-  to send them — so records the application had explicitly acknowledged were
-  redelivered anyway.
-
-  This is the documented shutdown sequence, not an exotic race: `wakeup()`
-  followed by `close()`, where `wakeup()` does not wait for the poll it
-  interrupts to unwind. Both flush paths now wait on an in-flight barrier
-  first — the same fix as the transactional producer's, and the same barrier
-  type, which moved to `crate::barrier` now that two subsystems use it.
+Six breaking changes — four from that removal, two in the consumer's offset
+accessors. See **Breaking** below before upgrading.
 
 ### Breaking
 
@@ -144,22 +64,6 @@ never had.
   `schema_registry()` / `schema_registry_with_source()` becoming `http()` /
   `http_with_source()`. The variant only ever described failures from the
   built-in HTTP client, which now serves the OIDC token provider alone.
-
-### Changed
-
-- The built-in HTTP/1.1 client (`src/http.rs`) is compiled for `oauth-oidc`
-  only. It stays because the OIDC token provider uses it — removing the registry
-  client did not remove the need for an HTTP client, and claiming otherwise
-  would have been the easy overstatement here.
-
-
-## [0.17.0] — 2026-08-07
-
-Ten defects fixed in the consumer's fetch-to-delivery path, and the read path
-turned into a real prefetch pipeline. Two breaking changes, both in the
-consumer's offset accessors — see **Breaking** below before upgrading.
-
-### Breaking
 
 - **`Consumer::cached_end_offset` is now isolation-aware.** Under
   `IsolationLevel::ReadCommitted` it returns the **last stable offset** rather
@@ -250,15 +154,14 @@ consumer's offset accessors — see **Breaking** below before upgrading.
   with a missing or malformed key leaves the filter engaged.
 
 - **The HTTP `Host` header omitted the port and did not bracket IPv6
-  literals.** `https://registry.example.com:8081/subjects` — the Confluent
-  Schema Registry's own default port, so the most common configuration — sent
-  `Host: registry.example.com`, violating RFC 9110 §7.2. Name-based virtual
+  literals.** A token endpoint on a non-default port —
+  `https://idp.example.com:8443/oauth2/token` — was sent
+  `Host: idp.example.com`, violating RFC 9110 §7.2. Name-based virtual
   hosting, nginx `server_name`, Envoy virtual hosts and ALB host-header rules
   all failed to match, and an OIDC token endpoint validating the request
-  authority against its issuer rejected the token request. An IPv6 registry
-  sent `Host: ::1`, which is not a parseable authority. Affects the Schema
-  Registry client (`schema-registry`) and the OIDC token provider
-  (`oauth-oidc`).
+  authority against its issuer rejected the token request. An IPv6 endpoint
+  was sent `Host: ::1`, which is not a parseable authority. Affects the OIDC
+  token provider (`oauth-oidc`), now the built-in HTTP client's only caller.
 
 - **`assign()` leaked state for partitions it dropped.** Narrowing a manual
   assignment — `assign("t", vec![0, 1])` then `assign("t", vec![0])` — left
@@ -268,6 +171,36 @@ consumer's offset accessors — see **Breaking** below before upgrading.
   kept dragging back the commit for one it had not. A narrower `assign()` now
   revokes what it drops, exactly as a rebalance does.
 
+- **`BackoffPolicy::calculate_backoff` jumped to `max_backoff` for a
+  slow-growing multiplier.** It short-circuited whenever
+  `multiplier > 1.0 && exponent >= 1024`, to avoid "evaluating `powi` with a
+  large exponent". Both halves of that were wrong: `powi` is repeated squaring,
+  so even `i32::MAX` costs ~31 multiplications, and for a multiplier just above
+  1.0 the series is nowhere near the ceiling at attempt 1025 — with
+  `multiplier = 1.0000001` a 100 ms initial backoff jumped straight to the
+  full 10 s ceiling instead of the ~100.01 ms it had actually reached.
+
+  The guard is removed rather than corrected: `.min(ceiling)` already carries
+  every case it was covering. A growing multiplier overflows `powi` to `+inf`
+  and `inf.min(ceiling)` is the ceiling; a shrinking one underflows to `0.0`
+  and the existing floor lifts it back to `initial_backoff`; a non-finite one
+  yields `NaN`, and `f64::min` returns the non-`NaN` operand. Mutation testing
+  found it: negating the `||` changed nothing any test could observe.
+
+- **A share-consumer `commit_sync()` or `close()` could strand
+  acknowledgements.** `poll()` drains every entry out of `pending_acks` into a
+  guard for the duration of its `ShareFetch`, so during that window the map is
+  empty. A concurrent flush took nothing, reported success, and left the
+  acknowledgements to be restored by the guard a moment later with nobody left
+  to send them — so records the application had explicitly acknowledged were
+  redelivered anyway.
+
+  This is the documented shutdown sequence, not an exotic race: `wakeup()`
+  followed by `close()`, where `wakeup()` does not wait for the poll it
+  interrupts to unwind. Both flush paths now wait on an in-flight barrier
+  first — the same fix as the transactional producer's, and the same barrier
+  type, which moved to `crate::barrier` now that two subsystems use it.
+
 ### Changed
 
 - **Lag counts records read ahead into the buffer.** `lag()`, `current_lag()`,
@@ -276,6 +209,11 @@ consumer's offset accessors — see **Breaking** below before upgrading.
   fetched but not returned is still backlog from the application's point of
   view. All five, plus `position()` and `commit()`, are now derived from one
   boundary — the lowest offset still awaiting delivery.
+
+- The built-in HTTP/1.1 client (`src/http.rs`) is compiled for `oauth-oidc`
+  only. It stays because the OIDC token provider uses it — removing the registry
+  client did not remove the need for an HTTP client, and claiming otherwise
+  would have been the easy overstatement here.
 
 ### Performance
 
@@ -332,12 +270,74 @@ consumer's offset accessors — see **Breaking** below before upgrading.
   `HEADER_EXCEPTION_MESSAGE`, so the producer-side and consumer-side paths
   cannot drift from one wire contract.
 
+- `Consumer::cached_high_watermark` — the partition's log-end offset regardless
+  of isolation level, for callers that want the value `cached_end_offset` used
+  to return under `read_committed`.
+- `Consumer::cached_last_stable_offset` — the first offset belonging to an open
+  transaction. The gap between it and the high watermark is the volume of
+  in-flight transactional data.
+- `Consumer::fetch_position` — the offset the next fetch starts from, for
+  callers that want the read-ahead value rather than the delivered one.
+
+### Testing
+
+- **`just mutants`** — scoped mutation testing over the invariant-dense modules
+  (sequence arithmetic, the in-flight barrier, varint codecs, fetch sessions).
+  Deliberately not part of `ci`: 8 200 mutants across the crate is roughly
+  45 CPU-hours, and the timing-based fake-broker tests turn many mutants into
+  timeouts rather than failures.
+
+  It found that **four separate corruptions of `is_newer_sequence` passed the
+  whole test suite**. That function decides whether a broker acknowledgement
+  moves `last_acked_sequence` forward, which feeds `can_reset_after_out_of_order`
+  and `reset_sequence`. Every existing test used `candidate == 0`, `last == 0`,
+  or values small enough that subtracting, adding and dividing all landed on the
+  same side of the half-sequence-space threshold — so the assertions held for
+  arithmetic that was wrong. Three new tests pin the forward branch, the wrap
+  branch and the exact-half-space boundary, chosen so each mutation flips the
+  answer rather than just an intermediate.
+
+  It also caught a missing assertion: `take_reinit_request` resets the producer
+  epoch alongside the ID, but `is_initialized()` only inspects the ID, so a
+  stale epoch was invisible to the test.
+
+  Running it over the rest of the scoped set found five more gaps, all in code
+  that fails *quietly* when it is wrong — which is why nothing had noticed:
+
+  - **`SessionKey::from_request` never tested a zero UUID.** A zero topic ID
+    means "no topic ID" (Fetch v12 and below), not "the topic whose ID is
+    zero". Three separate corruptions of that guard survived; any of them would
+    have collapsed every pre-v13 topic onto the single key `Uuid([0; 16])`, so
+    one topic's partition state would overwrite another's and the incremental
+    diff would describe the wrong topic.
+  - **`update_from_response` stored the UUID under the same rule, also
+    untested.** It is what `FetchForgottenTopic` entries carry, so a zero UUID
+    stored as real would tell the broker to forget topic `0`.
+  - **`next_epoch` could have returned a constant.** The fetch-session epoch is
+    how the broker detects a desynchronised session; a constant one draws
+    `INVALID_FETCH_SESSION_EPOCH`, the client resets, and every fetch silently
+    degrades to a full one — KIP-227's entire benefit lost with no error
+    surfaced.
+  - **`InFlightBarrier::is_closing` and its `Debug` impl** were both
+    unasserted. The barrier is what three shutdown paths block on, so its
+    `Debug` output is the first thing read when one appears to hang.
+  - **The UUID version/variant test was a coin flip.** It asserted the nibbles
+    of one random UUID, so a corrupted variant mask (`& 0x3F` → `| 0x3F`, which
+    leaves bit 6 random) passed half the time. The bit-stamping is now a
+    separate function checked against all 256 input bytes.
+
+  Not every surviving mutant is a defect. Three of them were provably
+  *equivalent* — `base + jitter` vs `base - jitter` over a symmetric jitter
+  range, and two `|` → `^` swaps on bits the preceding mask had already
+  cleared, identical for all 256 inputs. Those are left alone deliberately;
+  mutation score is a diagnostic, not a target.
+
 ### Documentation
 
 - **`just docs-test` now exists and runs in CI.** `xtask/doc_api.py` had
   documented it as the stronger guarantee for two releases; the recipe was never
   written. It compiles every snippet marked ```` ```rust,compile ```` against
-  the real crate. 196 of 343 Rust blocks across the README and the guides are
+  the real crate. 192 of 321 Rust blocks across the README and the guides are
   now compile-checked; the rest are deliberate fragments naming
   reader-supplied helpers.
 - **It immediately found broken snippets in the first two pages anyone reads.**
@@ -369,17 +369,6 @@ consumer's offset accessors — see **Breaking** below before upgrading.
 - The `dlq` module's own examples were wrong in two ways: one passed a
   `KrafkaError` where `send` takes a `String`, and the header table named raw
   strings rather than the constants that define them.
-
-### Added
-
-- `Consumer::cached_high_watermark` — the partition's log-end offset regardless
-  of isolation level, for callers that want the value `cached_end_offset` used
-  to return under `read_committed`.
-- `Consumer::cached_last_stable_offset` — the first offset belonging to an open
-  transaction. The gap between it and the high watermark is the volume of
-  in-flight transactional data.
-- `Consumer::fetch_position` — the offset the next fetch starts from, for
-  callers that want the read-ahead value rather than the delivered one.
 
 ## [0.16.0]
 
@@ -492,8 +481,7 @@ Initial development: wire protocol, producer, consumer, admin client,
 authentication (SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM), TLS,
 compression codecs, schema registry integration and the metrics layer.
 
-[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.18.0...HEAD
-[0.18.0]: https://github.com/hupe1980/krafka/compare/v0.17.0...v0.18.0
+[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.17.0...HEAD
 [0.17.0]: https://github.com/hupe1980/krafka/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/hupe1980/krafka/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/hupe1980/krafka/compare/v0.14.0...v0.15.0

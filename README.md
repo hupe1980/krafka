@@ -57,11 +57,11 @@ Add krafka to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-krafka = "0.18.0"
+krafka = "0.17.0"
 tokio = { version = "1", features = ["full"] }
 
 # For AWS MSK IAM authentication with full SDK support:
-# krafka = { version = "0.18.0", features = ["aws-msk"] }
+# krafka = { version = "0.17.0", features = ["aws-msk"] }
 ```
 
 ### Producer
@@ -285,10 +285,10 @@ To select only what you need:
 # Option 1: enable only the codecs you need
 # `default-features = false` also drops the default `ring` TLS backend, so a
 # crypto backend must be named explicitly.
-krafka = { version = "0.18.0", default-features = false, features = ["lz4", "snappy", "ring"] }
+krafka = { version = "0.17.0", default-features = false, features = ["lz4", "snappy", "ring"] }
 
 # Option 2: enable all compression codecs, including zstd
-# krafka = { version = "0.18.0", features = ["compression-all"] }
+# krafka = { version = "0.17.0", features = ["compression-all"] }
 ```
 
 ### TLS crypto backend
@@ -298,7 +298,7 @@ default; `rustls-aws-lc-rs` selects aws-lc-rs instead, which is the better
 choice on AWS Graviton and in FIPS-oriented deployments:
 
 ```toml
-krafka = { version = "0.18.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
+krafka = { version = "0.17.0", default-features = false, features = ["rustls-aws-lc-rs", "compression"] }
 ```
 
 The two backends are **additive**, not mutually exclusive — a transitive
@@ -647,15 +647,7 @@ what it does and, just as importantly, what it deliberately does not model.
 
 Release-by-release detail lives in **[CHANGELOG.md](CHANGELOG.md)**.
 
-### Upgrading to 0.18
-
-#### Fixed
-
-- **A share-consumer flush could strand acknowledgements.** `poll()` holds the
-  pending acks out of the map for the duration of its `ShareFetch`, so a
-  concurrent `commit_sync()` or `close()` flushed an empty map and reported
-  success. The documented `wakeup()` → `close()` shutdown hits exactly that
-  window. Both flush paths now wait for in-flight polls first.
+### Upgrading to 0.17
 
 #### Breaking — schema registry moved out
 
@@ -681,9 +673,7 @@ Since the traits are plain `Bytes -> Bytes`, they now cover encryption and
 compression as well as schema framing. The ~20-line `schemreg` adapter is in the
 [Cookbook](https://hupe1980.github.io/krafka/docs/cookbook/#use-a-schema-registry).
 
-### Upgrading to 0.17
-
-#### Breaking
+#### Breaking — consumer offset accessors
 
 - **`Consumer::cached_end_offset` is isolation-aware.** Under `read_committed`
   it returns the **last stable offset** rather than the high watermark, because
@@ -694,7 +684,7 @@ compression as well as schema framing. The ~20-line `schemreg` adapter is in the
   It is the value a commit writes, so `position()` and `commit()` cannot
   disagree. The read-ahead value is the new `fetch_position()`.
 
-#### Fixed — four defects in the fetch-to-delivery path
+#### Fixed
 
 - **A `seek()` could move the committed offset *backwards*.** Every reposition
   path left already-fetched records in the receive buffer, and a commit is
@@ -725,11 +715,15 @@ compression as well as schema framing. The ~20-line `schemreg` adapter is in the
   in flight**, committing the consumer's offsets outside the transaction. The
   output records stayed atomic with each other but not with the position that
   produced them.
-
 - **`assign()` leaked state for partitions it dropped.** Narrowing a manual
   assignment left the old partitions' positions, watermarks and buffered
   records behind — and the stale buffer entry dragged back the commit for the
   partitions still being consumed.
+- **A share-consumer flush could strand acknowledgements.** `poll()` holds the
+  pending acks out of the map for the duration of its `ShareFetch`, so a
+  concurrent `commit_sync()` or `close()` flushed an empty map and reported
+  success. The documented `wakeup()` → `close()` shutdown hits exactly that
+  window. Both flush paths now wait for in-flight polls first.
 
 #### Changed
 
@@ -766,7 +760,7 @@ compression as well as schema framing. The ~20-line `schemreg` adapter is in the
 #### Documentation
 
 - **`just docs-test` compiles the guide snippets.** It was referenced by the
-  doc tooling for two releases without existing; 196 of 343 Rust blocks are now
+  doc tooling for two releases without existing; 192 of 321 Rust blocks are now
   compile-checked in CI. It found broken examples in the README and Getting
   Started on its first run — including the admin quick-start, which chained a
   method onto a `Result`.

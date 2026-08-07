@@ -83,7 +83,7 @@ make actually reach the wire.
 
 ```toml
 [dependencies]
-krafka = "0.18"
+krafka = "0.17"
 tokio = { version = "1", features = ["full"] }
 ```
 
